@@ -150,6 +150,7 @@ const PARK_LABELS = {
   pool_wait: "waiting for pool",
   recovery_wait: "recovery wait",
   worker_requeue_exhausted: "recovery needs decision",
+  worker_memory_pressure: "memory pressure: owner hold",
   paused: "paused",
   credential_disabled: "waiting: credential disabled",
   provider_unavailable: "provider unavailable: owner hold",
@@ -211,6 +212,7 @@ export function effectiveRunStatus(
   // card, so runBadge meets this key too).
   if (run.status === "paused" && run.hold_reason === "credential_disabled") return "credential_disabled";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted") return "worker_requeue_exhausted";
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure") return "worker_memory_pressure";
   return run.status;
 }
 
@@ -341,7 +343,7 @@ export function runStatusTone(
   if (status === "pool_wait") return "warning";
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
-  if (status === "recovery_wait" || status === "worker_requeue_exhausted") return "warning";
+  if (status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
   // PRD #1190: a run its owner paused. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
@@ -514,7 +516,7 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "worker_recovery" | "requeue_count">>, nowMs: number): RunBadge {
+export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -675,6 +677,17 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
             ? `Automatic recovery limit: ${run.worker_recovery.automatic_requeue_limit}. Used: ${run.worker_recovery.episode_used}. Remaining: ${run.worker_recovery.episode_remaining}.`
             : "Automatic recovery limit, used and remaining: unknown.",
           `Lifetime automatic requeues: ${run.requeue_count ?? "unknown"}.`,
+        ].join(" "),
+      };
+    case "worker_memory_pressure":
+      return {
+        kind: "badge",
+        label: PARK_LABELS.worker_memory_pressure,
+        tone: "warning",
+        pulse: false,
+        title: [
+          "Memory interventions have stopped. Only the run owner can resume or cancel. Resume starts a fresh memory episode; there is no scheduled retry.",
+          `Memory interventions: used ${run.memory_hold?.used ?? "unknown"}. Maximum: ${run.memory_hold?.max ?? "unknown"}. Remaining: ${run.memory_hold?.remaining ?? "unknown"}.`,
         ].join(" "),
       };
     // The board projection omits the cause; run details determine the available actions.
@@ -928,6 +941,7 @@ export function needsHumanAttention(status: string): boolean {
     isAwaitingInput(status) ||
     isAwaitingFollowup(status) ||
     status === "worker_requeue_exhausted" ||
+    status === "worker_memory_pressure" ||
     status === "provider_unavailable"
   );
 }

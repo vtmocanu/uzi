@@ -2383,6 +2383,10 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Memory-pressure park fence, bound to the current registration. */
+  register_nonce?: string;
+  /** Memory-pressure episode; zero is the first episode. */
+  memory_episode?: number;
   /** Guard an awaiting_input write against a concurrent pause; requires a positive generation. */
   require_running?: boolean;
   /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
@@ -2725,6 +2729,15 @@ export type CompletedPublicationReason =
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  /** Local acceptance proof from the memory park RPC, never a serialized API receipt.
+   *  Only this binding authorizes marking a memory park; status/applied alone do not. */
+  readonly memoryParkAccepted?: Readonly<{
+    run_id: string;
+    worker_id: string;
+    register_nonce: string;
+    claim_generation: number;
+    memory_episode: number;
+  }>;
   /** Validated by WorkerClient against registration, request and known inventory. */
   completedPublicationReceipt?: CompletedPublicationReceipt;
   completedPublicationReason?: CompletedPublicationReason;

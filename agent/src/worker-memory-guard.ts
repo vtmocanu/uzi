@@ -165,6 +165,7 @@ export class WorkerMemoryGuard {
 
   resolveOutcome(intervention: Intervention): boolean {
     if (this.intervention !== intervention) return false;
+    if (!this.resolved) this.dwell = undefined;
     this.resolved = true;
     return true;
   }
@@ -178,6 +179,7 @@ type Timer = (callback: () => void, ms: number) => () => void;
 type Authority = Readonly<{
   request: Readonly<MemoryReservationRequest>;
   context: Context;
+  phaseRevision: number;
   entry: Entry;
   incarnation: MemoryIncarnation;
   sample: Available;
@@ -211,9 +213,10 @@ export class WorkerMemoryMonitor {
     incarnation: () => MemoryIncarnation | undefined;
     subscribeInvalidation?: (callback: () => void) => () => void;
     reserve: (request: MemoryReservationRequest, signal: AbortSignal, remainingMs: number) => Promise<MemoryReservation>;
-    report: (request: MemoryOutcomeRequest, signal: AbortSignal, remainingMs: number) => Promise<MemoryReservation>;
+    report: (request: MemoryOutcomeRequest, signal: AbortSignal, remainingMs: number, context: Context) => Promise<MemoryReservation>;
     feedback: (result: WorkerMemoryPressureResult, context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
     preserve: (context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
+    prepareFeedback?: (context: Context, result: WorkerMemoryPressureResult) => void;
     preparePreservation?: (context: Context, result: WorkerMemoryPressureResult) => void;
     preservationBudgetMs?: (context: Context) => number;
     timer?: Timer;
@@ -328,7 +331,7 @@ export class WorkerMemoryMonitor {
   private contextCurrent(a: Authority): boolean {
     const incarnation = this.ports.incarnation();
     return !this.closed
-      && this.ports.commands.isCurrent(a.context)
+      && this.ports.commands.phaseAdmits(a.context, a.phaseRevision)
       && incarnation?.worker_id === a.incarnation.worker_id
       && incarnation?.register_nonce === a.incarnation.register_nonce
       && incarnation?.revision === a.incarnation.revision;
@@ -370,25 +373,38 @@ export class WorkerMemoryMonitor {
     }
   }
 
-  private async report(a: Authority, outcome: MemoryOutcome, ticket?: Intervention): Promise<void> {
+  private async report(a: Authority, outcome: MemoryOutcome, ticket?: Intervention, attempts = 3): Promise<boolean> {
     this.record(a, "ambiguous", outcome);
-    try {
-      const ack = await this.bounded((signal, ms) => this.ports.report({ ...a.request, outcome }, signal, ms),
-        this.ports.now() + this.config.responseBudgetMs);
-      // Historical proof resolves only this held ticket; it never changes a context or allowance.
-      if (this.validAck(ack, a, outcome) && ticket && this.held?.ticket === ticket
-        && this.held.entry === a.entry && this.held.authority === a) this.guard.resolveOutcome(ticket);
-    } catch { /* unresolved outcome retains the global fence */ }
+    let confirmed = false;
+    const accept = (ack: MemoryReservation) => {
+      if (!this.validAck(ack, a, outcome)) return;
+      confirmed = true;
+      // Historical proof resolves only the original held ticket, with no authority gain.
+      if (ticket && this.held?.ticket === ticket && this.held.entry === a.entry
+        && this.held.authority === a) this.guard.resolveOutcome(ticket);
+    };
+    // Each fresh producer has its own budget. Failure permits the next identical replay;
+    // late producers remain observed, but are never joined without a deadline.
+    for (let attempt = 0; attempt < attempts && !confirmed && !this.closed; attempt++) {
+      try {
+        await this.bounded((signal, ms) => {
+          const producer = this.ports.report({ ...a.request, outcome }, signal, ms, a.context);
+          void producer.then(accept, () => {});
+          return producer;
+        }, this.ports.now() + this.config.responseBudgetMs);
+      } catch { /* unresolved outcome retains the global fence */ }
+    }
+    return confirmed;
   }
 
   private historical(a: Authority): void {
     if (this.closed) { this.record(a, "ambiguous", "no_signal"); return; }
-    const task = this.report(a, "no_signal");
+    const task = this.report(a, "no_signal").then(() => {});
     this.reports.add(task);
     void task.finally(() => this.reports.delete(task));
   }
 
-  private async finish(a: Authority, selected: Selection, outcome: MemoryOutcome, preserve: boolean): Promise<void> {
+  private async finish(a: Authority, selected: Selection, outcome: MemoryOutcome, preserve: boolean): Promise<Readonly<{ result: WorkerMemoryPressureResult; eligible: boolean; preserved: boolean }>> {
     const sample = a.sample;
     const result: WorkerMemoryPressureResult = Object.freeze({
       run_id: a.request.run_id, worker_id: a.request.worker_id, intervention_id: a.request.intervention_id,
@@ -400,14 +416,16 @@ export class WorkerMemoryMonitor {
       cancellation_confirmed: outcome === "confirmed_drained", outcome, retry_blocked: true,
       guidance: "Use smaller or serial commands after recovery.",
     });
-    const preserveCapturedFlight = preserve && this.ports.commands.isCurrent(a.context);
+    const eligible = this.ports.commands.isCurrent(a.context);
+    const preserveCapturedFlight = preserve && eligible;
+    // Retain feed intent for every outcome before tool completion and bounded IO.
+    // Eligibility was captured first: either preparation hook may retire admission.
+    try { this.ports.prepareFeedback?.(a.context, result); } catch {}
     if (preserveCapturedFlight) {
       // The owner sets clone/session retention intent synchronously, before feedback
       // can unblock tool completion. memoryPark only retires local authority; it
       // proves nothing about API park acceptance or preservation completion.
-      try { this.ports.preparePreservation?.(a.context, result); }
-      catch { /* Failed preparation cannot restore admission or suppress the preservation attempt. */ }
-      finally { this.ports.commands.memoryPark(a.context); }
+      this.preparePreservation(a, result);
       // Preparation may itself retire this exact context. The captured owner
       // attempt remains owed; retirement never redirects it to a successor.
     }
@@ -418,25 +436,37 @@ export class WorkerMemoryMonitor {
     if (preserveCapturedFlight) {
       // The fallback is for pure monitor ports. Runtime enrollment requires an
       // independent budget supplied by the captured runner owner.
-      const budget = this.ports.preservationBudgetMs?.(a.context) ?? this.config.responseBudgetMs;
-      try { await this.bounded((signal, ms) => this.ports.preserve(a.context, signal, ms), this.ports.now() + budget); } catch {}
+      await this.preserve(a);
     }
+    return Object.freeze({ result, eligible, preserved: preserveCapturedFlight });
+  }
+
+  private preparePreservation(a: Authority, result: WorkerMemoryPressureResult): void {
+    try { this.ports.preparePreservation?.(a.context, result); }
+    catch { /* The captured owner operation remains owed even if preparation fails. */ }
+    finally { this.ports.commands.memoryPark(a.context); }
+  }
+
+  private async preserve(a: Authority): Promise<void> {
+    const budget = this.ports.preservationBudgetMs?.(a.context) ?? this.config.responseBudgetMs;
+    try { await this.bounded((signal, ms) => this.ports.preserve(a.context, signal, ms), this.ports.now() + budget); } catch {}
   }
 
   private async intervene(entries: readonly Entry[], deadline: number): Promise<void> {
     const commands = this.ports.commands;
-    const candidates = await Promise.all(entries.map(async (entry) => {
-      try { return { entry, observation: await this.bounded((signal, remainingMs) => entry.observe({ signal, remainingMs }), deadline) }; }
+    const captures = entries.map((entry) => ({ entry, phaseRevision: commands.phaseRevision(entry.context) }));
+    const candidates = await Promise.all(captures.map(async ({ entry, phaseRevision }) => {
+      try { return { entry, phaseRevision, observation: await this.bounded((signal, remainingMs) => entry.observe({ signal, remainingMs }), deadline) }; }
       catch { return undefined; }
     }));
     if (this.closed || !this.applicable) return;
-    const selected = commands.select(candidates.filter((value) => value !== undefined), this.ports.now(), this.config.responseBudgetMs);
+    const selected = commands.select(candidates.filter((value) => value !== undefined).filter(({ entry, phaseRevision }) => commands.phaseAdmits(entry.context, phaseRevision)), this.ports.now(), this.config.responseBudgetMs);
     if (!selected) return;
     const entry = selected.entry;
     const incarnation = this.ports.incarnation();
     if (!this.latest || !incarnation || incarnation.worker_id !== entry.context.worker_id || incarnation.register_nonce !== entry.context.register_nonce) return;
     const a: Authority = Object.freeze({
-      context: entry.context, entry, incarnation: Object.freeze({ ...incarnation }),
+      context: entry.context, phaseRevision: selected.phaseRevision, entry, incarnation: Object.freeze({ ...incarnation }),
       sample: Object.freeze({ ...this.latest, stat: Object.freeze({ ...this.latest.stat }),
         pressure: Object.freeze({ some: Object.freeze({ ...this.latest.pressure.some }), full: Object.freeze({ ...this.latest.pressure.full }) }) }),
       request: Object.freeze({
@@ -496,7 +526,13 @@ export class WorkerMemoryMonitor {
     // Direct proof settles only an invoked cancellation, including command cleanup during either await.
     // It grants no new authority and cannot turn a no-signal attempt into a cancellation.
     if (cancelStarted && commands.hasConfirmedStop(entry)) outcome = "confirmed_drained";
-    await this.finish(a, selected, outcome, preserve);
-    await this.report(a, outcome, ticket);
+    const prepared = await this.finish(a, selected, outcome, preserve || outcome !== "confirmed_drained");
+    const confirmed = await this.report(a, outcome, ticket);
+    if (!confirmed && prepared.eligible && !prepared.preserved) {
+      this.preparePreservation(a, prepared.result);
+      await this.preserve(a);
+    }
+    // Park can release the claim; the exact historical replay grants no authority.
+    if (!confirmed && !this.closed) await this.report(a, outcome, ticket, 1);
   }
 }

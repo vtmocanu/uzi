@@ -23,6 +23,9 @@ func workerRecoveryAllowance(r apitypes.RunDTO) string {
 }
 
 func workerExhaustionLine(r apitypes.RunDTO) string {
+	if isMemoryHold(r) {
+		return memoryHoldLine(r)
+	}
 	if !isWorkerRecoveryExhausted(r) {
 		return ""
 	}
@@ -35,6 +38,9 @@ func workerExhaustionLine(r apitypes.RunDTO) string {
 // workerExhaustionEvidence describes the server's historical observation, never
 // current availability or an entitlement to export.
 func workerExhaustionEvidence(r apitypes.RunDTO) []string {
+	if isMemoryHold(r) {
+		return []string{"Source/archive availability and latest local edits are unverified. Historical checkpoints and captures do not verify current availability or latest edits."}
+	}
 	if !isWorkerRecoveryExhausted(r) {
 		return nil
 	}
@@ -75,6 +81,9 @@ func workerExhaustionEvidence(r apitypes.RunDTO) []string {
 // workerExhaustionTUILines puts owner actions and historical caveats before
 // values that a narrow terminal may clip. Each entry occupies one physical row.
 func workerExhaustionTUILines(r apitypes.RunDTO) []string {
+	if isMemoryHold(r) {
+		return memoryHoldTUILines(r)
+	}
 	if !isWorkerRecoveryExhausted(r) {
 		return nil
 	}
@@ -118,10 +127,14 @@ func workerExhaustionTUILines(r apitypes.RunDTO) []string {
 }
 
 func workerExhaustionRows(r apitypes.RunDTO) [][]string {
-	if !isWorkerRecoveryExhausted(r) {
+	if !isOwnerRequiredWorkerHold(r) {
 		return nil
 	}
-	rows := [][]string{{"WORKER_RECOVERY", workerExhaustionLine(r)}}
+	label := "WORKER_RECOVERY"
+	if isMemoryHold(r) {
+		label = "MEMORY_HOLD"
+	}
+	rows := [][]string{{label, workerExhaustionLine(r)}}
 	for _, line := range workerExhaustionEvidence(r) {
 		rows = append(rows, []string{"RECOVERY_EVIDENCE", line})
 	}

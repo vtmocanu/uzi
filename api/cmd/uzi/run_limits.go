@@ -97,6 +97,8 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			"keeps the worker pin, and banks the parked time so the remaining budget is what it was — the " +
 			"clock stopped while paused. The claim then continues the SDK session on the same worker if it " +
 			"is still alive, or recovers the branch from the checkpoint on another worker if it is gone.\n\n" +
+			"For worker memory pressure (recovery_wait), only owner Resume starts a fresh memory episode; " +
+			"Cancel is terminal. There is no automatic resume. Source/archive availability and latest edits remain unverified.\n\n" +
 			"For worker recovery exhausted (recovery_wait), only owner Resume starts a fresh recovery episode " +
 			"with the configured automatic requeue allowance; lifetime charged count is preserved. " +
 			"An allowance of zero still permits this explicit attempt but no automatic requeues. " +

@@ -9,6 +9,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
+import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
+import type { CapturedMemoryContext } from "./codex/broker.js";
+import type { MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, HELD_PUBLICATION_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
@@ -1723,7 +1726,36 @@ function logScratchPublicationRefused(
  * the park/shutdown flags). Unexported on purpose — an exported-but-unused carrier
  * would redden knip (deadcode:agent).
  */
+type MemoryContext = ReturnType<WorkerMemoryRuntime["begin"]>;
+type MemoryFlight = {
+  readonly incarnation: MemoryIncarnation;
+  readonly claim: ClaimResponse;
+  context?: MemoryContext;
+  lifecycleRevision: number;
+  spent: number;
+  running: boolean;
+  phaseToken?: NonNullable<ReturnType<WorkerMemoryRuntime["commands"]["holdPhase"]>>;
+  resumeReady?: boolean;
+  epochReady?: boolean;
+  revisionContext?: MemoryContext;
+  stateSequence: number;
+  held: boolean;
+  ended: boolean;
+  hold?: Readonly<{ context: MemoryContext; deadline: number; humanRevision: boolean }>;
+  operation?: Promise<void>;
+  settled?: boolean;
+  closing?: Promise<void>;
+  closingSettled?: boolean;
+  closingDeadline?: number;
+  tailPreservation?: Promise<boolean>;
+  tailDurable?: boolean;
+  readonly feedback: Map<string, { readonly context: MemoryContext; readonly result: WorkerMemoryPressureResult;
+    operation?: Promise<boolean> }>;
+  unsubscribe?: () => void;
+};
+
 interface RunFlight {
+  workerMemory?: MemoryFlight;
   readonly runId: string;
   executor: Executor;
   effectiveAttemptPaths?: boolean;
@@ -2102,6 +2134,7 @@ export interface CheckpointTestHooks {
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
+  memoryRuntime?: WorkerMemoryRuntime;
   /** Test-only timing overrides; production uses the approved bounded retry/poll policy. */
   planCrossCheckTiming?: PlanCrossCheckTiming;
   /** Test-only teardown seams; production uses the pinned walk with one 120 s deadline. */
@@ -2302,6 +2335,7 @@ export class RunRunner {
   /** PRD #1391 M2 — the worker message outbox the batcher spills to, the shared re-arm
    *  registry, the spill trip window and the spill-buffer cap. All threaded into every
    *  run's MessageBatcher; `outbox`/`rearm` undefined ⇒ today's trip behaviour. */
+  private readonly memoryRuntime: WorkerMemoryRuntime | undefined;
   private readonly outbox: Outbox | undefined;
   private readonly rearm: Map<string, () => void> | undefined;
   private readonly transientTripMs: number | undefined;
@@ -2447,6 +2481,7 @@ export class RunRunner {
     private readonly joinToken?: string,
     opts: RunnerOptions = {},
   ) {
+    this.memoryRuntime = opts.memoryRuntime;
     this.pollMs = opts.pollMs ?? 3_000;
     this.liveAttempts = opts.liveAttempts ?? new LiveAttemptRegistry();
     this.quiesceImpl = opts.quiesceRun ?? ((req) => quiesceRunAttempt(req));
@@ -3152,7 +3187,8 @@ export class RunRunner {
     const dispatchFailure = async (failure: unknown, allowDiskDeferral = false): Promise<void> => {
       // The owed-candidate cap stopped this run by aborting its attempt: report the cap, not the
       // executor's abort error. A cancel, a shutdown or a stale claim keeps its own arm.
-      const err = flight.owedLimitStop !== undefined && !flight.steering?.isCancelled() &&
+      if (flight.workerMemory?.hold) await this.reconcileWorkerMemory(flight);
+      const err = flight.workerMemory?.hold !== undefined ? new RetainedRecoveryStop() : flight.owedLimitStop !== undefined && !flight.steering?.isCancelled() &&
         !flight.active?.shuttingDown && flight.steering?.claimFence() === undefined
         ? flight.owedLimitStop : failure;
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
@@ -3725,7 +3761,11 @@ export class RunRunner {
           await this.reportGenericFailure(claim, flight, new Error("run cancelled"), { keepCustody: true });
         }
         runLog.info("retained recovery stopped; source and accounting kept");
-        await batcher.close().catch(() => undefined);
+        const memory = flight.workerMemory;
+        const closed = batcher.close();
+        if (memory?.closing) {
+          await this.joinWorkerMemory(closed, memory.closingDeadline!).catch(() => undefined);
+        } else await closed.catch(() => undefined);
       } else if (err instanceof CredentialSwitchRetainedStop) {
         // PRD #1247 M5b (BLOCKING-2/3 rework): the in-place ctx.attemptCredentialSwitch could not
         // CONFIRM the switch (an unverified give-up whose stamp-clear the server never confirmed, or
@@ -3812,6 +3852,7 @@ export class RunRunner {
       }
     };
     try {
+      this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
       executor = flight.executor;
       const sessionId = await this.phaseResume(claim, flight);
@@ -3909,6 +3950,12 @@ export class RunRunner {
       // never tripped, swallows the handler's rejection, and is bounded by the reap deadline, so it
       // never throws and never stalls the finally.
       await batcher.awaitPermanentFailureSettled();
+      await this.reconcileWorkerMemory(flight);
+      this.retireWorkerMemory(flight);
+      if (flight.workerMemory) {
+        flight.workerMemory.ended = true;
+        flight.workerMemory.unsubscribe?.();
+      }
       // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
       // settled. A Codex executor's run() no longer disposes its registry on the normal path —
       // its post-run sinks (park/shutdown/finalize) reap the provider root through withBoundary,
@@ -3922,7 +3969,9 @@ export class RunRunner {
       // blocked-retire posture). HOME handling is unchanged: a run without resume artifacts
       // still loses its HOME, as in #1783.
       let terminalDisposeUnproven = false;
-      if (executor.safety) {
+      if (executor.safety && !(flight.workerMemory?.closing && !flight.workerMemory.closingSettled) &&
+          !(flight.workerMemory?.operation && !flight.workerMemory.settled) &&
+          !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight)) {
         try {
           const disposal = await executor.safety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
           if (disposal.kind === "incomplete") {
@@ -4698,6 +4747,11 @@ export class RunRunner {
    * the terminal is not stranded until boot (N4).
    */
   private async handlePermanentFailure(claim: ClaimResponse, flight: RunFlight, reason: string): Promise<void> {
+    if (flight.workerMemory?.hold) {
+      this.retainWorkerMemoryCustody(flight);
+      flight.cancel.abort(new RetainedRecoveryStop());
+      return;
+    }
     const outbox = this.outbox;
     if (outbox) outbox.holdTerminalResolve(flight.runId, flight.claimGeneration);
     try {
@@ -4798,6 +4852,10 @@ export class RunRunner {
      *  and every custody settle, so the exact-generation hold stays open for the reconciler. */
     opts: { keepCustody?: boolean } = {},
   ): Promise<void> {
+    if (flight.workerMemory?.hold) {
+      await this.reconcileWorkerMemory(flight);
+      return;
+    }
     const { batcher, redactText, runLog } = flight;
     if (flight.retainedLocalCustody || flight.completedRetainedSuccessor) opts = { ...opts, keepCustody: true };
     // issue #2213: a run stopped by the worker quarantine (raised at a turn boundary, a provider
@@ -8516,6 +8574,18 @@ export class RunRunner {
       observedSessionId: undefined,
       latestContractRevision: undefined,
       reportState: async (body, signal, checked = false) => {
+        const memory = flight.workerMemory;
+        const memorySequence = memory && body.status !== undefined ? ++memory.stateSequence : undefined;
+        if (memory && body.status !== undefined && body.status !== "running") {
+          memory.running = false;
+          memory.resumeReady = false;
+          memory.epochReady = false;
+          memory.revisionContext = undefined;
+          if (["awaiting_approval", "awaiting_input", "awaiting_followup"].includes(body.status)) {
+            if (memory.context) memory.phaseToken = this.memoryRuntime!.commands.holdPhase(memory.context);
+          } else this.retireWorkerMemory(flight);
+        }
+        const memoryPhaseToken = body.status === "running" && memory?.resumeReady ? memory.phaseToken : undefined;
         // Session/roster/progress senders are separate from feed/usage transport. Hold new
         // informational running reports until the checker sequence barrier has reconciled.
         if (!checked && body.status === "running" && flight.checkedStateBarrier)
@@ -8606,7 +8676,20 @@ export class RunRunner {
         // executeClaim's catch chain closes the batcher and ends the flight with NO terminal
         // report (another claim owns the run now). A stale ack on the TERMINAL `failed` report is
         // a no-op: that reportState is already `.catch(...)`-guarded, so the throw is swallowed.
-        if (ack.staleClaim) throw new StaleClaimError();
+        if (ack.staleClaim) {
+          this.retireWorkerMemory(flight);
+          if (memory) memory.ended = true;
+          throw new StaleClaimError();
+        }
+        if (memorySequence !== undefined && memory?.stateSequence === memorySequence) {
+          memory.running = body.status === "running" && ack.status === "running" && ack.applied !== false &&
+            (!memory.phaseToken || memoryPhaseToken === memory.phaseToken);
+          if (memory.running && memoryPhaseToken && this.memoryRuntime!.commands.releasePhase(memoryPhaseToken)) {
+            if (memory.phaseToken === memoryPhaseToken) memory.phaseToken = undefined;
+          }
+          if (ack.status !== undefined && !["running", "awaiting_approval", "awaiting_input", "awaiting_followup"].includes(ack.status))
+            this.retireWorkerMemory(flight);
+        }
         // Issue #1626: remember the frozen completion-contract revision this (non-stale) ACK
         // carries, so the interlocked finalize can bind its permit to a contract that froze after
         // the claim was issued. Every report goes through here. MONOTONE: only ever raised, so a
@@ -8713,7 +8796,24 @@ export class RunRunner {
     let closing: ReturnType<MessageBatcher["close"]> | undefined;
     batcher.close = (...args: Parameters<MessageBatcher["close"]>) => {
       flight.owedFeedClosed = true;
-      closing ??= close(...args);
+      if (!closing) {
+        const memory = flight.workerMemory;
+        if (memory && (memory.hold || memory.feedback.size)) {
+          // Cleanup owns a fresh budget even when the feedback/capture deadline expired.
+          const deadline = Date.now() + this.codexBoundaryDeadlineMs;
+          memory.closingDeadline = deadline;
+          const expiry = AbortSignal.timeout(Math.max(0, deadline - Date.now()));
+          const signal = args[0] ? AbortSignal.any([args[0], expiry]) : expiry;
+          this.retainWorkerMemoryCustody(flight);
+          memory.tailPreservation = batcher.preserveOwnedTail(expiry);
+          closing = memory.tailPreservation.then(async durable => {
+            memory.tailDurable = durable;
+            if (!durable) this.retainWorkerMemoryCustody(flight);
+            await close(durable ? signal : AbortSignal.abort(new RetainedRecoveryStop()));
+          }).finally(() => { memory.closingSettled = true; });
+          memory.closing = closing;
+        } else closing = close(...args);
+      }
       return closing;
     };
     batcher.onPermanentFailureReport(({ reason }) => this.handlePermanentFailure(claim, flight, reason));
@@ -10437,9 +10537,15 @@ export class RunRunner {
     // Survives lifecycle interruptions after a completed pause attempt, including reconciliation.
     let parkContinuation: "attempt" | "reconcile" | "question" = "attempt";
     let parkOwnershipProbe: Promise<RunOwnershipResponse> | undefined;
+    // Only the question helpers call this alias after a validated answer settles.
+    const reportAnsweredState: typeof reportState = (body, ...args) => {
+      if (body.status === "running" && flight.workerMemory) flight.workerMemory.resumeReady = true;
+      return reportState(body, ...args);
+    };
     const ctx: RunContext = {
       runId,
       claimGeneration: claim.claim_generation,
+      ...(flight.workerMemory ? { capturedMemory: () => this.captureWorkerMemory(flight) } : {}),
       kind: resolveRunKind(claim.kind),
       issueIid: claim.issue_iid,
       issueTitle: claim.issue_title,
@@ -10676,6 +10782,7 @@ export class RunRunner {
         ? { takeResumedGateEvent: (signal?: AbortSignal) => this.takeResumedGateEvent(runId, steering, batcher, runLog, signal) }
         : {}),
       gatePlan: async (planMd, milestones, onAwaitingApproval, settles) => {
+        if (flight.workerMemory) flight.workerMemory.revisionContext = undefined;
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
         // short-circuit — it parks for human review even on an auto-triggered run. We
         // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
@@ -10859,6 +10966,16 @@ export class RunRunner {
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
         // (not the auto short-circuit). Read by the pre-push guard below.
         flight.ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
+        const memory = flight.workerMemory;
+        if (memory && verdict.kind === "approve") {
+          memory.resumeReady = true;
+          memory.epochReady = true;
+        } else if (memory && verdict.kind === "revise" && verdict.automatic !== true && verdict.inputId !== undefined && memory.context) {
+          if (memory.phaseToken && this.memoryRuntime!.commands.releasePhase(memory.phaseToken)) {
+            memory.phaseToken = undefined;
+            memory.revisionContext = memory.context;
+          }
+        }
         return verdict;
       },
       ...(claim.auto_approve && claim.plan_cross_check_required && !seeded ? {
@@ -10880,7 +10997,7 @@ export class RunRunner {
           questions,
           batcher,
           steering,
-          reportState,
+          reportAnsweredState,
           runLog,
           claim.auto_approve ?? false,
           claim.config ?? null,
@@ -10893,7 +11010,7 @@ export class RunRunner {
           runId,
           batcher,
           steering,
-          reportState,
+          reportAnsweredState,
           runLog,
           claim.auto_approve ?? false,
           claim.config ?? null,
@@ -10993,7 +11110,9 @@ export class RunRunner {
             );
           }
         }
-        return steering.awaitFollowUp(idleMs);
+        const outcome = await steering.awaitFollowUp(idleMs);
+        if (outcome.kind === "followup" && flight.workerMemory) flight.workerMemory.resumeReady = true;
+        return outcome;
       },
       // PRD #122 M2: carry the lead's live progress into the `running` report and return
       // the server-computed effective budget from the ack. Async (unlike M4's fire-and-
@@ -11335,7 +11454,7 @@ export class RunRunner {
               question: supported
                 ? "The pause did not complete. What should happen next? Answer /park to try once more, give actionable guidance, or cancel the run."
                 : `Parking here requires both server and worker support. Use uzi run pause ${runId} --now, give actionable guidance, or cancel. Answer /park to check again.`,
-            }], "worker", undefined, batcher, steering, reportState, runLog, claim.config ?? null,
+            }], "worker", undefined, batcher, steering, reportAnsweredState, runLog, claim.config ?? null,
             { confirmRunning: true, requireRunning: supported });
           } catch (error) {
             if (steering.isCancelled()) return { kind: "cancel" };
@@ -11481,6 +11600,10 @@ export class RunRunner {
       nowSummary?.start();
       try {
         result = await executor.run(ctx);
+        if (flight.workerMemory?.hold) {
+          await this.reconcileWorkerMemory(flight);
+          throw new RetainedRecoveryStop();
+        }
         const codeSummary = await ctx.codeCrossCheckSummary?.();
         if (codeSummary) result.codeCrossCheckSummary = codeSummary;
       } catch (value) {
@@ -11494,6 +11617,7 @@ export class RunRunner {
       // the executor of this generation succeeded. Awaited; never throws (a failure is logged by
       // the outbox as `finalize record not written` and the run continues exactly as before).
       // Only this run lane writes it, and a rejected executor.run never reaches this line.
+      this.retireWorkerMemory(flight);
       await this.journalFinalizeRecord(flight, result);
     } catch (err) {
       diskParked = err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk");
@@ -14593,10 +14717,10 @@ export class RunRunner {
    *  its live registry (never reconciling or minting a permit); a legacy executor was already
    *  reaped by the handler's `killAgentTree`; a `safety`-bearing executor without the method fails
    *  closed. Never throws. */
-  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs): Promise<CredentialFreeSettleOutcome> {
+  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeSettleOutcome> {
     if (executor.settleForCredentialFreeCapture) {
       try {
-        return await executor.settleForCredentialFreeCapture(deadlineMs);
+        return await executor.settleForCredentialFreeCapture(deadlineMs, purpose);
       } catch {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "capture settle threw" }] };
       }
@@ -16487,6 +16611,259 @@ export class RunRunner {
     if (profile) return { branch: profile.branch, key: profile.slug };
     if (claim.issue_iid == null) throw new Error("issue run claim is missing issue_iid");
     return { branch: `agent/issue-${claim.issue_iid}`, key: `issue-${claim.issue_iid}`, issueIid: claim.issue_iid };
+  }
+
+  private bindWorkerMemory(claim: ClaimResponse, flight: RunFlight): void {
+    if (!this.memoryRuntime || !claim.secrets.codex) return;
+    const incarnation = this.client.memoryIncarnation;
+    const policy = claim.memory_policy === null ? this.memoryRuntime.configuredMemoryPolicy : claim.memory_policy;
+    const count = claim.memory_intervention_count;
+    if (!this.client.hasFeature("worker_memory_pressure_v1") || !incarnation ||
+        !Number.isSafeInteger(claim.claim_generation) || (claim.claim_generation ?? 0) <= 0 ||
+        !Number.isSafeInteger(claim.memory_episode) || (claim.memory_episode ?? -1) < 0 ||
+        policy?.version !== 1 || !Number.isSafeInteger(policy.max_interventions) ||
+        policy.max_interventions < 1 || policy.max_interventions > 9999 ||
+        !Number.isSafeInteger(count) || (count ?? -1) < 0 || count! > policy.max_interventions)
+      throw new Error("Codex memory enrollment requires the full worker claim and registration");
+    const capturedClaim = Object.freeze({ ...claim, memory_policy: Object.freeze({ ...policy }) });
+    const memory: MemoryFlight = {
+      incarnation, claim: capturedClaim, lifecycleRevision: 0, spent: count!,
+      running: false, stateSequence: 0, held: false, ended: false, feedback: new Map(),
+    };
+    flight.workerMemory = memory;
+    memory.unsubscribe = this.memoryRuntime.subscribeInvalidation(() => {
+      memory.ended = true;
+      this.retireWorkerMemory(flight);
+    });
+    const retire = () => this.retireWorkerMemory(flight);
+    // Listeners own only this flight and are removed at its terminal reconciliation.
+    const signals = [flight.cancel.signal, flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal];
+    for (const signal of signals) signal.addEventListener("abort", retire, { once: true });
+    const unsubscribe = memory.unsubscribe;
+    memory.unsubscribe = () => {
+      unsubscribe?.();
+      for (const signal of signals) signal.removeEventListener("abort", retire);
+    };
+  }
+
+  private retireWorkerMemory(flight: RunFlight): void {
+    const memory = flight.workerMemory;
+    const commands = this.memoryRuntime?.commands;
+    if (!memory?.context || !commands) return;
+    const context = memory.context;
+    const remaining = commands.remaining(context);
+    if (remaining !== undefined && context.memory_policy)
+      memory.spent = Math.max(memory.spent, context.memory_policy.max_interventions - remaining);
+    if (commands.isCurrent(context) && commands.pressureHeld(context)) memory.held = true;
+    commands.retire(context);
+    memory.context = undefined;
+    memory.phaseToken = undefined;
+  }
+
+  private captureWorkerMemory(flight: RunFlight): CapturedMemoryContext | undefined {
+    const runtime = this.memoryRuntime;
+    const memory = flight.workerMemory;
+    if (!runtime || !memory) return undefined;
+    const lifecycle = flight.steering.lifecycleSignal();
+    if (memory.ended || memory.hold || this.client.memoryIncarnation !== memory.incarnation ||
+        flight.steering.claimFence() !== undefined || flight.steering.isCancelled() ||
+        flight.steering.pendingCredentialSwitch() !== undefined ||
+        flight.cancel.signal.aborted || lifecycle.aborted || this.shutdownSignal.signal.aborted) {
+      this.retireWorkerMemory(flight);
+      throw new RetainedRecoveryStop();
+    }
+    if (memory.epochReady) {
+      memory.epochReady = false;
+      if (memory.context && !runtime.commands.pressureHeld(memory.context)) this.retireWorkerMemory(flight);
+    }
+    if (memory.context && runtime.commands.isCurrent(memory.context))
+      return Object.freeze({ commands: runtime.commands, context: memory.context, flight,
+        lifecycleRevision: memory.context.lifecycleRevision });
+    if (memory.context || memory.held || (!memory.running && !memory.resumeReady)) {
+      memory.ended = true;
+      this.retireWorkerMemory(flight);
+      throw new RetainedRecoveryStop();
+    }
+    // Renewal uses only the original registration, episode and spent allowance.
+    // A retired context is never made current again.
+    const context = runtime.begin({
+      run_id: flight.runId, worker_id: memory.incarnation.worker_id,
+      register_nonce: memory.incarnation.register_nonce, claim_generation: memory.claim.claim_generation!,
+      memory_episode: memory.claim.memory_episode!, memory_policy: memory.claim.memory_policy!,
+      memory_intervention_count: memory.spent, flight, lifecycleRevision: ++memory.lifecycleRevision,
+    }, {
+      prepareFeedback: (captured, result) => {
+        if (captured.flight !== flight || result.claim_generation !== flight.claimGeneration) return;
+        if (memory.feedback.has(result.intervention_id)) return;
+        memory.feedback.set(result.intervention_id, { context: captured, result });
+        if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", payload: {
+          event: "worker_memory_pressure", ...result,
+        } });
+        else this.retainWorkerMemoryCustody(flight);
+      },
+      feedback: async (_result, captured, signal) => {
+        if (captured.flight !== flight) throw new RetainedRecoveryStop();
+        const pending = memory.feedback.get(_result.intervention_id);
+        const operation = pending?.operation ?? flight.batcher.flushOwned(signal);
+        if (pending) pending.operation = operation;
+        const delivered = await operation;
+        if (delivered && !signal.aborted)
+          memory.feedback.delete(_result.intervention_id);
+      },
+      preparePreservation: captured => {
+        if (captured.flight !== flight || memory.hold) return;
+        this.retainWorkerMemoryCustody(flight);
+        memory.hold = Object.freeze({ context: captured,
+          deadline: Date.now() + this.codexBoundaryDeadlineMs,
+          humanRevision: memory.revisionContext === captured });
+        this.retireWorkerMemory(flight);
+      },
+      preserve: async (captured, signal, remainingMs) => {
+        if (captured !== memory.hold?.context) throw new RetainedRecoveryStop();
+        await this.joinWorkerMemory(this.startWorkerMemoryPreservation(flight),
+          Math.min(memory.hold.deadline, Date.now() + remainingMs), signal);
+      },
+      preservationBudgetMs: this.codexBoundaryDeadlineMs,
+    });
+    memory.context = context;
+    // A persisted exhausted allowance has no new victim or outcome. Capture the
+    // full binding before retaining custody; executeClaim reconciles the same
+    // original owner operation used by pressure-triggered preservation.
+    if (runtime.commands.remaining(context) === 0) {
+      this.retainWorkerMemoryCustody(flight);
+      memory.hold = Object.freeze({ context, deadline: Date.now() + this.codexBoundaryDeadlineMs,
+        humanRevision: memory.revisionContext === context });
+      this.retireWorkerMemory(flight);
+      throw new RetainedRecoveryStop();
+    }
+    if (!memory.running) memory.phaseToken = runtime.commands.holdPhase(context);
+    const retire = () => { if (memory.context === context) this.retireWorkerMemory(flight); };
+    lifecycle.addEventListener("abort", retire, { once: true });
+    const unsubscribe = memory.unsubscribe;
+    memory.unsubscribe = () => { unsubscribe?.(); lifecycle.removeEventListener("abort", retire); };
+    return Object.freeze({ commands: runtime.commands, context, flight,
+      lifecycleRevision: context.lifecycleRevision });
+  }
+
+  private retainWorkerMemoryCustody(flight: RunFlight): void {
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.retainedLocalCustody = true;
+    flight.keepGuardedInventoryOpen = true;
+  }
+
+  /** Caller deadlines bound joining, not ownership. The original operation stays on the flight. */
+  private async joinWorkerMemory(work: Promise<void>, deadline: number, signal?: AbortSignal): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort: (() => void) | undefined;
+    try {
+      await Promise.race([work, new Promise<void>((_resolve, reject) => {
+        const stop = () => reject(new RetainedRecoveryStop());
+        abort = stop;
+        timer = setTimeout(stop, Math.max(0, deadline - Date.now()));
+        if (signal?.aborted) stop();
+        else signal?.addEventListener("abort", stop, { once: true });
+      })]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (abort) signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  private startWorkerMemoryPreservation(flight: RunFlight): Promise<void> {
+    const memory = flight.workerMemory!;
+    if (memory.operation) return memory.operation;
+    const hold = memory.hold!;
+    // Preparation left tool outcome delivery open. This owner operation now stops
+    // only the original model execution; its capture signal is independent.
+    flight.cancel.abort(new RetainedRecoveryStop());
+    memory.operation = this.preserveWorkerMemory(flight, hold).catch(() => {
+      this.retainWorkerMemoryCustody(flight);
+    }).finally(() => { memory.settled = true; });
+    return memory.operation;
+  }
+
+  private async preserveWorkerMemory(flight: RunFlight, hold: NonNullable<MemoryFlight["hold"]>): Promise<void> {
+    const memory = flight.workerMemory!;
+    const { context, deadline } = hold;
+    const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+    const identity = () => {
+      this.retainedTerminalGuard(flight);
+      lifecycle.throwIfAborted();
+      if (Date.now() >= deadline || memory.ended || this.client.memoryIncarnation !== memory.incarnation ||
+          context.flight !== flight || context.claim_generation !== flight.claimGeneration ||
+          flight.steering.pendingCredentialSwitch() !== undefined ||
+          flight.steering.getPauseMode() !== null)
+        throw new RetainedRecoveryStop();
+    };
+    try {
+      await this.git.withRecoveryOperation(lifecycle, deadline, async signal => {
+        const check = async () => {
+          identity();
+          signal.throwIfAborted();
+          const own = await this.client.getRunOwnership(flight.runId, signal);
+          identity();
+          signal.throwIfAborted();
+          if ((own?.status !== "running" && !(hold.humanRevision && own?.status === "awaiting_approval")) ||
+              own.claim_generation !== context.claim_generation)
+            throw new RetainedRecoveryStop();
+        };
+        await check();
+        // Memory parking already stopped the model; settle under the independent owner deadline.
+        const settled = await this.settleForCredentialCapture(flight.executor, Math.max(1, deadline - Date.now()), "cancel");
+        await check();
+        if (settled.kind !== "observed_empty") throw new RetainedRecoveryStop();
+        let captured: RecoveryCaptureResult = { verified: false, published: false };
+        // Three attempts share one deadline. Failure holds this flight; siblings continue.
+        for (let attempt = 0; attempt < 3 && !captured.verified; attempt++) {
+          await check();
+          captured = await this.captureRecoveryRestorePoint(memory.claim, flight, flight.runLog, "recovery_capture", {
+            credentialFree: true, publish: true, signal, beforeMutation: check,
+          });
+        }
+        await check();
+        const delivered = await flight.batcher.flushOwned(signal);
+        await check();
+        if (!delivered || flight.batcher.isTripped() || flight.batcher.bufferedCount() !== 0 ||
+            flight.batcher.isSpilled() || this.outbox?.hasUndrainedMessages(flight.runId) ||
+            memory.feedback.size !== 0) throw new RetainedRecoveryStop();
+        const ack = await flight.reportState({
+          status: "recovery_wait", recovery_cause: "worker_memory_pressure",
+          register_nonce: context.register_nonce, claim_generation: context.claim_generation,
+          memory_episode: context.memory_episode,
+          ...(captured.verified && captured.published ? { checkpoint_contains_latest: true } : {}),
+        }, signal);
+        identity();
+        signal.throwIfAborted();
+        const accepted = ack.memoryParkAccepted;
+        if (!accepted || accepted.run_id !== context.run_id || accepted.worker_id !== context.worker_id ||
+            accepted.register_nonce !== context.register_nonce ||
+            accepted.claim_generation !== context.claim_generation ||
+            accepted.memory_episode !== context.memory_episode) throw new RetainedRecoveryStop();
+        flight.parked = true;
+      });
+    } catch {
+      flight.runLog.warn("worker memory hold stopped without confirmed disposition; custody retained");
+    }
+  }
+
+  private async reconcileWorkerMemory(flight: RunFlight): Promise<void> {
+    const memory = flight.workerMemory;
+    if (!memory) return;
+    if (memory.hold) {
+      this.retainWorkerMemoryCustody(flight);
+      await this.joinWorkerMemory(this.startWorkerMemoryPreservation(flight), memory.hold.deadline).catch(() => {});
+    }
+    const receipts = this.memoryRuntime!.sinkReceipts.filter(receipt => receipt.context.flight === flight);
+    const deadline = memory.hold?.deadline ?? memory.closingDeadline ?? Date.now() + this.codexBoundaryDeadlineMs;
+    // Each captured receipt is joined once under the same deadline; a failure
+    // does not block sibling receipts, and uncooperative callbacks stay retained.
+    await this.joinWorkerMemory(Promise.allSettled(receipts.map(receipt => receipt.completion)).then(() => {}),
+      deadline).catch(() => {});
+    if (memory.closing) await this.joinWorkerMemory(memory.closing, deadline).catch(() => {});
+    if (memory.feedback.size || receipts.length || (memory.operation && !memory.settled) ||
+        (memory.closing && !memory.closingSettled))
+      this.retainWorkerMemoryCustody(flight);
   }
 
   private retainedTerminalGuard(flight: RunFlight): void {

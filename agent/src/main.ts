@@ -425,6 +425,9 @@ async function main(): Promise<void> {
   const client = new WorkerClient(config.apiUrl, config.workerToken, config.version, log, {
     httpTimeoutMs: config.httpTimeoutMs,
   });
+  const memory = config.memoryGuard?.enabled
+    ? new WorkerMemoryRuntime(config.memoryGuard, client, log, { secrets: [config.workerToken] })
+    : undefined;
   const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId));
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
@@ -565,6 +568,7 @@ async function main(): Promise<void> {
     reclaim: () => reclaimNow?.() ?? Promise.resolve(),
   });
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
+    memoryRuntime: memory,
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
     checkpointIntervalMs: config.checkpointIntervalMs,
@@ -824,9 +828,6 @@ async function main(): Promise<void> {
           log,
         })
       : undefined;
-  const memory = config.memoryGuard?.enabled
-    ? new WorkerMemoryRuntime(config.memoryGuard, client, log, { secrets: [config.workerToken] })
-    : undefined;
   worker = new Worker(
     config,
     client,

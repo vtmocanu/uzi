@@ -169,6 +169,7 @@ test("independent run/episode interventions are not lifetime capped; mutated sam
 
 type Monitor = import("../src/worker-memory-guard.js").WorkerMemoryMonitor;
 type MonitorPorts = ConstructorParameters<typeof import("../src/worker-memory-guard.js").WorkerMemoryMonitor>[1];
+type TreeObservation = Awaited<ReturnType<ReturnType<import("../src/worker-memory-commands.js").WorkerMemoryCommands["register"]>["observe"]>>;
 function barrier<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -180,6 +181,7 @@ async function until(predicate: () => boolean) {
   assert.ok(predicate(), "barrier reached within bounded microtask turns");
 }
 async function fixture(options: {
+  prepareFeedback?: MonitorPorts["prepareFeedback"];
   preparePreservation?: MonitorPorts["preparePreservation"];
   preservationBudgetMs?: MonitorPorts["preservationBudgetMs"];
   feedback?: MonitorPorts["feedback"];
@@ -254,6 +256,7 @@ async function fixture(options: {
       const reserved = requests.find((r) => r.intervention_id === request.intervention_id)!;
       return { ...ack(reserved, Math.min(1, reserved.policy.max_interventions - 1)), authorizing: false, outcome: request.outcome };
     },
+    prepareFeedback: options.prepareFeedback,
     preparePreservation: options.preparePreservation,
     preservationBudgetMs: options.preservationBudgetMs,
     feedback: async (result, ctx, signal, ms) => { feedback.push(result); await options.feedback?.(result, ctx, signal, ms); },
@@ -269,6 +272,73 @@ async function fixture(options: {
     advance: (ms: number) => { time += ms; for (const timer of timers) if (timer.at <= time) { timers.delete(timer); timer.callback(); } },
   };
 }
+
+test("observation captures phase revision before await, including wait then resume", async () => {
+  for (const resume of [false, true]) {
+    const observed = barrier<TreeObservation>();
+    let reads = 0;
+    const f = await fixture({ observe: async () => {
+      reads++;
+      return observed.promise;
+    } });
+    try {
+      f.monitor.tick();
+      await until(() => reads === 1);
+      const token = f.commands.holdPhase(f.context)!;
+      if (resume) f.commands.releasePhase(token);
+      observed.resolve({ available: true, complete: true, startedAtMs: 0, completedAtMs: 0,
+        rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] });
+      await f.monitor.settle();
+      assert.equal(f.requests.length, 0);
+      assert.equal(f.signals(), 0);
+      assert.equal(f.drainSignals(), 0);
+      assert.equal(f.commands.isCurrent(f.context), true);
+    } finally { await f.monitor.stop(); }
+  }
+});
+
+test("charged deferred reservation cannot signal after phase wait or wait then resume", async () => {
+  for (const resume of [false, true]) {
+    const f = await fixture();
+    try {
+      f.monitor.tick();
+      await until(() => f.requests.length === 1);
+      const token = f.commands.holdPhase(f.context)!;
+      if (resume) f.commands.releasePhase(token);
+      f.reservation.resolve(f.ack(undefined, 0));
+      await f.monitor.settle();
+      assert.equal(f.signals(), 0);
+      assert.equal(f.drainSignals(), 0);
+      assert.deepEqual(f.preserved, [f.context]);
+      assert.equal(f.feedback[0]?.outcome, "no_signal");
+      assert.equal(f.reports[0]?.intervention_id, f.requests[0]?.intervention_id);
+      assert.equal(f.reports[0]?.outcome, "no_signal");
+      assert.equal(f.requests.length, 1);
+    } finally { await f.monitor.stop(); }
+  }
+});
+
+test("recheck observation cannot regain signal authority after wait then resume", async () => {
+  const observed = barrier<TreeObservation>();
+  let reads = 0;
+  const tree: TreeObservation = { available: true, complete: true, startedAtMs: 0, completedAtMs: 0,
+    rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+  const f = await fixture({ observe: async () => ++reads === 1 ? tree : observed.promise });
+  try {
+    f.monitor.tick();
+    await until(() => f.requests.length === 1);
+    f.reservation.resolve(f.ack());
+    await until(() => reads === 2);
+    const phase = f.commands.holdPhase(f.context)!;
+    f.commands.releasePhase(phase);
+    observed.resolve(tree);
+    await f.monitor.settle();
+    assert.equal(f.signals(), 0);
+    assert.equal(f.drainSignals(), 0);
+    assert.equal(f.feedback[0]?.outcome, "no_signal");
+    assert.deepEqual(f.preserved, [f.context]);
+  } finally { await f.monitor.stop(); }
+});
 
 test("preservation intent and retirement precede feedback; timeout forwards abort and independent budgets", async () => {
   const feedback = barrier<void>();
@@ -441,9 +511,13 @@ test("hung outcome report does not delay ACK-authorized cancel; timeout keeps la
   await until(() => f.reports.length === 1);
   assert.equal(f.signals(), 1);
   assert.equal(f.commands.admitsCommands(f.context), false);
-  f.advance(100);
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await until(() => f.reports.length === attempt);
+    f.advance(100);
+  }
   await f.monitor.settle();
   assert.equal(f.monitor.state.unresolvedOutcome, true);
+  assert.deepEqual(f.preserved, [f.context]);
   await f.monitor.stop();
 });
 
@@ -456,6 +530,8 @@ test("single flight unknown drain admits no future victim and supplies safety fe
   await f.monitor.settle();
   assert.equal(f.feedback[0]?.outcome, "unknown");
   assert.equal(f.feedback[0]?.cancellation_confirmed, false);
+  assert.deepEqual(f.preserved, [f.context], "unconfirmed drainage preserves even with allowance remaining");
+  assert.equal(f.commands.remaining(f.context), 1);
   assert.equal(f.monitor.state.unconfirmedDrain, true);
   f.advance(1); f.monitor.tick();
   assert.equal(f.requests.length, 1);
@@ -570,9 +646,11 @@ test("old drain after replacement cannot dispose new root or allowance", async (
   await f.monitor.stop();
 });
 
-test("per-run policy and consumed count are frozen; exhausted run parks without reservation", async () => {
+test("per-run policy is frozen; already enrolled exhausted run parks without reservation", async () => {
   const policy = { version: 1 as const, max_interventions: 1 };
-  const f = await fixture({ policy, count: 1 });
+  const f = await fixture({ policy });
+  f.commands.updateAllowance(f.context, 0);
+  assert.throws(() => f.enroll(f.context, 20));
   policy.max_interventions = 2;
   f.monitor.tick();
   await f.monitor.settle();
@@ -978,6 +1056,71 @@ test("old outcome echo cannot resolve newer held ticket", async () => {
   assert.equal(f.commands.admitsCommands(next), false);
   assert.equal(f.commands.outcome(root) !== undefined, true);
   assert.equal(f.signals(), 2);
+  await f.monitor.stop();
+});
+
+test("unresolved ledger preserves original prepared result once even after feed preparation installs a successor", async () => {
+  let successor: ReturnType<import("../src/worker-memory-commands.js").WorkerMemoryCommands["begin"]> | undefined;
+  let originalResult: import("../src/protocol.js").WorkerMemoryPressureResult | undefined;
+  let preparations = 0;
+  const f = await fixture({
+    autoReserve: true,
+    report: async () => { throw new Error("fixture transport loss"); },
+    prepareFeedback: (context, result) => {
+      originalResult = result;
+      f.commands.retire(context);
+      successor = f.commands.begin({ ...f.input, flight: {}, lifecycleRevision: 2,
+        memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: 0 });
+    },
+    preparePreservation: (context, result) => {
+      assert.equal(context, f.context);
+      assert.equal(result, originalResult);
+      preparations++;
+    },
+  });
+  f.monitor.tick();
+  await f.monitor.settle();
+  assert.equal(preparations, 1);
+  assert.deepEqual(f.preserved, [f.context]);
+  assert.equal(f.feedback.length, 1);
+  assert.equal(f.feedback[0]!.cancellation_confirmed, true, "ledger loss cannot revoke drain proof");
+  assert.equal(f.reports.length, 4);
+  assert.ok(f.reports.every(request => request.intervention_id === f.requests[0]!.intervention_id
+    && request.outcome === "confirmed_drained"));
+  assert.equal(f.signals(), 1);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.commands.isCurrent(successor!), true);
+  assert.equal(f.commands.remaining(successor!), 2);
+  assert.equal(f.monitor.state.unresolvedOutcome, true);
+  await f.monitor.stop();
+});
+
+test("late abort-ignoring historical proof resolves original ticket and duplicates do not reset fresh quiet dwell", async () => {
+  const first = barrier<import("../src/protocol.js").MemoryReservation>();
+  const second = barrier<import("../src/protocol.js").MemoryReservation>();
+  let attempts = 0;
+  const f = await fixture({ report: () => ++attempts === 1 ? first.promise : second.promise });
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack());
+  await until(() => attempts === 1);
+  f.usage(100); f.advance(100); f.monitor.tick();
+  await until(() => attempts === 2);
+  assert.equal(f.monitor.state.unresolvedOutcome, true);
+  const ack = { ...f.ack(), authorizing: false, outcome: "confirmed_drained" as const };
+  first.resolve(ack);
+  await until(() => !f.monitor.state.unresolvedOutcome);
+  // Quiet samples before resolution cannot count toward the new dwell.
+  f.advance(1); f.monitor.tick();
+  assert.equal(f.monitor.state.armed, false);
+  f.advance(50); f.monitor.tick();
+  second.resolve(ack);
+  await f.monitor.settle();
+  f.advance(50); f.monitor.tick();
+  assert.equal(f.monitor.state.armed, true, "duplicate proof must not reset established dwell");
+  assert.equal(f.signals(), 1);
+  assert.equal(f.commands.remaining(f.context), 1);
+  assert.equal(f.preserved.length, 0);
   await f.monitor.stop();
 });
 

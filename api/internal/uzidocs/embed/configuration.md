@@ -436,6 +436,80 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
 
+### Worker memory guard
+
+The proactive worker memory guard is **off by default** (issue #2396).
+Enabling it requires six explicit numeric settings; there are no calibrated
+production thresholds. Configure the worker container, not the API:
+
+| Worker environment variable | Helm `workers.memoryGuard` key | Default | Meaning / ceiling |
+|---|---|---|---|
+| `WORKER_MEMORY_GUARD_ENABLED` | `enabled` | `false` | Opt in to the guard. |
+| `WORKER_MEMORY_GUARD_RESERVE_BYTES` | `reserveBytes` | empty | Headroom below the cgroup limit; bytes, maximum `9007199254740991`. |
+| `WORKER_MEMORY_GUARD_SAMPLE_MS` | `sampleMs` | empty | Sampling interval; milliseconds, maximum `2147483647`. |
+| `WORKER_MEMORY_GUARD_HYSTERESIS_BYTES` | `hysteresisBytes` | empty | Gap between high and quiet thresholds; bytes, maximum `9007199254740991`. |
+| `WORKER_MEMORY_GUARD_REARM_MS` | `rearmMs` | empty | Fresh low-usage dwell required before rearming; milliseconds, maximum `2147483647`. |
+| `WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS` | `responseBudgetMs` | empty | Bounded intervention response budget; milliseconds, maximum `2147483647`. |
+| `WORKER_MEMORY_GUARD_MAX_INTERVENTIONS` | `maxInterventions` | empty | Persisted maximum per run memory episode; maximum `9999`. |
+
+Compose relays these seven `WORKER_MEMORY_GUARD_*` variables from `.env`.
+Hosted workers use the chart keys above; the controller receives the same
+suffixes with a `UZI_` prefix (for example,
+`UZI_WORKER_MEMORY_GUARD_RESERVE_BYTES`) and relays them into worker pods.
+Standalone workers need the variables explicitly injected into their container.
+Restart to change worker settings; hosted configuration changes roll workers.
+
+The enabled flag is trimmed and case-insensitive: empty, `0`, `false`,
+`no` and `off` disable it; `1`, `true`, `yes` and `on` enable it.
+Other flag values reject startup/rendering. Disabled configuration ignores
+the numeric fields. When enabled, each numeric field must be a trimmed,
+positive decimal integer within its ceiling. Leading zeroes are accepted;
+missing/blank values, signs, fractions, exponent notation, zero and values
+above the ceiling reject worker/controller startup or chart rendering.
+These `_MS` settings take decimal milliseconds, not Go-style durations.
+
+For a finite cgroup limit `L = memory.max`, the guard computes
+`H = L - reserveBytes` and `Q = H - hysteresisBytes`, requiring
+`0 < Q < H < L`. Unavailable, stale or incompatible cgroup evidence inhibits
+intervention; an unlimited cgroup does not supply a usable limit. Total
+`memory.current` is authoritative, with no file-memory subtraction.
+Approximate command-tree RSS ranks eligible targets; it does not measure
+cgroup usage or prove that memory was freed.
+
+**Sizing input:** use `max(1Gi, 10-15% of memory.max)` as a reserve sizing
+input, subject to workload measurements. This is neither a shipped default
+nor a production recommendation. Measure allocation bursts, sampling delays,
+cleanup/capture costs and the shared run/chat/cross-check workload before
+choosing the six values. The guard does not force concurrency to one.
+Node memory pressure and separately accounted Docker-in-Docker sidecar
+memory remain outside the worker cgroup budget.
+
+Enabled workers require API feature `worker_memory_pressure_v1` and a valid
+registration incarnation; unsupported APIs are refused. Intervention uses
+the captured worker incarnation, claim generation and memory episode.
+The delivered adapter enrolls trusted Codex model shell commands through
+their exact registered supervisor handle and process start ticks.
+Claude enrollment (#2471), internal probes, provider/credential processes,
+boundary operations and cross-checker authority are outside this adapter's
+scope.
+
+After an intervention, another intervention/retry requires confirmed drain,
+a resolved outcome and fresh samples below `Q` for `rearmMs`; a low sample
+alone does not clear uncertainty. The API persists the episode's maximum
+and spent allowance across ordinary redispatch. Exhaustion, uncertain drainage
+or unconfirmed outcome reporting invokes capture and an owner-held `worker_memory_pressure` recovery
+park attempt. Unconfirmed capture or park retains local custody. Owner Resume
+starts a fresh memory episode subject to existing budget, custody and lifecycle
+fences; Cancel is terminal. See
+[Memory-pressure holds](./run-recovery.md#memory-pressure-holds) and
+[Worker setup](./worker-setup.md#proactive-memory-guard) for scope and
+recovery limitations.
+
+Implementation: [worker parsing](../agent/src/config.ts),
+[controller parsing](../controller/internal/config/memory_guard.go),
+[cgroup policy](../agent/src/worker-memory-guard.ts) and
+[episode persistence](../api/internal/store/queries/memory.sql).
+
 ### Recovery decoded-history limit
 
 `UZI_RECOVERY_DECODED_LIMIT_BYTES` bounds delivered decoded object contents
