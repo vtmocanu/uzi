@@ -826,6 +826,17 @@ type workerActiveRunDTO struct {
 	Title    string `json:"title"`
 }
 
+// workerBlockingHoldDTO is one open custody hold blocking a worker delete in the 409 body
+// (#3921). kind and title are empty when the hold's run row no longer exists or belongs
+// to another owner (the join is owner-scoped).
+type workerBlockingHoldDTO struct {
+	HoldID     string `json:"hold_id"`
+	RunID      string `json:"run_id"`
+	Generation int64  `json:"generation"`
+	Kind       string `json:"kind"`
+	Title      string `json:"title"`
+}
+
 // DeleteWorker revokes a worker owned by the current user.
 func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
@@ -852,9 +863,22 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 			// DeleteRepo's `custody_holds` 409 (forge.go): a deliberate destructive delete
 			// that would drop the final source must require an explicit discard decision,
 			// never inherit a generic cleanup path.
+			//
+			// #3921: also name the blocking holds (capped by the service; custody_holds /
+			// blocking_holds_total stay the authoritative count). blocking_holds is
+			// non-nil so an empty listing (holds released mid-request) encodes as [].
+			holds := make([]workerBlockingHoldDTO, 0, len(custody.List))
+			for _, hd := range custody.List {
+				holds = append(holds, workerBlockingHoldDTO{
+					HoldID: hd.ID.String(), RunID: hd.RunID.String(), Generation: hd.Generation,
+					Kind: hd.RunKind, Title: hd.RunTitle,
+				})
+			}
 			httpx.JSON(w, http.StatusConflict, map[string]any{
-				"error":         fmt.Sprintf("this worker is retaining unpublished committed work for recovery in %d custody hold(s); recover it (uzi run export) or explicitly discard those recovery archives before removing it", custody.Holds),
-				"custody_holds": custody.Holds,
+				"error":                fmt.Sprintf("this worker is retaining unpublished committed work for recovery in %d custody hold(s); recover it (uzi run export) or explicitly discard those recovery archives before removing it", custody.Holds),
+				"custody_holds":        custody.Holds,
+				"blocking_holds":       holds,
+				"blocking_holds_total": custody.Holds,
 			})
 		case errors.As(err, &activeRuns):
 			// #3390: name the blocking runs (capped by the service; the total is the

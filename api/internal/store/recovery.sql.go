@@ -1376,6 +1376,62 @@ func (q *Queries) ListCustodyHoldsForWorkerRun(ctx context.Context, arg ListCust
 	return items, nil
 }
 
+const listOpenCustodyHoldsForWorker = `-- name: ListOpenCustodyHoldsForWorker :many
+SELECT h.id, h.run_id, h.generation,
+       COALESCE(r.kind, '')::text AS run_kind,
+       COALESCE(r.title, r.issue_title, '')::text AS run_title
+FROM recovery_custody_holds h
+LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+WHERE h.live_worker_id = $1::uuid AND h.user_id = $2 AND h.state = 'open'
+ORDER BY h.created_at, h.id
+LIMIT 10
+`
+
+type ListOpenCustodyHoldsForWorkerParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	UserID   uuid.UUID `json:"user_id"`
+}
+
+type ListOpenCustodyHoldsForWorkerRow struct {
+	ID         uuid.UUID `json:"id"`
+	RunID      uuid.UUID `json:"run_id"`
+	Generation int64     `json:"generation"`
+	RunKind    string    `json:"run_kind"`
+	RunTitle   string    `json:"run_title"`
+}
+
+// #3921: names the holds CountOpenCustodyHoldsForWorker counts, for the DeleteWorker 409
+// body. The predicate is byte-identical to the count's (live holder, owner-scoped, open),
+// so the listing and the total cannot disagree about which holds block the delete. Capped at
+// 10, oldest first (the #3390 ListWorkerNonTerminalRuns precedent); the caller's total comes
+// from the count. recovery_custody_holds.run_id has no FK to runs, so the join is LEFT and
+// owner-scoped: a missing run yields empty kind/title instead of dropping the hold.
+func (q *Queries) ListOpenCustodyHoldsForWorker(ctx context.Context, arg ListOpenCustodyHoldsForWorkerParams) ([]ListOpenCustodyHoldsForWorkerRow, error) {
+	rows, err := q.db.Query(ctx, listOpenCustodyHoldsForWorker, arg.WorkerID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOpenCustodyHoldsForWorkerRow{}
+	for rows.Next() {
+		var i ListOpenCustodyHoldsForWorkerRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Generation,
+			&i.RunKind,
+			&i.RunTitle,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listOpenCustodyHoldsForWorkers = `-- name: ListOpenCustodyHoldsForWorkers :many
 SELECT w.id AS worker_id, h.state, h.inventory_guarded,
        f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed
