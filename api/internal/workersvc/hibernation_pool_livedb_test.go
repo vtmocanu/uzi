@@ -87,8 +87,20 @@ func (p *poolFx) owner() uuid.UUID {
 	return user
 }
 
-// beat refreshes the heartbeat of every awake worker of every owner this fixture seeded.
+// beat refreshes the heartbeat of every awake worker of every owner this fixture seeded. A worker
+// that already holds a memory-authority receipt (memory_authority_held_at) has it refreshed too,
+// standing in for the held claims a live agent keeps sending; beatOnly leaves the receipt alone.
 func (p *poolFx) beat(ids ...uuid.UUID) {
+	p.t.Helper()
+	for _, id := range ids {
+		p.env.exec(`UPDATE workers SET last_heartbeat_at = $2,
+		            memory_authority_held_at = CASE WHEN memory_authority_held_at IS NOT NULL THEN $2::timestamptz END
+		            WHERE id = $1`, id, p.clock)
+	}
+}
+
+// beatOnly refreshes heartbeats and nothing else.
+func (p *poolFx) beatOnly(ids ...uuid.UUID) {
 	p.t.Helper()
 	for _, id := range ids {
 		p.env.exec(`UPDATE workers SET last_heartbeat_at = $2 WHERE id = $1`, id, p.clock)
@@ -268,6 +280,8 @@ func TestHibernationSurplusMemoryAuthorityUnknownLiveDB(t *testing.T) {
 			cand, keeper := p.member(6*time.Hour), p.member(5*time.Hour)
 			if tc.capable {
 				p.env.exec(`UPDATE workers SET protocol_capabilities = $1 WHERE id = ANY($2)`, caps, []uuid.UUID{cand, keeper})
+				// The keeper's memory authority is known: a fresh held receipt (beat keeps it fresh).
+				p.env.exec(`UPDATE workers SET memory_authority_held_at = $2 WHERE id = $1`, keeper, p.clock)
 			}
 			p.pass(cand, keeper)
 			p.wantStates(map[uuid.UUID]string{cand: tc.want, keeper: "none"})
@@ -707,7 +721,22 @@ func TestHibernationSurplusAmbiguousCommitBudgetLiveDB(t *testing.T) {
 func TestHibernationCommitUncertainBodyLockTimeoutLiveDB(t *testing.T) {
 	p := newPoolFx(t)
 	id := p.member(10 * time.Hour)
+	readBlocked := func() pgtype.Text {
+		t.Helper()
+		var reason pgtype.Text
+		if err := p.env.pool.QueryRow(p.env.ctx, `SELECT hibernation_blocked_reason FROM workers WHERE id = $1`, id).Scan(&reason); err != nil {
+			t.Fatal(err)
+		}
+		return reason
+	}
+	before := readBlocked()
 	err := p.svc.hibernationOwnerTx(p.env.ctx, p.user, id, func(q *store.Queries, w store.Worker) error {
+		// A mutating statement runs first, then the body fails with a lock timeout.
+		if err := q.SetWorkerHibernationBlocked(p.env.ctx, store.SetWorkerHibernationBlockedParams{
+			ID: w.ID, Reason: "probe_body_write", At: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		}); err != nil {
+			return err
+		}
 		return &pgconn.PgError{Code: "55P03"}
 	})
 	var unc *hibernationCommitUncertainError
@@ -716,6 +745,9 @@ func TestHibernationCommitUncertainBodyLockTimeoutLiveDB(t *testing.T) {
 	}
 	if errors.Is(err, errHibernationOwnerBusy) {
 		t.Fatal("a 55P03 raised inside the body must not read as busy")
+	}
+	if after := readBlocked(); after != before {
+		t.Fatalf("hibernation_blocked_reason = %+v after a failed body, want %+v (the body's write must roll back)", after, before)
 	}
 }
 

@@ -615,10 +615,10 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 	if err != nil {
 		return false, err
 	}
-	return s.applyWorkerActiveSnapshot(ctx, qtx, locked, snap, mode, entries, locks, pending)
+	return s.applyWorkerActiveSnapshot(ctx, qtx, locked, snap, mode, entries, locks, pending, pgtype.Timestamptz{})
 }
 
-func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode, entries []validatedEntry, locks workerRecoveryLockSet, pending validatedPendingAll) (bool, error) {
+func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode, entries []validatedEntry, locks workerRecoveryLockSet, pending validatedPendingAll, heldAt pgtype.Timestamptz) (bool, error) {
 	frozen, parents, err := locks.parameters()
 	if err != nil {
 		return false, err
@@ -787,6 +787,9 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 		PendingOverflow: snap.PendingOverflow,
 		LeaseSeconds:    leaseSeconds,
 		ID:              wkr.ID,
+		// Issue #4395: the held receipt of a snapshot-carrying claim, fenced by the nonce.
+		MemoryAuthorityHeldAt: heldAt,
+		HeldRegisterNonce:     pgconv.TextOrNull(snap.RegisterNonce),
 	}); err != nil {
 		return false, err
 	}

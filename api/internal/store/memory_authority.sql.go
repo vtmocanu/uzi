@@ -36,7 +36,8 @@ func (q *Queries) ClearWorkerMemoryAuthorityLost(ctx context.Context, arg ClearW
 const setWorkerMemoryAuthorityLost = `-- name: SetWorkerMemoryAuthorityLost :execrows
 
 UPDATE workers
-   SET memory_authority_lost_at = $1
+   SET memory_authority_lost_at = $1,
+       memory_authority_held_at = NULL
  WHERE id = $2
    AND snapshot_register_nonce = $3
    AND memory_authority_lost_at IS NULL
@@ -57,6 +58,11 @@ type SetWorkerMemoryAuthorityLostParams struct {
 // changes 0 rows, so a delayed held or lost report from an older registration can neither set
 // nor clear the new registration's value. The IS [NOT] NULL guard keeps the first-lost time and
 // makes a repeat a zero-row no-op.
+//
+// workers.memory_authority_held_at (the last fresh held receipt) is written by
+// SetWorkerSnapshotState under the same nonce fence, cleared by Register, and cleared here by a
+// lost report: a loss invalidates any earlier held receipt. ClearWorkerMemoryAuthorityLost leaves
+// it alone; the same claim's snapshot apply stamps the new receipt.
 func (q *Queries) SetWorkerMemoryAuthorityLost(ctx context.Context, arg SetWorkerMemoryAuthorityLostParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setWorkerMemoryAuthorityLost, arg.LostAt, arg.ID, arg.RegisterNonce)
 	if err != nil {

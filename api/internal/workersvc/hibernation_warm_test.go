@@ -203,8 +203,27 @@ func TestDecideWarm(t *testing.T) {
 			t.Errorf("%s: a not-ready awake member is no reserve: %+v", name, d)
 		}
 	}
-	// With memory authority unpersisted, a memory-capable pool has unknown readiness: no decision.
 	caps := []string{capability.WorkerMemoryPressureV1, capability.WorkerMemoryAuthorityClaimV1}
+	// A memory-capable awake idle member whose memory authority is unknown (no receipt, or an
+	// expired one) is no reserve, while one with a fresh held receipt is (issue #4395, PRD D16).
+	for _, tc := range []struct {
+		name string
+		held pgtype.Timestamptz
+		want string
+	}{
+		{"fresh receipt", pgconv.Time(poolNow.Add(-5 * time.Second)), decisionNone},
+		{"no receipt", pgtype.Timestamptz{}, decisionWarmWake},
+		{"expired receipt", pgconv.Time(poolNow.Add(-time.Hour)), decisionWarmWake},
+	} {
+		k, sl := readyRow(1), sleeperRow(2, "hibernated")
+		k.OwnerActiveNow = true
+		k.ProtocolCapabilities, sl.ProtocolCapabilities = caps, caps
+		k.MemoryAuthorityHeldAt = tc.held
+		if d := warm([]poolRow{k, sl}, sl.ID); d.Action != tc.want {
+			t.Errorf("capable keeper, %s: %+v, want %s", tc.name, d, tc.want)
+		}
+	}
+	// With memory authority unpersisted, a memory-capable pool has unknown readiness: no decision.
 	b, s := busyRow(1), sleeperRow(2, "hibernated")
 	b.ProtocolCapabilities, s.ProtocolCapabilities = caps, caps
 	if d := decideWarm([]poolRow{b, s}, s.ID, poolNow, poolStale, warmIdleAfter, false); d.Why != noneMemoryAuthUnsure {
