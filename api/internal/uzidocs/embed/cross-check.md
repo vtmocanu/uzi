@@ -61,9 +61,11 @@ budget exhausts on REVISE; an older worker keeps the changes-requested human
 gate. BLOCK, timeout, failed or unavailable checker, refused candidate/diff
 and submit failure retain their human fallback or terminal delivery exception.
 A Codex lead consumes automatic REVISE rounds without spending its human
-revision allowance, and implements exactly the approved checked plan. Its
-worker must advertise `cross_check_codex_lead_v1` to submit for a check. A
-Codex lead on a worker without it, or on an api that does not signal support
+revision allowance, and implements from the approved canonical checked plan,
+which remains authoritative. An approval may also carry non-gating advice
+(see [Coverage advice](#coverage-advice)). Its worker must advertise
+`cross_check_codex_lead_v1` to submit for a check. A Codex lead on a worker
+without it, or on an api that does not signal support
 (see [rolling out](#rolling-out-codex-lead-checks)), keeps the older park, with
 `plan cross-check: not yet supported for a Codex lead`, and waits for a human.
 
@@ -131,8 +133,12 @@ The complete automatically revised `plan_md` must include the exact heading
 **Cross-check dispositions**, with one disposition for each item delivered by
 the immediately preceding check: addressed (where and how in the plan), or
 declined (rationale and inspectable evidence). Older entries are optional.
-Round 1 does not require dispositions; missing or incomplete entries in round 2
-and later call for ordinary REVISE, never BLOCK solely for that omission.
+Round 1 does not require dispositions; missing or incomplete defect entries in
+round 2 and later call for ordinary REVISE, never BLOCK solely for that omission.
+Coverage notes use `Requirement gap:` or `Coverage uncertainty:`. Disposition
+them where useful; a missing or declined prior coverage disposition alone
+never justifies REVISE, BLOCK or another round. Defect disposition rules remain
+unchanged; a supported decline cannot waive a mandatory defect requirement.
 The checker engages with the rationale and accepts evidence-supported declines
 as appropriate. An uninspectable instruction claim must be explicitly unverified;
 it alone cannot establish an exception to an inspectable requirement. Actual
@@ -156,6 +162,57 @@ Deterministic fixtures and mock tests do not prove model convergence; live
 hosted/model attempts, cost and latency are unmeasured, with no universal
 convergence guarantee. The [configuration notes](./configuration.md#cross-check-settings)
 explain the bounded additional wait and lead revision cost.
+
+### Coverage advice
+
+The checker brief asks both families to enumerate requirements and acceptance
+criteria from the supplied issue snapshot (`issue_title` and `issue_body`) and
+repository PRDs linked by the issue. Issue comments are not supplied. The
+checker uses its existing read/search tools within the current deadline and
+limits; it gains no URL fetching or additional tools.
+
+- An omitted or partly covered requirement is a `warning` with the mandatory
+  summary prefix `Requirement gap:`.
+- A requirement verifiable only on hosted, live or maintainer-only surfaces is
+  `info` with the mandatory summary prefix `Coverage uncertainty:`.
+- Missing, external, unreadable or oversized requirement sources get a
+  `Coverage uncertainty:` note in the summary and are never treated as covered.
+  Finding no defect does not establish that a requirement is covered.
+- An omitted requirement stated by the issue as a safety, security or
+  data-integrity constraint is an `error` defect, with no coverage prefix,
+  requiring REVISE under the existing defect rules.
+
+Every coverage item uses one of these prefixes; defects never use either.
+Coverage alone never justifies REVISE or BLOCK. Defects come first within the
+20-item cap; coverage fills spare space. The summary counts overflow with the
+literal form `N coverage notes omitted` (replacing N with the count). Coverage
+items and the omitted count never displace a defect. These are instruction
+contracts, not a parser that rewrites verdicts or proof of model convergence.
+
+On an approving verdict, both Claude and Codex leads receive every delivered
+item, including noncoverage warning/info items, and the complete bounded
+summary as nonce-fenced, untrusted, non-gating advice. A summary-only approval
+is delivered too. Absent or null findings, or an empty summary with no items,
+leave the implementation prompt unchanged.
+
+The lead must verify suggestions against the issue, code and uzi rules,
+decline conflicts and explain the decision, and keep existing permissions and
+constraints. The approved canonical plan remains authoritative. An omitted
+requirement may be implemented only within the issue's stated scope, with the
+addition named in the PR description. Code cross-check reviews the
+implementation **when enabled**; scope, permissions and canonical-plan
+constraints apply independently of that opt-in. Advice requires no extra gate,
+re-plan or revision round.
+
+Delivery is best-effort and worker-local: approval notes are lost on reclaim.
+When the dormant semantic human-gate path drops the checker approval, it also
+drops this advice. This adds no wire/API/schema fields, capability or
+persistence. During mixed-worker rollout, an old lead drops approving findings;
+an old checker supplies no new coverage account, and a new lead renders the
+findings it receives. The code-stage revision prompt's bytes are unchanged.
+See the [dated ADR amendment](../adr/2149-cross-check.md#advisory-plan-coverage-amendment-2026-10-23-3334--3168-m1)
+and [PRD #3168](../prds/3168-plan-cross-check-coverage.md) for validation and
+remaining replay scope.
 
 ## 3. Read the evidence and decide
 
@@ -396,15 +453,37 @@ support is deferred: equal base and index gitlink ids do not prove that
 directory is staged. Supporting it needs a proof that the worktree preserves
 the base gitlink under publication.
 
-Capture runs under two independent 128 MiB budgets: one for source reads
-(worktree compare reads and verified object reads) and one for the
-object-store snapshot copy, which is streamed in small chunks so cleanup can
-run on SIGTERM. The snapshot is a temporary tree on the worker's disk,
-removed when capture ends. Measured once on a clone of the uzi repository
-(October 2026), capture used about a 74 MiB snapshot (the temporary tree
-peaks near that size) and about 100 MiB of source reads, in under 7 s
-against a 28 s deadline; a repository whose tracked text approaches
-128 MiB will refuse with `diff_too_large`.
+Capture derives its budgets from the immutable base in the worker-held bare
+repository. The helper reads base objects only from that bare's object
+directory, with type, size and hash verification; it rejects bare alternates
+and uses neutral Git scratch instead of the clone's object store or
+configuration. Missing or detectably corrupt required objects refuse with
+`base_unavailable`; a concurrent repack may instead produce `diff_failed`
+(diagnostic `git_refused`). Capture holds no long-lived bare lock.
+
+Source reads have a limit of per-path base blob bytes (duplicates included),
+plus verified commit/tree bytes, plus 128 MiB. Clean or deleted paths fit
+within base credit; changed files charge roughly their new size against the
+allowance. Clone inputs grant no credit, and current regular files are read completely
+through pinned descriptors without trusting clean index stats. Independent
+index, path, walk and ignore budgets also scale from the verified base;
+see the [counter definitions and bounds](../adr/2149-cross-check.md#planning-diff-capture-symlinks-gitlinks-and-budgets-2026-10-07-2410).
+
+There is no object-store snapshot copy or snapshot budget. Base discovery
+has per-object, depth and deadline bounds, with no aggregate base cap or
+cache. No additional absolute ceiling applies to the relative totals. Limits remain: 4 MiB per file, 2 MiB per commit/tree object, depth 64,
+64 KiB per ignore/exclude read, 512 KiB patch/output and 200 non-ignored
+untracked files. The helper has 28 s and the outer capture 30 s; yielding
+during discovery and reads allows cancellation cleanup within the production
+2 s SIGTERM kill grace. Large clean repositories no longer meet a fixed
+128 MiB source ceiling, but other bounds and deadlines can still refuse.
+
+Hosted post-merge acceptance remains pending: a maintainer must measure
+clean HEAD capture including base sizing with a reported sample count,
+verify bare read/write posture on Docker and kube-native workers, and
+observe an auto-approved scheduled run proceeding without a gate.
+Single-UID operation still lacks OS write isolation; split-UID helpers can
+read the bare but cannot write it. Capture refusals keep the human fallback.
 
 ### Rollout
 

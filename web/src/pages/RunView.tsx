@@ -31,7 +31,7 @@ import {
 import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
 import { repoAgentFolder } from "../lib/repoAgentFolder";
-import { stripUnsafeChars } from "../lib/safeText";
+import { stripDisplayCell, stripUnsafeChars } from "../lib/safeText";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
@@ -306,7 +306,7 @@ function checkpointSentence(run: Run, nowMs: number): string | null {
 
 // HealthFlag renders the run-health warn chip in the header (PRD #47
 // Decision 10): `⚠ <label> · stuck for Xm — <reason>`. The run view is owner/admin
-// only, so health_reason is always present here (no gating needed). It ticks the
+// only; optional health_reason is shown when available. It ticks the
 // "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
 // re-render. The near-timeout flag ("slow", PRD #1170) instead counts DOWN to the run's
 // deadline_at (`· 1h 5m left`, or `· stopping` past it), falling back to "stuck for Xm"
@@ -354,17 +354,8 @@ export function HealthFlag({ run }: { run: Run }) {
         <span className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn">
           ⚠ {healthFlagLabel(run.health)}
           {stuck}
-          {/* Issue #124, TEXT channel. 96ed275a stripped this field where it reaches a `title`
-              attribute (runBadge's descriptor) and missed it here, where it renders as body
-              text — the mirror of f399ab26, which stripped upgrade_detail's TEXT and left its
-              attribute for 4a739bff. Same field, opposite channel, one commit apart.
-              (This sentence named 4a739bff until D1: that is the commit which fixed the
-              ATTRIBUTE, so the mirror read backwards in the clause whose whole point is the
-              mirror. Second time those two were transposed — see the note in
-              WorkerUpgradeBadge.test.tsx — because they are one apart, both about
-              upgrade_detail, and differ only in channel, which is the distinction being
-              taught.) */}
-          {run.health_reason && <span className="font-normal"> — {stripUnsafeChars(run.health_reason)}</span>}
+          {/* A single display cell, including server-composed manual attribution. */}
+          {run.health_reason && <span className="font-normal"> — {stripDisplayCell(run.health_reason)}</span>}
         </span>
       )}
       {/* ALWAYS MOUNTED, empty until a flag arrives — mirrors RunView's parkAnnounce

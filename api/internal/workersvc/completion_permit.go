@@ -248,6 +248,79 @@ func computeUnmetCriteria(run store.Run) (unmet []string, verifiable bool) {
 	return unmet, true
 }
 
+// structuralAuthority validates the shared frozen structural authority, including owner acceptances.
+func structuralAuthority(run store.Run, ms []Milestone) (map[string]string, bool) {
+	var c completionContract
+	if err := json.Unmarshal(run.CompletionContract, &c); err != nil ||
+		c.Profile != contractProfileStructural || !run.ContractRevision.Valid ||
+		c.Revision < 1 || c.Revision != int(run.ContractRevision.Int32) ||
+		!run.CompletionContractVersion.Valid || run.CompletionContractVersion.Int32 != 1 ||
+		c.Criteria == nil || len(c.Criteria) != len(ms) {
+		return nil, false
+	}
+	// The typed decoder maps missing and null fields alike. Require the reserved
+	// structural slots as well so malformed criterion objects cannot authorize a slice.
+	var shape struct{ Criteria []map[string]json.RawMessage }
+	if err := json.Unmarshal(run.CompletionContract, &shape); err != nil {
+		return nil, false
+	}
+	for _, cr := range shape.Criteria {
+		if string(cr["audit"]) != "null" {
+			return nil, false
+		}
+	}
+	frozen := make(map[string]string, len(ms))
+	for _, m := range ms {
+		if m.ID == "" {
+			return nil, false
+		}
+		if _, exists := frozen[m.ID]; exists {
+			return nil, false
+		}
+		frozen[m.ID] = m.Title
+	}
+	criteria := make(map[string]completionCriterion, len(ms))
+	seen := make(map[string]bool, len(ms))
+	for _, cr := range c.Criteria {
+		title, exists := frozen[cr.MilestoneID]
+		if !exists || seen[cr.MilestoneID] || cr.ID != cr.MilestoneID+".c1" ||
+			cr.Text != title || cr.Audit != nil || cr.FindingIDs == nil || len(cr.FindingIDs) != 0 {
+			return nil, false
+		}
+		seen[cr.MilestoneID] = true
+		criteria[cr.ID] = cr
+	}
+	if c.Scope != nil {
+		partition := make(map[string]bool, len(ms))
+		for _, id := range c.Scope.In {
+			if _, exists := frozen[id]; !exists || partition[id] {
+				return nil, false
+			}
+			partition[id] = true
+		}
+		for _, d := range c.Scope.Out {
+			if _, exists := frozen[d.MilestoneID]; !exists || partition[d.MilestoneID] ||
+				d.Reason == "" || d.Revision < 1 || d.Revision > c.Revision {
+				return nil, false
+			}
+			partition[d.MilestoneID] = true
+		}
+		if len(partition) != len(ms) {
+			return nil, false
+		}
+	}
+	accepted := make(map[string]bool, len(c.Accepted))
+	for _, a := range c.Accepted {
+		cr, exists := criteria[a.ID]
+		if !exists || accepted[a.ID] || a.MilestoneID != cr.MilestoneID || a.Text != cr.Text ||
+			a.Reason == "" || a.Revision < 1 || a.Revision > c.Revision {
+			return nil, false
+		}
+		accepted[a.ID] = true
+	}
+	return frozen, true
+}
+
 // scopeCapEligibility verifies the immutable structural list before authorizing a partial
 // delivery. Only distinct persisted completed members count; owner decisions do not.
 func scopeCapEligibility(run store.Run) (eligible, verifiable bool) {
@@ -258,73 +331,9 @@ func scopeCapEligibility(run store.Run) (eligible, verifiable bool) {
 	if err != nil || len(ms) == 0 {
 		return false, false
 	}
-	var c completionContract
-	if err := json.Unmarshal(run.CompletionContract, &c); err != nil ||
-		c.Profile != contractProfileStructural || !run.ContractRevision.Valid ||
-		c.Revision < 1 || c.Revision != int(run.ContractRevision.Int32) ||
-		!run.CompletionContractVersion.Valid || run.CompletionContractVersion.Int32 != 1 ||
-		c.Criteria == nil || len(c.Criteria) != len(ms) {
+	frozen, valid := structuralAuthority(run, ms)
+	if !valid {
 		return false, false
-	}
-	// The typed decoder maps missing and null fields alike. Require the reserved
-	// structural slots as well so malformed criterion objects cannot authorize a slice.
-	var shape struct{ Criteria []map[string]json.RawMessage }
-	if err := json.Unmarshal(run.CompletionContract, &shape); err != nil {
-		return false, false
-	}
-	for _, cr := range shape.Criteria {
-		if string(cr["audit"]) != "null" {
-			return false, false
-		}
-	}
-	frozen := make(map[string]string, len(ms))
-	for _, m := range ms {
-		if m.ID == "" {
-			return false, false
-		}
-		if _, exists := frozen[m.ID]; exists {
-			return false, false
-		}
-		frozen[m.ID] = m.Title
-	}
-	criteria := make(map[string]completionCriterion, len(ms))
-	seen := make(map[string]bool, len(ms))
-	for _, cr := range c.Criteria {
-		title, exists := frozen[cr.MilestoneID]
-		if !exists || seen[cr.MilestoneID] || cr.ID != cr.MilestoneID+".c1" ||
-			cr.Text != title || cr.Audit != nil || cr.FindingIDs == nil || len(cr.FindingIDs) != 0 {
-			return false, false
-		}
-		seen[cr.MilestoneID] = true
-		criteria[cr.ID] = cr
-	}
-	if c.Scope != nil {
-		partition := make(map[string]bool, len(ms))
-		for _, id := range c.Scope.In {
-			if _, exists := frozen[id]; !exists || partition[id] {
-				return false, false
-			}
-			partition[id] = true
-		}
-		for _, d := range c.Scope.Out {
-			if _, exists := frozen[d.MilestoneID]; !exists || partition[d.MilestoneID] ||
-				d.Reason == "" || d.Revision < 1 || d.Revision > c.Revision {
-				return false, false
-			}
-			partition[d.MilestoneID] = true
-		}
-		if len(partition) != len(ms) {
-			return false, false
-		}
-	}
-	accepted := make(map[string]bool, len(c.Accepted))
-	for _, a := range c.Accepted {
-		cr, exists := criteria[a.ID]
-		if !exists || accepted[a.ID] || a.MilestoneID != cr.MilestoneID || a.Text != cr.Text ||
-			a.Reason == "" || a.Revision < 1 || a.Revision > c.Revision {
-			return false, false
-		}
-		accepted[a.ID] = true
 	}
 	completed, err := DecodeMilestoneIDs(run.MilestonesCompleted)
 	if err != nil {
@@ -349,73 +358,9 @@ func headlessCompletedUnion(run store.Run, req StateRequest) ([]byte, bool) {
 	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(run.MilestonesFrozen)), "[") {
 		return nil, false
 	}
-	var c completionContract
-	if err := json.Unmarshal(run.CompletionContract, &c); err != nil ||
-		c.Profile != contractProfileStructural || !run.ContractRevision.Valid ||
-		c.Revision < 1 || c.Revision != int(run.ContractRevision.Int32) ||
-		!run.CompletionContractVersion.Valid || run.CompletionContractVersion.Int32 != 1 ||
-		c.Criteria == nil || len(c.Criteria) != len(ms) {
+	frozen, valid := structuralAuthority(run, ms)
+	if !valid {
 		return nil, false
-	}
-	// The typed decoder maps missing and null fields alike. Require the reserved
-	// structural slots as well so malformed criterion objects cannot authorize a slice.
-	var shape struct{ Criteria []map[string]json.RawMessage }
-	if err := json.Unmarshal(run.CompletionContract, &shape); err != nil {
-		return nil, false
-	}
-	for _, cr := range shape.Criteria {
-		if string(cr["audit"]) != "null" {
-			return nil, false
-		}
-	}
-	frozen := make(map[string]string, len(ms))
-	for _, m := range ms {
-		if m.ID == "" {
-			return nil, false
-		}
-		if _, exists := frozen[m.ID]; exists {
-			return nil, false
-		}
-		frozen[m.ID] = m.Title
-	}
-	criteria := make(map[string]completionCriterion, len(ms))
-	seen := make(map[string]bool, len(ms))
-	for _, cr := range c.Criteria {
-		title, exists := frozen[cr.MilestoneID]
-		if !exists || seen[cr.MilestoneID] || cr.ID != cr.MilestoneID+".c1" ||
-			cr.Text != title || cr.Audit != nil || cr.FindingIDs == nil || len(cr.FindingIDs) != 0 {
-			return nil, false
-		}
-		seen[cr.MilestoneID] = true
-		criteria[cr.ID] = cr
-	}
-	if c.Scope != nil {
-		partition := make(map[string]bool, len(ms))
-		for _, id := range c.Scope.In {
-			if _, exists := frozen[id]; !exists || partition[id] {
-				return nil, false
-			}
-			partition[id] = true
-		}
-		for _, d := range c.Scope.Out {
-			if _, exists := frozen[d.MilestoneID]; !exists || partition[d.MilestoneID] ||
-				d.Reason == "" || d.Revision < 1 || d.Revision > c.Revision {
-				return nil, false
-			}
-			partition[d.MilestoneID] = true
-		}
-		if len(partition) != len(ms) {
-			return nil, false
-		}
-	}
-	accepted := make(map[string]bool, len(c.Accepted))
-	for _, a := range c.Accepted {
-		cr, exists := criteria[a.ID]
-		if !exists || accepted[a.ID] || a.MilestoneID != cr.MilestoneID || a.Text != cr.Text ||
-			a.Reason == "" || a.Revision < 1 || a.Revision > c.Revision {
-			return nil, false
-		}
-		accepted[a.ID] = true
 	}
 
 	// Validate persisted arrays before unionMilestoneIDs, which discards decode errors.
@@ -952,7 +897,7 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 	// Completed publication and ephemeral leasing serialize on the worker before the run.
 	// A persistent worker or nil-generation report never enters a lease.
 	leaseTx := s.ephemeralLease > 0 && wkr.Ephemeral && req.ClaimGeneration != nil
-	if leaseTx || completedPublicationCapable(wkr, req) {
+	if leaseTx || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
 		if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 			if errors.Is(werr, pgx.ErrNoRows) {
 				return 0, false, lease, nil // the worker row is gone: no longer this worker's run
@@ -969,6 +914,15 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		return 0, false, lease, err
 	}
 
+	if req.SourcePublication != nil {
+		if run.Status == "completed" {
+			if !sourcePublicationIdentity(run, req) {
+				return 0, false, lease, ErrInvalidState
+			}
+		} else if err := validateSourcePublicationLive(run, wkr, req); err != nil {
+			return 0, false, lease, err
+		}
+	}
 	reconciled, rerr := reconciliationExists(ctx, tx, owned.ID)
 	if rerr != nil {
 		return 0, false, lease, rerr
@@ -1134,6 +1088,10 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		// The run left the completable state under the lock (e.g. a superseding terminal). Roll
 		// back so the permit is NOT consumed and the report stays non-terminal.
 		return 0, false, lease, nil
+	}
+
+	if err := bindSourcePublication(ctx, tx, wkr, run, req, completedParams.StopKind.String == "scope_capped"); err != nil {
+		return 0, false, lease, err
 	}
 
 	// Generation-activation hook seam (PRD #1226 M2, D4). This is a DELIBERATE no-op today:

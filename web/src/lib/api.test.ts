@@ -25,6 +25,37 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("manual worker cordon request contract", () => {
+  it.each([undefined, "", " raw\n\u202ereason 🚀 "])("posts the raw optional reason %j with cookies and CSRF", async (reason) => {
+    expect(MOCK_MODE).toBe(false);
+    const response = { worker: { id: "w1", manual_cordon_reason: reason } };
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, response));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+    expect(await api.cordonWorker("w1", reason)).toEqual(response);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]).toEqual(["/api/workers/w1/cordon", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": "csrf-value" },
+      body: JSON.stringify(reason === undefined ? {} : { reason }),
+    }]);
+  });
+
+  it("deletes without a body and propagates the server conflict", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(409, { error: "manual cordon is only supported for persistent workers" }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+    await expect(api.uncordonWorker("w2")).rejects.toMatchObject({
+      status: 409, message: "manual cordon is only supported for persistent workers",
+    });
+    expect(fetchMock.mock.calls[0]).toEqual(["/api/workers/w2/cordon", {
+      method: "DELETE", credentials: "same-origin",
+      headers: { "X-CSRF-Token": "csrf-value" }, body: undefined,
+    }]);
+  });
+});
+
 describe("cross-check preference request bodies", () => {
   it.each([true, false])("sends only code=%s through the production setter", async (code) => {
     expect(MOCK_MODE).toBe(false);

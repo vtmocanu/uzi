@@ -7,7 +7,7 @@
 **Numbering**: `1209` is the **issue** number, not an ADR sequence number (the
 convention ADR-0214/0238 record). A reader who assumes "ADR number == ADR
 count" will miscount.
-**Extends**: [PRD #1209](../prds/1209-codex-account-rate-limits.md) (Codex
+**Extends**: [PRD #1209](../prds/done/1209-codex-account-rate-limits.md) (Codex
 account rate-limit visibility — read it for the full milestone breakdown,
 the plan-gate addendum, and the Decision and progress log; this ADR is the
 durable subset a future change must not silently break). Reuses the

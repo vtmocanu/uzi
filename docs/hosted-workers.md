@@ -176,7 +176,7 @@ fence, and is deployment-order independent. See
 
 A cordoned worker shows a dashed **draining** or **cordoned** pill next to its
 status in the Workers list — **draining** while it's still finishing runs,
-**cordoned** once it's idle and just holding until the restart. `uzi worker
+**cordoned** once it's idle and waiting for release. `uzi worker
 list` shows the same thing folded into the STATUS column, e.g. `online
 (draining)` or `offline (draining)`.
 
@@ -185,9 +185,57 @@ and shows a free run slot, but isn't picking up a run sitting in the queue.
 That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
 resumes claiming when the roll-owned drain can safely be released. Independent
 maintenance or recovery fences can keep it cordoned. No timer automatically
-uncordons it. There is no user-facing
-manual cordon action; the cluster drives this process. Operators can follow the
+uncordons it. This automatic lifecycle is separate from an owner's manual
+cordon. Operators can follow the
 [hosted roll verification runbook](./hosted-worker-roll-verification.md).
+
+### Pause new work with a manual cordon
+
+On the Workers page, choose **Cordon** on your persistent hosted or external
+worker, optionally enter a reason, and confirm. Choose **Uncordon** to remove
+your manual hold. The CLI offers the same controls:
+
+```sh
+uzi worker cordon <id> [-m <reason>]
+uzi worker uncordon <id>
+```
+
+Both commands accept `--json`. Reasons are limited to 500 Unicode code points
+before trimming and sanitization; blank reasons become null. Repeating a cordon
+keeps the original actor, time and reason. Run-bound/ephemeral workers cannot be
+manually cordoned (HTTP 409:
+`manual cordon is only supported for persistent workers`).
+These are owner actions; being an admin does not grant control over another
+owner's worker.
+
+A manual cordon pauses new intake. Assigned work, including eligible pinned
+continuations and checkers, can continue subject to other restrictions. It
+does not cancel runs or end held chats, and it creates no new continuation
+affinity. New chat continuations may resume elsewhere. Offline status is
+independent: an offline worker can still carry a manual hold.
+
+Worker details show the manual actor, time and optional reason alongside
+automatic drains and other fences. Health and admin views show this information
+for diagnosis and offer no cordon action. A manual wait explanation requires
+suitable workers to be present, each manually cordoned, with no claimable
+assigned continuation. A suitable uncordoned worker that is busy or
+automatically drained prevents that explanation. Manual waits are not
+upgrade-only waits.
+
+Your manual hold survives registration, roll, restart, deadlines and ForceRoll.
+It ends when you explicitly uncordon or delete the worker. **Uncordon** removes
+the manual hold; automatic drain, maintenance, custody and other restrictions
+can still prevent new work. An idle hosted worker may roll and return manually
+cordoned. A busy worker still waits under the ordinary roll policy. Manually
+cordoned workers do not provide replacement coverage, so a multi-worker pool
+with no uncordoned provider can remain held.
+
+During deployment, older serving APIs may admit new work after a successful
+cordon until every serving API is compatible; a stalled rollout extends that
+window. Older controllers may count manual workers as coverage; use compatible
+controllers for ordinary coverage guarantees. Decisions from an earlier poll
+may finish. No worker-image upgrade or feature activation flag is required.
+See [CLI manual cordon](./cli.md#manual-worker-cordon) for response fields.
 
 ### See which assigned runs block an upgrade
 
@@ -491,7 +539,7 @@ gauges, same [concurrency](./worker-setup.md#concurrent-runs) rules.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.162.1 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.163.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides. See [Reasoning effort](worker-effort.md).

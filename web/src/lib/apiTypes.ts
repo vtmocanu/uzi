@@ -2976,6 +2976,8 @@ export interface Run {
   kind: RunKind;
   /** The worked issue for an issue run; null for a ci_fix or chat run (no issue). */
   issue_iid: number | null;
+  /** Optional for older API responses; task continuation metadata, separate from issue_iid. */
+  continued_issue_iid?: number | null;
   issue_title: string;
   issue_description: string;
   /** The run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored runs.harness.

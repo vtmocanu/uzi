@@ -118,39 +118,45 @@ func TestGenerateUXLabFrames(t *testing.T) {
 			m.updatePrompt.installedVersion = "v0.85.0"
 			return m.View().Content
 		},
-		"board-admin":                  boardAdmin,
-		"board-filter":                 func(d bool) string { return boardFilter(d, now) },
-		"board-planning":               func(d bool) string { return boardPlanning(d, now) },
-		"board-revising":               func(d bool) string { return boardRevising(d, now) },
-		"board-milestones":             func(d bool) string { return boardMilestones(d, now) },
-		"board-progress":               func(d bool) string { return boardProgress(d, now) },
-		"detail-plan-running-top":      func(d bool) string { return detailLongPlan(d, now, "running", false).View().Content },
-		"detail-plan-running-bottom":   func(d bool) string { return detailLongPlan(d, now, "running", true).View().Content },
-		"detail-plan-completed-top":    func(d bool) string { return detailLongPlan(d, now, "completed", false).View().Content },
-		"detail-plan-completed-bottom": func(d bool) string { return detailLongPlan(d, now, "completed", true).View().Content },
-		"detail-running":               func(d bool) string { return detailRunning(d, now) },
-		"detail-accounting-backfill":   func(d bool) string { return detailAccountingBackfill(d, now).View().Content },
-		"detail-codex":                 func(d bool) string { return detailCodex(d, now) },
-		"detail-blocked-by":            func(d bool) string { return detailBlockedBy(d, now) },
-		"detail-milestones-attributed": func(d bool) string { return detailMilestonesAttributed(d, now) },
-		"detail-crew-autofold":         func(d bool) string { return detailCrewAutofold(d, now) },
-		"detail-planning":              func(d bool) string { return detailPlanning(d, now) },
-		"detail-focus-transcript":      func(d bool) string { return detailFocusTranscript(d, now) },
-		"detail-paused":                func(d bool) string { return detailPaused(d, now) },
-		"detail-pause-lead":            func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 120) },
-		"detail-pause-owner":           func(d bool) string { return detailPauseOrigin(d, now, "owner", 120) },
-		"detail-pause-neutral":         func(d bool) string { return detailPauseOrigin(d, now, "", 120) },
-		"detail-pause-lead-narrow":     func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 60) },
-		"detail-pause-owner-narrow":    func(d bool) string { return detailPauseOrigin(d, now, "owner", 60) },
-		"detail-pause-neutral-narrow":  func(d bool) string { return detailPauseOrigin(d, now, "", 60) },
-		"detail-pause-lead-plain":      func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 60, true) },
-		"detail-pause-owner-plain":     func(d bool) string { return detailPauseOrigin(d, now, "owner", 60, true) },
-		"detail-pause-neutral-plain":   func(d bool) string { return detailPauseOrigin(d, now, "", 60, true) },
-		"detail-memory-hold-known":     func(d bool) string { return detailMemoryHold(d, now, true) },
-		"detail-memory-hold-missing":   func(d bool) string { return detailMemoryHold(d, now, false) },
-		"detail-stalled":               func(d bool) string { return detailStalled(d, now) },
-		"detail-awaiting-approval":     func(d bool) string { return detailAwaitingApproval(d, now) },
-		"detail-awaiting-input":        func(d bool) string { return detailAwaitingInput(d, now) },
+		"board-admin":                   boardAdmin,
+		"board-filter":                  func(d bool) string { return boardFilter(d, now) },
+		"board-planning":                func(d bool) string { return boardPlanning(d, now) },
+		"board-revising":                func(d bool) string { return boardRevising(d, now) },
+		"board-milestones":              func(d bool) string { return boardMilestones(d, now) },
+		"board-progress":                func(d bool) string { return boardProgress(d, now) },
+		"detail-plan-running-top":       func(d bool) string { return detailLongPlan(d, now, "running", false).View().Content },
+		"detail-plan-running-bottom":    func(d bool) string { return detailLongPlan(d, now, "running", true).View().Content },
+		"detail-plan-completed-top":     func(d bool) string { return detailLongPlan(d, now, "completed", false).View().Content },
+		"detail-plan-completed-bottom":  func(d bool) string { return detailLongPlan(d, now, "completed", true).View().Content },
+		"detail-running":                func(d bool) string { return detailRunning(d, now) },
+		"detail-accounting-backfill":    func(d bool) string { return detailAccountingBackfill(d, now).View().Content },
+		"detail-codex":                  func(d bool) string { return detailCodex(d, now) },
+		"detail-blocked-by":             func(d bool) string { return detailBlockedBy(d, now) },
+		"detail-milestones-attributed":  func(d bool) string { return detailMilestonesAttributed(d, now) },
+		"detail-crew-autofold":          func(d bool) string { return detailCrewAutofold(d, now) },
+		"detail-planning":               func(d bool) string { return detailPlanning(d, now) },
+		"detail-focus-transcript":       func(d bool) string { return detailFocusTranscript(d, now) },
+		"detail-paused":                 func(d bool) string { return detailPaused(d, now) },
+		"detail-pause-lead":             func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 120) },
+		"detail-pause-owner":            func(d bool) string { return detailPauseOrigin(d, now, "owner", 120) },
+		"detail-pause-neutral":          func(d bool) string { return detailPauseOrigin(d, now, "", 120) },
+		"detail-pause-lead-narrow":      func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 60) },
+		"detail-pause-owner-narrow":     func(d bool) string { return detailPauseOrigin(d, now, "owner", 60) },
+		"detail-pause-neutral-narrow":   func(d bool) string { return detailPauseOrigin(d, now, "", 60) },
+		"detail-pause-lead-plain":       func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 60, true) },
+		"detail-pause-owner-plain":      func(d bool) string { return detailPauseOrigin(d, now, "owner", 60, true) },
+		"detail-pause-neutral-plain":    func(d bool) string { return detailPauseOrigin(d, now, "", 60, true) },
+		"detail-pause-lead-40":          func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 40) },
+		"detail-pause-owner-40":         func(d bool) string { return detailPauseOrigin(d, now, "owner", 40) },
+		"detail-pause-neutral-40":       func(d bool) string { return detailPauseOrigin(d, now, "", 40) },
+		"detail-pause-lead-40-plain":    func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 40, true) },
+		"detail-pause-owner-40-plain":   func(d bool) string { return detailPauseOrigin(d, now, "owner", 40, true) },
+		"detail-pause-neutral-40-plain": func(d bool) string { return detailPauseOrigin(d, now, "", 40, true) },
+		"detail-memory-hold-known":      func(d bool) string { return detailMemoryHold(d, now, true) },
+		"detail-memory-hold-missing":    func(d bool) string { return detailMemoryHold(d, now, false) },
+		"detail-stalled":                func(d bool) string { return detailStalled(d, now) },
+		"detail-awaiting-approval":      func(d bool) string { return detailAwaitingApproval(d, now) },
+		"detail-awaiting-input":         func(d bool) string { return detailAwaitingInput(d, now) },
 		"detail-awaiting-input-collapsed": func(d bool) string {
 			return detailInputScene(d, now, "collapsed").View().Content
 		},
@@ -373,12 +379,16 @@ func crossCheckFleetScene(dark bool, split bool, width, active int) tuiModel {
 	return m
 }
 
-var workerSceneNames = []string{"workers-manual-120", "workers-manual-80", "workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
+var workerSceneNames = []string{"workers-manual-160", "workers-manual-120", "workers-manual-80", "workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
 
-var workerDetailSceneNames = []string{"worker-manual", "worker-manual-combined", "worker-upgrade-failed", "worker-outcome-outbox", "worker-holding", "worker-capacity-blocked", "worker-provisioning", "worker-provisioning-failed"}
+var workerDetailSceneNames = []string{"worker-manual-80", "worker-manual-combined-80", "worker-manual", "worker-manual-combined", "worker-upgrade-failed", "worker-outcome-outbox", "worker-holding", "worker-capacity-blocked", "worker-provisioning", "worker-provisioning-failed"}
 
 // workersScene uses the shipped model and the interactive demo's client.
 func workersScene(dark bool, name string) tuiModel {
+	narrowDetail := name == "worker-manual-80" || name == "worker-manual-combined-80"
+	if narrowDetail {
+		name = strings.TrimSuffix(name, "-80")
+	}
 	fake := newDemoClient()
 	if name == "workers-stale-stats" {
 		for i := range fake.Workers {
@@ -442,10 +452,13 @@ func workersScene(dark bool, name string) tuiModel {
 	}
 	m := uxModel(fake, "", dark)
 	width, height := 120, 34
-	if target != "" {
+	if target != "" && !narrowDetail {
 		height = 52
 	}
-	if name == "workers-list-80" || name == "workers-manual-80" {
+	if name == "workers-manual-160" {
+		width = 160
+	}
+	if narrowDetail || name == "workers-list-80" || name == "workers-manual-80" {
 		width = 80
 	}
 	if name == "split-workers-top" {

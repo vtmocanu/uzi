@@ -647,7 +647,10 @@ permitted scratch relocation alone is not a validation bypass or proof of
 harmlessness. Complete automatic revisions include `Cross-check dispositions`
 for every immediately preceding delivered item, with addressed location/method
 or declined rationale and inspectable evidence. The checker considers supported
-declines; round 2+ omissions mean REVISE, never BLOCK solely for omission.
+declines; round 2+ missing/incomplete defect dispositions mean REVISE, never
+BLOCK solely for omission. Missing or declined prior coverage dispositions
+alone never justify REVISE or BLOCK; a supported decline cannot waive a
+mandatory defect requirement.
 Uninspectable instruction claims remain explicitly unverified and cannot alone
 establish an exception to inspectable requirements; precedence is unchanged.
 This prompt contract adds no parser, fields, transport, history or authority:
@@ -656,11 +659,47 @@ dispositions are untrusted content within the exact candidate digest. See
 [#3091 amendment](adr/2149-cross-check.md#default-and-plan-prompt-amendment-2026-10-17-3091).
 Exhaustion, BLOCK, timeout
 and other failures keep their fallbacks. A Codex lead consumes automatic
-rounds without spending its human revision budget and implements exactly the
-acknowledged checked plan; its submit requires its worker to advertise
+rounds without spending its human revision budget and implements from the
+acknowledged canonical checked plan, which remains authoritative. Both lead
+families also receive approving findings as described below. Its submit
+requires its worker to advertise
 `cross_check_codex_lead_v1` and the api must send the claim field
 `plan_cross_check_codex_lead`, otherwise it keeps the older
 `codex_lead_unsupported` park to a human gate.
+
+The shared checker brief asks both families to enumerate requirements from the
+issue snapshot and linked repository PRDs with existing tools, deadlines and
+read/search limits; comments are not supplied and URLs are not fetched.
+Omitted/partly covered requirements use warning `Requirement gap:`; hosted,
+live or maintainer-only verification uses info `Coverage uncertainty:`.
+Every coverage item uses one of these prefixes; defects never use either.
+Missing/external/unreadable/oversized sources get a summary uncertainty note,
+never a covered claim. No defect found does not establish coverage. Omitted
+stated safety, security or data-integrity constraints remain error defects,
+without coverage prefixes, requiring REVISE under existing defect rules.
+Coverage alone never justifies REVISE or BLOCK. Defects take priority within
+the 20-item cap; spare slots hold coverage, with overflow summarized literally
+as `N coverage notes omitted`. Coverage and its count do not displace defects.
+
+The worker passes every approving item (including noncoverage warning/info)
+and the complete bounded summary, including summary-only findings, to both
+executors' implementation prompts through the shared nonce fence. Absent/null
+findings or empty summary plus empty items preserve prompt bytes. This is
+untrusted, non-gating advice: verify against code, issue and uzi rules, decline
+conflicts with reasons, and retain permissions and constraints. The canonical
+plan remains authoritative; omitted requirements may be implemented only
+within issue scope and must be disclosed in the PR description. Code
+cross-check reviews the implementation when enabled; scope, permissions and
+canonical authority apply independently. No extra gate, re-plan or round is
+introduced. Advice is worker-local and lost on reclaim; the dormant semantic
+human-gate path drops it when it drops the checker approval. Old lead workers
+discard approving findings; old checkers supply no new coverage account, and
+new leads render the findings received. These instruction contracts do not
+prove model convergence. No wire/API/schema, capability or persistence change
+is introduced; code-stage revision prompt bytes remain unchanged. See
+[PRD #3168](prds/3168-plan-cross-check-coverage.md) and the
+[2026-10-23 amendment](adr/2149-cross-check.md#advisory-plan-coverage-amendment-2026-10-23-3334--3168-m1)
+for rationale and validation boundaries.
 
 Recovery follows the 2026-10-07 preserve-decided-fallback decision in
 [PRD #2150 D8](prds/done/2150-plan-cross-check-auto-revise.md#decision-log).
@@ -807,7 +846,7 @@ for decisions and the pending acceptance checklist.
 
 PRD #2170 adds an opt-in, advisory check of the lead's committed code by the
 other model family before publication (see
-[PRD #2170](prds/2170-code-cross-check.md) for decisions and
+[PRD #2170](prds/done/2170-code-cross-check.md) for decisions and
 [docs/cross-check.md](docs/cross-check.md#code-cross-check) for the user view).
 It never blocks publication. It shares the `cross_checks` table
 (`stage = 'code'`, one attempt per lead) and the dedicated lane of #2169, but
@@ -946,11 +985,44 @@ and `prds/done/636-multi-repo-custom-schedules.md`.
 CLI (not the worker) pushes the user's own HEAD to a server-named
 `uzi/task/<run-id>` branch with the user's own git credentials, then dispatches
 the run so the worker clones that branch, works the inline context, and pushes
-commits back, with no forge issue and no MR unless `--mr` is passed. See
+commits back, creating no forge issue and no MR unless `--mr` is passed.
+`--issue <iid>` optionally links an existing issue for continuation. See
 [prds/done/400-uzi-handoff.md](prds/done/400-uzi-handoff.md),
 [docs/handoff.md](docs/handoff.md), and
-[docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs). Status
-is a linear state machine:
+[docs/cli.md](docs/cli.md#uzi-handoff-ephemeral-branch-scoped-task-runs).
+
+Issue continuation (#3326) stores a nullable `runs.continued_issue_iid`.
+Migration 351's CHECK permits a populated value only on a `task`, with a
+positive IID, non-null repo and null `issue_iid`; this adds no board
+association. `CreateTaskRun` verifies repo ownership and the real forge issue
+(open or closed, not a PR), without eligibility-label or PRD gates.
+`HasActiveRunForIssue` retains its existing `issue_iid` matches (including
+self-improvement) and also matches linked tasks, counting nonterminal states
+including `pool_wait`. The partial unique expression index on
+`(repo_id, coalesce(issue_iid, continued_issue_iid))` covers `issue`/`task`
+runs, excluding terminal states and `pool_wait`; the creation precheck
+still counts `pool_wait` as active. Terminal tasks release the active guard.
+A separate nonunique partial index, `idx_runs_continued_issue_lookup` on
+`(repo_id, continued_issue_iid)` for tasks with a non-null link, supports
+linked-task lookups alongside `idx_runs_issue_history` for `issue_iid`
+lookups. These lookup indexes do not bound the history scanned for one issue.
+Review and then-fix children inherit the link, with best-effort post-terminal
+creation and no continuous reservation while the chain is entirely terminal.
+`GetOpenMRRunForIssue` also finds completed linked tasks with an MR whose
+state is neither merged nor closed, including unknown state. That blocks a
+fresh issue run unless `run create --force` is used; force does not bypass
+the active guard. Task creation checks active runs, not completed open MRs.
+The link does not change task branches or the Refs-only MR profile, and does
+not itself generate a reference or closing keyword.
+
+**Deployment / rollback (migration 351).** The transactional `ALTER TABLE`
+holds `ACCESS EXCLUSIVE` through CHECK validation and index scans. A nullable
+column without a default avoids a table rewrite, but CHECK/index scans and
+their I/O/WAL costs remain; production-volume cost and lock duration are
+unknown. Down restores the old issue-only index, drops the linked-task lookup
+index and drops the link column, irreversibly losing continuation provenance.
+
+Status is a linear state machine:
 
 ```
 queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiting_approval ⟲ (revise, PRD #41) → running → completed
@@ -1002,9 +1074,9 @@ chain in the diagram above, with no intervening `running`.
   selected reset or bounded fallback, not provider prose, account reads or polling.
   If that account is unavailable after promotion, Claim refuses it and Sweep holds
   it at `recovery_wait` / `codex_account_unavailable`. The account hold and
-  same-identity re-admission are defined by [PRD #1590](prds/1590-codex-quarantine-claim-hold.md)
+  same-identity re-admission are defined by [PRD #1590](prds/done/1590-codex-quarantine-claim-hold.md)
   and [ADR-1590](adr/1590-codex-binding-same-identity-readmission.md).
-  [PRD #1595](prds/1595-codex-boundary-account-park.md) extends this hold to eligible
+  [PRD #1595](prds/done/1595-codex-boundary-account-park.md) extends this hold to eligible
   running subscription boundary reconciles: a negotiated worker captures source
   credential-free before requesting a park; the API re-classifies under claim fences
   and run → alias → account locks, revokes the capability, and retains custody and
@@ -1085,7 +1157,7 @@ chain in the diagram above, with no intervening `running`.
   auto-resume on its own**: it is wound down explicitly with `uzi run stop`,
   or by its worker-side idle timeout. See
   [docs/handoff.md](docs/handoff.md#interactive-mode).
-- **running → paused (owner request)** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
+- **running → paused (owner request)** ([PRD #1190](prds/done/1190-run-pause-resume.md)) — the
   owner-requested twin of `limit_wait`: `pause` (default: after the milestone
   or turn in flight; `--now`: drop it) is a **flag** on the still-running run,
   and the worker parks only after it publishes a checkpoint — a failed
@@ -1176,7 +1248,7 @@ chain in the diagram above, with no intervening `running`.
   and publish outcomes now surface on the run feed. See
   [ADR-628](adr/0628-cross-worker-resume-durability.md)'s #1030 amendment.
   The best-effort terminal-transition delete this amendment first added was
-  superseded by [PRD #1810](prds/1810-retain-failed-run-checkpoint-ref.md): the
+  superseded by [PRD #1810](prds/done/1810-retain-failed-run-checkpoint-ref.md): the
   ref is not deleted at any terminal transition while a custody hold
   stays open on the run (any writer, sweeper-driven included), and a new run
   needing the same branch slot moves the old tip to a per-run
@@ -1469,8 +1541,8 @@ chain in the diagram above, with no intervening `running`.
   `uzi run discard`; a Dashboard board alert and Workers resolution surface),
   with the per-run custody Slack nudge coalesced into one owner-level
   blocked-custody episode DM. See [docs/run-recovery.md](docs/run-recovery.md),
-  [PRD #1296](prds/1296-durable-run-recovery.md),
-  [PRD #1349](prds/1349-recovery-custody-hardening.md) and
+  [PRD #1296](prds/done/1296-durable-run-recovery.md),
+  [PRD #1349](prds/done/1349-recovery-custody-hardening.md) and
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (with
   its 2026-09-14 PRD #1349 amendment).
   [Issue #1924](https://github.com/vtmocanu/uzi/issues/1924) adds generation-latched `inventory_guarded` custody for
@@ -2244,7 +2316,7 @@ where available, unconfined otherwise). A worker advertises the Codex
 capability only when the split is active and the configured mode can run a
 command on this kernel; otherwise it never
 claims a Codex-indicating run, which stays queued instead. See
-[PRD #1493](prds/1493-codex-k8s-uid-split-profile.md) for the full design and
+[PRD #1493](prds/done/1493-codex-k8s-uid-split-profile.md) for the full design and
 Decision Log, and [docs/configuration.md](docs/configuration.md#controller)
 for the operator-facing knobs. See [ADR-1106](adr/1106-codex-harness.md) for
 the Codex harness's own execution design; automatic issue harness selection
@@ -2429,6 +2501,39 @@ Admitted image turns and eligible custody-held layout migrations receive an
 `image_roll` cordon over the authenticated
 `POST /api/controller/workers/{id}/drain` control-write channel. The API's
 `draining_since` and reason remain separate from heartbeat-derived status.
+
+Owner manual cordon is an independent persistent-worker intake boundary
+(scope amendment 2026-10-22, implementation recorded 2026-10-24).
+`POST`/`DELETE /api/workers/{id}/cordon` use existing `RequireUser` session
+plus CSRF or user CLI-token authentication and strict ownership even for admins.
+Persistent hosted/external workers (`ephemeral=false`) support it; ownership
+is checked before the ephemeral HTTP 409 refusal. The web Workers controls and
+`uzi worker cordon <id> [-m <reason>]` / `uzi worker uncordon <id>`
+(both `--json`) share this owner API. Health/admin surfaces remain read-only.
+
+Manual timestamp, actor UUID/label snapshot and optional reason are separate
+from automatic drains and maintenance. Transition plus audit event commits in
+one READ COMMITTED transaction under the owner-qualified worker lock;
+compatible claims re-read combined intake state after the same worker lock.
+Idempotent repeats preserve original metadata without another event.
+Registration, roll, restart, deadlines, ForceRoll and reason-owned automatic
+release preserve manual intent; explicit owner uncordon or deletion ends it.
+Held continuations/checkers/chat remain subject to existing fences; cordon
+cancels no run, ends no chat and adds no continuation affinity.
+
+Manual workers supply no serving/replacement coverage. Incarnation proof and
+reservation completion remain distinct from serving eligibility, so an idle
+manual worker can roll and return cordoned; busy drift still waits under #3103.
+An all-manual multi-worker pool may remain held, without a zero-coverage bypass.
+Custody/migration (#3153/#3307) and DinD/pressure/maintenance guards remain
+independent. Earlier poll decisions may finish. Older serving APIs can admit
+after a successful cordon until every serving replica is compatible; stalled
+rollout extends that interval. Older controllers may miscount manual coverage,
+so ordinary coverage guarantees require compatible controllers. No worker-image
+protocol requirement or activation flag is added. Contract and rationale:
+[ADR-422 D5a](adr/0422-decouple-worker-version.md#d5a--owner-manual-cordon-is-persistent-intent-scope-amendment-2026-10-22);
+user lifecycle: [manual cordon](docs/hosted-workers.md#pause-new-work-with-a-manual-cordon).
+
 Under #3103, actual spec-hash/generation drift (image pin, template or size) and
 associated recycle wait indefinitely for genuine idle, including run-bound
 workers outside pacing and calls with no pacing entry or a plain drain reason.
@@ -2467,7 +2572,7 @@ remain read-only at the API boundary, which holds no kube credentials. Local hea
 recorded in the PRD;
 hosted real-apiserver verification remains open. See
 [ADR-1470](adr/1470-paced-hosted-worker-rolls.md),
-[PRD #1470](prds/1470-paced-hosted-worker-rolls.md) and the
+[PRD #1470](prds/done/1470-paced-hosted-worker-rolls.md) and the
 [maintainer runbook](docs/hosted-worker-roll-verification.md).
 
 "Surge" here means the app stack surges forward on every release while old
@@ -2482,7 +2587,7 @@ holds its tier's ResourceQuota indefinitely (issue #360). The requeue-then-manua
 interrupted — by independent nondrifted maintenance expiry, global force-roll,
 or an uncontrolled pod loss)
 is unchanged by this PRD. Full rationale, the Decision Log, and what remains
-open (a CLI drain verb, live-cluster validation) are in
+open (live-cluster validation; the owner CLI manual-cordon deferral is superseded) are in
 [adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
 
 ### Worker disk: observed on the heartbeat, self-healed by the controller (PRD #837)
@@ -2554,7 +2659,7 @@ exactly as the worker controller section above requires — so every
 Kubernetes-derived fact (a worker pod stuck rolling) still arrives only over the
 existing controller report; pod-level health of the `api`/`web`/database/controller
 pods themselves stays out of scope, owned by cluster monitoring. See
-[PRD #1484](prds/1484-admin-health-tab.md) and
+[PRD #1484](prds/done/1484-admin-health-tab.md) and
 [ADR-1484](adr/1484-in-app-health-boundary.md) for the checks, the boundary
 rationale, and the deferred items (version skew, per-connection sync freshness).
 

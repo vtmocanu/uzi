@@ -615,9 +615,12 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 		return ""
 	}
 	n, online, used, cap, unknown, attention, holding, draining, cordoned := len(m.workers.rows), 0, 0, 0, 0, 0, 0, 0, 0
-	crossUsed, crossCap, crossUnknown := 0, 0, 0
+	crossUsed, crossCap, crossUnknown, manualIntake := 0, 0, 0, 0
 	now := time.Now()
 	for _, r := range m.workers.rows {
+		if r.w.ManualCordonedAt != nil {
+			manualIntake++
+		}
 		if r.w.Status == "online" {
 			online++
 			used += r.w.ActiveRuns
@@ -649,7 +652,7 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 	if m.board.admin {
 		scope = "factory workers"
 	}
-	build := func(showUnknown, showAdmission, showOnline, showCount bool) string {
+	build := func(showUnknown, showAdmission, showOnline, showCount bool, compact int) string {
 		parts := []string{paintSeg(nil, nil, true, scope)}
 		if showCount {
 			parts = append(parts, itoa(n))
@@ -664,7 +667,9 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 		if !showCount {
 			slots = fmt.Sprintf("%d/%d runs", used, cap)
 		}
-		parts = append(parts, slots)
+		if compact < 2 {
+			parts = append(parts, slots)
+		}
 		crossDenom := itoa(crossCap)
 		if crossUnknown > 0 {
 			crossDenom = "?"
@@ -675,6 +680,13 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 		}
 		if !hideIdleCrossChecks || crossUsed != 0 {
 			parts = append(parts, cross)
+		}
+		if manualIntake > 0 {
+			label := fmt.Sprintf("%d cordoned (manual)", manualIntake)
+			if compact > 0 {
+				label = fmt.Sprintf("%d manual", manualIntake)
+			}
+			parts = append(parts, paintSeg(m.pal.wait, nil, false, label))
 		}
 		if showAdmission {
 			if holding > 0 {
@@ -693,12 +705,21 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 		return strings.Join(parts, " · ")
 	}
 	for _, options := range [][4]bool{{true, true, true, true}, {false, true, true, true}, {false, false, true, true}, {false, false, false, false}} {
-		text := build(options[0], options[1], options[2], options[3])
+		text := build(options[0], options[1], options[2], options[3], 0)
 		if visualWidth(text) <= width {
 			return text
 		}
 	}
-	return build(false, false, false, false)
+	if manualIntake > 0 {
+		// Keep manual intent and attention in narrow titles; retain runs when they fit.
+		for compact := 1; compact <= 2; compact++ {
+			text := build(false, false, false, false, compact)
+			if visualWidth(text) <= width {
+				return text
+			}
+		}
+	}
+	return build(false, false, false, false, 0)
 }
 
 func (m tuiModel) workerKind(r workerRow) string {
@@ -800,12 +821,18 @@ func workerMemoryText(w apitypes.WorkerDTO) string {
 	return fmt.Sprintf("%.1fG", used)
 }
 
-type workerTableWidths struct{ memory, version int }
+type workerTableWidths struct {
+	memory, version, intake int
+	dense                   bool
+}
 
 // Measure the filtered fleet once; the header and every row share these widths.
 func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidths {
 	columns := workerTableWidths{memory: workerMemoryMinWidth, version: 8}
 	for _, row := range rows {
+		if workerIntakeLabel(row.w) != "" {
+			columns.intake = 17
+		}
 		text := workerMemoryText(row.w)
 		if workerState(row) == "offline" {
 			text = "~" + text
@@ -817,11 +844,15 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 		}
 		columns.version = max(columns.version, visualWidth(m.renderer.Plain(workerTextOf(row).workerVersion, 18))+marker)
 	}
+	columns.dense = width >= 120 && (columns.intake == 0 || width >= 160)
 	// Cursor, name, state, kind, runs, cross-checks, resource cells, heartbeat, eleven separators,
 	// and one attention glyph; factory scope adds owner plus its separator.
 	fixed := 1 + 13 + 10 + 9 + 5 + 6 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 12
 	if m.board.admin {
 		fixed += 8
+	}
+	if columns.intake > 0 {
+		fixed += columns.intake + 1
 	}
 	columns.version = max(1, min(columns.version, 18, max(1, width-fixed-4)))
 	return columns
@@ -845,7 +876,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 	}
 	state := workerState(r)
 	fields = append(fields, cell(workerStateGlyph(state)+" "+state, 10, m.workerStateColor(state)), cell(m.workerKind(r), 9, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
-	if width >= 120 {
+	if columns.dense {
 		cpu, disk := "?", "?"
 		var cpuC, diskC color.Color
 		if r.w.StatsCPUPct != nil {
@@ -883,6 +914,9 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 		ver := clampVisual(m.renderer.Plain(t.workerVersion, versionWidth), max(0, versionWidth-visualWidth(marker))) + marker
 		fields = append(fields, cell(cpu, workerCPUWidth, cpuC), cell(mem, columns.memory, memC), cell(disk, workerDiskWidth, diskC), cell(ver, versionWidth, verC), cell(workerAge(r.w.LastHeartbeatAt, now), 3, m.pal.faintC))
 	}
+	if columns.intake > 0 {
+		fields = append(fields, cell(m.renderer.Plain(workerIntakeLabel(r.w), columns.intake), columns.intake, m.pal.faintC))
+	}
 	items := workerAttention(r, now)
 	att := paintSeg(m.pal.faintC, bg, false, "—")
 	if len(items) > 0 {
@@ -895,9 +929,6 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 	}
 	fields = append(fields, att)
 	line := clampVisual(strings.Join(fields, paintSeg(nil, bg, false, " ")), width)
-	if label := workerIntakeLabel(r.w); label != "" {
-		line = clampVisual(clampVisual(line, max(0, width-visualWidth(label)-1))+" "+m.renderer.Plain(label, width), width)
-	}
 	return line + paintSeg(nil, bg, false, strings.Repeat(" ", max(0, width-visualWidth(line))))
 }
 func (m tuiModel) workerReadout(r workerRow, width int) []string {
@@ -951,8 +982,11 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 		cols = append(cols, padVisual("OWNER", 7))
 	}
 	cols = append(cols, padVisual("STATE", 10), padVisual("KIND", 9), padVisual("RUNS", 5), padVisual("CHECKS", 6))
-	if width >= 120 {
+	if columns.dense {
 		cols = append(cols, padVisual("CPU", workerCPUWidth), padVisual("MEM", columns.memory), padVisual("DISK (worst)", workerDiskWidth), padVisual("VERSION", columns.version), padVisual("HB", 3))
+	}
+	if columns.intake > 0 {
+		cols = append(cols, padVisual("INTAKE", columns.intake))
 	}
 	cols = append(cols, "ATTENTION")
 	header := "  " + strings.Join(cols, " ")

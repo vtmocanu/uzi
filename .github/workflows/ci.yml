@@ -306,18 +306,14 @@ jobs:
             ./internal/recovery/...
             ./internal/poller/...
           )
-          # Bound aggregate LiveDB time per package, matching run-store-it.sh: store
-          # exhausted 10m and workersvc exhausted 30m in measured sweeps. Allow
-          # store/handler 20m, workersvc 60m, and others 10m; outer limits still apply.
-          # Tests, -race, -p 1 and the skip guard are unchanged; longer budgets are
-          # not passing or performance proof.
+          # Match the local runner's bounded per-package timeouts. The workersvc
+          # race-enabled sweep exceeded 15 minutes after reconciliation coverage.
           : > livedb.log
           for p in "${PKGS[@]}"; do
-            case "$p" in
-              ./internal/store/...|./internal/handler/...) timeout=20m ;;
-              ./internal/workersvc/...) timeout=60m ;;
-              *) timeout=10m ;;
-            esac
+            timeout=10m
+            if [ "$p" = ./internal/workersvc/... ]; then
+              timeout=20m
+            fi
             go test -count=1 -v -race -p 1 -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a livedb.log
           done
           # Aggregate check shared with e2e/run-store-it.sh: something ran, and nothing
@@ -370,7 +366,7 @@ jobs:
         with:
           class: api-codex-refresh-e2e
           module: api
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "24"
           cache: npm
@@ -519,7 +515,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "24"
           cache: npm
@@ -551,7 +547,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "24"
           cache: npm
@@ -574,7 +570,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "24"
           cache: npm
@@ -599,7 +595,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "24"
           cache: npm
@@ -631,7 +627,7 @@ jobs:
         shard: [1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "24"
           cache: npm
@@ -712,7 +708,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: "24"
           cache: npm
@@ -960,7 +956,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
         with:
-          version: v4.3.0
+          version: v4.3.1
       - name: helm dependency build
         # Bundles the CNPG `cluster` subchart (oci://ghcr.io/cloudnative-pg/charts,
         # public) per Chart.lock, so the render below is self-contained.
@@ -1100,7 +1096,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
         with:
-          version: v4.3.0
+          version: v4.3.1
       - uses: ./.github/actions/setup-task
       # Pulls the digest-pinned nginx image from web/Dockerfile itself (Docker Hub, one
       # pull per run); yq, curl, gzip and cmp come with ubuntu-latest.

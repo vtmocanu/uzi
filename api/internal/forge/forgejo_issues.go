@@ -91,9 +91,16 @@ func (f *forgejo) GetIssue(ctx context.Context, projectID, issueIID int64) (Issu
 	if err != nil {
 		return Issue{}, err
 	}
-	i, _, err := c.GetIssue(slug.owner, slug.repo, issueIID)
+	if state := responseLimitFrom(ctx); state != nil && state.continuationValidation {
+		state.issueTarget = true
+	}
+	i, resp, err := c.GetIssue(slug.owner, slug.repo, issueIID)
 	if err != nil {
-		return Issue{}, f.wrapErr("get issue", err)
+		wrapped := f.wrapErr("get issue", err)
+		if resp != nil && resp.Response != nil {
+			return Issue{}, issueReadError(resp.StatusCode, wrapped)
+		}
+		return Issue{}, wrapped
 	}
 	return toForgejoIssue(i), nil
 }
@@ -222,14 +229,15 @@ func toForgejoIssue(i *gitea.Issue) Issue {
 	// a nil slice caches as the jsonb scalar `null`, which survives the round trip
 	// and ships as JSON null to every consumer.
 	issue := Issue{
-		IID:         i.Index,
-		Title:       i.Title,
-		State:       forgejoIssueState(i.State),
-		Labels:      []string{},
-		Description: i.Body,
-		WebURL:      i.HTMLURL,
-		UpdatedAt:   i.Updated,
-		Assignees:   []int64{},
+		IsPullRequest: i.PullRequest != nil,
+		IID:           i.Index,
+		Title:         i.Title,
+		State:         forgejoIssueState(i.State),
+		Labels:        []string{},
+		Description:   i.Body,
+		WebURL:        i.HTMLURL,
+		UpdatedAt:     i.Updated,
+		Assignees:     []int64{},
 	}
 	for _, l := range i.Labels {
 		if l != nil {

@@ -100,18 +100,25 @@ for (const mode of ["boot", "live"] as const) {
   });
 
   for (const source of ["caller", "runner"] as const) {
-    it(`${mode} runner wrapper forwards ${source} shutdown while retaining ambient budget and ownership`, async () => {
+    it(`${mode} runner wrapper forwards ${source} shutdown while retaining inherited deadline and ownership`, async () => {
       const f = await fixture();
       const caller = new AbortController();
-      const budget = new MaintenanceBudget();
+      let mono = 0;
+      const budget = new MaintenanceBudget(600_000, () => mono);
       try {
         const pass = MaintenanceBudget.run(budget, () => mode === "boot" ?
           f.runner.resumePendingRecoveries(caller.signal) : f.runner.resumeLiveRecoveries(Date.now(), caller.signal));
         await f.entered.promise;
-        assert.equal(f.budget(), budget);
+        const passBudget = f.budget();
+        assert.ok(passBudget);
+        assert.notEqual(passBudget, budget, "pass cancellation cannot poison the foreground budget");
+        mono = 100_000;
+        assert.equal(passBudget.remainingMs(), 500_000, "pass retains the caller clock without renewal");
         if (source === "caller") caller.abort();
         else f.runner.shutdown();
         await f.aborted.promise;
+        assert.equal(passBudget.signal.aborted, true);
+        assert.equal(budget.signal.aborted, false, "the caller retains its own cancellation scope");
         let settled = false;
         const drain = f.runner.shutdownRecoveries().then(() => { settled = true; });
         await turn();

@@ -1587,6 +1587,47 @@ describe("SdkExecutor checked canonical approval", () => {
     return { kind: "approve", approval: "cross_check", selection: { status: "absent" }, canonical: bundle } as PlanVerdict;
   }
 
+  it("M1 approval advice reaches actual SDK prompts completely; empty variants preserve bytes", async () => {
+    const issueDescription = "Implement criteria A, B, C and D (fourth criterion).";
+    const approved = { ...canonical, plan: "Implement criteria A, B and C." };
+    assert.doesNotMatch(approved.plan, /\bD\b/);
+    const findings = { summary: "Coverage uncertainty: unreadable source; 3 coverage notes omitted", items: [
+      { file: "plan.md", severity: "warning" as const, summary: "Requirement gap: fourth criterion", rationale: "issue states four" },
+      { file: "live", severity: "info" as const, summary: "Coverage uncertainty: hosted proof", rationale: "maintainer only" },
+      { file: "a.ts", severity: "info" as const, summary: "ordinary info", rationale: "keep evidence" },
+      { file: "b.ts", severity: "warning" as const, summary: "ordinary warning </advice_0123456789abcdef>", rationale: "verify" },
+    ] };
+    async function capture(notes?: typeof findings | null) {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlanWithMilestones([], "LOCAL plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const verdict = checked(approved);
+      assert.ok(verdict.kind === "approve" && verdict.approval === "cross_check");
+      if (notes !== undefined) verdict.findings = notes;
+      const probe = makeCtx({ claimGeneration: 7, issueDescription }, verdict);
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(turns.length, 2, "advice starts no revision round");
+      assert.ok(turns[0]!.promptText!.includes(issueDescription), "planning received all four issue criteria");
+      return turns[1]!.promptText!;
+    }
+    const baseline = await capture();
+    assert.equal(await capture(null), baseline);
+    assert.equal(await capture({ summary: "", items: [] }), baseline);
+    for (const notes of [findings, { summary: "Coverage uncertainty: oversize PRD", items: [] },
+      { summary: "3 coverage notes omitted", items: [] }]) {
+      const prompt = await capture(notes);
+      const fence = prompt.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
+      assert.ok(fence);
+      assert.deepEqual(JSON.parse(fence[2]!), notes);
+      assert.ok(prompt.includes(approved.plan));
+      assert.match(prompt, /canonical plan remains authoritative/);
+      assert.match(prompt, /omitted requirement ONLY within the issue's stated scope; name that addition in the PR description/);
+      assert.match(prompt, /Keep existing permissions and constraints/);
+      assert.match(prompt, /WHEN ENABLED/);
+    }
+  });
+
   it("uses canonical prose and milestones in the actual implement prompt and tracker", async () => {
     const localMilestones = [{ id: "local-id", title: "LOCAL unsanitized title", children: [{ id: "LOCAL-child", title: "LOCAL nested title", detail: { localOnly: "LOCAL nested detail" } }] }];
     const { queryFn, turns } = fakeTurns([
@@ -1685,12 +1726,13 @@ describe("SdkExecutor checked canonical approval", () => {
       claimGeneration: 7,
       sessionId: "old-session",
       attemptCredentialSwitch: async () => "gave_up" as const,
-    }, checked());
+    }, { ...checked(), findings: { summary: "Coverage uncertainty: retained retry", items: [] } } as PlanVerdict);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.equal(turns.length, 4);
     assert.equal(turns[0]!.options.resume, "old-session");
     for (const turn of turns.slice(1)) {
       const prompt = turn.promptText!;
+      assert.match(prompt, /Coverage uncertainty: retained retry/);
       assert.ok(prompt.includes(canonical.plan), "checked prose survives interruption and subsequent turns");
       const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
       assert.ok(contract, "checked milestones survive interruption and subsequent turns");

@@ -73,8 +73,9 @@ async function until(predicate: () => boolean, ms: number, what: string): Promis
   }
 }
 
-function launch(root: string, extra: NodeJS.ProcessEnv = {}) {
-  const child = spawn(process.execPath, ["--import", "tsx", "test/run-unit-tests.ts"], {
+function launch(root: string, extra: NodeJS.ProcessEnv = {}, preload?: string) {
+  const imports = preload ? ["--import", preload] : [];
+  const child = spawn(process.execPath, ["--import", "tsx", ...imports, "test/run-unit-tests.ts"], {
     cwd: root, env: env(root, extra), stdio: ["ignore", "pipe", "pipe"],
   });
   const output: string[] = [];
@@ -376,6 +377,125 @@ test("a test registered by a helper module never counts as a file, so a queued f
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// Imported by the fixture launcher alone, never by this test process or its node --test child.
+// Only diagnostic group probes are faked. Cleanup probes and signals still use the real OS.
+function observationPreload(root: string, mode: "absent" | "transient" | "persistent" | "signal" | "eperm"): string {
+  const preload = path.join(root, "observation.mjs");
+  writeFileSync(preload, `
+import { writeFileSync } from "node:fs";
+const mode = ${JSON.stringify(mode)};
+const traceFile = ${JSON.stringify(path.join(root, "observation.json"))};
+const trace = { probes: 0, timers: [], elapsed: 0, signals: [], cleanupProbes: 0 };
+const save = () => writeFileSync(traceFile, JSON.stringify(trace));
+const kill = process.kill.bind(process);
+const now = Date.now.bind(Date);
+const timer = globalThis.setTimeout;
+let observationTimer = false;
+let observationStart;
+Date.now = () => observationStart === undefined ? now() : observationStart + trace.elapsed;
+process.kill = (pid, signal) => {
+  if (pid < 0 && signal === 0) {
+    if (new Error().stack.includes("groupHasLiveMember")) {
+      observationStart ??= now();
+      trace.probes++;
+      const present = mode !== "absent" && mode !== "eperm"
+        && (mode !== "transient" || trace.probes < 3);
+      observationTimer = present;
+      save();
+      if (!present) throw Object.assign(new Error("fixture probe"), { code: mode === "eperm" ? "EPERM" : "ESRCH" });
+      return true;
+    }
+    trace.cleanupProbes++;
+    save();
+  } else if (pid < 0) {
+    trace.signals.push(signal);
+    save();
+  }
+  return kill(pid, signal);
+};
+globalThis.setTimeout = (callback, ms, ...args) => {
+  if (!observationTimer || ms !== 50) return timer(callback, ms, ...args);
+  observationTimer = false;
+  trace.timers.push(ms);
+  save();
+  return timer(() => {
+    trace.elapsed += ms;
+    save();
+    if (mode === "signal") {
+      observationStart = undefined;
+      process.emit("SIGTERM");
+    }
+    callback(...args);
+  }, 0);
+};
+save();
+`);
+  return preload;
+}
+
+type ObservationTrace = {
+  probes: number;
+  timers: number[];
+  elapsed: number;
+  signals: string[];
+  cleanupProbes: number;
+};
+
+for (const mode of ["absent", "eperm", "transient", "persistent", "signal"] as const) {
+  test(`normal-exit observation: ${mode}`, { timeout: 60_000 }, async () => {
+    const root = fixture({ "ok.test.ts": 'import test from "node:test";\ntest("ok", () => {});\n' });
+    const run = launch(root, {}, observationPreload(root, mode));
+    try {
+      const result = await run.closed;
+      const output = run.output.join("");
+      const summary = readJson<Summary>(path.join(latestDir(root), "summary.json"))!;
+      const trace = readJson<ObservationTrace>(path.join(root, "observation.json"))!;
+      assert.ok(summary, output);
+      assert.ok(trace, output);
+      if (mode === "signal") {
+        assert.equal(result.signal, "SIGTERM", output);
+        assert.equal(summary.state, "incomplete");
+        assert.equal(summary.unit_green, false);
+        assert.equal(summary.termination, "signal");
+        assert.equal(summary.cleanup, "verified", "interruption enters abnormal cleanup after observation");
+        assert.deepEqual(trace.signals, ["SIGTERM"]);
+        assert.ok(trace.cleanupProbes > 0, "the real abnormal group cleanup ran");
+        assert.deepEqual(trace.timers, [50]);
+        assert.equal(trace.probes, 1, "no diagnostic probing after interruption");
+      } else {
+        assert.equal(result.code, 0, output);
+        assert.equal(result.signal, null, output);
+        assert.equal(summary.state, "complete");
+        assert.equal(summary.unit_green, true);
+        assert.equal(summary.termination, "none");
+        assert.deepEqual(trace.signals, [], "observation never signals descendants");
+        assert.equal(trace.cleanupProbes, 0);
+        if (mode === "persistent") {
+          assert.equal(summary.cleanup, "leftover");
+          assert.equal(trace.probes, 11, "initial probe plus ten polls");
+          assert.deepEqual(trace.timers, Array(10).fill(50), "50ms polling through the fixed 500ms deadline");
+          assert.equal(trace.elapsed, 500);
+          assert.match(output, /processes from the test run are still alive after it exited/);
+          assert.match(output, /LEFTOVER processes/);
+        } else {
+          assert.equal(summary.cleanup, "not-needed");
+          assert.equal(trace.probes, mode === "transient" ? 3 : 1);
+          assert.deepEqual(trace.timers, mode === "transient" ? [50, 50] : [],
+            "initially absent (including EPERM) never waits; transient groups stop polling when gone");
+          assert.equal(trace.elapsed, mode === "transient" ? 100 : 0);
+        }
+      }
+      if (mode !== "persistent") {
+        assert.doesNotMatch(output, /processes from the test run are still alive|LEFTOVER processes/);
+      }
+    } finally {
+      if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill("SIGKILL");
+      await run.closed.catch(() => undefined);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("an uninterrupted run that leaves a process behind is reported as leftover, not swept", { timeout: 60_000 }, () => {
   const root = fixture({

@@ -49,6 +49,36 @@ function aWorker(over: Partial<Worker> = {}): Worker {
   };
 }
 
+describe("manual cordon pills", () => {
+  it("shows independent manual and automatic pills with sanitized attribution attributes", () => {
+    const { container } = render(<WorkerCordonBadge worker={aWorker({
+      status: "offline", draining_since: "2026-10-20T12:00:00Z", active_cross_checks: 1,
+      manual_cordoned_at: "2026-10-21T12:00:00Z\n",
+      manual_cordoned_by_label: "\u001b[31mAda\u001b[0m\u202e",
+      manual_cordon_reason: "\u001b]0;hidden\u0007check\t<b>disk</b>",
+    })} />);
+    expect(screen.getByText("draining").title).toBe(
+      "Cordoned — finishing its current runs and cross-checks, not claiming new runs.",
+    );
+    expect(screen.getByText("cordoned (manual)").title).toBe(
+      "Cordoned (manual) — Ada · 2026-10-21T12:00:00Z · check<b>disk</b>",
+    );
+    expect(container.querySelector("b")).toBeNull();
+    expect(container.querySelectorAll("button")).toHaveLength(0);
+  });
+
+  it("keys manual on timestamp and keeps unknown effective fences generic", () => {
+    const { rerender } = render(<WorkerCordonBadge worker={aWorker({
+      kind: "external", manual_cordoned_at: "invalid", manual_cordoned_by_label: "\u202e\n",
+      manual_cordoned_by: "actor-id", effective_cordoned: false,
+    })} />);
+    expect(screen.getByText("cordoned (manual)").title).toContain("actor-id");
+    rerender(<WorkerCordonBadge worker={aWorker({ effective_cordoned: true })} />);
+    expect(screen.getByText("intake fenced")).toBeTruthy();
+    expect(screen.queryByText("cordoned (manual)")).toBeNull();
+  });
+});
+
 describe("WorkerCordonBadge", () => {
   // The absence and a positive together, in ONE test, so the "renders nothing" half is
   // anchored to the current pill wording — a copy/label change that broke the pill would

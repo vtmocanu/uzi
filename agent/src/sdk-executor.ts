@@ -81,6 +81,7 @@ import {
   buildRepoInstructionsContext,
   buildRevisePlanPrompt,
   buildAutomaticRevisionPrompt,
+  renderPlanApprovalAdvice,
   buildSelfImprovePlanPrompt,
   dockerScratchResumeNote,
   isNotCodePlan,
@@ -112,7 +113,7 @@ export type { RunProcessOps } from "./run-procs.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
-import { isTransientStatus, type WorkerClient } from "./client.js";
+import { isTransientStatus, type PlanCrossCheckFindings, type WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { describeSkillDrop, qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
@@ -837,6 +838,7 @@ interface DriveState {
   approvedPlan?: string;
   /** Checked canonical instructions replace the local plan carried by the planning session. */
   checkedPlan?: boolean;
+  checkedFindings?: PlanCrossCheckFindings | null;
   /** Issue #3178: the plan gate approved (non-cross_check) while NO session exists to carry the
    *  plan (post-gate `resumeId` undefined), e.g. a re-presented stored plan after the SDK
    *  session was dropped. The first implement turn then opens a fresh session, so the approved
@@ -2704,6 +2706,7 @@ export class SdkExecutor implements Executor {
           approvedPlan = canonical.plan;
           candidateMilestones = canonical.milestones;
           drive.checkedPlan = true;
+          drive.checkedFindings = verdict.findings;
         }
         // Issue #3178: keyed on the post-gate resumeId (a revise turn may have produced a
         // session), never ctx.sessionId. Cross-check approvals carry the canonical contract.
@@ -2912,7 +2915,7 @@ export class SdkExecutor implements Executor {
       // Repeat the checked server contract on every implement attempt: an interrupted
       // first attempt may not have delivered it to the model or updated the old session.
       // Serialize the entire approved list, including nested values and explicit [].
-      const checkedContext = drive.checkedPlan ? checkedImplementationContext(approvedPlan, frozenMilestones) : "";
+      const checkedContext = drive.checkedPlan ? checkedImplementationContext(approvedPlan, frozenMilestones) + renderPlanApprovalAdvice(drive.checkedFindings) : "";
       const seededPlanBody = embedSeededPlan({
         preApproved,
         seeded: ctx.seeded === true,

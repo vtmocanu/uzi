@@ -1748,7 +1748,7 @@ func TestRenderThreadBlocksNeedsLanding(t *testing.T) {
 	}
 }
 
-// PRD #1190: the owner-pause thread event reads "‖ *Paused by you*" and, when the run has
+// PRD #1190: the ordinary pause thread event reads "‖ *Paused*" and, when the run has
 // published a checkpoint, carries `checkpoint <short>` — the first 7 chars of checkpoint_tip
 // — alongside the `after milestone N` clause and the resume hint. A run that never published
 // a checkpoint omits the clause (the arm's "omit when absent" convention).
@@ -1762,8 +1762,11 @@ func TestRenderThreadBlocksPausedCarriesCheckpoint(t *testing.T) {
 		t.Fatal("a paused transition must thread an event")
 	}
 	_, section := blockSummary(blocks)
-	if !strings.Contains(section, "‖ *Paused by you*") {
-		t.Fatalf("paused section = %q, want the owner-pause header", section)
+	if section != "‖ *Paused*" {
+		t.Errorf("paused section = %q, want the neutral pause header", section)
+	}
+	if strings.Contains(section, "by you") {
+		t.Errorf("paused section must not attribute the pause to its reader: %q", section)
 	}
 	ctx := contextText(blocks)
 	if !strings.Contains(ctx, "checkpoint abc1234") {
@@ -1778,8 +1781,11 @@ func TestRenderThreadBlocksPausedCarriesCheckpoint(t *testing.T) {
 	if !strings.Contains(ctx, "uzi run resume "+rc.ID.String()) {
 		t.Fatalf("paused context = %q, want the resume hint", ctx)
 	}
-	if !strings.Contains(fallback, "Paused by you") {
-		t.Fatalf("paused fallback = %q, want it to name the owner pause", fallback)
+	if fallback != "Paused · grp/repo#42" {
+		t.Errorf("paused fallback = %q, want the neutral pause summary", fallback)
+	}
+	if strings.Contains(fallback, "by you") {
+		t.Errorf("paused fallback must not attribute the pause to its reader: %q", fallback)
 	}
 
 	// A run with no published checkpoint omits the clause entirely.

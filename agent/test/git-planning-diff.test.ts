@@ -1,19 +1,27 @@
-import { after, describe, it } from "node:test";
+import { after, describe, it, type TestContext } from "node:test";
 import path from "node:path";
+import nativeFs from "node:fs/promises";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
 import { getEventListeners } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
-import { crc32, deflateSync } from "node:zlib";
+import { crc32, deflateSync, inflateSync } from "node:zlib";
 import { GitCache, PLANNING_REFUSAL_TOKENS, classifyPlanningCaptureError, gitEnv } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 import { RUNNER_UID, runnerPath, runnerTmpdir, uidSplitActive } from "../src/runner-uid.js";
 import { nullLogger } from "./helpers.js";
-import { commandSandboxArgv } from "../src/codex/codex-executor.js";
 import { probeLandlockAvailability } from "../src/codex/codex-capability.js";
 
 import { PlanningFixtureIO, planningExec, planningGitEnv } from "./planning-fixture-io.js";
+
+const workerExec = promisify(execFile);
+const defaultLimits = { sourceAllowance: 128 * 1024 * 1024, indexAllowance: 2 * 1024 * 1024,
+  pathAllowance: 20000, entryAllowance: 30000, directoryAllowance: 2048,
+  ignoreAllowance: 128 * 1024 * 1024, ignorePipeAllowance: 2 * 1024 * 1024 };
 
 const cap = 512 * 1024;
 const git = new GitCache(process.cwd(), nullLogger());
@@ -44,14 +52,6 @@ const fixtureIO = new PlanningFixtureIO();
 const fs = fixtureIO.fs;
 const exec = planningExec;
 after(async () => { await fixtureIO.close(); });
-async function directoryBytes(dir: string): Promise<number> {
-  let bytes = 0;
-  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-    const child = path.join(dir, entry.name);
-    bytes += entry.isDirectory() ? await directoryBytes(child) : (await fs.stat(child)).size;
-  }
-  return bytes;
-}
 // The classified outcome of a rejected capture; the raw message is never asserted for meaning.
 async function refusalOf(pending: Promise<unknown>): Promise<{ refusal: string; diagnostic: string; message: string }> {
   try { await pending; } catch (error) {
@@ -74,25 +74,37 @@ function captureSpawnRequest(request: BoundaryProcessRequest): BoundaryProcessRe
 }
 async function fixture(options: {
   seed?: (seed: string) => Promise<void>; shared?: boolean; meter?: boolean; sandbox?: boolean;
-  limits?: { snapshotLimit: number; totalLimit: number };
+  limits?: Partial<typeof defaultLimits>;
   // JS run first inside the trusted helper process; __DATA__ is the fixture directory literal.
   hook?: string;
   // Give the helper a private TMPDIR so leftover uzi-planning-* trees are observable.
   privateTmp?: boolean;
-  // TickSpawner SIGTERM-to-SIGKILL grace (default 100 ms); slowed-snapshot tests need more.
+  // TickSpawner SIGTERM-to-SIGKILL grace (default 100 ms); slowed cancellation probes use 1s.
   killGraceMs?: number;
   // Add this many unreferenced tiny loose objects to the clone's object store.
   looseObjects?: number;
 } = {}): Promise<{
-  cache: GitCache; clone: string; base: string; data: string; tmp: string;
+  cache: GitCache; clone: string; bare: string; protectedRoot: string; base: string; data: string; tmp: string;
   git: (...args: string[]) => Promise<string>;
+  bareGit: (...args: string[]) => Promise<string>;
+  looseBareObjects: () => Promise<void>;
   capture: (signal?: AbortSignal) => Promise<Buffer>;
   dispose: () => Promise<void>;
 }> {
   const data = await fixtureIO.temporaryDirectory("planning-fixture-");
+  // Under the UID split each identity's TMPDIR is a private 0700 directory. Place the worker-owned
+  // protected root beneath the shared traversable tmp parent. Its worker ownership and 0755 mode,
+  // together with the parent's ownership/sticky protection, prevent runner replacement or writes.
+  const protectedParent = uidSplitActive() ? path.dirname(os.tmpdir()) : os.tmpdir();
+  const protectedRoot = await nativeFs.mkdtemp(path.join(await nativeFs.realpath(protectedParent), "planning-protected-"));
+  await nativeFs.chmod(protectedRoot, 0o755);
+  let clone = "";
+  const stage = path.join(protectedRoot, "seed-stage");
+  const staged = path.join(stage, "seed.git");
   try {
     const seed = path.join(data, "seed");
-    const clone = path.join(data, "runner", "repo", "issue-1");
+    clone = path.join(protectedRoot, "runner", "repo", "issue-1");
+    const bare = path.join(protectedRoot, "repos", "repo.git");
     await fs.mkdir(seed);
     const run = async (cwd: string, ...args: string[]): Promise<string> =>
       (await exec("git", ["-C", cwd, ...args], { env: planningGitEnv(), timeout: 5000 })).stdout;
@@ -103,8 +115,22 @@ async function fixture(options: {
     await options.seed?.(seed);
     await run(seed, "add", ".");
     await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
-    await fs.mkdir(path.dirname(clone), { recursive: true });
-    await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", seed, clone);
+    // Worker native IO owns the bare and protected parents. Runner IPC never creates
+    // authority. The worker cannot traverse the runner's private TMPDIR, so the runner
+    // stages a bare copy of the seed in a temporarily open directory, removed afterwards.
+    await nativeFs.mkdir(stage, { mode: 0o755 });
+    await nativeFs.chmod(stage, 0o777);
+    await run(seed, "clone", "--quiet", "--bare", "--no-local", seed, staged);
+    await nativeFs.mkdir(path.dirname(bare), { recursive: true, mode: 0o755 });
+    const bareGit = async (...args: string[]): Promise<string> => (await workerExec("git", ["-C", bare, ...args],
+      { env: gitEnv(), timeout: 5000 })).stdout;
+    await workerExec("git", ["clone", "--quiet", "--bare", "--no-local", staged, bare], { env: gitEnv(), timeout: 5000 });
+    await fs.rm(staged, { recursive: true, force: true });
+    await nativeFs.rmdir(stage);
+    await nativeFs.mkdir(path.dirname(clone), { recursive: true, mode: 0o755 });
+    await nativeFs.chmod(path.dirname(clone), 0o777);
+    await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", bare, clone);
+    await nativeFs.chmod(path.dirname(clone), 0o755);
     if (options.looseObjects) {
       // A clone keeps its fetched objects in a pack, so write the tiny loose objects directly.
       const hashing = exec("git", ["-C", clone, "hash-object", "-w", "--stdin"], { env: planningGitEnv(), timeout: 30000 });
@@ -121,18 +147,36 @@ async function fixture(options: {
       await bulk;
     }
     const base = (await run(clone, "rev-parse", "HEAD")).trim();
-    const cache = new GitCache(data, nullLogger());
-    if (options.limits) cache.setPlanningLimitsForTest(options.limits);
+    const cache = new GitCache(protectedRoot, nullLogger());
+    if (options.limits) cache.setPlanningLimitsForTest({ ...defaultLimits, ...options.limits });
     const tmp = path.join(data, "private-tmp");
     if (options.privateTmp) await fs.mkdir(tmp, { mode: 0o700 });
     return {
-      data, tmp, clone, base, cache, git: (...args) => run(clone, ...args),
+      data, tmp, clone, bare, protectedRoot, base, cache, bareGit, git: (...args) => run(clone, ...args),
+      // Replace the worker-owned bare's object store with the seed's loose objects, staged the
+      // same way as the seed itself because the worker cannot traverse the runner's TMPDIR.
+      looseBareObjects: async () => {
+        await nativeFs.rm(path.join(bare, "objects"), { recursive: true });
+        await nativeFs.mkdir(stage, { mode: 0o755 });
+        await nativeFs.chmod(stage, 0o777);
+        try {
+          await fs.cp(path.join(seed, ".git/objects"), path.join(stage, "objects"), { recursive: true });
+          await nativeFs.cp(path.join(stage, "objects"), path.join(bare, "objects"), { recursive: true });
+        } finally {
+          await fs.rm(path.join(stage, "objects"), { recursive: true, force: true });
+          await nativeFs.rmdir(stage);
+        }
+      },
       capture: async (signal = new AbortController().signal) => {
         const owner = new TickSpawner({ signal, killGraceMs: options.killGraceMs ?? 100 });
         const privateTmp = options.sandbox
           ? await fixtureIO.temporaryDirectory("planning-command-") : undefined;
         try {
-          if (privateTmp) await assertOwned(privateTmp, 0o700);
+          if (privateTmp) {
+            await assertOwned(privateTmp, 0o700);
+            // The outside probe is readable before confinement is installed.
+            await fs.readFile(path.join(data, "seed", "tracked"));
+          }
           return await cache.withBoundaryProcessSpawner((request) => {
             if (privateTmp) {
               const argv = [...request.argv];
@@ -146,13 +190,20 @@ for (const denied of ["/", ${JSON.stringify(path.join(data, "seed", "tracked"))}
   catch (error) { deniedError = error; }
   if (deniedError?.code !== "EACCES") throw Error("required sandbox did not deny " + denied);
 }
+for (const denied of [${JSON.stringify(path.join(bare, "config"))}, ${JSON.stringify(path.join(bare, "objects", "sandbox-write"))}]) {
+  let deniedError;
+  try { const fd = denyFs.openSync(denied, denyFs.constants.O_WRONLY | denyFs.constants.O_CREAT); denyFs.closeSync(fd); }
+  catch (error) { deniedError = error; }
+  if (deniedError?.code !== "EACCES") throw Error("required sandbox allowed bare write");
+}
 ` + argv[2];
               return owner.spawn({
                 ...request,
                 // The sandbox enters its explicit clone cwd after the identity switch.
                 cwd: process.cwd(),
                 argv: ["/usr/local/bin/uzi-codex-command-sandbox",
-                  ...commandSandboxArgv(clone, clone, argv[0]!, argv.slice(1), privateTmp, "required")],
+                  "--cross-check", "--root", protectedRoot, "--state", privateTmp,
+                  "--cwd", clone, "--", argv[0]!, ...argv.slice(1)],
                 env: { ...request.env, HOME: privateTmp, TMPDIR: privateTmp },
               });
             }
@@ -199,16 +250,28 @@ meterCp.spawn = function(...args) {
 process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JSON.stringify(readMetrics)));
 ` : "") + argv[2];
             return owner.spawn(captureSpawnRequest({ ...spawnRequest, argv }));
-          }, signal, () => cache.capturePlanningDiff(clone, base));
+          }, signal, () => cache.capturePlanningDiff(clone, base, bare));
         } finally {
           await owner.settled();
           assert.deepEqual(owner.survivors(), []);
           if (privateTmp) await fs.rm(privateTmp, { recursive: true, force: true });
         }
       },
-      dispose: () => fs.rm(data, { recursive: true, force: true }),
+      dispose: async () => {
+        // The runner-owned clone sits in a worker-owned parent: reopen it so the runner can remove it.
+        await nativeFs.chmod(path.dirname(clone), 0o777);
+        await fs.rm(clone, { recursive: true, force: true });
+        await fs.rm(data, { recursive: true, force: true });
+        await nativeFs.rm(protectedRoot, { recursive: true, force: true });
+      },
     };
   } catch (error) {
+    if (clone) {
+      await nativeFs.chmod(path.dirname(clone), 0o777).catch(() => undefined);
+      await fs.rm(clone, { recursive: true, force: true });
+    }
+    await fs.rm(staged, { recursive: true, force: true });
+    await nativeFs.rm(protectedRoot, { recursive: true, force: true });
     await fs.rm(data, { recursive: true, force: true });
     throw error;
   }
@@ -222,7 +285,64 @@ async function assertOwned(file: string, mode?: number): Promise<void> {
 }
 
 // Native capture walks Linux /proc/<pid>/fd paths (src/git.ts); Linux CI runs this block.
+// Snapshot bytes and ownership, excluding access times changed by legitimate reads.
+async function bareInventory(root: string): Promise<unknown[]> {
+  const records: unknown[] = [];
+  async function visit(file: string): Promise<void> {
+    const st = await nativeFs.lstat(file);
+    records.push([path.relative(root, file), st.mode, st.uid, st.gid,
+      st.isFile() ? createHash("sha256").update(await nativeFs.readFile(file)).digest("hex") : null]);
+    if (st.isDirectory()) for (const name of (await nativeFs.readdir(file)).sort()) await visit(path.join(file, name));
+  }
+  await visit(root);
+  return records;
+}
+async function proveBareReadOnly(t: TestContext, packed: boolean): Promise<void> {
+  if (!uidSplitActive() || process.getuid?.() !== 10001) {
+    t.skip("requires actual worker 10001 and runner 10002"); return;
+  }
+  const hook = [
+    'const uidFs = require("node:fs"), uidPath = require("node:path");',
+    'if (process.getuid() !== 10002) throw Error("not the real runner uid");',
+    'const uidBare = process.argv[4];',
+    'for (const target of [uidBare + "/config", uidBare + "/objects/probe", uidBare + "/refs/probe"]) {',
+    '  let denied;',
+    '  try { const fd = uidFs.openSync(target, uidFs.constants.O_WRONLY | uidFs.constants.O_CREAT); uidFs.closeSync(fd); }',
+    '  catch (error) { denied = error; }',
+    '  if (!["EACCES", "EPERM"].includes(denied?.code)) throw Error("bare write authority");',
+    '}',
+    'for (const target of [uidBare, uidPath.dirname(uidBare)]) {',
+    '  let denied;',
+    '  try { uidFs.renameSync(target, target + "-moved"); } catch (error) { denied = error; }',
+    '  if (!["EACCES", "EPERM"].includes(denied?.code)) throw Error("protected rename authority");',
+    '}',
+    'uidFs.writeFileSync(__DATA__ + "/uid-proof", String(process.getuid()));',
+  ].join("\n") + "\n";
+  const f = await fixture({ hook });
+  try {
+    if (packed) await f.bareGit("repack", "-a", "-d");
+    else {
+      await f.looseBareObjects();
+    }
+    const before = await bareInventory(path.dirname(f.bare));
+    const protectedBefore = await nativeFs.stat(f.protectedRoot);
+    await fs.writeFile(path.join(f.clone, "tracked"), "real runner change\n");
+    assert.match((await f.capture()).toString(), /-base\n\+real runner change/);
+    assert.equal(await fs.readFile(path.join(f.data, "uid-proof"), "utf8"), "10002");
+    assert.deepEqual(await bareInventory(path.dirname(f.bare)), before);
+    const protectedAfter = await nativeFs.stat(f.protectedRoot);
+    assert.deepEqual([protectedAfter.ino, protectedAfter.mode, protectedAfter.uid, protectedAfter.gid],
+      [protectedBefore.ino, protectedBefore.mode, protectedBefore.uid, protectedBefore.gid]);
+  } finally { await f.dispose(); }
+}
+
 describe("Unit2 runner source capture", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
+  it("reads loose trusted bare objects as the real runner uid without write authority", async t => {
+    await proveBareReadOnly(t, false);
+  });
+  it("reads packed trusted bare objects as the real runner uid without write authority", async t => {
+    await proveBareReadOnly(t, true);
+  });
   it("cleans a fixture whose seed callback fails", async () => {
     let data = "";
     await assert.rejects(fixture({ seed: async seed => {
@@ -330,62 +450,61 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
   }
 
   for (const kind of ["outside loose symlink", "outside loose directory symlink", "forged blob", "forged commit", "forged tree", "packed pack symlink", "packed idx symlink", "packed directory symlink"]) {
-    it("refuses object integrity attack: " + kind, async () => {
+    it("authenticates trusted bare object integrity: " + kind, async () => {
       const f = await fixture();
       let forged: { type: string; oid: string } | undefined;
       try {
         if (!kind.startsWith("packed")) {
           // Force a loose-only baseline so Git cannot prefer an authentic packed duplicate.
-          await fs.rm(path.join(f.clone, ".git/objects"), { recursive: true });
-          await fs.cp(path.join(f.data, "seed/.git/objects"), path.join(f.clone, ".git/objects"), { recursive: true });
+          await f.looseBareObjects();
         }
         await fs.unlink(path.join(f.clone, "tracked"));
         assert.match((await f.capture()).toString(), /-base/);
         if (kind.startsWith("packed")) {
-          await f.git("repack", "-a", "-d");
+          await f.bareGit("repack", "-a", "-d");
           assert.match((await f.capture()).toString(), /-base/);
-          const packDir = path.join(f.clone, ".git/objects/pack");
+          const packDir = path.join(f.bare, "objects/pack");
           const suffix = kind.includes("idx") ? ".idx" : ".pack";
-          const name = (await fs.readdir(packDir)).find(name => name.endsWith(suffix))!;
+          const name = (await nativeFs.readdir(packDir)).find(name => name.endsWith(suffix))!;
           const object = path.join(packDir, name), outside = path.join(f.data, "outside-pack");
           if (kind === "packed directory symlink") {
-            await fs.cp(packDir, outside, { recursive: true });
-            await fs.rm(packDir, { recursive: true });
-            await fs.symlink(outside, packDir);
+            await nativeFs.cp(packDir, outside, { recursive: true });
+            await nativeFs.rm(packDir, { recursive: true });
+            await nativeFs.symlink(outside, packDir);
           } else {
-            await fs.copyFile(object, outside);
-            await fs.unlink(object);
-            await fs.symlink(outside, object);
+            await nativeFs.copyFile(object, outside);
+            await nativeFs.unlink(object);
+            await nativeFs.symlink(outside, object);
           }
         } else {
           const type = kind.includes("commit") ? "commit" : kind.includes("tree") ? "tree" : "blob";
-          const oid = (await f.git("rev-parse", type === "commit" ? "HEAD" : type === "tree" ? "HEAD^{tree}" : "HEAD:tracked")).trim();
+          const oid = (await f.bareGit("rev-parse", type === "commit" ? "HEAD" : type === "tree" ? "HEAD^{tree}" : "HEAD:tracked")).trim();
           if (kind.startsWith("forged")) forged = { type, oid };
           let body: Buffer;
-          if (type === "commit") body = Buffer.from((await f.git("cat-file", "commit", oid)) + "forged message\n");
+          if (type === "commit") body = Buffer.from((await f.bareGit("cat-file", "commit", oid)) + "forged message\n");
           else if (type === "tree") {
             // An otherwise valid tree under the original OID points tracked at a different authentic blob.
-            const other = (await f.git("rev-parse", "HEAD:deleted")).trim();
+            const other = (await f.bareGit("rev-parse", "HEAD:deleted")).trim();
             body = Buffer.concat([Buffer.from("100644 tracked\0"), Buffer.from(other, "hex")]);
           } else body = Buffer.from(kind.startsWith("outside") ? "base\n" : "evil\n"); // Same size; symlink controls use authentic bytes.
           assert.equal(createHash("sha1").update(type + " " + body.length + "\0").update(body).digest("hex") === oid,
             kind.startsWith("outside"));
           const bytes = deflateSync(Buffer.concat([Buffer.from(type + " " + body.length + "\0"), body]));
-          const object = path.join(f.clone, ".git/objects", oid.slice(0, 2), oid.slice(2));
-          await fs.mkdir(path.dirname(object), { recursive: true });
-          await fs.rm(object, { force: true });
+          const object = path.join(f.bare, "objects", oid.slice(0, 2), oid.slice(2));
+          await nativeFs.mkdir(path.dirname(object), { recursive: true });
+          await nativeFs.rm(object, { force: true });
           if (kind === "outside loose directory symlink") {
             // Redirect an authentic fanout directory, not just the final object file.
-            await fs.writeFile(object, bytes);
+            await nativeFs.writeFile(object, bytes);
             const outside = path.join(f.data, "outside-fanout");
-            await fs.cp(path.dirname(object), outside, { recursive: true });
-            await fs.rm(path.dirname(object), { recursive: true });
-            await fs.symlink(outside, path.dirname(object));
+            await nativeFs.cp(path.dirname(object), outside, { recursive: true });
+            await nativeFs.rm(path.dirname(object), { recursive: true });
+            await nativeFs.symlink(outside, path.dirname(object));
           } else if (kind === "outside loose symlink") {
             const outside = path.join(f.data, "outside-object");
-            await fs.writeFile(outside, bytes);
-            await fs.symlink(outside, object);
-          } else if (type === "blob") await fs.writeFile(object, bytes);
+            await nativeFs.writeFile(outside, bytes);
+            await nativeFs.symlink(outside, object);
+          } else if (type === "blob") await nativeFs.writeFile(object, bytes);
           else {
             // A valid pack/idx checksum does not authenticate the idx's object identity.
             // Keep other baseline objects loose; substitute this commit/tree through a forged idx.
@@ -407,21 +526,22 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
             Buffer.from(oid, "hex").copy(idx, 1032);
             idx.writeUInt32BE(crc32(entry), 1052); idx.writeUInt32BE(12, 1056);
             packHash.copy(idx, 1060);
-            const packDir = path.join(f.clone, ".git/objects/pack");
-            await fs.mkdir(packDir, { recursive: true });
+            const packDir = path.join(f.bare, "objects/pack");
+            await nativeFs.mkdir(packDir, { recursive: true });
             const stem = path.join(packDir, "pack-" + packHash.toString("hex"));
-            await fs.writeFile(stem + ".pack", pack);
-            await fs.writeFile(stem + ".idx", Buffer.concat([idx, createHash("sha1").update(idx).digest()]));
+            await nativeFs.writeFile(stem + ".pack", pack);
+            await nativeFs.writeFile(stem + ".idx", Buffer.concat([idx, createHash("sha1").update(idx).digest()]));
           }
         }
         if (forged) {
           // Prove Git serves the forged body; rejection must come from capture authentication.
           const { type, oid } = forged;
-          const served = (await exec("git", ["-C", f.clone, "cat-file", type, oid],
+          const served = (await workerExec("git", ["-C", f.bare, "cat-file", type, oid],
             { env: planningGitEnv(), timeout: 5000, encoding: "buffer" })).stdout;
           assert.notEqual(createHash("sha1").update(type + " " + served.length + "\0").update(served).digest("hex"), oid);
         }
-        await assert.rejects(f.capture(), kind.startsWith("forged") ? /UZI-PLANNING-REFUSAL base_object_integrity/ : /ELOOP|ENOTDIR/);
+        if (kind.startsWith("forged")) await assertRefused(f.capture(), "base_unavailable", "base_object_integrity");
+        else assert.match((await f.capture()).toString(), /-base/);
       } finally { await f.dispose(); }
     });
   }
@@ -540,21 +660,30 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
     } finally { await f.dispose(); }
   });
 
-  it("refuses aggregate overflow from unchanged baseline text without producing a patch", async () => {
+  it("captures 33 unchanged 4 MiB baseline files at default limits", async () => {
     const f = await fixture({ meter: true, seed: async seed => {
       const text = Buffer.alloc(4 * 1024 * 1024, 120);
       for (let i = 0; i < 33; i++) await fs.writeFile(path.join(seed, "unchanged-" + i), text);
     } });
     try {
-      // Every file hashes to its verified base OID; worktree compare reads consume the source
-      // budget. The object-store snapshot is metered too but charges its own budget only.
-      const snapshotBytes = await directoryBytes(path.join(f.clone, ".git/objects"));
-      await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
-      const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
-      console.log("aggregate source actual reads:", metrics.source, "snapshot bytes:", snapshotBytes);
-      assert.equal(metrics.source, snapshotBytes + 128 * 1024 * 1024 + 1);
-      assert.equal(metrics.diff, 0);
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      await fs.writeFile(path.join(f.clone, "tracked"), "small edit\n");
+      const expected = await f.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--", "tracked");
+      assert.match(expected, /-base\n\+small edit/);
+      assert.equal((await f.capture()).toString(), expected);
     } finally { await f.dispose(); }
+  });
+
+  it("captures unchanged baseline text across 1030 sibling one-file directories at default limits", async () => {
+    const f = await fixture({ seed: async seed => {
+      for (let i = 0; i < 1030; i++) {
+        const directory = path.join(seed, "sibling-" + String(i).padStart(4, "0"));
+        await fs.mkdir(directory);
+        await fs.writeFile(path.join(directory, "file"), "unchanged\n");
+      }
+    } });
+    try { assert.deepEqual(await f.capture(), Buffer.alloc(0)); }
+    finally { await f.dispose(); }
   });
 
   it("refuses patch overflow without returning partial output", async () => {
@@ -606,19 +735,15 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
     } finally { await f.dispose(); }
   });
 
-  it("refuses a direct shared clone and captures after repack and removal of alternates", async () => {
+  it("captures a direct shared clone and refuses after its trusted bare is removed", async () => {
     const f = await fixture({ shared: true });
     try {
-      const alternates = path.join(f.clone, ".git/objects/info/alternates");
-      assert.ok((await fs.readFile(alternates)).length > 0);
-      await assert.rejects(f.capture(), /UZI-PLANNING-REFUSAL object_alternates/);
-      // This is the materialization GitCache's existing selfContained preparation performs.
-      await f.git("repack", "-a", "-d");
-      await fs.unlink(alternates);
-      await fs.rm(path.join(f.data, "seed"), { recursive: true });
+      assert.ok((await fs.readFile(path.join(f.clone, ".git/objects/info/alternates"))).length > 0);
       assert.equal((await f.capture()).length, 0);
-      await fs.writeFile(path.join(f.clone, "tracked"), "dissociated change\n");
-      assert.match((await f.capture()).toString(), /-base\n\+dissociated change/);
+      await fs.writeFile(path.join(f.clone, "tracked"), "shared change\n");
+      assert.match((await f.capture()).toString(), /-base\n\+shared change/);
+      await nativeFs.rm(f.bare, { recursive: true });
+      await assertRefused(f.capture(), "base_unavailable", "base_object_type_mismatch");
     } finally { await f.dispose(); }
   });
 
@@ -659,7 +784,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
       await fs.writeFile(path.join(f.clone, ".gitignore"), "");
       const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal });
       await assert.rejects(f.cache.withBoundaryProcessSpawner(req => owner.spawn(captureSpawnRequest(req)), ac.signal,
-        () => f.cache.capturePlanningDiff(f.clone, "0".repeat(40))), /UZI-PLANNING-REFUSAL base_object_type_mismatch/);
+        () => f.cache.capturePlanningDiff(f.clone, "0".repeat(40), f.bare)), /UZI-PLANNING-REFUSAL base_object_type_mismatch/);
       await owner.settled();
       assert.deepEqual(owner.survivors(), []);
     } finally { await f.dispose(); }
@@ -839,41 +964,7 @@ process.on("exit", () => hookFs.writeFileSync(__DATA__ + "/hook.json", JSON.stri
     });
   }
 
-  // Budgets: the object-store snapshot and the source reads are independent 128 MiB-class budgets.
-  const seedRandom = async (seed: string): Promise<void> => {
-    await fs.writeFile(path.join(seed, "random"), randomBytes(300 * 1024));
-  };
-
-  it("refuses an object-store snapshot over its own budget", async () => {
-    const f = await fixture({ seed: seedRandom, limits: { snapshotLimit: 100 * 1024, totalLimit: 128 * 1024 * 1024 } });
-    try {
-      await assertRefused(f.capture(), "diff_too_large", "snapshot_cap");
-    } finally { await f.dispose(); }
-  });
-
-  it("splits the meter between snapshot and source reads when source reads overflow", async () => {
-    const f = await fixture({ meter: true, limits: { snapshotLimit: 8 * 1024 * 1024, totalLimit: 400 * 1024 },
-      seed: async seed => { for (let i = 0; i < 3; i++) await fs.writeFile(path.join(seed, "random-" + i), randomBytes(300 * 1024)); } });
-    try {
-      const snapshotBytes = await directoryBytes(path.join(f.clone, ".git/objects"));
-      assert.ok(snapshotBytes > 900 * 1024, "snapshot alone exceeds the source budget");
-      await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
-      const metrics = JSON.parse(await fs.readFile(path.join(f.data, "read-metrics.json"), "utf8"));
-      assert.equal(metrics.source, snapshotBytes + 400 * 1024 + 1);
-    } finally { await f.dispose(); }
-  });
-
-  it("does not charge snapshot bytes to the source budget", async () => {
-    // Snapshot (~300 KiB) plus source reads (~300 KiB) would exceed one shared 400 KiB budget.
-    const f = await fixture({ seed: seedRandom, limits: { snapshotLimit: 1024 * 1024, totalLimit: 400 * 1024 } });
-    try {
-      assert.equal((await f.capture()).length, 0);
-      await fs.writeFile(path.join(f.clone, "tracked"), "changed\n");
-      assert.match((await f.capture()).toString(), /\+changed/);
-    } finally { await f.dispose(); }
-  });
-
-  it("cancels while the object-store snapshot streams and leaves no temp tree", async () => {
+  it("cancels during worktree comparisons and leaves no temp tree", async () => {
     const hook = `
 const snapFs = require("node:fs");
 const snapRead = snapFs.readSync;
@@ -882,14 +973,14 @@ snapFs.readSync = function(...args) {
   const got = snapRead.apply(this, args);
   snapBytes += got;
   if (snapBytes > 64 * 1024) {
-    snapFs.writeFileSync(__DATA__ + "/snapshotting", "");
-    // Keep the large snapshot streaming long enough for the abort to land mid-copy.
+    snapFs.writeFileSync(__DATA__ + "/comparing", "");
+    // Keep the worktree comparisons streaming long enough for the abort to land during comparisons.
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 8);
   }
   return got;
 };
 `;
-    // The 3 MiB stream is slowed ~8 ms per 16 KiB read; a generous kill grace keeps a loaded
+    // The 3 MiB comparison is slowed ~8 ms per 16 KiB read; a generous kill grace keeps a loaded
     // CI host from SIGKILLing the helper before its cleanup turn runs. Without the yield the
     // blocked turn still exceeds it.
     const f = await fixture({ hook, privateTmp: true, killGraceMs: 1000,
@@ -898,37 +989,41 @@ snapFs.readSync = function(...args) {
       const ac = new AbortController();
       const pending = f.capture(ac.signal);
       const settled = assert.rejects(pending, /aborted/);
-      const marker = path.join(f.data, "snapshotting");
+      const marker = path.join(f.data, "comparing");
       for (let i = 0; i < 200 && !(await fs.stat(marker).then(() => true, () => false)); i++) await sleep(50);
-      assert.ok(await fs.stat(marker).then(() => true, () => false), "snapshot copy started");
-      assert.ok((await fs.readdir(f.tmp)).some(name => name.startsWith("uzi-planning-")), "temp tree exists mid-snapshot");
+      assert.ok(await fs.stat(marker).then(() => true, () => false), "worktree comparisons started");
+      assert.ok((await fs.readdir(f.tmp)).some(name => name.startsWith("uzi-planning-")), "temp tree exists during comparisons");
       ac.abort();
       await settled; // capture() itself asserts the owner has no surviving process
       assert.deepEqual((await fs.readdir(f.tmp)).filter(name => name.startsWith("uzi-planning-")), []);
     } finally { await f.dispose(); }
   });
 
-  it("cancels while many tiny object files are copied and leaves no temp tree", async () => {
-    // Each read stalls ~1 ms and every tiny file is read twice, so the whole copy blocks the
-    // loop for seconds unless it yields across files, not merely inside one file.
+  it("cancels while many tiny worktree entries are walked and leaves no temp tree", async () => {
+    // Enumeration stalls ~1 ms per entry, so cancellation needs yields across entries.
     const hook = `
 const snapFs = require("node:fs");
-const snapRead = snapFs.readSync;
+const snapOpen = snapFs.opendirSync;
 let marked = false;
-snapFs.readSync = function(...args) {
-  const got = snapRead.apply(this, args);
-  if (!marked) { marked = true; snapFs.writeFileSync(__DATA__ + "/snapshotting", ""); }
+snapFs.opendirSync = function(...args) {
+  const stream = snapOpen.apply(this, args);
+  const read = stream.readSync;
+  stream.readSync = function(...readArgs) {
+  const got = read.apply(this, readArgs);
+  if (!marked) { marked = true; snapFs.writeFileSync(__DATA__ + "/comparing", ""); }
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
   return got;
+  };
+  return stream;
 };
 `;
-    const f = await fixture({ hook, privateTmp: true, killGraceMs: 1000, looseObjects: 2000 });
+    const f = await fixture({ hook, privateTmp: true, killGraceMs: 1000, seed: async seed => { for (let i = 0; i < 2000; i++) await fs.writeFile(path.join(seed, "tiny-" + i), "x"); } });
     try {
       const ac = new AbortController();
       const settled = assert.rejects(f.capture(ac.signal), /aborted/);
-      const marker = path.join(f.data, "snapshotting");
+      const marker = path.join(f.data, "comparing");
       for (let i = 0; i < 200 && !(await fs.stat(marker).then(() => true, () => false)); i++) await sleep(50);
-      assert.ok(await fs.stat(marker).then(() => true, () => false), "snapshot copy started");
+      assert.ok(await fs.stat(marker).then(() => true, () => false), "walk enumeration started");
       ac.abort();
       await settled;
       assert.deepEqual((await fs.readdir(f.tmp)).filter(name => name.startsWith("uzi-planning-")), []);
@@ -997,11 +1092,712 @@ snapFs.readSync = function(...args) {
     });
   }
 
+  it("keeps tiny baseline source, ignore, index and walk allowances independent", async () => {
+    const f = await fixture({ limits: { sourceAllowance: 1, ignoreAllowance: 1,
+      indexAllowance: 1024, pathAllowance: 1, entryAllowance: 1, directoryAllowance: 1, ignorePipeAllowance: 1 },
+      seed: async seed => {
+        for (let i = 0; i < 30; i++) await fs.writeFile(path.join(seed, "tiny-" + i), "x");
+      } });
+    try {
+      await fs.rm(path.join(f.clone, ".git/info/exclude"), { force: true });
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+    } finally { await f.dispose(); }
+  });
+
+  // Construct valid v2 indexes independently of Git's optional cache extensions.
+  // Deliberately forged stat sizes are metadata, never baseline byte authority.
+  function testIndex(names: string[], extensionBytes = -1): Buffer {
+    const header = Buffer.alloc(12);
+    header.write("DIRC"); header.writeUInt32BE(2, 4); header.writeUInt32BE(names.length, 8);
+    const rows = names.sort().map(name => {
+      const bytes = Buffer.from(name);
+      const row = Buffer.alloc(Math.ceil((63 + bytes.length) / 8) * 8);
+      row.writeUInt32BE(0o100644, 24);
+      row.writeUInt32BE(0xffffffff, 36);
+      row.writeUInt16BE(bytes.length, 60); bytes.copy(row, 62);
+      return row;
+    });
+    const extension = extensionBytes < 0 ? Buffer.alloc(0) : Buffer.alloc(8 + extensionBytes);
+    if (extension.length) { extension.write("TEST"); extension.writeUInt32BE(extensionBytes, 4); }
+    const body = Buffer.concat([header, ...rows, extension]);
+    return Buffer.concat([body, createHash("sha1").update(body).digest()]);
+  }
+
+  it("bounded metadata: many tiny tracked ignore files retain independent baseline credits", async () => {
+    const f = await fixture({ limits: { sourceAllowance: 1, ignoreAllowance: 1,
+      indexAllowance: 1, pathAllowance: 1, entryAllowance: 1, directoryAllowance: 1, ignorePipeAllowance: 1 },
+      seed: async seed => {
+        for (let i = 0; i < 12; i++) {
+          const dir = path.join(seed, "d" + i); await fs.mkdir(dir);
+          await fs.writeFile(path.join(dir, ".gitignore"), "*.tmp\n");
+          await fs.writeFile(path.join(dir, "tiny"), "x");
+        }
+      } });
+    try {
+      const names = (await f.git("ls-files", "-z")).split("\0").filter(Boolean);
+      await fs.writeFile(path.join(f.clone, ".git/index"), testIndex(names));
+      await fs.rm(path.join(f.clone, ".git/info/exclude"), { force: true });
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+    } finally { await f.dispose(); }
+  });
+
+  it("bounded metadata: valid checksum inflated index cannot mint source or index byte credit", async () => {
+    const f = await fixture({ limits: { indexAllowance: 8, sourceAllowance: 1 } });
+    try {
+      const names = [".gitignore", "deleted", "tracked"];
+      // A valid, larger clone HEAD must not increase the explicit base's credits.
+      const plant = async (type: string, body: Buffer): Promise<string> => {
+        const object = Buffer.concat([Buffer.from(type + " " + body.length + "\0"), body]);
+        const oid = createHash("sha1").update(object).digest("hex");
+        const dir = path.join(f.clone, ".git/objects", oid.slice(0, 2));
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(path.join(dir, oid.slice(2)), deflateSync(object));
+        return oid;
+      };
+      const blob = await plant("blob", Buffer.alloc(4096));
+      const tree = await plant("tree", Buffer.concat([Buffer.from("100644 enormous\0"), Buffer.from(blob, "hex")]));
+      const head = await plant("commit", Buffer.from("tree " + tree
+        + "\nauthor Fixture <fixture@example.invalid> 1 +0000\ncommitter Fixture <fixture@example.invalid> 1 +0000\n\nclone only\n"));
+      await fs.writeFile(path.join(f.clone, ".git/HEAD"), head + "\n");
+      assert.equal((await f.git("cat-file", "-s", "HEAD:enormous")).trim(), "4096");
+      await fs.writeFile(path.join(f.clone, ".git/index"), testIndex(names, 0));
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      await fs.writeFile(path.join(f.clone, "new"), Buffer.alloc(2));
+      await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
+      await fs.unlink(path.join(f.clone, "new"));
+      await fs.writeFile(path.join(f.clone, ".git/index"), testIndex(names, 1));
+      await assertRefused(f.capture(), "diff_too_large", "source_cap");
+    } finally { await f.dispose(); }
+  });
+
+  it("bounded metadata: index entries and tracked union include absent index paths", async () => {
+    const f = await fixture({ limits: { pathAllowance: 1 } });
+    try {
+      const index = path.join(f.clone, ".git/index");
+      await fs.writeFile(index, testIndex([".gitignore", "deleted", "tracked", "absent"]));
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      await fs.writeFile(index, testIndex([".gitignore", "deleted", "tracked", "absent", "absent2"]));
+      await assertRefused(f.capture(), "diff_failed", "index_path_cap");
+      // Each input fits four entries; their union has five distinct paths.
+      await fs.writeFile(index, testIndex([".gitignore", "tracked", "absent", "absent2"]));
+      await assertRefused(f.capture(), "diff_failed", "tracked_path_cap");
+    } finally { await f.dispose(); }
+  });
+
+  it("bounded metadata: candidate compares count absent index paths alongside untracked files", async () => {
+    const f = await fixture({ limits: { pathAllowance: 2 } });
+    try {
+      await fs.writeFile(path.join(f.clone, ".git/index"), testIndex([".gitignore", "deleted", "tracked", "absent"]));
+      await fs.writeFile(path.join(f.clone, "new"), Buffer.alloc(1));
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      await fs.writeFile(path.join(f.clone, "other"), Buffer.alloc(1));
+      await assertRefused(f.capture(), "diff_failed", "tracked_path_cap");
+    } finally { await f.dispose(); }
+  });
+
+  for (const kind of ["entries", "directories"] as const) {
+    it("bounded metadata: independent walk " + kind + " boundary", async () => {
+      const f = await fixture({ limits: kind === "entries" ? { entryAllowance: 1 } : { directoryAllowance: 1 } });
+      try {
+        for (let i = 0; i < 2; i++) {
+          const name = path.join(f.clone, "extra" + i);
+          if (kind === "entries") await fs.writeFile(name, Buffer.alloc(1));
+          else await fs.mkdir(name);
+          if (i === 0) assert.deepEqual(await f.capture(), Buffer.alloc(0));
+        }
+        await assertRefused(f.capture(), "diff_failed", kind === "entries" ? "metadata_entry_cap" : "directory_cap");
+      } finally { await f.dispose(); }
+    });
+  }
+
+  it("bounded metadata: ignore reads accumulate separately across exclude and nested files", async () => {
+    const f = await fixture({ limits: { ignoreAllowance: 2 }, seed: async seed => {
+      await fs.mkdir(path.join(seed, "nested"));
+      await fs.writeFile(path.join(seed, "nested/.gitignore"), "#\n");
+    } });
+    try {
+      await fs.writeFile(path.join(f.clone, ".git/info/exclude"), "#\n");
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      await fs.writeFile(path.join(f.clone, "nested/.gitignore"), "#\n\n");
+      await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
+    } finally { await f.dispose(); }
+  });
+
+  it("bounded metadata: ignore query stdin accumulates across directories", async () => {
+    const f = await fixture({ limits: { ignorePipeAllowance: 4 }, seed: async seed => {
+      for (const name of ["a", "b"]) {
+        await fs.mkdir(path.join(seed, name)); await fs.writeFile(path.join(seed, name, "file"), "x");
+      }
+    } });
+    try {
+      await fs.writeFile(path.join(f.clone, "a/x"), Buffer.alloc(1));
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      await fs.writeFile(path.join(f.clone, "b/y"), Buffer.alloc(1));
+      await assertRefused(f.capture(), "diff_failed", "ignore_query_cap");
+    } finally { await f.dispose(); }
+  });
+
+  it("bounded metadata: ignore query stdout has its own cumulative pipe bound", async () => {
+    const hook = `
+const cp = require("node:child_process"), original = cp.spawn;
+let queries = 0;
+cp.spawn = function(...args) {
+  const p = original.apply(this, args);
+  if (args[1].includes("check-ignore")) {
+    require("node:fs").writeFileSync(__DATA__ + "/queries", String(++queries));
+    const real = p.stdout;
+    p.stdout = new (require("node:stream").Transform)({
+      transform(_chunk, _encoding, done) { done(); },
+      flush(done) { this.push(Buffer.from(".gitignore\\0".repeat(20))); done(); }
+    });
+    real.pipe(p.stdout);
+  }
+  return p;
+};
+`;
+    const f = await fixture({ hook, limits: { ignorePipeAllowance: 256 }, seed: async seed => {
+      // Tracked ignored paths still require recursion, producing multiple queries.
+      await fs.writeFile(path.join(seed, ".gitignore"), "*\n");
+      await fs.mkdir(path.join(seed, "a")); await fs.writeFile(path.join(seed, "a/.gitignore"), "*\n");
+      await fs.writeFile(path.join(seed, "a/file"), "x");
+      await exec("git", ["-C", seed, "add", "-f", "."], { env: planningGitEnv(), timeout: 5000 });
+    } });
+    try {
+      await assertRefused(f.capture(), "diff_failed", "git_pipe_cap");
+      assert.ok(Number(await fs.readFile(path.join(f.data, "queries"), "utf8")) >= 2);
+    } finally { await f.dispose(); }
+  });
+
+  it("bounded batch: sizes duplicate blob paths in one child and credits each occurrence", async () => {
+    const hook = `
+const cp = require("node:child_process"), original = cp.spawn;
+cp.spawn = function(...args) {
+  const p = original.apply(this, args);
+  if (args[1].includes("--batch-check=%(objectname) %(objecttype) %(objectsize)")) {
+    const end = p.stdin.end;
+    p.stdin.end = function(input, ...rest) {
+      require("node:fs").appendFileSync(__DATA__ + "/sizing", input);
+      require("node:fs").appendFileSync(__DATA__ + "/children", "sizing\\n");
+      return end.call(this, input, ...rest);
+    };
+  }
+  if (args[1].includes("cat-file") && args[1].includes("blob"))
+    require("node:fs").appendFileSync(__DATA__ + "/children", "body\\n");
+  return p;
+};
+`;
+    const f = await fixture({ hook, limits: { sourceAllowance: 1 }, seed: async seed => {
+      await fs.writeFile(path.join(seed, "same"), "base\n");
+    } });
+    try {
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      assert.equal(await fs.readFile(path.join(f.data, "children"), "utf8"), "sizing\n");
+      const expected = await Promise.all([".gitignore", "deleted", "tracked"].map(name =>
+        f.bareGit("rev-parse", "HEAD:" + name).then(s => s.trim())));
+      const input = await fs.readFile(path.join(f.data, "sizing"), "utf8");
+      assert.deepEqual(input.trimEnd().split("\n").sort(), expected.sort());
+      assert.equal(Buffer.byteLength(input), 3 * 41);
+    } finally { await f.dispose(); }
+  });
+
+
+  // A six-level binary directory tree has 64 leaf occurrences, but Git stores
+  // only seven distinct subtree bodies. All credits must follow paths, not OIDs.
+  const seedRepeatedSubtrees = async (seed: string): Promise<void> => {
+    for (let i = 0; i < 64; i++) {
+      const parts = Array.from({ length: 6 }, (_, bit) => i & (1 << bit) ? "b" : "a");
+      const leaf = path.join(seed, "dag", ...parts);
+      await fs.mkdir(leaf, { recursive: true });
+      await fs.writeFile(path.join(leaf, "file"), "same leaf\n");
+      await fs.writeFile(path.join(leaf, ".gitignore"), "# same rules\n");
+    }
+  };
+
+  it("primary proof: credits every repeated subtree occurrence at small allowances", async () => {
+    const f = await fixture({ seed: seedRepeatedSubtrees, limits: {
+      sourceAllowance: 1, pathAllowance: 1, entryAllowance: 1, directoryAllowance: 1,
+      ignoreAllowance: 1, ignorePipeAllowance: 1, indexAllowance: 1,
+    } });
+    try {
+      const rows = (await f.bareGit("ls-tree", "-r", "-t", "HEAD", "dag")).trimEnd().split("\n");
+      const trees = rows.filter(row => row.startsWith("040000 tree "));
+      assert.equal(trees.length, 127);
+      assert.equal(new Set(trees.map(row => row.split(/\s+/)[2])).size, 7);
+      assert.equal(rows.filter(row => row.includes("\t") && row.endsWith("/file")).length, 64);
+      const names = (await f.git("ls-files", "-z")).split("\0").filter(Boolean);
+      await fs.writeFile(path.join(f.clone, ".git/index"), testIndex(names));
+      await fs.rm(path.join(f.clone, ".git/info/exclude"), { force: true });
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+    } finally { await f.dispose(); }
+  });
+
+  for (const stop of ["deadline", "SIGTERM"] as const) {
+    it("primary proof: " + stop + " during repeated subtree discovery settles children and cleans up", async () => {
+      const hook = `
+const phaseFs = require("node:fs"), phaseCp = require("node:child_process"), phaseSpawn = phaseCp.spawn;
+const realNow = Date.now;
+let offset = 0;
+Date.now = () => realNow() + offset;
+const phase = { spawned: 0, closed: 0, trees: 0, stoppedAt: 0, sizing: 0, signalled: false, yielded: false };
+const phaseImmediate = setImmediate;
+global.setImmediate = function(callback, ...args) {
+  return phaseImmediate(() => {
+    if (phase.stoppedAt && ${JSON.stringify(stop)} === "SIGTERM") {
+      // Hold the awaited continuation until the real OS signal is delivered.
+      // Without the production cooperative yield this hook is never reached.
+      phase.yielded = true;
+      // An unresolved promise alone does not keep Node alive while the signal
+      // is pending. The production SIGTERM handler exits and reaps this timer.
+      setInterval(() => {}, 1000);
+      process.kill(process.pid, "SIGTERM");
+    } else callback(...args);
+  });
+};
+process.prependListener("SIGTERM", () => { phase.signalled = true; });
+process.on("exit", () => phaseFs.writeFileSync(__DATA__ + "/discovery.json", JSON.stringify(phase)));
+phaseCp.spawn = function(...args) {
+  if (phase.stoppedAt) throw Error("discovery continued without checking or yielding");
+  const p = phaseSpawn.apply(this, args);
+  phase.spawned++;
+  if (args[1].includes("--batch-check=%(objectname) %(objecttype) %(objectsize)")) phase.sizing++;
+  p.once("close", code => {
+    phase.closed++;
+    if (args[1].includes("cat-file") && args[1].includes("tree") && code === 0 && ++phase.trees === 3) {
+      // Run after every close listener (including command's resolver), before
+      // the resolved command resumes discovery. No child timer is advanced.
+      queueMicrotask(() => {
+        phase.stoppedAt = phase.closed;
+        offset = ${stop === "deadline" ? 28001 : 21};
+      });
+    }
+  });
+  return p;
+};
+`;
+      const f = await fixture({ seed: seedRepeatedSubtrees, hook, privateTmp: true, killGraceMs: 1000 });
+      try {
+        const got = await refusalOf(f.capture());
+        if (stop === "deadline") assert.deepEqual([got.refusal, got.diagnostic], ["diff_failed", "capture_deadline"]);
+        else assert.match(got.message, /bounded runner process failed/);
+        const phase = JSON.parse(await fs.readFile(path.join(f.data, "discovery.json"), "utf8"));
+        assert.equal(phase.trees, 3, "stopped inside discovery, not in the worktree");
+        assert.equal(phase.stoppedAt, phase.closed);
+        assert.equal(phase.spawned, phase.closed, "every real Git child closed before stop");
+        assert.equal(phase.sizing, 0);
+        assert.equal(phase.signalled, stop === "SIGTERM");
+        assert.equal(phase.yielded, stop === "SIGTERM");
+        assert.deepEqual(await fs.readdir(f.tmp), []);
+      } finally { await f.dispose(); }
+    });
+  }
+
+  it("primary proof: neutralizes poisoned Git redirect and config environment inside helper", async () => {
+    const hook = `
+const poisonFs = require("node:fs"), poisonCp = require("node:child_process"), poisonSpawn = poisonCp.spawn;
+const poisonRoot = __DATA__;
+const payload = poisonRoot + "/outside-payload", marker = poisonRoot + "/payload-ran";
+poisonFs.writeFileSync(payload, "#!/bin/sh\\nprintf poisoned > " + JSON.stringify(marker) + "\\n", { mode: 0o700 });
+const config = poisonRoot + "/outside-config";
+poisonFs.writeFileSync(config, "[diff]\\n external = " + payload + "\\n[core]\\n fsmonitor = " + payload + "\\n");
+Object.assign(process.env, {
+  GIT_DIR: poisonRoot + "/not-a-repository", GIT_COMMON_DIR: poisonRoot + "/not-common",
+  GIT_WORK_TREE: poisonRoot, GIT_INDEX_FILE: poisonRoot + "/not-index",
+  GIT_OBJECT_DIRECTORY: poisonRoot + "/not-objects",
+  GIT_ALTERNATE_OBJECT_DIRECTORIES: poisonRoot + "/not-alternates",
+  GIT_CONFIG: config, GIT_CONFIG_GLOBAL: config, GIT_CONFIG_SYSTEM: config,
+  GIT_CONFIG_PARAMETERS: "'diff.external=" + payload + "'",
+  GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "diff.external", GIT_CONFIG_VALUE_0: payload,
+  GIT_CONFIG_KEY_1: "core.fsmonitor", GIT_CONFIG_VALUE_1: payload,
+  GIT_EXTERNAL_DIFF: payload, GIT_CONFIG_NOSYSTEM: "0"
+});
+let commands = 0;
+poisonCp.spawn = function(...args) {
+  const e = args[2].env;
+  for (const key of ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1"]) {
+    if (key in e) throw Error("inherited Git redirect survived: " + key);
+  }
+  if (e.GIT_CONFIG_GLOBAL !== "/dev/null" || e.GIT_CONFIG_COUNT !== "0") throw Error("config not neutralized");
+  commands++;
+  return poisonSpawn.apply(this, args);
+};
+process.on("exit", () => poisonFs.writeFileSync(poisonRoot + "/poison-proof", String(commands)));
+`;
+    const f = await fixture({ hook });
+    try {
+      await fs.writeFile(path.join(f.clone, "tracked"), "known environment edit\n");
+      const expected = await f.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--", "tracked");
+      assert.match(expected, /-base\n\+known environment edit/);
+      assert.equal((await f.capture()).toString(), expected);
+      assert.ok(Number(await fs.readFile(path.join(f.data, "poison-proof"), "utf8")) > 0);
+      await assert.rejects(fs.stat(path.join(f.data, "payload-ran")), { code: "ENOENT" });
+    } finally { await f.dispose(); }
+  });
+
+  for (const edited of [false, true]) {
+    it("primary proof: bare repack overlaps an unlocked " + (edited ? "edited" : "clean") + " capture", async t => {
+      const hook = `
+const repackFs = require("node:fs"), repackCp = require("node:child_process"), repackSpawn = repackCp.spawn;
+let paused = false;
+repackCp.spawn = function(...args) {
+  if (!paused && args[1].includes("cat-file") && args[1].includes("tree")) {
+    paused = true;
+    repackFs.writeFileSync(__DATA__ + "/repack-ready", "");
+    const until = Date.now() + 5000;
+    while (!repackFs.existsSync(__DATA__ + "/repack-done")) {
+      if (Date.now() > until) throw Error("repack handshake timed out");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+  }
+  return repackSpawn.apply(this, args);
+};
+`;
+      const f = await fixture({ hook });
+      let locks = 0;
+      // Only capture uses this cache; worker-owned bare maintenance uses real Git.
+      const cache = f.cache as unknown as { withLock: (...args: unknown[]) => Promise<never> };
+      const originalLock = cache.withLock;
+      cache.withLock = async () => { locks++; throw Error("capture acquired whole-bare lock"); };
+      const ac = new AbortController();
+      let pending: Promise<{ patch: Buffer } | { error: unknown }> | undefined;
+      try {
+        if (edited) await fs.writeFile(path.join(f.clone, "tracked"), "repacked edit\n");
+        const expected = edited ? Buffer.from(await f.git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--", "tracked")) : Buffer.alloc(0);
+        pending = f.capture(ac.signal).then(patch => ({ patch }), error => ({ error }));
+        const marker = path.join(f.data, "repack-ready");
+        for (let i = 0; i < 200 && !(await fs.stat(marker).then(() => true, () => false)); i++) await sleep(10);
+        await fs.stat(marker);
+        await f.bareGit("repack", "-a", "-d", "-f");
+        assert.ok((await nativeFs.readdir(path.join(f.bare, "objects/pack"))).some(name => name.endsWith(".pack")));
+        await fs.writeFile(path.join(f.data, "repack-done"), "");
+        const result = await pending;
+        if ("patch" in result) {
+          assert.deepEqual(result.patch, expected, "only a complete patch is success");
+          t.diagnostic("repack outcome: complete " + result.patch.length + "-byte patch");
+        } else {
+          assert.deepEqual(classifyPlanningCaptureError((result.error as Error).message),
+            { refusal: "diff_failed", diagnostic: "git_refused" });
+          t.diagnostic("repack outcome: fixed git_refused");
+        }
+        assert.equal(locks, 0);
+      } finally {
+        ac.abort();
+        if (pending) await pending;
+        cache.withLock = originalLock;
+        await f.dispose();
+      }
+    });
+  }
+
+  for (const kind of ["symlink", "file"] as const) {
+    it("primary proof: unavailable bare authority replaced by " + kind, async () => {
+      const f = await fixture();
+      try {
+        await nativeFs.rename(f.bare, f.bare + "-saved");
+        if (kind === "symlink") await nativeFs.symlink(f.bare + "-saved", f.bare);
+        else await nativeFs.writeFile(f.bare, "not a directory\n");
+        await assertRefused(f.capture(), "base_unavailable", "base_object_type_mismatch");
+      } finally { await f.dispose(); }
+    });
+  }
+
+  for (const type of ["commit", "tree", "blob"] as const) {
+    it("primary proof: unavailable base with corrupt gzip " + type, async () => {
+      const f = await fixture();
+      try {
+        // Remove authentic packed duplicates so the malformed loose body is selected.
+        await f.looseBareObjects();
+        const oid = (await f.bareGit("rev-parse", type === "commit" ? "HEAD" : type === "tree" ? "HEAD^{tree}" : "HEAD:tracked")).trim();
+        const loose = path.join(f.bare, "objects", oid.slice(0, 2), oid.slice(2));
+        await nativeFs.unlink(loose);
+        await nativeFs.writeFile(loose, "not gzip\n");
+        if (type === "blob") await fs.writeFile(path.join(f.clone, "tracked"), "changed\n");
+        await assertRefused(f.capture(), "base_unavailable", "base_object_type_mismatch");
+      } finally { await f.dispose(); }
+    });
+  }
+
+
+  for (const type of ["commit", "tree", "blob"] as const) {
+    it("primary proof: unavailable base with damaged compressed " + type + " body", async () => {
+      const f = await fixture();
+      try {
+        await f.looseBareObjects();
+        const oid = (await f.bareGit("rev-parse", type === "commit" ? "HEAD" : type === "tree" ? "HEAD^{tree}" : "HEAD:tracked")).trim();
+        const loose = path.join(f.bare, "objects", oid.slice(0, 2), oid.slice(2));
+        const original = inflateSync(await nativeFs.readFile(loose));
+        // A readable header followed by a damaged zlib trailer: Git's metadata
+        // probe succeeds, but fetching the whole authenticated body must fail.
+        const body = Buffer.concat([original.subarray(original.indexOf(0) + 1), Buffer.alloc(32768, 120)]);
+        const damaged = deflateSync(Buffer.concat([Buffer.from(type + " " + body.length + "\0"), body]));
+        damaged.writeUInt8(damaged.readUInt8(damaged.length - 1) ^ 0xff, damaged.length - 1);
+        await nativeFs.unlink(loose);
+        await nativeFs.writeFile(loose, damaged);
+        assert.equal((await f.bareGit("cat-file", "-t", oid)).trim(), type);
+        assert.equal((await f.bareGit("cat-file", "-s", oid)).trim(), String(body.length));
+        await assert.rejects(f.bareGit("cat-file", type, oid), (error: unknown) => {
+          assert.match((error as Error & { stderr: string }).stderr, /(?:^|\n)error: inflate: /);
+          return true;
+        });
+        if (type === "blob") await fs.writeFile(path.join(f.clone, "tracked"), "changed\n");
+        await assertRefused(f.capture(), "base_unavailable", "base_object_integrity");
+      } finally { await f.dispose(); }
+    });
+  }
+
+
+  for (const kind of ["regular file", "symlink"] as const) {
+    it("refuses inflated bare blob credit for a clean " + kind + " with authentic OID identity", async () => {
+      const f = await fixture({ seed: async seed => {
+        if (kind === "symlink") await fs.symlink("tracked", path.join(seed, "link"));
+      } });
+      try {
+        f.cache.setPlanningLimitsForTest({ ...defaultLimits, sourceAllowance: 1 });
+        assert.deepEqual(await f.capture(), Buffer.alloc(0));
+        await fs.writeFile(path.join(f.clone, "new-binary"), Buffer.alloc(2));
+        await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
+        await fs.unlink(path.join(f.clone, "new-binary"));
+
+        // Corrupt worker-owned bare metadata under the authentic blob identity;
+        // the unchanged worktree still hashes to that identity.
+        await f.looseBareObjects();
+        const name = kind === "symlink" ? "link" : "tracked";
+        const oid = (await f.bareGit("rev-parse", "HEAD:" + name)).trim();
+        const loose = path.join(f.bare, "objects", oid.slice(0, 2), oid.slice(2));
+        const original = inflateSync(await nativeFs.readFile(loose));
+        const bytes = original.subarray(original.indexOf(0) + 1);
+        assert.equal(createHash("sha1").update("blob " + bytes.length + "\0").update(bytes).digest("hex"), oid);
+        const body = Buffer.concat([bytes, Buffer.alloc(32768, 120)]);
+        const damaged = deflateSync(Buffer.concat([Buffer.from("blob " + body.length + "\0"), body]));
+        damaged.writeUInt8(damaged.readUInt8(damaged.length - 1) ^ 0xff, damaged.length - 1);
+        await nativeFs.unlink(loose);
+        await nativeFs.writeFile(loose, damaged);
+        assert.equal((await f.bareGit("cat-file", "-s", oid)).trim(), String(body.length));
+
+        await assertRefused(f.capture(), "base_unavailable", "base_object_integrity");
+        await fs.writeFile(path.join(f.clone, "new-binary"), Buffer.alloc(2));
+        await assertRefused(f.capture(), "base_unavailable", "base_object_integrity");
+      } finally { await f.dispose(); }
+    });
+  }
+
+  it("primary proof: interrupted object child preserves fixed git_refused without partial output", async () => {
+    const hook = `
+const refusedCp = require("node:child_process"), refusedSpawn = refusedCp.spawn;
+refusedCp.spawn = function(...args) {
+  if (!args[1].includes("cat-file") || !args[1].includes("tree")) return refusedSpawn.apply(this, args);
+  // A stand-in object child that writes partial output and never finishes, killed only once
+  // that output proves it is running: the interruption cannot race a fast real child.
+  const p = refusedSpawn.call(this, process.execPath,
+    ["-e", "process.stdout.write('partial'); setInterval(() => {}, 1000);"], args[2]);
+  p.stdout.once("data", () => p.kill("SIGKILL"));
+  p.once("close", () => require("node:fs").writeFileSync(__DATA__ + "/interrupted-child", ""));
+  return p;
+};
+`;
+    const f = await fixture({ hook, privateTmp: true });
+    try {
+      await assertRefused(f.capture(), "diff_failed", "git_refused");
+      await fs.stat(path.join(f.data, "interrupted-child"));
+      assert.deepEqual(await fs.readdir(f.tmp), []);
+    } finally { await f.dispose(); }
+  });
+
+  const batchMutations: Record<string, string> = {
+    "wrong identity": 'rows[0] = "0".repeat(40) + rows[0].slice(40)',
+    "wrong type": 'rows[0] = rows[0].replace(" blob ", " tree ")',
+    "noncanonical decimal": 'rows[0] = rows[0].replace(/ (\\d+)$/, " 0$1")',
+    "negative size": 'rows[0] = rows[0].replace(/ (\\d+)$/, " -1")',
+    "fractional size": 'rows[0] = rows[0].replace(/ (\\d+)$/, " 1.5")',
+    "unsafe size": 'rows[0] = rows[0].replace(/ (\\d+)$/, " 9007199254740992")',
+    "reordered records": '[rows[0], rows[1]] = [rows[1], rows[0]]',
+    "missing record": 'rows.pop()',
+    "extra record": 'rows.push("extra")',
+    "raw NUL": 'rows[0] += "\\0"',
+    "CRLF": 'rows[0] += "\\r"',
+    "missing final newline": 'suffix = ""',
+    "pipe overflow": 'rows = Array(1000).fill(rows[0])',
+  };
+  for (const [name, mutation] of Object.entries(batchMutations)) {
+    it("bounded batch: rejects " + name, async () => {
+      const hook = `
+const cp = require("node:child_process"), original = cp.spawn;
+cp.spawn = function(...args) {
+  const p = original.apply(this, args);
+  if (args[1].includes("--batch-check=%(objectname) %(objecttype) %(objectsize)")) {
+    const real = p.stdout, chunks = [];
+    p.stdout = new (require("node:stream").Transform)({
+      transform(chunk, _encoding, done) { chunks.push(chunk); done(); },
+      flush(done) {
+        const bytes = Buffer.concat(chunks);
+        if (bytes.at(-1) !== 10) throw Error("incomplete batch instrument input");
+        let rows = bytes.toString("ascii").trimEnd().split("\\n"), suffix = "\\n";
+        ${mutation};
+        require("node:fs").writeFileSync(__DATA__ + "/batch-mutated", ${JSON.stringify(name)});
+        this.push(Buffer.from(rows.join("\\n") + suffix)); done();
+      }
+    });
+    real.pipe(p.stdout);
+  }
+  return p;
+};
+`;
+      const f = await fixture({ hook });
+      try {
+        await assertRefused(f.capture(), name === "pipe overflow" ? "diff_failed" : "base_unavailable",
+          name === "pipe overflow" ? "git_pipe_cap" : "base_object_type_mismatch");
+        assert.equal(await fs.readFile(path.join(f.data, "batch-mutated"), "utf8"), name);
+      } finally { await f.dispose(); }
+    });
+  }
+
+  it("charges clean, changed and deleted base bytes once per path", async () => {
+    const f = await fixture({ limits: { sourceAllowance: 7 } });
+    try {
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      await fs.writeFile(path.join(f.clone, "tracked"), "change\n");
+      assert.match((await f.capture()).toString(), /-base\n\+change/);
+      f.cache.setPlanningLimitsForTest({ ...defaultLimits, sourceAllowance: 6 });
+      await assertRefused(f.capture(), "diff_too_large", "base_source_cap");
+      await fs.unlink(path.join(f.clone, "tracked"));
+      f.cache.setPlanningLimitsForTest({ ...defaultLimits, sourceAllowance: 1 });
+      assert.match((await f.capture()).toString(), /-base/);
+    } finally { await f.dispose(); }
+  });
+
+  it("bounds new source reads by the independent remaining credit plus sentinel", async () => {
+    const f = await fixture({ limits: { sourceAllowance: 7 } });
+    try {
+      await fs.writeFile(path.join(f.clone, "new-binary"), Buffer.alloc(7));
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+      await fs.writeFile(path.join(f.clone, "new-binary"), Buffer.alloc(8));
+      await assertRefused(f.capture(), "diff_too_large", "total_source_cap");
+    } finally { await f.dispose(); }
+  });
+
+  it("rejects high-bit batch bytes before ASCII decoding", async () => {
+    const hook = [
+      'const rawCp = require("node:child_process"), rawSpawn = rawCp.spawn;',
+      'rawCp.spawn = function(...args) {',
+      '  const p = rawSpawn.apply(this, args);',
+      '  if (args[1].includes("--batch-check=%(objectname) %(objecttype) %(objectsize)")) {',
+      '    const read = p.stdout.read; let changed = false;',
+      '    p.stdout.read = function(...readArgs) {',
+      '      const bytes = read.apply(this, readArgs);',
+      '      if (Buffer.isBuffer(bytes) && bytes.length && !changed) {',
+      '        changed = true; bytes[0] |= 128;',
+      '        require("node:fs").writeFileSync(__DATA__ + "/high-bit", "");',
+      '      }',
+      '      return bytes;',
+      '    };',
+      '  }',
+      '  return p;',
+      '};',
+    ].join("\n") + "\n";
+    const f = await fixture({ hook });
+    try {
+      await assertRefused(f.capture(), "base_unavailable", "base_object_type_mismatch");
+      await fs.stat(path.join(f.data, "high-bit"));
+    } finally { await f.dispose(); }
+  });
+
+  it("reprobes trusted bare alternates between metadata and body queries", async () => {
+    const hook = [
+      'const lateFs = require("node:fs"), lateCp = require("node:child_process"), lateSpawn = lateCp.spawn;',
+      'let paused = false;',
+      'lateCp.spawn = function(...args) {',
+      '  if (!paused && args[1].includes("--batch-check=%(objecttype) %(objectsize)")) {',
+      '    paused = true; lateFs.writeFileSync(__DATA__ + "/metadata-started", "");',
+      '    const until = Date.now() + 5000;',
+      '    while (!lateFs.existsSync(__DATA__ + "/continue")) {',
+      '      if (Date.now() > until) throw Error("late alternates handshake timed out");',
+      '      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);',
+      '    }',
+      '  }',
+      '  return lateSpawn.apply(this, args);',
+      '};',
+    ].join("\n") + "\n";
+    const f = await fixture({ hook });
+    const ac = new AbortController();
+    const pending = refusalOf(f.capture(ac.signal));
+    try {
+      const marker = path.join(f.data, "metadata-started");
+      for (let i = 0; i < 100 && !(await fs.stat(marker).then(() => true, () => false)); i++) await sleep(20);
+      await fs.stat(marker);
+      await nativeFs.writeFile(path.join(f.bare, "objects/info/alternates"), "");
+      await fs.writeFile(path.join(f.data, "continue"), "");
+      const got = await pending;
+      assert.deepEqual([got.refusal, got.diagnostic], ["diff_failed", "object_alternates"]);
+    } finally { ac.abort(); await pending.catch(() => {}); await f.dispose(); }
+  });
+
+  it("never opens clone objects or follows clone alternates for base authority", async () => {
+    const hook = [
+      'const noFs = require("node:fs"), noPath = require("node:path"), noOpen = noFs.openSync;',
+      'const forbidden = process.argv[1] + "/.git/objects";',
+      'noFs.openSync = function(file, ...args) {',
+      '  let absolute = String(file);',
+      '  const match = /^\\/proc\\/\\d+\\/fd\\/(\\d+)(\\/.*)?$/.exec(absolute);',
+      '  if (match) absolute = noPath.resolve(noFs.readlinkSync("/proc/" + process.pid + "/fd/" + match[1]), "." + (match[2] || ""));',
+      '  if (absolute === forbidden || absolute.startsWith(forbidden + "/")) throw Error("clone objects opened");',
+      '  return noOpen.call(this, file, ...args);',
+      '};',
+    ].join("\n") + "\n";
+    const f = await fixture({ hook, shared: true, limits: { sourceAllowance: 1 } });
+    try {
+      // A planted clone store/config cannot replace the explicit bare authority.
+      await fs.rm(path.join(f.clone, ".git/objects"), { recursive: true });
+      await fs.symlink(path.join(f.data, "missing-objects"), path.join(f.clone, ".git/objects"));
+      assert.deepEqual(await f.capture(), Buffer.alloc(0));
+    } finally { await f.dispose(); }
+  });
+
+  it("refuses missing or noncanonical bare authority before spawning", async () => {
+    const f = await fixture();
+    let spawns = 0;
+    try {
+      for (const bare of [undefined, "", "relative.git", f.bare + "/.", path.join(f.data, "repo.git")]) {
+        const got = await refusalOf(f.cache.withBoundaryProcessSpawner(async () => {
+          spawns++; throw Error("must not spawn");
+        }, new AbortController().signal, () => f.cache.capturePlanningDiff(f.clone, f.base, bare)));
+        assert.deepEqual([got.refusal, got.diagnostic], ["base_unavailable", "bare_unavailable"]);
+      }
+      assert.equal(spawns, 0);
+    } finally { await f.dispose(); }
+  });
+
+  it("bounded limits: validates every numeric field with the current complete key shape", async () => {
+    const f = await fixture();
+    try {
+      for (const key of Object.keys(defaultLimits)) {
+        for (const value of [0, -1, 1.5, NaN, Infinity, "1", null, Number.MAX_SAFE_INTEGER,
+          Number.MAX_SAFE_INTEGER + 1, Number.MAX_SAFE_INTEGER - 1]) {
+          f.cache.setPlanningLimitsForTest({ ...defaultLimits, [key]: value } as Record<string, number>);
+          await assert.rejects(f.capture(), /UZI-PLANNING-REFUSAL invalid_limits/,
+            key + "=" + String(value));
+        }
+      }
+    } finally { await f.dispose(); }
+  });
+
+  it("bounded limits: rejects invalid JSON before reading repository metadata", async () => {
+    const f = await fixture({ hook: 'process.argv[5] = "{";\n' });
+    try { await assert.rejects(f.capture(), /UZI-PLANNING-REFUSAL invalid_limits/); }
+    finally { await f.dispose(); }
+  });
+
   it("rejects malformed helper limits from the parent argument", async () => {
     const f = await fixture();
     try {
-      for (const limits of [{ snapshotLimit: 0, totalLimit: 1 }, { snapshotLimit: 1.5, totalLimit: 1 }, { snapshotLimit: 1 }]) {
-        f.cache.setPlanningLimitsForTest(limits as { snapshotLimit: number; totalLimit: number });
+      const { pathAllowance: _missing, ...missing } = defaultLimits;
+      for (const limits of [
+        missing, { ...defaultLimits, unexpected: 1 },
+        ...[0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1]
+          .map(sourceAllowance => ({ ...defaultLimits, sourceAllowance })),
+        { ...defaultLimits, sourceAllowance: Number.MAX_SAFE_INTEGER - 1 },
+      ]) {
+        f.cache.setPlanningLimitsForTest(limits as Record<string, number>);
         await assert.rejects(f.capture(), /UZI-PLANNING-REFUSAL invalid_limits/);
       }
     } finally { await f.dispose(); }
@@ -1046,14 +1842,14 @@ snapFs.readSync = function(...args) {
   it("rejects lexical roots and aborts a real whole-root owner", async () => {
     const f = await fixture();
     try {
-      await assert.rejects(f.cache.capturePlanningDiff(f.data, f.base), /runnerRoot/);
-      await assert.rejects(f.cache.capturePlanningDiff(f.clone, "HEAD"), /40-hex/);
+      await assert.rejects(f.cache.capturePlanningDiff(f.data, f.base, f.bare), /runnerRoot/);
+      await assert.rejects(f.cache.capturePlanningDiff(f.clone, "HEAD", f.bare), /40-hex/);
       const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal, killGraceMs: 100 });
       const pending = f.cache.withBoundaryProcessSpawner(async req => {
         const handle = await owner.spawn(captureSpawnRequest(req));
         ac.abort();
         return handle;
-      }, ac.signal, () => f.cache.capturePlanningDiff(f.clone, f.base));
+      }, ac.signal, () => f.cache.capturePlanningDiff(f.clone, f.base, f.bare));
       await assert.rejects(pending, /aborted/);
       await owner.settled();
       assert.deepEqual(owner.survivors(), []);

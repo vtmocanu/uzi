@@ -284,7 +284,7 @@ observe, so Standard pricing remains the D5 estimation policy, not a measurement
 `send_user_message_async` / `clock` tools match what `gpt-6-astra` already had. The vocabulary
 stays closed and product-owned.
 
-**Superseded 2026-09-23** by [PRD #1551](../prds/1551-per-harness-worker-model-defaults.md) for
+**Superseded 2026-09-23** by [PRD #1551](../prds/done/1551-per-harness-worker-model-defaults.md) for
 per-user defaults only: Claude and Codex now keep separate, retained per-user model defaults
 instead of one shared slot, and Codex's per-user default gained a narrow, capability-gated custom
 model ID. The closed curated vocabulary and closed effort contract recorded above still govern
@@ -921,3 +921,48 @@ The Docker-free coordinate tests failed all seven leaves on the lock-only
 candidate and passed after reconciliation. This proves agreement of pins, not
 execution of 0.162.1. Installed receipt/probe acceptance, real worker-UID and M4
 execution remain separate evidence required before accepting the upgrade.
+
+## Amendment: coordinated runtime 0.163.0 (2026-10-23)
+
+The native package advances from 0.162.1 to 0.163.0, source commit
+`83086188ae0614bd882818ff1aa23f3194962012`. The target was published on
+2026-10-15 and meets the seven-day stability policy; 0.164.0 does not yet.
+There is no intermediate stable release. The lock, launcher, probe, active
+fixtures and M4 version evidence move together.
+
+The adoption read covers the official
+[0.163.0 notes](https://github.com/openai/codex/releases/tag/rust-v0.163.0)
+and the stable-to-stable source diff for the consumed paths:
+
+- The package no longer bundles patched zsh, and the `shell_zsh_fork` /
+  `unified_exec_zsh_fork` flags are retired. Both verified archives otherwise
+  carry the same members. `CODEX_MEMBERS` drops `codex-resources/zsh/bin/zsh`.
+  Every remaining member stays required, so the installer still fails closed on
+  a missing one. Uzi never enabled either flag (`shell_tool` and `unified_exec`
+  stay off).
+- Three feature defaults flip on. `code_mode_interrupt` lets an interrupt stop
+  active Code Mode cells and their nested tool calls; worker callback admission
+  and the pause/interrupt handling stay as they are. `cli_daybreak` applies only
+  to the TUI and `codex exec`, and uzi drives neither. `api_key_cyber_access_programs`
+  acts only when a turn requests an explicit access program, and uzi requests
+  none. `instant_interrupt` was already on in 0.162.1.
+- A resumed thread restores its saved permission profile and network grants
+  before validation, and explicit overrides keep precedence. Uzi sets
+  `approvalPolicy: "never"` and explicit `untrusted` project trust on every
+  thread start and resume, and sends `environments: []` on every turn. The
+  cold-resume native-denial proof stays required.
+- Incomplete responses (for example `max_output_tokens`) are now terminal and
+  non-retryable. They reach the app-server as `codexErrorInfo: "other"`, which
+  uzi's closed map already classifies as `unknown`. The app-server
+  `CodexErrorInfo` variant set is identical across both tags.
+- The built-in provider definitions (`model-provider-info`) are unchanged.
+  Dynamic tool output gains only an optional `retain` field. Thread read-state
+  and item lookup RPCs are additive. The model catalog leaves `shell_type`,
+  `default_service_tier` and `minimal_client_version` unchanged.
+- Adoption candidates such as `features.multi_agent_v2.disable_native_tools`,
+  tool-output retention and item lookup stay outside this upgrade.
+
+`task codex-pins:sync` rewrote every registered pin from the lock. This proves
+agreement of pins, not execution of 0.163.0. Installed receipt/probe acceptance,
+real worker-UID and M4 execution remain separate evidence required before
+accepting the upgrade.

@@ -2,6 +2,7 @@ import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { createHash, createHmac } from "node:crypto";
 import { RecoveryCoordinator, canonicalJson, type ClosedSourceObservation, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
 import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maintenance.js";
@@ -24,7 +25,7 @@ const sha = "a".repeat(40), origin = "b".repeat(64);
 const digest = (value: unknown) => createHash("sha256").update(canonicalJson(value)).digest("hex");
 
 async function fixture(t: test.TestContext) {
-  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/terminal-origin-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "terminal-origin-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const recoveryRoot = path.join(root, "recovery");
   const ledgerRoot = path.join(root, "recovery-maintenance");
@@ -560,3 +561,47 @@ for (const invalidate of ["writer", "registration", "abort"] as const) {
     assert.deepEqual(seen, [true, false]);
   });
 }
+
+test("N replay-only entry never admits or consumes producer resources with an eligible source tail", async t => {
+  const f = await fixture(t);
+  let admissions = 0, consumption = 0;
+  const admit = RecoveryMaintenance.prototype.admit;
+  t.mock.method(RecoveryMaintenance.prototype, "admit", function (this: RecoveryMaintenance,
+    ...args: Parameters<typeof admit>) {
+    admissions++;
+    return admit.apply(this, args);
+  });
+  const consume = MaintenanceResources.consume;
+  t.mock.method(MaintenanceResources, "consume", (...args: Parameters<typeof consume>) => {
+    consumption++;
+    return consume.apply(MaintenanceResources, args);
+  });
+  const method = (f.coordinator as unknown as {
+    resumeTerminalEvidence?: RecoveryCoordinator["resumeTerminalSource"];
+  }).resumeTerminalEvidence;
+  assert.ok(method, "the replay-only entry is installed");
+  // A sealed saved record (an uncertain held create) is the kind of evidence the replay-only entry may redrive.
+  await f.seal({ version: 1, runId, generation: 1, captureId: "00000000-0000-4000-8000-000000000041",
+    kind: "issue", branch: "task", sourceSha: sha, createdAt: Date.now(), state: "pinned", inventoryGuarded: true,
+    bareDir: "repo.git", heldCreateUncertain: true });
+  // The direct observable of replay processing: the coordinator redrives exactly the sealed record.
+  const redriven: Array<{ captureId: string; path: unknown }> = [];
+  const owner = f.coordinator as unknown as { pendingStep: (snap: RecoveryRecord, signal?: AbortSignal, path?: string) => Promise<void> };
+  const pendingStep = owner.pendingStep;
+  t.mock.method(owner, "pendingStep", function (this: unknown, snap: RecoveryRecord, signal?: AbortSignal, path?: string) {
+    redriven.push({ captureId: snap.captureId, path });
+    return pendingStep.call(this, snap, signal, path);
+  });
+  await method.call(f.coordinator, runId, Promise.resolve(f.observation), 1, f.signal.signal);
+  assert.deepEqual(redriven, [{ captureId: "00000000-0000-4000-8000-000000000041", path: "terminal_source" }],
+    "the sealed saved record was actually redriven (not a vacuous empty pass)");
+  assert.equal(admissions, 0, "saved replay must never enter real RecoveryMaintenance.admit");
+  assert.equal(consumption, 0, "saved replay consumes no producer resource budget");
+  assert.equal(await f.chargeCount(), 0);
+  await f.unchanged();
+  const f2 = await fixture(t);
+  await f2.run();
+  assert.equal(admissions, 1, "eligible fresh source is a positive real admission control");
+  assert.ok(consumption > 0, "positive source control uses real resource consumption");
+  assert.equal(await f2.chargeCount(), 1);
+});

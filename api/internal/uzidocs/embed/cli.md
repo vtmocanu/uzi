@@ -154,11 +154,13 @@ uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
 uzi findings undo <disposition-id>
 uzi findings stats [--repo <id>] [--json]
-uzi handoff -m <text> | -f <path> [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
+uzi handoff -m <text> | -f <path> [--base <ref>] [--issue <iid>] [--mr] [--review] [--then-fix] [--interactive] [--repo <id>]
 uzi handoff rm <run-id> | review <run-id>
 uzi token list
 uzi rate-limits [--provider claude|codex]
 uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id> --default
+uzi worker cordon <id> [-m <reason>] [--json]
+uzi worker uncordon <id> [--json]
 uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
@@ -244,7 +246,7 @@ A few worth knowing:
 - **No `worker create` and no `admin` writes.** Minting a worker join token
   returns a credential that reads decrypted secrets, and every admin write
   stays cookie-only — both are web UI actions by design.
-- **`token` is list-only, and `worker set-token` is the one write near it.**
+- **`token` is list-only; `worker set-token` writes the worker's credential binding.**
   See [Anthropic tokens](#anthropic-tokens) below for why the split falls
   exactly there.
 - **`uzi rate-limits [--provider claude|codex]`** — your own rate-limit
@@ -794,7 +796,7 @@ A few worth knowing:
   CI-fix run's queue starts empty and only ever holds what you actually sent
   mid-run.
 - **`run fetches <id>`** prints a research run's source log
-  ([PRD #1906](../prds/1906-official-sources-web-research.md)): one row per web
+  ([PRD #1906](../prds/done/1906-official-sources-web-research.md)): one row per web
   fetch the run attempted, oldest first, with `STARTED`, `VERDICT` (`allowed` or
   `refused`), `REASON`, `HTTP` status, `BYTES`, `CONTENT TYPE`, `URL` and
   `FINAL URL` (after redirects). The command follows every page of the log; a read taken while the run is still fetching can miss a row that commits late.
@@ -1470,14 +1472,14 @@ expires, or into a state that saved nothing); retry the removal after that.
 ## uzi handoff: ephemeral branch-scoped task runs
 
 ```sh
-uzi handoff -m "<context>" [--file <path>] [--base <ref>] [--mr]
+uzi handoff -m "<context>" [--file <path>] [--base <ref>] [--issue <iid>] [--mr]
             [--review] [--then-fix] [--repo <repo-id>]
 uzi handoff rm <run-id>
 uzi handoff review <run-id>
 ```
 
 `uzi handoff` (alias `uzi task`) hands a throwaway task to a worker without a
-forge issue and without a PRD: no plan gate, no issue to file, no MR to
+forge issue by default and without a PRD: no plan gate, no issue to file, no MR to
 review, unless you ask for one. Think of it as renting a remote worktree —
 you push it some work, watch it, pull the result, and throw the branch away.
 See [Handoff: renting a remote worktree](./handoff.md) for the full mental
@@ -1510,7 +1512,7 @@ first two fails:
 
 The worker clones `uzi/task/<id>`, works your inline context (from `-m`, or
 `-f <file>`/`-f -` for stdin, or piped bare stdin), commits, and pushes back
-to the same branch. There's no forge issue and no MR by default — pull the
+to the same branch. No forge issue is created, and there's no MR by default — pull the
 result yourself:
 
 ```sh
@@ -1534,11 +1536,33 @@ A few things worth knowing before you rely on this:
   "rebase onto main" — uzi can't force-push a rewrite of a branch it already
   published, so a rebase there gets bridged (or, if that's impossible, fails
   the run) at finalize instead of landing as asked.
-- **A raw handoff has no forge record.** With no issue and no MR (no `--mr`),
+- **An unlinked, no-MR handoff has no forge record.** Without `--issue` or `--mr`,
   there's nothing durable on the forge — the run transcript and your inline
   context are still persisted in uzi (`uzi run get`/`uzi run logs`), but if
   you want a forge-visible artifact, pass `--mr` or escalate later by opening
   one yourself from the pulled branch.
+- **`--issue <iid>`** links an existing issue for recovery or continuation. It
+  requires a positive signed 64-bit integer; zero, negative and overflowing
+  values are usage errors (exit 2). The server verifies a real forge issue
+  (not a pull request) in a repo you own; open and closed issues are allowed,
+  with no eligibility-label or PRD requirement. Without this flag, ordinary
+  task behavior is unchanged.
+
+  The run stays `kind: task`: `continued_issue_iid` carries the link,
+  `issue_iid` stays null, and there is no board association or branch change.
+  Run get/list JSON includes `continued_issue_iid` as null or the linked IID.
+  Passing the flag generates neither an MR reference nor a closing keyword.
+  Task MRs retain their existing non-closing behavior.
+
+  A nonterminal run for the issue, including `pool_wait`, blocks creation
+  (HTTP 409, CLI exit 5). Terminal tasks release this active guard. Review
+  and `--then-fix` runs inherit the link, but their creation is best effort:
+  there is a gap after a parent goes terminal, with no continuous reservation
+  when the chain is entirely terminal. A completed linked task whose MR is
+  still open or has unknown state blocks a fresh **issue run**, unless you
+  use `uzi run create --force`; that flag cannot bypass the active guard.
+  Handoff creation checks active runs, not completed open MRs, and has no
+  `--force` flag.
 - **`--mr`** has the worker open an MR for the branch once it finishes, the
   escalation path for a throwaway task that turns out to be keeper work. An
   MR-opened branch is exempt from `uzi handoff rm` — delete it via the MR
@@ -2521,6 +2545,45 @@ image or an unstamped control plane. It is not proof that an offline hosted work
 is healthy. Confirmed first-provision and capacity failures have their own labels.
 These diagnostics also appear in `uzi admin workers` and worker TUI details;
 capacity remains in the attention set without claiming that storage is healthy.
+
+### Manual worker cordon
+
+```sh
+uzi worker cordon <id> [-m <reason>]
+uzi worker uncordon <id>
+```
+
+Both commands accept `--json` and act on your persistent hosted or external
+workers. Admin status does not grant access to another owner's worker.
+Run-bound/ephemeral workers return HTTP 409 with
+`manual cordon is only supported for persistent workers`.
+
+Cordon pauses new intake; assigned work can continue subject to existing
+restrictions. It does not cancel runs, end chats or create continuation affinity.
+Uncordon removes the manual hold; automatic drains, maintenance and other fences
+can remain. The manual hold survives registration, roll, restart, deadlines and
+ForceRoll until you explicitly uncordon or delete the worker. Offline status is
+independent.
+
+`-m` (also `--reason`) accepts an optional reason of at most 500 Unicode code
+points before trimming/sanitization; blank reasons become null. Repeating a
+cordon preserves its first actor, time and reason. Repeating uncordon is a
+no-op. These owner writes do not add `worker create` or admin writes.
+
+Both commands return the updated worker DTO under `--json`. Manual metadata is
+`manual_cordoned_at`, `manual_cordoned_by` (actor UUID),
+`manual_cordoned_by_label` (snapshot) and `manual_cordon_reason`.
+`effective_cordoned` reflects the combined intake fences; automatic
+`draining_since`/reason remain separate. The human output shows manual metadata
+and remaining fences. Worker lists and details keep liveness separate from the
+manual annotation.
+
+The Workers page has the same owner controls. Health and admin views remain
+read-only. An idle manually cordoned hosted worker may roll and return cordoned;
+it supplies no serving coverage, and a multi-worker pool without an uncordoned
+provider can remain held. See [manual cordon lifecycle and deployment caveats](./hosted-workers.md#pause-new-work-with-a-manual-cordon),
+including older serving APIs admitting after cordon until their rollout completes
+and older controllers miscounting coverage.
 
 ### Worker lane capacity
 

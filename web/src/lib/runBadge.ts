@@ -16,7 +16,7 @@ import {
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
 import { formatCountdown } from "./limitWait";
-import { stripUnsafeChars } from "./safeText";
+import { stripDisplayCell, stripUnsafeChars } from "./safeText";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
 // color everywhere: queue (queued), neutral (stopped/idle), info
@@ -362,7 +362,7 @@ export function runStatusTone(
   // Recovery holds use warning: transient recovery and worker exhaustion are
   // non-terminal, though exhaustion requires an owner decision.
   if (status === "recovery_wait" || status === "worker_requeue_exhausted" || status === "worker_memory_pressure") return "warning";
-  // PRD #1190: a run its owner paused. INFO, not the warn the involuntary holds carry
+  // PRD #1190: an ordinary paused run. INFO, not the warn the involuntary holds carry
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
   if (status === "paused") return "info";
@@ -485,48 +485,13 @@ export function healthBadge(
     label: `⚠ ${label}${healthSuffix(run, nowMs)}`,
     tone: "warning",
     pulse: true,
-    title: badgeTitle(run.health_reason),
+    title: stripDisplayCell(run.health_reason) || undefined,
   };
 }
 
-/**
- * Issue #124 for the badge TOOLTIP, which is an ATTRIBUTE — and a whole-subtree
- * `container.textContent` assertion cannot see attribute values. That is why this class keeps
- * recurring: text is covered INCIDENTALLY by any subtree assertion, attributes only where
- * someone wrote an explicit check (`Judge.test.tsx` via getByLabelText,
- * `WorkerUpgradeBadge.test.tsx` via `span[title]` — so coverage exists, it is just never free).
- *
- * TWO renderers consume this descriptor, not five. The five `title={…}` badge sites share a
- * `{label, tone, title}` SHAPE, not a constructor:
- *
- *   Board.tsx          <- runBadge()        here            covered
- *   RunHealthBadge.tsx <- healthBadge()     here            covered
- *   JudgeRunBadge.tsx  <- judgeBadge()      judgeBadge.ts   not reached by this fix
- *   WorkerRunBadge.tsx <- workerRunBadge()  workerRuns.ts   not reached by this fix
- *   CIFixRunHeader.tsx <- fixVerdictChip()  fixVerdict.ts   not reached by this fix
- *
- * The three others need nothing TODAY, checked rather than assumed: `judgeBadge` is a closed
- * verdict lookup plus a count; `workerRunBadge` has TWO arms, a template over two numbers and
- * the literal "Holds an active run"; `fixVerdictChip` is four literals. But they are
- * where the next untrusted interpolation would land without a strip, and composing here
- * cannot reach them — so this placement prevents drift between the two constructors it owns,
- * NOT across all five. (An earlier version of this comment claimed the opposite; the drift it
- * said it was preventing is the drift that already exists.)
- *
- * Stripped at the descriptor rather than at the two renderers because this function's output
- * is display-only by construction — never posted back, never a key — so it is still a display
- * transform and not a boundary one.
- *
- * Covers BOTH title sources, which is why the fix does not depend on settling their
- * provenance separately:
- *   - `failure_reason` is worker-supplied and ingest does not strip it
- *     (workersvc `sanitizeFailureReason` is stripNUL + truncate). `service.go` writes
- *     `err.Error()` straight in, and a hostile repo can shape the error an agent fails
- *     with — attacker-influenceable, owner-only audience.
- *   - `health_reason` is server-composed as far as was traced, and NOT exhaustively so.
- *     The CLI already routes it through `sanitizeTTY` (cmd/uzi/run.go), so the web was the
- *     inconsistent side of a decision the CLI had already made.
- */
+// Failure tooltips keep the multiline stripUnsafeChars boundary. Health reasons
+// use stripDisplayCell in healthBadge, including manual cordon attribution. Both
+// descriptors are display-only; raw DTO values remain unchanged.
 function badgeTitle(reason: string | null | undefined): string | undefined {
   const clean = reason ? stripUnsafeChars(reason) : "";
   return clean === "" ? undefined : clean;
@@ -734,7 +699,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         title:
           "Recovery is on hold. Open the run page for details and available actions.",
       };
-    // PRD #1190: a run its owner paused. Info-toned and STATIC (no elapsed on the badge —
+    // PRD #1190: an ordinary paused run. Info-toned and STATIC (no elapsed on the badge —
     // the per-card duration token carries `paused <elapsed>` via runDurationLabel). The
     // "‖" glyph matches StatusPill's "‖ paused" label so one status prints one word on
     // both surfaces (ui.test.tsx label-agreement loop). Unlike the two self-resuming
@@ -745,7 +710,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
         label: `‖ ${PARK_LABELS.paused}`,
         tone: "info",
         pulse: false,
-        title: "Paused by its owner. Resume it from the run page or with `uzi run resume`.",
+        title: "Paused. Resume it from the run page or with `uzi run resume`.",
       };
     case "failed":
       return {

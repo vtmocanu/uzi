@@ -2,6 +2,75 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { noProofReseed } from "./helpers.js";
 import type { GitCache, OwedCandidateContext } from "../src/git.js";
+import type { ClaimResponse, PublicationContextRequest, PublicationContextResponse } from "../src/protocol.js";
+import type { WorkerClient } from "../src/client.js";
+import type { FakeApi } from "./fake-api.js";
+
+/** Explicit historical source authority; only the incoming candidate identity is echoed. */
+export function sourcePublicationContext(
+  runId: string,
+  request: PublicationContextRequest,
+  source: {
+    runId: string;
+    publishedHead: string;
+    mrIid: number;
+    issueIid: number | null;
+    intent: "closing" | "non_closing" | "not_applicable";
+  },
+): PublicationContextResponse {
+  assert.notEqual(source.runId, runId);
+  assert.notEqual(source.publishedHead, request.candidate_head);
+  assert.equal(source.issueIid === null, source.intent === "not_applicable");
+  return {
+    version: 1,
+    status: source.intent === "not_applicable" ? "not_applicable" : "resolved",
+    binding: {
+      run_id: runId,
+      ...request,
+      mr_iid: source.mrIid,
+      source_run_id: source.runId,
+      source_publication: source.intent === "not_applicable" ? null : {
+        version: 1,
+        claim_generation: 1,
+        branch: request.branch,
+        mr_iid: source.mrIid,
+        published_head: source.publishedHead,
+        intent: source.intent,
+        reported_non_closing: source.intent === "non_closing",
+      },
+      issue_iid: source.issueIid,
+      intent: source.intent,
+    },
+  };
+}
+
+/** Opt-in historical authority over HTTP, rebinding each alignment/retry candidate. */
+export function installSourcePublicationContext(
+  api: FakeApi, claim: ClaimResponse, publishedHead: string,
+  issueIid: number | null, intent: "closing" | "non_closing" | "not_applicable",
+): void {
+  assert.ok(claim.claim_generation);
+  api.publicationContextWire = ({ runId, body }) => {
+    assert.equal(runId, claim.run_id);
+    return { status: 200, body: sourcePublicationContext(runId, body as unknown as PublicationContextRequest, {
+      runId: "00000000-0000-4000-8000-000000003120",
+      publishedHead, mrIid: 42, issueIid, intent,
+    }) };
+  };
+}
+
+/** Preserve negotiated capabilities while opting this fixture into refresh publication. */
+export async function enableRefreshPublication(
+  api: FakeApi, client: WorkerClient, claim: ClaimResponse, originPath: string,
+  issueIid: number | null, intent: "closing" | "non_closing" | "not_applicable",
+): Promise<void> {
+  const historicalHead = execFileSync("git", ["-C", originPath, "rev-parse", "main"], { encoding: "utf8" }).trim();
+  installSourcePublicationContext(api, claim, historicalHead, issueIid, intent);
+  api.setRegisterProtocolFeatures([...new Set([
+    ...client.protocolFeatures, "claim_generation_fence", "refresh_publication_context_v1",
+  ])]);
+  await client.register("existing-refresh-fixture");
+}
 
 /** Fresh fixture admission through the same worker-owned tracking transport as production. */
 export async function establishTrackingOwnership(

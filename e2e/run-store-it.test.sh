@@ -271,7 +271,7 @@ for scenario in success optional retained-missing-run retained-missing-pass reta
   for pkg in "${expected_pkgs[@]}"; do
     limit=10m
     if [ "$pkg" = handler ]; then limit=20m; fi
-    if [ "$pkg" = workersvc ]; then limit=30m; fi
+    if [ "$pkg" = workersvc ]; then limit=45m; fi
     printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' \
       "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
     if [ "$scenario" = go-fail ] && [ "$pkg" = forgesvc ]; then break; fi
@@ -348,7 +348,7 @@ for scenario in artifact-success artifact-disabled artifact-go-fail artifact-top
   for pkg in "${expected_pkgs[@]}"; do
     limit=10m
     if [ "$pkg" = handler ]; then limit=20m; fi
-    if [ "$pkg" = workersvc ]; then limit=30m; fi
+    if [ "$pkg" = workersvc ]; then limit=45m; fi
     printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' \
       "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
   done

@@ -1,3 +1,4 @@
+import { enableRefreshPublication } from "./publication-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -275,6 +276,8 @@ describe("RunRunner — history_rewritten typed terminal (PRD #1416 M4)", () => 
       },
     };
     const claim = taskClaim(branch, { kind: "mr_rework", open_mr: true });
+    claim.claim_generation ??= 7;
+    await enableRefreshPublication(api, client, claim, fx.originPath, null, "not_applicable");
     await runner(concurrentAdvance, gitlab).execute(claim).catch(() => undefined);
 
     assert.ok(

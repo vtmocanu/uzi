@@ -267,8 +267,8 @@ export interface RecoveryArchiveClient {
   getExactRecoveryHold?: WorkerClient["getExactRecoveryHold"];
   observeTerminalMaintenanceHold?: WorkerClient["observeTerminalMaintenanceHold"];
   isCurrentTerminalMaintenanceHold?: WorkerClient["isCurrentTerminalMaintenanceHold"];
-  reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse>;
-  reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse>;
+  reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest, signal?: AbortSignal): Promise<RecoveryReconcileResponse>;
+  reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest, signal?: AbortSignal): Promise<RecoveryReserveResponse>;
   getRecoveryCaptureStatus(runId: string, captureId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RecoveryCaptureStatusResponse>;
   uploadRecoveryBundle(
     runId: string,
@@ -285,10 +285,10 @@ export interface RecoveryArchiveClient {
   /** Issue #2625: claim a completed run's archive is redundant with its published branch. Optional
    *  and gated on `recovery_archive_redundancy_v1`; the answer is only ever logged. */
   proveRecoveryArchiveRedundancy?(runId: string, captureId: string, req: RecoveryArchiveRedundancyRequest, signal?: AbortSignal): Promise<RecoveryArchiveRedundancyResponse>;
-  getRunOwnership?(runId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
+  getRunOwnership?(runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
   /** The worker's own open custody holds on a run — the post-clone generation-exact inventory
    *  (PRD #1349 M1/M2, D3). */
-  listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse>;
+  listRecoveryHolds(runId: string, signal?: AbortSignal): Promise<RecoveryHoldsResponse>;
 }
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
@@ -325,6 +325,7 @@ export interface RecoveryBundleProducer {
   produceRecoveryBundle(
     barePath: string,
     opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
+    signal?: AbortSignal,
   ): Promise<RecoveryBundleResult>;
   fetchDefaultTip(
     barePath: string,
@@ -369,6 +370,8 @@ export interface FrozenOperationOptions {
 }
 
 export interface CaptureInput {
+  /** Transient notification after actual upload and authenticated readback; never serialized. */
+  onArchiveAccepted?: (record: RecoveryRecord) => void;
   /** Foreground attempts hand their first observed cancellation back to the flight. Never serialized. */
   onCancellationObserved?: () => MaintenanceBudget;
   record: RecoveryRecord;
@@ -726,8 +729,10 @@ function maintenanceSignalArgs(): [] | [AbortSignal] {
 /** Owned operations settle before their lock or child ownership can be released. */
 async function ownedRecoveryIO<T>(action: () => T | Promise<T>): Promise<T> {
   MaintenanceBudget.current()?.check();
+  MaintenanceBudget.ownedSignal()?.throwIfAborted();
   const value = await action();
   MaintenanceBudget.current()?.check();
+  MaintenanceBudget.ownedSignal()?.throwIfAborted();
   return value;
 }
 
@@ -926,6 +931,7 @@ export class RecoveryCoordinator {
   /** In-flight passes (the boot sweep, a live pass): {@link resumeLive} is a no-op while non-empty. */
   private readonly passes = new Set<Promise<void>>();
   private readonly passShutdown = new AbortController();
+  private readonly passSignal = new AsyncLocalStorage<AbortSignal>();
   /** The earliest time the next live pass may run (the coordinator's `now()` clock). */
   private nextPassAt = 0;
   /** issue #2213: the quarantine skip of a live pass is logged once. */
@@ -1215,7 +1221,7 @@ export class RecoveryCoordinator {
       if (!(await this.openInventoryHold(probe))) return undefined;
       let exactHoldBinding: RecoveryRecord["exactHoldBinding"];
       if (input.repoId && this.client.getExactRecoveryHold) {
-        const response = await this.recoveryRPC(() => this.client.listRecoveryHolds(context.runId));
+        const response = await this.recoveryRPC(() => this.client.listRecoveryHolds(context.runId, ...this.passSignalArgs()));
         const holds = response.run_id === context.runId && Array.isArray(response.holds)
           ? response.holds.filter(h => h.generation === context.generation && h.inventory_guarded === true) : [];
         if (holds.length === 1 && HELD_PUBLICATION_ID_RE.test(holds[0]!.hold_id) && HELD_PUBLICATION_ID_RE.test(input.repoId)) {
@@ -1234,7 +1240,7 @@ export class RecoveryCoordinator {
         MaintenanceBudget.current()?.check();
         if (input.settledEvidence === "publication") {
           try {
-            const own = await this.recoveryRPC(() => this.client.getRunOwnership!(context.runId));
+            const own = await this.recoveryRPC(() => this.client.getRunOwnership!(context.runId, ...this.passSignalArgs()));
             if (own.status === "cancelled" && own.claim_generation === context.generation && own.inventory_guarded === true) MaintenanceBudget.observeCancellation();
             if (own.status !== "completed" || own.claim_generation !== context.generation || own.inventory_guarded !== true) return undefined;
           } catch { MaintenanceBudget.current()?.check(); return undefined; }
@@ -1388,7 +1394,7 @@ export class RecoveryCoordinator {
     if (!this.client.getRunOwnership) return "ownership_unsupported";
     if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0) return "generation";
     let own;
-    try { own = await this.recoveryRPC(() => this.client.getRunOwnership!(record.runId)); }
+    try { own = await this.recoveryRPC(() => this.client.getRunOwnership!(record.runId, ...this.passSignalArgs())); }
     catch (err) { MaintenanceBudget.current()?.check();
       if (!isRunOwnershipLost(err, record.runId)) return "ownership_lookup_failed";
       // A MAC-authenticated immutable FINAL may only replay; new work needs the exact open hold.
@@ -1411,7 +1417,7 @@ export class RecoveryCoordinator {
    *  missing or non-boolean flag, a bad generation or a foreign run throws instead of reading as "no
    *  guarded hold". Callers use it where absence would release or unprotect custody. */
   private async guardedHolds(runId: string): Promise<Array<{ generation: number }>> {
-    const response = await this.recoveryRPC(() => this.client.listRecoveryHolds(runId));
+    const response = await this.recoveryRPC(() => this.client.listRecoveryHolds(runId, ...this.passSignalArgs()));
     if (!response || response.run_id !== runId || !Array.isArray(response.holds)) throw new Error("malformed recovery holds response");
     const out: Array<{ generation: number }> = [];
     for (const h of response.holds as unknown[]) {
@@ -1477,7 +1483,7 @@ export class RecoveryCoordinator {
 
   private async openInventoryHold(record: Pick<RecoveryRecord, "runId" | "generation">): Promise<boolean> {
     if (!this.client.hasFeature?.("recovery_inventory_v1") || !Number.isSafeInteger(record.generation) || record.generation! <= 0) return false;
-    const response = await this.recoveryRPC(() => this.client.listRecoveryHolds(record.runId));
+    const response = await this.recoveryRPC(() => this.client.listRecoveryHolds(record.runId, ...this.passSignalArgs()));
     return response.run_id === record.runId && Array.isArray(response.holds) &&
       response.holds.filter(h => h.generation === record.generation && h.inventory_guarded === true &&
         typeof h.hold_id === "string" && h.hold_id.length > 0).length === 1;
@@ -2117,7 +2123,7 @@ export class RecoveryCoordinator {
       const response = await this.recoveryRPC(() => this.client.reconcileRecoveryCapture!(record.runId, record.serverCaptureId!, {
         generation: record.generation!, source_sha: record.sourceSha, coverage_digest: record.coverageDigest!,
         checksum: record.checksum!, byte_size: record.byteSize!,
-      }));
+      }, ...this.passSignalArgs()));
       if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
       if (!response || typeof response !== "object" || Array.isArray(response) ||
           response.run_id !== record.runId || response.generation !== record.generation ||
@@ -2230,14 +2236,14 @@ export class RecoveryCoordinator {
               await this.heldOperationState(trusted);
             } else if (trusted.exactHoldBinding) {
               const binding = trusted.exactHoldBinding;
-              const exact = await this.recoveryRPC(() => this.client.getExactRecoveryHold?.(trusted.runId, trusted.generation!, binding));
+              const exact = await this.recoveryRPC(() => this.client.getExactRecoveryHold?.(trusted.runId, trusted.generation!, binding, ...this.passSignalArgs()));
               if (exact && exact.run_id === trusted.runId && exact.generation === trusted.generation &&
                   exact.hold_id === binding.holdId && exact.repo_id === binding.repoId &&
                   exact.inventory_guarded === true && ["open", "released", "discarded"].includes(exact.state) &&
                   exact.run_status === "cancelled" && Number.isSafeInteger(exact.current_claim_generation) &&
                   exact.current_claim_generation >= trusted.generation!) MaintenanceBudget.observeCancellation();
             } else {
-              const own = await this.recoveryRPC(() => this.client.getRunOwnership?.(trusted.runId));
+              const own = await this.recoveryRPC(() => this.client.getRunOwnership?.(trusted.runId, ...this.passSignalArgs()));
               if (own && own.status === "cancelled" && Number.isSafeInteger(own.claim_generation) &&
                   typeof trusted.generation === "number" && own.claim_generation! >= trusted.generation &&
                   (!trusted.inventoryGuarded || own.inventory_guarded === true)) MaintenanceBudget.observeCancellation();
@@ -2251,8 +2257,10 @@ export class RecoveryCoordinator {
           return result;
         };
         const budget = MaintenanceBudget.current();
-        return budget && this.git.withRecoveryOperation
-          ? this.git.withRecoveryOperation(budget.signal, Infinity, run) : run();
+        const passSignal = this.passSignal.getStore();
+        const signal = passSignal ? maintenanceSignal(passSignal) : budget?.signal;
+        return signal && this.git.withRecoveryOperation
+          ? this.git.withRecoveryOperation(signal, Infinity, run) : run();
       });
     } finally { owned?.dispose(); }
   }
@@ -2351,7 +2359,7 @@ export class RecoveryCoordinator {
       } catch { MaintenanceBudget.current()?.check(); /* Unknown terminal eligibility retains the archive policy. */ }
     } else if (!options.foreground) {
       try {
-        const own = await this.recoveryRPC(() => this.client.getRunOwnership?.(record.runId));
+        const own = await this.recoveryRPC(() => this.client.getRunOwnership?.(record.runId, ...this.passSignalArgs()));
         if (own?.status === "cancelled" && own.inventory_guarded === true && Number.isSafeInteger(own.claim_generation) && own.claim_generation! >= record.generation!) MaintenanceBudget.observeCancellation();
         terminal = own && Number.isSafeInteger(own.claim_generation) &&
           own.claim_generation! >= record.generation! &&
@@ -2530,7 +2538,7 @@ export class RecoveryCoordinator {
       if (ctx.generation === null || !("kind" in ctx) || ctx.kind === null ||
           (this.isExecuting(ctx.runId) || isExecuting(ctx.runId)) || !this.client.hasFeature?.("recovery_inventory_v1")) continue;
       try {
-        const hold = (await this.recoveryRPC(() => this.client.listRecoveryHolds(ctx.runId))).holds.find(h =>
+        const hold = (await this.recoveryRPC(() => this.client.listRecoveryHolds(ctx.runId, ...this.passSignalArgs()))).holds.find(h =>
           h.generation === ctx.generation && h.inventory_guarded === true);
         if (!hold || !this.client.getRunOwnership) continue; // closed/discarded never reopened
         const existing = await this.newReconstructionRecords(ctx.runId, ctx.generation);
@@ -2700,7 +2708,9 @@ export class RecoveryCoordinator {
       }
       const outcome = await this.uploadJournaledBundle(record, input.signal, "capture");
       if (record.inventoryGuarded && outcome.state === "uploaded") {
-        const finalOutcome = await this.finalizeInventory(await this.requireRecord(record), false);
+        record = await this.requireRecord(record);
+        input.onArchiveAccepted?.(record);
+        const finalOutcome = await this.finalizeInventory(record, false);
         if (finalOutcome) return finalOutcome;
       }
       return outcome;
@@ -2762,7 +2772,7 @@ export class RecoveryCoordinator {
         sourceSha: record.sourceSha,
         outPath: tmpPath,
         ...(record.inventoryGuarded ? { guardedDefaultBranch: input.defaultBranch } : { forgeTip }),
-      }));
+      }, maintenanceSignal(input.signal)));
     } catch (err) { MaintenanceBudget.current()?.check();
       await ownedRecoveryIO(() => fs.rm(tmpPath, { force: true })).catch(() => undefined);
       if (err instanceof RecoveryBundleTooLargeError) {
@@ -2907,7 +2917,7 @@ export class RecoveryCoordinator {
           // Bind the reserve to the EXACT generation's hold (PRD #1349 M2, D1); a v1 record with
           // no generation omits it and the server falls back to the newest-hold reserve.
           ...(current.generation !== undefined ? { generation: current.generation } : {}),
-        }));
+        }, ...maintenanceSignalArgs()));
       } catch (err) { MaintenanceBudget.current()?.check();
         return this.failUpload(current, err, signal, mode);
       }
@@ -3173,7 +3183,7 @@ export class RecoveryCoordinator {
   async inventoryHolds(runId: string): Promise<RecoveryHold[]> {
     if (!this.enabled) return [];
     try {
-      const res = await this.recoveryRPC(() => this.client.listRecoveryHolds(runId));
+      const res = await this.recoveryRPC(() => this.client.listRecoveryHolds(runId, ...this.passSignalArgs()));
       return res.holds ?? [];
     } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: prior-hold inventory failed (custody unchanged)", {
@@ -3242,7 +3252,7 @@ export class RecoveryCoordinator {
     signal = signal ? AbortSignal.any([signal, this.passShutdown.signal]) : this.passShutdown.signal;
     // issue #1995: installed SYNCHRONOUSLY (before the first await) so a heartbeat-driven
     // resumeLive can never overlap the boot sweep: it returns at once while any pass is in flight.
-    return this.trackPass(() => this.resumePendingPass(signal, snapshot, discover));
+    return this.trackPass(signal, () => this.resumePendingPass(signal, snapshot, discover));
   }
 
   /** Register before the runner releases its exact local tail. The observation selects
@@ -3252,7 +3262,7 @@ export class RecoveryCoordinator {
     if (!this.enabled || this.passShutdown.signal.aborted || signal?.aborted ||
         residueQuarantine() !== undefined) return Promise.resolve();
     const passSignal = signal ? AbortSignal.any([signal, this.passShutdown.signal]) : this.passShutdown.signal;
-    return this.trackPass(async () => {
+    return this.trackPass(passSignal, async () => {
       // Join actual settlement even if shutdown arrives while the execution still owns work.
       const observation = await tail;
       if (passSignal.aborted || residueQuarantine() !== undefined || !observation ||
@@ -3269,37 +3279,56 @@ export class RecoveryCoordinator {
             Number.isSafeInteger(source.generation) && source.generation > 0 && source.generation <= generation && !!source.identity) ||
           !family.originals.some(source => source.generation === observation.genesis.generation &&
             source.clonePath === observation.genesis.clonePath && source.attemptId === observation.genesis.attemptId)) return;
-      const attempts = new Map<string, MaintenanceBudget>();
-      try {
-        await this.savedEvidenceOnly.run({ signal: passSignal, entries: 0, bytes: 0, exhausted: false }, async () => {
-          const records = await this.savedSourceCandidates(runId, passSignal);
-          // One bounded candidate snapshot, one attempt per record. Unreadable siblings
-          // may be skipped; shared exhaustion denies the rest of this pass.
-          // Discovery ends before fresh replay proofs.
-          for (const snap of records) {
-            if (this.savedEvidenceOnly.getStore()!.exhausted || passSignal.aborted ||
-                residueQuarantine() !== undefined || this.isExecuting(runId)) break;
-            if (!this.finalRetryReady(snap)) continue;
-            try {
-              await this.withCancellationAttempt(snap, async () =>
-                runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
-                  if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) return;
-                  const current = await this.readRecord(this.recordPath(snap));
-                  if (!current || !this.savedSourceCandidate(current) || !this.finalRetryReady(current)) return;
-                  await this.pendingStep(current, passSignal, "terminal_source");
-                }), attempts);
-            } catch {
-              this.log.warn("recovery: terminal saved evidence retained");
-            }
-          }
-        });
-      } finally { for (const budget of attempts.values()) budget.dispose(); }
+      await this.replayTerminalEvidence(runId, passSignal);
       // Replay gets the first opportunity. A separate COMPLETE view below decides
       // whether a new origin is admissible; the advisory saved snapshot never does.
       if (!this.terminalOriginAdmissionEnabled()) return;
       if (observation.originalContext) await M1MaintenanceResources.runDiscoveryPass(
         () => this.admitTerminalOrigin(observation, passSignal), { signal: passSignal });
     });
+  }
+
+  /** Saved evidence only: no source observation conveys producer eligibility here. */
+  resumeTerminalEvidence(runId: string, tail: Promise<ClosedSourceObservation | void>, generation: number,
+    signal?: AbortSignal): Promise<void> {
+    if (!this.enabled || this.passShutdown.signal.aborted || signal?.aborted ||
+        residueQuarantine() !== undefined) return Promise.resolve();
+    const passSignal = signal ? AbortSignal.any([signal, this.passShutdown.signal]) : this.passShutdown.signal;
+    return this.trackPass(passSignal, async () => {
+      await tail;
+      if (passSignal.aborted || residueQuarantine() !== undefined ||
+          !/^[a-zA-Z0-9_-]{1,128}(?![\s\S])/.test(runId) ||
+          !Number.isSafeInteger(generation) || generation <= 0) return;
+      await this.replayTerminalEvidence(runId, passSignal);
+    });
+  }
+
+  private async replayTerminalEvidence(runId: string, passSignal: AbortSignal): Promise<void> {
+    const attempts = new Map<string, MaintenanceBudget>();
+    try {
+      await this.savedEvidenceOnly.run({ signal: passSignal, entries: 0, bytes: 0, exhausted: false }, async () => {
+        const records = await this.savedSourceCandidates(runId, passSignal);
+        // One bounded candidate snapshot, one attempt per record. Unreadable siblings
+        // may be skipped; shared exhaustion denies the rest of this pass.
+        // Discovery ends before fresh replay proofs.
+        for (const snap of records) {
+          if (this.savedEvidenceOnly.getStore()!.exhausted || passSignal.aborted ||
+              residueQuarantine() !== undefined || this.isExecuting(runId)) break;
+          if (!this.finalRetryReady(snap)) continue;
+          try {
+            await this.withCancellationAttempt(snap, async () =>
+              runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
+                if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) return;
+                const current = await this.readRecord(this.recordPath(snap));
+                if (!current || !this.savedSourceCandidate(current) || !this.finalRetryReady(current)) return;
+                await this.pendingStep(current, passSignal, "terminal_source");
+              }), attempts);
+          } catch {
+            this.log.warn("recovery: terminal saved evidence retained");
+          }
+        }
+      });
+    } finally { for (const budget of attempts.values()) budget.dispose(); }
   }
 
   /** Production always reads the fixed guard; only tests substitute this method to exercise the
@@ -3580,15 +3609,26 @@ export class RecoveryCoordinator {
     }
   }
 
+  private passSignalArgs(): [] | [AbortSignal] {
+    const signal = this.passSignal.getStore();
+    return signal ? [maintenanceSignal(signal)!] : [];
+  }
+
   /** RPCs can finish remotely after cancellation; their late answers grant no local authority.
    * An exhausted saved metadata view cannot dispatch another RPC even through a catch/fallback. */
   private async recoveryRPC<T>(action: () => T | Promise<T>): Promise<T> {
     this.checkSavedMetadata();
     const budget = MaintenanceBudget.current();
-    const value = await (budget ? budget.raceIO(async () => action()) : action());
-    MaintenanceBudget.current()?.check();
-    this.checkSavedMetadata();
-    return value;
+    const passSignal = this.passSignal.getStore();
+    const signal = passSignal ? maintenanceSignal(passSignal) : undefined;
+    signal?.throwIfAborted();
+    return MaintenanceBudget.runResponseRPC(async () => {
+      const value = await (budget && !passSignal ? budget.raceIO(async () => action()) : action());
+      signal?.throwIfAborted();
+      MaintenanceBudget.current()?.check();
+      this.checkSavedMetadata();
+      return value;
+    });
   }
 
   /** Issue #3031: the one async scope in which a producer-origin record may be advanced. Exactly the
@@ -3602,6 +3642,7 @@ export class RecoveryCoordinator {
   /** Volatile, deny-only accounting shared by discovery and every nested journal reopen.
    * It adds no deadline; existing discovery, caller and cancellation clocks still apply. */
   private checkSavedMetadata(resource?: "entries" | "bytes", amount = 0): void {
+    this.passSignal.getStore()?.throwIfAborted();
     M1MaintenanceResources.checkIfActive();
     const pass = this.savedEvidenceOnly.getStore();
     if (!pass) return;
@@ -3689,10 +3730,20 @@ export class RecoveryCoordinator {
   }
 
   /** Install ownership synchronously before dispatch, including reentrant shutdown from hooks. */
-  private trackPass(fn: () => Promise<void>): Promise<void> {
-    const pass = Promise.resolve().then(() => {
-      if (this.passShutdown.signal.aborted) return;
-      return fn();
+  private trackPass(callerSignal: AbortSignal | undefined, fn: () => Promise<void>): Promise<void> {
+    const signal = AbortSignal.any([this.passShutdown.signal, ...(callerSignal ? [callerSignal] : [])]);
+    const pass = Promise.resolve().then(async () => {
+      if (signal.aborted) return;
+      try {
+        await this.passSignal.run(signal, () => {
+          // Adopt a Git-inherited caller budget before owned cancellation is installed,
+          // so runOwned isolates it even when the budget scope is not yet active.
+          const run = () => MaintenanceBudget.runOwned(signal, fn);
+          return this.git.withRecoveryOperation ? this.git.withRecoveryOperation(signal, Infinity, run) : run();
+        });
+      } catch (error) {
+        if (!signal.aborted) throw error;
+      }
     });
     this.passes.add(pass);
     return pass.finally(() => {
@@ -3920,7 +3971,7 @@ export class RecoveryCoordinator {
           sourceSha: record.sourceSha,
           outPath: tmpPath,
           forgeTip: undefined,
-        }));
+        }, maintenanceSignal(signal)));
       } catch (err) { MaintenanceBudget.current()?.check();
         await ownedRecoveryIO(() => fs.rm(tmpPath, { force: true })).catch(() => undefined);
         const reason = err instanceof RecoveryBundleTooLargeError ? "oversized" : "bundle_failed";
@@ -3978,7 +4029,7 @@ export class RecoveryCoordinator {
       return;
     }
     if (this.now() < this.nextPassAt) return;
-    await this.trackPass(() => this.livePass(opts));
+    await this.trackPass(opts.signal, () => this.livePass(opts));
   }
 
   private async livePass(opts: ResumeLiveOptions): Promise<void> {

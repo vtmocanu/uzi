@@ -11,8 +11,8 @@ const harness = path.join(repo, "e2e/worker-uid");
 const suite = "Unit2 runner source capture";
 const file = "agent/test/git-planning-diff.test.ts";
 const leaves = [
-  "cancels while the object-store snapshot streams and leaves no temp tree",
-  "cancels while many tiny object files are copied and leaves no temp tree",
+  "cancels during worktree comparisons and leaves no temp tree",
+  "cancels while many tiny worktree entries are walked and leaves no temp tree",
   "never reads a symlink target's content",
   "reads each symlink only through its still-open pinned parent descriptor",
   "refuses a leaf swapped to a regular file before readlink without resolving the pathname",
@@ -20,13 +20,16 @@ const leaves = [
   "captures an unchanged tracked symlink tree as an empty patch",
   "captures edits elsewhere next to unchanged tracked symlinks",
   "treats a symlinked .gitignore as absent while the path stays a candidate",
+  "reads loose trusted bare objects as the real runner uid without write authority",
+  "reads packed trusted bare objects as the real runner uid without write authority",
+  "captures under the enforced required command sandbox",
 ];
 type Identity = { file: string; names: string[] };
 const expected: Identity[] = leaves.map(leaf => ({ file, names: [suite, leaf] }));
 const declarations = leaves.map(leaf => `it(${JSON.stringify(leaf)}, () => {});`);
 const wrap = (body: string, title = JSON.stringify(suite)) => `describe(${title}, () => { ${body} });`;
 
-it("worker UID inventory requires exactly nine literal capture leaves and preserves UID gates", async () => {
+it("worker UID inventory requires exactly twelve literal capture leaves and preserves UID gates", async () => {
   const { inventoryForSource } = await import(new URL("../../e2e/worker-uid/inventory.mjs", import.meta.url).href);
   mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
   const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/worker-uid-inventory."));
@@ -34,7 +37,6 @@ it("worker UID inventory requires exactly nine literal capture leaves and preser
   try {
     const fixtures: { name: string; source: string; error?: RegExp; uid?: boolean }[] = [
       { name: "exact", source: wrap(declarations.join("\n") + `
-        it("captures under the enforced required command sandbox", () => {});
         for (const scenario of ["one", "two"]) it("generated " + scenario, () => {});
         it(` + "`generated ${scenario}`" + `, () => {});
       `) + wrap(declarations.join("\n"), JSON.stringify("Unit2 bounded runner stdout transport")) },
@@ -92,7 +94,7 @@ it("worker UID inventory requires exactly nine literal capture leaves and preser
       assert.equal(pattern.test(`${suite} ${leaf} suffix`), false);
       assert.equal(pattern.test(`Unit2 bounded runner stdout transport ${leaf}`), false);
     }
-    for (const leaf of ["captures under the enforced required command sandbox", "generated one",
+    for (const leaf of ["generated one",
       leaves[8]!.replace(".gitignore", "Xgitignore")]) {
       assert.equal(pattern.test(`${suite} ${leaf}`), false, leaf);
     }

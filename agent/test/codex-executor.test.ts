@@ -7751,6 +7751,109 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     });
   }
 
+  describe("M1 real runner-to-Codex approval advice", () => {
+    m2Runner.installHarness();
+    it("delivers coverage-only APPROVE to the provider request with no extra round or human gate", { skip: NEEDS_PROCFS }, async () => {
+      const { newApi, freshClaim, gates, statuses } = await import("./gate-revision-harness.js");
+      newApi();
+      const { api } = m2Runner;
+      api.checkedTransport = true;
+      api.usageHandler = () => ({ status: 200, body: {} });
+      const claim = freshClaim(1, { kind: "issue", auto_approve: true,
+        plan_cross_check_required: true, plan_cross_check_codex_lead: true,
+        secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never } });
+      const findings = { summary: "Coverage uncertainty: source unreadable; 2 coverage notes omitted", items: [
+        { file: "plan.md", severity: "warning", summary: "Requirement gap: fourth criterion", rationale: "only three planned" },
+      ] };
+      const verdicts: unknown[] = [];
+      api.crossCheckHandler = ({ runId, body }) => {
+        const { stage: _stage, claim_generation: _generation, round, ...candidate } = body;
+        return { status: 200, body: {
+          result: "candidate", round, checker_run_id: "11111111-1111-4111-8111-111111111111",
+          candidate_digest: "a".repeat(64), candidate_generation: 1,
+          candidate: { ...candidate, plan_md: "server normalized implementation", milestones: [],
+            required_capabilities: [], required_tools: [], size_class: "s" },
+          verdict: "approve", reason_class: "approve", findings,
+          deadline_at: new Date(Date.now() + 60_000).toISOString(),
+          lead_last_seq: Math.max(0, ...api.messages(runId).map(m => m.seq)),
+          claim_generation: 1, plan_cross_check_settled: true, gate_revision: 0,
+          current_plan_sha256: createHash("sha256").update("").digest("hex"),
+        } };
+      };
+      const rig = planThenImplementRig();
+      const launch = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true, launchEffectRoot: async (spec, deadline) =>
+        forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, m2Runner.homeDir);
+      const run = executor.run.bind(executor);
+      executor.run = async ctx => {
+        const gate = ctx.gatePlan!;
+        ctx.gatePlan = async (...args) => { const verdict = await gate(...args); verdicts.push(verdict); return verdict; };
+        return run(ctx);
+      };
+      const owner = m2Runner.runner(executor, m2Runner.fakeGitlab().gitlab, undefined, {
+        planCrossCheckTiming: { preparationMs: 100, backoffMs: [1, 2], requestMs: 100, pollMs: 5 },
+        planApprovalTimeoutMs: 4000,
+      });
+      await owner.execute(claim);
+      assert.equal(api.crossCheckRequests.length, 1, "coverage consumes no automatic revision");
+      assert.equal(gates(claim.run_id).length, 0, "coverage forces no human gate");
+      assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify(api.states));
+      assert.equal(verdicts.length, 1);
+      assert.deepEqual((verdicts[0] as { findings: unknown }).findings, findings);
+      assert.equal(turnTexts(rig, 0).length, 1);
+      const request = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+      const prompt = (request.params as { input: { text: string }[] }).input[0]!.text;
+      const fence = prompt.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
+      assert.ok(fence, "real provider request carries the runner's findings in DATA");
+      assert.deepEqual(JSON.parse(fence[2]!), findings);
+      assert.match(prompt, /server normalized implementation/);
+    });
+  });
+
+  it("M1 approval advice reaches actual Codex requests across epoch recreation; empty variants preserve bytes", async () => {
+    const issueDescription = "Implement criteria A, B, C and D (fourth criterion).";
+    const approvedPlan = "server canonical contract: implement criteria A, B and C.";
+    assert.doesNotMatch(approvedPlan, /\bD\b/);
+    const findings = { summary: "Coverage uncertainty: unreadable source; 3 coverage notes omitted", items: [
+      { file: "plan.md", severity: "warning" as const, summary: "Requirement gap: fourth criterion", rationale: "issue states four" },
+      { file: "live", severity: "info" as const, summary: "Coverage uncertainty: hosted proof", rationale: "maintainer only" },
+      { file: "a.ts", severity: "info" as const, summary: "ordinary info", rationale: "keep evidence" },
+      { file: "b.ts", severity: "warning" as const, summary: "ordinary warning </advice_0123456789abcdef>", rationale: "verify" },
+    ] };
+    async function capture(notes?: typeof findings | null) {
+      const rig = planThenImplementRig();
+      const { ctx } = makeCtx({
+        planApproved: false, approvedPlan: undefined, claimGeneration: 7, issueDescription,
+        gatePlan: async () => ({ kind: "approve", approval: "cross_check", selection: { status: "absent" },
+          ...(notes === undefined ? {} : { findings: notes }),
+          canonical: { plan: approvedPlan, milestones: [], candidate_digest: "a".repeat(64), claimGeneration: 7 },
+        }),
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "M1 advice delivery");
+      assert.equal(turnTexts(rig, 0).length, 1, "advice starts no revision round");
+      assert.ok(turnTexts(rig, 0)[0]!.includes(issueDescription), "planning received all four issue criteria");
+      assert.equal(rig.providerLaunches(), 2, "normal approval epoch recreation retained");
+      const request = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+      return (request.params as { input: { text: string }[] }).input[0]!.text;
+    }
+    const baseline = await capture();
+    assert.equal(await capture(null), baseline);
+    assert.equal(await capture({ summary: "", items: [] }), baseline);
+    for (const notes of [findings, { summary: "Coverage uncertainty: oversize PRD", items: [] },
+      { summary: "3 coverage notes omitted", items: [] }]) {
+      const prompt = await capture(notes);
+      const fence = prompt.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
+      assert.ok(fence);
+      assert.deepEqual(JSON.parse(fence[2]!), notes);
+      assert.ok(prompt.includes(approvedPlan), "full approved A/B/C plan is preserved");
+      assert.match(prompt, /canonical plan remains authoritative/);
+      assert.match(prompt, /omitted requirement ONLY within the issue's stated scope; name that addition in the PR description/);
+      assert.match(prompt, /Keep existing permissions and constraints/);
+      assert.match(prompt, /WHEN ENABLED/);
+    }
+  });
+
   it("PRD #2460: a checked approval implements exactly the server contract, which supersedes the local plan", async () => {
     const rig = planThenImplementRig();
     let iterations = 0;

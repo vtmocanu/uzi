@@ -1648,6 +1648,8 @@ for (const wip of [false, true]) {
         fs.writeFileSync(path.join(source.clonePath, ".git", "info", "attributes"),
           "README.md filter=successorproof\n");
         // Real Git reachability control in the owned predecessor fixture, then clear.
+        // Checkout skips a stat-clean index entry, so remove the files to force the smudge.
+        for (const name of ["work.txt", "README.md"]) fs.rmSync(path.join(source.clonePath, name));
         git(source.clonePath, ["checkout", "--force", "HEAD", "--", "work.txt", "README.md"]);
         assert.ok(fs.readFileSync(filter.marker, "utf8").includes(source.clonePath), "local filter control executed");
         assert.ok(fs.readFileSync(hook.marker, "utf8").includes(source.clonePath), "local hook control executed");

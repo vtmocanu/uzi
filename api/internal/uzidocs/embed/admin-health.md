@@ -6,7 +6,7 @@ audience: operator
 
 # Admin health
 
-Admin health ([PRD #1484](../prds/1484-admin-health-tab.md)) is a read-only,
+Admin health ([PRD #1484](../prds/done/1484-admin-health-tab.md)) is a read-only,
 admin-only diagnostic of what uzi itself can tell about its own ability to run
 work: worker rolls and capacity, the queue, the controller's own liveness,
 background loops, the database, integrations, and a handful of housekeeping

@@ -501,8 +501,8 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
     result("1-cli", { sdkInit: lead.initVersion });
     // A bump of either pin invalidates this proof: re-run M0 for the new SDK before changing the pins.
     const sdkPkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json"), "utf8")) as { version: string };
-    assert.equal(sdkPkg.version, "0.3.293", "installed SDK package version changed: re-run M0 for the new SDK");
-    assert.equal(lead.initVersion, "2.1.293", "bundled CLI version changed: re-run M0 for the new SDK");
+    assert.equal(sdkPkg.version, "0.3.301", "installed SDK package version changed: re-run M0 for the new SDK");
+    assert.equal(lead.initVersion, "2.1.301", "bundled CLI version changed: re-run M0 for the new SDK");
     for (const r of [lead, inherit, explicit]) {
       result("1-offered", {
         scenario: r.name,

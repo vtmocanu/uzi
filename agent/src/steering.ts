@@ -63,6 +63,8 @@ export type PlanVerdict =
   | {
       kind: "approve";
       approval: "cross_check";
+      /** Worker-local, best-effort advice; never part of the canonical bundle. */
+      findings?: PlanCrossCheckFindings | null;
       selection: AgentSelectionParse;
       /** One server-normalized candidate, delivered only after exact approval and durable applied ACK.
        * Consumers must adopt plan and milestones together; no local candidate fallback. */

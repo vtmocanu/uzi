@@ -30,9 +30,10 @@ import (
 // Issue.UnmarshalJSON panics on a missing id). The protMode enum and guardBotUserID
 // are shared with repo_enable_guardrail_livedb_test.go (same package).
 type startRunFakeForge struct {
-	server *httptest.Server
-	mu     sync.Mutex
-	prot   map[int64]protMode
+	server         *httptest.Server
+	mu             sync.Mutex
+	prot           map[int64]protMode
+	oversizedIssue bool
 }
 
 func newStartRunFakeForge(t *testing.T) *startRunFakeForge {
@@ -72,6 +73,14 @@ func newStartRunFakeForge(t *testing.T) *startRunFakeForge {
 				})
 			}
 		case strings.Contains(path, "/issues/"):
+			fg.mu.Lock()
+			oversized := fg.oversizedIssue
+			fg.mu.Unlock()
+			if oversized {
+				w.(http.Flusher).Flush()
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001, "iid": 7, "description": strings.Repeat("RAW_OVERSIZED", (2<<20)/13+1)})
+				return
+			}
 			// StartRunForUser's forge GetIssue snapshot. Must carry an "id" or the
 			// client-go Issue.UnmarshalJSON panics.
 			_ = json.NewEncoder(w).Encode(map[string]any{

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { WorkerClient, readRunAck } from "../src/client.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { MaintenanceResources } from "../src/recovery-maintenance.js";
 import { nullLogger } from "./helpers.js";
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -310,4 +311,94 @@ test("legacy four-argument release remains compatible without an ambient budget"
   });
   assert.deepEqual(await client.releaseRecoveryCustody("run", 7, "publication", undefined), { holds_released: 1 });
   assert.deepEqual(sent, { generation: 7, release_evidence: "publication" });
+});
+
+test("owned recovery query joins cancellation of an unsupported discovery response body", async () => {
+  const cancelling = deferred<void>(), release = deferred<void>();
+  let settled = false, sourceSettled = false;
+  const body = new ReadableStream<Uint8Array>({
+    async cancel() {
+      cancelling.resolve();
+      await release.promise;
+      sourceSettled = true;
+    },
+  }, { highWaterMark: 0 });
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+    fetch: async () => new Response(body),
+  });
+  const controller = new AbortController();
+  const operation = MaintenanceBudget.runOwned(controller.signal, () =>
+    MaintenanceResources.runDiscovery(() => client.listRecoveryHolds("run")))
+    .then(value => ({ value }), error => ({ error }))
+    .finally(() => { settled = true; });
+  try {
+    await cancelling.promise;
+    await tick();
+    assert.equal(settled, false, "owned body refusal returned before source cancellation settled");
+  } finally {
+    release.resolve();
+    await operation;
+  }
+  assert.equal(sourceSettled, true);
+  assert.ok("error" in await operation, "unsupported byte stream remains a refusal");
+});
+
+for (const operation of ["default POST", "bounded GET", "custom hold", "marker refusal"] as const) {
+  test(`owned response handoff joins cleanup at RPC boundary: ${operation}`, async t => {
+    const controller = new AbortController();
+    const cancelling = deferred<void>(), release = deferred<void>();
+    const budget = new MaintenanceBudget();
+    t.after(() => budget.dispose());
+    let cancellations = 0, rpcSettled = false;
+    const body = new ReadableStream<Uint8Array>({
+      async cancel() { cancellations++; cancelling.resolve(); await release.promise; },
+    }, { highWaterMark: 0 });
+    const response = new Response(body, { headers: operation === "marker refusal"
+      ? { "X-Uzi-Candidate-Identity-Version": "unknown" } : {} });
+    // Status is first inspected by the RPC caller after maintenanceFetch has returned.
+    Object.defineProperty(response, "status", { get() {
+      if (operation !== "marker refusal") controller.abort(new Error("handoff stopped"));
+      return 200;
+    } });
+    const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), { fetch: async () => response });
+    const pending = MaintenanceBudget.runOwned(controller.signal, () => MaintenanceBudget.run(budget, () =>
+      MaintenanceBudget.runResponseRPC(async () => {
+        if (operation === "default POST") return client.register("worker");
+        if (operation === "custom hold") return client.listRecoveryHolds("run");
+        return client.getRunOwnership("run");
+      }).finally(() => { rpcSettled = true; })))
+      .then(value => ({ value }), error => ({ error }));
+    try {
+      await Promise.race([cancelling.promise, pending]);
+      await tick();
+      assert.equal(rpcSettled, false, "RPC propagated failure before joining requested response cancellation");
+      assert.equal(body.locked, false, "pre-reader refusal must cancel the body directly");
+    } finally { release.resolve(); await pending; }
+    assert.equal(cancellations, 1, "RPC and pass finalizers share the first cancellation");
+    assert.ok("error" in await pending);
+  });
+}
+
+test("owned reader abort and pass finalizer join the same source cancellation", async () => {
+  const controller = new AbortController();
+  const reading = deferred<void>(), cancelling = deferred<void>(), release = deferred<void>();
+  let cancellations = 0, settled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull() { reading.resolve(); },
+    async cancel() { cancellations++; cancelling.resolve(); await release.promise; },
+  }, { highWaterMark: 0 });
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), { fetch: async () => new Response(body) });
+  const pending = MaintenanceBudget.runOwned(controller.signal, () => client.listRecoveryHolds("run"))
+    .then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
+  try {
+    await reading.promise;
+    controller.abort(new Error("reader stopped"));
+    await cancelling.promise;
+    await tick();
+    assert.equal(settled, false);
+    assert.equal(body.locked, true, "reader ownership lasts through source cancellation");
+  } finally { release.resolve(); await pending; }
+  assert.equal(cancellations, 1);
+  assert.equal(body.locked, false);
+  assert.ok("error" in await pending);
 });

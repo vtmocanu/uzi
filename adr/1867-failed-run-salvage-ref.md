@@ -4,7 +4,7 @@
 maintainer-owned and pending)
 **Date**: 2026-09-28
 **Issue**: [vtmocanu/uzi#1867](https://github.com/vtmocanu/uzi/issues/1867)
-**PRD**: [prds/1867-failed-run-salvage-ref.md](../prds/1867-failed-run-salvage-ref.md)
+**PRD**: [prds/done/1867-failed-run-salvage-ref.md](../prds/done/1867-failed-run-salvage-ref.md)
 
 ## Decision (summary)
 
@@ -29,7 +29,7 @@ merged) was **promote-then-delete**: the sweep would create a salvage ref
 and then delete the branch checkpoint ref itself, deferred off the terminal
 path so a run's failure never raced the ref it needed.
 
-While this PRD was in flight, [PRD #1810](../prds/1810-retain-failed-run-checkpoint-ref.md)
+While this PRD was in flight, [PRD #1810](../prds/done/1810-retain-failed-run-checkpoint-ref.md)
 landed on `main` (PR #1819) and closed most of that same gap from a
 different angle: a failed or cancelled run's checkpoint ref is now **kept**
 (never deleted) while any custody hold of the run is open, and moved to
@@ -346,7 +346,7 @@ its own right:
 
 ## References
 
-- [PRD #1867](../prds/1867-failed-run-salvage-ref.md)
+- [PRD #1867](../prds/done/1867-failed-run-salvage-ref.md)
 - [ADR-0122](0122-checkpoint-push-broker.md) — the push broker's CAS,
   never-forced invariant, reused unchanged.
 - [ADR-1810](1810-checkpoint-retention-follows-custody.md) — owns the

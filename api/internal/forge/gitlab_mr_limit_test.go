@@ -287,8 +287,8 @@ func wantRefusal(t *testing.T, mr MergeRequest, err error) {
 	if !errors.As(err, &typed) {
 		t.Fatalf("error %T is not *ResponseTooLargeError", err)
 	}
-	if Class(err) != ErrorClassOther {
-		t.Fatalf("class = %q, want other", Class(err))
+	if Class(err) != ErrorClassOther || IsIssueResponseTooLarge(err) {
+		t.Fatalf("class = %q, want %q; MR must not be an issue refusal", Class(err), ErrorClassOther)
 	}
 	if mr != (MergeRequest{}) {
 		t.Fatalf("a refused response must return the zero MergeRequest, got %+v", mr)
@@ -1318,22 +1318,21 @@ func TestGitLabGetMergeRequestNon2xxSizeBoundary(t *testing.T) {
 	}
 }
 
-// Scope: only GetMergeRequest and GetMergeRequestSummary are marked; another method
-// keeps today's behaviour.
+// VerifyToken remains unmarked and keeps its existing encoding and body behavior.
 func TestGitLabLimitDoesNotApplyToUnmarkedMethods(t *testing.T) {
 	lowerGitLabLimit(t, 4096)
 	var seenEnc atomic.Value
 	w := newWireMR(t, func(rw http.ResponseWriter, r *http.Request) {
 		seenEnc.Store(r.Header.Get("Accept-Encoding"))
-		b := []byte(`{"id":1,"iid":3,"title":"t","state":"opened","labels":[],"updated_at":"2026-07-03T10:00:00Z"}`)
+		b := []byte(`{"id":1,"username":"bot"}`)
 		b = append(b, bytes.Repeat([]byte(" "), 20000)...)
 		_, _ = rw.Write(b)
 	}, 5*time.Second)
-	issue, err := w.d.GetIssue(context.Background(), 7, 3)
+	identity, err := w.d.VerifyToken(context.Background())
 	if got, _ := seenEnc.Load().(string); got == "identity" {
 		t.Fatalf("an unmarked request got Accept-Encoding %q", got)
 	}
-	if err != nil || issue.IID != 3 {
-		t.Fatalf("GetIssue over the lowered limit: issue=%+v err=%v", issue, err)
+	if err != nil || identity.ForgeUserID != 1 || identity.Username != "bot" {
+		t.Fatalf("VerifyToken over the lowered limit: identity=%+v err=%v", identity, err)
 	}
 }

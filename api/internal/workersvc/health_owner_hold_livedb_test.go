@@ -275,3 +275,59 @@ func TestOwnerHoldPrecedesStalePinAndPreservesStaleOnlyLiveDB(t *testing.T) {
 		})
 	}
 }
+
+// Manual intent must not turn a stale owner into an automatic affinity hold.
+func TestManualCordonStaleOwnerReleasesAcrossClaimProvisioningAndHealthLiveDB(t *testing.T) {
+	at := time.Now().UTC().Truncate(time.Microsecond)
+	p := setupOwnerHold(t, at)
+	for _, manual := range []bool{false, true, false} {
+		p.e.exec(t, `UPDATE workers SET status=CASE WHEN name='capable-at-cap' THEN 'online' ELSE 'offline' END WHERE user_id=$1`, p.e.userID)
+		if _, err := store.ChangeWorkerManualCordon(p.e.ctx, p.e.pool, p.e.userID, p.owner, "lane operator", pgtype.Text{}, manual); err != nil {
+			t.Fatal(err)
+		}
+		p.e.exec(t, `UPDATE workers SET last_heartbeat_at=$2 WHERE id=$1`, p.owner, at.Add(-10*time.Minute))
+		resetOwnerHoldRuns(t, p, at, at.Add(-time.Hour))
+		for _, id := range []uuid.UUID{p.gapRun, p.satRun} {
+			if row := p.e.healthRowFor(t, id); row.OwnerHoldPinnable {
+				t.Fatalf("manual=%v run=%s: stale owner gained automatic hold", manual, id)
+			}
+		}
+		// Includes real demand queries, peer strict eligibility and a successful peer ClaimRun.
+		assertOwnerHold(t, p, at, "", false)
+	}
+}
+
+func TestManualCordonFreshOwnerRetainsIndependentAffinityLiveDB(t *testing.T) {
+	at := time.Now().UTC().Truncate(time.Microsecond)
+	p := setupOwnerHold(t, at)
+	resetOwnerHoldRuns(t, p, at, at.Add(-time.Hour))
+	gapBefore, satBefore := p.demand(t, at)
+	if _, err := store.ChangeWorkerManualCordon(p.e.ctx, p.e.pool, p.e.userID, p.owner, "lane operator", pgtype.Text{}, true); err != nil {
+		t.Fatal(err)
+	}
+	if gap, sat := p.demand(t, at); gap != gapBefore || sat != satBefore {
+		t.Fatalf("manual cordon changed fresh owner demand: gap=%v saturation=%v, before gap=%v saturation=%v", gap, sat, gapBefore, satBefore)
+	}
+	for _, id := range []uuid.UUID{p.gapRun, p.satRun} {
+		if row := p.e.healthRowFor(t, id); row.OwnerHoldPinnable {
+			t.Fatalf("fresh manually cordoned owner gained automatic hold: %s", id)
+		}
+	}
+	p.e.exec(t, `UPDATE workers SET status='offline' WHERE user_id=$1 AND id<>$2`, p.e.userID, p.peer)
+	p.e.exec(t, `UPDATE workers SET status='online',last_heartbeat_at=$2 WHERE id=$1`, p.peer, at)
+	counts, err := p.svc.workerEligibilityForHealth(p.e.ctx, at, p.satRun, true)
+	if err != nil || counts.StrictEligible != 0 {
+		t.Fatalf("fresh owner peer eligibility=%+v err=%v", counts, err)
+	}
+	_, err = p.e.q.ClaimRun(p.e.ctx, store.ClaimRunParams{
+		UserID: p.e.userID, WorkerID: pgtype.UUID{Bytes: p.peer, Valid: true},
+		HeartbeatCutoff: ownerHoldStamp(at.Add(-45 * time.Second)), AffinityCutoff: ownerHoldStamp(at.Add(-p.ceiling)),
+		StaleRequeueCutoff: StaleRequeueCutoff(at, p.grace), SpreadCutoff: ownerHoldStamp(at.Add(-9 * time.Second)),
+		BackgroundGraceCutoff: ownerHoldStamp(at.Add(-15 * time.Minute)),
+		CrossCheckEvaluatedAt: ownerHoldStamp(at), CrossCheckAffinityCutoff: ownerHoldStamp(at.Add(-2 * time.Minute)),
+		WorkerCaps: []string{}, WorkerProtocolCaps: []string{}, CodexCuratedModels: codexCuratedModelsSlice(),
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("fresh owner peer ClaimRun err=%v, want no rows", err)
+	}
+}

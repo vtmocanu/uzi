@@ -584,6 +584,10 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 
 	capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 	if err != nil {
+		if forge.IsIssueResponseTooLarge(err) {
+			iidCopy := iid
+			return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Reason: SkipDescriptionTooLarge}}}, nil
+		}
 		// A forge error on an ISSUE target is transient (retry next tick), NOT a recorded
 		// fetch_failed skip — that bucketing is a sweep-only choice (PRD #308). Return the
 		// zero outcome so nothing is recorded for this fire.
@@ -793,7 +797,11 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		capture, err := issueinput.Fetch(ctx, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 		if err != nil {
 			e.logger.Warn("scheduler: sweep fetch issue", "schedule", sched.ID.String(), "issue", iid, "error", err)
-			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipFetchFailed})
+			reason := SkipFetchFailed
+			if forge.IsIssueResponseTooLarge(err) {
+				reason = SkipDescriptionTooLarge
+			}
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: reason})
 			continue
 		}
 		issue := capture.Issue

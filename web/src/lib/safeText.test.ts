@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { splitUnsafeChars, stripUnsafeChars } from "./safeText";
+import { splitUnsafeChars, stripDisplayCell, stripUnsafeChars } from "./safeText";
 
 // Issue #124. The corpus below deliberately MIRRORS the one the api pins for `sanitizeTTY`
 // (api/cmd/uzi/tui_render_test.go:61), which is the scrubber this util converges on — a
@@ -20,6 +20,108 @@ import { splitUnsafeChars, stripUnsafeChars } from "./safeText";
 const RLO = "\u202E"; // RIGHT-TO-LEFT OVERRIDE
 const ZWSP = "\u200B"; // ZERO WIDTH SPACE
 const ESC = "\u001B"; // the ANSI-escape introducer
+
+describe("stripDisplayCell", () => {
+  it.each([
+    ["LF", "\n"],
+    ["DEL", "\u007f"],
+    ["NUL", "\u0000"],
+  ])("removes a complete CSI with embedded %s", (_name, control) => {
+    expect(stripDisplayCell("a\u001b[3" + control + "1mb")).toBe("ab");
+  });
+
+  it("removes complete CSI and legacy ESC forms across each allowed C0/DEL seam", () => {
+    // Fixed, bounded census: CAN, SUB and ESC have cancellation/restart tests below.
+    for (const cp of [
+      ...Array.from({ length: 0x18 }, (_, i) => i),
+      0x19, 0x1c, 0x1d, 0x1e, 0x1f, 0x7f,
+    ]) {
+      const control = String.fromCodePoint(cp);
+      for (const sequence of [
+        "\u001b" + control + "[31m",
+        "\u001b[3" + control + "1m",
+        "\u009b" + control + "31m",
+        "\u001b[31" + control + " m",
+        "\u001b[31 " + control + "!p",
+        "\u001b[31 !" + control + "p",
+        "\u001b" + control + "7",
+        "\u001b" + control + "c",
+        "\u001b" + control + "(0",
+        "\u001b(" + control + "0",
+      ]) {
+        expect(stripDisplayCell("a" + sequence + "b"), JSON.stringify(sequence)).toBe("ab");
+      }
+      expect(stripDisplayCell("café" + control + " 漢字 🚀 <b>text</b>")).toBe("café 漢字 🚀 <b>text</b>");
+    }
+  });
+
+  it.each([
+    ["CSI CAN", "\u001b[3\u00181m", "1m"],
+    ["CSI SUB", "\u009b3\u001a1m", "1m"],
+    ["ESC CAN", "\u001b(\u00180text", "0text"],
+    ["ESC SUB", "\u001b\u001acafé", "café"],
+    ["CSI restart", "\u001b[3\u001b[32mtext", "text"],
+    ["ESC restart", "\u001b(\u001b7text", "text"],
+    ["OSC CAN", "\u001b]title\u0018text", "text"],
+    ["DCS SUB", "\u001bPdata\u001atext", "text"],
+    ["OSC restart", "\u001b]title\u001b[31mtext", "text"],
+  ])("preserves text following %s", (_name, sequence, text) => {
+    expect(stripDisplayCell("a" + sequence + "b")).toBe("a" + text + "b");
+  });
+
+  it.each([
+    ["OSC BEL", "\u001b\u0000]title\u0007"],
+    ["OSC ST", "\u001b\n]title\u001b\\"],
+    ["OSC C1 ST", "\u009dtitle\u009c"],
+    ["OSC ST with ignored control", "\u001b]title\u001b\n\\"],
+    ["DCS ST with ignored control", "\u001bPdata\u001b\u0000\\"],
+    ["DCS BEL payload then ST", "\u001b\u007fPdata\u0007hidden\u001b\\"],
+    ["SOS ST", "\u001b\u0000Xhidden\u001b\\"],
+    ["PM ST", "\u001b\n^hidden\u009c"],
+    ["APC ST", "\u001b\u007f_hidden\u001b\\"],
+  ])("keeps %s termination ahead of generic ESC removal", (_name, sequence) => {
+    expect(stripDisplayCell("a" + sequence + "b")).toBe("ab");
+  });
+
+  it.each([
+    ["save cursor", "\u001b7"],
+    ["restore cursor", "\u001b8"],
+    ["reset", "\u001bc"],
+    ["character-set designation", "\u001b(0"],
+    ["lowest ESC final byte", "\u001b0"],
+    ["highest ESC final byte", "\u001b~"],
+    ["intermediate and uppercase final", "\u001b)B"],
+  ])("removes the complete %s sequence", (_name, sequence) => {
+    expect(stripDisplayCell(`a${sequence}b`)).toBe("ab");
+  });
+
+  it.each(["P", "X", "^", "_"])("removes ESC %s string payloads before generic ESC sequences", (introducer) => {
+    expect(stripDisplayCell(`a\u001b${introducer}hidden\u001b\\b`)).toBe("ab");
+  });
+
+  it.each([
+    ["a\u001b[31mb\u001b[0mc", "abc"],
+    ["a\u001b]0;hidden\u0007b\u001b]8;;url\u001b\\c\u001b]8;;\u001b\\d", "abcd"],
+    ["a\u009b31mb\u009dtitle\u009cc", "abc"],
+    ["a\u0000\u0007\u007f\u0085\u009fb\u001b\\c", "ac"],
+    ["a\n\t\r\u2028\u2029b\u202e\u200b\u2066\uFEFFc", "abc"],
+    ["café 漢字 🚀 \uE000 \u{F0000}", "café 漢字 🚀 \uE000 \u{F0000}"],
+    ["a\u{E0001}b\u{E007F}c", "abc"],
+    ["<b>literal & text</b>", "<b>literal & text</b>"],
+    ["7 8 c (0 )B 0 ~ café 漢字 🚀", "7 8 c (0 )B 0 ~ café 漢字 🚀"],
+  ])("sanitizes %j as one cell", (raw, clean) => {
+    expect(stripDisplayCell(raw)).toBe(clean);
+    expect(stripDisplayCell(clean)).toBe(clean);
+  });
+
+  it("leaves the multiline helper's newline/tab behavior intact", () => {
+    expect(stripUnsafeChars("a\n\tb")).toBe("a\n\tb");
+    expect(stripDisplayCell("a\n\tb")).toBe("ab");
+    for (const value of [null, undefined, 42, {}, ["text"]]) {
+      expect(stripDisplayCell(value)).toBe("");
+    }
+  });
+});
 
 describe("stripUnsafeChars", () => {
   it("removes the bidi overrides and isolates that reorder what a human reads", () => {

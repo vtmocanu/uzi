@@ -88,6 +88,34 @@ export function stripUnsafeChars(s: string): string {
   return s.replace(UNSAFE_CHAR, "");
 }
 
+// Complete terminal sequences must go before their introducers are stripped, otherwise
+// OSC payloads and CSI parameters would become visible text.
+// C0 executes/is ignored inside ESC/CSI without ending it; DEL is ignored too.
+// CAN/SUB cancel instead, and ESC restarts parsing at the next introducer.
+const EMBEDDED_CONTROL = String.raw`[\u0000-\u0017\u0019\u001c-\u001f\u007f]`;
+const ESC_START = String.raw`\u001b${EMBEDDED_CONTROL}*`;
+const CANCEL_OR_RESTART = String.raw`(?:[\u0018\u001a]|(?=\u001b)|$)`;
+const STRING_END = String.raw`(?:${ESC_START}\\|\u009c|${CANCEL_OR_RESTART})`;
+const TERMINAL_SEQUENCE = new RegExp(
+  // String terminators must be consumed here, before generic ESC removal.
+  String.raw`(?:${ESC_START}\]|\u009d)[^\u0007\u0018\u001a\u001b\u009c]*(?:\u0007|${STRING_END})` +
+  String.raw`|(?:${ESC_START}[PX^_]|[\u0090\u0098\u009e\u009f])[^\u0018\u001a\u001b\u009c]*${STRING_END}` +
+  String.raw`|(?:${ESC_START}\[|\u009b)${EMBEDDED_CONTROL}*(?:[0-?]${EMBEDDED_CONTROL}*)*(?:[ -/]${EMBEDDED_CONTROL}*)*(?:[@-~]|${CANCEL_OR_RESTART})` +
+  String.raw`|${ESC_START}(?:[ -/]${EMBEDDED_CONTROL}*)*(?:[0-~]|${CANCEL_OR_RESTART})`,
+  "gu",
+);
+
+/** Display-only single cell/attribute boundary. Never use to normalize request inputs.
+ * Unlike stripUnsafeChars, this removes newlines/tabs as well as whole ANSI/OSC
+ * sequences. HTML stays literal text for React to escape. Non-string optional DTO
+ * values render empty rather than crashing or being coerced into misleading text.
+ */
+export function stripDisplayCell(value: unknown): string {
+  return typeof value === "string"
+    ? value.replace(TERMINAL_SEQUENCE, "").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "")
+    : "";
+}
+
 // The same predicate as UNSAFE_CHAR, wrapped in one capture group so `split` keeps each
 // offender as its own odd-indexed piece. Not global: split iterates on its own.
 const UNSAFE_CHAR_SPLIT = /((?![\n\t])[\p{Cc}\p{Cf}])/u;

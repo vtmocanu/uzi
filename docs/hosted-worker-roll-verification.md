@@ -9,7 +9,7 @@ audience: contributor
 This is the maintainer's **open verification procedure**, not an executed test
 report. Local implementation and checks are recorded in the PRD; they do not
 complete this hosted verification. Record actual results before closing
-[PRD #1470](../prds/1470-paced-hosted-worker-rolls.md); local fake-client and
+[PRD #1470](../prds/done/1470-paced-hosted-worker-rolls.md); local fake-client and
 PostgreSQL evidence there does not establish hosted availability or real
 API-server optimistic-write ordering. Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 
@@ -70,6 +70,64 @@ prove it no longer forces image upgrades. Busy actual spec-hash/generation drift
 idle, including run-bound workers outside pacing, plain drains and calls with no
 pacing entry. No timer uncordons workers or expires a pool hold. No knob is added.
 Indefinite waits can delay capacity turnover and security fixes.
+
+## Owner manual-cordon verification (scope amendment 2026-10-22)
+
+This is an additional **unexecuted procedure**, not acceptance evidence for the
+manual-cordon feature (implementation recorded 2026-10-24). The lead/maintainer
+with an isolated hosted deployment owns these live observations. Follow
+[ADR-422 D5a](../adr/0422-decouple-worker-version.md#d5a--owner-manual-cordon-is-persistent-intent-scope-amendment-2026-10-22)
+for the contract; preserve #3103/#3153/#3307 checks below.
+
+1. Deploy compatible serving APIs and the compatible singleton controller before
+   relying on intake or ordinary coverage guarantees. Older serving replicas
+   can admit work after a successful cordon until their rollout completes;
+   stalled rollout extends this window. Older controllers may count manual
+   workers as coverage. Earlier poll decisions may finish. No worker-image
+   prerequisite, worker-protocol change or activation flag is required.
+2. On persistent hosted and external workers, exercise Workers **Cordon** with
+   an optional reason, then **Uncordon**, plus
+   `uzi worker cordon <id> [-m <reason>]` and `uzi worker uncordon <id>`,
+   both with `--json`. Check manual timestamp/actor UUID/label/reason alongside
+   automatic drains and combined fences; offline liveness stays separate.
+   Check that health/admin views offer diagnosis without write actions.
+3. Confirm strict owner authorization, including a different owner's admin
+   session. Ownership precedes the persistent-only refusal: foreign workers
+   return 404; owned run-bound/ephemeral workers return HTTP 409 with exactly
+   `manual cordon is only supported for persistent workers`. Use the existing
+   session+CSRF/user CLI-token paths; no new admin write is available.
+4. Check reason omission/blank sanitization and the 500 raw Unicode-code-point
+   bound. API bodies are empty or one strict object, bounded to 8 KiB encoded.
+   Repeating cordon preserves the first metadata and adds no event; each real
+   transition and its event commit together, with the old reason on uncordon.
+   Keep database inspection to a disposable fixture; no audit read/prune API
+   or DB-enforced append-only guarantee is claimed.
+5. Verify no unrelated roots, unassigned children or judge work enter after
+   cordon on compatible APIs. Already assigned continuations/checkers and held
+   chat work may continue subject to existing fences. Cordon cancels no run,
+   ends no chat and creates no new continuation affinity. Check races at the
+   worker-lock boundary separately from observations of ordinary polling.
+6. Register/restart and roll an idle manual worker. Verify manual intent remains
+   and the replacement returns cordoned even when incarnation proof completes
+   the reservation. It provides no serving/replacement coverage. Busy drift
+   still waits under #3103. Cordon each provider in a multi-worker pool and
+   verify ordinary admission may remain held, without a zero-coverage bypass.
+   Preserve migration coverage, custody and independent maintenance/DinD guards.
+7. In the disposable fixture, check manual intent alongside automatic image,
+   maintenance and recovery holds. Release each automatic reason through its
+   owning path; manual intent remains. Deadline expiry and global ForceRoll
+   do not clear it. Explicit uncordon removes manual intent while other fences
+   can continue to block. Deletion ends the worker's intent; no TTL or
+   provisioning repair is introduced.
+8. Verify manual wait diagnosis with a nonempty suitable population entirely
+   manually cordoned and no claimable assigned continuation. Add a suitable
+   uncordoned busy peer, then an automatically drained peer: neither population
+   should be diagnosed as entirely manually cordoned. Manual waits must not
+   become upgrade-only waits or receive the upgrade-only queue exemption.
+
+Record actual results, revision/topology, sanitized metadata and remaining
+checks separately. This procedure does not establish production lock behavior
+or full worker acceptance.
 
 ## Capture proof without credentials
 
