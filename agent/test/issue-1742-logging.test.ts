@@ -48,7 +48,8 @@ it("reports physical terminals separately from authenticated terminals without f
     assert.equal(inventory?.symlink_entries, 1);
     assert.equal(load?.authenticated_pending, 0);
     assert.equal(load?.rejected_files, 2);
-    assert.deepEqual(restarted.listPendingTerminals().map(p => [p.claim_generation, p.outcome_kind]),
+    assert.deepEqual(restarted.listPendingTerminals().sort((a, b) => a.claim_generation - b.claim_generation)
+      .map(p => [p.claim_generation, p.outcome_kind]),
       [[5, "unknown"], [6, "unknown"]]);
     assert.equal(await restarted.hasPendingPolicyOutcome(runId), true);
     assert.equal(await restarted.readTerminalJournal(runId, 5), undefined);

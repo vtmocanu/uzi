@@ -4611,7 +4611,8 @@ export class RunRunner {
   private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
     ownMemory: (operation: Promise<void>) => void): Promise<void> {
     const eligible = this.client.supportsPolicyHold && !!this.outbox && !!this.snapshotRegistry &&
-      !!claim.secrets.codex && claim.interactive !== true &&
+      !!claim.secrets.codex && Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
+      claim.interactive !== true &&
       ["issue", "task", "prompt", "self_improve"].includes(claim.kind ?? "issue");
     const reservation = eligible ? this.outbox!.reservePolicyFlight(claim.run_id, claim.claim_generation ?? 0) : undefined;
     if (eligible && !reservation) return;

@@ -148,3 +148,143 @@ func TestCreateRunInputPendingOutcomeForeignCallerNotFound(t *testing.T) {
 		t.Fatalf("status = %d, want 404 (a foreign/admin-ro caller must not cancel; body: %s)", w.Code, w.Body.String())
 	}
 }
+
+// pendingOutcomeRouteStore keeps the existing detail-read fake but implements
+// only the lease and guarded write reached by this cancel flow. Unexpected
+// queries still panic through runsStore's embedded workersvc.Store.
+type pendingOutcomeRouteStore struct {
+	*runsStore
+	raced       bool
+	cancelCalls int
+	reloadCalls int
+	cancelArg   store.CancelRunServerSideWithPendingOutcomeParams
+}
+
+func (s *pendingOutcomeRouteStore) RunHasPendingOutcomeLease(_ context.Context, id uuid.UUID) (bool, error) {
+	return id == s.run.ID && s.run.Status == "running" && s.run.WorkerID.Valid, nil
+}
+
+func (s *pendingOutcomeRouteStore) CancelRunServerSideWithPendingOutcome(_ context.Context, arg store.CancelRunServerSideWithPendingOutcomeParams) (int64, error) {
+	s.cancelCalls++
+	s.cancelArg = arg
+	if s.raced || arg.ID != s.run.ID || arg.UserID != s.ownerID || s.run.Status != "running" || !s.run.WorkerID.Valid {
+		return 0, nil
+	}
+	s.run.Status = "cancelled"
+	s.run.StopKind = pgtype.Text{String: "cancelled", Valid: true}
+	s.run.StopReason = arg.StopReason
+	s.run.FinishedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	return 1, nil
+}
+
+func (s *pendingOutcomeRouteStore) GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error) {
+	s.reloadCalls++
+	return s.runsStore.GetRunByID(ctx, id)
+}
+
+func TestCreateRunInputPolicyPendingDiscardRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		confirmed       bool
+		raced           bool
+		foreignCaller   bool
+		admin           bool
+		foreignReporter bool
+		wantCode        int
+		wantReason      string
+		wantStatus      string
+		wantWrites      int
+	}{
+		{"confirmed discard", true, false, false, false, false, http.StatusAccepted, "", "cancelled", 1},
+		{"unconfirmed discard", false, false, false, false, false, http.StatusConflict, "outcome_pending_confirmation_required", "running", 0},
+		{"raced discard", true, true, false, false, false, http.StatusConflict, "outcome_pending_changed", "running", 1},
+		{"foreign caller", true, false, true, false, false, http.StatusNotFound, "", "running", 0},
+		{"foreign admin caller", true, false, true, true, false, http.StatusNotFound, "", "running", 0},
+		{"foreign telemetry cannot suppress lease confirmation", false, false, false, false, true, http.StatusConflict, "outcome_pending_confirmation_required", "running", 0},
+		{"confirmed discard uses lease despite foreign telemetry", true, false, false, false, true, http.StatusAccepted, "", "cancelled", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := store.User{ID: uuid.New()}
+			worker := freshWorker()
+			runID := uuid.New()
+			st := &pendingOutcomeRouteStore{raced: tc.raced, runsStore: &runsStore{
+				ownerID: owner.ID, worker: worker,
+				run: store.Run{ID: runID, UserID: owner.ID, Kind: runkind.Issue, Status: "running", WorkerID: pgUUIDv(worker.ID)},
+			}}
+			h := newRunsHandler(t, st)
+			h.wsvc = newPendingOutcomeHandler(st).wsvc
+			reporter := worker.ID
+			if tc.foreignReporter {
+				reporter = uuid.New()
+			}
+			if _, err := h.wsvc.Heartbeat(context.Background(), store.Worker{ID: reporter}, nil,
+				[]workersvc.OutboxEntry{{
+					RunID: runID, PendingTerminal: 1, BlockedReason: "gap_unrecoverable", Since: time.Now(),
+					PolicyPendingOutcomeID: uuid.New(), PolicyPendingSourceGeneration: 2,
+				}}, nil); err != nil {
+				t.Fatalf("seed both pending facts: %v", err)
+			}
+			caller := owner
+			if tc.foreignCaller {
+				caller = store.User{ID: uuid.New(), IsAdmin: tc.admin}
+			}
+			body := `{"kind":"cancel","body":"discard held outcome"}`
+			if tc.confirmed {
+				body = `{"kind":"cancel","body":"discard held outcome","discard_pending_outcome":true}`
+			}
+			rec := httptest.NewRecorder()
+			h.CreateRunInput(rec, inputReq(caller, runID, body))
+			if rec.Code != tc.wantCode {
+				t.Fatalf("cancel = %d, want %d: %s", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			var response struct {
+				ServerSide bool   `json:"server_side"`
+				Reason     string `json:"reason"`
+				Error      string `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode cancel: %v", err)
+			}
+			if response.Reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q", response.Reason, tc.wantReason)
+			}
+			if tc.wantCode == http.StatusConflict && strings.TrimSpace(response.Error) == "" {
+				t.Fatal("conflict omitted human guidance")
+			}
+			if st.cancelCalls != tc.wantWrites {
+				t.Fatalf("guarded writes = %d, want %d", st.cancelCalls, tc.wantWrites)
+			}
+			if tc.wantWrites > 0 && (st.cancelArg.ID != runID || st.cancelArg.UserID != owner.ID || !st.cancelArg.StopReason.Valid || st.cancelArg.StopReason.String != "discard held outcome") {
+				t.Fatalf("guarded cancel parameters = %+v", st.cancelArg)
+			}
+			if tc.wantStatus == "cancelled" {
+				if !response.ServerSide || st.reloadCalls != 1 {
+					t.Fatalf("success server_side = %v, authoritative judge reloads = %d", response.ServerSide, st.reloadCalls)
+				}
+				if !st.run.FinishedAt.Valid || st.run.StopKind.String != "cancelled" || st.run.StopReason.String != "discard held outcome" {
+					t.Fatalf("cancel did not persist terminal fields: status=%s stop_kind=%+v stop_reason=%+v finished_at=%+v", st.run.Status, st.run.StopKind, st.run.StopReason, st.run.FinishedAt)
+				}
+			} else if response.ServerSide || st.run.FinishedAt.Valid || st.reloadCalls != 0 {
+				t.Fatal("refused cancel reported success or invoked terminal follow-up")
+			}
+			// Read through the detail handler as the owner, rather than treating
+			// an acknowledgement or a zero-row write as cancellation evidence.
+			detail := httptest.NewRecorder()
+			h.GetRun(detail, runReq(owner, runID))
+			if detail.Code != http.StatusOK {
+				t.Fatalf("detail = %d: %s", detail.Code, detail.Body.String())
+			}
+			var got struct {
+				Run struct {
+					Status string `json:"status"`
+				} `json:"run"`
+			}
+			if err := json.Unmarshal(detail.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode authoritative detail: %v", err)
+			}
+			if got.Run.Status != tc.wantStatus {
+				t.Fatalf("authoritative status = %q, want %q", got.Run.Status, tc.wantStatus)
+			}
+		})
+	}
+}

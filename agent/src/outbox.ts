@@ -1250,46 +1250,95 @@ export class Outbox {
     let directory: Dir;
     try { directory = await fs.opendir(dir); } catch { return result; }
     let readBytes = 0;
-    for await (const entry of directory) {
-      const name = entry.name;
-      const gen = parseTerminalFileName(name);
-      if (gen === undefined) continue;
-      this.retainUnknownTerminal(runId, gen, name, true);
-      if (!this.runs.get(runId)?.terminals.has(gen)) break;
-      // Bound aggregate bytes before any record materialization, in addition to inspectTerminal's cap+1.
-      let bytes = this.terminalReadMaxBytes + 1;
-      try {
-        const stat = await fs.lstat(path.join(dir, name), { bigint: true });
-        bytes = Number(stat.size);
-        const held = this.runs.get(runId)?.terminals.get(gen);
-        if (held) held.deferredVersion = fileVersion(stat);
-      } catch { /* unknown stays pending */ }
-      const affordable = bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes - readBytes &&
-        bytes <= this.maxBytes - this.terminalLoadBytes;
-      const parsed = affordable ? (await this.inspectTerminal(runId, gen, name, undefined, bytes)).record : null;
-      if (affordable) { readBytes += bytes; this.terminalLoadBytes += bytes; }
-      if (!parsed) {
-        result.rejected++;
-        const held = this.runs.get(runId)?.terminals.get(gen);
-        if (held) held.budgetDeferred = !affordable && bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes && bytes <= this.maxBytes;
-        continue; // physical evidence cannot establish absence
+    try {
+      for (;;) {
+        // Reserve before advancing the iterator, including an in-flight raw read.
+        const token = this.reserveInspection(runId);
+        try {
+          const entry = await directory.read();
+          if (!entry) break;
+          const name = entry.name;
+          if (!name.startsWith(TERMINAL_FILE_PREFIX) ||
+              (entry.isFile() && isTerminalInstallTempName(name))) continue;
+          const represented = [...(this.runs.get(runId)?.terminals.values() ?? [])]
+            .find(meta => meta.fileName === name);
+          if (!token && !represented && !this.hasCountedPhysicalScope(runId, name)) {
+            this.terminalInventoryComplete = false;
+            break; // Only a raw scheduling frontier was observed.
+          }
+          const ownedScope = this.hasCountedPhysicalScope(runId, name);
+          if (token && ownedScope) this.policyInspections.delete(token);
+          const scope = token && this.policyInspections.get(token);
+          if (scope) {
+            scope.sourceKey = createHash("sha256").update(name).digest("hex");
+            scope.held = true;
+          }
+          const gen = parseTerminalFileName(name);
+          if (gen === undefined) continue;
+          // Transfer without yielding or counting the source twice.
+          if (token && !ownedScope && !this.runs.get(runId)?.terminals.has(gen)) {
+            this.policyInspections.delete(token);
+            if (!this.retainUnknownTerminal(runId, gen, name, true) && scope)
+              this.policyInspections.set(token, scope);
+          }
+          const enrolled = this.runs.get(runId)?.terminals.get(gen);
+          if (token && enrolled?.fileName === name && enrolled.outcomeKind !== "terminal")
+            this.policyInspections.delete(token);
+          // Bound aggregate bytes before any record materialization, in addition to inspectTerminal's cap+1.
+          let bytes = this.terminalReadMaxBytes + 1;
+          try {
+            const stat = await fs.lstat(path.join(dir, name), { bigint: true });
+            bytes = Number(stat.size);
+            if (represented?.outcomeKind === "terminal" && represented.ordinaryVersion === fileVersion(stat)) {
+              if (token) this.policyInspections.delete(token);
+            } else if (!token && represented?.outcomeKind === "terminal" && !this.hasCountedPhysicalScope(runId, name)) {
+              this.terminalInventoryComplete = false;
+              break; // A changed ordinary lifetime needs new capacity.
+            }
+            const held = this.runs.get(runId)?.terminals.get(gen);
+            if (held) held.deferredVersion = fileVersion(stat);
+          } catch { /* unknown stays pending */ }
+          const affordable = bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes - readBytes &&
+            bytes <= this.maxBytes - this.terminalLoadBytes;
+          const inspected = affordable ? await this.inspectTerminal(runId, gen, name, undefined, bytes) : undefined;
+          if (token && scope && this.policyInspections.get(token) === scope && inspected) {
+            if (inspected.observation.kind === "mac_failure") scope.macBinding = this.copyMACBinding(inspected.observation);
+            else {
+              const sourceBinding = this.physicalSourceBindings.get(inspected.observation);
+              if (sourceBinding && Buffer.byteLength(JSON.stringify({ ...scope, sourceBinding })) <= 1024)
+                scope.sourceBinding = sourceBinding;
+            }
+          }
+          const parsed = inspected?.record;
+          if (affordable) { readBytes += bytes; this.terminalLoadBytes += bytes; }
+          if (!parsed) {
+            result.rejected++;
+            const held = this.runs.get(runId)?.terminals.get(gen);
+            if (held) held.budgetDeferred = !affordable && bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes && bytes <= this.maxBytes;
+            continue; // physical evidence cannot establish absence
+          }
+          const meta = coerceTerminal(parsed, runId, gen, name);
+          if (!meta) {
+            this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { ...(terminalRunUUID(runId) ? { run_id: runId.toLowerCase() } : {}), claim_generation: gen, fact: "malformed" });
+            result.rejected++;
+            this.retainUnknownTerminal(runId, gen, name);
+            continue;
+          }
+          const rs = this.ensureInMemoryRun(runId, meta.since);
+          if (rs.terminals.get(gen)?.fileName !== name) continue;
+          meta.policyBytes = bytes;
+          if (meta.outcomeKind === "terminal") meta.ordinaryVersion = this.authenticatedFileVersions.get(parsed);
+          if (meta.outcomeKind === "policy_hold") meta.selectedLifetime = this.authenticatedLifetimes.get(parsed);
+          if (meta.outcomeKind === "policy_hold" && !this.admitPolicyMetadata(runId, meta)) break;
+          rs.terminals.set(meta.claimGeneration, meta);
+          result.authenticated++;
+          if (token && meta.outcomeKind === "terminal") this.policyInspections.delete(token);
+        } finally {
+          // Unused reservations are not evidence; release only after I/O joins.
+          if (token && !this.policyInspections.get(token)?.held) this.policyInspections.delete(token);
+        }
       }
-      const meta = coerceTerminal(parsed, runId, gen, name);
-      if (!meta) {
-        this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { ...(terminalRunUUID(runId) ? { run_id: runId.toLowerCase() } : {}), claim_generation: gen, fact: "malformed" });
-        result.rejected++;
-        this.retainUnknownTerminal(runId, gen, name);
-        continue;
-      }
-      const rs = this.ensureInMemoryRun(runId, meta.since);
-      if (rs.terminals.get(gen)?.fileName !== name) continue;
-      meta.policyBytes = bytes;
-      if (meta.outcomeKind === "terminal") meta.ordinaryVersion = this.authenticatedFileVersions.get(parsed);
-      if (meta.outcomeKind === "policy_hold") meta.selectedLifetime = this.authenticatedLifetimes.get(parsed);
-      if (meta.outcomeKind === "policy_hold" && !this.admitPolicyMetadata(runId, meta)) break;
-      rs.terminals.set(meta.claimGeneration, meta);
-      result.authenticated++;
-    }
+    } finally { await directory.close(); }
     return result;
   }
 
@@ -3138,7 +3187,15 @@ export class Outbox {
         return result;
       }
       if (!coerceTerminalRecord(obj, runId, generation)) return result;
+      // Join the descriptor before publishing authentication or releasing the
+      // budgetDeferred identity. Selection can change while close is pending;
+      // the metadata and selected identity checks below must use the live slot.
+      const closing = fh;
+      fh = undefined;
+      await closing.close();
+      checkProofBudget(budget);
       const candidate = this.runs.get(runId)?.terminals.get(generation);
+      if (candidate !== initial) { observation.kind = "unreadable"; return result; }
       if (candidate?.fileName === fileName && candidate.capturePending) {
         // The identity is selected, but its owned payload has not been captured yet.
         observation.kind = "unreadable";
@@ -3283,48 +3340,94 @@ export class Outbox {
       for (let visited = 0; visited < 256; visited++) {
         if (Date.now() >= budget.deadline || remaining <= 0) break;
         if (this.terminalScanRun) {
-          const entry = this.terminalScanFrontier ? { name: this.terminalScanFrontier } : await this.terminalScanRun.dir.read();
-          if (!entry) {
-            const version = fileVersion(await fs.lstat(this.runDir(this.terminalScanRun.id), { bigint: true }));
-            if (version !== this.terminalScanRunVersion) this.terminalScanIncomplete = true;
-            await this.terminalScanRun.dir.close();
-            this.terminalScanRun = undefined;
-            runRemaining = this.runMaxBytes;
-            continue;
-          }
-          if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) {
-            if (isTerminalInstallTempName(entry.name)) {
+          const token = this.reserveInspection(this.terminalScanRun.id);
+          try {
+            const entry = this.terminalScanFrontier ? { name: this.terminalScanFrontier } : await this.terminalScanRun.dir.read();
+            if (!entry) {
+              const version = fileVersion(await fs.lstat(this.runDir(this.terminalScanRun.id), { bigint: true }));
+              if (version !== this.terminalScanRunVersion) this.terminalScanIncomplete = true;
+              await this.terminalScanRun.dir.close();
+              this.terminalScanRun = undefined;
+              runRemaining = this.runMaxBytes;
+              continue;
+            }
+            if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) {
+              if (isTerminalInstallTempName(entry.name)) {
+                checkProofBudget(budget);
+                const regular = "isFile" in entry ? entry.isFile() :
+                  (await fs.lstat(path.join(this.runDir(this.terminalScanRun.id), entry.name))).isFile();
+                checkProofBudget(budget);
+                if (regular) { this.terminalScanFrontier = undefined; continue; }
+              }
+              const runId = this.terminalScanRun.id;
+              const represented = [...(this.runs.get(runId)?.terminals.values() ?? [])]
+                .find(meta => meta.fileName === entry.name);
+              if (!token && !represented && !this.hasCountedPhysicalScope(runId, entry.name)) {
+                this.terminalScanFrontier = entry.name;
+                this.terminalScanIncomplete = true;
+                break; // Do not interpret an unrepresented generation at capacity.
+              }
+              const ownedScope = this.hasCountedPhysicalScope(runId, entry.name);
+              if (token && ownedScope) this.policyInspections.delete(token);
+              const scope = token && this.policyInspections.get(token);
+              if (scope) {
+                scope.sourceKey = createHash("sha256").update(entry.name).digest("hex");
+                scope.held = true;
+              }
+              const generation = parseTerminalFileName(entry.name);
+              if (generation === undefined) this.terminalScanIncomplete = true;
+              else {
+                // Transfer the counted slot synchronously, as in scanTargetPolicyPages.
+                if (token && !ownedScope && !this.runs.get(runId)?.terminals.has(generation)) {
+                  this.policyInspections.delete(token);
+                  if (!this.retainUnknownTerminal(runId, generation, entry.name, true) && scope)
+                    this.policyInspections.set(token, scope);
+                }
+                const enrolled = this.runs.get(runId)?.terminals.get(generation);
+                if (token && enrolled?.fileName === entry.name && enrolled.outcomeKind !== "terminal")
+                  this.policyInspections.delete(token);
+              }
+              this.terminalScanFrontier = undefined;
+              let bytes = this.terminalReadMaxBytes;
+              try {
+                const stat = await fs.lstat(path.join(this.runDir(runId), entry.name), { bigint: true });
+                bytes = Number(stat.size);
+                if (represented?.outcomeKind === "terminal" && represented.ordinaryVersion === fileVersion(stat)) {
+                  if (token) this.policyInspections.delete(token);
+                } else if (!token && represented?.outcomeKind === "terminal" && !this.hasCountedPhysicalScope(runId, entry.name)) {
+                  this.terminalScanFrontier = entry.name;
+                  this.terminalScanIncomplete = true;
+                  break; // A changed ordinary lifetime needs a new counted slot.
+                }
+              } catch { /* inspection records uncertainty */ }
               checkProofBudget(budget);
-              const regular = "isFile" in entry ? entry.isFile() :
-                (await fs.lstat(path.join(this.runDir(this.terminalScanRun.id), entry.name))).isFile();
-              checkProofBudget(budget);
-              if (regular) { this.terminalScanFrontier = undefined; continue; }
+              const individualCap = Math.min(this.terminalReadMaxBytes, this.runMaxBytes, this.maxBytes);
+              if (bytes <= individualCap && (bytes > remaining || bytes > runRemaining)) {
+                // This valid-sized record belongs to the next page, not the oversized
+                // rejection class. Retain its exact frontier and deferred evidence.
+                this.terminalScanFrontier = entry.name;
+                break;
+              }
+              const cap = Math.min(remaining, individualCap, runRemaining, bytes);
+              const result = await this.inspectTerminal(this.terminalScanRun.id, generation, entry.name, budget, cap);
+              if (token && scope && this.policyInspections.get(token) === scope) {
+                if (result.observation.kind === "mac_failure") scope.macBinding = this.copyMACBinding(result.observation);
+                else {
+                  const sourceBinding = this.physicalSourceBindings.get(result.observation);
+                  if (sourceBinding && Buffer.byteLength(JSON.stringify({ ...scope, sourceBinding })) <= 1024)
+                    scope.sourceBinding = sourceBinding;
+                }
+              }
+              remaining -= cap;
+              runRemaining -= cap;
+              const meta = generation === undefined ? undefined : this.runs.get(this.terminalScanRun.id)?.terminals.get(generation);
+              if (meta?.outcomeKind === "unknown" && result.observation.kind !== "unreadable" && result.observation.kind !== "key_unavailable") meta.budgetDeferred = false;
+              if (token && result.record && result.record.outcome_kind !== "policy_hold")
+                this.policyInspections.delete(token);
+              page.observations.push(result.observation);
             }
-            const generation = parseTerminalFileName(entry.name);
-            if (generation === undefined) this.terminalScanIncomplete = true;
-            else if (!this.hasCountedPhysicalScope(this.terminalScanRun.id, entry.name) &&
-                !this.retainUnknownTerminal(this.terminalScanRun.id, generation, entry.name, true)) {
-              this.terminalScanFrontier = entry.name;
-              break;
-            }
-            this.terminalScanFrontier = undefined;
-            let bytes = this.terminalReadMaxBytes;
-            try { bytes = (await fs.lstat(path.join(this.runDir(this.terminalScanRun.id), entry.name))).size; } catch { /* inspection records uncertainty */ }
-            checkProofBudget(budget);
-            const individualCap = Math.min(this.terminalReadMaxBytes, this.runMaxBytes, this.maxBytes);
-            if (bytes <= individualCap && (bytes > remaining || bytes > runRemaining)) {
-              // This valid-sized record belongs to the next page, not the oversized
-              // rejection class. Retain its exact frontier and deferred evidence.
-              this.terminalScanFrontier = entry.name;
-              break;
-            }
-            const cap = Math.min(remaining, individualCap, runRemaining, bytes);
-            const result = await this.inspectTerminal(this.terminalScanRun.id, parseTerminalFileName(entry.name), entry.name, budget, cap);
-            remaining -= cap;
-            runRemaining -= cap;
-            const meta = generation === undefined ? undefined : this.runs.get(this.terminalScanRun.id)?.terminals.get(generation);
-            if (meta?.outcomeKind === "unknown" && result.observation.kind !== "unreadable" && result.observation.kind !== "key_unavailable") meta.budgetDeferred = false;
-            page.observations.push(result.observation);
+          } finally {
+            if (token && !this.policyInspections.get(token)?.held) this.policyInspections.delete(token);
           }
         } else {
           const entry = await this.terminalScanRoot.read();

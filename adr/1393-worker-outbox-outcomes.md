@@ -118,6 +118,22 @@ leaves its generation unbumped, so the local-retire path D11 describes for a pla
 spill never needs to fire for an outcome already journaled. A future recovery path must keep
 checking the pending-outcome lease before assuming a generation is free to move.
 
+**Scoped amendment (#3607, 2026-10-31) — the closure remains; fresh claimant isolation is narrower.**
+The D11 exclusion of candidates attributed to an overflowed worker is unchanged.
+[ADR-3607](3607-compact-policy-hold-m1-isolation.md) permits a snapshot-carrying
+transactional claimant to take unrelated work under negotiated
+`pending_outcome_scoped_claim_v1`: complete untruncated source identities, freshly
+applied nonce/epoch, locked worker capability, ordered parent/frozen-target locks,
+fresh current claimed/running unreleased owner rows, and real pending-cap accounting
+are required. A policy group counts once; outside ordinary tuples each require
+exact attributable identity writes. Historical group source writes can affect zero
+rows without fabricating a source-generation lease. Register and heartbeat confer
+no exemption; no exemption is persisted. Overflow and candidate SQL exclusions stay
+in force. Bodyless ordinary, ephemeral and no-transaction paths are unchanged.
+This amends the old claimant-wide implication, not the pending lease or stale replay
+authority. The field is a trusted-worker attestation, not filesystem completeness
+proved cryptographically by the API.
+
 ### D12 — Segments are immutable and one generation-numbered manifest is the only metadata authority
 
 The terminal journal is its own file, not a mutation of a Run A segment, and is never
@@ -176,6 +192,26 @@ paths. It never retires, deletes or resends it; the outcome bytes are kept and t
   A server-mediated owner discard is follow-up work. Its natural extension point is the existing
   api-authorized deletion protocol (`agent/src/terminal-rejections.ts`, `terminal_rejection_report`,
   `outbox.cleanupRejectedTerminalFiles`) and it needs its own authorization decision.
+
+**Scoped amendment (#3607, 2026-10-31) — isolation does not resolve an outcome.**
+The negotiated claim exception in [ADR-3607](3607-compact-policy-hold-m1-isolation.md)
+does not settle a blocked journal or authorize discard. Selected policy/UNKNOWN
+identity and physical source protection can outlive delivery settlement; custody,
+ACK, lease and guarded deletion remain separate. Destroyed or unprovable enrolled
+identities may permanently fill the bounded live catalog and backpressure policy
+production; they cannot be evicted to manufacture safe absence. Unrelated
+unnegotiated ordinary work retains its existing exact-target behavior.
+
+For a current-owner permanent blocked reason, the detail route's transient policy
+overlay applies only when `dto.OutcomePending == nil`, preserving the owner's
+discard-confirmation reason and existing confirmation/race checks. In the distinct
+policy-report branch for an already requested cancel, one guarded cancellation is
+read back from the same transaction using the locked worker, then committed before
+state broadcast, terminal notification, scope settlement, checkpoint retention and
+ephemeral teardown. The updated row supplies metadata; existing custody guards
+remain. No second cancellation or completed-custody release is introduced.
+The original D13 resolution and the #2950 unowned-journal exception above retain
+their respective boundaries; claim isolation adds no cleanup authority.
 
 ## Operational seams
 
