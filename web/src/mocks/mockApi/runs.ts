@@ -927,9 +927,14 @@ export const runsApi = {
   resumeRun: async (id: string) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
-    if (run.status !== "paused" && run.status !== "pool_wait")
+    if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
+      throw new ApiError(404, "run not found");
+    const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
+    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld)
       throw new ApiError(409, `run is ${run.status}`);
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      // The held-only projection disappears on Resume; the API owns the fresh episode.
+      ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
       ...(run.hold_reason === "provider_unavailable" ? {
         provider_park_count: 0, provider_park_streak_started_at: null, can_stop_at_provider_hold: false,
       } : {}),
@@ -962,6 +967,8 @@ export const runsApi = {
   // SteerQueueCard renders every chip). A run with no sample inputs returns an empty
   // queue; a missing run 404s (which the card treats as "no queue", never an error).
   getRunInputs: async (id: string) => {
+    if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
+      throw new ApiError(404, "run not found");
     if (!getRun(id)) throw new ApiError(404, "run not found");
     const inputs = (mockRunInputs[id] ?? []).map((i) => ({ ...i }));
     return delay({ inputs }, 60);
@@ -1080,6 +1087,8 @@ export const runsApi = {
     _discardPendingOutcome?: boolean,
     expectedGateRevision?: number,
   ) => {
+    if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
+      throw new ApiError(404, "run not found");
     const current = getRun(id);
     if (!current) throw new ApiError(404, "run not found");
     // PRD #1795 D5: mirror the server's expected-revision contract. A revision on any kind

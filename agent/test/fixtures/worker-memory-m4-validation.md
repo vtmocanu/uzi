@@ -1,0 +1,33 @@
+# M4 owner surfaces — partial validation record
+
+M4 remains in progress. This record covers committed web and CLI surfaces and the repaired web dependency environment. Operator documentation, embedded-doc synchronization, configuration verification, actual memory-hold browser/TUI visual review and the CLI/API integration gate remain pending. Production defaults remain disabled; M5 calibration and lander-owned CI timing are not claimed.
+
+## Committed surfaces
+
+Web unit `d29dc767cad80274d193a83e27ac83fdadb326ad` changes only ten files under `web/src/**`. Memory holds have explicit badge, panel and announcement copy. Page Resume, Cancel, Stop and discard controls use confirmed ownership together with steering permission. Allowance comes from `memory_hold`, never automatic requeues; absent or null values remain unknown and zero remains zero. Historical source/checkpoint/capture wording does not promise current availability or latest edits. Mock cases and REST/socket refresh tests cover the exposed fields. Cause-omitting board projections remain generic and link to detail.
+
+CLI/TUI unit `3ed822cdf08075378977e1da16276de0d1a660df` changes only eleven files under `api/cmd/uzi/**`. Separate memory predicates and allowance rendering feed get/list/inputs, default wait/follow and TUI rows. Default waiting stops at an owner-required hold; explicit `--until` retains its requested-status behavior. Memory counters do not substitute requeue counters, and untrusted IDs pass through cell sanitation. Known/missing-allowance uxlab scenes use the shipped model, but no scene was rendered or visually reviewed in this wave.
+
+These surfaces consume the already executed M1/M3 API seam. This wave changed no DTO, API authority, SQL, chart/controller/Compose wiring, lockfile or dependency declaration. The earlier owner Resume/Cancel LiveDB results remain backend evidence, not browser execution or live CLI control proof.
+
+## Focused checks and immutable reviews
+
+The web implementer passed 243 focused tests (`gate-log.bTp99s`, EXIT=0). Reviewer, tester and auditor reviewed `09851a52..d29dc767` with no mandatory or optional code findings. Their focused selections passed 199, 300 and 199 tests respectively. Tester reported compiling isolated controls that fail ownership and allowance assertions, and a prior-production control that fails all ten named memory-hold cases. Those results are bounded to their selected tests; modal/archive gating also received source review, and arbitrary retry or action-path sensitivity is not claimed.
+
+The CLI implementer passed its focused suite (`gate-log.7gNkfu`, EXIT=0). Tester reviewed the immutable CLI unit, executed 142 matching test/subtest names with zero skips/failures, and confirmed a compiling prior-consumer control fails missing hold guidance, default wait/follow stopping and stale checkpoint claims. Auditor reported no security findings. Reviewer found one mandatory Medium correctness defect: log-follow could omit a message persisted between the last drain and the status read observing an owner hold.
+
+Repair `78f33965c5fb347079d8d04c3f7849ab4350145e` changes only `run_get.go` and `memory_hold_test.go`: the owner-hold exit performs the existing final drain, matching terminal exit behavior. Its eight regression cases cover memory/requeue holds, text/NDJSON, final sequence appearing once, drain-error propagation, one status poll and no Resume. The lead inspected pre-fix named assertion failures (`gate-log.yVFg6F`, EXIT=1, no timeout) and restored green output (`gate-log.xO1wVR`, EXIT=0). Reviewer/tester/auditor reviewed `3ed822cd..78f33965` and reported the finding closed with no new mandatory or optional findings. Tester independently compiled the exact pre-fix production file in an export and reproduced all eight semantic failures.
+
+Available secret scans detected both canaries with zero tracked findings. Web auditor also reported successful Semgrep canary/tree checks and a dependency audit with zero vulnerabilities. Git-dependent scans ran on the unchanged checkout; web sources matched the reviewed web commit. CLI repair Semgrep had zero applicable Go targets, which supplies no Go SAST coverage. Go dependency vulnerability scanning remained unavailable because govulncheck was absent and validator installation was prohibited.
+
+## Dependency failure and repaired canonical web gate
+
+The first canonical `.uzi/scratch/task-bin/task gate:web` at frozen `3ed822cd` stopped at dependency validation (`gate-log.OnGWHq`, EXIT=201). Installed knip, Mermaid, Vite and transitive packages did not satisfy the committed manifest/lockfile. The lead reproduced the same narrow canonical `deps-check:web` failure on a fresh export of base `09851a52` with the same installed tree (`gate-log.mLUW8o`, EXIT=201). Web package files are identical across that range. The failed gate remains a reported failed check, with comparison evidence.
+
+Earlier focused web runs borrowed that stale installed tree. Matching source manifests and lockfiles alone did not verify installed versions; their passing results do not establish the final environment. The lead followed the documented remedy, `cd web && npm ci --ignore-scripts` (`gate-log.MQHwTN`, EXIT=0), without changing tracked package files. Its install audit reported zero vulnerabilities. Canonical `deps-check:web` then passed with installed/locked versions matched (`gate-log.xcnaYZ`, EXIT=0).
+
+With this relevant environment repair, the lead repeated the unchanged canonical full web gate over frozen `78f33965` (`gate-log.GUJ3xA`, EXIT=0): dependency validation, lint, dead code, docs/changelog/styles, typecheck, 6,861 unit tests across 336 files and 19 Chromium browser tests across five files passed. The ten memory-hold view tests and five mock tests executed and passed. No gate flags, environment settings or concurrency were changed. The browser suite covers its existing scenarios; it does not substitute an actual visual review of the new memory-hold scenes. A read-only log diagnostic and the returned command both confirmed the final exit; the lead inspected the summaries.
+
+## Remaining M4 work
+
+Complete the operator-facing settings/limitations documentation and CHANGELOG, synchronize embedded docs, verify preserved opt-in deployment wiring, build the affected frontend, obtain actual browser and fresh TUI image reviews, run the required CLI/API integration gate and review subsequent committed units. Keep M4 in progress until that work is verified. M5 retains the isolated real-adapter calibration, measured local timing and final canonical gate requirements.

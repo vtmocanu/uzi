@@ -126,6 +126,9 @@ function seed(): MockState {
   // usage-limit feed rows (it is not a usage-limit park), and an empty log opens the
   // run view without a 404 (getRunMessages 404s an unseeded id).
   messages.set("run-pool-wait", []);
+  for (const r of mockRuns) {
+    if (r.recovery_wait_cause === "worker_memory_pressure") messages.set(r.id, []);
+  }
   // PRD #1732: the runs held on credential_disabled. Empty logs, like the pool hold: the
   // hold carries no feed rows of its own, and an empty log opens the run view.
   messages.set("run-cred-disabled", []);
