@@ -1,0 +1,8 @@
+task: [vulncheck:agent] ./scripts/npm-audit-gate.sh agent high
+[vulncheck:agent] 
+[vulncheck:agent] > uzi-agent@0.1.0-m4 audit
+[vulncheck:agent] > npm audit --audit-level=high --include=dev
+[vulncheck:agent] 
+[vulncheck:agent] found 0 vulnerabilities
+[vulncheck:agent] npm-audit-gate: agent clean at --audit-level=high
+EXIT=0
