@@ -45,7 +45,7 @@ import type { Executor, ExecutorResult, InPlaceSwitchSite, RunContext, SecretRem
 import type { Logger } from "./log.js";
 import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
 import { toLeadObservation } from "./runtime-observation.js";
-import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
+import { buildSdkEnv, sdkRunEnvInjected, type SdkCredential } from "./sdk-env.js";
 import { runEnvDropText } from "./run-env-inject.js";
 import { buildRunEnvBlock } from "./run-env-prompt.js";
 import { assertAgentModelsMapped, isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding, stripProviderCost } from "./provider-binding.js";
@@ -1704,9 +1704,16 @@ export class SdkExecutor implements Executor {
     const credential: SdkCredential = ctx.provider ? sdkCredentialFromBinding(ctx.provider) : { kind: "oauth", token: oauthToken! };
     // PRD #4416 M2: the lead lane alone receives the run's user variables (lowest precedence); each
     // dropped name is reported as a run event naming the rule, never the value.
+    // The variables the builder injects are named once per executor run, here, after provisioning (the
+    // builder's pre-fold inputs are known by now) and before the env build and every prompt: each prompt site
+    // reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
+    const runEnvSet = ctx.runEnv && ctx.runEnv.length > 0
+      ? sdkRunEnvInjected(ctx.runEnv, credential, this.homeDir, toolEnv, ctx.runTmpdir)
+      : undefined;
+    if (runEnvSet) ctx.injectedRunEnv = runEnvSet.injected;
     const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir,
-      ctx.runEnv && ctx.runEnv.length > 0
-        ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }), onInjected: (vars) => { ctx.injectedRunEnv = [...vars]; } }
+      ctx.runEnv && runEnvSet
+        ? { vars: ctx.runEnv, set: runEnvSet, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
         : undefined);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for

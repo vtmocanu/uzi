@@ -94,13 +94,29 @@ describe("the durable marker", () => {
     assert.deepEqual(trace, ["mkdirp", `syncDir:${path.basename(dir)}`, "write+fsync:tmp", `rename:${RUN}.seen`, "syncDir:run-variables-seen"]);
   });
 
-  it("a failed write, rename or directory sync throws and leaves no marker or temporary file", async () => {
+  it("a failed mkdirp, a failed first directory sync, a failed write or a failed rename throws and leaves no marker or temporary file", async () => {
     for (const failing of ["mkdirp", "syncDir", "writeSynced", "rename"] as const) {
       const ops: SeenOps = { ...realSeenOps, [failing]: async () => { throw new Error(`${failing} failed`); } };
       await assert.rejects(markRunEnvSeen(root, RUN, ops), new RegExp(`${failing} failed`));
       assert.equal(await runEnvSeen(root, RUN), false, failing);
       assert.deepEqual(fs.existsSync(root) ? fs.readdirSync(root) : [], [], failing);
     }
+  });
+
+  it("a failed directory sync after the rename throws, leaves no temporary file and leaves the marker (fail-closed)", async () => {
+    let syncCalls = 0;
+    const ops: SeenOps = {
+      ...realSeenOps,
+      syncDir: async (d) => {
+        syncCalls++;
+        if (syncCalls === 2) throw new Error("final syncDir failed");
+        await realSeenOps.syncDir(d);
+      },
+    };
+    await assert.rejects(markRunEnvSeen(root, RUN, ops), /final syncDir failed/);
+    assert.equal(syncCalls, 2, "the failing call is the one after the rename");
+    assert.deepEqual(fs.readdirSync(root), [`${RUN}.seen`], "only the marker remains: a present marker only withholds more");
+    assert.equal(await runEnvSeen(root, RUN), true);
   });
 
   it("a write that fails after the temporary file exists removes it", async () => {

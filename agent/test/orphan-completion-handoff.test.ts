@@ -1,5 +1,4 @@
 import { describe, it, type TestContext } from "node:test";
-import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -11,6 +10,7 @@ import { parseCompletionSourceV2, type CompletionSourceFence, type CompletionSou
 import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { nullLogger } from "./helpers.js";
 import { legacyCompletionCore, type HandoffRetirement, type HandoffRetirementInput } from "../src/recovery.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { api, git, gitlabClaim, installHarness } from "./runner-harness.js";
 import {
   ATTEMPT_ROWS, ROWS, STOPPED, OWNER_FILE, assertUnchanged, diagnostics, durable, failure, holdCycle, reported, scene,

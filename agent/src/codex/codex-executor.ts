@@ -71,7 +71,7 @@ import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
-import { foldRunEnv, runEnvDropText, type RunEnvInjection } from "../run-env-inject.js";
+import { foldRunEnv, runEnvDropText, runEnvInjectedSet, type RunEnvInjectedSet, type RunEnvInjection } from "../run-env-inject.js";
 import { buildRunEnvBlock } from "../run-env-prompt.js";
 import { randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
@@ -147,7 +147,7 @@ import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexSecrets, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexSecrets, type ClaimRunEnvVar, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -3757,6 +3757,13 @@ export class CodexExecutor implements Executor {
       // run's canonical checkout, via worker-set command-line-scope config (see
       // withCommandGitTrust). Composed HERE, never in commandEffectSpec: the post-run
       // boundary sink shares that function and must keep its own gitEnv() untouched.
+      // PRD #4416 M2: the variables the builder injects are named once per executor run, here, after provisioning
+      // (the builder's pre-fold inputs are known by now) and before the env build and every prompt: each prompt
+      // site reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
+      const runEnvSet = ctx.runEnv && ctx.runEnv.length > 0
+        ? commandRunEnvInjected(ctx.runEnv, this.deps.commandTmpdir ?? "/tmp", provisioned.toolEnv)
+        : undefined;
+      if (runEnvSet) ctx.injectedRunEnv = runEnvSet.injected;
       const commandEnv: NodeJS.ProcessEnv = withCommandGitTrust(
         buildCommandEnv(
           this.deps.commandTmpdir ?? "/tmp",
@@ -3765,8 +3772,8 @@ export class CodexExecutor implements Executor {
           // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
           // only the fileop root is forced to "required" for cross_check, and it runs no browser.
           commandSandbox === "off",
-          ctx.runEnv && ctx.runEnv.length > 0
-            ? { vars: ctx.runEnv, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }), onInjected: (vars) => { ctx.injectedRunEnv = [...vars]; } }
+          ctx.runEnv && runEnvSet
+            ? { vars: ctx.runEnv, set: runEnvSet, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
             : undefined,
         ),
         await canonicalCheckoutPath(worktreePath),
@@ -8268,6 +8275,37 @@ export function buildCommandEnv(
   browserDiscovery = false,
   runEnv?: RunEnvInjection,
 ): NodeJS.ProcessEnv {
+  const env = commandPreFoldEnv(tmpdir, toolEnv);
+  // PRD #4416 M2: the run's user variables, lowest precedence: after the tool profile, before every
+  // worker-set key below, and never a protected key or git config carrier.
+  foldRunEnv(env, runEnv, isCommandRunEnvProtected);
+  // PRD #4416 M2: the worker-set keys below overwrite a user variable of the same name silently (no
+  // drop event); every such key is also denied by name (RUN_ENV_DENIED_NAMES / prefixes), so a user
+  // variable never reaches this point under it.
+  // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
+  Object.assign(env, goConcurrencyEnv());
+  if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
+  if (browserDiscovery) Object.assign(env, BROWSER_DISCOVERY_ENV);
+  return env;
+}
+
+/** The keys {@link buildCommandEnv} refuses to let a user variable take. */
+const isCommandRunEnvProtected = (k: string): boolean => COMMAND_ENV_PROTECTED_KEYS.has(k) || isGitConfigEnvKey(k);
+
+/** PRD #4416 M2: which of `vars` {@link buildCommandEnv} injects and which it drops for these inputs, computed over
+ *  the same pre-fold env the builder folds into and with the same predicate, so the executor can name them
+ *  once per run (before any prompt) and pass it to the builder as `RunEnvInjection.set`, which folds exactly it. */
+export function commandRunEnvInjected(
+  vars: readonly ClaimRunEnvVar[],
+  tmpdir: string,
+  toolEnv: Record<string, string>,
+): RunEnvInjectedSet {
+  return runEnvInjectedSet(vars, Object.keys(commandPreFoldEnv(tmpdir, toolEnv)), isCommandRunEnvProtected);
+}
+
+/** The command env before the run's variables fold in: the fixed boundary keys, UZI_SQLC_DIR and the
+ *  provisioned tool env minus the protected keys and git config carriers. */
+function commandPreFoldEnv(tmpdir: string, toolEnv: Record<string, string>): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -8285,16 +8323,6 @@ export function buildCommandEnv(
     if (isGitConfigEnvKey(k)) continue;
     env[k] = v;
   }
-  // PRD #4416 M2: the run's user variables, lowest precedence: after the tool profile, before every
-  // worker-set key below, and never a protected key or git config carrier.
-  foldRunEnv(env, runEnv, (k) => COMMAND_ENV_PROTECTED_KEYS.has(k) || isGitConfigEnvKey(k));
-  // PRD #4416 M2: the worker-set keys below overwrite a user variable of the same name silently (no
-  // drop event); every such key is also denied by name (RUN_ENV_DENIED_NAMES / prefixes), so a user
-  // variable never reaches this point under it.
-  // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
-  Object.assign(env, goConcurrencyEnv());
-  if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
-  if (browserDiscovery) Object.assign(env, BROWSER_DISCOVERY_ENV);
   return env;
 }
 

@@ -1,5 +1,4 @@
 import { describe, it, type TestContext } from "node:test";
-import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -14,6 +13,7 @@ import { ExecutorLifetime, type ExecutorTerminalSeal } from "../src/codex/execut
 import type { Executor } from "../src/executor.js";
 import { legacyCompletionCore, type CompletionSource, type PublicationFsOps, type RecoveryCoordinator } from "../src/recovery.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { validCompletionSource as baseValidCompletionSource } from "./fixtures/base-valid-completion-source.js";
 import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/base-parse-recovery-journal.js";

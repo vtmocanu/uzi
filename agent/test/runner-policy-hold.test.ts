@@ -194,14 +194,19 @@ describe("policy admission on every production claim", () => {
     await outbox.journalPolicyHold(claim.run_id, original);
     // The original stays pending at its own generation (so the claim is admitted under it); the rehold at this claim's
     // generation settles it while the run keeps running, so the claim goes on to fail on its forms.
-    client.reportPolicyHold = async (_id, body) => body.claim_generation === 1
-      ? { disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 }
-      : { disposition: "already_applied", outcome_id: body.outcome_id, source_generation: 1, observed_status: "running", observed_generation: 3 };
+    const modes: string[] = [];
+    client.reportPolicyHold = async (_id, body) => {
+      if (body.claim_generation === 1) return { disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 };
+      modes.push(body.continuation_mode);
+      return { disposition: "already_applied", outcome_id: body.outcome_id, source_generation: 1, observed_status: "running", observed_generation: 3 };
+    };
     client.getRunOwnership = async () => ({ status: "running", claim_generation: 3, claim_released: false }) as never;
     let models = 0;
+    // An attempt-paths runner: the settlement runs before phaseClone, so the mode comes from the runner's own paths.
     await runnerWith(() => ({ executor: { run: async () => { models++; throw new Error("unexpected model"); } } }),
-      fakeGitlab().gitlab, undefined, nullLogger(), { outbox }).execute(claim);
+      fakeGitlab().gitlab, undefined, nullLogger(), { outbox, dockerHost: "unix:///fixture" }).execute(claim);
     assert.equal(models, 0);
+    assert.deepEqual(modes, ["fresh_from_saved_work"]);
     const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
     assert.ok(failed, "the over-budget failure is reported, not dropped by the admission early return");
     assert.match(String(failed.failure_reason), /run_env_forms_over_budget/);

@@ -94,6 +94,9 @@ function errorCode(body: unknown): string | undefined {
   }
 }
 
+/** The live-set marker and withhold reason of a claim whose forms passed the form budget (no needle set exists). */
+export const FORMS_OVER_BUDGET = "forms_over_budget" as const;
+
 export type NeedleResolution =
   | { kind: "needles"; needles: ScanNeedle[] }
   | { kind: "withhold"; reason: string };
@@ -116,12 +119,12 @@ export type NeedleResolution =
  * A withheld publish is refused now and retried later.
  */
 export async function resolveScanNeedles(opts: {
-  live: readonly ScanNeedle[] | "forms_over_budget" | undefined;
+  live: readonly ScanNeedle[] | typeof FORMS_OVER_BUDGET | undefined;
   fetchProtected: () => Promise<RunEnvRedactResponse>;
   /** Whether this worker ever handed the run variables: see run-env-seen.ts. */
   runEnvSeen?: () => Promise<boolean | "unknown">;
 }): Promise<NeedleResolution> {
-  if (opts.live === "forms_over_budget") return { kind: "withhold", reason: "forms_over_budget" };
+  if (opts.live === FORMS_OVER_BUDGET) return { kind: "withhold", reason: FORMS_OVER_BUDGET };
   if (opts.live !== undefined) return { kind: "needles", needles: [...opts.live] };
   let body: RunEnvRedactResponse;
   try {
@@ -147,12 +150,147 @@ export async function resolveScanNeedles(opts: {
   }
   if (!body.protected) return { kind: "needles", needles: [] };
   const forms = runEnvClaimForms(undefined, body.versions);
-  if (forms.overBudget) return { kind: "withhold", reason: "forms_over_budget" };
+  if (forms.overBudget) return { kind: "withhold", reason: FORMS_OVER_BUDGET };
   return { kind: "needles", needles: forms.needles };
 }
 
+/** The prefixes of the extended header lines patchImages accepts between a `diff --git` line and the first
+ *  hunk of a file. Any other line there makes the patch unparseable. */
+const FILE_HEADER_PREFIXES = [
+  "index ", "--- ", "+++ ", "old mode ", "new mode ", "new file mode ", "deleted file mode ",
+  "similarity index ", "dissimilarity index ", "rename from ", "rename to ", "copy from ", "copy to ",
+];
+
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+/**
+ * The pre-image and post-image text of every hunk of a unified diff, rebuilt per file and per hunk. The
+ * post-image is the hunk's context and `+` lines, the pre-image its context and `-` lines, each with its
+ * prefix stripped and every line terminated by "\n" (a CRLF line keeps its "\r"). A `\ No newline at end of
+ * file` marker removes the terminator of the line before it from the image(s) that line belongs to; it is not a
+ * content line. Hunks are never joined with one another. Lines between a `diff --git` line and its first hunk
+ * are file headers and carry no content, provided each starts with one of FILE_HEADER_PREFIXES.
+ *
+ * Returns "unparseable" for anything it cannot rebuild exactly: a binary patch, a combined diff, a line that
+ * is not a hunk line inside or between hunks, a line between a `diff --git` line and its first hunk that is
+ * not a recognised file header line, or a hunk whose line counts do not match its header. A caller that must
+ * not ship a patch it cannot read withholds it.
+ */
+export function patchImages(patch: string): { images: string[] } | "unparseable" {
+  const lines = patch.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  const images: string[] = [];
+  let inFile = false;
+  let afterHunk = false;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    if (line.startsWith("diff --git ")) {
+      inFile = true;
+      afterHunk = false;
+      i++;
+      continue;
+    }
+    if (line.startsWith("diff --cc ") || line.startsWith("diff --combined ") || line.startsWith("@@@")) return "unparseable";
+    if (!inFile) {
+      // Text before the first file header carries no hunk: only a hunk header makes it unreadable.
+      if (line.startsWith("@@")) return "unparseable";
+      i++;
+      continue;
+    }
+    const head = HUNK_HEADER.exec(line);
+    if (head === null) {
+      if (line.startsWith("GIT binary patch") || (line.startsWith("Binary files ") && line.endsWith(" differ"))) return "unparseable";
+      if (line.startsWith("@@")) return "unparseable";
+      // After a hunk only another hunk or the next file may follow.
+      if (afterHunk) return "unparseable";
+      if (!FILE_HEADER_PREFIXES.some((p) => line.startsWith(p))) return "unparseable";
+      i++;
+      continue;
+    }
+    let oldLeft = head[2] === undefined ? 1 : Number(head[2]);
+    let newLeft = head[4] === undefined ? 1 : Number(head[4]);
+    const pre: string[] = [];
+    const post: string[] = [];
+    let preOpen = true;
+    let postOpen = true;
+    let last: " " | "-" | "+" | undefined;
+    i++;
+    while (i < lines.length && (oldLeft > 0 || newLeft > 0 || lines[i]!.startsWith("\\"))) {
+      const l = lines[i]!;
+      if (l.startsWith("\\")) {
+        if (last === undefined) return "unparseable";
+        if (last !== "+") preOpen = false;
+        if (last !== "-") postOpen = false;
+        i++;
+        continue;
+      }
+      const prefix = l === "" ? " " : l[0]!;
+      const body = l === "" ? "" : l.slice(1);
+      if (prefix === " ") {
+        if (oldLeft === 0 || newLeft === 0) return "unparseable";
+        pre.push(body);
+        post.push(body);
+        oldLeft--;
+        newLeft--;
+      } else if (prefix === "-") {
+        if (oldLeft === 0) return "unparseable";
+        pre.push(body);
+        oldLeft--;
+      } else if (prefix === "+") {
+        if (newLeft === 0) return "unparseable";
+        post.push(body);
+        newLeft--;
+      } else {
+        return "unparseable";
+      }
+      last = prefix as " " | "-" | "+";
+      i++;
+    }
+    if (oldLeft !== 0 || newLeft !== 0) return "unparseable";
+    afterHunk = true;
+    // preOpen / postOpen went false at a no-newline marker that followed a line of that image.
+    const image = (rows: string[], terminated: boolean): string => (rows.length === 0 ? "" : rows.join("\n") + (terminated ? "\n" : ""));
+    for (const text of [image(pre, preOpen), image(post, postOpen)]) if (text !== "") images.push(text);
+  }
+  return { images };
+}
+
+export type PatchVerdict =
+  | { withhold: false }
+  | { withhold: true; reason: "raw_value" | "hunk_image_value" | "unparseable_patch" | "line_form"; variables: string[] };
+
+/**
+ * Whether a raw (uncapped, unredacted) preserved patch may be redacted and shipped. It must not carry a
+ * whole-value form of a secret variable (raw text, or the rebuilt pre- or post-image of any hunk, where a
+ * value split by diff prefixes reads as one run), nor any registered line form of a multi-line secret, and it
+ * must be a diff {@link patchImages} can rebuild. Variable names only; never a value.
+ */
+export function patchScanVerdict(
+  rawPatch: string, needles: readonly ScanNeedle[], lineForms: readonly ScanNeedle[],
+): PatchVerdict {
+  const raw = textHitVariables(rawPatch, needles);
+  if (raw.length > 0) return { withhold: true, reason: "raw_value", variables: raw };
+  if (needles.length === 0 && lineForms.length === 0) return { withhold: false };
+  const rebuilt = patchImages(rawPatch);
+  if (rebuilt === "unparseable") return { withhold: true, reason: "unparseable_patch", variables: [] };
+  const present = literalsPresent(needles.flatMap((n) => n.forms));
+  const hit = new Set<string>();
+  for (const image of rebuilt.images) {
+    // Each image is read as written and with CRLF and lone CR normalized to LF, as valueVariants does for a value.
+    for (const text of new Set([image, image.replace(/\r\n?/g, "\n")])) {
+      const found = present(text);
+      if (found.size > 0) for (const n of needles) if (n.forms.some((f) => found.has(f))) hit.add(n.name);
+    }
+  }
+  if (hit.size > 0) return { withhold: true, reason: "hunk_image_value", variables: [...hit] };
+  const lines = textHitVariables(rawPatch, lineForms);
+  if (lines.length > 0) return { withhold: true, reason: "line_form", variables: lines };
+  return { withhold: false };
+}
+
 /** The names of the variables whose forms occur in `text` (a raw patch), in needle order. Used before the
- *  patch is redacted. One pass over the text for every form of every needle. */
+ *  patch is redacted. */
 export function textHitVariables(text: string, needles: readonly ScanNeedle[]): string[] {
   const formsPresent = literalsPresent(needles.flatMap((n) => n.forms));
   const present = formsPresent(text);

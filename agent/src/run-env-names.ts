@@ -208,6 +208,7 @@ export const RUN_ENV_DENIED_NAMES: readonly RunEnvDeniedRule[] = [
   { value: "NODE_PENDING_PIPE_INSTANCES", invariant: "process_loader", note: "Node pipe instance count on Windows" },
   { value: "UV_USE_IO_URING", invariant: "process_loader", note: "libuv I/O backend of every Node process, harness included" },
   { value: "AWS_EC2_METADATA_SERVICE_ENDPOINT", invariant: "network_wiring", note: "metadata endpoint the harness's AWS SDK reads" },
+  { value: "AWS_ENDPOINT_URL", invariant: "network_wiring", note: "global AWS endpoint override; it also routes the Bedrock traffic the AWS_ENDPOINT_URL_BEDROCK prefix is denied for" },
 ];
 
 /** Name prefixes reserved for the worker and the agent harnesses. */

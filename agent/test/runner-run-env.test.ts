@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, secretRecordingLogger } from "./runner-harness.js";
 import { runEnvSeen } from "../src/run-env-seen.js";
+import { FORMS_OVER_BUDGET } from "../src/run-env-scan.js";
 
 installHarness();
 
@@ -241,7 +242,55 @@ describe("a claim over the form budget", () => {
     };
     await runner.execute(claim);
     assert.equal(resolutions.length, 1, "the live set was published once for the run");
-    assert.deepEqual(await resolutions[0], { kind: "withhold", reason: "forms_over_budget" });
+    assert.deepEqual(await resolutions[0], { kind: "withhold", reason: FORMS_OVER_BUDGET });
     assert.equal(internals.liveScanNeedles.has(claim.run_id), false, "and it is evicted at terminal");
+  });
+
+  describe("a hand-built over-budget flight is withheld, never read as clean", () => {
+    const TIP = "a".repeat(40);
+    function rig() {
+      const { gitlab } = fakeGitlab();
+      const runner = runnerWith(() => ({ executor: { run: async () => ({ branch: "b" }) } }), gitlab);
+      const warnings: string[] = [];
+      const reasons: unknown[] = [];
+      const flight = {
+        runId: "run-over-budget-direct", scanOverBudget: true, scanNeedles: [] as unknown[], branch: undefined,
+        publishedRealTips: [] as string[], reportedPublishOutcomes: new Set<string>(),
+        runLog: { warn: (m: string) => { warnings.push(m); }, info: () => undefined },
+      };
+      const internals = runner as unknown as {
+        requireNoRunEnv(f: unknown, bare: string, tip: string, excludes: string[], what: string): Promise<unknown>;
+        scanCheckpointForPublish(f: unknown, bare: string, branch: string): Promise<{ kind: string; outcome?: string }>;
+        scanRemediationRange(f: unknown, bare: string, branch: string, tip: string): Promise<{ trusted: boolean; why?: string }>;
+        reportPublishOutcome(f: unknown, key: string, msg: string, data?: { why?: unknown }): void;
+        persistRemediationScan(): Promise<void>;
+      };
+      // A resolvable range whose scan is trusted and clean: without the over-budget guard each site reads clean.
+      git.resolveCheckpointRange = (async () => ({ tipSha: TIP, excludeSha: "b".repeat(40) })) as unknown as typeof git.resolveCheckpointRange;
+      git.secretScanCheckpointRange = (async () => ({ trusted: true, findings: [] })) as unknown as typeof git.secretScanCheckpointRange;
+      internals.persistRemediationScan = async () => undefined;
+      internals.reportPublishOutcome = (_f, _k, _m, data) => { reasons.push(data?.why); };
+      return { flight, internals, warnings, reasons };
+    }
+
+    it("the upload scan withholds it", async () => {
+      const { flight, internals, warnings } = rig();
+      await assert.rejects(internals.requireNoRunEnv(flight, "/nonexistent-bare", TIP, [], "direct"),
+        (e: Error) => e.constructor.name === "SecretRemediationPendingError");
+      assert.ok(warnings.length > 0, "the withhold is logged");
+    });
+
+    it("the checkpoint publish scan blocks it with the over-budget reason", async () => {
+      const { flight, internals, reasons } = rig();
+      assert.deepEqual(await internals.scanCheckpointForPublish(flight, "/nonexistent-bare", "agent/issue-1"),
+        { kind: "blocked", outcome: "secret_scan_untrusted" });
+      assert.deepEqual(reasons, [FORMS_OVER_BUDGET]);
+    });
+
+    it("the remediation range scan is untrusted with the over-budget reason", async () => {
+      const { flight, internals } = rig();
+      assert.deepEqual(await internals.scanRemediationRange(flight, "/nonexistent-bare", "agent/issue-1", TIP),
+        { trusted: false, why: FORMS_OVER_BUDGET });
+    });
   });
 });

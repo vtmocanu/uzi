@@ -1,5 +1,4 @@
 import { it } from "node:test";
-import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
 import { performance } from "node:perf_hooks";
@@ -8,6 +7,7 @@ import { WorkerClient } from "../src/client.js";
 import { RunRunner } from "../src/runner.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { nullLogger } from "./helpers.js";
 
 const TIP = "a".repeat(40), FLOOR = "b".repeat(40), DEFAULT = "c".repeat(40);

@@ -120,7 +120,7 @@ export interface RunEnvClaimForms {
    *  forms and after a multi-line value's line and diff forms, so building stops after the group whose forms pass
    *  {@link RUN_ENV_FORM_CHARS_MAX} and the count can exceed the cap by that group's forms. */
   readonly formChars: number;
-  /** Building stopped because {@link RUN_ENV_FORM_CHARS_MAX} was passed; no partial form set is returned. */
+  /** Building stopped because {@link RUN_ENV_FORM_CHARS_MAX} was passed; the redaction list then holds only each value's raw variants, and the needles and line forms are empty. */
   readonly overBudget: boolean;
 }
 

@@ -158,7 +158,7 @@ describe("a multi-line secret in a unified diff", () => {
     assert.ok(out.includes(BEGIN) && out.includes(END));
   });
 
-  it("masks the secret in a preserved patch", () => {
+  it("the redactor masks each line of a multi-line secret inside unified-diff text", () => {
     const out = redact(asPatch(lines));
     for (const line of bodyLines("one")) assert.ok(!out.includes(line));
   });

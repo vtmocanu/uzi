@@ -1,5 +1,4 @@
 import { it } from "node:test";
-import { runEnvClaimForms } from "../src/run-env-forms.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import type { CompletionSource, RecoveryCoordinator, RecoveryRecord } from "../src/recovery.js";
@@ -8,6 +7,7 @@ import type { CodexExecutionSafety } from "../src/harness.js";
 import { RunDiskLocks } from "../src/run-disk-locks.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
