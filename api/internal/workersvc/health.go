@@ -497,7 +497,8 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// A live plan or code cross-check is expected waiting. A worker-pickup nudge would
 		// describe its already-running lead incorrectly, even with no checker capacity.
 		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
-		if isCodeCrossCheckWaitingReason(reason) || reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
+		if isCodeCrossCheckWaitingReason(reason) || reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker ||
+			(r.Status == "running" && isManualCordonWaitReason(reason)) {
 			nudge = false
 		}
 		since := healthSince(now, target, r)
@@ -573,7 +574,7 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 				// Only a persistent hold warrants the prerequisite ladder before
 				// the age threshold; unrelated young runs retain the cheap path.
 				reason := s.queuedReasonBeforeAge(ctx, now, r, th, true)
-				if strings.HasPrefix(reason, "waiting for workers cordoned (manual):") || isStaleRequeuePinReason(reason) {
+				if isManualCordonWaitReason(reason) || isStaleRequeuePinReason(reason) {
 					return healthWaitingWorker, reason
 				}
 			}
