@@ -21,7 +21,7 @@ Either works; pick the one that matches how you pay for Claude.
 | Credential | How you get it | Best for |
 |---|---|---|
 | **OAuth token** | `claude setup-token` (needs the Claude Code CLI and a Claude Pro/Max subscription login) | Anyone already on Claude Code; billed against your subscription. |
-| **Console API key** | [console.anthropic.com](https://console.anthropic.com) → **API keys** → **Create key** | Anyone on usage-based API billing without a subscription. |
+| **Console API key** | [platform.claude.com](https://platform.claude.com/) → **API keys** → **Create key** | Anyone on usage-based API billing without a subscription. |
 
 Both paste into the same field; uzi doesn't check for a particular prefix,
 so either kind is accepted. Storing one of each is the common reason to hold
@@ -51,11 +51,11 @@ set by Anthropic's terms, not by uzi.
 
 ## 1. Mint a credential
 
-- **OAuth token**: install the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/overview)
+- **OAuth token**: install the [Claude Code CLI](https://code.claude.com/docs/en/overview)
   if needed, then run `claude setup-token`. It opens your browser to sign
   in and prints a long-lived token to your terminal: copy it, then clear
   your terminal scrollback/history if it persists.
-- **Console API key**: sign in at [console.anthropic.com](https://console.anthropic.com),
+- **Console API key**: sign in at [platform.claude.com](https://platform.claude.com/),
   open **API keys**, **Create key**, and copy it; the console shows it
   only once.
 
