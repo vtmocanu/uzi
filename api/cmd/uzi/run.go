@@ -491,7 +491,10 @@ func submitBoundInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comm
 		token = actionIfMatch[0]
 	}
 	if approval != nil || token != "" {
-		res, err = c.SubmitRunInputWithOptions(cmd.Context(), runID, apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel, ExpectedGateRevision: expectedGateRevision, SemanticApproval: approval, DiscardPendingOutcome: discardPendingOutcome, ActionIfMatch: token})
+		res, err = c.SubmitRunInputWithOptions(cmd.Context(), runID, uzicli.RunInputOptions{
+			Kind: kind, Body: body, Selection: sel, DiscardPendingOutcome: discardPendingOutcome,
+			ExpectedGateRevision: expectedGateRevision, SemanticApproval: approval, ActionIfMatch: token,
+		})
 	} else {
 		res, err = c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome, expectedGateRevision)
 	}

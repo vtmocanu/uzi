@@ -235,29 +235,32 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			var expected *int64
 			var semantic *apitypes.SemanticGateApproval
 			if cmd.Flags().Changed("token") {
-				// Bind the credential action and automatic semantic approval to one presentation.
-				// Explicit semantic/revision flags resolve without a second owner read.
-				if cmd.Flags().Changed("semantic-approval") || cmd.Flags().Changed(expectedGateRevisionFlag) {
+				// Validate an explicit semantic snapshot before any server step.
+				if cmd.Flags().Changed("semantic-approval") {
 					expected, semantic, err = resolveSemanticApproval(env, cmd, c, args[0])
-					if err == nil {
-						presented, _, err = approvalPresentation(cmd, c, args[0])
+					if err != nil {
+						return err
 					}
+					presented, _, err = approvalPresentation(cmd, c, args[0])
 				} else {
+					// The structural fence, semantic snapshot and policy action all
+					// use this read; none is rebound after switching credentials.
 					presented, expected, err = approvalPresentation(cmd, c, args[0])
-					if err == nil && expected != nil && presented.SemanticGate != nil {
-						var raw []byte
-						raw, err = json.Marshal(presented.SemanticGate.Approval)
-						if err == nil {
-							semantic = new(apitypes.SemanticGateApproval)
-							err = json.Unmarshal(raw, semantic)
+					if err == nil && !cmd.Flags().Changed(expectedGateRevisionFlag) &&
+						presented.Status == "awaiting_approval" && presented.GateRevision > 0 && presented.SemanticGate != nil {
+						raw, encodeErr := json.Marshal(presented.SemanticGate.Approval)
+						if encodeErr != nil {
+							return encodeErr
 						}
-						if err == nil && semantic.PresentationRevision != *expected {
-							err = uzicli.Exitf(uzicli.ExitConflict, "semantic presentation revision changed; review the gate again")
+						semantic = &apitypes.SemanticGateApproval{}
+						if err = json.Unmarshal(raw, semantic); err != nil {
+							return err
 						}
-						if err == nil {
-							for _, row := range semanticGateRows(presented) {
-								_, _ = fmt.Fprintf(env.Stderr, "%s: %s\n", row[0], row[1])
-							}
+						if semantic.PresentationRevision != presented.GateRevision {
+							return uzicli.Exitf(uzicli.ExitConflict, "semantic presentation revision changed; review the gate again")
+						}
+						for _, row := range semanticGateRows(presented) {
+							_, _ = fmt.Fprintf(env.Stderr, "%s: %s\n", row[0], row[1])
 						}
 					}
 				}

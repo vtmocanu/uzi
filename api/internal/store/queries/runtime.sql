@@ -4251,6 +4251,7 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Provider availability and policy holds retain this protection through owner resume.
   AND NOT (status IN ('paused', 'queued') AND (policy_refusal_count > 0 OR COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)))
+
   -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
   -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
@@ -4368,6 +4369,7 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Provider availability and policy holds retain this protection through owner resume.
   AND NOT (status IN ('paused', 'queued') AND (policy_refusal_count > 0 OR COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)))
+
   -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
   -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
   AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))

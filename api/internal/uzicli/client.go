@@ -934,18 +934,18 @@ func isLoopbackURL(u *url.URL) bool {
 // HTTP-status classification, since some callers (the poll loop) branch on
 // non-error statuses like 202/410 that others treat as failures.
 func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBody any) (*http.Response, []byte, error) {
-	return c.doJSONReadOptions(ctx, method, path, reqBody, false, nil)
-}
-
-func (c *HTTPClient) doJSONReadOwner(ctx context.Context, method, path string, reqBody any, ownerRun bool) (*http.Response, []byte, error) {
-	return c.doJSONReadOptions(ctx, method, path, reqBody, ownerRun, nil)
+	return c.doJSONReadOwnerHeaders(ctx, method, path, reqBody, false, nil)
 }
 
 func (c *HTTPClient) doJSONReadHeaders(ctx context.Context, method, path string, reqBody any, headers http.Header) (*http.Response, []byte, error) {
-	return c.doJSONReadOptions(ctx, method, path, reqBody, false, headers)
+	return c.doJSONReadOwnerHeaders(ctx, method, path, reqBody, false, headers)
 }
 
-func (c *HTTPClient) doJSONReadOptions(ctx context.Context, method, path string, reqBody any, ownerRun bool, headers http.Header) (*http.Response, []byte, error) {
+func (c *HTTPClient) doJSONReadOwner(ctx context.Context, method, path string, reqBody any, ownerRun bool) (*http.Response, []byte, error) {
+	return c.doJSONReadOwnerHeaders(ctx, method, path, reqBody, ownerRun, nil)
+}
+
+func (c *HTTPClient) doJSONReadOwnerHeaders(ctx context.Context, method, path string, reqBody any, ownerRun bool, headers http.Header) (*http.Response, []byte, error) {
 	var body io.Reader
 	if reqBody != nil {
 		b, err := json.Marshal(reqBody)

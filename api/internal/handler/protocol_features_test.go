@@ -19,7 +19,7 @@ import (
 // then recovery_cause_data_volume_full,
 // then run_checkpoint_durability, then repo_agent_folder, then terminal_rejection_report
 // (independent of the snapshot kill switch), then credential_switch_hold (unconditional),
-// active_run_snapshot and provider_policy_hold (the latter also requires a positive pending lease),
+// then active_run_snapshot and provider_policy_hold (the latter also requires a positive pending lease),
 // and issue #2545's
 // recovery_held_publication_v1 followed by recovery_held_publication_v2 (gated on UZI_HELD_PUBLICATION) are last. A drift here is a
 // wire-contract change a worker negotiates on. Issue #2507 adds
