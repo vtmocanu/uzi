@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -75,12 +76,42 @@ func TestHealthQueuedCheckerVaultPrecedesPlacement(t *testing.T) {
 	}
 }
 
+func TestHealthQueuedManualCordonNudges(t *testing.T) {
+	r := runRow("queued")
+	r.Kind = runkind.Issue
+	r.StatusSince = ago(15 * time.Minute)
+	fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+	actor, worker := uuid.New(), uuid.New()
+	fs.eligibility = store.CountOnlineWorkersClaimableForRunRow{
+		ManualSuitable: 1, ManualCordoned: 1,
+		ManualContext: mustJSON(t, map[string]any{
+			"actor_id": actor, "worker_id": worker, "at": t0,
+			"actor_label": "queue operator", "reason": "maintenance",
+		}),
+	}
+	if changed := svc.detectRunHealth(context.Background(), t0); changed != 1 {
+		t.Fatalf("changed=%d want 1", changed)
+	}
+	w := lastWrite(t, fs, r.ID)
+	want := fmt.Sprintf("waiting for workers cordoned (manual): queue operator (%s) at %s: maintenance", actor, t0.Format(time.RFC3339))
+	if w.Health != healthWaitingWorker || w.HealthReason.String != want {
+		t.Fatalf("queued health=%s/%s want waiting_worker/%s", w.Health, w.HealthReason.String, want)
+	}
+	if !w.HealthNotifiedAt.Valid || !w.HealthNotifiedAt.Time.Equal(t0) || len(b.healthNudges) != 1 || !b.healthNudges[0] {
+		t.Fatalf("queued manual episode did not nudge: write=%+v nudges=%v", w, b.healthNudges)
+	}
+}
+
 func TestHealthCrossCheckPlacementDoesNotNudgeRunningLead(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		counts store.CountOnlineWorkersClaimableForRunRow
 		reason string
 	}{
+		{"manual before no eligible checker", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1}, "manual"},
+		{"manual before busy slots", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1, StrictEligible: 1}, "manual"},
+		{"manual with suitable peer", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 2, ManualCordoned: 1, StrictEligible: 1}, reasonCrossCheckSlotsBusy},
+		{"manual own continuation", store.CountOnlineWorkersClaimableForRunRow{ManualSuitable: 1, ManualCordoned: 1, StrictEligible: 1, Claimable: 1}, reasonPlanCrossCheckWaiting},
 		{"slot busy", store.CountOnlineWorkersClaimableForRunRow{StrictEligible: 1}, reasonCrossCheckSlotsBusy},
 		{"no eligible checker", store.CountOnlineWorkersClaimableForRunRow{}, reasonNoCrossCheckWorker},
 		{"checker available", store.CountOnlineWorkersClaimableForRunRow{StrictEligible: 1, Claimable: 1}, reasonPlanCrossCheckWaiting},
@@ -91,14 +122,24 @@ func TestHealthCrossCheckPlacementDoesNotNudgeRunningLead(t *testing.T) {
 			fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
 			fs.liveCrossCheck = map[uuid.UUID]bool{r.ID: true}
 			fs.eligibility = tc.counts
+			actor, worker := uuid.New(), uuid.New()
+			evidence, err := json.Marshal(map[string]any{"actor_id": actor, "worker_id": worker, "at": t0, "actor_label": "parent operator", "reason": "checker maintenance"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fs.eligibility.ManualContext = evidence
+			want := tc.reason
+			if want == "manual" {
+				want = fmt.Sprintf("waiting for workers cordoned (manual): parent operator (%s) at %s: checker maintenance", actor, t0.Format(time.RFC3339))
+			}
 			childID := uuid.New()
 			svc.q = &healthCrossCheckPlacementStore{healthFakeStore: fs, childID: childID}
 			if changed := svc.detectRunHealth(context.Background(), t0); changed != 1 {
 				t.Fatalf("changed=%d want 1", changed)
 			}
 			w := lastWrite(t, fs, r.ID)
-			if w.Health != healthWaitingWorker || w.HealthReason.String != tc.reason {
-				t.Fatalf("health=%s/%s want %s/%s", w.Health, w.HealthReason.String, healthWaitingWorker, tc.reason)
+			if w.Health != healthWaitingWorker || w.HealthReason.String != want {
+				t.Fatalf("health=%s/%s want %s/%s", w.Health, w.HealthReason.String, healthWaitingWorker, want)
 			}
 			if w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || b.healthNudges[0] {
 				t.Fatalf("running lead waiting on child nudged: write=%+v nudges=%v", w, b.healthNudges)

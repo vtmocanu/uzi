@@ -72,6 +72,83 @@ func TestWaitingM2Evaluation(t *testing.T) {
 	}
 }
 
+// Even a stale stored upgrade reason must be revalidated against manual intent.
+// Both real checks share confirmation, but retain their ordinary 5m/10m/30m ages.
+func TestWaitingManualCordonEvaluation(t *testing.T) {
+	for _, age := range []time.Duration{6 * time.Minute, 40 * time.Minute} {
+		for _, mode := range []string{"manual only", "manual plus image roll", "suitable uncordoned peer", "assigned continuation", "upgrade only"} {
+			t.Run(age.String()+"/"+mode, func(t *testing.T) {
+				id, owner := uuid.New(), uuid.New()
+				since := pgtype.Timestamptz{Time: fixedNow.Add(-age), Valid: true}
+				reason := pgtype.Text{String: workersvc.ReasonWorkersUpgrading, Valid: true}
+				counts := store.CountOnlineWorkersClaimableForRunRow{
+					ManualSuitable: 1, ManualCordoned: 1,
+					LatestSuitableDrainingSince: since,
+				}
+				switch mode {
+				case "manual plus image roll":
+					counts.DrainingEligible = 1
+				case "suitable uncordoned peer":
+					counts.ManualSuitable = 2
+					counts.DrainingEligible = 1
+					counts.NonDrainingEligible = 1
+				case "assigned continuation":
+					counts.DrainingEligible = 1
+					counts.SuitableOwnDraining = 1
+					counts.Claimable = 1
+				case "upgrade only":
+					counts.ManualCordoned = 0
+					counts.DrainingEligible = 1
+				}
+				f := &fakeStore{
+					capacityRows: []store.ListOwnersWaitingNoCapacityRow{{RunID: id, UserID: owner, HealthSince: since, HealthReason: reason}},
+					waitingRows:  []store.ListWaitingWorkerRunsRow{{RunID: id, UserID: owner, HealthSince: since, HealthReason: reason}},
+					controller:   pgtype.Timestamptz{Time: fixedNow, Valid: true},
+				}
+				s := newSvc(f, &fakeSettings{healthEnabled: true})
+				calls := 0
+				s.cfg.WorkerEligibilityForHealth = func(_ context.Context, _ time.Time, run uuid.UUID) (store.CountOnlineWorkersClaimableForRunRow, error) {
+					if run != id {
+						t.Fatalf("confirmation run=%s want=%s", run, id)
+					}
+					calls++
+					return counts, nil
+				}
+				d, err := s.Evaluate(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCap, wantQueue := sevDanger, sevOK
+				if age == 40*time.Minute {
+					wantQueue = sevDanger
+				}
+				if mode == "upgrade only" {
+					wantCap, wantQueue = sevOK, sevOK
+				}
+				seen := map[string]bool{}
+				for _, c := range d.Checks {
+					want := ""
+					switch c.ID {
+					case "fleet.capacity":
+						want = wantCap
+					case "queue.waiting":
+						want = wantQueue
+					default:
+						continue
+					}
+					seen[c.ID] = true
+					if c.Severity != want {
+						t.Fatalf("%s: severity=%s want=%s summary=%q", c.ID, c.Severity, want, c.Summary)
+					}
+				}
+				if !seen["fleet.capacity"] || !seen["queue.waiting"] || calls != 1 {
+					t.Fatalf("missing evaluation checks or shared confirmation: seen=%v calls=%d", seen, calls)
+				}
+			})
+		}
+	}
+}
+
 func TestWaitingM2InvalidAndEvidence(t *testing.T) {
 	for _, bad := range []pgtype.Timestamptz{{}, {Valid: true, InfinityModifier: pgtype.Infinity}, {Valid: true, InfinityModifier: pgtype.NegativeInfinity}, {Valid: true}, {Valid: true, Time: fixedNow.Add(time.Second)}} {
 		for _, danger := range []bool{false, true} {
