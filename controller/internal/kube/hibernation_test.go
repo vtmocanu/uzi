@@ -637,7 +637,9 @@ func TestTerminatingReadyPodIsNeverReportedReady(t *testing.T) {
 
 func TestAmbiguousWakePatchErrorReportsNoReady(t *testing.T) {
 	hash := currentHash(t, "w1", 0)
-	m, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"), hibPod("pod-uid-7", hash, true, false))
+	// No pod remains (the hold releases the restore only then); the Ready pod appears
+	// once the restore has landed.
+	m, client, rec := hibEnv(t, hibCurrent(t, 0, "sleep-op"))
 	fail := true
 	client.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		if fail {
@@ -658,6 +660,9 @@ func TestAmbiguousWakePatchErrorReportsNoReady(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Fatal("ready reported on the tick that patched; it must re-read first")
+	}
+	if _, err := client.CoreV1().Pods(testConfig().Namespace).Create(context.Background(), hibPod("pod-uid-7", hash, true, false), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
 	}
 	if err := hibTick(t, m, w); err != nil {
 		t.Fatal(err)
@@ -859,6 +864,284 @@ func TestRestartMidPreparingResumesWithoutASecondScaleDown(t *testing.T) {
 	}
 	if n := len(deploymentPatchBodies(client)); n != 0 {
 		t.Fatalf("restart issued %d deployment patches, want none", n)
+	}
+}
+
+func hibDeletePod(t *testing.T, c *fake.Clientset, uid string) {
+	t.Helper()
+	if err := c.CoreV1().Pods(testConfig().Namespace).Delete(context.Background(), "pod-"+uid, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hibCreatePod(t *testing.T, c *fake.Clientset, p *corev1.Pod) {
+	t.Helper()
+	if _, err := c.CoreV1().Pods(testConfig().Namespace).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A quick wake: the api moved preparing to waking while the original pod still exists.
+// Restoring replicas 1 then would keep that pod alive, and the api never settles it after
+// scaling_down, so the restore waits until no pod of the worker remains.
+func TestQuickWakeHoldsZeroReplicasUntilTheOriginalPodIsGone(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 0, "prep-op"), hibPod("orig", hash, true, false))
+	w := hibW(protocol.HibernationWaking, "wake-op")
+
+	for i := 0; i < 2; i++ {
+		if err := hibTick(t, m, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(deploymentPatchBodies(client)); n != 0 {
+		t.Fatalf("restore patched while the original pod exists: %d patches", n)
+	}
+	if d := hibGet(t, client); *d.Spec.Replicas != 0 {
+		t.Fatalf("replicas = %d, want 0 while the original pod exists", *d.Spec.Replicas)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("reported %v while the original pod exists", rec.transitions())
+	}
+
+	hibDeletePod(t, client, "orig")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 1 {
+		t.Fatalf("patches after the pod is gone = %d, want exactly one", n)
+	}
+	d := hibGet(t, client)
+	if *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+		t.Fatalf("restore: replicas=%d annotations=%v", *d.Spec.Replicas, d.Annotations)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("reported %v on the restoring tick", rec.transitions())
+	}
+
+	hibCreatePod(t, client, hibPod("fresh", hash, true, false))
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady || rec.calls[0].PodUID != "fresh" {
+		t.Fatalf("calls = %+v, want one ready naming the new pod", rec.calls)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 1 {
+		t.Fatalf("ready tick patched again: %d patches", n)
+	}
+	assertNothingDeleted(t, client)
+}
+
+func TestQuickWakeTerminatingOriginalPodAlsoHoldsTheRestore(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 0, "prep-op"), hibPod("dying", hash, true, true))
+	if err := hibTick(t, m, hibW(protocol.HibernationWaking, "wake-op")); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 0 {
+		t.Fatalf("restore patched over a terminating pod: %d patches", n)
+	}
+	if *hibGet(t, client).Spec.Replicas != 0 || len(rec.calls) != 0 {
+		t.Fatalf("replicas=%d calls=%v", *hibGet(t, client).Spec.Replicas, rec.transitions())
+	}
+}
+
+// A controller restarted mid-hold, and again after the restore, converges without an
+// extra write.
+func TestQuickWakeHoldSurvivesAControllerRestart(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	_, client, rec := hibEnv(t, hibCurrent(t, 0, "prep-op"), hibPod("orig", hash, true, false))
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	newM := func() *Materializer {
+		return New(client, testConfig(), testResolver(t), rec, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+	m2 := newM()
+	if err := hibTick(t, m2, w); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 0 || len(rec.calls) != 0 {
+		t.Fatalf("mid-hold restart: patches=%d calls=%v", n, rec.transitions())
+	}
+	hibDeletePod(t, client, "orig")
+	m3 := newM()
+	if err := hibTick(t, m3, w); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 1 {
+		t.Fatalf("patches = %d, want exactly one restore", n)
+	}
+	m4 := newM()
+	if err := hibTick(t, m4, w); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 1 || len(rec.calls) != 0 {
+		t.Fatalf("after restore restart: patches=%d calls=%v", n, rec.transitions())
+	}
+	hibCreatePod(t, client, hibPod("fresh", hash, true, false))
+	if err := hibTick(t, newM(), w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].PodUID != "fresh" || len(deploymentPatchBodies(client)) != 1 {
+		t.Fatalf("calls=%+v patches=%d", rec.calls, len(deploymentPatchBodies(client)))
+	}
+}
+
+// The restore patch is lost ambiguously: the next tick re-reads and restores once more,
+// and nothing is reported on the tick that patched.
+func TestQuickWakeLostRestoreAckRereadsAndRestoresOnce(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 0, "prep-op"), hibPod("orig", hash, true, false))
+	fail := true
+	client.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if fail {
+			return true, nil, errors.New("timeout: outcome unknown")
+		}
+		return false, nil, nil
+	})
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatalf("held tick must not error: %v", err)
+	}
+	hibDeletePod(t, client, "orig")
+	if err := hibTick(t, m, w); err == nil {
+		t.Fatal("ambiguous restore error was swallowed")
+	}
+	fail = false
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if d := hibGet(t, client); *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+		t.Fatalf("not restored: replicas=%d annotations=%v", *d.Spec.Replicas, d.Annotations)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("ready on a patching tick: %v", rec.transitions())
+	}
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("ready without a Ready pod: %v", rec.transitions())
+	}
+	hibCreatePod(t, client, hibPod("fresh", hash, true, false))
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].PodUID != "fresh" {
+		t.Fatalf("calls = %+v", rec.calls)
+	}
+}
+
+// The scale-down patch landed but no scaling_down was ever reported (replicas 0 under the
+// prepare op, pod present) when the wake arrives: the restore still waits for the pod.
+func TestQuickWakeAfterScaleDownLandedBeforeAnyScalingDownReport(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 0, "prep-op"), hibPod("orig", hash, true, false))
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if len(deploymentPatchBodies(client)) != 0 || len(rec.calls) != 0 {
+		t.Fatalf("held tick wrote: patches=%d calls=%v", len(deploymentPatchBodies(client)), rec.transitions())
+	}
+	hibDeletePod(t, client, "orig")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if *hibGet(t, client).Spec.Replicas != 1 {
+		t.Fatal("not restored after the pod left")
+	}
+	hibCreatePod(t, client, hibPod("fresh", hash, true, false))
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady || rec.calls[0].PodUID != "fresh" {
+		t.Fatalf("calls = %+v", rec.calls)
+	}
+}
+
+// Pins the unchanged path: replicas still 1 under the prepare op (scale-down never
+// landed), so the original pod is not being stopped and is the one that comes back.
+func TestWakeAtReplicasOneKeepsTheSamePod(t *testing.T) {
+	hash := currentHash(t, "w1", 0)
+	m, client, rec := hibEnv(t, hibCurrent(t, 1, "prep-op"), hibPod("orig", hash, true, false))
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	d := hibGet(t, client)
+	if *d.Spec.Replicas != 1 || d.Annotations[annotationHibernationOp] != "wake-op" {
+		t.Fatalf("replicas=%d annotations=%v", *d.Spec.Replicas, d.Annotations)
+	}
+	if n := len(deploymentPatchBodies(client)); n != 1 || len(rec.calls) != 0 {
+		t.Fatalf("patches=%d calls=%v", n, rec.transitions())
+	}
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].Transition != protocol.TransitionReady || rec.calls[0].PodUID != "orig" {
+		t.Fatalf("calls = %+v, want ready for the same pod", rec.calls)
+	}
+}
+
+// The hold reads an unknown or incomplete pod set as "pods may remain", never as none.
+func TestQuickWakeNeverReadsAnUnknownPodSetAsNoPods(t *testing.T) {
+	page := func(cont string) runtime.Object {
+		return &corev1.PodList{ListMeta: metav1.ListMeta{Continue: cont}}
+	}
+	cases := []struct {
+		name string
+		// script answers the nth pod list (1-based); Observe's own list is the first.
+		script func(n int) (bool, runtime.Object, error)
+		// minHits is how many pod lists the scenario must reach.
+		minHits int
+	}{
+		{"observe list fails", func(int) (bool, runtime.Object, error) {
+			return true, nil, errors.New("pod list unavailable")
+		}, 2},
+		{"repeated continuation", func(n int) (bool, runtime.Object, error) {
+			if n == 1 {
+				return true, nil, errors.New("pod list unavailable")
+			}
+			return true, page("same"), nil
+		}, 3},
+		{"error on a later page", func(n int) (bool, runtime.Object, error) {
+			switch n {
+			case 1:
+				return true, nil, errors.New("pod list unavailable")
+			case 2:
+				return true, page("t1"), nil
+			}
+			return true, nil, errors.New("page 2 failed")
+		}, 3},
+		{"page limit reached", func(n int) (bool, runtime.Object, error) {
+			if n == 1 {
+				return true, nil, errors.New("pod list unavailable")
+			}
+			return true, page(strings.Repeat("t", n)), nil
+		}, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, client, rec := hibEnv(t, hibCurrent(t, 0, "prep-op"))
+			hits := 0
+			client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+				hits++
+				return tc.script(hits)
+			})
+			w := hibW(protocol.HibernationWaking, "wake-op")
+			for i := 0; i < 2; i++ {
+				_ = hibTick(t, m, w)
+			}
+			if hits < tc.minHits {
+				t.Fatalf("pod list reached %d times, want at least %d: the failure path was not exercised", hits, tc.minHits)
+			}
+			if n := len(deploymentPatchBodies(client)); n != 0 {
+				t.Fatalf("restore patched on an unknown pod set: %d patches", n)
+			}
+			if *hibGet(t, client).Spec.Replicas != 0 || len(rec.calls) != 0 {
+				t.Fatalf("replicas=%d calls=%v", *hibGet(t, client).Spec.Replicas, rec.transitions())
+			}
+		})
 	}
 }
 
