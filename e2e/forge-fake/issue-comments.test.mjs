@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import { once } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import https from "node:https";
@@ -7,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const bot = { id: 1, login: "uzi-bot" };
 const reviewer = { id: 2, login: "reviewer" };
@@ -69,6 +71,9 @@ test("shared fake HTTPS comment, author and publication contracts", { timeout: 3
   const head2 = git("repo2", "commit-tree", tree2, "-m", "second project");
   git("repo2", "update-ref", "refs/heads/agent/fixture", head2);
   git("repo2", "update-ref", "refs/heads/main", head2);
+  const gitUser = "uzi-bot";
+  const gitPassword = "fixture-git-password";
+  const authorization = `Basic ${Buffer.from(`${gitUser}:${gitPassword}`).toString("base64")}`;
   let diagnostics = "";
   child = spawn(process.execPath, [path.join(root, "e2e/forge-fake/forge-fake.mjs")], {
     cwd: root,
@@ -78,6 +83,7 @@ test("shared fake HTTPS comment, author and publication contracts", { timeout: 3
       FORGE_FAKE_STATE: statePath, FORGE_FAKE_BASE_URL: "https://configured.invalid",
       FORGE_FAKE_PROJECT: "group/repo", FORGE_FAKE_PROJECT2: "group/repo2",
       FORGE_FAKE_GIT_ROOT: gitRoot,
+      FORGE_FAKE_EXPECT_USER: gitUser, FORGE_FAKE_EXPECT_PAT: gitPassword,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -139,6 +145,63 @@ test("shared fake HTTPS comment, author and publication contracts", { timeout: 3
     assert.equal(response.status, 200, route);
     return response;
   }
+
+  await t.test("HTTPS fetch and checkpoint push keep both project refs and objects isolated", async (subtest) => {
+    subtest.after(async () => {
+      await new Promise(setImmediate);
+      if (!subtest.passed) subtest.diagnostic(diagnostics);
+    });
+    const client = async (dir, args, auth = authorization) => (await execFileAsync("git", [
+      "-C", dir, "-c", `http.sslCAInfo=${certPath}`, "-c", "http.proxy=", "-c", "credential.helper=",
+      "-c", `http.extraHeader=Authorization: ${auth}`,
+      "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", ...args,
+    ], {
+      encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    })).stdout.trim();
+    const checkpoint = "refs/uzi-checkpoints/agent/https-routing";
+    const projects = [
+      { repo: "repo", slug: "group/repo", root: base, foreign: head2 },
+      { repo: "repo2", slug: "group/repo2", root: head2, foreign: base },
+    ];
+    assert.notEqual(base, head2);
+    for (const project of projects) {
+      const dir = path.join(scratch, `client-${project.repo}`);
+      mkdirSync(dir);
+      await client(dir, ["init", "--bare"]);
+      const remote = `${origin}/${project.slug}.git`;
+      await client(dir, ["fetch", "--no-tags", remote, "refs/heads/main:refs/heads/main"]);
+      assert.equal(await client(dir, ["rev-parse", "refs/heads/main"]), project.root);
+      await assert.rejects(() => client(dir, ["cat-file", "-e", project.foreign]));
+      project.checkpoint = await client(dir, ["commit-tree", tree, "-p", project.root, "-m", `checkpoint ${project.repo}`]);
+      await client(dir, ["push", remote, `${project.checkpoint}:${checkpoint}`]);
+    }
+    for (const [index, project] of projects.entries()) {
+      const sibling = projects[1 - index];
+      assert.equal(git(project.repo, "rev-parse", "refs/heads/main"), project.root);
+      assert.equal(git(project.repo, "rev-parse", checkpoint), project.checkpoint);
+      assert.throws(() => git(project.repo, "cat-file", "-e", sibling.root));
+      assert.throws(() => git(project.repo, "cat-file", "-e", sibling.checkpoint));
+    }
+
+    // Unknown paths retain the original first-bare fallback, even if their
+    // basename resembles the configured second project.
+    const fallback = path.join(scratch, "client-fallback");
+    mkdirSync(fallback);
+    await client(fallback, ["init", "--bare"]);
+    for (const slug of ["unknown/project", "elsewhere/repo2", "group/repo2-extra"]) {
+      await client(fallback, ["fetch", "--no-tags", `${origin}/${slug}.git`, "refs/heads/main"]);
+      assert.equal(await client(fallback, ["rev-parse", "FETCH_HEAD"]), base);
+      await assert.rejects(() => client(fallback, ["cat-file", "-e", head2]));
+    }
+    for (const project of projects) {
+      for (const auth of ["", `Basic ${Buffer.from("uzi-bot:wrong-password").toString("base64")}`,
+        `Basic ${Buffer.from(`wrong-user:${gitPassword}`).toString("base64")}`, `Bearer ${gitPassword}`]) {
+        await assert.rejects(() => client(fallback, ["ls-remote", `${origin}/${project.slug}.git`], auth),
+          (error) => error.code === 128 && /Authentication failed|could not read Username/.test(error.stderr.toString()));
+      }
+    }
+  });
 
   await t.test("GitLab custody proof reads exact project refs and real ancestry", async () => {
     const branch = encodeURIComponent("agent/fixture");

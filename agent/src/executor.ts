@@ -1295,6 +1295,10 @@ const STUB_CODER_USAGE = {
 
 /** Options for the stub executor. */
 export interface StubExecutorOptions {
+  /** Trusted fixture timer override; production stub ceiling is 180 seconds. */
+  fixtureBarrierTimeoutMs?: number;
+  /** Trusted fixture directory override; worker release markers default to /tmp. */
+  fixtureBarrierDirectory?: string;
   /**
    * Drive the M4 plan-approval gate before committing (emit a plan → the runner
    * posts awaiting_approval → await the human verdict). Off by default so the
@@ -1400,13 +1404,70 @@ export async function stampPrSummaryHead(
   return sha === undefined ? rest : { ...rest, verifiedAtSha: sha };
 }
 
+// Constructor identity is deliberately independent of descriptions, environment and prototypes.
+const actualStubs = new WeakSet<Executor>();
+
 export class StubExecutor implements Executor {
+  #fixtureContext?: Pick<RunContext, "runId" | "claimGeneration" | "issueDescription">;
+
+  static fixture(executor: Executor | undefined): StubExecutor | undefined {
+    return executor && actualStubs.has(executor) ? executor as StubExecutor : undefined;
+  }
+
+  fixtureRequested(name: string, runId: string, generation: number): boolean {
+    const ctx = this.#fixtureContext;
+    return ctx?.runId === runId && ctx.claimGeneration === generation &&
+      Number.isSafeInteger(generation) && generation > 0 &&
+      ctx.issueDescription.split(/\s+/).includes(name);
+  }
+
+  /** Exact-generation release; watcher, timer and abort listener are all bounded to this await. */
+  async fixtureBarrier(stage: "terminal" | "running-ack", runId: string, generation: number,
+    signal: AbortSignal, ready: () => void): Promise<void> {
+    if (!this.fixtureRequested(stage === "terminal" ? "UZI_STUB_POST_PUBLICATION_BARRIER" :
+      "UZI_STUB_PRE_RUNNING_ACK_BARRIER", runId, generation)) return;
+    if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(runId))
+      throw new Error("invalid stub fixture run id");
+    const name = `cdr-outbox-${stage}-${runId}-${generation}`;
+    const directory = this.opts.fixtureBarrierDirectory ?? "/tmp";
+    const file = path.join(directory, name);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let done = false;
+        const finish = (error?: unknown) => {
+          if (done) return;
+          done = true;
+          watcher.close();
+          clearTimeout(timer);
+          signal.removeEventListener("abort", abort);
+          if (error) reject(error); else resolve();
+        };
+        const abort = () => finish(signal.reason ?? new Error("stub fixture aborted"));
+        const check = () => { void fs.access(file).then(() => finish(), error => {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") finish(error);
+        }); };
+        const watcher = watch(directory, (_event, changed) => { if (changed === name) check(); });
+        watcher.on("error", finish);
+        const timer = setTimeout(() => finish(new Error("stub fixture barrier timeout")),
+          this.opts.fixtureBarrierTimeoutMs ?? 180_000);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+        else {
+          try { ready(); check(); } catch (error) { finish(error); }
+        }
+      });
+    } finally {
+      await fs.unlink(file).catch(() => undefined);
+    }
+  }
+
   constructor(
     private readonly log: Logger,
     private readonly opts: StubExecutorOptions = {},
-  ) {}
+  ) { actualStubs.add(this); }
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
+    this.#fixtureContext = { runId: ctx.runId, claimGeneration: ctx.claimGeneration, issueDescription: ctx.issueDescription };
     ctx.emit({
       kind: "status",
       agent: "worker",
@@ -1765,11 +1826,6 @@ export class StubExecutor implements Executor {
       });
     }
 
-    // PRD #47 M6: reproduce a stall / loop / long in-flight tool call so the
-    // server-side run-health detector is provable end to end with no live SDK.
-    // Gated on the UZI_STUB_* sentinels; a normal run is unaffected.
-    await this.simulateHealth(ctx);
-
     const markerPath = path.join(ctx.worktreePath, "UZI_RUN.md");
     const marker = [
       `# uzi stub run`,
@@ -1783,7 +1839,19 @@ export class StubExecutor implements Executor {
       `Claude Agent SDK.`,
       ``,
     ].join("\n");
-    await fs.writeFile(markerPath, marker, "utf8");
+    // Trusted stub fixture only: leave ordinary work dirty for commitWipMarker
+    // when phase 45 pauses at the first-generation executor barrier.
+    const preparePauseWork = ctx.issueDescription.split(/\s+/).includes("UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK");
+    if (preparePauseWork && (!Number.isSafeInteger(ctx.claimGeneration) || ctx.claimGeneration! < 1))
+      throw new Error("invalid stub checkpointable work claim generation");
+    const earlyMarker = preparePauseWork && ctx.claimGeneration === 1 &&
+      ctx.issueDescription.includes(STUB_OUTBOX_SENTINEL) &&
+      ctx.issueDescription.includes("UZI_STUB_OUTBOX_FIRST_CUT_BARRIER");
+    if (earlyMarker) await fs.writeFile(markerPath, marker, "utf8");
+
+    // PRD #47 M6: reproduce health/outage fixtures before the ordinary local commit.
+    await this.simulateHealth(ctx);
+    if (!earlyMarker) await fs.writeFile(markerPath, marker, "utf8");
 
     // Local commit only. Identity is pinned per-invocation via -c so nothing is
     // written to the worktree's git config, and gpg signing is forced off so a

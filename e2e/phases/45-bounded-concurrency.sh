@@ -5,7 +5,7 @@
 # lane:     gitlab
 # executor: any
 # race-sensitive: yes
-# requires: UZI_WORKER_TOKEN
+# requires: REPO_ID UZI_WORKER_TOKEN UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
 # mutates:  -
@@ -25,24 +25,117 @@
 #       while both are live (the "N/M runs" saturation badge's data, PRD #42 M3a);
 #   (d) lands BOTH MRs, each on its own repo's independent git bare-cache, with no
 #       message cross-talk between the two concurrent run streams;
-#   (e) on a mid-run SIGKILL of the agent (two in-flight runs), re-queues BOTH
-#       together via the SWEEPER at N=2 (worker-loss recovery, now exercised with
-#       two runs), and a restarted worker re-claims both by affinity and completes
-#       them.
+#   (e) resumes two cooperatively paused, positively ended sources after restart;
+#   (f) refuses two active predecessors after SIGKILL, preserving source/custody,
+#       then records explicit fixture-owner disposition.
 #
 # STATED LIMIT (PRD #42 M5 / review — do not overclaim): the stub executor is
 # already concurrency-safe (zero instance-level run state), so this exercises the
 # worker loop + server + API-listing path, NOT the M1 per-run executor kill/reap
 # isolation fix (per-instance SdkExecutor / runId-scoped killAgentTree). M1's unit
 # test (agent/test/) is the guard for that; the stub cannot exercise it.
-assert_cap2_recovered_run() {
-  local run="$1" original="$2" branch="$3" generation parks
-  generation="$(db_psql "SELECT claim_generation FROM runs WHERE id = '$run'")"
-  parks="$(db_psql "SELECT recovery_wait_count FROM runs WHERE id = '$run'")"
-  [ "$generation" = "$((original + 1))" ] \
-    || fail "run $run recovery generation is $generation, want $((original + 1))"
-  [ "$parks" = 0 ] || fail "run $run re-parked retained recovery ($parks parks)"
-  wait_same_claim_capture_resume "$run" "$generation" 60 "$branch"
+# Owner Resume mints one ordinary claim without charging worker-loss budget.
+assert_cap2_owner_resume() {
+  local run="$1" original="$2" requeues="$3" iid="$4" project="$5" view
+  view="$(apiget "/api/runs/$run")"
+  [ "$(db_psql "SELECT claim_generation FROM runs WHERE id='$run'")" = "$((original + 1))" ] \
+    || fail "owner resume generation mismatch"
+  printf '%s' "$view" | jq -e --argjson requeues "$requeues" --arg branch "agent/issue-$iid" \
+    '.run|.status=="completed" and .requeue_count==$requeues and .branch==$branch and (.mr_iid>0)' >/dev/null \
+    || fail "owner resume outcome/branch/requeue mismatch"
+  fake_state | jq -e --arg branch "agent/issue-$iid" --argjson project "$project" \
+    'any(.mrs[]; .source_branch==$branch and .project_id==$project)' >/dev/null \
+    || fail "owner resume MR project mismatch"
+}
+
+# One capped log: exact foreign-active refusal on the second and last claim.
+assert_cap2_crash_refusal() {
+  local run="$1" original="$2" branch="$3" log="$4" view
+  view="$(apiget "/api/runs/$run")"
+  [ "$(db_psql "SELECT claim_generation FROM runs WHERE id='$run'")" = "$((original + 1))" ] \
+    || fail "crash refusal generation mismatch"
+  printf '%s' "$view" | jq -e '.run|.status=="failed" and .requeue_count==1 and
+    (.failure_reason|contains("Retained recovery blocked: preservation failed") and contains("local work and custody retained"))' >/dev/null \
+    || fail "crash refusal failure_reason/budget mismatch"
+  jq -Rse --arg run "$run" --arg branch "$branch" --argjson gen "$((original + 1))" '
+    [split("\n")[]|sub("^[^{]*";"")|fromjson?] as $events |
+    [$events|to_entries[]|select(.value.run_id==$run and .value.msg=="run claimed")] as $claims |
+    [$events|to_entries[]|select(.value.run_id==$run and .value.msg=="retained predecessor refused by source-use admission; capture not started"
+      and (.value.error|contains("source is active under another worker incarnation")))] as $refusals |
+    [$events|to_entries[]|select(.value.run_id==$run and .value.msg=="outbox: terminal journaled write-ahead"
+      and .value.claim_generation==$gen and .value.status=="failed")] as $terminals |
+    ($claims|length)==2 and ($refusals|length)==1 and ($terminals|length)==1 and
+    $claims[1].key<$refusals[0].key and $refusals[0].key<$terminals[0].key and
+    all($events[($claims[1].key+1):][];
+      (if .run_id==$run then
+        (.msg!="recovery: bundle uploaded (durable capture)" and .msg!="recovery: prior open custody holds inventoried after clone"
+         and .msg!="stub executor committed marker") else true end) and
+      (if .branch==$branch then .msg!="runner clone: seeding" else true end))' "$log" >/dev/null \
+    || fail "crash lacks exact foreign-active refusal or captured/reseeded/executed"
+}
+
+assert_cap2_crash_bytes() {
+  local before="$1" after="$2"
+  jq -ne --slurpfile b "$before" --slurpfile a "$after" '
+    $b[0] as $b|$a[0] as $a|
+    ($b|del(.pins))==($a|del(.pins)) and all($b.pins[]; . as $p|$a.pins|index($p)!=null)' >/dev/null \
+    || fail "crash original source bytes/head/journal/pins changed"
+}
+
+cap2_early_barrier() {
+  local file="$CAP2_SCRATCH/early-barrier"
+  fixture_crash_read "$file" apiget "/api/runs/$1/messages" || return 1
+  jq -r 'any(.messages[]; .payload.text=="stub: outbox waiting for API cut")' "$file"
+}
+
+# Three fresh inspections allow normal local-record cleanup. There is no resolve
+# RPC: unresolved records/refusals retain bytes. Only a fresh explicit local
+# discard disposition authorizes the guarded client; failures stop this run.
+cap2_crash_local_teardown() {
+  local run="$1" gen="$2" original="$3" dir="$4" n source disposition attempt generation descriptor rc
+  attempt="$(jq -er '.sources[0].attempt' "$original")" || fail "missing original attempt identity"
+  for n in 1 2 3; do
+    rc=0
+    fixture_crash_inspect "$run" "$gen" "$dir/local" "$attempt" || rc=$?
+    if [ "$rc" = 2 ]; then
+      fail "crashed-active source disappeared before guarded local discard: $run"
+    fi
+    [ "$rc" = 0 ] || fail "crash original inspection unavailable during local teardown ($rc)"
+    source="$(jq -ce --slurpfile old "$original" '.sources[0]|select(.runId==$old[0].sources[0].runId and
+      .barePath==$old[0].sources[0].barePath and .branch==$old[0].sources[0].branch and
+      .attempt==$old[0].sources[0].attempt and .sources[0].clonePath==$old[0].sources[0].sources[0].clonePath)' "$dir/local")" \
+      || fail "local teardown source changed identity"
+    disposition="$(printf '%s' "$source" | jq -r '.disposition.kind')"
+    case "$disposition" in
+      local_discard|local_protected_discard)
+        attempt="$(printf '%s' "$source" | jq -r '.attempt')"
+        generation="$(printf '%s' "$source" | jq -r '.generation')"
+        descriptor="$(printf '%s' "$source" | jq -r '.descriptor')"
+        local protected=()
+        [ "$disposition" != local_protected_discard ] || protected=(--protected)
+        fixture_crash_read "$dir/discard" "${COMPOSE[@]}" exec -T -u worker agent /usr/bin/env -i \
+          PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs discard \
+          --run "$run" --generation "$generation" --attempt "$attempt" --confirm "$descriptor" "${protected[@]}" \
+          || fail "guarded local discard failed"
+        jq -e --argjson source "$source" '.ok==true and .op=="discard" and .result.kind=="done" and
+          .result.metadata=="retired" and (.result.sources|length==1) and
+          (.result.sources[0]|.clonePath==$source.sources[0].clonePath and (.outcome|IN("removed","missing")))' "$dir/discard" >/dev/null \
+          || fail "local discard not acknowledged for exact original path"
+        rc=0; fixture_crash_inspect "$run" "$gen" "$dir/local-after" "$attempt" || rc=$?
+        [ "$rc" = 2 ] || fail "local source remains after discard"
+        fixture_crash_snapshot "$original" "$dir/absent" absent || fail "guarded discard left original bytes"
+        jq -e '.absent==true' "$dir/absent" >/dev/null || fail "missing positive original absence"
+        pass "crash source guarded local discard observed: $run"
+        return ;;
+      resolve_local_record|owner_hold_discard|refused) ;;
+      *) fail "unknown local crash disposition" ;;
+    esac
+    [ "$n" = 3 ] || sleep 1
+  done
+  fixture_crash_snapshot "$original" "$dir/retained" || fail "unresolved crash source bytes unavailable"
+  assert_cap2_crash_bytes "$dir/before" "$dir/retained"
+  jq -c '{sources:[.sources[]|{runId,generation,attempt,disposition,localRecords,consumers}]}' "$dir/local"
+  pass "crash source positively retained after bounded normal cleanup attempts: $run"
 }
 
 if [ "$EXECUTOR" != stub ]; then
@@ -67,6 +160,15 @@ else
   # via phase 13's `provides` round-trip (see `requires: UZI_WORKER_TOKEN` above), so the
   # force-recreated container re-reads the SAME join token and re-registers into its
   # existing row; without the provide it would read the --env-file placeholder and 401.
+  export TMPDIR="$ROOT/.uzi/scratch"
+  CAP2_SCRATCH="$(mktemp -d)"
+  CAP2_TICKS_SET="${UZI_STUB_OUTBOX_TICKS+x}" CAP2_TICKS="${UZI_STUB_OUTBOX_TICKS-}"
+  cap2_restore_ticks() {
+    if [ "$CAP2_TICKS_SET" = x ]; then export UZI_STUB_OUTBOX_TICKS="$CAP2_TICKS";
+    else unset UZI_STUB_OUTBOX_TICKS; fi
+  }
+  trap cap2_restore_ticks EXIT
+  export UZI_STUB_OUTBOX_TICKS=3
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
   # Wait for the NEW worker's registration to actually LAND its advertised cap —
@@ -143,99 +245,128 @@ else
     || fail "both concurrent runs must open an MR (got A=$MRA B=$MRB)"
   # Each branch landed on its OWN repo's bare — proving the two runs used
   # independent git caches (repo2's branch is NOT in repo1's bare, and vice versa).
-  #
-  # This REMOTE-bare independence check holds only for the default (insteadOf) transport,
-  # where repo.git and repo2.git are two distinct local bares. Under E2E_GIT_SMART_HTTP
-  # forge-fake routes EVERY repo path onto the ONE shared bare (forge-fake.mjs
-  # PATH_INFO=/repo.git${rest}), so both branches necessarily land on repo.git and this
-  # check is unsatisfiable by construction — the pre-#97-M1 opt-in smart-HTTP full run was
-  # already red here (PRD #97 M1 confirm-and-fix). The WORKER-side cache independence — the
-  # actual #42 property — still holds under smart-HTTP (repo and repo2 have DISTINCT clone
-  # URLs ⇒ distinct worker bare dirs, no per-repo GitCache lock shared) and is proven by the
-  # concurrency asserts above (both parked at once on the one worker) plus the per-project
-  # MR attribution below. So gate the remote-bare check to the default transport; under
-  # smart-HTTP assert only that both branches reached the shared bare.
-  if [ -z "${E2E_GIT_SMART_HTTP:-}" ]; then
-    git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
-      || fail "run A branch not on the repo1 bare"
-    git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      || fail "run B branch not on the repo2 bare (independent bare-cache check)"
-    git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      && fail "run B's branch leaked into the repo1 bare (caches not independent)"
-  else
-    git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
-      || fail "run A branch not on the shared smart-HTTP bare"
-    git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      || fail "run B branch not on the shared smart-HTTP bare (forge-fake collapses repo/repo2 — see comment)"
-  fi
+  # Both local-path and smart-HTTP transports select the same independent bares.
+  git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
+    || fail "run A branch not on the repo1 bare"
+  git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+    || fail "run B branch not on the repo2 bare (independent bare-cache check)"
+  git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+    && fail "run B's branch leaked into the repo1 bare (caches not independent)"
+  git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
+    && fail "run A's branch leaked into the repo2 bare (caches not independent)"
   FS="$(fake_state)"
   [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_A" '[.mrs[]|select(.source_branch==$b)]|length')" -ge 1 ] \
     || fail "fake recorded no MR for run A's branch"
   # The repo2 MR is attributed to project 2 (the multi-project fake resolves :id).
   [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_B" '[.mrs[]|select(.source_branch==$b)][-1].project_id')" = 2 ] \
     || fail "run B's MR not attributed to forge project 2 (group/repo2)"
-  if [ -z "${E2E_GIT_SMART_HTTP:-}" ]; then bare_note="each on its own independent bare"; else bare_note="both on the one shared smart-HTTP bare"; fi
-  pass "both runs completed: MRs !$MRA (repo) + !$MRB (repo2, project 2), $bare_note"
+  pass "both runs completed: MRs !$MRA (repo) + !$MRB (repo2, project 2), each on its own independent bare"
 
-  # --- (e) mid-run SIGKILL → sweeper re-queues BOTH (N=2) → restart completes ---
-  say "PRD #42: mid-run SIGKILL of the agent with two in-flight runs → sweeper re-queues BOTH → restart completes"
-  # The heartbeat-stale window is already tightened to 15s from BOOT (E2E_WORKER_HEARTBEAT_STALE
-  # in the env-file), so the sweeper's worker-loss recovery is bounded here with no dedicated
-  # api recreate — 15s is still 3× the 5s heartbeat, so a LIVE worker is never spuriously swept.
-
-  IID_KA="$(apipost "/api/repos/$REPO_ID/issues" \
-    '{"title":"E2E cap2 kill A","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
-  IID_KB="$(apipost "/api/repos/$REPO2_ID/issues" \
-    '{"title":"E2E cap2 kill B","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
-  RUN_KA="$(create_run "$REPO_ID" "$IID_KA")" || fail "cap2 kill-scenario run A run-create failed (non-transient; see stderr)"
-  RUN_KB="$(create_run "$REPO2_ID" "$IID_KB")" || fail "cap2 kill-scenario run B run-create failed (non-transient; see stderr)"
-  { [ -n "$RUN_KA" ] && [ "$RUN_KA" != null ] && [ -n "$RUN_KB" ] && [ "$RUN_KB" != null ]; } \
-    || fail "the two kill-scenario runs were not created"
-  wait_status "$RUN_KA" awaiting_approval
-  wait_status "$RUN_KB" awaiting_approval
-  pass "two fresh runs in-flight (both parked at the gate, each holding a slot)"
-  GEN_KA_ORIGINAL="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_KA'")"
-  GEN_KB_ORIGINAL="$(db_psql "SELECT claim_generation FROM runs WHERE id='$RUN_KB'")"
-
-  # Hard-kill the agent: no graceful drain, no re-register — only the server-side
-  # sweeper can recover the two orphaned runs. Do NOT restart the worker yet, so
-  # the SWEEPER (not the restart's register-time requeue) is what re-queues them.
-  "${COMPOSE[@]}" kill -s KILL agent >/dev/null
-  pass "SIGKILL delivered to the agent container (two runs left in-flight)"
-
-  # Both orphaned runs go back to `queued` together — the sweeper's N=2 recovery.
-  wait_status "$RUN_KA" queued 60
-  wait_status "$RUN_KB" queued 60
-  pass "sweeper marked the dead worker offline and re-queued BOTH runs (N=2)"
-
-  # Restart the worker (same join token ⇒ same worker id): it re-claims both by
-  # affinity and drives them to completion. The exported UZI_WORKER_TOKEN re-sources
-  # the `worker_token` secret; no token re-delivery is needed.
-  #
-  # #2512 verifies/captures the retained predecessor and seeds a fresh attempt
-  # inside the acquired successor claim. The 90s gate ceiling covers recovery
-  # work under CI load; no extra park, promotion or generation is expected.
+  # --- A: cooperative pause, positive source end, restart, owner resume --------
+  say "PRD #42: two running owners pause now before worker restart"
+  PAUSE_RUNS=() PAUSE_IIDS=() PAUSE_GENS=() PAUSE_REQUEUES=()
+  for repo in "$REPO_ID" "$REPO2_ID"; do
+    wait_custody_headroom 1
+    iid="$(apipost "/api/repos/$repo/issues" '{"title":"E2E cap2 cooperative pause","description":"implements prds/4-agent-runtime-workers.md UZI_STUB_OUTBOX UZI_STUB_OUTBOX_FIRST_CUT_BARRIER UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK UZI_STUB_SOURCE_END_READY"}' | jq -er '.card.iid')"
+    run="$(create_run "$repo" "$iid")" || fail "cap2 pause run-create failed"
+    PAUSE_RUNS+=("$run"); PAUSE_IIDS+=("$iid")
+    wait_status "$run" awaiting_approval
+    PAUSE_GENS+=("$(db_psql "SELECT claim_generation FROM runs WHERE id='$run'")")
+    PAUSE_REQUEUES+=("$(apiget "/api/runs/$run" | jq -er '.run.requeue_count')")
+    apipost "/api/runs/$run/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  done
+  for i in 0 1; do
+    run="${PAUSE_RUNS[$i]}"
+    wait_status "$run" running
+    wait_eq true 40 "cap2 first-claim early barrier $run" cap2_early_barrier "$run"
+  done
+  for run in "${PAUSE_RUNS[@]}"; do
+    apipost "/api/runs/$run/inputs" '{"kind":"pause","body":"now"}' >/dev/null
+  done
+  for i in 0 1; do
+    run="${PAUSE_RUNS[$i]}"
+    wait_status "$run" paused
+    wait_fixture_worker_event "$run" "${PAUSE_GENS[$i]}" "stub: source-end ready" \
+      || fail "cooperative pause lacks positive exact source end"
+  done
+  "${COMPOSE[@]}" stop agent >/dev/null
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
   wait_worker_online
-  wait_status "$RUN_KA" awaiting_approval 90
-  wait_status "$RUN_KB" awaiting_approval 90
-  assert_cap2_recovered_run "$RUN_KA" "$GEN_KA_ORIGINAL" "agent/issue-$IID_KA"
-  assert_cap2_recovered_run "$RUN_KB" "$GEN_KB_ORIGINAL" "agent/issue-$IID_KB"
-  pass "restarted worker captured and re-gated both runs inside one successor claim each (affinity preserved)"
+  for run in "${PAUSE_RUNS[@]}"; do apipost "/api/runs/$run/resume-now" '{}' >/dev/null; done
+  for i in 0 1; do
+    run="${PAUSE_RUNS[$i]}"
+    wait_status "$run" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+    assert_cap2_owner_resume "$run" "${PAUSE_GENS[$i]}" "${PAUSE_REQUEUES[$i]}" "${PAUSE_IIDS[$i]}" "$((i+1))"
+    resolve_fixture_run_source_holds "$run"
+  done
+  pass "both cooperatively paused runs completed on G+1 without worker-loss requeue charges"
 
-  apipost "/api/runs/$RUN_KA/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
-  apipost "/api/runs/$RUN_KB/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
-  wait_status "$RUN_KA" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
-  wait_status "$RUN_KB" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
-  FKA="$(apiget "/api/runs/$RUN_KA")"; FKB="$(apiget "/api/runs/$RUN_KB")"
-  [ "$(echo "$FKA" | jq -r '.run.requeue_count')" -ge 1 ] || fail "run KA was never re-queued (requeue_count=0)"
-  [ "$(echo "$FKB" | jq -r '.run.requeue_count')" -ge 1 ] || fail "run KB was never re-queued (requeue_count=0)"
-  MRKA="$(echo "$FKA" | jq -r '.run.mr_iid')"; MRKB="$(echo "$FKB" | jq -r '.run.mr_iid')"
-  { [ "$MRKA" != null ] && [ "$MRKA" -gt 0 ] && [ "$MRKB" != null ] && [ "$MRKB" -gt 0 ]; } \
-    || fail "re-queued runs must still land their MRs after the restart (got A=$MRKA B=$MRKB)"
-  pass "both re-queued runs completed after restart (requeue_count>=1), MRs !$MRKA + !$MRKB"
-  # The phase created and killed these exact originals. Their preservation was
-  # asserted above; now record the fixture owner's decision, keeping ready archives.
-  resolve_fixture_source_hold "$RUN_KA" "$GEN_KA_ORIGINAL"
-  resolve_fixture_source_hold "$RUN_KB" "$GEN_KB_ORIGINAL"
+  # --- B: active sources cannot be recovered from a foreign incarnation -------
+  say "PRD #42: hard crash preserves two active predecessor sources"
+  CRASH_RUNS=() CRASH_IIDS=() CRASH_GENS=()
+  for repo in "$REPO_ID" "$REPO2_ID"; do
+    wait_custody_headroom 1
+    iid="$(apipost "/api/repos/$repo/issues" '{"title":"E2E cap2 active crash","description":"implements prds/4-agent-runtime-workers.md"}' | jq -er '.card.iid')"
+    run="$(create_run "$repo" "$iid")" || fail "cap2 crash run-create failed"
+    CRASH_RUNS+=("$run"); CRASH_IIDS+=("$iid")
+    wait_status "$run" awaiting_approval
+    gen="$(db_psql "SELECT claim_generation FROM runs WHERE id='$run'")"
+    CRASH_GENS+=("$gen")
+    dir="$CAP2_SCRATCH/$run"; mkdir "$dir"
+    fixture_worker_log "$dir/seed-log" || fail "crash seed identity log unavailable"
+    # Branch is bound by this just-created issue/run; the guarded inspection must
+    # independently confirm the resulting selector's run/generation/path.
+    attempt="$(jq -Rrse --arg branch "agent/issue-$iid" --argjson gen "$gen" '
+      [split("\n")[]|sub("^[^{]*";"")|fromjson?|
+        select(.msg=="runner clone: seeding" and .branch==$branch)|.path]|unique|
+      if length!=1 then error("ambiguous original seed") else .[0] end |
+      if contains(".attempt-") then
+        capture("\\.attempt-(?<id>[0-9]{8}T[0-9]{6}Z-g"+($gen|tostring)+"-[0-9a-f]{16})$").id
+      else "canonical" end' "$dir/seed-log")" || fail "crash original attempt identity unavailable"
+    fixture_crash_inspect "$run" "$gen" "$dir/original" "$attempt" || fail "crash source original identity unavailable"
+    jq -e 'any(.sources[0].sources[]; .live==true)' "$dir/original" >/dev/null || fail "crash predecessor not positively live"
+    fixture_crash_snapshot "$dir/original" "$dir/before" || fail "crash original snapshot unavailable"
+    db_psql "SELECT count(*) FROM run_messages WHERE run_id='$run' AND payload->>'text'='stub executor starting'" > "$dir/executions"
+    [ "$(cat "$dir/executions")" = 1 ] || fail "crash original executor start missing/ambiguous"
+    fixture_crash_read "$dir/holds" uzi_cli run recovery "$run" --json || fail "crash custody snapshot unavailable"
+    jq -e --arg run "$run" --argjson gen "$gen" '[.[]|select(.run_id==$run and .generation==$gen and .state=="open")]|length==1' "$dir/holds" >/dev/null \
+      || fail "crash original custody missing"
+    fixture_worker_event_ready "$run" "$gen" "stub: source-end ready" && fail "active crash already has source end"
+  done
+  # Keep the worker stopped until the sweeper has requeued BOTH original claims.
+  "${COMPOSE[@]}" kill -s KILL agent >/dev/null
+  for run in "${CRASH_RUNS[@]}"; do wait_status "$run" queued 60; done
+  for run in "${CRASH_RUNS[@]}"; do [ "$(run_status_quick "$run")" = queued ] || fail "sweeper pair not simultaneously queued"; done
+  "${COMPOSE[@]}" up -d --wait agent >/dev/null
+  wait_worker_online
+  for run in "${CRASH_RUNS[@]}"; do wait_status "$run" failed 90; done
+  fixture_worker_log "$CAP2_SCRATCH/crash.log" || fail "bounded crash log unavailable"
+  for i in 0 1; do
+    run="${CRASH_RUNS[$i]}"; gen="${CRASH_GENS[$i]}"; dir="$CAP2_SCRATCH/$run"
+    assert_cap2_crash_refusal "$run" "$gen" "agent/issue-${CRASH_IIDS[$i]}" "$CAP2_SCRATCH/crash.log"
+    fixture_crash_snapshot "$dir/original" "$dir/after" || fail "crash retained original snapshot unavailable"
+    assert_cap2_crash_bytes "$dir/before" "$dir/after"
+    [ "$(db_psql "SELECT count(*) FROM run_messages WHERE run_id='$run' AND payload->>'text'='stub executor starting'")" = "$(cat "$dir/executions")" ] \
+      || fail "refused crash successor executed the stub"
+    fixture_crash_read "$dir/holds-after" uzi_cli run recovery "$run" --json || fail "crash custody recheck unavailable"
+    jq -ne --slurpfile b "$dir/holds" --slurpfile a "$dir/holds-after" '
+      all($b[0][]; . as $h|any($a[0][]; .id==$h.id and .run_id==$h.run_id and .generation==$h.generation and .state=="open"))' >/dev/null \
+      || fail "crash original custody not retained"
+    jq -ne --slurpfile b "$dir/holds" --slurpfile a "$dir/holds-after" '
+      ([$b[0][]|.captures[]?.id]|sort) == ([$a[0][]|.captures[]?.id]|sort)' >/dev/null \
+      || fail "refused crash successor captured work"
+    discard_fixture_crash_owner_holds "$run" "$((gen + 1))"
+    cap2_crash_local_teardown "$run" "$gen" "$dir/original" "$dir"
+  done
+  # Prove admission AND fresh source use on each of the same repositories.
+  for repo in "$REPO_ID" "$REPO2_ID"; do
+    wait_custody_headroom 1
+    iid="$(apipost "/api/repos/$repo/issues" '{"title":"E2E cap2 fresh after refused crash","description":"implements prds/4-agent-runtime-workers.md"}' | jq -er '.card.iid')"
+    run="$(create_run "$repo" "$iid")" || fail "fresh post-crash run-create failed"
+    wait_status "$run" awaiting_approval
+    apipost "/api/runs/$run/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+    wait_status "$run" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+    resolve_fixture_run_source_holds "$run"
+  done
+  cap2_restore_ticks
 fi

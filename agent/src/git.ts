@@ -1,4 +1,5 @@
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
+import { AuthorityRefusal } from "./authority-lock.js";
 import { isCheckpointBoundaryFailure, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
@@ -1566,6 +1567,16 @@ export class BareCacheShallowError extends Error {
 
 /** A bounded graph is too large to classify, never an operational read failure. */
 class MarkerWrapperGraphLimitError extends Error {}
+
+/** Publication verification refusal before successor admission or writes. */
+export class PublicationCandidateRestoreRefusal extends Error {
+  constructor(cause: unknown) {
+    super("successor recovery verification failed", { cause });
+    this.name = "PublicationCandidateRestoreRefusal";
+    const reason = cause instanceof Error ? retainedSuccessorDiagnostics.get(cause) : undefined;
+    if (reason) retainedSuccessorDiagnostics.set(this, reason);
+  }
+}
 
 /** A frozen reused source cannot be reconstructed by wrapping a different object. */
 export class RecoveryCoverageReuseRefused extends Error {
@@ -8411,7 +8422,10 @@ export class GitCache {
    * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
    * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
    * unchanged shapes (the tip itself is a marker, or neither the source nor any wrapper leaf is one),
-   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
+   * which keep the plain adoption of the tip unless the caller positively binds publicationCandidate
+   * to the authenticated clean source. That exception restores exactly that enrolled candidate using
+   * the same provenance and content proofs; it does not change readMarkerWrapperGraph or coverage reuse.
+   * Otherwise the wrapper must be provably the worker's own
    * coverage of the journaled source, and the successor adopts the SOURCE (a marker is then peeled by
    * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
    * `successor recovery verification failed`, before a ledger entry or clone exists.
@@ -8430,15 +8444,16 @@ export class GitCache {
    * why it reads aggregates through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
    */
   private async resolveMarkerWrapperAdoption(
-    barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
+    barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined, publicationCandidate?: string,
   ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
     const graph = await this.readMarkerWrapperGraph(barePath, tip, src);
     if (!graph) return undefined;
     const { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail } = graph;
-    if (!srcMarker && markerLeaves.size === 0) return undefined;
+    if (!srcMarker && markerLeaves.size === 0 && (publicationCandidate === undefined || src !== publicationCandidate)) return undefined;
     if (lookalike) return fail("wrapper_lookalike");
 
-    // From here the shape involves a marker: everything below is a hard requirement.
+    // Marker peeling and explicitly eligible publication restoration require every proof below.
+    // The candidate is caller-bound to an authenticated capture, never inferred from graph shape.
     if (!src) return fail("wrapper_source_missing");
     if (!aggregates.length) return fail("wrapper_aggregate_missing");
     const fp = aggregates[0]!.fp;
@@ -8505,7 +8520,7 @@ export class GitCache {
    * This return value is usable only by the current caller, never by rediscovery after reclaim. */
   async prepareRecoverySuccessor(
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number,
-    attemptId: string, opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
+    attemptId: string, opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean; publicationCandidate?: string },
   ): Promise<RunnerClone> {
     if (!ATTEMPT_ID_RE.test(attemptId)) throw annotateRetainedSuccessorError(new Error("invalid successor attempt"), "attempt_invalid");
     return this.withLock(barePath, async () => {
@@ -8522,7 +8537,18 @@ export class GitCache {
       const pin = `refs/uzi-recovery-episode/${journal.runId}/${tip}`;
       if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw annotateRetainedSuccessorError(new Error("recovery pin changed"), "episode_pin_changed");
       // issue #3239: before any write, so a refusal leaves no ledger entry, journal change or clone.
-      const wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource);
+      let wrapped;
+      try {
+        wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource, opts?.publicationCandidate);
+      } catch (error) {
+        // Ordinary adoption preserves the original thrown value, including hostile getters.
+        if (opts?.publicationCandidate === undefined) throw error;
+        const abort = this.boundaryAbortError(error);
+        if (abort) throw abort;
+        if (error instanceof AuthorityRefusal || isCheckpointBoundaryFailure(error) ||
+            error instanceof CheckpointChildStartupTimeoutError || isAbortLike(error)) throw error;
+        throw new PublicationCandidateRestoreRefusal(error);
+      }
       const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
       if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw annotateRetainedSuccessorError(new Error("successor identity already used"), "identity_used");
       const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };

@@ -76,7 +76,7 @@ function resolveProject(idParam) {
 }
 
 // --- git smart-HTTP (optional; the E2E_GIT_SMART_HTTP variant) ----------------
-// Serves the single bare repo under GIT_ROOT via `git http-backend`, gated on an
+// Serves the configured project bares under GIT_ROOT via `git http-backend`, gated on an
 // HTTP Basic credential. This lets the harness assert the worker sends
 // git-over-HTTPS *Basic* auth (the M6 fix) — which the default local-path remote
 // cannot exercise. Dormant in the default harness (the worker never git-talks to
@@ -703,14 +703,18 @@ function handleGit(req, res, url) {
   // local-path bare is the same host dir, so this counter is the only transport signal).
   if (req.method === "POST" && /\/git-receive-pack$/.test(url.pathname)) gitStats.receivePackPosts++;
   if (req.method === "POST" && /\/git-upload-pack$/.test(url.pathname)) gitStats.uploadPackPosts++;
-  // Map any /<ns…>/<repo>.git/<rest> onto the single bare repo GIT_ROOT/repo.git.
+  // Only the exact configured second project selects repo2.git. Keep the legacy
+  // first-project fallback for all other routes; URL paths never become disk paths.
+  const gitPath = url.pathname.match(/^\/(.*?)\.git(?=\/|$)/);
+  const project = PROJECTS.find((p) => p.path_with_namespace === gitPath?.[1]);
+  const bare = project?.id === 2 ? "repo2.git" : "repo.git";
   const rest = url.pathname.replace(/^.*?\.git/, "");
   const cgi = spawn(GIT_HTTP_BACKEND, [], {
     env: {
       ...process.env,
       GIT_PROJECT_ROOT: GIT_ROOT,
       GIT_HTTP_EXPORT_ALL: "1",
-      PATH_INFO: `/repo.git${rest}`,
+      PATH_INFO: `/${bare}${rest}`,
       REQUEST_METHOD: req.method || "GET",
       QUERY_STRING: url.search.replace(/^\?/, ""),
       CONTENT_TYPE: req.headers["content-type"] || "",

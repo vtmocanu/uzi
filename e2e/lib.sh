@@ -540,6 +540,265 @@ wait_custody_headroom() {
   done
 }
 
+# fixture_event_ready FILE RUN GEN EVENT [STAGE] — exact same-line JSON fields.
+# Consume every line, including Compose-prefixed JSON, without an early pipe close.
+# Invalid JSON and unrelated prose are misses; source readiness requires positive sources.
+fixture_event_ready() {
+  local file="$1" run="$2" gen="$3" event="$4" stage="${5:-}" bytes spool limiter rc=0
+  [[ "$gen" =~ ^[1-9][0-9]*$ ]] || return 1
+  limiter="$(command -v timeout || command -v gtimeout || true)"
+  [ -n "$limiter" ] || return 1
+  spool="$(mktemp)" || return 1
+  # Bound even direct stream inputs before parsing; never parse an overflowing prefix.
+  if ! "$limiter" 10 head -c 4194305 -- "$file" > "$spool"; then
+    rm -f "$spool"
+    return 1
+  fi
+  bytes="$(LC_ALL=C wc -c < "$spool")" || { rm -f "$spool"; return 1; }
+  if [ "$bytes" -gt 4194304 ]; then
+    rm -f "$spool"
+    return 1
+  fi
+  jq -Rne --arg run "$run" --argjson gen "$gen" --arg event "$event" --arg stage "$stage" '
+    reduce inputs as $line (false;
+      . or (try ($line | .[index("{"):] | fromjson |
+        .run_id==$run and .claim_generation==$gen and .msg==$event and
+        (if $stage=="" then true else .stage==$stage end) and
+        (if $event=="stub: source-end ready" then
+          (.sources | type=="number" and .>0 and .==floor)
+         else true end)) catch false))
+    | select(.)' "$spool" >/dev/null || rc=$?
+  rm -f "$spool"
+  return "$rc"
+}
+
+# A daemon read gets at most 10s and 4 MiB; retain one extra byte to detect overflow.
+# Missing host timeout support or overflow is a miss, never truncated readiness.
+fixture_worker_log() {
+  local file="$1" limiter bytes
+  limiter="$(command -v timeout || command -v gtimeout || true)"
+  [ -n "$limiter" ] || return 1
+  (
+    set -o pipefail
+    "$limiter" 10 "${COMPOSE[@]}" logs --no-color agent 2>/dev/null |
+      head -c 4194305 > "$file"
+  ) || return 1
+  bytes="$(LC_ALL=C wc -c < "$file")" || return 1
+  [ "$bytes" -le 4194304 ]
+}
+
+# Read the worker log once; an unsuccessful read cannot provide readiness.
+fixture_worker_event_ready() {
+  local run="$1" gen="$2" event="$3" stage="${4:-}" file="$RUNROOT/.fixture-ready.log"
+  fixture_worker_log "$file" || return 1
+  fixture_event_ready "$file" "$run" "$gen" "$event" "$stage"
+}
+
+# Bounded polling returns nonzero on timeout; callers restore API before judging.
+# TIMEOUT=0 performs one observation. A failed observation never blocks sibling cleanup.
+wait_fixture_worker_event() {
+  local run="$1" gen="$2" event="$3" stage="${4:-}" timeout="${5:-90}"
+  local deadline=$((SECONDS + timeout))
+  while :; do
+    fixture_worker_event_ready "$run" "$gen" "$event" "$stage" && return 0
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+# Enumerate actual owned generations, including intermediate successor captures.
+# Each ordinary resolution retains resolve_fixture_source_hold's archive FINAL wait.
+# The finite snapshot bounds attempts, each by TIMEOUT; failure stops later generations
+# and preserves evidence for the phase's restore trap.
+resolve_fixture_run_source_holds() {
+  local run="$1" timeout="${2:-120}" generations gen
+  generations="$(apiget /api/recovery/holds | jq -r --arg run "$run" '
+    [.holds[] | select(.run_id==$run) | .generation] | unique | sort |
+    if length>0 and all(.[]; type=="number" and .>0 and .==floor)
+    then .[] else error("missing/invalid generations") end')" \
+    || fail "fixture hold generation listing failed: $run"
+  while IFS= read -r gen; do
+    [ -n "$gen" ] || continue
+    resolve_fixture_source_hold "$run" "$gen" "$timeout"
+  done <<< "$generations"
+}
+
+# Phase 45 evidence reads: bound actual bytes before jq/JSON/hash, including RPC
+# output. Each invocation is at most 10s and 4 MiB; overflow is never evidence.
+fixture_crash_read() {
+  local file="$1" limiter bytes; shift
+  limiter="$(command -v timeout || command -v gtimeout || true)"
+  [ -n "$limiter" ] || return 1
+  # timeout executes programs, not the harness shell functions.
+  case "$1" in
+    apiget) shift; set -- curl -fsS --max-time 8 -b "$JAR" "$BASE$1" ;;
+    uzi_cli) shift; set -- env -i HOME="$RUNROOT" PATH="$PATH" UZI_URL="$BASE" UZI_TOKEN="$UZI_TOKEN_VAL" \
+      GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" GIT_CONFIG_NOSYSTEM=1 UZI_SKILL_AUTO_UPGRADE=0 UZI_VERSION_CHECK=0 "$UZI_BIN" "$@" ;;
+  esac
+  ( set -o pipefail; "$limiter" 10 "$@" 2>&1 | head -c 4194305 > "$file" ) || return 1
+  bytes="$(LC_ALL=C wc -c < "$file")" || return 1
+  [ "$bytes" -le 4194304 ]
+}
+
+# Explicit fixture OWNER teardown after intentional crash preservation. This is
+# separate from ordinary archive-FINAL resolution: discard open holds across ALL
+# actual generations, even with available captures. Never delete local sources here.
+# One finite list (<=256 holds), one RPC per open hold; failure stops this run.
+discard_fixture_crash_owner_holds() {
+  local run="$1" expected="$2" dir view before after id gen
+  [[ "$run" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ &&
+     "$expected" =~ ^[1-9][0-9]*$ ]] && [ "$expected" -le 256 ] || fail "invalid crash fixture run/generation"
+  dir="$(mktemp -d)" || fail "crash teardown scratch"
+  fixture_crash_read "$dir/run" apiget "/api/runs/$run" &&
+    jq -e --arg run "$run" '.run.id==$run and (.run.status|IN("completed","failed","cancelled"))' "$dir/run" >/dev/null \
+    || fail "crash fixture run is not terminal"
+  fixture_crash_read "$dir/holds" uzi_cli run recovery "$run" --json || fail "crash hold read failed"
+  view="$(jq -ce --arg run "$run" --argjson expected "$expected" '
+    select(type=="array" and length>0 and length<=256) |
+    select(all(.[]; .run_id==$run and (.generation|type=="number" and .>0 and .==floor)
+      and (.id|type=="string" and test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"))
+      and (.state|IN("open","released","discarded")))) |
+    select(([.[].id]|unique|length)==length) |
+    select(([.[].generation]|sort)==[range(1;$expected+1)])' "$dir/holds")" || fail "crash hold identity missing/malformed"
+  fixture_crash_read "$dir/archives" apiget "/api/runs/$run/archives" || fail "crash archive read failed"
+  before="$(jq -ce '.archives|select(type=="array" and length<=256)|[.[]|select(.state=="available")]|sort_by(.id)' "$dir/archives")" \
+    || fail "crash archives malformed"
+  while IFS=$'\t' read -r id gen; do
+    [ -n "$id" ] || continue
+    fixture_crash_read "$dir/reply" uzi_cli run discard "$run" --hold "$id" --yes --json || fail "crash owner discard failed"
+    jq -e --arg run "$run" --arg id "$id" '.run_id==$run and .hold_id==$id and .discarded==true' "$dir/reply" >/dev/null \
+      || fail "crash owner discard not acknowledged"
+    fixture_crash_read "$dir/post" uzi_cli run recovery "$run" --json || fail "crash discarded hold read failed"
+    jq -e --arg run "$run" --arg id "$id" --argjson gen "$gen" \
+      '[.[]|select(.id==$id)]|length==1 and (.[0]|.run_id==$run and .generation==$gen and .state=="discarded")' "$dir/post" >/dev/null \
+      || fail "crash owner discard lacks exact row"
+  done < <(printf '%s' "$view" | jq -r '.[]|select(.state=="open")|[.id,.generation]|@tsv')
+  fixture_crash_read "$dir/post" uzi_cli run recovery "$run" --json || fail "crash final hold read failed"
+  jq -e --argjson before "$view" '
+    ([.[]|{id,run_id,generation}]|sort_by(.id))==([$before[]|{id,run_id,generation}]|sort_by(.id)) and
+    all(.[]; .state=="released" or .state=="discarded")' "$dir/post" >/dev/null ||
+    fail "crash holds remain open or changed identity"
+  fixture_crash_read "$dir/after" apiget "/api/runs/$run/archives" || fail "crash archive recheck failed"
+  after="$(jq -ce '.archives|select(type=="array" and length<=256)|[.[]|select(.state=="available")]|sort_by(.id)' "$dir/after")" \
+    || fail "crash archives malformed"
+  jq -ne --argjson before "$before" --argjson after "$after" 'all($before[]; . as $a|any($after[]; .==$a))' >/dev/null \
+    || fail "crash owner discard changed an available archive"
+  rm -rf "$dir"
+  pass "explicit crash owner holds discarded across all generations; available archives unchanged"
+}
+
+# Exact source inspection, with the documented generation-none fallback.
+# A successful empty generation read is not proof of absence until both reads land.
+fixture_crash_inspect() {
+  local run="$1" gen="$2" file="$3" attempt="${4:-canonical}" g
+  [[ "$gen" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$attempt" = canonical || "$attempt" =~ ^[0-9]{8}T[0-9]{6}Z-g[0-9]+-[0-9a-f]{16}$ ]] || return 1
+  for g in "$gen" none; do
+    fixture_crash_read "$file" "${COMPOSE[@]}" exec -T -u worker agent /usr/bin/env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+      inspect --run "$run" --generation "$g" --attempt "$attempt" || return 1
+    jq -e '.ok==true and .op=="inspect" and .partial==false and .unreadable==0 and .holdsRead=="read" and (.lifecycleRead|IN("not_terminal","terminal"))
+      and (.sources|type=="array" and length<=1)' "$file" >/dev/null || return 1
+    if jq -e '.sources|length==1' "$file" >/dev/null; then
+      jq -e --arg run "$run" --arg g "$g" --arg attempt "$attempt" '.sources[0]|
+        .runId==$run and (.generation|tostring)==$g and .attempt==$attempt and
+        (.descriptor|type=="string" and test("^[0-9a-f]{64}$")) and
+        (.sources|type=="array" and length==1) and .presence=="present"' "$file" >/dev/null || return 1
+      return 0
+    fi
+  done
+  return 2
+}
+
+# Phase-local, credential-free reader. Only paths from guarded inspection (or
+# its frozen original) are accepted. No symlink components, no source output.
+# Walk <=10000 entries / depth 64 / 8 MiB total; git reads <=64 KiB each / 2s.
+fixture_crash_snapshot() {
+  local evidence="$1" output="$2" source
+  source="$(jq -ce '.sources[0]' "$evidence")" || return 1
+  fixture_crash_read "$output" "${COMPOSE[@]}" exec -T -u worker agent /usr/bin/env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node - "$source" "${3:-snapshot}" <<'NODE'
+const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
+const {execFileSync} = require("node:child_process");
+const s = JSON.parse(process.argv[2]);
+const must = (v) => { if (!v) throw Error("invalid crash snapshot binding"); };
+must(/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(s.runId));
+must(/^agent\/issue-[1-9][0-9]*$/.test(s.branch));
+function safe(p) {
+  must(typeof p === "string" && p.length < 1024 && path.normalize(p) === p &&
+    ["/data/runner/", "/data/repos/"].some(root => p.startsWith(root)));
+  let at = "/";
+  for (const c of p.split("/").filter(Boolean)) {
+    at = path.join(at, c); must(!fs.lstatSync(at).isSymbolicLink());
+  }
+  return p;
+}
+const frozen = s.sources[0].clonePath;
+if (process.argv[3] === "absent") {
+  safe(path.dirname(frozen));
+  must(path.normalize(frozen) === frozen && path.basename(frozen) !== "." && path.basename(frozen) !== "..");
+  try { fs.lstatSync(frozen); throw Error("original crash source remains"); }
+  catch (e) { if (e.code !== "ENOENT") throw e; }
+  console.log(JSON.stringify({run:s.runId,clone:frozen,absent:true}));
+  process.exit(0);
+}
+const bare = safe(s.barePath), clone = safe(frozen);
+// Initial canonical fixtures use a directory .git, never an indirect gitdir file.
+must(fs.lstatSync(safe(path.join(clone, ".git"))).isDirectory());
+must(s.sources.length === 1 && s.sources[0].attempt === s.attempt);
+function git(dir, args) {
+  return execFileSync("git", ["-c", "safe.directory=" + dir, "-c", "core.fsmonitor=false", "-C", dir, ...args],
+    {encoding:"utf8", maxBuffer:65536, timeout:2000, env:{PATH:process.env.PATH,
+      GIT_CONFIG_NOSYSTEM:"1", GIT_CONFIG_GLOBAL:"/dev/null", GIT_OPTIONAL_LOCKS:"0"}});
+}
+const head = git(clone, ["rev-parse", "--verify", "HEAD"]).trim();
+must(/^[0-9a-f]{40,64}$/.test(head));
+const raw = git(bare, ["config", "--local", "--get", "uzi-recovery." + s.branch + ".clone"]);
+const journal = JSON.parse(raw);
+must(journal.runId === s.runId && journal.clonePath === clone);
+must(journal.restoreTip === undefined || /^[0-9a-f]{40,64}$/.test(journal.restoreTip));
+must((journal.attemptId ?? "canonical") === s.attempt);
+const core = Object.fromEntries(["runId","clonePath","attemptId","restoreTip"].filter(k => k in journal).map(k => [k,journal[k]]));
+const pins = git(bare, ["for-each-ref", "--format=%(refname) %(objectname)",
+  ...["refs/uzi-recovery-pin/","refs/uzi-coverage/","refs/uzi-recovery-episode/"].map(p => p + s.runId + "/")])
+  .trim().split("\n").filter(Boolean).sort();
+must(pins.length <= 256);
+let entries = 0, bytes = 0;
+const files = [];
+function walk(dir, rel, depth) {
+  must(depth <= 64);
+  const h = fs.opendirSync(dir);
+  try {
+    for (let e; (e = h.readSync()) !== null;) {
+      must(++entries <= 10000);
+      if (!rel && e.name === ".git") continue;
+      const p = path.join(dir,e.name), name = rel ? rel + "/" + e.name : e.name;
+      const st = fs.lstatSync(p); must(!st.isSymbolicLink());
+      if (st.isDirectory()) { files.push([name,"directory"]); walk(p,name,depth+1); }
+      else {
+        must(st.isFile() && st.size <= 8388608 - bytes);
+        const fd = fs.openSync(p,fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        const hash = crypto.createHash("sha256"), buf = Buffer.alloc(65536);
+        try {
+          const opened = fs.fstatSync(fd); must(opened.dev===st.dev && opened.ino===st.ino && opened.size===st.size);
+          let n, size=0;
+          while ((n=fs.readSync(fd,buf,0,buf.length,null))>0) {
+            bytes+=n; size+=n; must(bytes<=8388608); hash.update(buf.subarray(0,n));
+          }
+          must(size===st.size);
+        } finally { fs.closeSync(fd); }
+        files.push([name,st.mode & 511,st.size,hash.digest("hex")]);
+      }
+    }
+  } finally { h.closeSync(); }
+}
+walk(clone,"",0); must(files.length>0 && bytes>0);
+files.sort((a,b)=>a[0].localeCompare(b[0]));
+console.log(JSON.stringify({run:s.runId,branch:s.branch,bare,clone,attempt:s.attempt,generation:s.generation,
+  head,core,pins,entries,bytes,digest:crypto.createHash("sha256").update(JSON.stringify(files)).digest("hex")}));
+NODE
+}
+
 # An ephemeral fixture with no bound run may be reaped between any two checks.
 # Absence is global by exact UUID, never inferred from an empty owner-filtered read.
 fixture_worker_absent() {

@@ -35,6 +35,7 @@ import type { MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, Git
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
+  PublicationCandidateRestoreRefusal,
   RetainedReadinessCleanupUnconfirmedError,
   formatRetainedRecoveryDiagnostic,
   annotateRetainedSuccessorError,
@@ -59,7 +60,7 @@ import type {
   WallParkOutcome,
   WallParkRefresh,
 } from "./executor.js";
-import { PlanRejectedError } from "./executor.js";
+import { PlanRejectedError, StubExecutor } from "./executor.js";
 import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
@@ -6420,6 +6421,26 @@ export class RunRunner {
       // issue #3404 M2 U3 - END SOURCE USE, the last teardown step: every worker-owned tail above is joined or
       // known not to be, and this is the single seam where the flight's source slots leave `active`.
       const sourceEnd = await this.endFlightSourceUse(flight, runLog);
+      const stub = StubExecutor.fixture(executor);
+      const sourceReadyRequested = ["UZI_STUB_SOURCE_END_READY", "UZI_STUB_PRE_ENROLLMENT_STOP",
+        ...(flight.claimGeneration === 1 ? ["UZI_STUB_FIRST_PRE_ENROLLMENT_STOP"] : [])]
+        .some(name => stub?.fixtureRequested(name, flight.runId, flight.claimGeneration));
+      const incarnation = this.authority?.authorityIncarnation();
+      if (sourceReadyRequested && incarnation && flight.sourceTailsJoined && !sourceEnd.published &&
+          !await this.outbox?.hasPublicationFile(flight.runId) &&
+          sourceEnd.paths.length > 0 && sourceEnd.paths.length === sourceEnd.endedSlots.length &&
+          new Set(sourceEnd.paths).size === sourceEnd.paths.length &&
+          new Set(sourceEnd.endedSlots.map(slot => slot.key)).size === sourceEnd.paths.length &&
+          sourceEnd.paths.every(p => {
+            const matches = sourceEnd.endedSlots.filter(slot => slot.path === p);
+            return matches.length === 1 && !!sourceEnd.ownedEpochs[p] &&
+              matches[0]!.epoch === sourceEnd.ownedEpochs[p] && matches[0]!.worker === incarnation &&
+              Number.isSafeInteger(matches[0]!.seq) && matches[0]!.seq > 0;
+          })) {
+        // One bounded diagnostic per flight. Paths, epochs and source contents stay local.
+        runLog.info("stub: source-end ready", { run_id: flight.runId,
+          claim_generation: flight.claimGeneration, sources: sourceEnd.paths.length });
+      }
       // issue #3638 D3: the cooperative memory-park record, after the source use ended. Never throws.
       await this.recordMemoryParkOutcome(flight, runLog, sourceEnd, {
         steeringJoined, parkReap: parkReapApplied ? "complete" : "not_applicable" });
@@ -8847,6 +8868,23 @@ export class RunRunner {
         });
         return;
       }
+      const fixture = StubExecutor.fixture(flight.executor);
+      if (body.status === "completed" &&
+          fixture?.fixtureRequested("UZI_STUB_POST_PUBLICATION_BARRIER", flight.runId, flight.claimGeneration)) {
+        // All publication/head verification has finished, but the ordinary batcher is still open.
+        // Only a constructed stub with this exact marker emits a post-release tail; Codex's
+        // deferred terminal callback above and real harnesses never enter this fixture seam.
+        await fixture.fixtureBarrier("terminal", flight.runId, flight.claimGeneration,
+          flight.cancel.signal, () => flight.runLog.info("stub: fixture barrier ready", {
+            stage: "terminal", run_id: flight.runId, claim_generation: flight.claimGeneration,
+          }));
+        batcher.emit({ kind: "status", agent: "worker", payload: {
+          event: "stub_outbox_terminal_tail", run_id: flight.runId, claim_generation: flight.claimGeneration,
+        } });
+        // The fixture's immediate-spill setting makes a refused send enter spill while
+        // still open. Ordinary close then durably writes the tail through finalSpillOnClose.
+        await batcher.flushOwned(flight.cancel.signal);
+      }
       await closeBatcher();
       await journalTerminalReport(body);
       runLog.info(logMessage, fields);
@@ -9141,6 +9179,21 @@ export class RunRunner {
     // now idempotent re-reaps of an already-reaped tree.
     steps?.enter("run_quiescence");
     const finalizeQuiescence = await this.quiesceRun(flight, executor, { mode: "own", site: "finalize" });
+    const fixture = StubExecutor.fixture(executor);
+    const retainedFixture = fixture?.fixtureRequested("UZI_STUB_PRE_ENROLLMENT_STOP", flight.runId, flight.claimGeneration) ||
+      (flight.claimGeneration === 1 && fixture?.fixtureRequested("UZI_STUB_FIRST_PRE_ENROLLMENT_STOP", flight.runId, flight.claimGeneration));
+    if (retainedFixture) {
+      // The ordinary finalize proof runs first. Ambiguous proof still retains custody;
+      // teardown cannot announce SOURCE-END without its own positively joined tails.
+      if (finalizeQuiescence.outcome.process?.state === "quiescent" && !finalizeQuiescence.blocked &&
+          this.outbox?.listPendingFinalizes().some(record =>
+            record.run_id === flight.runId && record.claim_generation === flight.claimGeneration) &&
+          !this.outbox.hasPublicationRecords(flight.runId) &&
+          !await this.outbox.hasPublicationFile(flight.runId)) {
+        runLog.info("stub: pre-enrollment retained stop", { run_id: flight.runId, claim_generation: flight.claimGeneration });
+      }
+      throw new RetainedRecoveryStop();
+    }
     if (finalizeQuiescence.blocked) {
       flight.preserveRecoveryClone = true;
       throw new RunResidueBlockedError(finalizeQuiescence.outcome.process?.detail ?? "not quiescent");
@@ -10125,6 +10178,13 @@ export class RunRunner {
     // This fresh ACK supplies only the request-local publication guard projection. Completion
     // permit and frozen contract authority remain unchanged; cached ACKs cannot supply this guard.
     if (interlocked && issuePublication) {
+      if (flight.publicationRecord && fixture) {
+        await fixture.fixtureBarrier("running-ack", runId, flight.claimGeneration,
+          boundarySignal ? AbortSignal.any([boundarySignal, flight.cancel.signal]) : flight.cancel.signal,
+          () => runLog.info("stub: fixture barrier ready", {
+            stage: "running-ack", run_id: runId, claim_generation: flight.claimGeneration,
+          }));
+      }
       publicationAck = await flight.reportState({ status: "running" }, boundarySignal);
       // Reuse the stopped-claim path so the owner's local bytes survive this nonterminal exit.
       if (publicationAck.status !== "running") throw new StaleClaimError();
@@ -24919,6 +24979,9 @@ export class RunRunner {
           await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username,
             flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined);
           await check();
+          const publicationRecovery = claim.publication_resume !== undefined && claim.inventory_guarded === true && this.recovery.enabled;
+          let publicationCandidate: string | undefined;
+          let publicationRefusal: PublicationHoldReason = "publication_source_unavailable";
           const captureResult = await this.runFreeCapture(claim, flight, iteration.deadline, signal, async held => {
             const check = async () => {
               this.assertHeldFreeCapture(flight, held);
@@ -24975,6 +25038,7 @@ export class RunRunner {
               const local = await this.recovery.verifiedLocalCapture(record!, held.signal);
               if (outcome.reason === "oversized") { blocker = "oversize"; throw finalize; }
               if (!local?.bundlePath || !local.checksum || !Array.isArray(local.prerequisiteShas)) {
+                if (publicationRecovery) return "publication_source_unavailable" as const;
                 if (outcome.reason === "bundle_failed" || outcome.reason === "capture_error") throw new Error("local bundle capture temporarily unavailable");
                 blocker = "prerequisites_unavailable"; throw finalize;
               }
@@ -24983,9 +25047,46 @@ export class RunRunner {
               // records itself as its source, which is never attested: the guard holds it (fail closed).
               capturedSource = local!.runId === claim.run_id && local!.generation === options.context.generation &&
                 local!.inventoryCurrentSha === tip ? local!.inventoryCurrentSha : undefined;
+              // Authenticate the exact capture mapping and active enrollment before allowing a
+              // metadata-only restoration. phasePublicationOnly still validates the full intent,
+              // ancestry, floor and exact workspace; this grants no publication authority itself.
+              if (claim.publication_resume !== undefined && capturedSource !== undefined) {
+                try {
+                  const server = parseClaimPublicationResume(claim.publication_resume, flight.runKind === "task" ? "task" : "issue");
+                  if (server.run_id !== claim.run_id || server.repo_id !== claim.repo.id || server.branch !== branch ||
+                      server.claim_generation > flight.claimGeneration) publicationRefusal = "publication_intent_mismatch";
+                  else if (server.candidate !== null && server.candidate !== capturedSource &&
+                      await this.git.ancestry(bare, server.candidate, capturedSource) === "ancestor") {
+                    publicationRefusal = "publication_model_required";
+                  }
+                  if (server.run_id === claim.run_id && server.repo_id === claim.repo.id && server.branch === branch &&
+                      server.claim_generation <= flight.claimGeneration && server.candidate === capturedSource &&
+                      this.outbox && !this.outbox.isDisabled()) {
+                    const locals: PublicationRecord[] = [];
+                    let usable = true;
+                    const generations = new Set([server.claim_generation]);
+                    for (const entry of this.outbox.listPublicationRecords()) if (entry.run_id === claim.run_id) generations.add(entry.claim_generation);
+                    for (const generation of generations) {
+                      const loaded = await this.outbox.loadPublicationRecord(claim.run_id, generation);
+                      if (loaded.kind === "ok") locals.push(loaded.record);
+                      else if (loaded.kind !== "absent") usable = false;
+                    }
+                    const choice = chooseResumeRecord(locals, claim.publication_resume, server);
+                    if (choice.kind === "mismatch") publicationRefusal = "publication_intent_mismatch";
+                    if (usable && choice.kind !== "mismatch" && choice.kind !== "resend_local" &&
+                        (choice.kind !== "use_local" || choice.record.candidate === server.candidate)) {
+                      publicationCandidate = capturedSource;
+                    }
+                  }
+                } catch (error) {
+                  if (!(error instanceof PublicationIntentMismatchError)) throw error;
+                  publicationRefusal = "publication_intent_mismatch";
+                }
+              }
               tip = local!.sourceSha;
               for (const prerequisite of local!.prerequisiteShas!) {
                 if (!await this.git.verifyRecoveryClosure(bare, prerequisite)) {
+                  if (publicationRecovery) return "publication_source_unavailable" as const;
                   blocker = "prerequisites_unavailable"; throw finalize;
                 }
                 await check();
@@ -24998,11 +25099,29 @@ export class RunRunner {
           if (captureResult.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }
           await check();
           blocker = "adoption_failed";
+          // A guarded publication-only successor may restore only its positively bound candidate.
+          // In particular, ordinary marker peeling could leave HEAD at C with genuine staged work;
+          // the publication phase's HEAD equality is not authority to discard that work.
+          if (publicationRecovery && (captureResult.value !== undefined || publicationCandidate === undefined)) {
+            await this.holdPublicationOnly(flight, captureResult.value ?? publicationRefusal,
+              "the retained source cannot be bound to the exact enrolled publication candidate");
+            throw new RetainedRecoveryStop();
+          }
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
-          const successor = await this.inFlightAuthority(flight, () => this.git.prepareRecoverySuccessor(bare, branch, key, source,
-            iteration.attempts, attemptId, { checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
-              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true }),
-            { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
+          let successor: RunnerClone;
+          try {
+            successor = await this.inFlightAuthority(flight, () => this.git.prepareRecoverySuccessor(bare, branch, key, source,
+              iteration.attempts, attemptId, { publicationCandidate, checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
+                (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true }),
+              { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
+          } catch (error) {
+            if (!publicationRecovery || !(error instanceof PublicationCandidateRestoreRefusal)) throw error;
+            // The verifier refused before admission/writes; its authority transaction has unwound.
+            await check();
+            await this.holdPublicationOnly(flight, "publication_source_unavailable",
+              "the retained publication metadata could not be verified");
+            throw new RetainedRecoveryStop({ cause: error });
+          }
           expectedSource = { ...source, clonePath: successor.path, attemptId: successor.attemptId };
           flight.runnerClone = successor;
           flight.worktreePath = successor.path;

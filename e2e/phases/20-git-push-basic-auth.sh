@@ -24,11 +24,10 @@
 # now go over HTTPS), run one issue on group/repo, and let the worker fetch+push against
 # forge-fake, which 401s any git op lacking a valid Basic uzi-bot:PAT. A run that reaches
 # `completed` with its branch on the bare therefore PROVES the worker sent Basic; a
-# credential-injection regression turns this red. Scoped to the SINGLE repo on purpose
-# (Decision 1): forge-fake routes every repo path to one shared bare, so a smart-HTTP
-# happy-path flip would collapse the PRD #42 two-repo independent-bare asserts (:26xx) —
-# #42 stays on insteadOf. We restore insteadOf before any later phase, which all rely on
-# the local bare.
+# credential-injection regression turns this red. This focused pass uses one repo;
+# forge-fake also routes the configured second project to its independent bare.
+# Restore insteadOf for the default transport in later phases; the opt-in full
+# smart-HTTP lane retains the same independent-bare assertions.
 say "PRD #97 M1: worker pushes the agent branch over git-over-HTTPS Basic auth (default coverage)"
 # Drop insteadOf ⇒ the worker's git speaks smart-HTTP to forge-fake. Keep safe.directory:
 # this file is the worker's GIT_CONFIG_GLOBAL, and it is the trust the LATER local-bare

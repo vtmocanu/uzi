@@ -267,6 +267,67 @@ describe("StubExecutor — PRD #1391 M5 outbox-outage sentinel", () => {
         "case 7's resumed claim must complete without a second outage");
     } finally { controller.abort(); fs.rmSync(marker, {force:true}); wt.cleanup(); resumedWt.cleanup(); }
   });
+  for (const optedIn of [false, true]) {
+    it(`first barrier exposes ${optedIn ? "dirty checkpointable work" : "the unchanged empty base"}`, async () => {
+      const wt = makeWorktree(), controller = new AbortController();
+      let ready!: () => void;
+      const waiting = new Promise<void>(resolve => { ready = resolve; });
+      const { ctx } = makeCtx({ runId: randomUUID(), claimGeneration: 1,
+        worktreePath: wt.path, signal: controller.signal,
+        issueDescription: `${STUB_OUTBOX_SENTINEL} UZI_STUB_OUTBOX_FIRST_CUT_BARRIER ${optedIn ? "UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK" : ""}`,
+        emit: m => { if ((m.payload as { text?: string }).text === "stub: outbox waiting for API cut") ready(); },
+      });
+      const work = new StubExecutor(nullLogger(), { outboxTickMs: 0, outboxTicks: 1 }).run(ctx);
+      const rejected = assert.rejects(work, /test pause/);
+      try {
+        await Promise.race([waiting, work]);
+        const status = execFileSync("git", ["-C", wt.path, "status", "--porcelain"], { encoding: "utf8" });
+        assert.equal(status, optedIn ? "?? UZI_RUN.md\n" : "");
+        assert.throws(() => execFileSync("git", ["-C", wt.path, "rev-parse", "--verify", "HEAD"], { stdio: "pipe" }),
+          "the early write never commits");
+        if (optedIn) {
+          assert.equal(fs.readFileSync(path.join(wt.path, "UZI_RUN.md"), "utf8"),
+            `# uzi stub run\n\n- run_id: ${ctx.runId}\n- issue #7 — E2E interleave\n- branch: agent/issue-7\n\nThis file is written by the M2 stub executor to prove the claim →\nworktree → work → report loop end to end. M3 replaces it with the\nClaude Agent SDK.\n`);
+        }
+      } finally {
+        controller.abort(new Error("test pause"));
+        await rejected;
+        wt.cleanup();
+      }
+    });
+  }
+
+  it("checkpointable work is inactive on generation 2 and without the first barrier", async () => {
+    for (const [generation, barrier] of [[2, true], [1, false]] as const) {
+      const wt = makeWorktree();
+      try {
+        const { ctx } = makeCtx({ runId: randomUUID(), claimGeneration: generation, worktreePath: wt.path,
+          issueDescription: `${STUB_OUTBOX_SENTINEL} UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK ${barrier ? "UZI_STUB_OUTBOX_FIRST_CUT_BARRIER" : ""}`,
+          emit: m => {
+            if ((m.payload as { text?: string }).text === "stub: outbox tick 1")
+              assert.equal(fs.existsSync(path.join(wt.path, "UZI_RUN.md")), false);
+            if ((m.payload as { text?: string }).text === "stub: outbox waiting for API cut")
+              assert.fail("later generation entered the first barrier");
+          },
+        });
+        await new StubExecutor(nullLogger(), { outboxTickMs: 0, outboxTicks: 1 }).run(ctx);
+        assert.ok(fs.existsSync(path.join(wt.path, "UZI_RUN.md")), "ordinary completion still writes the marker");
+      } finally { wt.cleanup(); }
+    }
+  });
+
+  for (const generation of [undefined, 0, -1, 1.5, NaN]) {
+    it(`checkpointable work rejects invalid generation ${generation} before writing`, async () => {
+      const wt = makeWorktree();
+      try {
+        const { ctx } = makeCtx({ worktreePath: wt.path, claimGeneration: generation,
+          issueDescription: `${STUB_OUTBOX_SENTINEL} UZI_STUB_OUTBOX_FIRST_CUT_BARRIER UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK` });
+        await assert.rejects(new StubExecutor(nullLogger()).run(ctx), /invalid stub checkpointable work claim generation/);
+        assert.equal(fs.existsSync(path.join(wt.path, "UZI_RUN.md")), false);
+      } finally { wt.cleanup(); }
+    });
+  }
+
   it("rejects an unknown generation for the first-claim-only barrier", async () => {
     const wt = makeWorktree();
     try {

@@ -272,7 +272,7 @@ headers, not the rows.
 | 49 | docker-sidecar | gitlab | no | PRD #83 M2: rootless DinD sidecar + Decision-3 efficacy |
 | 50 | worker-token-binding | gitlab | no | PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim |
 | 51 | auto-stop-poison | gitlab | no | PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to-API poison) |
-| 52 | api-outage-outbox | gitlab | no | PRD #1391 + #1742: worker outbox survives an api outage (M5 spill+drain/tombstones, M6 write-ahead terminal replay; finalize-resume across an agent SIGKILL) |
+| 52 | api-outage-outbox | gitlab | no | PRD #1391 + #1742: worker outbox survives an api outage (M5 spill+drain/tombstones, M6 write-ahead terminal replay; stage-specific terminal/running-ACK cuts and settled-source finalize restart across an agent SIGKILL) |
 | 59 | restart-agent | gitlab | no | PRD #966: restart the agent worker before schedule phases 60-62 |
 | 60 | schedules-sweep | gitlab | no | PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate filter, open-MR skip) |
 | 61 | schedules-prompt | gitlab | no | PRD #966 M4: scheduled prompt run (issue-less repo->MR run via run-now) |
@@ -329,10 +329,9 @@ toolchain, as with the other Go test targets.
   lacking a valid `Authorization: Basic` (`uzi-bot:PAT`)**. A run that reaches
   `completed` with its branch on the bare therefore proves the worker sent Basic; a
   credential-injection regression turns the run red. (The opt-in
-  `E2E_GIT_SMART_HTTP=1` variant routes the *whole* suite over smart-HTTP; because
-  `forge-fake` collapses every repo path to one bare, that variant's #42 phase
-  asserts against the one shared bare — the default run keeps the full independent-
-  bare check.)
+  `E2E_GIT_SMART_HTTP=1` variant routes the *whole* suite over smart-HTTP.
+  The fake routes each configured project to its own bare, so phase #42 verifies
+  independent repositories under both transports.)
 - **`main` is never touched — and the fake remote enforces it** (PRD #97 M1). Each
   seeded bare carries a `pre-receive` hook that refuses `refs/heads/main`, so the
   "push to main is refused" assertion is real, not vacuous. The backstop is
