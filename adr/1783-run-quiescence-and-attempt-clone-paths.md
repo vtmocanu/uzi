@@ -67,12 +67,15 @@ removes the tree.
 4. **Gating by site**, all fail-closed on a non-quiescent verdict:
    - the limit, wall-clock and completion-hold parks leave the park standing, with
      no credentialed publish;
-   - an owner pause that cannot prove quiescence reports `pause_failed` and the
-     run keeps running, under the existing pause rule (PRD #1190 D8: no
+   - an owner pause that cannot prove quiescence reports `pause_failed`; ordinary
+     refusal leaves the run running, subject to accepted B1's nonterminal stop below,
+     under the existing pause rule (PRD #1190 D8: no
      durable checkpoint, no park) rather than
      parking on unproven ground. If capture may have drained a Codex epoch before
-     pause failure or withdrawal, continuation first recreates it from saved
-     session state; a vault lock on recreation takes ADR-1766 credential deferral;
+     pause failure or withdrawal, proven cleanup permits recreation from saved
+     session state before continuation; accepted B1 retains the exact refused or
+     unacknowledged owner-pause case on unproven cleanup, as detailed below.
+     A vault lock on recreation takes ADR-1766 credential deferral (AI-synced 2026-10-22);
    - finalize fails the run with the typed `fail_origin` `worker_residue_blocked`;
    - terminal retire keeps the clone rather than removing it;
    - graceful shutdown, milestone checkpoint, and restore-point capture are all
@@ -394,10 +397,22 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   executing flight is unchanged. Finalization classifies Codex using the same safety
   markers as free capture.
 
-  Save credential-free session state before capture may drain the epoch. After
-  failed or withdrawn pause, and before human or automatic changed-milestone gate
-  revision continues the model, recreate a possibly drained provider through the
-  existing epoch path. Check newer cancellation, pause and vault-lock state before
+  Save credential-free session state before capture may drain the epoch. With proven
+  cleanup, recreate a possibly drained provider through the existing saved-session
+  epoch path before continuing after failed/withdrawn pause or human/automatic
+  changed-milestone gate revision. Under accepted B1, production still throws
+  `EpochCleanupUnprovenError` when the old registry remains in
+  `unverifiedEpochRegistries`; no forced recreation or new in-run epoch passes that
+  guard. The runner converts the error to `RetainedRecoveryStop` only when its safety
+  facade matches the exact refused or unacknowledged owner-pause capture and newer
+  steering authority does not take precedence. This matching case stops nonterminally,
+  without reporting `failed`, and retains clone, session, journal and custody. The
+  conversion is not a rule for every changed-milestone gate revision failure.
+  Subsequent execution may recover through existing in-budget requeue or owner
+  Resume/hold policy, conditional on budget and hold state; neither automatic
+  recovery nor Resume is guaranteed. Retained-source recovery uses a fresh attempt
+  path and model session (`thread/start`), not the old model thread.
+  Check newer cancellation, pause and vault-lock state before
   credentials or model execution; recreation-time vault lock takes
   [ADR-1766's deferral](1766-codex-vault-lock-park.md#d3-settle-before-capture-and-no-completion-authority-while-locked).
   Keep the prior session generation until provider adoption. `settleForCapture`
@@ -407,7 +422,7 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   scope for source HEAD, generation pin and guarded inventory after the earlier
   scope expired. Refused fresh proof performs no source operations and retains the
   exact parked clone, session, journal and custody; an uncertain ACK grants no
-  recapture or new pause attempt. Refs #2852 (AI-synced 2026-10-18).
+  recapture or new pause attempt. Refs #2852 (AI-synced 2026-10-22).
   The approval path still skips persistence from the old drained HOME. This does
   not make an open approval gate parkable or change retained recovery's fresh
   path/session policy. Retained-source A coverage ends after `recordRecoveryCapture`;
@@ -750,10 +765,14 @@ The original follow-ups are recorded below with their later disposition where kn
   pause and credential-free recovery, memory-pressure and retained-source capture
   through supervised-child settlement, including the narrow lane of an intentionally
   poisoned, successfully settled registry. It restores neither normal admission
-  nor credentialed authority. Failed/withdrawn pause after possible drain and
-  changed-milestone gate revision recreate a saved-session provider epoch before
-  continuing; vault lock on recreation takes credential deferral. Slice B's healthy
-  wall/hold/recovery/switch pre-publish closure and slice C's strengthened terminal
+  nor credentialed authority. Proven cleanup permits saved-session epoch recreation
+  before continuing after possibly drained failed/withdrawn pause or changed-milestone
+  gate revision. Accepted B1 retains the exact refused/unacknowledged owner-pause
+  case on unproven cleanup as a nonterminal stop, without a new in-run epoch;
+  later execution depends on existing budget/hold policy and uses a fresh attempt
+  path/model session for retained-source recovery. This is not a blanket gate-revision
+  error conversion. Vault lock on recreation takes credential deferral (AI-synced 2026-10-22).
+  Slice B's healthy wall/hold/recovery/switch pre-publish closure and slice C's strengthened terminal
   proof remain unshipped. Existing credentialed permits remain required at their
   sinks; A's capture context is separate and supplies no structural completion permit.
   Owned summary/setup/auth cleanup remains joined after authority or delivery expiry,

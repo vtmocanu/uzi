@@ -17011,7 +17011,7 @@ export class RunRunner {
           this.shutdownSignal.signal, held => this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
             credentialFree: true, heldCapture: held, signal: held.signal,
             publish, terminalDisk: opts.terminalDisk,
-          }));
+          }), "capture", "strict");
         if (result.kind !== "observed_empty") return false;
         const attempt = result.value;
         if (attempt.verified) {
@@ -17308,7 +17308,7 @@ export class RunRunner {
                 this.shutdownSignal.signal, held => this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
                   credentialFree: true, heldCapture: held, signal: held.signal,
                   terminalDisk: opts.terminalDisk,
-                }));
+                }), "capture", "strict");
               if (result.kind !== "observed_empty") {
                 await note(feed.settleIncomplete);
                 await retryWait();
@@ -17321,6 +17321,11 @@ export class RunRunner {
               const settlement = await this.settleForCredentialCapture(executor, undefined, "capture", "authenticated");
               if (settlement.kind !== "observed_empty") {
                 if (!opts.terminalDisk) {
+                  runLog.warn("credential recovery park: the execution did not settle; retaining work and retrying", {
+                    run_id: flight.runId,
+                    errors: settlement.errors.map((e) => e.category),
+                  });
+                  await note(feed.settleIncomplete);
                   await retryWait();
                   continue;
                 }
@@ -18240,7 +18245,7 @@ export class RunRunner {
     const result = await this.runFreeCapture(claim, flight, deadlineAt, opts.signal,
       held => this.captureRecoveryRestorePoint(claim, flight, runLog, site, {
         ...opts, signal: held.signal, heldCapture: held,
-      }));
+      }), "capture", "strict");
     if (result.kind === "observed_empty") return result.value;
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
@@ -19465,7 +19470,7 @@ export class RunRunner {
               accepted.claim_generation !== context.claim_generation ||
               accepted.memory_episode !== context.memory_episode) throw new RetainedRecoveryStop();
           this.assertHeldFreeCapture(flight, held);
-        }, "cancel");
+        }, "cancel", "strict");
         if (result.kind !== "observed_empty") throw new RetainedRecoveryStop();
         flight.parked = true;
       });
@@ -20220,7 +20225,7 @@ export class RunRunner {
               });
               this.assertHeldFreeCapture(flight, held);
               return proof;
-            });
+            }, "capture", "strict");
           await check();
           if (quiescence.kind !== "observed_empty" || quiescence.value.blocked) {
             blocker = "quiescence_failed"; throw finalize;
@@ -20317,7 +20322,7 @@ export class RunRunner {
             await check();
             await this.git.recordRecoveryCapture(bare, branch, key, source, iteration.attempts, tip, capturedSource);
             await check();
-          });
+          }, "capture", "strict");
           if (captureResult.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }
           await check();
           blocker = "adoption_failed";

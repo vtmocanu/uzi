@@ -425,6 +425,96 @@ async function seed(iid = 2512, large = false, cache = git) {
   api.setOwnershipStatus(claim.run_id, "running", 2);
   return { claim, bare, clone, key: `issue-${iid}` };
 }
+for (const site of ["initial retained", "second retained"] as const) {
+  for (const outcome of ["false", "throw", "confirmed"] as const) {
+    it(`capture policy: ${site} / ${outcome}`, { timeout: 60_000 }, async t => {
+      const mask = process.umask(0o022);
+      try {
+        const { claim, bare, clone } = await seed();
+        const before = readJournal(bare, clone.branch);
+        const sourceHead = command(clone.path, "rev-parse", "HEAD");
+        let refreshes = 0, settlements = 0, poisoned = 0, models = 0;
+        let markers = 0, publications = 0, facts = 0, adoptions = 0;
+        let callbackFailure: unknown;
+        const refresh = git.ensureClone.bind(git);
+        t.mock.method(git, "ensureClone", async (...args: Parameters<typeof refresh>) => {
+          const result = await refresh(...args);
+          refreshes++;
+          return result;
+        });
+        const marker = git.commitWipMarker.bind(git);
+        t.mock.method(git, "commitWipMarker", async (...args: Parameters<typeof marker>) => {
+          markers++; return marker(...args);
+        });
+        const publish = client.publishCheckpoint.bind(client);
+        t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof publish>) => {
+          publications++; return publish(...args);
+        });
+        const record = git.recordRecoveryCapture.bind(git);
+        t.mock.method(git, "recordRecoveryCapture", async (...args: Parameters<typeof record>) => {
+          facts++; return record(...args);
+        });
+        const adopt = git.prepareRecoverySuccessor.bind(git);
+        t.mock.method(git, "prepareRecoverySuccessor", async (...args: Parameters<typeof adopt>) => {
+          adoptions++; return adopt(...args);
+        });
+        const executor: import("../src/executor.js").Executor = {
+          run: async ctx => {
+            models++;
+            try {
+              assert.notEqual(ctx.worktreePath, clone.path, "confirmed capture adopts a successor before model admission");
+              assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
+              await ctx.onModelTurnSettled!(1);
+            } catch (error) { callbackFailure = error; throw error; }
+            throw new Error("confirmed control ends successor model");
+          },
+          settleWorkerCommands: async () => {
+            settlements++;
+            // The second site permits every initial proof and turns hostile only
+            // after the real credentialed refresh has completed.
+            const target = site === "initial retained" || refreshes > 0;
+            if (!target || outcome === "confirmed") return { confirmed: true };
+            poisoned++;
+            if (outcome === "throw") throw new Error("retained command protocol failure");
+            return { confirmed: false };
+          },
+        };
+        const runner = runnerWith(() => ({ executor, homeDir: path.join(homeDir, claim.run_id) }),
+          fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1, codexBoundaryDeadlineMs: 30_000 });
+        try {
+          assert.equal(claim.secrets.codex, undefined);
+          assert.equal(executor.safety, undefined);
+          assert.equal(executor.withCredentialFreeCapture, undefined);
+          await runner.execute(claim);
+          if (callbackFailure) throw callbackFailure;
+          assert.ok(settlements > 0, "retained iteration reached command settlement");
+          if (outcome === "confirmed") {
+            assert.ok(refreshes > 0 && markers > 0 && publications > 0 && facts > 0 && adoptions > 0);
+            assert.equal(models, 1, "confirmed control reaches real capture, adoption, and model admission");
+          } else {
+            assert.ok(poisoned > 0, "the selected settlement was actually poisoned");
+            assert.equal(refreshes, site === "initial retained" ? 0 : 1,
+              "second settlement is reached only after the first succeeds and credentialed refresh completes");
+            assert.deepEqual({ markers, publications, facts, adoptions, models },
+              { markers: 0, publications: 0, facts: 0, adoptions: 0, models: 0 });
+            const after = readJournal(bare, clone.branch);
+            assert.deepEqual({ ...after, recovery: undefined }, { ...before, recovery: undefined },
+              "the exact retained source descriptor survives; only episode bookkeeping advances");
+            assert.equal(after.recovery.stage, "blocked");
+            assert.equal(after.recovery.blocker, "quiescence_failed");
+            assert.equal(after.recovery.attempts, 1);
+            assert.equal(command(clone.path, "rev-parse", "HEAD"), sourceHead);
+            assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+            assert.ok(api.states.some(s => s.body.status === "failed" &&
+              String(s.body.failure_reason).includes("quiescence failed")));
+            assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+          }
+        } finally { runner.shutdown(); }
+      } finally { process.umask(mask); }
+    });
+  }
+}
+
 it("retained recovery credential switch acknowledges verified exact generation without releasing custody", async () => {
   await retainedSwitchRegression("capture", true);
 });

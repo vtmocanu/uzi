@@ -1732,16 +1732,17 @@ function snapshot(c: NonNullable<ReturnType<NonNullable<RunContext["capturedMemo
     remaining: c.commands.remaining(c.context),
   };
 }
-async function memoryRun(f: Awaited<ReturnType<typeof setup>>, body: (ctx: RunContext) => Promise<void>) {
+async function memoryRun(f: Awaited<ReturnType<typeof setup>>, body: (ctx: RunContext) => Promise<void>,
+  capture?: NonNullable<Executor["withCredentialFreeCapture"]>) {
   const monitoring = f.memory.run();
   let executorError: unknown, proof = false;
-  const executor: Executor = { run: async ctx => {
+  const executor: Executor = { withCredentialFreeCapture: capture, run: async ctx => {
     try { await body(ctx); proof = true; } catch (error) { executorError = error; throw error; }
     throw new Error("fixture proof complete");
   } };
   try {
     await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
-      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: capture ? 30_000 : 1000 }).execute(f.claim);
   } catch (error) {
     // A body assertion failure wins over the runner's own rejection (e.g. a tolerated StaleClaimError).
     throw executorError ?? error;
@@ -1817,7 +1818,7 @@ test("a pause that parks still retires the captured memory context", async () =>
       assert.equal(await ctx.parkForPause!({ completedCount: 0, total: 1 }), true, "a publishable pause parks");
       assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
         "a real park retires the context");
-    });
+    }, realCapture());
   } finally {
     (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = publish;
   }
