@@ -42,6 +42,7 @@ type agentTemplateDTO struct {
 	Description string    `json:"description"`
 	Model       *string   `json:"model"`
 	Tools       []string  `json:"tools"`
+	PromptBody  string    `json:"prompt_body"`
 	IsBuiltin   bool      `json:"is_builtin"`
 	UpdatedBy   *string   `json:"updated_by"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -54,6 +55,7 @@ func templateDTO(t store.AgentTemplate) agentTemplateDTO {
 		Name:        t.Name,
 		Description: t.Description,
 		Tools:       decodeTools(t.Tools),
+		PromptBody:  t.PromptBody,
 		IsBuiltin:   t.IsBuiltin,
 		CreatedAt:   t.CreatedAt.Time,
 		UpdatedAt:   t.UpdatedAt.Time,

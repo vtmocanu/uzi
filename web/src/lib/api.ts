@@ -20,6 +20,31 @@ export interface SecretMeta {
   updated_at: string;
 }
 
+// AgentTemplate is a stored agent definition. tools is null when the template
+// inherits all tools; model is null when it inherits the model.
+export interface AgentTemplate {
+  id: string;
+  name: string;
+  description: string;
+  model: string | null;
+  tools: string[] | null;
+  prompt_body: string;
+  is_builtin: boolean;
+  updated_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// AgentTemplateInput is the admin-editable shape. name is only sent on create
+// (it is immutable afterwards).
+export interface AgentTemplateInput {
+  name?: string;
+  description: string;
+  model: string | null;
+  tools: string[] | null;
+  prompt_body: string;
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -87,4 +112,16 @@ export const api = {
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
   deleteAnthropicToken: () => request<null>("DELETE", "/me/secrets/anthropic_token"),
+  listAgentTemplates: () =>
+    request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
+  getAgentTemplate: (id: string) =>
+    request<{ template: AgentTemplate }>("GET", `/agent-templates/${id}`),
+  createAgentTemplate: (input: AgentTemplateInput) =>
+    request<{ template: AgentTemplate }>("POST", "/agent-templates", input),
+  updateAgentTemplate: (id: string, input: AgentTemplateInput) =>
+    request<{ template: AgentTemplate }>("PUT", `/agent-templates/${id}`, input),
+  deleteAgentTemplate: (id: string) =>
+    request<null>("DELETE", `/agent-templates/${id}`),
+  resetAgentTemplate: (id: string) =>
+    request<{ template: AgentTemplate }>("POST", `/agent-templates/${id}/reset`),
 };
