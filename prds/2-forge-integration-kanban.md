@@ -62,6 +62,8 @@ The server makes authenticated outbound HTTP to `base_url`, so it must not be fr
 
 ### Schema (goose migrations, extends PRD #1 DB)
 
+> Parallel-safety with PRD #3: this PRD's goose versions are reserved to `00002`–`00009` (PRD #3 starts at `00010`) — duplicate versions from parallel branches merge without git conflict but fail at `goose up`. Shared frontend shell files (sidebar nav, Settings layout, route table) are expected merge points; keep those edits in dedicated commits.
+
 ```sql
 forge_connections (
   id uuid PK default gen_random_uuid(),
