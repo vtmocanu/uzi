@@ -73,6 +73,19 @@ type Config struct {
 	SeedForgePAT     string
 	SeedForgeBaseURL string
 	SeedForgeRepos   []string
+
+	// Agent-runtime (PRD #4) knobs. All have safe defaults; none is a boot guard
+	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
+	// and RunMaxIterations are enforced worker-side and shipped in the claim
+	// payload; the rest drive the server sweeper and claim affinity.
+	RunTimeout              time.Duration // wall clock before a running run is failed
+	RunIdleTimeout          time.Duration // worker-side no-message idle cap
+	RunMaxIterations        int           // implement⇄review loop cap (worker-side)
+	RunMaxRequeues          int           // worker-death re-queues allowed before a run is failed
+	WorkerHeartbeatInterval time.Duration // how often a worker heartbeats
+	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
+	WorkerPollInterval      time.Duration // worker claim-poll cadence
+	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -138,6 +151,15 @@ func Load() (Config, error) {
 	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
 	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
 	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
+
+	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
+	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
+	cfg.RunMaxIterations = parseInt("RUN_MAX_ITERATIONS", 5)
+	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 1)
+	cfg.WorkerHeartbeatInterval = parseDuration("WORKER_HEARTBEAT_INTERVAL", 15*time.Second)
+	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
+	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
+	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
 
 	if err := loadSeedAdmin(&cfg); err != nil {
 		return Config{}, err
@@ -368,6 +390,21 @@ func parseInt(key string, def int) int {
 	}
 	var n int
 	if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+// parseNonNegInt is parseInt but accepts 0 (a legitimate value for e.g.
+// RUN_MAX_REQUEUES, meaning "never re-queue"). A negative or malformed value
+// falls back to def.
+func parseNonNegInt(key string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	var n int
+	if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n >= 0 {
 		return n
 	}
 	return def

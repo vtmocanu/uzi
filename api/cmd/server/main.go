@@ -28,6 +28,8 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 func main() {
@@ -114,20 +116,42 @@ func run() error {
 		return err
 	}
 
+	// Agent-runtime service (PRD #4): the run queue, worker protocol, and sweeper
+	// DB work. Shares the same secret cipher (sole key holder) as the forge svc.
+	wsvc := workersvc.New(q, box, workersvc.Params{
+		RunTimeout:           cfg.RunTimeout,
+		RunIdleTimeout:       cfg.RunIdleTimeout,
+		RunMaxIterations:     cfg.RunMaxIterations,
+		RunMaxRequeues:       cfg.RunMaxRequeues,
+		WorkerHeartbeatStale: cfg.WorkerHeartbeatStale,
+		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
+	})
+
 	// Background sync engine: pulls forge changes into the issue cache for every
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
 	// pool is closed (a mid-tick query must not race pool.Close).
 	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
-	var pollerWG sync.WaitGroup
-	pollerWG.Add(1)
+
+	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
+	// immediately, then the goroutine sweeps on its own interval. Both lifetimes
+	// are awaited on shutdown before the pool closes.
+	sweep := sweeper.New(wsvc, 0)
+	sweep.Boot(ctx)
+
+	var bgWG sync.WaitGroup
+	bgWG.Add(2)
 	go func() {
-		defer pollerWG.Done()
+		defer bgWG.Done()
 		engine.Run(ctx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		sweep.Run(ctx)
 	}()
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg, box, svc)
+	h := handler.New(pool, q, cfg, box, svc, wsvc)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -153,15 +177,15 @@ func run() error {
 		slog.Info("shutting down")
 	}
 
-	// Drain the HTTP server, then stop and await the poller before returning so
-	// the deferred pool.Close() cannot race an in-flight sync query.
+	// Drain the HTTP server, then stop and await the background goroutines before
+	// returning so the deferred pool.Close() cannot race an in-flight query.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
 		runErr = err
 	}
-	stop() // cancel ctx so the poller's Run returns (covers the server-error path too)
-	pollerWG.Wait()
+	stop() // cancel ctx so the poller + sweeper Run return (covers the server-error path too)
+	bgWG.Wait()
 	return runErr
 }
 
