@@ -75,7 +75,7 @@ func run() error {
 	defer pool.Close()
 
 	q := store.New(pool)
-	limiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow)
+	limiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg)
 
 	srv := &http.Server{

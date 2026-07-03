@@ -10,8 +10,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-uzi}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-uzi}
-    ports:
-      - "127.0.0.1:5432:5432"
+    # Not published to the host: the DB is reachable only over the compose
+    # network (by the api service). Nothing on the laptop can reach it.
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -31,6 +31,10 @@ services:
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://127.0.0.1:8080}
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
       RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-1m}
+      # Trust the nginx hop (the compose network is private RFC1918) so the
+      # real client IP is read from the XFF nginx sets. A direct hit that
+      # bypasses nginx from a non-trusted source has its XFF ignored.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,10.244.0.0/16,127.0.0.1/32}
     ports:
       - "127.0.0.1:8081:8080"
     depends_on:
@@ -46,7 +50,7 @@ services:
   web:
     build: ./web
     ports:
-      - "127.0.0.1:8080:80"
+      - "127.0.0.1:8080:8080"
     depends_on:
       api:
         condition: service_healthy

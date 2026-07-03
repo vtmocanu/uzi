@@ -5,6 +5,8 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -30,6 +32,10 @@ type Config struct {
 	RateLimitMax int
 	// RateLimitWindow is the fixed window for the rate limiter.
 	RateLimitWindow time.Duration
+	// TrustedProxies is the set of CIDRs whose direct connections are allowed
+	// to speak for a real client via X-Forwarded-For. Empty means never trust
+	// XFF (RemoteAddr only) — the conservative default.
+	TrustedProxies []*net.IPNet
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -60,6 +66,7 @@ func Load() (Config, error) {
 		AuthTokenTTL:    parseDuration("AUTH_TOKEN_TTL", 168*time.Hour),
 		RateLimitMax:    parseInt("RATE_LIMIT_MAX", 10),
 		RateLimitWindow: parseDuration("RATE_LIMIT_WINDOW", time.Minute),
+		TrustedProxies:  parseTrustedProxies(os.Getenv("TRUSTED_PROXIES")),
 	}
 
 	if strings.TrimSpace(cfg.DatabaseURL) == "" {
@@ -102,6 +109,29 @@ func originIsHTTPS(origin string) bool {
 		return false
 	}
 	return strings.EqualFold(u.Scheme, "https")
+}
+
+// parseTrustedProxies parses a comma-separated list of CIDRs. Invalid entries
+// are warned and skipped. Returns nil for empty input (never trust XFF).
+func parseTrustedProxies(raw string) []*net.IPNet {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var nets []*net.IPNet
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		_, cidr, err := net.ParseCIDR(part)
+		if err != nil {
+			slog.Warn("TRUSTED_PROXIES: skipping invalid CIDR", "cidr", part, "error", err)
+			continue
+		}
+		nets = append(nets, cidr)
+	}
+	return nets
 }
 
 func getenv(key, def string) string {
