@@ -30,6 +30,9 @@ export function Layout({ children }: { children: ReactNode }) {
                     Users
                   </Link>
                 )}
+                <Link to="/settings" className="text-slate-300 hover:text-white">
+                  Settings
+                </Link>
                 <span className="text-slate-500">{user.email}</span>
                 <Button variant="ghost" onClick={handleLogout}>
                   Log out
