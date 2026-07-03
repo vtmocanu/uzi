@@ -56,7 +56,7 @@ State-changing requests (POST/PATCH) additionally run CSRF validation inside `Re
 
 `api`'s entrypoint (`api/cmd/server/main.go`) does not assume the DB is ready or up to date:
 
-1. Loads config (`config.Load`), including the `UZI_SECRET_KEY` boot guard (`secretbox.LoadKey`): boot fails here, before any DB connection is attempted, if the key is missing or malformed.
+1. Loads config (`config.Load`), including the `UZI_SECRET_KEY` boot guard (`secretbox.LoadKey`): boot fails here, before any DB connection is attempted, if the key is missing, malformed, or a low-entropy placeholder (e.g. an all-zero key).
 2. Waits for `db` to accept connections (bounded retry loop; compose's `depends_on: condition: service_healthy` on `db`'s `pg_isready` healthcheck already gates container start, this is a second, in-process guard).
 3. Runs all pending **goose** migrations, embedded in the binary via `go:embed` (`api/internal/store/migrate.go`, `api/internal/store/migrations/`) — no separate migration step or tool needed at deploy time.
 4. Opens the `pgx` connection pool, then reconciles the builtin agent templates through it (`store.ReconcileBuiltinTemplates`, see below): idempotent, so this is safe to run on every boot.
@@ -140,9 +140,10 @@ recipe a later release renders into a running one.
 `anthropic_token`, `CHECK`-constrained so a new kind is one migration, not a
 new table) holding one AES-256-GCM-sealed secret per `(user, kind)`. The
 `secretbox` package (`api/internal/secretbox/`) wraps `Seal`/`Open` around a
-single 32-byte key loaded from `UZI_SECRET_KEY` once at boot into one
-`*secretbox.Box` shared by every handler; the API refuses to start without a
-valid key (see [docs/configuration.md](docs/configuration.md)). This is the
+single 32-byte key that `config.Load` validates from `UZI_SECRET_KEY` at boot
+(refusing to start if it is missing, malformed, or a low-entropy placeholder)
+and then builds, already validated, into one `*secretbox.Box` shared by every
+handler (see [docs/configuration.md](docs/configuration.md)). This is the
 platform's one shared secret-at-rest mechanism: any feature that needs to
 store a per-user credential (starting with the Anthropic token this PRD adds)
 seals it with the same key before it reaches Postgres, so a DB dump alone
