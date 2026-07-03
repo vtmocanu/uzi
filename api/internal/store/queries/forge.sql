@@ -91,10 +91,13 @@ SELECT count(*) FROM board_columns WHERE repo_id = $1;
 -- name: DeleteBoardColumnsByRepo :exec
 DELETE FROM board_columns WHERE repo_id = $1;
 
--- name: InsertBoardColumn :one
+-- name: InsertBoardColumn :exec
+-- DO NOTHING makes seeding idempotent: two concurrent first-opens (e.g. React
+-- StrictMode double-firing GetBoard) can both run the seed without the second
+-- hitting the (repo_id, label_name) unique violation.
 INSERT INTO board_columns (repo_id, label_name, position)
 VALUES ($1, $2, $3)
-RETURNING *;
+ON CONFLICT (repo_id, label_name) DO NOTHING;
 
 -- Issues cache -------------------------------------------------------------
 

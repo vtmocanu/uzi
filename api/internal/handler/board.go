@@ -24,6 +24,11 @@ import (
 // does not yet exist on the forge.
 const defaultColumnColor = "#8c8c8c"
 
+// maxBoardColumns caps how many columns a board may have. Each column is an
+// EnsureLabels call on the forge and a rendered lane; the cap bounds both the
+// request's forge work and the board width.
+const maxBoardColumns = 10
+
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
 type columnDTO struct {
@@ -105,7 +110,7 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 		return false
 	}
 	for i, col := range forgesvc.DefaultColumns {
-		if _, err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
+		if err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
 			RepoID:    repo.ID,
 			LabelName: col.Name,
 			Position:  int32(i),
@@ -239,6 +244,10 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		seen[name] = struct{}{}
 		names = append(names, name)
 	}
+	if len(names) > maxBoardColumns {
+		httpx.Error(w, http.StatusBadRequest, "too many columns (max "+strconv.Itoa(maxBoardColumns)+")")
+		return
+	}
 
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
@@ -263,7 +272,7 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for i, n := range names {
-		if _, err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
+		if err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
 			RepoID:    repo.ID,
 			LabelName: n,
 			Position:  int32(i),

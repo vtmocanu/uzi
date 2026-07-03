@@ -172,10 +172,10 @@ func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) 
 	return i, err
 }
 
-const insertBoardColumn = `-- name: InsertBoardColumn :one
+const insertBoardColumn = `-- name: InsertBoardColumn :exec
 INSERT INTO board_columns (repo_id, label_name, position)
 VALUES ($1, $2, $3)
-RETURNING id, repo_id, label_name, position
+ON CONFLICT (repo_id, label_name) DO NOTHING
 `
 
 type InsertBoardColumnParams struct {
@@ -184,16 +184,12 @@ type InsertBoardColumnParams struct {
 	Position  int32     `json:"position"`
 }
 
-func (q *Queries) InsertBoardColumn(ctx context.Context, arg InsertBoardColumnParams) (BoardColumn, error) {
-	row := q.db.QueryRow(ctx, insertBoardColumn, arg.RepoID, arg.LabelName, arg.Position)
-	var i BoardColumn
-	err := row.Scan(
-		&i.ID,
-		&i.RepoID,
-		&i.LabelName,
-		&i.Position,
-	)
-	return i, err
+// DO NOTHING makes seeding idempotent: two concurrent first-opens (e.g. React
+// StrictMode double-firing GetBoard) can both run the seed without the second
+// hitting the (repo_id, label_name) unique violation.
+func (q *Queries) InsertBoardColumn(ctx context.Context, arg InsertBoardColumnParams) error {
+	_, err := q.db.Exec(ctx, insertBoardColumn, arg.RepoID, arg.LabelName, arg.Position)
+	return err
 }
 
 const listBoardColumns = `-- name: ListBoardColumns :many
