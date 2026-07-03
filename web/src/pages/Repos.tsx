@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, type ForgeConnection, type Repo } from "../lib/api";
+import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo } from "../lib/api";
 import { Alert, Button, Card, Select } from "../components/ui";
 
 export function Repos() {
@@ -123,14 +123,20 @@ export function Repos() {
                     repos.map((r) => (
                       <tr key={r.id}>
                         <td className="px-4 py-3">
-                          <a
-                            href={r.web_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-medium text-slate-100 hover:text-indigo-300"
-                          >
-                            {r.path_with_namespace}
-                          </a>
+                          {isHttpsUrl(r.web_url) ? (
+                            <a
+                              href={r.web_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="font-medium text-slate-100 hover:text-indigo-300"
+                            >
+                              {r.path_with_namespace}
+                            </a>
+                          ) : (
+                            <span className="font-medium text-slate-100">
+                              {r.path_with_namespace}
+                            </span>
+                          )}
                         </td>
                         <td className="px-4 py-3 text-slate-400">{r.default_branch ?? "—"}</td>
                         <td className="px-4 py-3">

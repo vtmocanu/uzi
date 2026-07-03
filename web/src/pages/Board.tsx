@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, Link } from "react-router-dom";
-import { api, ApiError, type Board as BoardData, type Card as CardData } from "../lib/api";
+import {
+  api,
+  ApiError,
+  isHttpsUrl,
+  type Board as BoardData,
+  type Card as CardData,
+} from "../lib/api";
 import { Alert, Badge, Button, Card, Input } from "../components/ui";
 
 const OPEN_KEY = "";
@@ -191,24 +197,31 @@ function IssueCard({
   onDragEnd: () => void;
   dimmed: boolean;
 }) {
+  // Closed cards are not movable (move-to-Closed is unsupported; close/reopen
+  // stays on the forge), so they are not draggable.
+  const draggable = !card.closed;
   return (
     <div
-      draggable
-      onDragStart={onDragStart}
-      onDragEnd={onDragEnd}
-      className={`cursor-grab rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm active:cursor-grabbing ${
-        dimmed ? "opacity-40" : ""
-      }`}
+      draggable={draggable}
+      onDragStart={draggable ? onDragStart : undefined}
+      onDragEnd={draggable ? onDragEnd : undefined}
+      className={`rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm ${
+        draggable ? "cursor-grab active:cursor-grabbing" : "cursor-default"
+      } ${dimmed ? "opacity-40" : ""}`}
     >
       <div className="flex items-start justify-between gap-2">
-        <a
-          href={card.web_url}
-          target="_blank"
-          rel="noreferrer"
-          className="font-medium text-slate-100 hover:text-indigo-300"
-        >
-          {card.title}
-        </a>
+        {isHttpsUrl(card.web_url) ? (
+          <a
+            href={card.web_url}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-slate-100 hover:text-indigo-300"
+          >
+            {card.title}
+          </a>
+        ) : (
+          <span className="font-medium text-slate-100">{card.title}</span>
+        )}
         <span className="shrink-0 text-xs text-slate-500">#{card.iid}</span>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-1.5">

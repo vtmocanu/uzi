@@ -63,6 +63,13 @@ export interface ForgeConfig {
   forge_types: string[];
 }
 
+// isHttpsUrl guards rendering forge-supplied URLs as links: only https URLs are
+// turned into anchors, so a hostile or malformed web_url (e.g. javascript:) is
+// never made clickable.
+export function isHttpsUrl(url: string | null | undefined): boolean {
+  return typeof url === "string" && url.startsWith("https://");
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
