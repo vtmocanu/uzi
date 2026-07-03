@@ -12,6 +12,14 @@ export interface User {
   last_login: string | null;
 }
 
+// SecretMeta is the metadata-only view of a stored per-user secret. The secret
+// value is never returned by the API, so it never appears here.
+export interface SecretMeta {
+  kind: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -75,4 +83,8 @@ export const api = {
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
+  listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
+  putAnthropicToken: (token: string) =>
+    request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
+  deleteAnthropicToken: () => request<null>("DELETE", "/me/secrets/anthropic_token"),
 };
