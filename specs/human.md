@@ -33,8 +33,20 @@ Tracked as GitLab issue vtmocanu/uzi#1; PRD at `prds/1-simple-webui-user-registr
 - Stack: Go API + React/Vite SPA.
 - Minimal-shell scope: landing, register/login, protected dashboard, admin user list.
 
+## Feature #3 — Agent templates & per-user Anthropic token
+
+Tracked as GitLab issue vtmocanu/uzi#3; PRD at `prds/3-agent-templates-anthropic-tokens.md`.
+
+- Agent templates stored in the DB, editable via the UI (the agents themselves sit with the code).
+- Admin-only template writes; all authenticated users can read/preview. [AI-proposed, user-confirmed 2026-07-03]
+- Each user stores their own Anthropic OAuth token via the webui, encrypted in the DB.
+- A doc explaining how to obtain the token.
+- Scope: templates + token storage only. Agent runtime/execution deferred to PRD #4 (no spawning, no file writes, no Anthropic API calls).
+- Built in parallel with PRD #2, on a separate worktree/branch.
+
 ## Deferred (user, "later stuff")
 
 - GitLab integration.
 - Enable/disable registration for users.
 - SSO with Keycloak.
+- Agent runtime/execution (spawn, file writes, Anthropic API calls) — PRD #4.
