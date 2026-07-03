@@ -18,10 +18,11 @@ import (
 )
 
 // minPasswordLen is the server-side minimum; the client adds strength
-// feedback but this is the authoritative floor.
+// feedback but this is the authoritative floor. Sourced from the auth package
+// so registration and admin seeding share one policy.
 const (
-	minPasswordLen = 12
-	maxPasswordLen = 1024
+	minPasswordLen = auth.MinPasswordLen
+	maxPasswordLen = auth.MaxPasswordLen
 )
 
 // dummyHash is a valid argon2id hash used to equalize login timing when the

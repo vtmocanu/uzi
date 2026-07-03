@@ -1,4 +1,8 @@
-name: uzi
+# No hardcoded `name:`. Compose derives the project name from the directory, so
+# each git worktree gets its own isolated stack + pgdata volume. (A pinned
+# `name: uzi` made every worktree share containers and the pgdata volume with
+# the main `uzi` checkout, so a `down -v` in one wiped another's data.) The main
+# checkout dir is `uzi`, so its volume name stays `uzi_pgdata`.
 
 # Local laptop demo. Every published port is bound to 127.0.0.1 so nothing is
 # exposed on the network (copied from multica's loopback binding).
@@ -27,10 +31,26 @@ services:
       API_ADDR: ":8080"
       DATABASE_URL: "postgres://${POSTGRES_USER:-uzi}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-uzi}?sslmode=disable"
       JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env - generate with openssl rand -hex 64}"
+      UZI_SECRET_KEY: "${UZI_SECRET_KEY:?set UZI_SECRET_KEY in .env - generate with openssl rand -base64 32}"
       AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-168h}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://127.0.0.1:8080}
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
       RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-1m}
+      # Forge integration (PRD #2). Base URLs are an SSRF allowlist; the sync
+      # engine polls each enabled repo on FORGE_POLL_INTERVAL.
+      FORGE_ALLOWED_BASE_URLS: ${FORGE_ALLOWED_BASE_URLS:-https://gitlab.example.com}
+      FORGE_POLL_INTERVAL: ${FORGE_POLL_INTERVAL:-60s}
+      FORGE_RECONCILE_EVERY: ${FORGE_RECONCILE_EVERY:-10}
+      FORGE_HTTP_TIMEOUT: ${FORGE_HTTP_TIMEOUT:-15s}
+      # Per-user budget on the forge-proxying endpoints (verify/projects/sync/move).
+      FORGE_RATE_LIMIT_MAX: ${FORGE_RATE_LIMIT_MAX:-30}
+      FORGE_RATE_LIMIT_WINDOW: ${FORGE_RATE_LIMIT_WINDOW:-1m}
+      # Optional startup admin seed. Unset => no seeding. If set, the API creates
+      # this admin after migrations (only if absent) and refuses to boot on an
+      # invalid seed password.
+      UZI_SEED_EMAIL: ${UZI_SEED_EMAIL:-}
+      UZI_SEED_PASSWORD: ${UZI_SEED_PASSWORD:-}
+      UZI_SEED_NAME: ${UZI_SEED_NAME:-}
       # Trust the nginx hop (the compose network is private RFC1918) so the
       # real client IP is read from the XFF nginx sets. A direct hit that
       # bypasses nginx from a non-trusted source has its XFF ignored.

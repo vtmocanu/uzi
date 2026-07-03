@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -21,11 +22,12 @@ type Handler struct {
 	pool *pgxpool.Pool
 	q    *store.Queries
 	cfg  config.Config
+	svc  *forgesvc.Service
 }
 
 // New constructs a Handler.
-func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg}
+func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, svc *forgesvc.Service) *Handler {
+	return &Handler{pool: pool, q: q, cfg: cfg, svc: svc}
 }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
@@ -67,9 +69,11 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// Routes builds the API router. The limiter is applied per-route to the
-// register and login endpoints.
-func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
+// Routes builds the API router. authLimiter is applied per-route to the
+// register and login endpoints; forgeLimiter is a per-user budget on the
+// forge-proxying endpoints (verify/projects/sync/move) so one user cannot
+// hammer the upstream forge.
+func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -78,8 +82,8 @@ func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
 		r.Get("/health", h.Health)
 
 		r.Route("/auth", func(r chi.Router) {
-			r.With(limiter.Middleware).Post("/register", h.Register)
-			r.With(limiter.Middleware).Post("/login", h.Login)
+			r.With(authLimiter.Middleware).Post("/register", h.Register)
+			r.With(authLimiter.Middleware).Post("/login", h.Login)
 
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -93,6 +97,34 @@ func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
 			r.Use(mw.RequireAdmin)
 			r.Get("/users", h.ListUsers)
 			r.Patch("/users/{id}", h.PatchUser)
+		})
+
+		// Forge integration: connections, repo discovery, and the label-synced
+		// kanban board. Every route is per-user authorized through the owning
+		// connection's user_id (see the handlers).
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+
+			r.Get("/forge/config", h.ForgeConfig)
+
+			r.Route("/forge/connections", func(r chi.Router) {
+				r.Post("/", h.CreateConnection)
+				r.Get("/", h.ListConnections)
+				// verify + projects hit the upstream forge → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/verify", h.VerifyConnection)
+				r.Delete("/{id}", h.DeleteConnection)
+				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/projects", h.ListProjects)
+			})
+
+			r.Route("/repos", func(r chi.Router) {
+				r.Get("/", h.ListRepos)
+				r.Put("/{id}", h.SetRepoEnabled)
+				r.Get("/{id}/board", h.GetBoard)
+				r.Put("/{id}/board/columns", h.ConfigureColumns)
+				// move + sync write/read through to the forge → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/move", h.MoveIssue)
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
+			})
 		})
 	})
 

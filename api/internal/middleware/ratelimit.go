@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 )
 
@@ -81,6 +83,34 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.Path + "|" + ClientIP(r, l.trustedProxies)
 		if !l.allow(key) {
+			w.Header().Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
+			httpx.Error(w, http.StatusTooManyRequests, "too many requests")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// PerUserMiddleware limits by (route pattern, authenticated user id). It MUST
+// run after RequireAuth (which sets the user in context). Keying on the chi
+// route pattern rather than the exact path means all calls to e.g.
+// /repos/{id}/sync share one budget per user, so hitting many different repos
+// or issues cannot bypass the limit. Used on the forge-proxying endpoints to
+// keep one user from hammering the upstream forge. Falls back to the client IP
+// if no user is in context (should not happen post-auth).
+func (l *Limiter) PerUserMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pattern := chi.RouteContext(r.Context()).RoutePattern()
+		if pattern == "" {
+			pattern = r.URL.Path
+		}
+		var who string
+		if user, ok := UserFromContext(r.Context()); ok {
+			who = user.ID.String()
+		} else {
+			who = ClientIP(r, l.trustedProxies)
+		}
+		if !l.allow(pattern + "|" + who) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
 			httpx.Error(w, http.StatusTooManyRequests, "too many requests")
 			return

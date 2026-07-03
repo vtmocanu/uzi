@@ -19,3 +19,29 @@ All configuration is via environment variables, set in `.env` (copied from `.env
 Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last one is logged as a warning); only a bad `JWT_SECRET` or missing `DATABASE_URL` refuses to start.
 
 There is no CORS configuration to make, by design: nginx serves the SPA and proxies `/api/*` to the API on the same origin (see [ARCHITECTURE.md](../ARCHITECTURE.md)), so the browser never makes a cross-origin request.
+
+## Forge integration
+
+See [gitlab-bot-setup.md](gitlab-bot-setup.md) for the bot-account procedure these variables support.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_SECRET_KEY` | — (required) | base64-encoded 32-byte AES-256 master key that encrypts bot PATs at rest (`api/internal/secretbox`). The API refuses to start if it is missing, not valid base64, not exactly 32 bytes decoded, or a low-entropy placeholder (e.g. all-zero). Generate with `openssl rand -base64 32`. **Rotating this key invalidates every stored bot token** — every user must reconnect their PAT in Settings → Forge; there is no re-encrypt path in this MVP. |
+| `FORGE_ALLOWED_BASE_URLS` | `https://gitlab.example.com` | Comma-separated SSRF allowlist: the only forge base URLs a connection may target. Every entry must be an absolute `https://` URL; boot fails if the list is empty or any entry is malformed or non-`https`. The Settings → Forge base-URL dropdown offers exactly this set. |
+| `FORGE_POLL_INTERVAL` | `60s` (`1m`) | Per-enabled-repo incremental sync cadence (Go duration). An invalid or non-positive value falls back to the default. See "Freshness contract" below. |
+| `FORGE_RECONCILE_EVERY` | `10` | Every Nth incremental poll is a full reconcile instead (fetches the complete `PRD`-labeled issue set with no `updated_after` bound, diffs, and evicts cache rows the forge no longer returns). A non-positive or unparseable value falls back to the default, same as the other numeric/duration vars here (the poller itself additionally clamps any value `< 1` to `1` — every poll becomes a full reconcile — as defense in depth, but that path isn't reachable through this env var). The very first poll after a repo is enabled is always a full reconcile regardless of this setting, since it has to seed the cache. |
+| `FORGE_HTTP_TIMEOUT` | `15s` | Hard per-call timeout on every outbound HTTP request to the forge (connect, projects, labels, issues, label updates). Closes the untimeouted-`http.DefaultClient` wart the `multica` inspiration shipped with. |
+| `FORGE_RATE_LIMIT_MAX` / `FORGE_RATE_LIMIT_WINDOW` | `30` / `1m` | Per-user request budget (not per-IP) on the forge-*proxying* endpoints only — connection verify, project listing, issue move, manual sync — so one user's connection can't hammer the upstream forge. Separate limiter and separate budget from `RATE_LIMIT_MAX`/`RATE_LIMIT_WINDOW`, which only cover `/api/auth/register` and `/api/auth/login`. |
+| `UZI_SEED_EMAIL` | — (optional) | Setting this provisions an admin user automatically at startup, after migrations, if no user with that email already exists yet (an existing user's password is never touched — the seed is idempotent and safe to leave set across restarts). Must be a syntactically valid address or boot fails. Leave unset to disable seeding entirely (the normal first-registration-becomes-admin flow still applies). |
+| `UZI_SEED_PASSWORD` | — (required if `UZI_SEED_EMAIL` is set) | Password for the seeded admin, hashed with the same argon2id parameters as normal registration. Must satisfy the same length policy as registration (12–1024 characters) or boot refuses to start — a set-but-invalid seed is a loud misconfiguration, not a silent skip. |
+| `UZI_SEED_NAME` | — (optional) | Display name for the seeded admin. |
+
+### Default column labels are created on the forge
+
+The first time a repo's board is opened, uzi ensures three labels exist on that GitLab project — `In Progress`, `Upcoming`, `Later` (`forgesvc.DefaultColumns`) — creating any that are missing via the forge's label-create API. This is a deliberate, visible side effect: those labels then show up in GitLab's own label list and board for that project, not just inside uzi. Board columns are reconfigurable afterward to any of the project's labels; the default set is only what's seeded on first open.
+
+### Freshness contract
+
+- Content edits and label adds/removes made at normal human cadence (spaced further apart than GitLab's `updated_at` bump throttle — see below) are picked up within one `FORGE_POLL_INTERVAL`.
+- GitLab throttles how often it bumps an issue's `updated_at` to roughly once per ~60-second window, regardless of whether the triggering change is a label add or a label remove (verified against gitlab.example.com — see the PRD's Sync engine section for the full finding). Multiple edits landing inside the same throttle window collapse to a single bump, so only the latest of them is guaranteed to be caught incrementally; earlier ones in that window are caught by the next reconcile pass instead. `FORGE_POLL_INTERVAL`'s default (`60s`) is the same order of magnitude as the throttle window, so normal editing cadence is still caught incrementally almost all the time.
+- De-labeling, issue deletion, and any edit whose `updated_at` bump the incremental filter missed are only guaranteed to be visible within one `FORGE_RECONCILE_EVERY`-th poll (the full reconcile), because eviction — noticing a previously-cached issue is now absent from the forge's current set — is structurally impossible for an `updated_after`-filtered incremental query to do.

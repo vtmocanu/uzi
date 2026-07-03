@@ -7,10 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/mail"
 	"net/url"
 	"os"
 	"strings"
 	"time"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 )
 
 // Config holds all runtime settings derived from the environment.
@@ -36,6 +40,30 @@ type Config struct {
 	// to speak for a real client via X-Forwarded-For. Empty means never trust
 	// XFF (RemoteAddr only) — the conservative default.
 	TrustedProxies []*net.IPNet
+	// SecretKey is the validated 32-byte AES-256 master key (from
+	// UZI_SECRET_KEY) that encrypts bot PATs at rest. Boot fails without it.
+	SecretKey []byte
+	// ForgeAllowedBaseURLs is the SSRF allowlist: the only forge base URLs a
+	// connection may target. Normalized (scheme+host, no trailing slash), https
+	// only. The connect UI offers exactly this set.
+	ForgeAllowedBaseURLs []string
+	// ForgePollInterval is the per-enabled-repo incremental poll cadence.
+	ForgePollInterval time.Duration
+	// ForgeReconcileEvery is the number of incremental polls between full
+	// reconcile passes (the eviction-capable freshness floor).
+	ForgeReconcileEvery int
+	// ForgeHTTPTimeout bounds every outbound forge HTTP call.
+	ForgeHTTPTimeout time.Duration
+	// ForgeRateLimitMax/Window bound how often one authenticated user may hit
+	// the forge-proxying endpoints (verify/projects/sync/move), protecting the
+	// upstream forge from a single user's abuse.
+	ForgeRateLimitMax    int
+	ForgeRateLimitWindow time.Duration
+	// SeedEmail/SeedPassword/SeedName optionally provision an admin at startup.
+	// Empty SeedEmail disables seeding. Validated at boot (see Load).
+	SeedEmail    string
+	SeedPassword string
+	SeedName     string
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -45,16 +73,19 @@ var placeholderSecrets = map[string]struct{}{
 	"multica-dev-secret-change-in-production": {},
 	"bottega-dev-secret-change-in-production": {},
 	"uzi-dev-secret-change-in-production":     {},
-	"change-me":                              {},
-	"changeme":                               {},
-	"secret":                                 {},
-	"password":                               {},
+	"change-me":                               {},
+	"changeme":                                {},
+	"secret":                                  {},
+	"password":                                {},
 }
 
 // minSecretLen is the minimum acceptable JWT secret length. `openssl rand -hex
 // 64` produces 128 chars; this floor rejects obviously weak keys while staying
 // permissive enough for hand-set values in local demos.
 const minSecretLen = 16
+
+// defaultForgeBaseURL is the single allowlisted forge for the example demo.
+const defaultForgeBaseURL = "https://gitlab.example.com"
 
 // Load reads configuration from the environment and validates it. It returns
 // an error (rather than exiting) so the caller controls the failure path.
@@ -79,9 +110,121 @@ func Load() (Config, error) {
 	}
 	cfg.JWTSecret = secret
 
+	// Boot guard for the at-rest encryption key, same stance as JWT_SECRET: a
+	// missing/short/mis-encoded UZI_SECRET_KEY aborts start rather than running
+	// with unencryptable or guessable-keyed token storage.
+	key, err := secretbox.LoadKey("UZI_SECRET_KEY")
+	if err != nil {
+		return Config{}, fmt.Errorf("%w; generate one with: openssl rand -base64 32", err)
+	}
+	cfg.SecretKey = key
+
+	allowed, err := parseAllowedBaseURLs(getenv("FORGE_ALLOWED_BASE_URLS", defaultForgeBaseURL))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ForgeAllowedBaseURLs = allowed
+	cfg.ForgePollInterval = parseDuration("FORGE_POLL_INTERVAL", time.Minute)
+	cfg.ForgeReconcileEvery = parseInt("FORGE_RECONCILE_EVERY", 10)
+	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
+	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
+	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
+
+	if err := loadSeedAdmin(&cfg); err != nil {
+		return Config{}, err
+	}
+
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
 	return cfg, nil
+}
+
+// loadSeedAdmin reads and validates the optional startup-admin seed. Seeding is
+// off unless UZI_SEED_EMAIL is set; when it is, the email must be valid and the
+// password must satisfy the same length policy as registration, or boot fails
+// (a set-but-invalid seed should be a loud misconfiguration, not a silent
+// skip). The email is normalized to match how registration stores it.
+func loadSeedAdmin(cfg *Config) error {
+	email := strings.TrimSpace(strings.ToLower(os.Getenv("UZI_SEED_EMAIL")))
+	if email == "" {
+		return nil
+	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return fmt.Errorf("UZI_SEED_EMAIL is not a valid email address")
+	}
+	password := os.Getenv("UZI_SEED_PASSWORD")
+	if len(password) < auth.MinPasswordLen {
+		return fmt.Errorf("UZI_SEED_PASSWORD must be at least %d characters when UZI_SEED_EMAIL is set", auth.MinPasswordLen)
+	}
+	if len(password) > auth.MaxPasswordLen {
+		return fmt.Errorf("UZI_SEED_PASSWORD is too long (max %d characters)", auth.MaxPasswordLen)
+	}
+	cfg.SeedEmail = email
+	cfg.SeedPassword = password
+	cfg.SeedName = strings.TrimSpace(os.Getenv("UZI_SEED_NAME"))
+	return nil
+}
+
+// parseAllowedBaseURLs parses the comma-separated SSRF allowlist. Every entry
+// must be an absolute https URL; it is normalized to scheme://host[:port] with
+// no path or trailing slash so comparisons against a connection's base_url are
+// exact. An empty list or any non-https/malformed entry is a hard error — an
+// empty allowlist would silently forbid all connections, and a plain-http entry
+// would defeat the guard.
+func parseAllowedBaseURLs(raw string) ([]string, error) {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		norm, err := NormalizeForgeBaseURL(part)
+		if err != nil {
+			return nil, fmt.Errorf("FORGE_ALLOWED_BASE_URLS: %w", err)
+		}
+		if _, dup := seen[norm]; dup {
+			continue
+		}
+		seen[norm] = struct{}{}
+		out = append(out, norm)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("FORGE_ALLOWED_BASE_URLS resolves to an empty allowlist; set at least one https URL")
+	}
+	return out, nil
+}
+
+// NormalizeForgeBaseURL validates and canonicalizes a forge base URL to
+// scheme://host[:port]. It requires the https scheme and a host, and strips any
+// path, query, or fragment. Used both to build the allowlist and to check a
+// user-supplied base_url against it.
+func NormalizeForgeBaseURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", fmt.Errorf("invalid URL %q: %w", raw, err)
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return "", fmt.Errorf("base URL %q must use https", raw)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("base URL %q has no host", raw)
+	}
+	return "https://" + strings.ToLower(u.Host), nil
+}
+
+// ForgeBaseURLAllowed reports whether raw normalizes to an allowlisted base URL.
+func (c Config) ForgeBaseURLAllowed(raw string) bool {
+	norm, err := NormalizeForgeBaseURL(raw)
+	if err != nil {
+		return false
+	}
+	for _, a := range c.ForgeAllowedBaseURLs {
+		if a == norm {
+			return true
+		}
+	}
+	return false
 }
 
 // validateSecret enforces the boot guard: reject missing, empty, placeholder,
