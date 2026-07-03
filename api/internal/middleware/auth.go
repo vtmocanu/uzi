@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
@@ -70,14 +71,20 @@ func RequireAuth(q *store.Queries, cfg config.Config) func(http.Handler) http.Ha
 				return
 			}
 
-			// Rolling refresh: mint a fresh token at the current version and
-			// slide the cookie expiry. If a bump happens later in this same
-			// request (logout / password change), the token minted here
-			// carries the pre-bump version and is rejected on next use, so
-			// revocation still holds.
-			if token, err := auth.IssueToken(cfg.JWTSecret, claims.UserID, user.TokenVersion, cfg.AuthTokenTTL); err == nil {
-				if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: cfg.CookieSecure, TTL: cfg.AuthTokenTTL}); err != nil {
-					slog.Warn("rolling refresh: set cookies", "error", err)
+			// Rolling refresh: once the token is past the halfway point of its
+			// TTL, mint a fresh token at the current version and slide the
+			// cookie expiry, re-issuing BOTH cookies together (the CSRF cookie
+			// is HMAC-bound to the JWT). Refreshing only past half-life (rather
+			// than every request) keeps active sessions alive while shrinking
+			// the window in which concurrent requests could see mismatched
+			// cookie pairs. If a bump happens later in this same request
+			// (logout / password change), the token minted here carries the
+			// pre-bump version and is rejected on next use, so revocation holds.
+			if shouldRefresh(claims, cfg.AuthTokenTTL) {
+				if token, err := auth.IssueToken(cfg.JWTSecret, claims.UserID, user.TokenVersion, cfg.AuthTokenTTL); err == nil {
+					if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: cfg.CookieSecure, TTL: cfg.AuthTokenTTL}); err != nil {
+						slog.Warn("rolling refresh: set cookies", "error", err)
+					}
 				}
 			}
 
@@ -85,6 +92,16 @@ func RequireAuth(q *store.Queries, cfg config.Config) func(http.Handler) http.Ha
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// shouldRefresh reports whether more than half of the token's TTL has elapsed,
+// i.e. its remaining lifetime is under half the configured TTL. Missing/zero
+// expiry is treated as "refresh" (fail safe toward keeping the session alive).
+func shouldRefresh(claims *auth.Claims, ttl time.Duration) bool {
+	if claims.ExpiresAt == nil {
+		return true
+	}
+	return time.Until(claims.ExpiresAt.Time) < ttl/2
 }
 
 // RequireAdmin gates a route to admin users. It must run after RequireAuth.

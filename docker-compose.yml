@@ -5,7 +5,7 @@ name: uzi
 
 services:
   db:
-    image: postgres:17
+    image: postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-uzi}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -35,8 +35,7 @@ services:
       # real client IP is read from the XFF nginx sets. A direct hit that
       # bypasses nginx from a non-trusted source has its XFF ignored.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,10.244.0.0/16,127.0.0.1/32}
-    ports:
-      - "127.0.0.1:8081:8080"
+    # Not published to the host: reached only by web over the compose network.
     depends_on:
       db:
         condition: service_healthy
