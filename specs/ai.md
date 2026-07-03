@@ -213,3 +213,249 @@ users(
   granularity needs a front proxy that preserves real client IPs.
 - No password reset / email verification / 2FA (deferred; see human.md).
 - Secret scanner and CI are deferred. Minor-tag → digest pinning is done.
+- **Rotating `UZI_SECRET_KEY` invalidates every stored bot PAT** — no re-encrypt
+  path in MVP; every user must reconnect. Accepted (see §17).
+- **Forgejo label-swap atomicity** is GitLab-only; single-column enforcement is
+  best-effort on any future non-GitLab driver (see §16, §20).
+- **Move-to-Closed is unsupported** from the board; closing/reopening stays on the
+  forge (see §20).
+
+---
+
+# PRD #2 — Forge integration & label-synced kanban
+
+Serves human Feature #2. Sections below extend the design for the forge layer;
+all of it lives inside the existing `api` service (no new container).
+
+## 16. Forge abstraction
+
+Serves human: "forge-generic design, GitLab first, Forgejo later"; "uzi only sees
+issues the bot has rights to".
+
+- **`Forge` interface** in `api/internal/forge/` (`VerifyToken`, `ListProjects`,
+  `ListLabels`, `EnsureLabels`, `ListIssues`, `UpdateIssueLabels`) over a neutral
+  domain vocabulary (`BotIdentity`, `Project`, `Label`, `Issue`). `forge.New(Type,
+  baseURL, token, timeout)` selects a driver by `Type` (maps 1:1 to
+  `forge_connections.forge_type`); **no caller ever imports a driver**.
+  - Why: neither inspiration abstracts the forge (multica hand-rolls GitHub-only
+    `net/http`; bottega shells out to `gh`). A Forgejo driver later must not touch
+    callers, schema shape, or UI flows.
+- **GitLab driver** (`gitlab.go`): official client `gitlab.com/gitlab-org/api/client-go/v2`
+  (successor to `xanzy/go-gitlab`). Membership discovery uses
+  `min_access_level=Developer`; label moves use the **atomic** `add_labels`/
+  `remove_labels` issue update. Base URL is per-connection (self-hosted-first).
+- **Wrapper** on every call: `FORGE_HTTP_TIMEOUT`-bounded `*http.Client` (closes
+  multica's untimeouted `http.DefaultClient` wart), 429/`Retry-After` +
+  `RateLimit-*` handling, pagination, and **secret redaction** — a `redactor`
+  (`redact.go`) scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN` value from
+  every returned error before it can reach a log or response (redaction unit test
+  required and present).
+- **Forgejo** deferred: interface, schema (`forge_type`), and UI copy stay
+  forge-neutral. Forgejo has no atomic add+remove label call, so
+  `UpdateIssueLabels` would be non-atomic and single-column enforcement
+  best-effort there.
+
+## 17. Bot PAT encryption at rest
+
+Serves human: "each user connects their own bot PAT"; best-practice (secret at rest).
+
+- **`api/internal/secretbox`**: generic AES-256-GCM box (12-byte random nonce
+  prepended to ciphertext). Deliberately **not PAT-specific** — earmarked to also
+  hold per-user Anthropic OAuth tokens in the agent PRD.
+- Master key from **`UZI_SECRET_KEY`** (base64, exactly 32 bytes). `secretbox.LoadKey`
+  runs at boot with a **refuse-to-start guard** identical in stance to `JWT_SECRET`:
+  aborts if missing, not valid base64, not 32 bytes, or a **low-entropy placeholder**
+  (e.g. all-zero).
+- One `*secretbox.Box` built in `main.go`, handed to `forgesvc.Service`, which seals
+  the PAT into `forge_connections.token_ciphertext` on connect and opens it on every
+  forge call. **Never returned to the client** after save; re-connect to rotate a PAT.
+- **Accepted limitation**: rotating `UZI_SECRET_KEY` invalidates all stored tokens —
+  no re-encrypt path in MVP (see §15).
+
+## 18. SSRF guard on base_url
+
+Serves human: best-practice (server makes authenticated outbound calls to a
+user-supplied base URL).
+
+- **`FORGE_ALLOWED_BASE_URLS`** admin allowlist (comma-separated, default
+  `https://gitlab.example.com`). `NormalizeForgeBaseURL` requires **https** and
+  canonicalizes to `scheme://host[:port]` (strips path/query/fragment) before every
+  comparison. Boot fails if the list is empty or any entry is malformed/non-https.
+- The Settings → Forge base-URL dropdown offers **exactly this set** (`GET
+  /api/forge/config`), so a free-text URL can't even be attempted — closes SSRF
+  (cloud metadata, internal services, loopback) without per-request IP filtering.
+  If free-text URLs are ever allowed, private/loopback/link-local ranges must be
+  resolved and rejected at that point.
+
+## 19. Forge schema (migration `00002_forge.sql`)
+
+Serves human: "repo list + picker"; "board on labels"; "forge as source of truth".
+
+- Goose versions for this PRD reserved `00002`–`00009` (PRD #3 starts `00010`) so
+  parallel branches don't collide at `goose up`.
+- **`forge_connections`** — one row per `(user_id, forge_type, base_url)`;
+  encrypted PAT + verified bot identity (`bot_username`, `bot_forge_user_id`).
+- **`repos`** — projects from the bot's membership list, keyed by the forge's
+  **stable numeric project id** (not the renamable path). Upserted `enabled=false`
+  on every listing call so enable/disable always has a row id to target.
+- **`board_columns`** — ordered label names per repo. The implicit **Open**
+  (no column label) and **Closed** (issue `state`) columns are never stored.
+- **`issues`** — a **cache, never authoritative**. uzi's only owned board state is
+  column config; every issue field is overwritten from the forge each sync.
+  `has_prd_link` is stored as a bool computed at fetch time; the description itself
+  is never persisted.
+- All four tables cascade-delete from `forge_connections.user_id`, so every
+  repo/board/issue row is scoped to one user's bot world.
+  - Why keyed by forge id + explicit `(repo_id, forge_issue_iid)` FK: beats both
+    inspirations' brittle text-convention issue↔work mapping and multica's
+    FK-less JSONB repo registry.
+
+## 20. Kanban semantics (GitLab-board compatible)
+
+Serves human: "per-repo kanban board based on GitLab labels, two-way synced".
+
+- **Columns = labels.** Per repo: implicit **Open** (no column label) + ordered
+  label columns (default seeded `In Progress`, `Upcoming`, `Later` =
+  `forgesvc.DefaultColumns`) + implicit **Closed**. A card is in a column iff the
+  issue carries that label (GitLab board-list semantics).
+- **Single column label enforced.** A move issues one atomic
+  `UpdateIssueLabels(add=[target], remove=[other column labels])`. Move-to-**Open**
+  removes all column labels. Move-to-**Closed** is **unsupported** (returns 400;
+  closing/reopening stays on the forge — the card links out).
+- **Conflict handling**: an issue arriving with multiple column labels renders in
+  the highest-positioned column with a **conflict badge**; the next uzi-side move
+  normalizes it.
+- **Default columns seeded on the forge** on first board open (`EnsureLabels`) — a
+  deliberate, documented side effect visible in GitLab's own label list. Columns
+  are reconfigurable to any project label afterward. **Column count capped at 10**
+  (`maxBoardColumns`).
+
+## 21. PRD-label filter + PRD-link sanity check
+
+Serves human: "board/agents work only PRD-labeled issues, sanity-checked to contain
+a link to the PRD file".
+
+- Board shows **only `PRD`-labeled issues** (`ListIssues(labels=["PRD"], …)`).
+- **PRD-link check** computed at fetch time from the issue description: must contain
+  a relative path or absolute URL to a PRD file. Regex:
+  `(?i)(?:https?://\S+/-/blob/[^\s)]+/)?prds/[\w.-]+\.md(?:[#?][^\s)]*)?` — matches
+  subdir paths (e.g. `prds/done/…`). Result stored as `issues.has_prd_link`
+  (description not persisted). Failing cards render a warning badge and are
+  **excluded from future agent pickup**.
+
+## 22. Sync engine
+
+Serves human: "kept in sync two-way between uzi and GitLab".
+
+- **Forge is the source of truth**; `issues` is a cache. `api/internal/forgesvc.Service`
+  is shared by handlers and the poller (`IncrementalSync`/`FullSync` against a
+  narrow `IssueStore` interface, unit-tested with a fake store + mocked `Forge`).
+- **Incremental pull** (`api/internal/poller.Engine`, one background goroutine):
+  per enabled repo, `ListIssues(labels=PRD, state=all, updated_after=HWM)` each
+  `FORGE_POLL_INTERVAL` (default 60s). **HWM = max `updated_at` returned by the
+  forge**, never the client clock (skew would drop updates); GitLab's
+  `updated_after` is inclusive at second granularity, so boundary rows re-fetch and
+  dedupe by upsert.
+- **Full reconcile** every `FORGE_RECONCILE_EVERY`-th tick (default 10) and always
+  on a repo's first poll after enable: fetch the complete PRD set with no
+  `updated_after`, upsert everything, and **evict cache rows the forge no longer
+  returns**. Eviction is the only way to see de-labeling/close-with-label-removed/
+  deletion, which an `updated_after` filter structurally cannot report. Manual
+  `POST /api/repos/:id/sync` and the Refresh button run the same full sync.
+- **Push is forge-first**: a move calls `UpdateIssueLabels` before touching the
+  cache and updates the cache only on success — a failed forge write leaves the
+  card put (**snap-back**), never an optimistic divergence. Conflicts resolve
+  last-writer-wins at the forge (persisted-truth-over-event-claim, multica's lesson).
+- **EMPIRICAL FINDING (verified 2026-07-03, E2E vs gitlab.example.com)**: GitLab
+  throttles issue `updated_at` bumps to **~1 per ~60s window, independent of
+  add-vs-remove**. Consequence: changes at normal human cadence (spaced past the
+  throttle window) are caught incrementally within one poll; multiple changes inside
+  one window share a single bump, so only the last is guaranteed incrementally and
+  earlier ones wait for the reconcile tier. **Freshness contract**: normal-cadence
+  edits within one poll interval; bunched-window edits + de-label/close/reopen/delete
+  within one reconcile interval.
+- **Webhooks deferred** (laptop compose is unreachable from the forge): the design
+  keeps a `ChangeSource` seam (poller now; webhook receiver later, authenticated via
+  GitLab's HMAC-SHA256 signing token preferred over legacy `X-Gitlab-Token`).
+- **Graceful shutdown ordering**: `main.go` drains HTTP (`srv.Shutdown`), cancels the
+  root context (stops the next tick), then `pollerWG.Wait()`s an in-flight sync — all
+  before the deferred `pool.Close()`, so a mid-tick query never races the pool.
+
+## 23. Rate limiting & poller bounding
+
+Serves human: best-practice (protect the upstream forge; abuse resistance).
+
+- **Per-user forge limiter** (`PerUserMiddleware` over the same fixed-window
+  `mw.Limiter` PRD #1 uses, but keyed per user, not per IP) on the forge-proxying
+  endpoints only: verify, projects, move, sync. Budget `FORGE_RATE_LIMIT_MAX`/
+  `FORGE_RATE_LIMIT_WINDOW` (default 30/min), separate from the auth limiter.
+- **Poller bounding**: per-tick **bounded concurrency of 4**
+  (`defaultMaxConcurrency`, semaphore) + a **per-tick deadline** clamped to one poll
+  interval, so a slow forge can't let ticks pile up. In-memory per-repo state
+  (`hwm`, poll count) — a disabled repo drops out; a re-enabled one restarts with a
+  fresh full reconcile.
+
+## 24. Startup admin seed
+
+Serves human: "seed an admin from env so the user survives DB wipes; admin role;
+never overwrite an existing user".
+
+- `UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`. Runs in `main.go` after
+  migrations. Empty `UZI_SEED_EMAIL` disables seeding.
+- **Create-only-if-absent**: if a user with that email exists, leave it untouched
+  (idempotent, safe to leave set across restarts; never overwrites a password).
+- Same **argon2id** params and **password-length policy** as registration (shared
+  `auth.MinPasswordLen`/`MaxPasswordLen`, refactored to one place). Seeded user is
+  `is_admin=true`.
+- **Boot-refusal on invalid seed input** (bad email, or password outside 12–1024):
+  a set-but-invalid seed is a loud misconfiguration, not a silent skip.
+- **23505-tolerant**: a duplicate-key on insert is treated as "already seeded"
+  (replica-safe against a concurrent create).
+
+## 25. Forge configuration (env, extends §13)
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_SECRET_KEY` | — (required, boot guard) | base64 32B; encrypts bot PATs; rotation invalidates stored tokens |
+| `FORGE_ALLOWED_BASE_URLS` | `https://gitlab.example.com` | comma-separated https allowlist (SSRF guard) |
+| `FORGE_POLL_INTERVAL` | `60s` | per enabled repo |
+| `FORGE_RECONCILE_EVERY` | `10` | full reconcile every Nth poll; poller clamps `<1` to 1 |
+| `FORGE_HTTP_TIMEOUT` | `15s` | every forge call |
+| `FORGE_RATE_LIMIT_MAX` / `FORGE_RATE_LIMIT_WINDOW` | `30` / `1m` | per-user, forge-proxying endpoints only |
+| `UZI_SEED_EMAIL` | — (optional) | set to seed an admin at startup; disables seeding when empty |
+| `UZI_SEED_PASSWORD` | — (required if seed email set) | 12–1024 chars or boot fails |
+| `UZI_SEED_NAME` | — (optional) | display name for the seeded admin |
+
+Invalid numeric/duration forge vars fall back to defaults (same as §13); only
+`UZI_SECRET_KEY`, a malformed `FORGE_ALLOWED_BASE_URLS`, and an invalid seed refuse
+to start.
+
+## 26. API surface (forge; all authenticated, PRD #1 session/CSRF)
+
+- `POST/GET/DELETE /api/forge/connections` (+ `POST .../verify`); `GET /api/forge/config`
+  (allowlisted base URLs for the dropdown).
+- `GET /api/forge/connections/:id/projects` — live membership; upserts `repos`
+  (`enabled=false`).
+- `PUT /api/repos/:id` (enable/disable) · `GET /api/repos` (enabled repos).
+- `GET /api/repos/:id/board` · `PUT /api/repos/:id/board/columns` · `POST
+  /api/repos/:id/issues/:iid/move {to_column}` · `POST /api/repos/:id/sync`.
+- Every repo/board endpoint authorizes through the owning connection's `user_id`
+  (bottega's membership-authz shape) — a user only ever sees their own bot's world.
+
+## 27. Compose worktree isolation
+
+Serves human: "local docker-compose MVP".
+
+- **Dropped the pinned `name:` in `docker-compose.yml`** so Compose derives the
+  project name from the directory. A hardcoded `name: uzi` made every git worktree
+  share one set of containers and the `pgdata` volume; per-directory names give each
+  worktree an isolated stack.
+
+## 28. E2E test convention
+
+Serves human: best-practice (real-forge verification of the sync contract).
+
+- `UZI_E2E_BOT_PAT` / `UZI_E2E_BOT_USERNAME` / `UZI_E2E_PROJECT` in a **gitignored
+  `.env`**, **never read by the app** (not among `Config`'s fields — grep-verifiable).
+  A live E2E suite should **skip (not fail)** when they are unset, mirroring
+  `scripts/smoke.sh`'s require-a-running-stack stance.

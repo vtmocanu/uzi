@@ -33,8 +33,26 @@ Tracked as GitLab issue vtmocanu/uzi#1; PRD at `prds/1-simple-webui-user-registr
 - Stack: Go API + React/Vite SPA.
 - Minimal-shell scope: landing, register/login, protected dashboard, admin user list.
 
+## Feature #2 — Forge integration & label-synced kanban
+
+Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/2-forge-integration-kanban.md`.
+
+- Forge-generic design: GitLab first, Forgejo support later.
+- Each user creates their own GitLab bot account + PAT, adds it as Developer to the projects they choose.
+- uzi only sees issues the bot has rights to — no shared/ambient identity.
+- Repo list + picker in the UI.
+- Per-repo kanban board, columns = GitLab labels, kept in two-way sync between uzi and GitLab.
+  - Reference: example-app board (label-as-column example); kan.bn (UI style).
+- Board/agents work only issues carrying the `PRD` label, sanity-checked to contain a link to the PRD file.
+
+## Startup admin seed
+
+- Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
+- Seeded user gets the admin role; never overwrite an existing user.
+
 ## Deferred (user, "later stuff")
 
-- GitLab integration.
+- Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
+- Forgejo driver (interface is forge-generic; GitLab implemented first).
 - Enable/disable registration for users.
 - SSO with Keycloak.
