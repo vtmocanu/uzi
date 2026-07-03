@@ -41,7 +41,8 @@ type Config struct {
 	// XFF (RemoteAddr only) — the conservative default.
 	TrustedProxies []*net.IPNet
 	// SecretKey is the validated 32-byte AES-256 master key (from
-	// UZI_SECRET_KEY) that encrypts bot PATs at rest. Boot fails without it.
+	// UZI_SECRET_KEY) that encrypts secrets at rest: forge bot PATs and per-user
+	// Anthropic tokens. Boot fails without it.
 	SecretKey []byte
 	// ForgeAllowedBaseURLs is the SSRF allowlist: the only forge base URLs a
 	// connection may target. Normalized (scheme+host, no trailing slash), https

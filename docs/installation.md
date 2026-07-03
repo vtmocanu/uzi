@@ -52,6 +52,18 @@ docker compose down -v && docker compose up -d --build
 
 Override the target with `BASE=http://127.0.0.1:8080 ./scripts/smoke.sh`.
 
+`scripts/smoke-prd3.sh` covers agent templates and the per-user Anthropic token the same way (admin-only template writes, builtin protection, byte-stable render, metadata-only secret responses, a DB dump that holds only ciphertext); same fresh-stack expectation and `BASE`/`DB_DUMP` overrides (see the script header).
+
+## Development
+
+Editing a migration or a query file (`api/internal/store/migrations/`, `api/internal/store/queries/`) requires regenerating the `sqlc` code before it compiles:
+
+```sh
+cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
+```
+
+Pinned via `go run`, so no local `sqlc` install is needed (the same command is commented atop `api/sqlc.yaml`). Never hand-edit the generated files under `api/internal/store/`.
+
 ## Persistence
 
 Postgres data lives in the named volume `pgdata` (declared in `docker-compose.yml`), not a bind mount.

@@ -12,6 +12,39 @@ export interface User {
   last_login: string | null;
 }
 
+// SecretMeta is the metadata-only view of a stored per-user secret. The secret
+// value is never returned by the API, so it never appears here.
+export interface SecretMeta {
+  kind: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// AgentTemplate is a stored agent definition. tools is null when the template
+// inherits all tools; model is null when it inherits the model.
+export interface AgentTemplate {
+  id: string;
+  name: string;
+  description: string;
+  model: string | null;
+  tools: string[] | null;
+  prompt_body: string;
+  is_builtin: boolean;
+  updated_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// AgentTemplateInput is the admin-editable shape. name is only sent on create
+// (it is immutable afterwards).
+export interface AgentTemplateInput {
+  name?: string;
+  description: string;
+  model: string | null;
+  tools: string[] | null;
+  prompt_body: string;
+}
+
 export interface ForgeConnection {
   id: string;
   forge_type: string;
@@ -133,6 +166,22 @@ export const api = {
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
+  listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
+  putAnthropicToken: (token: string) =>
+    request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
+  deleteAnthropicToken: () => request<null>("DELETE", "/me/secrets/anthropic_token"),
+  listAgentTemplates: () =>
+    request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
+  getAgentTemplate: (id: string) =>
+    request<{ template: AgentTemplate }>("GET", `/agent-templates/${id}`),
+  createAgentTemplate: (input: AgentTemplateInput) =>
+    request<{ template: AgentTemplate }>("POST", "/agent-templates", input),
+  updateAgentTemplate: (id: string, input: AgentTemplateInput) =>
+    request<{ template: AgentTemplate }>("PUT", `/agent-templates/${id}`, input),
+  deleteAgentTemplate: (id: string) =>
+    request<null>("DELETE", `/agent-templates/${id}`),
+  resetAgentTemplate: (id: string) =>
+    request<{ template: AgentTemplate }>("POST", `/agent-templates/${id}/reset`),
 
   // Forge integration.
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),

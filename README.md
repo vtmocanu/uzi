@@ -14,7 +14,7 @@ cp .env.example .env
 docker compose up
 ```
 
-Open <http://127.0.0.1:8080> and register. The first registered account becomes admin — or set `UZI_SEED_EMAIL`/`UZI_SEED_PASSWORD` in `.env` to provision an admin automatically at startup (see [configuration.md](docs/configuration.md)).
+Open <http://127.0.0.1:8080> and register. The first registered account becomes admin — or set `UZI_SEED_EMAIL`/`UZI_SEED_PASSWORD` in `.env` to provision an admin automatically at startup (see [configuration.md](docs/configuration.md)). Admins can define agent templates under **Agents**; any user can connect their own Anthropic token under **Settings** (see [docs/anthropic-token.md](docs/anthropic-token.md)).
 
 Each git checkout/worktree gets its own isolated compose stack and `pgdata` volume (no shared `name:` in `docker-compose.yml`), so running the stack from a PRD worktree never touches another checkout's data.
 
@@ -35,6 +35,8 @@ Full docs live in [docs/](docs/):
 - [Configuration](docs/configuration.md)
 - [Auth design](docs/auth-design.md)
 - [GitLab bot setup](docs/gitlab-bot-setup.md)
+- [Agent templates](docs/agent-templates.md)
+- [Anthropic token](docs/anthropic-token.md)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for product specs, and [specs/](specs/) for the requirements contract ([human.md](specs/human.md)) and design decisions ([ai.md](specs/ai.md)).
 

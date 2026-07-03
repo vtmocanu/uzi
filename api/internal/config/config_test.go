@@ -1,8 +1,11 @@
 package config
 
 import (
+	"encoding/base64"
 	"reflect"
 	"testing"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 )
 
 func TestValidateSecretRejectsUnsafe(t *testing.T) {
@@ -25,6 +28,58 @@ func TestValidateSecretAcceptsGood(t *testing.T) {
 	good := "0f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e" // 32 hex chars
 	if _, err := validateSecret(good); err != nil {
 		t.Errorf("validateSecret rejected a good secret: %v", err)
+	}
+}
+
+// TestLoadSecretKeyBootGuard covers the UZI_SECRET_KEY boot guard end to end
+// through config.Load(): a valid base64 32-byte key loads into cfg.SecretKey,
+// while a missing, non-base64, wrong-length, or low-entropy key aborts start.
+// Only LoadKey (the primitive) was covered before; this exercises the wiring in
+// Load().
+func TestLoadSecretKeyBootGuard(t *testing.T) {
+	// A syntactically valid environment except for UZI_SECRET_KEY, which each
+	// subtest sets. JWT_SECRET is a real (non-placeholder, long-enough) value.
+	setBase := func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+		t.Setenv("JWT_SECRET", "0f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e")
+	}
+	// A real (varied-byte) 32-byte key. An all-zero key would trip the
+	// low-entropy guard, so distinct bytes are used here.
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	validKey := base64.StdEncoding.EncodeToString(varied)
+
+	t.Run("valid key loads", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_SECRET_KEY", validKey)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() errored on a valid key: %v", err)
+		}
+		if len(cfg.SecretKey) != secretbox.KeySize {
+			t.Fatalf("cfg.SecretKey len = %d, want %d", len(cfg.SecretKey), secretbox.KeySize)
+		}
+	})
+
+	// Empty behaves as "unset" (LoadKey treats "" as not set); the guard must
+	// also reject non-base64, a correctly-encoded but wrong-length key, and a
+	// low-entropy all-identical-byte placeholder.
+	bad := map[string]string{
+		"missing":      "",
+		"not base64":   "!!!not-base64!!!",
+		"wrong length": base64.StdEncoding.EncodeToString(make([]byte, 16)),
+		"low entropy":  base64.StdEncoding.EncodeToString(make([]byte, secretbox.KeySize)),
+	}
+	for name, val := range bad {
+		t.Run(name, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("UZI_SECRET_KEY", val)
+			if _, err := Load(); err == nil {
+				t.Errorf("Load() = nil error for %s UZI_SECRET_KEY, want boot-guard failure", name)
+			}
+		})
 	}
 }
 

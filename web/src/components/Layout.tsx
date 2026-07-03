@@ -43,6 +43,9 @@ export function Layout({ children }: { children: ReactNode }) {
                 <Link to="/dashboard" className="text-slate-300 hover:text-white">
                   Dashboard
                 </Link>
+                <Link to="/agents" className="text-slate-300 hover:text-white">
+                  Agents
+                </Link>
                 <Link to="/repos" className="text-slate-300 hover:text-white">
                   Repos
                 </Link>
@@ -71,6 +74,9 @@ export function Layout({ children }: { children: ReactNode }) {
                     Users
                   </Link>
                 )}
+                <Link to="/settings" className="text-slate-300 hover:text-white">
+                  Settings
+                </Link>
                 <span className="hidden text-slate-500 sm:inline">{user.email}</span>
                 <Button variant="ghost" onClick={handleLogout}>
                   Log out

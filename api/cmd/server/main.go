@@ -87,6 +87,12 @@ func run() error {
 
 	q := store.New(pool)
 
+	// Seed/refresh the builtin agent templates. Idempotent and edit-preserving:
+	// missing builtins are inserted, existing rows are left untouched.
+	if err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
+		return err
+	}
+
 	box, err := secretbox.New(cfg.SecretKey)
 	if err != nil {
 		return err
@@ -121,7 +127,7 @@ func run() error {
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg, svc)
+	h := handler.New(pool, q, cfg, box, svc)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

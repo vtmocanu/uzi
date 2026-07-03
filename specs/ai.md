@@ -213,8 +213,9 @@ users(
   granularity needs a front proxy that preserves real client IPs.
 - No password reset / email verification / 2FA (deferred; see human.md).
 - Secret scanner and CI are deferred. Minor-tag → digest pinning is done.
-- **Rotating `UZI_SECRET_KEY` invalidates every stored bot PAT** — no re-encrypt
-  path in MVP; every user must reconnect. Accepted (see §17).
+- **Rotating `UZI_SECRET_KEY` invalidates every stored secret** — forge bot
+  PATs and per-user Anthropic tokens alike; no re-encrypt path in MVP, so each
+  user reconnects/re-pastes. Accepted (see §17, §29).
 - **Forgejo label-swap atomicity** is GitLab-only; single-column enforcement is
   best-effort on any future non-GitLab driver (see §16, §20).
 - **Move-to-Closed is unsupported** from the board; closing/reopening stays on the
@@ -496,3 +497,152 @@ Serves human: best-practice (real-forge verification of the sync contract).
   `.env`**, **never read by the app** (not among `Config`'s fields — grep-verifiable).
   A live E2E suite should **skip (not fail)** when they are unset, mirroring
   `scripts/smoke.sh`'s require-a-running-stack stance.
+
+---
+
+# PRD #3 — Agent templates & per-user Anthropic token
+
+## 29. Shared secret-at-rest (secretbox + `UZI_SECRET_KEY`)
+
+Serves human: "Anthropic token encrypted in the DB"; best-practice bar.
+
+- **`api/internal/secretbox/`**: AES-256-GCM (`Seal`/`Open`), per-message 12-byte
+  random nonce prepended to ciphertext; GCM gives integrity (tampered row →
+  decrypt error, not garbled plaintext). `LoadKey` reads a base64 32-byte key
+  from an env var; empty ⇒ treated as unset.
+  - Why: multica's secretbox pattern, applied to provider creds (which multica
+    itself stored plaintext). NaCl-style name, AES-GCM construction.
+- **Boot guard**: `config.Load` calls `secretbox.LoadKey("UZI_SECRET_KEY")`;
+  missing / non-base64 / wrong-length aborts start **before** any DB connection.
+  Key held for the process lifetime as one shared `*secretbox.Box` (`main.go`),
+  not re-derived per request.
+- **Provenance**: the secretbox util + config wiring were cherry-picked
+  **byte-identical** from PRD #2's branch (958f9b3 → e6f17cb) so the two parallel
+  branches merge conflict-free (whichever lands M1 first ships it). Its comments
+  are still bot-PAT-oriented (PRD #2's use); genericizing them is a tracked
+  post-merge follow-up, not a behavior change.
+- **Rotation** invalidates all stored secrets across every feature at once
+  (§15). Accepted, matches PRD #2.
+
+## 30. `user_secrets` table + Anthropic token API
+
+Serves human: "each user stores their own Anthropic token via the webui,
+encrypted in the DB".
+
+- **Generic kind-keyed table** (migration `00010`), chosen over a column on
+  `users` so the next secret kind needs no shape change:
+  ```
+  user_secrets(
+    id uuid PK, user_id uuid → users ON DELETE CASCADE,
+    kind text CHECK (kind IN ('anthropic_token')),  -- new kind = one ALTER-CHECK migration
+    ciphertext bytea,                                -- secretbox.Seal(secret)
+    created_at, updated_at timestamptz,
+    UNIQUE(user_id, kind)
+  )
+  ```
+- **API** (current user only; no admin path to another user's value):
+  - `PUT /api/me/secrets/anthropic_token` `{token}` → sanity-check → `Seal` →
+    upsert. **Response is metadata-only** `{kind, created_at, updated_at}`.
+  - `GET /api/me/secrets` → metadata list.
+  - `DELETE /api/me/secrets/anthropic_token` → idempotent (absent ⇒ 204).
+- **Token sanity check**: trimmed, non-empty, **1–4096 bytes**, no interior
+  whitespace/control chars. **No format assumption** (no `sk-ant-` prefix check —
+  Anthropic prefixes are not a documented contract); accepts both `setup-token`
+  OAuth tokens and console API keys.
+- **No reveal endpoint** (re-paste to rotate; multica's reveal+audit is more than
+  MVP needs). **No live verification** (validated on first agent run, PRD #4 —
+  avoids burning quota / hard-coding endpoint behavior).
+- **Redaction**: token never logged, never in error strings; validation errors
+  carry no token bytes. Enforced by a handler-level redaction test grepping logs
+  for the plaintext fixture.
+
+## 31. `agent_templates` store + builtins reconciler
+
+Serves human: "agent templates stored in DB, editable via the UI (agents
+themselves sit with code)".
+
+- **Schema** (migration `00011`): `id, name (UNIQUE), description, model (NULL=inherit),
+  tools (jsonb, NULL=inherit all), prompt_body, is_builtin, updated_by (→users ON
+  DELETE SET NULL), created_at, updated_at`. No versioning/history in MVP;
+  `updated_by`/`updated_at` give minimal attribution.
+- **Builtin source of truth is Go, not SQL**: the repo's seven `.claude/agents/*.md`
+  (coder, reviewer, auditor, tester, documenter, fact-checker, spec-keeper) are
+  embedded **byte-identical** under `api/internal/agenttmpl/builtins/` (embed can't
+  reference paths outside the module root, so they are copies; a **drift test**
+  enforces they stay identical to the checked-in originals), parsed once at
+  package init.
+  - Why Go over a SQL seed: an **idempotent startup reconciler**
+    (`store.ReconcileBuiltinTemplates`, `ON CONFLICT DO NOTHING`) inserts missing
+    builtins and **never overwrites** an existing row, so admin edits survive
+    restarts and future releases can add/upgrade builtins without a
+    non-re-runnable seed.
+- **Builtin lifecycle**: editable; **not deletable** (`DELETE` → 409); **Reset**
+  (`POST /:id/reset`, builtins only, 400 on non-builtin) re-applies the embedded
+  definition. Guarantees the core roles always exist for PRD #4.
+
+## 32. Renderer (template → Claude Code subagent Markdown)
+
+Serves human: templates are the definition PRD #4 will consume.
+
+- **`agenttmpl.Render`** is a **pure function**, no DB dependency (so golden-file
+  tests can pin output). Fixed field order: **name, description, tools, model**;
+  `tools`/`model` lines **omitted when empty** (inherit).
+- **`tools` is an inline comma-separated string** (`tools: Bash, Read, …`), not a
+  YAML sequence — matches this repo's own `.claude/agents/*.md`. Built with
+  ordered `strings.Builder`, **not `yaml.Marshal`** (a map marshal would reorder
+  keys and break byte-stability).
+- **Byte-match guarantee**: a builtin's rendered output byte-matches the
+  checked-in source file, pinned by golden-file tests.
+- **`GET /api/agent-templates/:id/rendered`** serves the Markdown **raw**
+  (`text/markdown`, `X-Content-Type-Options: nosniff`), not wrapped in JSON, for
+  any authenticated user.
+
+## 33. Template validation & frontmatter/secret hardening
+
+Serves human: best-practice bar; admin-edited free-form content is untrusted.
+
+- **`name`**: kebab-case `^[a-z0-9]+(-[a-z0-9]+)*$`, unique, and **immutable after
+  creation** (structural: `UPDATE` never touches `name`) — it is the subagent
+  filename + PRD #4 routing key; rename = create-new + delete-old (non-builtins;
+  builtins never renamed).
+- **`description`, `prompt_body`**: non-empty. **`model`**: NULL or non-empty token
+  (no CHECK — upstream accepts aliases *and* full model IDs, incl. `fable`).
+  **`tools`**: NULL or JSON array of non-empty strings; `[]` **normalized to NULL**
+  (inherit-all) so empty-list and inherit render identically.
+- **Frontmatter-injection hardening**: reject control chars
+  (`unicode.IsControl` + U+FFFD) in `description`, `model`, and each tool name,
+  and **commas in tool names** (they'd break the inline comma-joined `tools`
+  line). `prompt_body` is **exempt** (renders after the frontmatter, its newlines
+  are ordinary Markdown).
+- **Secret guardrail**: server **hard-rejects** a high-confidence full `sk-ant-…`
+  token in `description`/`prompt_body`; the **UI warns** (non-blocking) on looser
+  credential-ish patterns and unknown tool names, so prompts that merely *mention*
+  token formats stay savable.
+- **Concurrency**: last-write-wins (`updated_at`/`updated_by` attribute it); an
+  `If-Match`-style precondition is a noted follow-up, out of scope.
+
+## 34. Template API surface & authorization
+
+Serves human: "editable via the UI"; admin-only writes (USER-CONFIRMED 2026-07-03).
+
+- **Any authenticated user**: `GET /api/agent-templates`, `GET /:id`,
+  `GET /:id/rendered` (they'll run these roles in PRD #4).
+- **Admin only** (`RequireAdmin`): `POST`, `PUT /:id` (name ignored — immutable),
+  `DELETE /:id` (409 for builtins), `POST /:id/reset` (400 for non-builtins).
+  - Why admin-write / all-read: closes bottega's hole where any user rewrites the
+    shared prompts everyone else's agents run with. Per-user forks deferred to
+    PRD #4.
+- All under PRD #1 session + CSRF.
+
+## 35. Tooling & parallel-safety (PRD #2/#3 coordination)
+
+- **Goose version ranges reserved**: PRD #2 `00002`–`00009`, PRD #3 `00010`+.
+  Duplicate goose versions from parallel branches merge cleanly in git but fail
+  at `goose up`; reserving ranges prevents the silent-until-runtime break.
+- **Shared frontend shell files** (sidebar nav, Settings layout, route table) are
+  touched by both PRDs — expected small merge conflicts, kept in dedicated commits.
+- **sqlc** regen via pinned `go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate`.
+- **Build gate** uses `-buildvcs=false` (worktree VCS-stamp quirk).
+- **E2E**: `scripts/smoke-prd3.sh` — seed → admin edit → non-admin blocked (403) →
+  render stable → token set/rotate/delete → restart persistence → DB dump shows
+  only ciphertext.

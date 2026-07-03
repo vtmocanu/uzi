@@ -14,6 +14,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -22,12 +23,16 @@ type Handler struct {
 	pool *pgxpool.Pool
 	q    *store.Queries
 	cfg  config.Config
-	svc  *forgesvc.Service
+	// box is the generic secret cipher used by the per-user secret endpoints
+	// (Anthropic token). svc owns the forge-specific machinery (which also holds
+	// its own box for PAT sealing); the two share the same key material.
+	box *secretbox.Box
+	svc *forgesvc.Service
 }
 
 // New constructs a Handler.
-func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, svc *forgesvc.Service) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg, svc: svc}
+func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service) *Handler {
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc}
 }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
@@ -89,6 +94,33 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
 				r.Post("/logout", h.Logout)
 				r.Get("/me", h.Me)
+			})
+		})
+
+		// Current-user secrets (per-user, encrypted at rest). No admin read
+		// path to other users' secret values by design.
+		r.Route("/me/secrets", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListMySecrets)
+			r.Put("/anthropic_token", h.PutAnthropicToken)
+			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
+		})
+
+		// Agent templates: all authenticated users can read and preview; only
+		// admins can create, edit, delete, or reset (closes bottega's hole
+		// where any user rewrites the shared prompts everyone's agents run).
+		r.Route("/agent-templates", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListAgentTemplates)
+			r.Get("/{id}", h.GetAgentTemplate)
+			r.Get("/{id}/rendered", h.GetRenderedAgentTemplate)
+
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAdmin)
+				r.Post("/", h.CreateAgentTemplate)
+				r.Put("/{id}", h.UpdateAgentTemplate)
+				r.Delete("/{id}", h.DeleteAgentTemplate)
+				r.Post("/{id}/reset", h.ResetAgentTemplate)
 			})
 		})
 

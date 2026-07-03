@@ -9,6 +9,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AgentTemplate struct {
+	ID          uuid.UUID          `json:"id"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	Model       pgtype.Text        `json:"model"`
+	Tools       []byte             `json:"tools"`
+	PromptBody  string             `json:"prompt_body"`
+	IsBuiltin   bool               `json:"is_builtin"`
+	UpdatedBy   pgtype.UUID        `json:"updated_by"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
 type BoardColumn struct {
 	ID        uuid.UUID `json:"id"`
 	RepoID    uuid.UUID `json:"repo_id"`
@@ -62,4 +75,13 @@ type User struct {
 	TokenVersion int32              `json:"token_version"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 	LastLogin    pgtype.Timestamptz `json:"last_login"`
+}
+
+type UserSecret struct {
+	ID         uuid.UUID          `json:"id"`
+	UserID     uuid.UUID          `json:"user_id"`
+	Kind       string             `json:"kind"`
+	Ciphertext []byte             `json:"ciphertext"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 }

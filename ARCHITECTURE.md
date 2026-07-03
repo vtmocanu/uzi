@@ -31,7 +31,7 @@ uzi's current MVP is a single docker-compose stack: three services, one trust bo
 ```
 
 - **`web`** (`web/Dockerfile`) — a Vite/React SPA built at image build time and served by `nginxinc/nginx-unprivileged`. Its `nginx.conf` does two jobs: serve the built static assets, and reverse-proxy `/api/*` to `api:8080`. The SPA and API therefore share one origin (`http://127.0.0.1:8080`) — no CORS configuration exists anywhere in the stack.
-- **`api`** (`api/Dockerfile`) — a statically linked Go binary (`chi` router) on `gcr.io/distroless/static-debian12`, running as `nonroot`. Serves `/api/auth/*`, `/api/admin/*`, `/api/health`. Runs its own DB migrations at startup before it starts accepting traffic (see below).
+- **`api`** (`api/Dockerfile`) — a statically linked Go binary (`chi` router) on `gcr.io/distroless/static-debian12`, running as `nonroot`. Serves `/api/auth/*`, `/api/admin/*`, `/api/agent-templates/*`, `/api/me/secrets/*`, `/api/health`. Runs its own DB migrations and builtin-template reconciliation at startup before it starts accepting traffic (see below).
 - **`db`** — stock `postgres:17`, digest-pinned in `docker-compose.yml`. Data lives in the named volume `pgdata`; it is not a bind mount, so it survives container recreation but is bound to the Docker volume store on this host.
 
 All three images are pulled/built by digest or pinned tag in `docker-compose.yml`, not floating `latest`.
@@ -56,9 +56,12 @@ State-changing requests (POST/PATCH) additionally run CSRF validation inside `Re
 
 `api`'s entrypoint (`api/cmd/server/main.go`) does not assume the DB is ready or up to date:
 
-1. Waits for `db` to accept connections (bounded retry loop; compose's `depends_on: condition: service_healthy` on `db`'s `pg_isready` healthcheck already gates container start, this is a second, in-process guard).
-2. Runs all pending **goose** migrations, embedded in the binary via `go:embed` (`api/internal/store/migrate.go`, `api/internal/store/migrations/`) — no separate migration step or tool needed at deploy time.
-3. Only then opens the `pgx` connection pool and starts the HTTP server.
+1. Loads config (`config.Load`), including the `UZI_SECRET_KEY` boot guard (`secretbox.LoadKey`): boot fails here, before any DB connection is attempted, if the key is missing, malformed, or a low-entropy placeholder (e.g. an all-zero key).
+2. Waits for `db` to accept connections (bounded retry loop; compose's `depends_on: condition: service_healthy` on `db`'s `pg_isready` healthcheck already gates container start, this is a second, in-process guard).
+3. Runs all pending **goose** migrations, embedded in the binary via `go:embed` (`api/internal/store/migrate.go`, `api/internal/store/migrations/`) — no separate migration step or tool needed at deploy time.
+4. Opens the `pgx` connection pool, then reconciles the builtin agent templates through it (`store.ReconcileBuiltinTemplates`, see below): idempotent, so this is safe to run on every boot.
+5. Builds the `secretbox.Box` from the already-validated key.
+6. Only then starts the HTTP server.
 
 `web` depends on `api`'s healthcheck (`GET /api/health`, which itself pings the DB pool), so `docker compose up` brings the stack up in the correct order: `db` healthy → `api` migrated and healthy → `web` serving.
 
@@ -101,6 +104,65 @@ Shutdown ordering matters here specifically because of the poller: `main.go`'s `
 
 The endpoints that call out to the forge on a user's behalf (`.../verify`, `.../projects`, `.../issues/:iid/move`, `.../sync`) run behind a second instance of the same fixed-window `mw.Limiter` PRD #1 uses for auth endpoints, but keyed **per user** (`PerUserMiddleware`) rather than per client IP, and budgeted separately (`FORGE_RATE_LIMIT_MAX`/`FORGE_RATE_LIMIT_WINDOW`, default 30/minute) from `RATE_LIMIT_MAX`/`RATE_LIMIT_WINDOW`. This bounds how hard one uzi user's actions can hit the upstream forge, independent of the local-network IP-sharing caveat already documented for the auth limiter in [auth-design.md](docs/auth-design.md#accepted-limitations).
 
+## Agent templates
+
+An agent template (`agent_templates` table) is the definition of one role an
+agent can play: name, description, an optional model override, an optional
+tools allowlist, and a prompt body. It is not itself an agent; it is the
+recipe a later release renders into a running one.
+
+- **Source of truth split.** The seven builtin roles (`coder`, `reviewer`,
+  `auditor`, `tester`, `documenter`, `fact-checker`, `spec-keeper`) are
+  Go-embedded from copies of this repo's own `.claude/agents/*.md` files
+  (`api/internal/agenttmpl/builtins/`, parsed at package `init()`). At every
+  boot, `store.ReconcileBuiltinTemplates` inserts any builtin row missing from
+  the DB and never touches one that already exists, so an admin's edits to a
+  builtin survive restarts, and future releases can add or upgrade builtins
+  without a SQL seed that can't be re-run.
+- **Read/write split.** Any authenticated user can list, view, and preview
+  templates (`GET /api/agent-templates*`); only an admin can create, edit,
+  delete, or reset one (`RequireAdmin` in `api/internal/handler/handler.go`).
+  Templates are shared across all users, so this closes the hole where any
+  user could rewrite the prompts everyone else's agents run with.
+- **Renderer.** `api/internal/agenttmpl/render.go` turns a template into
+  Claude Code's subagent Markdown (fixed-order YAML frontmatter, `tools` as an
+  inline comma-separated string, `tools`/`model` omitted when they inherit).
+  It is a pure function with no DB dependency, so golden-file tests pin a
+  builtin's rendered output to byte-match the checked-in `.claude/agents/*.md`
+  file. `GET /api/agent-templates/:id/rendered` serves this Markdown directly;
+  nothing in this release writes it to a filesystem or spawns anything from it
+  (that is a later release's job). See
+  [docs/agent-templates.md](docs/agent-templates.md).
+
+## Secrets: per-user credentials at rest
+
+`user_secrets` is a generic, kind-keyed table (`kind` currently only
+`anthropic_token`, `CHECK`-constrained so a new kind is one migration, not a
+new table) holding one AES-256-GCM-sealed secret per `(user, kind)`. The
+`secretbox` package (`api/internal/secretbox/`) wraps `Seal`/`Open` around a
+single 32-byte key that `config.Load` validates from `UZI_SECRET_KEY` at boot
+(refusing to start if it is missing, malformed, or a low-entropy placeholder)
+and then builds, already validated, into one `*secretbox.Box` shared by every
+handler (see [docs/configuration.md](docs/configuration.md)). This is the
+platform's one shared secret-at-rest mechanism: any feature that needs to
+store a per-user credential (starting with the Anthropic token this PRD adds)
+seals it with the same key before it reaches Postgres, so a DB dump alone
+never yields a plaintext secret, and rotating the key invalidates every
+stored secret across every feature at once, not just one.
+
+The API around it is deliberately minimal: `PUT /api/me/secrets/anthropic_token`
+writes or rotates the caller's own secret, `DELETE` on the same path removes
+it, and `GET /api/me/secrets` (and every other read) returns **metadata
+only** (`kind`, `created_at`, `updated_at`); there is no reveal endpoint, and
+no admin path to another user's secret value. See
+[docs/anthropic-token.md](docs/anthropic-token.md) for the user-facing flow.
+
 ## Not yet in scope
 
-Job submission and agent control are deliberately out of this MVP — see [plan.md](plan.md) and the forge integration PRD's Risks section ("this PRD ends at the synced board"). The kanban board reflects and writes back forge labels, but nothing in uzi yet acts on a card's issue; that is the next PRD. This document will grow new sections (additional services, data flows, trust boundaries) as those land.
+The execution surface is deliberately out of this MVP: spawning agents from a
+template, connecting them to the server, decrypting and injecting a user's
+Anthropic token into a running agent, and acting on a board card's issue (job
+submission / agent control) all belong to a later PRD — see [plan.md](plan.md) and
+the PRDs' Risks sections. The kanban board reflects and writes back forge labels,
+but nothing in uzi yet acts on a card. This document will grow new sections
+(additional services, data flows, trust boundaries) as those land.

@@ -5,6 +5,7 @@ All configuration is via environment variables, set in `.env` (copied from `.env
 | Var | Default | Notes |
 |---|---|---|
 | `JWT_SECRET` | — (required) | HS256 signing key for session JWTs. The API refuses to start if it is missing, empty, shorter than 16 characters, or a known placeholder (`change-me`, `secret`, `password`, etc. — see `api/internal/config/config.go`). Generate with `openssl rand -hex 64`. |
+| `UZI_SECRET_KEY` | — (required) | Base64-encoded 32-byte master key for AES-256-GCM. The API refuses to start if it is missing, not valid base64, not exactly 32 bytes decoded, or a low-entropy placeholder such as an all-zero key (same boot-guard stance as `JWT_SECRET`). Generate with `openssl rand -base64 32`. It is the platform's one shared encryption-at-rest key: it seals every stored secret kind (today the per-user Anthropic token and forge bot PATs; any future kind) before it reaches Postgres, so a DB dump alone never recovers a plaintext secret. Rotating this key invalidates **all** stored secrets across every kind at once, not just one feature's: every affected user has to reconnect or re-paste theirs. There is no re-encrypt path. |
 | `POSTGRES_PASSWORD` | — (required) | Password for the bundled Postgres role. Generate with `openssl rand -hex 24`. Compose refuses to start without it. |
 | `POSTGRES_USER` | `uzi` | Postgres role name. |
 | `POSTGRES_DB` | `uzi` | Postgres database name. |
@@ -16,7 +17,7 @@ All configuration is via environment variables, set in `.env` (copied from `.env
 | `DATABASE_URL` | set by compose | pgx connection string, built from `POSTGRES_*` and the `db` service name. Not meant to be set directly when using compose. |
 | `API_ADDR` | `:8080` | Address the `api` binary listens on inside its container. Set by compose; no need to change it. |
 
-Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last one is logged as a warning); only a bad `JWT_SECRET` or missing `DATABASE_URL` refuses to start.
+Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last one is logged as a warning); only a bad `JWT_SECRET`, a bad `UZI_SECRET_KEY`, or a missing `DATABASE_URL` refuses to start.
 
 There is no CORS configuration to make, by design: nginx serves the SPA and proxies `/api/*` to the API on the same origin (see [ARCHITECTURE.md](../ARCHITECTURE.md)), so the browser never makes a cross-origin request.
 
@@ -24,9 +25,10 @@ There is no CORS configuration to make, by design: nginx serves the SPA and prox
 
 See [gitlab-bot-setup.md](gitlab-bot-setup.md) for the bot-account procedure these variables support.
 
+These extend the core table above; `UZI_SECRET_KEY` (which also encrypts forge bot PATs) is documented there.
+
 | Var | Default | Notes |
 |---|---|---|
-| `UZI_SECRET_KEY` | — (required) | base64-encoded 32-byte AES-256 master key that encrypts bot PATs at rest (`api/internal/secretbox`). The API refuses to start if it is missing, not valid base64, not exactly 32 bytes decoded, or a low-entropy placeholder (e.g. all-zero). Generate with `openssl rand -base64 32`. **Rotating this key invalidates every stored bot token** — every user must reconnect their PAT in Settings → Forge; there is no re-encrypt path in this MVP. |
 | `FORGE_ALLOWED_BASE_URLS` | `https://gitlab.example.com` | Comma-separated SSRF allowlist: the only forge base URLs a connection may target. Every entry must be an absolute `https://` URL; boot fails if the list is empty or any entry is malformed or non-`https`. The Settings → Forge base-URL dropdown offers exactly this set. |
 | `FORGE_POLL_INTERVAL` | `60s` (`1m`) | Per-enabled-repo incremental sync cadence (Go duration). An invalid or non-positive value falls back to the default. See "Freshness contract" below. |
 | `FORGE_RECONCILE_EVERY` | `10` | Every Nth incremental poll is a full reconcile instead (fetches the complete `PRD`-labeled issue set with no `updated_after` bound, diffs, and evicts cache rows the forge no longer returns). A non-positive or unparseable value falls back to the default, same as the other numeric/duration vars here (the poller itself additionally clamps any value `< 1` to `1` — every poll becomes a full reconcile — as defense in depth, but that path isn't reachable through this env var). The very first poll after a repo is enabled is always a full reconcile regardless of this setting, since it has to seed the cache. |
