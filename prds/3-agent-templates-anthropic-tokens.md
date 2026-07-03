@@ -1,7 +1,7 @@
 # PRD #3: Agent Definitions, Templates & Anthropic Token Storage
 
 **GitLab Issue**: [vtmocanu/uzi#3](https://gitlab.example.com/vtmocanu/uzi/-/issues/3)
-**Status**: Draft
+**Status**: Complete (2026-07-03, all milestones done, reviewed + audited + E2E-tested)
 **Priority**: High
 **Created**: 2026-07-03
 **Depends on**: PRD #1 (auth shell, done); PRD #2 M1 only (secretbox utility + `UZI_SECRET_KEY` boot guard — see Coordination)
@@ -111,12 +111,12 @@ No new variables. Reuses `UZI_SECRET_KEY` (PRD #2, required, boot guard). The bo
 
 ## Milestones
 
-- [ ] **M1 — Secretbox + user_secrets + token API**: shared `api/internal/secretbox/` (skip if PRD #2 M1 already merged it; else ship standalone commit) with `UZI_SECRET_KEY` boot guard; `user_secrets` migration (goose versions `00010`+, range reserved vs PRD #2); `PUT/GET/DELETE /api/me/secrets/*` with metadata-only responses, sanity checks, redaction unit test.
-- [ ] **M2 — Token UI + doc**: Settings → Anthropic token page (set/rotate/delete/status); `docs/anthropic-token.md` (`claude setup-token` walkthrough, verified against the current CLI, API-key alternative, rotation and `UZI_SECRET_KEY` caveats).
-- [ ] **M3 — Agent template store**: `agent_templates` migration + Go-embedded builtin definitions (seven roles from `.claude/agents/`) with startup reconciler; CRUD API with admin authz, validation (immutable name), builtin delete-protection + reset; renderer to Claude Code subagent Markdown (fixed field order, inline tools string) with golden-file tests proving builtins byte-match the checked-in files.
-- [ ] **M4 — Agent template UI**: Agents list/detail/preview for all users; admin edit form + reset; secret guardrail (server reject on full-token match, UI warn on loose patterns) and unknown-tool-name warnings surfaced in the form.
-- [ ] **M5 — E2E + hardening**: scripted scenario (seed → admin edit → non-admin blocked (403) → render stable → token set/rotate/delete → restart persistence → DB-dump shows only ciphertext); auditor pass on secret handling and template authz; fix blockers.
-- [ ] **M6 — Docs**: README/ARCHITECTURE updates (agent template model, secrets model); configuration doc gains `UZI_SECRET_KEY` as shared platform requirement.
+- [x] **M1 — Secretbox + user_secrets + token API**: shared `api/internal/secretbox/` (skip if PRD #2 M1 already merged it; else ship standalone commit) with `UZI_SECRET_KEY` boot guard; `user_secrets` migration (goose versions `00010`+, range reserved vs PRD #2); `PUT/GET/DELETE /api/me/secrets/*` with metadata-only responses, sanity checks, redaction unit test.
+- [x] **M2 — Token UI + doc**: Settings → Anthropic token page (set/rotate/delete/status); `docs/anthropic-token.md` (`claude setup-token` walkthrough, verified against the current CLI, API-key alternative, rotation and `UZI_SECRET_KEY` caveats).
+- [x] **M3 — Agent template store**: `agent_templates` migration + Go-embedded builtin definitions (seven roles from `.claude/agents/`) with startup reconciler; CRUD API with admin authz, validation (immutable name), builtin delete-protection + reset; renderer to Claude Code subagent Markdown (fixed field order, inline tools string) with golden-file tests proving builtins byte-match the checked-in files.
+- [x] **M4 — Agent template UI**: Agents list/detail/preview for all users; admin edit form + reset; secret guardrail (server reject on full-token match, UI warn on loose patterns) and unknown-tool-name warnings surfaced in the form.
+- [x] **M5 — E2E + hardening**: scripted scenario (seed → admin edit → non-admin blocked (403) → render stable → token set/rotate/delete → restart persistence → DB-dump shows only ciphertext); auditor pass on secret handling and template authz; fix blockers.
+- [x] **M6 — Docs**: README/ARCHITECTURE updates (agent template model, secrets model); configuration doc gains `UZI_SECRET_KEY` as shared platform requirement.
 
 ## Success Criteria
 
