@@ -33,8 +33,9 @@ func TestValidateSecretAcceptsGood(t *testing.T) {
 
 // TestLoadSecretKeyBootGuard covers the UZI_SECRET_KEY boot guard end to end
 // through config.Load(): a valid base64 32-byte key loads into cfg.SecretKey,
-// while a missing, non-base64, or wrong-length key aborts start. Only LoadKey
-// (the primitive) was covered before; this exercises the wiring in Load().
+// while a missing, non-base64, wrong-length, or low-entropy key aborts start.
+// Only LoadKey (the primitive) was covered before; this exercises the wiring in
+// Load().
 func TestLoadSecretKeyBootGuard(t *testing.T) {
 	// A syntactically valid environment except for UZI_SECRET_KEY, which each
 	// subtest sets. JWT_SECRET is a real (non-placeholder, long-enough) value.
@@ -42,7 +43,13 @@ func TestLoadSecretKeyBootGuard(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
 		t.Setenv("JWT_SECRET", "0f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e")
 	}
-	validKey := base64.StdEncoding.EncodeToString(make([]byte, secretbox.KeySize))
+	// A real (varied-byte) 32-byte key. An all-zero key would trip the
+	// low-entropy guard, so distinct bytes are used here.
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	validKey := base64.StdEncoding.EncodeToString(varied)
 
 	t.Run("valid key loads", func(t *testing.T) {
 		setBase(t)
@@ -57,11 +64,13 @@ func TestLoadSecretKeyBootGuard(t *testing.T) {
 	})
 
 	// Empty behaves as "unset" (LoadKey treats "" as not set); the guard must
-	// also reject non-base64 and a correctly-encoded but wrong-length key.
+	// also reject non-base64, a correctly-encoded but wrong-length key, and a
+	// low-entropy all-identical-byte placeholder.
 	bad := map[string]string{
 		"missing":      "",
 		"not base64":   "!!!not-base64!!!",
 		"wrong length": base64.StdEncoding.EncodeToString(make([]byte, 16)),
+		"low entropy":  base64.StdEncoding.EncodeToString(make([]byte, secretbox.KeySize)),
 	}
 	for name, val := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -138,6 +147,115 @@ func TestParseAllowedBaseURLs(t *testing.T) {
 	if _, err := parseAllowedBaseURLs("http://insecure.example.com"); err == nil {
 		t.Error("http entry should error")
 	}
+}
+
+func TestLoadSeedAdmin(t *testing.T) {
+	t.Run("off when email unset", func(t *testing.T) {
+		t.Setenv("UZI_SEED_EMAIL", "")
+		var c Config
+		if err := loadSeedAdmin(&c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedEmail != "" {
+			t.Fatalf("seeding should be off, got email %q", c.SeedEmail)
+		}
+	})
+	t.Run("invalid email errors", func(t *testing.T) {
+		t.Setenv("UZI_SEED_EMAIL", "not-an-email")
+		t.Setenv("UZI_SEED_PASSWORD", "correct-horse-battery-staple")
+		if err := loadSeedAdmin(&Config{}); err == nil {
+			t.Fatal("expected error on invalid email")
+		}
+	})
+	t.Run("short password errors (refuse boot)", func(t *testing.T) {
+		t.Setenv("UZI_SEED_EMAIL", "admin@uzi.test")
+		t.Setenv("UZI_SEED_PASSWORD", "short")
+		if err := loadSeedAdmin(&Config{}); err == nil {
+			t.Fatal("expected error on short seed password")
+		}
+	})
+	t.Run("valid seed normalizes email", func(t *testing.T) {
+		t.Setenv("UZI_SEED_EMAIL", "  Admin@Uzi.TEST ")
+		t.Setenv("UZI_SEED_PASSWORD", "correct-horse-battery-staple")
+		t.Setenv("UZI_SEED_NAME", "Root")
+		var c Config
+		if err := loadSeedAdmin(&c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedEmail != "admin@uzi.test" {
+			t.Fatalf("email not normalized: %q", c.SeedEmail)
+		}
+		if c.SeedName != "Root" {
+			t.Fatalf("name = %q", c.SeedName)
+		}
+	})
+}
+
+func TestLoadSeedForge(t *testing.T) {
+	const base = "https://gitlab.example.com"
+	withAllowlist := func() *Config {
+		return &Config{ForgeAllowedBaseURLs: []string{base}, SeedEmail: "admin@uzi.test"}
+	}
+
+	t.Run("off when PAT unset", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "")
+		c := withAllowlist()
+		if err := loadSeedForge(c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedForgePAT != "" || c.SeedForgeBaseURL != "" || c.SeedForgeRepos != nil {
+			t.Fatalf("forge seed should be off, got %+v", *c)
+		}
+	})
+
+	t.Run("PAT without seed email refuses boot", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+		c := &Config{ForgeAllowedBaseURLs: []string{base}} // SeedEmail deliberately empty
+		if err := loadSeedForge(c); err == nil {
+			t.Fatal("expected boot-fatal error when PAT is set without a seed email")
+		}
+	})
+
+	t.Run("non-allowlisted base URL refuses boot", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+		t.Setenv("UZI_SEED_FORGE_BASE_URL", "https://evil.example.com")
+		if err := loadSeedForge(withAllowlist()); err == nil {
+			t.Fatal("expected boot-fatal error for a base URL outside the allowlist")
+		}
+	})
+
+	t.Run("base URL defaults to first allowlisted entry", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+		t.Setenv("UZI_SEED_FORGE_BASE_URL", "")
+		t.Setenv("UZI_SEED_FORGE_REPOS", "")
+		c := withAllowlist()
+		if err := loadSeedForge(c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedForgeBaseURL != base {
+			t.Fatalf("base URL = %q, want default %q", c.SeedForgeBaseURL, base)
+		}
+	})
+
+	t.Run("valid seed trims PAT, normalizes base URL, dedups repos", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "  glpat-xxx  ")
+		t.Setenv("UZI_SEED_FORGE_BASE_URL", "https://gitlab.example.com/")
+		t.Setenv("UZI_SEED_FORGE_REPOS", "vtmocanu/uzi, vtmocanu/other , vtmocanu/uzi")
+		c := withAllowlist()
+		if err := loadSeedForge(c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedForgePAT != "glpat-xxx" {
+			t.Fatalf("PAT not trimmed: %q", c.SeedForgePAT)
+		}
+		if c.SeedForgeBaseURL != base {
+			t.Fatalf("base URL not normalized: %q", c.SeedForgeBaseURL)
+		}
+		want := []string{"vtmocanu/uzi", "vtmocanu/other"}
+		if !reflect.DeepEqual(c.SeedForgeRepos, want) {
+			t.Fatalf("repos = %v, want %v (trimmed, deduped, order-preserving)", c.SeedForgeRepos, want)
+		}
+	})
 }
 
 func TestForgeBaseURLAllowed(t *testing.T) {

@@ -22,6 +22,49 @@ type AgentTemplate struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type BoardColumn struct {
+	ID        uuid.UUID `json:"id"`
+	RepoID    uuid.UUID `json:"repo_id"`
+	LabelName string    `json:"label_name"`
+	Position  int32     `json:"position"`
+}
+
+type ForgeConnection struct {
+	ID              uuid.UUID          `json:"id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	ForgeType       string             `json:"forge_type"`
+	BaseUrl         string             `json:"base_url"`
+	BotUsername     string             `json:"bot_username"`
+	BotForgeUserID  int64              `json:"bot_forge_user_id"`
+	TokenCiphertext []byte             `json:"token_ciphertext"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	LastVerifiedAt  pgtype.Timestamptz `json:"last_verified_at"`
+}
+
+type Issue struct {
+	ID             uuid.UUID          `json:"id"`
+	RepoID         uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid  int64              `json:"forge_issue_iid"`
+	Title          string             `json:"title"`
+	State          string             `json:"state"`
+	Labels         []byte             `json:"labels"`
+	WebUrl         string             `json:"web_url"`
+	Author         pgtype.Text        `json:"author"`
+	HasPrdLink     bool               `json:"has_prd_link"`
+	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
+	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
+}
+
+type Repo struct {
+	ID                uuid.UUID   `json:"id"`
+	ConnectionID      uuid.UUID   `json:"connection_id"`
+	ForgeProjectID    int64       `json:"forge_project_id"`
+	PathWithNamespace string      `json:"path_with_namespace"`
+	WebUrl            string      `json:"web_url"`
+	DefaultBranch     pgtype.Text `json:"default_branch"`
+	Enabled           bool        `json:"enabled"`
+}
+
 type User struct {
 	ID           uuid.UUID          `json:"id"`
 	Email        string             `json:"email"`

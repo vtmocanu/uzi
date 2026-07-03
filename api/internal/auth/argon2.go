@@ -24,6 +24,14 @@ const (
 	argonKeyLength  = 32
 )
 
+// Password length policy shared by registration and admin seeding, so both
+// enforce the identical floor/ceiling. MinPasswordLen is the OWASP-aligned
+// minimum; MaxPasswordLen caps argon2 input to bound hashing work.
+const (
+	MinPasswordLen = 12
+	MaxPasswordLen = 1024
+)
+
 // ErrInvalidHash is returned when a stored hash string is not a well-formed
 // PHC argon2id encoding.
 var ErrInvalidHash = errors.New("invalid argon2 hash format")

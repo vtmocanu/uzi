@@ -65,6 +65,45 @@ State-changing requests (POST/PATCH) additionally run CSRF validation inside `Re
 
 `web` depends on `api`'s healthcheck (`GET /api/health`, which itself pings the DB pool), so `docker compose up` brings the stack up in the correct order: `db` healthy → `api` migrated and healthy → `web` serving.
 
+## Forge integration
+
+uzi's second surface connects each user to a git forge (GitLab now, via a forge-generic interface that keeps a later Forgejo driver from touching callers, schema, or UI) so the board has real work to show. It adds no new service — everything below lives inside `api` — but it does add a second trust boundary: `api` now makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge described above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md) for the operator/user procedure and the PRD (`prds/2-forge-integration-kanban.md`) for the full design rationale.
+
+### Forge abstraction
+
+`api/internal/forge` defines the `Forge` interface (`VerifyToken`, `ListProjects`, `ListLabels`, `EnsureLabels`, `ListIssues`, `UpdateIssueLabels`) and a neutral domain vocabulary (`BotIdentity`, `Project`, `Label`, `Issue`); `forge.New` selects a driver by `forge.Type` (`gitlab.go` today) so no other package ever imports a driver directly. Every driver call goes through an `*http.Client` bounded by `FORGE_HTTP_TIMEOUT` (`timeoutClient` in `forge.go`) — closing the untimeouted-`http.DefaultClient` wart the `multica` inspiration carries — and every returned error is passed through a `redactor` (`redact.go`) that scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN` header value before the error can reach a log line or an HTTP response body.
+
+### Bot PATs, encrypted at rest
+
+`api/internal/secretbox` is a generic AES-256-GCM box (12-byte random nonce prepended to the ciphertext) — deliberately not PAT-specific, since the same utility is slated for per-user Anthropic OAuth tokens in the next PRD. `config.Load` calls `secretbox.LoadKey("UZI_SECRET_KEY")` at boot and refuses to start if it is missing, not valid base64, not exactly 32 bytes, or a low-entropy placeholder (e.g. all-zero) — the same refuse-to-start stance as `JWT_SECRET`. The resulting `*secretbox.Box` is constructed once in `main.go` and handed to `forgesvc.Service`, which seals a PAT into `forge_connections.token_ciphertext` on connect and opens it on every forge call thereafter. **Rotating `UZI_SECRET_KEY` invalidates every stored PAT** — there is no re-encrypt path in this MVP, so a rotation means every user reconnects.
+
+### SSRF guard
+
+The server making authenticated outbound calls to a `base_url` supplied at connection time is a classic SSRF surface (cloud metadata endpoints, internal services, loopback). `config.Config.ForgeAllowedBaseURLs` (from `FORGE_ALLOWED_BASE_URLS`, default `https://gitlab.example.com`) is the only set of base URLs a connection may target; `config.NormalizeForgeBaseURL` requires `https` and canonicalizes to `scheme://host[:port]` before every allowlist comparison, and boot fails if the parsed list is empty or any entry is malformed or non-`https`. The Settings → Forge UI offers only this set (`GET /api/forge/config`), so a user cannot even attempt a free-text URL.
+
+### Data model: forge as source of truth
+
+Migration `00002_forge.sql` adds four tables, all scoped down to `forge_connections.user_id` by FK cascade:
+
+- **`forge_connections`** — one row per (user, forge_type, base_url); carries the encrypted PAT and the verified bot identity.
+- **`repos`** — projects discovered via the bot's membership list, keyed by the forge's stable numeric project id (not the path, which can be renamed); upserted with `enabled=false` on every listing call so enable/disable always has a row to target.
+- **`board_columns`** — ordered label names per repo; the implicit Open (no column label) and Closed (issue `state`) columns are never stored.
+- **`issues`** — a *cache*, never authoritative. uzi's own board state is limited to column configuration; every other field is overwritten from the forge on each sync. `has_prd_link` is computed at fetch time from the issue description (regex match on a `prds/*.md` reference) and stored as a bool — the description itself is never persisted.
+
+### Sync engine
+
+`api/internal/forgesvc.Service` is shared by the HTTP handlers and the background poller: it builds a `Forge` driver from a stored (encrypted) connection, runs the PRD-link check, and implements `IncrementalSync`/`FullSync` against an `IssueStore` interface (narrowed for unit testing against a fake store and a mocked `Forge`, without a live database).
+
+`api/internal/poller.Engine` (`main.go`) is started as a single background goroutine alongside the HTTP server. Each tick, for every enabled repo, it either runs an incremental pull (`ListIssues(labels=["PRD"], state=all, updated_after=HWM)`, high-water-mark = the max `updated_at` the forge itself returned, never the client clock) or, every `FORGE_RECONCILE_EVERY`-th tick (and always on a repo's first poll after being enabled), a full reconcile: fetch the complete `PRD`-labeled set with no lower bound, upsert everything, and evict cache rows the forge no longer returns. Eviction is the only way to observe de-labeling, closing-with-label-removed, or deletion, which an `updated_after`-filtered query structurally cannot report. Per-repo state (`hwm`, poll count) lives only in the `Engine`'s in-memory map — a disabled repo simply drops out and a re-enabled one starts over with a fresh full reconcile.
+
+Writes are forge-first: a board move (`POST /api/repos/:id/issues/:iid/move`) calls `UpdateIssueLabels` before touching the cache, and only updates the cache on success — a failed forge write leaves the card where it was (snap-back), never an optimistically-moved card the forge disagrees with.
+
+Shutdown ordering matters here specifically because of the poller: `main.go`'s `run()` calls `srv.Shutdown` to drain in-flight HTTP requests, cancels the root context (stopping the poller's next tick), then `pollerWG.Wait()`s for any in-flight sync to finish — all *before* the deferred `pool.Close()` runs, so a mid-tick database query never races the pool shutting down underneath it.
+
+### Per-user rate limiting on forge-proxying endpoints
+
+The endpoints that call out to the forge on a user's behalf (`.../verify`, `.../projects`, `.../issues/:iid/move`, `.../sync`) run behind a second instance of the same fixed-window `mw.Limiter` PRD #1 uses for auth endpoints, but keyed **per user** (`PerUserMiddleware`) rather than per client IP, and budgeted separately (`FORGE_RATE_LIMIT_MAX`/`FORGE_RATE_LIMIT_WINDOW`, default 30/minute) from `RATE_LIMIT_MAX`/`RATE_LIMIT_WINDOW`. This bounds how hard one uzi user's actions can hit the upstream forge, independent of the local-network IP-sharing caveat already documented for the auth limiter in [auth-design.md](docs/auth-design.md#accepted-limitations).
+
 ## Agent templates
 
 An agent template (`agent_templates` table) is the definition of one role an
@@ -119,8 +158,10 @@ no admin path to another user's secret value. See
 
 ## Not yet in scope
 
-Spawning agents from a template, connecting them to the server, decrypting
-and injecting a user's Anthropic token into a running agent, and any other
-"factory" execution surface are deliberately out of this MVP (see
-[plan.md](plan.md) and the PRD's Risks section). This document will grow new
-sections (additional services, data flows, trust boundaries) as those land.
+The execution surface is deliberately out of this MVP: spawning agents from a
+template, connecting them to the server, decrypting and injecting a user's
+Anthropic token into a running agent, and acting on a board card's issue (job
+submission / agent control) all belong to a later PRD — see [plan.md](plan.md) and
+the PRDs' Risks sections. The kanban board reflects and writes back forge labels,
+but nothing in uzi yet acts on a card. This document will grow new sections
+(additional services, data flows, trust boundaries) as those land.

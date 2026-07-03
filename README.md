@@ -14,7 +14,18 @@ cp .env.example .env
 docker compose up
 ```
 
-Open <http://127.0.0.1:8080> and register. The first registered account becomes admin. Admins can define agent templates under **Agents**; any user can connect their own Anthropic token under **Settings** (see [docs/anthropic-token.md](docs/anthropic-token.md)).
+Open <http://127.0.0.1:8080> and register. The first registered account becomes admin — or set `UZI_SEED_EMAIL`/`UZI_SEED_PASSWORD` in `.env` to provision an admin automatically at startup (see [configuration.md](docs/configuration.md)). Admins can define agent templates under **Agents**; any user can connect their own Anthropic token under **Settings** (see [docs/anthropic-token.md](docs/anthropic-token.md)).
+
+Each git checkout/worktree gets its own isolated compose stack and `pgdata` volume (no shared `name:` in `docker-compose.yml`), so running the stack from a PRD worktree never touches another checkout's data.
+
+### Connect a forge
+
+The board works against GitLab issues, via a per-user bot account:
+
+1. Create a bot account and an `api`-scoped PAT, add it as Developer to a project — see [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md) (`scripts/create-gitlab-bot.sh` automates the admin path).
+2. In uzi: **Settings → Forge**, pick a base URL and paste the PAT.
+3. **Repos**, enable the project you added the bot to.
+4. Open its board from the sidebar — `PRD`-labeled issues appear as cards; drag between columns to relabel on the forge.
 
 ## Documentation
 
@@ -23,6 +34,7 @@ Full docs live in [docs/](docs/):
 - [Installation](docs/installation.md)
 - [Configuration](docs/configuration.md)
 - [Auth design](docs/auth-design.md)
+- [GitLab bot setup](docs/gitlab-bot-setup.md)
 - [Agent templates](docs/agent-templates.md)
 - [Anthropic token](docs/anthropic-token.md)
 

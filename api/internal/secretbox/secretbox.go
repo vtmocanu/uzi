@@ -37,6 +37,12 @@ var ErrInvalidKey = errors.New("secretbox: key must be 32 bytes")
 // nonce + GCM tag overhead.
 var ErrCiphertextTooShort = errors.New("secretbox: ciphertext too short")
 
+// ErrWeakKey is returned by LoadKey when the decoded key has no entropy (every
+// byte identical — e.g. the all-zero key, or a lazy "AAAA…"/"0000…" base64
+// placeholder). A real random 32-byte key is astronomically unlikely to be
+// all-identical, so this only ever fires on an obvious placeholder.
+var ErrWeakKey = errors.New("secretbox: key is a low-entropy placeholder (all bytes identical); generate a random one with: openssl rand -base64 32")
+
 // Box encrypts and decrypts byte slices using a fixed master key. Box instances
 // are safe for concurrent use after construction — cipher.AEAD itself is
 // goroutine-safe.
@@ -103,5 +109,19 @@ func LoadKey(envVar string) ([]byte, error) {
 	if len(key) != KeySize {
 		return nil, fmt.Errorf("secretbox: %s decodes to %d bytes, expected %d", envVar, len(key), KeySize)
 	}
+	if isAllIdentical(key) {
+		return nil, ErrWeakKey
+	}
 	return key, nil
+}
+
+// isAllIdentical reports whether every byte of b equals the first. This catches
+// the all-zero key and single-repeated-byte placeholder keys.
+func isAllIdentical(b []byte) bool {
+	for _, x := range b {
+		if x != b[0] {
+			return false
+		}
+	}
+	return true
 }

@@ -104,6 +104,22 @@ func TestLoadKey(t *testing.T) {
 			t.Fatal("expected error on short key")
 		}
 	})
+	t.Run("all-zero key rejected", func(t *testing.T) {
+		t.Setenv(envVar, base64.StdEncoding.EncodeToString(make([]byte, KeySize)))
+		if _, err := LoadKey(envVar); err != ErrWeakKey {
+			t.Fatalf("expected ErrWeakKey for all-zero key, got %v", err)
+		}
+	})
+	t.Run("single-repeated-byte placeholder rejected", func(t *testing.T) {
+		k := make([]byte, KeySize)
+		for i := range k {
+			k[i] = 'A'
+		}
+		t.Setenv(envVar, base64.StdEncoding.EncodeToString(k))
+		if _, err := LoadKey(envVar); err != ErrWeakKey {
+			t.Fatalf("expected ErrWeakKey for repeated-byte key, got %v", err)
+		}
+	})
 	t.Run("happy path", func(t *testing.T) {
 		key := make([]byte, KeySize)
 		_, _ = rand.Read(key)
