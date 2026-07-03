@@ -369,7 +369,10 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 		}
 	}
 
-	if req.Tools != nil {
+	// An empty (or absent) tools list normalizes to NULL = inherit all, so a
+	// direct-API empty array does not persist a `[]` that renders as inherit-all
+	// but lists as "none".
+	if len(req.Tools) > 0 {
 		for _, t := range req.Tools {
 			if strings.TrimSpace(t) == "" {
 				return f, errors.New("tools must be a list of non-empty names")

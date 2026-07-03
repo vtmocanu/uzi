@@ -56,6 +56,14 @@ func TestValidateTemplateFields(t *testing.T) {
 		t.Error("absent tools should be nil")
 	}
 
+	// An explicit empty tools array normalizes to NULL (inherit all), not a
+	// stored `[]` that would list as "none".
+	emptyTools := base
+	emptyTools.Tools = []string{}
+	if f, err = validateTemplateFields(emptyTools); err != nil || f.tools != nil {
+		t.Errorf("empty tools array should normalize to NULL: tools=%v err=%v", f.tools, err)
+	}
+
 	// Empty model string trims to NULL, not a blank model.
 	empty := ""
 	blankModel := base

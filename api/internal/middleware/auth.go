@@ -23,6 +23,14 @@ func UserFromContext(ctx context.Context) (store.User, bool) {
 	return u, ok
 }
 
+// ContextWithUser returns a copy of ctx carrying the authenticated user under
+// the key UserFromContext reads. RequireAuth uses it after authenticating a
+// request; handler tests use it to exercise an authed endpoint without a full
+// login round-trip.
+func ContextWithUser(ctx context.Context, user store.User) context.Context {
+	return context.WithValue(ctx, userKey, user)
+}
+
 // RequireAuth authenticates a request from the HttpOnly JWT cookie. It:
 //   - rejects state-changing methods without a valid CSRF token;
 //   - validates the JWT signature and expiry;
@@ -88,7 +96,7 @@ func RequireAuth(q *store.Queries, cfg config.Config) func(http.Handler) http.Ha
 				}
 			}
 
-			ctx := context.WithValue(r.Context(), userKey, user)
+			ctx := ContextWithUser(r.Context(), user)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

@@ -65,14 +65,16 @@ export function splitToolInput(raw: string): string[] {
     .filter(Boolean);
 }
 
-// hasControlChar reports whether s contains a newline, carriage return, any
-// other C0 control character, or DEL — the characters that would break out of a
-// single frontmatter line. Implemented by code point (no control chars in the
-// source) so the mirror of the server rule stays legible.
+// hasControlChar reports whether s contains a character the server's
+// unicode.IsControl-based check rejects: a C0 control (incl. newline/CR/tab),
+// DEL, a C1 control (0x80-0x9f), or the Unicode replacement char (malformed
+// UTF-8). Kept in lockstep with the server so a user gets a clear UI warning
+// instead of a bare 400. Implemented by code point so no control chars appear
+// in the source.
 function hasControlChar(s: string): boolean {
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
-    if (c < 0x20 || c === 0x7f) return true;
+    if (c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0xfffd) return true;
   }
   return false;
 }
