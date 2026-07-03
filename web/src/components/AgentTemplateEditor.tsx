@@ -2,9 +2,11 @@ import { useMemo, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { AgentTemplateInput } from "../lib/api";
 import { Alert, Button, Field, Input } from "./ui";
 import {
+  frontmatterFieldWarning,
   KNOWN_TOOLS,
   looseSecretWarning,
   renderSubagent,
+  splitToolInput,
   unknownTools,
 } from "../lib/agentTemplates";
 
@@ -48,6 +50,10 @@ export function AgentTemplateEditor({
     [description, promptBody],
   );
   const unknown = useMemo(() => unknownTools(tools), [tools]);
+  const injectionWarning = useMemo(
+    () => frontmatterFieldWarning({ description, model, tools }),
+    [description, model, tools],
+  );
 
   const preview = useMemo(
     () =>
@@ -62,8 +68,12 @@ export function AgentTemplateEditor({
   );
 
   const addTool = (raw: string) => {
-    const t = raw.trim().replace(/,$/, "").trim();
-    if (t && !tools.includes(t)) setTools([...tools, t]);
+    const parts = splitToolInput(raw);
+    if (parts.length) {
+      const next = [...tools];
+      for (const p of parts) if (!next.includes(p)) next.push(p);
+      setTools(next);
+    }
     setToolDraft("");
   };
 
@@ -199,6 +209,12 @@ export function AgentTemplateEditor({
         </div>
       )}
 
+      {injectionWarning && (
+        <div className="rounded-lg border border-rose-800 bg-rose-950/60 px-3 py-2 text-sm text-rose-200">
+          {injectionWarning}
+        </div>
+      )}
+
       <div>
         <span className="text-sm font-medium text-slate-300">
           Rendered subagent file (preview)
@@ -208,7 +224,7 @@ export function AgentTemplateEditor({
         </pre>
       </div>
 
-      <Button type="submit" disabled={busy}>
+      <Button type="submit" disabled={busy || !!injectionWarning}>
         {submitLabel}
       </Button>
     </form>

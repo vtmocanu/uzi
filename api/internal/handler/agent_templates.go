@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -144,6 +145,9 @@ func (h *Handler) GetRenderedAgentTemplate(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	// Defense in depth: this is raw user-editable content served inline, so stop
+	// the browser from MIME-sniffing it into something executable.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(agenttmpl.Render(templateToDefinition(t))); err != nil {
 		slog.Error("write rendered template", "error", err)
@@ -341,6 +345,14 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 	if f.description == "" {
 		return f, errors.New("description must not be empty")
 	}
+	// The frontmatter fields (description, model, each tool name) each render on
+	// a single YAML line, so a newline/CR/control char would forge or duplicate
+	// a key or break out of the block, making the rendered subagent file diverge
+	// from the structured columns PRD #4 trusts. The prompt body renders after
+	// the frontmatter, so its newlines are legitimate Markdown and are allowed.
+	if hasControlChar(f.description) {
+		return f, errors.New("description must not contain newlines or control characters")
+	}
 
 	f.promptBody = req.PromptBody
 	if strings.TrimSpace(f.promptBody) == "" {
@@ -350,6 +362,9 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 	if req.Model != nil {
 		m := strings.TrimSpace(*req.Model)
 		if m != "" {
+			if hasControlChar(m) {
+				return f, errors.New("model must not contain newlines or control characters")
+			}
 			f.model = pgtype.Text{String: m, Valid: true}
 		}
 	}
@@ -358,6 +373,12 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 		for _, t := range req.Tools {
 			if strings.TrimSpace(t) == "" {
 				return f, errors.New("tools must be a list of non-empty names")
+			}
+			// A comma is the tools-line separator; a control char breaks the
+			// line. Either would let a tool name inject extra entries into the
+			// rendered allowlist.
+			if hasControlChar(t) || strings.Contains(t, ",") {
+				return f, errors.New("tool names must not contain commas, newlines, or control characters")
 			}
 		}
 		b, err := json.Marshal(req.Tools)
@@ -389,6 +410,19 @@ func storeColumns(def agenttmpl.Definition) (pgtype.Text, []byte, error) {
 		tools = b
 	}
 	return model, tools, nil
+}
+
+// hasControlChar reports whether s contains a rune that would break out of a
+// single frontmatter line: a newline, carriage return, any other control
+// character, or the Unicode replacement character (malformed UTF-8). A plain
+// space is not a control character, so ordinary multi-word text is unaffected.
+func hasControlChar(s string) bool {
+	for _, r := range s {
+		if r == unicode.ReplacementChar || unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // pgUUID wraps a google/uuid value as a valid pgtype.UUID.

@@ -55,6 +55,51 @@ export function unknownTools(tools: string[]): string[] {
   return tools.filter((t) => !KNOWN_TOOLS.includes(t));
 }
 
+// splitToolInput turns raw tag-editor input into clean tool names, splitting on
+// commas and whitespace and dropping blanks. This keeps commas, spaces, and
+// newlines (the frontmatter-injection vectors) out of every stored tag.
+export function splitToolInput(raw: string): string[] {
+  return raw
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// hasControlChar reports whether s contains a newline, carriage return, any
+// other C0 control character, or DEL — the characters that would break out of a
+// single frontmatter line. Implemented by code point (no control chars in the
+// source) so the mirror of the server rule stays legible.
+function hasControlChar(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return true;
+  }
+  return false;
+}
+
+// frontmatterFieldWarning mirrors the server rejection of newline/control
+// characters (and commas in tool names) in the single-line frontmatter fields.
+// The server is authoritative; this blocks submit early with a clear message
+// (the usual vector is a paste into the description). "" means clean.
+export function frontmatterFieldWarning(fields: {
+  description: string;
+  model: string;
+  tools: string[];
+}): string {
+  if (hasControlChar(fields.description)) {
+    return "Description contains a newline or control character; remove it before saving.";
+  }
+  if (hasControlChar(fields.model)) {
+    return "Model contains a newline or control character; remove it before saving.";
+  }
+  for (const t of fields.tools) {
+    if (hasControlChar(t) || t.includes(",")) {
+      return `Tool name "${t}" contains a comma, newline, or control character.`;
+    }
+  }
+  return "";
+}
+
 // looseSecretWarning returns a warning string if the text looks like it might
 // carry an Anthropic credential, or "" otherwise. This is deliberately looser
 // than the server guardrail (which rejects only a full token): it nudges on
