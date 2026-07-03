@@ -23,7 +23,7 @@ Full docs live in [docs/](docs/):
 - [Configuration](docs/configuration.md)
 - [Auth design](docs/auth-design.md)
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, and [prds/](prds/) for product specs.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for product specs, and [specs/](specs/) for the requirements contract ([human.md](specs/human.md)) and design decisions ([ai.md](specs/ai.md)).
 
 ## Contributing
 
