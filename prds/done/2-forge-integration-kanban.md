@@ -1,7 +1,7 @@
 # PRD #2: Forge Integration — Repos, PRD Issues, Label-Synced Kanban
 
 **GitLab Issue**: [vtmocanu/uzi#2](https://gitlab.example.com/vtmocanu/uzi/-/issues/2)
-**Status**: Draft
+**Status**: Complete (2026-07-03)
 **Priority**: High
 **Created**: 2026-07-03
 **Depends on**: PRD #1 (users, sessions, admin — the auth shell)
