@@ -1,0 +1,9 @@
+[submodule "inspiration/bottega"]
+	path = inspiration/bottega
+	url = https://github.com/vdaubry/bottega.git
+[submodule "inspiration/multica"]
+	path = inspiration/multica
+	url = https://github.com/multica-ai/multica.git
+[submodule "inspiration/dot-agent-deck"]
+	path = inspiration/dot-agent-deck
+	url = https://github.com/vfarcic/dot-agent-deck.git
