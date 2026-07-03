@@ -14,8 +14,11 @@ import (
 	"time"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -75,8 +78,20 @@ func run() error {
 	defer pool.Close()
 
 	q := store.New(pool)
+
+	box, err := secretbox.New(cfg.SecretKey)
+	if err != nil {
+		return err
+	}
+	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout)
+
+	// Background sync engine: pulls forge changes into the issue cache for every
+	// enabled repo. Stopped when ctx is cancelled on shutdown.
+	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
+	go engine.Run(ctx)
+
 	limiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg)
+	h := handler.New(pool, q, cfg, svc)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -21,11 +22,12 @@ type Handler struct {
 	pool *pgxpool.Pool
 	q    *store.Queries
 	cfg  config.Config
+	svc  *forgesvc.Service
 }
 
 // New constructs a Handler.
-func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg}
+func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, svc *forgesvc.Service) *Handler {
+	return &Handler{pool: pool, q: q, cfg: cfg, svc: svc}
 }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
@@ -93,6 +95,32 @@ func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
 			r.Use(mw.RequireAdmin)
 			r.Get("/users", h.ListUsers)
 			r.Patch("/users/{id}", h.PatchUser)
+		})
+
+		// Forge integration: connections, repo discovery, and the label-synced
+		// kanban board. Every route is per-user authorized through the owning
+		// connection's user_id (see the handlers).
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+
+			r.Get("/forge/config", h.ForgeConfig)
+
+			r.Route("/forge/connections", func(r chi.Router) {
+				r.Post("/", h.CreateConnection)
+				r.Get("/", h.ListConnections)
+				r.Post("/{id}/verify", h.VerifyConnection)
+				r.Delete("/{id}", h.DeleteConnection)
+				r.Get("/{id}/projects", h.ListProjects)
+			})
+
+			r.Route("/repos", func(r chi.Router) {
+				r.Get("/", h.ListRepos)
+				r.Put("/{id}", h.SetRepoEnabled)
+				r.Get("/{id}/board", h.GetBoard)
+				r.Put("/{id}/board/columns", h.ConfigureColumns)
+				r.Post("/{id}/issues/{iid}/move", h.MoveIssue)
+				r.Post("/{id}/sync", h.SyncRepo)
+			})
 		})
 	})
 
