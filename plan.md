@@ -43,9 +43,17 @@ we should be able to define skills global skills and also each user should be ab
 always verify that our agents only have the rights to create MR, nothing else in write mode (except code ofc), they should not be able to modify resources, code on main directly etc! this is a primary directive!
 
 for encryption - maybe/can we store/encrypt each users/agents secrets with the password of its user? so nobody can decode them?
+a real trade-off worth discussing before it lands in a PRD (agents can't decrypt secrets while you're logged out — breaks background agents). - to be discussed
+
+can uzi verify the glpat does not have more permissions than needed for a MR? for each repo? when we save it? and afterwards?
+
+adaptive/responsive width so it works on mobile and larger screens
+
+integration with gitlab to check and display CI status, if it is broken spin up an agent to review what happened and if it can fix it - if the code was bad => uzi verifies it's work
 
 ## later stuff
 
+- maybe have a label in glab and agents auto start working on issues? how would it work? by using the agent from the user which created the label?
 - dark/light theme with autodetect
 - have AI agent - u can chat with UZI - it can see it's code and create issues for itself (local webui agent uses each user aouth token)
 - gitlab integration - with later forgejo support
@@ -57,5 +65,5 @@ for encryption - maybe/can we store/encrypt each users/agents secrets with the p
 - slack notifications - if an agent needs human input / when issues transition from one state to other.
 - have a catalog for agents (each user builds/defines its own agent with the tools needed by him/she - one might need node tools, other might need java tools, etc)
 - agents should be able to injects secrets - to connect to other resources, like prometheus for example, maybe a kubeconfig/etc, those secrets should sit encrypted in db
-- remove vlad seed user from env
-- CICD + deploy to k8s
+- remove vlad seed user from env + remove all seeds
+- CICD + deploy to k8s + regen vmocanu bot token!! and create a dedicated one for tests!!!
