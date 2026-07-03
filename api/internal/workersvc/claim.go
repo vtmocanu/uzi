@@ -10,51 +10,53 @@ import (
 // ClaimPayload is the complete, self-contained handoff a worker receives when it
 // claims a run: everything it needs to execute without a second server round
 // trip. It is returned only over the claim response (the sole secret-delivery
-// channel) and must never be logged — it carries the decrypted bot PAT and
+// channel) and must never be logged — it carries the decrypted forge PAT and
 // Anthropic token.
+//
+// Wire shape reconciled with the M2 worker: run fields are flat at the top
+// level; repo/secrets/config are nested; secret field names are forge_pat and
+// anthropic_oauth_token. Deviation from M2's assumption: agents is an ARRAY of
+// structured templates (PRD #3 provides several subagents that map to
+// programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	Run         ClaimRun         `json:"run"`
-	Repo        ClaimRepo        `json:"repo"`
-	Credentials ClaimCredentials `json:"credentials"`
-	Agents      []ClaimAgent     `json:"agents"`
-	Config      ClaimConfig      `json:"config"`
-}
-
-// ClaimRun is the run snapshot. SessionID/Branch/PlanMd are populated on a
-// resume (a re-queued run that already has a session, branch, or captured plan);
-// LastSeq lets the worker continue message numbering without a seq collision.
-type ClaimRun struct {
-	ID               string  `json:"id"`
+	RunID            string  `json:"run_id"`
 	IssueIID         int64   `json:"issue_iid"`
 	IssueTitle       string  `json:"issue_title"`
 	IssueDescription string  `json:"issue_description"`
 	Status           string  `json:"status"`
-	SessionID        *string `json:"session_id"`
-	LastSeq          int32   `json:"last_seq"`
+	Branch           *string `json:"branch"`     // resume: attach existing branch
+	SessionID        *string `json:"session_id"` // resume: continue SDK session
+	LastSeq          int32   `json:"last_seq"`   // resume: continue message numbering
 	IterationCount   int32   `json:"iteration_count"`
 	RequeueCount     int32   `json:"requeue_count"`
-	Branch           *string `json:"branch"`
-	PlanMd           *string `json:"plan_md"`
+	PlanMd           *string `json:"plan_md"` // resume: plan already captured
+
+	Repo    ClaimRepo    `json:"repo"`
+	Secrets ClaimSecrets `json:"secrets"`
+	Agents  []ClaimAgent `json:"agents"`
+	Config  ClaimConfig  `json:"config"`
 }
 
-// ClaimRepo carries the repo facts the worker needs to clone and push. CloneURL
-// is the https clone URL the worker authenticates with the bot PAT (via a
-// per-invocation http.extraHeader), never writing the PAT into git config.
+// ClaimRepo carries the repo facts the worker needs. CloneURL is the https clone
+// target the worker authenticates with the PAT (via a per-invocation
+// http.extraHeader, never writing the PAT into git config); URL is the GitLab
+// web URL. Clone from CloneURL, not URL.
 type ClaimRepo struct {
-	WebURL            string  `json:"web_url"`
-	PathWithNamespace string  `json:"path_with_namespace"`
-	DefaultBranch     *string `json:"default_branch"`
-	CloneURL          string  `json:"clone_url"`
+	ID            string  `json:"id"`
+	URL           string  `json:"url"`
+	CloneURL      string  `json:"clone_url"`
+	DefaultBranch *string `json:"default_branch"`
 }
 
-// ClaimCredentials are the decrypted secrets for this run only. The worker holds
-// the PAT (the agent subprocess never sees it) and uses the Anthropic token as
-// the SDK's OAuth credential. Never logged; never persisted on the worker beyond
-// the run.
-type ClaimCredentials struct {
-	BotUsername    string `json:"bot_username"`
-	BotPAT         string `json:"bot_pat"`
-	AnthropicToken string `json:"anthropic_token"`
+// ClaimSecrets are the decrypted secrets for this run only. The worker holds the
+// PAT (the agent subprocess never sees it) and uses the Anthropic token as the
+// SDK's OAuth credential. Never logged; never persisted on the worker beyond the
+// run. ForgeUsername is the bot login (not sensitive; travels with the PAT for
+// git identity / MR authorship).
+type ClaimSecrets struct {
+	ForgeUsername       string `json:"forge_username"`
+	ForgePAT            string `json:"forge_pat"`
+	AnthropicOAuthToken string `json:"anthropic_oauth_token"`
 }
 
 // ClaimAgent is a PRD #3 agent template as structured fields, ready to map onto

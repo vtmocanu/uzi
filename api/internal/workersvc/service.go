@@ -197,6 +197,12 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 			}
 			return nil, nil // idle; the run now shows failed in the UI
 		}
+		// The run vanished between claim and payload assembly (its forge
+		// connection was deleted, cascading repo → run away). Nothing to fail or
+		// hand out; report idle.
+		if errors.Is(err, errRunVanished) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return payload, nil
@@ -207,10 +213,17 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 // run failure reason (it never includes secret bytes).
 var errCredentialUnavailable = errors.New("credential unavailable")
 
+// errRunVanished marks a claim whose run disappeared before its payload could be
+// assembled (a cascading delete of the forge connection).
+var errRunVanished = errors.New("run vanished before claim assembly")
+
 // assembleClaim builds the claim payload for an already-claimed run.
 func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errRunVanished
+		}
 		return nil, fmt.Errorf("claim context: %w", err)
 	}
 
@@ -241,29 +254,27 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 	}
 
 	return &ClaimPayload{
-		Run: ClaimRun{
-			ID:               run.ID.String(),
-			IssueIID:         run.IssueIid,
-			IssueTitle:       run.IssueTitle,
-			IssueDescription: run.IssueDescription,
-			Status:           run.Status,
-			SessionID:        textPtr(run.SessionID),
-			LastSeq:          run.LastSeq,
-			IterationCount:   run.IterationCount,
-			RequeueCount:     run.RequeueCount,
-			Branch:           textPtr(run.Branch),
-			PlanMd:           textPtr(run.PlanMd),
-		},
+		RunID:            run.ID.String(),
+		IssueIID:         run.IssueIid,
+		IssueTitle:       run.IssueTitle,
+		IssueDescription: run.IssueDescription,
+		Status:           run.Status,
+		Branch:           textPtr(run.Branch),
+		SessionID:        textPtr(run.SessionID),
+		LastSeq:          run.LastSeq,
+		IterationCount:   run.IterationCount,
+		RequeueCount:     run.RequeueCount,
+		PlanMd:           textPtr(run.PlanMd),
 		Repo: ClaimRepo{
-			WebURL:            rc.RepoWebUrl,
-			PathWithNamespace: rc.RepoPath,
-			DefaultBranch:     textPtr(rc.DefaultBranch),
-			CloneURL:          rc.RepoWebUrl + ".git",
+			ID:            run.RepoID.String(),
+			URL:           rc.RepoWebUrl,
+			CloneURL:      rc.RepoWebUrl + ".git",
+			DefaultBranch: textPtr(rc.DefaultBranch),
 		},
-		Credentials: ClaimCredentials{
-			BotUsername:    rc.BotUsername,
-			BotPAT:         string(botPAT),
-			AnthropicToken: string(anthropic),
+		Secrets: ClaimSecrets{
+			ForgeUsername:       rc.BotUsername,
+			ForgePAT:            string(botPAT),
+			AnthropicOAuthToken: string(anthropic),
 		},
 		Agents: agentsFromTemplates(templates),
 		Config: ClaimConfig{
@@ -328,52 +339,60 @@ type StateRequest struct {
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
-// row. All transitions are guarded against terminal statuses, so a report that
-// lands on an already-terminal run (e.g. a cancel raced in) is a no-op and the
-// caller still sees success with the run's real status — "already terminal is
-// success" (multica), and it lets the worker learn it was cancelled.
-func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (store.Run, error) {
-	if _, err := s.runOwnedByWorker(ctx, runID, wkr); err != nil {
-		return store.Run{}, err
+// row plus whether the transition was applied. All transitions are guarded
+// against terminal statuses, so a report that lands on an already-terminal run
+// (e.g. a cancel raced in) is a no-op: applied is false and the run's real
+// status is returned. The handler maps applied==false to 409 (the worker treats
+// "already terminal" as success and learns it was cancelled), per the M2 wire
+// contract.
+func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, err error) {
+	if _, err = s.runOwnedByWorker(ctx, runID, wkr); err != nil {
+		return store.Run{}, false, err
 	}
-	var err error
+	var rows int64
 	switch req.State {
 	case "running":
-		_, err = s.q.SetRunRunning(ctx, store.SetRunRunningParams{
+		rows, err = s.q.SetRunRunning(ctx, store.SetRunRunningParams{
 			IterationCount: req.IterationCount, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "awaiting_approval":
-		_, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
+		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: textParam(req.PlanMd), ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
-		_, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
+		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "failed":
-		_, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
+		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
 			FailureReason: textParam(req.FailureReason), ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	default:
-		return store.Run{}, ErrInvalidState
+		return store.Run{}, false, ErrInvalidState
 	}
 	if err != nil {
-		return store.Run{}, err
+		return store.Run{}, false, err
 	}
-	// Re-read so the worker sees the authoritative status (covers the
-	// already-terminal no-op path).
-	return s.runOwnedByWorker(ctx, runID, wkr)
+	// Re-read so the worker sees the authoritative status. Ownership already
+	// held above, so 0 rows means the run was terminal (the only other WHERE
+	// guard) → not applied.
+	run, err = s.runOwnedByWorker(ctx, runID, wkr)
+	return run, rows > 0, err
 }
 
-// InputDTO is a consumed steering input handed to the worker.
+// InputDTO is a consumed steering input handed to the worker. ID is the input's
+// primary key (per the M2 wire contract).
 type InputDTO struct {
+	ID        int64     `json:"id"`
 	Kind      string    `json:"kind"`
 	Body      *string   `json:"body"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 // ConsumeInputs returns and marks-consumed every pending steering input for a
-// run the worker owns, FIFO.
+// run the worker owns, FIFO. Delivery marks the input consumed (there is no
+// separate ack), so a worker crash right after the GET drops that input — an
+// accepted MVP trade-off for the steering channel (the user can re-send).
 func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) ([]InputDTO, error) {
 	if _, err := s.runOwnedByWorker(ctx, runID, wkr); err != nil {
 		return nil, err
@@ -384,7 +403,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	}
 	out := make([]InputDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, InputDTO{Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+		out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
 	}
 	return out, nil
 }

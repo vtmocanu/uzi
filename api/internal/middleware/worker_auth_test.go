@@ -34,7 +34,9 @@ func TestRequireWorkerAcceptsValidToken(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 	wantID := uuid.New()
-	ws := &fakeWorkerStore{wantHash: hash, worker: store.Worker{ID: wantID}}
+	// The stored row carries the same hash (SELECT * in the real query), which
+	// the middleware re-checks in constant time.
+	ws := &fakeWorkerStore{wantHash: hash, worker: store.Worker{ID: wantID, TokenHash: hash}}
 
 	var gotID uuid.UUID
 	h := RequireWorker(ws)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

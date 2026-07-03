@@ -35,7 +35,12 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, false)})
+	// worker_id is echoed for the worker's convenience; identity on every other
+	// call comes from the Bearer token, never a URL path (M2 wire contract).
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"worker_id": updated.ID.String(),
+		"worker":    workerDTOFromWorker(updated, false),
+	})
 }
 
 // WorkerHeartbeat refreshes liveness. No body.
@@ -129,7 +134,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	run, err := h.wsvc.SetState(r.Context(), wkr, runID, req)
+	run, applied, err := h.wsvc.SetState(r.Context(), wkr, runID, req)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
@@ -140,6 +145,13 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
+		return
+	}
+	if !applied {
+		// The run was already terminal (e.g. cancelled out from under the worker):
+		// 409 with the run's real status. The worker treats 409 as success and
+		// stops (M2 wire contract).
+		httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run)})
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run)})

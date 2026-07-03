@@ -41,10 +41,20 @@ func RequireWorker(q WorkerStore) func(http.Handler) http.Handler {
 				httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 				return
 			}
-			wkr, err := q.GetWorkerByTokenHash(r.Context(), jointoken.Hash(token))
+			hash := jointoken.Hash(token)
+			wkr, err := q.GetWorkerByTokenHash(r.Context(), hash)
 			if err != nil {
 				// Do not distinguish "no such token" from other lookup failures —
 				// a probing worker learns nothing about which tokens exist.
+				httpx.Error(w, http.StatusUnauthorized, "invalid worker token")
+				return
+			}
+			// Belt-and-suspenders constant-time credential check. The row was
+			// found by an indexed equality on the sha256 of a 256-bit random
+			// token (no exploitable timing channel on its own), so this compare is
+			// always true here; it makes the constant-time guarantee explicit and
+			// keeps holding if the lookup is ever refactored to fetch-then-compare.
+			if !jointoken.Equal(hash, wkr.TokenHash) {
 				httpx.Error(w, http.StatusUnauthorized, "invalid worker token")
 				return
 			}

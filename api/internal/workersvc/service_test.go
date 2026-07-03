@@ -292,26 +292,29 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 		t.Fatal("expected a payload, got idle")
 	}
 
-	// Decrypted credentials are delivered in the payload (the sole channel).
-	if payload.Credentials.BotPAT != pat {
-		t.Fatal("bot PAT not decrypted into the payload")
+	// Decrypted secrets are delivered in the payload (the sole channel).
+	if payload.Secrets.ForgePAT != pat {
+		t.Fatal("forge PAT not decrypted into the payload")
 	}
-	if payload.Credentials.AnthropicToken != token {
+	if payload.Secrets.AnthropicOAuthToken != token {
 		t.Fatal("anthropic token not decrypted into the payload")
 	}
-	// Resume fields carried through.
-	if payload.Run.LastSeq != 7 || payload.Run.IterationCount != 2 || payload.Run.RequeueCount != 1 {
-		t.Fatalf("resume counters wrong: %+v", payload.Run)
+	// Resume fields carried through (flat, per the M2 wire contract).
+	if payload.LastSeq != 7 || payload.IterationCount != 2 || payload.RequeueCount != 1 {
+		t.Fatalf("resume counters wrong: %+v", payload)
 	}
-	if payload.Run.SessionID == nil || *payload.Run.SessionID != "sess-abc" {
+	if payload.SessionID == nil || *payload.SessionID != "sess-abc" {
 		t.Fatal("session id not carried for resume")
 	}
-	if payload.Run.Branch == nil || *payload.Run.Branch != branch {
+	if payload.Branch == nil || *payload.Branch != branch {
 		t.Fatal("branch not carried for resume")
 	}
 	// Repo + clone URL.
 	if payload.Repo.CloneURL != "https://gitlab.example.com/grp/proj.git" {
 		t.Fatalf("clone url = %q", payload.Repo.CloneURL)
+	}
+	if payload.Repo.URL != "https://gitlab.example.com/grp/proj" {
+		t.Fatalf("repo url = %q", payload.Repo.URL)
 	}
 	// Structured agents.
 	if len(payload.Agents) != 2 || payload.Agents[0].Name != "coder" {
@@ -473,14 +476,33 @@ func TestSetStateAlreadyTerminalIsSuccess(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams())
 	branch, mr := "agent/issue-1", int64(5)
-	run, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+	run, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
 		State: "completed", Branch: &branch, MrIID: &mr,
 	})
 	if err != nil {
 		t.Fatalf("SetState: %v", err)
 	}
+	if applied {
+		t.Fatal("a report onto an already-terminal run must not be applied (handler answers 409)")
+	}
 	if run.Status != "cancelled" {
 		t.Fatalf("status = %q, want the run's real (terminal) status 'cancelled'", run.Status)
+	}
+}
+
+func TestSetStateAppliedOnLiveRun(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+		setRunningRows: 1,
+	}
+	svc := New(fs, newBox(t), testParams())
+	_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "running", IterationCount: 2})
+	if err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if !applied {
+		t.Fatal("a transition on a non-terminal run must be applied (handler answers 200)")
 	}
 }
 
@@ -488,8 +510,22 @@ func TestSetStateRejectsUnknownState(t *testing.T) {
 	w := worker()
 	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"}}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "bogus"}); err != ErrInvalidState {
+	if _, _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "bogus"}); err != ErrInvalidState {
 		t.Fatalf("err = %v, want ErrInvalidState", err)
+	}
+}
+
+func TestSetStateRejectsForeignRun(t *testing.T) {
+	// A valid worker token but the run belongs to another worker/tenant: the
+	// ownership lookup misses, so the transition is refused (handler answers 404)
+	// and no state write occurs.
+	fs := &fakeStore{runOwnedErr: pgx.ErrNoRows}
+	svc := New(fs, newBox(t), testParams())
+	if _, _, err := svc.SetState(context.Background(), worker(), uuid.New(), StateRequest{State: "completed"}); err != ErrRunNotOwned {
+		t.Fatalf("err = %v, want ErrRunNotOwned", err)
+	}
+	if fs.setCompleted != nil {
+		t.Fatal("no state write should occur for a run the worker does not own")
 	}
 }
 
