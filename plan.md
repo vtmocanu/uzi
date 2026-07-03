@@ -33,6 +33,7 @@ Agents sit with code, but we have some agent temapltes that will sit in DB, and 
 
 ## later stuff
 
+- dark/light theme with autodetect
 - have AI agent - u can chat with UZI - it can see it's code and create issues for itself
 - gitlab integration - with later forgejo support
 - enable/disable registration for users
