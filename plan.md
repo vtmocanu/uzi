@@ -31,13 +31,31 @@ Admin users should be able to see all agents status, if they are connected to se
 We should be able to define/edit agents from UI, see /dot-ai-agent-team for how we create/update agents pls.
 Agents sit with code, but we have some agent temapltes that will sit in DB, and we can edit them via UI.
 
+In the UI i want to see when an issue is in progress (team is working on it) - which agents are live, which are idle, which will be spawned next.
+Also i want to see the messages, what athey currently doing and correct them if needed.
+
+agents should use worktrees so they can work on same codebase in parallel
+
+for now we are using claude/anthopic agents - but prepare for the future when we can switch to a different model/provider - we should also do a PoC with openai - as we have a key for openai
+
+we should be able to define skills global skills and also each user should be able to define skill for his aagent, and he should be able to associate/allocate global or user skills to each agent (pod/vm)
+
+always verify that our agents only have the rights to create MR, nothing else in write mode (except code ofc), they should not be able to modify resources, code on main directly etc! this is a primary directive!
+
+for encryption - maybe/can we store/encrypt each users/agents secrets with the password of its user? so nobody can decode them?
+
 ## later stuff
 
 - dark/light theme with autodetect
-- have AI agent - u can chat with UZI - it can see it's code and create issues for itself
+- have AI agent - u can chat with UZI - it can see it's code and create issues for itself (local webui agent uses each user aouth token)
 - gitlab integration - with later forgejo support
 - enable/disable registration for users
 - SSO with KC
 - switch to VMs?
 - make UZI create the bots for users in gitlab? make absolutly sure they only have correct roles (developer?) - they must only be able to create MRs nothing else
 - ios client
+- slack notifications - if an agent needs human input / when issues transition from one state to other.
+- have a catalog for agents (each user builds/defines its own agent with the tools needed by him/she - one might need node tools, other might need java tools, etc)
+- agents should be able to injects secrets - to connect to other resources, like prometheus for example, maybe a kubeconfig/etc, those secrets should sit encrypted in db
+- remove vlad seed user from env
+- CICD + deploy to k8s
