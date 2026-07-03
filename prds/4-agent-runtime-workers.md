@@ -1,0 +1,185 @@
+# PRD #4: Agent Runtime — Workers, Job Queue & Live Run View
+
+**GitLab Issue**: [vtmocanu/uzi#4](https://gitlab.example.com/vtmocanu/uzi/-/issues/4)
+**Status**: Draft
+**Priority**: High
+**Created**: 2026-07-03
+**Depends on**: PRD #1 (auth, done); PRD #2 (forge integration + kanban, done); PRD #3 (agent templates + Anthropic token storage, in progress — this PRD consumes its templates and `user_secrets`)
+
+## Problem
+
+uzi can show a forge-synced kanban of PRD issues (#2) and will soon hold agent templates plus each user's encrypted Anthropic token (#3), but nothing acts on a card. plan.md's core promise — the "AI dark factory" — needs: a per-user agent client (container) connected to the server, the ability to create a PRD issue in GitLab and work on it from uzi web, live visibility of which agents are running/idle/next with their messages, the ability to correct a running agent, worktree-isolated parallel work, and the primary directive that agents can only ever create MRs (never write to main). None of that exists.
+
+## Solution Overview
+
+Three moving parts, split along the trust boundary plan.md draws (server/client):
+
+1. **Server (Go API, extends the existing service)** — a run queue and worker registry. Users queue a *run* from a kanban card (or a newly created issue); the user's worker claims it, streams messages back, and reports terminal state. The API persists everything (runs, messages, worker liveness) and fans live events out to browsers over WebSocket. Watchdog sweeper enforces timeouts the workers can't.
+2. **Worker (`uzi-agent`, new TypeScript container, one per user)** — connects *outbound-only* to the API with a join token (multica's daemon pattern: no inbound ports, works from any network). Executes runs with the **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`) — not a real interactive Claude Code (Viktor's agent-deck approach is explicitly deferred). It clones the repo with the user's GitLab bot PAT, works in a per-issue git worktree, runs the workflow (plan → approval gate → implement ⇄ review loop using PRD #3's templates as SDK subagents), pushes a branch and opens an MR. SDK `PreToolUse` hooks + tool policy make pushing to protected branches impossible from inside the agent, on top of GitLab-side role enforcement.
+3. **Web (extends the SPA)** — create a PRD issue in GitLab from uzi, start a run from a card, watch the live run view (agent/subagent activity + messages), approve the plan, stop a run, send follow-up corrections, and see worker status (own worker; admins see all).
+
+All three inspirations were audited for the runtime (2026-07-03 submodule audit — see decision log):
+
+| Concern | bottega does | multica does | dot-agent-deck does | uzi will do |
+|---|---|---|---|---|
+| Agent execution | **Claude Agent SDK** (`query()`, TS) in-process with the server, `bypassPermissions`, no OS isolation (weakness) | Spawns vendor CLIs (`claude -p --output-format stream-json`) as daemon child processes, auto-approves every tool (weakness) | Real interactive Claude Code on PTYs owned by a daemon | **Claude Agent SDK (TS) inside a per-user container** — SDK like bottega, but isolated from the server like multica; PTY/real-CC approach deferred |
+| Server↔worker link | None (same process) | **Outbound-only daemon**: HTTP claim (`FOR UPDATE SKIP LOCKED`), WS wakeup, heartbeats, server sweeper timeouts | Unix socket, same-host only | multica's shape: outbound HTTPS + join token, `SKIP LOCKED` claim, heartbeat, server-side sweeper; WS wakeup deferred (3s poll is fine for MVP) |
+| Git | Worktree per task; **all users share the host's `gh` identity** (weakness) | Bare-clone cache + worktree per task; agent runs with runtime owner's ambient credentials, `safe.directory=*` (weaknesses) | Worktree per issue, branch `agent/issue-N`, worktree-is-the-ledger idempotency | Bare-clone cache + **worktree per issue, branch `agent/issue-{iid}`**, authenticated *only* with that user's bot PAT (PRD #2), scoped git env — no ambient credentials |
+| Main-branch protection | None in code (prompt-level) | None — `bypassPermissions` + auto-allow every control request (weakness) | N/A (agents use their own auth) | **Layered**: SDK `PreToolUse` hook denies pushes to protected branches / force pushes; locked-down permission mode; GitLab-side bot = Developer + protected main (documented check) |
+| Timeouts / liveness | No wall-clock timeout; hung subprocess needs human Stop (weakness) | **Good**: idle+tool watchdogs, dispatch/running/queued sweeper caps, stale-claim reclaim | Cooperative only — agent must run `work-done`; silent loss if it forgets (weakness) | multica's model: worker-side idle watchdog + server sweeper (claimed/running/queued caps); never trust the agent to self-report liveness |
+| Live UI + steering | WS streaming; Stop; `AskUserQuestion` gate; no mid-turn injection | WS rooms; **no steering at all** — cancel or wait (weakness); lossy stream buffer (weakness) | PTY attach (full terminal) | WS streaming with **persisted, seq-numbered messages** (reconnect = replay, never lossy); Stop; follow-up message resumes the session as next turn; `AskUserQuestion` deferred |
+| Completion signal | DB-driven (run row status), crash-tolerant, orphan sweep on boot | Terminal callbacks with retry + "already terminal is success" | Cooperative CLI call (weakness) | bottega's DB-driven state machine + multica's retrying terminal callbacks; orphan sweep on API boot |
+
+Patterns copied: bottega's SDK usage, sparse credential env, and DB-driven run lifecycle; multica's outbound daemon protocol, claim semantics, sweeper, and bare-clone/worktree layout; dot-agent-deck's branch naming and worktree-as-ledger idempotency. Weaknesses avoided: agents in the server process (bottega), shared git identity (bottega), auto-approve-everything and plaintext creds (multica), cooperative-only completion (agent-deck), lossy live streams (multica).
+
+## Technical Design
+
+### Architecture
+
+```
+browser ──WS+REST──▶ web(nginx) ──▶ api (Go)  ◀──HTTPS poll/claim/report── uzi-agent (TS, per user)
+                                      │  ▲                                      │
+                                      ▼  │ decrypted per-run secrets            ▼
+                                     db  └── forge (GitLab): issues, MRs   repo clone + worktrees
+```
+
+- The worker never receives inbound connections; everything is worker→API, authenticated by the join token. **TLS on the worker↔API hop is a deferred requirement, not met by the MVP compose stack** (the `api` service listens plain HTTP on the compose network). plan.md's "connection server/agent should be encrypted" (plan.md line 28) is therefore **partially deferred**: the join-token gives authentication now; transport encryption arrives with the TLS-terminated ingress when the worker becomes remote (k8s pod/VM). In the local compose demo the worker is an on-network service, not a remote client — the "works from any network" property is a design consequence of outbound-only, realized once TLS lands, not an MVP claim. **Flagged for sign-off.**
+- The API remains the only holder of encryption keys. Per run, it decrypts the user's Anthropic token (`user_secrets`, PRD #3) and bot PAT (`forge_connections`, PRD #2) and hands them to the worker **in the claim response only** — never persisted on the worker beyond the run, never logged (reuses the PRD #2/#3 redaction discipline).
+
+### Schema (goose migrations `00020`+ — range reserved above PRD #2's reserved `00002–00009` and PRD #3's reserved `00010+`; goose tolerates gaps, so `00020+` is conflict-free regardless of how many each actually lands)
+
+```sql
+workers (
+  id uuid PK, user_id uuid NOT NULL REFERENCES users ON DELETE CASCADE,
+  name text NOT NULL,                        -- e.g. "vlad-laptop"
+  token_hash bytea NOT NULL,                 -- sha256 of join token; token shown once at issuance (net-new mechanism — no reusable precedent in PRD #1)
+  status text NOT NULL DEFAULT 'offline',    -- offline|online (heartbeat-derived) — "busy" is derived at read time from an active claimed/running run, not stored
+  last_heartbeat_at timestamptz, version text, created_at/updated_at
+)
+
+runs (
+  id uuid PK, user_id uuid NOT NULL REFERENCES users,
+  repo_id uuid NOT NULL REFERENCES repos, issue_iid bigint NOT NULL,   -- repos.id is uuid (PRD #2); issue_iid is the forge iid, snapshotted below
+  issue_title text NOT NULL, issue_description text NOT NULL,  -- snapshot at queue time: run is self-contained vs the mutable issues cache (PRD #2 reconcile can evict)
+  requeue_count int NOT NULL DEFAULT 0,      -- worker-death re-queues; capped (see sweeper)
+  status text NOT NULL DEFAULT 'queued',
+  -- queued → claimed → running → awaiting_approval → running → completed | failed | cancelled
+  worker_id uuid REFERENCES workers, session_id text,   -- SDK session for resume; worker affinity: a re-queued run prefers its original worker (see resume, below)
+  last_seq int NOT NULL DEFAULT 0,           -- high-water mark of run_messages.seq; returned in claim so a resuming worker continues numbering (no seq collision → no dropped messages)
+  branch text, mr_iid bigint, failure_reason text,
+  plan_md text,                              -- captured plan awaiting approval
+  iteration_count int NOT NULL DEFAULT 0,    -- implement⇄review loop counter (cap: RUN_MAX_ITERATIONS)
+  claimed_at/started_at/finished_at timestamptz, created_at/updated_at
+)
+
+run_messages (
+  id bigserial PK, run_id uuid NOT NULL REFERENCES runs ON DELETE CASCADE,
+  seq int NOT NULL,                          -- per-run, gapless; UNIQUE(run_id, seq) — replayable, never lossy
+  kind text NOT NULL,                        -- text|thinking|tool_use|tool_result|status|error|user_message|plan
+  agent text,                                -- which (sub)agent produced it (lead|coder|reviewer|…)
+  payload jsonb NOT NULL, created_at timestamptz
+)
+
+run_user_inputs (                            -- steering: follow-ups + plan verdicts, consumed FIFO by the worker
+  id bigserial PK, run_id uuid REFERENCES runs ON DELETE CASCADE,
+  kind text NOT NULL,                        -- follow_up|approve_plan|reject_plan|cancel
+  body text, consumed_at timestamptz, created_at timestamptz
+)
+```
+
+One `runs` row is the unit of work (an issue can accumulate several runs over its life). A DB partial unique index enforces one non-terminal run per issue (fixes bottega's TOCTOU check-then-insert race). The issue title/description are **snapshotted into the run at queue time** so the run is self-contained: PRD #2's reconcile can evict the `issues` cache row (de-label, close) between queue and claim, and the run must still be buildable (the claim re-fetches from the forge only to refresh, never as the sole source).
+
+### Worker protocol (all `/api/worker/*`, Bearer join token)
+
+- `POST /api/worker/register` — worker announces name/version; `POST /api/worker/heartbeat` every 15s (server marks offline after 45s).
+- `POST /api/worker/runs/claim` — atomic claim (`FOR UPDATE SKIP LOCKED`) of the oldest queued run **belonging to the worker's user** (a re-queued run with a prior `worker_id` prefers that worker: it is claimable by others only after a short affinity grace, so a resume lands on the disk that still holds the session + worktree). Response carries the issue snapshot, repo URL, decrypted bot PAT + Anthropic OAuth token, the **structured** agent-template fields (name/description/prompt_body/tools/model — see below), config caps, and — for a resume — the existing `session_id` and `last_seq` so the worker continues session and message numbering. 204 when idle; worker polls every 3s (WS wakeup is a noted follow-up, not MVP).
+- `POST /api/worker/runs/:id/messages` — batched (500ms) seq-numbered message append; server persists then broadcasts. Idempotent on `(run_id, seq)`.
+- `POST /api/worker/runs/:id/state` — running/awaiting_approval (with `plan_md`)/completed (with `branch`, `mr_iid`)/failed (with reason); retried with backoff, "already terminal" treated as success (multica).
+- `GET /api/worker/runs/:id/inputs` — poll for user inputs (approval, follow-ups, cancel) while running or gated.
+
+Server sweeper (goroutine next to the PRD #2 poller): claimed-but-never-started > 5m → re-queue; running > `RUN_TIMEOUT` (default 2h) → failed; heartbeat-stale workers → offline and their non-terminal runs re-queued (incrementing `requeue_count`), and a run whose `requeue_count` exceeds `RUN_MAX_REQUEUES` (default 1) → failed instead of re-queued. Orphan sweep on API boot (bottega). **Cancel/reject of a run with no live poller** (still `queued`, or worker gone stale) is transitioned server-side directly to `cancelled`/`failed` — user inputs are not stranded waiting for a `GET /inputs` poll that will never come.
+
+### Worker runtime (new top-level `agent/` dir, TypeScript, Node 22, minimal node+git+bash image)
+
+- **Why TS**: bottega is the production-proven reference for exactly this stack (Agent SDK + per-user `claude setup-token` OAuth token), so its load-bearing patterns port directly; the SDK's TS build bundles the Claude Code binary; and the team stack stays Go + TS. (Python SDK was the alternative; see decision log.) The image can't be distroless — the SDK's Bash tool needs a real shell and the git flow needs `git` + coreutils; the *api* image stays distroless, the *worker* image is a minimal Node+git+bash base.
+- **Credentials env (bottega's sparse-env pattern)**: the SDK subprocess gets *only* `CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `PATH` — `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` explicitly unset (they'd outrank the OAuth token), and **none of the worker's own env (join token, GitLab PAT) leaks into the agent's Bash**. **The subscription OAuth token from `claude setup-token` is the only supported credential** (user decision — no API keys available); the token is validated for real at first run start (PRD #3 defers validation to here).
+- **Who holds the PAT (reconciles the sparse-env guarantee with pushing/MR)**: the **worker process**, not the agent, performs every authenticated network git op (clone, fetch, push) and the MR creation, via per-invocation `git -c http.extraHeader="PRIVATE-TOKEN: …"` (or the GitLab API directly) — the PAT is never written to on-disk git config and never enters the agent subprocess env. The **agent only edits files and makes local commits** (no network, no credential); when the agent signals its work is done, the worker pushes the branch and opens the MR. This is what makes success criterion "worker disk/agent env contain no PAT" actually hold, and turns the `PreToolUse` push-guard into pure defense-in-depth (the agent has no credential to push with in the first place).
+- **Git**: bare-clone cache per repo under `$UZI_DATA_DIR/repos` (multica), `git worktree add -b agent/issue-{iid}` per run; branch-exists ⇒ attach (agent-deck idempotency); worktree removed on terminal state, clone kept.
+- **Agent assembly**: PRD #3 templates arrive in the claim payload **as structured fields** (name/description/prompt_body/tools/model) and map to **programmatic SDK `AgentDefinition`s** (`agents` option), *not* `.claude/agents/*.md` files — which `settingSources: []` would never load anyway. (Correction vs PRD #3: its Markdown renderer is a UI preview/export nicety, not the runtime handoff; PRD #3's "PRD #4 writes rendered files to `.claude/agents/`" contract is superseded — noted in the decision log and to be reflected in PRD #3.) The lead agent's prompt embeds the snapshotted issue + linked PRD content and the workflow contract.
+- **Guardrails (primary directive, layered)**:
+  1. GitLab: the bot user is Developer and `main` is protected — uzi documents the required project config (`docs/gitlab-bot-setup.md` gains a protected-branch section); PAT-scope least-privilege verification is plan.md's separate backlog item.
+  2. Worker-owned network git (above): the agent literally has no push credential, so protected-branch writes are impossible regardless of what the model attempts.
+  3. SDK `PreToolUse` hook on `Bash` (defense-in-depth): deny `git push` to any branch, any `--force`/`-f`, remote mutation (`git remote set-url`), and any credential-reading command (`git config --get`, `env`) — a deny from any hook blocks the tool even under `bypassPermissions`.
+  4. **Permission mode is explicitly `bypassPermissions` + the `PreToolUse` deny-hook + `disallowedTools`** (allow-by-default, deny-specific), *not* `default` (which hangs headless waiting for an approval that never comes) and *not* `dontAsk` (deny-by-default allowlist — rejected because the coder subagent needs broad file/bash access). `disallowedTools` blocks nested `Agent` spawning beyond the defined subagents (bottega). Read-only roles (reviewer/tester) are constrained per-`AgentDefinition` via `tools` allowlist + `disallowedTools` (subagents inherit the parent's permission mode and can't override it, so the tool allowlist — not a per-subagent mode — is what enforces read-only; PRD #3 already excludes Edit/Write from those roles).
+  5. `settingSources: []` — nothing from the cloned repo's `.claude/settings.json`, hooks, or `.claude/agents` can grant the agent extra permissions (prompt-injection-via-repo defense none of the inspirations has).
+- **Workflow (per run)**: lead agent produces `PLAN.md` → worker posts `awaiting_approval` with the plan → user approves in uzi web (reject = failed with reason; if the worker died while gated, the server transitions it directly) → implement ⇄ review loop driven by the lead using `coder`/`reviewer`/`tester` subagents, `iteration_count` capped (default 5, bottega's 25 was generous) → agent signals done → **worker** commits/pushes the branch and creates the MR via the PAT (MR description links the issue; never merges — humans merge) → completed. Follow-up user inputs are injected between turns via SDK session `resume` (bottega's model — no mid-turn injection). Cancel kills the SDK subprocess group.
+- **Session persistence & resume**: the SDK writes transcripts under `$HOME/.claude/projects/…`; the worker pins `HOME` (or the SDK session dir) onto the persistent `$UZI_DATA_DIR` volume so `docker compose down && up` doesn't wipe sessions. On resume, the worker uses the claim's `session_id` + `last_seq`. If a re-queued run lands on a worker whose disk lacks the session/worktree (affinity grace expired), it falls back gracefully: fresh session + branch-exists-attach, which re-triggers the plan gate (documented, acceptable).
+- **Watchdogs**: per-run wall clock and idle (no SDK message for N minutes) timers worker-side (multica), on top of the server sweeper.
+
+### Issue creation from uzi web
+
+`Forge` interface (PRD #2) gains `CreateIssue(title, description, labels)`; `POST /api/repos/:id/issues` creates the issue on GitLab with the `PRD` label, and the board picks it up on next sync (forge stays the source of truth — uzi never fabricates local-only cards). The UI form nudges toward the PRD shape (title, description with a `prds/*.md` link slot — the existing `has_prd_link` check then passes).
+
+### Web UI
+
+1. **Kanban card actions** — "Create issue" button on the board (form above); on a PRD-labeled card with a PRD link: "Start run" (creates a `runs` row; disabled with reason when the user has no connected worker, no Anthropic token, or a non-terminal run exists).
+2. **Run view** (`/runs/:id`) — live message stream over WS (browser subscribes per run; on reconnect, REST replay from last seen `seq` then live — multica's lossy buffer explicitly avoided), grouped by agent with status chips (which subagents are live/idle — plan.md's visibility ask). plan.md also asks to see "which agents will be spawned next": with SDK subagents invoked dynamically by the lead there is no deterministic queue, so this is surfaced as *best-effort* (the lead's stated intent, if it announces a delegation) rather than a firm schedule — noted as partial coverage, not full. Plus a plan-approval panel (`approve` / `reject with reason`), Stop button, follow-up composer, and a link to the MR when created. Responsive width (carries the PRD #2/#3 UI convention — mobile through desktop).
+3. **Workers page** (Settings → Workers) — generate join token (shown once, hash stored — PRD #1 api-key pattern), worker list with online/busy status; `docs/worker-setup.md` walks through `docker run`/compose profile.
+4. **Admin → Agents status** — all users' workers + running runs (plan.md: admins see all, users see their own).
+
+Browser WS endpoint `/api/ws` (session-cookie authN, same-origin through nginx; `github.com/coder/websocket`), hub keyed by run id. Two auth rules are mandatory, not incidental: (a) **Origin validation** against the expected host on the upgrade — cookie-authenticated WebSockets are a CSWSH target (`coder/websocket` checks `Origin==Host` by default; the design relies on it explicitly); (b) a **per-run authorization check on subscribe** — the user must own the run, or be an admin, exactly as REST enforces. Every event also lands in `run_messages` first, so WS is a cache-invalidation/live channel, never the source of truth.
+
+### Configuration (env)
+
+`RUN_TIMEOUT` (2h), `RUN_IDLE_TIMEOUT` (10m), `RUN_MAX_ITERATIONS` (5), `RUN_MAX_REQUEUES` (1), `WORKER_HEARTBEAT_INTERVAL`/`_STALE` (15s/45s), `WORKER_POLL_INTERVAL` (3s), `WORKER_AFFINITY_GRACE` (how long a re-queued run waits for its original worker before any worker may claim it). Worker container: `UZI_API_URL`, `UZI_WORKER_TOKEN`, `UZI_DATA_DIR` (persistent: repos, worktrees, and the pinned SDK session dir).
+
+## User Journey
+
+1. User opens Settings → Workers, generates a join token, runs `docker compose --profile agent up` (or `docker run … uzi-agent`) with the token; the worker shows **online**.
+2. User clicks "Create issue" on the board for repo X, fills in the PRD-shaped form; the issue appears in GitLab with the `PRD` label and syncs onto the board.
+3. User opens the card → "Start run". The run appears as queued, the worker claims it within seconds; the run view streams the lead agent reading the issue and writing a plan.
+4. The run pauses at **awaiting approval**; the user reads the plan, approves. Implement ⇄ review iterations stream live, per-subagent.
+5. Mid-run the user notices a wrong assumption and sends a follow-up ("use pgx, not database/sql"); the correction is applied on the next turn.
+6. The run completes: branch `agent/issue-N` pushed, MR opened and linked from the run view and the card. `main` was never touched — and could not have been (hook + GitLab role).
+7. An admin opens Agents status and sees every user's workers and active runs. `docker compose down && up` mid-run: the sweeper re-queues the orphaned run; the worker re-claims and resumes from the persisted session.
+
+## Milestones
+
+- [ ] **M1 — Server: schema + worker protocol**: migrations `00020`+ (workers/runs/run_messages/run_user_inputs, one-non-terminal-run-per-issue index); join-token issuance + hashed storage; register/heartbeat/claim (`SKIP LOCKED`)/messages/state/inputs endpoints with per-run secret decryption in the claim payload; sweeper + boot orphan sweep; unit tests against a fake worker.
+- [ ] **M2 — Worker: skeleton + git**: `agent/` TS project + Dockerfile + compose profile; register/heartbeat/claim/report loop; bare-clone cache + worktree lifecycle + PAT-scoped git auth; end-to-end with a stub executor (no SDK yet) proving claim→branch→state machine→sweeper interplay.
+- [ ] **M3 — Worker: SDK execution + guardrails**: Claude Agent SDK integration (sparse credential env, OAuth/API-key detection, session persistence + resume); PRD #3 templates → programmatic subagents; `PreToolUse` push-guard + permission lockdown + `settingSources` off; message batching with gapless seq; watchdogs. Guardrail tests: a scripted hostile prompt attempting `git push origin main`, force-push, and repo-settings mutation must be denied.
+- [ ] **M4 — Workflow: plan gate + loop + MR**: plan capture → `awaiting_approval` → approve/reject (incl. server-side transition when no live poller); implement ⇄ review loop with iteration cap; **worker-performed** branch push + MR creation via the PAT (agent has no credential); follow-up injection via session resume; cancel of queued/stale runs.
+- [ ] **M5 — Web: issue creation + run view + workers**: `CreateIssue` forge method + board form; Start-run affordance with precondition checks; live run view (WS + replay-from-seq, per-agent grouping, plan panel, stop, follow-up composer); Settings → Workers; Admin → Agents status.
+- [ ] **M6 — E2E + hardening**: scripted scenario (token → worker online → create issue → run → plan gate → iterate → MR → restart-resilience → cancel path); auditor pass on secret flow (claim payload, logs, worker disk), guardrail bypasses, and WS auth; fix blockers.
+- [ ] **M7 — Docs**: `docs/worker-setup.md`, ARCHITECTURE.md (new service + trust boundaries + run lifecycle), configuration doc, `docs/gitlab-bot-setup.md` protected-branch section, README demo flow.
+
+## Success Criteria
+
+- From uzi web: create a PRD issue in GitLab, start a run, approve a plan, watch live per-agent messages, and end with an open MR on branch `agent/issue-N` — no CLI interaction after worker setup.
+- The primary directive holds under adversarial prompting: the guardrail test suite shows pushes to protected branches denied at the hook layer even before GitLab would reject them.
+- Secrets never rest outside the DB: worker disk and logs contain no PAT/Anthropic token after a run, and the **agent subprocess never sees the PAT at all** (the worker holds it and performs all authenticated git/MR ops); the claim payload is the only delivery path (audited).
+- Liveness is server-enforced: killing the worker mid-run re-queues within the sweeper window; a hung agent is failed at `RUN_TIMEOUT`/idle timeout without human action (beats bottega and agent-deck).
+- Message stream is lossless: killing the browser mid-run and reopening replays the full history then continues live (beats multica).
+- Admins see all workers/runs; users see only their own (authz tests on every worker/run endpoint and WS subscribe).
+
+## Risks
+
+- **Agent SDK API drift** (v0.x, moves fast) — mitigation: pin the version; the worker's SDK surface is isolated in one executor module; bottega (`inspiration/bottega`) tracks the same SDK as living reference.
+- **OAuth-token ToS ambiguity**: docs steer products toward `ANTHROPIC_API_KEY`; per-user `claude setup-token` OAuth tokens work (bottega runs this daily) but sit in a gray zone for third-party products. Accepted (user decision 2026-07-03): only subscription OAuth tokens are available to the team, so OAuth is the sole supported credential; internal team use; revisit if uzi is ever offered externally.
+- **Prompt-injection via repo/issue content** — the agent reads attacker-influencable text (issue bodies, cloned code). Mitigation: the guardrail layer doesn't trust the model (hooks + GitLab roles are outside the prompt); `settingSources` off; worker has only that user's scoped credentials, so blast radius = what the bot PAT can do — which is why the PAT least-privilege check (plan.md backlog) matters and is noted as fast-follow.
+- **Runaway cost** (loop burning tokens) — iteration cap, idle/wall-clock timeouts, plan gate before any implementation spend; per-run token usage surfaced in the run view is a stretch goal.
+- **Scope**: this PRD is deliberately thick (it's the product's core). The milestone order keeps M1–M2 shippable/testable without any AI, and M5's UI rides on APIs proven in M3–M4. CI-status agents, auto-start-on-label, `AskUserQuestion` steering, WS wakeup, per-user-password secret encryption, and multi-provider (OpenAI PoC) are explicitly out — see below.
+- **Multi-provider future**: the Claude Agent SDK is Claude-only; an OpenAI PoC later means a second executor implementation behind the worker's executor interface (bottega's `LlmProvider` shape), not a swap — the run protocol, queue, and UI are provider-agnostic by design.
+
+## Out of scope (deferred, from plan.md "later stuff" + research)
+
+Auto-start runs from a GitLab label; CI-status watching/fixing agent; `AskUserQuestion` mid-run gate; WS wakeup for workers; API-spawned worker containers / k8s pods / VMs; per-user skills management UI (templates come from PRD #3 as-is); encrypting secrets with the user's password (open trade-off in plan.md); PAT least-privilege verification (fast-follow); OpenAI executor PoC.
+
+## Decision Log
+
+- 2026-07-03 (user): implement the workers PRD; read plan.md; research bottega/multica/agent-deck and deviate where better; **do not** use agent-deck's real-Claude-Code/PTY approach (maybe later) — use the Anthropic Claude Agent SDK; must be able to create a PRD/issue in GitLab and work on it from uzi web.
+- 2026-07-03 (research, submodule audit): bottega = Agent SDK in server process, per-user `claude setup-token` OAuth via `CLAUDE_CODE_OAUTH_TOKEN` sparse env, worktrees, WS streaming, DB-driven completion — but no isolation, shared git identity, no timeouts. multica = server never runs LLMs; outbound daemon spawns vendor CLIs, `SKIP LOCKED` claims, sweepers/watchdogs, bare-clone+worktree — but auto-approves all tools, plaintext `custom_env` creds, no steering, lossy stream. dot-agent-deck = daemon-owned PTYs driving real Claude Code, hooks for status, worktree-as-ledger — cooperative completion, single-user/host trust model. Claude Agent SDK verified current (TS `@anthropic-ai/claude-agent-sdk`, Python `claude-agent-sdk`): programmatic `AgentDefinition`s, `PreToolUse` hooks, permission modes, session resume/fork; docs steer products to API keys (OAuth ToS gray zone — risk noted).
+- 2026-07-03 (AI, defaults chosen while user AFK — **revisit on review**): worker language TypeScript (bottega-proven patterns, SDK bundles the CLI, stack stays Go+TS) over Python; workflow = plan-approval gate + implement⇄review loop (bottega's shape, satisfies plan.md's "correct them if needed" and cost control) over one-shot or chat-driven; provisioning = join-token worker the user runs (multica's daemon model; no docker.sock in the API; maps cleanly to later pods/VMs) over API-spawned or shared worker; steering = stop + follow-up-resumes-session, `AskUserQuestion` deferred.
+- 2026-07-03 (user): **OAuth subscription tokens only** — the team has no Anthropic API keys; `claude setup-token` OAuth is the sole supported model credential (`CLAUDE_CODE_OAUTH_TOKEN`), ToS gray zone accepted for internal use.
+- 2026-07-03 (AI): runs/messages/inputs persisted server-side with gapless seq so the WS layer is never authoritative (fixes multica's lossy stream); one-non-terminal-run-per-issue as a DB constraint (fixes bottega's TOCTOU); secrets delivered only in claim responses (server stays sole key holder — consistent with PRD #2/#3 secretbox model); `settingSources` disabled in the worker (repo-borne prompt-injection defense none of the inspirations has); goose range `00020`+ reserved (PRD #3 convention).
+- 2026-07-03 (AI, post-review — design review + fact-check, both against the live code/SDK docs): fixed blockers — `runs.repo_id` is `uuid` not `bigint` (`repos.id` is uuid, PRD #2); the **worker**, not the agent, holds the PAT and performs all authenticated git/MR (reconciles the sparse-env guarantee with pushing — the agent only edits + commits locally); PRD #3's Markdown renderer is demoted to UI preview, worker consumes structured template fields into programmatic `AgentDefinition`s (its `.claude/agents/` write contract is superseded and must be updated in PRD #3, since `settingSources: []` would never load those files). Should-fixes: permission mode pinned to `bypassPermissions` + PreToolUse deny-hook + `disallowedTools` (not `default`, which hangs headless); SDK session dir pinned onto `$UZI_DATA_DIR` + worker affinity/graceful-fallback for resume; `requeue_count` + `RUN_MAX_REQUEUES` (bounded re-queue); `last_seq` returned in claim (no dropped messages on worker restart); server-side cancel/reject for runs with no live poller; issue title/description snapshotted into the run (self-contained vs evictable issue cache); TLS on worker↔API hop explicitly deferred (join-token authN now, transport encryption with ingress later) — not claimed as met; WS design mandates Origin validation (CSWSH) + per-run authz on subscribe. Nits: `github.com/coder/websocket` (nhooyr path deprecated); worker image is minimal Node+git+bash, not distroless; read-only subagents enforced via `tools` allowlist since subagents inherit the parent permission mode; migration wording corrected to "reserved"; "which agents next" acknowledged as best-effort; run view responsive. No factual claim about the inspirations or the SDK was refuted in fact-check.
