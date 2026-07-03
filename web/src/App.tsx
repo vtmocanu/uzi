@@ -7,6 +7,9 @@ import { Register } from "./pages/Register";
 import { Dashboard } from "./pages/Dashboard";
 import { AdminUsers } from "./pages/AdminUsers";
 import { Settings } from "./pages/Settings";
+import { Agents } from "./pages/Agents";
+import { AgentNew } from "./pages/AgentNew";
+import { AgentDetail } from "./pages/AgentDetail";
 
 export default function App() {
   return (
@@ -28,6 +31,30 @@ export default function App() {
           element={
             <ProtectedRoute>
               <Settings />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/agents"
+          element={
+            <ProtectedRoute>
+              <Agents />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/agents/new"
+          element={
+            <AdminRoute>
+              <AgentNew />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="/agents/:id"
+          element={
+            <ProtectedRoute>
+              <AgentDetail />
             </ProtectedRoute>
           }
         />

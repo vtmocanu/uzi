@@ -25,6 +25,9 @@ export function Layout({ children }: { children: ReactNode }) {
                 <Link to="/dashboard" className="text-slate-300 hover:text-white">
                   Dashboard
                 </Link>
+                <Link to="/agents" className="text-slate-300 hover:text-white">
+                  Agents
+                </Link>
                 {user.is_admin && (
                   <Link to="/admin/users" className="text-slate-300 hover:text-white">
                     Users
