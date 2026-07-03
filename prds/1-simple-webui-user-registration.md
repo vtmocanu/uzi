@@ -1,7 +1,7 @@
 # PRD #1: Simple WebUI with User Registration
 
 **GitLab Issue**: [vtmocanu/uzi#1](https://gitlab.example.com/vtmocanu/uzi/-/issues/1)
-**Status**: Draft
+**Status**: Implemented (pending MR review)
 **Priority**: High
 **Created**: 2026-07-03
 
@@ -103,12 +103,12 @@ users (
 
 ## Milestones
 
-- [ ] **M1 — Repo scaffold + compose skeleton**: Go module, React/Vite app, docker-compose with Postgres 17 + named volume; `docker compose up` serves a hello page through nginx→api→db healthcheck chain.
-- [ ] **M2 — DB layer + migrations**: goose wired, `users` table migration, sqlc queries; migrations run on api startup.
-- [ ] **M3 — Auth API complete**: register/login/logout/me + admin user endpoints with argon2id, cookie JWT + CSRF + rolling refresh, token_version revocation (logout/password-change/deactivation), advisory-locked first-user-admin, rate limiting, JWT_SECRET boot guard. Verified with curl scenario script incl. a concurrent-first-registration race test.
-- [ ] **M4 — WebUI shell**: landing, register, login, dashboard, admin user-list pages wired to the API; auth context + protected routes.
-- [ ] **M5 — E2E validation + hardening pass**: scripted scenario (register→login→dashboard→admin→deactivate→revocation→persistence-across-restart); auditor pass on the auth surface; fix blockers.
-- [ ] **M6 — Docs**: terse README quick-start (compose up → register), docs/ pages for configuration + auth design decisions; ARCHITECTURE.md seeded.
+- [x] **M1 — Repo scaffold + compose skeleton**: Go module, React/Vite app, docker-compose with Postgres 17 + named volume; `docker compose up` serves a hello page through nginx→api→db healthcheck chain.
+- [x] **M2 — DB layer + migrations**: goose wired, `users` table migration, sqlc queries; migrations run on api startup.
+- [x] **M3 — Auth API complete**: register/login/logout/me + admin user endpoints with argon2id, cookie JWT + CSRF + rolling refresh, token_version revocation (logout/password-change/deactivation), advisory-locked first-user-admin, rate limiting, JWT_SECRET boot guard. Verified with curl scenario script incl. a concurrent-first-registration race test.
+- [x] **M4 — WebUI shell**: landing, register, login, dashboard, admin user-list pages wired to the API; auth context + protected routes.
+- [x] **M5 — E2E validation + hardening pass**: scripted scenario (register→login→dashboard→admin→deactivate→revocation→persistence-across-restart); auditor pass on the auth surface; fix blockers.
+- [x] **M6 — Docs**: terse README quick-start (compose up → register), docs/ pages for configuration + auth design decisions; ARCHITECTURE.md seeded.
 
 ## Success Criteria
 

@@ -1,0 +1,58 @@
+name: uzi
+
+# Local laptop demo. Every published port is bound to 127.0.0.1 so nothing is
+# exposed on the network (copied from multica's loopback binding).
+
+services:
+  db:
+    image: postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-uzi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-uzi}
+    # Not published to the host: the DB is reachable only over the compose
+    # network (by the api service). Nothing on the laptop can reach it.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-uzi} -d ${POSTGRES_DB:-uzi}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build: ./api
+    environment:
+      API_ADDR: ":8080"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-uzi}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-uzi}?sslmode=disable"
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env - generate with openssl rand -hex 64}"
+      AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-168h}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://127.0.0.1:8080}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-1m}
+      # Trust the nginx hop (the compose network is private RFC1918) so the
+      # real client IP is read from the XFF nginx sets. A direct hit that
+      # bypasses nginx from a non-trusted source has its XFF ignored.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,10.244.0.0/16,127.0.0.1/32}
+    # Not published to the host: reached only by web over the compose network.
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/server", "-health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  web:
+    build: ./web
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
