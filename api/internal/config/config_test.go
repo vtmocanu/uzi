@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestValidateSecretRejectsUnsafe(t *testing.T) {
 	bad := []string{
@@ -36,5 +39,73 @@ func TestOriginIsHTTPS(t *testing.T) {
 		if got := originIsHTTPS(origin); got != want {
 			t.Errorf("originIsHTTPS(%q) = %v, want %v", origin, got, want)
 		}
+	}
+}
+
+func TestNormalizeForgeBaseURL(t *testing.T) {
+	ok := map[string]string{
+		"https://gitlab.example.com":      "https://gitlab.example.com",
+		"https://gitlab.example.com/":     "https://gitlab.example.com",
+		"https://gitlab.example.com/path": "https://gitlab.example.com",
+		"https://GitLab.example.com":      "https://gitlab.example.com",
+		"https://host:8443/x?y=1#z":         "https://host:8443",
+		"  https://spaced.example.com  ":    "https://spaced.example.com",
+	}
+	for in, want := range ok {
+		got, err := NormalizeForgeBaseURL(in)
+		if err != nil {
+			t.Errorf("NormalizeForgeBaseURL(%q) errored: %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("NormalizeForgeBaseURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	bad := []string{
+		"http://gitlab.example.com", // plain http rejected (SSRF/credential-leak guard)
+		"ftp://x",
+		"gitlab.example.com", // no scheme
+		"https://",             // no host
+		"",
+	}
+	for _, in := range bad {
+		if _, err := NormalizeForgeBaseURL(in); err == nil {
+			t.Errorf("NormalizeForgeBaseURL(%q) = nil error, want rejection", in)
+		}
+	}
+}
+
+func TestParseAllowedBaseURLs(t *testing.T) {
+	got, err := parseAllowedBaseURLs("https://a.example.com, https://b.example.com/ , https://a.example.com")
+	if err != nil {
+		t.Fatalf("parseAllowedBaseURLs: %v", err)
+	}
+	want := []string{"https://a.example.com", "https://b.example.com"} // deduped, normalized
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseAllowedBaseURLs = %v, want %v", got, want)
+	}
+
+	if _, err := parseAllowedBaseURLs("   "); err == nil {
+		t.Error("empty allowlist should error")
+	}
+	if _, err := parseAllowedBaseURLs("http://insecure.example.com"); err == nil {
+		t.Error("http entry should error")
+	}
+}
+
+func TestForgeBaseURLAllowed(t *testing.T) {
+	c := Config{ForgeAllowedBaseURLs: []string{"https://gitlab.example.com"}}
+	if !c.ForgeBaseURLAllowed("https://gitlab.example.com/") {
+		t.Error("trailing-slash variant should be allowed")
+	}
+	if !c.ForgeBaseURLAllowed("https://GitLab.example.com") {
+		t.Error("case-insensitive host should be allowed")
+	}
+	if c.ForgeBaseURLAllowed("https://evil.example.com") {
+		t.Error("non-allowlisted host must be rejected")
+	}
+	if c.ForgeBaseURLAllowed("http://gitlab.example.com") {
+		t.Error("http scheme must be rejected")
 	}
 }
