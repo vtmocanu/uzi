@@ -40,3 +40,4 @@ Agents sit with code, but we have some agent temapltes that will sit in DB, and 
 - SSO with KC
 - switch to VMs?
 - make UZI create the bots for users in gitlab? make absolutly sure they only have correct roles (developer?) - they must only be able to create MRs nothing else
+- ios client
