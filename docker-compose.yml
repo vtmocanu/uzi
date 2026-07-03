@@ -27,6 +27,7 @@ services:
       API_ADDR: ":8080"
       DATABASE_URL: "postgres://${POSTGRES_USER:-uzi}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-uzi}?sslmode=disable"
       JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET in .env - generate with openssl rand -hex 64}"
+      UZI_SECRET_KEY: "${UZI_SECRET_KEY:?set UZI_SECRET_KEY in .env - generate with openssl rand -base64 32}"
       AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-168h}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://127.0.0.1:8080}
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}

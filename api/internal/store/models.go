@@ -20,3 +20,12 @@ type User struct {
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 	LastLogin    pgtype.Timestamptz `json:"last_login"`
 }
+
+type UserSecret struct {
+	ID         uuid.UUID          `json:"id"`
+	UserID     uuid.UUID          `json:"user_id"`
+	Kind       string             `json:"kind"`
+	Ciphertext []byte             `json:"ciphertext"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}

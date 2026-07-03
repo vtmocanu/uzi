@@ -13,6 +13,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -21,11 +22,12 @@ type Handler struct {
 	pool *pgxpool.Pool
 	q    *store.Queries
 	cfg  config.Config
+	box  *secretbox.Box
 }
 
 // New constructs a Handler.
-func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg}
+func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box) *Handler {
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box}
 }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
@@ -86,6 +88,15 @@ func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
 				r.Post("/logout", h.Logout)
 				r.Get("/me", h.Me)
 			})
+		})
+
+		// Current-user secrets (per-user, encrypted at rest). No admin read
+		// path to other users' secret values by design.
+		r.Route("/me/secrets", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListMySecrets)
+			r.Put("/anthropic_token", h.PutAnthropicToken)
+			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
 		})
 
 		r.Route("/admin", func(r chi.Router) {

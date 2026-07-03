@@ -16,6 +16,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -75,8 +76,14 @@ func run() error {
 	defer pool.Close()
 
 	q := store.New(pool)
+
+	box, err := secretbox.New(cfg.SecretKey)
+	if err != nil {
+		return err
+	}
+
 	limiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg)
+	h := handler.New(pool, q, cfg, box)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
