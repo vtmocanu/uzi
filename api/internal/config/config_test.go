@@ -136,6 +136,73 @@ func TestLoadSeedAdmin(t *testing.T) {
 	})
 }
 
+func TestLoadSeedForge(t *testing.T) {
+	const base = "https://gitlab.example.com"
+	withAllowlist := func() *Config {
+		return &Config{ForgeAllowedBaseURLs: []string{base}, SeedEmail: "admin@uzi.test"}
+	}
+
+	t.Run("off when PAT unset", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "")
+		c := withAllowlist()
+		if err := loadSeedForge(c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedForgePAT != "" || c.SeedForgeBaseURL != "" || c.SeedForgeRepos != nil {
+			t.Fatalf("forge seed should be off, got %+v", *c)
+		}
+	})
+
+	t.Run("PAT without seed email refuses boot", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+		c := &Config{ForgeAllowedBaseURLs: []string{base}} // SeedEmail deliberately empty
+		if err := loadSeedForge(c); err == nil {
+			t.Fatal("expected boot-fatal error when PAT is set without a seed email")
+		}
+	})
+
+	t.Run("non-allowlisted base URL refuses boot", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+		t.Setenv("UZI_SEED_FORGE_BASE_URL", "https://evil.example.com")
+		if err := loadSeedForge(withAllowlist()); err == nil {
+			t.Fatal("expected boot-fatal error for a base URL outside the allowlist")
+		}
+	})
+
+	t.Run("base URL defaults to first allowlisted entry", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "glpat-xxx")
+		t.Setenv("UZI_SEED_FORGE_BASE_URL", "")
+		t.Setenv("UZI_SEED_FORGE_REPOS", "")
+		c := withAllowlist()
+		if err := loadSeedForge(c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedForgeBaseURL != base {
+			t.Fatalf("base URL = %q, want default %q", c.SeedForgeBaseURL, base)
+		}
+	})
+
+	t.Run("valid seed trims PAT, normalizes base URL, dedups repos", func(t *testing.T) {
+		t.Setenv("UZI_SEED_FORGE_PAT", "  glpat-xxx  ")
+		t.Setenv("UZI_SEED_FORGE_BASE_URL", "https://gitlab.example.com/")
+		t.Setenv("UZI_SEED_FORGE_REPOS", "vtmocanu/uzi, vtmocanu/other , vtmocanu/uzi")
+		c := withAllowlist()
+		if err := loadSeedForge(c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedForgePAT != "glpat-xxx" {
+			t.Fatalf("PAT not trimmed: %q", c.SeedForgePAT)
+		}
+		if c.SeedForgeBaseURL != base {
+			t.Fatalf("base URL not normalized: %q", c.SeedForgeBaseURL)
+		}
+		want := []string{"vtmocanu/uzi", "vtmocanu/other"}
+		if !reflect.DeepEqual(c.SeedForgeRepos, want) {
+			t.Fatalf("repos = %v, want %v (trimmed, deduped, order-preserving)", c.SeedForgeRepos, want)
+		}
+	})
+}
+
 func TestForgeBaseURLAllowed(t *testing.T) {
 	c := Config{ForgeAllowedBaseURLs: []string{"https://gitlab.example.com"}}
 	if !c.ForgeBaseURLAllowed("https://gitlab.example.com/") {
