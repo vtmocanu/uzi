@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/mail"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 )
 
@@ -52,6 +54,16 @@ type Config struct {
 	ForgeReconcileEvery int
 	// ForgeHTTPTimeout bounds every outbound forge HTTP call.
 	ForgeHTTPTimeout time.Duration
+	// ForgeRateLimitMax/Window bound how often one authenticated user may hit
+	// the forge-proxying endpoints (verify/projects/sync/move), protecting the
+	// upstream forge from a single user's abuse.
+	ForgeRateLimitMax    int
+	ForgeRateLimitWindow time.Duration
+	// SeedEmail/SeedPassword/SeedName optionally provision an admin at startup.
+	// Empty SeedEmail disables seeding. Validated at boot (see Load).
+	SeedEmail    string
+	SeedPassword string
+	SeedName     string
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -115,10 +127,42 @@ func Load() (Config, error) {
 	cfg.ForgePollInterval = parseDuration("FORGE_POLL_INTERVAL", time.Minute)
 	cfg.ForgeReconcileEvery = parseInt("FORGE_RECONCILE_EVERY", 10)
 	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
+	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
+	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
+
+	if err := loadSeedAdmin(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
 	return cfg, nil
+}
+
+// loadSeedAdmin reads and validates the optional startup-admin seed. Seeding is
+// off unless UZI_SEED_EMAIL is set; when it is, the email must be valid and the
+// password must satisfy the same length policy as registration, or boot fails
+// (a set-but-invalid seed should be a loud misconfiguration, not a silent
+// skip). The email is normalized to match how registration stores it.
+func loadSeedAdmin(cfg *Config) error {
+	email := strings.TrimSpace(strings.ToLower(os.Getenv("UZI_SEED_EMAIL")))
+	if email == "" {
+		return nil
+	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return fmt.Errorf("UZI_SEED_EMAIL is not a valid email address")
+	}
+	password := os.Getenv("UZI_SEED_PASSWORD")
+	if len(password) < auth.MinPasswordLen {
+		return fmt.Errorf("UZI_SEED_PASSWORD must be at least %d characters when UZI_SEED_EMAIL is set", auth.MinPasswordLen)
+	}
+	if len(password) > auth.MaxPasswordLen {
+		return fmt.Errorf("UZI_SEED_PASSWORD is too long (max %d characters)", auth.MaxPasswordLen)
+	}
+	cfg.SeedEmail = email
+	cfg.SeedPassword = password
+	cfg.SeedName = strings.TrimSpace(os.Getenv("UZI_SEED_NAME"))
+	return nil
 }
 
 // parseAllowedBaseURLs parses the comma-separated SSRF allowlist. Every entry

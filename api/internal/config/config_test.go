@@ -94,6 +94,48 @@ func TestParseAllowedBaseURLs(t *testing.T) {
 	}
 }
 
+func TestLoadSeedAdmin(t *testing.T) {
+	t.Run("off when email unset", func(t *testing.T) {
+		t.Setenv("UZI_SEED_EMAIL", "")
+		var c Config
+		if err := loadSeedAdmin(&c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedEmail != "" {
+			t.Fatalf("seeding should be off, got email %q", c.SeedEmail)
+		}
+	})
+	t.Run("invalid email errors", func(t *testing.T) {
+		t.Setenv("UZI_SEED_EMAIL", "not-an-email")
+		t.Setenv("UZI_SEED_PASSWORD", "correct-horse-battery-staple")
+		if err := loadSeedAdmin(&Config{}); err == nil {
+			t.Fatal("expected error on invalid email")
+		}
+	})
+	t.Run("short password errors (refuse boot)", func(t *testing.T) {
+		t.Setenv("UZI_SEED_EMAIL", "admin@uzi.test")
+		t.Setenv("UZI_SEED_PASSWORD", "short")
+		if err := loadSeedAdmin(&Config{}); err == nil {
+			t.Fatal("expected error on short seed password")
+		}
+	})
+	t.Run("valid seed normalizes email", func(t *testing.T) {
+		t.Setenv("UZI_SEED_EMAIL", "  Admin@Uzi.TEST ")
+		t.Setenv("UZI_SEED_PASSWORD", "correct-horse-battery-staple")
+		t.Setenv("UZI_SEED_NAME", "Root")
+		var c Config
+		if err := loadSeedAdmin(&c); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.SeedEmail != "admin@uzi.test" {
+			t.Fatalf("email not normalized: %q", c.SeedEmail)
+		}
+		if c.SeedName != "Root" {
+			t.Fatalf("name = %q", c.SeedName)
+		}
+	})
+}
+
 func TestForgeBaseURLAllowed(t *testing.T) {
 	c := Config{ForgeAllowedBaseURLs: []string{"https://gitlab.example.com"}}
 	if !c.ForgeBaseURLAllowed("https://gitlab.example.com/") {

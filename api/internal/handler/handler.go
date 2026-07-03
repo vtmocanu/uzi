@@ -69,9 +69,11 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// Routes builds the API router. The limiter is applied per-route to the
-// register and login endpoints.
-func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
+// Routes builds the API router. authLimiter is applied per-route to the
+// register and login endpoints; forgeLimiter is a per-user budget on the
+// forge-proxying endpoints (verify/projects/sync/move) so one user cannot
+// hammer the upstream forge.
+func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -80,8 +82,8 @@ func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
 		r.Get("/health", h.Health)
 
 		r.Route("/auth", func(r chi.Router) {
-			r.With(limiter.Middleware).Post("/register", h.Register)
-			r.With(limiter.Middleware).Post("/login", h.Login)
+			r.With(authLimiter.Middleware).Post("/register", h.Register)
+			r.With(authLimiter.Middleware).Post("/login", h.Login)
 
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -108,9 +110,10 @@ func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
 			r.Route("/forge/connections", func(r chi.Router) {
 				r.Post("/", h.CreateConnection)
 				r.Get("/", h.ListConnections)
-				r.Post("/{id}/verify", h.VerifyConnection)
+				// verify + projects hit the upstream forge → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/verify", h.VerifyConnection)
 				r.Delete("/{id}", h.DeleteConnection)
-				r.Get("/{id}/projects", h.ListProjects)
+				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/projects", h.ListProjects)
 			})
 
 			r.Route("/repos", func(r chi.Router) {
@@ -118,8 +121,9 @@ func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
 				r.Put("/{id}", h.SetRepoEnabled)
 				r.Get("/{id}/board", h.GetBoard)
 				r.Put("/{id}/board/columns", h.ConfigureColumns)
-				r.Post("/{id}/issues/{iid}/move", h.MoveIssue)
-				r.Post("/{id}/sync", h.SyncRepo)
+				// move + sync write/read through to the forge → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/move", h.MoveIssue)
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
 			})
 		})
 	})

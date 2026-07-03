@@ -6,13 +6,20 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
@@ -85,17 +92,31 @@ func run() error {
 	}
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout)
 
-	// Background sync engine: pulls forge changes into the issue cache for every
-	// enabled repo. Stopped when ctx is cancelled on shutdown.
-	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
-	go engine.Run(ctx)
+	// Optional startup admin seed. Runs after migrations, before serving. A
+	// failure here (e.g. DB error) aborts boot; an already-present seed user is
+	// left untouched.
+	if err := seedAdmin(ctx, q, cfg); err != nil {
+		return err
+	}
 
-	limiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
+	// Background sync engine: pulls forge changes into the issue cache for every
+	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
+	// pool is closed (a mid-tick query must not race pool.Close).
+	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
+	var pollerWG sync.WaitGroup
+	pollerWG.Add(1)
+	go func() {
+		defer pollerWG.Done()
+		engine.Run(ctx)
+	}()
+
+	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
+	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, svc)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           h.Routes(limiter),
+		Handler:           h.Routes(authLimiter, forgeLimiter),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -110,13 +131,60 @@ func run() error {
 		}
 	}()
 
+	var runErr error
 	select {
-	case err := <-errCh:
-		return err
+	case runErr = <-errCh:
 	case <-ctx.Done():
 		slog.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
 	}
+
+	// Drain the HTTP server, then stop and await the poller before returning so
+	// the deferred pool.Close() cannot race an in-flight sync query.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
+		runErr = err
+	}
+	stop() // cancel ctx so the poller's Run returns (covers the server-error path too)
+	pollerWG.Wait()
+	return runErr
+}
+
+// seedAdmin provisions the configured admin user if seeding is enabled and no
+// user with that email exists yet. It uses the exact same argon2id hashing as
+// registration and never touches an existing user's password. A concurrent
+// create (unique violation) is treated as "already exists".
+func seedAdmin(ctx context.Context, q *store.Queries, cfg config.Config) error {
+	if cfg.SeedEmail == "" {
+		return nil
+	}
+	if _, err := q.GetUserByEmail(ctx, cfg.SeedEmail); err == nil {
+		slog.Info("seed admin already present, leaving untouched", "email", cfg.SeedEmail)
+		return nil
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("seed admin lookup: %w", err)
+	}
+
+	hash, err := auth.HashPassword(cfg.SeedPassword)
+	if err != nil {
+		return fmt.Errorf("seed admin hash: %w", err)
+	}
+	name := pgtype.Text{}
+	if cfg.SeedName != "" {
+		name = pgtype.Text{String: cfg.SeedName, Valid: true}
+	}
+	if _, err := q.CreateUser(ctx, store.CreateUserParams{
+		Email:        cfg.SeedEmail,
+		PasswordHash: hash,
+		DisplayName:  name,
+		IsAdmin:      true,
+	}); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil // raced with another creator; the user now exists
+		}
+		return fmt.Errorf("seed admin create: %w", err)
+	}
+	slog.Info("seeded admin user", "email", cfg.SeedEmail)
+	return nil
 }
