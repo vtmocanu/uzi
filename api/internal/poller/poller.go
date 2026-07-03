@@ -11,6 +11,7 @@ package poller
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,9 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
+
+// defaultMaxConcurrency bounds how many repos are synced in parallel per tick.
+const defaultMaxConcurrency = 4
 
 // Engine polls all enabled repos. A single goroutine drives every repo each
 // tick, holding per-repo state (high-water-mark + poll counter) in memory. The
@@ -28,6 +32,7 @@ type Engine struct {
 	q              *store.Queries
 	interval       time.Duration
 	reconcileEvery int
+	maxConcurrency int
 
 	states map[uuid.UUID]*repoState
 }
@@ -52,8 +57,16 @@ func New(svc *forgesvc.Service, q *store.Queries, interval time.Duration, reconc
 		q:              q,
 		interval:       interval,
 		reconcileEvery: reconcileEvery,
+		maxConcurrency: defaultMaxConcurrency,
 		states:         make(map[uuid.UUID]*repoState),
 	}
+}
+
+// reconcileDue reports whether the given poll should be a full reconcile (with
+// eviction) rather than an incremental pull: the first poll after (re)enable,
+// then every reconcileEvery-th poll thereafter.
+func reconcileDue(pollCount, reconcileEvery int) bool {
+	return pollCount == 1 || pollCount%reconcileEvery == 0
 }
 
 // Run blocks until ctx is cancelled, ticking every interval. It does not run an
@@ -74,20 +87,47 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// tick syncs every enabled repo once. Errors on one repo are logged and skipped
-// so a single bad connection (revoked PAT, forge down) never stalls the others.
+// tick syncs every enabled repo once, with bounded concurrency and a hard
+// per-tick deadline so one slow forge call can neither stall the cycle nor let
+// a tick run longer than the poll interval. Errors on one repo are logged and
+// skipped so a single bad connection (revoked PAT, forge down) never stalls the
+// others.
 func (e *Engine) tick(ctx context.Context) {
-	repos, err := e.q.ListEnabledReposWithConnections(ctx)
+	// Cap the whole tick at one interval: even under bounded concurrency, a
+	// pile-up of slow forges can't run past the next scheduled tick.
+	tickCtx, cancel := context.WithTimeout(ctx, e.interval)
+	defer cancel()
+
+	repos, err := e.q.ListEnabledReposWithConnections(tickCtx)
 	if err != nil {
 		slog.Error("poller: list enabled repos", "error", err)
 		return
 	}
 
+	// Pre-create every repo's state entry in this goroutine so the workers below
+	// only ever touch their own (distinct) *repoState — no map writes race, no
+	// per-state lock needed. Ticks never overlap (the ticker loop calls tick
+	// synchronously and we wait for all workers before returning).
 	seen := make(map[uuid.UUID]struct{}, len(repos))
 	for _, r := range repos {
 		seen[r.ID] = struct{}{}
-		e.syncRepo(ctx, r)
+		if e.states[r.ID] == nil {
+			e.states[r.ID] = &repoState{}
+		}
 	}
+
+	sem := make(chan struct{}, e.maxConcurrency)
+	var wg sync.WaitGroup
+	for _, r := range repos {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r store.ListEnabledReposWithConnectionsRow, st *repoState) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			e.syncRepo(tickCtx, r, st)
+		}(r, e.states[r.ID])
+	}
+	wg.Wait()
 
 	// Drop state for repos no longer enabled so a re-enable starts fresh (full
 	// reconcile) and the map does not grow without bound.
@@ -98,23 +138,18 @@ func (e *Engine) tick(ctx context.Context) {
 	}
 }
 
-func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConnectionsRow) {
+// syncRepo runs one repo's sync using the caller-provided state (which only this
+// worker touches this tick).
+func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, st *repoState) {
 	f, err := e.svc.ForgeForConnection(r.ForgeType, r.BaseUrl, r.TokenCiphertext)
 	if err != nil {
 		slog.Error("poller: build forge client", "repo", r.PathWithNamespace, "error", err)
 		return
 	}
 
-	st := e.states[r.ID]
-	if st == nil {
-		st = &repoState{}
-		e.states[r.ID] = st
-	}
 	st.pollCount++
 
-	// First poll after (re)enable and every reconcileEvery-th poll: full
-	// reconcile with eviction. Otherwise a cheap incremental pull.
-	if st.pollCount == 1 || st.pollCount%e.reconcileEvery == 0 {
+	if reconcileDue(st.pollCount, e.reconcileEvery) {
 		maxUpdated, err := e.svc.FullSync(ctx, r.ID, r.ForgeProjectID, f)
 		if err != nil {
 			slog.Error("poller: full sync", "repo", r.PathWithNamespace, "error", err)
