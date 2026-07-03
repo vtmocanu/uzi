@@ -32,25 +32,34 @@ var DefaultColumns = []forge.Label{
 }
 
 // prdLinkRe matches a PRD reference in an issue description: a bare or
-// blob-URL-prefixed path to a prds/<file>.md. Computed at fetch time; the
-// description itself is never stored.
-var prdLinkRe = regexp.MustCompile(`(?i)(?:https?://\S+/-/blob/[^\s)]+/)?prds/[\w.-]+\.md(?:[#?][^\s)]*)?`)
+// blob-URL-prefixed path to a prds/.../<file>.md, allowing subdirectories
+// (e.g. prds/done/1-foo.md). Computed at fetch time; the description itself is
+// never stored.
+var prdLinkRe = regexp.MustCompile(`(?i)(?:https?://\S+/-/blob/[^\s)]+/)?prds/(?:[\w.-]+/)*[\w.-]+\.md(?:[#?][^\s)]*)?`)
 
 // HasPRDLink reports whether an issue description contains a PRD-file link.
 func HasPRDLink(description string) bool {
 	return prdLinkRe.MatchString(description)
 }
 
+// IssueStore is the subset of store methods the sync paths need. Narrowing to an
+// interface lets the sync logic be unit-tested against a fake store (and a
+// mocked Forge) without a live database. *store.Queries satisfies it.
+type IssueStore interface {
+	UpsertIssue(ctx context.Context, arg store.UpsertIssueParams) (store.Issue, error)
+	DeleteIssuesNotIn(ctx context.Context, arg store.DeleteIssuesNotInParams) (int64, error)
+}
+
 // Service bundles the dependencies for building forge clients and syncing.
 type Service struct {
-	q       *store.Queries
+	q       IssueStore
 	box     *secretbox.Box
 	timeout time.Duration
 }
 
 // New constructs a Service. box encrypts/decrypts stored PATs; timeout bounds
 // every forge HTTP call.
-func New(q *store.Queries, box *secretbox.Box, timeout time.Duration) *Service {
+func New(q IssueStore, box *secretbox.Box, timeout time.Duration) *Service {
 	return &Service{q: q, box: box, timeout: timeout}
 }
 
@@ -83,12 +92,17 @@ func (s *Service) ForgeForConnection(forgeType, baseURL string, tokenCiphertext 
 func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (time.Time, error) {
 	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{PRDLabel}})
 	if err != nil {
+		// Abort BEFORE any eviction: a failed/partial fetch must never be
+		// treated as an authoritative empty set, or a transient forge error
+		// would wipe the cache. Eviction only runs below, after a clean fetch.
 		return time.Time{}, err
 	}
 	maxUpdated, err := s.upsertIssues(ctx, repoID, issues)
 	if err != nil {
 		return time.Time{}, err
 	}
+	// A clean fetch that legitimately returns zero PRD issues DOES evict
+	// everything — the forge is the source of truth (empty means empty).
 	keep := make([]int64, len(issues))
 	for i, is := range issues {
 		keep[i] = is.IID

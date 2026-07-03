@@ -11,6 +11,9 @@ func TestHasPRDLink(t *testing.T) {
 		"with query prds/2-forge.md?ref=main",
 		"in parens (prds/2-forge.md)",
 		"CAPS PRDS not matched but Prds/Case.md is", // "Prds/Case.md" matches case-insensitively
+		"subdir prds/done/1-simple-webui-user-registration.md",
+		"deep subdir prds/archive/2025/old.md",
+		"blob URL to a subdir file with line anchor https://gitlab.example.com/vtmocanu/uzi/-/blob/main/prds/done/1-simple-webui-user-registration.md#L4",
 	}
 	for _, m := range match {
 		if !HasPRDLink(m) {
