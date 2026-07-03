@@ -12,6 +12,57 @@ export interface User {
   last_login: string | null;
 }
 
+export interface ForgeConnection {
+  id: string;
+  forge_type: string;
+  base_url: string;
+  bot_username: string;
+  bot_forge_user_id: number;
+  created_at: string;
+  last_verified_at: string | null;
+}
+
+export interface Repo {
+  id: string;
+  connection_id: string;
+  forge_project_id: number;
+  path_with_namespace: string;
+  web_url: string;
+  default_branch: string | null;
+  enabled: boolean;
+}
+
+export interface BoardColumn {
+  label_name: string;
+  position: number;
+}
+
+export interface Card {
+  iid: number;
+  title: string;
+  state: string;
+  labels: string[];
+  web_url: string;
+  author: string | null;
+  has_prd_link: boolean;
+  column: string;
+  closed: boolean;
+  conflict: boolean;
+}
+
+export interface Board {
+  repo_id: string;
+  path_with_namespace: string;
+  web_url: string;
+  columns: BoardColumn[];
+  cards: Card[];
+}
+
+export interface ForgeConfig {
+  allowed_base_urls: string[];
+  forge_types: string[];
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -75,4 +126,30 @@ export const api = {
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
+
+  // Forge integration.
+  forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
+  listConnections: () => request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
+  createConnection: (baseUrl: string, token: string, forgeType = "gitlab") =>
+    request<{ connection: ForgeConnection }>("POST", "/forge/connections", {
+      base_url: baseUrl,
+      token,
+      forge_type: forgeType,
+    }),
+  verifyConnection: (id: string) =>
+    request<{ connection: ForgeConnection }>("POST", `/forge/connections/${id}/verify`),
+  deleteConnection: (id: string) => request<null>("DELETE", `/forge/connections/${id}`),
+  listProjects: (connectionId: string) =>
+    request<{ repos: Repo[] }>("GET", `/forge/connections/${connectionId}/projects`),
+
+  listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),
+  setRepoEnabled: (id: string, enabled: boolean) =>
+    request<{ repo: Repo }>("PUT", `/repos/${id}`, { enabled }),
+
+  getBoard: (repoId: string) => request<{ board: Board }>("GET", `/repos/${repoId}/board`),
+  configureColumns: (repoId: string, columns: { label_name: string }[]) =>
+    request<{ board: Board }>("PUT", `/repos/${repoId}/board/columns`, { columns }),
+  moveIssue: (repoId: string, iid: number, toColumn: string) =>
+    request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/move`, { to_column: toColumn }),
+  syncRepo: (repoId: string) => request<{ board: Board }>("POST", `/repos/${repoId}/sync`),
 };

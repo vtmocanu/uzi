@@ -6,6 +6,9 @@ import { Login } from "./pages/Login";
 import { Register } from "./pages/Register";
 import { Dashboard } from "./pages/Dashboard";
 import { AdminUsers } from "./pages/AdminUsers";
+import { ForgeSettings } from "./pages/ForgeSettings";
+import { Repos } from "./pages/Repos";
+import { Board } from "./pages/Board";
 
 export default function App() {
   return (
@@ -19,6 +22,30 @@ export default function App() {
           element={
             <ProtectedRoute>
               <Dashboard />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/settings/forge"
+          element={
+            <ProtectedRoute>
+              <ForgeSettings />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/repos"
+          element={
+            <ProtectedRoute>
+              <Repos />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/repos/:id/board"
+          element={
+            <ProtectedRoute>
+              <Board />
             </ProtectedRoute>
           }
         />
