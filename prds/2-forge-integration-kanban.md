@@ -62,6 +62,8 @@ The server makes authenticated outbound HTTP to `base_url`, so it must not be fr
 
 ### Schema (goose migrations, extends PRD #1 DB)
 
+> Parallel-safety with PRD #3: this PRD's goose versions are reserved to `00002`–`00009` (PRD #3 starts at `00010`) — duplicate versions from parallel branches merge without git conflict but fail at `goose up`. Shared frontend shell files (sidebar nav, Settings layout, route table) are expected merge points; keep those edits in dedicated commits.
+
 ```sql
 forge_connections (
   id uuid PK default gen_random_uuid(),
@@ -122,11 +124,11 @@ issues (                                   -- cache of forge truth, never author
 ### Sync engine
 
 - **Forge is the source of truth.** uzi's `issues` table is a cache; no uzi-only board state beyond column config.
-- **Incremental pull**: per enabled repo, poll `ListIssues(labels=PRD, state=all, updated_after=HWM)` on `FORGE_POLL_INTERVAL` (default `60s`). High-water-mark = max `updated_at` **returned by the forge** (never client clock — skew would drop updates); GitLab's `updated_after` is inclusive at second granularity, so boundary rows are re-fetched and deduped by upsert. Assumption to verify in M1: a label change bumps GitLab's issue `updated_at`; if not, incremental polling degrades and the reconcile interval becomes the real freshness floor.
+- **Incremental pull**: per enabled repo, poll `ListIssues(labels=PRD, state=all, updated_after=HWM)` on `FORGE_POLL_INTERVAL` (default `60s`). High-water-mark = max `updated_at` **returned by the forge** (never client clock — skew would drop updates); GitLab's `updated_after` is inclusive at second granularity, so boundary rows are re-fetched and deduped by upsert. **Verified 2026-07-03 against gitlab.example.com (bot PAT, live test on vtmocanu/uzi#1): label *add* bumps `updated_at`; label *remove alone* does NOT.** Consequence: every column-to-column move is caught incrementally (GitLab board drags remove+add in one update, and uzi moves always add the target label), but GitLab-side remove-only transitions (drag to Open/backlog, de-labeling) do not bump `updated_at` and are caught only by the reconcile tier.
 - **Full reconcile** (every `FORGE_RECONCILE_EVERY` polls, default 10): fetch the complete PRD-labeled set (`state=all`, no `updated_after`), diff against cached IIDs, upsert everything, **evict cache rows absent from the fresh set** — this is the only way to observe de-labeling and deletion, which the incremental filter structurally cannot return. Manual Refresh triggers the same full sync.
 - **Push**: card moves apply the label change via the API **first**; on success, update the cache; on failure, the card snaps back with the API error. No optimistic divergence.
 - **Conflicts**: last-writer-wins at the forge (its native semantics). If a poll shows the forge changed an issue uzi displays, forge state replaces cache (persisted-truth-over-event-claim, multica's lesson).
-- **Freshness contract**: content edits and column-label changes appear within one poll interval; de-labeling, close/reopen visibility gaps, and deletions are caught within one reconcile interval.
+- **Freshness contract**: content edits and label-*adding* changes (all column-to-column moves) appear within one poll interval; remove-only transitions (GitLab-side drag to Open, de-labeling), close/reopen visibility gaps, and deletions are caught within one reconcile interval.
 - **Repo disable** stops its poller and hides the board; cache rows are retained (purged only when the connection is deleted, via FK cascade).
 - **Webhooks** (deferred): the laptop compose stack is not reachable from gitlab.example.com. Design keeps a seam: the sync engine consumes a `ChangeSource` (poller now; webhook receiver later authenticated via GitLab's HMAC-SHA256 signing token — preferred — or legacy `X-Gitlab-Token` compared in constant time).
 
@@ -168,9 +170,7 @@ All repo/board endpoints authorize through the owning connection's `user_id` (bo
 
 ## Milestones
 
-- [ ] **M1 — Forge abstraction + connection management**: `Forge` interface + GitLab driver (official client v2, wrapper with timeouts/429/pagination/redaction); AES-256-GCM token encryption + `UZI_SECRET_KEY` boot guard; `FORGE_ALLOWED_BASE_URLS` SSRF guard; connections API + Settings UI (connect/verify/rotate/delete). Verify the label-change-bumps-`updated_at` assumption against gitlab.example.com and record the result in this PRD.
-
-  > **M1 verification finding (2026-07-03, coder):** Not verified against a live forge — no bot PAT was available, and a label change requires write access to bump `updated_at`. From the official [Issues API docs](https://docs.gitlab.com/api/issues/): `updated_after` is documented as "Return issues updated **on or after** the given time" (ISO 8601), which confirms the inclusive-boundary assumption the incremental poller relies on (boundary rows are re-fetched and deduped by upsert). The docs do **not** explicitly state that adding/removing a label bumps `updated_at`. Label writes go through the issue-update endpoint (`add_labels`/`remove_labels` on `PUT /issues/:iid`), which returns a fresh `updated_at`, so the assumption is very likely to hold for API-driven moves (uzi's own path); it is less certain for board/quick-action edits made in the GitLab UI. Either way the design does not depend on it: the periodic **full reconcile with eviction** (`FORGE_RECONCILE_EVERY`) is the guaranteed freshness floor and observes de-labeling/deletion that the incremental filter structurally cannot. Recommend the live check (uzi move → poll interval) be run in M5 once a bot PAT is supplied.
+- [ ] **M1 — Forge abstraction + connection management**: `Forge` interface + GitLab driver (official client v2, wrapper with timeouts/429/pagination/redaction); AES-256-GCM token encryption + `UZI_SECRET_KEY` boot guard; `FORGE_ALLOWED_BASE_URLS` SSRF guard; connections API + Settings UI (connect/verify/rotate/delete). ~~Verify the label-change-bumps-`updated_at` assumption~~ **Done 2026-07-03, pre-implementation**: add bumps, remove-only does not — see Sync engine section.
 - [ ] **M2 — Repo discovery + selection**: membership listing with `repos` upsert, enable/disable API + Repos page + sidebar picker; per-user authz on every repo path.
 - [ ] **M3 — PRD issue import**: issue cache schema, PRD-label fetch (`state=all`), PRD-link sanity check, list view with badges.
 - [ ] **M4 — Kanban board**: column config (default set seeded on forge), board API + drag-drop UI, single-column-label enforcement (incl. move-to-Open), move-writes-through-to-forge with snap-back on failure, manual `POST …/sync` + Refresh button (reuses M3 import as a full sync).
