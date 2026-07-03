@@ -26,6 +26,7 @@ import (
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -96,6 +97,14 @@ func run() error {
 	// failure here (e.g. DB error) aborts boot; an already-present seed user is
 	// left untouched.
 	if err := seedAdmin(ctx, q, cfg); err != nil {
+		return err
+	}
+	// Optional startup forge-connection seed for the seed admin. Runs after the
+	// admin seed (whose user it belongs to) and before the poller starts (so a
+	// seeded repo is picked up on the first tick). A forge outage here is
+	// non-fatal — it logs and skips, retrying on the next boot — but a DB error
+	// aborts boot, same as the admin seed.
+	if err := seed.ForgeConnection(ctx, q, svc, cfg); err != nil {
 		return err
 	}
 

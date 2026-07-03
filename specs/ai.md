@@ -412,6 +412,38 @@ never overwrite an existing user".
 - **23505-tolerant**: a duplicate-key on insert is treated as "already seeded"
   (replica-safe against a concurrent create).
 
+### Forge-connection seed (extends the admin seed)
+
+- `UZI_SEED_FORGE_PAT` / `UZI_SEED_FORGE_BASE_URL` / `UZI_SEED_FORGE_REPOS`
+  optionally seed a forge connection **belonging to the seed admin** and enable a
+  set of repos, so the whole demo (admin + bot connection + tracked repos)
+  survives a DB wipe from env alone. Lives in `api/internal/seed` (narrow `Store`
+  + `ForgeService` interfaces for unit-testing against a mocked `Forge`, mirroring
+  `forgesvc.IssueStore`); `main.go` calls it after the admin seed and before the
+  poller starts. Empty `UZI_SEED_FORGE_PAT` disables it.
+- **Reuses the connect flow's primitives** (`svc.ForgeForToken` → `VerifyToken` →
+  `svc.EncryptToken` → `q.UpsertForgeConnection`, then `q.UpsertRepo` /
+  `q.SetRepoEnabledForUser`) rather than duplicating the handler — same encryption
+  path, same verified-identity capture.
+- **Create-only, never re-verify**: if the seed admin already has a connection for
+  `(gitlab, base_url)`, do nothing at all (no overwrite, no re-verify) — consistent
+  with never-touch-existing-user.
+- **Static config is boot-fatal** (`config.loadSeedForge`): `UZI_SEED_FORGE_PAT`
+  set without `UZI_SEED_EMAIL`, or a base URL outside `FORGE_ALLOWED_BASE_URLS`,
+  refuses to start. `UZI_SEED_FORGE_BASE_URL` defaults to the first allowlisted
+  entry and is stored normalized (matches a connection's `base_url`).
+- **Runtime forge failure is NON-fatal** (deliberately unlike the static guards): a
+  network error / 401 at seed time logs and skips, and boot continues — the forge
+  being down must not kill the stack; the seed retries next boot. Both forge calls
+  (verify + list-projects) run **before any write**, so a mid-seed forge failure
+  leaves no half-created connection the create-only guard would then strand.
+- **Repo enable + warning**: every visible project is upserted as a repo
+  (`enabled=false`, like the ListProjects handler); those whose
+  `path_with_namespace` is in `UZI_SEED_FORGE_REPOS` are enabled. A requested repo
+  the bot can't see is logged as a **warning** and skipped, not fatal.
+- **PAT never logged** (the driver already redacts; the seed logs only the bot
+  username / base URL / counts).
+
 ## 25. Forge configuration (env, extends §13)
 
 | Var | Default | Notes |
@@ -425,10 +457,15 @@ never overwrite an existing user".
 | `UZI_SEED_EMAIL` | — (optional) | set to seed an admin at startup; disables seeding when empty |
 | `UZI_SEED_PASSWORD` | — (required if seed email set) | 12–1024 chars or boot fails |
 | `UZI_SEED_NAME` | — (optional) | display name for the seeded admin |
+| `UZI_SEED_FORGE_PAT` | — (optional) | set to seed a forge connection (owned by the seed admin) at startup; requires `UZI_SEED_EMAIL` or boot fails |
+| `UZI_SEED_FORGE_BASE_URL` | first `FORGE_ALLOWED_BASE_URLS` entry | forge base URL for the seeded connection; must be allowlisted |
+| `UZI_SEED_FORGE_REPOS` | — (optional) | comma-separated `path_with_namespace` list to enable; unseen repos warn, not fatal |
 
 Invalid numeric/duration forge vars fall back to defaults (same as §13); only
-`UZI_SECRET_KEY`, a malformed `FORGE_ALLOWED_BASE_URLS`, and an invalid seed refuse
-to start.
+`UZI_SECRET_KEY`, a malformed `FORGE_ALLOWED_BASE_URLS`, and an invalid seed
+(admin or forge: bad email/password, PAT without email, non-allowlisted forge
+base URL) refuse to start. A forge outage during the forge-connection seed is
+non-fatal (see §24).
 
 ## 26. API surface (forge; all authenticated, PRD #1 session/CSRF)
 

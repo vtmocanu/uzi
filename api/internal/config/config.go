@@ -64,6 +64,14 @@ type Config struct {
 	SeedEmail    string
 	SeedPassword string
 	SeedName     string
+	// SeedForgePAT/SeedForgeBaseURL/SeedForgeRepos optionally seed a forge
+	// connection (belonging to the seed admin) and enable a set of repos at
+	// startup. Empty SeedForgePAT disables it. Requires SeedEmail; the base URL
+	// must be allowlisted. Validated at boot (see loadSeedForge). SeedForgeBaseURL
+	// is stored normalized to match how a connection's base_url is stored.
+	SeedForgePAT     string
+	SeedForgeBaseURL string
+	SeedForgeRepos   []string
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -133,6 +141,11 @@ func Load() (Config, error) {
 	if err := loadSeedAdmin(&cfg); err != nil {
 		return Config{}, err
 	}
+	// Must run after loadSeedAdmin (needs SeedEmail) and after the allowlist is
+	// set (needs it for the default base URL and the allowlist check).
+	if err := loadSeedForge(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
@@ -163,6 +176,58 @@ func loadSeedAdmin(cfg *Config) error {
 	cfg.SeedPassword = password
 	cfg.SeedName = strings.TrimSpace(os.Getenv("UZI_SEED_NAME"))
 	return nil
+}
+
+// loadSeedForge reads and validates the optional startup forge-connection seed.
+// It is off unless UZI_SEED_FORGE_PAT is set; when set it requires the admin
+// seed (the connection belongs to that user) and a base URL that is in the
+// FORGE_ALLOWED_BASE_URLS allowlist, or boot fails — a set-but-invalid seed is a
+// loud misconfiguration, consistent with the other static boot guards.
+// UZI_SEED_FORGE_BASE_URL defaults to the first allowlisted entry and is stored
+// normalized so it matches how a connection's base_url is stored. Runtime forge
+// failures at seed time are handled non-fatally by the seeder, not here.
+func loadSeedForge(cfg *Config) error {
+	pat := strings.TrimSpace(os.Getenv("UZI_SEED_FORGE_PAT"))
+	if pat == "" {
+		return nil
+	}
+	if cfg.SeedEmail == "" {
+		return fmt.Errorf("UZI_SEED_FORGE_PAT is set but UZI_SEED_EMAIL is not; the seeded forge connection must belong to the seed admin")
+	}
+	baseURL := strings.TrimSpace(os.Getenv("UZI_SEED_FORGE_BASE_URL"))
+	if baseURL == "" {
+		baseURL = cfg.ForgeAllowedBaseURLs[0] // already normalized; default to the first allowlisted forge
+	}
+	if !cfg.ForgeBaseURLAllowed(baseURL) {
+		return fmt.Errorf("UZI_SEED_FORGE_BASE_URL %q is not in FORGE_ALLOWED_BASE_URLS", baseURL)
+	}
+	norm, err := NormalizeForgeBaseURL(baseURL)
+	if err != nil {
+		return fmt.Errorf("UZI_SEED_FORGE_BASE_URL: %w", err)
+	}
+	cfg.SeedForgePAT = pat
+	cfg.SeedForgeBaseURL = norm
+	cfg.SeedForgeRepos = parseCommaList(os.Getenv("UZI_SEED_FORGE_REPOS"))
+	return nil
+}
+
+// parseCommaList splits a comma-separated env value into trimmed, non-empty,
+// de-duplicated entries, preserving first-seen order.
+func parseCommaList(raw string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, dup := seen[part]; dup {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return out
 }
 
 // parseAllowedBaseURLs parses the comma-separated SSRF allowlist. Every entry

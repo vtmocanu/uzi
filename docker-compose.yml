@@ -51,6 +51,13 @@ services:
       UZI_SEED_EMAIL: ${UZI_SEED_EMAIL:-}
       UZI_SEED_PASSWORD: ${UZI_SEED_PASSWORD:-}
       UZI_SEED_NAME: ${UZI_SEED_NAME:-}
+      # Optional startup forge-connection seed (belongs to the admin above).
+      # Unset UZI_SEED_FORGE_PAT => no forge seeding. A forge outage at seed time
+      # is non-fatal (logged and skipped); a bad static config (PAT without email,
+      # non-allowlisted base URL) refuses to boot.
+      UZI_SEED_FORGE_PAT: ${UZI_SEED_FORGE_PAT:-}
+      UZI_SEED_FORGE_BASE_URL: ${UZI_SEED_FORGE_BASE_URL:-}
+      UZI_SEED_FORGE_REPOS: ${UZI_SEED_FORGE_REPOS:-}
       # Trust the nginx hop (the compose network is private RFC1918) so the
       # real client IP is read from the XFF nginx sets. A direct hit that
       # bypasses nginx from a non-trusted source has its XFF ignored.
