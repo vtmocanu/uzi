@@ -99,6 +99,24 @@ func (h *Handler) Routes(limiter *mw.Limiter) http.Handler {
 			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
 		})
 
+		// Agent templates: all authenticated users can read and preview; only
+		// admins can create, edit, delete, or reset (closes bottega's hole
+		// where any user rewrites the shared prompts everyone's agents run).
+		r.Route("/agent-templates", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListAgentTemplates)
+			r.Get("/{id}", h.GetAgentTemplate)
+			r.Get("/{id}/rendered", h.GetRenderedAgentTemplate)
+
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAdmin)
+				r.Post("/", h.CreateAgentTemplate)
+				r.Put("/{id}", h.UpdateAgentTemplate)
+				r.Delete("/{id}", h.DeleteAgentTemplate)
+				r.Post("/{id}/reset", h.ResetAgentTemplate)
+			})
+		})
+
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Use(mw.RequireAdmin)

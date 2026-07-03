@@ -9,6 +9,19 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AgentTemplate struct {
+	ID          uuid.UUID          `json:"id"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	Model       pgtype.Text        `json:"model"`
+	Tools       []byte             `json:"tools"`
+	PromptBody  string             `json:"prompt_body"`
+	IsBuiltin   bool               `json:"is_builtin"`
+	UpdatedBy   pgtype.UUID        `json:"updated_by"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
 type User struct {
 	ID           uuid.UUID          `json:"id"`
 	Email        string             `json:"email"`

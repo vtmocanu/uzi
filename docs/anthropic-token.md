@@ -31,7 +31,9 @@ kind is accepted.
 
 3. The command opens your browser to sign in to your Claude subscription and
    authorize a long-lived token, then prints the token to the terminal.
-4. Copy the printed token.
+4. Copy the printed token. Because the token is long-lived and printed to the
+   terminal, treat your terminal scrollback and shell history as sensitive
+   afterward (clear them if they persist the token).
 
 `claude setup-token` requires a Claude subscription login. If you do not have a
 subscription, use a Console API key instead (Option B).

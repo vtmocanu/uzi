@@ -77,6 +77,12 @@ func run() error {
 
 	q := store.New(pool)
 
+	// Seed/refresh the builtin agent templates. Idempotent and edit-preserving:
+	// missing builtins are inserted, existing rows are left untouched.
+	if err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
+		return err
+	}
+
 	box, err := secretbox.New(cfg.SecretKey)
 	if err != nil {
 		return err
