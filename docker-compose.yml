@@ -81,5 +81,27 @@ services:
       api:
         condition: service_healthy
 
+  # Per-user worker (PRD #4). Opt-in via `docker compose --profile agent up`, so
+  # the base stack (db/api/web) runs without it. Outbound-only: no published
+  # ports; it reaches the api over the compose network with a join token. The
+  # bare-clone cache + worktrees live on a persistent volume.
+  agent:
+    build: ./agent
+    profiles: ["agent"]
+    environment:
+      UZI_API_URL: ${UZI_API_URL:-http://api:8080}
+      UZI_WORKER_TOKEN: "${UZI_WORKER_TOKEN:?set UZI_WORKER_TOKEN in .env - generate one from Settings > Workers}"
+      UZI_DATA_DIR: /data
+      UZI_WORKER_NAME: ${UZI_WORKER_NAME:-}
+      WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-15s}
+      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-3s}
+      UZI_LOG_LEVEL: ${UZI_LOG_LEVEL:-info}
+    volumes:
+      - agentdata:/data
+    depends_on:
+      api:
+        condition: service_healthy
+
 volumes:
   pgdata:
+  agentdata:
