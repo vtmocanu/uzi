@@ -1,4 +1,8 @@
-name: uzi
+# No hardcoded `name:`. Compose derives the project name from the directory, so
+# each git worktree gets its own isolated stack + pgdata volume. (A pinned
+# `name: uzi` made every worktree share containers and the pgdata volume with
+# the main `uzi` checkout, so a `down -v` in one wiped another's data.) The main
+# checkout dir is `uzi`, so its volume name stays `uzi_pgdata`.
 
 # Local laptop demo. Every published port is bound to 127.0.0.1 so nothing is
 # exposed on the network (copied from multica's loopback binding).
@@ -38,6 +42,15 @@ services:
       FORGE_POLL_INTERVAL: ${FORGE_POLL_INTERVAL:-60s}
       FORGE_RECONCILE_EVERY: ${FORGE_RECONCILE_EVERY:-10}
       FORGE_HTTP_TIMEOUT: ${FORGE_HTTP_TIMEOUT:-15s}
+      # Per-user budget on the forge-proxying endpoints (verify/projects/sync/move).
+      FORGE_RATE_LIMIT_MAX: ${FORGE_RATE_LIMIT_MAX:-30}
+      FORGE_RATE_LIMIT_WINDOW: ${FORGE_RATE_LIMIT_WINDOW:-1m}
+      # Optional startup admin seed. Unset => no seeding. If set, the API creates
+      # this admin after migrations (only if absent) and refuses to boot on an
+      # invalid seed password.
+      UZI_SEED_EMAIL: ${UZI_SEED_EMAIL:-}
+      UZI_SEED_PASSWORD: ${UZI_SEED_PASSWORD:-}
+      UZI_SEED_NAME: ${UZI_SEED_NAME:-}
       # Trust the nginx hop (the compose network is private RFC1918) so the
       # real client IP is read from the XFF nginx sets. A direct hit that
       # bypasses nginx from a non-trusted source has its XFF ignored.
