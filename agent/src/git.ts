@@ -213,18 +213,25 @@ function withDir(cwd: string | undefined, args: string[]): string[] {
  * git subprocess env. safe.directory=* trusts the daemon-managed dirs
  * (ownership check adds nothing here and breaks when the container UID differs
  * from the volume owner); GIT_TERMINAL_PROMPT=0 turns auth failures into clear
- * errors instead of a hang. When a PAT is supplied it is injected as an
- * http.extraHeader via env-scoped config — off the argv, never on disk.
+ * errors instead of a hang.
+ *
+ * When a PAT is supplied it is injected as an http.extraHeader via env-scoped
+ * config (GIT_CONFIG_KEY/VALUE), NOT via `git -c`. This is deliberate and
+ * load-bearing: `git -c value` lands on git's argv, where the PAT is readable in
+ * the container's process table (`ps`, /proc/<pid>/cmdline) during every network
+ * op — and in M3 an agent subprocess may be alive during the worker's push. The
+ * env path keeps it off argv (env is 0600 per /proc/<pid>/environ), off on-disk
+ * config, and out of logs (runGit logs args only). Exported for the secret-flow
+ * test. Supported since git 2.31.
  */
-function gitEnv(pat?: string): NodeJS.ProcessEnv {
+export function gitEnv(pat?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
   const pairs: Array<[string, string]> = [["safe.directory", "*"]];
   if (pat) {
-    // AMBIGUITY (flagged in report): GitLab accepts `Authorization: Bearer
-    // <PAT>` for git-over-HTTPS; the exact header is unverified against a live
-    // GitLab until M4 wires real clones. M2 tests use local fixture repos, which
-    // ignore the header entirely.
-    pairs.push(["http.extraHeader", `Authorization: Bearer ${pat}`]);
+    // GitLab reads PRIVATE-TOKEN for authenticated requests (auditor decision).
+    // M2 tests use local fixture repos, which ignore the header entirely; its
+    // efficacy against a live GitLab is validated when M4 wires real clones.
+    pairs.push(["http.extraHeader", `PRIVATE-TOKEN: ${pat}`]);
   }
   let count = Number(env.GIT_CONFIG_COUNT ?? "0") || 0;
   for (const [k, v] of pairs) {

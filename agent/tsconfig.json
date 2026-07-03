@@ -1,8 +1,8 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "lib": ["ES2023"],
     "types": ["node"],
     "strict": true,
@@ -20,6 +20,6 @@
     "noUncheckedIndexedAccess": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "test", "vitest.config.ts"],
+  "include": ["src", "test"],
   "exclude": ["node_modules"]
 }

@@ -22,14 +22,14 @@ Agent SDK executor, guardrails, plan gate, and MR push land in M3/M4.
 | `src/runner.ts` | Per-run state machine |
 | `src/worker.ts` | Register + heartbeat + claim-poll loops |
 | `src/main.ts` | Entry point |
-| `test/` | Vitest suites against an in-process fake API + on-disk fixture repos |
+| `test/` | `node:test` suites against an in-process fake API + on-disk fixture repos |
 
 ## Develop
 
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # vitest run
+npm test            # node --test via the tsx loader (no extra test deps)
 npm start           # tsx src/main.ts  (needs the env vars below)
 ```
 

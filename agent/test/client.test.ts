@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
 import { FakeApi } from "./fake-api.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { WorkerClient, RequestError, isTransient } from "../src/client.js";
@@ -29,20 +30,20 @@ afterEach(async () => {
 describe("register / heartbeat / claim", () => {
   it("registers with name + version and Bearer auth", async () => {
     const res = await newClient().register("vlad-laptop");
-    expect(res.worker_id).toBeTruthy();
-    expect(api.registers).toEqual([{ name: "vlad-laptop", version: "0.1.0-test", authorized: true }]);
-    expect(api.unauthorized).toBe(0);
+    assert.ok(res.worker_id);
+    assert.deepStrictEqual(api.registers, [{ name: "vlad-laptop", version: "0.1.0-test", authorized: true }]);
+    assert.strictEqual(api.unauthorized, 0);
   });
 
   it("rejects a wrong token with 401", async () => {
     const bad = new WorkerClient(baseUrl, "nope", "0.1.0-test", nullLogger());
-    await expect(bad.heartbeat()).rejects.toBeInstanceOf(RequestError);
-    expect(api.unauthorized).toBe(1);
+    await assert.rejects(bad.heartbeat(), RequestError);
+    assert.strictEqual(api.unauthorized, 1);
   });
 
   it("heartbeats", async () => {
     await newClient().heartbeat();
-    expect(api.heartbeats).toBe(1);
+    assert.strictEqual(api.heartbeats, 1);
   });
 
   it("returns the claim on 200 and null on 204", async () => {
@@ -51,11 +52,11 @@ describe("register / heartbeat / claim", () => {
     const client = newClient();
 
     const got = await client.claimRun();
-    expect(got?.run_id).toBe(claim.run_id);
-    expect(got?.issue_iid).toBe(42);
-    expect(got?.secrets.forge_pat).toBe(claim.secrets.forge_pat);
+    assert.strictEqual(got?.run_id, claim.run_id);
+    assert.strictEqual(got?.issue_iid, 42);
+    assert.strictEqual(got?.secrets.forge_pat, claim.secrets.forge_pat);
 
-    expect(await client.claimRun()).toBeNull();
+    assert.strictEqual(await client.claimRun(), null);
   });
 });
 
@@ -63,8 +64,8 @@ describe("reportState", () => {
   it("posts a non-terminal state once", async () => {
     const client = newClient();
     await client.reportState("run-1", { status: "running" });
-    expect(api.states).toEqual([{ runId: "run-1", body: { status: "running" } }]);
-    expect(api.stateAttempts).toBe(1);
+    assert.deepStrictEqual(api.states, [{ runId: "run-1", body: { status: "running" } }]);
+    assert.strictEqual(api.stateAttempts, 1);
   });
 
   it("retries a terminal report through transient failures", async () => {
@@ -72,24 +73,24 @@ describe("reportState", () => {
     const client = newClient();
     await client.reportState("run-1", { status: "completed", branch: "agent/issue-1" });
     // 2 injected failures + 1 success.
-    expect(api.stateAttempts).toBe(3);
-    expect(api.states).toEqual([{ runId: "run-1", body: { status: "completed", branch: "agent/issue-1" } }]);
+    assert.strictEqual(api.stateAttempts, 3);
+    assert.deepStrictEqual(api.states, [{ runId: "run-1", body: { status: "completed", branch: "agent/issue-1" } }]);
   });
 
   it("treats an already-terminal (409) terminal report as success", async () => {
     api.markAlreadyTerminal("run-1");
     const client = newClient();
-    await expect(client.reportState("run-1", { status: "failed", failure_reason: "boom" })).resolves.toBeUndefined();
     // The server rejected it as already-terminal, so nothing was recorded, yet
     // the client did not surface an error.
-    expect(api.states).toHaveLength(0);
+    assert.strictEqual(await client.reportState("run-1", { status: "failed", failure_reason: "boom" }), undefined);
+    assert.strictEqual(api.states.length, 0);
   });
 
   it("gives up on a permanent 4xx for a terminal report", async () => {
     api.failStateNext(1, 400);
     const client = newClient();
-    await expect(client.reportState("run-1", { status: "completed", branch: "b" })).rejects.toBeInstanceOf(RequestError);
-    expect(api.stateAttempts).toBe(1); // no retry on a permanent error
+    await assert.rejects(client.reportState("run-1", { status: "completed", branch: "b" }), RequestError);
+    assert.strictEqual(api.stateAttempts, 1); // no retry on a permanent error
   });
 });
 
@@ -109,7 +110,7 @@ describe("MessageBatcher seq numbering", () => {
     await batcher.close();
 
     const seqs = api.messages(runId).map((m) => m.seq);
-    expect(seqs).toEqual([6, 7, 8, 9, 10]);
+    assert.deepStrictEqual(seqs, [6, 7, 8, 9, 10]);
   });
 
   it("re-sends a failed batch on the next flush, preserving order and gaps", async () => {
@@ -120,23 +121,23 @@ describe("MessageBatcher seq numbering", () => {
 
     batcher.emit({ kind: "text", payload: { i: 1 } });
     await batcher.flush(); // fails; seq 1 is put back at the head of the buffer
-    expect(api.messages(runId)).toHaveLength(0);
+    assert.strictEqual(api.messages(runId).length, 0);
 
     batcher.emit({ kind: "text", payload: { i: 2 } });
     await batcher.close(); // succeeds; delivers [1, 2] in order
 
-    expect(api.messages(runId).map((m) => m.seq)).toEqual([1, 2]);
+    assert.deepStrictEqual(api.messages(runId).map((m) => m.seq), [1, 2]);
   });
 });
 
 describe("isTransient", () => {
   it("classifies retryable vs permanent", () => {
-    expect(isTransient(new RequestError("POST", "/x", 500, ""))).toBe(true);
-    expect(isTransient(new RequestError("POST", "/x", 503, ""))).toBe(true);
-    expect(isTransient(new RequestError("POST", "/x", 429, ""))).toBe(true);
-    expect(isTransient(new RequestError("POST", "/x", 408, ""))).toBe(true);
-    expect(isTransient(new RequestError("POST", "/x", 400, ""))).toBe(false);
-    expect(isTransient(new RequestError("POST", "/x", 404, ""))).toBe(false);
-    expect(isTransient(new Error("network down"))).toBe(true);
+    assert.strictEqual(isTransient(new RequestError("POST", "/x", 500, "")), true);
+    assert.strictEqual(isTransient(new RequestError("POST", "/x", 503, "")), true);
+    assert.strictEqual(isTransient(new RequestError("POST", "/x", 429, "")), true);
+    assert.strictEqual(isTransient(new RequestError("POST", "/x", 408, "")), true);
+    assert.strictEqual(isTransient(new RequestError("POST", "/x", 400, "")), false);
+    assert.strictEqual(isTransient(new RequestError("POST", "/x", 404, "")), false);
+    assert.strictEqual(isTransient(new Error("network down")), true);
   });
 });

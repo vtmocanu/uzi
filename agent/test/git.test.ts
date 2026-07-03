@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -25,28 +26,28 @@ function gitIn(dir: string, args: string[]): string {
 
 describe("bareDirName", () => {
   it("maps repo URLs to collision-free directory names", () => {
-    expect(bareDirName("https://gitlab.com/org/repo.git")).toBe("gitlab.com+org+repo.git");
-    expect(bareDirName("https://gitlab.com/org/repo")).toBe("gitlab.com+org+repo.git");
-    expect(bareDirName("git@gitlab.com:org/repo.git")).toBe("gitlab.com+org+repo.git");
-    expect(bareDirName("ssh://git@gitlab.com:22/org/repo.git")).toBe("gitlab.com%3A22+org+repo.git");
+    assert.strictEqual(bareDirName("https://gitlab.com/org/repo.git"), "gitlab.com+org+repo.git");
+    assert.strictEqual(bareDirName("https://gitlab.com/org/repo"), "gitlab.com+org+repo.git");
+    assert.strictEqual(bareDirName("git@gitlab.com:org/repo.git"), "gitlab.com+org+repo.git");
+    assert.strictEqual(bareDirName("ssh://git@gitlab.com:22/org/repo.git"), "gitlab.com%3A22+org+repo.git");
   });
 });
 
 describe("ensureClone", () => {
   it("clones bare on first call and fetches on the second", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    expect(fs.existsSync(path.join(bare, "HEAD"))).toBe(true);
+    assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true);
     // Second call refreshes the existing cache and returns the same path.
     const bareAgain = await git.ensureClone(fx.originPath);
-    expect(bareAgain).toBe(bare);
+    assert.strictEqual(bareAgain, bare);
   });
 
   it("never writes the PAT to the bare repo config", async () => {
     const secret = "super-secret-pat-value-999";
     const bare = await git.ensureClone(fx.originPath, secret);
     const cfg = fs.readFileSync(path.join(bare, "config"), "utf8");
-    expect(cfg).not.toContain(secret);
-    expect(cfg).not.toContain("extraHeader");
+    assert.ok(!cfg.includes(secret));
+    assert.ok(!cfg.includes("extraHeader"));
   });
 });
 
@@ -55,11 +56,11 @@ describe("worktree lifecycle", () => {
     const bare = await git.ensureClone(fx.originPath);
     const wt = await git.createOrAttachWorktree(bare, 42);
 
-    expect(wt.branch).toBe("agent/issue-42");
-    expect(fs.existsSync(path.join(wt.path, "README.md"))).toBe(true); // origin content checked out
+    assert.strictEqual(wt.branch, "agent/issue-42");
+    assert.strictEqual(fs.existsSync(path.join(wt.path, "README.md")), true); // origin content checked out
     // A worktree's .git is a file pointing at the shared repo, not a directory.
-    expect(fs.statSync(path.join(wt.path, ".git")).isFile()).toBe(true);
-    expect(gitIn(bare, ["rev-parse", "--verify", "refs/heads/agent/issue-42"])).toMatch(/^[0-9a-f]{40}$/);
+    assert.strictEqual(fs.statSync(path.join(wt.path, ".git")).isFile(), true);
+    assert.match(gitIn(bare, ["rev-parse", "--verify", "refs/heads/agent/issue-42"]), /^[0-9a-f]{40}$/);
   });
 
   it("attaches to an existing agent/issue-N branch on a later run", async () => {
@@ -75,11 +76,11 @@ describe("worktree lifecycle", () => {
     await git.removeWorktree(bare, first.path);
     const second = await git.createOrAttachWorktree(bare, 7);
 
-    expect(second.branch).toBe("agent/issue-7");
-    expect(second.path).toBe(first.path);
+    assert.strictEqual(second.branch, "agent/issue-7");
+    assert.strictEqual(second.path, first.path);
     // Attached to the advanced branch (has EXTRA.txt), not recreated off default.
-    expect(fs.existsSync(path.join(second.path, "EXTRA.txt"))).toBe(true);
-    expect(gitIn(bare, ["rev-parse", "refs/heads/agent/issue-7"])).toBe(advancedSha);
+    assert.strictEqual(fs.existsSync(path.join(second.path, "EXTRA.txt")), true);
+    assert.strictEqual(gitIn(bare, ["rev-parse", "refs/heads/agent/issue-7"]), advancedSha);
   });
 
   it("removes the worktree but keeps the bare clone and branch", async () => {
@@ -88,8 +89,8 @@ describe("worktree lifecycle", () => {
 
     await git.removeWorktree(bare, wt.path);
 
-    expect(fs.existsSync(wt.path)).toBe(false);
-    expect(fs.existsSync(path.join(bare, "HEAD"))).toBe(true);
-    expect(gitIn(bare, ["rev-parse", "--verify", "refs/heads/agent/issue-5"])).toMatch(/^[0-9a-f]{40}$/);
+    assert.strictEqual(fs.existsSync(wt.path), false);
+    assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true);
+    assert.match(gitIn(bare, ["rev-parse", "--verify", "refs/heads/agent/issue-5"]), /^[0-9a-f]{40}$/);
   });
 });

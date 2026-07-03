@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -46,24 +47,24 @@ describe("RunRunner", () => {
 
     // State machine: exactly running then completed on agent/issue-7.
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    expect(statuses).toEqual(["running", "completed"]);
-    expect(api.states.find((s) => s.body.status === "completed")?.body.branch).toBe("agent/issue-7");
+    assert.deepStrictEqual(statuses, ["running", "completed"]);
+    assert.strictEqual(api.states.find((s) => s.body.status === "completed")?.body.branch, "agent/issue-7");
 
     // Messages are gapless starting at last_seq + 1.
     const seqs = api.messages(claim.run_id).map((m) => m.seq);
-    expect(seqs.length).toBeGreaterThan(0);
-    expect(seqs).toEqual(seqs.map((_, i) => i + 1));
+    assert.ok(seqs.length > 0);
+    assert.deepStrictEqual(seqs, seqs.map((_, i) => i + 1));
 
     // The stub's commit landed on the branch in the shared bare store.
     const bare = git.barePathFor(fx.originPath);
     const log = execFileSync("git", ["-C", bare, "log", "--oneline", "agent/issue-7"], { encoding: "utf8" });
-    expect(log).toContain("uzi stub: work on issue #7");
+    assert.ok(log.includes("uzi stub: work on issue #7"));
     const files = execFileSync("git", ["-C", bare, "show", "--name-only", "--format=", "agent/issue-7"], { encoding: "utf8" });
-    expect(files).toContain("UZI_RUN.md");
+    assert.ok(files.includes("UZI_RUN.md"));
 
     // Worktree torn down; clone kept.
-    expect(fs.existsSync(worktreeDirFor(7))).toBe(false);
-    expect(fs.existsSync(path.join(bare, "HEAD"))).toBe(true);
+    assert.strictEqual(fs.existsSync(worktreeDirFor(7)), false);
+    assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true);
   });
 
   it("reports failed with a reason and still tears the worktree down when the executor throws", async () => {
@@ -72,8 +73,8 @@ describe("RunRunner", () => {
     await new RunRunner(client, git, boom, nullLogger(), 20).execute(claim);
 
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    expect(statuses).toEqual(["running", "failed"]);
-    expect(api.states.find((s) => s.body.status === "failed")?.body.failure_reason).toContain("kaboom");
-    expect(fs.existsSync(worktreeDirFor(9))).toBe(false);
+    assert.deepStrictEqual(statuses, ["running", "failed"]);
+    assert.ok(api.states.find((s) => s.body.status === "failed")?.body.failure_reason?.includes("kaboom"));
+    assert.strictEqual(fs.existsSync(worktreeDirFor(9)), false);
   });
 });
