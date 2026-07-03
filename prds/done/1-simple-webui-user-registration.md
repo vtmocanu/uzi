@@ -1,7 +1,7 @@
 # PRD #1: Simple WebUI with User Registration
 
 **GitLab Issue**: [vtmocanu/uzi#1](https://gitlab.example.com/vtmocanu/uzi/-/issues/1)
-**Status**: Implemented (pending MR review)
+**Status**: Complete (2026-07-03, MR !1 merged)
 **Priority**: High
 **Created**: 2026-07-03
 
