@@ -37,7 +37,7 @@ export class RunRunner {
       runLog.info("run claimed", { repo: claim.repo.url, branch: claim.branch ?? null });
       await this.client.reportState(runId, { status: "running" });
 
-      barePath = await this.git.ensureClone(claim.repo.url, claim.secrets.forge_pat);
+      barePath = await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat);
       const worktree = await this.git.createOrAttachWorktree(barePath, claim.issue_iid);
       worktreePath = worktree.path;
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `worktree ready on ${worktree.branch}` } });

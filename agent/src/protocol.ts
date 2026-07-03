@@ -69,8 +69,12 @@ export interface AgentTemplate {
 /** Repo coordinates for the clone (PRD #2 repos row). */
 export interface ClaimRepo {
   id: string;
-  /** https clone URL the worker clones with the bot PAT. */
+  /** GitLab WEB url of the repo (for display/links); NOT the clone target. */
   url: string;
+  /** The clone target the worker clones from. Tokenless https: the PAT is
+   *  supplied out-of-band via the PRIVATE-TOKEN header, never embedded in the
+   *  URL (so it can't rest in the bare repo's on-disk config). */
+  clone_url: string;
   default_branch?: string | null;
 }
 
@@ -81,12 +85,13 @@ export interface ClaimRepo {
  * authenticated git/MR op with it.
  */
 export interface ClaimSecrets {
-  // AMBIGUITY: field name for the bot PAT — `forge_pat` here vs a possible
-  // `bot_pat`/`gitlab_pat` on the server.
   forge_pat: string;
-  // AMBIGUITY: the Anthropic subscription OAuth token (M3 sets it as
+  // The Anthropic subscription OAuth token (M3 sets it as
   // CLAUDE_CODE_OAUTH_TOKEN). Unused in M2; captured so the shape is stable.
   anthropic_oauth_token?: string;
+  // Bot login for the git commit identity + MR authorship. Used in M4; M2
+  // ignores it.
+  forge_username?: string;
 }
 
 /** Per-run caps the server may push down (PRD §Configuration). Advisory in M2. */
@@ -96,7 +101,12 @@ export interface ClaimConfig {
   max_iterations?: number;
 }
 
-/** Response body of a successful (200) claim. */
+/**
+ * Response body of a successful (200) claim.
+ *
+ * The server also sends top-level run fields the worker does not consume in M2
+ * (status, iteration_count, requeue_count, plan_md); they are ignored here.
+ */
 export interface ClaimResponse {
   run_id: string;
   issue_iid: number;
@@ -111,9 +121,9 @@ export interface ClaimResponse {
   session_id?: string | null;
   /** High-water mark of run_messages.seq; the worker continues numbering here. */
   last_seq: number;
-  /** Lead + subagent templates (M3). Optional in M2. */
-  template?: AgentTemplate | null;
-  subagents?: AgentTemplate[] | null;
+  /** Structured PRD #3 templates — the lead plus any subagents — consumed
+   *  programmatically by M3 (mapped to SDK AgentDefinitions). M2 ignores them. */
+  agents: AgentTemplate[];
   config?: ClaimConfig | null;
 }
 

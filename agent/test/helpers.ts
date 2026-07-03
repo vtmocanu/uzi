@@ -44,10 +44,15 @@ export function makeClaim(overrides: Partial<ClaimResponse> = {}): ClaimResponse
     issue_iid: 1,
     issue_title: "test issue",
     issue_description: "do the thing",
-    repo: { id: randomUUID(), url: "https://example.test/org/repo.git" },
+    repo: {
+      id: randomUUID(),
+      url: "https://example.test/org/repo",
+      clone_url: "https://example.test/org/repo.git",
+    },
     // Deliberately NOT a real `glpat-` shape so secret scanners don't flag the fixture.
     secrets: { forge_pat: "fixture-forge-pat-000000" },
     last_seq: 0,
+    agents: [],
     ...overrides,
   };
 }

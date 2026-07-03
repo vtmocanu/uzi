@@ -42,7 +42,13 @@ function worktreeDirFor(iid: number): string {
 
 describe("RunRunner", () => {
   it("drives a claim running→completed, commits in the worktree, streams gapless messages, and cleans up", async () => {
-    const claim = makeClaim({ issue_iid: 7, repo: { id: "r1", url: fx.originPath }, last_seq: 0 });
+    // Bogus web url + fixture clone_url: proves the worker clones from clone_url,
+    // never the display url (cloning the bogus url would fail the run).
+    const claim = makeClaim({
+      issue_iid: 7,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      last_seq: 0,
+    });
     await new RunRunner(client, git, new StubExecutor(nullLogger()), nullLogger(), 20).execute(claim);
 
     // State machine: exactly running then completed on agent/issue-7.
@@ -69,7 +75,11 @@ describe("RunRunner", () => {
 
   it("reports failed with a reason and still tears the worktree down when the executor throws", async () => {
     const boom: Executor = { run: async () => { throw new Error("kaboom"); } };
-    const claim = makeClaim({ issue_iid: 9, repo: { id: "r", url: fx.originPath }, last_seq: 0 });
+    const claim = makeClaim({
+      issue_iid: 9,
+      repo: { id: "r", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      last_seq: 0,
+    });
     await new RunRunner(client, git, boom, nullLogger(), 20).execute(claim);
 
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
