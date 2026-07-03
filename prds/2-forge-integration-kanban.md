@@ -170,12 +170,12 @@ All repo/board endpoints authorize through the owning connection's `user_id` (bo
 
 ## Milestones
 
-- [ ] **M1 — Forge abstraction + connection management**: `Forge` interface + GitLab driver (official client v2, wrapper with timeouts/429/pagination/redaction); AES-256-GCM token encryption + `UZI_SECRET_KEY` boot guard; `FORGE_ALLOWED_BASE_URLS` SSRF guard; connections API + Settings UI (connect/verify/rotate/delete). ~~Verify the label-change-bumps-`updated_at` assumption~~ **Done 2026-07-03 (E2E)**: GitLab throttles `updated_at` bumps to ~1 per 60s window, independent of add vs remove — see Sync engine section.
-- [ ] **M2 — Repo discovery + selection**: membership listing with `repos` upsert, enable/disable API + Repos page + sidebar picker; per-user authz on every repo path.
-- [ ] **M3 — PRD issue import**: issue cache schema, PRD-label fetch (`state=all`), PRD-link sanity check, list view with badges.
-- [ ] **M4 — Kanban board**: column config (default set seeded on forge), board API + drag-drop UI, single-column-label enforcement (incl. move-to-Open), move-writes-through-to-forge with snap-back on failure, manual `POST …/sync` + Refresh button (reuses M3 import as a full sync).
-- [ ] **M5 — Sync engine + hardening**: poller with server-clock high-water-mark, full reconcile with eviction, rate-limit handling; E2E: move in uzi → verify via `glab`; move in GitLab → appears in uzi ≤ poll interval; de-label in GitLab → evicted ≤ reconcile interval; concurrent-move conflict test; auditor pass on token handling incl. log-redaction test.
-- [ ] **M6 — Bot procedure + docs**: `docs/gitlab-bot-setup.md` + `glab` helper script (create PAT guidance, add bot to project); README/ARCHITECTURE updates; config reference incl. `UZI_SECRET_KEY` rotation warning and default-label seeding note.
+- [x] **M1 — Forge abstraction + connection management**: `Forge` interface + GitLab driver (official client v2, wrapper with timeouts/429/pagination/redaction); AES-256-GCM token encryption + `UZI_SECRET_KEY` boot guard; `FORGE_ALLOWED_BASE_URLS` SSRF guard; connections API + Settings UI (connect/verify/rotate/delete). ~~Verify the label-change-bumps-`updated_at` assumption~~ **Done 2026-07-03 (E2E)**: GitLab throttles `updated_at` bumps to ~1 per 60s window, independent of add vs remove — see Sync engine section.
+- [x] **M2 — Repo discovery + selection**: membership listing with `repos` upsert, enable/disable API + Repos page + sidebar picker; per-user authz on every repo path.
+- [x] **M3 — PRD issue import**: issue cache schema, PRD-label fetch (`state=all`), PRD-link sanity check, list view with badges.
+- [x] **M4 — Kanban board**: column config (default set seeded on forge), board API + drag-drop UI, single-column-label enforcement (incl. move-to-Open), move-writes-through-to-forge with snap-back on failure, manual `POST …/sync` + Refresh button (reuses M3 import as a full sync).
+- [x] **M5 — Sync engine + hardening**: poller with server-clock high-water-mark, full reconcile with eviction, rate-limit handling; E2E: move in uzi → verify via `glab`; move in GitLab → appears in uzi ≤ poll interval; de-label in GitLab → evicted ≤ reconcile interval; concurrent-move conflict test; auditor pass on token handling incl. log-redaction test.
+- [x] **M6 — Bot procedure + docs**: `docs/gitlab-bot-setup.md` + `glab` helper script (create PAT guidance, add bot to project); README/ARCHITECTURE updates; config reference incl. `UZI_SECRET_KEY` rotation warning and default-label seeding note.
 
 ## Success Criteria
 
