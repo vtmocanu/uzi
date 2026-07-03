@@ -1,0 +1,14 @@
+# Secrets / local env
+.env
+
+# Node
+web/node_modules/
+web/dist/
+
+# Go
+api/server
+*.test
+
+# Editor / OS
+.DS_Store
+*.swp
