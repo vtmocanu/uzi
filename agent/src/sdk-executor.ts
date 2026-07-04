@@ -10,6 +10,11 @@
 // the current turn's subprocess group. The WORKER performs the branch push + MR
 // after this returns; the executor never holds a credential.
 //
+// Every agent subprocess spawned across the run's turns is group-killed before
+// this returns (killAgentTree, run() finally) — the DONE path, not just a
+// watchdog/cancel trip — so an agent-backgrounded process can never survive to
+// read the PAT out of the worker's git-push subprocess env (M4 audit B1).
+//
 // Everything that touches the network is behind an injectable `queryFn` (default
 // = the SDK's `query`). Tests pass a fake that returns a controllable message
 // stream, so the gate, the loop, the guardrails, sparse env, session/resume, and
@@ -62,6 +67,10 @@ const defaultQueryFn: SdkQueryFn = (params) =>
 export interface SdkExecutorOptions {
   /** Override the SDK entrypoint (tests inject a fake transport here). */
   queryFn?: SdkQueryFn;
+  /** Spawn the SDK CLI (default = detached spawn). Injected in tests. */
+  spawn?: (opts: SpawnOptions) => { pid?: number };
+  /** Group-kill a pid (default = killProcessGroup). Injected in tests. */
+  kill?: (pid: number | undefined) => boolean;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -84,6 +93,10 @@ interface RunDrive {
 
 export class SdkExecutor implements Executor {
   private readonly queryFn: SdkQueryFn;
+  private readonly spawn: (opts: SpawnOptions) => { pid?: number };
+  private readonly kill: (pid: number | undefined) => boolean;
+  /** Every pid spawned across the current run's turns, for the done-path reap. */
+  private readonly spawnedPids = new Set<number>();
 
   /**
    * @param homeDir pinned HOME (a dir on $UZI_DATA_DIR) so SDK session
@@ -95,9 +108,26 @@ export class SdkExecutor implements Executor {
     opts: SdkExecutorOptions = {},
   ) {
     this.queryFn = opts.queryFn ?? defaultQueryFn;
+    this.spawn = opts.spawn ?? spawnDetached;
+    this.kill = opts.kill ?? killProcessGroup;
+  }
+
+  /**
+   * Group-kill every subprocess the agent spawned across this run's turns (M4
+   * audit B1). The default per-turn `abort()` only signals the SDK CLI pid, not
+   * its process group, so an agent-backgrounded process (`nohup … &`) survives —
+   * and could read the PAT out of the git child's /proc/environ during the
+   * worker's push. The runner calls this before pushBranch; run()'s finally also
+   * calls it so no path leaks an orphan. Idempotent: the set is cleared so a
+   * recycled pid is never re-signalled.
+   */
+  killAgentTree(): void {
+    for (const pid of this.spawnedPids) this.kill(pid);
+    this.spawnedPids.clear();
   }
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
+    this.spawnedPids.clear();
     const oauthToken = ctx.oauthToken?.trim();
     if (!oauthToken) {
       // OAuth is the sole supported credential (no API keys). Detect its
@@ -210,6 +240,10 @@ export class SdkExecutor implements Executor {
     } finally {
       this.disarmWall(state);
       if (ctx.signal) ctx.signal.removeEventListener("abort", onSignal);
+      // Reap every agent subprocess before returning, so none survives into the
+      // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
+      // too, not just the runner's explicit pre-push call.
+      this.killAgentTree();
     }
   }
 
@@ -235,8 +269,11 @@ export class SdkExecutor implements Executor {
     // Spawn the CLI in its own process group so a watchdog trip can group-kill
     // the whole tree (default SDK spawn is not detached).
     options.spawnClaudeCodeProcess = (spawnOpts: SpawnOptions): SpawnedProcess => {
-      const proc = spawnDetached(spawnOpts);
-      state.currentChild.pid = proc.pid;
+      const proc = this.spawn(spawnOpts);
+      if (typeof proc.pid === "number") {
+        state.currentChild.pid = proc.pid;
+        this.spawnedPids.add(proc.pid); // reaped on the done path (B1)
+      }
       return proc as unknown as SpawnedProcess;
     };
 
@@ -321,7 +358,7 @@ export class SdkExecutor implements Executor {
     // abort() is the primary, asserted stop (SDK: stdin EOF → grace → signal);
     // the group kill is best-effort defense for orphaned children.
     state.currentAbort?.abort();
-    killProcessGroup(state.currentChild.pid);
+    this.kill(state.currentChild.pid);
   }
 
   /** Arm the wall-clock budget for the active turn (paused across the gate). */

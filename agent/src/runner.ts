@@ -122,6 +122,13 @@ export class RunRunner {
 
       const result = await this.executor.run(ctx);
 
+      // Reap any agent-backgrounded subprocess BEFORE the PAT touches a git child
+      // env — otherwise a survivor could read the PAT from that child's
+      // /proc/environ during the push (M4 audit B1). The SDK executor also
+      // self-reaps in its run() finally; this is the explicit, load-bearing call
+      // at the security boundary.
+      this.executor.killAgentTree?.();
+
       // The agent signalled done. The WORKER now performs the authenticated push
       // + MR with the PAT — the agent never had a credential.
       batcher.emit({ kind: "status", agent: "worker", payload: { text: "work complete; pushing branch and opening merge request" } });

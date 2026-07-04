@@ -81,6 +81,14 @@ export class PlanRejectedError extends Error {
  */
 export interface Executor {
   run(ctx: RunContext): Promise<ExecutorResult>;
+  /**
+   * Group-kill every subprocess the agent spawned for the last run. The runner
+   * calls this BEFORE any PAT-bearing git op (push) so an agent-backgrounded
+   * process cannot survive to read the PAT out of the git child's /proc/environ
+   * (M4 audit B1). Optional so the M2 stub and test executors need not implement
+   * it; the SDK executor also self-reaps in its own run() finally.
+   */
+  killAgentTree?(): void;
 }
 
 /**

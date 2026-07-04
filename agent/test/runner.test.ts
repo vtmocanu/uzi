@@ -4,8 +4,9 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKMessage, SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { FakeApi } from "./fake-api.js";
+import { spawnDetached } from "../src/sdk-spawn.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
@@ -46,6 +47,20 @@ afterEach(async () => {
 function worktreeDirFor(iid: number): string {
   const repoDir = path.basename(git.barePathFor(fx.originPath)).replace(/\.git$/, "");
   return path.join(fx.dataDir, "worktrees", repoDir, `issue-${iid}`);
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitDead(pid: number, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (isAlive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
 }
 
 interface MrCall {
@@ -233,6 +248,70 @@ describe("RunRunner — plan gate + steering end to end", () => {
     await runner(rejectExec, gitlab).execute(claim);
     const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
     assert.strictEqual(failed!.body.failure_reason, "no");
+  });
+
+  it("reaps the agent tree BEFORE the PAT-bearing push (B1 ordering)", async () => {
+    const { gitlab } = fakeGitlab();
+    const events: string[] = [];
+    const exec: Executor = {
+      run: async (ctx) => ({ branch: ctx.branch }),
+      killAgentTree: () => events.push("kill"),
+    };
+    const claim = gitlabClaim(31);
+    const origPush = git.pushBranch.bind(git);
+    (git as unknown as { pushBranch: unknown }).pushBranch = async (...args: unknown[]) => {
+      events.push("push");
+      return (origPush as (...a: unknown[]) => Promise<void>)(...args);
+    };
+    try {
+      await runner(exec, gitlab).execute(claim);
+    } finally {
+      (git as unknown as { pushBranch: unknown }).pushBranch = origPush;
+    }
+    assert.ok(events.includes("kill") && events.includes("push"));
+    assert.ok(events.indexOf("kill") < events.indexOf("push"), "kill must precede push");
+  });
+
+  it("kills a real agent-backgrounded survivor before the run completes (B1)", async () => {
+    const { gitlab } = fakeGitlab();
+    const survivors: number[] = [];
+    // Injected spawn stands in for the SDK CLI spawn, launching a real detached
+    // `sleep` in its own group — the kind of survivor a `nohup … &` leaves behind.
+    const spawn = (_opts: SpawnOptions): { pid?: number } => {
+      const p = spawnDetached({ command: "sleep", args: ["30"] } as SpawnOptions);
+      if (p.pid) survivors.push(p.pid);
+      return p;
+    };
+    // Real plan→done query that also triggers the spawn hook each turn.
+    const scripts: SDKMessage[][] = [
+      [assistant([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# P" } }]), resultOk()],
+      [assistant([{ type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} }]), resultOk()],
+    ];
+    let turn = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      const script = scripts[Math.min(turn, scripts.length - 1)]!;
+      turn++;
+      return (async function* () {
+        params.options.spawnClaudeCodeProcess?.({ command: "x", args: [] } as never);
+        for await (const _ of params.prompt) { /* drain */ }
+        for (const m of script) yield m;
+      })();
+    };
+    const claim = gitlabClaim(32);
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    const exec = new SdkExecutor(nullLogger(), homeDir, { queryFn, spawn });
+    try {
+      await runner(exec, gitlab).execute(claim);
+      assert.ok(survivors.length >= 1, "at least one survivor was spawned");
+      for (const pid of survivors) {
+        await waitDead(pid);
+        assert.strictEqual(isAlive(pid), false, `survivor ${pid} must be dead after the run`);
+      }
+      // The run still completed with an MR (the reap did not disturb the happy path).
+      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    } finally {
+      for (const pid of survivors) try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+    }
   });
 
   it("cancels a live run: a cancel input aborts the executor's signal and fails the run", async () => {

@@ -93,11 +93,15 @@ services:
   # worker's uid, so a `cat <symlink>/self/environ` (a symlink to /proc, which the
   # lexical Bash `/proc/` guard and the file-tool realpath guard cannot both cover)
   # can still read the worker's own /proc/<pid>/environ and leak the join token
-  # (redacted from every message; the PAT is never in the worker's env). The real
-  # STRUCTURAL close — a distinct uid for the agent, a user namespace, /proc
-  # hidepid=2, or gVisor — needs privileges this non-root compose MVP lacks and is
-  # deferred to the remote-worker (k8s/VM) phase. See screenToolPath in
-  # agent/src/guardrails.ts.
+  # (redacted from every message; the PAT is never in the worker's env). The PAT
+  # is only ever in a transient git CHILD env during push/MR, and the worker
+  # group-kills the agent subprocess tree before that op (B1), so a normal
+  # survivor is dead first — but a `setsid`-escaped survivor in its own session
+  # could still race that window. The real STRUCTURAL close — a distinct uid for
+  # the agent vs the worker's git ops, a user namespace, /proc hidepid=2, or
+  # gVisor — needs privileges this non-root compose MVP lacks and is deferred to
+  # the remote-worker (k8s/VM) phase. See screenToolPath + killAgentTree in
+  # agent/src/{guardrails,sdk-executor}.ts.
   agent:
     build: ./agent
     profiles: ["agent"]

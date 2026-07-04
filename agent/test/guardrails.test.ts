@@ -211,6 +211,26 @@ describe("screenToolPath — symlink resolution (item 6)", () => {
     assert.strictEqual(screenToolPath("real.ts", wt, wt).denied, false);
     assert.strictEqual(screenToolPath("does-not-exist-yet.ts", wt, wt).denied, false);
   });
+
+  it("allows a real in-worktree file when the ROOT itself is a symlink (N2 symmetry)", () => {
+    // realRoot is the true worktree; linkRoot is a symlink to it, passed AS the
+    // worktree root (mirrors a symlinked data volume or macOS /var → /private/var).
+    const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-realroot-"));
+    const linkRoot = path.join(os.tmpdir(), `uzi-linkroot-${Date.now()}`);
+    fs.symlinkSync(realRoot, linkRoot);
+    fs.writeFileSync(path.join(realRoot, "app.ts"), "x");
+    try {
+      // Without realpath'ing the root too, this over-DENIES a real in-worktree file.
+      assert.strictEqual(screenToolPath("app.ts", linkRoot, linkRoot).denied, false);
+      // The jail still holds through a symlinked root: /proc + escapes stay denied.
+      fs.symlinkSync("/proc", path.join(realRoot, "pl"));
+      assert.strictEqual(screenToolPath("pl/1/environ", linkRoot, linkRoot).denied, true);
+      assert.strictEqual(screenToolPath("/etc/passwd", linkRoot, linkRoot).denied, true);
+    } finally {
+      fs.rmSync(linkRoot, { force: true });
+      fs.rmSync(realRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("buildAgentGuardHook (item 7)", () => {

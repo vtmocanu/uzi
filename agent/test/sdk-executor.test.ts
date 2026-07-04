@@ -287,6 +287,51 @@ describe("SdkExecutor guardrail options", () => {
   });
 });
 
+describe("SdkExecutor agent-tree reap (B1)", () => {
+  // A query that, per turn, simulates the SDK spawning the CLI (so a pid is
+  // tracked) before replaying its script.
+  function spawningQuery(scripts: SDKMessage[][]): SdkQueryFn {
+    let i = 0;
+    return (params) => {
+      const script = scripts[Math.min(i, scripts.length - 1)]!;
+      i++;
+      return (async function* () {
+        params.options.spawnClaudeCodeProcess?.({ command: "x", args: [] } as never);
+        for await (const _ of params.prompt) { /* drain */ }
+        for (const m of script) yield m;
+      })();
+    };
+  }
+
+  it("group-kills every spawned agent subprocess on the DONE path (not just on a trip)", async () => {
+    const killed: (number | undefined)[] = [];
+    let pid = 5000;
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningQuery([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
+      spawn: () => ({ pid: ++pid }),
+      kill: (p) => (killed.push(p), true),
+    });
+    await exec.run(makeCtx().ctx);
+    // Both turns' pids were reaped when the run finished its DONE path.
+    assert.deepStrictEqual([...killed].sort(), [5001, 5002]);
+    // Idempotent: a second reap does nothing (the set was cleared → no recycled-pid kill).
+    killed.length = 0;
+    exec.killAgentTree();
+    assert.deepStrictEqual(killed, []);
+  });
+
+  it("reaps the agent subprocess even on a failure path (no plan submitted)", async () => {
+    const killed: (number | undefined)[] = [];
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningQuery([[assistantText("nothing"), resultSuccess()]]),
+      spawn: () => ({ pid: 6001 }),
+      kill: (p) => (killed.push(p), true),
+    });
+    await assert.rejects(exec.run(makeCtx().ctx), /without submitting a plan/);
+    assert.deepStrictEqual(killed, [6001]);
+  });
+});
+
 describe("SdkExecutor failure + watchdog paths", () => {
   it("fails fast when no OAuth token is present", async () => {
     const { queryFn } = fakeTurns([[resultSuccess()]]);

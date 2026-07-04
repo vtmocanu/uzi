@@ -428,10 +428,17 @@ function extractToolPaths(toolInput: unknown): string[] {
  * Residual (documented, k8s-phase fix): this only guards the FILE tools. A Bash
  * `cat symlink/1/environ` still bypasses both this and the Bash `/proc/` string
  * guard, because worker and agent share a uid and /proc/<pid>/environ is
- * owner-readable. The real structural close (different uid / userns / hidepid=2 /
- * gVisor) belongs to the remote-worker phase; see the header of docker-compose's
- * agent service. The leak is bounded to the worker join token (redacted from
- * every message; the PAT is never in the worker's env).
+ * owner-readable. Two things are readable that way:
+ *   - the WORKER's own environ, which holds the join token (redacted from every
+ *     message; the PAT is never in the worker's persistent env); and
+ *   - during the worker's git push/MR, the PAT lives in a git CHILD's env — but
+ *     the executor group-kills the agent's subprocess tree BEFORE the push (B1,
+ *     see sdk-executor.killAgentTree), so a normal survivor is already dead. A
+ *     survivor that escaped into its OWN session (`setsid`) is not reached by
+ *     killing the CLI's group and could still race that window.
+ * The real structural close (different uid for the agent vs the worker's git
+ * ops / userns / hidepid=2 / gVisor) belongs to the remote-worker phase; see the
+ * header of docker-compose's agent service.
  */
 export function screenToolPath(candidate: string, worktreeRoot: string, cwd: string): BashScreenResult {
   const root = path.resolve(worktreeRoot);
@@ -439,10 +446,14 @@ export function screenToolPath(candidate: string, worktreeRoot: string, cwd: str
   const lexicalResult = classifyResolvedPath(candidate, lexical, root);
   if (lexicalResult.denied) return lexicalResult;
   // Resolve symlinks on the existing prefix and re-check, so a symlink that
-  // lexically stays in-worktree but points at /proc or outside is caught.
+  // lexically stays in-worktree but points at /proc or outside is caught. Both
+  // sides must be realpath'd (N2): comparing a realpath'd candidate against a
+  // lexical root over-DENIES every real file when the worktree root itself sits
+  // under a symlink ancestor (e.g. macOS /var → /private/var, or a symlinked
+  // data volume) — a fail-closed asymmetry, not a security hole, but fragile.
   const real = realpathExisting(lexical);
   if (real === lexical) return ALLOW;
-  return classifyResolvedPath(candidate, real, root);
+  return classifyResolvedPath(candidate, real, realpathExisting(root));
 }
 
 /** Deny a resolved absolute path that reads /proc, escapes the worktree, or hits .git/. */

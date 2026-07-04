@@ -16,7 +16,14 @@ import { errMessage } from "./util.js";
 /** Injectable transport (default = global fetch). */
 export type FetchFn = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
+  init: {
+    method: string;
+    headers: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+    /** Pinned to "error" so a 3xx cannot replay the PAT header cross-origin. */
+    redirect?: "error" | "follow" | "manual";
+  },
 ) => Promise<{ status: number; text(): Promise<string> }>;
 
 export interface CreateMrParams {
@@ -67,6 +74,10 @@ export class GitLabClient {
    * than erroring, so re-running the finish step never dead-ends.
    */
   async createMergeRequest(p: CreateMrParams): Promise<MergeRequest> {
+    // Refuse a non-https base: the PAT rides a header, and only TLS keeps it off
+    // the wire. A plaintext (or malformed) base URL is a hard error, never a
+    // best-effort send (M4 audit N1, same PAT class as the git host-scoping).
+    if (!isHttps(p.baseUrl)) throw new GitLabError(0, "refusing to send the PAT to a non-https GitLab base URL");
     const projectSeg = encodeURIComponent(p.projectPath);
     const base = `${p.baseUrl.replace(/\/+$/, "")}/api/v4/projects/${projectSeg}/merge_requests`;
     const res = await this.request("POST", base, p.pat, {
@@ -119,6 +130,9 @@ export class GitLabClient {
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(this.httpTimeoutMs),
+        // A redirect must never carry the PAT header to another origin: turn any
+        // 3xx into a transport error instead of following it (M4 audit N1).
+        redirect: "error",
       });
     } catch (err) {
       // A transport failure carries no GitLab status; surface it without the PAT
@@ -138,6 +152,14 @@ export function gitlabBaseUrl(repoUrl: string): string {
 export function gitlabProjectPath(repoUrl: string): string {
   const u = new URL(repoUrl);
   return u.pathname.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "");
+}
+
+function isHttps(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function parseMr(text: string): MergeRequest {

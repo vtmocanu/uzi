@@ -11,13 +11,14 @@ interface Call {
   method: string;
   headers: Record<string, string>;
   body?: string;
+  redirect?: string;
 }
 
 function recorder(responses: Array<{ status: number; body: unknown }>): { fetchFn: FetchFn; calls: Call[] } {
   const calls: Call[] = [];
   let i = 0;
   const fetchFn: FetchFn = async (url, init) => {
-    calls.push({ url, method: init.method, headers: init.headers, body: init.body });
+    calls.push({ url, method: init.method, headers: init.headers, body: init.body, redirect: init.redirect });
     const r = responses[Math.min(i, responses.length - 1)]!;
     i++;
     return { status: r.status, text: async () => (typeof r.body === "string" ? r.body : JSON.stringify(r.body)) };
@@ -74,6 +75,21 @@ describe("GitLabClient.createMergeRequest", () => {
       new GitLabClient({ fetchFn }).createMergeRequest(base),
       (err: unknown) => err instanceof GitLabError && err.status === 403 && !err.message.includes(PAT),
     );
+  });
+
+  it("pins redirect:error so a 3xx cannot replay the PAT header cross-origin (N1)", async () => {
+    const { fetchFn, calls } = recorder([{ status: 201, body: { iid: 1, web_url: "https://x/1" } }]);
+    await new GitLabClient({ fetchFn }).createMergeRequest(base);
+    assert.strictEqual(calls[0]!.redirect, "error");
+  });
+
+  it("refuses a non-https base URL and never sends the PAT (N1)", async () => {
+    const { fetchFn, calls } = recorder([{ status: 201, body: {} }]);
+    await assert.rejects(
+      new GitLabClient({ fetchFn }).createMergeRequest({ ...base, baseUrl: "http://gitlab.example.com" }),
+      (err: unknown) => err instanceof GitLabError && /non-https/.test(err.message),
+    );
+    assert.strictEqual(calls.length, 0, "no request made to a non-https base");
   });
 });
 
