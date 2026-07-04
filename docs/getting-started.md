@@ -1,0 +1,42 @@
+---
+title: Getting started
+order: 10
+audience: user
+---
+
+# Getting started
+
+The golden path from a fresh account to a running board, in five steps.
+
+## 1. Register
+
+Open the app and register. The first account created becomes admin
+automatically; every account after that is a regular user.
+
+![Registration form, the first step to a working uzi account](img/getting-started-register.png)
+
+## 2. Create a bot and connect a forge
+
+uzi acts on your behalf through a bot account, never your own identity.
+Create one and connect its token: see [GitLab bot setup](./gitlab-bot-setup.md).
+
+## 3. Open a board
+
+Once a repo is enabled, its board appears in the sidebar: `PRD`-labeled
+issues become cards, and dragging a card between columns relabels the issue
+on the forge. See [Board](./board.md).
+
+## 4. Add your Anthropic token
+
+Agents run with your own Anthropic credential. Paste it once in Settings:
+see [Anthropic token](./anthropic-token.md).
+
+## 5. Run an agent
+
+Register a worker and start a run from a board card: see
+[Worker setup](./worker-setup.md).
+
+## Along the way
+
+- [Agent templates](./agent-templates.md) — the roles (`coder`, `reviewer`,
+  ...) your agents play, and how an admin edits them.

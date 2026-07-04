@@ -1,3 +1,8 @@
+---
+title: Configuration
+audience: operator
+---
+
 # Configuration
 
 All configuration is via environment variables, set in `.env` (copied from `.env.example`) and passed into the `api` container by `docker-compose.yml`. `POSTGRES_*` also configures the `db` service directly.

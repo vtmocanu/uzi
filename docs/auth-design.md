@@ -1,3 +1,8 @@
+---
+title: Auth design
+audience: design
+---
+
 # Auth design
 
 uzi's auth is a hand-rolled email+password flow, deliberately compared against the two inspiration projects (`inspiration/bottega`, `inspiration/multica`) and designed to beat both. No SSO/OAuth, no OTP, no email verification for this MVP (see [plan.md](../plan.md) "later stuff" and the PRD's "Out of scope").
