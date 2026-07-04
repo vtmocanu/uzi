@@ -123,7 +123,11 @@ export class FakeApi {
       if (req.method === "POST" && kind === "messages") return this.handleMessages(res, runId, json);
       if (req.method === "POST" && kind === "state") return this.handleState(res, runId, json);
       if (req.method === "GET" && kind === "inputs") {
-        return send(res, 200, { inputs: this.inputsByRun.get(runId) ?? [] });
+        // Consume-on-read, FIFO — matches M1's ConsumeInputs (each GET returns
+        // then clears the pending inputs; there is no separate ack).
+        const pending = this.inputsByRun.get(runId) ?? [];
+        this.inputsByRun.set(runId, []);
+        return send(res, 200, { inputs: pending });
       }
     }
     return send(res, 404, { error: "not found", path: p });
