@@ -58,6 +58,12 @@ services:
       UZI_SEED_FORGE_PAT: ${UZI_SEED_FORGE_PAT:-}
       UZI_SEED_FORGE_BASE_URL: ${UZI_SEED_FORGE_BASE_URL:-}
       UZI_SEED_FORGE_REPOS: ${UZI_SEED_FORGE_REPOS:-}
+      # Optional startup Anthropic-token seed (belongs to the admin above), so a
+      # local `down -v` doesn't force re-pasting it. Unset => no seeding. Seeds the
+      # operator's EXISTING token; never mints one (testing-credentials policy).
+      # Without this line the boot-seed is inert — config.Load reads it from the
+      # api container env, which compose must wire in from .env.
+      UZI_SEED_ANTHROPIC_TOKEN: ${UZI_SEED_ANTHROPIC_TOKEN:-}
       # Trust the nginx hop (the compose network is private RFC1918) so the
       # real client IP is read from the XFF nginx sets. A direct hit that
       # bypasses nginx from a non-trusted source has its XFF ignored.

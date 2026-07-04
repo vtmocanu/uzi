@@ -87,3 +87,9 @@ real Claude Agent SDK:
 
 The plan-gate + restart + cancel structure is identical; only the "work" step
 becomes a real agent turn. No milestone assertion depends on this path.
+
+Note: the base `docker-compose.yml` now wires `UZI_SEED_ANTHROPIC_TOKEN` from
+`.env` into the api service (an M6 fix — it was missing, so the token boot-seed
+was inert on a fresh stack and every real SDK run failed fast with "no Anthropic
+token"). A normal `docker compose up` with the var set in `.env` seeds the token;
+the E2E overlay sets it directly, so the harness does not depend on `.env`.
