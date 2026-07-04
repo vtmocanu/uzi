@@ -9,10 +9,14 @@ import {
   type RunListItem,
 } from "../lib/api";
 import { Alert, Badge, Card } from "../components/ui";
+import { isStoppedRun } from "../lib/runBadge";
 
-function statusTone(status: string): "neutral" | "warning" | "danger" {
+function statusTone(status: string, failureReason: string | null): "neutral" | "warning" | "danger" {
   if (status === "awaiting_approval") return "warning";
-  if (status === "failed" || status === "cancelled") return "danger";
+  // A deliberate stop (cancelled, or a cancel-shaped failed) is not breakage —
+  // calm/neutral, never rose (PRD #12 §2).
+  if (isStoppedRun(status, failureReason)) return "neutral";
+  if (status === "failed") return "danger";
   return "neutral";
 }
 
@@ -35,7 +39,9 @@ function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
           <span>· {new Date(run.updated_at).toLocaleString()}</span>
         </div>
       </div>
-      <Badge tone={statusTone(run.status)}>{run.status.replace("_", " ")}</Badge>
+      <Badge tone={statusTone(run.status, run.failure_reason)}>
+        {isStoppedRun(run.status, run.failure_reason) ? "stopped" : run.status.replace("_", " ")}
+      </Badge>
     </li>
   );
 }

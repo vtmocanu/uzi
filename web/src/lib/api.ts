@@ -70,6 +70,22 @@ export interface BoardColumn {
   position: number;
 }
 
+// LatestRun is the newest run for a card's issue (PRD #12 M2), or null when the
+// issue has never run. Display-only: no secrets. is_mine gates the in-app run-view
+// link (a non-owner would 403 on the run); run_count drives the "×N" retry hint.
+export interface LatestRun {
+  id: string;
+  status: RunStatus;
+  mr_iid: number | null;
+  failure_reason: string | null;
+  owner_name: string;
+  worker_name: string | null;
+  is_mine: boolean;
+  run_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Card {
   iid: number;
   title: string;
@@ -81,6 +97,7 @@ export interface Card {
   column: string;
   closed: boolean;
   conflict: boolean;
+  latest_run: LatestRun | null;
 }
 
 export interface Board {
@@ -312,7 +329,13 @@ export const api = {
 
   createRun: (repoId: string, issueIid: number) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, { issue_iid: issueIid }),
-  listRuns: () => request<{ runs: RunListItem[] }>("GET", "/runs"),
+  listRuns: (params?: { repoId?: string; issueIid?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.repoId) q.set("repo_id", params.repoId);
+    if (params?.issueIid != null) q.set("issue_iid", String(params.issueIid));
+    const qs = q.toString();
+    return request<{ runs: RunListItem[] }>("GET", qs ? `/runs?${qs}` : "/runs");
+  },
   getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),
   getRunMessages: (id: string, afterSeq = 0) =>
     request<{ messages: RunMessage[] }>(
