@@ -4,7 +4,7 @@
 **Status**: Ready (2026-07-04: reviewed by 2 agents — UX-expert review + adversarial fact-check — all findings incorporated)
 **Priority**: Medium
 **Created**: 2026-07-04
-**Depends on**: PRD #4 (agent runtime + live run view, done). Coordinates with PRD #7 (docs section) on the `react-markdown` + `remark-gfm` dependency — whichever lands first adds the deps; the other reuses them.
+**Depends on**: PRD #4 (agent runtime + live run view, done). Coordinates with PRD #7 (docs section) — **#7 is already in progress**, so PRD #11 work MUST start with a reconnaissance step: check what #7 has landed (on `main` and any open #7 branch/MR) before writing anything. Concretely: (a) if `react-markdown`/`remark-gfm` are already in `web/package.json`, reuse — do not re-add or bump; (b) if #7 created a markdown renderer (component or `web/src/lib/docs.ts` pipeline), extract/reuse its **core** (react-markdown + remark-gfm + prose styles) rather than creating a parallel one; (c) the trust policies differ and must stay per-caller: #7 renders trusted repo docs (link rewriting to `/docs/:slug`, resolved images, same-tab nav), #11 renders untrusted LLM output (size-capped images, external-only `noopener` links, no rewriting) — inject link/image behavior via `components` props at each call site, never bake either policy into the shared core, and never add `rehype-raw` to the core.
 
 ## Problem
 
@@ -32,7 +32,7 @@ Almost no API/DB/protocol changes — the payloads already reach the browser. **
 - New `web/src/components/Markdown.tsx` wrapping `react-markdown` + `remark-gfm`, styled for the dark theme (same prose rules PRD #7 needs — share the component when both land).
 - No `rehype-raw`: plan/agent output is untrusted LLM output; react-markdown's default (raw HTML stays inert text, `javascript:`/`data:` link URLs sanitized) is exactly right. External links get `rel="noopener noreferrer" target="_blank"`. Images: size-capped via CSS (`max-h`, `max-w-full`) — a remote `<img>` in LLM output is a potential beacon and a layout bomb; acceptable for this loopback-only MVP but must not blow up the box.
 - Used in: `PlanPanel` (replaces the `<pre>`), and `text` activity messages (agent prose is markdown too).
-- Deps: `react-markdown` + `remark-gfm` added to `web/package.json` (+ lockfile) **unless PRD #7 already added them** (verified 2026-07-04: not yet present).
+- Deps: `react-markdown` + `remark-gfm` — **expected to already exist by the time #11 starts** (PRD #7 is in progress and adds them); M0 verifies instead of assuming. Only add them here if #7 stalled or dropped them.
 
 ### 2. Activity box + follow mode
 
@@ -86,7 +86,8 @@ Kinds observed in real feeds (from `agent/src/sdk-messages.ts` **plus the runner
 
 ## Milestones
 
-- [ ] **M1 — Markdown rendering**: `Markdown` component (react-markdown + remark-gfm, dark-theme prose, image size-caps); `PlanPanel` and `text` events render markdown. Deps coordinated with PRD #7.
+- [ ] **M0 — PRD #7 reconnaissance** (small, blocking): audit what #7 landed (deps in `web/package.json`, any markdown component/pipeline, prose styles); record in this PRD what is reused vs created; refactor #7's renderer into the shared core + per-caller policy split if it wasn't built that way.
+- [ ] **M1 — Markdown rendering**: `Markdown` component built on the shared core from M0 (untrusted policy: image size-caps, external-only links); `PlanPanel` and `text` events render markdown.
 - [ ] **M2 — Activity box + follow mode**: bounded scrollable container (`overscroll-behavior: contain`); follow state in an `onScroll` ref (not derived post-append), instant scroll, "{n} new ↓" pill while paused, re-arm at bottom; reconnecting banner. Verified against a live streaming run.
 - [ ] **M3 — Terse event rendering**: per-kind renderers per the table (incl. `plan` and worker `status {text}`); id-map tool pairing; in-flight spinner + client-side durations; auto-expand errored results; `mapResult` forwards `duration_ms`/`total_cost_usd`; `JSON.stringify` fallback removed; row memoization + message cap; a11y semantics.
 - [ ] **M4 — Worker debug logging**: raw frames logged at `debug` in `MessageBatcher.emit`; `UZI_LOG_LEVEL=debug` verified end-to-end via `docker logs`; redaction spot-checked (no PAT/token/OAuth string in output).
