@@ -12,9 +12,13 @@
 .gitignore
 .gitmodules
 
-# Secrets must never enter a build context.
+# Secrets must never enter a build context — including a dev-local one nested in
+# a subdir (e.g. web/.env). The bare patterns only match the root; the `**/`
+# globs catch any depth.
 .env
 .env.*
+**/.env
+**/.env.*
 
 # Submodules and sibling services the web build does not need. inspiration/ is
 # large; api/ and agent/ build from their own contexts; e2e/ is test-only.
