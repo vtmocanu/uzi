@@ -59,6 +59,18 @@ fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
 
 cleanup() {
   local code=$?
+  # KEEP_STACK leaves the whole stack running (containers + volumes + rundir) so
+  # the auditor can inspect logs, the claim payload path, and the worker's /data
+  # against a live run. Tear it down manually with the printed command.
+  if [ -n "${KEEP_STACK:-}" ]; then
+    say "leaving the stack UP for inspection (KEEP_STACK set)"
+    printf '  project:  %s\n  web:      %s\n  rundir:   %s\n' "$PROJECT" "$BASE" "$RUNROOT"
+    printf '  logs:     docker compose -p %s logs\n' "$PROJECT"
+    printf '  worker:   docker compose -p %s exec agent sh\n' "$PROJECT"
+    printf '  teardown: docker compose -p %s --env-file %s -f %s -f %s --profile agent down -v\n' \
+      "$PROJECT" "$ENVFILE" "$ROOT/docker-compose.yml" "$ROOT/e2e/docker-compose.e2e.yml"
+    exit $code
+  fi
   say "tearing down (down -v)"
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   [ -n "$KEEP" ] || rm -rf "$RUNROOT"

@@ -21,6 +21,10 @@ Knobs (env vars):
 
 - `KEEP_RUNDIR=1` — keep the per-run scratch dir (certs, env-file, the local git
   remote, container logs are reachable via compose) for post-mortem.
+- `KEEP_STACK=1` — do NOT tear down on exit; leave the whole stack (containers +
+  volumes + rundir) running so the auditor can inspect logs, the claim-payload
+  path, and the worker's `/data` against the live run. Prints the manual teardown
+  command.
 - `UZI_E2E_PROJECT=<name>` — override the compose project name (default
   `uzi-e2e-$$`).
 - `E2E_RUN_DIR=<dir>` — override the scratch dir (default `$TMPDIR/uzi-e2e-$$`).
