@@ -45,17 +45,17 @@ export class GitCache {
   }
 
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
-  async ensureClone(repoUrl: string, pat?: string): Promise<string> {
+  async ensureClone(repoUrl: string, pat?: string, username?: string): Promise<string> {
     const barePath = this.barePathFor(repoUrl);
     const scope = httpScopeForUrl(repoUrl);
     return this.withLock(barePath, async () => {
       await fs.mkdir(this.reposRoot, { recursive: true });
       if (await isBareRepo(barePath)) {
         this.log.info("repo cache: fetching", { bare: barePath });
-        await this.fetch(barePath, pat, scope);
+        await this.fetch(barePath, pat, scope, username);
       } else {
         this.log.info("repo cache: cloning bare", { url: repoUrl, bare: barePath });
-        await this.cloneBare(repoUrl, barePath, pat, scope);
+        await this.cloneBare(repoUrl, barePath, pat, scope, username);
       }
       return barePath;
     });
@@ -68,10 +68,10 @@ export class GitCache {
    * extraHeader in the env (off argv, off disk), and the push is never forced.
    * Idempotent on resume: a branch already at origin pushes as up-to-date.
    */
-  async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string): Promise<void> {
+  async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
     await this.withLock(barePath, async () => {
-      await this.runGit(barePath, ["push", "origin", `refs/heads/${branch}:refs/heads/${branch}`], pat, scope);
+      await this.runGit(barePath, ["push", "origin", `refs/heads/${branch}:refs/heads/${branch}`], pat, scope, username);
     });
   }
 
@@ -121,9 +121,9 @@ export class GitCache {
     });
   }
 
-  private async cloneBare(repoUrl: string, dest: string, pat?: string, scope?: string): Promise<void> {
+  private async cloneBare(repoUrl: string, dest: string, pat?: string, scope?: string, username?: string): Promise<void> {
     try {
-      await this.runGit(undefined, ["clone", "--bare", repoUrl, dest], pat, scope);
+      await this.runGit(undefined, ["clone", "--bare", repoUrl, dest], pat, scope, username);
     } catch (err) {
       await fs.rm(dest, { recursive: true, force: true });
       throw err;
@@ -132,11 +132,11 @@ export class GitCache {
     // refs/remotes/origin/* and never collide with the refs/heads/agent/* the
     // worktrees lock (multica).
     await this.runGit(dest, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
-    await this.fetch(dest, pat, scope);
+    await this.fetch(dest, pat, scope, username);
   }
 
-  private async fetch(barePath: string, pat?: string, scope?: string): Promise<void> {
-    await this.runGit(barePath, ["fetch", "origin"], pat, scope);
+  private async fetch(barePath: string, pat?: string, scope?: string, username?: string): Promise<void> {
+    await this.runGit(barePath, ["fetch", "origin"], pat, scope, username);
     // Refresh origin/HEAD so a remote default-branch change takes effect. Best
     // effort: defaultBranchRef has fallbacks if this symref is absent.
     await this.tryGit(barePath, ["remote", "set-head", "origin", "--auto"]);
@@ -180,8 +180,8 @@ export class GitCache {
 
   // --- git subprocess plumbing -------------------------------------------------
 
-  private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string): Promise<string> {
-    const env = gitEnv(pat, scope);
+  private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string> {
+    const env = gitEnv(pat, scope, username);
     // Log args only; the PAT lives in env (GIT_CONFIG_VALUE_n), never in args.
     this.log.debug("git", { cwd, args });
     try {
@@ -246,24 +246,33 @@ function withDir(cwd: string | undefined, args: string[]): string[] {
  * config, and out of logs (runGit logs args only). Exported for the secret-flow
  * test. Supported since git 2.31.
  *
- * `httpScope` (M4 audit item 9) host-scopes the header so the PAT is only sent to
- * the repo's own host: `http.<scope>.extraHeader` where <scope> is e.g.
+ * The header is HTTP **Basic** auth — `Authorization: Basic base64(user:pat)` —
+ * NOT `PRIVATE-TOKEN`. GitLab honors PRIVATE-TOKEN only on its REST API; git-over-
+ * HTTPS (clone/fetch/push) speaks HTTP Basic, so a PRIVATE-TOKEN header carries no
+ * credential and git falls back to a (disabled) terminal prompt and fails. The PAT
+ * is the Basic *password*; the username is the bot login when known, else the
+ * conventional `oauth2` (GitLab accepts any non-empty username with a PAT).
+ *
+ * `httpScope` (M4 audit item 9) host-scopes the header so the credential is only
+ * sent to the repo's own host: `http.<scope>.extraHeader` where <scope> is e.g.
  * `https://gitlab.example.com/`. Without scoping (`http.extraHeader`), a cross-
- * host redirect would replay the PAT to the redirect target. `followRedirects`
- * is also pinned off so no redirect can carry the credential elsewhere. A hostless
- * URL (local fixture path / scp form) has no scope, so the header falls back to
+ * host redirect would replay it to the redirect target. `followRedirects` is also
+ * pinned off so no redirect can carry the credential elsewhere. A hostless URL
+ * (local fixture path / scp form) has no scope, so the header falls back to
  * unscoped — harmless because local/file transport ignores http.* config entirely.
  */
-export function gitEnv(pat?: string, httpScope?: string): NodeJS.ProcessEnv {
+export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
   const pairs: Array<[string, string]> = [["safe.directory", "*"]];
   if (pat) {
-    // GitLab reads PRIVATE-TOKEN for authenticated requests (auditor decision).
-    // Scope the header + pin followRedirects to the repo host so neither the
-    // credential nor a redirect can reach another host.
+    // HTTP Basic (base64(user:pat)) — git-over-HTTPS auth, unlike GitLab's
+    // REST-only PRIVATE-TOKEN. Scope the header + pin followRedirects to the repo
+    // host so neither the credential nor a redirect can reach another host.
+    const user = username?.trim() || "oauth2";
+    const basic = Buffer.from(`${user}:${pat}`).toString("base64");
     const headerKey = httpScope ? `http.${httpScope}.extraHeader` : "http.extraHeader";
     const redirKey = httpScope ? `http.${httpScope}.followRedirects` : "http.followRedirects";
-    pairs.push([headerKey, `PRIVATE-TOKEN: ${pat}`]);
+    pairs.push([headerKey, `Authorization: Basic ${basic}`]);
     pairs.push([redirKey, "false"]);
   }
   let count = Number(env.GIT_CONFIG_COUNT ?? "0") || 0;

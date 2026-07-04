@@ -70,8 +70,9 @@ export interface ClaimRepo {
   /** GitLab WEB url of the repo (for display/links); NOT the clone target. */
   url: string;
   /** The clone target the worker clones from. Tokenless https: the PAT is
-   *  supplied out-of-band via the PRIVATE-TOKEN header, never embedded in the
-   *  URL (so it can't rest in the bare repo's on-disk config). */
+   *  supplied out-of-band via an env-scoped HTTP auth header (Basic, since
+   *  git-over-HTTPS uses Basic — not GitLab's REST-only PRIVATE-TOKEN), never
+   *  embedded in the URL (so it can't rest in the bare repo's on-disk config). */
   clone_url: string;
   default_branch?: string | null;
 }

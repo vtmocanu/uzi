@@ -27,17 +27,34 @@ beforeEach(() => {
 afterEach(() => fx.cleanup());
 
 describe("gitEnv", () => {
-  it("carries the PAT only inside a GIT_CONFIG_VALUE, as a PRIVATE-TOKEN header", () => {
+  // Locate the extraHeader (idx, value) that carries the Basic credential.
+  function authHeader(env: NodeJS.ProcessEnv): { idx: string; value: string } {
+    const holder = Object.entries(env).find(
+      ([k, v]) => /^GIT_CONFIG_VALUE_\d+$/.test(k) && typeof v === "string" && v.startsWith("Authorization: Basic "),
+    );
+    assert.ok(holder, "an Authorization: Basic extraHeader value is present");
+    return { idx: holder![0].slice("GIT_CONFIG_VALUE_".length), value: holder![1] as string };
+  }
+  const decodeBasic = (value: string): string =>
+    Buffer.from(value.slice("Authorization: Basic ".length), "base64").toString("utf8");
+
+  it("carries the PAT as HTTP Basic (base64 user:pat) in a GIT_CONFIG_VALUE extraHeader", () => {
     const env = gitEnv(FAKE_PAT);
-    const holders = Object.entries(env).filter(([, v]) => typeof v === "string" && v.includes(FAKE_PAT));
-    // Exactly one env var holds the secret, and it is the extraHeader value.
-    assert.strictEqual(holders.length, 1);
-    const [key, value] = holders[0]!;
-    assert.match(key, /^GIT_CONFIG_VALUE_\d+$/);
-    assert.strictEqual(value, `PRIVATE-TOKEN: ${FAKE_PAT}`);
-    // The corresponding key entry names http.extraHeader.
-    const idx = key.slice("GIT_CONFIG_VALUE_".length);
+    // The raw PAT is base64-encoded, so it never appears literally anywhere in env.
+    assert.ok(
+      !Object.values(env).some((v) => typeof v === "string" && v.includes(FAKE_PAT)),
+      "the raw PAT must not appear literally (it is base64-encoded)",
+    );
+    const { idx, value } = authHeader(env);
     assert.strictEqual(env[`GIT_CONFIG_KEY_${idx}`], "http.extraHeader");
+    // git-over-HTTPS auth is Basic, NOT PRIVATE-TOKEN (that is REST-only): the PAT
+    // is the password and the default username is the conventional "oauth2".
+    assert.strictEqual(decodeBasic(value), `oauth2:${FAKE_PAT}`);
+  });
+
+  it("uses the supplied bot username as the Basic user", () => {
+    const env = gitEnv(FAKE_PAT, undefined, "uzi-bot");
+    assert.strictEqual(decodeBasic(authHeader(env).value), `uzi-bot:${FAKE_PAT}`);
   });
 
   it("adds nothing secret-bearing when no PAT is supplied", () => {
@@ -48,13 +65,12 @@ describe("gitEnv", () => {
   it("host-scopes the header and pins followRedirects off when a scope is given (item 9)", () => {
     const scope = httpScopeForUrl("https://gitlab.example.com/org/repo.git");
     assert.strictEqual(scope, "https://gitlab.example.com/");
-    const env = gitEnv(FAKE_PAT, scope);
+    const env = gitEnv(FAKE_PAT, scope, "uzi-bot");
     // The header key is scoped to the repo host, not the global http.extraHeader.
-    const holders = Object.entries(env).filter(([, v]) => typeof v === "string" && v.includes(FAKE_PAT));
-    assert.strictEqual(holders.length, 1);
-    const idx = holders[0]![0].slice("GIT_CONFIG_VALUE_".length);
+    const { idx, value } = authHeader(env);
     assert.strictEqual(env[`GIT_CONFIG_KEY_${idx}`], `http.${scope}.extraHeader`);
-    // followRedirects is pinned false on the same scope so a redirect can't replay the PAT.
+    assert.strictEqual(decodeBasic(value), `uzi-bot:${FAKE_PAT}`);
+    // followRedirects is pinned false on the same scope so a redirect can't replay the credential.
     const keys = Object.entries(env).filter(([k]) => /^GIT_CONFIG_KEY_\d+$/.test(k)).map(([, v]) => v);
     assert.ok(keys.includes(`http.${scope}.followRedirects`));
   });
