@@ -16,6 +16,8 @@ import { Board } from "./pages/Board";
 import { RunsList } from "./pages/RunsList";
 import { RunView } from "./pages/RunView";
 import { WorkersSettings } from "./pages/WorkersSettings";
+import { Docs } from "./pages/Docs";
+import { DocPage } from "./pages/DocPage";
 
 export default function App() {
   return (
@@ -24,6 +26,9 @@ export default function App() {
         <Route path="/" element={<Landing />} />
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
+        {/* Public, unauthenticated: onboarding howtos are needed before login. */}
+        <Route path="/docs" element={<Docs />} />
+        <Route path="/docs/:slug" element={<DocPage />} />
         <Route
           path="/dashboard"
           element={

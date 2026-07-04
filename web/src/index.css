@@ -10,3 +10,79 @@ body {
   @apply bg-ink text-slate-100 antialiased;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
+
+/* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules
+   consistent with the dark theme — the @tailwindcss/typography plugin is not a
+   dependency. Interactive/asset elements (a, img, table) are handled in
+   DocMarkdown; everything else is styled here. */
+.docs-prose {
+  @apply max-w-none text-slate-300;
+}
+.docs-prose > :first-child {
+  @apply mt-0;
+}
+.docs-prose h1 {
+  @apply mb-4 mt-8 text-3xl font-bold tracking-tight text-slate-100;
+}
+.docs-prose h2 {
+  @apply mb-3 mt-8 border-b border-slate-800 pb-1.5 text-xl font-semibold text-slate-100;
+}
+.docs-prose h3 {
+  @apply mb-2 mt-6 text-lg font-semibold text-slate-100;
+}
+.docs-prose h4 {
+  @apply mb-2 mt-4 text-base font-semibold text-slate-200;
+}
+.docs-prose p {
+  @apply my-4 leading-7;
+}
+.docs-prose a {
+  @apply text-indigo-400 underline underline-offset-2 hover:text-indigo-300;
+}
+.docs-prose strong {
+  @apply font-semibold text-slate-100;
+}
+.docs-prose ul {
+  @apply my-4 list-disc space-y-1.5 pl-6;
+}
+.docs-prose ol {
+  @apply my-4 list-decimal space-y-1.5 pl-6;
+}
+.docs-prose li {
+  @apply leading-7;
+}
+.docs-prose li > ul,
+.docs-prose li > ol {
+  @apply my-1.5;
+}
+.docs-prose blockquote {
+  @apply my-4 border-l-2 border-slate-700 pl-4 italic text-slate-400;
+}
+.docs-prose hr {
+  @apply my-8 border-slate-800;
+}
+.docs-prose code {
+  @apply rounded bg-slate-800 px-1.5 py-0.5 text-[0.85em] text-slate-200;
+}
+.docs-prose pre {
+  @apply my-4 overflow-x-auto rounded-lg border border-slate-800 bg-slate-900 p-4 text-sm leading-6;
+}
+.docs-prose pre code {
+  @apply bg-transparent p-0 text-slate-200;
+}
+.docs-prose img {
+  @apply my-4 max-w-full rounded-lg border border-slate-800;
+}
+.docs-prose table {
+  @apply my-0 w-full border-collapse text-sm;
+}
+.docs-prose thead {
+  @apply bg-slate-900;
+}
+.docs-prose th,
+.docs-prose td {
+  @apply border border-slate-800 px-3 py-2 text-left align-top;
+}
+.docs-prose th {
+  @apply font-semibold text-slate-200;
+}
