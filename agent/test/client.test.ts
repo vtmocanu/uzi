@@ -68,6 +68,22 @@ describe("reportState", () => {
     assert.strictEqual(api.stateAttempts, 1);
   });
 
+  it("retries a non-terminal report through transient failures", async () => {
+    api.failStateNext(2, 503);
+    const client = newClient();
+    await client.reportState("run-1", { status: "running" });
+    // 2 injected failures + 1 success — same backoff path as terminal reports.
+    assert.strictEqual(api.stateAttempts, 3);
+    assert.deepStrictEqual(api.states, [{ runId: "run-1", body: { status: "running" } }]);
+  });
+
+  it("gives up on a permanent 4xx for a non-terminal report", async () => {
+    api.failStateNext(1, 400);
+    const client = newClient();
+    await assert.rejects(client.reportState("run-1", { status: "running" }), RequestError);
+    assert.strictEqual(api.stateAttempts, 1); // no retry on a permanent error
+  });
+
   it("retries a terminal report through transient failures", async () => {
     api.failStateNext(2, 503);
     const client = newClient();
@@ -127,6 +143,38 @@ describe("MessageBatcher seq numbering", () => {
     await batcher.close(); // succeeds; delivers [1, 2] in order
 
     assert.deepStrictEqual(api.messages(runId).map((m) => m.seq), [1, 2]);
+  });
+});
+
+describe("MessageBatcher close race", () => {
+  it("awaits an in-flight flush so a batch that fails mid-flight is not stranded", async () => {
+    // Gate the first postMessages open so a flush is provably in flight when
+    // close() runs; that first attempt then fails and re-buffers its batch.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let calls = 0;
+    const fakeClient = {
+      postMessages: async () => {
+        calls += 1;
+        if (calls === 1) {
+          await gate;
+          throw new Error("boom"); // in-flight flush fails after close() is called
+        }
+        // The drain retry from close() succeeds.
+      },
+    } as unknown as WorkerClient;
+
+    const batcher = new MessageBatcher(fakeClient, "run-race", 0, 60_000, nullLogger());
+    batcher.emit({ kind: "text", payload: { i: 1 } });
+
+    const flushing = batcher.flush(); // starts, blocks on the gate
+    const closing = batcher.close(); // runs while the flush is in flight
+    release(); // let the in-flight flush fail and re-buffer seq 1
+    await Promise.all([flushing, closing]);
+
+    // Without awaiting the in-flight flush, close() would have returned before
+    // the failure re-buffered and seq 1 would be lost (calls === 1).
+    assert.strictEqual(calls, 2);
   });
 });
 

@@ -1,7 +1,6 @@
 import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
-  TERMINAL_STATES,
   type ClaimResponse,
   type HeartbeatRequest,
   type MessagesRequest,
@@ -84,20 +83,16 @@ export class WorkerClient {
   }
 
   /**
-   * Report a run state. Terminal reports (completed/failed) are retried with
-   * bounded backoff and treat an "already terminal" server response as success
-   * (multica) so a lost ack / duplicate replay is safe. Non-terminal reports
-   * are single-shot.
+   * Report a run state. Every report — terminal (completed/failed) and
+   * non-terminal (running/awaiting_approval) alike — is retried with bounded
+   * backoff on transient failures: the server transition is idempotent, so a
+   * retried non-terminal report is safe (PRD: "/state is retried with backoff"),
+   * and a terminal report *must* reach the server. An "already terminal" server
+   * response (409, or a 4xx body mentioning terminal) is treated as success
+   * (multica) so a lost ack / duplicate replay is safe. A 4xx is otherwise fatal.
    */
   async reportState(runId: string, body: StateRequest): Promise<void> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
-    const terminal = TERMINAL_STATES.has(body.status);
-    if (!terminal) {
-      await this.postJSON(path, body);
-      return;
-    }
-
-    let lastErr: unknown;
     for (let attempt = 0; ; attempt++) {
       try {
         await this.postJSON(path, body);
@@ -107,15 +102,12 @@ export class WorkerClient {
           this.log.info("state already terminal server-side, treating as success", { run_id: runId, status: body.status });
           return;
         }
-        lastErr = err;
         if (!isTransient(err) || attempt >= this.terminalRetrySchedule.length) throw err;
         const delay = this.terminalRetrySchedule[attempt] ?? 0;
         this.log.warn("state report failed, retrying", { run_id: runId, status: body.status, attempt, delay_ms: delay });
         await this.sleep(delay);
       }
     }
-    // Unreachable: the loop either returns or throws.
-    void lastErr;
   }
 
   async getInputs(runId: string): Promise<UserInput[]> {
@@ -124,7 +116,7 @@ export class WorkerClient {
   }
 
   /** A 409, or a 4xx body mentioning "terminal", means the server already
-   *  finalized the run — an idempotent success for a terminal report. */
+   *  finalized the run — an idempotent success for any state report. */
   private isAlreadyTerminal(err: unknown): boolean {
     if (!(err instanceof RequestError)) return false;
     if (err.status === 409) return true;

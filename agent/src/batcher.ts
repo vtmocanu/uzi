@@ -21,6 +21,8 @@ export class MessageBatcher {
   private timer: NodeJS.Timeout | undefined;
   private flushing = false;
   private closed = false;
+  /** The currently running flush, if any, so close() can await it. */
+  private inFlight: Promise<void> | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -59,6 +61,15 @@ export class MessageBatcher {
   async flush(): Promise<void> {
     if (this.flushing || this.buffer.length === 0) return;
     this.flushing = true;
+    this.inFlight = this.doFlush();
+    try {
+      await this.inFlight;
+    } finally {
+      this.inFlight = undefined;
+    }
+  }
+
+  private async doFlush(): Promise<void> {
     const batch = this.buffer;
     this.buffer = [];
     try {
@@ -80,6 +91,11 @@ export class MessageBatcher {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
+    // A flush kicked off by the batch timer may be in flight; await it so a
+    // failed flush re-buffers its batch before we decide what is left to drain
+    // (otherwise close() could observe an empty buffer and return while the
+    // in-flight flush later fails and strands those messages).
+    if (this.inFlight) await this.inFlight;
     for (let attempt = 0; attempt < 3 && this.buffer.length > 0; attempt++) {
       await this.flush();
       if (this.buffer.length > 0) await sleep(200 * (attempt + 1));

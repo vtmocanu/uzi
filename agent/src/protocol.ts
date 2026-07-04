@@ -1,14 +1,12 @@
 // Worker↔API wire contract (PRD #4 §Worker protocol).
 //
-// M1 (the server side) is built in parallel on a sibling branch, so these
-// shapes are the worker's *assumed* contract, derived from the PRD schema and
-// the multica daemon reference. Field names follow the DB column names (PRD #4
-// §Schema) and snake_case JSON, matching the Go server's conventions.
-//
-// Every field whose exact wire name/nesting is not yet pinned by M1 is called
-// out in AMBIGUITY comments and surfaced in the M2 report for reconciliation;
-// parseClaim() below is deliberately lenient so a rename on the server side is a
-// one-line fix here, not a reshape.
+// These shapes are pinned against the M1 server, not assumed: the claim payload
+// was reconciled in f74bf6a (structured agents[], tokenless clone_url), and the
+// /state body's `status` key matches M1's reconciled JSON tag. Field names
+// follow the DB column names (PRD #4 §Schema) and snake_case JSON, matching the
+// Go server's conventions; `config` timeouts are in *seconds*
+// (run_timeout_seconds / idle_timeout_seconds), matching M1's claim.go. See the
+// PRD #4 Decision Log for the reconciliation history.
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
@@ -45,9 +43,9 @@ export interface RegisterRequest {
 }
 
 export interface RegisterResponse {
-  // AMBIGUITY: the PRD identifies the worker by its Bearer token on every
-  // subsequent call (heartbeat/claim carry no worker id in the path), so the
-  // worker does not strictly need this. Captured for logging when present.
+  // The worker is identified by its Bearer token on every subsequent call
+  // (heartbeat/claim carry no worker id in the path), so this is not strictly
+  // needed; M1 returns it and we capture it for logging when present.
   worker_id?: string;
 }
 
@@ -94,10 +92,12 @@ export interface ClaimSecrets {
   forge_username?: string;
 }
 
-/** Per-run caps the server may push down (PRD §Configuration). Advisory in M2. */
+/** Per-run caps the server may push down (PRD §Configuration). Advisory in M2.
+ *  Field names + units match M1's claim.go: timeouts are in *seconds*; any
+ *  future ms consumer converts at the use site. */
 export interface ClaimConfig {
-  run_timeout_ms?: number;
-  idle_timeout_ms?: number;
+  run_timeout_seconds?: number;
+  idle_timeout_seconds?: number;
   max_iterations?: number;
 }
 
