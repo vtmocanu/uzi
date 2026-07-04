@@ -145,11 +145,14 @@ export interface StateRequest {
   status: RunState;
   /** awaiting_approval carries the captured plan. */
   plan_md?: string;
-  /** completed carries the pushed branch + opened MR (mr_iid arrives in M4). */
+  /** completed carries the pushed branch + opened MR. */
   branch?: string;
   mr_iid?: number;
   /** failed carries a human-readable reason. */
   failure_reason?: string;
+  /** implement⇄review loop counter, reported on running reports (M4). The
+   *  server persists it with GREATEST, so a resume never regresses it. */
+  iteration_count?: number;
   /** Pinned mid-flight so a resume has the SDK session (M3). */
   session_id?: string;
 }

@@ -24,6 +24,13 @@ export interface Config {
   messageBatchMs: number;
   /** Per-request HTTP timeout for control-plane calls. */
   httpTimeoutMs: number;
+  /**
+   * Bound on how long a run may sit at the plan-approval gate before it is failed
+   * (M4 resolution of the PRD's open "awaiting_approval wall-clock cap"). Generous
+   * by default so a human has ample time, but finite so an abandoned plan never
+   * wedges the worker (one run at a time).
+   */
+  planApprovalTimeoutMs: number;
   logLevel: LogLevel;
 }
 
@@ -75,12 +82,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     workerToken: required(env, "UZI_WORKER_TOKEN"),
     dataDir: env.UZI_DATA_DIR?.trim() || "/data",
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
-    version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m3",
+    version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m4",
     executor: parseExecutor(env.UZI_EXECUTOR),
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),
     messageBatchMs: duration(env, "WORKER_MESSAGE_BATCH_INTERVAL", "500ms"),
     httpTimeoutMs: duration(env, "WORKER_HTTP_TIMEOUT", "30s"),
+    planApprovalTimeoutMs: duration(env, "WORKER_PLAN_APPROVAL_TIMEOUT", "24h"),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }
