@@ -38,8 +38,9 @@ when scripting something the helper script doesn't cover.
 ## E2E test bot
 
 Some of uzi's forge tests exercise a real GitLab instance rather than a mock
-(the `httptest`-based unit tests in `api/internal/forge` and
-`api/internal/forgesvc` don't need this — only a live, end-to-end run does).
+(the `httptest`-based unit tests in `api/internal/forge` and the
+`fakeForge`-mock-based ones in `api/internal/forgesvc` don't need this, only
+a live, end-to-end run does).
 The convention for supplying that bot's credentials is three variables in
 your gitignored `.env`, **never read by the application itself** (grep
 `api/internal/config/config.go` — they are not among `Config`'s fields):

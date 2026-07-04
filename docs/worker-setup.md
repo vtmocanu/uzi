@@ -10,7 +10,7 @@ A **worker** is the `uzi-agent` container: it connects to your uzi server, claim
 
 ## 1. Generate a join token
 
-In uzi, open **Settings → Workers** and register a worker (give it a name, e.g. `laptop`). The join token is shown **once** — copy it now, since only its hash is stored server-side (register a new worker if you lose it).
+In uzi, open **Settings → Workers** and register a worker (give it a name, e.g. `laptop`). The join token is shown **once**: copy it now, since only its hash is stored server-side (register a new worker if you lose it).
 
 ![Settings → Workers, showing a newly generated join token](img/worker-setup-join-token.png)
 
@@ -36,7 +36,7 @@ docker run -d -e UZI_API_URL=https://uzi.example.com -e UZI_WORKER_TOKEN=<the jo
   -v uzi-agent-data:/data --cap-drop ALL --security-opt no-new-privileges:true uzi-agent
 ```
 
-Put a TLS-terminating proxy in front of a worker reached over an untrusted network — `api` itself listens plain HTTP.
+Put a TLS-terminating proxy in front of a worker reached over an untrusted network: `api` itself listens plain HTTP.
 
 ## Online, offline, busy
 
@@ -46,6 +46,6 @@ Put a TLS-terminating proxy in front of a worker reached over an untrusted netwo
 
 ## Multiple workers, removing a worker
 
-Register more than one worker (e.g. `laptop` and `ci-runner-1`) — each claims independently from your queue. **Settings → Workers → Delete** removes a registration (refused while it holds a non-terminal run); it doesn't stop the container itself.
+Register more than one worker (e.g. `laptop` and `ci-runner-1`); each claims independently from your queue. **Settings → Workers → Delete** removes a registration (refused while it holds a non-terminal run); it doesn't stop the container itself.
 
 See [configuration.md](./configuration.md#worker-container-agent) for every worker environment variable, and [ARCHITECTURE.md](../ARCHITECTURE.md#run-lifecycle) for claim and requeue semantics.

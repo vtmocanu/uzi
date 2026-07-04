@@ -138,12 +138,12 @@ recipe a later release renders into a running one.
   and immutable after creation (it is the subagent's filename and identity;
   renaming means creating a new template and deleting the old one; builtins
   are never renamed). `description` and `prompt_body` are required and
-  non-empty; `model` and each tool name must not contain a newline, carriage
-  return, or other control character (they each render on a single
-  frontmatter line). A template is rejected if its description or prompt body
-  contains what looks like a complete Anthropic token (a high-confidence
-  `sk-ant-...` match); the UI separately warns, without blocking, on looser
-  patterns so legitimate text stays savable.
+  non-empty; `description`, `model`, and each tool name must not contain a
+  newline, carriage return, or other control character (they each render on
+  a single frontmatter line). A template is rejected if its description or
+  prompt body contains what looks like a complete Anthropic token (a
+  high-confidence `sk-ant-...` match); the UI separately warns, without
+  blocking, on looser patterns so legitimate text stays savable.
 - **API surface.** All endpoints require authentication (session + CSRF); the
   writes also require admin: `GET /api/agent-templates` (list), `GET
   /api/agent-templates/:id` (one), `GET .../rendered`, `POST

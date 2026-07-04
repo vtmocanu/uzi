@@ -26,25 +26,24 @@ so either kind is accepted.
 
 - **OAuth token**: install the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/overview)
   if needed, then run `claude setup-token`. It opens your browser to sign
-  in and prints a long-lived token to your terminal — copy it, then clear
+  in and prints a long-lived token to your terminal: copy it, then clear
   your terminal scrollback/history if it persists.
 - **Console API key**: sign in at [console.anthropic.com](https://console.anthropic.com),
-  open **API keys**, **Create key**, and copy it — the console shows it
+  open **API keys**, **Create key**, and copy it; the console shows it
   only once.
 
 ## 2. Store it in uzi
 
-Open **Settings → Anthropic token**, paste it, and click **Save**. The
-status flips to **Set** with the save date; the token itself is never
+Open **Settings → Anthropic token**, paste it, and click **Save token**.
+The status flips to **Set** with the save date; the token itself is never
 shown again.
 
 ![Settings, Anthropic token, showing the paste field and Set status](img/anthropic-token-settings.png)
 
 ## Rotate or remove
 
-- **Rotate**: paste a new token and **Save** — it overwrites the old one.
-- **Remove**: click **Delete** (a no-op if nothing is set, so always safe
-  to click).
+- **Rotate**: paste a new token and click **Save new token**; it overwrites the old one.
+- **Remove**: once a token is set, a **Delete** button appears next to its status; click it to disconnect uzi from your Anthropic account.
 
 ## Good to know
 

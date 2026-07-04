@@ -38,5 +38,5 @@ Register a worker and start a run from a board card: see
 
 ## Along the way
 
-- [Agent templates](./agent-templates.md) — the roles (`coder`, `reviewer`,
+- [Agent templates](./agent-templates.md): the roles (`coder`, `reviewer`,
   ...) your agents play, and how an admin edits them.
