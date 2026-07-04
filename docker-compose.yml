@@ -68,6 +68,19 @@ services:
       # real client IP is read from the XFF nginx sets. A direct hit that
       # bypasses nginx from a non-trusted source has its XFF ignored.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,10.244.0.0/16,127.0.0.1/32}
+      # Agent-runtime knobs (PRD #4), read by the API's config.Load (server side).
+      # RUN_TIMEOUT and RUN_MAX_REQUEUES drive the run sweeper; WORKER_HEARTBEAT_STALE
+      # and WORKER_AFFINITY_GRACE drive worker liveness + claim affinity; RUN_IDLE_TIMEOUT
+      # and RUN_MAX_ITERATIONS are read here and shipped to the worker in the claim
+      # payload (enforced worker-side). Without these lines, setting them in .env is
+      # inert and the API falls back to its Go defaults. (WORKER_HEARTBEAT_INTERVAL and
+      # WORKER_POLL_INTERVAL are worker cadences consumed by the agent service, not here.)
+      RUN_TIMEOUT: ${RUN_TIMEOUT:-2h}
+      RUN_IDLE_TIMEOUT: ${RUN_IDLE_TIMEOUT:-10m}
+      RUN_MAX_ITERATIONS: ${RUN_MAX_ITERATIONS:-5}
+      RUN_MAX_REQUEUES: ${RUN_MAX_REQUEUES:-1}
+      WORKER_HEARTBEAT_STALE: ${WORKER_HEARTBEAT_STALE:-45s}
+      WORKER_AFFINITY_GRACE: ${WORKER_AFFINITY_GRACE:-2m}
     # Not published to the host: reached only by web over the compose network.
     depends_on:
       db:
