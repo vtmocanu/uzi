@@ -605,15 +605,15 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 }
 
 // originColumn resolves the issue's current column to snapshot onto the run, so a
-// failed/cancelled run restores where it started. It is always a valid text value
-// ("" = the implicit Open column) — distinct from NULL (unknown) — because the
-// resolution runs against the same cache the board renders from. A failure to
-// list columns degrades to "" rather than blocking the run; the manual-drag guard
-// tolerates a stale baseline.
+// failed/cancelled run restores where it started. A successful resolution is
+// always a valid text value ("" = the implicit Open column). If the columns
+// cannot be listed the origin is left NULL (unknown), NOT "" — the run is not
+// blocked, but a later restore must skip rather than confidently strip the card
+// to Open on a guess (spec invariant: NULL = unknown = never restore).
 func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue store.Issue) pgtype.Text {
 	cols, err := s.q.ListBoardColumns(ctx, repoID)
 	if err != nil {
-		return pgtype.Text{String: "", Valid: true}
+		return pgtype.Text{} // NULL = unknown, never guess Open
 	}
 	position := make(map[string]int, len(cols))
 	for _, c := range cols {

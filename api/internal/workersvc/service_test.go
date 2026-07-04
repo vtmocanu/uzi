@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -76,6 +77,7 @@ type fakeStore struct {
 	issueByID       store.Issue
 	issueByIDErr    error
 	boardCols       []store.BoardColumn
+	boardColsErr    error
 	createRunResult store.Run
 	createRunErr    error
 	createRunParams *store.CreateRunParams
@@ -213,7 +215,7 @@ func (f *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (s
 	return f.issueByID, f.issueByIDErr
 }
 func (f *fakeStore) ListBoardColumns(context.Context, uuid.UUID) ([]store.BoardColumn, error) {
-	return f.boardCols, nil
+	return f.boardCols, f.boardColsErr
 }
 func (f *fakeStore) CreateRun(_ context.Context, arg store.CreateRunParams) (store.Run, error) {
 	f.createRunParams = &arg
@@ -1050,6 +1052,31 @@ func TestCreateRunNotifiesQueuedWithOriginSnapshot(t *testing.T) {
 	}
 	if len(lc.notes) != 1 || lc.notes[0].status != "queued" || lc.notes[0].runID != runID {
 		t.Fatalf("expected one 'queued' notification, got %+v", lc.notes)
+	}
+}
+
+func TestCreateRunOriginNullWhenColumnsUnavailable(t *testing.T) {
+	// A DB error listing the board columns must NOT degrade the origin snapshot to
+	// "" (Open): that is a confident guess a later failed/cancelled restore would
+	// act on, stripping the card to Open. Unknown must stay NULL so the restore
+	// skips instead.
+	user, repo := uuid.New(), uuid.New()
+	labels, _ := json.Marshal([]string{"PRD", "Later"})
+	fs := &fakeStore{
+		issueByID:       store.Issue{Title: "T", State: "opened", Labels: labels, HasPrdLink: true},
+		boardColsErr:    errors.New("db unavailable"),
+		createRunResult: store.Run{ID: uuid.New()},
+	}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc"); err != nil {
+		t.Fatalf("CreateRun should not be blocked by a column-list error: %v", err)
+	}
+	if fs.createRunParams == nil {
+		t.Fatal("CreateRun not called")
+	}
+	if fs.createRunParams.OriginColumn.Valid {
+		t.Fatalf("origin_column must be NULL (unknown) when columns can't be listed, got %+v", fs.createRunParams.OriginColumn)
 	}
 }
 
