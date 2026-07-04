@@ -2,6 +2,7 @@ import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import type { EmittedMessage } from "./executor.js";
 import type { OutgoingMessage } from "./protocol.js";
+import type { PayloadRedactor } from "./redact.js";
 import { errMessage, sleep } from "./util.js";
 
 /**
@@ -24,20 +25,27 @@ export class MessageBatcher {
   /** The currently running flush, if any, so close() can await it. */
   private inFlight: Promise<void> | undefined;
 
+  /** Scrubs known secrets from every payload before it leaves the worker. */
+  private readonly redact: PayloadRedactor;
+
   constructor(
     private readonly client: WorkerClient,
     private readonly runId: string,
     lastSeq: number,
     private readonly batchMs: number,
     private readonly log: Logger,
+    redact?: PayloadRedactor,
   ) {
     this.seq = lastSeq;
+    this.redact = redact ?? ((p) => p);
   }
 
   emit(msg: EmittedMessage): void {
     if (this.closed) return;
     this.seq += 1;
-    const out: OutgoingMessage = { seq: this.seq, kind: msg.kind, payload: msg.payload };
+    // Redact before buffering so no secret is ever persisted or broadcast, even
+    // if a tool_result echoed the OAuth token from the agent's env.
+    const out: OutgoingMessage = { seq: this.seq, kind: msg.kind, payload: this.redact(msg.payload) };
     if (msg.agent !== undefined) out.agent = msg.agent;
     this.buffer.push(out);
     this.scheduleFlush();
