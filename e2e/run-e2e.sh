@@ -34,8 +34,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXECUTOR="${UZI_E2E_EXECUTOR:-stub}"
 PROJECT="${UZI_E2E_COMPOSE_PROJECT:-uzi-e2e-$$}"
-# A real SDK agent turn takes minutes; the stub finishes in seconds.
-[ "$EXECUTOR" = sdk ] && COMPLETE_TIMEOUT_DEFAULT=600 || COMPLETE_TIMEOUT_DEFAULT=90
+# A real SDK agent turn takes minutes (observed ~13m: the seeded template spawns
+# a reviewer subagent), where the stub finishes in seconds.
+[ "$EXECUTOR" = sdk ] && COMPLETE_TIMEOUT_DEFAULT=1800 || COMPLETE_TIMEOUT_DEFAULT=90
 RUNROOT="${E2E_RUN_DIR:-${TMPDIR:-/tmp}/uzi-e2e-$$}"
 RUNROOT="${RUNROOT%/}"
 ENVFILE="$RUNROOT/e2e.env"
