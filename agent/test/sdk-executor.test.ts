@@ -155,10 +155,32 @@ describe("SdkExecutor guardrail options", () => {
       assert.deepStrictEqual(o.agents?.[name]?.disallowedTools, ["Agent"]);
     }
 
-    // PreToolUse hook is wired, scoped to Bash.
-    const matcher = o.hooks?.PreToolUse?.[0];
-    assert.strictEqual(matcher?.matcher, "Bash");
-    assert.strictEqual(matcher?.hooks.length, 1);
+    // Two PreToolUse matchers are wired: Bash (command screening) and the file
+    // tools (path screening).
+    const bashMatcher = o.hooks?.PreToolUse?.[0];
+    assert.strictEqual(bashMatcher?.matcher, "Bash");
+    assert.strictEqual(bashMatcher?.hooks.length, 1);
+    const pathMatcher = o.hooks?.PreToolUse?.[1];
+    assert.match(pathMatcher?.matcher ?? "", /Read\|Edit\|Write/);
+    // The wired path hook denies a /proc Read (the sibling-tool bypass).
+    const pathHook = pathMatcher!.hooks[0]!;
+    const denied = await pathHook(
+      {
+        session_id: "s",
+        transcript_path: "/t",
+        cwd: "/tmp/does-not-need-to-exist",
+        hook_event_name: "PreToolUse",
+        tool_name: "Read",
+        tool_input: { file_path: "/proc/1/environ" },
+        tool_use_id: "tu",
+      } as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+    assert.strictEqual(
+      (denied as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
+      "deny",
+    );
 
     // session id surfaced once; success status + start status streamed.
     assert.deepStrictEqual(sessionIds, ["sess-1"]);

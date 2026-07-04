@@ -16,7 +16,7 @@ import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { assembleAgents } from "./agents.js";
 import { buildLeadPrompt, buildLeadSystemPrompt } from "./prompt.js";
-import { buildPreToolUseHook } from "./guardrails.js";
+import { buildPreToolUseHook, buildPathGuardHook } from "./guardrails.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
 import { errMessage } from "./util.js";
@@ -98,9 +98,17 @@ export class SdkExecutor implements Executor {
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       // The load-bearing deny layer: even under bypassPermissions a PreToolUse
-      // deny blocks the tool. Scoped to Bash, where the repo/credential risk is.
+      // deny blocks the tool. The Bash hook screens commands; the path hook
+      // screens the file tools so `Read /proc/<pid>/environ`, out-of-worktree
+      // paths, and `.git/` access can't sidestep the Bash deny-list.
       hooks: {
-        PreToolUse: [{ matcher: "Bash", hooks: [buildPreToolUseHook(this.log)] }],
+        PreToolUse: [
+          { matcher: "Bash", hooks: [buildPreToolUseHook(this.log)] },
+          {
+            matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
+            hooks: [buildPathGuardHook(ctx.worktreePath, this.log)],
+          },
+        ],
       },
       // Persist discrete blocks only; partial token deltas would flood the seq
       // stream (the live-partial channel is M5, not M3).

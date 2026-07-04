@@ -20,6 +20,9 @@ export class RunRunner {
     private readonly executor: Executor,
     private readonly log: Logger,
     private readonly batchMs: number,
+    /** The worker's join token — redacted from message payloads (it lives in
+     *  the worker env, reachable via a /proc read of the parent). */
+    private readonly joinToken?: string,
   ) {}
 
   async execute(claim: ClaimResponse): Promise<void> {
@@ -30,9 +33,10 @@ export class RunRunner {
     if (claim.secrets.anthropic_oauth_token) this.log.addSecret(claim.secrets.anthropic_oauth_token);
 
     const runLog = this.log.child({ run_id: runId, issue_iid: claim.issue_iid });
-    // Scrub the per-run secrets out of every message payload before it is sent
-    // (a tool_result could echo the OAuth token from the agent's env).
-    const redact = makeRedactor([claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token]);
+    // Scrub the per-run secrets AND the worker join token out of every message
+    // payload before it is sent (a tool_result could echo the OAuth token from
+    // the agent env, or the join token via a /proc read of the worker).
+    const redact = makeRedactor([claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, this.joinToken]);
     const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
 
     // Last SDK session id the executor observed; carried on the TERMINAL state

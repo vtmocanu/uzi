@@ -38,7 +38,7 @@ async function main(): Promise<void> {
   const sdkHomeDir = path.join(config.dataDir, "agent-home");
   const executor: Executor =
     config.executor === "stub" ? new StubExecutor(log) : new SdkExecutor(log, sdkHomeDir);
-  const runner = new RunRunner(client, git, executor, log, config.messageBatchMs);
+  const runner = new RunRunner(client, git, executor, log, config.messageBatchMs, config.workerToken);
   const worker = new Worker(config, client, runner, log);
 
   const controller = new AbortController();

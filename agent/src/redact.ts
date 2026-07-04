@@ -5,9 +5,17 @@
 // can carry a secret: the OAuth token is in the agent subprocess env as
 // CLAUDE_CODE_OAUTH_TOKEN, so a tool_result from `echo $CLAUDE_CODE_OAUTH_TOKEN`
 // (or any command that surfaces it) would otherwise reach the DB and the live
-// stream verbatim. This scrubs known secret substrings out of every payload
-// before it is batched, the same way and with the same 8-char floor as the
-// logger, so nothing sensitive is persisted or broadcast.
+// stream verbatim. The worker's join token, though absent from the sparse agent
+// env, lives in the WORKER process env and so is reachable via a /proc read of
+// the parent (denied by the guardrails, redacted here as defense-in-depth).
+// This scrubs the run's forge PAT, OAuth token, and join token out of every
+// payload before it is batched, the same way and with the same 8-char floor as
+// the logger, so nothing sensitive is persisted or broadcast.
+//
+// Best-effort by design: this is exact-substring replacement, so an obfuscated
+// secret (base64, char-split, whitespace-injected) slips through. It is a
+// safety net, not a boundary — the boundaries are the sparse agent env (the PAT
+// and join token never enter the agent) and the tool-boundary guardrails.
 
 const REDACTED = "***REDACTED***";
 // Matches log.ts SecretRegistry: don't blanket-replace short strings whose

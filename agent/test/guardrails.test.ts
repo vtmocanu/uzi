@@ -1,6 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { screenBashCommand, buildPreToolUseHook, NESTED_AGENT_TOOL } from "../src/guardrails.js";
+import {
+  screenBashCommand,
+  buildPreToolUseHook,
+  screenToolPath,
+  buildPathGuardHook,
+  NESTED_AGENT_TOOL,
+} from "../src/guardrails.js";
 import { nullLogger } from "./helpers.js";
 import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
 
@@ -40,6 +46,14 @@ const DENIED: Array<[string, string]> = [
   ["nohup git push origin main &", "nohup + backgrounded push"],
   ["git config --unset remote.origin.url", "config unset of remote.*"],
   ["timeout 30 git push", "timeout-wrapped push"],
+  // git config include/includeIf can pull in an attacker config file.
+  ["git config include.path /tmp/evil", "config include.path"],
+  ["git config includeIf.gitdir:/repo.path /tmp/evil", "config includeIf.path"],
+  // Force ops that rewrite refs / discard work stay denied.
+  ["git switch --force other", "force switch"],
+  ["git restore --force src/x.ts", "force restore"],
+  ["git branch -D main", "force branch delete (-D)"],
+  ["git branch -M main trunk", "force branch move (-M)"],
 ];
 
 const ALLOWED: string[] = [
@@ -60,6 +74,11 @@ const ALLOWED: string[] = [
   "sh -c 'npm run build'", // benign inner command
   "bash -c \"git status && git commit -m ok\"", // benign inner chain
   "timeout 30 npm test", // timeout wrapper around a benign command
+  // Local-worktree force ops are NOT a directive concern — must stay allowed.
+  "git clean -f",
+  "git clean -fd",
+  "git add -f build/ignored.log",
+  "git branch -d stale", // safe (non-force) branch delete
 ];
 
 describe("screenBashCommand", () => {
@@ -135,5 +154,69 @@ describe("buildPreToolUseHook", () => {
 
   it("exports the nested-agent tool name it blocks on subagents", () => {
     assert.strictEqual(NESTED_AGENT_TOOL, "Agent");
+  });
+});
+
+const WT = "/work/wt";
+
+describe("screenToolPath", () => {
+  it("denies /proc, out-of-worktree, and .git paths", () => {
+    assert.strictEqual(screenToolPath("/proc/1/environ", WT, WT).denied, true);
+    assert.strictEqual(screenToolPath("/etc/passwd", WT, WT).denied, true);
+    assert.strictEqual(screenToolPath("../../etc/passwd", WT, WT).denied, true);
+    assert.strictEqual(screenToolPath("/work/wt-sibling/x", WT, WT).denied, true); // prefix-safe
+    assert.strictEqual(screenToolPath(".git/config", WT, WT).denied, true);
+    assert.strictEqual(screenToolPath("/work/wt/.git/hooks/pre-commit", WT, WT).denied, true);
+  });
+
+  it("allows in-worktree paths (absolute and relative to cwd)", () => {
+    assert.strictEqual(screenToolPath("src/index.ts", WT, WT).denied, false);
+    assert.strictEqual(screenToolPath("/work/wt/src/index.ts", WT, WT).denied, false);
+    assert.strictEqual(screenToolPath("x.ts", WT, "/work/wt/src").denied, false); // relative to subdir cwd
+    assert.strictEqual(screenToolPath("./README.md", WT, WT).denied, false);
+  });
+});
+
+function pathInput(tool: string, toolInput: Record<string, unknown>): HookInput {
+  return {
+    session_id: "s",
+    transcript_path: "/t",
+    cwd: WT,
+    hook_event_name: "PreToolUse",
+    tool_name: tool,
+    tool_input: toolInput,
+    tool_use_id: "tu",
+  } as HookInput;
+}
+
+describe("buildPathGuardHook", () => {
+  const hook = buildPathGuardHook(WT, nullLogger());
+
+  it("denies Read of /proc (the sibling-tool bypass of the Bash /proc deny)", async () => {
+    const out = await hook(pathInput("Read", { file_path: "/proc/1/environ" }));
+    assert.strictEqual(
+      (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
+      "deny",
+    );
+  });
+
+  it("denies an out-of-worktree absolute path and a .git path", async () => {
+    for (const p of ["/etc/passwd", ".git/config"]) {
+      const out = await hook(pathInput("Write", { file_path: p }));
+      assert.strictEqual(
+        (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
+        "deny",
+        `expected deny for ${p}`,
+      );
+    }
+  });
+
+  it("allows an in-worktree read and a Grep with no explicit path", async () => {
+    assert.deepStrictEqual(await hook(pathInput("Read", { file_path: "src/index.ts" })), {});
+    assert.deepStrictEqual(await hook(pathInput("Grep", { pattern: "TODO" })), {});
+  });
+
+  it("ignores non-path tools (Bash is handled by the other hook)", async () => {
+    assert.deepStrictEqual(await hook(pathInput("Bash", { command: "cat /proc/1/environ" })), {});
   });
 });

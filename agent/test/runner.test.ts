@@ -73,13 +73,15 @@ describe("RunRunner", () => {
     assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true);
   });
 
-  it("redacts a secret an executor emitted in a message before it reaches the API", async () => {
+  it("redacts the OAuth token AND the worker join token from emitted messages", async () => {
     const TOKEN = "dummy-oauth-token-runner-000000";
+    const JOIN_TOKEN = "dummy-join-token-runner-111111";
     // An executor whose tool_result echoes the OAuth token (as `echo
-    // $CLAUDE_CODE_OAUTH_TOKEN` would) — it must not reach the DB/stream.
+    // $CLAUDE_CODE_OAUTH_TOKEN` would) and the join token (as a /proc read of
+    // the worker would) — neither may reach the DB/stream.
     const leaky: Executor = {
       run: async (ctx) => {
-        ctx.emit({ kind: "tool_result", agent: "coder", payload: { content: `the token is ${TOKEN}` } });
+        ctx.emit({ kind: "tool_result", agent: "coder", payload: { content: `oauth=${TOKEN} join=${JOIN_TOKEN}` } });
         return { branch: ctx.branch };
       },
     };
@@ -89,13 +91,15 @@ describe("RunRunner", () => {
       last_seq: 0,
       secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: TOKEN },
     });
-    await new RunRunner(client, git, leaky, nullLogger(), 20).execute(claim);
+    // 6th arg = the worker join token, added to the redactor list.
+    await new RunRunner(client, git, leaky, nullLogger(), 20, JOIN_TOKEN).execute(claim);
 
     const tr = api.messages(claim.run_id).find((m) => m.kind === "tool_result");
     assert.ok(tr, "the tool_result should have been delivered");
     const serialized = JSON.stringify(tr.payload);
     assert.ok(!serialized.includes(TOKEN), "the OAuth token must not reach the API");
-    assert.ok(serialized.includes("***REDACTED***"), "the token should be redacted in place");
+    assert.ok(!serialized.includes(JOIN_TOKEN), "the join token must not reach the API");
+    assert.ok(serialized.includes("***REDACTED***"), "secrets should be redacted in place");
   });
 
   it("reports failed with a reason and still tears the worktree down when the executor throws", async () => {

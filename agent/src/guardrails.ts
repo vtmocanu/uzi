@@ -19,11 +19,23 @@
 // shell operators, skips git global options to reach the REAL subcommand, and
 // recursively unwraps `sh -c` / `bash -c` / `eval` / `env VAR=v` wrappers.
 //
-// Residual (accepted, documented at merge): shell-expansion indirection a
-// static screener cannot see through — `$(printf 'g%sh' it) push`, base64|sh,
-// variable-built commands. These are out of reach for any static check; the
-// real guarantee remains that the agent holds no push credential.
+// The file tools (Read/Edit/Write/Glob/Grep) get their own PreToolUse matcher
+// (buildPathGuardHook): the Bash deny-list would otherwise be sidestepped by
+// `Read /proc/<worker_pid>/environ` (which leaks the worker's join token), by an
+// absolute path into `/etc`, or by a `..` escape out of the worktree. The path
+// guard denies /proc, anything resolving outside the run worktree, and anything
+// under `.git/`.
+//
+// Residual (accepted, documented at merge):
+//  - Shell-expansion indirection a static screener cannot see through
+//    (`$(printf 'g%sh' it) push`, base64|sh, variable-built commands). Out of
+//    reach for any static check; the real guarantee remains that the agent
+//    holds no push credential.
+//  - Heredoc bodies are tokenized as if they were commands, so a benign
+//    `cat <<EOF … git push … EOF` may be over-denied. That degrades SAFE (a
+//    denied benign heredoc) and the agent can use Write/Edit instead.
 
+import path from "node:path";
 import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./log.js";
 
@@ -52,6 +64,8 @@ const REASON_ENV = "denied by guardrail: reading the process environment is not 
 const REASON_PS = "denied by guardrail: inspecting the process table is not permitted";
 const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
 const REASON_DEPTH = "denied by guardrail: command wrapping is nested too deeply to screen safely";
+const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted";
+const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not permitted";
 
 const MAX_DEPTH = 6;
 
@@ -65,6 +79,12 @@ const GENERIC_WRAPPERS = new Set([
 const REMOTE_MUTATORS = new Set([
   "set-url", "add", "remove", "rm", "rename", "set-branches", "set-head", "prune", "update",
 ]);
+// Force flags are denied only for subcommands that rewrite refs/history/discard
+// work; local file ops (git clean -f, git add -f, …) are allowed. Force-push is
+// denied unconditionally by the `push` rule above, not here.
+const FORCE_DENY_SUBCOMMANDS = new Set(["checkout", "switch", "restore"]);
+// File tools that carry a path and so get the worktree/`/proc`/`.git` guard.
+const PATH_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Glob", "Grep"]);
 // git global options that consume the following token as their value.
 const GIT_VALUE_OPTS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"]);
 const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"]);
@@ -193,8 +213,9 @@ function analyzeGitConfig(rest: string[]): BashScreenResult {
   }
   const key = rest[k];
   // A write/unset to a remote/transport/credential namespace can repoint origin
-  // or inject an auth header — deny even though the read flags didn't match.
-  if (key && /^(remote|core|http|url|credential)\./i.test(key)) return deny(REASON_CONFIG_WRITE);
+  // or inject an auth header; an include/includeIf can pull in an attacker
+  // config file that does the same. Deny even though the read flags didn't match.
+  if (key && /^(remote|core|http|url|credential|include|includeif)\./i.test(key)) return deny(REASON_CONFIG_WRITE);
   return ALLOW;
 }
 
@@ -216,7 +237,12 @@ function analyzeGit(args: string[]): BashScreenResult {
     return mut && REMOTE_MUTATORS.has(mut.toLowerCase()) ? deny(REASON_REMOTE) : ALLOW;
   }
   if (sub === "config") return analyzeGitConfig(rest);
-  if (rest.some(isForceFlag)) return deny(REASON_FORCE);
+  if (sub === "branch") {
+    // Force delete (-D), force move (-M), or explicit --force/-f rewrites a ref.
+    if (rest.some((x) => x === "-D" || x === "-M" || isForceFlag(x))) return deny(REASON_FORCE);
+    return ALLOW;
+  }
+  if (FORCE_DENY_SUBCOMMANDS.has(sub) && rest.some(isForceFlag)) return deny(REASON_FORCE);
   return ALLOW;
 }
 
@@ -327,5 +353,65 @@ export function buildPreToolUseHook(log: Logger): (input: HookInput) => Promise<
         permissionDecisionReason: screen.reason ?? "denied by guardrail",
       },
     };
+  };
+}
+
+/** Path-bearing fields across the file tools (file_path / path / notebook_path). */
+function extractToolPaths(toolInput: unknown): string[] {
+  if (!toolInput || typeof toolInput !== "object") return [];
+  const rec = toolInput as Record<string, unknown>;
+  const out: string[] = [];
+  for (const key of ["file_path", "path", "notebook_path"]) {
+    const v = rec[key];
+    if (typeof v === "string" && v.length > 0) out.push(v);
+  }
+  return out;
+}
+
+/**
+ * Screen a single file-tool path against the run worktree. Pure/synchronous so
+ * the guardrail suite can assert it with no live session. Relative paths resolve
+ * against `cwd` (the tool's working dir), and containment is checked against the
+ * worktree root — so a `..` escape, an absolute path into `/etc` or `/proc`, or
+ * a path under `.git/` is denied.
+ */
+export function screenToolPath(candidate: string, worktreeRoot: string, cwd: string): BashScreenResult {
+  if (candidate.includes("/proc/")) return deny(REASON_PROC);
+  const root = path.resolve(worktreeRoot);
+  const resolved = path.resolve(cwd || root, candidate);
+  const inRoot = resolved === root || resolved.startsWith(root + path.sep);
+  if (!inRoot) return deny(REASON_OUTSIDE_WORKTREE);
+  const gitDir = path.join(root, ".git");
+  if (resolved === gitDir || resolved.startsWith(gitDir + path.sep)) return deny(REASON_DOTGIT);
+  return ALLOW;
+}
+
+/**
+ * Build the PreToolUse hook for the path-bearing file tools. Denies any path
+ * that reads /proc, escapes the run worktree, or touches `.git/`, closing the
+ * sibling-tool bypass of the Bash `/proc` deny. Non-path tools and in-worktree
+ * paths return no decision (the tool proceeds under `bypassPermissions`).
+ */
+export function buildPathGuardHook(
+  worktreeRoot: string,
+  log: Logger,
+): (input: HookInput) => Promise<HookJSONOutput> {
+  return async (input: HookInput): Promise<HookJSONOutput> => {
+    if (input.hook_event_name !== "PreToolUse" || !PATH_TOOLS.has(input.tool_name)) return {};
+    const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : worktreeRoot;
+    for (const candidate of extractToolPaths(input.tool_input)) {
+      const screen = screenToolPath(candidate, worktreeRoot, cwd);
+      if (screen.denied) {
+        log.warn("guardrail denied a file-tool path", { tool: input.tool_name, reason: screen.reason });
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: screen.reason ?? "denied by guardrail",
+          },
+        };
+      }
+    }
+    return {};
   };
 }
