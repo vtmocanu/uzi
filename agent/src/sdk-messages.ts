@@ -100,17 +100,22 @@ function mapResult(msg: Record<string, unknown>): EmittedMessage[] {
   const subtype = asString(msg["subtype"]) ?? "unknown";
   if (subtype === "success" && msg["is_error"] !== true) {
     // duration_ms/total_cost_usd are forwarded additively so the run view can
-    // show the finish line's duration and cost (PRD #11); num_turns is unchanged.
-    // Added only when the SDK frame carries them, so the payload stays minimal
-    // (and absent fields never surface as null in the persisted stream).
-    const payload: Record<string, unknown> = {
-      event: "result",
-      subtype,
-      num_turns: msg["num_turns"],
-    };
-    if (typeof msg["duration_ms"] === "number") payload["duration_ms"] = msg["duration_ms"];
-    if (typeof msg["total_cost_usd"] === "number") payload["total_cost_usd"] = msg["total_cost_usd"];
-    return [{ kind: "status", agent: LEAD, payload }];
+    // show the finish line's duration and cost (PRD #11). Unguarded passthrough,
+    // same style as num_turns: when the SDK frame omits a field it lands as
+    // undefined and JSON-serialization drops it, so nothing surfaces on the wire.
+    return [
+      {
+        kind: "status",
+        agent: LEAD,
+        payload: {
+          event: "result",
+          subtype,
+          num_turns: msg["num_turns"],
+          duration_ms: msg["duration_ms"],
+          total_cost_usd: msg["total_cost_usd"],
+        },
+      },
+    ];
   }
   // error_during_execution / error_max_turns / error_max_budget_usd / etc.
   const errors = Array.isArray(msg["errors"]) ? (msg["errors"] as unknown[]).map(String) : [];

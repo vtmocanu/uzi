@@ -49,10 +49,20 @@ describe("mapSdkMessage", () => {
     ]);
   });
 
-  it("maps a success result to a status message", () => {
+  it("maps a success result to a status message (unguarded passthrough, absent fields are undefined)", () => {
     const out = mapSdkMessage({ type: "result", subtype: "success", is_error: false, num_turns: 3 });
     assert.deepStrictEqual(out, [
-      { kind: "status", agent: "lead", payload: { event: "result", subtype: "success", num_turns: 3 } },
+      {
+        kind: "status",
+        agent: "lead",
+        payload: {
+          event: "result",
+          subtype: "success",
+          num_turns: 3,
+          duration_ms: undefined,
+          total_cost_usd: undefined,
+        },
+      },
     ]);
   });
 
