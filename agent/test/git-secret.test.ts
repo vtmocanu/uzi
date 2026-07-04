@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { recordingLogger } from "./helpers.js";
-import { GitCache, gitEnv, httpScopeForUrl } from "../src/git.js";
+import { GitCache, gitEnv, gitBasicCredential, httpScopeForUrl } from "../src/git.js";
 
 // Primary directive (auditor): the bot PAT must never be readable in the git
 // process table. Passing it via `git -c` would put it on argv (world-readable
@@ -112,6 +112,10 @@ describe("pushBranch secret flow", () => {
     assert.ok(recordedArgv.includes("push"), "push should have run through the shim");
     assert.ok(!recordedArgv.includes(FAKE_PAT), "PAT must not appear in any git argv");
     assert.ok(!JSON.stringify(lines).includes(FAKE_PAT), "PAT must not appear in any log line");
+    // Nor the base64 Basic credential (base64(user:pat)) it is sent as.
+    const basic = gitBasicCredential(FAKE_PAT);
+    assert.ok(!recordedArgv.includes(basic), "the Basic credential must not appear in any git argv");
+    assert.ok(!JSON.stringify(lines).includes(basic), "the Basic credential must not appear in any log line");
 
     // The branch really landed on origin.
     const log = execFileSync("git", ["-C", fx.originPath, "log", "--oneline", "agent/issue-7"], { encoding: "utf8" });
@@ -151,5 +155,8 @@ describe("secret flow through real git spawns", () => {
     assert.ok(recordedArgv.includes("clone"), "clone should have run through the shim");
     assert.ok(!recordedArgv.includes(FAKE_PAT), "PAT must not appear in any git argv");
     assert.ok(!JSON.stringify(lines).includes(FAKE_PAT), "PAT must not appear in any log line");
+    const basic = gitBasicCredential(FAKE_PAT);
+    assert.ok(!recordedArgv.includes(basic), "the Basic credential must not appear in any git argv");
+    assert.ok(!JSON.stringify(lines).includes(basic), "the Basic credential must not appear in any log line");
   });
 });

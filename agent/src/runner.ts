@@ -1,5 +1,6 @@
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
+import { gitBasicCredential } from "./git.js";
 import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import type { Logger } from "./log.js";
@@ -59,9 +60,14 @@ export class RunRunner {
     // output, then never log the claim payload itself.
     this.log.addSecret(claim.secrets.forge_pat);
     if (claim.secrets.anthropic_oauth_token) this.log.addSecret(claim.secrets.anthropic_oauth_token);
+    // Defense in depth: the git-over-HTTPS Basic credential (base64(user:pat))
+    // only ever lives in a GIT_CONFIG_VALUE (never argv/logs), but register it too
+    // so a future leak through the git env would still be scrubbed.
+    const gitBasic = gitBasicCredential(claim.secrets.forge_pat, claim.secrets.forge_username);
+    this.log.addSecret(gitBasic);
 
     const runLog = this.log.child({ run_id: runId, issue_iid: claim.issue_iid });
-    const redact = makeRedactor([claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, this.joinToken]);
+    const redact = makeRedactor([claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, this.joinToken, gitBasic]);
     const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
 
     // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the

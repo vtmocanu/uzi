@@ -268,11 +268,9 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     // HTTP Basic (base64(user:pat)) — git-over-HTTPS auth, unlike GitLab's
     // REST-only PRIVATE-TOKEN. Scope the header + pin followRedirects to the repo
     // host so neither the credential nor a redirect can reach another host.
-    const user = username?.trim() || "oauth2";
-    const basic = Buffer.from(`${user}:${pat}`).toString("base64");
     const headerKey = httpScope ? `http.${httpScope}.extraHeader` : "http.extraHeader";
     const redirKey = httpScope ? `http.${httpScope}.followRedirects` : "http.followRedirects";
-    pairs.push([headerKey, `Authorization: Basic ${basic}`]);
+    pairs.push([headerKey, `Authorization: Basic ${gitBasicCredential(pat, username)}`]);
     pairs.push([redirKey, "false"]);
   }
   let count = Number(env.GIT_CONFIG_COUNT ?? "0") || 0;
@@ -283,6 +281,19 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
   }
   env.GIT_CONFIG_COUNT = String(count);
   return env;
+}
+
+/**
+ * The base64 credential for git-over-HTTPS Basic auth: base64(`user:pat`), with
+ * `user` the bot login when known else the conventional `oauth2`. Exported so the
+ * runner can register this exact blob with the redactor / secret registry —
+ * defense in depth: it only ever lives in GIT_CONFIG_VALUE_n (never argv/logs),
+ * but if future code ever logged the git env, the scrubber would catch it. Keep
+ * the fallback in lockstep with gitEnv's, so the two never drift.
+ */
+export function gitBasicCredential(pat: string, username?: string): string {
+  const user = username?.trim() || "oauth2";
+  return Buffer.from(`${user}:${pat}`).toString("base64");
 }
 
 /**
