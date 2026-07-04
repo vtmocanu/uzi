@@ -70,7 +70,7 @@ type Store interface {
 	CreateRun(ctx context.Context, arg store.CreateRunParams) (store.Run, error)
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
 	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
-	ListRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListRunsForUserRow, error)
+	ListRunsForUser(ctx context.Context, arg store.ListRunsForUserParams) ([]store.ListRunsForUserRow, error)
 	ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
@@ -674,9 +674,18 @@ func (s *Service) ListRunMessagesForViewer(ctx context.Context, userID uuid.UUID
 }
 
 // ListRunsForUser returns the user's runs (newest first) with repo path and
-// worker name for the Runs index.
-func (s *Service) ListRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListRunsForUserRow, error) {
-	return s.q.ListRunsForUser(ctx, userID)
+// worker name for the Runs index. repoID and issueIID are optional narrowings
+// (nil = no filter): repo scope backs the board attention strip, repo+issue backs
+// the in-app issue history.
+func (s *Service) ListRunsForUser(ctx context.Context, userID uuid.UUID, repoID *uuid.UUID, issueIID *int64) ([]store.ListRunsForUserRow, error) {
+	arg := store.ListRunsForUserParams{UserID: userID}
+	if repoID != nil {
+		arg.RepoID = pgUUID(*repoID)
+	}
+	if issueIID != nil {
+		arg.IssueIid = pgtype.Int8{Int64: *issueIID, Valid: true}
+	}
+	return s.q.ListRunsForUser(ctx, arg)
 }
 
 // ListAllWorkers returns every worker with owner email and busy status (admin).

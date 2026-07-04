@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -53,6 +54,52 @@ type cardDTO struct {
 	// Conflict flags an issue that arrived carrying more than one column label;
 	// it is shown in the highest-positioned one until the next move normalizes it.
 	Conflict bool `json:"conflict"`
+	// LatestRun is the newest run for this issue, or null when it has never run.
+	// It carries only display state (no secrets); the run-view link is owner-only,
+	// so IsMine tells the client whether the viewer may open it.
+	LatestRun *latestRunDTO `json:"latest_run"`
+}
+
+// latestRunDTO is the run summary a card carries (PRD #12 M2), so the board needs
+// no second listRuns fan-in. OwnerName drives the "started by X" treatment;
+// IsMine gates the run-view link (a non-owner would 403 on GetRunByIDForUser).
+type latestRunDTO struct {
+	ID            string    `json:"id"`
+	Status        string    `json:"status"`
+	MrIID         *int64    `json:"mr_iid"`
+	FailureReason *string   `json:"failure_reason"`
+	OwnerName     string    `json:"owner_name"`
+	WorkerName    *string   `json:"worker_name"`
+	IsMine        bool      `json:"is_mine"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// mapLatestRun builds the card's run summary from the shared run + owner + worker
+// columns the board and single-card queries both return. viewerID is the board
+// viewer; IsMine is set when the run belongs to them (only then does the client
+// render the run-view link). ownerName prefers the display name, falling back to
+// the email, so "started by X" is never blank.
+func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, failureReason, ownerName, ownerEmail, workerName pgtype.Text, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+	dto := &latestRunDTO{
+		ID:            runID.String(),
+		Status:        status,
+		FailureReason: textPtrValue(failureReason.Valid, failureReason.String),
+		WorkerName:    textPtrValue(workerName.Valid, workerName.String),
+		IsMine:        ownerID == viewerID,
+		CreatedAt:     createdAt.Time,
+		UpdatedAt:     updatedAt.Time,
+	}
+	if mrIID.Valid {
+		v := mrIID.Int64
+		dto.MrIID = &v
+	}
+	if ownerName.Valid && ownerName.String != "" {
+		dto.OwnerName = ownerName.String
+	} else if ownerEmail.Valid {
+		dto.OwnerName = ownerEmail.String
+	}
+	return dto
 }
 
 type boardDTO struct {
@@ -224,6 +271,19 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return boardDTO{}, false
 	}
+	runRows, err := h.q.ListLatestRunsForRepo(r.Context(), repo.ID)
+	if err != nil {
+		slog.Error("list latest runs", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return boardDTO{}, false
+	}
+	// Newest run per issue, keyed by iid. repo.UserID is the board viewer (the
+	// connection owner); IsMine gates the run-view link.
+	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
+	for _, rr := range runRows {
+		latestByIID[rr.IssueIid] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
+			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.CreatedAt, rr.UpdatedAt, repo.UserID)
+	}
 
 	columns := make([]columnDTO, 0, len(cols))
 	position := make(map[string]int, len(cols))
@@ -249,6 +309,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 			Column:     col,
 			Closed:     closed,
 			Conflict:   conflict,
+			LatestRun:  latestByIID[is.ForgeIssueIid],
 		}
 		if is.Author.Valid {
 			a := is.Author.String
@@ -440,7 +501,16 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"card": issueToCard(updated, position)})
+	card := issueToCard(updated, position)
+	// Carry the issue's latest run on the single-card response too, so a drag never
+	// blanks the run badge the board is showing (the client replaces the card).
+	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: iid}); err == nil {
+		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
+			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Warn("latest run for moved card", "error", err)
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 
 // issueToCard resolves a cached issue row into a card DTO.

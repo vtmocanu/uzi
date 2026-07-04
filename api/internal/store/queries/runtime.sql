@@ -94,12 +94,18 @@ SELECT * FROM runs WHERE id = @id;
 
 -- name: ListRunsForUser :many
 -- The user's runs, newest first (Runs index + Agents-status "your runs"), joined
--- to the repo path and the nullable worker name for display.
+-- to the repo path and the nullable worker name for display. The optional
+-- repo_id / issue_iid narrowings (PRD #12 M2) serve the board attention strip
+-- (repo scope) and the in-app issue history (repo + issue); when both are NULL
+-- this is the unchanged full list. The per-issue narrowing rides the composite
+-- index runs (repo_id, issue_iid, created_at DESC).
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 WHERE r.user_id = @user_id
+  AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id'))
+  AND (sqlc.narg('issue_iid')::bigint IS NULL OR r.issue_iid = sqlc.narg('issue_iid'))
 ORDER BY r.created_at DESC
 LIMIT 200;
 

@@ -1005,9 +1005,17 @@ FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 WHERE r.user_id = $1
+  AND ($2::uuid IS NULL OR r.repo_id = $2)
+  AND ($3::bigint IS NULL OR r.issue_iid = $3)
 ORDER BY r.created_at DESC
 LIMIT 200
 `
+
+type ListRunsForUserParams struct {
+	UserID   uuid.UUID   `json:"user_id"`
+	RepoID   pgtype.UUID `json:"repo_id"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
+}
 
 type ListRunsForUserRow struct {
 	Run        Run         `json:"run"`
@@ -1016,9 +1024,13 @@ type ListRunsForUserRow struct {
 }
 
 // The user's runs, newest first (Runs index + Agents-status "your runs"), joined
-// to the repo path and the nullable worker name for display.
-func (q *Queries) ListRunsForUser(ctx context.Context, userID uuid.UUID) ([]ListRunsForUserRow, error) {
-	rows, err := q.db.Query(ctx, listRunsForUser, userID)
+// to the repo path and the nullable worker name for display. The optional
+// repo_id / issue_iid narrowings (PRD #12 M2) serve the board attention strip
+// (repo scope) and the in-app issue history (repo + issue); when both are NULL
+// this is the unchanged full list. The per-issue narrowing rides the composite
+// index runs (repo_id, issue_iid, created_at DESC).
+func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams) ([]ListRunsForUserRow, error) {
+	rows, err := q.db.Query(ctx, listRunsForUser, arg.UserID, arg.RepoID, arg.IssueIid)
 	if err != nil {
 		return nil, err
 	}
