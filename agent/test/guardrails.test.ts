@@ -25,6 +25,21 @@ const DENIED: Array<[string, string]> = [
   ["ps aux | grep git", "process listing"],
   ["cat /proc/1/environ", "/proc read"],
   ["cat /proc/self/cmdline", "/proc cmdline read"],
+  // Auditor PoCs — argv-level bypasses the old raw-string regex allowed.
+  ["git -C /repo push origin main", "global -C before subcommand"],
+  ["git -c protocol.version=2 push", "global -c before subcommand"],
+  ["sh -c 'git push origin main'", "sh -c wrapper"],
+  ["bash -c \"git push --force\"", "bash -c wrapper"],
+  ["git config remote.origin.url https://evil.example/x.git", "config WRITE to remote.*"],
+  ["git -C /repo remote set-url origin https://evil.example/x.git", "-C then remote set-url"],
+  // More indirection the tokenizer must still catch.
+  ["bash -lc \"git -C /r push\"", "combined -lc wrapper + global option"],
+  ["env FOO=bar git push origin main", "env-prefixed push"],
+  ["eval \"git push\"", "eval wrapper"],
+  ["sudo git push", "sudo-prefixed push"],
+  ["nohup git push origin main &", "nohup + backgrounded push"],
+  ["git config --unset remote.origin.url", "config unset of remote.*"],
+  ["timeout 30 git push", "timeout-wrapped push"],
 ];
 
 const ALLOWED: string[] = [
@@ -39,6 +54,12 @@ const ALLOWED: string[] = [
   "ls -la",
   "cat src/index.ts",
   "git checkout -b feature/x", // create a branch, no force
+  "git -C /repo status", // global option, benign subcommand
+  "git config user.email dev@example.com", // config write to a non-sensitive key
+  "env FOO=bar npm test", // env wrapper around a benign command
+  "sh -c 'npm run build'", // benign inner command
+  "bash -c \"git status && git commit -m ok\"", // benign inner chain
+  "timeout 30 npm test", // timeout wrapper around a benign command
 ];
 
 describe("screenBashCommand", () => {

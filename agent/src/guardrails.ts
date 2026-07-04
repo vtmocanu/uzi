@@ -11,6 +11,18 @@
 // why the worker runs `bypassPermissions` (allow-by-default, deny-specific) plus
 // this deny-hook rather than `default` (which hangs headless) or `dontAsk`
 // (deny-by-default, too tight for the coder subagent's broad file/bash needs).
+//
+// Screening is done by a small shell tokenizer + git-command analyzer rather
+// than regex-on-the-raw-string, because a raw-string matcher is trivially
+// bypassed: `git -C /repo push`, `git -c x=y push`, and `sh -c 'git push'` all
+// hide the real subcommand from a `/git\s+push/` regex. The analyzer splits on
+// shell operators, skips git global options to reach the REAL subcommand, and
+// recursively unwraps `sh -c` / `bash -c` / `eval` / `env VAR=v` wrappers.
+//
+// Residual (accepted, documented at merge): shell-expansion indirection a
+// static screener cannot see through — `$(printf 'g%sh' it) push`, base64|sh,
+// variable-built commands. These are out of reach for any static check; the
+// real guarantee remains that the agent holds no push credential.
 
 import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./log.js";
@@ -30,65 +42,244 @@ export interface BashScreenResult {
   reason?: string;
 }
 
-// Each rule pairs a matcher against the (whitespace-normalized, lowercased)
-// command with a STATIC reason. Reasons never echo the command, so a denial can
-// be surfaced to the run stream without leaking attacker-influenced text.
-interface DenyRule {
-  test: (normalized: string) => boolean;
-  reason: string;
+// Static (content-free) reasons — never echo the attacker-influenced command.
+const REASON_PUSH = "denied by guardrail: git push is not permitted (the worker opens MRs; the agent never pushes)";
+const REASON_REMOTE = "denied by guardrail: git remote mutation is not permitted";
+const REASON_FORCE = "denied by guardrail: forced git operations are not permitted";
+const REASON_CONFIG_READ = "denied by guardrail: reading git config values is not permitted";
+const REASON_CONFIG_WRITE = "denied by guardrail: modifying remote/core/http/credential git config is not permitted";
+const REASON_ENV = "denied by guardrail: reading the process environment is not permitted";
+const REASON_PS = "denied by guardrail: inspecting the process table is not permitted";
+const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
+const REASON_DEPTH = "denied by guardrail: command wrapping is nested too deeply to screen safely";
+
+const MAX_DEPTH = 6;
+
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
+// Wrappers that prefix a real command; skip the wrapper (and its options) and
+// analyze what follows. `env` and `eval` are handled specially below.
+const GENERIC_WRAPPERS = new Set([
+  "command", "builtin", "nohup", "nice", "ionice", "stdbuf", "setsid", "time",
+  "xargs", "sudo", "doas", "busybox", "timeout", "chrt", "exec",
+]);
+const REMOTE_MUTATORS = new Set([
+  "set-url", "add", "remove", "rm", "rename", "set-branches", "set-head", "prune", "update",
+]);
+// git global options that consume the following token as their value.
+const GIT_VALUE_OPTS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"]);
+const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"]);
+const GIT_CONFIG_VALUE_OPTS = new Set(["--file", "-f", "--type", "--blob"]);
+
+const deny = (reason: string): BashScreenResult => ({ denied: true, reason });
+const ALLOW: BashScreenResult = { denied: false };
+
+// --- tokenizer ---------------------------------------------------------------
+
+type Token = { word: string } | { op: string };
+
+/** Shell-word tokenizer: honors quotes/escapes, emits control operators as
+ *  their own tokens. Quotes are stripped (so `sh -c 'git push'` yields the word
+ *  `git push`); variable expansion is intentionally NOT performed. */
+function tokenize(input: string): Token[] {
+  const toks: Token[] = [];
+  let cur = "";
+  let hasCur = false;
+  const flush = (): void => {
+    if (hasCur) {
+      toks.push({ word: cur });
+      cur = "";
+      hasCur = false;
+    }
+  };
+  let i = 0;
+  const n = input.length;
+  while (i < n) {
+    const ch = input[i]!;
+    if (ch === "'") {
+      hasCur = true;
+      i++;
+      while (i < n && input[i] !== "'") { cur += input[i]; i++; }
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      hasCur = true;
+      i++;
+      while (i < n && input[i] !== '"') {
+        if (input[i] === "\\" && i + 1 < n) {
+          const nx = input[i + 1]!;
+          if (nx === '"' || nx === "\\" || nx === "$" || nx === "`") { cur += nx; i += 2; continue; }
+        }
+        cur += input[i];
+        i++;
+      }
+      i++;
+      continue;
+    }
+    if (ch === "\\") {
+      if (i + 1 < n) {
+        const nx = input[i + 1]!;
+        if (nx !== "\n") { cur += nx; hasCur = true; }
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\r") { flush(); i++; continue; }
+    if (ch === "\n" || ch === ";" || ch === "(" || ch === ")" || ch === "<" || ch === ">") {
+      flush();
+      toks.push({ op: ch });
+      i++;
+      continue;
+    }
+    if (ch === "&") { const two = input[i + 1] === "&"; flush(); toks.push({ op: two ? "&&" : "&" }); i += two ? 2 : 1; continue; }
+    if (ch === "|") { const two = input[i + 1] === "|"; flush(); toks.push({ op: two ? "||" : "|" }); i += two ? 2 : 1; continue; }
+    cur += ch;
+    hasCur = true;
+    i++;
+  }
+  flush();
+  return toks;
 }
 
-/** A git subcommand appears anywhere in the (possibly chained) command line. */
-function hasGit(normalized: string): boolean {
-  return /(^|[\s;|&(])git(\s|$)/.test(normalized);
+/** Split a token stream into per-simple-command word lists at every operator. */
+function splitSegments(toks: Token[]): string[][] {
+  const segs: string[][] = [];
+  let cur: string[] = [];
+  for (const t of toks) {
+    if ("op" in t) {
+      if (cur.length) { segs.push(cur); cur = []; }
+    } else {
+      cur.push(t.word);
+    }
+  }
+  if (cur.length) segs.push(cur);
+  return segs;
 }
 
-const DENY_RULES: DenyRule[] = [
-  // Any push — the primary directive. Covers `git push`, `git push --force`,
-  // `git push origin main`, force-with-lease, etc.
-  {
-    test: (c) => /(^|[\s;|&(])git\s+push(\s|$|;|&|\|)/.test(c),
-    reason: "denied by guardrail: git push is not permitted (the worker opens MRs; the agent never pushes)",
-  },
-  // Remote mutation — repointing origin could exfiltrate or bypass the MR flow.
-  {
-    test: (c) => /(^|[\s;|&(])git\s+remote\s+set-url(\s|$)/.test(c),
-    reason: "denied by guardrail: git remote mutation is not permitted",
-  },
-  // Any force flag in a git command. Scoped to git so ordinary non-git `-f`
-  // (e.g. `rm -f`, `grep -f`) still works; the intent here is force-push and
-  // force repo mutation (git push -f, git branch -f, git checkout -f, …).
-  {
-    test: (c) => hasGit(c) && /(^|\s)(--force(-with-lease)?|-f)(\s|=|$)/.test(c),
-    reason: "denied by guardrail: forced git operations are not permitted",
-  },
-  // Credential / secret reads. `git config --get`/`--list` and a bare
-  // `env`/`printenv` could dump configured values or the environment. (The PAT
-  // is off-disk and off-env for the agent, but the auditor requires the read
-  // itself be denied as defense-in-depth.)
-  {
-    test: (c) => /(^|[\s;|&(])git\s+config\s+([^\n]*\s)?(--get|--get-all|--list|-l)(\s|$)/.test(c),
-    reason: "denied by guardrail: reading git config values is not permitted",
-  },
-  {
-    test: (c) => /(^|[\s;|&(])(env|printenv)(\s|$|;|&|\|)/.test(c),
-    reason: "denied by guardrail: reading the process environment is not permitted",
-  },
-  // Process-table / /proc snooping (auditor requirement): argv/environ of any
-  // process could in principle reveal secrets, so both are denied.
-  {
-    test: (c) => /(^|[\s;|&(])ps(\s|$|;|&|\|)/.test(c),
-    reason: "denied by guardrail: listing processes is not permitted",
-  },
-  {
-    test: (c) => /\/proc\//.test(c),
-    reason: "denied by guardrail: reading /proc is not permitted",
-  },
-];
+function basename(word: string): string {
+  const idx = Math.max(word.lastIndexOf("/"), word.lastIndexOf("\\"));
+  return idx >= 0 ? word.slice(idx + 1) : word;
+}
 
-/** Collapse runs of whitespace and lowercase, so matchers stay simple. */
-function normalizeCommand(command: string): string {
-  return command.replace(/\s+/g, " ").trim().toLowerCase();
+/** Value of a shell `-c` option (`sh -c STR`, `bash -lc STR`), else undefined. */
+function shellDashCArg(words: string[], start: number): string | undefined {
+  for (let k = start; k < words.length; k++) {
+    const w = words[k]!;
+    if (w === "-c" || /^-[a-z]*c$/i.test(w)) return words[k + 1];
+    if (w.startsWith("-c") && w.length > 2) return w.slice(2);
+    if (!w.startsWith("-")) return undefined; // reached an operand before any -c
+  }
+  return undefined;
+}
+
+// --- analyzer ----------------------------------------------------------------
+
+function isForceFlag(x: string): boolean {
+  if (x === "--force" || x === "--force-with-lease" || x === "--force-if-includes") return true;
+  // Short flag (single dash) containing a lowercase f: -f, -fd, -rf, ...
+  return /^-[a-z]*f[a-z]*$/.test(x);
+}
+
+function analyzeGitConfig(rest: string[]): BashScreenResult {
+  if (rest.some((x) => GIT_CONFIG_READ_FLAGS.has(x))) return deny(REASON_CONFIG_READ);
+  let k = 0;
+  while (k < rest.length) {
+    const a = rest[k]!;
+    if (GIT_CONFIG_VALUE_OPTS.has(a)) { k += 2; continue; }
+    if (a.startsWith("-")) { k++; continue; } // --global/--local/--system/--add/--unset/--replace-all/…
+    break;
+  }
+  const key = rest[k];
+  // A write/unset to a remote/transport/credential namespace can repoint origin
+  // or inject an auth header — deny even though the read flags didn't match.
+  if (key && /^(remote|core|http|url|credential)\./i.test(key)) return deny(REASON_CONFIG_WRITE);
+  return ALLOW;
+}
+
+function analyzeGit(args: string[]): BashScreenResult {
+  let j = 0;
+  while (j < args.length) {
+    const a = args[j]!;
+    if (GIT_VALUE_OPTS.has(a)) { j += 2; continue; }
+    if (/^--(git-dir|work-tree|exec-path|namespace|super-prefix|config-env)=/.test(a)) { j++; continue; }
+    if (a.startsWith("-")) { j++; continue; } // -p, --no-pager, --bare, --exec-path, … (flags)
+    break;
+  }
+  if (j >= args.length) return ALLOW; // bare `git`
+  const sub = args[j]!.toLowerCase();
+  const rest = args.slice(j + 1);
+  if (sub === "push") return deny(REASON_PUSH);
+  if (sub === "remote") {
+    const mut = rest.find((x) => !x.startsWith("-"));
+    return mut && REMOTE_MUTATORS.has(mut.toLowerCase()) ? deny(REASON_REMOTE) : ALLOW;
+  }
+  if (sub === "config") return analyzeGitConfig(rest);
+  if (rest.some(isForceFlag)) return deny(REASON_FORCE);
+  return ALLOW;
+}
+
+/** Analyze one simple command (operator-free word list) after wrapper peeling. */
+function analyzeSimple(cmd: string[]): BashScreenResult {
+  if (cmd.length === 0) return ALLOW;
+  if (cmd.some((w) => w.includes("/proc/"))) return deny(REASON_PROC);
+  const base = basename(cmd[0]!).toLowerCase();
+  if (base === "printenv" || base === "env") return deny(REASON_ENV);
+  if (base === "ps" || base === "pgrep") return deny(REASON_PS);
+  if (base === "git") return analyzeGit(cmd.slice(1));
+  return ALLOW;
+}
+
+/** Peel `env`/shell/`eval`/generic wrappers, then screen the real command. */
+function analyzeSegment(words: string[], depth: number): BashScreenResult {
+  let i = 0;
+  while (i < words.length) {
+    const base = basename(words[i]!).toLowerCase();
+
+    if (base === "env") {
+      i++;
+      while (i < words.length) {
+        const a = words[i]!;
+        if (a === "-u") { i += 2; continue; }
+        if (a === "-i" || a === "-" || a === "--" || a === "-0") { i++; continue; }
+        if (a.startsWith("-")) { i++; continue; }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) { i++; continue; } // VAR=value assignment
+        break;
+      }
+      if (i >= words.length) return deny(REASON_ENV); // bare `env` dumps the environment
+      continue;
+    }
+
+    if (SHELLS.has(base)) {
+      const inner = shellDashCArg(words, i + 1);
+      if (inner !== undefined) return screenWithDepth(inner, depth + 1);
+      return ALLOW; // `bash script.sh` — the script file cannot be inspected statically
+    }
+
+    if (base === "eval") {
+      return screenWithDepth(words.slice(i + 1).join(" "), depth + 1);
+    }
+
+    if (GENERIC_WRAPPERS.has(base)) {
+      i++;
+      while (i < words.length && words[i]!.startsWith("-")) i++;
+      if ((base === "timeout" || base === "nice" || base === "ionice" || base === "chrt") && i < words.length && /^\d/.test(words[i]!)) i++;
+      continue;
+    }
+    break;
+  }
+  return analyzeSimple(words.slice(i));
+}
+
+function screenWithDepth(command: string, depth: number): BashScreenResult {
+  if (depth > MAX_DEPTH) return deny(REASON_DEPTH);
+  if (command.includes("/proc/")) return deny(REASON_PROC);
+  for (const seg of splitSegments(tokenize(command))) {
+    const r = analyzeSegment(seg, depth);
+    if (r.denied) return r;
+  }
+  return ALLOW;
 }
 
 /**
@@ -97,12 +288,7 @@ function normalizeCommand(command: string): string {
  * Anthropic session.
  */
 export function screenBashCommand(command: string): BashScreenResult {
-  const normalized = normalizeCommand(command);
-  if (!normalized) return { denied: false };
-  for (const rule of DENY_RULES) {
-    if (rule.test(normalized)) return { denied: true, reason: rule.reason };
-  }
-  return { denied: false };
+  return screenWithDepth(command, 0);
 }
 
 /** Extract the `command` field from a Bash tool_input, if present. */
