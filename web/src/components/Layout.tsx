@@ -52,6 +52,9 @@ export function Layout({ children }: { children: ReactNode }) {
                 <Link to="/repos" className="text-slate-300 hover:text-white">
                   Repos
                 </Link>
+                <Link to="/docs" className="text-slate-300 hover:text-white">
+                  Docs
+                </Link>
                 {repos.length > 0 && (
                   <select
                     value={currentRepoId}
@@ -87,6 +90,9 @@ export function Layout({ children }: { children: ReactNode }) {
               </>
             ) : (
               <>
+                <Link to="/docs" className="text-slate-300 hover:text-white">
+                  Docs
+                </Link>
                 <Link to="/login" className="text-slate-300 hover:text-white">
                   Log in
                 </Link>

@@ -93,7 +93,12 @@ services:
       start_period: 15s
 
   web:
-    build: ./web
+    # Context is the repo root (not ./web) so the docs viewer can bundle docs/
+    # as a sibling of web/ at build time; see web/Dockerfile and the root
+    # .dockerignore that keeps the context lean while preserving docs/*.md.
+    build:
+      context: .
+      dockerfile: web/Dockerfile
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:

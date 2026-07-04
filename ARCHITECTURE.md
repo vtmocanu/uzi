@@ -134,6 +134,24 @@ recipe a later release renders into a running one.
   nothing in this release writes it to a filesystem or spawns anything from it
   (that is a later release's job). See
   [docs/agent-templates.md](docs/agent-templates.md).
+- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique,
+  and immutable after creation (it is the subagent's filename and identity;
+  renaming means creating a new template and deleting the old one; builtins
+  are never renamed). `description` and `prompt_body` are required and
+  non-empty; `description`, `model`, and each tool name must not contain a
+  newline, carriage return, or other control character (they each render on
+  a single frontmatter line). A template is rejected if its description or
+  prompt body contains what looks like a complete Anthropic token (a
+  high-confidence `sk-ant-...` match); the UI separately warns, without
+  blocking, on looser patterns so legitimate text stays savable.
+- **API surface.** All endpoints require authentication (session + CSRF); the
+  writes also require admin: `GET /api/agent-templates` (list), `GET
+  /api/agent-templates/:id` (one), `GET .../rendered`, `POST
+  /api/agent-templates` (create), `PUT .../:id` (update; name is ignored,
+  immutable), `DELETE .../:id` (409 on a builtin), `POST .../:id/reset` (400
+  on a non-builtin). Edits are last-write-wins — no optimistic-concurrency
+  check in this release — but every row records `updated_by` and `updated_at`
+  so concurrent edits are at least attributable after the fact.
 
 ## Secrets: per-user credentials at rest
 
@@ -335,6 +353,39 @@ that are load-bearing, not incidental: **Origin validation** on the upgrade
 **per-run authorization check on subscribe** — the same owner-or-admin rule
 REST enforces, checked again here since a WS subscription is a second entry
 point into the same data.
+
+## Docs
+
+The `/docs` section (`web/src/pages/Docs.tsx`, `web/src/pages/DocPage.tsx`)
+renders the repo's own `docs/*.md` in-app, bundled at build time via a Vite
+glob (`web/src/lib/docs.ts`) rather than served from an API or duplicated
+into `web/`, so the in-app copy can never drift from the repo copy. See
+[docs/README.md](docs/README.md) for the frontmatter contract and how to
+add a page, and the PRD (`prds/7-docs-section-webui.md`) for the design
+rationale.
+
+- **Audience-gated visibility.** Every doc carries a leading-fence
+  frontmatter block (`title`, `order`, `audience`); only `audience: user`
+  pages are listed and routable at `/docs/:slug`, ordered by `order`.
+  `operator`/`design`/`contributor` pages (and anything with missing or
+  malformed frontmatter) stay repo-only, so adding a page is self-describing
+  and never touches `web/` code.
+- **No new trust boundary.** `/docs` is public (no auth) — the content is
+  non-secret and already world-readable in the repo, and onboarding docs are
+  needed before a user can do anything else. `react-markdown` renders
+  without `rehype-raw`, so raw HTML in a doc stays inert rather than needing
+  a sanitizer; content is repo-reviewed, not user- or model-supplied.
+- **Link rewriting.** A relative link to another bundled `user` page becomes
+  an in-app route (`/docs/:slug`); a link to a repo-only file (`../plan.md`,
+  a `design`/`operator` doc) rewrites to the pinned GitLab blob URL instead.
+  `#anchor` fragments are preserved either way.
+- **Build-time validation gate.** `web/scripts/check-docs.mjs` runs ahead of
+  `npm run build` and fails on missing/invalid frontmatter, a duplicate
+  `order` among `user` pages, a broken relative link (doc→doc or doc→img),
+  reference-style links, or an oversized `docs/img/*` file; it warns
+  (without failing) on a `user` page over the 60-line house-style budget.
+  There is no CI yet (`plan.md`: later), so this build step is the only gate
+  keeping in-app docs from rotting.
 
 ## Not yet in scope
 
