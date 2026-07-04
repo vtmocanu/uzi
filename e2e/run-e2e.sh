@@ -33,7 +33,9 @@ set -euo pipefail
 # --- layout ------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXECUTOR="${UZI_E2E_EXECUTOR:-stub}"
-PROJECT="${UZI_E2E_PROJECT:-uzi-e2e-$$}"
+PROJECT="${UZI_E2E_COMPOSE_PROJECT:-uzi-e2e-$$}"
+# A real SDK agent turn takes minutes; the stub finishes in seconds.
+[ "$EXECUTOR" = sdk ] && COMPLETE_TIMEOUT_DEFAULT=600 || COMPLETE_TIMEOUT_DEFAULT=90
 RUNROOT="${E2E_RUN_DIR:-${TMPDIR:-/tmp}/uzi-e2e-$$}"
 RUNROOT="${RUNROOT%/}"
 ENVFILE="$RUNROOT/e2e.env"
@@ -259,7 +261,7 @@ pass "orphaned run was re-queued, re-claimed, and is back at the gate"
 
 say "approve the plan and let the run finish"
 apipost "/api/runs/$RUN/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
-wait_status "$RUN" completed
+wait_status "$RUN" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 pass "run completed"
 
 # =============================================================================
