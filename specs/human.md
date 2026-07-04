@@ -56,6 +56,14 @@ Tracked as GitLab issue vtmocanu/uzi#3; PRD at `prds/3-agent-templates-anthropic
 - Scope: templates + token storage only. Agent runtime/execution deferred to PRD #4 (no spawning, no file writes, no Anthropic API calls).
 - Built in parallel with PRD #2, on a separate worktree/branch.
 
+## Feature #4 — Agent runtime: workers, job queue & live run view
+
+Tracked as GitLab issue vtmocanu/uzi#4; PRD at `prds/4-agent-runtime-workers.md`.
+
+> PLACEHOLDER — pending user confirmation. The full proposed contract text for
+> this feature has been sent to the team lead for user ratification and is NOT
+> yet part of the binding contract. Design detail lives in specs/ai.md §36–§53.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
