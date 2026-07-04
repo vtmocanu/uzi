@@ -1,7 +1,7 @@
 # PRD #11: Run View UX — Markdown Plan, Boxed Auto-scroll Activity, Terse Events
 
 **GitLab Issue**: [vtmocanu/uzi#11](https://gitlab.example.com/vtmocanu/uzi/-/issues/11)
-**Status**: Ready (2026-07-04: reviewed by 2 agents — UX-expert review + adversarial fact-check — all findings incorporated)
+**Status**: Implementation complete (2026-07-04: M0-M5 done on `prd-11-run-view-ux`; reviewer APPROVE + auditor clean + tester 6/6 success criteria PASS incl. docker debug-log e2e; specs synced. Remaining manual items: real-browser live-streaming feel pass; live-SDK tool-frame capstone.)
 **Priority**: Medium
 **Created**: 2026-07-04
 **Depends on**: PRD #4 (agent runtime + live run view, done). Coordinates with PRD #7 (docs section) — **#7 is already in progress**, so PRD #11 work MUST start with a reconnaissance step: check what #7 has landed (on `main` and any open #7 branch/MR) before writing anything. Concretely: (a) if `react-markdown`/`remark-gfm` are already in `web/package.json`, reuse — do not re-add or bump; (b) if #7 created a markdown renderer (component or `web/src/lib/docs.ts` pipeline), extract/reuse its **core** (react-markdown + remark-gfm + prose styles) rather than creating a parallel one; (c) the trust policies differ and must stay per-caller: #7 renders trusted repo docs (link rewriting to `/docs/:slug`, resolved images, same-tab nav), #11 renders untrusted LLM output (size-capped images, external-only `noopener` links, no rewriting) — inject link/image behavior via `components` props at each call site, never bake either policy into the shared core, and never add `rehype-raw` to the core.
