@@ -56,6 +56,7 @@ can we use agent teams? in sdk? - if not lets see how multica/bottega do it (reg
 
 ## later stuff
 
+- cli to interact with running sessions, see them + chat with them
 - maybe have a label in glab and agents auto start working on issues? how would it work? by using the agent from the user which created the label?
 - dark/light theme with autodetect
 - have AI agent - u can chat with UZI - it can see it's code and create issues for itself (local webui agent uses each user aouth token)
@@ -73,8 +74,10 @@ can we use agent teams? in sdk? - if not lets see how multica/bottega do it (reg
 - CICD + deploy to k8s + regen vmocanu bot token!! and create a dedicated one for tests!!!
 - check what other functionalities does multica/bottega have than we dont have and we might steal from them?
 - report on token used per issues - in webui and in PRD file and gitlab issue
+- debug mode with verbose logs
+- lanfuse integration
 
 ## later - later
 
 - leaderboard :) tokens/model used
-- how can we work on codebases for which we dont have access - transfer repo from laptop to agent?
+- how can we work on codebases for which we dont have access - transfer repo from laptop to agent? - see also if this can help: <https://github.com/openclaw/crabbox>
