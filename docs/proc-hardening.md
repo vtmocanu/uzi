@@ -66,10 +66,25 @@ be unlinked, and that's fine). The token then lives only in the worker's process
 - backward compatible: `UZI_WORKER_TOKEN` (env) still works when the file var is
   unset, so nothing existing breaks.
 
-This is proven by the E2E harness (`e2e/run-e2e.sh`): after a full run it asserts
-the token string appears in **zero** process `environ`s inside the worker
-container and that the delivery file was unlinked. See `agent/src/config.ts`
-(`resolveWorkerToken`) and `e2e/docker-compose.e2e.yml`.
+**Where it is wired (shipping stack vs test overlay):**
+
+- **The shipping stack** (`docker-compose.yml`, `--profile agent up`) delivers the
+  token as a **compose file secret**: `UZI_WORKER_TOKEN` (from `.env`) is mounted
+  at `/run/secrets/worker_token` and the agent reads it via `UZI_WORKER_TOKEN_FILE`
+  — so the token is **absent from the container `environ`**. Compose secret mounts
+  are **read-only**, so the worker's post-read unlink *fails and the file persists*
+  at `/run/secrets/worker_token`. The **environ win still holds** (the leak the
+  residual named is the `/proc/<pid>/environ` read, which is closed); the on-disk
+  copy is a lesser, documented residue that the full structural close below also
+  covers.
+- **The E2E overlay** (`e2e/docker-compose.e2e.yml`) delivers the token via a
+  **writable** bind-mounted file, so there the unlink also succeeds and **both**
+  the environ and the on-disk vectors are closed. The harness (`e2e/run-e2e.sh`)
+  asserts the token appears in **zero** process `environ`s and that the delivery
+  file was unlinked.
+
+See `agent/src/config.ts` (`resolveWorkerToken`), the `secrets:` block in
+`docker-compose.yml`, and `e2e/docker-compose.e2e.yml`.
 
 **What this does NOT close:** the **PAT** transient-window vector (a
 `setsid`-escaped survivor racing the push) is unchanged — the PAT is a git
@@ -109,11 +124,14 @@ On the remote-worker phase the worker runs as a pod, where the uid split and
    both structurally closed. Requires making the worker↔agent boundary an IPC
    one (the redesign noted above).
 
-2. **`hidepid=2` on the agent's `/proc`.** If the worker and agent stay in one
-   process tree, mount the agent's view of `/proc` with `hidepid=2` (via a
-   `proc` volume with mount options, or a runtimeClass that sets it) so a
-   same-uid process still cannot see *other* pids' `/proc` entries. Coarser than
-   the uid split but closes the environ read.
+2. **`hidepid=2` on `/proc` — only as a COMPLEMENT to the uid split, not alone.**
+   Important caveat: `hidepid=2` hides the `/proc` entries of *other users'*
+   processes; it does **not** hide same-uid processes from each other. So with a
+   same-uid worker+agent it buys nothing — the agent still sees the worker's
+   `/proc/<pid>/environ`. It is only useful **once the uids differ** (option 1),
+   where it additionally hides the worker's entire `/proc` entry from the agent
+   (not just makes `environ` unreadable via the 0400 perm). Do **not** rely on
+   `hidepid` as a standalone same-uid mitigation.
 
 3. **gVisor (`runtimeClassName: gvisor`).** Run the whole pod under `runsc`:
    `/proc` is a gVisor-synthesized, sandbox-local view and host-level `/proc`

@@ -95,19 +95,21 @@ services:
   # M4 defense-in-depth (audit item 6): drop all Linux capabilities and forbid
   # privilege escalation for the whole container. This shrinks the blast radius of
   # a prompt-injected agent (the agent's Bash tool runs in this same container).
-  # NOTE — the residual it does NOT close: the SDK agent subprocess shares the
-  # worker's uid, so a `cat <symlink>/self/environ` (a symlink to /proc, which the
-  # lexical Bash `/proc/` guard and the file-tool realpath guard cannot both cover)
-  # can still read the worker's own /proc/<pid>/environ and leak the join token
-  # (redacted from every message; the PAT is never in the worker's env). The PAT
-  # is only ever in a transient git CHILD env during push/MR, and the worker
-  # group-kills the agent subprocess tree before that op (B1), so a normal
-  # survivor is dead first — but a `setsid`-escaped survivor in its own session
-  # could still race that window. The real STRUCTURAL close — a distinct uid for
-  # the agent vs the worker's git ops, a user namespace, /proc hidepid=2, or
-  # gVisor — needs privileges this non-root compose MVP lacks and is deferred to
-  # the remote-worker (k8s/VM) phase. See screenToolPath + killAgentTree in
-  # agent/src/{guardrails,sdk-executor}.ts.
+  # M6 /proc hardening: the join token is delivered as a FILE secret (mounted at
+  # /run/secrets/worker_token from UZI_WORKER_TOKEN) instead of an env var, so it is
+  # NOT in the worker's /proc/<pid>/environ — closing the same-uid
+  # `cat <symlink>/self/environ` join-token leak the earlier milestones left open.
+  # The compose secret mount is read-only, so the worker's post-read unlink fails
+  # and the file persists at /run/secrets/worker_token; the environ win holds
+  # regardless (a writable delivery also gets the on-disk unlink). REMAINING
+  # residual: the PAT is in a transient git CHILD env during push/MR; the worker
+  # group-kills the agent tree before that op (B1) so a normal survivor is dead
+  # first, but a `setsid`-escaped survivor could still race that window. The full
+  # STRUCTURAL close (agent under a DISTINCT uid so it can't read the worker's /proc
+  # at all — a two-container pod with different runAsUser + shareProcessNamespace:
+  # false, or gVisor) needs privileges this non-root compose MVP lacks and is
+  # deferred to the remote-worker (k8s/VM) phase. See docs/proc-hardening.md and
+  # killAgentTree in agent/src/sdk-executor.ts.
   agent:
     build: ./agent
     profiles: ["agent"]
@@ -117,7 +119,11 @@ services:
       - ALL
     environment:
       UZI_API_URL: ${UZI_API_URL:-http://api:8080}
-      UZI_WORKER_TOKEN: "${UZI_WORKER_TOKEN:?set UZI_WORKER_TOKEN in .env - generate one from Settings > Workers}"
+      # /proc hardening (M6): read the join token from the mounted secret file, not
+      # an env var, so it never lands in the worker's /proc/<pid>/environ. The value
+      # comes from UZI_WORKER_TOKEN (.env) via the `worker_token` secret below; the
+      # worker also accepts UZI_WORKER_TOKEN directly as a backward-compat fallback.
+      UZI_WORKER_TOKEN_FILE: /run/secrets/worker_token
       UZI_DATA_DIR: /data
       UZI_WORKER_NAME: ${UZI_WORKER_NAME:-}
       WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-15s}
@@ -129,6 +135,8 @@ services:
       UZI_LOG_LEVEL: ${UZI_LOG_LEVEL:-info}
     volumes:
       - agentdata:/data
+    secrets:
+      - worker_token
     depends_on:
       api:
         condition: service_healthy
@@ -136,3 +144,11 @@ services:
 volumes:
   pgdata:
   agentdata:
+
+secrets:
+  # The worker join token, delivered to the agent as a FILE (mounted read-only at
+  # /run/secrets/worker_token) rather than an env var, so it is absent from the
+  # container's environ (the M6 /proc close). Sourced from UZI_WORKER_TOKEN (.env);
+  # if unset, the secret is empty and the worker fails fast with a clear error.
+  worker_token:
+    environment: UZI_WORKER_TOKEN
