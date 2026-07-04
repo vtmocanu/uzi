@@ -48,4 +48,15 @@ Put a TLS-terminating proxy in front of a worker reached over an untrusted netwo
 
 Register more than one worker (e.g. `laptop` and `ci-runner-1`); each claims independently from your queue. **Settings → Workers → Delete** removes a registration (refused while it holds a non-terminal run); it doesn't stop the container itself.
 
+## Seeing raw run events
+
+The run view shows a terse, readable feed, not raw JSON. To watch the complete raw events a run emits (every tool call, tool result, and status frame), start the worker with `UZI_LOG_LEVEL=debug` and follow its logs:
+
+```sh
+UZI_LOG_LEVEL=debug docker compose --profile agent up -d
+docker logs -f uzi-agent-1
+```
+
+Each run event is logged as a `run event` line with its `kind` and payload. Secrets (your worker token, forge credential, and Anthropic token) are redacted before anything is written. Leave the level at `info` for normal use, where these per-event lines are absent.
+
 See [configuration.md](./configuration.md#worker-container-agent) for every worker environment variable, and [ARCHITECTURE.md](../ARCHITECTURE.md#run-lifecycle) for claim and requeue semantics.
