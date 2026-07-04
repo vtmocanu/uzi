@@ -86,7 +86,13 @@ Kinds observed in real feeds (from `agent/src/sdk-messages.ts` **plus the runner
 
 ## Milestones
 
-- [ ] **M0 — PRD #7 reconnaissance** (small, blocking): audit what #7 landed (deps in `web/package.json`, any markdown component/pipeline, prose styles); record in this PRD what is reused vs created; refactor #7's renderer into the shared core + per-caller policy split if it wasn't built that way.
+- [x] **M0 — PRD #7 reconnaissance** (small, blocking): audit what #7 landed (deps in `web/package.json`, any markdown component/pipeline, prose styles); record in this PRD what is reused vs created; refactor #7's renderer into the shared core + per-caller policy split if it wasn't built that way.
+
+  **M0 outcome (reused vs created):**
+  - *Reused as-is:* `react-markdown@^10.1.0` + `remark-gfm@^4.0.1` (already in `web/package.json`; not re-added/bumped). react-markdown v10's `defaultUrlTransform` (allows only `https?|ircs?|mailto|xmpp` + relative, strips `javascript:`/`data:`/`file:` to `""` before component overrides run) — this is the untrusted image/link sanitization the PRD relies on, so no `rehype-raw`. The `.docs-prose` typography rules in `index.css` are shared by both callers.
+  - *Created:* `web/src/components/MarkdownCore.tsx` — the policy-free core (react-markdown + remark-gfm + the policy-neutral GFM table-overflow wrapper), taking link/image behavior via injected `components`.
+  - *Refactored:* `DocMarkdown.tsx` now delegates to `MarkdownCore`, keeping its trusted-docs policy (`rewriteHref`/`resolveImageSrc`, same-tab internal nav, the table wrapper moved into the core). Observable behavior is unchanged — the existing `docs.test.ts` suite (19 tests) still passes and the docs pages render identically.
+  - `schemeIsDangerous` (exported from `lib/docs.ts`) is reused by the new untrusted renderer as defense-in-depth on top of react-markdown's own sanitization.
 - [ ] **M1 — Markdown rendering**: `Markdown` component built on the shared core from M0 (untrusted policy: image size-caps, external-only links); `PlanPanel` and `text` events render markdown.
 - [ ] **M2 — Activity box + follow mode**: bounded scrollable container (`overscroll-behavior: contain`); follow state in an `onScroll` ref (not derived post-append), instant scroll, "{n} new ↓" pill while paused, re-arm at bottom; reconnecting banner. Verified against a live streaming run.
 - [ ] **M3 — Terse event rendering**: per-kind renderers per the table (incl. `plan` and worker `status {text}`); id-map tool pairing; in-flight spinner + client-side durations; auto-expand errored results; `mapResult` forwards `duration_ms`/`total_cost_usd`; `JSON.stringify` fallback removed; row memoization + message cap; a11y semantics.
