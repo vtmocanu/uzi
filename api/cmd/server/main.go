@@ -23,6 +23,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
@@ -127,6 +128,12 @@ func run() error {
 		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
 	})
 
+	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
+	// it, and the WS handler fans them out to subscribed browsers. In-process and
+	// stateless — every event is already durable in the DB.
+	liveHub := hub.New()
+	wsvc.SetBroadcaster(liveHub)
+
 	// Background sync engine: pulls forge changes into the issue cache for every
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
 	// pool is closed (a mid-tick query must not race pool.Close).
@@ -151,7 +158,7 @@ func run() error {
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg, box, svc, wsvc)
+	h := handler.New(pool, q, cfg, box, svc, wsvc, liveHub)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

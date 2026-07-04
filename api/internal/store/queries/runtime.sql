@@ -80,6 +80,48 @@ RETURNING *;
 -- name: GetRunByIDForUser :one
 SELECT * FROM runs WHERE id = @id AND user_id = @user_id;
 
+-- name: GetRunByID :one
+-- Admin viewer path: fetch any run regardless of owner. The per-run authz check
+-- lives in the service, which only reaches this after confirming the viewer is an
+-- admin (owners go through GetRunByIDForUser).
+SELECT * FROM runs WHERE id = @id;
+
+-- name: ListRunsForUser :many
+-- The user's runs, newest first (Runs index + Agents-status "your runs"), joined
+-- to the repo path and the nullable worker name for display.
+SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN workers w ON w.id = r.worker_id
+WHERE r.user_id = @user_id
+ORDER BY r.created_at DESC
+LIMIT 200;
+
+-- name: ListActiveRunsAll :many
+-- Admin Agents-status: every non-terminal run across all users, with repo path,
+-- worker name, and owner email for the admin overview.
+SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN workers w ON w.id = r.worker_id
+JOIN users u ON u.id = r.user_id
+WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY r.created_at DESC
+LIMIT 500;
+
+-- name: ListAllWorkers :many
+-- Admin Agents-status: every worker with derived busy status and owner email.
+SELECT sqlc.embed(w),
+       EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+       ) AS busy,
+       u.email AS owner_email
+FROM workers w
+JOIN users u ON u.id = w.user_id
+ORDER BY w.created_at DESC;
+
 -- name: GetRunOwnedByWorker :one
 -- Worker-endpoint authz: a worker may only touch a run it currently holds.
 SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;

@@ -150,6 +150,30 @@ func (g *gitLab) ListIssues(ctx context.Context, projectID int64, opts ListIssue
 	return out, nil
 }
 
+func (g *gitLab) GetIssue(ctx context.Context, projectID, issueIID int64) (Issue, error) {
+	i, _, err := g.client.Issues.GetIssue(projectID, issueIID, gitlab.WithContext(ctx))
+	if err != nil {
+		return Issue{}, g.redact.error(fmt.Errorf("gitlab: get issue: %w", err))
+	}
+	return toIssue(i), nil
+}
+
+func (g *gitLab) CreateIssue(ctx context.Context, projectID int64, title, description string, labels []string) (Issue, error) {
+	opt := &gitlab.CreateIssueOptions{
+		Title:       gitlab.Ptr(title),
+		Description: gitlab.Ptr(description),
+	}
+	if len(labels) > 0 {
+		l := gitlab.LabelOptions(labels)
+		opt.Labels = &l
+	}
+	i, _, err := g.client.Issues.CreateIssue(projectID, opt, gitlab.WithContext(ctx))
+	if err != nil {
+		return Issue{}, g.redact.error(fmt.Errorf("gitlab: create issue: %w", err))
+	}
+	return toIssue(i), nil
+}
+
 func (g *gitLab) UpdateIssueLabels(ctx context.Context, projectID, issueIID int64, add, remove []string) error {
 	if len(add) == 0 && len(remove) == 0 {
 		return nil

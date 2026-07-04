@@ -32,6 +32,12 @@ func (f *fakeForge) EnsureLabels(context.Context, int64, []forge.Label) error { 
 func (f *fakeForge) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
 	return nil, nil
 }
+func (f *fakeForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
+	return forge.Issue{}, nil
+}
+func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
+	return forge.Issue{}, nil
+}
 func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
 	return nil
 }

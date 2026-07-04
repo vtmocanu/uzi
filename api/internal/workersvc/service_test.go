@@ -889,3 +889,71 @@ func TestCreateWorkerReturnsTokenOnce(t *testing.T) {
 		t.Fatal("stored token_hash must not contain the plaintext token")
 	}
 }
+
+// fakeBroadcaster records the run events the service fans out, to assert the
+// persist-then-broadcast contract (dedup on retry, broadcast only on apply).
+type fakeBroadcaster struct {
+	msgSeqs  []int32
+	statuses []string
+}
+
+func (b *fakeBroadcaster) PublishMessage(_ uuid.UUID, seq int32, _, _ string, _ []byte, _ time.Time) {
+	b.msgSeqs = append(b.msgSeqs, seq)
+}
+func (b *fakeBroadcaster) PublishState(_ uuid.UUID, status string) {
+	b.statuses = append(b.statuses, status)
+}
+
+func TestAppendMessagesBroadcastsOnlyNewlyInserted(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	svc := New(fs, newBox(t), testParams())
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	first := []IncomingMessage{
+		{Seq: 1, Kind: "text", Payload: json.RawMessage(`{}`)},
+		{Seq: 2, Kind: "text", Payload: json.RawMessage(`{}`)},
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, first); err != nil {
+		t.Fatalf("AppendMessages first: %v", err)
+	}
+	// A worker retry re-delivers 1 and 2 (idempotent no-ops) plus a new 3.
+	second := []IncomingMessage{
+		{Seq: 1, Kind: "text", Payload: json.RawMessage(`{}`)},
+		{Seq: 2, Kind: "text", Payload: json.RawMessage(`{}`)},
+		{Seq: 3, Kind: "text", Payload: json.RawMessage(`{}`)},
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, second); err != nil {
+		t.Fatalf("AppendMessages second: %v", err)
+	}
+	// The re-delivered 1 and 2 must NOT be broadcast again: WS never double-emits.
+	want := []int32{1, 2, 3}
+	if len(b.msgSeqs) != len(want) {
+		t.Fatalf("broadcast seqs = %v, want %v (dup re-delivery must not re-broadcast)", b.msgSeqs, want)
+	}
+	for i, s := range want {
+		if b.msgSeqs[i] != s {
+			t.Fatalf("broadcast seqs = %v, want %v", b.msgSeqs, want)
+		}
+	}
+}
+
+func TestSetStateBroadcastsAppliedStatus(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+		setRunningRows: 1,
+	}
+	svc := New(fs, newBox(t), testParams())
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	_, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "running"})
+	if err != nil || !applied {
+		t.Fatalf("SetState: applied=%v err=%v", applied, err)
+	}
+	if len(b.statuses) != 1 || b.statuses[0] != "running" {
+		t.Fatalf("state broadcast = %v, want [running]", b.statuses)
+	}
+}

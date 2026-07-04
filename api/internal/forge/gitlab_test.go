@@ -155,6 +155,70 @@ func TestListIssuesAlwaysQueriesStateAll(t *testing.T) {
 	}
 }
 
+func TestGetIssueReturnsDescription(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/issues/11": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1001, "iid": 11, "title": "Do the thing", "state": "opened",
+				"labels": []string{"PRD"}, "description": "body links prds/4-agent-runtime-workers.md",
+				"web_url": "https://gl/grp/a/-/issues/11",
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	issue, err := d.GetIssue(context.Background(), 7, 11)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if issue.IID != 11 || issue.Title != "Do the thing" {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+	if issue.Description != "body links prds/4-agent-runtime-workers.md" {
+		t.Fatalf("GetIssue must carry the description (the run-create snapshot source), got %q", issue.Description)
+	}
+}
+
+func TestCreateIssueSendsTitleDescriptionAndLabels(t *testing.T) {
+	var gotTitle, gotDescription, gotLabels string
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/issues": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			var body struct {
+				Title       string `json:"title"`
+				Description string `json:"description"`
+				Labels      string `json:"labels"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotTitle, gotDescription, gotLabels = body.Title, body.Description, body.Labels
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 2002, "iid": 42, "title": body.Title, "state": "opened",
+				"labels": []string{"PRD"}, "web_url": "https://gl/grp/a/-/issues/42",
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	issue, err := d.CreateIssue(context.Background(), 7, "New PRD", "see prds/9-foo.md", []string{"PRD"})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if issue.IID != 42 {
+		t.Fatalf("expected created issue iid 42, got %d", issue.IID)
+	}
+	if gotTitle != "New PRD" || gotDescription != "see prds/9-foo.md" {
+		t.Fatalf("wrong title/description sent: %q / %q", gotTitle, gotDescription)
+	}
+	if gotLabels != "PRD" {
+		t.Fatalf("expected labels=PRD to be sent, got %q", gotLabels)
+	}
+}
+
 func TestUpdateIssueLabelsSendsAtomicAddRemove(t *testing.T) {
 	var addLabels, removeLabels string
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
