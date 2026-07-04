@@ -16,22 +16,22 @@ If self-registration is open on your GitLab instance, register a second account 
 
 If you provisioned the bot yourself, create its token from the bot account's **Settings → Access Tokens**:
 
-- **Scope: `api`**, not `read_api` — moving a card in uzi writes labels, and `read_api` is read-only.
+- **Scope: `api`**, not `read_api` (moving a card in uzi writes labels, and `read_api` is read-only).
 - **Expiry**: as short as your workflow tolerates. uzi has no expiry-warning UI, so put a reminder on your calendar to rotate before it lapses.
 
 ## 3. Add the bot to your project
 
-Project → **Manage → Members → Invite members**, add the bot with role **Developer** — not Reporter and not Maintainer. Developer is a hard requirement: uzi's project discovery only sees projects where the bot has at least Developer access.
+Project → **Manage → Members → Invite members**, add the bot with role **Developer** (not Reporter, not Maintainer). Developer is a hard requirement: uzi's project discovery only sees projects where the bot has at least Developer access.
 
 ![Adding the bot account as a Developer member of a GitLab project](img/gitlab-bot-setup-enable.png)
 
 ## 4. Connect the bot in uzi
 
-1. Log in and open **Settings → Forge**.
-2. Pick a base URL — only the operator-configured allowlist is offered (the SSRF guard; see [ARCHITECTURE.md](../ARCHITECTURE.md#forge-integration)).
+1. Log in and open **Forge** from the top nav.
+2. Pick a base URL: only the operator-configured allowlist is offered (the SSRF guard; see [ARCHITECTURE.md](../ARCHITECTURE.md#forge-integration)).
 3. Paste the bot's PAT and submit. uzi verifies it immediately and shows the bot's username; the token itself is never shown again.
 
-![Settings → Forge, pasting and verifying a bot PAT](img/gitlab-bot-setup-connect.png)
+![The Forge page, pasting and verifying a bot PAT](img/gitlab-bot-setup-connect.png)
 
 ## 5. Enable the repo
 
@@ -41,6 +41,6 @@ If verification fails, check: the PAT's scope is `api`, it hasn't expired, and t
 
 ## Protect your main branch
 
-If you'll run agents against a project, protect its default branch (**Settings → Repository → Protected branches**): allow only Maintainer+ to merge or push. Because the bot is Developer-only, it can open a merge request but can never merge or push there itself — the platform-enforced half of uzi's ["an agent can only ever open an MR" guarantee](../ARCHITECTURE.md#guardrail-layers-the-primary-directive).
+If you'll run agents against a project, protect its default branch (**Settings → Repository → Protected branches**): allow only Maintainer+ to merge or push. Because the bot is Developer-only, it can open a merge request but can never merge or push there itself: the platform-enforced half of uzi's ["an agent can only ever open an MR" guarantee](../ARCHITECTURE.md#guardrail-layers-the-primary-directive).
 
 For scripting these steps with `glab` and the E2E test bot convention, see [Developer conventions](./dev-conventions.md).

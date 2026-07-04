@@ -13,7 +13,7 @@ issues, kept in sync with the forge in both directions.
 
 - **Open** (implicit): issues carrying none of the configured column labels.
 - One column per configured label (seeded on first open: `In Progress`,
-  `Upcoming`, `Later`) — reconfigure any time from the board's column
+  `Upcoming`, `Later`); reconfigure any time from the board's column
   settings.
 - **Closed** (implicit): the issue's GitLab state, not a label; cards here
   aren't draggable.
@@ -22,7 +22,7 @@ issues, kept in sync with the forge in both directions.
 
 Drag a card to another column. uzi writes the label change to GitLab first
 (`add`/`remove` on that issue) and only updates the board once the forge
-confirms it — a failed write snaps the card back rather than showing a move
+confirms it: a failed write snaps the card back rather than showing a move
 that didn't really happen. The same change is visible in GitLab's own issue
 and board views.
 
@@ -30,8 +30,8 @@ and board views.
 
 ## Why only some issues show up
 
-The board lists only issues carrying the **`PRD`** label — uzi works PRDs,
-not arbitrary tickets. Each card also needs its issue description to link a
+The board lists only issues carrying the **`PRD`** label (uzi works PRDs,
+not arbitrary tickets). Each card also needs its issue description to link a
 `prds/*.md` file; a card missing that link shows a warning badge and is
 excluded from agent pickup until the link is added. A card carrying more
 than one column label (edited outside uzi) shows a conflict badge and

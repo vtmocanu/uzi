@@ -34,7 +34,7 @@ re-apply the shipped definition instead.
 ## Edit a template
 
 1. Open **Agents** and pick a template (or **New** for a custom one).
-2. Set its name (kebab-case, immutable after creation — renaming means
+2. Set its name (kebab-case, immutable after creation: renaming means
    creating a new template and deleting the old one), description, and
    prompt body; optionally override the model or restrict its tools.
 3. The detail page shows a live preview of the rendered Markdown as you
