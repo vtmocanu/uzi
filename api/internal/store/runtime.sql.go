@@ -13,7 +13,7 @@ import (
 )
 
 const cancelRunServerSide = `-- name: CancelRunServerSide :execrows
-UPDATE runs SET status = 'cancelled', finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'cancelled', move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE id = $1 AND user_id = $2
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -25,7 +25,7 @@ type CancelRunServerSideParams struct {
 
 // Server-side cancel for a run with no live poller (still queued, or its worker
 // went stale): the user input is not stranded waiting for a GET /inputs poll
-// that will never come.
+// that will never come. cancelled restores the origin column → stamp.
 func (q *Queries) CancelRunServerSide(ctx context.Context, arg CancelRunServerSideParams) (int64, error) {
 	result, err := q.db.Exec(ctx, cancelRunServerSide, arg.ID, arg.UserID)
 	if err != nil {
@@ -51,7 +51,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since
 `
 
 type ClaimRunParams struct {
@@ -91,8 +91,46 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.FinishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
 	)
 	return i, err
+}
+
+const clearIssueRunsMovePending = `-- name: ClearIssueRunsMovePending :execrows
+UPDATE runs SET move_pending_since = NULL, updated_at = now()
+WHERE repo_id = $1 AND issue_iid = $2 AND move_pending_since IS NOT NULL
+`
+
+type ClearIssueRunsMovePendingParams struct {
+	RepoID   uuid.UUID `json:"repo_id"`
+	IssueIid int64     `json:"issue_iid"`
+}
+
+// A manual drag heals it: clear the pending marker for every run of this issue so
+// the reconcile loop stops trying to move a card a human just placed.
+func (q *Queries) ClearIssueRunsMovePending(ctx context.Context, arg ClearIssueRunsMovePendingParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearIssueRunsMovePending, arg.RepoID, arg.IssueIid)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const clearRunMovePending = `-- name: ClearRunMovePending :execrows
+UPDATE runs SET move_pending_since = NULL, updated_at = now()
+WHERE id = $1
+`
+
+// Clear a run's pending marker without recording a column: used when the move is
+// deliberately skipped (manual drag detected, closed issue, unknown baseline).
+func (q *Queries) ClearRunMovePending(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, clearRunMovePending, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const consumeRunInputs = `-- name: ConsumeRunInputs :many
@@ -170,22 +208,29 @@ func (q *Queries) CountWorkerNonTerminalRuns(ctx context.Context, arg CountWorke
 
 const createRun = `-- name: CreateRun :one
 
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since)
+VALUES ($1, $2, $3, $4, $5, $6, now())
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since
 `
 
 type CreateRunParams struct {
-	UserID           uuid.UUID `json:"user_id"`
-	RepoID           uuid.UUID `json:"repo_id"`
-	IssueIid         int64     `json:"issue_iid"`
-	IssueTitle       string    `json:"issue_title"`
-	IssueDescription string    `json:"issue_description"`
+	UserID           uuid.UUID   `json:"user_id"`
+	RepoID           uuid.UUID   `json:"repo_id"`
+	IssueIid         int64       `json:"issue_iid"`
+	IssueTitle       string      `json:"issue_title"`
+	IssueDescription string      `json:"issue_description"`
+	OriginColumn     pgtype.Text `json:"origin_column"`
 }
 
 // Runs ---------------------------------------------------------------------
 // Queue a run from a card. The one-non-terminal-run-per-issue partial unique
 // index rejects a second active run for the same issue (23505 → 409).
+// origin_column snapshots the issue's column now, so a failed/cancelled run can
+// be restored to where it started; it is passed even when "" (Open), and only
+// NULL for a caller that cannot resolve it. move_pending_since is stamped in this
+// same INSERT — queued is a status the column automation reacts to (→ In
+// Progress), and the same-statement stamp closes the crash window before the
+// forge move.
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createRun,
 		arg.UserID,
@@ -193,6 +238,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		arg.IssueIid,
 		arg.IssueTitle,
 		arg.IssueDescription,
+		arg.OriginColumn,
 	)
 	var i Run
 	err := row.Scan(
@@ -217,6 +263,9 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.FinishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
 	)
 	return i, err
 }
@@ -300,7 +349,7 @@ func (q *Queries) DeleteWorkerForUser(ctx context.Context, arg DeleteWorkerForUs
 }
 
 const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :execrows
-UPDATE runs SET status = 'failed', failure_reason = $1, finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= $2
   AND worker_id IN (
@@ -315,7 +364,9 @@ type FailRunsOfStaleWorkersOverCapParams struct {
 }
 
 // A stale worker's non-terminal run that has already used its re-queue budget →
-// failed instead of re-queued.
+// failed instead of re-queued. Stamps move_pending_since (reconcile restores the
+// origin column; the sweep itself never touches the forge — worker-loss recovery
+// must not wait on a down forge).
 func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRunsOfStaleWorkersOverCapParams) (int64, error) {
 	result, err := q.db.Exec(ctx, failRunsOfStaleWorkersOverCap, arg.FailureReason, arg.MaxRequeues, arg.Cutoff)
 	if err != nil {
@@ -326,7 +377,7 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 
 const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :execrows
 
-UPDATE runs SET status = 'failed', failure_reason = $1, finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE worker_id = $2
   AND status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= $3
@@ -340,7 +391,9 @@ type FailWorkerRunsOverCapParams struct {
 
 // Register-time orphan recovery (worker-scoped) ------------------------------
 // On register a worker declares a fresh start, so any run it still holds is
-// orphaned (its execution is gone). Over its re-queue budget → failed.
+// orphaned (its execution is gone). Over its re-queue budget → failed. failed →
+// origin restore, applied by the reconcile loop (register does no forge I/O), so
+// it stamps move_pending_since.
 func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) (int64, error) {
 	result, err := q.db.Exec(ctx, failWorkerRunsOverCap, arg.FailureReason, arg.WorkerID, arg.MaxRequeues)
 	if err != nil {
@@ -350,7 +403,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -381,12 +434,15 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.FinishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -419,6 +475,9 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.FinishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
 	)
 	return i, err
 }
@@ -465,8 +524,57 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 	return i, err
 }
 
+const getRunMoveContext = `-- name: GetRunMoveContext :one
+
+SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
+       rp.forge_project_id,
+       c.forge_type, c.base_url, c.token_ciphertext
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id
+WHERE r.id = $1
+`
+
+type GetRunMoveContextRow struct {
+	Status           string             `json:"status"`
+	IssueIid         int64              `json:"issue_iid"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	OriginColumn     pgtype.Text        `json:"origin_column"`
+	BoardColumn      pgtype.Text        `json:"board_column"`
+	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
+	ForgeProjectID   int64              `json:"forge_project_id"`
+	ForgeType        string             `json:"forge_type"`
+	BaseUrl          string             `json:"base_url"`
+	TokenCiphertext  []byte             `json:"token_ciphertext"`
+}
+
+// Column automation (PRD #12 M1) ------------------------------------------
+// The run + connection facts the column automation needs to perform a forge-first
+// label move: the run's status/issue/columns, plus the connection to build a
+// client and the numeric project id UpdateIssueLabels requires. GetRunClaimContext
+// (the sibling) deliberately lacks forge_project_id and the column snapshot, so
+// this is its own query. token_ciphertext is decrypted by the service, never
+// selected in the clear.
+func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRunMoveContextRow, error) {
+	row := q.db.QueryRow(ctx, getRunMoveContext, runID)
+	var i GetRunMoveContextRow
+	err := row.Scan(
+		&i.Status,
+		&i.IssueIid,
+		&i.RepoID,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.ForgeProjectID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.TokenCiphertext,
+	)
+	return i, err
+}
+
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -500,6 +608,9 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.FinishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
 	)
 	return i, err
 }
@@ -632,7 +743,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -682,6 +793,9 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.FinishedAt,
 			&i.Run.CreatedAt,
 			&i.Run.UpdatedAt,
+			&i.Run.OriginColumn,
+			&i.Run.BoardColumn,
+			&i.Run.MovePendingSince,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -748,6 +862,100 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 	return items, nil
 }
 
+const listGaveUpColumnMoves = `-- name: ListGaveUpColumnMoves :many
+SELECT r.id, r.repo_id, r.issue_iid, r.status, r.move_pending_since
+FROM runs r
+WHERE r.move_pending_since IS NOT NULL
+  AND r.move_pending_since <= $1
+  AND r.move_pending_since > $2
+ORDER BY r.move_pending_since ASC
+LIMIT 100
+`
+
+type ListGaveUpColumnMovesParams struct {
+	GiveupCutoff pgtype.Timestamptz `json:"giveup_cutoff"`
+	PriorCutoff  pgtype.Timestamptz `json:"prior_cutoff"`
+}
+
+type ListGaveUpColumnMovesRow struct {
+	ID               uuid.UUID          `json:"id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	IssueIid         int64              `json:"issue_iid"`
+	Status           string             `json:"status"`
+	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
+}
+
+// Runs whose pending marker crossed the 30-minute give-up boundary during the
+// last reconcile interval, for a one-shot warn log. The marker is deliberately
+// NOT cleared (a silent clear would hide the drift behind a correct-looking
+// badge); the next transition or manual drag clears it.
+func (q *Queries) ListGaveUpColumnMoves(ctx context.Context, arg ListGaveUpColumnMovesParams) ([]ListGaveUpColumnMovesRow, error) {
+	rows, err := q.db.Query(ctx, listGaveUpColumnMoves, arg.GiveupCutoff, arg.PriorCutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListGaveUpColumnMovesRow{}
+	for rows.Next() {
+		var i ListGaveUpColumnMovesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RepoID,
+			&i.IssueIid,
+			&i.Status,
+			&i.MovePendingSince,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPendingColumnMoves = `-- name: ListPendingColumnMoves :many
+SELECT id FROM runs
+WHERE move_pending_since IS NOT NULL
+  AND move_pending_since <= $1
+  AND move_pending_since > $2
+ORDER BY move_pending_since ASC
+LIMIT $3
+`
+
+type ListPendingColumnMovesParams struct {
+	GraceCutoff  pgtype.Timestamptz `json:"grace_cutoff"`
+	GiveupCutoff pgtype.Timestamptz `json:"giveup_cutoff"`
+	MaxBatch     int32              `json:"max_batch"`
+}
+
+// Reconcile-loop candidates: runs with a pending column move that is older than a
+// short grace (so the inline move is not raced) and still inside the 30-minute
+// retry window (older markers have been given up on and are deliberately left
+// set). Only the id is returned — the loop re-reads each run's full context
+// (GetRunMoveContext) immediately before the write to narrow the clobber window
+// against a concurrent manual drag.
+func (q *Queries) ListPendingColumnMoves(ctx context.Context, arg ListPendingColumnMovesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listPendingColumnMoves, arg.GraceCutoff, arg.GiveupCutoff, arg.MaxBatch)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunMessagesAfter = `-- name: ListRunMessagesAfter :many
 SELECT id, run_id, seq, kind, agent, payload, created_at
 FROM run_messages
@@ -792,7 +1000,7 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, rp.path_with_namespace AS repo_path, w.name AS worker_name
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -840,6 +1048,9 @@ func (q *Queries) ListRunsForUser(ctx context.Context, userID uuid.UUID) ([]List
 			&i.Run.FinishedAt,
 			&i.Run.CreatedAt,
 			&i.Run.UpdatedAt,
+			&i.Run.OriginColumn,
+			&i.Run.BoardColumn,
+			&i.Run.MovePendingSince,
 			&i.RepoPath,
 			&i.WorkerName,
 		); err != nil {
@@ -913,10 +1124,11 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 
 const markRunFailedByID = `-- name: MarkRunFailedByID :execrows
 UPDATE runs SET
-    status         = 'failed',
-    failure_reason = $1,
-    finished_at    = now(),
-    updated_at     = now()
+    status             = 'failed',
+    failure_reason     = $1,
+    move_pending_since = now(),
+    finished_at        = now(),
+    updated_at         = now()
 WHERE id = $2
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -927,7 +1139,8 @@ type MarkRunFailedByIDParams struct {
 }
 
 // Service-internal fail (e.g. a claim whose secrets are missing/undecryptable):
-// the run was just claimed by this worker but cannot run.
+// the run was just claimed by this worker but cannot run. failed → origin
+// restore, so it stamps move_pending_since like the other failed paths.
 func (q *Queries) MarkRunFailedByID(ctx context.Context, arg MarkRunFailedByIDParams) (int64, error) {
 	result, err := q.db.Exec(ctx, markRunFailedByID, arg.FailureReason, arg.ID)
 	if err != nil {
@@ -945,6 +1158,26 @@ WHERE status = 'online'
 // Sweeper: workers past the heartbeat-stale window go offline.
 func (q *Queries) MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
 	result, err := q.db.Exec(ctx, markStaleWorkersOffline, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordRunColumnMove = `-- name: RecordRunColumnMove :execrows
+UPDATE runs SET board_column = $1, move_pending_since = NULL, updated_at = now()
+WHERE id = $2
+`
+
+type RecordRunColumnMoveParams struct {
+	BoardColumn pgtype.Text `json:"board_column"`
+	ID          uuid.UUID   `json:"id"`
+}
+
+// A successful automation move: record the column just applied (board_column) and
+// clear the pending marker in one statement.
+func (q *Queries) RecordRunColumnMove(ctx context.Context, arg RecordRunColumnMoveParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordRunColumnMove, arg.BoardColumn, arg.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -985,7 +1218,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 }
 
 const rejectRunServerSide = `-- name: RejectRunServerSide :execrows
-UPDATE runs SET status = 'failed', failure_reason = $1, finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE id = $2 AND user_id = $3
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -996,6 +1229,7 @@ type RejectRunServerSideParams struct {
 	UserID        uuid.UUID   `json:"user_id"`
 }
 
+// Server-side plan rejection → failed → origin restore → stamp.
 func (q *Queries) RejectRunServerSide(ctx context.Context, arg RejectRunServerSideParams) (int64, error) {
 	result, err := q.db.Exec(ctx, rejectRunServerSide, arg.FailureReason, arg.ID, arg.UserID)
 	if err != nil {
@@ -1082,12 +1316,13 @@ func (q *Queries) SetRunAwaitingApproval(ctx context.Context, arg SetRunAwaiting
 
 const setRunCompleted = `-- name: SetRunCompleted :execrows
 UPDATE runs SET
-    status      = 'completed',
-    branch      = $1,
-    mr_iid      = $2,
-    session_id  = COALESCE($3, session_id),
-    finished_at = now(),
-    updated_at  = now()
+    status             = 'completed',
+    branch             = $1,
+    mr_iid             = $2,
+    session_id         = COALESCE($3, session_id),
+    move_pending_since = now(),
+    finished_at        = now(),
+    updated_at         = now()
 WHERE id = $4 AND worker_id = $5
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -1100,6 +1335,9 @@ type SetRunCompletedParams struct {
 	WorkerID  pgtype.UUID `json:"worker_id"`
 }
 
+// completed is the terminal MR-opened event → Human Review. move_pending_since is
+// stamped here (same statement as the status write) so a crash before the forge
+// move still leaves the reconcile loop a marker to heal from.
 func (q *Queries) SetRunCompleted(ctx context.Context, arg SetRunCompletedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunCompleted,
 		arg.Branch,
@@ -1116,11 +1354,12 @@ func (q *Queries) SetRunCompleted(ctx context.Context, arg SetRunCompletedParams
 
 const setRunFailed = `-- name: SetRunFailed :execrows
 UPDATE runs SET
-    status         = 'failed',
-    failure_reason = $1,
-    session_id     = COALESCE($2, session_id),
-    finished_at    = now(),
-    updated_at     = now()
+    status             = 'failed',
+    failure_reason     = $1,
+    session_id         = COALESCE($2, session_id),
+    move_pending_since = now(),
+    finished_at        = now(),
+    updated_at         = now()
 WHERE id = $3 AND worker_id = $4
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -1132,6 +1371,8 @@ type SetRunFailedParams struct {
 	WorkerID      pgtype.UUID `json:"worker_id"`
 }
 
+// failed restores the origin column → move_pending_since stamped in the same
+// statement (same-tx crash-window closure, as for completed).
 func (q *Queries) SetRunFailed(ctx context.Context, arg SetRunFailedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunFailed,
 		arg.FailureReason,
@@ -1197,7 +1438,7 @@ func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Ti
 }
 
 const sweepRunningTimeout = `-- name: SweepRunningTimeout :execrows
-UPDATE runs SET status = 'failed', failure_reason = $1, finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE status = 'running' AND started_at < $2
 `
 
@@ -1207,6 +1448,8 @@ type SweepRunningTimeoutParams struct {
 }
 
 // running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
+// Stamps move_pending_since so the (forge-free) sweep leaves the isolated
+// reconcile loop a marker to restore the origin column later.
 func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeoutParams) (int64, error) {
 	result, err := q.db.Exec(ctx, sweepRunningTimeout, arg.FailureReason, arg.Cutoff)
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -24,11 +25,14 @@ const PRDLabel = "PRD"
 
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
 // first time a repo's board is opened. Colors are required by GitLab's label
-// create API; these are the common-board reference set.
+// create API. In Progress / Upcoming / Later are the common-board reference set;
+// Human Review (PRD #12) is where the automation parks a card once its MR is
+// open. GetBoard also ensures Human Review on boards seeded before it existed.
 var DefaultColumns = []forge.Label{
-	{Name: "In Progress", Color: "#1f75cb"},
+	{Name: board.ColumnInProgress, Color: "#1f75cb"},
 	{Name: "Upcoming", Color: "#6699cc"},
 	{Name: "Later", Color: "#999999"},
+	{Name: board.ColumnHumanReview, Color: "#6e49cb"},
 }
 
 // prdLinkRe matches a PRD reference in an issue description: a bare or
@@ -82,6 +86,52 @@ func (s *Service) ForgeForConnection(forgeType, baseURL string, tokenCiphertext 
 		return nil, err
 	}
 	return forge.New(forge.Type(forgeType), baseURL, string(plain), s.timeout)
+}
+
+// AutoMove applies a single-column move forge-first, then updates the issue
+// cache — the mechanic the board drag and the run-lifecycle automation share
+// (both need the same "one atomic label swap, then snapshot" behavior). It plans
+// the add/remove sets against the repo's column set, calls UpdateIssueLabels once
+// (GitLab makes that atomic, which is what enforces single-column membership),
+// and only on forge success upserts the new label set. A forge error is returned
+// with the cache untouched, so a failed move never desyncs the cache from the
+// forge; the caller decides whether that fails a request (manual drag) or leaves
+// a pending marker for reconciliation (automation). The returned issue is the
+// re-cached row. Guards (closed issue, manual-drag) live in the caller, not here:
+// a manual drag is itself the human's intent and must not be second-guessed.
+func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
+	var current []string
+	if err := json.Unmarshal(issue.Labels, &current); err != nil {
+		current = []string{}
+	}
+	columnSet := make(map[string]struct{}, len(columns))
+	for _, c := range columns {
+		columnSet[c.LabelName] = struct{}{}
+	}
+	add, remove, newLabels := board.PlanLabelMove(current, columnSet, target)
+
+	// Forge-first: apply the label change remotely before touching the cache. On
+	// failure the cache is untouched (UpdateIssueLabels no-ops on empty sets, so a
+	// move to a column the card already sits in costs no forge call).
+	if err := f.UpdateIssueLabels(ctx, forgeProjectID, issue.ForgeIssueIid, add, remove); err != nil {
+		return store.Issue{}, err
+	}
+
+	labelsJSON, err := json.Marshal(newLabels)
+	if err != nil {
+		return store.Issue{}, err
+	}
+	return s.q.UpsertIssue(ctx, store.UpsertIssueParams{
+		RepoID:         issue.RepoID,
+		ForgeIssueIid:  issue.ForgeIssueIid,
+		Title:          issue.Title,
+		State:          issue.State,
+		Labels:         labelsJSON,
+		WebUrl:         issue.WebUrl,
+		Author:         issue.Author,
+		HasPrdLink:     issue.HasPrdLink,
+		ForgeUpdatedAt: issue.ForgeUpdatedAt,
+	})
 }
 
 // FullSync fetches the complete PRD-labeled set (state=all, no lower bound),

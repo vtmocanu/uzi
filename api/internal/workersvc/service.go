@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -101,6 +102,7 @@ type Store interface {
 	// Cross-cutting reads for run creation + claim.
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
+	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) ([]byte, error)
 	ListAgentTemplates(ctx context.Context) ([]store.AgentTemplate, error)
 }
@@ -129,6 +131,17 @@ type Broadcaster interface {
 	PublishState(runID uuid.UUID, status string)
 }
 
+// RunLifecycle is notified after each run status write so the board's column
+// automation can react (queued → In Progress, completed → Human Review,
+// failed/cancelled → origin). It is the seam onto runlifecycle; nil in tests and
+// deployments that run no automation. Notify is best-effort and must never block
+// or error the persistence path — it is called on the request path, and the
+// durable move marker is already stamped in the status write's transaction.
+type RunLifecycle interface {
+	// Notify reports that a run just transitioned to status.
+	Notify(runID uuid.UUID, status string)
+}
+
 // Service holds the store, the secret cipher, and the runtime params.
 type Service struct {
 	q   Store
@@ -141,12 +154,28 @@ type Service struct {
 	// (nil-safe); set via SetBroadcaster after construction so New's signature —
 	// and every existing caller — stays unchanged.
 	bcast Broadcaster
+	// lifecycle reacts to status changes with board column moves. Optional
+	// (nil-safe); set via SetLifecycle for the same reason as bcast.
+	lifecycle RunLifecycle
 }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
 // startup, before serving. A nil broadcaster disables live fan-out; the persisted
 // message log still backs the browser's REST replay.
 func (s *Service) SetBroadcaster(b Broadcaster) { s.bcast = b }
+
+// SetLifecycle wires the run-lifecycle column automation. Call once at startup,
+// before serving. A nil lifecycle disables auto-moves; the same-transaction move
+// markers still accumulate and would be applied if one were later attached.
+func (s *Service) SetLifecycle(l RunLifecycle) { s.lifecycle = l }
+
+// notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
+// every call site stays unconditional.
+func (s *Service) notify(runID uuid.UUID, status string) {
+	if s.lifecycle != nil {
+		s.lifecycle.Notify(runID, status)
+	}
+}
 
 // defaultClaimGrace is the claimed-but-never-started reclaim window (PRD: 5m).
 const defaultClaimGrace = 5 * time.Minute
@@ -224,7 +253,8 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 			}); ferr != nil {
 				return nil, ferr
 			}
-			return nil, nil // idle; the run now shows failed in the UI
+			s.notify(run.ID, "failed") // restore the origin column for the dead run
+			return nil, nil            // idle; the run now shows failed in the UI
 		}
 		// The run vanished between claim and payload assembly (its forge
 		// connection was deleted, cascading repo → run away). Nothing to fail or
@@ -433,8 +463,13 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// held above, so 0 rows means the run was terminal (the only other WHERE
 	// guard) → not applied.
 	run, err = s.runOwnedByWorker(ctx, runID, wkr)
-	if err == nil && rows > 0 && s.bcast != nil {
-		s.bcast.PublishState(runID, run.Status)
+	if err == nil && rows > 0 {
+		if s.bcast != nil {
+			s.bcast.PublishState(runID, run.Status)
+		}
+		// Only a genuinely-applied transition drives the column automation; a
+		// no-op onto an already-terminal run (rows == 0) must not.
+		s.notify(runID, run.Status)
 	}
 	return run, rows > 0, err
 }
@@ -555,6 +590,7 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		IssueIid:         issueIID,
 		IssueTitle:       issue.Title,
 		IssueDescription: description,
+		OriginColumn:     s.originColumn(ctx, repoID, issue),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -562,7 +598,33 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
+	// queued is the operator's click intent → In Progress. The move marker is
+	// already stamped in the CreateRun statement; Notify performs the move.
+	s.notify(run.ID, "queued")
 	return run, nil
+}
+
+// originColumn resolves the issue's current column to snapshot onto the run, so a
+// failed/cancelled run restores where it started. It is always a valid text value
+// ("" = the implicit Open column) — distinct from NULL (unknown) — because the
+// resolution runs against the same cache the board renders from. A failure to
+// list columns degrades to "" rather than blocking the run; the manual-drag guard
+// tolerates a stale baseline.
+func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue store.Issue) pgtype.Text {
+	cols, err := s.q.ListBoardColumns(ctx, repoID)
+	if err != nil {
+		return pgtype.Text{String: "", Valid: true}
+	}
+	position := make(map[string]int, len(cols))
+	for _, c := range cols {
+		position[c.LabelName] = int(c.Position)
+	}
+	var labels []string
+	if err := json.Unmarshal(issue.Labels, &labels); err != nil {
+		labels = []string{}
+	}
+	col, _, _ := board.ResolveColumn(labels, issue.State, position)
+	return pgtype.Text{String: col, Valid: true}
 }
 
 // GetRun returns a run owned by the user.
@@ -670,6 +732,7 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			if s.bcast != nil {
 				s.bcast.PublishState(runID, status)
 			}
+			s.notify(runID, status) // cancelled → origin restore; failed (reject) → origin restore
 			return SubmitInputResult{ServerSide: true}, nil
 		}
 	}

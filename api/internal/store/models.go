@@ -87,6 +87,9 @@ type Run struct {
 	FinishedAt       pgtype.Timestamptz `json:"finished_at"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	OriginColumn     pgtype.Text        `json:"origin_column"`
+	BoardColumn      pgtype.Text        `json:"board_column"`
+	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
 }
 
 type RunMessage struct {

@@ -75,6 +75,7 @@ type fakeStore struct {
 	repoErr         error
 	issueByID       store.Issue
 	issueByIDErr    error
+	boardCols       []store.BoardColumn
 	createRunResult store.Run
 	createRunErr    error
 	createRunParams *store.CreateRunParams
@@ -210,6 +211,9 @@ func (f *fakeStore) GetRepoForUser(context.Context, store.GetRepoForUserParams) 
 }
 func (f *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error) {
 	return f.issueByID, f.issueByIDErr
+}
+func (f *fakeStore) ListBoardColumns(context.Context, uuid.UUID) ([]store.BoardColumn, error) {
+	return f.boardCols, nil
 }
 func (f *fakeStore) CreateRun(_ context.Context, arg store.CreateRunParams) (store.Run, error) {
 	f.createRunParams = &arg
@@ -955,5 +959,134 @@ func TestSetStateBroadcastsAppliedStatus(t *testing.T) {
 	}
 	if len(b.statuses) != 1 || b.statuses[0] != "running" {
 		t.Fatalf("state broadcast = %v, want [running]", b.statuses)
+	}
+}
+
+// -------------------------------------------------------------------------
+// Run-lifecycle column-automation hook wiring
+// -------------------------------------------------------------------------
+
+// fakeLifecycle records the (runID, status) notifications the service fires, so
+// the tests can assert the column automation is driven at exactly the applied
+// status-write sites (and never on a no-op transition).
+type fakeLifecycle struct {
+	notes []lifecycleNote
+}
+
+type lifecycleNote struct {
+	runID  uuid.UUID
+	status string
+}
+
+func (l *fakeLifecycle) Notify(runID uuid.UUID, status string) {
+	l.notes = append(l.notes, lifecycleNote{runID, status})
+}
+
+func TestSetStateNotifiesAppliedStatus(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "completed"},
+		setCompletedRows: 1,
+	}
+	svc := New(fs, newBox(t), testParams())
+	lc := &fakeLifecycle{}
+	svc.SetLifecycle(lc)
+
+	branch, mr := "agent/issue-1", int64(9)
+	if _, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+		State: "completed", Branch: &branch, MrIID: &mr,
+	}); err != nil || !applied {
+		t.Fatalf("SetState: applied=%v err=%v", applied, err)
+	}
+	if len(lc.notes) != 1 || lc.notes[0].status != "completed" || lc.notes[0].runID != fs.runOwned.ID {
+		t.Fatalf("expected one 'completed' notification for the run, got %+v", lc.notes)
+	}
+}
+
+func TestSetStateTerminalRaceDoesNotNotify(t *testing.T) {
+	// A completed report onto an already-terminal (cancelled) run applies 0 rows;
+	// the automation must NOT be driven — otherwise a lost race would re-move a
+	// card whose real terminal state is elsewhere.
+	w := worker()
+	fs := &fakeStore{
+		runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "cancelled"},
+		setCompletedRows: 0,
+	}
+	svc := New(fs, newBox(t), testParams())
+	lc := &fakeLifecycle{}
+	svc.SetLifecycle(lc)
+
+	branch, mr := "agent/issue-1", int64(9)
+	if _, applied, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+		State: "completed", Branch: &branch, MrIID: &mr,
+	}); err != nil || applied {
+		t.Fatalf("SetState: applied=%v err=%v (want not-applied)", applied, err)
+	}
+	if len(lc.notes) != 0 {
+		t.Fatalf("a no-op transition must not notify the automation, got %+v", lc.notes)
+	}
+}
+
+func TestCreateRunNotifiesQueuedWithOriginSnapshot(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	labels, _ := json.Marshal([]string{"PRD", "Later"})
+	runID := uuid.New()
+	fs := &fakeStore{
+		issueByID:       store.Issue{Title: "T", State: "opened", Labels: labels, HasPrdLink: true},
+		boardCols:       []store.BoardColumn{{LabelName: "In Progress", Position: 0}, {LabelName: "Upcoming", Position: 1}, {LabelName: "Later", Position: 2}},
+		createRunResult: store.Run{ID: runID},
+	}
+	svc := New(fs, newBox(t), testParams())
+	lc := &fakeLifecycle{}
+	svc.SetLifecycle(lc)
+
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc"); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	// origin_column snapshots the issue's current column ("Later"), always a valid
+	// text value (never NULL for a run created from the cache).
+	if fs.createRunParams == nil || !fs.createRunParams.OriginColumn.Valid || fs.createRunParams.OriginColumn.String != "Later" {
+		t.Fatalf("origin_column should snapshot 'Later', got %+v", fs.createRunParams.OriginColumn)
+	}
+	if len(lc.notes) != 1 || lc.notes[0].status != "queued" || lc.notes[0].runID != runID {
+		t.Fatalf("expected one 'queued' notification, got %+v", lc.notes)
+	}
+}
+
+func TestSubmitInputServerSideCancelNotifiesCancelled(t *testing.T) {
+	user, runID := uuid.New(), uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "queued"}}
+	svc := New(fs, newBox(t), testParams())
+	lc := &fakeLifecycle{}
+	svc.SetLifecycle(lc)
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "cancel", ""); err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if len(lc.notes) != 1 || lc.notes[0].status != "cancelled" || lc.notes[0].runID != runID {
+		t.Fatalf("server-side cancel must notify 'cancelled', got %+v", lc.notes)
+	}
+}
+
+func TestClaimCredentialFailureNotifiesFailed(t *testing.T) {
+	// A claim whose Anthropic token is missing fails the run server-side; the
+	// automation restores the origin column for the dead run.
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-something-long-enough"))
+	runID := uuid.New()
+	fs := &fakeStore{
+		claimRun:     store.Run{ID: runID, Status: "claimed"},
+		claimCtx:     store.GetRunClaimContextRow{TokenCiphertext: sealedPAT, RepoWebUrl: "https://x/y"},
+		anthropicErr: pgx.ErrNoRows,
+	}
+	svc := New(fs, box, testParams())
+	lc := &fakeLifecycle{}
+	svc.SetLifecycle(lc)
+
+	if _, err := svc.Claim(context.Background(), worker()); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(lc.notes) != 1 || lc.notes[0].status != "failed" || lc.notes[0].runID != runID {
+		t.Fatalf("a credential-failed claim must notify 'failed', got %+v", lc.notes)
 	}
 }

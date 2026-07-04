@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
@@ -85,13 +86,71 @@ func (h *Handler) GetBoard(w http.ResponseWriter, r *http.Request) {
 		if !h.seedBoard(w, r, repo) {
 			return
 		}
+	} else if !h.ensureHumanReviewColumn(w, r, repo) {
+		// Boards seeded before PRD #12 lack the Human Review column the automation
+		// parks completed runs in; add it on load. Freshly seeded boards already
+		// carry it (it is in DefaultColumns), so this only runs for older boards.
+		return
 	}
 
-	board, ok := h.buildBoard(w, r, repo)
+	b, ok := h.buildBoard(w, r, repo)
 	if !ok {
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"board": board})
+	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
+}
+
+// ensureHumanReviewColumn makes sure the repo's board has the Human Review column
+// (label on the forge + board_columns row), positioned right after In Progress.
+// It is idempotent: once present, later loads see it and return without touching
+// the forge. A forge outage is non-fatal — the board still renders with its
+// existing columns and the next successful load ensures the column. Returns false
+// (after writing an error) only on a DB failure.
+func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request, repo store.GetRepoForUserRow) bool {
+	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
+	if err != nil {
+		slog.Error("list board columns", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	inProgressPos, maxPos := -1, -1
+	for _, c := range cols {
+		if c.LabelName == board.ColumnHumanReview {
+			return true // already present
+		}
+		if c.LabelName == board.ColumnInProgress {
+			inProgressPos = int(c.Position)
+		}
+		if int(c.Position) > maxPos {
+			maxPos = int(c.Position)
+		}
+	}
+
+	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		slog.Error("build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	// Color matches DefaultColumns' Human Review entry.
+	if err := f.EnsureLabels(r.Context(), repo.ForgeProjectID, []forge.Label{{Name: board.ColumnHumanReview, Color: "#6e49cb"}}); err != nil {
+		slog.Warn("ensure Human Review label on the forge", "repo", repo.PathWithNamespace, "error", err)
+		return true // non-fatal: render with existing columns, retry next load
+	}
+	pos := inProgressPos + 1
+	if inProgressPos < 0 {
+		pos = maxPos + 1 // In Progress somehow absent → append
+	}
+	if err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
+		RepoID:    repo.ID,
+		LabelName: board.ColumnHumanReview,
+		Position:  int32(pos),
+	}); err != nil {
+		slog.Error("insert Human Review board column", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	return true
 }
 
 // seedBoard creates the default column labels on the forge, records them as
@@ -155,7 +214,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		if err := json.Unmarshal(is.Labels, &labels); err != nil {
 			labels = []string{}
 		}
-		col, closed, conflict := resolveColumn(labels, is.State, position)
+		col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 		card := cardDTO{
 			IID:        is.ForgeIssueIid,
 			Title:      is.Title,
@@ -181,32 +240,6 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		Columns: columns,
 		Cards:   cards,
 	}, true
-}
-
-// resolveColumn decides which column a card belongs to. Closed issues go to the
-// implicit Closed column regardless of labels. Otherwise the card sits in its
-// single column label, or Open ("") if it has none. An issue carrying more than
-// one column label is shown in the highest-positioned one and flagged as a
-// conflict until the next move normalizes it.
-func resolveColumn(labels []string, state string, position map[string]int) (column string, closed bool, conflict bool) {
-	if state == "closed" {
-		return "", true, false
-	}
-	best := ""
-	bestPos := -1
-	matches := 0
-	for _, l := range labels {
-		pos, isCol := position[l]
-		if !isCol {
-			continue
-		}
-		matches++
-		if pos > bestPos {
-			bestPos = pos
-			best = l
-		}
-	}
-	return best, false, matches > 1
 }
 
 type configureColumnsRequest struct {
@@ -283,11 +316,11 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	board, ok := h.buildBoard(w, r, repo)
+	b, ok := h.buildBoard(w, r, repo)
 	if !ok {
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"board": board})
+	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
 }
 
 // ── Move ────────────────────────────────────────────────────────────────────
@@ -352,12 +385,6 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	var labels []string
-	if err := json.Unmarshal(issue.Labels, &labels); err != nil {
-		labels = []string{}
-	}
-
-	add, remove, newLabels := planLabelMove(labels, columnSet, target)
 
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
@@ -365,34 +392,24 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// Forge-first: apply the label change remotely before touching the cache.
-	// On failure the cache is untouched and the client snaps the card back.
-	if err := f.UpdateIssueLabels(r.Context(), repo.ForgeProjectID, iid, add, remove); err != nil {
+	// Forge-first single-column move + cache snapshot, shared with the run
+	// automation (forgesvc.AutoMove). On failure the cache is untouched and the
+	// client snaps the card back.
+	updated, err := h.svc.AutoMove(r.Context(), f, repo.ForgeProjectID, issue, cols, target)
+	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())
 		return
 	}
-
-	labelsJSON, err := json.Marshal(newLabels)
-	if err != nil {
-		slog.Error("marshal labels", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	updated, err := h.q.UpsertIssue(r.Context(), store.UpsertIssueParams{
-		RepoID:         repo.ID,
-		ForgeIssueIid:  issue.ForgeIssueIid,
-		Title:          issue.Title,
-		State:          issue.State,
-		Labels:         labelsJSON,
-		WebUrl:         issue.WebUrl,
-		Author:         issue.Author,
-		HasPrdLink:     issue.HasPrdLink,
-		ForgeUpdatedAt: issue.ForgeUpdatedAt,
-	})
-	if err != nil {
-		slog.Error("upsert issue after move", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+	// A manual drag is the operator's explicit intent and overrides any pending
+	// automatic move: clear the lifecycle's pending markers for this issue's runs
+	// so the reconcile loop stops trying to reposition the card the human placed.
+	if _, err := h.q.ClearIssueRunsMovePending(r.Context(), store.ClearIssueRunsMovePendingParams{
+		RepoID:   repo.ID,
+		IssueIid: iid,
+	}); err != nil {
+		// Non-fatal: the move already landed; a stray marker is at worst one
+		// reconcile attempt that the manual-drag guard itself skips.
+		slog.Warn("clear pending column moves after manual drag", "error", err)
 	}
 
 	position := make(map[string]int, len(cols))
@@ -402,53 +419,13 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": issueToCard(updated, position)})
 }
 
-// planLabelMove computes the atomic add/remove sets for a single-column move and
-// the resulting label set for the cache. add is the target column (if not
-// already present); remove is every OTHER column label the issue currently
-// carries. Moving to Open (target == "") removes all column labels and adds none.
-func planLabelMove(current []string, columnSet map[string]struct{}, target string) (add, remove, newLabels []string) {
-	has := map[string]struct{}{}
-	for _, l := range current {
-		has[l] = struct{}{}
-	}
-	// remove: current column labels that are not the target.
-	for _, l := range current {
-		if _, isCol := columnSet[l]; isCol && l != target {
-			remove = append(remove, l)
-		}
-	}
-	// add: the target, if set and not already present.
-	if target != "" {
-		if _, present := has[target]; !present {
-			add = append(add, target)
-		}
-	}
-	// newLabels: current minus removed, plus target.
-	removeSet := map[string]struct{}{}
-	for _, l := range remove {
-		removeSet[l] = struct{}{}
-	}
-	for _, l := range current {
-		if _, dropped := removeSet[l]; dropped {
-			continue
-		}
-		newLabels = append(newLabels, l)
-	}
-	if target != "" {
-		if _, present := has[target]; !present {
-			newLabels = append(newLabels, target)
-		}
-	}
-	return add, remove, newLabels
-}
-
 // issueToCard resolves a cached issue row into a card DTO.
 func issueToCard(is store.Issue, position map[string]int) cardDTO {
 	var labels []string
 	if err := json.Unmarshal(is.Labels, &labels); err != nil {
 		labels = []string{}
 	}
-	col, closed, conflict := resolveColumn(labels, is.State, position)
+	col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 	card := cardDTO{
 		IID:        is.ForgeIssueIid,
 		Title:      is.Title,
@@ -487,11 +464,11 @@ func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "sync failed: "+err.Error())
 		return
 	}
-	board, ok := h.buildBoard(w, r, repo)
+	b, ok := h.buildBoard(w, r, repo)
 	if !ok {
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"board": board})
+	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
