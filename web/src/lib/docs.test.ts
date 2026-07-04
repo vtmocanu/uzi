@@ -5,7 +5,15 @@ import {
   resolveFromDocs,
   resolveHref,
   resolveImageSrc,
+  sortDocsForIndex,
+  summarize,
+  type Audience,
+  type Doc,
 } from "./docs";
+
+function doc(slug: string, order: number | null, audience: Audience = "user"): Doc {
+  return { slug, meta: { title: slug, order, audience }, body: "", summary: "" };
+}
 
 // These tests use inline-string fixtures and a fake `isUserPage` predicate, so
 // they are decoupled from the real docs/ content (M2 can rewrite every page
@@ -106,19 +114,83 @@ describe("resolveHref", () => {
       internal: false,
     });
   });
+
+  it("classifies protocol-relative //host (and the /\\ variant) as external", () => {
+    expect(resolveHref("//evil.example.com", isUser)).toEqual({
+      href: "//evil.example.com",
+      external: true,
+      internal: false,
+    });
+    expect(resolveHref("/\\evil.example.com", isUser).external).toBe(true);
+    // a single-slash path stays internal
+    expect(resolveHref("/docs/board", isUser).internal).toBe(true);
+  });
+
+  it("neutralizes dangerous schemes to an empty href (defense-in-depth)", () => {
+    for (const bad of [
+      "javascript:alert(1)",
+      "JavaScript:alert(1)",
+      "  javascript:alert(1)",
+      "java\tscript:alert(1)",
+      "vbscript:msgbox(1)",
+      "data:text/html,<script>alert(1)</script>",
+      "file:///etc/passwd",
+    ]) {
+      expect(resolveHref(bad, isUser)).toEqual({ href: "", external: false, internal: false });
+    }
+  });
 });
 
 describe("resolveImageSrc (content-independent passthroughs)", () => {
-  it("passes through empty, absolute, data: and http(s) sources unchanged", () => {
+  it("passes through empty, root-absolute and http(s) sources unchanged", () => {
     expect(resolveImageSrc("")).toBe("");
     expect(resolveImageSrc("/logo.png")).toBe("/logo.png");
     expect(resolveImageSrc("https://x/y.png")).toBe("https://x/y.png");
-    expect(resolveImageSrc("data:image/png;base64,AAAA")).toBe("data:image/png;base64,AAAA");
+  });
+
+  it("neutralizes dangerous schemes (incl. data:) to an empty src", () => {
+    expect(resolveImageSrc("data:image/png;base64,AAAA")).toBe("");
+    expect(resolveImageSrc("javascript:alert(1)")).toBe("");
+    expect(resolveImageSrc("file:///etc/passwd")).toBe("");
   });
 
   it("falls back to the raw src for a relative path with no bundled asset", () => {
     expect(resolveImageSrc("img/definitely-not-a-real-shot.png")).toBe(
       "img/definitely-not-a-real-shot.png",
     );
+  });
+});
+
+describe("sortDocsForIndex", () => {
+  it("orders by `order` ascending, missing order last, slug as the tiebreak", () => {
+    const sorted = sortDocsForIndex([
+      doc("zeta", null),
+      doc("board", 30),
+      doc("alpha", null),
+      doc("getting-started", 10),
+    ]);
+    expect(sorted.map((d) => d.slug)).toEqual(["getting-started", "board", "alpha", "zeta"]);
+  });
+
+  it("does not mutate its input", () => {
+    const input = [doc("b", 20), doc("a", 10)];
+    sortDocsForIndex(input);
+    expect(input.map((d) => d.slug)).toEqual(["b", "a"]);
+  });
+});
+
+describe("summarize", () => {
+  it("skips the leading H1 and derives a blurb from the first paragraph, stripping markdown", () => {
+    expect(summarize("# Title\n\nA **bold** intro with a [link](x.md) and `code`.\n\n## Next")).toBe(
+      "A bold intro with a link and code.",
+    );
+  });
+
+  it("stops at the first table/heading/code fence and truncates long blurbs", () => {
+    expect(summarize("# T\n\nfirst line\nsecond line\n\n| a | b |")).toBe("first line second line");
+    const long = `# T\n\n${"word ".repeat(60)}`;
+    const out = summarize(long);
+    expect(out.length).toBeLessThanOrEqual(160);
+    expect(out.endsWith("…")).toBe(true);
   });
 });

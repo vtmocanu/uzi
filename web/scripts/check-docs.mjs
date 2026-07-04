@@ -118,10 +118,24 @@ for (const file of files) {
     }
   }
 
+  const noCode = stripCode(raw);
+
+  // Reference-style links are invisible to the inline-link existence check below
+  // and can render broken, so the gate forbids them: fail on link/image
+  // reference definitions (`[label]: target`) and full/collapsed reference
+  // usages (`[text][ref]`, `[text][]`). Code is already stripped so snippets do
+  // not trip it. The "inline links only" convention is documented in M5.
+  if (/^ {0,3}\[[^\]]+\]:\s+\S/m.test(noCode)) {
+    fail(file, "reference-style link/image definition ([label]: target) found — use inline links only");
+  }
+  if (/\]\[[^\]]*\]/.test(noCode)) {
+    fail(file, "reference-style link usage ([text][ref]) found — use inline links only");
+  }
+
   // Relative link/image existence (doc->doc and doc->img). External URLs and
   // pure `#anchor` fragments are skipped; fragments/queries are stripped before
   // resolving the file path (anchors within a target are not verified).
-  for (const target of extractTargets(stripCode(raw))) {
+  for (const target of extractTargets(noCode)) {
     if (isExternal(target) || target.startsWith("#")) continue;
     const filePart = target.split("#")[0].split("?")[0];
     if (filePart === "") continue;

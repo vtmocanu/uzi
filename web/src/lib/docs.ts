@@ -80,7 +80,7 @@ export function parseFrontmatter(raw: string): { meta: DocMeta; body: string } {
 
 // A one-line blurb for the index: the first real paragraph after the leading
 // `# Heading`, stripped of markdown syntax and truncated.
-function summarize(body: string): string {
+export function summarize(body: string): string {
   const lines = body.split("\n");
   let i = 0;
   while (i < lines.length && lines[i].trim() === "") i++;
@@ -129,16 +129,19 @@ export function isUserDoc(slug: string): boolean {
   return docsBySlug.get(slug)?.meta.audience === "user";
 }
 
-// In-app index: only `audience: user` pages, ordered by `order` (missing order
-// sorts last), then by slug as a stable tiebreak.
+// Index order: `order` ascending, missing order last, slug as a stable
+// tiebreak. Pure (operates on its input) so the ordering rule is unit-testable.
+export function sortDocsForIndex(docs: Doc[]): Doc[] {
+  return [...docs].sort((a, b) => {
+    const ao = a.meta.order ?? Number.POSITIVE_INFINITY;
+    const bo = b.meta.order ?? Number.POSITIVE_INFINITY;
+    return ao - bo || a.slug.localeCompare(b.slug);
+  });
+}
+
+// In-app index: only `audience: user` pages, ordered by sortDocsForIndex.
 export function listUserDocs(): Doc[] {
-  return [...docsBySlug.values()]
-    .filter((d) => d.meta.audience === "user")
-    .sort((a, b) => {
-      const ao = a.meta.order ?? Number.POSITIVE_INFINITY;
-      const bo = b.meta.order ?? Number.POSITIVE_INFINITY;
-      return ao - bo || a.slug.localeCompare(b.slug);
-    });
+  return sortDocsForIndex([...docsBySlug.values()].filter((d) => d.meta.audience === "user"));
 }
 
 // Resolve a doc-relative POSIX path against `docs/` and normalize `.`/`..` into
@@ -162,17 +165,39 @@ export interface RewrittenHref {
   internal: boolean;
 }
 
+// javascript:/vbscript:/data:/file: are unsafe as link or image targets. Strip
+// ASCII control/space chars first so a smuggled scheme (e.g. "java\tscript:")
+// cannot slip past the check.
+const DANGEROUS_SCHEME = /^(?:javascript|vbscript|data|file):/i;
+export function schemeIsDangerous(url: string): boolean {
+  return DANGEROUS_SCHEME.test(url.replace(/[\x00-\x20]+/g, ""));
+}
+
 // Pure core of link rewriting. `isUserPage(slug)` reports whether a doc slug is
 // a bundled in-app page; passing it in (rather than reading module state) keeps
 // this rule unit-testable without the build-time doc glob.
 //   - `#anchor` and absolute/external URLs pass through untouched.
+//   - dangerous schemes are neutralized to an empty href.
 //   - a relative `*.md` that resolves to a bundled `user` page -> `/docs/:slug`
 //     (in-app route), preserving any `#anchor`.
 //   - any other relative path (repo-only doc, ../plan.md, ...) -> the pinned
 //     GitLab blob URL, preserving any `#anchor`.
 export function resolveHref(href: string, isUserPage: (slug: string) => boolean): RewrittenHref {
+  // Protocol-relative (`//host`, and the `/\` variant browsers also treat as
+  // such) is an off-app URL, not an in-app route — classify before the
+  // single-slash internal case below.
+  if (/^\/[/\\]/.test(href)) {
+    return { href, external: true, internal: false };
+  }
   if (href.startsWith("#") || href.startsWith("/")) {
     return { href, external: false, internal: href.startsWith("/") };
+  }
+  // Defense-in-depth: independently neutralize dangerous URL schemes rather than
+  // leaning only on react-markdown's defaultUrlTransform (which a future
+  // urlTransform override could disable). Content is repo-trusted, so this only
+  // fires on a mistake, but it closes the XSS door structurally.
+  if (schemeIsDangerous(href)) {
+    return { href: "", external: false, internal: false };
   }
   if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
     return { href, external: /^https?:/i.test(href), internal: false };
@@ -199,9 +224,13 @@ export function rewriteHref(href: string): RewrittenHref {
 }
 
 // Resolve a relative image src in doc markdown to its hashed asset URL. Absolute
-// and data: URLs pass through; an unbundled path falls back to the raw src.
+// (http[s]) and root-absolute srcs pass through; dangerous schemes (including
+// data:) are neutralized to an empty src; an unbundled relative path falls back
+// to the raw src.
 export function resolveImageSrc(src: string): string {
-  if (src === "" || /^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("/")) return src;
+  if (src === "") return "";
+  if (schemeIsDangerous(src)) return "";
+  if (/^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("/")) return src;
   const rel = resolveFromDocs(src).replace(/^docs\//, "");
   return imageUrlByPath.get(rel) ?? src;
 }
