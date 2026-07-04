@@ -47,7 +47,7 @@ export interface Doc {
 // inside a code fence) is content. A file with no leading fence — or a
 // malformed one — renders as audience "design" (repo-only) rather than erroring,
 // so a pre-content build stays green.
-function parseFrontmatter(raw: string): { meta: DocMeta; body: string } {
+export function parseFrontmatter(raw: string): { meta: DocMeta; body: string } {
   const fallback: DocMeta = { title: "", order: null, audience: "design" };
   if (!raw.startsWith("---\n")) return { meta: fallback, body: raw };
 
@@ -144,7 +144,7 @@ export function listUserDocs(): Doc[] {
 // Resolve a doc-relative POSIX path against `docs/` and normalize `.`/`..` into
 // a repo-relative path (e.g. "configuration.md" -> "docs/configuration.md",
 // "../plan.md" -> "plan.md", "img/x.png" -> "docs/img/x.png").
-function resolveFromDocs(rel: string): string {
+export function resolveFromDocs(rel: string): string {
   const out: string[] = [];
   for (const part of `docs/${rel}`.split("/")) {
     if (part === "" || part === ".") continue;
@@ -162,13 +162,15 @@ export interface RewrittenHref {
   internal: boolean;
 }
 
-// Rewrite a link href found in doc markdown:
+// Pure core of link rewriting. `isUserPage(slug)` reports whether a doc slug is
+// a bundled in-app page; passing it in (rather than reading module state) keeps
+// this rule unit-testable without the build-time doc glob.
 //   - `#anchor` and absolute/external URLs pass through untouched.
 //   - a relative `*.md` that resolves to a bundled `user` page -> `/docs/:slug`
 //     (in-app route), preserving any `#anchor`.
 //   - any other relative path (repo-only doc, ../plan.md, ...) -> the pinned
 //     GitLab blob URL, preserving any `#anchor`.
-export function rewriteHref(href: string): RewrittenHref {
+export function resolveHref(href: string, isUserPage: (slug: string) => boolean): RewrittenHref {
   if (href.startsWith("#") || href.startsWith("/")) {
     return { href, external: false, internal: href.startsWith("/") };
   }
@@ -184,11 +186,16 @@ export function rewriteHref(href: string): RewrittenHref {
   const repoPath = resolveFromDocs(path);
   if (repoPath.startsWith("docs/") && repoPath.endsWith(".md")) {
     const slug = repoPath.slice("docs/".length, -".md".length);
-    if (isUserDoc(slug)) {
+    if (isUserPage(slug)) {
       return { href: `/docs/${slug}${anchor}`, external: false, internal: true };
     }
   }
   return { href: `${GITLAB_BLOB_BASE}${repoPath}${anchor}`, external: true, internal: false };
+}
+
+// Bound to the docs actually bundled in this build.
+export function rewriteHref(href: string): RewrittenHref {
+  return resolveHref(href, isUserDoc);
 }
 
 // Resolve a relative image src in doc markdown to its hashed asset URL. Absolute
