@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type { AgentTemplate, ClaimConfig, MessageKind } from "./protocol.js";
+import type { PlanVerdict } from "./steering.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -43,11 +44,34 @@ export interface RunContext {
   onSessionId?(sessionId: string): void;
   /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
   signal?: AbortSignal;
+  /**
+   * M4 plan gate. Called by the executor after the lead submits a plan: the
+   * runner posts /state awaiting_approval with the plan and returns the user's
+   * verdict (approve/reject/cancel), polled from /inputs. Absent in M2/M3.
+   */
+  gatePlan?(planMd: string): Promise<PlanVerdict>;
+  /** M4: dequeue the next queued follow-up to inject into the next loop turn. */
+  pullFollowUp?(): string | undefined;
+  /** M4: report a running/iteration heartbeat (server persists via GREATEST). */
+  reportIteration?(iteration: number): void;
 }
 
 export interface ExecutorResult {
-  /** The branch to report as completed. M4 adds the pushed MR iid. */
+  /** The branch to report as completed. The runner pushes it + opens the MR. */
   branch: string;
+}
+
+/**
+ * Thrown by the executor when the human rejects the plan at the gate. The runner
+ * catches it and reports `failed` with the (user-supplied) reason verbatim,
+ * rather than treating it as an internal crash. The reason is human/user text,
+ * never a secret.
+ */
+export class PlanRejectedError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = "PlanRejectedError";
+  }
 }
 
 /**
@@ -57,6 +81,14 @@ export interface ExecutorResult {
  */
 export interface Executor {
   run(ctx: RunContext): Promise<ExecutorResult>;
+  /**
+   * Group-kill every subprocess the agent spawned for the last run. The runner
+   * calls this BEFORE any PAT-bearing git op (push) so an agent-backgrounded
+   * process cannot survive to read the PAT out of the git child's /proc/environ
+   * (M4 audit B1). Optional so the M2 stub and test executors need not implement
+   * it; the SDK executor also self-reaps in its own run() finally.
+   */
+  killAgentTree?(): void;
 }
 
 /**

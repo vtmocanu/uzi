@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { recordingLogger } from "./helpers.js";
-import { GitCache, gitEnv } from "../src/git.js";
+import { GitCache, gitEnv, httpScopeForUrl } from "../src/git.js";
 
 // Primary directive (auditor): the bot PAT must never be readable in the git
 // process table. Passing it via `git -c` would put it on argv (world-readable
@@ -43,6 +43,63 @@ describe("gitEnv", () => {
   it("adds nothing secret-bearing when no PAT is supplied", () => {
     const env = gitEnv();
     assert.ok(!Object.values(env).some((v) => typeof v === "string" && v.includes("extraHeader")));
+  });
+
+  it("host-scopes the header and pins followRedirects off when a scope is given (item 9)", () => {
+    const scope = httpScopeForUrl("https://gitlab.example.com/org/repo.git");
+    assert.strictEqual(scope, "https://gitlab.example.com/");
+    const env = gitEnv(FAKE_PAT, scope);
+    // The header key is scoped to the repo host, not the global http.extraHeader.
+    const holders = Object.entries(env).filter(([, v]) => typeof v === "string" && v.includes(FAKE_PAT));
+    assert.strictEqual(holders.length, 1);
+    const idx = holders[0]![0].slice("GIT_CONFIG_VALUE_".length);
+    assert.strictEqual(env[`GIT_CONFIG_KEY_${idx}`], `http.${scope}.extraHeader`);
+    // followRedirects is pinned false on the same scope so a redirect can't replay the PAT.
+    const keys = Object.entries(env).filter(([k]) => /^GIT_CONFIG_KEY_\d+$/.test(k)).map(([, v]) => v);
+    assert.ok(keys.includes(`http.${scope}.followRedirects`));
+  });
+
+  it("has no http scope for a local/scp-style URL", () => {
+    assert.strictEqual(httpScopeForUrl("/tmp/fixture/origin"), undefined);
+    assert.strictEqual(httpScopeForUrl("git@gitlab.example.com:org/repo.git"), undefined);
+  });
+});
+
+describe("pushBranch secret flow", () => {
+  it("pushes the branch to origin without the PAT ever touching git argv", async () => {
+    const realGit = execFileSync("bash", ["-lc", "command -v git"], { encoding: "utf8" }).trim();
+    const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-gitshim-"));
+    const argvLog = path.join(shimDir, "argv.log");
+    const shim = path.join(shimDir, "git");
+    fs.writeFileSync(
+      shim,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(argvLog)}\nexec ${JSON.stringify(realGit)} "$@"\n`,
+    );
+    fs.chmodSync(shim, 0o755);
+
+    const { logger, lines } = recordingLogger();
+    const git = new GitCache(fx.dataDir, logger);
+    // Clone + create the branch (without the shim, to keep the log focused on push).
+    const bare = await git.ensureClone(fx.originPath);
+    await git.createOrAttachWorktree(bare, 7);
+
+    const oldPath = process.env.PATH ?? "";
+    process.env.PATH = shimDir + path.delimiter + oldPath;
+    try {
+      await git.pushBranch(bare, "agent/issue-7", FAKE_PAT, fx.originPath);
+    } finally {
+      process.env.PATH = oldPath;
+    }
+
+    const recordedArgv = fs.readFileSync(argvLog, "utf8");
+    fs.rmSync(shimDir, { recursive: true, force: true });
+    assert.ok(recordedArgv.includes("push"), "push should have run through the shim");
+    assert.ok(!recordedArgv.includes(FAKE_PAT), "PAT must not appear in any git argv");
+    assert.ok(!JSON.stringify(lines).includes(FAKE_PAT), "PAT must not appear in any log line");
+
+    // The branch really landed on origin.
+    const log = execFileSync("git", ["-C", fx.originPath, "log", "--oneline", "agent/issue-7"], { encoding: "utf8" });
+    assert.ok(log.length > 0);
   });
 });
 

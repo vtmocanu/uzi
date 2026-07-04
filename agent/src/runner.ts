@@ -1,19 +1,42 @@
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
 import type { Executor, RunContext } from "./executor.js";
+import { PlanRejectedError } from "./executor.js";
 import type { Logger } from "./log.js";
 import type { ClaimResponse } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
+import { SteeringChannel, type PlanVerdict } from "./steering.js";
+import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
 import { makeRedactor } from "./redact.js";
 import { errMessage } from "./util.js";
 
+/** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
+export interface RunnerOptions {
+  /** How often the steering channel polls /inputs (default 3s). */
+  pollMs?: number;
+  /** Plan-approval gate cap; 0 disables (default 24h). */
+  planApprovalTimeoutMs?: number;
+  /** Injected for tests; default opens real GitLab MRs. */
+  gitlab?: GitLabClient;
+}
+
 /**
- * Drives one claimed run through the state machine:
- *   claim → running → clone/worktree → execute → completed | failed
- * and always tears the worktree down (keeping the bare clone). M4 inserts the
- * plan gate and MR push around executor.run(); M2 proves the loop with a stub.
+ * Drives one claimed run through the full M4 workflow:
+ *   claim → running → clone/worktree → PLAN turn → approval gate → implement⇄
+ *   review loop → worker pushes branch + opens MR → completed | failed
+ * and always tears the worktree down (keeping the bare clone).
+ *
+ * The plan gate, follow-up injection, and cancel are steered through a single
+ * /inputs poller (SteeringChannel); the executor drives the SDK turns and calls
+ * back here to gate/report; and — the primary directive — the WORKER (never the
+ * agent) performs the authenticated push + MR with the PAT once the agent signals
+ * done.
  */
 export class RunRunner {
+  private readonly pollMs: number;
+  private readonly planApprovalTimeoutMs: number;
+  private readonly gitlab: GitLabClient;
+
   constructor(
     private readonly client: WorkerClient,
     private readonly git: GitCache,
@@ -23,7 +46,12 @@ export class RunRunner {
     /** The worker's join token — redacted from message payloads (it lives in
      *  the worker env, reachable via a /proc read of the parent). */
     private readonly joinToken?: string,
-  ) {}
+    opts: RunnerOptions = {},
+  ) {
+    this.pollMs = opts.pollMs ?? 3_000;
+    this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
+    this.gitlab = opts.gitlab ?? new GitLabClient();
+  }
 
   async execute(claim: ClaimResponse): Promise<void> {
     const runId = claim.run_id;
@@ -33,21 +61,26 @@ export class RunRunner {
     if (claim.secrets.anthropic_oauth_token) this.log.addSecret(claim.secrets.anthropic_oauth_token);
 
     const runLog = this.log.child({ run_id: runId, issue_iid: claim.issue_iid });
-    // Scrub the per-run secrets AND the worker join token out of every message
-    // payload before it is sent (a tool_result could echo the OAuth token from
-    // the agent env, or the join token via a /proc read of the worker).
     const redact = makeRedactor([claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, this.joinToken]);
     const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
 
-    // Last SDK session id the executor observed; carried on the TERMINAL state
-    // report too (not only the async running report), so resume survives a lost
-    // running report.
+    // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
+    // steering channel, which the executor's ctx.signal watches.
+    const cancel = new AbortController();
+    const steering = new SteeringChannel(this.client, runId, this.pollMs, runLog, cancel);
+
+    // Last SDK session id the executor observed; carried on EVERY state report so
+    // resume survives a lost report.
     let observedSessionId: string | undefined;
+    const reportState = (body: Parameters<WorkerClient["reportState"]>[1]): Promise<void> =>
+      this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
+
     let barePath: string | undefined;
     let worktreePath: string | undefined;
     try {
       runLog.info("run claimed", { repo: claim.repo.url, branch: claim.branch ?? null });
-      await this.client.reportState(runId, { status: "running" });
+      await reportState({ status: "running" });
+      steering.start();
 
       barePath = await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat);
       const worktree = await this.git.createOrAttachWorktree(barePath, claim.issue_iid);
@@ -66,39 +99,68 @@ export class RunRunner {
         agents: claim.agents,
         config: claim.config,
         sessionId: claim.session_id,
+        signal: cancel.signal,
         // Persist the SDK session id the moment the executor learns it, so a
-        // re-queued run can resume it. Best-effort: a failed report must not
-        // fail the run (the state report is retried internally, and a report
-        // landing after the terminal state is treated as already-terminal).
+        // re-queued run can resume it. Best-effort.
         onSessionId: (sessionId) => {
           observedSessionId = sessionId;
-          void this.client
-            .reportState(runId, { status: "running", session_id: sessionId })
-            .catch((e) => runLog.warn("could not persist session id", { error: errMessage(e) }));
+          void reportState({ status: "running" }).catch((e) =>
+            runLog.warn("could not persist session id", { error: errMessage(e) }),
+          );
+        },
+        // The plan gate: surface the plan, post awaiting_approval, and return the
+        // verdict the steering channel resolves (bounded so an abandoned plan
+        // fails rather than wedging the worker).
+        gatePlan: (planMd) => this.gatePlan(runId, planMd, batcher, steering, reportState, runLog),
+        pullFollowUp: () => steering.pullFollowUp(),
+        reportIteration: (iteration) => {
+          void reportState({ status: "running", iteration_count: iteration }).catch((e) =>
+            runLog.warn("could not report iteration", { error: errMessage(e) }),
+          );
         },
       };
+
       const result = await this.executor.run(ctx);
 
-      await batcher.close();
-      await this.client.reportState(runId, {
-        status: "completed",
-        branch: result.branch,
-        ...(observedSessionId ? { session_id: observedSessionId } : {}),
+      // Reap any agent-backgrounded subprocess BEFORE the PAT touches a git child
+      // env — otherwise a survivor could read the PAT from that child's
+      // /proc/environ during the push (M4 audit B1). The SDK executor also
+      // self-reaps in its run() finally; this is the explicit, load-bearing call
+      // at the security boundary.
+      this.executor.killAgentTree?.();
+
+      // The agent signalled done. The WORKER now performs the authenticated push
+      // + MR with the PAT — the agent never had a credential.
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: "work complete; pushing branch and opening merge request" } });
+      await this.git.pushBranch(barePath, result.branch, claim.secrets.forge_pat, claim.repo.clone_url);
+      const targetBranch =
+        claim.repo.default_branch?.trim() || (await this.git.defaultBranchName(barePath)) || "main";
+      const mr = await this.gitlab.createMergeRequest({
+        baseUrl: gitlabBaseUrl(claim.repo.url),
+        projectPath: gitlabProjectPath(claim.repo.url),
+        pat: claim.secrets.forge_pat,
+        sourceBranch: result.branch,
+        targetBranch,
+        title: mrTitle(claim),
+        description: mrDescription(claim, result.branch),
       });
-      runLog.info("run completed", { branch: result.branch });
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` } });
+
+      await batcher.close();
+      await reportState({ status: "completed", branch: result.branch, mr_iid: mr.iid });
+      runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
     } catch (err) {
-      const reason = errMessage(err);
+      // A plan rejection reports the user's reason verbatim; anything else reports
+      // its (static/redacted) message.
+      const reason = err instanceof PlanRejectedError ? err.reason : errMessage(err);
       runLog.error("run failed", { error: reason });
       batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } });
       await batcher.close().catch(() => undefined);
-      await this.client
-        .reportState(runId, {
-          status: "failed",
-          failure_reason: reason,
-          ...(observedSessionId ? { session_id: observedSessionId } : {}),
-        })
-        .catch((e) => runLog.error("could not report failed state", { error: errMessage(e) }));
+      await reportState({ status: "failed", failure_reason: reason }).catch((e) =>
+        runLog.error("could not report failed state", { error: errMessage(e) }),
+      );
     } finally {
+      await steering.stop().catch(() => undefined);
       if (barePath && worktreePath) {
         await this.git
           .removeWorktree(barePath, worktreePath)
@@ -106,4 +168,50 @@ export class RunRunner {
       }
     }
   }
+
+  /** Post awaiting_approval with the plan and await the steering verdict, bounded. */
+  private async gatePlan(
+    runId: string,
+    planMd: string,
+    batcher: MessageBatcher,
+    steering: SteeringChannel,
+    reportState: (body: { status: "awaiting_approval"; plan_md: string }) => Promise<void>,
+    runLog: Logger,
+  ): Promise<PlanVerdict> {
+    batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
+    // Get the plan message onto the stream before the run parks at the gate.
+    await batcher.flush().catch(() => undefined);
+    await reportState({ status: "awaiting_approval", plan_md: planMd });
+    runLog.info("plan gate: awaiting approval", { run_id: runId });
+
+    if (this.planApprovalTimeoutMs <= 0) return steering.awaitVerdict();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<PlanVerdict>((resolve) => {
+      timer = setTimeout(() => resolve({ kind: "reject", reason: "plan approval timed out" }), this.planApprovalTimeoutMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([steering.awaitVerdict(), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+}
+
+/** MR title from the issue snapshot (never empty). */
+function mrTitle(claim: ClaimResponse): string {
+  const t = claim.issue_title?.trim();
+  return t ? t : `Resolve issue #${claim.issue_iid}`;
+}
+
+/** MR body: links + closes the issue, and states the primary directive (humans merge). */
+function mrDescription(claim: ClaimResponse, branch: string): string {
+  return [
+    `Implements issue #${claim.issue_iid}.`,
+    "",
+    `Closes #${claim.issue_iid}`,
+    "",
+    "---",
+    `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`,
+  ].join("\n");
 }

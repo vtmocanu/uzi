@@ -35,6 +35,7 @@
 //    `cat <<EOF … git push … EOF` may be over-denied. That degrades SAFE (a
 //    denied benign heredoc) and the agent can use Write/Edit instead.
 
+import fs from "node:fs";
 import path from "node:path";
 import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./log.js";
@@ -66,6 +67,7 @@ const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
 const REASON_DEPTH = "denied by guardrail: command wrapping is nested too deeply to screen safely";
 const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted";
 const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not permitted";
+const REASON_UNKNOWN_SUBAGENT = "denied by guardrail: only the run's assembled subagents may be invoked";
 
 const MAX_DEPTH = 6;
 
@@ -214,8 +216,11 @@ function analyzeGitConfig(rest: string[]): BashScreenResult {
   const key = rest[k];
   // A write/unset to a remote/transport/credential namespace can repoint origin
   // or inject an auth header; an include/includeIf can pull in an attacker
-  // config file that does the same. Deny even though the read flags didn't match.
-  if (key && /^(remote|core|http|url|credential|include|includeif)\./i.test(key)) return deny(REASON_CONFIG_WRITE);
+  // config file that does the same; an `alias.<x> = !<shell>` body runs an
+  // arbitrary command OUTSIDE the Bash screener the next time any `git <x>` runs,
+  // so a write to the alias namespace is denied too (M4 audit item 8). Deny even
+  // though the read flags didn't match.
+  if (key && /^(remote|core|http|url|credential|include|includeif|alias)\./i.test(key)) return deny(REASON_CONFIG_WRITE);
   return ALLOW;
 }
 
@@ -356,6 +361,44 @@ export function buildPreToolUseHook(log: Logger): (input: HookInput) => Promise<
   };
 }
 
+/** The `subagent_type` an Agent tool_use targets, if present. */
+function subagentTypeOf(toolInput: unknown): string | undefined {
+  if (toolInput && typeof toolInput === "object" && "subagent_type" in toolInput) {
+    const t = (toolInput as { subagent_type?: unknown }).subagent_type;
+    if (typeof t === "string" && t.length > 0) return t;
+  }
+  return undefined;
+}
+
+/**
+ * Build the PreToolUse hook that hard-fails any Agent invocation whose
+ * `subagent_type` is not one of the run's assembled subagents (M4 audit item 7).
+ * The SDK's built-in `general-purpose` agent AUGMENTS our programmatic `agents`
+ * map and is otherwise invokable unbounded — so an allow-list of exactly our
+ * subagent names denies it (and any typo/hallucinated role), which is both
+ * defense-in-depth and cost control. The lead keeps the Agent tool to delegate to
+ * the allowed roles; every subagent already carries `disallowedTools:['Agent']`.
+ */
+export function buildAgentGuardHook(
+  allowed: Iterable<string>,
+  log: Logger,
+): (input: HookInput) => Promise<HookJSONOutput> {
+  const allowSet = new Set(allowed);
+  return async (input: HookInput): Promise<HookJSONOutput> => {
+    if (input.hook_event_name !== "PreToolUse" || input.tool_name !== NESTED_AGENT_TOOL) return {};
+    const sub = subagentTypeOf(input.tool_input);
+    if (sub !== undefined && allowSet.has(sub)) return {};
+    log.warn("guardrail denied an unexpected subagent", { subagent_type: sub ?? null });
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: REASON_UNKNOWN_SUBAGENT,
+      },
+    };
+  };
+}
+
 /** Path-bearing fields across the file tools (file_path / path / notebook_path). */
 function extractToolPaths(toolInput: unknown): string[] {
   if (!toolInput || typeof toolInput !== "object") return [];
@@ -369,21 +412,118 @@ function extractToolPaths(toolInput: unknown): string[] {
 }
 
 /**
- * Screen a single file-tool path against the run worktree. Pure/synchronous so
- * the guardrail suite can assert it with no live session. Relative paths resolve
+ * Screen a single file-tool path against the run worktree. Relative paths resolve
  * against `cwd` (the tool's working dir), and containment is checked against the
  * worktree root — so a `..` escape, an absolute path into `/etc` or `/proc`, or
  * a path under `.git/` is denied.
+ *
+ * The M3 jail was purely lexical (path.resolve), so an in-worktree symlink to
+ * /proc or outside the worktree slipped the check: `link -> /proc`, then
+ * `Read link/1/environ` resolves lexically inside the worktree. M4 audit item 6
+ * closes this for the file tools by ALSO resolving symlinks on the existing
+ * portion of the path (realpath-when-exists) and re-checking. Non-existent paths
+ * (a Write target being created) keep the lexical check, so the function stays
+ * pure for those and the unit suite can assert it without touching disk.
+ *
+ * Residual (documented, k8s-phase fix): this only guards the FILE tools. A Bash
+ * `cat symlink/1/environ` still bypasses both this and the Bash `/proc/` string
+ * guard, because worker and agent share a uid and /proc/<pid>/environ is
+ * owner-readable. Two things are readable that way:
+ *   - the WORKER's own environ, which holds the join token (redacted from every
+ *     message; the PAT is never in the worker's persistent env); and
+ *   - during the worker's git push/MR, the PAT lives in a git CHILD's env — but
+ *     the executor group-kills the agent's subprocess tree BEFORE the push (B1,
+ *     see sdk-executor.killAgentTree), so a normal survivor is already dead. A
+ *     survivor that escaped into its OWN session (`setsid`) is not reached by
+ *     killing the CLI's group and could still race that window.
+ * The real structural close (different uid for the agent vs the worker's git
+ * ops / userns / hidepid=2 / gVisor) belongs to the remote-worker phase; see the
+ * header of docker-compose's agent service.
  */
 export function screenToolPath(candidate: string, worktreeRoot: string, cwd: string): BashScreenResult {
-  if (candidate.includes("/proc/")) return deny(REASON_PROC);
   const root = path.resolve(worktreeRoot);
-  const resolved = path.resolve(cwd || root, candidate);
+  const lexical = path.resolve(cwd || root, candidate);
+  const lexicalResult = classifyResolvedPath(candidate, lexical, root);
+  if (lexicalResult.denied) return lexicalResult;
+  // Resolve symlinks on the existing prefix and re-check, so a symlink that
+  // lexically stays in-worktree but points at /proc or outside is caught. Both
+  // sides must be realpath'd (N2): comparing a realpath'd candidate against a
+  // lexical root over-DENIES every real file when the worktree root itself sits
+  // under a symlink ancestor (e.g. macOS /var → /private/var, or a symlinked
+  // data volume) — a fail-closed asymmetry, not a security hole, but fragile.
+  const real = realpathExisting(lexical);
+  if (real === lexical) return ALLOW;
+  return classifyResolvedPath(candidate, real, realpathExisting(root));
+}
+
+/** Deny a resolved absolute path that reads /proc, escapes the worktree, or hits .git/. */
+function classifyResolvedPath(candidate: string, resolved: string, root: string): BashScreenResult {
+  if (candidate.includes("/proc/") || resolved === "/proc" || resolved.startsWith("/proc/")) return deny(REASON_PROC);
   const inRoot = resolved === root || resolved.startsWith(root + path.sep);
   if (!inRoot) return deny(REASON_OUTSIDE_WORKTREE);
   const gitDir = path.join(root, ".git");
   if (resolved === gitDir || resolved.startsWith(gitDir + path.sep)) return deny(REASON_DOTGIT);
   return ALLOW;
+}
+
+/**
+ * Resolve symlinks on the existing portion of `p`, re-appending any non-existent
+ * remainder, so a symlink whose target does not (yet) exist is still followed —
+ * e.g. `link -> /proc` resolves even on a host without /proc. Done manually
+ * (deepest existing ancestor → readlink one hop → repeat) rather than via
+ * `fs.realpathSync`, which throws on a dangling link and would leave the escape
+ * unresolved. Bounded hops guard against a symlink cycle; any fs error falls back
+ * to what is resolved so far (the lexical check already ran).
+ */
+function realpathExisting(p: string): string {
+  let current = path.resolve(p);
+  for (let hops = 0; hops < 64; hops++) {
+    const found = deepestExisting(current);
+    if (!found) return current;
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(found.path);
+    } catch {
+      return current;
+    }
+    if (st.isSymbolicLink()) {
+      let target: string;
+      try {
+        target = fs.readlinkSync(found.path);
+      } catch {
+        return current;
+      }
+      const abs = path.resolve(path.dirname(found.path), target);
+      current = found.tail.length ? path.join(abs, ...found.tail) : abs;
+      continue; // the target may itself contain further symlinks
+    }
+    // Deepest existing component is a real file/dir: realpath it (resolves any
+    // intermediate symlinks in the prefix) and re-append the non-existent tail.
+    try {
+      const real = fs.realpathSync.native(found.path);
+      return found.tail.length ? path.join(real, ...found.tail) : real;
+    } catch {
+      return current;
+    }
+  }
+  return current;
+}
+
+/** The deepest lstat-existing ancestor of `p` plus the non-existent tail below it. */
+function deepestExisting(p: string): { path: string; tail: string[] } | undefined {
+  let prefix = p;
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      fs.lstatSync(prefix);
+      return { path: prefix, tail };
+    } catch {
+      const parent = path.dirname(prefix);
+      if (parent === prefix) return undefined;
+      tail.unshift(path.basename(prefix));
+      prefix = parent;
+    }
+  }
 }
 
 /**

@@ -5,67 +5,78 @@ import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
-import type { EmittedMessage, RunContext } from "../src/executor.js";
+import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
+import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
-// The SDK executor is exercised only up to — never across — the network
-// boundary: `queryFn` is faked, so guardrails, sparse env, session/resume, the
-// message stream, and the watchdogs are all provable with dummy credentials and
-// NO live Anthropic session (testing-credentials policy).
+// The SDK executor is exercised only up to — never across — the network boundary:
+// `queryFn` is faked, so the plan gate, the implement⇄review loop + cap, follow-up
+// injection, guardrails, sparse env, session/resume, and watchdogs are all
+// provable with dummy credentials and NO live Anthropic session. The plan/done
+// signals are scripted as MCP tool_use blocks the executor observes in the stream.
 
 const OAUTH = "dummy-oauth-token-do-not-scan-0000";
 const FAKE_PAT = "dummy-forge-pat-do-not-scan-1111";
 const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 
-const coder: AgentTemplate = {
-  name: "coder",
-  description: "writes code",
-  prompt_body: "You implement.",
-  tools: ["Read", "Edit", "Write", "Bash"],
-};
-const reviewer: AgentTemplate = {
-  name: "reviewer",
-  description: "reviews",
-  prompt_body: "You review.",
-  tools: ["Read", "Grep"],
-};
-const lead: AgentTemplate = {
-  name: "lead",
-  description: "leads",
-  prompt_body: "LEAD SYSTEM PROMPT",
-  model: "fable",
-};
+const coder: AgentTemplate = { name: "coder", description: "writes code", prompt_body: "You implement.", tools: ["Read", "Edit", "Write", "Bash"] };
+const reviewer: AgentTemplate = { name: "reviewer", description: "reviews", prompt_body: "You review.", tools: ["Read", "Grep"] };
+const lead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT", model: "fable" };
 
-interface Captured {
-  options?: SdkOptions;
-  promptText?: string;
+// --- scripted SDK messages ---------------------------------------------------
+
+function assistantText(text: string, sessionId = "sess-1"): SDKMessage {
+  return { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text }] } } as unknown as SDKMessage;
+}
+function submitPlan(plan: string, sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: { content: [{ type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan } }] },
+  } as unknown as SDKMessage;
+}
+function signalDone(sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: { content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: {} }] },
+  } as unknown as SDKMessage;
+}
+function resultSuccess(sessionId = "sess-1"): SDKMessage {
+  return { type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: sessionId } as unknown as SDKMessage;
 }
 
 type Script = SDKMessage[] | ((signal: AbortSignal) => AsyncIterable<unknown>);
 
-/** A fake `query`: captures the options/prompt, then replays a scripted stream. */
-function fakeQuery(script: Script): { queryFn: SdkQueryFn; captured: Captured } {
-  const captured: Captured = {};
+interface Turn {
+  options: SdkOptions;
+  promptText?: string;
+}
+
+/** A fake `query` that replays one scripted stream per turn (invocation). */
+function fakeTurns(scripts: Script[]): { queryFn: SdkQueryFn; turns: Turn[] } {
+  const turns: Turn[] = [];
+  let i = 0;
   const queryFn: SdkQueryFn = (params) => {
-    captured.options = params.options;
+    const script = scripts[Math.min(i, scripts.length - 1)]!;
+    i++;
+    const turn: Turn = { options: params.options };
+    turns.push(turn);
     return (async function* () {
       for await (const p of params.prompt) {
         const rec = p as { message?: { content?: unknown } };
         const content = rec.message?.content;
-        captured.promptText = typeof content === "string" ? content : JSON.stringify(content);
+        turn.promptText = typeof content === "string" ? content : JSON.stringify(content);
       }
-      if (typeof script === "function") {
-        yield* script(params.options.abortController!.signal) as AsyncIterable<SDKMessage>;
-      } else {
-        for (const m of script) yield m;
-      }
+      const s = typeof script === "function" ? script(params.options.abortController!.signal) : script;
+      if (Array.isArray(s)) for (const m of s) yield m;
+      else yield* s as AsyncIterable<SDKMessage>;
     })();
   };
-  return { queryFn, captured };
+  return { queryFn, turns };
 }
 
-/** Async iterable that yields nothing and returns only once aborted. */
 function hangUntilAbort(signal: AbortSignal): AsyncIterable<unknown> {
   return {
     async *[Symbol.asyncIterator]() {
@@ -77,20 +88,22 @@ function hangUntilAbort(signal: AbortSignal): AsyncIterable<unknown> {
   };
 }
 
-function resultSuccess(sessionId: string): SDKMessage {
-  return { type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: sessionId } as unknown as SDKMessage;
-}
-
 let homeDir: string;
 let saved: Record<string, string | undefined>;
 
-function makeCtx(overrides: Partial<RunContext> = {}): {
+interface CtxProbe {
   ctx: RunContext;
   emits: EmittedMessage[];
   sessionIds: string[];
-} {
+  gated: string[];
+  iterations: number[];
+}
+
+function makeCtx(overrides: Partial<RunContext> = {}, verdict: PlanVerdict = { kind: "approve" }): CtxProbe {
   const emits: EmittedMessage[] = [];
   const sessionIds: string[] = [];
+  const gated: string[] = [];
+  const iterations: number[] = [];
   const ctx: RunContext = {
     runId: "r1",
     issueIid: 5,
@@ -104,9 +117,15 @@ function makeCtx(overrides: Partial<RunContext> = {}): {
     config: null,
     sessionId: null,
     onSessionId: (s) => sessionIds.push(s),
+    gatePlan: async (planMd) => {
+      gated.push(planMd);
+      return verdict;
+    },
+    pullFollowUp: () => undefined,
+    reportIteration: (n) => iterations.push(n),
     ...overrides,
   };
-  return { ctx, emits, sessionIds };
+  return { ctx, emits, sessionIds, gated, iterations };
 }
 
 beforeEach(() => {
@@ -124,145 +143,209 @@ afterEach(() => {
   }
 });
 
-describe("SdkExecutor guardrail options", () => {
-  it("locks down permissions, isolation, subagents, and reports the branch", async () => {
-    const { queryFn, captured } = fakeQuery([resultSuccess("sess-1")]);
-    const { ctx, emits, sessionIds } = makeCtx({ agents: [lead, coder, reviewer] });
+describe("SdkExecutor plan gate", () => {
+  it("captures the plan, gates on it, then runs the loop to done and reports the branch", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# The Plan\n- step 1"), resultSuccess()], // planning turn
+      [assistantText("implementing"), signalDone(), resultSuccess()], // loop turn 1
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
     assert.deepStrictEqual(result, { branch: "agent/issue-5" });
-
-    const o = captured.options!;
-    assert.strictEqual(o.permissionMode, "bypassPermissions");
-    assert.strictEqual(o.allowDangerouslySkipPermissions, true);
-    assert.deepStrictEqual(o.settingSources, []);
-    assert.strictEqual(o.includePartialMessages, false);
-    assert.strictEqual(o.cwd, "/tmp/does-not-need-to-exist");
-    assert.strictEqual(o.resume, undefined); // no session to resume
-
-    // Lead template drives the system prompt + model; it is NOT a subagent.
-    // systemPrompt keeps the claude_code preset and appends the lead body.
-    assert.ok(o.systemPrompt && typeof o.systemPrompt === "object" && !Array.isArray(o.systemPrompt));
-    const sp = o.systemPrompt as { type: string; preset: string; append: string };
-    assert.strictEqual(sp.type, "preset");
-    assert.strictEqual(sp.preset, "claude_code");
-    assert.match(sp.append, /^LEAD SYSTEM PROMPT\n\n/);
-    assert.strictEqual(o.model, "fable");
-    // Detached-spawn hook is wired so a watchdog trip can group-kill the tree.
-    assert.strictEqual(typeof o.spawnClaudeCodeProcess, "function");
-    assert.deepStrictEqual(Object.keys(o.agents ?? {}).sort(), ["coder", "reviewer"]);
-    for (const name of ["coder", "reviewer"]) {
-      assert.deepStrictEqual(o.agents?.[name]?.disallowedTools, ["Agent"]);
-    }
-
-    // Two PreToolUse matchers are wired: Bash (command screening) and the file
-    // tools (path screening).
-    const bashMatcher = o.hooks?.PreToolUse?.[0];
-    assert.strictEqual(bashMatcher?.matcher, "Bash");
-    assert.strictEqual(bashMatcher?.hooks.length, 1);
-    const pathMatcher = o.hooks?.PreToolUse?.[1];
-    assert.match(pathMatcher?.matcher ?? "", /Read\|Edit\|Write/);
-    // The wired path hook denies a /proc Read (the sibling-tool bypass).
-    const pathHook = pathMatcher!.hooks[0]!;
-    const denied = await pathHook(
-      {
-        session_id: "s",
-        transcript_path: "/t",
-        cwd: "/tmp/does-not-need-to-exist",
-        hook_event_name: "PreToolUse",
-        tool_name: "Read",
-        tool_input: { file_path: "/proc/1/environ" },
-        tool_use_id: "tu",
-      } as HookInput,
-      "tu",
-      { signal: new AbortController().signal },
-    );
-    assert.strictEqual(
-      (denied as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
-      "deny",
-    );
-
-    // session id surfaced once; success status + start status streamed.
-    assert.deepStrictEqual(sessionIds, ["sess-1"]);
-    assert.ok(emits.some((m) => m.kind === "status" && m.payload["event"] === "result"));
+    assert.deepStrictEqual(probe.gated, ["# The Plan\n- step 1"]); // gate saw the plan
+    assert.deepStrictEqual(probe.iterations, [1]); // one loop iteration reported
+    assert.strictEqual(turns.length, 2); // exactly one planning + one loop turn
+    // The signal tool_use is NOT leaked to the run stream as a raw tool_use.
+    assert.ok(!probe.emits.some((m) => m.kind === "tool_use" && m.payload["name"] === "mcp__uzi__submit_plan"));
   });
 
-  it("hands the SDK a sparse env with no worker secrets", async () => {
-    const { queryFn, captured } = fakeQuery([resultSuccess("s")]);
-    const { ctx } = makeCtx();
-    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
-
-    const env = captured.options!.env!;
-    assert.deepStrictEqual(
-      new Set(Object.keys(env)),
-      new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]),
-    );
-    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, OAUTH);
-    assert.strictEqual(env.HOME, homeDir);
-    const serialized = JSON.stringify(env);
-    assert.ok(!serialized.includes(FAKE_PAT), "PAT must not reach the SDK env");
-    assert.ok(!serialized.includes(FAKE_JOIN_TOKEN), "join token must not reach the SDK env");
-  });
-
-  it("wires a PreToolUse hook that denies a protected push", async () => {
-    const { queryFn, captured } = fakeQuery([resultSuccess("s")]);
-    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx().ctx);
-
-    const hook = captured.options!.hooks!.PreToolUse![0]!.hooks[0]!;
-    const input: HookInput = {
-      session_id: "s",
-      transcript_path: "/t",
-      cwd: "/w",
-      hook_event_name: "PreToolUse",
-      tool_name: "Bash",
-      tool_input: { command: "git push origin main" },
-      tool_use_id: "tu",
-    } as HookInput;
-    const out = await hook(input, "tu", { signal: new AbortController().signal });
-    assert.strictEqual(
-      (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
-      "deny",
+  it("fails with the user's reason (verbatim) when the plan is rejected", async () => {
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()]]);
+    const probe = makeCtx({}, { kind: "reject", reason: "not thorough enough" });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      (err: unknown) => err instanceof PlanRejectedError && err.reason === "not thorough enough",
     );
   });
 
-  it("passes the claim's session id as the SDK resume target", async () => {
-    const { queryFn, captured } = fakeQuery([resultSuccess("s")]);
-    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ sessionId: "prev-session" }).ctx);
-    assert.strictEqual(captured.options!.resume, "prev-session");
+  it("cancels the run when the gate returns cancel", async () => {
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()]]);
+    const probe = makeCtx({}, { kind: "cancel" });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /run cancelled/);
+  });
+
+  it("fails when the planning turn ends without a submitted plan", async () => {
+    const { queryFn } = fakeTurns([[assistantText("I did nothing"), resultSuccess()]]);
+    const probe = makeCtx();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      /without submitting a plan/,
+    );
+    assert.deepStrictEqual(probe.gated, []); // gate never reached
   });
 });
 
-describe("SdkExecutor streaming + attribution", () => {
-  it("maps assistant and subagent frames onto the run stream", async () => {
-    const script: SDKMessage[] = [
-      { type: "assistant", session_id: "s2", message: { content: [{ type: "text", text: "planning" }] } } as unknown as SDKMessage,
-      { type: "assistant", subagent_type: "reviewer", message: { content: [{ type: "text", text: "LGTM" }] } } as unknown as SDKMessage,
-      resultSuccess("s2"),
-    ];
-    const { queryFn } = fakeQuery(script);
-    const { ctx, emits } = makeCtx({ agents: [coder, reviewer] });
-    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+describe("SdkExecutor implement/review loop", () => {
+  it("caps the loop at max_iterations and fails when done is never signalled", async () => {
+    // Planning turn, then loop turns that never signal done.
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [assistantText("still working"), resultSuccess()],
+    ]);
+    const probe = makeCtx({ config: { max_iterations: 3 } });
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+      /maximum implement\/review iterations/,
+    );
+    assert.deepStrictEqual(probe.iterations, [1, 2, 3]); // reported each iteration
+    assert.strictEqual(turns.length, 1 /*plan*/ + 3 /*loop*/);
+  });
 
-    assert.ok(emits.some((m) => m.kind === "text" && m.agent === "lead" && m.payload["text"] === "planning"));
-    assert.ok(emits.some((m) => m.kind === "text" && m.agent === "reviewer" && m.payload["text"] === "LGTM"));
+  it("injects a queued follow-up into the next loop turn's prompt", async () => {
+    const followUps = ["please also add tests"];
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()], // planning
+      [assistantText("first pass"), resultSuccess()], // loop 1 (no done)
+      [assistantText("second pass"), signalDone(), resultSuccess()], // loop 2 (done)
+    ]);
+    const probe = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: () => followUps.shift() });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // turns[0] = plan, turns[1] = loop1, turns[2] = loop2 (carries the follow-up).
+    assert.match(turns[2]!.promptText ?? "", /please also add tests/);
+    assert.match(turns[2]!.promptText ?? "", /UNTRUSTED INPUT/); // framed as data
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /please also add tests/);
+  });
+});
+
+describe("SdkExecutor guardrail options", () => {
+  it("wires the signal MCP server, the subagent guard, and the file/bash hooks", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const o = turns[0]!.options;
+    assert.strictEqual(o.permissionMode, "bypassPermissions");
+    assert.deepStrictEqual(o.settingSources, []);
+    assert.ok(o.mcpServers && "uzi" in o.mcpServers, "signal MCP server wired");
+    assert.deepStrictEqual(Object.keys(o.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(o.model, "fable");
+
+    // Three PreToolUse matchers: Bash, the file tools, and the Agent guard.
+    const matchers = (o.hooks?.PreToolUse ?? []).map((m) => m.matcher);
+    assert.deepStrictEqual(matchers, ["Bash", "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep", "Agent"]);
+
+    // The Agent guard denies a subagent not in the assembled map (item 7).
+    const agentHook = o.hooks!.PreToolUse![2]!.hooks[0]!;
+    const denied = await agentHook(
+      { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "general-purpose" } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+    assert.strictEqual((denied as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision, "deny");
+    // ...but allows an assembled subagent.
+    const allowed = await agentHook(
+      { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "coder" } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+    assert.deepStrictEqual(allowed, {});
+  });
+
+  it("hands the SDK a sparse env with no worker secrets (every turn)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx().ctx);
+
+    for (const t of turns) {
+      const env = t.options.env!;
+      assert.deepStrictEqual(
+        new Set(Object.keys(env)),
+        new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]),
+      );
+      const serialized = JSON.stringify(env);
+      assert.ok(!serialized.includes(FAKE_PAT), "PAT must not reach the SDK env");
+      assert.ok(!serialized.includes(FAKE_JOIN_TOKEN), "join token must not reach the SDK env");
+    }
+  });
+
+  it("resumes the session across turns, seeding from the claim's session id", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan", "sess-A"), resultSuccess("sess-A")],
+      [signalDone("sess-A"), resultSuccess("sess-A")],
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ sessionId: "prev-session" }).ctx);
+    // Planning turn resumes the claim's session; the loop turn resumes the SDK's.
+    assert.strictEqual(turns[0]!.options.resume, "prev-session");
+    assert.strictEqual(turns[1]!.options.resume, "sess-A");
+  });
+});
+
+describe("SdkExecutor agent-tree reap (B1)", () => {
+  // A query that, per turn, simulates the SDK spawning the CLI (so a pid is
+  // tracked) before replaying its script.
+  function spawningQuery(scripts: SDKMessage[][]): SdkQueryFn {
+    let i = 0;
+    return (params) => {
+      const script = scripts[Math.min(i, scripts.length - 1)]!;
+      i++;
+      return (async function* () {
+        params.options.spawnClaudeCodeProcess?.({ command: "x", args: [] } as never);
+        for await (const _ of params.prompt) { /* drain */ }
+        for (const m of script) yield m;
+      })();
+    };
+  }
+
+  it("group-kills every spawned agent subprocess on the DONE path (not just on a trip)", async () => {
+    const killed: (number | undefined)[] = [];
+    let pid = 5000;
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningQuery([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
+      spawn: () => ({ pid: ++pid }),
+      kill: (p) => (killed.push(p), true),
+    });
+    await exec.run(makeCtx().ctx);
+    // Both turns' pids were reaped when the run finished its DONE path.
+    assert.deepStrictEqual([...killed].sort(), [5001, 5002]);
+    // Idempotent: a second reap does nothing (the set was cleared → no recycled-pid kill).
+    killed.length = 0;
+    exec.killAgentTree();
+    assert.deepStrictEqual(killed, []);
+  });
+
+  it("reaps the agent subprocess even on a failure path (no plan submitted)", async () => {
+    const killed: (number | undefined)[] = [];
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningQuery([[assistantText("nothing"), resultSuccess()]]),
+      spawn: () => ({ pid: 6001 }),
+      kill: (p) => (killed.push(p), true),
+    });
+    await assert.rejects(exec.run(makeCtx().ctx), /without submitting a plan/);
+    assert.deepStrictEqual(killed, [6001]);
   });
 });
 
 describe("SdkExecutor failure + watchdog paths", () => {
   it("fails fast when no OAuth token is present", async () => {
-    const { queryFn } = fakeQuery([resultSuccess("s")]);
-    const { ctx } = makeCtx({ oauthToken: undefined });
+    const { queryFn } = fakeTurns([[resultSuccess()]]);
     await assert.rejects(
-      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx),
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ oauthToken: undefined }).ctx),
       /no Anthropic OAuth token/,
     );
   });
 
-  it("fails when the agent run ends in an error result", async () => {
+  it("fails when the planning turn ends in an error result", async () => {
     const script: SDKMessage[] = [
       { type: "result", subtype: "error_max_turns", is_error: true, errors: ["cap"], session_id: "s" } as unknown as SDKMessage,
     ];
-    const { queryFn } = fakeQuery(script);
+    const { queryFn } = fakeTurns([script]);
     await assert.rejects(
       new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx().ctx),
       /agent run failed: error_max_turns/,
@@ -270,40 +353,30 @@ describe("SdkExecutor failure + watchdog paths", () => {
   });
 
   it("trips the idle watchdog on a silent agent and aborts the SDK", async () => {
-    const { queryFn, captured } = fakeQuery((signal) => hangUntilAbort(signal));
-    const { ctx } = makeCtx({ config: { idle_timeout_seconds: 0.03, run_timeout_seconds: 100 } });
-    await assert.rejects(
-      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx),
-      /idle timeout/,
-    );
-    // abort() is the asserted stop: the abortController handed to the SDK fired.
-    assert.strictEqual(captured.options!.abortController!.signal.aborted, true);
+    const { queryFn, turns } = fakeTurns([(signal) => hangUntilAbort(signal)]);
+    const probe = makeCtx({ config: { idle_timeout_seconds: 0.03, run_timeout_seconds: 100 } });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /idle timeout/);
+    assert.strictEqual(turns[0]!.options.abortController!.signal.aborted, true);
   });
 
   it("trips the wall-clock watchdog even while the agent is active and aborts", async () => {
-    // Yield a message (resets idle) then hang; a short wall-clock still fires.
     const script = (signal: AbortSignal): AsyncIterable<unknown> => ({
       async *[Symbol.asyncIterator]() {
-        yield { type: "assistant", session_id: "s", message: { content: [{ type: "text", text: "working" }] } };
+        yield assistantText("working");
         yield* hangUntilAbort(signal);
       },
     });
-    const { queryFn, captured } = fakeQuery(script);
-    const { ctx } = makeCtx({ config: { idle_timeout_seconds: 100, run_timeout_seconds: 0.03 } });
-    await assert.rejects(
-      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx),
-      /wall-clock timeout/,
-    );
-    assert.strictEqual(captured.options!.abortController!.signal.aborted, true);
+    const { queryFn } = fakeTurns([script]);
+    const probe = makeCtx({ config: { idle_timeout_seconds: 100, run_timeout_seconds: 0.03 } });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /wall-clock timeout/);
   });
 
-  it("cancels via an external abort signal", async () => {
+  it("cancels via an external abort signal (before the gate)", async () => {
     const controller = new AbortController();
     controller.abort();
-    const { queryFn } = fakeQuery((signal) => hangUntilAbort(signal));
-    const { ctx } = makeCtx({ signal: controller.signal });
+    const { queryFn } = fakeTurns([(signal) => hangUntilAbort(signal)]);
     await assert.rejects(
-      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx),
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ signal: controller.signal }).ctx),
       /run cancelled/,
     );
   });
