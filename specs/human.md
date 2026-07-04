@@ -77,6 +77,18 @@ Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/7-docs-section-webui.md`.
 - Include screenshots; screenshots are provided by the user (ask the user for them).
 - Skills howto is out of scope until a skills feature exists.
 
+## Feature #11 — Run view UX: markdown plan, boxed activity, terse events
+
+Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
+
+- Plan (and agent prose) renders as formatted markdown, not raw `#`/`-`/backticks.
+- Activity feed is a bounded, scrollable box that auto-scrolls (follows) live runs; scrolling up pauses following without fighting the user; a "{n} new ↓" affordance resumes it in one click.
+- No raw JSON anywhere in the run view, for any event kind.
+- Long tool calls visibly show as running (spinner + elapsed) — no frozen-feed dead air.
+- Raw run frames go to the worker's docker logs behind `UZI_LOG_LEVEL=debug`, not the browser.
+- No "show raw JSON" toggle in the web UI. [explicit user rejection]
+- Reuse PRD #7's markdown renderer rather than building a parallel one. [user coordination]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

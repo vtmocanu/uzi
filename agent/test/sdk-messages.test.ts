@@ -49,10 +49,44 @@ describe("mapSdkMessage", () => {
     ]);
   });
 
-  it("maps a success result to a status message", () => {
+  it("maps a success result to a status message (unguarded passthrough, absent fields are undefined)", () => {
     const out = mapSdkMessage({ type: "result", subtype: "success", is_error: false, num_turns: 3 });
     assert.deepStrictEqual(out, [
-      { kind: "status", agent: "lead", payload: { event: "result", subtype: "success", num_turns: 3 } },
+      {
+        kind: "status",
+        agent: "lead",
+        payload: {
+          event: "result",
+          subtype: "success",
+          num_turns: 3,
+          duration_ms: undefined,
+          total_cost_usd: undefined,
+        },
+      },
+    ]);
+  });
+
+  it("forwards duration_ms and total_cost_usd on a success result when present (PRD #11)", () => {
+    const out = mapSdkMessage({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      num_turns: 3,
+      duration_ms: 12400,
+      total_cost_usd: 0.0731,
+    });
+    assert.deepStrictEqual(out, [
+      {
+        kind: "status",
+        agent: "lead",
+        payload: {
+          event: "result",
+          subtype: "success",
+          num_turns: 3,
+          duration_ms: 12400,
+          total_cost_usd: 0.0731,
+        },
+      },
     ]);
   });
 

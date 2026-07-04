@@ -61,6 +61,8 @@ The first time a repo's board is opened, uzi ensures three labels exist on that 
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md#agent-runtime-workers-runs-live-view) for how these are used (run lifecycle, sweeper, claim affinity) and [worker-setup.md](worker-setup.md) for the operator procedure. `UZI_SEED_ANTHROPIC_TOKEN` (dev convenience: boot-seeds an existing Anthropic token for the seed admin) is documented above, in the Forge integration seed table, alongside the other startup seeds.
 
+The run view in the web UI shows a terse, one-line-per-event feed (tool calls with argument summaries, results folded under their call, durations, an in-flight spinner), never raw JSON. When you need the complete raw frames for debugging, set `UZI_LOG_LEVEL=debug` and read them from the worker's `docker logs` (see the `UZI_LOG_LEVEL` row below).
+
 ### Server (`api`)
 
 | Var | Default | Notes |
@@ -95,6 +97,6 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `WORKER_MESSAGE_BATCH_INTERVAL` | `500ms` | How long the worker accumulates SDK output before a batched `POST .../messages` call. |
 | `WORKER_HTTP_TIMEOUT` | `30s` | Per-request timeout on the worker's own control-plane HTTP calls to `api`. |
 | `WORKER_PLAN_APPROVAL_TIMEOUT` | `24h` | How long a run may sit at `awaiting_approval` before the worker fails it: generous so a human has time, finite so an abandoned plan never wedges the (single-run-at-a-time) worker. |
-| `UZI_LOG_LEVEL` | `info` | Worker log verbosity: `debug`/`info`/`warn`/`error`. |
+| `UZI_LOG_LEVEL` | `info` | Worker log verbosity: `debug`/`info`/`warn`/`error`. At `debug` the worker also writes every raw run event (each `tool_use`, `tool_result`, status, etc.) to its stdout as it is emitted, so `docker logs uzi-agent-1` becomes the full-frame debug surface. Secrets are redacted before logging. `info` stays terse (no per-event lines). |
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.

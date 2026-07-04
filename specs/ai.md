@@ -220,6 +220,11 @@ users(
   best-effort on any future non-GitLab driver (see §16, §20).
 - **Move-to-Closed is unsupported** from the board; closing/reopening stays on the
   forge (see §20).
+- **Untrusted-markdown remote images** in the run view load loopback-only; a remote
+  `<img>` in LLM output is an accepted beacon risk until a CSP `img-src` restriction
+  lands (see §61).
+- **Worker `debug` logs contain full (redacted) run frames by design** — may include
+  sensitive repo content; enable `UZI_LOG_LEVEL=debug` only when inspecting (see §65).
 
 ---
 
@@ -1206,3 +1211,181 @@ Serves human: the docs feature must be maintainable (a contributor can add a pag
 - ARCHITECTURE.md gains a short **Docs** section; the root `README.md` Documentation
   list includes the pages added since the PRD's original table (`getting-started`,
   `board`, `dev-conventions`) plus a `/docs` pointer.
+
+---
+
+# PRD #11 — Run View UX: markdown plan, boxed auto-scroll activity, terse events
+
+Serves human Feature #11. **Status: M0–M5 built and merged on `prd-11-run-view-ux`.**
+Adds **zero** new services, DB tables, env vars, or API/worker-protocol routes: the
+feature is a web-side re-render of payloads that already reach the browser, plus one
+additive worker field and one debug-log line. Coordinates with PRD #7 (shares its
+markdown pipeline rather than forking a parallel one — a user-stated coordination
+requirement). M2+M3 shipped as **one commit** (`d45f41f`) because `RunView`,
+`ActivityFeed`, and `RunEvent` are mutually dependent and can't compile half-wired.
+
+## 61. Shared markdown core + per-caller trust policy
+
+Serves human: "the plan renders as markdown"; best-practice (untrusted LLM output).
+Coordinates with PRD #7 §56 (which first added react-markdown for trusted docs).
+
+- **`web/src/components/MarkdownCore.tsx`** — the policy-free core: pins the pipeline
+  (`react-markdown` v10 + `remark-gfm`, **no `rehype-raw`** — raw HTML stays inert
+  text) and the one policy-neutral element override (GFM tables scroll inside their
+  own `overflow-x-auto` container). Link/image **behaviour is deliberately not decided
+  here**; each caller injects its own `a`/`img` via `components` (caller overrides merge
+  over the base, so even the table wrapper is replaceable).
+  - Why the split: PRD #7 had shipped `DocMarkdown` with the docs trust policy baked
+    in. Instead of a parallel renderer for the run view (which the user asked to
+    avoid), M0 extracted the shared core and refactored `DocMarkdown` into one caller.
+    `DocMarkdown`'s observable behaviour is unchanged — PRD #7's `docs.test.ts` (19
+    tests) still passes and docs pages render identically.
+- **Two callers, two policies, never mixed:**
+  - `DocMarkdown` (**trusted repo docs**, PRD #7): `rewriteHref`/`resolveImageSrc`,
+    internal links become same-tab SPA `<Link>`s, hashed-asset images.
+  - `Markdown.tsx` (**untrusted LLM output**, PRD #11): links treated as **external
+    only** — new tab + `rel="noopener noreferrer"`, never rewritten to SPA routes (a
+    model must not forge in-app navigation); images size-capped via CSS
+    (`max-h-64 max-w-full`, `loading="lazy"`) so a remote/oversized `<img>` can't blow
+    up the box; dangerous schemes neutralized to inert text / an alt-text placeholder.
+- **Untrusted-caller sanitization is layered**: react-markdown v10's `defaultUrlTransform`
+  is the **primary** sanitizer (strips `javascript:`/`data:`/`file:` to `""` before the
+  overrides run); `schemeIsDangerous` (reused from PRD #7's `lib/docs.ts`) is
+  **independent defense-in-depth** so a future urlTransform change can't reopen the hole.
+- Both callers use the shared `.docs-prose` typography class for a consistent
+  dark-theme look with the plan panel.
+- **Accepted risk** (audit): a remote `<img>` in LLM output is a potential beacon;
+  acceptable **loopback-only**. Revisit with a CSP `img-src` restriction before any
+  multi-user exposure (see §15).
+
+## 62. Activity feed: bounded box + follow mode
+
+Serves human: "activity is a bounded auto-scroll box following live runs; pause on
+scroll-up; one-click resume".
+
+- **`web/src/lib/useFollowScroll.ts`** — `useFollowScroll(itemCount)`. Load-bearing
+  rule (PRD review H2): `follow` lives in a **ref** updated by the `onScroll` handler
+  (true when within 48px of the bottom), and on append we scroll to bottom **iff the
+  ref is true**. We **never re-derive "am I at bottom?" after React appended nodes** —
+  `scrollHeight` has already grown by then, so the classic post-append check detaches on
+  the first message and fights the user.
+- Scrolling is **instant** (`scrollTop = scrollHeight`), never `behavior:"smooth"` (a
+  burst of frames makes smooth scrolling lag); no focus stealing.
+- **Paused affordance**: while follow is off and messages arrive, an accruing `newCount`
+  drives a "**{n} new ↓**" pill in the Activity header; clicking `jumpToBottom` re-arms
+  follow and clears it, and scrolling back to the bottom also re-arms. `isNearBottom` is
+  a pure function of the three scroll metrics (testable without a live DOM).
+- **`useReconnectingBanner(connected, delayMs=3000)`** — promotes a WS disconnect to a
+  visible "Reconnecting…" banner only after ~3s, so a brief blip doesn't flash. The
+  replay burst on reconnect flows through the same follow rules ("{n} new ↓" if paused).
+- **`ActivityFeed.tsx`** hosts the bounded container: `max-h-[65vh] overflow-auto`,
+  `[overscroll-behavior:contain]` (no scroll-chaining into the page), styled like the
+  plan box; `role="log"` + `aria-live="polite"`.
+
+## 63. Terse per-kind event rendering
+
+Serves human: "no raw JSON anywhere in the run view"; "long tool calls visibly show as
+running (no dead-air)".
+
+- **`web/src/components/RunEvent.tsx`** renders one readable line per event; the
+  `JSON.stringify` fallback is **deleted**. Pure helpers (`toolSummary`, `resultToText`,
+  `formatDuration`, `describeStatus`, `describeError`, `buildToolIndex`) are exported and
+  unit-tested in isolation. Kinds: `text | thinking | tool_use | tool_result | status |
+  error | plan`, plus a muted **unknown-kind fallback** (`RunMessage.kind` is a free
+  string; raw frames live in worker debug logs). The schema-declared-but-currently-
+  unemitted `user_message` kind (§37) intentionally lands on that fallback.
+- **`text`** → markdown via the untrusted `Markdown`. **`thinking`** → collapsed dimmed
+  one-liner, expandable. **`tool_use`** → `⚙ {name} — {summary}`; per-tool summary
+  (`Bash`→command first line, `Read/Write/Edit`→path, `Glob/Grep`→pattern[+path],
+  `Task`→`subagent_type: gist` so sub-agent spawns are recognizable, `WebFetch`→url,
+  `WebSearch`→query, else compact `key: value`), truncated ~160 chars with a `more`/`less`
+  expander. **`plan`** → terse "📋 plan submitted (awaiting approval)" one-liner (the body
+  lives in `PlanPanel`; not rendered twice, never hits the fallback).
+- **In-flight tool spinner (kills dead-air)**: a `tool_use` with no matching result yet
+  renders a spinner + live elapsed timer (`RunningIndicator`, 1s tick) while the run is
+  live; a settled call shows a **client-computed** duration
+  (`result.created_at − tool_use.created_at`), no payload support needed; a non-live run
+  with no result shows "no result".
+- **Tool pairing by id, never adjacency**: `buildToolIndex` maps `tool_use_id →
+  tool_use.id` across the full message array (spanning agent groups), so parallel calls
+  (`useA, useB, resA, resB`) pair A→resA / B→resB. A result whose id isn't among the
+  tool_use ids is an **orphan** and renders standalone. First-writer-wins on duplicate ids.
+- **`tool_result`** folds under its call: small results (≤8 lines) inline, larger collapse
+  to "show {n} lines"; **`is_error` results auto-expand** with a rose ✗. `content` may be a
+  **string or an array of blocks** (`mapUser` passes it through as-is) — `resultToText`
+  walks the array, extracts text blocks, and flags non-text blocks (images) as a labeled
+  "non-text result … omitted" placeholder (known lost signal, accepted). Rendered as a
+  React-escaped `<pre>`, **NOT markdown** (tool output is not prose and must not be
+  re-parsed).
+- **`status` has two shapes** (`describeStatus`): worker progress `{text}` → rendered
+  as-is, muted (already human-readable, e.g. "worktree ready on…"); SDK frame `{event}` →
+  `init` → "agent started ({model})"; `result` **discriminated by `subtype`** (not
+  `event:"success"`) → `success` → "agent finished ({duration}, {n} turns, ${cost})" from
+  the newly-forwarded fields (§64), else "status: result/{subtype}".
+- **`error`** (`describeError`): worker `{text}`, or SDK `{event, subtype, errors[]}` →
+  render **`subtype`** (the useful signal: `error_max_turns` vs `error_during_execution`) +
+  joined `errors[]`; no assumed `message` field. Rose-tinted.
+- **Performance / a11y**: each row is `React.memo`-ized keyed by immutable `seq` (append-
+  only stream ⇒ memo trivially valid; markdown parse memoized per message via the memoized
+  `Markdown`). DOM cap: past 1000 messages, render only the most recent 500 behind a "Show
+  {n} earlier messages" expander (cap-and-expand chosen over a virtualization dep for this
+  MVP; revisit on evidence). Collapsibles are real `<button aria-expanded>`; ✓/✗ carry text
+  labels, not color alone.
+- **Cap-straddle fix** (`2f38f9b`): fold-skip of a `tool_result` is scoped to
+  `visibleToolUseIds` (ids present in the visible window), not the full index. Otherwise a
+  call capped out past the 500-message window while its result stays visible would skip the
+  result AND never render its call — vanishing it. Now such a result renders standalone.
+- Messages are grouped into consecutive **agent blocks**; the last block is marked
+  "active" while the run is live. Timestamps demoted to agent-group boundaries + hover.
+
+## 64. Additive worker forwarding (`mapResult`)
+
+Serves human: the finish line's duration/cost (part of the terse, useful event set).
+
+- **`agent/src/sdk-messages.ts` `mapResult`** forwards `duration_ms` and `total_cost_usd`
+  from the SDK `result` frame alongside the existing `num_turns`. **Additive only** —
+  unguarded passthrough in the same style as `num_turns`: when the SDK omits a field it
+  lands `undefined` and JSON-serialization drops it, so nothing new appears on the wire
+  when absent; the web `describeStatus` type-guards each field before display. Success is
+  discriminated `subtype === "success" && is_error !== true`; everything else maps to an
+  `error` message carrying `subtype` + `errors[]`.
+  - This is the **only** non-web change in the PRD; no existing field changes shape (per
+    the user constraint that the run view needed almost no protocol change).
+
+## 65. Raw frames → worker debug logs (`MessageBatcher.emit`)
+
+Serves human: "raw frames belong in the worker's docker logs behind `UZI_LOG_LEVEL=debug`,
+not the browser"; explicit user rejection of an in-UI raw-JSON toggle.
+
+- Hook point is **`MessageBatcher.emit`** (`agent/src/batcher.ts`) — the single chokepoint
+  every outgoing run message passes through, already holding a run-scoped child logger and
+  the redacted payload. One added line: `log.debug("run event", { seq, kind, agent, payload })`.
+  Default `info` behaviour is unchanged (no new info-level lines).
+- **Gate**: the existing `UZI_LOG_LEVEL` env (compose-plumbed, default `info`).
+  `UZI_LOG_LEVEL=debug` → `docker logs -f uzi-agent-1` shows every (redacted) frame. This is
+  documented as *the* way to see raw events; there is deliberately **no "show raw JSON"
+  toggle in the web UI** (user rejection — JSON in the browser helps nobody, `docker logs` is
+  the debug surface).
+- **Double redaction**: the payload is already redacted before buffering (`redact.ts`), and
+  the child logger independently scrubs the serialized line against the `SecretRegistry`
+  (worker token, forge PAT, Anthropic OAuth token, git credentials). Both are exact-substring
+  scrubs — **accepted limitation** (a mangled/split secret could theoretically slip;
+  spot-checked deterministically in M4's `batcher.test.ts`).
+- **Accepted risk** (audit): debug logs may contain sensitive repo content **by design** —
+  the point is full frames. Enable `debug` only when intentionally inspecting (see §15).
+
+## 66. Docs & validation posture
+
+Serves human: operability ("how to see raw events"); PRD #4 testing-credentials policy.
+
+- `docs/worker-setup.md` (env-var table) + `docs/configuration.md` document
+  `UZI_LOG_LEVEL=debug` as the raw-run-event surface; a line notes the UI shows terse events
+  while raw frames live in worker logs.
+- **Tests** (vitest, dummy data — no live Anthropic session, per PRD #4's never-mint policy):
+  `RunEvent.test.tsx` (per-kind renderers, parallel-call pairing, error auto-expand,
+  unknown-kind fallback), `ActivityFeed.test.tsx` (grouping, cap-straddle), `useFollowScroll.test.tsx`
+  (follow-mode logic), `batcher.test.ts` (debug log path + redaction, deterministic),
+  `sdk-messages.test.ts` (additive forwarding).
+- The **live visual walkthrough** (plan approval, streaming activity, long tool call,
+  reconnect, `docker logs` at debug) is a **manual-validation item for the tester** — it needs
+  a real Anthropic session beyond the sandbox and must never be required to prove a milestone.

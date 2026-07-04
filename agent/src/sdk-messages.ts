@@ -99,11 +99,21 @@ function mapUser(msg: Record<string, unknown>): EmittedMessage[] {
 function mapResult(msg: Record<string, unknown>): EmittedMessage[] {
   const subtype = asString(msg["subtype"]) ?? "unknown";
   if (subtype === "success" && msg["is_error"] !== true) {
+    // duration_ms/total_cost_usd are forwarded additively so the run view can
+    // show the finish line's duration and cost (PRD #11). Unguarded passthrough,
+    // same style as num_turns: when the SDK frame omits a field it lands as
+    // undefined and JSON-serialization drops it, so nothing surfaces on the wire.
     return [
       {
         kind: "status",
         agent: LEAD,
-        payload: { event: "result", subtype, num_turns: msg["num_turns"] },
+        payload: {
+          event: "result",
+          subtype,
+          num_turns: msg["num_turns"],
+          duration_ms: msg["duration_ms"],
+          total_cost_usd: msg["total_cost_usd"],
+        },
       },
     ];
   }

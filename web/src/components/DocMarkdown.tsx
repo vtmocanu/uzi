@@ -1,14 +1,14 @@
-import Markdown, { type Components } from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { type Components } from "react-markdown";
 import { Link } from "react-router-dom";
 import { rewriteHref, resolveImageSrc } from "../lib/docs";
+import { MarkdownCore } from "./MarkdownCore";
 
-// react-markdown builds a React element tree (no HTML injection); raw HTML in
-// the source stays inert. Content is repo-authored and reviewed, so no
-// rehype-raw/sanitize pipeline is needed. Typography lives in the `.docs-prose`
-// rules in index.css; only the elements that need behaviour (links → SPA routes
-// / GitLab, images → hashed assets, tables → horizontal scroll) are overridden
-// here.
+// Trusted-docs policy for the shared MarkdownCore. Content is repo-authored and
+// reviewed; the pipeline (react-markdown, no rehype-raw) plus these overrides
+// give links repo-aware routing (internal → SPA route, repo-only → GitLab blob)
+// and images their hashed asset URLs. Typography lives in the `.docs-prose`
+// rules in index.css. The table overflow wrapper is policy-neutral and lives in
+// MarkdownCore.
 const components: Components = {
   // `{...props}` is spread FIRST throughout so our resolved href/src and safety
   // attrs (target/rel) always win over anything carried on the markdown node.
@@ -45,23 +45,8 @@ const components: Components = {
       />
     );
   },
-  table({ children, node: _node, ...props }) {
-    // GFM tables can overflow narrow viewports; keep the page from scrolling
-    // horizontally by scrolling the table inside its own container.
-    return (
-      <div className="my-4 overflow-x-auto">
-        <table {...props}>{children}</table>
-      </div>
-    );
-  },
 };
 
 export function DocMarkdown({ content }: { content: string }) {
-  return (
-    <div className="docs-prose">
-      <Markdown remarkPlugins={[remarkGfm]} components={components}>
-        {content}
-      </Markdown>
-    </div>
-  );
+  return <MarkdownCore content={content} className="docs-prose" components={components} />;
 }
