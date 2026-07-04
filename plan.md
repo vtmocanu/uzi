@@ -59,6 +59,8 @@ can we use agent teams? in sdk? - if not lets see how multica/bottega do it (reg
 
 have a docs section on uzi  with relevant howtos (example how to create an agent/bot/skill/etc how to do gitlab bots/give permissions, etc, include screenshots, ask me for screenshots)
 
+user should be able to choose model for each agent defined including for lead
+
 ## later stuff
 
 - cli to interact with running sessions, see them + chat with them
