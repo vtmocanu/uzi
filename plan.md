@@ -61,7 +61,6 @@ have a docs section on uzi  with relevant howtos (example how to create an agent
 
 ## later stuff
 
-- i think agent pods should stay up only till they finish jobs? would this work?
 - cli to interact with running sessions, see them + chat with them
 - maybe have a label in glab and agents auto start working on issues? how would it work? by using the agent from the user which created the label?
 - dark/light theme with autodetect
