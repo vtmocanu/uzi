@@ -122,3 +122,4 @@ House style for every `user` page: task-titled, numbered steps, one screenshot p
 - 2026-07-04 — `react-markdown` without `rehype-raw`: content is trusted (repo-reviewed), so raw HTML stays inert rather than sanitized; smallest safe pipeline.
 - 2026-07-04 — Frontmatter `audience` field over a hardcoded page list in `web/`: docs stay self-describing; adding a page never touches web code.
 - 2026-07-04 — Screenshots via placeholders first (Vlad): implementation never blocks on captures; real screenshots land as a single final commit after all other milestones.
+- 2026-07-04 — Real captures scoped to GitLab-side shots only (Vlad): uzi's own UI is expected to change, so its six shots keep the generated placeholders; only `gitlab-bot-setup-enable.png` (GitLab Members/Developer step) gets a real screenshot for now.
