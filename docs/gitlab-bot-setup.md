@@ -63,6 +63,19 @@ env -u GITLAB_TOKEN glab api --hostname gitlab.example.com \
 
 If verification fails, double-check: the PAT scope is `api` (not `read_api`), the token hasn't expired, and the bot is at least Developer on the target project.
 
+## Protected main branch
+
+If you plan to run agents against a project (PRD #4's worker), protect its default branch. This is the **documented half** of uzi's layered primary directive, "an agent can only ever open an MR, never write to `main`" (the other half is enforced in the worker/agent code itself: see [ARCHITECTURE.md](../ARCHITECTURE.md#guardrail-layers-the-primary-directive)); this GitLab-side setting is the outermost, platform-enforced backstop, independent of anything uzi's code does or fails to do.
+
+Via the GitLab UI: project → **Settings → Repository → Protected branches**, protect `main` (or whatever the default branch is) with:
+
+- **Allowed to merge**: Maintainer (or higher), never Developer.
+- **Allowed to push and merge**: No one, or Maintainer, never Developer.
+
+Because the bot is only **Developer** (step 3, above), it is structurally unable to push to or merge into a branch protected this way; it can only open a merge request, which a human with Maintainer access reviews and merges. This holds regardless of what the bot's PAT is used for, so it is a real backstop, not just a convention.
+
+**Not yet covered:** verifying the bot PAT's *own* scope is no broader than it needs (today it's `api`, the minimum that covers both reads and label writes) beyond what step 2 already documents; a dedicated least-privilege audit of the PAT is a separate, tracked backlog item (see `plan.md`), not something this setup guide currently checks for you.
+
 ## E2E test bot (developers only)
 
 Some of uzi's forge tests exercise a real GitLab instance rather than a mock (the `httptest`-based unit tests in `api/internal/forge` and `api/internal/forgesvc` don't need this — only a live, end-to-end run does). The convention for supplying that bot's credentials is three variables in your gitignored `.env`, **never read by the application itself** (grep `api/internal/config/config.go` — they are not among `Config`'s fields):

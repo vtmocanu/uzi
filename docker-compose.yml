@@ -58,10 +58,29 @@ services:
       UZI_SEED_FORGE_PAT: ${UZI_SEED_FORGE_PAT:-}
       UZI_SEED_FORGE_BASE_URL: ${UZI_SEED_FORGE_BASE_URL:-}
       UZI_SEED_FORGE_REPOS: ${UZI_SEED_FORGE_REPOS:-}
+      # Optional startup Anthropic-token seed (belongs to the admin above), so a
+      # local `down -v` doesn't force re-pasting it. Unset => no seeding. Seeds the
+      # operator's EXISTING token; never mints one (testing-credentials policy).
+      # Without this line the boot-seed is inert — config.Load reads it from the
+      # api container env, which compose must wire in from .env.
+      UZI_SEED_ANTHROPIC_TOKEN: ${UZI_SEED_ANTHROPIC_TOKEN:-}
       # Trust the nginx hop (the compose network is private RFC1918) so the
       # real client IP is read from the XFF nginx sets. A direct hit that
       # bypasses nginx from a non-trusted source has its XFF ignored.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,10.244.0.0/16,127.0.0.1/32}
+      # Agent-runtime knobs (PRD #4), read by the API's config.Load (server side).
+      # RUN_TIMEOUT and RUN_MAX_REQUEUES drive the run sweeper; WORKER_HEARTBEAT_STALE
+      # and WORKER_AFFINITY_GRACE drive worker liveness + claim affinity; RUN_IDLE_TIMEOUT
+      # and RUN_MAX_ITERATIONS are read here and shipped to the worker in the claim
+      # payload (enforced worker-side). Without these lines, setting them in .env is
+      # inert and the API falls back to its Go defaults. (WORKER_HEARTBEAT_INTERVAL and
+      # WORKER_POLL_INTERVAL are worker cadences consumed by the agent service, not here.)
+      RUN_TIMEOUT: ${RUN_TIMEOUT:-2h}
+      RUN_IDLE_TIMEOUT: ${RUN_IDLE_TIMEOUT:-10m}
+      RUN_MAX_ITERATIONS: ${RUN_MAX_ITERATIONS:-5}
+      RUN_MAX_REQUEUES: ${RUN_MAX_REQUEUES:-1}
+      WORKER_HEARTBEAT_STALE: ${WORKER_HEARTBEAT_STALE:-45s}
+      WORKER_AFFINITY_GRACE: ${WORKER_AFFINITY_GRACE:-2m}
     # Not published to the host: reached only by web over the compose network.
     depends_on:
       db:
@@ -81,5 +100,68 @@ services:
       api:
         condition: service_healthy
 
+  # Per-user worker (PRD #4). Opt-in via `docker compose --profile agent up`, so
+  # the base stack (db/api/web) runs without it. Outbound-only: no published
+  # ports; it reaches the api over the compose network with a join token. The
+  # bare-clone cache + worktrees live on a persistent volume.
+  #
+  # M4 defense-in-depth (audit item 6): drop all Linux capabilities and forbid
+  # privilege escalation for the whole container. This shrinks the blast radius of
+  # a prompt-injected agent (the agent's Bash tool runs in this same container).
+  # M6 /proc hardening: the join token is delivered as a FILE secret (mounted at
+  # /run/secrets/worker_token from UZI_WORKER_TOKEN) instead of an env var, so it is
+  # NOT in the worker's /proc/<pid>/environ — closing the same-uid
+  # `cat <symlink>/self/environ` join-token leak the earlier milestones left open.
+  # The compose secret mount is read-only, so the worker's post-read unlink fails
+  # and the file persists at /run/secrets/worker_token; the environ win holds
+  # regardless (a writable delivery also gets the on-disk unlink). REMAINING
+  # residual: the PAT is in a transient git CHILD env during push/MR; the worker
+  # group-kills the agent tree before that op (B1) so a normal survivor is dead
+  # first, but a `setsid`-escaped survivor could still race that window. The full
+  # STRUCTURAL close (agent under a DISTINCT uid so it can't read the worker's /proc
+  # at all — a two-container pod with different runAsUser + shareProcessNamespace:
+  # false, or gVisor) needs privileges this non-root compose MVP lacks and is
+  # deferred to the remote-worker (k8s/VM) phase. See docs/proc-hardening.md and
+  # killAgentTree in agent/src/sdk-executor.ts.
+  agent:
+    build: ./agent
+    profiles: ["agent"]
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    environment:
+      UZI_API_URL: ${UZI_API_URL:-http://api:8080}
+      # /proc hardening (M6): read the join token from the mounted secret file, not
+      # an env var, so it never lands in the worker's /proc/<pid>/environ. The value
+      # comes from UZI_WORKER_TOKEN (.env) via the `worker_token` secret below; the
+      # worker also accepts UZI_WORKER_TOKEN directly as a backward-compat fallback.
+      UZI_WORKER_TOKEN_FILE: /run/secrets/worker_token
+      UZI_DATA_DIR: /data
+      UZI_WORKER_NAME: ${UZI_WORKER_NAME:-}
+      WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-15s}
+      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-3s}
+      # Cap on how long a run may sit at the plan-approval gate before it is failed
+      # (M4 resolution of the PRD's open awaiting_approval cap): generous so a human
+      # has time, finite so an abandoned plan never wedges the single-run worker.
+      WORKER_PLAN_APPROVAL_TIMEOUT: ${WORKER_PLAN_APPROVAL_TIMEOUT:-24h}
+      UZI_LOG_LEVEL: ${UZI_LOG_LEVEL:-info}
+    volumes:
+      - agentdata:/data
+    secrets:
+      - worker_token
+    depends_on:
+      api:
+        condition: service_healthy
+
 volumes:
   pgdata:
+  agentdata:
+
+secrets:
+  # The worker join token, delivered to the agent as a FILE (mounted read-only at
+  # /run/secrets/worker_token) rather than an env var, so it is absent from the
+  # container's environ (the M6 /proc close). Sourced from UZI_WORKER_TOKEN (.env);
+  # if unset, the secret is empty and the worker fails fast with a clear error.
+  worker_token:
+    environment: UZI_WORKER_TOKEN

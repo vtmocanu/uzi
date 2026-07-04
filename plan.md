@@ -4,8 +4,11 @@ we have 3 sources of inspiration, we can implement what we want, but we also loo
 1. <https://github.com/vdaubry/bottega>
 2. <https://github.com/multica-ai/multica>
 3. <https://github.com/vfarcic/dot-agent-deck>
+4. <https://github.com/coder/coder> - for agents/VM to see how they provision - see also <https://gitlab.example.com/myorg/k8s/coder>
 
 lets clone all 3 as submodules, before implementing something we will look at them if they implemented same thing or something similar. We will always choose a better version then them if available! We want best practice level of implementation. Some stuff we can deffer for later.
+
+for agents lets see how coder is able to do docker and kind in k8s pods - maybe we replicate or steal ideeas, look also at the k8s/coder gitlab repo
 
 the initial MVP will be local laptop demo, docker-compose.
 it will have a psql DB si persistent storage
@@ -51,11 +54,18 @@ adaptive/responsive width so it works on mobile and larger screens
 
 integration with gitlab to check and display CI status, if it is broken spin up an agent to review what happened and if it can fix it - if the code was bad => uzi verifies it's work
 
+we should allow registration lony from @example.com email addresses - configurable
+can we use agent teams? in sdk? - if not lets see how multica/bottega do it (regardless we should keep a reviwer step/stage)
+
+have a docs section on uzi  with relevant howtos (example how to create an agent/bot/skill/etc how to do gitlab bots/give permissions, etc, include screenshots, ask me for screenshots)
+
 ## later stuff
 
+- cli to interact with running sessions, see them + chat with them
 - maybe have a label in glab and agents auto start working on issues? how would it work? by using the agent from the user which created the label?
 - dark/light theme with autodetect
 - have AI agent - u can chat with UZI - it can see it's code and create issues for itself (local webui agent uses each user aouth token)
+- we should be able to create a PRD with the AI agent from web so it should create an issue/prd we should be able to spin up agents to review prd before submission - all from webui
 - gitlab integration - with later forgejo support
 - enable/disable registration for users
 - SSO with KC
@@ -67,3 +77,14 @@ integration with gitlab to check and display CI status, if it is broken spin up 
 - agents should be able to injects secrets - to connect to other resources, like prometheus for example, maybe a kubeconfig/etc, those secrets should sit encrypted in db
 - remove vlad seed user from env + remove all seeds
 - CICD + deploy to k8s + regen vmocanu bot token!! and create a dedicated one for tests!!!
+- check what other functionalities does multica/bottega have than we dont have and we might steal from them?
+- report on token used per issues - in webui and in PRD file and gitlab issue
+- debug mode with verbose logs
+- lanfuse integration
+- for CICD code generation uzi should plug to qdrant KB? how do we say this? we tell agents? skills better? myabe only skills?
+- have a way to analize sessions (like a LLM judge) - that checks if tools/permissions are missing and does some recommandations (maybe have a message inbox - both for user and admins, admins should see all notifications)
+
+## later - later
+
+- leaderboard :) tokens/model used
+- how can we work on codebases for which we dont have access - transfer repo from laptop to agent? - see also if this can help: <https://github.com/openclaw/crabbox>

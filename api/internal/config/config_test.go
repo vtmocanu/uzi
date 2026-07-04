@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"reflect"
 	"testing"
+	"time"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 )
@@ -80,6 +81,56 @@ func TestLoadSecretKeyBootGuard(t *testing.T) {
 				t.Errorf("Load() = nil error for %s UZI_SECRET_KEY, want boot-guard failure", name)
 			}
 		})
+	}
+}
+
+// TestLoadAgentRuntimeDefaults locks the PRD #4 runtime knob defaults so a typo
+// in a default never ships silently. RUN_MAX_REQUEUES=0 must survive (it is a
+// legitimate "never re-queue" value, which the ordinary >0 int parser would
+// reject).
+func TestLoadAgentRuntimeDefaults(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	// Low-entropy but valid (non-placeholder, long-enough) signing key; a
+	// high-entropy literal would trip the secret scanner on a fresh add.
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"RunTimeout", cfg.RunTimeout, 2 * time.Hour},
+		{"RunIdleTimeout", cfg.RunIdleTimeout, 10 * time.Minute},
+		{"RunMaxIterations", cfg.RunMaxIterations, 5},
+		{"RunMaxRequeues", cfg.RunMaxRequeues, 1},
+		{"WorkerHeartbeatInterval", cfg.WorkerHeartbeatInterval, 15 * time.Second},
+		{"WorkerHeartbeatStale", cfg.WorkerHeartbeatStale, 45 * time.Second},
+		{"WorkerPollInterval", cfg.WorkerPollInterval, 3 * time.Second},
+		{"WorkerAffinityGrace", cfg.WorkerAffinityGrace, 2 * time.Minute},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s default = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+
+	// RUN_MAX_REQUEUES=0 is a valid, non-default value.
+	t.Setenv("RUN_MAX_REQUEUES", "0")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with RUN_MAX_REQUEUES=0: %v", err)
+	}
+	if cfg.RunMaxRequeues != 0 {
+		t.Errorf("RunMaxRequeues = %d, want 0 (never re-queue)", cfg.RunMaxRequeues)
 	}
 }
 

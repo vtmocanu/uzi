@@ -13,9 +13,11 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Handler bundles the dependencies shared by every HTTP handler.
@@ -26,13 +28,17 @@ type Handler struct {
 	// box is the generic secret cipher used by the per-user secret endpoints
 	// (Anthropic token). svc owns the forge-specific machinery (which also holds
 	// its own box for PAT sealing); the two share the same key material.
-	box *secretbox.Box
-	svc *forgesvc.Service
+	box  *secretbox.Box
+	svc  *forgesvc.Service
+	wsvc *workersvc.Service
+	// hub fans persisted run events out to browser WebSocket subscribers (M5). It
+	// is the same instance workersvc broadcasts to.
+	hub *hub.Hub
 }
 
 // New constructs a Handler.
-func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc}
+func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, h *hub.Hub) *Handler {
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, hub: h}
 }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
@@ -129,6 +135,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Use(mw.RequireAdmin)
 			r.Get("/users", h.ListUsers)
 			r.Patch("/users/{id}", h.PatchUser)
+			// Agents-status overview: every user's workers + active runs.
+			r.Get("/workers", h.AdminListWorkers)
+			r.Get("/runs", h.AdminListRuns)
 		})
 
 		// Forge integration: connections, repo discovery, and the label-synced
@@ -156,7 +165,44 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				// move + sync write/read through to the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/move", h.MoveIssue)
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
+				// Create a PRD issue on the forge (source of truth) → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues", h.CreateIssue)
+				// Queue an agent run from a card (PRD #4). Fetches the issue snapshot
+				// from the forge → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/runs", h.CreateRun)
 			})
+
+			// Agent-runtime: the user's workers and their runs. Every route is
+			// authorized to the owning user (admins-see-all is M5).
+			r.Route("/workers", func(r chi.Router) {
+				r.Post("/", h.CreateWorker)
+				r.Get("/", h.ListWorkers)
+				r.Delete("/{id}", h.DeleteWorker)
+			})
+			r.Route("/runs", func(r chi.Router) {
+				r.Get("/", h.ListRuns)
+				r.Get("/{id}", h.GetRun)
+				r.Get("/{id}/messages", h.ListRunMessages)
+				r.Post("/{id}/inputs", h.CreateRunInput)
+			})
+
+			// Browser live channel (M5): a WebSocket subscribed to one run's
+			// events. Session-cookie authN via RequireAuth above (a GET upgrade, so
+			// no CSRF step); Origin validation + per-run authz enforced in ServeWS.
+			r.Get("/ws", h.ServeWS)
+		})
+
+		// Worker protocol (PRD #4): outbound-only workers, authenticated by a
+		// Bearer join token (sha256 lookup), not a session cookie. No CSRF step —
+		// the credential is a held bearer secret, not an ambient cookie.
+		r.Route("/worker", func(r chi.Router) {
+			r.Use(mw.RequireWorker(h.q))
+			r.Post("/register", h.WorkerRegister)
+			r.Post("/heartbeat", h.WorkerHeartbeat)
+			r.Post("/runs/claim", h.WorkerClaim)
+			r.Post("/runs/{id}/messages", h.WorkerRunMessages)
+			r.Post("/runs/{id}/state", h.WorkerRunState)
+			r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 		})
 	})
 

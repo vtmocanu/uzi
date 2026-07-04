@@ -1,6 +1,6 @@
 # Architecture
 
-uzi's current MVP is a single docker-compose stack: three services, one trust boundary at the edge, no external dependencies. This document describes that shape; see [docs/auth-design.md](docs/auth-design.md) for the security design of the auth surface it carries.
+uzi's current MVP is a docker-compose stack of three always-on services (`web`, `api`, `db`) plus one opt-in, profile-gated service (`agent`, a per-user worker — PRD #4), with three trust boundaries: the inbound edge at nginx, the API's outbound calls to the forge (GitLab), and the API's connection to each user's worker. This document describes that shape; see [docs/auth-design.md](docs/auth-design.md) for the auth surface, and [docs/proc-hardening.md](docs/proc-hardening.md) for the worker/agent process-isolation detail the Secrets and Guardrails sections below summarize.
 
 ## Services
 
@@ -31,10 +31,11 @@ uzi's current MVP is a single docker-compose stack: three services, one trust bo
 ```
 
 - **`web`** (`web/Dockerfile`) — a Vite/React SPA built at image build time and served by `nginxinc/nginx-unprivileged`. Its `nginx.conf` does two jobs: serve the built static assets, and reverse-proxy `/api/*` to `api:8080`. The SPA and API therefore share one origin (`http://127.0.0.1:8080`) — no CORS configuration exists anywhere in the stack.
-- **`api`** (`api/Dockerfile`) — a statically linked Go binary (`chi` router) on `gcr.io/distroless/static-debian12`, running as `nonroot`. Serves `/api/auth/*`, `/api/admin/*`, `/api/agent-templates/*`, `/api/me/secrets/*`, `/api/health`. Runs its own DB migrations and builtin-template reconciliation at startup before it starts accepting traffic (see below).
+- **`api`** (`api/Dockerfile`) — a statically linked Go binary (`chi` router) on `gcr.io/distroless/static-debian12`, running as `nonroot`. Serves `/api/auth/*`, `/api/admin/*`, `/api/agent-templates/*`, `/api/me/secrets/*`, `/api/worker/*` (the worker protocol, PRD #4), `/api/ws`, `/api/health`, among others. Runs its own DB migrations and builtin-template reconciliation at startup before it starts accepting traffic (see below).
 - **`db`** — stock `postgres:17`, digest-pinned in `docker-compose.yml`. Data lives in the named volume `pgdata`; it is not a bind mount, so it survives container recreation but is bound to the Docker volume store on this host.
+- **`agent`** (`agent/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 22 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* to `api` and executes runs. See [Agent runtime](#agent-runtime-workers-runs-live-view) below and [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure.
 
-All three images are pulled/built by digest or pinned tag in `docker-compose.yml`, not floating `latest`.
+All images are pulled/built by digest or pinned tag in `docker-compose.yml`, not floating `latest`.
 
 ## Trust boundaries
 
@@ -157,12 +158,193 @@ only** (`kind`, `created_at`, `updated_at`); there is no reveal endpoint, and
 no admin path to another user's secret value. See
 [docs/anthropic-token.md](docs/anthropic-token.md) for the user-facing flow.
 
+## Agent runtime: workers, runs, live view
+
+uzi's third surface is the one that acts: a per-user worker container claims
+queued work, drives a Claude Agent SDK session against a cloned repo, and opens
+an MR — never touching `main`. This adds one optional service (`agent`, above)
+and a third trust boundary: `api` now also accepts *inbound* calls from each
+user's worker (the reverse of the forge boundary, where `api` calls *out*).
+Full design rationale lives in the PRD (`prds/4-agent-runtime-workers.md`,
+especially its Decision Log); this section is the map.
+
+```
+browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (TLS deferred), poll/claim/report── agent (worker, per user)
+                                       │  ▲                                        │
+                                       ▼  │ decrypted per-run secrets              ▼
+                                      db  └── forge (GitLab): issues, MRs     repo clone + worktrees
+```
+
+### Server/worker trust boundary
+
+The worker never receives inbound connections; every call is worker → `api`
+(`POST/GET /api/worker/*`), authenticated by a Bearer join token whose sha256
+the server looks up (`mw.RequireWorker`) — never a session cookie, so there is
+no CSRF step on this path. The token is shown once, at issuance (Settings →
+Workers), and only its hash is ever stored.
+
+**TLS on this hop is accepted as deferred, not met, by the MVP.** The `api`
+service listens plain HTTP on the compose network; the join token gives
+*authentication* now, but not *transport encryption*. This is fine while the
+worker is another container on the same private compose network; it becomes a
+real gap the moment a worker runs off-network (a laptop, a remote VM) with
+`UZI_API_URL` pointed at a public `api` endpoint over plain HTTP. Closing it —
+a TLS-terminated ingress in front of `api` — is scoped to the same later phase
+that moves the worker off compose onto its own host/pod (see
+[docs/proc-hardening.md](docs/proc-hardening.md)'s remote-worker design); it is
+flagged here so it is never silently assumed solved by "outbound-only".
+
+`api` remains the **sole holder of the encryption keys** (`UZI_SECRET_KEY`, see
+above) throughout: it decrypts a user's Anthropic token and forge bot PAT and
+hands both to the worker **only inside a run's claim response**
+(`POST /api/worker/runs/claim`) — never persisted server-side in plaintext,
+never logged (the same redaction discipline as the forge integration).
+
+### Run lifecycle
+
+One `runs` row is the unit of work; an issue can accumulate several over its
+life (a DB partial unique index enforces at most one non-terminal run per
+issue). Status is a linear state machine:
+
+```
+queued → claimed → running → awaiting_approval → running → completed
+                                                           → failed
+   ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
+   ↳ cancel with no live poller → cancelled directly (server-side)
+```
+
+- **queued → claimed** — `POST /api/worker/runs/claim` atomically claims the
+  oldest queued run belonging to the caller's user (`FOR UPDATE SKIP LOCKED`),
+  or the caller's own re-queued run if it is still inside its **affinity
+  grace** (`WORKER_AFFINITY_GRACE`, default 2m) — giving a resume the best
+  chance of landing back on the worker whose disk still holds the session and
+  git worktree. After the grace window any of the user's workers may claim it.
+- **running → awaiting_approval → running** — the lead agent produces a plan;
+  the worker reports it (`POST /api/worker/runs/:id/state`) and the run parks
+  until the user approves or rejects it in the run view, or
+  `WORKER_PLAN_APPROVAL_TIMEOUT` (worker-side, default 24h) elapses. Approval
+  resumes the same SDK session into the implement ⇄ review loop
+  (`RUN_MAX_ITERATIONS`, default 5).
+- **→ completed / failed** — the **worker**, not the agent, pushes the branch
+  (`agent/issue-{iid}`) and opens the MR on completion (see Secrets, below);
+  failure carries a `failure_reason`.
+- **Sweeper** (a goroutine beside the forge poller) enforces what workers
+  can't be trusted to self-report: a claimed-but-never-started run older than
+  5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 2h)
+  is failed; a worker whose heartbeat is stale past `WORKER_HEARTBEAT_STALE`
+  (default 45s) is marked offline and its non-terminal runs re-queued,
+  incrementing `requeue_count` — past `RUN_MAX_REQUEUES` (default 1) a run is
+  failed instead of re-queued again. An orphan sweep also runs once at API
+  boot, so a run left dangling by a server restart is not stuck forever.
+- **Cancel/reject with no live poller** (a `queued` run, or one whose worker
+  has gone stale) is transitioned straight to `cancelled`/`failed`
+  server-side rather than waiting on a `GET /api/worker/runs/:id/inputs` poll
+  that would never arrive. **Accepted residual:** a live-run cancel (the
+  worker is actively polling) still ends as `failed` with reason "run
+  cancelled" — the worker protocol has no settable `cancelled` state, only
+  the server-side no-poller path yields a true `cancelled`.
+- The full message history (`run_messages`, gapless per-run `seq`) and any
+  captured plan/session id survive every transition above, so a resumed run
+  continues exactly where it left off — see Live message stream, below.
+
+### Secrets: who holds what
+
+Three tiers, deliberately narrower at each step, are the primary directive's
+real enforcement (GitLab-side role protection and the SDK hook below are
+defense-in-depth *on top of* this, not instead of it):
+
+1. **`api`** decrypts the user's Anthropic OAuth token and forge bot PAT and
+   sends both, once, in the claim response. It never sends them anywhere
+   else and never logs them.
+2. **The worker process** receives both, but only the PAT ever leaves the
+   worker's own memory: the worker itself — not the agent — performs every
+   authenticated git operation (clone, fetch, push) and the MR creation, via
+   per-invocation env-scoped git config (`GIT_CONFIG_COUNT` plus a
+   `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pair at the next free index,
+   e.g. `GIT_CONFIG_KEY_0=http.<host-scope>.extraHeader`, host-scoped so the
+   credential is only ever sent to the repo's own host, **not** `git -c`,
+   whose values are readable on argv in the process table). The PAT is never
+   written to on-disk git config and never enters the agent subprocess's
+   environment.
+3. **The agent subprocess** (the Claude Agent SDK's own process) gets *only*
+   `CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `PATH` — none of the worker's own env
+   (join token, PAT) is inherited; `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
+   are explicitly unset so they can't outrank the OAuth token. The agent only
+   edits files and makes local commits; when it signals done, the worker
+   performs the push and MR.
+
+This means "worker disk/agent env contain no PAT" (a Success Criterion) holds
+structurally, not by policy — the agent has no credential to push with in the
+first place. See [docs/proc-hardening.md](docs/proc-hardening.md) for the
+one honestly-open residual: a same-uid `/proc` read of a live git child's
+environment during the short push window, and the k8s uid-split design that
+closes it fully.
+
+### Guardrail layers (the primary directive)
+
+Four independent layers, any one of which failing still leaves the others:
+
+1. **GitLab role.** The bot account is Developer, never Maintainer/Owner, and
+   `main` is a protected branch — see
+   [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md#protected-main-branch).
+   A GitLab-side rejection is the outermost, platform-enforced backstop.
+2. **Worker-owned network git** (above). The agent process has no push
+   credential at all, so a protected-branch write is impossible regardless of
+   what the model attempts — this is the layer the other three exist to
+   reinforce, not replace.
+3. **SDK `PreToolUse` deny-hook** on `Bash` (`agent/src/guardrails.ts`):
+   denies `git push` to any branch unconditionally, ref/history-rewriting
+   force operations (`git branch -D`/`-M`/`--force`, `--force`/`-f` on
+   `checkout`/`switch`/`restore`), remote mutation (`git remote set-url`,
+   `git config` writes to the `remote`/`url`/`http`/`credential`/`alias`
+   namespaces), and credential-reading commands (`git config --get`, `env`,
+   reads of `/proc` or the worker's token-secret path) — including through
+   shell wrappers (`sh -c`, `git -c`, `eval`, `sudo`, `env X=y …`). Force
+   flags on local, non-history file ops (`git clean -f`, `git add -f`) are
+   deliberately **allowed**; only the ref/history-rewriting subcommands above
+   are denied. A deny from this hook blocks the tool call even though the
+   permission mode below is allow-by-default.
+4. **`settingSources: []`.** Nothing from the cloned repository's own
+   `.claude/settings.json`, hooks, or `.claude/agents` is loaded — a
+   prompt-injection-via-repo defense none of the inspiration projects has.
+
+Permission mode is explicitly `bypassPermissions` (allow-by-default) **plus**
+the deny-hook and a `disallowedTools` list — not `default` (which hangs
+headless waiting for an approval that will never come in an unattended
+worker) and not a deny-by-default allowlist (too narrow for the coder
+subagent's legitimate file/bash needs). Read-only roles (reviewer, tester)
+are constrained per-subagent via their `tools` allowlist instead, since
+subagents inherit the parent's permission mode and cannot loosen it.
+
+### Live message stream
+
+Every agent/tool event is **persisted first, broadcast second**:
+`run_messages` rows carry a per-run, gapless `seq` (`UNIQUE(run_id, seq)`),
+written by the worker's batched (500ms) `POST /api/worker/runs/:id/messages`
+call before `internal/hub` fans it out over `/api/ws`. A browser reconnecting
+mid-run replays via REST from its last-seen `seq` (`?after=<seq>`) and only
+then continues on the live socket — so a dropped WebSocket connection loses
+nothing, unlike a design where the socket itself is the only record. The
+socket is a live cache and reconnect-convenience layer, **never** the source
+of truth.
+
+The `/api/ws` endpoint authenticates with the same session cookie as the rest
+of the browser API (not the worker's Bearer token) and enforces two rules
+that are load-bearing, not incidental: **Origin validation** on the upgrade
+(the standard CSWSH defense for cookie-authenticated WebSockets) and a
+**per-run authorization check on subscribe** — the same owner-or-admin rule
+REST enforces, checked again here since a WS subscription is a second entry
+point into the same data.
+
 ## Not yet in scope
 
-The execution surface is deliberately out of this MVP: spawning agents from a
-template, connecting them to the server, decrypting and injecting a user's
-Anthropic token into a running agent, and acting on a board card's issue (job
-submission / agent control) all belong to a later PRD — see [plan.md](plan.md) and
-the PRDs' Risks sections. The kanban board reflects and writes back forge labels,
-but nothing in uzi yet acts on a card. This document will grow new sections
-(additional services, data flows, trust boundaries) as those land.
+Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
+`AskUserQuestion` mid-run steering, WS wakeup for idle workers (a 3s poll is
+the MVP), API-spawned worker containers (pods/VMs the server provisions
+itself), per-user skills-management UI, encrypting secrets with the user's
+own password instead of a shared server key, PAT least-privilege
+verification, and a second (e.g. OpenAI) execution provider are all
+deliberately deferred — see [plan.md](plan.md), the PRDs' Risks sections, and
+`prds/4-agent-runtime-workers.md`'s "Out of scope". This document will grow
+new sections (additional services, data flows, trust boundaries) as those
+land.

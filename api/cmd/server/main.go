@@ -23,11 +23,14 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 func main() {
@@ -113,21 +116,59 @@ func run() error {
 	if err := seed.ForgeConnection(ctx, q, svc, cfg); err != nil {
 		return err
 	}
+	// Optional startup Anthropic-token seed for the seed admin (dev convenience:
+	// survives `docker compose down -v` so the token need not be re-pasted). Runs
+	// after the admin seed (whose user it belongs to). Create-only and
+	// format-checked only — it seeds the operator's EXISTING token, never mints a
+	// credential, never does a live/network check, and never logs the value. A DB
+	// error or a malformed configured token aborts boot; an already-present token
+	// is left untouched.
+	if err := seed.AnthropicToken(ctx, q, box, cfg); err != nil {
+		return err
+	}
+
+	// Agent-runtime service (PRD #4): the run queue, worker protocol, and sweeper
+	// DB work. Shares the same secret cipher (sole key holder) as the forge svc.
+	wsvc := workersvc.New(q, box, workersvc.Params{
+		RunTimeout:           cfg.RunTimeout,
+		RunIdleTimeout:       cfg.RunIdleTimeout,
+		RunMaxIterations:     cfg.RunMaxIterations,
+		RunMaxRequeues:       cfg.RunMaxRequeues,
+		WorkerHeartbeatStale: cfg.WorkerHeartbeatStale,
+		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
+	})
+
+	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
+	// it, and the WS handler fans them out to subscribed browsers. In-process and
+	// stateless — every event is already durable in the DB.
+	liveHub := hub.New()
+	wsvc.SetBroadcaster(liveHub)
 
 	// Background sync engine: pulls forge changes into the issue cache for every
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
 	// pool is closed (a mid-tick query must not race pool.Close).
 	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
-	var pollerWG sync.WaitGroup
-	pollerWG.Add(1)
+
+	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
+	// immediately, then the goroutine sweeps on its own interval. Both lifetimes
+	// are awaited on shutdown before the pool closes.
+	sweep := sweeper.New(wsvc, 0)
+	sweep.Boot(ctx)
+
+	var bgWG sync.WaitGroup
+	bgWG.Add(2)
 	go func() {
-		defer pollerWG.Done()
+		defer bgWG.Done()
 		engine.Run(ctx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		sweep.Run(ctx)
 	}()
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg, box, svc)
+	h := handler.New(pool, q, cfg, box, svc, wsvc, liveHub)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -153,15 +194,15 @@ func run() error {
 		slog.Info("shutting down")
 	}
 
-	// Drain the HTTP server, then stop and await the poller before returning so
-	// the deferred pool.Close() cannot race an in-flight sync query.
+	// Drain the HTTP server, then stop and await the background goroutines before
+	// returning so the deferred pool.Close() cannot race an in-flight query.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
 		runErr = err
 	}
-	stop() // cancel ctx so the poller's Run returns (covers the server-error path too)
-	pollerWG.Wait()
+	stop() // cancel ctx so the poller + sweeper Run return (covers the server-error path too)
+	bgWG.Wait()
 	return runErr
 }
 

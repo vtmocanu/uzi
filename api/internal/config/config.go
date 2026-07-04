@@ -73,6 +73,27 @@ type Config struct {
 	SeedForgePAT     string
 	SeedForgeBaseURL string
 	SeedForgeRepos   []string
+
+	// SeedAnthropicToken optionally seeds the seed admin's Anthropic token from
+	// UZI_SEED_ANTHROPIC_TOKEN at startup (create-only), so a local
+	// `docker compose down -v` does not force re-pasting it. Empty disables it.
+	// Requires SeedEmail (the token belongs to that user), rejected at Load
+	// otherwise. This seeds the operator's EXISTING token — it never mints one —
+	// and is format-checked (never network-verified) at seed time.
+	SeedAnthropicToken string
+
+	// Agent-runtime (PRD #4) knobs. All have safe defaults; none is a boot guard
+	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
+	// and RunMaxIterations are enforced worker-side and shipped in the claim
+	// payload; the rest drive the server sweeper and claim affinity.
+	RunTimeout              time.Duration // wall clock before a running run is failed
+	RunIdleTimeout          time.Duration // worker-side no-message idle cap
+	RunMaxIterations        int           // implement⇄review loop cap (worker-side)
+	RunMaxRequeues          int           // worker-death re-queues allowed before a run is failed
+	WorkerHeartbeatInterval time.Duration // how often a worker heartbeats
+	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
+	WorkerPollInterval      time.Duration // worker claim-poll cadence
+	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -139,12 +160,25 @@ func Load() (Config, error) {
 	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
 	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
 
+	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
+	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
+	cfg.RunMaxIterations = parseInt("RUN_MAX_ITERATIONS", 5)
+	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 1)
+	cfg.WorkerHeartbeatInterval = parseDuration("WORKER_HEARTBEAT_INTERVAL", 15*time.Second)
+	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
+	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
+	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
+
 	if err := loadSeedAdmin(&cfg); err != nil {
 		return Config{}, err
 	}
 	// Must run after loadSeedAdmin (needs SeedEmail) and after the allowlist is
 	// set (needs it for the default base URL and the allowlist check).
 	if err := loadSeedForge(&cfg); err != nil {
+		return Config{}, err
+	}
+	// Must run after loadSeedAdmin (the token belongs to the seed admin).
+	if err := loadSeedAnthropic(&cfg); err != nil {
 		return Config{}, err
 	}
 
@@ -209,6 +243,25 @@ func loadSeedForge(cfg *Config) error {
 	cfg.SeedForgePAT = pat
 	cfg.SeedForgeBaseURL = norm
 	cfg.SeedForgeRepos = parseCommaList(os.Getenv("UZI_SEED_FORGE_REPOS"))
+	return nil
+}
+
+// loadSeedAnthropic reads the optional startup Anthropic-token seed. It is off
+// unless UZI_SEED_ANTHROPIC_TOKEN is set; when set it requires the admin seed
+// (the token belongs to that user) or boot fails — a set-but-invalid seed is a
+// loud misconfiguration, consistent with loadSeedAdmin/loadSeedForge. Only the
+// static presence/pairing is checked here; the token FORMAT is validated at seed
+// time (no network, never logged), never here where a bad value could surface in
+// an error. The trimmed value is stored, mirroring how the forge PAT is stored.
+func loadSeedAnthropic(cfg *Config) error {
+	token := strings.TrimSpace(os.Getenv("UZI_SEED_ANTHROPIC_TOKEN"))
+	if token == "" {
+		return nil
+	}
+	if cfg.SeedEmail == "" {
+		return fmt.Errorf("UZI_SEED_ANTHROPIC_TOKEN is set but UZI_SEED_EMAIL is not; the seeded token must belong to the seed admin")
+	}
+	cfg.SeedAnthropicToken = token
 	return nil
 }
 
@@ -368,6 +421,21 @@ func parseInt(key string, def int) int {
 	}
 	var n int
 	if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+// parseNonNegInt is parseInt but accepts 0 (a legitimate value for e.g.
+// RUN_MAX_REQUEUES, meaning "never re-queue"). A negative or malformed value
+// falls back to def.
+func parseNonNegInt(key string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	var n int
+	if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n >= 0 {
 		return n
 	}
 	return def

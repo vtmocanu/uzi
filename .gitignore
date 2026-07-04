@@ -12,3 +12,18 @@ api/server
 # Editor / OS
 .DS_Store
 *.swp
+# IDEs
+.cursor
+.vscode
+# Python
+__pycache__/
+*.py[cod]
+# Env files
+# Devbox
+.devbox/
+# Task remote-include cache
+.task/
+# Claude
+.claude/agent-team-tasks/
+.claude/scheduled_tasks.lock
+.claude/skill-stats.json

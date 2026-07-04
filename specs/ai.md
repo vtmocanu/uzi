@@ -646,3 +646,399 @@ Serves human: "editable via the UI"; admin-only writes (USER-CONFIRMED 2026-07-0
 - **E2E**: `scripts/smoke-prd3.sh` — seed → admin edit → non-admin blocked (403) →
   render stable → token set/rotate/delete → restart persistence → DB dump shows
   only ciphertext.
+
+---
+
+# PRD #4 — Agent Runtime: Workers, Job Queue & Live Run View
+
+Serves human Feature #4. **Status: M1 + M2 built and merged; M3–M7 not yet built.**
+Sections below cover only what ships in M1 (server: schema, join tokens, worker
+protocol, sweeper, web-facing run/worker API) and M2 (worker: TS skeleton, git
+worktree lifecycle, run state machine driven by a stub executor). The SDK
+executor, plan-gate/MR workflow, live web UI, E2E, and docs (M3–M7) are designed
+in the PRD (`prds/4-agent-runtime-workers.md`) but are **not** realized in code
+yet; where a decision here anticipates them it says so.
+
+Two moving parts split along plan.md's server/client trust boundary: the **api**
+service gains the run queue + worker registry (no new container); a new
+top-level **`agent/`** TypeScript worker runs one-per-user, outbound-only.
+
+## 36. Runtime architecture & trust boundary
+
+Serves human: "server/client architecture; each user has their own client"; "agents
+only create MRs (primary directive)"; "connection server/agent should be encrypted".
+
+- **Outbound-only worker** (multica's daemon model, AI choice 2026-07-03 over
+  API-spawned or shared workers): the worker opens every connection to the api and
+  authenticates with a Bearer join token; it never listens. No `docker.sock` in the
+  api; the model maps cleanly to later pods/VMs. In the compose demo the worker is
+  an on-network service, not a remote client.
+- **Server is the sole key holder.** Per claimed run the api decrypts that user's
+  bot PAT (PRD #2 `forge_connections`) and Anthropic token (PRD #3 `user_secrets`)
+  and returns them **only in the claim response** — never persisted on the worker
+  beyond the run, never logged (reuses the PRD #2/#3 redaction discipline).
+- **TLS on the worker↔api hop is DEFERRED** — the join token authenticates now;
+  transport encryption arrives with a TLS-terminated ingress when the worker
+  becomes remote. plan.md's "connection should be encrypted" is therefore only
+  **partially met** by the MVP (authentication yes, encryption later). **Deferral
+  accepted by the user 2026-07-04** — join-token auth now, transport TLS with the
+  remote-worker/ingress; recorded as an accepted gap, not a satisfied requirement.
+
+## 37. Runtime schema (migration `00020_workers_runs.sql`)
+
+Serves human: Feature #4 job queue + worker registry + lossless live stream.
+
+- Goose range **`00020`+** reserved above PRD #2 (`00002`–`00009`) and PRD #3
+  (`00010`+); goose tolerates gaps so the range is conflict-free. One migration
+  landed (`00020`); the range stays reserved for M3+.
+- **`workers`** — `id, user_id→users ON DELETE CASCADE, name, token_hash bytea
+  UNIQUE (sha256 of the join token), status ('offline'|'online', CHECK-constrained),
+  last_heartbeat_at, version, timestamps`. Status is heartbeat-derived; **"busy" is
+  never stored** — it is derived at read time from an active claimed/running/
+  awaiting_approval run.
+- **`runs`** — the unit of work; an issue can accumulate several runs over its life.
+  `repo_id` is **uuid** (repos.id is uuid in PRD #2, not bigint). `issue_iid` +
+  `issue_title` + `issue_description` are **snapshotted at queue time** so a run is
+  self-contained even after PRD #2 reconcile evicts the `issues` cache row. State
+  machine `queued → claimed → running → awaiting_approval → running → completed |
+  failed | cancelled`, CHECK-constrained. Resume/affinity/liveness columns:
+  `worker_id→workers ON DELETE SET NULL` (affinity), `session_id` (SDK resume),
+  `last_seq` (message high-water mark), `requeue_count` (bounded re-queue),
+  `iteration_count` (loop cap), `branch`, `mr_iid`, `failure_reason`, `plan_md`,
+  and `claimed_at/started_at/finished_at`.
+- **One-non-terminal-run-per-issue** enforced by a **partial UNIQUE index**
+  `(repo_id, issue_iid) WHERE status NOT IN (completed,failed,cancelled)` — fixes
+  bottega's check-then-insert TOCTOU race with a DB constraint. Terminal runs are
+  excluded so an issue can be re-run once its prior run finishes.
+- **`run_messages`** — `bigserial id, run_id→runs ON DELETE CASCADE, seq int,
+  kind, agent, payload jsonb, created_at`, **UNIQUE(run_id, seq)**. Per-run gapless
+  seq makes the worker's batched append idempotent and the browser stream replayable
+  (fixes multica's lossy buffer). `kind ∈ {text, thinking, tool_use, tool_result,
+  status, error, user_message, plan}`.
+- **`run_user_inputs`** — steering channel: `bigserial id, run_id→runs ON DELETE
+  CASCADE, kind CHECK ∈ {follow_up, approve_plan, reject_plan, cancel}, body,
+  consumed_at, created_at`. A partial index on `(run_id, id) WHERE consumed_at IS
+  NULL` serves the FIFO consume scan.
+- Indexes: `idx_runs_claimable (user_id, status, created_at)` backs the claim scan;
+  per-fk indexes on user/repo/worker.
+
+## 38. Join token mechanism (`api/internal/jointoken`)
+
+Serves human: "each user has their own client" (the worker must authenticate); best-practice.
+
+- **Net-new** vs PRD #1 (no reusable token-hash precedent). Token = `uzw_` prefix +
+  32 crypto/rand bytes, base64url. Shown **once** at issuance; only **sha256(token)**
+  is stored in `workers.token_hash`. Prefix aids humans + secret scanners and is
+  covered by the hash.
+- **Unsalted sha256 is deliberate and safe**: the token is uniformly random 256-bit
+  data, so there is no low-entropy keyspace to precompute — the per-record salt that
+  password hashing needs buys nothing here.
+- `RequireWorker` middleware extracts the Bearer credential, hashes it, looks up the
+  row by an **indexed equality on the full 32-byte digest**, then does a
+  **constant-time compare** (`crypto/subtle`) as belt-and-suspenders. Lookup failure
+  and mismatch both return an indistinguishable 401 (a prober learns nothing about
+  which tokens exist). No CSRF step — the credential is a held bearer secret, not an
+  ambient browser cookie.
+
+## 39. Worker protocol (`/api/worker/*`, Bearer join token)
+
+Serves human: "each user's client connects to the server"; job queue.
+
+Six endpoints, all under `RequireWorker`, **no worker id in any URL path** — identity
+is always the Bearer token (AI wire decision 2026-07-03). Worker routes are excluded
+from the browser rate limiters.
+
+- `POST /register` — brings the worker online **and recovers its orphaned runs**
+  (see §41). Body `{version, name}`; `name` is accepted for wire compatibility but
+  **ignored** — the authoritative name is the label chosen at token issuance, not
+  something the worker may overwrite. (This was the third wire bug: M1's
+  DisallowUnknownFields 400'd the posted `name` until it was declared-and-ignored.)
+- `POST /heartbeat` — refreshes liveness (default every 15s; server marks offline
+  after 45s of silence).
+- `POST /runs/claim` — atomic claim (§40). **204** when idle (no body); **200** with
+  the full claim payload otherwise.
+- `POST /runs/{id}/messages` — `{messages:[{seq, kind, agent, payload}]}`; batch is
+  validated **all-or-nothing** (one invalid message rejects the whole batch, nothing
+  written) then persisted and the run's `last_seq` advanced. Idempotent on
+  `(run_id, seq)`. Ownership-checked.
+- `POST /runs/{id}/state` — `{status, plan_md?, branch?, mr_iid?, failure_reason?,
+  iteration_count?, session_id?}`. **The wire key is `status`** (matches
+  `runs.status`, multica, and the worker client) — the second wire bug was M1
+  decoding `state` while M2 sent `status`; fixed to `status`. A report that lands on
+  an already-terminal run returns **409** with the run's real status; the worker
+  treats 409 as success and stops (learning it was cancelled). `session_id` is
+  persisted atomically with the transition when present (empty = no change) — the
+  resume prerequisite.
+- `GET /runs/{id}/inputs` — consumes + returns pending steering inputs FIFO as
+  `{inputs:[{id, kind, body, created_at}]}`. **Delivery marks consumed** (no separate
+  ack): a worker crash right after the GET drops that input — accepted MVP trade-off
+  (user re-sends); an explicit ack endpoint is a clean later addition.
+
+## 40. Claim payload & atomic claim (`workersvc/claim.go`, `ClaimRun` query)
+
+Serves human: "server/client; agents work an issue"; secret-at-rest (server holds keys).
+
+- **Atomic claim**: `UPDATE runs SET status='claimed', worker_id=…` selecting the
+  oldest `queued` run **for the worker's user** via `FOR UPDATE SKIP LOCKED`
+  (multica) so concurrent workers claim disjoint runs without blocking.
+- **Worker affinity**: a re-queued run with a prior `worker_id` sorts its original
+  worker first and is claimable by **others only after `WORKER_AFFINITY_GRACE`**
+  (default 2m) — so a resume lands on the disk that still holds the session +
+  worktree. Ordering `COALESCE(worker_id = @worker_id, false) DESC, created_at ASC`.
+- **Claim payload shape** (AI wire contract, pinned across the M1/M2 branches):
+  flat run fields at top level (`run_id, issue_iid, issue_title, issue_description,
+  status, branch?, session_id?, last_seq, iteration_count, requeue_count, plan_md?`)
+  plus nested objects:
+  - `repo: {id, url, clone_url, default_branch?}` — `clone_url` is `url + ".git"`,
+    **tokenless by contract** (the PAT is supplied out-of-band, never embedded in the
+    URL — a credentialed URL would persist in the bare repo's on-disk config and
+    defeat the guarantee). Clone from `clone_url`, not `url`.
+  - `secrets: {forge_username, forge_pat, anthropic_oauth_token}` — decrypted for
+    this run only; the **sole** secret-delivery channel; never logged/persisted.
+  - `agents: [{name, description, prompt_body, tools, model}]` — an **array** of
+    PRD #3 templates as **structured fields** (not `.claude/agents/*.md` files),
+    ready to map onto programmatic SDK `AgentDefinition`s in M3. `tools` nil =
+    inherit-all; `model` nil = inherit. (Deviation from M2's initial single-`template`
+    assumption; reconciled to the array.)
+  - `config: {run_timeout_seconds, idle_timeout_seconds, max_iterations}` — **caps in
+    SECONDS on the wire** (the first-fixed field-unit bug was M2 expecting `_ms`);
+    any ms consumer converts at the use site.
+- **Claim-time credential failure is non-retryable**: if the bot PAT or Anthropic
+  token is missing/undecryptable, the run is **failed immediately with a static
+  reason** (carrying no secret bytes) and the claim answers **idle** — a broken run
+  never wedges the worker in a claim loop. A run that vanished between claim and
+  assembly (cascading forge-connection delete) also answers idle.
+
+## 41. Run lifecycle, sweeper, orphan recovery (`workersvc/service.go`)
+
+Serves human: liveness never trusted to the agent; "restart-resilience".
+
+- **State transitions** (`SetState`) are all guarded against terminal statuses, so a
+  cancel that raced in makes the worker's report a no-op (`applied=false` → 409).
+- **Server sweeper** (goroutine beside the PRD #2 poller; also run once at boot as the
+  orphan sweep — bottega): each pass, in order, (1) marks heartbeat-stale workers
+  offline; (2) reclaims claimed-but-never-started runs past `ClaimGrace` (fixed 5m,
+  not an env var); (3) fails running runs past `RUN_TIMEOUT`; (4) fails stale-worker
+  runs **over** the re-queue cap; (5) re-queues stale-worker runs **under** the cap
+  (incrementing `requeue_count`). Fail-over-cap runs before re-queue so a run that
+  just hit the cap isn't re-queued.
+- **Bounded re-queue**: `RUN_MAX_REQUEUES` (default 1) caps worker-death re-queues;
+  `0` is supported (fail immediately on worker death).
+- **Register-time orphan recovery**: a re-registering worker has, by definition, just
+  restarted and is executing nothing, so any run it still holds is orphaned — failed
+  over cap, else re-queued **to the same worker** (affinity) for resume. This is what
+  makes `docker compose down && up` recover: a fresh worker's own restart signal,
+  which the server cannot infer from heartbeats (a fresh heartbeat would otherwise
+  defeat staleness detection). The sweeper still covers never-returning workers.
+
+## 42. Web-facing run + worker management API (M1)
+
+Serves human: "start a run from a card"; "generate a worker join token"; "see run
+messages / correct them" (the SPA consuming these is M5, but the endpoints ship in M1).
+
+- All under PRD #1 session + CSRF; every route authorizes through the owning user
+  (`GetRunByIDForUser`, `GetRepoForUser`) — a user only ever touches their own runs/
+  workers. Admin cross-user views are M5.
+- **Workers**: `POST /api/workers` (issues a worker, returns the plaintext join token
+  **once**), `GET /api/workers` (list with derived busy status), `DELETE
+  /api/workers/{id}` — **409 while the worker still owns a non-terminal run** (the FK
+  is ON DELETE SET NULL; deleting would orphan the run past every sweep and wedge the
+  one-active-run index).
+- **Runs**: `POST /api/repos/{id}/runs` (queue a run — repo owned + issue is a cached
+  PRD issue **with a PRD link**; title snapshotted from cache, description from the
+  request; duplicate active run → 409 via the unique index), `GET /api/runs/{id}`,
+  `GET /api/runs/{id}/messages` (replay after a seq), `POST /api/runs/{id}/inputs`
+  (submit steering).
+- **No-live-poller server-side transition**: a `cancel` or `reject_plan` for a run
+  with no live poller (still `queued`, or its worker gone stale) is applied
+  **server-side** directly to `cancelled`/`failed` — the input is never stranded
+  waiting for a `GET /inputs` that will never come. "Live poller" = run assigned to a
+  worker whose heartbeat is within `WORKER_HEARTBEAT_STALE`. Other inputs
+  (follow-up/approve) are enqueued for the worker to consume.
+
+## 43. Worker runtime (M2): TS project, config, loop (`agent/`)
+
+Serves human: "client based on the Anthropic SDK, one per user" (SDK wiring is M3;
+M2 builds the container + protocol + git around a stub executor).
+
+- **TypeScript, Node 22** (AI choice 2026-07-03 over Python): bottega is the
+  production-proven reference for exactly this stack (Agent SDK + per-user OAuth
+  token), the SDK's TS build bundles the Claude Code binary, and the team stack stays
+  Go + TS. The **executor is isolated behind one interface** so the SDK surface
+  (M3) is swappable and a future OpenAI executor is a second implementation, not a
+  rewrite.
+- **Outbound loop** (`worker.ts`): register-with-retry once, then a heartbeat loop
+  and a claim loop run concurrently until abort. Claim → execute a run to a terminal
+  state → immediately try the next; otherwise wait `WORKER_POLL_INTERVAL` (3s). **One
+  run at a time** in M2.
+- **Config** (`config.ts`, from env): `UZI_API_URL`, `UZI_WORKER_TOKEN`, `UZI_DATA_DIR`
+  (default `/data`), `UZI_WORKER_NAME` (default hostname), plus interval knobs that
+  accept **either a Go-style duration** (`15s`, `500ms`, `2h`) or a bare integer as
+  ms — so the same knob reads identically server-side, in compose, and here.
+- **Terminal-callback reliability** (`client.ts`): every `/state` report — terminal
+  and non-terminal alike — is retried with bounded backoff on transient failures
+  (5xx/408/429/network); an "already terminal" response (409, or a <500 body
+  mentioning "terminal") is treated as **success** (multica) so a lost ack/duplicate
+  replay is safe; other 4xx are fatal.
+
+## 44. Git: bare-clone cache + worktree lifecycle (`agent/src/git.ts`)
+
+Serves human: "agents use worktrees to work in parallel"; primary directive (no
+ambient credentials).
+
+- **Layout under `UZI_DATA_DIR`**: `repos/<host>+<ns>+<repo>.git` one bare clone per
+  repo kept across runs (multica's cache), `worktrees/<repo>/issue-<iid>` one
+  worktree per run removed on terminal state. `bareDirName` joins host + path
+  segments with `+` (illegal in forge path segments → collision-free).
+- **Branch is `agent/issue-{iid}`** (dot-agent-deck naming). **Branch-exists ⇒
+  attach** (worktree-as-ledger idempotency for resume / same-issue re-run), else
+  create off the resolved default branch. Bare clone converted to remote-tracking
+  refspec so `agent/*` heads the worktrees lock never collide with fetched refs.
+- **Per-bare-path serialization** (chained promises): git's lockfiles can't take
+  parallel mutations on the same bare repo.
+- `safe.directory=*` (container UID ≠ volume owner makes the ownership check useless
+  and breaking) + `GIT_TERMINAL_PROMPT=0` (auth failure → clear error, not a hang).
+
+## 45. Worker-holds-PAT + PAT-off-argv (primary directive, reconciles sparse-env)
+
+Serves human: "agents only ever create MRs, never write to main"; "secrets never
+outside the DB"; "verify agents can't modify main directly".
+
+- **The worker process — not the agent — holds the PAT and performs every
+  authenticated network git op** (clone, fetch, and in M4 push + MR). The agent only
+  edits files and makes local commits (no network, no credential). This is the
+  design correction that reconciles the sparse-env guarantee with pushing: the agent
+  subprocess **never sees the PAT at all**, which is what makes the "worker
+  disk/agent env contain no PAT" criterion actually hold and turns the M3 push-guard
+  into pure defense-in-depth.
+- **PAT delivered to git via env-scoped config only**: `GIT_CONFIG_COUNT` +
+  `GIT_CONFIG_KEY_n=http.extraHeader` + `GIT_CONFIG_VALUE_n="PRIVATE-TOKEN: <pat>"`
+  (git ≥ 2.31). **NOT `git -c`** — whose values land on argv and are readable in the
+  container process table (`ps`, `/proc/<pid>/cmdline`) while an agent subprocess may
+  be alive during the push. The env path keeps the PAT off argv, off on-disk config,
+  and out of logs (git plumbing logs args only, never env). GitLab reads
+  `PRIVATE-TOKEN` for authenticated requests (auditor decision).
+- **Deferred to M4 (before live clones)**: host-scoping the `http.extraHeader` (so
+  the token isn't sent on a redirect to another host) and pinning
+  `http.followRedirects`. M2's fixture repos are local and ignore the header, so its
+  efficacy against a live GitLab is validated when M4 wires real clones.
+
+## 46. Message batching / gapless seq (`agent/src/batcher.ts`)
+
+Serves human: "see the messages the agents produce"; lossless stream (beats multica).
+
+- Buffers emitted messages and flushes seq-numbered batches every
+  `WORKER_MESSAGE_BATCH_INTERVAL` (500ms), **continuing numbering from the claim's
+  `last_seq`** so a resuming worker never collides seqs. A failed batch is put back
+  at the head and retried, so the server (idempotent on `(run_id, seq)`) never sees a
+  gap in what it receives. `close()` awaits any in-flight flush then drains with
+  bounded retries. The server persists before broadcasting, so this channel is a
+  liveness optimization, **never the source of truth**.
+
+## 47. Executor interface + stub (M2 boundary) (`agent/src/executor.ts`, `runner.ts`)
+
+Serves human: Feature #4 agent execution (the real SDK executor is M3).
+
+- **`Executor` interface** (`run(ctx) → {branch}`) is the seam M3 replaces with the
+  Claude Agent SDK. `RunContext` gives the executor the issue snapshot, the
+  checked-out worktree path, the branch, and an `emit` for stream messages.
+- **`StubExecutor`** (M2): writes a marker file, makes a **single local commit** on
+  `agent/issue-{iid}` (no SDK, no network, no push), so tests prove the full
+  claim → worktree → work → report loop with **no AI in the loop**. Commit identity
+  pinned per-invocation via `-c` (nothing written to worktree config), gpg signing
+  forced off.
+- **`RunRunner`** drives one claim through `running → clone/worktree → execute →
+  completed | failed`, always tearing down the worktree (keeping the bare clone) in
+  `finally`. Per-run secrets are registered with the logger's scrubber before any
+  work; the claim payload itself is never logged.
+
+## 48. Worker image & delivery (`agent/Dockerfile`)
+
+Serves human: "local docker-compose demo"; worker is a container per user.
+
+- The worker image **cannot be distroless** (unlike the api): the SDK's Bash tool
+  needs a real shell and the git flow needs `git` + coreutils, so it is a **minimal
+  Node + git + bash base**. The api image stays distroless.
+- Shipped as a compose profile (`--profile agent`) / `docker run`; `UZI_DATA_DIR` is
+  a persistent volume holding repos, worktrees, and (M3) the pinned SDK session dir,
+  so `compose down && up` doesn't wipe caches or sessions.
+
+## 49. Runtime configuration (env, extends §13/§25)
+
+Serves human: operability of the run queue + worker liveness.
+
+Server-side (defaults): `RUN_TIMEOUT` 2h, `RUN_IDLE_TIMEOUT` 10m (worker-enforced,
+shipped in the claim), `RUN_MAX_ITERATIONS` 5 (worker-enforced), `RUN_MAX_REQUEUES`
+1 (`0` = never re-queue), `WORKER_HEARTBEAT_INTERVAL` 15s, `WORKER_HEARTBEAT_STALE`
+45s, `WORKER_POLL_INTERVAL` 3s, `WORKER_AFFINITY_GRACE` 2m. Claimed-never-started
+grace is fixed at 5m in code, not an env var. Invalid numeric/duration values fall
+back to defaults (PRD #1/#2 convention). Worker-side: `UZI_API_URL`,
+`UZI_WORKER_TOKEN`, `UZI_DATA_DIR`, `UZI_WORKER_NAME`, and the interval knobs above
+(duration-or-ms).
+
+## 50. Guardrail layering (design; enforcement lands M3)
+
+Serves human: "agents only ever create MRs, never write to main — primary directive."
+
+Layered so no single layer is load-bearing, and none trusts the model:
+1. **GitLab role**: the bot is Developer and `main` is protected (documented project
+   config; PAT least-privilege verification is a plan.md fast-follow).
+2. **Worker-owned network git** (§45): the agent literally has no push credential, so
+   protected-branch writes are impossible regardless of what the model attempts —
+   **this is realized now** (M2), the strongest layer.
+3. **SDK `PreToolUse` deny-hook** (M3, defense-in-depth): deny `git push`, any
+   `--force`/`-f`, remote mutation, and credential-reading commands (`git config
+   --get`, `env`, and `ps`/`/proc` probes per the auditor ask).
+4. **Permission mode `bypassPermissions` + deny-hook + `disallowedTools`** (M3): not
+   `default` (hangs headless) nor `dontAsk` (too restrictive for the coder). Read-only
+   subagents constrained via per-`AgentDefinition` `tools` allowlist (subagents
+   inherit the parent mode).
+5. **`settingSources: []`** (M3): nothing from the cloned repo's `.claude/*` can grant
+   the agent extra permissions — a repo-borne prompt-injection defense none of the
+   inspirations has.
+Only layers 1–2 exist in M1+M2; 3–5 are M3 and are recorded as design intent.
+
+## 51. Session resume (design; wiring lands M3)
+
+Serves human: "restart-resilience"; "correct a running agent".
+
+- The SDK writes transcripts under `$HOME/.claude/projects/…`; M3 pins `HOME`/the
+  session dir onto the persistent `UZI_DATA_DIR` volume so restarts don't wipe
+  sessions. On resume the worker uses the claim's `session_id` + `last_seq`. M1
+  already persists `session_id` from state reports (the prerequisite); M2 carries it
+  through the claim payload. If a re-queued run lands on a worker whose disk lacks the
+  session (affinity grace expired), it falls back to a fresh session + branch-attach,
+  which re-triggers the plan gate (documented, acceptable).
+
+## 52. Runtime testing & validation posture
+
+Serves human: testing-credentials policy (never mint an OAuth token); best-practice.
+
+- **All runtime tests use dummy credentials + the stub executor** (never a live
+  Anthropic session). M2's Vitest suite (25 tests) exercises the client, git cache
+  (incl. the secret-flow test asserting the PAT is off argv), batcher, and runner
+  against a fake api; M1's Go suite runs the service against a fake store.
+- **Live compose smoke** (dummy creds, per policy) verified the full control plane on
+  the merged tip: migrations→00020, register→online, heartbeats, 3s claim polling/204,
+  claim-time credential-failure → run failed with a static reason, stale worker →
+  offline at ~49s.
+- **Deferred to M6**: Postgres-backed `SKIP LOCKED`/partial-index tests (the Go suite
+  uses a fake store, so the concurrency + index semantics are not yet exercised
+  against real Postgres). An optional final live E2E uses the user's **existing**
+  token, provided at that moment, never minted.
+
+## 53. Validation-wave lessons (2026-07-04) & runtime coordination
+
+- **Lenient fakes hid wire truth**: three contract bugs survived green suites on both
+  M1 and M2 because each side's fake encoded its own assumption — (1) `/state` key
+  `status` vs `state`; (2) claim `config` units `_seconds` vs `_ms`; (3) `register`
+  body `name` vs DisallowUnknownFields (found only by the live smoke). **Rule
+  institutionalized: every milestone pairing gets a live smoke before merge; a
+  cross-branch contract test is queued for the integration branch.**
+- **Milestone parallel-safety**: M1 (`api/`) and M2 (`agent/`) touch disjoint trees
+  and pinned the wire contract in the PRD decision log so they could be built in
+  parallel; the shared truth is the JSON shape, not shared code.
+- **Docker smoke isolation**: compose project names are daemon-global — every smoke
+  needs a unique `-p` and a scratchpad `--env-file` (a bare `up` falls back to the
+  worktree `.env` whose placeholder `UZI_SECRET_KEY` intentionally crashes the api).
+  The user's own stack runs on host :8080, so smokes publish elsewhere.
