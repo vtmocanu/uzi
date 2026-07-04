@@ -66,7 +66,14 @@ Knobs (env vars):
   worker reaches it because a `url.<local>.insteadOf` gitconfig rewrites the
   https clone/push URL the api hands out. The worker's clone → worktree → commit
   → **push** path runs for real against it; the branch-pushed assertion reads the
-  bare repo directly.
+  bare repo directly. **Fidelity caveat:** because the rewritten remote is a
+  *local path*, git ignores all `http.*` config on it, so the worker's
+  **git-over-HTTPS Basic auth header is NOT exercised** by the default harness —
+  which is exactly why this harness (like every prior test) would not have caught
+  the `PRIVATE-TOKEN`-vs-Basic auth bug; the live run did. (The
+  `E2E_GIT_SMART_HTTP=1` variant, when available, points `clone_url` at a real
+  git-smart-HTTP endpoint on `forge-fake` that 401s without a valid `Authorization:
+  Basic` header, closing this gap and guarding against a git-auth regression.)
 - **The executor** is the M2 stub with `UZI_STUB_PLAN_GATE=1`, so it drives the
   full M4 plan gate (emit plan → `awaiting_approval` → await verdict → implement)
   with no SDK.

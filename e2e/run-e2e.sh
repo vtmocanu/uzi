@@ -153,6 +153,9 @@ chmod 0644 "$RUNROOT/certs/"*.pem
 # Local bare repo standing in for GitLab's git server, seeded with a main commit.
 git init --bare -q "$RUNROOT/fakeremote/repo.git"
 git -C "$RUNROOT/fakeremote/repo.git" symbolic-ref HEAD refs/heads/main
+# Allow pushes over git smart-HTTP (the E2E_GIT_SMART_HTTP variant); a no-op for
+# the default local-path remote.
+git -C "$RUNROOT/fakeremote/repo.git" config http.receivepack true
 seedwc="$RUNROOT/.seedwc"
 git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/repo.git" .seedwc
 git -C "$seedwc" checkout -q -b main
@@ -163,11 +166,22 @@ git -C "$seedwc" push -q origin main
 rm -rf "$seedwc"
 chmod -R a+rwX "$RUNROOT/fakeremote"
 
-# The worker's git rewrites the https clone/push URL to the local bare remote.
-cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
+if [ -n "${E2E_GIT_SMART_HTTP:-}" ]; then
+  # Fidelity variant: leave the clone/push URL pointing at forge-fake's git
+  # smart-HTTP endpoint (no insteadOf), so the worker's git-over-HTTPS Basic auth
+  # is genuinely exercised (forge-fake 401s without a valid Authorization: Basic).
+  : > "$RUNROOT/agent-gitconfig/gitconfig"
+  GIT_MODE="smart-HTTP (Basic auth exercised)"
+else
+  # Default: rewrite the https clone/push URL to the local bare remote (fast,
+  # hermetic; does NOT exercise git-over-HTTPS auth — see README).
+  cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
 [url "/fakeremote/repo.git"]
 	insteadOf = https://forge-fake.e2e/group/repo.git
 EOF
+  GIT_MODE="local bare remote via insteadOf"
+fi
+say "git remote mode: $GIT_MODE"
 
 # Per-run env-file: strong generated secrets for the base stack + the scratch dir
 # the overlay bind-mounts. UZI_WORKER_TOKEN is a placeholder that only satisfies
@@ -267,6 +281,21 @@ STATE_JSON="$("${COMPOSE[@]}" exec -T forge-fake cat /tmp/forge-fake-state.json)
   || fail "recorded MR source_branch mismatch"
 [ "$(echo "$STATE_JSON" | jq -r '.mrs[-1].target_branch')" = "main" ] || fail "recorded MR target_branch is not main"
 pass "fake GitLab recorded an MR from agent/issue-$IID into main"
+
+# When the authenticated-remote variant ran, prove the git smart-HTTP endpoint
+# actually GATES on the Basic credential (not a no-op that accepts anything): no
+# credential must 401, the correct Basic header must 200. Probed from inside the
+# agent, which resolves forge-fake.e2e and trusts its cert (NODE_EXTRA_CA_CERTS).
+if [ -n "${E2E_GIT_SMART_HTTP:-}" ]; then
+  refs_url="https://forge-fake.e2e/group/repo.git/info/refs?service=git-upload-pack"
+  probe='const https=require("https");const u=new URL(process.argv[1]);const o={hostname:u.hostname,port:443,path:u.pathname+u.search,headers:{}};if(process.argv[2])o.headers.Authorization=process.argv[2];https.get(o,r=>{console.log(r.statusCode);r.resume();}).on("error",e=>{console.error(e.message);process.exit(2);});'
+  auth="Basic $(printf 'uzi-bot:%s' "$DUMMY_FORGE_PAT" | base64 | tr -d '\r\n')"
+  code_noauth="$("${COMPOSE[@]}" exec -T agent node -e "$probe" "$refs_url" | tr -d '\r\n')"
+  [ "$code_noauth" = 401 ] || fail "git smart-HTTP without a credential should 401 (got '$code_noauth')"
+  code_auth="$("${COMPOSE[@]}" exec -T agent node -e "$probe" "$refs_url" "$auth" | tr -d '\r\n')"
+  [ "$code_auth" = 200 ] || fail "git smart-HTTP with the correct Basic credential should 200 (got '$code_auth')"
+  pass "git smart-HTTP auth gate: no credential -> 401, correct Basic -> 200"
+fi
 
 MSGS="$(apiget "/api/runs/$RUN/messages")"
 echo "$MSGS" | jq -e '.messages | (length > 0) and ([.[].seq] == [range(1; length+1)])' >/dev/null \

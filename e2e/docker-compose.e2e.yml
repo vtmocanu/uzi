@@ -13,8 +13,16 @@ services:
   # https base, and NormalizeForgeBaseURL drops the port — so it must be :443).
   forge-fake:
     build: ./e2e/forge-fake
+    environment:
+      # Used only by the optional git smart-HTTP endpoint (E2E_GIT_SMART_HTTP): the
+      # worker's git-over-HTTPS Basic credential must decode to this user:pat, or
+      # forge-fake 401s the clone/push. Dormant in the default (local-remote) run.
+      FORGE_FAKE_EXPECT_USER: uzi-bot
+      FORGE_FAKE_EXPECT_PAT: e2e-dummy-forge-pat-000000
     volumes:
       - ${E2E_RUN_DIR}/certs:/certs:ro
+      # The bare repo served over git smart-HTTP (E2E_GIT_SMART_HTTP variant).
+      - ${E2E_RUN_DIR}/fakeremote:/gitroot
     networks:
       default:
         aliases:
