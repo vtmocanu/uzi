@@ -71,7 +71,7 @@ House style for every `user` page: task-titled, numbered steps, one screenshot p
 ### Screenshots
 
 - Stored in `docs/img/`, kebab-named after page + step (`board-move-card.png`), PNG, each ≤ 300 KB (bundle ships to every visitor), meaningful alt text.
-- Captured by **Vlad on the running stack** — M3 starts with a checklist of requested shots (register form, forge connect + verify, repo enable, board with cards, token settings, agent template editor). Implementation blocks on receiving them; placeholders never ship.
+- Captured by **Vlad on the running stack** — M3 starts with a checklist of requested shots (register form, forge connect + verify, repo enable, board with cards, token settings, agent template editor). Pages ship with **placeholder images** (clearly-marked generated PNGs in `docs/img/`, alt text describing the intended shot) until Vlad delivers the real captures; swapping placeholders for real screenshots is a **single final commit** after all other milestones land (decision 2026-07-04).
 
 ### Build-time validation
 
@@ -81,7 +81,7 @@ House style for every `user` page: task-titled, numbered steps, one screenshot p
 
 - [ ] **M1 — Docs viewer infrastructure**: deps added (`react-markdown`, `remark-gfm`); `/docs` + `/docs/:slug` routes render bundled markdown with GFM tables, images, rewritten links, and an in-shell 404; nav link present logged-in and logged-out; responsive + dark-theme-consistent; compose context/Dockerfile/root-`.dockerignore` reworked per the sibling-layout spec above; `docker compose build web` green **against pre-M2 docs** (frontmatterless files default to repo-only, and one existing doc gets seed frontmatter as the M1 rendering/link-rewrite fixture). *Files: `web/*`, `docker-compose.yml`, `.dockerignore`, + frontmatter on one doc.*
 - [ ] **M2 — Content curation**: frontmatter on all `docs/*.md`; the five `user` pages exist, terse (target ≤ 60 lines), house style; cut material relocated per the recorded mapping (`operator`/`design`/`contributor`); existing repo links (README, ARCHITECTURE) still resolve. *Files: `docs/*` only — runs in parallel with M1; the schema contract is fixed in this PRD, and M1 does not depend on M2's content thanks to the graceful-no-frontmatter rule.*
-- [ ] **M3 — Screenshots**: shot checklist presented to Vlad; delivered images in `docs/img/`, wired into pages with alt text, size-checked. **Gated on user input.** *Depends on M1 + M2.*
+- [ ] **M3 — Screenshots**: shot checklist presented to Vlad; **placeholder images** wired into pages with alt text now (not gating anything); real captures replace them in a single final commit after all other milestones. *Depends on M1 + M2.*
 - [ ] **M4 — Validation gate**: `check-docs.mjs` wired into the build and failing on frontmatter/link rot; whole suite green (`npm run build`, `go test ./...` untouched-but-verified, compose smoke: `/docs` and one page render end-to-end).
 - [ ] **M5 — Meta-docs & handoff**: "how to add a docs page" section (frontmatter contract, line budget, screenshot conventions) in `docs/README.md`; ARCHITECTURE.md gets a short Docs section; PRD closed out.
 
@@ -121,3 +121,4 @@ House style for every `user` page: task-titled, numbered steps, one screenshot p
 - 2026-07-04 — `/docs` public (unauthenticated): onboarding docs are needed pre-registration; content is non-secret and repo-public anyway.
 - 2026-07-04 — `react-markdown` without `rehype-raw`: content is trusted (repo-reviewed), so raw HTML stays inert rather than sanitized; smallest safe pipeline.
 - 2026-07-04 — Frontmatter `audience` field over a hardcoded page list in `web/`: docs stay self-describing; adding a page never touches web code.
+- 2026-07-04 — Screenshots via placeholders first (Vlad): implementation never blocks on captures; real screenshots land as a single final commit after all other milestones.
