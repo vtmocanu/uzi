@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
 func txt(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
@@ -73,4 +75,65 @@ func TestMapLatestRun(t *testing.T) {
 			t.Fatalf("owner_name should be empty when no name/email, got %q", dto.OwnerName)
 		}
 	})
+}
+
+func TestAssembleCards(t *testing.T) {
+	viewer := uuid.New()
+	other := uuid.New()
+	run10, run20 := uuid.New(), uuid.New()
+	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+
+	// Three issues: 10 (viewer's run), 20 (another owner's run), 30 (no run).
+	issues := []store.Issue{
+		{ForgeIssueIid: 10, Title: "ten", State: "opened", Labels: []byte(`["In Progress"]`)},
+		{ForgeIssueIid: 20, Title: "twenty", State: "opened", Labels: []byte(`[]`)},
+		{ForgeIssueIid: 30, Title: "thirty", State: "opened", Labels: []byte(`[]`)},
+	}
+	// Deliberately NOT in issue order (20 before 10): a correct assembly keys by
+	// issue_iid, so a positional/cross-keying bug would surface here.
+	runRows := []store.ListLatestRunsForRepoRow{
+		{IssueIid: 20, ID: run20, UserID: other, Status: "completed", MrIid: i8(5),
+			OwnerName: nullTxt(), OwnerEmail: txt("o@example.com"), CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+		{IssueIid: 10, ID: run10, UserID: viewer, Status: "running",
+			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+	}
+	position := map[string]int{"In Progress": 0}
+
+	cards := assembleCards(issues, runRows, position, viewer)
+	byIID := make(map[int64]cardDTO, len(cards))
+	for _, c := range cards {
+		byIID[c.IID] = c
+	}
+	if len(cards) != 3 {
+		t.Fatalf("expected 3 cards, got %d", len(cards))
+	}
+
+	// (1) each latest_run lands on the RIGHT issue (no cross-keying).
+	if lr := byIID[10].LatestRun; lr == nil || lr.ID != run10.String() {
+		t.Fatalf("issue 10 must carry its own run %s, got %+v", run10, lr)
+	}
+	if lr := byIID[20].LatestRun; lr == nil || lr.ID != run20.String() {
+		t.Fatalf("issue 20 must carry its own run %s, got %+v", run20, lr)
+	}
+	// (2) an issue with no run gets latest_run: null.
+	if byIID[30].LatestRun != nil {
+		t.Fatalf("issue 30 has no run and must have latest_run null, got %+v", byIID[30].LatestRun)
+	}
+	// (3) is_mine and owner_name fallback flow through.
+	if !byIID[10].LatestRun.IsMine || byIID[10].LatestRun.OwnerName != "Vlad" {
+		t.Fatalf("issue 10: viewer's run should be mine + named Vlad, got %+v", byIID[10].LatestRun)
+	}
+	if byIID[20].LatestRun.IsMine {
+		t.Fatal("issue 20: another owner's run must not be is_mine")
+	}
+	if byIID[20].LatestRun.OwnerName != "o@example.com" {
+		t.Fatalf("issue 20: owner_name should fall back to email, got %q", byIID[20].LatestRun.OwnerName)
+	}
+	if byIID[20].LatestRun.MrIID == nil || *byIID[20].LatestRun.MrIID != 5 {
+		t.Fatalf("issue 20: mr_iid should flow through, got %v", byIID[20].LatestRun.MrIID)
+	}
+	// Column resolution flows through the assembly too.
+	if byIID[10].Column != "In Progress" {
+		t.Fatalf("issue 10 column = %q, want In Progress", byIID[10].Column)
+	}
 }

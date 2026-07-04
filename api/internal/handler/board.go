@@ -277,19 +277,37 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return boardDTO{}, false
 	}
-	// Newest run per issue, keyed by iid. repo.UserID is the board viewer (the
-	// connection owner); IsMine gates the run-view link.
-	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
-	for _, rr := range runRows {
-		latestByIID[rr.IssueIid] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
-			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.CreatedAt, rr.UpdatedAt, repo.UserID)
-	}
 
 	columns := make([]columnDTO, 0, len(cols))
 	position := make(map[string]int, len(cols))
 	for _, c := range cols {
 		columns = append(columns, columnDTO{LabelName: c.LabelName, Position: int(c.Position)})
 		position[c.LabelName] = int(c.Position)
+	}
+
+	// repo.UserID is the board viewer (the connection owner); IsMine gates the
+	// owner-only run-view link.
+	cards := assembleCards(issues, runRows, position, repo.UserID)
+
+	return boardDTO{
+		RepoID:  repo.ID.String(),
+		Path:    repo.PathWithNamespace,
+		WebURL:  repo.WebUrl,
+		Columns: columns,
+		Cards:   cards,
+	}, true
+}
+
+// assembleCards builds the board's cards from the cached issues, the newest run
+// per issue (runRows, one row per issue that has run), the column position map,
+// and the board viewer. It is the pure, DB-free core of the board payload: it
+// keys each issue's latest_run by issue_iid (issues with no run get null), and
+// resolves each card's column. viewerID drives IsMine.
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, position map[string]int, viewerID uuid.UUID) []cardDTO {
+	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
+	for _, rr := range runRows {
+		latestByIID[rr.IssueIid] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
+			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
 
 	cards := make([]cardDTO, 0, len(issues))
@@ -317,14 +335,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		}
 		cards = append(cards, card)
 	}
-
-	return boardDTO{
-		RepoID:  repo.ID.String(),
-		Path:    repo.PathWithNamespace,
-		WebURL:  repo.WebUrl,
-		Columns: columns,
-		Cards:   cards,
-	}, true
+	return cards
 }
 
 type configureColumnsRequest struct {
