@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { assembleAgents, DEFAULT_READONLY_TOOLS } from "../src/agents.js";
+import { assembleAgents } from "../src/agents.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
 const coder: AgentTemplate = {
@@ -51,15 +51,15 @@ describe("assembleAgents", () => {
     assert.ok(tools.includes("Read"));
   });
 
-  it("fails closed to a read-only allowlist when the template omits tools", () => {
-    // Absent/empty tools must NOT inherit everything (fail-open); it defaults to
-    // read-only, so a template that forgot to list Edit/Write/Bash can't write.
+  it("leaves tools UNSET (inherit all) when the template omits tools", () => {
+    // PRD #3 wire contract: null/absent/empty tools ⇒ inherit all. The SDK
+    // grants the full toolset when `tools` is unset (this is what keeps the
+    // builtin coder, which ships with no tools line, write-capable).
     for (const tools of [null, [] as string[], undefined]) {
       const { subagents } = assembleAgents([{ ...coder, tools }]);
-      assert.deepStrictEqual(subagents.coder?.tools, DEFAULT_READONLY_TOOLS);
-      assert.ok(!subagents.coder?.tools?.includes("Edit"));
-      assert.ok(!subagents.coder?.tools?.includes("Write"));
-      assert.ok(!subagents.coder?.tools?.includes("Bash"));
+      assert.strictEqual(subagents.coder?.tools, undefined);
+      // Nested spawning is still blocked regardless of the inherited toolset.
+      assert.deepStrictEqual(subagents.coder?.disallowedTools, ["Agent"]);
     }
   });
 

@@ -18,20 +18,27 @@
 // and cannot override it, so the allowlist (already excluding Edit/Write in the
 // PRD #3 templates) is what makes them read-only. Every subagent additionally
 // disallows the Agent tool, so no subagent can spawn further nested agents.
+//
+// null/absent/empty `tools` = INHERIT ALL (PRD #3 wire contract). We honor it by
+// leaving the allowlist UNSET, so the SDK grants the full toolset — the built-in
+// `coder` template deliberately ships with no `tools:` line for exactly this
+// reason (pinned by the api-side agenttmpl tests), and downgrading it to a
+// read-only default would silently break the implement role. The read-only
+// roles restrict themselves by DECLARING a toolset, not by us defaulting.
+//
+// ACCEPTED RESIDUAL (auditor F4, team-lead ruling 2026-07-04): a *malformed*
+// custom template with null tools therefore inherits all tools. That is bounded
+// by the global Bash PreToolUse deny-hook, the file-tool worktree jail, and the
+// agent holding no credentials — and is no looser than the built-in
+// general-purpose subagent, which our allowlist never constrained either. The
+// per-template allowlist is a correctness/cost shaper, not the primary-directive
+// boundary; do NOT "re-fix" this into a fail-closed default (it breaks coder).
 
 import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentTemplate } from "./protocol.js";
 import { NESTED_AGENT_TOOL } from "./guardrails.js";
 
 const LEAD_NAME_RE = /^(lead|orchestrator)$/i;
-
-/**
- * Fail-closed default when a subagent template supplies no tools allowlist.
- * Read-only tools only: no Edit/Write/Bash/Agent. A template that needs to
- * modify files or run commands MUST list those tools explicitly, so a missing
- * allowlist denies write access instead of inheriting everything.
- */
-export const DEFAULT_READONLY_TOOLS = ["Read", "Grep", "Glob"];
 
 export interface AssembledAgents {
   /** Invokable subagents, keyed by name, for `options.agents`. */
@@ -50,12 +57,11 @@ function toDefinition(t: AgentTemplate): AgentDefinition {
     // No subagent may spawn nested agents (defense-in-depth over the fact that
     // `agents` + settingSources:[] already limit spawnable agents to these).
     disallowedTools: [NESTED_AGENT_TOOL],
-    // Always set an allowlist. A non-empty template list makes the role
-    // read-only when Edit/Write are absent (PRD #3 excludes them from
-    // reviewer/tester); an absent/empty list fails CLOSED to read-only rather
-    // than inheriting every tool.
-    tools: t.tools && t.tools.length > 0 ? [...t.tools] : [...DEFAULT_READONLY_TOOLS],
   };
+  // A non-empty template list is an explicit allowlist honored verbatim (and is
+  // what makes reviewer/tester read-only). null/absent/empty ⇒ leave `tools`
+  // unset so the SDK inherits all — the PRD #3 contract (see header).
+  if (t.tools && t.tools.length > 0) def.tools = [...t.tools];
   if (t.model) def.model = t.model;
   return def;
 }
