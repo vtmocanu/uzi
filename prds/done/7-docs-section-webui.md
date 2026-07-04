@@ -1,7 +1,7 @@
 # PRD #7: In-app Docs Section — Terse Howtos with Screenshots
 
 **GitLab Issue**: [vtmocanu/uzi#7](https://gitlab.example.com/vtmocanu/uzi/-/issues/7)
-**Status**: Implementation complete (2026-07-04: M1–M5 done on `prd-7-docs-section`; 4-agent review wave passed with all findings fixed; specs synced; real screenshot landed for the GitLab-side shot, uzi-UI shots stay placeholders by decision. Remaining: MR + merge to main.)
+**Status**: Complete (2026-07-04). M1-M5 done; 4-agent review wave passed, all findings fixed; specs synced; merged to main via MR !9. GitLab-side screenshot real, uzi-UI shots stay placeholders by decision until the UI stabilizes.
 **Priority**: Medium
 **Created**: 2026-07-04
 **Depends on**: PRD #1 (web shell, done). Content covers PRD #2/#3 features (done). No dependency on PRD #4/#5/#6; new runtime docs land with those PRDs.
