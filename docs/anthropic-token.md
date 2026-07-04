@@ -1,3 +1,9 @@
+---
+title: Anthropic token
+order: 40
+audience: user
+---
+
 # Anthropic token
 
 uzi runs its agents with **your** Anthropic credentials, one token per user. You
