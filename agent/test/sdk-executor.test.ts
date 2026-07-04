@@ -235,6 +235,12 @@ describe("SdkExecutor guardrail options", () => {
     assert.deepStrictEqual(Object.keys(o.agents ?? {}).sort(), ["coder", "reviewer"]);
     assert.strictEqual(o.model, "fable");
 
+    // The deferral tools are blocked so the lead can't background work to a future
+    // turn the per-turn reap would only wake to a killed subagent (#34).
+    for (const t of ["ScheduleWakeup", "CronCreate"]) {
+      assert.ok((o.disallowedTools ?? []).includes(t), `${t} must be disallowed`);
+    }
+
     // Three PreToolUse matchers: Bash, the file tools, and the Agent guard.
     const matchers = (o.hooks?.PreToolUse ?? []).map((m) => m.matcher);
     assert.deepStrictEqual(matchers, ["Bash", "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep", "Agent"]);
@@ -247,13 +253,16 @@ describe("SdkExecutor guardrail options", () => {
       { signal: new AbortController().signal },
     );
     assert.strictEqual((denied as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision, "deny");
-    // ...but allows an assembled subagent.
+    // ...but allows an assembled subagent, forcing it to run synchronously (#34).
     const allowed = await agentHook(
       { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "coder" } } as unknown as HookInput,
       "tu",
       { signal: new AbortController().signal },
     );
-    assert.deepStrictEqual(allowed, {});
+    assert.strictEqual(
+      (allowed as { hookSpecificOutput?: { updatedInput?: Record<string, unknown> } }).hookSpecificOutput?.updatedInput?.run_in_background,
+      false,
+    );
   });
 
   it("hands the SDK a sparse env with no worker secrets (every turn)", async () => {

@@ -48,6 +48,17 @@ import type { Logger } from "./log.js";
  */
 export const NESTED_AGENT_TOOL = "Agent";
 
+/**
+ * Tools that let an agent DEFER work to a future turn (schedule a wakeup / a
+ * session-scoped cron). Disallowed for a uzi run (wired in sdk-executor): a run
+ * is a bounded task and the executor tears the agent tree down at every turn
+ * boundary, so a deferred wakeup would only ever wake to a killed subagent.
+ * Blocking these — together with forcing synchronous in-turn delegation
+ * (buildAgentGuardHook) — makes multi-agent delegation actually work without
+ * reopening B1 (no subagent survives into the worker's PAT-bearing push). (#34)
+ */
+export const ASYNC_DEFERRAL_TOOLS = ["ScheduleWakeup", "CronCreate"] as const;
+
 /** Result of screening one Bash command against the deny-list. */
 export interface BashScreenResult {
   denied: boolean;
@@ -64,12 +75,24 @@ const REASON_CONFIG_WRITE = "denied by guardrail: modifying remote/core/http/cre
 const REASON_ENV = "denied by guardrail: reading the process environment is not permitted";
 const REASON_PS = "denied by guardrail: inspecting the process table is not permitted";
 const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
+const REASON_SECRET_FILE = "denied by guardrail: reading the worker credential file is not permitted";
 const REASON_DEPTH = "denied by guardrail: command wrapping is nested too deeply to screen safely";
 const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted";
 const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not permitted";
 const REASON_UNKNOWN_SUBAGENT = "denied by guardrail: only the run's assembled subagents may be invoked";
 
 const MAX_DEPTH = 6;
+
+// The worker's join-token file is delivered under a Docker/k8s secret mount. A
+// read-only mount can't be unlinked, so the file persists and is same-uid
+// readable — and the file-tool jail only covers Read/Grep/Glob, not a Bash `cat`.
+// Deny any Bash reference to the secret-mount prefix (symmetric with the /proc
+// deny). Like the /proc Bash-deny this is a BAR-RAISE, not a complete close: a
+// script that reads the file, a shell-indirection primitive, or another read tool
+// can still reach a same-uid-readable file; the real close is the k8s uid split
+// (docs/proc-hardening.md). The specific UZI_WORKER_TOKEN_FILE path (if outside
+// this prefix) is added at the hook via `extraSecretPaths`.
+const SECRET_PATH_PREFIXES = ["/run/secrets/"];
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
 // Wrappers that prefix a real command; skip the wrapper (and its options) and
@@ -94,6 +117,11 @@ const GIT_CONFIG_VALUE_OPTS = new Set(["--file", "-f", "--type", "--blob"]);
 
 const deny = (reason: string): BashScreenResult => ({ denied: true, reason });
 const ALLOW: BashScreenResult = { denied: false };
+
+/** True if `s` references any configured secret-mount path (the worker token file). */
+function hitsSecret(s: string, secretPaths: readonly string[]): boolean {
+  return secretPaths.some((p) => p.length > 0 && s.includes(p));
+}
 
 // --- tokenizer ---------------------------------------------------------------
 
@@ -252,9 +280,10 @@ function analyzeGit(args: string[]): BashScreenResult {
 }
 
 /** Analyze one simple command (operator-free word list) after wrapper peeling. */
-function analyzeSimple(cmd: string[]): BashScreenResult {
+function analyzeSimple(cmd: string[], secretPaths: readonly string[]): BashScreenResult {
   if (cmd.length === 0) return ALLOW;
   if (cmd.some((w) => w.includes("/proc/"))) return deny(REASON_PROC);
+  if (cmd.some((w) => hitsSecret(w, secretPaths))) return deny(REASON_SECRET_FILE);
   const base = basename(cmd[0]!).toLowerCase();
   if (base === "printenv" || base === "env") return deny(REASON_ENV);
   if (base === "ps" || base === "pgrep") return deny(REASON_PS);
@@ -263,7 +292,7 @@ function analyzeSimple(cmd: string[]): BashScreenResult {
 }
 
 /** Peel `env`/shell/`eval`/generic wrappers, then screen the real command. */
-function analyzeSegment(words: string[], depth: number): BashScreenResult {
+function analyzeSegment(words: string[], depth: number, secretPaths: readonly string[]): BashScreenResult {
   let i = 0;
   while (i < words.length) {
     const base = basename(words[i]!).toLowerCase();
@@ -284,12 +313,12 @@ function analyzeSegment(words: string[], depth: number): BashScreenResult {
 
     if (SHELLS.has(base)) {
       const inner = shellDashCArg(words, i + 1);
-      if (inner !== undefined) return screenWithDepth(inner, depth + 1);
+      if (inner !== undefined) return screenWithDepth(inner, depth + 1, secretPaths);
       return ALLOW; // `bash script.sh` — the script file cannot be inspected statically
     }
 
     if (base === "eval") {
-      return screenWithDepth(words.slice(i + 1).join(" "), depth + 1);
+      return screenWithDepth(words.slice(i + 1).join(" "), depth + 1, secretPaths);
     }
 
     if (GENERIC_WRAPPERS.has(base)) {
@@ -300,14 +329,15 @@ function analyzeSegment(words: string[], depth: number): BashScreenResult {
     }
     break;
   }
-  return analyzeSimple(words.slice(i));
+  return analyzeSimple(words.slice(i), secretPaths);
 }
 
-function screenWithDepth(command: string, depth: number): BashScreenResult {
+function screenWithDepth(command: string, depth: number, secretPaths: readonly string[]): BashScreenResult {
   if (depth > MAX_DEPTH) return deny(REASON_DEPTH);
   if (command.includes("/proc/")) return deny(REASON_PROC);
+  if (hitsSecret(command, secretPaths)) return deny(REASON_SECRET_FILE);
   for (const seg of splitSegments(tokenize(command))) {
-    const r = analyzeSegment(seg, depth);
+    const r = analyzeSegment(seg, depth, secretPaths);
     if (r.denied) return r;
   }
   return ALLOW;
@@ -316,10 +346,12 @@ function screenWithDepth(command: string, depth: number): BashScreenResult {
 /**
  * Screen a single Bash command string against the deny-list. Pure and
  * synchronous so the guardrail suite can assert it directly with NO live
- * Anthropic session.
+ * Anthropic session. `extraSecretPaths` are additional worker-credential file
+ * paths to deny (the configured UZI_WORKER_TOKEN_FILE), on top of the built-in
+ * `/run/secrets/` secret-mount prefix.
  */
-export function screenBashCommand(command: string): BashScreenResult {
-  return screenWithDepth(command, 0);
+export function screenBashCommand(command: string, extraSecretPaths: readonly string[] = []): BashScreenResult {
+  return screenWithDepth(command, 0, [...SECRET_PATH_PREFIXES, ...extraSecretPaths]);
 }
 
 /** Extract the `command` field from a Bash tool_input, if present. */
@@ -336,8 +368,15 @@ function bashCommandOf(toolInput: unknown): string | undefined {
  * Bash tool runs; a matching command is denied with a static reason. Anything
  * that is not a Bash tool call, or a Bash command that passes the deny-list,
  * returns no decision (the tool proceeds under `bypassPermissions`).
+ *
+ * `extraSecretPaths` are worker-credential file paths (the configured
+ * UZI_WORKER_TOKEN_FILE) to deny a Bash read of, on top of the built-in
+ * `/run/secrets/` prefix.
  */
-export function buildPreToolUseHook(log: Logger): (input: HookInput) => Promise<HookJSONOutput> {
+export function buildPreToolUseHook(
+  log: Logger,
+  extraSecretPaths: readonly string[] = [],
+): (input: HookInput) => Promise<HookJSONOutput> {
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Bash") {
       return {};
@@ -345,7 +384,7 @@ export function buildPreToolUseHook(log: Logger): (input: HookInput) => Promise<
     const command = bashCommandOf(input.tool_input);
     if (command === undefined) return {};
 
-    const screen = screenBashCommand(command);
+    const screen = screenBashCommand(command, extraSecretPaths);
     if (!screen.denied) return {};
 
     // Log the denial (reason only — never the command) so an operator can see
@@ -371,13 +410,27 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
 }
 
 /**
- * Build the PreToolUse hook that hard-fails any Agent invocation whose
- * `subagent_type` is not one of the run's assembled subagents (M4 audit item 7).
- * The SDK's built-in `general-purpose` agent AUGMENTS our programmatic `agents`
- * map and is otherwise invokable unbounded — so an allow-list of exactly our
- * subagent names denies it (and any typo/hallucinated role), which is both
- * defense-in-depth and cost control. The lead keeps the Agent tool to delegate to
- * the allowed roles; every subagent already carries `disallowedTools:['Agent']`.
+ * Build the PreToolUse hook for the Agent (subagent-invocation) tool. It does two
+ * things:
+ *
+ *  1. hard-fails any invocation whose `subagent_type` is not one of the run's
+ *     assembled subagents (M4 audit item 7). The SDK's built-in `general-purpose`
+ *     agent AUGMENTS our programmatic `agents` map and is otherwise invokable
+ *     unbounded — an allow-list of exactly our subagent names denies it (and any
+ *     typo/hallucinated role): defense-in-depth + cost control.
+ *
+ *  2. for an ALLOWED subagent, rewrites the input to `run_in_background: false`,
+ *     forcing SYNCHRONOUS in-turn delegation (#34). The SDK's Agent tool runs
+ *     subagents in the BACKGROUND by default, but the executor drives one turn to
+ *     its result frame then abort()s + group-kills the whole agent tree (B1) — so
+ *     a backgrounded subagent is terminated before it does any work and delegation
+ *     silently no-ops (the live run burned iterations on this). Running the
+ *     subagent synchronously makes it complete IN-TURN, before the turn-end reap,
+ *     so delegation works AND B1 stays closed (no survivor into the PAT push).
+ *
+ * The lead keeps the Agent tool to delegate to the allowed roles; every subagent
+ * already carries `disallowedTools:['Agent']`, so this hook only ever sees the
+ * lead's calls.
  */
 export function buildAgentGuardHook(
   allowed: Iterable<string>,
@@ -387,13 +440,26 @@ export function buildAgentGuardHook(
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse" || input.tool_name !== NESTED_AGENT_TOOL) return {};
     const sub = subagentTypeOf(input.tool_input);
-    if (sub !== undefined && allowSet.has(sub)) return {};
-    log.warn("guardrail denied an unexpected subagent", { subagent_type: sub ?? null });
+    if (sub === undefined || !allowSet.has(sub)) {
+      log.warn("guardrail denied an unexpected subagent", { subagent_type: sub ?? null });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: REASON_UNKNOWN_SUBAGENT,
+        },
+      };
+    }
+    // Allowed subagent: force synchronous delegation. Already-synchronous calls
+    // pass through untouched.
+    const original = input.tool_input && typeof input.tool_input === "object"
+      ? (input.tool_input as Record<string, unknown>)
+      : {};
+    if (original["run_in_background"] === false) return {};
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: REASON_UNKNOWN_SUBAGENT,
+        updatedInput: { ...original, run_in_background: false },
       },
     };
   };

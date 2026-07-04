@@ -1,0 +1,106 @@
+# M6 E2E overlay. Layered on the base docker-compose.yml:
+#   docker compose -f docker-compose.yml -f e2e/docker-compose.e2e.yml ...
+#
+# It adds a fake GitLab (forge-fake) and rewires api + agent to use it with
+# dummy credentials and the stub executor. Everything the harness needs at
+# runtime (self-signed cert, the worker-token file, the local bare git remote,
+# the insteadOf gitconfig) lives under ${E2E_RUN_DIR}, a per-run scratch dir the
+# driver bind-mounts in. See e2e/run-e2e.sh and e2e/README.md.
+
+services:
+  # Fake GitLab: HTTPS v4 API subset + MR recorder. Reachable in-network as
+  # forge-fake.e2e (the api SSRF allowlist + the worker MR guard both require an
+  # https base, and NormalizeForgeBaseURL drops the port — so it must be :443).
+  forge-fake:
+    build: ./e2e/forge-fake
+    environment:
+      # Used only by the optional git smart-HTTP endpoint (E2E_GIT_SMART_HTTP): the
+      # worker's git-over-HTTPS Basic credential must decode to this user:pat, or
+      # forge-fake 401s the clone/push. Dormant in the default (local-remote) run.
+      FORGE_FAKE_EXPECT_USER: uzi-bot
+      FORGE_FAKE_EXPECT_PAT: e2e-dummy-forge-pat-000000
+    volumes:
+      - ${E2E_RUN_DIR}/certs:/certs:ro
+      # The bare repo served over git smart-HTTP (E2E_GIT_SMART_HTTP variant).
+      - ${E2E_RUN_DIR}/fakeremote:/gitroot
+    networks:
+      default:
+        aliases:
+          - forge-fake.e2e
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('https').get({host:'127.0.0.1',port:443,path:'/_e2e/health',rejectUnauthorized:false},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
+
+  # Publish the SPA/nginx origin on a per-run high port so the harness never
+  # collides with the user's own `uzi` stack on 8080. `!override` replaces the
+  # base ports list (compose would otherwise append and keep 8080 bound).
+  web:
+    ports: !override
+      - "127.0.0.1:${E2E_WEB_PORT}:8080"
+
+  api:
+    environment:
+      # Trust forge-fake's self-signed cert (Go honors SSL_CERT_FILE; the api
+      # makes no other outbound TLS call in the E2E).
+      SSL_CERT_FILE: /certs/cert.pem
+      # Match the per-run published web port (base default is :8080).
+      FRONTEND_ORIGIN: http://127.0.0.1:${E2E_WEB_PORT}
+      # Give the restart-resilience step head-room to re-queue the orphaned run.
+      RUN_MAX_REQUEUES: "3"
+      # Point the SSRF allowlist + the boot seed at the fake forge.
+      FORGE_ALLOWED_BASE_URLS: https://forge-fake.e2e
+      # Poll rarely: the harness drives issues/runs directly; a long interval keeps
+      # a reconcile pass from racing the assertions (forge-fake also returns the
+      # created issues, so a poll would be a no-op either way).
+      FORGE_POLL_INTERVAL: 24h
+      # Deterministic bootstrap (no registration race): seed the admin, the
+      # Anthropic token (dummy), and the forge connection + repo at boot. All
+      # dummy per the testing-credentials policy.
+      UZI_SEED_EMAIL: admin@uzi.e2e
+      UZI_SEED_PASSWORD: e2e-admin-password-000000
+      UZI_SEED_NAME: E2E Admin
+      UZI_SEED_ANTHROPIC_TOKEN: sk-ant-e2e-dummy-do-not-use-000000
+      UZI_SEED_FORGE_PAT: e2e-dummy-forge-pat-000000
+      UZI_SEED_FORGE_BASE_URL: https://forge-fake.e2e
+      UZI_SEED_FORGE_REPOS: group/repo
+    volumes:
+      - ${E2E_RUN_DIR}/certs:/certs:ro
+    depends_on:
+      forge-fake:
+        condition: service_healthy
+
+  agent:
+    environment:
+      # stub by default (no live session); the harness can flip this to `sdk` for
+      # the OPTIONAL user-gated live capstone (UZI_E2E_EXECUTOR=sdk — see README).
+      UZI_EXECUTOR: ${UZI_E2E_EXECUTOR:-stub}
+      # Drive the M4 plan gate from the stub (no live Anthropic session). The SDK
+      # executor ignores this flag, so it is harmless in `sdk` mode.
+      UZI_STUB_PLAN_GATE: "1"
+      # Structural /proc hardening (M6): deliver the join token via a file, not an
+      # env var, so it never lands in the worker's /proc/<pid>/environ. The worker
+      # reads it once and unlinks it. The harness (re)writes it before every start.
+      UZI_WORKER_TOKEN_FILE: /worker-secret/token
+      HOME: /home/uzi
+      # Trust forge-fake's cert for the worker's MR fetch (Node) and any git-over-
+      # https (git). The git remote is actually local (insteadOf below), so git
+      # never does TLS here — GIT_SSL_CAINFO is belt-and-suspenders.
+      NODE_EXTRA_CA_CERTS: /certs/cert.pem
+      GIT_SSL_CAINFO: /certs/cert.pem
+      # Rewrite the https clone/push URL the api hands out to the local bare repo
+      # standing in for GitLab's git server (a real remote the worker pushes to).
+      GIT_CONFIG_GLOBAL: /e2e-git/gitconfig
+      WORKER_HEARTBEAT_INTERVAL: 5s
+      WORKER_POLL_INTERVAL: 2s
+    volumes:
+      - ${E2E_RUN_DIR}/certs:/certs:ro
+      - ${E2E_RUN_DIR}/worker-secret:/worker-secret
+      - ${E2E_RUN_DIR}/agent-gitconfig:/e2e-git:ro
+      - ${E2E_RUN_DIR}/fakeremote:/fakeremote

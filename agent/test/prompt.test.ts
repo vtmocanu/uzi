@@ -108,5 +108,8 @@ describe("buildLeadSystemPrompt", () => {
     assert.match(LEAD_GUARDRAIL_APPEND, /do not spawn any other agents/i);
     assert.match(LEAD_GUARDRAIL_APPEND, /submit_plan/);
     assert.match(LEAD_GUARDRAIL_APPEND, /signal_done/);
+    // Synchronous-delegation instruction (#34): delegate in-turn, never background.
+    assert.match(LEAD_GUARDRAIL_APPEND, /synchronously/i);
+    assert.match(LEAD_GUARDRAIL_APPEND, /background/i);
   });
 });

@@ -222,6 +222,34 @@ describe("RunRunner — plan gate + steering end to end", () => {
     assert.ok(states.some((s) => s.status === "running" && s.iteration_count === 1));
   });
 
+  it("stub executor with planGate halts at awaiting_approval, then completes on approve", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(24);
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "awaiting_approval", "running", "completed"]);
+    const gate = api.states.find((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")!.body;
+    assert.match(gate.plan_md ?? "", /Stub plan for issue #24/);
+    const completed = api.states.find((s) => s.body.status === "completed")!.body;
+    assert.strictEqual(completed.branch, "agent/issue-24");
+    assert.strictEqual(completed.mr_iid, 42);
+    assert.strictEqual(calls.length, 1, "one MR opened after approval");
+    // The plan reached the run stream exactly once.
+    assert.strictEqual(api.messages(claim.run_id).filter((m) => m.kind === "plan").length, 1);
+  });
+
+  it("stub executor with planGate fails verbatim when the plan is rejected", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(25);
+    api.setInputs(claim.run_id, [input("reject_plan", "not this way")]);
+    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.strictEqual(failed!.body.failure_reason, "not this way");
+    assert.strictEqual(calls.length, 0, "no MR on rejection");
+  });
+
   it("fails with the rejection reason (verbatim) when the plan is rejected", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(22);

@@ -30,7 +30,7 @@ import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { assembleAgents } from "./agents.js";
 import { buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt } from "./prompt.js";
-import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL } from "./guardrails.js";
+import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
@@ -71,6 +71,8 @@ export interface SdkExecutorOptions {
   spawn?: (opts: SpawnOptions) => { pid?: number };
   /** Group-kill a pid (default = killProcessGroup). Injected in tests. */
   kill?: (pid: number | undefined) => boolean;
+  /** Worker-credential file paths (UZI_WORKER_TOKEN_FILE) the Bash guard denies. */
+  secretPaths?: readonly string[];
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -95,6 +97,7 @@ export class SdkExecutor implements Executor {
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
+  private readonly secretPaths: readonly string[];
   /** Every pid spawned across the current run's turns, for the done-path reap. */
   private readonly spawnedPids = new Set<number>();
 
@@ -110,6 +113,7 @@ export class SdkExecutor implements Executor {
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
+    this.secretPaths = opts.secretPaths ?? [];
   }
 
   /**
@@ -156,12 +160,16 @@ export class SdkExecutor implements Executor {
       mcpServers: { [SIGNAL_SERVER_NAME]: buildSignalMcpServer() },
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
+      // Block the deferral tools so the lead can't background work to a future
+      // turn that the per-turn reap would only wake to a killed subagent (#34).
+      // Delegation is forced synchronous by the Agent guard hook below.
+      disallowedTools: [...ASYNC_DEFERRAL_TOOLS],
       // The load-bearing deny layer: a PreToolUse deny blocks a tool even under
       // bypassPermissions. Bash screening, the file-tool path jail, AND the M4
       // hard-fail-on-unexpected-subagent guard (item 7) all live here.
       hooks: {
         PreToolUse: [
-          { matcher: "Bash", hooks: [buildPreToolUseHook(this.log)] },
+          { matcher: "Bash", hooks: [buildPreToolUseHook(this.log, this.secretPaths)] },
           {
             matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
             hooks: [buildPathGuardHook(ctx.worktreePath, this.log)],

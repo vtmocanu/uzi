@@ -1,5 +1,7 @@
 import os from "node:os";
+import fs from "node:fs";
 import type { LogLevel } from "./log.js";
+import { errMessage } from "./util.js";
 
 // Worker configuration, parsed from env (PRD #4 §Configuration).
 //
@@ -18,6 +20,21 @@ export interface Config {
   version: string;
   /** `sdk` = Claude Agent SDK (default, product path); `stub` = M2 no-AI stub. */
   executor: ExecutorKind;
+  /**
+   * When true (UZI_STUB_PLAN_GATE), the `stub` executor drives the M4 plan gate
+   * (emit plan → awaiting_approval → await verdict) before committing, so the
+   * full plan-approval workflow can be exercised end-to-end with no live SDK.
+   * Off by default: the bare M2 stub goes straight to a local commit.
+   */
+  stubPlanGate: boolean;
+  /**
+   * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. A
+   * read-only secret mount (the shipping compose default) can't be unlinked, so
+   * the token file persists and is same-uid readable; the Bash guardrail denies a
+   * `cat` of this path (symmetric with its /proc deny). Undefined for env-var
+   * delivery.
+   */
+  workerTokenFile?: string;
   heartbeatIntervalMs: number;
   pollIntervalMs: number;
   /** How long messages accumulate before a batched POST (PRD: 500ms). */
@@ -74,16 +91,55 @@ function parseExecutor(v: string | undefined): ExecutorKind {
   throw new Error(`invalid UZI_EXECUTOR ${JSON.stringify(v)} (expected "sdk" or "stub")`);
 }
 
+function parseBool(v: string | undefined): boolean {
+  const s = v?.trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes";
+}
+
+/**
+ * Resolve the worker join token. UZI_WORKER_TOKEN_FILE (a path) is preferred and
+ * is the STRUCTURAL /proc hardening (M6): delivering the token via a file rather
+ * than an env var keeps it out of the worker's `/proc/<pid>/environ`, where a
+ * same-uid agent subprocess (`cat <symlink>/self/environ`) could otherwise read
+ * it. After reading, the file is unlinked so it does not rest on disk for the
+ * agent's Bash to `cat` either — best-effort, since a read-only secret mount
+ * (k8s Secret, `--read-only`) cannot be unlinked; the environ win holds
+ * regardless. Falls back to UZI_WORKER_TOKEN (env) for backward compatibility.
+ */
+function resolveWorkerToken(env: NodeJS.ProcessEnv): string {
+  const file = env.UZI_WORKER_TOKEN_FILE?.trim();
+  if (file) {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch (err) {
+      throw new Error(`cannot read UZI_WORKER_TOKEN_FILE ${file}: ${errMessage(err)}`);
+    }
+    const token = raw.trim();
+    if (token === "") throw new Error(`UZI_WORKER_TOKEN_FILE ${file} is empty`);
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // Read-only mount or already gone: the token is no longer in environ, which
+      // is the primary win; the on-disk residue is only a defense-in-depth extra.
+    }
+    return token;
+  }
+  return required(env, "UZI_WORKER_TOKEN");
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
   const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
   return {
     apiUrl,
-    workerToken: required(env, "UZI_WORKER_TOKEN"),
+    workerToken: resolveWorkerToken(env),
     dataDir: env.UZI_DATA_DIR?.trim() || "/data",
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
     version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m4",
     executor: parseExecutor(env.UZI_EXECUTOR),
+    stubPlanGate: parseBool(env.UZI_STUB_PLAN_GATE),
+    workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),
     messageBatchMs: duration(env, "WORKER_MESSAGE_BATCH_INTERVAL", "500ms"),
