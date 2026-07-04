@@ -115,6 +115,16 @@ func run() error {
 	if err := seed.ForgeConnection(ctx, q, svc, cfg); err != nil {
 		return err
 	}
+	// Optional startup Anthropic-token seed for the seed admin (dev convenience:
+	// survives `docker compose down -v` so the token need not be re-pasted). Runs
+	// after the admin seed (whose user it belongs to). Create-only and
+	// format-checked only — it seeds the operator's EXISTING token, never mints a
+	// credential, never does a live/network check, and never logs the value. A DB
+	// error or a malformed configured token aborts boot; an already-present token
+	// is left untouched.
+	if err := seed.AnthropicToken(ctx, q, box, cfg); err != nil {
+		return err
+	}
 
 	// Agent-runtime service (PRD #4): the run queue, worker protocol, and sweeper
 	// DB work. Shares the same secret cipher (sole key holder) as the forge svc.

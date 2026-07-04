@@ -74,6 +74,14 @@ type Config struct {
 	SeedForgeBaseURL string
 	SeedForgeRepos   []string
 
+	// SeedAnthropicToken optionally seeds the seed admin's Anthropic token from
+	// UZI_SEED_ANTHROPIC_TOKEN at startup (create-only), so a local
+	// `docker compose down -v` does not force re-pasting it. Empty disables it.
+	// Requires SeedEmail (the token belongs to that user), rejected at Load
+	// otherwise. This seeds the operator's EXISTING token — it never mints one —
+	// and is format-checked (never network-verified) at seed time.
+	SeedAnthropicToken string
+
 	// Agent-runtime (PRD #4) knobs. All have safe defaults; none is a boot guard
 	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
@@ -169,6 +177,10 @@ func Load() (Config, error) {
 	if err := loadSeedForge(&cfg); err != nil {
 		return Config{}, err
 	}
+	// Must run after loadSeedAdmin (the token belongs to the seed admin).
+	if err := loadSeedAnthropic(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
@@ -231,6 +243,25 @@ func loadSeedForge(cfg *Config) error {
 	cfg.SeedForgePAT = pat
 	cfg.SeedForgeBaseURL = norm
 	cfg.SeedForgeRepos = parseCommaList(os.Getenv("UZI_SEED_FORGE_REPOS"))
+	return nil
+}
+
+// loadSeedAnthropic reads the optional startup Anthropic-token seed. It is off
+// unless UZI_SEED_ANTHROPIC_TOKEN is set; when set it requires the admin seed
+// (the token belongs to that user) or boot fails — a set-but-invalid seed is a
+// loud misconfiguration, consistent with loadSeedAdmin/loadSeedForge. Only the
+// static presence/pairing is checked here; the token FORMAT is validated at seed
+// time (no network, never logged), never here where a bad value could surface in
+// an error. The trimmed value is stored, mirroring how the forge PAT is stored.
+func loadSeedAnthropic(cfg *Config) error {
+	token := strings.TrimSpace(os.Getenv("UZI_SEED_ANTHROPIC_TOKEN"))
+	if token == "" {
+		return nil
+	}
+	if cfg.SeedEmail == "" {
+		return fmt.Errorf("UZI_SEED_ANTHROPIC_TOKEN is set but UZI_SEED_EMAIL is not; the seeded token must belong to the seed admin")
+	}
+	cfg.SeedAnthropicToken = token
 	return nil
 }
 
