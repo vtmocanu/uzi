@@ -1,0 +1,100 @@
+package handler
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+)
+
+// protocolStore is a minimal workersvc.Store for the worker-protocol HTTP tests:
+// it embeds the interface (unused methods panic) and overrides only the queries
+// the tested paths reach.
+type protocolStore struct {
+	workersvc.Store
+	claimErr      error
+	ownedRun      store.Run
+	ownedErr      error
+	completedRows int64
+}
+
+func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
+	return store.Run{}, p.claimErr
+}
+func (p *protocolStore) GetRunOwnedByWorker(context.Context, store.GetRunOwnedByWorkerParams) (store.Run, error) {
+	return p.ownedRun, p.ownedErr
+}
+func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedParams) (int64, error) {
+	return p.completedRows, nil
+}
+
+func newProtocolHandler(t *testing.T, st workersvc.Store) *Handler {
+	t.Helper()
+	box, err := secretbox.New(make([]byte, secretbox.KeySize))
+	if err != nil {
+		t.Fatalf("new box: %v", err)
+	}
+	return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{})}
+}
+
+// workerCtx builds a request carrying an authenticated worker plus a chi {id}
+// route param, the way RequireWorker + the router would.
+func workerReq(method, body string, runID uuid.UUID) *http.Request {
+	req := httptest.NewRequest(method, "/api/worker/x", strings.NewReader(body))
+	ctx := mw.ContextWithWorker(req.Context(), store.Worker{ID: uuid.New(), UserID: uuid.New()})
+	if runID != uuid.Nil {
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", runID.String())
+		ctx = context.WithValue(ctx, chi.RouteCtxKey, rctx)
+	}
+	return req.WithContext(ctx)
+}
+
+func TestWorkerClaimIdleReturns204NoBody(t *testing.T) {
+	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
+	rec := httptest.NewRecorder()
+	h.WorkerClaim(rec, workerReq(http.MethodPost, "", uuid.Nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("204 must have an empty body, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerStateAlreadyTerminalReturns409(t *testing.T) {
+	runID := uuid.New()
+	// Owned run is cancelled; the guarded completed-update touches 0 rows.
+	h := newProtocolHandler(t, &protocolStore{
+		ownedRun:      store.Run{ID: runID, Status: "cancelled"},
+		completedRows: 0,
+	})
+	rec := httptest.NewRecorder()
+	h.WorkerRunState(rec, workerReq(http.MethodPost, `{"status":"completed"}`, runID))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (already-terminal)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "cancelled") {
+		t.Fatalf("409 body should echo the run's real status, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerMessagesForeignRunReturns404(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedErr: pgx.ErrNoRows})
+	rec := httptest.NewRecorder()
+	h.WorkerRunMessages(rec, workerReq(http.MethodPost, `{"messages":[{"seq":1,"kind":"text","payload":{}}]}`, runID))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (run not owned by this worker)", rec.Code)
+	}
+}

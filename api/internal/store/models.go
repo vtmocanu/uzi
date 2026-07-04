@@ -65,6 +65,49 @@ type Repo struct {
 	Enabled           bool        `json:"enabled"`
 }
 
+type Run struct {
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	IssueIid         int64              `json:"issue_iid"`
+	IssueTitle       string             `json:"issue_title"`
+	IssueDescription string             `json:"issue_description"`
+	Status           string             `json:"status"`
+	RequeueCount     int32              `json:"requeue_count"`
+	WorkerID         pgtype.UUID        `json:"worker_id"`
+	SessionID        pgtype.Text        `json:"session_id"`
+	LastSeq          int32              `json:"last_seq"`
+	Branch           pgtype.Text        `json:"branch"`
+	MrIid            pgtype.Int8        `json:"mr_iid"`
+	FailureReason    pgtype.Text        `json:"failure_reason"`
+	PlanMd           pgtype.Text        `json:"plan_md"`
+	IterationCount   int32              `json:"iteration_count"`
+	ClaimedAt        pgtype.Timestamptz `json:"claimed_at"`
+	StartedAt        pgtype.Timestamptz `json:"started_at"`
+	FinishedAt       pgtype.Timestamptz `json:"finished_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RunMessage struct {
+	ID        int64              `json:"id"`
+	RunID     uuid.UUID          `json:"run_id"`
+	Seq       int32              `json:"seq"`
+	Kind      string             `json:"kind"`
+	Agent     pgtype.Text        `json:"agent"`
+	Payload   []byte             `json:"payload"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunUserInput struct {
+	ID         int64              `json:"id"`
+	RunID      uuid.UUID          `json:"run_id"`
+	Kind       string             `json:"kind"`
+	Body       pgtype.Text        `json:"body"`
+	ConsumedAt pgtype.Timestamptz `json:"consumed_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
 type User struct {
 	ID           uuid.UUID          `json:"id"`
 	Email        string             `json:"email"`
@@ -84,4 +127,16 @@ type UserSecret struct {
 	Ciphertext []byte             `json:"ciphertext"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type Worker struct {
+	ID              uuid.UUID          `json:"id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	Name            string             `json:"name"`
+	TokenHash       []byte             `json:"token_hash"`
+	Status          string             `json:"status"`
+	LastHeartbeatAt pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version         pgtype.Text        `json:"version"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
