@@ -25,9 +25,11 @@ Knobs (env vars):
   volumes + rundir) running so the auditor can inspect logs, the claim-payload
   path, and the worker's `/data` against the live run. Prints the manual teardown
   command.
-- `UZI_E2E_PROJECT=<name>` — override the compose project name (default
+- `UZI_E2E_COMPOSE_PROJECT=<name>` — override the compose project name (default
   `uzi-e2e-$$`).
 - `E2E_RUN_DIR=<dir>` — override the scratch dir (default `$TMPDIR/uzi-e2e-$$`).
+- `UZI_E2E_COMPLETE_TIMEOUT=<seconds>` — override how long to wait for the run to
+  reach `completed` (default `90` for the stub, `1800` for the `sdk` executor).
 - `UZI_E2E_EXECUTOR=sdk` — the OPTIONAL live capstone (see below).
 
 ## What it asserts
@@ -98,6 +100,12 @@ real Claude Agent SDK:
 
 The plan-gate + restart + cancel structure is identical; only the "work" step
 becomes a real agent turn. No milestone assertion depends on this path.
+
+Because a real agent turn takes minutes (not the stub's seconds), the completion
+wait defaults to `1800`s under `UZI_E2E_EXECUTOR=sdk` (vs `90`s for the stub). The
+seeded template spawns a reviewer subagent, so long turns are by design: an
+observed live capstone took ~13 min (780s, 34 turns). Override with
+`UZI_E2E_COMPLETE_TIMEOUT=<seconds>` if your turn runs longer.
 
 Note: the base `docker-compose.yml` now wires `UZI_SEED_ANTHROPIC_TOKEN` from
 `.env` into the api service (an M6 fix — it was missing, so the token boot-seed
