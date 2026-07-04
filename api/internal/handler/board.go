@@ -113,17 +113,9 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	inProgressPos, maxPos := -1, -1
-	for _, c := range cols {
-		if c.LabelName == board.ColumnHumanReview {
-			return true // already present
-		}
-		if c.LabelName == board.ColumnInProgress {
-			inProgressPos = int(c.Position)
-		}
-		if int(c.Position) > maxPos {
-			maxPos = int(c.Position)
-		}
+	pos, needed := humanReviewPlacement(cols)
+	if !needed {
+		return true // already present — idempotent, no forge or DB work
 	}
 
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
@@ -136,10 +128,6 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 	if err := f.EnsureLabels(r.Context(), repo.ForgeProjectID, []forge.Label{{Name: board.ColumnHumanReview, Color: "#6e49cb"}}); err != nil {
 		slog.Warn("ensure Human Review label on the forge", "repo", repo.PathWithNamespace, "error", err)
 		return true // non-fatal: render with existing columns, retry next load
-	}
-	pos := inProgressPos + 1
-	if inProgressPos < 0 {
-		pos = maxPos + 1 // In Progress somehow absent → append
 	}
 	// Bump the columns Human Review displaces (the backlog buckets) up one so the
 	// new column lands right after In Progress with a distinct position — the same
@@ -163,6 +151,30 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 		return false
 	}
 	return true
+}
+
+// humanReviewPlacement decides whether the Human Review column must be added to a
+// board and at what position. needed is false when the column is already present
+// (which is what makes the retrofit idempotent — no re-shift on later loads).
+// Otherwise the position is right after In Progress, or the end of the board when
+// In Progress is somehow absent.
+func humanReviewPlacement(cols []store.BoardColumn) (pos int, needed bool) {
+	inProgressPos, maxPos := -1, -1
+	for _, c := range cols {
+		if c.LabelName == board.ColumnHumanReview {
+			return 0, false // already present
+		}
+		if c.LabelName == board.ColumnInProgress {
+			inProgressPos = int(c.Position)
+		}
+		if int(c.Position) > maxPos {
+			maxPos = int(c.Position)
+		}
+	}
+	if inProgressPos < 0 {
+		return maxPos + 1, true // In Progress absent → append at the end
+	}
+	return inProgressPos + 1, true
 }
 
 // seedBoard creates the default column labels on the forge, records them as
