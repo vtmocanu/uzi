@@ -51,6 +51,22 @@ export function ActivityFeed({
   const groups = useMemo(() => groupByAgent(visible), [visible]);
   const activeAgent = runningLive ? groups[groups.length - 1]?.agent : undefined;
 
+  // A tool_result is fold-skipped only when its call is ALSO in the visible
+  // window. Result pairing uses the full-message index (so a visible call still
+  // folds its result), but the skip decision is scoped to `visible`: otherwise a
+  // call capped out past the ~500-message cap while its result stays visible
+  // would skip the result AND never render its call, vanishing it from the view.
+  const visibleToolUseIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const m of visible) {
+      if (m.kind === "tool_use") {
+        const id = (m.payload as { id?: string } | null)?.id;
+        if (id) ids.add(id);
+      }
+    }
+    return ids;
+  }, [visible]);
+
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
@@ -103,6 +119,7 @@ export function ActivityFeed({
               group={g}
               live={g.agent === activeAgent}
               toolIndex={toolIndex}
+              visibleToolUseIds={visibleToolUseIds}
             />
           ))}
         </div>
@@ -115,10 +132,12 @@ function AgentBlock({
   group,
   live,
   toolIndex,
+  visibleToolUseIds,
 }: {
   group: AgentGroup;
   live: boolean;
   toolIndex: ReturnType<typeof buildToolIndex>;
+  visibleToolUseIds: Set<string>;
 }) {
   return (
     <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3">
@@ -133,10 +152,12 @@ function AgentBlock({
       </div>
       <div className="space-y-2">
         {group.messages.map((m) => {
-          // Fold a tool_result under its call (matched by id); skip it here.
+          // Fold a tool_result under its call (matched by id); skip it here — but
+          // only when the call is in the visible window, else render it standalone
+          // (its call was capped out, so nothing else would show the result).
           if (m.kind === "tool_result") {
             const useId = (m.payload as { tool_use_id?: string } | null)?.tool_use_id;
-            if (useId && toolIndex.toolUseIds.has(useId)) return null;
+            if (useId && visibleToolUseIds.has(useId)) return null;
           }
           const result =
             m.kind === "tool_use"
