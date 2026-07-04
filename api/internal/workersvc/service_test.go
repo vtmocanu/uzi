@@ -82,6 +82,12 @@ type fakeStore struct {
 	// Create worker.
 	createWorkerResult store.Worker
 	createWorkerParams *store.CreateWorkerParams
+
+	// Delete worker.
+	countActiveRuns    int64
+	countActiveParams  *store.CountWorkerNonTerminalRunsParams
+	deleteWorkerRows   int64
+	deleteWorkerParams *store.DeleteWorkerForUserParams
 }
 
 func (f *fakeStore) ClaimRun(_ context.Context, arg store.ClaimRunParams) (store.Run, error) {
@@ -212,6 +218,14 @@ func (f *fakeStore) CreateRun(_ context.Context, arg store.CreateRunParams) (sto
 func (f *fakeStore) CreateWorker(_ context.Context, arg store.CreateWorkerParams) (store.Worker, error) {
 	f.createWorkerParams = &arg
 	return f.createWorkerResult, nil
+}
+func (f *fakeStore) CountWorkerNonTerminalRuns(_ context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error) {
+	f.countActiveParams = &arg
+	return f.countActiveRuns, nil
+}
+func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorkerForUserParams) (int64, error) {
+	f.deleteWorkerParams = &arg
+	return f.deleteWorkerRows, nil
 }
 
 // testParams are sane fixed knobs for the tests.
@@ -453,6 +467,29 @@ func TestAppendMessagesRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestAppendMessagesAllOrNothingOnInvalid(t *testing.T) {
+	// A [valid, valid, invalid] batch must persist nothing: the whole batch is
+	// validated before any insert, so the first two are never half-written.
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), LastSeq: 0}}
+	svc := New(fs, newBox(t), testParams())
+
+	msgs := []IncomingMessage{
+		{Seq: 1, Kind: "text", Payload: json.RawMessage(`{"t":"hi"}`)},
+		{Seq: 2, Kind: "tool_use", Payload: json.RawMessage(`{"tool":"Edit"}`)},
+		{Seq: 3, Kind: "", Payload: json.RawMessage(`{}`)}, // invalid: empty kind
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != ErrInvalidMessage {
+		t.Fatalf("err = %v, want ErrInvalidMessage", err)
+	}
+	if len(fs.insertedMessages) != 0 {
+		t.Fatalf("a batch with any invalid message must persist nothing, got %d inserts", len(fs.insertedMessages))
+	}
+	if fs.lastSeqUpdated != nil {
+		t.Fatal("last_seq must not advance when the batch is rejected")
+	}
+}
+
 func TestAppendMessagesRejectsForeignRun(t *testing.T) {
 	fs := &fakeStore{runOwnedErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
@@ -526,6 +563,51 @@ func TestSetStateRejectsForeignRun(t *testing.T) {
 	}
 	if fs.setCompleted != nil {
 		t.Fatal("no state write should occur for a run the worker does not own")
+	}
+}
+
+func TestSetStatePersistsSessionIDWhenSet(t *testing.T) {
+	// The worker pins its SDK session by reporting session_id alongside a state
+	// transition; the service persists it in the same transition (resume plumbing).
+	w := worker()
+	fs := &fakeStore{
+		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+		setRunningRows: 1,
+	}
+	svc := New(fs, newBox(t), testParams())
+	sess := "sess-xyz-9"
+	if _, _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+		State: "running", IterationCount: 1, SessionID: &sess,
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.setRunningParams == nil {
+		t.Fatal("SetRunRunning not called")
+	}
+	if !fs.setRunningParams.SessionID.Valid || fs.setRunningParams.SessionID.String != sess {
+		t.Fatalf("session_id not persisted with the transition: %+v", fs.setRunningParams.SessionID)
+	}
+}
+
+func TestSetStateLeavesSessionIDUnsetWhenAbsent(t *testing.T) {
+	// No session_id on the report → the param is NULL, so the COALESCE keeps the
+	// run's existing session_id (never clobbered to empty).
+	w := worker()
+	fs := &fakeStore{
+		runOwned:       store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Status: "running"},
+		setRunningRows: 1,
+	}
+	svc := New(fs, newBox(t), testParams())
+	if _, _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{
+		State: "running", IterationCount: 1,
+	}); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	if fs.setRunningParams == nil {
+		t.Fatal("SetRunRunning not called")
+	}
+	if fs.setRunningParams.SessionID.Valid {
+		t.Fatalf("session_id must be NULL (no change) when the report omits it, got %+v", fs.setRunningParams.SessionID)
 	}
 }
 
@@ -750,6 +832,45 @@ func TestCreateRunRepoNotOwned(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d"); err != ErrRepoNotFound {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
+	}
+}
+
+func TestDeleteWorkerRejectedWhileHoldingActiveRuns(t *testing.T) {
+	// A worker with a non-terminal run may not be deleted: the FK is ON DELETE SET
+	// NULL, so deleting would strand the run (an awaiting_approval run matches no
+	// sweep once its worker_id is gone).
+	fs := &fakeStore{countActiveRuns: 1}
+	svc := New(fs, newBox(t), testParams())
+	user, wkrID := uuid.New(), uuid.New()
+	if err := svc.DeleteWorker(context.Background(), user, wkrID); err != ErrWorkerHasActiveRuns {
+		t.Fatalf("err = %v, want ErrWorkerHasActiveRuns", err)
+	}
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued while the worker owns active runs")
+	}
+	// The guard is user-scoped so a cross-tenant attempt still 404s (never 409).
+	if fs.countActiveParams == nil || fs.countActiveParams.UserID != user {
+		t.Fatalf("active-run count must be scoped to the requesting user: %+v", fs.countActiveParams)
+	}
+}
+
+func TestDeleteWorkerSucceedsWhenIdle(t *testing.T) {
+	fs := &fakeStore{countActiveRuns: 0, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	if err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New()); err != nil {
+		t.Fatalf("DeleteWorker: %v", err)
+	}
+	if fs.deleteWorkerParams == nil {
+		t.Fatal("an idle worker should be deleted")
+	}
+}
+
+func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
+	// No active runs and no row deleted (unknown or other-tenant id) → 404.
+	fs := &fakeStore{countActiveRuns: 0, deleteWorkerRows: 0}
+	svc := New(fs, newBox(t), testParams())
+	if err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New()); err != ErrWorkerNotFound {
+		t.Fatalf("err = %v, want ErrWorkerNotFound", err)
 	}
 }
 

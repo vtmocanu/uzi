@@ -80,7 +80,7 @@ func TestWorkerStateAlreadyTerminalReturns409(t *testing.T) {
 		completedRows: 0,
 	})
 	rec := httptest.NewRecorder()
-	h.WorkerRunState(rec, workerReq(http.MethodPost, `{"state":"completed"}`, runID))
+	h.WorkerRunState(rec, workerReq(http.MethodPost, `{"status":"completed"}`, runID))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (already-terminal)", rec.Code)
 	}

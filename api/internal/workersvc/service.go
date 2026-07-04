@@ -45,6 +45,10 @@ var (
 	ErrInvalidState    = errors.New("invalid run state")
 	ErrInvalidMessage  = errors.New("invalid run message")
 	ErrWorkerNotFound  = errors.New("worker not found")
+	// ErrWorkerHasActiveRuns rejects deletion of a worker that still owns a
+	// non-terminal run: the FK is ON DELETE SET NULL, so deleting would orphan the
+	// run past every sweep (and the one-active-run index would then block re-runs).
+	ErrWorkerHasActiveRuns = errors.New("worker has active runs")
 )
 
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
@@ -58,6 +62,7 @@ type Store interface {
 	RegisterWorker(ctx context.Context, arg store.RegisterWorkerParams) (store.Worker, error)
 	HeartbeatWorker(ctx context.Context, id uuid.UUID) (store.Worker, error)
 	DeleteWorkerForUser(ctx context.Context, arg store.DeleteWorkerForUserParams) (int64, error)
+	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
 	MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 
 	// Runs.
@@ -301,11 +306,19 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return err
 	}
+	// Validate the whole batch before persisting any of it: a single invalid
+	// message rejects the batch with nothing written (all-or-nothing), so a
+	// [valid, valid, invalid] batch never leaves the first two half-persisted.
 	var maxSeq int32
 	for _, m := range msgs {
 		if m.Seq <= 0 || m.Kind == "" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
 			return ErrInvalidMessage
 		}
+		if m.Seq > maxSeq {
+			maxSeq = m.Seq
+		}
+	}
+	for _, m := range msgs {
 		if _, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 			RunID:   runID,
 			Seq:     m.Seq,
@@ -314,9 +327,6 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			Payload: []byte(m.Payload),
 		}); err != nil {
 			return err
-		}
-		if m.Seq > maxSeq {
-			maxSeq = m.Seq
 		}
 	}
 	if maxSeq > run.LastSeq {
@@ -328,14 +338,20 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 }
 
 // StateRequest is the worker's report of a run's new state. Only the fields
-// relevant to State are read.
+// relevant to State are read. The wire key is `status` (matches the runs.status
+// column, the M2 worker client, and multica's protocol); the Go field stays
+// `State` to avoid churn in the switch below.
 type StateRequest struct {
-	State          string  `json:"state"` // running|awaiting_approval|completed|failed
+	State          string  `json:"status"` // running|awaiting_approval|completed|failed
 	PlanMd         *string `json:"plan_md"`
 	Branch         *string `json:"branch"`
 	MrIID          *int64  `json:"mr_iid"`
 	FailureReason  *string `json:"failure_reason"`
 	IterationCount int32   `json:"iteration_count"`
+	// SessionID pins the worker's SDK session for resume. Empty means "no change"
+	// (the run keeps whatever session_id it already had); when set it is persisted
+	// atomically with this state transition.
+	SessionID *string `json:"session_id"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -349,23 +365,24 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if _, err = s.runOwnedByWorker(ctx, runID, wkr); err != nil {
 		return store.Run{}, false, err
 	}
+	sessionID := textParam(req.SessionID)
 	var rows int64
 	switch req.State {
 	case "running":
 		rows, err = s.q.SetRunRunning(ctx, store.SetRunRunningParams{
-			IterationCount: req.IterationCount, ID: runID, WorkerID: pgUUID(wkr.ID),
+			IterationCount: req.IterationCount, SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "awaiting_approval":
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
-			PlanMd: textParam(req.PlanMd), ID: runID, WorkerID: pgUUID(wkr.ID),
+			PlanMd: textParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "completed":
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
-			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), ID: runID, WorkerID: pgUUID(wkr.ID),
+			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "failed":
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
-			FailureReason: textParam(req.FailureReason), ID: runID, WorkerID: pgUUID(wkr.ID),
+			FailureReason: textParam(req.FailureReason), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	default:
 		return store.Run{}, false, ErrInvalidState
@@ -442,8 +459,22 @@ func (s *Service) ListWorkers(ctx context.Context, userID uuid.UUID) ([]store.Li
 	return s.q.ListWorkersByUser(ctx, userID)
 }
 
-// DeleteWorker revokes a worker (its token stops authenticating).
+// DeleteWorker revokes a worker (its token stops authenticating). A worker that
+// still owns a non-terminal run is refused (ErrWorkerHasActiveRuns): deleting it
+// would NULL the run's worker_id and strand it (see ErrWorkerHasActiveRuns). The
+// count-then-delete is not one statement, but the worst a lost race does is
+// re-queue one run to a now-deleted worker_id, which the next claim's affinity
+// fallback and the running/claimed sweeps still recover.
 func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) error {
+	active, err := s.q.CountWorkerNonTerminalRuns(ctx, store.CountWorkerNonTerminalRunsParams{
+		WorkerID: pgUUID(workerID), UserID: userID,
+	})
+	if err != nil {
+		return err
+	}
+	if active > 0 {
+		return ErrWorkerHasActiveRuns
+	}
 	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 	if err != nil {
 		return err

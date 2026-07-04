@@ -51,6 +51,17 @@ RETURNING *;
 -- name: DeleteWorkerForUser :execrows
 DELETE FROM workers WHERE id = @id AND user_id = @user_id;
 
+-- name: CountWorkerNonTerminalRuns :one
+-- Deletion guard: a worker holding a non-terminal run may not be deleted. The FK
+-- is ON DELETE SET NULL, so deleting would orphan such a run — an awaiting_approval
+-- run matches no sweep once its worker_id is gone (the stale-worker sweeps key on
+-- worker_id), and the one-active-run index then blocks re-running the issue.
+-- Scoped by user_id so a cross-tenant delete attempt still 404s (never 409).
+SELECT count(*) FROM runs
+WHERE worker_id = @worker_id
+  AND user_id = @user_id
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: MarkStaleWorkersOffline :execrows
 -- Sweeper: workers past the heartbeat-stale window go offline.
 UPDATE workers SET status = 'offline', updated_at = now()
@@ -122,6 +133,7 @@ UPDATE runs SET
     status          = 'running',
     started_at      = COALESCE(started_at, now()),
     iteration_count = GREATEST(iteration_count, @iteration_count),
+    session_id      = COALESCE(sqlc.narg('session_id'), session_id),
     updated_at      = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -130,6 +142,7 @@ WHERE id = @id AND worker_id = @worker_id
 UPDATE runs SET
     status     = 'awaiting_approval',
     plan_md    = @plan_md,
+    session_id = COALESCE(sqlc.narg('session_id'), session_id),
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -139,6 +152,7 @@ UPDATE runs SET
     status      = 'completed',
     branch      = @branch,
     mr_iid      = @mr_iid,
+    session_id  = COALESCE(sqlc.narg('session_id'), session_id),
     finished_at = now(),
     updated_at  = now()
 WHERE id = @id AND worker_id = @worker_id
@@ -148,6 +162,7 @@ WHERE id = @id AND worker_id = @worker_id
 UPDATE runs SET
     status         = 'failed',
     failure_reason = @failure_reason,
+    session_id     = COALESCE(sqlc.narg('session_id'), session_id),
     finished_at    = now(),
     updated_at     = now()
 WHERE id = @id AND worker_id = @worker_id

@@ -228,12 +228,15 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.wsvc.DeleteWorker(r.Context(), user.ID, id); err != nil {
-		if errors.Is(err, workersvc.ErrWorkerNotFound) {
+		switch {
+		case errors.Is(err, workersvc.ErrWorkerNotFound):
 			httpx.Error(w, http.StatusNotFound, "worker not found")
-			return
+		case errors.Is(err, workersvc.ErrWorkerHasActiveRuns):
+			httpx.Error(w, http.StatusConflict, "worker has active runs; cancel them before deleting it")
+		default:
+			slog.Error("delete worker", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
-		slog.Error("delete worker", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

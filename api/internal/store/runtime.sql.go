@@ -144,6 +144,30 @@ func (q *Queries) ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]Cons
 	return items, nil
 }
 
+const countWorkerNonTerminalRuns = `-- name: CountWorkerNonTerminalRuns :one
+SELECT count(*) FROM runs
+WHERE worker_id = $1
+  AND user_id = $2
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+type CountWorkerNonTerminalRunsParams struct {
+	WorkerID pgtype.UUID `json:"worker_id"`
+	UserID   uuid.UUID   `json:"user_id"`
+}
+
+// Deletion guard: a worker holding a non-terminal run may not be deleted. The FK
+// is ON DELETE SET NULL, so deleting would orphan such a run — an awaiting_approval
+// run matches no sweep once its worker_id is gone (the stale-worker sweeps key on
+// worker_id), and the one-active-run index then blocks re-running the issue.
+// Scoped by user_id so a cross-tenant delete attempt still 404s (never 409).
+func (q *Queries) CountWorkerNonTerminalRuns(ctx context.Context, arg CountWorkerNonTerminalRunsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countWorkerNonTerminalRuns, arg.WorkerID, arg.UserID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description)
@@ -815,19 +839,26 @@ const setRunAwaitingApproval = `-- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
     status     = 'awaiting_approval',
     plan_md    = $1,
+    session_id = COALESCE($2, session_id),
     updated_at = now()
-WHERE id = $2 AND worker_id = $3
+WHERE id = $3 AND worker_id = $4
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunAwaitingApprovalParams struct {
-	PlanMd   pgtype.Text `json:"plan_md"`
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
+	PlanMd    pgtype.Text `json:"plan_md"`
+	SessionID pgtype.Text `json:"session_id"`
+	ID        uuid.UUID   `json:"id"`
+	WorkerID  pgtype.UUID `json:"worker_id"`
 }
 
 func (q *Queries) SetRunAwaitingApproval(ctx context.Context, arg SetRunAwaitingApprovalParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunAwaitingApproval, arg.PlanMd, arg.ID, arg.WorkerID)
+	result, err := q.db.Exec(ctx, setRunAwaitingApproval,
+		arg.PlanMd,
+		arg.SessionID,
+		arg.ID,
+		arg.WorkerID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -839,23 +870,26 @@ UPDATE runs SET
     status      = 'completed',
     branch      = $1,
     mr_iid      = $2,
+    session_id  = COALESCE($3, session_id),
     finished_at = now(),
     updated_at  = now()
-WHERE id = $3 AND worker_id = $4
+WHERE id = $4 AND worker_id = $5
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunCompletedParams struct {
-	Branch   pgtype.Text `json:"branch"`
-	MrIid    pgtype.Int8 `json:"mr_iid"`
-	ID       uuid.UUID   `json:"id"`
-	WorkerID pgtype.UUID `json:"worker_id"`
+	Branch    pgtype.Text `json:"branch"`
+	MrIid     pgtype.Int8 `json:"mr_iid"`
+	SessionID pgtype.Text `json:"session_id"`
+	ID        uuid.UUID   `json:"id"`
+	WorkerID  pgtype.UUID `json:"worker_id"`
 }
 
 func (q *Queries) SetRunCompleted(ctx context.Context, arg SetRunCompletedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunCompleted,
 		arg.Branch,
 		arg.MrIid,
+		arg.SessionID,
 		arg.ID,
 		arg.WorkerID,
 	)
@@ -869,20 +903,27 @@ const setRunFailed = `-- name: SetRunFailed :execrows
 UPDATE runs SET
     status         = 'failed',
     failure_reason = $1,
+    session_id     = COALESCE($2, session_id),
     finished_at    = now(),
     updated_at     = now()
-WHERE id = $2 AND worker_id = $3
+WHERE id = $3 AND worker_id = $4
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunFailedParams struct {
 	FailureReason pgtype.Text `json:"failure_reason"`
+	SessionID     pgtype.Text `json:"session_id"`
 	ID            uuid.UUID   `json:"id"`
 	WorkerID      pgtype.UUID `json:"worker_id"`
 }
 
 func (q *Queries) SetRunFailed(ctx context.Context, arg SetRunFailedParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunFailed, arg.FailureReason, arg.ID, arg.WorkerID)
+	result, err := q.db.Exec(ctx, setRunFailed,
+		arg.FailureReason,
+		arg.SessionID,
+		arg.ID,
+		arg.WorkerID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -894,13 +935,15 @@ UPDATE runs SET
     status          = 'running',
     started_at      = COALESCE(started_at, now()),
     iteration_count = GREATEST(iteration_count, $1),
+    session_id      = COALESCE($2, session_id),
     updated_at      = now()
-WHERE id = $2 AND worker_id = $3
+WHERE id = $3 AND worker_id = $4
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunRunningParams struct {
 	IterationCount int32       `json:"iteration_count"`
+	SessionID      pgtype.Text `json:"session_id"`
 	ID             uuid.UUID   `json:"id"`
 	WorkerID       pgtype.UUID `json:"worker_id"`
 }
@@ -909,7 +952,12 @@ type SetRunRunningParams struct {
 // only advances (GREATEST) so a resume never regresses the loop counter. A
 // terminal run (e.g. cancelled) is left untouched → 0 rows → "already terminal".
 func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunRunning, arg.IterationCount, arg.ID, arg.WorkerID)
+	result, err := q.db.Exec(ctx, setRunRunning,
+		arg.IterationCount,
+		arg.SessionID,
+		arg.ID,
+		arg.WorkerID,
+	)
 	if err != nil {
 		return 0, err
 	}
