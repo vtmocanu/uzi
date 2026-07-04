@@ -37,7 +37,9 @@ async function main(): Promise<void> {
   // sessions and resume still works.
   const sdkHomeDir = path.join(config.dataDir, "agent-home");
   const executor: Executor =
-    config.executor === "stub" ? new StubExecutor(log) : new SdkExecutor(log, sdkHomeDir);
+    config.executor === "stub"
+      ? new StubExecutor(log, { planGate: config.stubPlanGate })
+      : new SdkExecutor(log, sdkHomeDir);
   const runner = new RunRunner(client, git, executor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
