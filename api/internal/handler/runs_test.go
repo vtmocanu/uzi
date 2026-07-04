@@ -58,6 +58,9 @@ func (s *runsStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, 
 func (s *runsStore) ListActiveRunsAll(context.Context) ([]store.ListActiveRunsAllRow, error) {
 	return s.activeRuns, nil
 }
+func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) (store.RunUserInput, error) {
+	return store.RunUserInput{}, nil
+}
 
 func newRunsHandler(t *testing.T, st workersvc.Store) *Handler {
 	t.Helper()
@@ -77,6 +80,16 @@ func runReq(user store.User, runID uuid.UUID) *http.Request {
 		rctx.URLParams.Add("id", runID.String())
 		ctx = context.WithValue(ctx, chi.RouteCtxKey, rctx)
 	}
+	return req.WithContext(ctx)
+}
+
+// inputReq builds a POST /runs/{id}/inputs authenticated as user, carrying a JSON
+// steering body.
+func inputReq(user store.User, runID uuid.UUID, body string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/api/runs/x/inputs", strings.NewReader(body))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", runID.String())
+	ctx := context.WithValue(mw.ContextWithUser(req.Context(), user), chi.RouteCtxKey, rctx)
 	return req.WithContext(ctx)
 }
 
@@ -138,6 +151,36 @@ func TestListRunMessagesViewerAuthz(t *testing.T) {
 	h.ListRunMessages(rec, runReq(admin, runID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin messages = %d, want 200", rec.Code)
+	}
+}
+
+func TestCreateRunInputIsOwnerOnly(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &runsStore{ownerID: owner.ID, run: store.Run{ID: runID, UserID: owner.ID, Status: "running"}}
+	h := newRunsHandler(t, st)
+
+	// Owner may steer their own run.
+	rec := httptest.NewRecorder()
+	h.CreateRunInput(rec, inputReq(owner, runID, `{"kind":"follow_up","body":"keep going"}`))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("owner steering = %d, want 202", rec.Code)
+	}
+
+	// A non-owner is denied (404, indistinguishable from an unknown run).
+	rec = httptest.NewRecorder()
+	h.CreateRunInput(rec, inputReq(store.User{ID: uuid.New()}, runID, `{"kind":"follow_up","body":"x"}`))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("non-owner steering = %d, want 404", rec.Code)
+	}
+
+	// A non-owner ADMIN is ALSO denied: steering is owner-only, with no admin
+	// bypass (admin visibility is read-only — reads + WS are owner-or-admin, but
+	// approving/cancelling another user's run is not).
+	rec = httptest.NewRecorder()
+	h.CreateRunInput(rec, inputReq(store.User{ID: uuid.New(), IsAdmin: true}, runID, `{"kind":"cancel"}`))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("non-owner admin steering = %d, want 404 (steering is owner-only)", rec.Code)
 	}
 }
 

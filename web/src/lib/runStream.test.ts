@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { emptyStream, ingest, ingestMany, startRunGate } from "./runStream";
+import { applyFrame, emptyStream, ingest, ingestMany, startRunGate } from "./runStream";
 import type { RunMessage } from "./api";
 
 function msg(seq: number): RunMessage {
@@ -65,6 +65,44 @@ describe("ingest", () => {
     const r = ingest(s, msg(4)); // same future seq again
     expect(r.gap).toBe(false);
     expect(r.state.pending.size).toBe(1);
+  });
+});
+
+describe("applyFrame", () => {
+  it("ingests a contiguous message frame with no replay", () => {
+    const s = ingestMany(emptyStream(), [msg(1)]).state;
+    const r = applyFrame(s, { type: "message", seq: 2, kind: "text", payload: "x" });
+    expect(r.effects).toEqual({ replay: false, refreshRun: false });
+    expect(seqs(r.state.messages)).toEqual([1, 2]);
+  });
+
+  it("flags a replay when a message frame arrives past a gap", () => {
+    const s = ingestMany(emptyStream(), [msg(1)]).state;
+    const r = applyFrame(s, { type: "message", seq: 5, kind: "text", payload: "x" }); // 2..4 missing
+    expect(r.effects.replay).toBe(true);
+    expect(seqs(r.state.messages)).toEqual([1]); // not rendered ahead of the gap
+  });
+
+  it("backfills a hub-dropped tail message on a state frame, no reconnect", () => {
+    // The hub dropped message 3 (the last one) right before the run went
+    // awaiting_approval. Only a state frame arrives over WS.
+    const s = ingestMany(emptyStream(), [msg(1), msg(2)]).state;
+    const r = applyFrame(s, { type: "state", status: "awaiting_approval" });
+    // The state frame carries no message data, but asks for a re-read AND a replay.
+    expect(r.effects).toEqual({ replay: true, refreshRun: true });
+    expect(seqs(r.state.messages)).toEqual([1, 2]);
+    // The replay it triggers fetches messages after lastSeq (2) → [3]; ingesting
+    // that batch completes the stream — the dropped tail is recovered live.
+    const filled = ingestMany(r.state, [msg(3)]);
+    expect(seqs(filled.state.messages)).toEqual([1, 2, 3]);
+    expect(filled.state.lastSeq).toBe(3);
+  });
+
+  it("ignores an unknown frame type", () => {
+    const s = ingestMany(emptyStream(), [msg(1)]).state;
+    const r = applyFrame(s, { type: "bogus" as unknown as "state" });
+    expect(r.effects).toEqual({ replay: false, refreshRun: false });
+    expect(r.state).toBe(s);
   });
 });
 

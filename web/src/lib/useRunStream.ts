@@ -9,7 +9,7 @@ import {
   type RunMessage,
   type WsEvent,
 } from "./api";
-import { emptyStream, ingest, ingestMany, type StreamState } from "./runStream";
+import { applyFrame, emptyStream, ingestMany, type StreamState } from "./runStream";
 
 const RECONNECT_MS = 1500;
 const CATCHUP_DEBOUNCE_MS = 150;
@@ -89,20 +89,13 @@ export function useRunStream(runId: string) {
         } catch {
           return;
         }
-        if (frame.type === "message" && typeof frame.seq === "number") {
-          const msg: RunMessage = {
-            seq: frame.seq,
-            kind: frame.kind ?? "",
-            agent: frame.agent ?? null,
-            payload: frame.payload,
-            created_at: frame.created_at ?? new Date().toISOString(),
-          };
-          const r = ingest(streamRef.current, msg);
-          commit(r.state);
-          if (r.gap) scheduleCatchup();
-        } else if (frame.type === "state") {
-          void refreshRun();
-        }
+        const { state, effects } = applyFrame(streamRef.current, frame);
+        commit(state);
+        // A state frame (and any message-seq gap) triggers a replay routed through
+        // the debounced catch-up, so a hub-dropped tail message is backfilled
+        // without a reconnect — and a burst of frames coalesces into one REST call.
+        if (effects.replay) scheduleCatchup();
+        if (effects.refreshRun) void refreshRun();
       };
       ws.onclose = () => {
         setConnected(false);

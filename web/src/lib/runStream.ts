@@ -3,7 +3,7 @@
 // out of the React components so both can be unit-tested in isolation (the SPA
 // has no component test harness — see runStream.test.ts).
 
-import type { RunMessage } from "./api";
+import type { RunMessage, WsEvent } from "./api";
 
 // StreamState is the client's view of a run's message log. `messages` are the
 // contiguously-rendered messages in ascending seq order; `lastSeq` is the highest
@@ -66,6 +66,43 @@ export function ingestMany(
     gap = gap || r.gap;
   }
   return { state: cur, gap };
+}
+
+// FrameEffects are the side-effects a WS frame asks the caller to perform, kept
+// out of the pure merge so the hook can debounce/coalesce them.
+export interface FrameEffects {
+  // replay: REST-replay from lastSeq. The caller MUST route this through its
+  // debounced catch-up path so a burst of frames does not spam REST.
+  replay: boolean;
+  // refreshRun: re-read the run row (status/plan/mr/branch changed).
+  refreshRun: boolean;
+}
+
+// applyFrame folds one live WS frame into the stream and reports the side-effects
+// it triggers. A "message" frame is ingested (a seq gap asks for a replay to fill
+// it). A "state" frame carries NO authoritative data — it asks for a run re-read
+// AND a replay: the message that preceded the state report is persisted before
+// the report, so if the hub dropped that tail message (a slow-subscriber drop
+// right as the run went quiescent), the replay backfills it without a reconnect.
+export function applyFrame(
+  state: StreamState,
+  frame: WsEvent,
+): { state: StreamState; effects: FrameEffects } {
+  if (frame.type === "message" && typeof frame.seq === "number") {
+    const msg: RunMessage = {
+      seq: frame.seq,
+      kind: frame.kind ?? "",
+      agent: frame.agent ?? null,
+      payload: frame.payload,
+      created_at: frame.created_at ?? new Date().toISOString(),
+    };
+    const r = ingest(state, msg);
+    return { state: r.state, effects: { replay: r.gap, refreshRun: false } };
+  }
+  if (frame.type === "state") {
+    return { state, effects: { replay: true, refreshRun: true } };
+  }
+  return { state, effects: { replay: false, refreshRun: false } };
 }
 
 // StartRunPreconditions are the facts the board knows about an issue + the user.
