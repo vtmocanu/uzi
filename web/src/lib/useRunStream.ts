@@ -65,7 +65,13 @@ export function useRunStream(runId: string) {
     setMessages([]);
     setRun(null);
     setError("");
+    // Load the run and its message history on MOUNT, independent of the socket.
+    // The persisted log is authoritative and a page load must show existing
+    // history (and current status) immediately — even if the WS is slow to
+    // connect or never connects. The socket then only layers on live deltas, and
+    // its onopen replay backfills anything that landed during the connect window.
     void refreshRun();
+    void replay();
 
     const scheduleCatchup = () => {
       if (catchup != null) return;
