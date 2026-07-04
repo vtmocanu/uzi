@@ -1042,3 +1042,167 @@ Serves human: testing-credentials policy (never mint an OAuth token); best-pract
   needs a unique `-p` and a scratchpad `--env-file` (a bare `up` falls back to the
   worktree `.env` whose placeholder `UZI_SECRET_KEY` intentionally crashes the api).
   The user's own stack runs on host :8080, so smokes publish elsewhere.
+
+---
+
+# PRD #7 — In-app Docs Section (terse howtos with screenshots)
+
+Serves human Feature #7 ("a docs section on uzi with relevant howtos … include
+screenshots"). **Status: M1–M5 built and merged on `prd-7-docs-section`; the only
+remaining work is swapping placeholder screenshots for Vlad's real captures in one
+final commit.** Adds **zero** new services, API routes, DB tables, or env vars —
+the whole feature is a build-time bundle plus SPA routes.
+
+## 54. Docs bundling: repo `docs/` as the single source of truth
+
+Serves human: "a docs section … howtos"; best-practice (no drift between repo docs
+and in-app docs).
+
+- The in-app docs are the **same `docs/*.md` files** the repo already carries — the
+  web build imports them at **build time**, so there is structurally no second copy
+  to drift. Chosen over an API endpoint or a duplicated `web/src/docs/` tree (single
+  source of truth, no runtime moving parts); the cost is a widened compose build
+  context, judged cheap.
+- **Mechanism** (`web/src/lib/docs.ts`): a Vite eager glob imports `../../../docs/*.md`
+  as raw strings (`query: "?raw"`) and `../../../docs/img/*` as hashed asset URLs
+  (`query: "?url"`, emitted as lazily-fetched files, **not** inlined into the JS
+  bundle so per-image cost is a page download bounded by the size budget in §58).
+- **Sibling-layout invariant**: the globs resolve **relative to the source file**, so
+  the `web/`↔`docs/` sibling layout must survive into the image. `docker-compose.yml`
+  `web.build` is `{ context: ., dockerfile: web/Dockerfile }` (repo root, not `./web`);
+  the Dockerfile copies `web/` and `docs/` into `/app/web` + `/app/docs` and builds
+  with `WORKDIR /app/web`. The validator (§58) reaches docs at a **different** depth
+  (`../../docs` from `web/scripts/`); both only work under the preserved layout.
+- **Root `.dockerignore`** (net-new, applies only to the web image now that its
+  context is the repo root — `web/.dockerignore` stops applying): excludes `.git`,
+  `inspiration/`, `api/`, `agent/`, `e2e/`, `web/node_modules`, `web/dist`, and — via
+  bare + `**/` `.env*` globs at every depth — all env files. It must **not**
+  blanket-exclude `*.md` (the way `web/.dockerignore` does), or it would strip the
+  very files this feature bundles.
+- **Dev**: Vite `server.fs.allow` includes the repo root (raw imports are read off
+  disk in dev; the production rollup build is unaffected).
+
+## 55. Frontmatter contract & hand-rolled parser
+
+Serves human: "howtos … include screenshots" (which pages appear in-app); self-
+describing docs (adding a page never touches web code).
+
+- Every `docs/*.md` carries minimal YAML frontmatter `title` / `order` / `audience`
+  where `audience ∈ {user, operator, design, contributor}`. **Only `audience: user`
+  pages** are listed and routable in-app, ordered by `order` (integer, unique among
+  user pages). Slug = filename (`gitlab-bot-setup.md` → `/docs/gitlab-bot-setup`).
+  `docs/README.md` is excluded from the glob and from validation.
+- **`audience` over a hardcoded page list in web code**: docs stay self-describing;
+  `operator`/`design`/`contributor` pages (installation, configuration, auth-design,
+  proc-hardening, dev-conventions) stay repo-only because the in-app audience already
+  has a running instance.
+- **Hand-rolled ~15-line parser** (`parseFrontmatter`), not `gray-matter` (which
+  drags Buffer polyfills into the browser bundle). It consumes **only a leading
+  `---\n` fence at byte 0**; a `---` later in a body (e.g. inside agent-templates.md's
+  embedded code fence) is content. `order` parses to a number or null; unknown
+  `audience` values are ignored (fall to the default).
+- **Graceful-no-frontmatter at the viewer**: a file with no/malformed leading fence
+  renders as `audience: design` (repo-only) rather than erroring — so a pre-content
+  build stays green and M1 did not depend on M2's content. The **build gate (§58)**
+  is stricter: it *fails* on missing/invalid frontmatter (README exempt). The two are
+  intentionally asymmetric — graceful at runtime, enforced at build.
+
+## 56. Viewer: routes, rendering, link/image rewriting, XSS posture
+
+Serves human: "docs section on uzi" (in the webui, where users hit the moments that
+need it); best-practice (safe rendering of repo content).
+
+- **Routes**: `/docs` (index — user pages only, one-line auto-summary each via
+  `summarize()`, the first paragraph after the H1 stripped of markdown) and
+  `/docs/:slug` (`web/src/pages/Docs.tsx`, `DocPage.tsx`). An unknown slug renders a
+  not-found state **inside the docs shell** with a link back to `/docs`, not the
+  App-level catch-all redirect. A "Docs" nav link shows in **both** authenticated and
+  logged-out states (`web/src/components/Layout.tsx`).
+- **Public, unauthenticated** — bot-setup and token howtos are exactly what a user
+  needs *before* they can do anything in uzi, and nothing in `docs/` is secret (the
+  stack is loopback-only; the files are world-readable in the repo).
+- **Renderer**: `react-markdown` + `remark-gfm` (existing docs use GFM tables), added
+  with the lockfile as an explicit M1 step. **Deliberately no `rehype-raw`**: content
+  is repo-authored/reviewed, so raw HTML stays **inert** instead of needing a
+  sanitizer — the smallest safe pipeline (multica's `rehype-raw`+sanitize is for
+  untrusted LLM output; dead weight here). No nginx CSP change needed (same-origin
+  `img-src 'self'`, class-based Tailwind, no inline scripts).
+- **Link rewriting** (`resolveHref`, pure + unit-tested by injecting the is-user-page
+  predicate): a relative `*.md` resolving to a bundled **user** page → the in-app
+  `/docs/:slug` route (react-router `<Link>`); any other relative target (repo-only
+  doc, `../plan.md`, `auth-design.md`) → the **pinned GitLab blob base**
+  `https://gitlab.example.com/vtmocanu/uzi/-/blob/main/` + repo-relative path.
+  `#anchor` fragments are preserved in both cases (existing docs lean on them).
+  External `http(s)` links get `target=_blank` + `rel="noopener noreferrer"`.
+- **Defense-in-depth XSS**: `javascript:`/`vbscript:`/`data:`/`file:` schemes are
+  **independently neutralized** to an empty href/src in `resolveHref`/`resolveImageSrc`
+  (ASCII control/space chars stripped first so `java\tscript:` can't slip past),
+  rather than trusting react-markdown's `defaultUrlTransform` alone. Protocol-relative
+  `//host` and the `/\` variant are classified as external, not in-app routes. This
+  only fires on a mistake (content is trusted) but closes the door structurally.
+- **Images**: relative `img/*` srcs resolve through the hashed-asset URL map;
+  absolute/root-absolute srcs pass through; dangerous schemes → empty.
+
+## 57. Content curation & house style
+
+Serves human: howtos that a small-attention-span human will actually read.
+
+- **Six `user` pages** (one more than the PRD's original five — `worker-setup` was
+  promoted to `user`): `getting-started` (order 10, the golden path, mostly links),
+  `gitlab-bot-setup` (20), `board` (30), `anthropic-token` (40), `agent-templates`
+  (50), `worker-setup` (60).
+- **House style** (build-*warned*, not gated): task-titled, numbered steps, one
+  screenshot per major step, no design rationale (link to design docs instead),
+  target **≤ 60 body lines** per page.
+- **Nothing cut outright**: trimmed material relocates to an explicit destination —
+  `installation`/`configuration` → `operator`; `auth-design`/`proc-hardening` →
+  `design`; the E2E-test-bot convention split out of gitlab-bot-setup → the
+  `contributor` page `dev-conventions`; agent-templates' renderer/validation
+  internals → ARCHITECTURE.md's Agent templates section. The relocation mapping was
+  recorded in the M2 commit, not left implicit.
+- **User pages are em-dash-free** (the user's global writing preference for
+  reader-facing content); internal/design docs are unaffected.
+
+## 58. Build-time validation gate (`web/scripts/check-docs.mjs`)
+
+Serves human: docs must not silently rot (there is no CI yet — the image build is
+the only gate).
+
+- Runs standalone (`npm run check-docs`) and as the **first step of `npm run build`**
+  (so it also runs inside the web image build). Its frontmatter parser **mirrors**
+  the viewer's so the gate accepts exactly what the viewer parses.
+- **Fails the build** on: missing/invalid frontmatter (README exempt); a `user` page
+  missing/duplicate/non-numeric `order`; **reference-style links** (`[label]: url`,
+  `[text][ref]`) — invisible to the existence check and easy to break, so the
+  convention is inline-links-only; broken relative doc→doc / doc→img links; any
+  `docs/img/*` over the **300 KB** per-image budget (ships to every visitor).
+- **Warns only** on a `user` page over the 60-line budget.
+- **Context-aware link checks**: the web image context is trimmed to `web/` + `docs/`,
+  so repo-root targets (`../ARCHITECTURE.md`, `../plan.md`) are absent there by
+  design (the viewer rewrites them to GitLab anyway). Links resolving **inside**
+  `docs/` are always checked; targets **outside** `docs/` are checked **only in a
+  full checkout** (`.git` present), so the containerized build stays green.
+
+## 59. Screenshots: placeholders now, real captures as one final commit
+
+Serves human: "include screenshots" + user decision 2026-07-04 (real shots provided
+by Vlad, landing as a single final commit after everything else).
+
+- Stored in `docs/img/`, kebab-named `<page>-<step>.png` (e.g. `board-move-card.png`),
+  each ≤ 300 KB (§58), meaningful alt text describing the intended shot.
+- **The filename is the swap contract**: pages ship now with clearly-marked generated
+  **placeholder** PNGs (7 of them, produced by the dev-only
+  `web/scripts/gen-doc-placeholders.sh`); Vlad's real captures replace them **in
+  place** so no page markdown changes. Implementation never blocks on captures.
+- **Still pending**: the real-screenshot swap is the one open item on this PRD — a
+  single final commit after all other milestones.
+
+## 60. Meta-docs & handoff
+
+Serves human: the docs feature must be maintainable (a contributor can add a page).
+
+- `docs/README.md` — contributor authoring guide (frontmatter contract, line budget,
+  screenshot conventions, inline-links-only rule); exempt from the glob and the gate.
+- ARCHITECTURE.md gains a short **Docs** section; the root `README.md` Documentation
+  list includes the pages added since the PRD's original table (`getting-started`,
+  `board`, `dev-conventions`) plus a `/docs` pointer.
