@@ -4,8 +4,11 @@ we have 3 sources of inspiration, we can implement what we want, but we also loo
 1. <https://github.com/vdaubry/bottega>
 2. <https://github.com/multica-ai/multica>
 3. <https://github.com/vfarcic/dot-agent-deck>
+4. <https://github.com/coder/coder> - for agents/VM to see how they provision - see also <https://gitlab.example.com/myorg/k8s/coder>
 
 lets clone all 3 as submodules, before implementing something we will look at them if they implemented same thing or something similar. We will always choose a better version then them if available! We want best practice level of implementation. Some stuff we can deffer for later.
+
+for agents lets see how coder is able to do docker and kind in k8s pods - maybe we replicate or steal ideeas, look also at the k8s/coder gitlab repo
 
 the initial MVP will be local laptop demo, docker-compose.
 it will have a psql DB si persistent storage
@@ -54,8 +57,11 @@ integration with gitlab to check and display CI status, if it is broken spin up 
 we should allow registration lony from @example.com email addresses - configurable
 can we use agent teams? in sdk? - if not lets see how multica/bottega do it (regardless we should keep a reviwer step/stage)
 
+have a docs section on uzi  with relevant howtos (example how to create an agent/bot/skill/etc how to do gitlab bots/give permissions, etc, include screenshots, ask me for screenshots)
+
 ## later stuff
 
+- i think agent pods should stay up only till they finish jobs? would this work?
 - cli to interact with running sessions, see them + chat with them
 - maybe have a label in glab and agents auto start working on issues? how would it work? by using the agent from the user which created the label?
 - dark/light theme with autodetect
@@ -76,6 +82,8 @@ can we use agent teams? in sdk? - if not lets see how multica/bottega do it (reg
 - report on token used per issues - in webui and in PRD file and gitlab issue
 - debug mode with verbose logs
 - lanfuse integration
+- for CICD code generation uzi should plug to qdrant KB? how do we say this? we tell agents? skills better? myabe only skills?
+- have a way to analize sessions (like a LLM judge) - that checks if tools/permissions are missing and does some recommandations (maybe have a message inbox - both for user and admins, admins should see all notifications)
 
 ## later - later
 
