@@ -47,6 +47,12 @@ export class MessageBatcher {
     // if a tool_result echoed the OAuth token from the agent's env.
     const out: OutgoingMessage = { seq: this.seq, kind: msg.kind, payload: this.redact(msg.payload) };
     if (msg.agent !== undefined) out.agent = msg.agent;
+    // Every outgoing run message passes through here — the single chokepoint for
+    // dumping raw frames to the operator's `docker logs` at debug level (PRD #11
+    // §4). Log the redacted payload (the child logger's SecretRegistry scrubs the
+    // serialized line a second time); UZI_LOG_LEVEL=debug turns it on, info stays
+    // terse. The browser never shows raw JSON — this is the debug surface.
+    this.log.debug("run event", { seq: out.seq, kind: out.kind, agent: out.agent, payload: out.payload });
     this.buffer.push(out);
     this.scheduleFlush();
   }
