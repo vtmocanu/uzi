@@ -1,0 +1,61 @@
+import Markdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Link } from "react-router-dom";
+import { rewriteHref, resolveImageSrc } from "../lib/docs";
+
+// react-markdown builds a React element tree (no HTML injection); raw HTML in
+// the source stays inert. Content is repo-authored and reviewed, so no
+// rehype-raw/sanitize pipeline is needed. Typography lives in the `.docs-prose`
+// rules in index.css; only the elements that need behaviour (links → SPA routes
+// / GitLab, images → hashed assets, tables → horizontal scroll) are overridden
+// here.
+const components: Components = {
+  a({ href, children, node: _node, ...props }) {
+    const target = rewriteHref(href ?? "");
+    if (target.internal) {
+      return (
+        <Link to={target.href} {...props}>
+          {children}
+        </Link>
+      );
+    }
+    return (
+      <a
+        href={target.href}
+        {...(target.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
+        {...props}
+      >
+        {children}
+      </a>
+    );
+  },
+  img({ src, alt, node: _node, ...props }) {
+    return (
+      <img
+        src={resolveImageSrc(typeof src === "string" ? src : "")}
+        alt={alt ?? ""}
+        loading="lazy"
+        {...props}
+      />
+    );
+  },
+  table({ children, node: _node, ...props }) {
+    // GFM tables can overflow narrow viewports; keep the page from scrolling
+    // horizontally by scrolling the table inside its own container.
+    return (
+      <div className="my-4 overflow-x-auto">
+        <table {...props}>{children}</table>
+      </div>
+    );
+  },
+};
+
+export function DocMarkdown({ content }: { content: string }) {
+  return (
+    <div className="docs-prose">
+      <Markdown remarkPlugins={[remarkGfm]} components={components}>
+        {content}
+      </Markdown>
+    </div>
+  );
+}

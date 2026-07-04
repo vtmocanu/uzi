@@ -1,0 +1,200 @@
+// The docs viewer bundles the repo's `docs/` at build time — one source of
+// truth, no runtime service. The globs below resolve RELATIVE TO THIS FILE, so
+// `docs/` must stay a sibling of `web/` (see web/Dockerfile's `COPY docs/` and
+// the root .dockerignore that keeps `*.md` in the build context). In dev, Vite
+// reads these off disk, which needs `server.fs.allow` to include the repo root.
+
+// Raw markdown for every `docs/*.md`. README.md is filtered out below.
+const rawDocs = import.meta.glob("../../../docs/*.md", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+}) as Record<string, string>;
+
+// Hashed asset URLs for `docs/img/*` (emitted as lazily-fetched files, not
+// inlined into the JS bundle). Empty until M3 adds screenshots — that is fine.
+const rawAssets = import.meta.glob("../../../docs/img/*", {
+  query: "?url",
+  import: "default",
+  eager: true,
+}) as Record<string, string>;
+
+// Pinned GitLab blob base for links to repo-only files (design/operator docs,
+// ../plan.md, etc.) that are not bundled as in-app pages.
+export const GITLAB_BLOB_BASE = "https://gitlab.example.com/vtmocanu/uzi/-/blob/main/";
+
+const DOCS_GLOB_PREFIX = "../../../docs/";
+
+export type Audience = "user" | "operator" | "design" | "contributor";
+const AUDIENCES: readonly Audience[] = ["user", "operator", "design", "contributor"];
+
+export interface DocMeta {
+  title: string;
+  order: number | null;
+  audience: Audience;
+}
+
+export interface Doc {
+  slug: string;
+  meta: DocMeta;
+  body: string;
+  summary: string;
+}
+
+// A tiny parser for our own constrained frontmatter (title/order/audience). We
+// avoid gray-matter, which drags Buffer polyfills into the browser bundle. Only
+// a leading `---` fence at byte 0 is consumed; a `---` later in the body (e.g.
+// inside a code fence) is content. A file with no leading fence — or a
+// malformed one — renders as audience "design" (repo-only) rather than erroring,
+// so a pre-content build stays green.
+function parseFrontmatter(raw: string): { meta: DocMeta; body: string } {
+  const fallback: DocMeta = { title: "", order: null, audience: "design" };
+  if (!raw.startsWith("---\n")) return { meta: fallback, body: raw };
+
+  const close = raw.indexOf("\n---", 4);
+  if (close === -1) return { meta: fallback, body: raw };
+
+  const yaml = raw.slice(4, close);
+  // Body starts after the closing fence's own line (which may carry trailing
+  // whitespace); drop any leading blank lines so it begins at real content.
+  const afterFence = raw.indexOf("\n", close + 4);
+  const body = (afterFence === -1 ? "" : raw.slice(afterFence + 1)).replace(/^\n+/, "");
+
+  const meta: DocMeta = { title: "", order: null, audience: "design" };
+  for (const line of yaml.split("\n")) {
+    const m = /^([A-Za-z]+):\s*(.*)$/.exec(line.trim());
+    if (!m) continue;
+    const [, key, rawValue] = m;
+    const value = rawValue.trim();
+    if (key === "title") {
+      meta.title = value;
+    } else if (key === "order") {
+      const n = Number(value);
+      meta.order = value !== "" && Number.isFinite(n) ? n : null;
+    } else if (key === "audience" && (AUDIENCES as readonly string[]).includes(value)) {
+      meta.audience = value as Audience;
+    }
+  }
+  return { meta, body };
+}
+
+// A one-line blurb for the index: the first real paragraph after the leading
+// `# Heading`, stripped of markdown syntax and truncated.
+function summarize(body: string): string {
+  const lines = body.split("\n");
+  let i = 0;
+  while (i < lines.length && lines[i].trim() === "") i++;
+  if (i < lines.length && lines[i].startsWith("# ")) i++; // skip the page's own H1
+  while (i < lines.length && lines[i].trim() === "") i++;
+
+  const paragraph: string[] = [];
+  for (; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t === "") break;
+    if (t.startsWith("#") || t.startsWith("|") || t.startsWith("```")) break;
+    paragraph.push(t);
+  }
+  const text = paragraph
+    .join(" ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1") // links/images -> their text
+    .replace(/[*_`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > 160 ? `${text.slice(0, 157).trimEnd()}…` : text;
+}
+
+function slugOf(globKey: string): string {
+  return globKey.slice(globKey.lastIndexOf("/") + 1).replace(/\.md$/, "");
+}
+
+const docsBySlug = new Map<string, Doc>();
+for (const [key, raw] of Object.entries(rawDocs)) {
+  const slug = slugOf(key);
+  if (slug === "README") continue;
+  const { meta, body } = parseFrontmatter(raw);
+  docsBySlug.set(slug, { slug, meta, body, summary: summarize(body) });
+}
+
+// Asset lookup keyed by `docs/`-relative path, e.g. "img/board-move-card.png".
+const imageUrlByPath = new Map<string, string>();
+for (const [key, url] of Object.entries(rawAssets)) {
+  imageUrlByPath.set(key.slice(DOCS_GLOB_PREFIX.length), url);
+}
+
+export function getDoc(slug: string): Doc | undefined {
+  return docsBySlug.get(slug);
+}
+
+export function isUserDoc(slug: string): boolean {
+  return docsBySlug.get(slug)?.meta.audience === "user";
+}
+
+// In-app index: only `audience: user` pages, ordered by `order` (missing order
+// sorts last), then by slug as a stable tiebreak.
+export function listUserDocs(): Doc[] {
+  return [...docsBySlug.values()]
+    .filter((d) => d.meta.audience === "user")
+    .sort((a, b) => {
+      const ao = a.meta.order ?? Number.POSITIVE_INFINITY;
+      const bo = b.meta.order ?? Number.POSITIVE_INFINITY;
+      return ao - bo || a.slug.localeCompare(b.slug);
+    });
+}
+
+// Resolve a doc-relative POSIX path against `docs/` and normalize `.`/`..` into
+// a repo-relative path (e.g. "configuration.md" -> "docs/configuration.md",
+// "../plan.md" -> "plan.md", "img/x.png" -> "docs/img/x.png").
+function resolveFromDocs(rel: string): string {
+  const out: string[] = [];
+  for (const part of `docs/${rel}`.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") out.pop();
+    else out.push(part);
+  }
+  return out.join("/");
+}
+
+export interface RewrittenHref {
+  href: string;
+  /** External (off-app) target — gets target=_blank + rel=noopener noreferrer. */
+  external: boolean;
+  /** In-app SPA route — render with react-router's <Link>. */
+  internal: boolean;
+}
+
+// Rewrite a link href found in doc markdown:
+//   - `#anchor` and absolute/external URLs pass through untouched.
+//   - a relative `*.md` that resolves to a bundled `user` page -> `/docs/:slug`
+//     (in-app route), preserving any `#anchor`.
+//   - any other relative path (repo-only doc, ../plan.md, ...) -> the pinned
+//     GitLab blob URL, preserving any `#anchor`.
+export function rewriteHref(href: string): RewrittenHref {
+  if (href.startsWith("#") || href.startsWith("/")) {
+    return { href, external: false, internal: href.startsWith("/") };
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+    return { href, external: /^https?:/i.test(href), internal: false };
+  }
+
+  const hashIdx = href.indexOf("#");
+  const anchor = hashIdx === -1 ? "" : href.slice(hashIdx);
+  const path = hashIdx === -1 ? href : href.slice(0, hashIdx);
+  if (path === "") return { href, external: false, internal: false };
+
+  const repoPath = resolveFromDocs(path);
+  if (repoPath.startsWith("docs/") && repoPath.endsWith(".md")) {
+    const slug = repoPath.slice("docs/".length, -".md".length);
+    if (isUserDoc(slug)) {
+      return { href: `/docs/${slug}${anchor}`, external: false, internal: true };
+    }
+  }
+  return { href: `${GITLAB_BLOB_BASE}${repoPath}${anchor}`, external: true, internal: false };
+}
+
+// Resolve a relative image src in doc markdown to its hashed asset URL. Absolute
+// and data: URLs pass through; an unbundled path falls back to the raw src.
+export function resolveImageSrc(src: string): string {
+  if (src === "" || /^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("/")) return src;
+  const rel = resolveFromDocs(src).replace(/^docs\//, "");
+  return imageUrlByPath.get(rel) ?? src;
+}

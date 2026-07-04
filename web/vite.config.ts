@@ -9,6 +9,10 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   server: {
+    // The docs viewer raw-imports repo-root `docs/*.md` (a sibling of `web/`),
+    // which lives outside Vite's project root; allow reading the repo root in
+    // dev. The production rollup build is unaffected by this.
+    fs: { allow: [".."] },
     proxy: {
       "/api": {
         target: "http://127.0.0.1:8080",
