@@ -48,6 +48,17 @@ import type { Logger } from "./log.js";
  */
 export const NESTED_AGENT_TOOL = "Agent";
 
+/**
+ * Tools that let an agent DEFER work to a future turn (schedule a wakeup / a
+ * session-scoped cron). Disallowed for a uzi run (wired in sdk-executor): a run
+ * is a bounded task and the executor tears the agent tree down at every turn
+ * boundary, so a deferred wakeup would only ever wake to a killed subagent.
+ * Blocking these — together with forcing synchronous in-turn delegation
+ * (buildAgentGuardHook) — makes multi-agent delegation actually work without
+ * reopening B1 (no subagent survives into the worker's PAT-bearing push). (#34)
+ */
+export const ASYNC_DEFERRAL_TOOLS = ["ScheduleWakeup", "CronCreate"] as const;
+
 /** Result of screening one Bash command against the deny-list. */
 export interface BashScreenResult {
   denied: boolean;
@@ -371,13 +382,27 @@ function subagentTypeOf(toolInput: unknown): string | undefined {
 }
 
 /**
- * Build the PreToolUse hook that hard-fails any Agent invocation whose
- * `subagent_type` is not one of the run's assembled subagents (M4 audit item 7).
- * The SDK's built-in `general-purpose` agent AUGMENTS our programmatic `agents`
- * map and is otherwise invokable unbounded — so an allow-list of exactly our
- * subagent names denies it (and any typo/hallucinated role), which is both
- * defense-in-depth and cost control. The lead keeps the Agent tool to delegate to
- * the allowed roles; every subagent already carries `disallowedTools:['Agent']`.
+ * Build the PreToolUse hook for the Agent (subagent-invocation) tool. It does two
+ * things:
+ *
+ *  1. hard-fails any invocation whose `subagent_type` is not one of the run's
+ *     assembled subagents (M4 audit item 7). The SDK's built-in `general-purpose`
+ *     agent AUGMENTS our programmatic `agents` map and is otherwise invokable
+ *     unbounded — an allow-list of exactly our subagent names denies it (and any
+ *     typo/hallucinated role): defense-in-depth + cost control.
+ *
+ *  2. for an ALLOWED subagent, rewrites the input to `run_in_background: false`,
+ *     forcing SYNCHRONOUS in-turn delegation (#34). The SDK's Agent tool runs
+ *     subagents in the BACKGROUND by default, but the executor drives one turn to
+ *     its result frame then abort()s + group-kills the whole agent tree (B1) — so
+ *     a backgrounded subagent is terminated before it does any work and delegation
+ *     silently no-ops (the live run burned iterations on this). Running the
+ *     subagent synchronously makes it complete IN-TURN, before the turn-end reap,
+ *     so delegation works AND B1 stays closed (no survivor into the PAT push).
+ *
+ * The lead keeps the Agent tool to delegate to the allowed roles; every subagent
+ * already carries `disallowedTools:['Agent']`, so this hook only ever sees the
+ * lead's calls.
  */
 export function buildAgentGuardHook(
   allowed: Iterable<string>,
@@ -387,13 +412,26 @@ export function buildAgentGuardHook(
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse" || input.tool_name !== NESTED_AGENT_TOOL) return {};
     const sub = subagentTypeOf(input.tool_input);
-    if (sub !== undefined && allowSet.has(sub)) return {};
-    log.warn("guardrail denied an unexpected subagent", { subagent_type: sub ?? null });
+    if (sub === undefined || !allowSet.has(sub)) {
+      log.warn("guardrail denied an unexpected subagent", { subagent_type: sub ?? null });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: REASON_UNKNOWN_SUBAGENT,
+        },
+      };
+    }
+    // Allowed subagent: force synchronous delegation. Already-synchronous calls
+    // pass through untouched.
+    const original = input.tool_input && typeof input.tool_input === "object"
+      ? (input.tool_input as Record<string, unknown>)
+      : {};
+    if (original["run_in_background"] === false) return {};
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: REASON_UNKNOWN_SUBAGENT,
+        updatedInput: { ...original, run_in_background: false },
       },
     };
   };

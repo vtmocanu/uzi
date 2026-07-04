@@ -10,6 +10,7 @@ import {
   buildPathGuardHook,
   buildAgentGuardHook,
   NESTED_AGENT_TOOL,
+  ASYNC_DEFERRAL_TOOLS,
 } from "../src/guardrails.js";
 import { nullLogger } from "./helpers.js";
 import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
@@ -257,9 +258,31 @@ describe("buildAgentGuardHook (item 7)", () => {
     }
   });
 
-  it("allows an assembled subagent", async () => {
-    assert.deepStrictEqual(await hook(agentInput("coder")), {});
-    assert.deepStrictEqual(await hook(agentInput("tester")), {});
+  it("allows an assembled subagent but forces synchronous delegation (#34)", async () => {
+    for (const sub of ["coder", "tester"]) {
+      const out = (await hook(agentInput(sub))) as {
+        hookSpecificOutput?: { permissionDecision?: string; updatedInput?: Record<string, unknown> };
+      };
+      assert.notStrictEqual(out.hookSpecificOutput?.permissionDecision, "deny", `${sub} must not be denied`);
+      // The Agent tool backgrounds by default; the hook rewrites it to run in-turn.
+      assert.strictEqual(out.hookSpecificOutput?.updatedInput?.run_in_background, false, `${sub} must be forced synchronous`);
+      assert.strictEqual(out.hookSpecificOutput?.updatedInput?.subagent_type, sub, "original input is preserved");
+    }
+  });
+
+  it("passes an already-synchronous subagent call through untouched (#34)", async () => {
+    const input = {
+      ...baseInput(),
+      hook_event_name: "PreToolUse",
+      tool_name: NESTED_AGENT_TOOL,
+      tool_input: { subagent_type: "coder", run_in_background: false },
+      tool_use_id: "tu",
+    } as HookInput;
+    assert.deepStrictEqual(await hook(input), {});
+  });
+
+  it("names the deferral tools it blocks (schedule-wakeup / cron)", () => {
+    assert.deepStrictEqual([...ASYNC_DEFERRAL_TOOLS], ["ScheduleWakeup", "CronCreate"]);
   });
 
   it("ignores non-Agent tools", async () => {

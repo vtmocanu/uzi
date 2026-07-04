@@ -30,7 +30,7 @@ import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { assembleAgents } from "./agents.js";
 import { buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt } from "./prompt.js";
-import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL } from "./guardrails.js";
+import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
@@ -156,6 +156,10 @@ export class SdkExecutor implements Executor {
       mcpServers: { [SIGNAL_SERVER_NAME]: buildSignalMcpServer() },
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
+      // Block the deferral tools so the lead can't background work to a future
+      // turn that the per-turn reap would only wake to a killed subagent (#34).
+      // Delegation is forced synchronous by the Agent guard hook below.
+      disallowedTools: [...ASYNC_DEFERRAL_TOOLS],
       // The load-bearing deny layer: a PreToolUse deny blocks a tool even under
       // bypassPermissions. Bash screening, the file-tool path jail, AND the M4
       // hard-fail-on-unexpected-subagent guard (item 7) all live here.
