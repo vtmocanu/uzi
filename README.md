@@ -23,7 +23,7 @@ Each git checkout/worktree gets its own isolated compose stack and `pgdata` volu
 The board works against GitLab issues, via a per-user bot account:
 
 1. Create a bot account and an `api`-scoped PAT, add it as Developer to a project — see [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md) (`scripts/create-gitlab-bot.sh` automates the admin path).
-2. In uzi: **Settings → Forge**, pick a base URL and paste the PAT.
+2. In uzi: **Forge** (top nav), pick a base URL and paste the PAT.
 3. **Repos**, enable the project you added the bot to.
 4. Open its board from the sidebar — `PRD`-labeled issues appear as cards; drag between columns to relabel on the forge.
 
@@ -40,16 +40,20 @@ With a forge connected and your Anthropic token saved (**Settings**), have uzi w
 
 ## Documentation
 
-Full docs live in [docs/](docs/):
+Full docs live in [docs/](docs/), and the same golden-path pages are
+browsable in-app under **Docs**:
 
+- [Getting started](docs/getting-started.md)
+- [GitLab bot setup](docs/gitlab-bot-setup.md)
+- [Board](docs/board.md)
+- [Anthropic token](docs/anthropic-token.md)
+- [Agent templates](docs/agent-templates.md)
+- [Worker setup](docs/worker-setup.md)
 - [Installation](docs/installation.md)
 - [Configuration](docs/configuration.md)
 - [Auth design](docs/auth-design.md)
-- [GitLab bot setup](docs/gitlab-bot-setup.md)
-- [Agent templates](docs/agent-templates.md)
-- [Anthropic token](docs/anthropic-token.md)
-- [Worker setup](docs/worker-setup.md)
 - [Proc hardening](docs/proc-hardening.md)
+- [Developer conventions](docs/dev-conventions.md)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for product specs, and [specs/](specs/) for the requirements contract ([human.md](specs/human.md)) and design decisions ([ai.md](specs/ai.md)).
 

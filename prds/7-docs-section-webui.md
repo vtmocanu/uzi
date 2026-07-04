@@ -1,7 +1,7 @@
 # PRD #7: In-app Docs Section — Terse Howtos with Screenshots
 
 **GitLab Issue**: [vtmocanu/uzi#7](https://gitlab.example.com/vtmocanu/uzi/-/issues/7)
-**Status**: In progress (2026-07-04: M1–M4 done on `prd-7-docs-section`; 4-agent review wave — reviewer/auditor/fact-checker/tester — passed with all findings fixed; M5 + spec sync pending; real-screenshot swap pending as the single final commit)
+**Status**: In progress (2026-07-04: M1–M5 done on `prd-7-docs-section`; 4-agent review wave — reviewer/auditor/fact-checker/tester — passed with all findings fixed; spec sync and real-screenshot swap remain as separate follow-up commits)
 **Priority**: Medium
 **Created**: 2026-07-04
 **Depends on**: PRD #1 (web shell, done). Content covers PRD #2/#3 features (done). No dependency on PRD #4/#5/#6; new runtime docs land with those PRDs.
@@ -83,7 +83,7 @@ House style for every `user` page: task-titled, numbered steps, one screenshot p
 - [x] **M2 — Content curation**: frontmatter on all `docs/*.md`; the five `user` pages exist, terse (target ≤ 60 lines), house style; cut material relocated per the recorded mapping (`operator`/`design`/`contributor`); existing repo links (README, ARCHITECTURE) still resolve. *Files: `docs/*` only — runs in parallel with M1; the schema contract is fixed in this PRD, and M1 does not depend on M2's content thanks to the graceful-no-frontmatter rule.*
 - [x] **M3 — Screenshots**: shot checklist presented to Vlad; **placeholder images** wired into pages with alt text now (not gating anything); real captures replace them in a single final commit after all other milestones. *Depends on M1 + M2.* (Placeholders shipped — 7 PNGs in `docs/img/`; real-capture swap pending.)
 - [x] **M4 — Validation gate**: `check-docs.mjs` wired into the build and failing on frontmatter/link rot; whole suite green (`npm run build`, `go test ./...` untouched-but-verified, compose smoke: `/docs` and one page render end-to-end).
-- [ ] **M5 — Meta-docs & handoff**: "how to add a docs page" section (frontmatter contract, line budget, screenshot conventions) in `docs/README.md`; ARCHITECTURE.md gets a short Docs section; PRD closed out.
+- [x] **M5 — Meta-docs & handoff**: "how to add a docs page" section (frontmatter contract, line budget, screenshot conventions) in `docs/README.md`; ARCHITECTURE.md gets a short Docs section; PRD closed out. (`docs/README.md` added; `ARCHITECTURE.md` Docs section added; root `README.md` Documentation list updated with the three pages added since the PRD's original content table (`getting-started`, `board`, `dev-conventions`). Spec sync to `specs/ai.md` and the real-screenshot swap are tracked separately, not part of this milestone's deliverable.)
 
 ### Parallelization
 
