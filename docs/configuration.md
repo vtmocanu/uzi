@@ -60,18 +60,16 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md#agent-runtime-workers-runs-live-view) f
 
 | Var | Default | Notes |
 |---|---|---|
-| `RUN_TIMEOUT` | `2h` | Wall-clock cap on a `running` run; the sweeper fails it past this. Sent to the worker in the claim payload (`RunTimeoutSeconds`) for its own reference; the server's own sweeper is the actual enforcement. |
-| `RUN_IDLE_TIMEOUT` | `10m` | No-SDK-message idle cap, enforced **worker-side**; sent in the claim payload (`IdleTimeoutSeconds`). |
-| `RUN_MAX_ITERATIONS` | `5` | Cap on the implement ⇄ review loop count, enforced worker-side; sent in the claim payload. |
+| `RUN_TIMEOUT` | `2h` | Wall-clock cap on a `running` run; the sweeper fails it past this. Also sent to the worker in the claim payload (`RunTimeoutSeconds`) for its own reference; the server's own sweeper is the actual enforcement. |
+| `RUN_IDLE_TIMEOUT` | `10m` | No-SDK-message idle cap, enforced **worker-side**; read here and shipped in the claim payload (`IdleTimeoutSeconds`). |
+| `RUN_MAX_ITERATIONS` | `5` | Cap on the implement ⇄ review loop count, enforced worker-side; read here and shipped in the claim payload. |
 | `RUN_MAX_REQUEUES` | `1` | How many times the sweeper may re-queue a run whose worker went stale before failing it instead. `0` means fail immediately on worker death (no re-queue). |
 | `WORKER_HEARTBEAT_STALE` | `45s` | No heartbeat past this and the sweeper marks a worker offline and re-queues its non-terminal runs. |
 | `WORKER_AFFINITY_GRACE` | `2m` | How long a re-queued run is claimable only by the worker that was already running it, before any of the user's other workers may claim it (gives a resume a chance to land back on the disk that still holds the session + git worktree). |
-| `WORKER_HEARTBEAT_INTERVAL` | `15s` | Parsed and defaulted the same as the worker-side var of the same name (below); the server does not currently gate anything on this value itself (`WORKER_HEARTBEAT_STALE` is what the sweeper acts on), so set it to keep the number in sync if you also change the worker's interval. |
-| `WORKER_POLL_INTERVAL` | `3s` | Same note as above: parsed server-side for symmetry with the worker's own poll cadence; the sweeper does not read it. |
 
-Invalid values for any of the above fall back to their defaults (the same lenient-parse behavior as the core table); none of them is a boot guard.
+Invalid values for any of the above fall back to their defaults (the same lenient-parse behavior as the core table); none of them is a boot guard. All six are wired into the `api` service's `environment:` block in `docker-compose.yml` and documented in `.env.example`, so setting them in `.env` takes effect on the bundled stack.
 
-**Not yet wired through `docker-compose.yml`'s `api` service.** Unlike the core and Forge tables above, none of the eight vars in this table appear in the `api` service's `environment:` block in the bundled `docker-compose.yml`; only the `agent` service gets `WORKER_HEARTBEAT_INTERVAL`, `WORKER_POLL_INTERVAL`, and `WORKER_PLAN_APPROVAL_TIMEOUT` (worker-side meaning, see below). Setting `RUN_TIMEOUT`, `RUN_IDLE_TIMEOUT`, `RUN_MAX_ITERATIONS`, `RUN_MAX_REQUEUES`, `WORKER_HEARTBEAT_STALE`, or `WORKER_AFFINITY_GRACE` in `.env` today has **no effect** on the bundled stack; the `api` binary always falls back to the defaults above. To change one, add it to the `api` service's `environment:` block yourself (or via a `docker-compose.override.yml`), or run the binary directly with it set.
+`config.Load` also parses `WORKER_HEARTBEAT_INTERVAL` and `WORKER_POLL_INTERVAL` into the server's `Config` struct, but nothing on the API side reads those two fields back out (the sweeper acts on `WORKER_HEARTBEAT_STALE`, not on them) — they are not server knobs despite being parsed here. The values that actually matter are the **worker's own copy** of the same-named variables, consumed by the `agent` binary and wired to the `agent` compose service; see the Worker container table below.
 
 ### Worker container (`agent`)
 
@@ -82,7 +80,7 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `UZI_API_URL` | — (required) | Base URL the worker uses to reach `api`. The bundled compose profile sets `http://api:8080` (the compose network); a remote/standalone worker points this at wherever `api` is actually reachable. |
 | `UZI_WORKER_TOKEN` | — (required, unless `_FILE` is set) | The join token from Settings → Workers, sent as a Bearer credential on every worker call. |
 | `UZI_WORKER_TOKEN_FILE` | — (optional, preferred) | Path to a file containing the join token; read once at startup, then the file is unlinked (best-effort — a read-only secret mount can't be). Takes precedence over `UZI_WORKER_TOKEN` when set. Keeps the token out of the worker's `/proc/<pid>/environ`; see [proc-hardening.md](proc-hardening.md). The bundled compose profile mounts this as a compose file secret. |
-| `UZI_DATA_DIR` | `/data` | Persistent storage: the bare-clone cache, per-run git worktrees, and the pinned Claude Agent SDK session directory. Must be a durable volume for resume-after-restart to work. |
+| `UZI_DATA_DIR` | `/data` | Persistent storage: the bare-clone cache, per-run git worktrees, and the pinned Claude Agent SDK session directory. Must be a durable volume for resume-after-restart to work. In the bundled compose profile this is **hardcoded** to `/data` (matching the `agentdata` volume mount), not read from `.env`; it's only a real knob for a standalone `docker run` or a compose override. |
 | `UZI_WORKER_NAME` | container hostname | Display name shown in Settings → Workers / Admin. |
 | `UZI_AGENT_VERSION` | `0.1.0-m4` | Version string the worker reports on `register`/`heartbeat`; informational only. |
 | `UZI_EXECUTOR` | `sdk` | `sdk` runs real Claude Agent SDK turns (the product path); `stub` is a no-AI executor the project's own tests use — leave at `sdk` for real use. |

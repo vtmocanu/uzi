@@ -169,7 +169,7 @@ Full design rationale lives in the PRD (`prds/4-agent-runtime-workers.md`,
 especially its Decision Log); this section is the map.
 
 ```
-browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTPS poll/claim/report── agent (worker, per user)
+browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (TLS deferred), poll/claim/report── agent (worker, per user)
                                        │  ▲                                        │
                                        ▼  │ decrypted per-run secrets              ▼
                                       db  └── forge (GitLab): issues, MRs     repo clone + worktrees
@@ -259,10 +259,13 @@ defense-in-depth *on top of* this, not instead of it):
 2. **The worker process** receives both, but only the PAT ever leaves the
    worker's own memory: the worker itself — not the agent — performs every
    authenticated git operation (clone, fetch, push) and the MR creation, via
-   per-invocation env-scoped git config (`GIT_CONFIG_COUNT`/
-   `GIT_CONFIG_KEY_0=http.extraHeader`, **not** `git -c`, whose values are
-   readable on argv in the process table). The PAT is never written to
-   on-disk git config and never enters the agent subprocess's environment.
+   per-invocation env-scoped git config (`GIT_CONFIG_COUNT` plus a
+   `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pair at the next free index,
+   e.g. `GIT_CONFIG_KEY_0=http.<host-scope>.extraHeader`, host-scoped so the
+   credential is only ever sent to the repo's own host, **not** `git -c`,
+   whose values are readable on argv in the process table). The PAT is never
+   written to on-disk git config and never enters the agent subprocess's
+   environment.
 3. **The agent subprocess** (the Claude Agent SDK's own process) gets *only*
    `CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `PATH` — none of the worker's own env
    (join token, PAT) is inherited; `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
@@ -290,13 +293,17 @@ Four independent layers, any one of which failing still leaves the others:
    what the model attempts — this is the layer the other three exist to
    reinforce, not replace.
 3. **SDK `PreToolUse` deny-hook** on `Bash` (`agent/src/guardrails.ts`):
-   denies `git push` to any branch, any `--force`/`-f`, remote mutation
-   (`git remote set-url`, `git config` writes to the
-   `remote`/`url`/`http`/`credential` namespaces), and credential-reading
-   commands (`git config --get`, `env`, reads of `/proc` or the worker's
-   token-secret path) — including through shell wrappers (`sh -c`, `git -c`,
-   `eval`, `sudo`, `env X=y …`). A deny from this hook blocks the tool call
-   even though the permission mode below is allow-by-default.
+   denies `git push` to any branch unconditionally, ref/history-rewriting
+   force operations (`git branch -D`/`-M`/`--force`, `--force`/`-f` on
+   `checkout`/`switch`/`restore`), remote mutation (`git remote set-url`,
+   `git config` writes to the `remote`/`url`/`http`/`credential`/`alias`
+   namespaces), and credential-reading commands (`git config --get`, `env`,
+   reads of `/proc` or the worker's token-secret path) — including through
+   shell wrappers (`sh -c`, `git -c`, `eval`, `sudo`, `env X=y …`). Force
+   flags on local, non-history file ops (`git clean -f`, `git add -f`) are
+   deliberately **allowed**; only the ref/history-rewriting subcommands above
+   are denied. A deny from this hook blocks the tool call even though the
+   permission mode below is allow-by-default.
 4. **`settingSources: []`.** Nothing from the cloned repository's own
    `.claude/settings.json`, hooks, or `.claude/agents` is loaded — a
    prompt-injection-via-repo defense none of the inspiration projects has.

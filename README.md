@@ -36,7 +36,7 @@ With a forge connected and your Anthropic token saved (**Settings**), have uzi w
 3. Open the card → **Start run**. A worker claims it and the run view streams the lead agent's progress live.
 4. It pauses at **awaiting approval** with a plan: read it, approve (or reject with a reason).
 5. Watch the implement ⇄ review loop stream per agent; send a follow-up message if it needs steering.
-6. On completion, a branch and MR are open, linked from the run view and the card. `main` is never touched: see [ARCHITECTURE.md](ARCHITECTURE.md#agent-runtime-workers-runs-live-view) for why that holds even under an adversarial prompt.
+6. On completion, a branch and MR are open, linked from the run view and the card. `main` is never touched: see [ARCHITECTURE.md](ARCHITECTURE.md#guardrail-layers-the-primary-directive) for why that holds even under an adversarial prompt.
 
 ## Documentation
 
@@ -49,6 +49,7 @@ Full docs live in [docs/](docs/):
 - [Agent templates](docs/agent-templates.md)
 - [Anthropic token](docs/anthropic-token.md)
 - [Worker setup](docs/worker-setup.md)
+- [Proc hardening](docs/proc-hardening.md)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the system shape, [prds/](prds/) for product specs, and [specs/](specs/) for the requirements contract ([human.md](specs/human.md)) and design decisions ([ai.md](specs/ai.md)).
 
