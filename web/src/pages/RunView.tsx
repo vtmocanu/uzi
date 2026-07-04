@@ -1,15 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import {
-  api,
-  ApiError,
-  isHttpsUrl,
-  isTerminalRun,
-  type Repo,
-  type Run,
-  type RunMessage,
-} from "../lib/api";
+import { api, ApiError, isHttpsUrl, isTerminalRun, type Repo, type Run } from "../lib/api";
 import { useRunStream } from "../lib/useRunStream";
+import { formatDuration } from "../components/RunEvent";
+import { ActivityFeed } from "../components/ActivityFeed";
+import { Markdown } from "../components/Markdown";
 import { Alert, Badge, Button, Card } from "../components/ui";
 
 // statusTone maps a run status to a badge tone.
@@ -19,41 +14,16 @@ function statusTone(status: string): "neutral" | "warning" | "danger" {
   return "neutral";
 }
 
-// agentGroup is a run of consecutive messages produced by the same agent.
-interface AgentGroup {
-  agent: string;
-  messages: RunMessage[];
-}
-
-function groupByAgent(messages: RunMessage[]): AgentGroup[] {
-  const groups: AgentGroup[] = [];
-  for (const m of messages) {
-    const agent = m.agent ?? "lead";
-    const last = groups[groups.length - 1];
-    if (last && last.agent === agent) {
-      last.messages.push(m);
-    } else {
-      groups.push({ agent, messages: [m] });
-    }
-  }
-  return groups;
-}
-
-// payloadText renders a message payload as readable text, degrading to pretty
-// JSON for structured kinds (tool_use/tool_result/…) whose shape the run view
-// does not model.
-function payloadText(payload: unknown): string {
-  if (typeof payload === "string") return payload;
-  if (payload && typeof payload === "object") {
-    const obj = payload as Record<string, unknown>;
-    if (typeof obj.text === "string") return obj.text;
-    if (typeof obj.message === "string") return obj.message;
-  }
-  try {
-    return JSON.stringify(payload, null, 2);
-  } catch {
-    return String(payload);
-  }
+// LiveElapsed ticks a wall-clock timer for a still-running run.
+function LiveElapsed({ since }: { since: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const start = new Date(since).getTime();
+  if (!Number.isFinite(start)) return null;
+  return <span className="text-xs text-slate-500">{formatDuration(now - start)}</span>;
 }
 
 export function RunView() {
@@ -75,9 +45,6 @@ export function RunView() {
       })
       .catch(() => setRepoWebUrl(null));
   }, [run]);
-
-  const groups = useMemo(() => groupByAgent(messages), [messages]);
-  const activeAgent = run && run.status === "running" ? groups[groups.length - 1]?.agent : undefined;
 
   const act = async (fn: () => Promise<unknown>) => {
     setActionErr("");
@@ -129,6 +96,7 @@ export function RunView() {
               />
               {connected ? "live" : "offline"}
             </span>
+            {run.status === "running" && run.started_at && <LiveElapsed since={run.started_at} />}
             {run.iteration_count > 0 && (
               <span className="text-xs text-slate-500">iteration {run.iteration_count}</span>
             )}
@@ -164,24 +132,13 @@ export function RunView() {
         />
       )}
 
-      <Card className="space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
-            Activity
-          </h2>
-          <span className="text-xs text-slate-500">{messages.length} messages</span>
-        </div>
-        {groups.length === 0 ? (
-          <p className="py-6 text-center text-sm text-slate-600">
-            {terminal ? "No messages were recorded for this run." : "Waiting for the agent…"}
-          </p>
-        ) : (
-          <div className="space-y-4">
-            {groups.map((g, i) => (
-              <AgentBlock key={i} group={g} live={g.agent === activeAgent} />
-            ))}
-          </div>
-        )}
+      <Card>
+        <ActivityFeed
+          messages={messages}
+          runningLive={run.status === "running"}
+          connected={connected}
+          terminal={terminal}
+        />
       </Card>
 
       {!terminal && (
@@ -193,41 +150,6 @@ export function RunView() {
       )}
 
       {terminal && <TerminalSummary run={run} />}
-    </div>
-  );
-}
-
-function AgentBlock({ group, live }: { group: AgentGroup; live: boolean }) {
-  return (
-    <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3">
-      <div className="mb-2 flex items-center gap-2">
-        <span className="text-sm font-semibold text-slate-200">{group.agent}</span>
-        <Badge tone={live ? "warning" : "neutral"} title={live ? "Most recent activity" : "Idle"}>
-          {live ? "active" : "idle"}
-        </Badge>
-      </div>
-      <div className="space-y-2">
-        {group.messages.map((m) => (
-          <MessageRow key={m.seq} msg={m} />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function MessageRow({ msg }: { msg: RunMessage }) {
-  const text = payloadText(msg.payload);
-  return (
-    <div className="text-sm">
-      <div className="flex items-center gap-2">
-        <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[11px] font-medium text-slate-400">
-          {msg.kind}
-        </span>
-        <span className="text-[11px] text-slate-600">
-          {new Date(msg.created_at).toLocaleTimeString()}
-        </span>
-      </div>
-      <pre className="mt-1 whitespace-pre-wrap break-words font-sans text-slate-200">{text}</pre>
     </div>
   );
 }
@@ -251,9 +173,9 @@ function PlanPanel({
         Plan awaiting approval
       </h2>
       {plan ? (
-        <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-900/60 p-3 font-sans text-sm text-slate-200">
-          {plan}
-        </pre>
+        <div className="max-h-96 overflow-auto rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+          <Markdown content={plan} />
+        </div>
       ) : (
         <p className="text-sm text-slate-500">The agent has not attached a plan body.</p>
       )}
@@ -328,9 +250,14 @@ function FollowUpComposer({
 }
 
 function TerminalSummary({ run }: { run: Run }) {
+  const duration =
+    run.started_at && run.finished_at
+      ? formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime())
+      : null;
   return (
     <Card className="text-sm text-slate-400">
       This run is <span className="font-medium text-slate-200">{run.status}</span>.
+      {duration && <> Ran for {duration}.</>}
       {run.branch && (
         <>
           {" "}

@@ -56,6 +56,30 @@ describe("mapSdkMessage", () => {
     ]);
   });
 
+  it("forwards duration_ms and total_cost_usd on a success result when present (PRD #11)", () => {
+    const out = mapSdkMessage({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      num_turns: 3,
+      duration_ms: 12400,
+      total_cost_usd: 0.0731,
+    });
+    assert.deepStrictEqual(out, [
+      {
+        kind: "status",
+        agent: "lead",
+        payload: {
+          event: "result",
+          subtype: "success",
+          num_turns: 3,
+          duration_ms: 12400,
+          total_cost_usd: 0.0731,
+        },
+      },
+    ]);
+  });
+
   it("maps an error result to an error message", () => {
     const out = mapSdkMessage({
       type: "result",
