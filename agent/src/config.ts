@@ -27,6 +27,14 @@ export interface Config {
    * Off by default: the bare M2 stub goes straight to a local commit.
    */
   stubPlanGate: boolean;
+  /**
+   * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. A
+   * read-only secret mount (the shipping compose default) can't be unlinked, so
+   * the token file persists and is same-uid readable; the Bash guardrail denies a
+   * `cat` of this path (symmetric with its /proc deny). Undefined for env-var
+   * delivery.
+   */
+  workerTokenFile?: string;
   heartbeatIntervalMs: number;
   pollIntervalMs: number;
   /** How long messages accumulate before a batched POST (PRD: 500ms). */
@@ -131,6 +139,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m4",
     executor: parseExecutor(env.UZI_EXECUTOR),
     stubPlanGate: parseBool(env.UZI_STUB_PLAN_GATE),
+    workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),
     messageBatchMs: duration(env, "WORKER_MESSAGE_BATCH_INTERVAL", "500ms"),

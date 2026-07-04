@@ -73,10 +73,20 @@ be unlinked, and that's fine). The token then lives only in the worker's process
   at `/run/secrets/worker_token` and the agent reads it via `UZI_WORKER_TOKEN_FILE`
   — so the token is **absent from the container `environ`**. Compose secret mounts
   are **read-only**, so the worker's post-read unlink *fails and the file persists*
-  at `/run/secrets/worker_token`. The **environ win still holds** (the leak the
-  residual named is the `/proc/<pid>/environ` read, which is closed); the on-disk
-  copy is a lesser, documented residue that the full structural close below also
-  covers.
+  at `/run/secrets/worker_token`. The **environ vector is closed** (the leak the
+  residual named is the `/proc/<pid>/environ` read). But be precise: that
+  persisted file is a **same-uid-readable copy** of the join token whose
+  reachability for a prompt-injected agent is **equivalent to** (not "lesser
+  than") the environ it replaced — a `cat` reads it just as a `cat` of
+  `/proc/<pid>/environ` did. Two guardrail layers cover the obvious read paths:
+  the **file-tool jail** denies `Read`/`Grep`/`Glob` of it (out-of-worktree), and
+  the **Bash deny-hook** denies a `cat`/read of the `/run/secrets/` prefix (and the
+  configured `UZI_WORKER_TOKEN_FILE`), symmetric with its `/proc` deny. Both are
+  bar-raises, not a complete close: a script that reads the file, a shell-
+  indirection primitive, or any read tool the screener does not model can still
+  reach a same-uid-readable file. The **only complete close is the uid split**
+  (option 1 below), where the file is owned by the worker uid and unreadable to the
+  agent uid.
 - **The E2E overlay** (`e2e/docker-compose.e2e.yml`) delivers the token via a
   **writable** bind-mounted file, so there the unlink also succeeds and **both**
   the environ and the on-disk vectors are closed. The harness (`e2e/run-e2e.sh`)

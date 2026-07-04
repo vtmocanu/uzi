@@ -36,6 +36,10 @@ const DENIED: Array<[string, string]> = [
   ["ps aux | grep git", "process listing"],
   ["cat /proc/1/environ", "/proc read"],
   ["cat /proc/self/cmdline", "/proc cmdline read"],
+  // The worker join-token file lives under the /run/secrets/ mount (persists on a
+  // read-only secret mount); a Bash read of it is denied, symmetric with /proc.
+  ["cat /run/secrets/worker_token", "worker token secret file read"],
+  ["sh -c 'cat /run/secrets/worker_token'", "wrapped worker token secret file read"],
   // Auditor PoCs — argv-level bypasses the old raw-string regex allowed.
   ["git -C /repo push origin main", "global -C before subcommand"],
   ["git -c protocol.version=2 push", "global -c before subcommand"],
@@ -108,6 +112,15 @@ describe("screenBashCommand", () => {
 
   it("allows an empty command", () => {
     assert.strictEqual(screenBashCommand("").denied, false);
+  });
+
+  it("denies a read of the configured UZI_WORKER_TOKEN_FILE path (extraSecretPaths)", () => {
+    const tokenPath = "/worker-secret/token"; // a non-default path outside /run/secrets/
+    // Allowed with no configured secret path (it's just an in-container file)...
+    assert.strictEqual(screenBashCommand(`cat ${tokenPath}`).denied, false);
+    // ...but denied once the worker passes its UZI_WORKER_TOKEN_FILE path in.
+    assert.strictEqual(screenBashCommand(`cat ${tokenPath}`, [tokenPath]).denied, true);
+    assert.strictEqual(screenBashCommand(`sh -c 'cat ${tokenPath}'`, [tokenPath]).denied, true);
   });
 });
 

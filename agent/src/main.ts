@@ -39,7 +39,12 @@ async function main(): Promise<void> {
   const executor: Executor =
     config.executor === "stub"
       ? new StubExecutor(log, { planGate: config.stubPlanGate })
-      : new SdkExecutor(log, sdkHomeDir);
+      : new SdkExecutor(log, sdkHomeDir, {
+          // Deny a Bash `cat` of the join-token file (a read-only secret mount
+          // persists it); the built-in /run/secrets/ prefix already covers the
+          // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path.
+          secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
+        });
   const runner = new RunRunner(client, git, executor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,

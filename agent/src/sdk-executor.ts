@@ -71,6 +71,8 @@ export interface SdkExecutorOptions {
   spawn?: (opts: SpawnOptions) => { pid?: number };
   /** Group-kill a pid (default = killProcessGroup). Injected in tests. */
   kill?: (pid: number | undefined) => boolean;
+  /** Worker-credential file paths (UZI_WORKER_TOKEN_FILE) the Bash guard denies. */
+  secretPaths?: readonly string[];
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -95,6 +97,7 @@ export class SdkExecutor implements Executor {
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
+  private readonly secretPaths: readonly string[];
   /** Every pid spawned across the current run's turns, for the done-path reap. */
   private readonly spawnedPids = new Set<number>();
 
@@ -110,6 +113,7 @@ export class SdkExecutor implements Executor {
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
+    this.secretPaths = opts.secretPaths ?? [];
   }
 
   /**
@@ -165,7 +169,7 @@ export class SdkExecutor implements Executor {
       // hard-fail-on-unexpected-subagent guard (item 7) all live here.
       hooks: {
         PreToolUse: [
-          { matcher: "Bash", hooks: [buildPreToolUseHook(this.log)] },
+          { matcher: "Bash", hooks: [buildPreToolUseHook(this.log, this.secretPaths)] },
           {
             matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
             hooks: [buildPathGuardHook(ctx.worktreePath, this.log)],
