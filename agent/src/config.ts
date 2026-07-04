@@ -7,12 +7,17 @@ import type { LogLevel } from "./log.js";
 // "2h") — matching how the same knobs are expressed server-side and in
 // docker-compose — or a bare integer read as milliseconds.
 
+/** Which executor drives a claimed run. */
+export type ExecutorKind = "sdk" | "stub";
+
 export interface Config {
   apiUrl: string;
   workerToken: string;
   dataDir: string;
   workerName: string;
   version: string;
+  /** `sdk` = Claude Agent SDK (default, product path); `stub` = M2 no-AI stub. */
+  executor: ExecutorKind;
   heartbeatIntervalMs: number;
   pollIntervalMs: number;
   /** How long messages accumulate before a batched POST (PRD: 500ms). */
@@ -55,6 +60,13 @@ function isLogLevel(v: string): v is LogLevel {
   return v === "debug" || v === "info" || v === "warn" || v === "error";
 }
 
+function parseExecutor(v: string | undefined): ExecutorKind {
+  const kind = v?.trim().toLowerCase();
+  if (kind === "stub") return "stub";
+  if (kind === "sdk" || kind === undefined || kind === "") return "sdk";
+  throw new Error(`invalid UZI_EXECUTOR ${JSON.stringify(v)} (expected "sdk" or "stub")`);
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
   const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
@@ -63,7 +75,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     workerToken: required(env, "UZI_WORKER_TOKEN"),
     dataDir: env.UZI_DATA_DIR?.trim() || "/data",
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
-    version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m2",
+    version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m3",
+    executor: parseExecutor(env.UZI_EXECUTOR),
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),
     messageBatchMs: duration(env, "WORKER_MESSAGE_BATCH_INTERVAL", "500ms"),

@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { MessageKind } from "./protocol.js";
+import type { AgentTemplate, ClaimConfig, MessageKind } from "./protocol.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -14,7 +14,13 @@ export interface EmittedMessage {
   payload: Record<string, unknown>;
 }
 
-/** Everything an executor needs to work one run. */
+/**
+ * Everything an executor needs to work one run.
+ *
+ * The fields below `emit` are consumed only by the SDK executor (M3); the M2
+ * stub ignores them, so they are optional and the interface stays backward
+ * compatible. The runner populates them from the claim.
+ */
 export interface RunContext {
   runId: string;
   issueIid: number;
@@ -25,6 +31,18 @@ export interface RunContext {
   branch: string;
   /** Append a message to the run's live stream. */
   emit(msg: EmittedMessage): void;
+  /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
+  oauthToken?: string;
+  /** PRD #3 templates (lead + subagents) mapped to SDK AgentDefinitions. */
+  agents?: AgentTemplate[];
+  /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
+  config?: ClaimConfig | null;
+  /** SDK session to resume; null/absent for a fresh run. */
+  sessionId?: string | null;
+  /** Called once with the SDK session id when first observed (for /state). */
+  onSessionId?(sessionId: string): void;
+  /** Aborts the SDK subprocess when signalled (cancel/shutdown; wired in M4). */
+  signal?: AbortSignal;
 }
 
 export interface ExecutorResult {

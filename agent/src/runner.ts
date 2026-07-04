@@ -50,6 +50,19 @@ export class RunRunner {
         worktreePath: worktree.path,
         branch: worktree.branch,
         emit: (m) => batcher.emit(m),
+        oauthToken: claim.secrets.anthropic_oauth_token,
+        agents: claim.agents,
+        config: claim.config,
+        sessionId: claim.session_id,
+        // Persist the SDK session id the moment the executor learns it, so a
+        // re-queued run can resume it. Best-effort: a failed report must not
+        // fail the run (the state report is retried internally, and a report
+        // landing after the terminal state is treated as already-terminal).
+        onSessionId: (sessionId) => {
+          void this.client
+            .reportState(runId, { status: "running", session_id: sessionId })
+            .catch((e) => runLog.warn("could not persist session id", { error: errMessage(e) }));
+        },
       };
       const result = await this.executor.run(ctx);
 

@@ -1,8 +1,10 @@
+import path from "node:path";
 import { loadConfig } from "./config.js";
 import { createLogger, type Logger } from "./log.js";
 import { WorkerClient } from "./client.js";
 import { GitCache } from "./git.js";
-import { StubExecutor } from "./executor.js";
+import { StubExecutor, type Executor } from "./executor.js";
+import { SdkExecutor } from "./sdk-executor.js";
 import { RunRunner } from "./runner.js";
 import { Worker } from "./worker.js";
 import { errMessage } from "./util.js";
@@ -23,13 +25,19 @@ async function main(): Promise<void> {
     api_url: config.apiUrl,
     data_dir: config.dataDir,
     worker_name: config.workerName,
+    executor: config.executor,
   });
 
   const client = new WorkerClient(config.apiUrl, config.workerToken, config.version, log, {
     httpTimeoutMs: config.httpTimeoutMs,
   });
   const git = new GitCache(config.dataDir, log);
-  const executor = new StubExecutor(log);
+  // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
+  // the persistent data volume so `docker compose down && up` doesn't wipe
+  // sessions and resume still works.
+  const sdkHomeDir = path.join(config.dataDir, "agent-home");
+  const executor: Executor =
+    config.executor === "stub" ? new StubExecutor(log) : new SdkExecutor(log, sdkHomeDir);
   const runner = new RunRunner(client, git, executor, log, config.messageBatchMs);
   const worker = new Worker(config, client, runner, log);
 
