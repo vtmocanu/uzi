@@ -680,8 +680,9 @@ only create MRs (primary directive)"; "connection server/agent should be encrypt
 - **TLS on the worker↔api hop is DEFERRED** — the join token authenticates now;
   transport encryption arrives with a TLS-terminated ingress when the worker
   becomes remote. plan.md's "connection should be encrypted" is therefore only
-  **partially met** by the MVP (authentication yes, encryption later). Flagged for
-  user sign-off; recorded here as a known gap, not a satisfied requirement.
+  **partially met** by the MVP (authentication yes, encryption later). **Deferral
+  accepted by the user 2026-07-04** — join-token auth now, transport TLS with the
+  remote-worker/ingress; recorded as an accepted gap, not a satisfied requirement.
 
 ## 37. Runtime schema (migration `00020_workers_runs.sql`)
 

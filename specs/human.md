@@ -60,9 +60,14 @@ Tracked as GitLab issue vtmocanu/uzi#3; PRD at `prds/3-agent-templates-anthropic
 
 Tracked as GitLab issue vtmocanu/uzi#4; PRD at `prds/4-agent-runtime-workers.md`.
 
-> PLACEHOLDER — pending user confirmation. The full proposed contract text for
-> this feature has been sent to the team lead for user ratification and is NOT
-> yet part of the binding contract. Design detail lives in specs/ai.md §36–§53.
+- Implement the agent-runtime/workers PRD: act on a PRD card — run an agent, watch it live, correct it, land an MR.
+- Agent execution uses the Claude Agent SDK. NOT agent-deck's real-Claude-Code/PTY approach (deferred, maybe later).
+- Create a PRD issue in GitLab from uzi web and work on it from uzi web (no CLI after worker setup).
+- PRIMARY DIRECTIVE: agents may only ever create MRs; never write to main (or mutate other resources). Verify this holds.
+- Model credential: OAuth subscription tokens only (`claude setup-token`); no Anthropic API keys available to the team.
+- Testing-credentials policy: never mint an OAuth token for tests/CI/dev; tests use dummy creds + stub executor; optional live validation only with the user's EXISTING token, provided at that moment, removed after — live tests must never be REQUIRED to prove a milestone.
+- Live run visibility: which agents are live/idle (+ best-effort "next"), the messages, plan-approval gate, stop, follow-up corrections; admins see all agents/runs, users see their own.
+- Each user runs their own worker (container), connected outbound to the server; worker↔server link should be encrypted. (MVP: join-token auth now; transport TLS deferred to remote-worker/ingress — deferral accepted by user 2026-07-04.)
 
 ## Startup admin seed
 
