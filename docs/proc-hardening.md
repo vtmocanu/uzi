@@ -1,3 +1,8 @@
+---
+title: Proc hardening
+audience: design
+---
+
 # Worker `/proc` isolation: the structural residual and its close
 
 This documents the M3/M4 accepted residual around `/proc/<pid>/environ`, what M6

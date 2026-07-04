@@ -6,86 +6,55 @@ audience: user
 
 # Anthropic token
 
-uzi runs its agents with **your** Anthropic credentials, one token per user. You
-paste the token once in **Settings, Anthropic token**; uzi stores it encrypted
-and injects it into your agents when they run (that part lands in a later
-release). This page explains how to obtain a token, which kind to use, and how
-uzi keeps it safe.
+uzi runs your agents with **your own** Anthropic credential. Paste it once
+in **Settings → Anthropic token**; uzi stores it encrypted and injects it
+into your runs.
 
 ## Which credential to use
 
-You can give uzi either of two credentials. Prefer the first.
+Prefer the first.
 
 | Credential | How you get it | Best for |
 |---|---|---|
-| **OAuth token** (recommended) | `claude setup-token` (needs the Claude Code CLI and a Claude Pro or Max **subscription** login) | Anyone who already uses Claude Code; billed against your subscription. |
-| **Console API key** | [console.anthropic.com](https://console.anthropic.com) then **API keys**, **Create key** | Anyone on usage-based API billing without a subscription. |
+| **OAuth token** (recommended) | `claude setup-token` (needs the Claude Code CLI and a Claude Pro/Max subscription login) | Anyone already on Claude Code; billed against your subscription. |
+| **Console API key** | [console.anthropic.com](https://console.anthropic.com) → **API keys** → **Create key** | Anyone on usage-based API billing without a subscription. |
 
-Both are pasted into the same field. uzi makes no assumption about the format
-(it does not check for an `sk-ant-` prefix), so a valid credential of either
-kind is accepted.
+Both paste into the same field; uzi doesn't check for a particular prefix,
+so either kind is accepted.
 
-## Option A: mint an OAuth token with `claude setup-token`
+## 1. Mint a credential
 
-1. Install the Claude Code CLI if you do not have it (see the
-   [Claude Code docs](https://docs.claude.com/en/docs/claude-code/overview)).
-2. Run:
+- **OAuth token**: install the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code/overview)
+  if needed, then run `claude setup-token`. It opens your browser to sign
+  in and prints a long-lived token to your terminal — copy it, then clear
+  your terminal scrollback/history if it persists.
+- **Console API key**: sign in at [console.anthropic.com](https://console.anthropic.com),
+  open **API keys**, **Create key**, and copy it — the console shows it
+  only once.
 
-   ```bash
-   claude setup-token
-   ```
+## 2. Store it in uzi
 
-3. The command opens your browser to sign in to your Claude subscription and
-   authorize a long-lived token, then prints the token to the terminal.
-4. Copy the printed token. Because the token is long-lived and printed to the
-   terminal, treat your terminal scrollback and shell history as sensitive
-   afterward (clear them if they persist the token).
+Open **Settings → Anthropic token**, paste it, and click **Save**. The
+status flips to **Set** with the save date; the token itself is never
+shown again.
 
-`claude setup-token` requires a Claude subscription login. If you do not have a
-subscription, use a Console API key instead (Option B).
+![Settings, Anthropic token, showing the paste field and Set status](img/anthropic-token-settings.png)
 
-## Option B: create a Console API key
+## Rotate or remove
 
-1. Sign in at [console.anthropic.com](https://console.anthropic.com).
-2. Open **API keys** and click **Create key**.
-3. Copy the key when it is shown. The console displays it only once.
+- **Rotate**: paste a new token and **Save** — it overwrites the old one.
+- **Remove**: click **Delete** (a no-op if nothing is set, so always safe
+  to click).
 
-## Store it in uzi
+## Good to know
 
-1. Open **Settings, Anthropic token**.
-2. Paste the token into the field and click **Save**.
-3. The status flips to **Set** with the save date. The token itself is never
-   shown again.
-
-That is the whole flow, and it takes under two minutes.
-
-### Rotate or remove
-
-- **Rotate:** paste a new token and click **Save**. It overwrites the old one.
-- **Remove:** click **Delete**. This disconnects uzi from your Anthropic account
-  (removing an absent token is a no-op, so it is always safe to click).
-
-## How uzi protects it
-
-- **Encrypted at rest.** The token is sealed with AES-256-GCM before it is
-  written to the database, keyed by the server's `UZI_SECRET_KEY` (see
-  [configuration.md](configuration.md)). A database dump alone cannot recover
-  it.
-- **Never returned.** After you save it, no API response and no log line ever
-  contains the token. uzi only ever reports metadata about it: its kind and the
-  created and updated timestamps. There is no "reveal" button; to change it, you
-  re-paste.
-- **Yours only.** A token belongs to the user who saved it. No other user, admin
-  included, can read its value.
-
-## Two things to know
-
-- **No verification at save time.** uzi does not call Anthropic when you paste
-  the token, so it cannot tell you at that moment whether the token is valid.
-  The token is exercised for real the first time one of your agents runs; a bad
-  or expired token surfaces then. Re-paste a fresh one if that happens.
-- **Key rotation invalidates stored tokens.** If an operator rotates
-  `UZI_SECRET_KEY`, every stored token can no longer be decrypted and each user
-  must paste theirs again. There is no re-encrypt path. This is the same
-  accepted limitation documented for all secrets in
-  [configuration.md](configuration.md).
+- **Encrypted, never returned.** uzi seals it at rest and never echoes it
+  back in any response or log; see
+  [ARCHITECTURE.md](../ARCHITECTURE.md#secrets-per-user-credentials-at-rest)
+  for the mechanism.
+- **Not verified at save time.** uzi doesn't call Anthropic when you paste
+  it, so a bad or expired token only surfaces the first time an agent
+  actually runs. Re-paste a fresh one if that happens.
+- **Key rotation resets it.** If an operator rotates the server's master
+  key, every stored token (yours included) must be re-pasted; see
+  [configuration.md](./configuration.md).

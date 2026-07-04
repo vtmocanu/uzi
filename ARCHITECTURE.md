@@ -134,6 +134,24 @@ recipe a later release renders into a running one.
   nothing in this release writes it to a filesystem or spawns anything from it
   (that is a later release's job). See
   [docs/agent-templates.md](docs/agent-templates.md).
+- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique,
+  and immutable after creation (it is the subagent's filename and identity;
+  renaming means creating a new template and deleting the old one; builtins
+  are never renamed). `description` and `prompt_body` are required and
+  non-empty; `model` and each tool name must not contain a newline, carriage
+  return, or other control character (they each render on a single
+  frontmatter line). A template is rejected if its description or prompt body
+  contains what looks like a complete Anthropic token (a high-confidence
+  `sk-ant-...` match); the UI separately warns, without blocking, on looser
+  patterns so legitimate text stays savable.
+- **API surface.** All endpoints require authentication (session + CSRF); the
+  writes also require admin: `GET /api/agent-templates` (list), `GET
+  /api/agent-templates/:id` (one), `GET .../rendered`, `POST
+  /api/agent-templates` (create), `PUT .../:id` (update; name is ignored,
+  immutable), `DELETE .../:id` (409 on a builtin), `POST .../:id/reset` (400
+  on a non-builtin). Edits are last-write-wins — no optimistic-concurrency
+  check in this release — but every row records `updated_by` and `updated_at`
+  so concurrent edits are at least attributable after the fact.
 
 ## Secrets: per-user credentials at rest
 
