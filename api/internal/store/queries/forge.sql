@@ -99,6 +99,15 @@ INSERT INTO board_columns (repo_id, label_name, position)
 VALUES ($1, $2, $3)
 ON CONFLICT (repo_id, label_name) DO NOTHING;
 
+-- name: ShiftBoardColumnsFrom :exec
+-- Make room to insert a column at @from_position by bumping every column at or
+-- after it up by one. The Human Review retrofit (GetBoard) uses this so the new
+-- column lands right after In Progress with a distinct position instead of tying
+-- the column it displaces (position is not unique and ORDER BY would then be
+-- arbitrary).
+UPDATE board_columns SET position = position + 1
+WHERE repo_id = @repo_id AND position >= @from_position;
+
 -- Issues cache -------------------------------------------------------------
 
 -- name: UpsertIssue :one

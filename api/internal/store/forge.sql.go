@@ -455,6 +455,26 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 	return i, err
 }
 
+const shiftBoardColumnsFrom = `-- name: ShiftBoardColumnsFrom :exec
+UPDATE board_columns SET position = position + 1
+WHERE repo_id = $1 AND position >= $2
+`
+
+type ShiftBoardColumnsFromParams struct {
+	RepoID       uuid.UUID `json:"repo_id"`
+	FromPosition int32     `json:"from_position"`
+}
+
+// Make room to insert a column at @from_position by bumping every column at or
+// after it up by one. The Human Review retrofit (GetBoard) uses this so the new
+// column lands right after In Progress with a distinct position instead of tying
+// the column it displaces (position is not unique and ORDER BY would then be
+// arbitrary).
+func (q *Queries) ShiftBoardColumnsFrom(ctx context.Context, arg ShiftBoardColumnsFromParams) error {
+	_, err := q.db.Exec(ctx, shiftBoardColumnsFrom, arg.RepoID, arg.FromPosition)
+	return err
+}
+
 const touchForgeConnectionVerified = `-- name: TouchForgeConnectionVerified :one
 UPDATE forge_connections SET last_verified_at = now() WHERE id = $1 AND user_id = $2
 RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at

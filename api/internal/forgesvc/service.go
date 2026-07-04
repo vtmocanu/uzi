@@ -24,15 +24,17 @@ import (
 const PRDLabel = "PRD"
 
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
-// first time a repo's board is opened. Colors are required by GitLab's label
-// create API. In Progress / Upcoming / Later are the common-board reference set;
-// Human Review (PRD #12) is where the automation parks a card once its MR is
-// open. GetBoard also ensures Human Review on boards seeded before it existed.
+// first time a repo's board is opened, in board order. Colors are required by
+// GitLab's label create API. In Progress / Upcoming / Later are the common-board
+// reference set; Human Review (PRD #12) is where the automation parks a card once
+// its MR is open, and sits directly after In Progress — the two workflow columns
+// lead, the backlog buckets follow. GetBoard retrofits this exact order onto
+// boards seeded before Human Review existed.
 var DefaultColumns = []forge.Label{
 	{Name: board.ColumnInProgress, Color: "#1f75cb"},
+	{Name: board.ColumnHumanReview, Color: "#6e49cb"},
 	{Name: "Upcoming", Color: "#6699cc"},
 	{Name: "Later", Color: "#999999"},
-	{Name: board.ColumnHumanReview, Color: "#6e49cb"},
 }
 
 // prdLinkRe matches a PRD reference in an issue description: a bare or

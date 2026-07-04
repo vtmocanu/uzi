@@ -141,6 +141,18 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 	if inProgressPos < 0 {
 		pos = maxPos + 1 // In Progress somehow absent → append
 	}
+	// Bump the columns Human Review displaces (the backlog buckets) up one so the
+	// new column lands right after In Progress with a distinct position — the same
+	// order fresh boards seed (In Progress, Human Review, then the rest). The shift
+	// is a no-op when appending (In Progress absent).
+	if err := h.q.ShiftBoardColumnsFrom(r.Context(), store.ShiftBoardColumnsFromParams{
+		RepoID:       repo.ID,
+		FromPosition: int32(pos),
+	}); err != nil {
+		slog.Error("shift board columns for Human Review", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
 	if err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
 		RepoID:    repo.ID,
 		LabelName: board.ColumnHumanReview,
