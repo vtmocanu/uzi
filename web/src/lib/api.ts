@@ -96,6 +96,99 @@ export interface ForgeConfig {
   forge_types: string[];
 }
 
+// ── Agent runtime (PRD #4) ────────────────────────────────────────────────
+
+export interface Worker {
+  id: string;
+  name: string;
+  status: string; // "offline" | "online"
+  busy: boolean; // derived: holds a claimed/running/awaiting_approval run
+  version: string | null;
+  last_heartbeat_at: string | null;
+  created_at: string;
+}
+
+export interface AdminWorker extends Worker {
+  owner_email: string;
+}
+
+export type RunStatus =
+  | "queued"
+  | "claimed"
+  | "running"
+  | "awaiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+// TERMINAL_RUN_STATUSES mirrors the DB CHECK: a run in any of these is finished.
+export const TERMINAL_RUN_STATUSES: RunStatus[] = ["completed", "failed", "cancelled"];
+
+export function isTerminalRun(status: string): boolean {
+  return (TERMINAL_RUN_STATUSES as string[]).includes(status);
+}
+
+export interface Run {
+  id: string;
+  repo_id: string;
+  issue_iid: number;
+  issue_title: string;
+  issue_description: string;
+  status: RunStatus;
+  requeue_count: number;
+  iteration_count: number;
+  worker_id: string | null;
+  branch: string | null;
+  mr_iid: number | null;
+  failure_reason: string | null;
+  plan_md: string | null;
+  claimed_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// RunListItem is a run row for the index + admin overview: the run plus display
+// context. owner_email is present only on the admin (all-users) list.
+export interface RunListItem extends Run {
+  repo_path: string;
+  worker_name: string | null;
+  owner_email?: string;
+}
+
+// RunMessage is one persisted, seq-numbered event in a run's stream.
+export interface RunMessage {
+  seq: number;
+  kind: string;
+  agent: string | null;
+  payload: unknown;
+  created_at: string;
+}
+
+export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
+
+// WsEvent is a live frame from /api/ws. A "message" carries a persisted message
+// (rendered directly, deduped by seq); a "state" signals a status change (the
+// client re-reads the run over REST — WS is never the source of truth).
+export interface WsEvent {
+  type: "message" | "state";
+  seq?: number;
+  kind?: string;
+  agent?: string | null;
+  payload?: unknown;
+  created_at?: string;
+  status?: string;
+}
+
+// runSocketUrl builds the same-origin WebSocket URL for a run. The HttpOnly auth
+// cookie rides along automatically (same origin through nginx); Origin==Host is
+// enforced server-side against cross-site hijacking.
+export function runSocketUrl(runId: string): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/api/ws?run=${encodeURIComponent(runId)}`;
+}
+
 // isHttpsUrl guards rendering forge-supplied URLs as links: only https URLs are
 // turned into anchors, so a hostile or malformed web_url (e.g. javascript:) is
 // never made clickable.
@@ -208,4 +301,27 @@ export const api = {
   moveIssue: (repoId: string, iid: number, toColumn: string) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/move`, { to_column: toColumn }),
   syncRepo: (repoId: string) => request<{ board: Board }>("POST", `/repos/${repoId}/sync`),
+  createIssue: (repoId: string, title: string, description: string) =>
+    request<{ card: Card }>("POST", `/repos/${repoId}/issues`, { title, description }),
+
+  // Agent runtime (PRD #4).
+  listWorkers: () => request<{ workers: Worker[] }>("GET", "/workers"),
+  createWorker: (name: string) =>
+    request<{ worker: Worker; token: string }>("POST", "/workers", { name }),
+  deleteWorker: (id: string) => request<null>("DELETE", `/workers/${id}`),
+
+  createRun: (repoId: string, issueIid: number) =>
+    request<{ run: Run }>("POST", `/repos/${repoId}/runs`, { issue_iid: issueIid }),
+  listRuns: () => request<{ runs: RunListItem[] }>("GET", "/runs"),
+  getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),
+  getRunMessages: (id: string, afterSeq = 0) =>
+    request<{ messages: RunMessage[] }>(
+      "GET",
+      afterSeq > 0 ? `/runs/${id}/messages?after=${afterSeq}` : `/runs/${id}/messages`,
+    ),
+  submitRunInput: (id: string, kind: RunInputKind, body = "") =>
+    request<{ server_side: boolean }>("POST", `/runs/${id}/inputs`, { kind, body }),
+
+  adminListWorkers: () => request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
+  adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),
 };

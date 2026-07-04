@@ -68,6 +68,10 @@ type Store interface {
 	// Runs.
 	CreateRun(ctx context.Context, arg store.CreateRunParams) (store.Run, error)
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
+	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
+	ListRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListRunsForUserRow, error)
+	ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error)
+	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
 	ClaimRun(ctx context.Context, arg store.ClaimRunParams) (store.Run, error)
 	GetRunClaimContext(ctx context.Context, runID uuid.UUID) (store.GetRunClaimContextRow, error)
@@ -114,6 +118,17 @@ type Params struct {
 	ClaimGrace time.Duration
 }
 
+// Broadcaster receives run events after they are persisted, for live fan-out to
+// browsers. It is the seam onto the WS hub; nil in tests and any deployment that
+// serves no live channel. Every method is best-effort and must never block or
+// error the persistence path (the DB write is authoritative).
+type Broadcaster interface {
+	// PublishMessage forwards one newly-persisted run message.
+	PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time)
+	// PublishState signals that a run's status changed.
+	PublishState(runID uuid.UUID, status string)
+}
+
 // Service holds the store, the secret cipher, and the runtime params.
 type Service struct {
 	q   Store
@@ -122,7 +137,16 @@ type Service struct {
 	// now is time.Now in production; overridable in tests for deterministic
 	// cutoffs.
 	now func() time.Time
+	// bcast fans persisted run events out to browser WS subscribers. Optional
+	// (nil-safe); set via SetBroadcaster after construction so New's signature —
+	// and every existing caller — stays unchanged.
+	bcast Broadcaster
 }
+
+// SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
+// startup, before serving. A nil broadcaster disables live fan-out; the persisted
+// message log still backs the browser's REST replay.
+func (s *Service) SetBroadcaster(b Broadcaster) { s.bcast = b }
 
 // defaultClaimGrace is the claimed-but-never-started reclaim window (PRD: 5m).
 const defaultClaimGrace = 5 * time.Minute
@@ -318,20 +342,35 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			maxSeq = m.Seq
 		}
 	}
+	inserted := make([]IncomingMessage, 0, len(msgs))
 	for _, m := range msgs {
-		if _, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
+		rows, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 			RunID:   runID,
 			Seq:     m.Seq,
 			Kind:    m.Kind,
 			Agent:   pgText(m.Agent),
 			Payload: []byte(m.Payload),
-		}); err != nil {
+		})
+		if err != nil {
 			return err
+		}
+		// rows == 0 means a duplicate (run_id, seq) — a worker re-delivery. Only
+		// broadcast genuinely new messages so a retry never double-emits over WS.
+		if rows > 0 {
+			inserted = append(inserted, m)
 		}
 	}
 	if maxSeq > run.LastSeq {
 		if _, err := s.q.UpdateRunLastSeq(ctx, store.UpdateRunLastSeqParams{ID: runID, Seq: maxSeq}); err != nil {
 			return err
+		}
+	}
+	// Fan out after the log + high-water mark are durably advanced, so a browser
+	// that reacts by replaying from last_seq sees a consistent state.
+	if s.bcast != nil {
+		now := s.now()
+		for _, m := range inserted {
+			s.bcast.PublishMessage(runID, m.Seq, m.Kind, m.Agent, []byte(m.Payload), now)
 		}
 	}
 	return nil
@@ -394,6 +433,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// held above, so 0 rows means the run was terminal (the only other WHERE
 	// guard) → not applied.
 	run, err = s.runOwnedByWorker(ctx, runID, wkr)
+	if err == nil && rows > 0 && s.bcast != nil {
+		s.bcast.PublishState(runID, run.Status)
+	}
 	return run, rows > 0, err
 }
 
@@ -543,6 +585,48 @@ func (s *Service) ListRunMessages(ctx context.Context, userID, runID uuid.UUID, 
 	return s.q.ListRunMessagesAfter(ctx, store.ListRunMessagesAfterParams{RunID: runID, AfterSeq: afterSeq})
 }
 
+// GetRunForViewer returns a run visible to the viewer: the owner sees their own
+// run; an admin sees any run. A non-owner non-admin gets ErrRunNotFound, exactly
+// as an unknown id would — the same authorization REST and WS both enforce.
+func (s *Service) GetRunForViewer(ctx context.Context, userID uuid.UUID, isAdmin bool, runID uuid.UUID) (store.Run, error) {
+	if isAdmin {
+		run, err := s.q.GetRunByID(ctx, runID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.Run{}, ErrRunNotFound
+			}
+			return store.Run{}, err
+		}
+		return run, nil
+	}
+	return s.GetRun(ctx, userID, runID)
+}
+
+// ListRunMessagesForViewer is ListRunMessages with the owner-or-admin visibility
+// rule, backing the run view's replay for both an owner and an admin observer.
+func (s *Service) ListRunMessagesForViewer(ctx context.Context, userID uuid.UUID, isAdmin bool, runID uuid.UUID, afterSeq int32) ([]store.RunMessage, error) {
+	if _, err := s.GetRunForViewer(ctx, userID, isAdmin, runID); err != nil {
+		return nil, err
+	}
+	return s.q.ListRunMessagesAfter(ctx, store.ListRunMessagesAfterParams{RunID: runID, AfterSeq: afterSeq})
+}
+
+// ListRunsForUser returns the user's runs (newest first) with repo path and
+// worker name for the Runs index.
+func (s *Service) ListRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListRunsForUserRow, error) {
+	return s.q.ListRunsForUser(ctx, userID)
+}
+
+// ListAllWorkers returns every worker with owner email and busy status (admin).
+func (s *Service) ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error) {
+	return s.q.ListAllWorkers(ctx)
+}
+
+// ListActiveRunsAll returns every non-terminal run across all users (admin).
+func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error) {
+	return s.q.ListActiveRunsAll(ctx)
+}
+
 // SubmitInputResult reports how a steering input was handled.
 type SubmitInputResult struct {
 	// ServerSide is true when a cancel/reject was applied directly because no
@@ -571,15 +655,20 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			return SubmitInputResult{}, err
 		}
 		if !live {
+			status := "cancelled"
 			if kind == "cancel" {
 				_, err = s.q.CancelRunServerSide(ctx, store.CancelRunServerSideParams{ID: runID, UserID: userID})
 			} else {
+				status = "failed"
 				_, err = s.q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{
 					ID: runID, UserID: userID, FailureReason: pgText("plan rejected"),
 				})
 			}
 			if err != nil {
 				return SubmitInputResult{}, err
+			}
+			if s.bcast != nil {
+				s.bcast.PublishState(runID, status)
 			}
 			return SubmitInputResult{ServerSide: true}, nil
 		}

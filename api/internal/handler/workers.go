@@ -247,21 +247,18 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 // -------------------------------------------------------------------------
 
 // CreateRun queues an agent run from a card. The issue must be a cached PRD
-// issue with a PRD link in a repo the user owns.
+// issue with a PRD link in a repo the user owns. The issue description is
+// snapshotted from the forge (the source of truth) at queue time — the board
+// never stores descriptions, so the browser has none to send, and fetching it
+// here keeps the run self-contained and authoritative.
 func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
-	user, ok := mw.UserFromContext(r.Context())
+	repo, ok := h.repoForRequest(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	repoID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
-		return
-	}
+	user, _ := mw.UserFromContext(r.Context())
 	var req struct {
-		IssueIID         int64  `json:"issue_iid"`
-		IssueDescription string `json:"issue_description"`
+		IssueIID int64 `json:"issue_iid"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -271,12 +268,25 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "issue_iid must be a positive integer")
 		return
 	}
-	if len(req.IssueDescription) > maxIssueDescriptionBytes {
-		httpx.Error(w, http.StatusBadRequest, "issue_description is too large")
+
+	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		slog.Error("build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	issue, err := f.GetIssue(r.Context(), repo.ForgeProjectID, req.IssueIID)
+	if err != nil {
+		// err is already PAT-redacted by the driver.
+		httpx.Error(w, http.StatusBadGateway, "could not read the issue from the forge: "+err.Error())
+		return
+	}
+	if len(issue.Description) > maxIssueDescriptionBytes {
+		httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
 		return
 	}
 
-	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repoID, req.IssueIID, req.IssueDescription)
+	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
@@ -296,7 +306,7 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
 }
 
-// GetRun returns one run owned by the current user.
+// GetRun returns one run visible to the viewer (owner, or any run for an admin).
 func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -308,7 +318,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid run id")
 		return
 	}
-	run, err := h.wsvc.GetRun(r.Context(), user.ID, id)
+	run, err := h.wsvc.GetRunForViewer(r.Context(), user.ID, user.IsAdmin, id)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
@@ -322,7 +332,8 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListRunMessages returns a run's persisted messages after ?after=<seq> (default
-// 0), the replay source a reconnecting browser reads before going live.
+// 0), the replay source a reconnecting browser reads before going live. Visible
+// to the run's owner or an admin.
 func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -343,7 +354,7 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		after = int32(n)
 	}
-	msgs, err := h.wsvc.ListRunMessages(r.Context(), user.ID, id, after)
+	msgs, err := h.wsvc.ListRunMessagesForViewer(r.Context(), user.ID, user.IsAdmin, id, after)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")

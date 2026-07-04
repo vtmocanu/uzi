@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
 import { api, ApiError, type SecretMeta } from "../lib/api";
 import { Alert, Button, Card, Field, Input } from "../components/ui";
 
@@ -62,9 +63,14 @@ export function Settings() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold">Settings</h1>
-        <p className="mt-1 text-slate-400">Your personal uzi configuration.</p>
+      <div className="flex items-end justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">Settings</h1>
+          <p className="mt-1 text-slate-400">Your personal uzi configuration.</p>
+        </div>
+        <Link to="/settings/workers" className="text-sm text-indigo-400 hover:text-indigo-300">
+          Workers
+        </Link>
       </div>
 
       {error && <Alert message={error} />}

@@ -35,6 +35,12 @@ func (f *fakeForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssues
 	}
 	return f.issues, nil
 }
+func (f *fakeForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
+	return forge.Issue{}, nil
+}
+func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
+	return forge.Issue{}, nil
+}
 func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
 	return nil
 }

@@ -349,6 +349,42 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 	return result.RowsAffected(), nil
 }
 
+const getRunByID = `-- name: GetRunByID :one
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at FROM runs WHERE id = $1
+`
+
+// Admin viewer path: fetch any run regardless of owner. The per-run authz check
+// lives in the service, which only reaches this after confirming the viewer is an
+// admin (owners go through GetRunByIDForUser).
+func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
+	row := q.db.QueryRow(ctx, getRunByID, id)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
 SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at FROM runs WHERE id = $1 AND user_id = $2
 `
@@ -595,6 +631,123 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 	return result.RowsAffected(), nil
 }
 
+const listActiveRunsAll = `-- name: ListActiveRunsAll :many
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN workers w ON w.id = r.worker_id
+JOIN users u ON u.id = r.user_id
+WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY r.created_at DESC
+LIMIT 500
+`
+
+type ListActiveRunsAllRow struct {
+	Run        Run         `json:"run"`
+	RepoPath   string      `json:"repo_path"`
+	WorkerName pgtype.Text `json:"worker_name"`
+	OwnerEmail string      `json:"owner_email"`
+}
+
+// Admin Agents-status: every non-terminal run across all users, with repo path,
+// worker name, and owner email for the admin overview.
+func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow, error) {
+	rows, err := q.db.Query(ctx, listActiveRunsAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveRunsAllRow{}
+	for rows.Next() {
+		var i ListActiveRunsAllRow
+		if err := rows.Scan(
+			&i.Run.ID,
+			&i.Run.UserID,
+			&i.Run.RepoID,
+			&i.Run.IssueIid,
+			&i.Run.IssueTitle,
+			&i.Run.IssueDescription,
+			&i.Run.Status,
+			&i.Run.RequeueCount,
+			&i.Run.WorkerID,
+			&i.Run.SessionID,
+			&i.Run.LastSeq,
+			&i.Run.Branch,
+			&i.Run.MrIid,
+			&i.Run.FailureReason,
+			&i.Run.PlanMd,
+			&i.Run.IterationCount,
+			&i.Run.ClaimedAt,
+			&i.Run.StartedAt,
+			&i.Run.FinishedAt,
+			&i.Run.CreatedAt,
+			&i.Run.UpdatedAt,
+			&i.RepoPath,
+			&i.WorkerName,
+			&i.OwnerEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAllWorkers = `-- name: ListAllWorkers :many
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at,
+       EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+       ) AS busy,
+       u.email AS owner_email
+FROM workers w
+JOIN users u ON u.id = w.user_id
+ORDER BY w.created_at DESC
+`
+
+type ListAllWorkersRow struct {
+	Worker     Worker `json:"worker"`
+	Busy       bool   `json:"busy"`
+	OwnerEmail string `json:"owner_email"`
+}
+
+// Admin Agents-status: every worker with derived busy status and owner email.
+func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, error) {
+	rows, err := q.db.Query(ctx, listAllWorkers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllWorkersRow{}
+	for rows.Next() {
+		var i ListAllWorkersRow
+		if err := rows.Scan(
+			&i.Worker.ID,
+			&i.Worker.UserID,
+			&i.Worker.Name,
+			&i.Worker.TokenHash,
+			&i.Worker.Status,
+			&i.Worker.LastHeartbeatAt,
+			&i.Worker.Version,
+			&i.Worker.CreatedAt,
+			&i.Worker.UpdatedAt,
+			&i.Busy,
+			&i.OwnerEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunMessagesAfter = `-- name: ListRunMessagesAfter :many
 SELECT id, run_id, seq, kind, agent, payload, created_at
 FROM run_messages
@@ -627,6 +780,68 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 			&i.Agent,
 			&i.Payload,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunsForUser = `-- name: ListRunsForUser :many
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, rp.path_with_namespace AS repo_path, w.name AS worker_name
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN workers w ON w.id = r.worker_id
+WHERE r.user_id = $1
+ORDER BY r.created_at DESC
+LIMIT 200
+`
+
+type ListRunsForUserRow struct {
+	Run        Run         `json:"run"`
+	RepoPath   string      `json:"repo_path"`
+	WorkerName pgtype.Text `json:"worker_name"`
+}
+
+// The user's runs, newest first (Runs index + Agents-status "your runs"), joined
+// to the repo path and the nullable worker name for display.
+func (q *Queries) ListRunsForUser(ctx context.Context, userID uuid.UUID) ([]ListRunsForUserRow, error) {
+	rows, err := q.db.Query(ctx, listRunsForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunsForUserRow{}
+	for rows.Next() {
+		var i ListRunsForUserRow
+		if err := rows.Scan(
+			&i.Run.ID,
+			&i.Run.UserID,
+			&i.Run.RepoID,
+			&i.Run.IssueIid,
+			&i.Run.IssueTitle,
+			&i.Run.IssueDescription,
+			&i.Run.Status,
+			&i.Run.RequeueCount,
+			&i.Run.WorkerID,
+			&i.Run.SessionID,
+			&i.Run.LastSeq,
+			&i.Run.Branch,
+			&i.Run.MrIid,
+			&i.Run.FailureReason,
+			&i.Run.PlanMd,
+			&i.Run.IterationCount,
+			&i.Run.ClaimedAt,
+			&i.Run.StartedAt,
+			&i.Run.FinishedAt,
+			&i.Run.CreatedAt,
+			&i.Run.UpdatedAt,
+			&i.RepoPath,
+			&i.WorkerName,
 		); err != nil {
 			return nil, err
 		}

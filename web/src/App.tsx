@@ -13,6 +13,9 @@ import { AgentDetail } from "./pages/AgentDetail";
 import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
+import { RunsList } from "./pages/RunsList";
+import { RunView } from "./pages/RunView";
+import { WorkersSettings } from "./pages/WorkersSettings";
 
 export default function App() {
   return (
@@ -42,6 +45,30 @@ export default function App() {
           element={
             <ProtectedRoute>
               <ForgeSettings />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/settings/workers"
+          element={
+            <ProtectedRoute>
+              <WorkersSettings />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/runs"
+          element={
+            <ProtectedRoute>
+              <RunsList />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/runs/:id"
+          element={
+            <ProtectedRoute>
+              <RunView />
             </ProtectedRoute>
           }
         />

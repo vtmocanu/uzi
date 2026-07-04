@@ -86,6 +86,13 @@ type Forge interface {
 	EnsureLabels(ctx context.Context, projectID int64, labels []Label) error
 	// ListIssues returns issues matching opts, always across state=all.
 	ListIssues(ctx context.Context, projectID int64, opts ListIssuesOptions) ([]Issue, error)
+	// GetIssue returns one issue by its project-scoped IID. Its Description is
+	// populated (the run-create path snapshots it), unlike the cached list rows.
+	GetIssue(ctx context.Context, projectID, issueIID int64) (Issue, error)
+	// CreateIssue opens a new issue with the given title, description, and labels
+	// and returns it. uzi never fabricates a local-only card — the forge stays the
+	// source of truth and the board picks the issue up on the next sync.
+	CreateIssue(ctx context.Context, projectID int64, title, description string, labels []string) (Issue, error)
 	// UpdateIssueLabels adds and removes labels on an issue in one call. On
 	// GitLab this is atomic (a single add_labels/remove_labels update);
 	// single-column enforcement relies on that atomicity.

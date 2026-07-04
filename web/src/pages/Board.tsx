@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useParams, Link } from "react-router-dom";
+import { useParams, Link, useNavigate } from "react-router-dom";
 import {
   api,
   ApiError,
   isHttpsUrl,
+  isTerminalRun,
   type Board as BoardData,
   type Card as CardData,
 } from "../lib/api";
-import { Alert, Badge, Button, Card, Input } from "../components/ui";
+import { startRunGate, type StartRunGate } from "../lib/runStream";
+import { Alert, Badge, Button, Card, Field, Input } from "../components/ui";
 
 const OPEN_KEY = "";
 const CLOSED_KEY = "__closed__";
@@ -20,6 +22,7 @@ function columnKeyForCard(card: CardData): string {
 
 export function Board() {
   const { id: repoId = "" } = useParams();
+  const navigate = useNavigate();
   const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -27,6 +30,15 @@ export function Board() {
   const [dragIid, setDragIid] = useState<number | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [editingColumns, setEditingColumns] = useState(false);
+  const [creatingIssue, setCreatingIssue] = useState(false);
+  const [starting, setStarting] = useState<number | null>(null);
+
+  // Start-run preconditions, refreshed alongside the board: whether the user has
+  // a worker and an Anthropic token, and which of this repo's issues already have
+  // a non-terminal run.
+  const [hasWorker, setHasWorker] = useState(false);
+  const [hasToken, setHasToken] = useState(false);
+  const [activeIids, setActiveIids] = useState<Set<number>>(new Set());
 
   const load = useCallback(async () => {
     setError("");
@@ -40,9 +52,42 @@ export function Board() {
     }
   }, [repoId]);
 
+  const loadPreconditions = useCallback(async () => {
+    try {
+      const [{ workers }, { secrets }, { runs }] = await Promise.all([
+        api.listWorkers(),
+        api.listSecrets(),
+        api.listRuns(),
+      ]);
+      setHasWorker(workers.length > 0);
+      setHasToken(secrets.some((s) => s.kind === "anthropic_token"));
+      const active = new Set<number>();
+      for (const r of runs) {
+        if (r.repo_id === repoId && !isTerminalRun(r.status)) active.add(r.issue_iid);
+      }
+      setActiveIids(active);
+    } catch {
+      // Non-fatal: the board still renders; Start-run stays gated conservatively.
+    }
+  }, [repoId]);
+
   useEffect(() => {
     load();
-  }, [load]);
+    loadPreconditions();
+  }, [load, loadPreconditions]);
+
+  const startRun = async (card: CardData) => {
+    setError("");
+    setStarting(card.iid);
+    try {
+      const { run } = await api.createRun(repoId, card.iid);
+      navigate(`/runs/${run.id}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not start run");
+      setStarting(null);
+      loadPreconditions();
+    }
+  };
 
   const refresh = async () => {
     setSyncing(true);
@@ -112,6 +157,9 @@ export function Board() {
           </p>
         </div>
         <div className="flex gap-2">
+          <Button onClick={() => setCreatingIssue((v) => !v)}>
+            {creatingIssue ? "Close" : "Create issue"}
+          </Button>
           <Button variant="ghost" onClick={() => setEditingColumns((v) => !v)}>
             {editingColumns ? "Close settings" : "Columns"}
           </Button>
@@ -122,6 +170,18 @@ export function Board() {
       </div>
 
       {error && <Alert message={error} />}
+
+      {creatingIssue && (
+        <CreateIssueForm
+          repoId={repoId}
+          onCreated={() => {
+            setCreatingIssue(false);
+            load();
+            loadPreconditions();
+          }}
+          onError={setError}
+        />
+      )}
 
       {editingColumns && board && (
         <ColumnSettings
@@ -166,6 +226,15 @@ export function Board() {
                   <IssueCard
                     key={card.iid}
                     card={card}
+                    gate={startRunGate({
+                      hasPrdLink: card.has_prd_link,
+                      closed: card.closed,
+                      hasWorker,
+                      hasToken,
+                      activeRunExists: activeIids.has(card.iid),
+                    })}
+                    starting={starting === card.iid}
+                    onStart={() => startRun(card)}
                     onDragStart={(e) => {
                       e.dataTransfer.setData("text/plain", String(card.iid));
                       setDragIid(card.iid);
@@ -188,11 +257,17 @@ export function Board() {
 
 function IssueCard({
   card,
+  gate,
+  starting,
+  onStart,
   onDragStart,
   onDragEnd,
   dimmed,
 }: {
   card: CardData;
+  gate: StartRunGate;
+  starting: boolean;
+  onStart: () => void;
   onDragStart: (e: React.DragEvent) => void;
   onDragEnd: () => void;
   dimmed: boolean;
@@ -237,7 +312,82 @@ function IssueCard({
         )}
         {card.author && <span className="text-xs text-slate-500">{card.author}</span>}
       </div>
+      {!card.closed && (
+        <div className="mt-2">
+          <Button
+            variant={gate.enabled ? "primary" : "ghost"}
+            disabled={!gate.enabled || starting}
+            title={gate.enabled ? "Queue an agent run for this issue" : gate.reason}
+            onClick={onStart}
+            className="w-full"
+          >
+            {starting ? "Starting…" : "Start run"}
+          </Button>
+          {!gate.enabled && <p className="mt-1 text-[11px] text-slate-500">{gate.reason}</p>}
+        </div>
+      )}
     </div>
+  );
+}
+
+// CreateIssueForm opens a PRD-shaped issue on the forge. The description carries a
+// prds/*.md link slot so the server's has_prd_link check passes and the card is
+// immediately run-able.
+function CreateIssueForm({
+  repoId,
+  onCreated,
+  onError,
+}: {
+  repoId: string;
+  onCreated: () => void;
+  onError: (m: string) => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    onError("");
+    setSaving(true);
+    try {
+      await api.createIssue(repoId, title.trim(), description);
+      onCreated();
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : "Could not create the issue");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card className="space-y-3">
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+        Create a PRD issue
+      </h2>
+      <p className="text-xs text-slate-500">
+        Opened on GitLab with the <span className="font-medium">PRD</span> label. Link a{" "}
+        <code className="rounded bg-slate-800 px-1 py-0.5 text-slate-200">prds/*.md</code> file in the
+        description so a run can be started from it.
+      </p>
+      <form onSubmit={submit} className="space-y-3">
+        <Field label="Title">
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Issue title" />
+        </Field>
+        <Field label="Description">
+          <textarea
+            className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-400"
+            rows={5}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder={"What to build…\n\nSee prds/N-feature.md"}
+          />
+        </Field>
+        <Button type="submit" disabled={saving || title.trim() === ""}>
+          {saving ? "Creating…" : "Create issue"}
+        </Button>
+      </form>
+    </Card>
   );
 }
 

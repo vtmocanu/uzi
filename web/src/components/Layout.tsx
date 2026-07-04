@@ -46,6 +46,9 @@ export function Layout({ children }: { children: ReactNode }) {
                 <Link to="/agents" className="text-slate-300 hover:text-white">
                   Agents
                 </Link>
+                <Link to="/runs" className="text-slate-300 hover:text-white">
+                  Runs
+                </Link>
                 <Link to="/repos" className="text-slate-300 hover:text-white">
                   Repos
                 </Link>
