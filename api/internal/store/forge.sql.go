@@ -125,7 +125,8 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 
 const getLatestRunForIssue = `-- name: GetLatestRunForIssue :one
 SELECT r.id, r.user_id, r.status, r.mr_iid, r.failure_reason, r.created_at, r.updated_at,
-       ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name
+       ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
+       COUNT(*) OVER () AS run_count
 FROM runs r
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
@@ -150,11 +151,14 @@ type GetLatestRunForIssueRow struct {
 	OwnerName     pgtype.Text        `json:"owner_name"`
 	OwnerEmail    pgtype.Text        `json:"owner_email"`
 	WorkerName    pgtype.Text        `json:"worker_name"`
+	RunCount      int64              `json:"run_count"`
 }
 
 // One issue's newest run with the same display fields as the board lateral join,
 // for the single-card responses (e.g. after a manual drag) so a card never loses
-// its run badge on partial updates. Returns no rows when the issue has never run.
+// its run badge on partial updates. run_count mirrors ListLatestRunsForRepo (a
+// window count over the issue's runs, already scoped to one issue by the WHERE) so
+// the "×N" retry hint survives a drag. Returns no rows when the issue has never run.
 func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForIssueParams) (GetLatestRunForIssueRow, error) {
 	row := q.db.QueryRow(ctx, getLatestRunForIssue, arg.RepoID, arg.IssueIid)
 	var i GetLatestRunForIssueRow
@@ -169,6 +173,7 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.OwnerName,
 		&i.OwnerEmail,
 		&i.WorkerName,
+		&i.RunCount,
 	)
 	return i, err
 }
@@ -440,7 +445,8 @@ const listLatestRunsForRepo = `-- name: ListLatestRunsForRepo :many
 SELECT DISTINCT ON (r.issue_iid)
        r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.failure_reason,
        r.created_at, r.updated_at,
-       ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name
+       ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
+       COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
 FROM runs r
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
@@ -460,6 +466,7 @@ type ListLatestRunsForRepoRow struct {
 	OwnerName     pgtype.Text        `json:"owner_name"`
 	OwnerEmail    pgtype.Text        `json:"owner_email"`
 	WorkerName    pgtype.Text        `json:"worker_name"`
+	RunCount      int64              `json:"run_count"`
 }
 
 // The board payload's run half (PRD #12 M2): the newest run per issue for a repo,
@@ -470,8 +477,10 @@ type ListLatestRunsForRepoRow struct {
 // non-null and would then panic on scan — so the caller maps these onto issues in
 // Go instead, and issues with no run simply render latest_run: null). owner
 // name/email + worker name ride along for the "started by X" treatment; user_id
-// lets the caller flag viewer ownership. Only display fields — never session_id,
-// plan_md, or any secret.
+// lets the caller flag viewer ownership. run_count is a window count over each
+// issue's runs (evaluated before DISTINCT ON, so it survives the newest-row pick)
+// and drives the board's "×N" retry hint without a per-issue history fan-in. Only
+// display fields — never session_id, plan_md, or any secret.
 func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) ([]ListLatestRunsForRepoRow, error) {
 	rows, err := q.db.Query(ctx, listLatestRunsForRepo, repoID)
 	if err != nil {
@@ -493,6 +502,7 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.OwnerName,
 			&i.OwnerEmail,
 			&i.WorkerName,
+			&i.RunCount,
 		); err != nil {
 			return nil, err
 		}

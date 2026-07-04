@@ -25,9 +25,12 @@ func TestMapLatestRun(t *testing.T) {
 
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
 		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("boom"),
-			txt("Vlad"), txt("vlad@example.com"), txt("laptop"), tstamp(created), tstamp(updated), viewer)
+			txt("Vlad"), txt("vlad@example.com"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
 		if dto.ID != runID.String() || dto.Status != "completed" {
 			t.Fatalf("id/status wrong: %+v", dto)
+		}
+		if dto.RunCount != 3 {
+			t.Fatalf("run_count should be 3, got %d", dto.RunCount)
 		}
 		if dto.MrIID == nil || *dto.MrIID != 7 {
 			t.Fatalf("mr_iid should be 7, got %v", dto.MrIID)
@@ -52,7 +55,7 @@ func TestMapLatestRun(t *testing.T) {
 	t.Run("another owner's run is not mine, still shows owner name", func(t *testing.T) {
 		otherOwner := uuid.New()
 		dto := mapLatestRun(runID, otherOwner, "running", pgtype.Int8{}, nullTxt(),
-			nullTxt(), txt("someone@example.com"), nullTxt(), tstamp(created), tstamp(updated), viewer)
+			nullTxt(), txt("someone@example.com"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
 		}
@@ -70,7 +73,7 @@ func TestMapLatestRun(t *testing.T) {
 
 	t.Run("blank display name and email leave owner name empty", func(t *testing.T) {
 		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(),
-			txt(""), nullTxt(), nullTxt(), tstamp(created), tstamp(updated), viewer)
+			txt(""), nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.OwnerName != "" {
 			t.Fatalf("owner_name should be empty when no name/email, got %q", dto.OwnerName)
 		}
@@ -93,9 +96,9 @@ func TestAssembleCards(t *testing.T) {
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
 		{IssueIid: 20, ID: run20, UserID: other, Status: "completed", MrIid: i8(5),
-			OwnerName: nullTxt(), OwnerEmail: txt("o@example.com"), CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+			OwnerName: nullTxt(), OwnerEmail: txt("o@example.com"), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 		{IssueIid: 10, ID: run10, UserID: viewer, Status: "running",
-			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 	}
 	position := map[string]int{"In Progress": 0}
 
@@ -131,6 +134,13 @@ func TestAssembleCards(t *testing.T) {
 	}
 	if byIID[20].LatestRun.MrIID == nil || *byIID[20].LatestRun.MrIID != 5 {
 		t.Fatalf("issue 20: mr_iid should flow through, got %v", byIID[20].LatestRun.MrIID)
+	}
+	// (4) run_count keys onto the right issue (drives the "×N" retry hint).
+	if byIID[20].LatestRun.RunCount != 2 {
+		t.Fatalf("issue 20: run_count should be 2, got %d", byIID[20].LatestRun.RunCount)
+	}
+	if byIID[10].LatestRun.RunCount != 1 {
+		t.Fatalf("issue 10: run_count should be 1, got %d", byIID[10].LatestRun.RunCount)
 	}
 	// Column resolution flows through the assembly too.
 	if byIID[10].Column != "In Progress" {

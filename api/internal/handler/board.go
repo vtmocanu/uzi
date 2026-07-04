@@ -71,6 +71,9 @@ type latestRunDTO struct {
 	OwnerName     string    `json:"owner_name"`
 	WorkerName    *string   `json:"worker_name"`
 	IsMine        bool      `json:"is_mine"`
+	// RunCount is how many runs the issue has had (this run being the newest). >1
+	// drives the board's "×N" retry hint; full history lives in the issue view.
+	RunCount      int64     `json:"run_count"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
@@ -80,13 +83,14 @@ type latestRunDTO struct {
 // viewer; IsMine is set when the run belongs to them (only then does the client
 // render the run-view link). ownerName prefers the display name, falling back to
 // the email, so "started by X" is never blank.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, failureReason, ownerName, ownerEmail, workerName pgtype.Text, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, failureReason, ownerName, ownerEmail, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:            runID.String(),
 		Status:        status,
 		FailureReason: textPtrValue(failureReason.Valid, failureReason.String),
 		WorkerName:    textPtrValue(workerName.Valid, workerName.String),
 		IsMine:        ownerID == viewerID,
+		RunCount:      runCount,
 		CreatedAt:     createdAt.Time,
 		UpdatedAt:     updatedAt.Time,
 	}
@@ -307,7 +311,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		latestByIID[rr.IssueIid] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
-			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.CreatedAt, rr.UpdatedAt, viewerID)
+			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
 
 	cards := make([]cardDTO, 0, len(issues))
@@ -517,7 +521,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: iid}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
 	}
