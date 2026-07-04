@@ -24,6 +24,12 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Version string `json:"version"`
+		// Name is accepted for wire compatibility (the M2 worker announces both
+		// name and version) but deliberately ignored: the authoritative worker
+		// name is the user-chosen label set at token issuance, not something the
+		// worker may overwrite. DecodeJSON rejects unknown fields, so this must be
+		// declared even though nothing reads it.
+		Name string `json:"name"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")

@@ -38,6 +38,18 @@ func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedPa
 	return p.completedRows, nil
 }
 
+// Register path: orphan recovery + the online transition. The counts are
+// irrelevant to the wire-decode test, so they return 0/empty.
+func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) (int64, error) {
+	return 0, nil
+}
+func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) (int64, error) {
+	return 0, nil
+}
+func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.Worker, error) {
+	return store.Worker{ID: arg.ID, Status: "online", Version: arg.Version}, nil
+}
+
 func newProtocolHandler(t *testing.T, st workersvc.Store) *Handler {
 	t.Helper()
 	box, err := secretbox.New(make([]byte, secretbox.KeySize))
@@ -69,6 +81,18 @@ func TestWorkerClaimIdleReturns204NoBody(t *testing.T) {
 	}
 	if rec.Body.Len() != 0 {
 		t.Fatalf("204 must have an empty body, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerRegisterAcceptsNameField(t *testing.T) {
+	// The M2 worker announces {name, version}; DecodeJSON rejects unknown fields,
+	// so register must declare name (accepted, ignored) or every worker 400s on
+	// register and never comes online. Posts the worker's exact body.
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3"}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (register must accept the name field), body %q", rec.Code, rec.Body.String())
 	}
 }
 
