@@ -73,6 +73,31 @@ describe("RunRunner", () => {
     assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true);
   });
 
+  it("redacts a secret an executor emitted in a message before it reaches the API", async () => {
+    const TOKEN = "dummy-oauth-token-runner-000000";
+    // An executor whose tool_result echoes the OAuth token (as `echo
+    // $CLAUDE_CODE_OAUTH_TOKEN` would) — it must not reach the DB/stream.
+    const leaky: Executor = {
+      run: async (ctx) => {
+        ctx.emit({ kind: "tool_result", agent: "coder", payload: { content: `the token is ${TOKEN}` } });
+        return { branch: ctx.branch };
+      },
+    };
+    const claim = makeClaim({
+      issue_iid: 11,
+      repo: { id: "r", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      last_seq: 0,
+      secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: TOKEN },
+    });
+    await new RunRunner(client, git, leaky, nullLogger(), 20).execute(claim);
+
+    const tr = api.messages(claim.run_id).find((m) => m.kind === "tool_result");
+    assert.ok(tr, "the tool_result should have been delivered");
+    const serialized = JSON.stringify(tr.payload);
+    assert.ok(!serialized.includes(TOKEN), "the OAuth token must not reach the API");
+    assert.ok(serialized.includes("***REDACTED***"), "the token should be redacted in place");
+  });
+
   it("reports failed with a reason and still tears the worktree down when the executor throws", async () => {
     const boom: Executor = { run: async () => { throw new Error("kaboom"); } };
     const claim = makeClaim({

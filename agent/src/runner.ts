@@ -4,6 +4,7 @@ import type { Executor, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
 import type { ClaimResponse } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
+import { makeRedactor } from "./redact.js";
 import { errMessage } from "./util.js";
 
 /**
@@ -29,8 +30,15 @@ export class RunRunner {
     if (claim.secrets.anthropic_oauth_token) this.log.addSecret(claim.secrets.anthropic_oauth_token);
 
     const runLog = this.log.child({ run_id: runId, issue_iid: claim.issue_iid });
-    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog);
+    // Scrub the per-run secrets out of every message payload before it is sent
+    // (a tool_result could echo the OAuth token from the agent's env).
+    const redact = makeRedactor([claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token]);
+    const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
 
+    // Last SDK session id the executor observed; carried on the TERMINAL state
+    // report too (not only the async running report), so resume survives a lost
+    // running report.
+    let observedSessionId: string | undefined;
     let barePath: string | undefined;
     let worktreePath: string | undefined;
     try {
@@ -59,6 +67,7 @@ export class RunRunner {
         // fail the run (the state report is retried internally, and a report
         // landing after the terminal state is treated as already-terminal).
         onSessionId: (sessionId) => {
+          observedSessionId = sessionId;
           void this.client
             .reportState(runId, { status: "running", session_id: sessionId })
             .catch((e) => runLog.warn("could not persist session id", { error: errMessage(e) }));
@@ -67,7 +76,11 @@ export class RunRunner {
       const result = await this.executor.run(ctx);
 
       await batcher.close();
-      await this.client.reportState(runId, { status: "completed", branch: result.branch });
+      await this.client.reportState(runId, {
+        status: "completed",
+        branch: result.branch,
+        ...(observedSessionId ? { session_id: observedSessionId } : {}),
+      });
       runLog.info("run completed", { branch: result.branch });
     } catch (err) {
       const reason = errMessage(err);
@@ -75,7 +88,11 @@ export class RunRunner {
       batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } });
       await batcher.close().catch(() => undefined);
       await this.client
-        .reportState(runId, { status: "failed", failure_reason: reason })
+        .reportState(runId, {
+          status: "failed",
+          failure_reason: reason,
+          ...(observedSessionId ? { session_id: observedSessionId } : {}),
+        })
         .catch((e) => runLog.error("could not report failed state", { error: errMessage(e) }));
     } finally {
       if (barePath && worktreePath) {

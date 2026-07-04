@@ -25,6 +25,14 @@ import { NESTED_AGENT_TOOL } from "./guardrails.js";
 
 const LEAD_NAME_RE = /^(lead|orchestrator)$/i;
 
+/**
+ * Fail-closed default when a subagent template supplies no tools allowlist.
+ * Read-only tools only: no Edit/Write/Bash/Agent. A template that needs to
+ * modify files or run commands MUST list those tools explicitly, so a missing
+ * allowlist denies write access instead of inheriting everything.
+ */
+export const DEFAULT_READONLY_TOOLS = ["Read", "Grep", "Glob"];
+
 export interface AssembledAgents {
   /** Invokable subagents, keyed by name, for `options.agents`. */
   subagents: Record<string, AgentDefinition>;
@@ -42,10 +50,12 @@ function toDefinition(t: AgentTemplate): AgentDefinition {
     // No subagent may spawn nested agents (defense-in-depth over the fact that
     // `agents` + settingSources:[] already limit spawnable agents to these).
     disallowedTools: [NESTED_AGENT_TOOL],
+    // Always set an allowlist. A non-empty template list makes the role
+    // read-only when Edit/Write are absent (PRD #3 excludes them from
+    // reviewer/tester); an absent/empty list fails CLOSED to read-only rather
+    // than inheriting every tool.
+    tools: t.tools && t.tools.length > 0 ? [...t.tools] : [...DEFAULT_READONLY_TOOLS],
   };
-  // A non-empty allowlist makes the role read-only when Edit/Write are absent
-  // (PRD #3 excludes them from reviewer/tester). Absent/empty ⇒ inherit all.
-  if (t.tools && t.tools.length > 0) def.tools = [...t.tools];
   if (t.model) def.model = t.model;
   return def;
 }

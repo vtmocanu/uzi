@@ -141,8 +141,15 @@ describe("SdkExecutor guardrail options", () => {
     assert.strictEqual(o.resume, undefined); // no session to resume
 
     // Lead template drives the system prompt + model; it is NOT a subagent.
-    assert.strictEqual(o.systemPrompt, "LEAD SYSTEM PROMPT");
+    // systemPrompt keeps the claude_code preset and appends the lead body.
+    assert.ok(o.systemPrompt && typeof o.systemPrompt === "object" && !Array.isArray(o.systemPrompt));
+    const sp = o.systemPrompt as { type: string; preset: string; append: string };
+    assert.strictEqual(sp.type, "preset");
+    assert.strictEqual(sp.preset, "claude_code");
+    assert.match(sp.append, /^LEAD SYSTEM PROMPT\n\n/);
     assert.strictEqual(o.model, "fable");
+    // Detached-spawn hook is wired so a watchdog trip can group-kill the tree.
+    assert.strictEqual(typeof o.spawnClaudeCodeProcess, "function");
     assert.deepStrictEqual(Object.keys(o.agents ?? {}).sort(), ["coder", "reviewer"]);
     for (const name of ["coder", "reviewer"]) {
       assert.deepStrictEqual(o.agents?.[name]?.disallowedTools, ["Agent"]);
@@ -240,16 +247,18 @@ describe("SdkExecutor failure + watchdog paths", () => {
     );
   });
 
-  it("trips the idle watchdog on a silent agent", async () => {
-    const { queryFn } = fakeQuery((signal) => hangUntilAbort(signal));
+  it("trips the idle watchdog on a silent agent and aborts the SDK", async () => {
+    const { queryFn, captured } = fakeQuery((signal) => hangUntilAbort(signal));
     const { ctx } = makeCtx({ config: { idle_timeout_seconds: 0.03, run_timeout_seconds: 100 } });
     await assert.rejects(
       new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx),
       /idle timeout/,
     );
+    // abort() is the asserted stop: the abortController handed to the SDK fired.
+    assert.strictEqual(captured.options!.abortController!.signal.aborted, true);
   });
 
-  it("trips the wall-clock watchdog even while the agent is active", async () => {
+  it("trips the wall-clock watchdog even while the agent is active and aborts", async () => {
     // Yield a message (resets idle) then hang; a short wall-clock still fires.
     const script = (signal: AbortSignal): AsyncIterable<unknown> => ({
       async *[Symbol.asyncIterator]() {
@@ -257,12 +266,13 @@ describe("SdkExecutor failure + watchdog paths", () => {
         yield* hangUntilAbort(signal);
       },
     });
-    const { queryFn } = fakeQuery(script);
+    const { queryFn, captured } = fakeQuery(script);
     const { ctx } = makeCtx({ config: { idle_timeout_seconds: 100, run_timeout_seconds: 0.03 } });
     await assert.rejects(
       new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx),
       /wall-clock timeout/,
     );
+    assert.strictEqual(captured.options!.abortController!.signal.aborted, true);
   });
 
   it("cancels via an external abort signal", async () => {

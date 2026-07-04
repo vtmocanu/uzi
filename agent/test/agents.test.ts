@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { assembleAgents } from "../src/agents.js";
+import { assembleAgents, DEFAULT_READONLY_TOOLS } from "../src/agents.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
 const coder: AgentTemplate = {
@@ -51,9 +51,16 @@ describe("assembleAgents", () => {
     assert.ok(tools.includes("Read"));
   });
 
-  it("omits the tools allowlist when the template inherits all tools", () => {
-    const { subagents } = assembleAgents([{ ...coder, tools: null }]);
-    assert.strictEqual(subagents.coder?.tools, undefined);
+  it("fails closed to a read-only allowlist when the template omits tools", () => {
+    // Absent/empty tools must NOT inherit everything (fail-open); it defaults to
+    // read-only, so a template that forgot to list Edit/Write/Bash can't write.
+    for (const tools of [null, [] as string[], undefined]) {
+      const { subagents } = assembleAgents([{ ...coder, tools }]);
+      assert.deepStrictEqual(subagents.coder?.tools, DEFAULT_READONLY_TOOLS);
+      assert.ok(!subagents.coder?.tools?.includes("Edit"));
+      assert.ok(!subagents.coder?.tools?.includes("Write"));
+      assert.ok(!subagents.coder?.tools?.includes("Bash"));
+    }
   });
 
   it("routes a lead-named template to the lead system prompt, not the subagents", () => {

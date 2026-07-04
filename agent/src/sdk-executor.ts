@@ -10,13 +10,14 @@
 
 import fs from "node:fs/promises";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { Options as SdkOptions, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Options as SdkOptions, SDKMessage, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { assembleAgents } from "./agents.js";
-import { buildLeadPrompt, leadSystemPrompt } from "./prompt.js";
+import { buildLeadPrompt, buildLeadSystemPrompt } from "./prompt.js";
 import { buildPreToolUseHook } from "./guardrails.js";
+import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
 import { errMessage } from "./util.js";
 
@@ -33,8 +34,8 @@ const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
 
 /**
  * Injectable seam over the SDK's `query`. The return only needs to be async
- * iterable for the executor; the real Query carries more (pid, interrupt) which
- * we probe defensively for the process-group kill.
+ * iterable for the executor; cancellation goes through `options.abortController`
+ * and the process-group kill uses the pid captured by `spawnClaudeCodeProcess`.
  */
 export type SdkQueryFn = (params: {
   prompt: AsyncIterable<unknown>;
@@ -87,7 +88,9 @@ export class SdkExecutor implements Executor {
       // Repo-borne prompt-injection defense: nothing from the cloned repo's
       // .claude/{settings.json,agents,hooks} can grant the agent permissions.
       settingSources: [],
-      systemPrompt: leadSystemPrompt(assembled.leadSystemPrompt),
+      // Preset + append (bottega's shape) so Claude Code's own tool-use system
+      // prompt is kept, not replaced by a bare string.
+      systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt),
       // Programmatic subagents (each already disallows nested Agent spawning).
       agents: assembled.subagents,
       // Allow-by-default + explicit denies (see guardrails.ts for why not
@@ -112,6 +115,17 @@ export class SdkExecutor implements Executor {
     const abortController = new AbortController();
     options.abortController = abortController;
 
+    // Spawn the CLI in its own process group and capture the pid, so a watchdog
+    // trip can group-kill the whole tree (the default SDK spawn is not detached,
+    // so kill(-pid) would not otherwise reach a backgrounded bash). Only invoked
+    // on a real run; the fake queryFn used in tests never calls it.
+    const child: { pid?: number } = {};
+    options.spawnClaudeCodeProcess = (spawnOpts: SpawnOptions): SpawnedProcess => {
+      const proc = spawnDetached(spawnOpts);
+      child.pid = proc.pid;
+      return proc as unknown as SpawnedProcess;
+    };
+
     const prompt = buildLeadPrompt({
       issueIid: ctx.issueIid,
       issueTitle: ctx.issueTitle,
@@ -120,7 +134,7 @@ export class SdkExecutor implements Executor {
       subagentNames,
     });
 
-    return this.drive(ctx, options, prompt, abortController);
+    return this.drive(ctx, options, prompt, abortController, child);
   }
 
   private async drive(
@@ -128,6 +142,7 @@ export class SdkExecutor implements Executor {
     options: SdkOptions,
     prompt: string,
     abortController: AbortController,
+    child: { pid?: number },
   ): Promise<ExecutorResult> {
     // A watchdog trip / external cancel records a static reason and aborts the
     // subprocess; the reason is thrown after the loop unwinds so the runner
@@ -145,8 +160,10 @@ export class SdkExecutor implements Executor {
       if (tripReason) return; // first trip wins
       tripReason = reason;
       this.log.warn("run watchdog/cancel tripped, aborting SDK", { run_id: ctx.runId, reason });
+      // abort() is the primary, asserted stop (SDK: stdin EOF → grace → signal);
+      // the group kill is best-effort defense for orphaned children.
       abortController.abort();
-      this.killProcessGroup(queryInstance);
+      killProcessGroup(child.pid);
     };
 
     const armIdle = (): void => {
@@ -218,27 +235,6 @@ export class SdkExecutor implements Executor {
       if (ctx.signal) ctx.signal.removeEventListener("abort", onSignal);
     }
   }
-
-  /**
-   * Best-effort kill of the SDK subprocess group. `abortController.abort()` is
-   * the primary stop; this is defense for orphaned children (e.g. a backgrounded
-   * bash) the agent may have left running. The pid is probed off the Query
-   * instance (shape not guaranteed by the public types), so failures are
-   * swallowed.
-   */
-  private killProcessGroup(queryInstance: unknown): void {
-    const pid = pidOf(queryInstance);
-    if (pid === undefined) return;
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Already gone / not permitted — abort() will have handled the SDK side.
-      }
-    }
-  }
 }
 
 /** One-shot prompt stream: the SDK consumes the lead's first user turn. */
@@ -250,21 +246,4 @@ async function* promptStream(text: string): AsyncGenerator<unknown> {
 function seconds(value: number | undefined, fallback: number): number {
   const s = typeof value === "number" && value > 0 ? value : fallback;
   return Math.round(s * 1000);
-}
-
-/** Probe a Query instance for the subprocess pid across known internal shapes. */
-function pidOf(queryInstance: unknown): number | undefined {
-  const q = queryInstance as
-    | {
-        transport?: { process?: { pid?: number } };
-        process?: { pid?: number };
-        childProcess?: { pid?: number };
-        _processPid?: number;
-        pid?: number;
-      }
-    | null
-    | undefined;
-  const pid =
-    q?.transport?.process?.pid ?? q?.process?.pid ?? q?.childProcess?.pid ?? q?._processPid ?? q?.pid;
-  return typeof pid === "number" && pid > 0 ? pid : undefined;
 }

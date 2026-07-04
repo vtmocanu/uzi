@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildLeadPrompt, leadSystemPrompt, DEFAULT_LEAD_SYSTEM_PROMPT } from "../src/prompt.js";
+import { buildLeadPrompt, buildLeadSystemPrompt, LEAD_GUARDRAIL_APPEND } from "../src/prompt.js";
 
 // Untrusted-content discipline (both auditors): issue_title/issue_description are
 // attacker-influenceable. They must be delimited as data and framed as untrusted
@@ -57,18 +57,26 @@ describe("buildLeadPrompt", () => {
   });
 });
 
-describe("leadSystemPrompt", () => {
-  it("uses the template body when provided", () => {
-    assert.strictEqual(leadSystemPrompt("  custom lead prompt  "), "custom lead prompt");
+describe("buildLeadSystemPrompt", () => {
+  it("returns the claude_code preset with an appended reminder (not a bare replace)", () => {
+    const sp = buildLeadSystemPrompt(undefined);
+    assert.strictEqual(sp.type, "preset");
+    assert.strictEqual(sp.preset, "claude_code");
+    assert.strictEqual(sp.append, LEAD_GUARDRAIL_APPEND);
   });
 
-  it("falls back to the default when absent or blank", () => {
-    assert.strictEqual(leadSystemPrompt(undefined), DEFAULT_LEAD_SYSTEM_PROMPT);
-    assert.strictEqual(leadSystemPrompt("   "), DEFAULT_LEAD_SYSTEM_PROMPT);
+  it("appends the template body ahead of the guardrail reminder", () => {
+    const sp = buildLeadSystemPrompt("  custom lead prompt  ");
+    assert.match(sp.append, /^custom lead prompt\n\n/);
+    assert.ok(sp.append.endsWith(LEAD_GUARDRAIL_APPEND));
   });
 
-  it("the default forbids pushing and nested spawning", () => {
-    assert.match(DEFAULT_LEAD_SYSTEM_PROMPT, /NEVER run `git push`/);
-    assert.match(DEFAULT_LEAD_SYSTEM_PROMPT, /do not spawn any other agents/i);
+  it("falls back to the reminder only when the body is blank", () => {
+    assert.strictEqual(buildLeadSystemPrompt("   ").append, LEAD_GUARDRAIL_APPEND);
+  });
+
+  it("the guardrail reminder forbids pushing and nested spawning", () => {
+    assert.match(LEAD_GUARDRAIL_APPEND, /NEVER run `git push`/);
+    assert.match(LEAD_GUARDRAIL_APPEND, /do not spawn any other agents/i);
   });
 });
