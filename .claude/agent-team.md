@@ -13,6 +13,7 @@ Generated 2026-07-03 by the `agent-team` skill (roster adapted from the example-
 | spec-keeper | spec-keeper | opus | Bash, Read, Grep, Glob, Edit, Write + team tools |
 | fact-checker | fact-checker | opus | Bash, Read, Grep, Glob, WebFetch, WebSearch + team tools |
 | documenter | documenter | sonnet | Bash, Read, Grep, Glob, Edit, Write, WebFetch + team tools |
+| web-ux | web-ux | opus | Bash, Read, Grep, Glob, WebFetch + team tools |
 
 ## Orchestrator workflow
 
