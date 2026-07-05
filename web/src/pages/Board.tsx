@@ -27,6 +27,8 @@ import {
   runBadge,
 } from "../lib/runBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
+import { visibleColumns } from "../lib/boardColumns";
+import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
 import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
 
@@ -61,6 +63,23 @@ export function Board() {
   const [editingColumns, setEditingColumns] = useState(false);
   const [creatingIssue, setCreatingIssue] = useState(false);
   const [starting, setStarting] = useState<number | null>(null);
+
+  // Hide-empty-columns toggle, persisted per repo. Initialised lazily from prefs;
+  // re-read on repoId change because the route swaps :id without remounting the
+  // component (the lazy init only ran for the first repo). See boardColumns.ts —
+  // the actual hide decision is derived at render, never stored per column.
+  const hideEmptyKey = `uzi.board.${repoId}.hideEmpty`;
+  const [hideEmpty, setHideEmpty] = useState(() => prefs.get(hideEmptyKey, false));
+  useEffect(() => {
+    setHideEmpty(prefs.get(`uzi.board.${repoId}.hideEmpty`, false));
+  }, [repoId]);
+  const toggleHideEmpty = () => {
+    setHideEmpty((v) => {
+      const next = !v;
+      prefs.set(hideEmptyKey, next);
+      return next;
+    });
+  };
 
   // Start-run preconditions, refreshed alongside the board: whether the user has a
   // worker and an Anthropic token. Whether an issue already has an active run now
@@ -265,6 +284,19 @@ export function Board() {
     );
   }
 
+  // Columns to render: hide-empty is derived here from the freshly-polled cards,
+  // never stored, so an auto-move that populates a hidden column reveals it on the
+  // next poll. A live drag reveals every lane so they stay drop targets. The hint
+  // reads columns.length - visible.length (so it shows "0 hidden" mid-drag — an
+  // accepted v1 cosmetic).
+  const visible = visibleColumns(
+    columns,
+    (key) => cardsByColumn.get(key)?.length ?? 0,
+    hideEmpty,
+    dragIid != null,
+  );
+  const hiddenCount = columns.length - visible.length;
+
   return (
     <div className="space-y-5">
       <PageHeader
@@ -274,6 +306,16 @@ export function Board() {
         description="Columns are GitLab labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here."
         actions={
           <>
+            <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted">
+              <input
+                type="checkbox"
+                checked={hideEmpty}
+                onChange={toggleHideEmpty}
+                className="h-3.5 w-3.5 rounded border-edge accent-brand"
+              />
+              Hide empty
+              {hiddenCount > 0 && <span className="text-faint">({hiddenCount} hidden)</span>}
+            </label>
             <Button size="sm" onClick={() => setCreatingIssue((v) => !v)}>
               {creatingIssue ? (
                 <>
@@ -338,10 +380,13 @@ export function Board() {
       )}
 
       <div className="flex items-start gap-4 overflow-x-auto pb-4">
-        {columns.map((col) => {
+        {visible.map((col) => {
           const cards = cardsByColumn.get(col.key) ?? [];
           const isTarget = dropTarget === col.key && col.droppable;
           const closedCol = col.key === CLOSED_KEY;
+          // An empty lane only visible because a drag is in progress: dim it so it
+          // reads as a transient drop target, not a real column.
+          const dragRevealed = hideEmpty && dragIid != null && cards.length === 0;
           return (
             <div
               key={col.key || "open"}
@@ -359,6 +404,7 @@ export function Board() {
               }}
               className={cx(
                 "flex w-72 shrink-0 flex-col rounded-xl border p-2.5 transition-colors",
+                dragRevealed && "opacity-60",
                 isTarget
                   ? "border-brand/70 bg-brand/5 ring-1 ring-brand/40"
                   : closedCol
