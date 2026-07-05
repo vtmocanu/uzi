@@ -21,10 +21,10 @@ default theme.
 
 Which theme a user with no personal choice sees — new users, and anyone who
 hasn't picked one under Settings → Appearance. A user's own pick, once made,
-always wins over this setting. Changing it restyles every un-overridden
-session live, no reload needed, since each session re-resolves its theme on
-its next `me` refresh. See [Theming](./theming.md) for how themes work and
-how to add one.
+always wins over this setting. Saving restyles the admin's own session live;
+every other un-overridden user picks up the change on their next `me`
+refresh (in practice, their next login or reload — there's no push). See
+[Theming](./theming.md) for how themes work and how to add one.
 
 ## Validation
 
