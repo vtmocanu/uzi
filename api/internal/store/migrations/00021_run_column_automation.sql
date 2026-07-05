@@ -27,9 +27,10 @@ ALTER TABLE runs
     ADD COLUMN board_column       text,
     ADD COLUMN move_pending_since timestamptz;
 
--- The lateral "latest run per issue" join (PRD #12 M2) and the per-issue run
--- history both scan runs by (repo, issue) newest-first; only idx_runs_repo
--- exists today.
+-- The "latest run per issue" query (PRD #12 M2 — a DISTINCT ON (issue_iid)
+-- ORDER BY created_at DESC, not a LATERAL join; see the M2 sqlc-nullability
+-- decision) and the per-issue run history both scan runs by (repo, issue)
+-- newest-first; only idx_runs_repo exists today.
 CREATE INDEX idx_runs_issue_history ON runs (repo_id, issue_iid, created_at DESC);
 
 -- Reconcile-loop scan: pending moves, oldest first.
