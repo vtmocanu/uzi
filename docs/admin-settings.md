@@ -34,7 +34,7 @@ GitLab's.
 
 ## Resync after a change
 
-Saving a changed label triggers a full resync of every connected repo, not
+Saving a changed label triggers a full resync of every enabled repo, not
 just the next incremental poll, so the effect isn't instant: boards drop
 issues that only carried the old label and pick up the new set once that
 repo's resync completes. See "Freshness contract" in
