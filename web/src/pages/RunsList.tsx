@@ -45,7 +45,14 @@ function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
             {run.mr_iid != null && <span className="font-medium text-ok">· MR !{run.mr_iid}</span>}
           </p>
         </div>
-        <StatusPill status={pillStatus} />
+        <div className="flex items-center gap-2">
+          {run.auto_approve && (
+            <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
+              autopilot
+            </Badge>
+          )}
+          <StatusPill status={pillStatus} />
+        </div>
       </Link>
     </li>
   );

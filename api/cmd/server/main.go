@@ -158,7 +158,7 @@ func run() error {
 	// forge dropped. Wired into workersvc as the status-change hook and run as its
 	// own goroutine, isolated from the liveness sweep so a stalled forge never
 	// delays worker-loss recovery.
-	lifecycle := runlifecycle.New(q, svc)
+	lifecycle := runlifecycle.New(q, svc, cfg.FrontendOrigin)
 	wsvc.SetLifecycle(lifecycle)
 
 	// Background sync engine: pulls forge changes into the issue cache for every

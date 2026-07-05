@@ -508,19 +508,25 @@ func TestAutopilotTooLargeDescriptionComments(t *testing.T) {
 		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "alice")},
 		cc:         ccOwner("alice", true, true),
 	}
-	runs := &apRuns{}
+	// The description cap now lives once in workersvc.createRun (M5 unification); the
+	// poller reacts to the ErrDescriptionTooLarge it surfaces by posting the too-large
+	// comment instead of size-checking itself.
+	runs := &apRuns{err: workersvc.ErrDescriptionTooLarge}
 	f := &apForge{
 		events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}},
-		issue:  forge.Issue{Description: strings.Repeat("x", maxIssueDescriptionBytes+1)},
+		issue:  forge.Issue{Description: "any description; the shared cap rejects it"},
 	}
 
 	detectWith(st, runs, f)
 
-	if len(runs.calls) != 0 {
-		t.Fatalf("expected no run for an oversized description, got %d", len(runs.calls))
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected the shared create path to be attempted once, got %d", len(runs.calls))
 	}
 	if len(f.notes) != 1 || !strings.Contains(f.notes[0].body, "too large") {
 		t.Fatalf("expected one too-large comment, got %+v", f.notes)
+	}
+	if len(st.upserts) != 1 {
+		t.Fatalf("too-large comment must record the event first (record-then-comment), upserts=%d", len(st.upserts))
 	}
 }
 

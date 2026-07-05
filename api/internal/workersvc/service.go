@@ -31,21 +31,29 @@ import (
 // anthropicTokenKind mirrors the secret kind PRD #3's handler stores under.
 const anthropicTokenKind = "anthropic_token"
 
+// MaxIssueDescriptionBytes bounds the snapshotted issue description carried in a
+// run: generous for a PRD-shaped body, a secondary guard under the 1 MiB whole-body
+// cap DecodeJSON already enforces. Enforced once inside createRun so BOTH the
+// manual-start (handler) and autopilot (poller) paths share the exact cap — the
+// single source of truth that replaced the two mirrored consts (PRD #19 M5).
+const MaxIssueDescriptionBytes = 256 * 1024
+
 // Terminal run statuses. A run in any of these is finished and immutable.
 var terminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
 
 // Sentinel errors mapped to HTTP status codes by the handlers.
 var (
-	ErrRunNotFound     = errors.New("run not found")
-	ErrRunNotOwned     = errors.New("run not owned by worker")
-	ErrRepoNotFound    = errors.New("repo not found")
-	ErrIssueNotFound   = errors.New("issue not found")
-	ErrNoPRDLink       = errors.New("issue has no PRD link")
-	ErrActiveRunExists = errors.New("a non-terminal run already exists for this issue")
-	ErrRunTerminal     = errors.New("run has already finished")
-	ErrInvalidState    = errors.New("invalid run state")
-	ErrInvalidMessage  = errors.New("invalid run message")
-	ErrWorkerNotFound  = errors.New("worker not found")
+	ErrRunNotFound         = errors.New("run not found")
+	ErrRunNotOwned         = errors.New("run not owned by worker")
+	ErrRepoNotFound        = errors.New("repo not found")
+	ErrIssueNotFound       = errors.New("issue not found")
+	ErrNoPRDLink           = errors.New("issue has no PRD link")
+	ErrDescriptionTooLarge = errors.New("issue description is too large to run")
+	ErrActiveRunExists     = errors.New("a non-terminal run already exists for this issue")
+	ErrRunTerminal         = errors.New("run has already finished")
+	ErrInvalidState        = errors.New("invalid run state")
+	ErrInvalidMessage      = errors.New("invalid run message")
+	ErrWorkerNotFound      = errors.New("worker not found")
 	// ErrWorkerHasActiveRuns rejects deletion of a worker that still owns a
 	// non-terminal run: the FK is ON DELETE SET NULL, so deleting would orphan the
 	// run past every sweep (and the one-active-run index would then block re-runs).
@@ -324,6 +332,7 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		IterationCount:   run.IterationCount,
 		RequeueCount:     run.RequeueCount,
 		PlanMd:           textPtr(run.PlanMd),
+		AutoApprove:      run.AutoApprove,
 		Repo: ClaimRepo{
 			ID:            run.RepoID.String(),
 			URL:           rc.RepoWebUrl,
@@ -584,6 +593,12 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 }
 
 func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool) (store.Run, error) {
+	// The description cap is enforced HERE, once, so the manual (handler → 422) and
+	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
+	// first: it is pure input validation, independent of the repo/issue gates below.
+	if len(description) > MaxIssueDescriptionBytes {
+		return store.Run{}, ErrDescriptionTooLarge
+	}
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound

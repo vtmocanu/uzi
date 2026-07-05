@@ -355,6 +355,7 @@ export const mockApi = {
       status: "queued",
       requeue_count: 0,
       iteration_count: 0,
+      auto_approve: false,
       worker_id: null,
       branch: null,
       mr_iid: null,

@@ -211,6 +211,9 @@ export interface Run {
   status: RunStatus;
   requeue_count: number;
   iteration_count: number;
+  /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
+   *  "autopilot" badge; a manually-started run is false. */
+  auto_approve: boolean;
   worker_id: string | null;
   branch: string | null;
   mr_iid: number | null;

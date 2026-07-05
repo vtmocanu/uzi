@@ -15,10 +15,6 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// maxIssueDescriptionBytes mirrors the manual-start cap in the workers handler:
-// autopilot must not snapshot an unbounded description onto an unattended run.
-const maxIssueDescriptionBytes = 256 * 1024
-
 // RunStarter creates an autopilot run through workersvc's shared manual-start
 // path. *workersvc.Service satisfies it. Keeping run creation on the workersvc
 // side (rather than re-implementing it here) is what makes an autopilot run and a
@@ -183,10 +179,6 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		slog.Warn("poller: autopilot fetch issue", "repo", r.PathWithNamespace, "issue", iid, "error", err)
 		return
 	}
-	if len(issue.Description) > maxIssueDescriptionBytes {
-		a.recordThenComment(ctx, r, f, iid, eventID, tooLargeComment())
-		return
-	}
 
 	_, err = a.runs.CreateAutopilotRun(ctx, cc.UserID, r.ID, iid, issue.Description)
 	switch {
@@ -195,6 +187,10 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		// so the next tick's active-run check swallows the re-detection (no double run)
 		// and records the event id then.
 		a.record(ctx, r, iid, eventID)
+	case errors.Is(err, workersvc.ErrDescriptionTooLarge):
+		// The shared createRun cap (unified in M5): the description is too large to
+		// snapshot onto an unattended run — explain it instead of running.
+		a.recordThenComment(ctx, r, f, iid, eventID, tooLargeComment())
 	case errors.Is(err, workersvc.ErrNoPRDLink):
 		// The same gate the manual path enforces: an autopilot issue with no prds/*.md
 		// link never runs; it gets the explanatory comment instead (PRD invariant).

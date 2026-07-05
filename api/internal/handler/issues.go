@@ -15,6 +15,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // maxIssueTitleBytes bounds a created issue's title (GitLab caps titles at 255).
@@ -45,7 +46,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "title must be non-empty and at most 255 characters")
 		return
 	}
-	if len(req.Description) > maxIssueDescriptionBytes {
+	if len(req.Description) > workersvc.MaxIssueDescriptionBytes {
 		httpx.Error(w, http.StatusBadRequest, "description is too large")
 		return
 	}

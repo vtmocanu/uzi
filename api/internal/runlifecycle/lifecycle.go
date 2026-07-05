@@ -21,7 +21,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,6 +67,7 @@ type Store interface {
 	ClearRunMovePending(ctx context.Context, id uuid.UUID) (int64, error)
 	ListPendingColumnMoves(ctx context.Context, arg store.ListPendingColumnMovesParams) ([]uuid.UUID, error)
 	ListGaveUpColumnMoves(ctx context.Context, arg store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error)
+	ClaimAutopilotTerminalComment(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
 // Mover builds a forge client from a stored connection and applies the shared
@@ -80,6 +83,10 @@ type Lifecycle struct {
 	mover Mover
 	now   func() time.Time
 
+	// frontendOrigin is the user-facing origin (config.FrontendOrigin) the
+	// terminal-comment hook builds run links from. Empty omits the link.
+	frontendOrigin string
+
 	interval time.Duration
 	grace    time.Duration
 	giveup   time.Duration
@@ -90,16 +97,19 @@ type Lifecycle struct {
 	wg sync.WaitGroup
 }
 
-// New constructs a Lifecycle with the default tuning.
-func New(q Store, mover Mover) *Lifecycle {
+// New constructs a Lifecycle with the default tuning. frontendOrigin is the
+// user-facing origin (config.FrontendOrigin) used to build run links in autopilot
+// terminal comments; "" omits the link.
+func New(q Store, mover Mover, frontendOrigin string) *Lifecycle {
 	return &Lifecycle{
-		q:        q,
-		mover:    mover,
-		now:      time.Now,
-		interval: defaultInterval,
-		grace:    defaultGrace,
-		giveup:   defaultGiveup,
-		batch:    defaultBatch,
+		q:              q,
+		mover:          mover,
+		now:            time.Now,
+		frontendOrigin: strings.TrimRight(frontendOrigin, "/"),
+		interval:       defaultInterval,
+		grace:          defaultGrace,
+		giveup:         defaultGiveup,
+		batch:          defaultBatch,
 	}
 }
 
@@ -214,6 +224,9 @@ func (l *Lifecycle) notifyOnce(ctx context.Context, runID uuid.UUID, status stri
 		return
 	}
 	l.apply(ctx, runID, contextFromRow(mc), notifierDecision(status, mc.OriginColumn))
+	// The worker's Set('completed'|'failed') funnels the terminal comment here; the
+	// passed status is the just-written one (see notifyOnce's doc).
+	l.maybeTerminalComment(ctx, runID, status, mc)
 }
 
 func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
@@ -335,6 +348,96 @@ func coalesceColumn(boardCol, originCol pgtype.Text) (string, bool) {
 	return "", false
 }
 
+// maybeTerminalComment is the SINGLE run-lifecycle hook that posts an autopilot
+// run's outcome as a GitLab issue comment (PRD #19 Decision 6). It fires for BOTH
+// terminal paths through the one place they converge — the lifecycle notifier: the
+// worker's Set('failed'|'completed') reaches it via the inline notifyOnce, and the
+// sweeper's bulk terminal writes reach it via the reconcile loop (they stamp
+// move_pending_since but never call the inline notify). It is a no-op for anything
+// but a just-terminal autopilot run.
+//
+// Ordering is record-then-comment: ClaimAutopilotTerminalComment atomically marks
+// the run FIRST (and doubles as the concurrency claim — of the possibly-racing
+// invocations exactly one wins the row), then the comment is posted. A crash or a
+// forge error after the claim loses that one comment rather than ever
+// double-posting — the same trade the pre-run comments make.
+//
+// Bodies are FIXED templates plus links built only from trusted values (the run
+// uuid, the numeric mr_iid, the config origin, and the repo's own web_url). Issue
+// title/description and the free-text failure_reason are NEVER interpolated: issue
+// text is untrusted input and the reason is not guaranteed content-free, so the
+// failure comment points at the run for detail instead of echoing it (audit
+// requirement).
+func (l *Lifecycle) maybeTerminalComment(ctx context.Context, runID uuid.UUID, status string, mc store.GetRunMoveContextRow) {
+	switch status {
+	case "completed", "failed":
+	default:
+		return // non-terminal, or a cancel (a human stop, not an autopilot outcome)
+	}
+	if !mc.AutoApprove {
+		return // only autopilot runs comment; a manual run's outcome is the user's own
+	}
+
+	// Record-then-comment: claim the one comment for this run. 0 rows means either
+	// a manual run (already excluded) or a peer invocation already claimed it.
+	claimed, err := l.q.ClaimAutopilotTerminalComment(ctx, runID)
+	if err != nil {
+		slog.Warn("run lifecycle: claim autopilot terminal comment", "run", runID, "error", err)
+		return
+	}
+	if claimed == 0 {
+		return
+	}
+
+	f, err := l.mover.ForgeForConnection(mc.ForgeType, mc.BaseUrl, mc.TokenCiphertext)
+	if err != nil {
+		// The marker is recorded, so this comment is now lost (never retried) — the
+		// accepted record-then-comment trade. Likely an undecryptable token.
+		slog.Warn("run lifecycle: build forge for terminal comment", "run", runID, "error", err)
+		return
+	}
+	body := l.terminalCommentBody(status, runID, mc)
+	if _, err := f.CreateIssueNote(ctx, mc.ForgeProjectID, mc.IssueIid, body); err != nil {
+		// Already PAT-redacted by the driver. Recorded but lost (never retried).
+		slog.Warn("run lifecycle: post autopilot terminal comment", "run", runID, "error", err)
+	}
+}
+
+// terminalCommentBody renders the fixed comment for a terminal autopilot run. Only
+// trusted values are interpolated (see maybeTerminalComment): the run uuid, the
+// numeric mr_iid, and URLs derived from the config origin and the repo's web_url.
+func (l *Lifecycle) terminalCommentBody(status string, runID uuid.UUID, mc store.GetRunMoveContextRow) string {
+	if status == "completed" {
+		if mc.MrIid.Valid {
+			return fmt.Sprintf(
+				"**Autopilot opened a merge request.**\n\n"+
+					"Autopilot finished this issue and opened merge request !%d for your review: %s",
+				mc.MrIid.Int64, mergeRequestURL(mc.RepoWebUrl, mc.MrIid.Int64))
+		}
+		// Completed without an MR is not expected on the normal success path; still
+		// close the loop with the run link rather than going silent.
+		return "**Autopilot finished this issue.**\n\n" +
+			"Autopilot completed without opening a merge request." + l.runLinkSuffix(runID)
+	}
+	return "**Autopilot could not complete this issue.**\n\n" +
+		"The autopilot run failed." + l.runLinkSuffix(runID) +
+		"\n\nRemove and re-add the label to retry."
+}
+
+// runLinkSuffix appends " See the run: <url>" when the frontend origin is known,
+// else nothing (a bare, unroutable path is worse than no link).
+func (l *Lifecycle) runLinkSuffix(runID uuid.UUID) string {
+	if l.frontendOrigin == "" {
+		return ""
+	}
+	return fmt.Sprintf(" See the run: %s/runs/%s", l.frontendOrigin, runID)
+}
+
+// mergeRequestURL builds the GitLab merge-request web URL from the repo's web_url.
+func mergeRequestURL(repoWebURL string, mrIID int64) string {
+	return fmt.Sprintf("%s/-/merge_requests/%d", strings.TrimRight(repoWebURL, "/"), mrIID)
+}
+
 // RunReconciler blocks until ctx is cancelled, retrying pending moves every
 // interval. It is the isolated sibling of the liveness sweeper: its forge I/O
 // must never sit in the sweep path, and each pass is bounded so a slow forge
@@ -392,6 +495,10 @@ func (l *Lifecycle) reconcileOne(ctx context.Context, runID uuid.UUID) {
 		return // healed by an inline move or manual drag since the candidate scan
 	}
 	l.apply(ctx, runID, contextFromRow(mc), reconcilerDecision(mc.Status, mc.OriginColumn))
+	// The sweeper's bulk terminal writes never call the inline notify — they only
+	// stamp move_pending_since — so the reconcile loop is the terminal comment's
+	// funnel for that path. mc.Status is the run's current (terminal) status.
+	l.maybeTerminalComment(ctx, runID, mc.Status, mc)
 }
 
 // warnGivenUp emits a one-shot warning for each run whose marker crossed the

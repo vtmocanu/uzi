@@ -48,6 +48,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     status: "running",
     requeue_count: 0,
     iteration_count: 0,
+    auto_approve: false,
     worker_id: "w1",
     branch: null,
     mr_iid: null,

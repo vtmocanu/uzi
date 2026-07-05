@@ -34,6 +34,27 @@ func (q *Queries) CancelRunServerSide(ctx context.Context, arg CancelRunServerSi
 	return result.RowsAffected(), nil
 }
 
+const claimAutopilotTerminalComment = `-- name: ClaimAutopilotTerminalComment :execrows
+UPDATE runs SET autopilot_commented_at = now()
+WHERE id = $1 AND auto_approve = true AND autopilot_commented_at IS NULL
+`
+
+// Atomically claim the single terminal issue comment for an autopilot run (PRD #19
+// M5, Decision 6 record-then-comment). Records the marker FIRST; the caller posts
+// the comment only when this returns 1. The auto_approve + IS NULL guard makes it
+// both the autopilot gate and the concurrency claim: a manual run is never claimed,
+// and of the possibly-racing lifecycle invocations (inline notify vs reconcile
+// retry) exactly one gets the row — the rest read 0 and do not re-post. A crash
+// after this commits but before the forge post loses that one comment, never
+// double-posts.
+func (q *Queries) ClaimAutopilotTerminalComment(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, claimAutopilotTerminalComment, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const claimRun = `-- name: ClaimRun :one
 UPDATE runs SET
     status     = 'claimed',
@@ -51,7 +72,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at
 `
 
 type ClaimRunParams struct {
@@ -96,6 +117,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.MovePendingSince,
 		&i.MrState,
 		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
 	)
 	return i, err
 }
@@ -212,7 +234,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
 VALUES ($1, $2, $3, $4, $5, $6, now(), $7)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at
 `
 
 type CreateRunParams struct {
@@ -273,6 +295,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.MovePendingSince,
 		&i.MrState,
 		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
 	)
 	return i, err
 }
@@ -410,7 +433,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -446,12 +469,13 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.MovePendingSince,
 		&i.MrState,
 		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -489,6 +513,7 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.MovePendingSince,
 		&i.MrState,
 		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
 	)
 	return i, err
 }
@@ -538,7 +563,8 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 const getRunMoveContext = `-- name: GetRunMoveContext :one
 
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
-       rp.forge_project_id,
+       r.auto_approve, r.mr_iid,
+       rp.forge_project_id, rp.web_url AS repo_web_url,
        c.forge_type, c.base_url, c.token_ciphertext
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
@@ -553,7 +579,10 @@ type GetRunMoveContextRow struct {
 	OriginColumn     pgtype.Text        `json:"origin_column"`
 	BoardColumn      pgtype.Text        `json:"board_column"`
 	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
+	AutoApprove      bool               `json:"auto_approve"`
+	MrIid            pgtype.Int8        `json:"mr_iid"`
 	ForgeProjectID   int64              `json:"forge_project_id"`
+	RepoWebUrl       string             `json:"repo_web_url"`
 	ForgeType        string             `json:"forge_type"`
 	BaseUrl          string             `json:"base_url"`
 	TokenCiphertext  []byte             `json:"token_ciphertext"`
@@ -566,6 +595,12 @@ type GetRunMoveContextRow struct {
 // (the sibling) deliberately lacks forge_project_id and the column snapshot, so
 // this is its own query. token_ciphertext is decrypted by the service, never
 // selected in the clear.
+//
+// It also carries the facts the M5 terminal-comment hook needs from the same read:
+// auto_approve gates the comment to autopilot runs, mr_iid links the success
+// comment, and rp.web_url builds that merge-request link. Both lifecycle observers
+// (the inline notify and the reconcile loop) already load this row, so the terminal
+// comment rides along without a second query.
 func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRunMoveContextRow, error) {
 	row := q.db.QueryRow(ctx, getRunMoveContext, runID)
 	var i GetRunMoveContextRow
@@ -576,7 +611,10 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 		&i.OriginColumn,
 		&i.BoardColumn,
 		&i.MovePendingSince,
+		&i.AutoApprove,
+		&i.MrIid,
 		&i.ForgeProjectID,
+		&i.RepoWebUrl,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
@@ -585,7 +623,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -624,6 +662,7 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.MovePendingSince,
 		&i.MrState,
 		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
 	)
 	return i, err
 }
@@ -756,7 +795,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -811,6 +850,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.MovePendingSince,
 			&i.Run.MrState,
 			&i.Run.AutoApprove,
+			&i.Run.AutopilotCommentedAt,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -1015,7 +1055,7 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, rp.path_with_namespace AS repo_path, w.name AS worker_name
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -1080,6 +1120,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.MovePendingSince,
 			&i.Run.MrState,
 			&i.Run.AutoApprove,
+			&i.Run.AutopilotCommentedAt,
 			&i.RepoPath,
 			&i.WorkerName,
 		); err != nil {
