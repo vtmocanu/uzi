@@ -87,9 +87,12 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		}
 		s.recordMRState(ctx, c.ID, observed)
 	default:
-		// merged / locked / any non-actionable transition: record, never move. A
+		// Every transition that is NOT one of the two actionable edges above —
+		// merged, locked, AND any unrecognized state string — is record-only,
+		// never a move: only the known opened↔closed edges may move a card. A
 		// merge closes the issue via `Closes #N`, which the existing issue-close
-		// sync owns; locked is transient during merge processing.
+		// sync owns; locked is transient during merge processing; an unknown
+		// state is still recorded so the next real edge is detected against it.
 		s.recordMRState(ctx, c.ID, observed)
 	}
 }

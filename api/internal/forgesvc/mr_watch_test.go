@@ -295,6 +295,24 @@ func TestMRLockedIsRecordedNeverMoves(t *testing.T) {
 	assertRecorded(t, st, runID, "locked")
 }
 
+func TestMRUnknownStateIsRecordedNeverMoves(t *testing.T) {
+	// Audit requirement: only the known opened<->closed edges may move a card. An
+	// unrecognized state string (a future/unexpected GitLab value) must be
+	// record-only, never a move — it falls through the switch's default.
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("opened"))},
+		issue:      mrIssue(repoID, 9, "opened", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	f := &fakeForge{mr: forgeMR(13, "some_new_state")}
+
+	run(t, st, f)
+
+	assertNoMove(t, f)
+	assertRecorded(t, st, runID, "some_new_state")
+}
+
 // ── read failure leaves the edge ────────────────────────────────────────────
 
 func TestMRReadErrorLeavesEdge(t *testing.T) {
