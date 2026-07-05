@@ -19,10 +19,16 @@ services:
       # forge-fake 401s the clone/push. Dormant in the default (local-remote) run.
       FORGE_FAKE_EXPECT_USER: uzi-bot
       FORGE_FAKE_EXPECT_PAT: e2e-dummy-forge-pat-000000
+      # Persist recorded state to a bind mount so it survives the restart-resilience
+      # down/up. The fake is otherwise in-memory; a real forge does not forget its
+      # issues/MRs when uzi restarts, and the MR-close phase reconciles against it.
+      FORGE_FAKE_STATE: /state/state.json
     volumes:
       - ${E2E_RUN_DIR}/certs:/certs:ro
       # The bare repo served over git smart-HTTP (E2E_GIT_SMART_HTTP variant).
       - ${E2E_RUN_DIR}/fakeremote:/gitroot
+      # Recorded issues/MRs, persisted across container recreate (see FORGE_FAKE_STATE).
+      - ${E2E_RUN_DIR}/forge-fake-state:/state
     networks:
       default:
         aliases:
@@ -56,10 +62,12 @@ services:
       RUN_MAX_REQUEUES: "3"
       # Point the SSRF allowlist + the boot seed at the fake forge.
       FORGE_ALLOWED_BASE_URLS: https://forge-fake.e2e
-      # Poll rarely: the harness drives issues/runs directly; a long interval keeps
-      # a reconcile pass from racing the assertions (forge-fake also returns the
-      # created issues, so a poll would be a no-op either way).
-      FORGE_POLL_INTERVAL: 24h
+      # Poll rarely by DEFAULT: the harness drives issues/runs directly, and a long
+      # interval keeps a reconcile pass from racing the run-lifecycle assertions.
+      # The MR-close phase (PRD #24) overrides this to ~2s via E2E_FORGE_POLL_INTERVAL
+      # and recreates the api, so the MR-state watcher actually ticks. Overlay-only;
+      # the production default (config.go) is untouched.
+      FORGE_POLL_INTERVAL: ${E2E_FORGE_POLL_INTERVAL:-24h}
       # Deterministic bootstrap (no registration race): seed the admin, the
       # Anthropic token (dummy), and the forge connection + repo at boot. All
       # dummy per the testing-credentials policy.

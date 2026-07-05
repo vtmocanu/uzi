@@ -41,6 +41,9 @@ func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string
 func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
 	return nil
 }
+func (f *fakeForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
+	return forge.MergeRequest{}, nil
+}
 func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 	return forge.TokenInfo{}, nil
 }

@@ -52,7 +52,7 @@ JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, e
 
 **Pipeline-source honesty**: branch-ref filtering only sees *branch* pipelines. Projects configured MR-only (`rules: if $CI_PIPELINE_SOURCE == "merge_request_event"`) run detached pipelines on `refs/merge-requests/:iid/head`, invisible to `LatestPipeline(branch)`. So the sync uses **`LatestMRPipeline` whenever the watched ref belongs to a run with an `mr_iid`** (which is every pushed run branch — PRD #4's worker pushes and opens the MR in the same step) and `LatestPipeline` only for the default branch. Default branches of MR-only projects will honestly show "no CI" — documented, not fabricated.
 
-### Pipeline status sync + persistence (migration `00040`+ — range reserved above PRD #5's `00030+`, same gap convention)
+### Pipeline status sync + persistence (migration drafted as `00040`+ — final number assigned at merge time, next free above the live head, per the CLAUDE.md convention)
 
 ```sql
 pipeline_statuses (

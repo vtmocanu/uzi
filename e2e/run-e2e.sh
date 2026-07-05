@@ -14,6 +14,11 @@
 # is re-queued, re-claimed, and driven to completion with a gapless seq) and the
 # server-side cancel path.
 #
+# Finally, the PRD #24 MR-close watcher: with the poller sped to ~2s, closing the
+# completed run's MR (without merging, via forge-fake's /_e2e mutator) moves the
+# card Human Review → In Progress; reopening restores it; and a manual drag is
+# never fought (the reopen edge's source-column guard backs off).
+#
 # Observable assertions: DB run-state transitions (via the API), gapless
 # run_messages seq, branch pushed to the remote, MR recorded by the fake GitLab,
 # NO secret (PAT / Anthropic token / worker join token) in container logs or on
@@ -132,9 +137,46 @@ wait_status() {
   fail "timeout: run $run never reached '$want' (last: ${s:-none})"
 }
 
+# card_column IID — the board's resolved column for one issue (empty = Open).
+card_column() {
+  apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" \
+    '.board.cards[] | select(.iid==$iid) | .column'
+}
+
+# wait_card_column IID WANT [TIMEOUT] — poll the board until a card resolves to
+# WANT (used for the MR-close watcher's async, poller-driven moves).
+wait_card_column() {
+  local iid="$1" want="$2" deadline=$((SECONDS + ${3:-40})) c
+  while [ $SECONDS -lt $deadline ]; do
+    c="$(card_column "$iid")"
+    [ "$c" = "$want" ] && return 0
+    sleep 2
+  done
+  fail "timeout: card #$iid never reached column '$want' (last: '${c:-none}')"
+}
+
+# flip_mr IID STATE — drive forge-fake's /_e2e state mutator (the harness stand-in
+# for a reviewer closing/reopening/merging an MR). Run from inside the agent, which
+# resolves forge-fake.e2e and trusts its self-signed cert (NODE_EXTRA_CA_CERTS).
+flip_mr() {
+  local iid="$1" state="$2"
+  "${COMPOSE[@]}" exec -T agent node -e '
+    const https=require("https");
+    const data=JSON.stringify({state:process.argv[2]});
+    const req=https.request({hostname:"forge-fake.e2e",port:443,method:"POST",
+      path:`/_e2e/mrs/${process.argv[1]}/state`,
+      headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(data)}},
+      r=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>{
+        if(r.statusCode!==200){console.error("flip failed",r.statusCode,b);process.exit(1)}});});
+    req.on("error",e=>{console.error(e.message);process.exit(2)});
+    req.write(data);req.end();
+  ' "$iid" "$state" >/dev/null
+}
+
 # =============================================================================
 say "provisioning scratch dir $RUNROOT (project $PROJECT, web $BASE, executor $EXECUTOR)"
-mkdir -p "$RUNROOT/certs" "$RUNROOT/worker-secret" "$RUNROOT/agent-gitconfig" "$RUNROOT/fakeremote"
+mkdir -p "$RUNROOT/certs" "$RUNROOT/worker-secret" "$RUNROOT/agent-gitconfig" "$RUNROOT/fakeremote" "$RUNROOT/forge-fake-state"
+chmod a+rwX "$RUNROOT/forge-fake-state"  # forge-fake persists its recorded state here (survives the restart)
 
 # Self-signed cert for forge-fake.e2e (trusted by api/worker/git in the overlay).
 cat > "$RUNROOT/certs/openssl.cnf" <<'EOF'
@@ -214,6 +256,13 @@ login
 REPO_ID="$(apiget /api/repos | jq -r '.repos[0].id // empty')"
 [ -n "$REPO_ID" ] || fail "no enabled repo after seed (expected group/repo)"
 pass "admin logged in; repo $REPO_ID enabled"
+
+# Open the board once up front so its columns are seeded (as labels on the fake).
+# An unopened board has no columns, which would let the run-lifecycle's
+# single-column moves leave a card carrying two column labels; seeding first keeps
+# the column state clean for the run-lifecycle path and the PRD #24 MR-close phase.
+apiget "/api/repos/$REPO_ID/board" >/dev/null
+pass "board columns seeded"
 
 # --- PRD #5: least-privilege journey (steps 3-4) -----------------------------
 # The forge base the seed + SSRF allowlist use (docker-compose.e2e.yml).
@@ -319,7 +368,7 @@ git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/hea
   || fail "branch agent/issue-$IID was not pushed to the remote"
 pass "branch agent/issue-$IID present on the git remote"
 
-STATE_JSON="$("${COMPOSE[@]}" exec -T forge-fake cat /tmp/forge-fake-state.json)"
+STATE_JSON="$("${COMPOSE[@]}" exec -T forge-fake cat /state/state.json)"
 [ "$(echo "$STATE_JSON" | jq '.mrs | length')" -ge 1 ] || fail "fake GitLab recorded no merge request"
 [ "$(echo "$STATE_JSON" | jq -r '.mrs[-1].source_branch')" = "agent/issue-$IID" ] \
   || fail "recorded MR source_branch mismatch"
@@ -374,4 +423,57 @@ ENV_HITS="$("${COMPOSE[@]}" exec -T agent sh -c '
 [ "$ENV_HITS" = 0 ] || fail "the join token is present in $ENV_HITS process environ(s) — /proc leak NOT closed"
 pass "/proc hardening: join token absent from every process environ; delivery file unlinked"
 
-printf '\n\033[32mAll M6 E2E checks passed.\033[0m (executor=%s)\n' "$EXECUTOR"
+# =============================================================================
+# PRD #24 — MR-close watcher: a reviewer closing an agent's MR without merging
+# moves the card from Human Review back to In Progress; reopening restores it; a
+# manual drag is never fought. The happy-path run above left card #$IID in Human
+# Review with an open MR ($MR_IID) — exactly the watcher's precondition.
+say "PRD #24: MR-close watcher (Human Review ⇄ In Progress on MR close/reopen)"
+
+# The watcher only ticks inside the poller; the overlay default is 24h. Switch to
+# ~2s and recreate the api so the MR-state watcher actually runs.
+printf 'E2E_FORGE_POLL_INTERVAL=2s\n' >> "$ENVFILE"
+"${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
+wait_http
+login
+# The completed run's run-lifecycle move to Human Review is async; tolerate it
+# settling (and confirm the fake retained the issue across the restart).
+wait_card_column "$IID" "Human Review" 20
+pass "poller sped to ~2s; card #$IID in Human Review with open MR !$MR_IID"
+
+# NULL-bootstrap (Decision 9): the first tick records the MR's CURRENT state
+# ('opened') WITHOUT moving, so a pre-existing state never triggers a spurious
+# move. Give it a few ticks; the card must stay put.
+sleep 6
+[ "$(card_column "$IID")" = "Human Review" ] \
+  || fail "NULL-bootstrap must record MR state without moving the card (Decision 9)"
+pass "NULL-bootstrap recorded MR state without moving the card"
+
+# Close edge: reviewer closes the MR without merging → rework → In Progress.
+flip_mr "$MR_IID" closed
+wait_card_column "$IID" "In Progress" 40
+pass "MR closed unmerged → card #$IID moved Human Review → In Progress"
+
+# Reopen edge: reopening the MR restores the card to Human Review, symmetrically.
+flip_mr "$MR_IID" opened
+wait_card_column "$IID" "Human Review" 40
+pass "MR reopened → card #$IID returned In Progress → Human Review"
+
+# Manual-drag pre-emption, exercising the Go source-column guard (not just the SQL
+# prefilter): re-close so the card is In Progress AND still a watch candidate
+# (mr_state='closed'), drag it to Later, then reopen. The reopen edge's guard sees
+# the card is no longer in its expected source column (In Progress) and backs off —
+# the human's placement wins.
+flip_mr "$MR_IID" closed
+wait_card_column "$IID" "In Progress" 40
+apipost "/api/repos/$REPO_ID/issues/$IID/move" '{"to_column":"Later"}' >/dev/null
+wait_card_column "$IID" "Later" 10   # the move is forge-first; let any in-flight reconcile settle
+flip_mr "$MR_IID" opened
+# Several ticks must pass with the card LEFT in Later (a fight would yank it to
+# Human Review within one tick).
+sleep 10
+[ "$(card_column "$IID")" = "Later" ] \
+  || fail "watcher fought a manual drag: card #$IID left Later after the MR reopened"
+pass "manual drag wins: card #$IID stayed in Later despite the MR reopening"
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close; executor=%s)\n' "$EXECUTOR"

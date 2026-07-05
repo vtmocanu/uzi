@@ -85,7 +85,7 @@ Rules, restated precisely:
 2. **On demand**: `POST /api/forge/connections/{id}/privilege-check` runs the full report (token + all enabled repos), persists it, returns it. Owner-only authz; **behind the per-user forge rate limiter** like every forge-proxying route (it is the heaviest of them: 1 + 2×repos upstream calls). The Settings page gets a "Check privileges" button next to the existing "Verify".
 3. **Periodic**: a background loop (`UZI_PRIVILEGE_CHECK_INTERVAL`, default `24h`, `0` disables), modeled on the **worker sweeper, not the poller**: it runs an immediate pass at boot (`Boot()`-style, like `main.go`'s worker sweeper) so pre-existing/never-checked connections get a report right after deploy, then ticks on the interval. Per-repo fan-out uses bounded concurrency (same `maxConcurrency=4` discipline as the poller) to stay polite to gitlab.example.com. Failures (forge unreachable, token revoked) are recorded *in the report* rather than crashing the loop — a revoked token is exactly what the report must surface; a connection or repo deleted mid-sweep is a 0-rows-affected write-back, tolerated silently. Single-instance assumption (compose has one API): like the existing poller and sweeper, this loop has no leader election — a multi-replica k8s deploy needs that for all three loops (noted, deferred with the k8s work).
 
-**Persistence** (goose migration `00030`+ — range reserved above PRD #4's `00020+`, same gap convention):
+**Persistence** (goose migration drafted as `00030`+ — final number assigned at merge time, next free above the live head, per the CLAUDE.md convention; strict goose refuses to boot on below-head versions):
 
 ```sql
 ALTER TABLE forge_connections ADD COLUMN privilege_report jsonb,

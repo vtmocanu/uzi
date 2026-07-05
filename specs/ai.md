@@ -1843,3 +1843,139 @@ recomputed on every one of those polls, so a hidden column can never go stale.)
   gets `py-1.5` so its hit target clears the WCAG 2.5.8 24px minimum; the "N hidden"
   hint uses `text-muted` (not `text-faint`) for AA contrast at 12px — both stay within
   the §76 theme tokens, no hardcoded colors.
+
+---
+
+# PRD #24 — MR closed without merging → card back to In Progress
+
+Serves human Feature #24 (close-unmerged → In Progress; user, 2026-07-05). The
+board's column automation was driven exclusively by **run status** (§67); nothing
+watched **MR state**, so a reviewer closing an agent's MR without merging (the
+"rejected, redo it" signal) left the card parked in Human Review forever. This PRD
+adds an edge-triggered MR-state watcher that moves the card back to In Progress on
+close, and symmetrically restores it on reopen. Merged MRs trigger nothing — the
+existing `Closes #N` → issue-close → sync path (§22) owns that outcome. Section
+numbers continue past PRD #23's #88; the numbered decisions below realize the PRD's
+Decision Log (`prds/24-mr-close-rework.md`).
+
+## 89. Detection: poller-based, edge-triggered on `runs.mr_state`
+
+Serves human Feature #24; reuses the PRD #2 poller (§22–§23).
+
+- **Poller-based, not webhook-based.** uzi's target is a laptop where only `web`
+  publishes a loopback-only port, so GitLab can never reach in — webhooks are
+  structurally unavailable (same reason as §22's deferred webhooks). The MR check
+  joins the existing per-repo poller tick and inherits its redaction, timeout, and
+  bounded-concurrency posture for free.
+- **Edge-triggered, not level-triggered.** The move fires once per opened→closed
+  (and closed→opened) transition, tracked by persisting the last-seen MR state on
+  the run in new column **`runs.mr_state`** (migration `00029`; NULL = never
+  observed, no backfill). A level trigger ("MR is closed and card is in Human
+  Review → move") would re-fight a human who deliberately drags the card back after
+  the close; an edge touches the board exactly once per state change.
+- **`mr_state` is watcher-owned** — the sole writer is `SetRunMRState` (§90); no
+  run-status path writes it (`SetRunCompleted` rewrites `mr_iid` but never
+  `mr_state`; requeue/sweep touch only non-terminal runs). Asserted in a query test.
+  Why: the run stays `completed` — closing an MR is review feedback, not a
+  run-status event — so the watcher and the run-lifecycle reconciler (§67) act on
+  disjoint triggers (MR-state edges vs run-status markers) and cannot fight.
+- **Poll cadence IS the retry loop** (see the state-persistence contract in §91):
+  the watcher needs no durable move marker of its own, unlike run-lifecycle's
+  `move_pending_since` (§69).
+
+## 90. Forge method + schema + candidate query
+
+Serves human Feature #24; extends the forge seam (§16) and runtime schema (§37).
+
+- **Forge interface grows `GetMergeRequest(ctx, projectID, mrIID) (MergeRequest,
+  error)`** with a neutral `MergeRequest{IID, State, WebURL}` type. `State` is one
+  of the `MRState*` constants (`opened|closed|merged|locked`, as GitLab reports on
+  the single-MR GET — distinguishable from the multi-MR list). GitLab driver only
+  (Forgejo still deferred, §16); read-only; errors pass the existing PAT-scrubbing
+  redactor (§16). `IsKnownMRState` gates recording (§91).
+- **Migration `00029`** (`ALTER TABLE runs ADD COLUMN mr_state text`; reversible;
+  no backfill). Reserved slot in the goose ledger (`00021` head, `00030+` PRD #5,
+  `00036+` #19, `00040+` #6, `00050+` #16) so parallel branches don't collide.
+- **`ListMRWatchCandidates` (Decision 4 candidate rule)**: per repo, `DISTINCT ON
+  (issue_iid)` the issue's **latest run OVERALL** (newest `created_at`, riding
+  `idx_runs_issue_history`), **then** filter `status='completed' AND mr_iid IS NOT
+  NULL`. Order matters: filtering `completed` *inside* the `DISTINCT ON` would pick
+  the latest *completed* run and silently watch a **superseded MR** while a newer
+  rework run exists. So a non-completed latest run yields **no candidate** (an
+  in-flight rework run suppresses the watch entirely — this closes the mid-rework
+  reopen misfire), and a completed latest run with NULL `mr_iid` yields none either
+  (never fall back to an older run's MR). Plus: issue open, and a **coarse** column
+  prefilter (`jsonb_exists(labels,'Human Review') OR mr_state='closed'` — the
+  reopen-edge watch, Decision 10). The SQL prefilter is deliberately **not**
+  `board.ResolveColumn` (highest-position-wins across multiple column labels isn't
+  cheaply expressible in SQL); it only bounds how many MRs get polled — the Go
+  `ResolveColumn` check in the watcher is authoritative (§91).
+- **`SetRunMRState`** — the sole `mr_state` writer; touches `mr_state` + `updated_at`
+  only, never the run's status.
+
+## 91. Watcher: edges, guards, state-persistence contract (`forgesvc.SyncMRStates`)
+
+Serves human Feature #24; the primary-directive guard shape mirrors §67/§68.
+
+- **Wiring**: `poller.syncRepo` calls `SyncMRStates` **after** the issue sync each
+  tick (so MR checks see the freshest issue cache) and **only on a successful
+  sync** (an early return when the forge is unreachable skips it). Per-candidate
+  errors are log-and-skipped inside; only candidate-enumeration failure surfaces to
+  the poller. Store seam: **widened the existing `forgesvc.IssueStore`** interface
+  (rather than a new seam — TD §3 left the choice to implementation) with
+  `ListMRWatchCandidates`, `GetIssueByIID`, `ListBoardColumns`, `SetRunMRState`, so
+  the watcher stays fake-testable like the sync paths.
+- **Two edges, symmetric.** `opened→closed` → move Human Review → In Progress
+  (rework needed). `closed→opened` (Decision 6) → move In Progress → Human Review
+  (a reviewer who closed by accident and reopened must not leave the board lying).
+  Each fires once per transition.
+- **Guards mirror `runlifecycle.apply`** (load issue → closed-skip → resolve-column
+  → source-column compare → `AutoMove`, forge-first): never move a **closed** issue
+  (Closed is terminal placement, not a workflow column); the card must currently
+  sit in the edge's **expected source column** via `board.ResolveColumn` (a human
+  who dragged it elsewhere wins — manual drags are never re-fought). A guard-skip
+  **consumes the edge** (records state; we never retry a move a human pre-empted).
+- **State-persistence contract (the anti-stuck-card invariant).** `mr_state`
+  advances only on: (a) a successful move, (b) a deliberate guard-skip (manual drag
+  / closed issue), or (c) a no-op observation (`merged`, `locked`, NULL bootstrap).
+  On a forge-side **failure** (the MR read *or* the move) `mr_state` is **left
+  as-is**, so the next poller tick re-observes the same edge and retries — the
+  poller cadence is the retry loop. Consuming the edge on failure would re-create
+  exactly the stuck-card bug this PRD fixes. Modeled in code as a three-value
+  `moveOutcome` (applied / skipped → consume; deferred → leave).
+- **Write ordering: forge move FIRST, then `SetRunMRState`.** A crash in between
+  re-fires the edge next tick, and the source-column guard makes the retry a no-op
+  (card already moved) — except the narrow window where a human dragged the card
+  back to the source column in the crash gap, which then gets re-moved once;
+  accepted (crash-window-sized) and noted in the watcher's comments.
+- **NULL bootstrap (Decision 9)**: the first observation of a NULL-`mr_state` run
+  records the state **without moving**. Acting on NULL→closed can't distinguish
+  "closed and stuck" from "closed yesterday, already triaged elsewhere", so
+  pre-migration runs (e.g. the motivating #9) never cause a wave of moves — a single
+  manual drag heals a pre-existing stuck card (documented in `docs/board.md`).
+- **Known-states-only recording (post-audit hardening, reverses an earlier
+  record-verbatim choice).** An unrecognized or empty forge state is ignored
+  **entirely** — no `mr_state` write — in both the bootstrap and transition paths,
+  leaving the prior baseline (or NULL) intact. Because edges fire on exact string
+  compares, recording garbage would mask the next real close until a full reopen
+  cycle re-synced the baseline; ignoring lets a transient glitch self-heal.
+  `merged`/`locked` are known but **record-only, never move** (a merge closes the
+  issue via `Closes #N`; `locked` is transient during merge processing).
+- **The watcher records only `mr_state`, never `runs.board_column`.** After a
+  close-edge move a completed run's `board_column` still reads Human Review while
+  the card sits in In Progress — safe **only** because completed runs are terminal
+  for run-lifecycle (marker resolved, no further transitions); noted at the
+  `board_column` definition so future code never re-stamps `move_pending_since` on
+  completed runs.
+
+## 92. Web + docs
+
+Serves human Feature #24; no new surface required.
+
+- **No new web surface.** The board converges via the existing sync, and MR links
+  already render on cards/run views. Exposing `mr_state` on the runs API for an
+  optional `closed`/`merged` chip next to the `MR !N` chips is a noted nice-to-have,
+  **not built** (Open Question 2); prior art if pursued is multica's derived
+  PR-status enum (precompute a display status, don't surface the raw forge string).
+- **Docs**: `docs/board.md` gains the MR-close/reopen automation and the Decision 9
+  note (pre-existing stuck cards heal with one manual drag).

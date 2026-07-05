@@ -265,6 +265,24 @@ func (g *gitLab) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 	return nil
 }
 
+func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error) {
+	mr, _, err := g.client.MergeRequests.GetMergeRequest(projectID, mrIID, nil, gitlab.WithContext(ctx))
+	if err != nil {
+		return MergeRequest{}, g.redact.error(fmt.Errorf("gitlab: get merge request: %w", err))
+	}
+	return toMergeRequest(mr), nil
+}
+
+// toMergeRequest maps a client-go merge request to the neutral domain type. The
+// State field is one of the MRState* constants (opened|closed|merged|locked).
+func toMergeRequest(mr *gitlab.MergeRequest) MergeRequest {
+	return MergeRequest{
+		IID:    mr.IID,
+		State:  mr.State,
+		WebURL: mr.WebURL,
+	}
+}
+
 // toIssue maps a client-go issue to the neutral domain type. A nil author (rare
 // but possible for system issues) yields an empty Author; a nil UpdatedAt
 // yields the zero time, which the sync engine treats as "no HWM advance".

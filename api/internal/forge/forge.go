@@ -103,6 +103,39 @@ type Issue struct {
 	UpdatedAt   time.Time
 }
 
+// MR states as GitLab reports them on the single-MR GET. The MR-close watcher
+// (PRD #24) only acts on the opened↔closed edges; merged and locked are recorded
+// but never move a card (a merge closes the issue via `Closes #N`, which the
+// existing issue-close sync owns; locked is transient during merge processing).
+const (
+	MRStateOpened = "opened"
+	MRStateClosed = "closed"
+	MRStateMerged = "merged"
+	MRStateLocked = "locked"
+)
+
+// MergeRequest is a forge merge request as the MR-close watcher observes it
+// (PRD #24). Only the fields the watcher needs are carried; add more as callers
+// require. State is one of the MRState* constants.
+type MergeRequest struct {
+	IID    int64
+	State  string
+	WebURL string
+}
+
+// IsKnownMRState reports whether s is one of the MR states this integration
+// recognizes. The MR-close watcher records and acts on known states only; an
+// unrecognized or empty value is ignored so a transient forge glitch cannot
+// poison the watcher's edge baseline (reviewer hardening, PRD #24 Decision Log).
+func IsKnownMRState(s string) bool {
+	switch s {
+	case MRStateOpened, MRStateClosed, MRStateMerged, MRStateLocked:
+		return true
+	default:
+		return false
+	}
+}
+
 // ListIssuesOptions filters ListIssues. State is always queried as "all" by the
 // driver (the Closed column requires it), so it is not exposed here. Labels is
 // ANDed; an empty UpdatedAfter means "no lower bound" (full fetch).
@@ -142,6 +175,10 @@ type Forge interface {
 	// GitLab this is atomic (a single add_labels/remove_labels update);
 	// single-column enforcement relies on that atomicity.
 	UpdateIssueLabels(ctx context.Context, projectID, issueIID int64, add, remove []string) error
+	// GetMergeRequest returns one merge request by its project-scoped IID. The
+	// MR-close watcher (PRD #24) polls this for cards parked in Human Review to
+	// detect an opened→closed (reviewer rejected the MR) edge.
+	GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error)
 	// TokenInfo returns introspection data for the PAT the client authenticates
 	// with: its scopes, whether it is active, and its expiry. GitLab: GET
 	// /personal_access_tokens/self. Returns ErrTokenIntrospectionUnsupported when

@@ -1,7 +1,7 @@
 # PRD #24: MR Closed Without Merging → Card Back to In Progress
 
 **GitLab Issue**: [#24](https://gitlab.example.com/vtmocanu/uzi/-/issues/24)
-**Status**: Draft
+**Status**: Complete (2026-07-05)
 **Priority**: Medium
 **Created**: 2026-07-05
 
@@ -83,3 +83,4 @@ Watch the MR each completed run reported (`runs.mr_iid`, written by the worker o
 
 - 2026-07-05: PRD created (user request, prompted by issue #9 / MR !13 stuck in Human Review). Target column In Progress chosen by user; poller-based detection; edge-triggered with `runs.mr_state`; symmetric reopen handling; NULL-bootstrap records-without-moving.
 - 2026-07-05: Review round (reviewer + fact-checker agents). Fact-check: all 12 codebase claims confirmed (incl. live #9/!13 state and closed-vs-merged distinguishability on GitLab's single-MR GET); AutoMove "snap-back" attribution corrected (caller-owned recovery). Review fixes applied: candidate redefined to latest-run-overall-watched-only-if-completed (kills the mid-rework reopen misfire and the superseded-MR fallback); SQL column filter demoted to coarse prefilter with the Go `ResolveColumn` guard authoritative; state-persistence contract pinned (forge failure leaves the edge unconsumed → poller-tick retry, preventing re-introducing the stuck-card bug); move-then-state write order + crash-window caveat documented; `forgesvc` store-seam widening, guard-helper factoring, `board_column` divergence, and watcher-owned `mr_state` invariant called out.
+- 2026-07-05: Reviewer hardening (post-audit, M1–M3 implementation). The watcher records only KNOWN MR states (`opened|closed|merged|locked`); an unrecognized or empty forge state is ignored entirely (no `mr_state` write) in both the bootstrap and transition paths, leaving the prior baseline (or NULL) intact so a transient glitch self-heals. This reverses an earlier "record unknown states verbatim" choice: because edges fire on exact string compares, a garbage baseline would mask the next real close until a full reopen cycle re-synced it.
