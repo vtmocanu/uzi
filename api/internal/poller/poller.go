@@ -195,13 +195,21 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		if maxUpdated.After(st.hwm) {
 			st.hwm = maxUpdated
 		}
-		return
+	} else {
+		newHWM, err := e.svc.IncrementalSync(ctx, r.ID, r.ForgeProjectID, f, st.hwm)
+		if err != nil {
+			slog.Error("poller: incremental sync", "repo", r.PathWithNamespace, "error", err)
+			return
+		}
+		st.hwm = newHWM
 	}
 
-	newHWM, err := e.svc.IncrementalSync(ctx, r.ID, r.ForgeProjectID, f, st.hwm)
-	if err != nil {
-		slog.Error("poller: incremental sync", "repo", r.PathWithNamespace, "error", err)
-		return
+	// MR-close watcher (PRD #24): after the issue cache is fresh, check each
+	// watched card's MR for an opened↔closed edge and move the card accordingly.
+	// Runs only after a successful issue sync (an early return above skips it when
+	// the forge is unreachable). Per-candidate errors are log-and-skipped inside;
+	// only a candidate-enumeration failure surfaces here.
+	if err := e.svc.SyncMRStates(ctx, r.ID, r.ForgeProjectID, f); err != nil {
+		slog.Error("poller: sync MR states", "repo", r.PathWithNamespace, "error", err)
 	}
-	st.hwm = newHWM
 }

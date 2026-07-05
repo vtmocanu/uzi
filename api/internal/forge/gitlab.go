@@ -239,6 +239,14 @@ func (g *gitLab) CreateIssueNote(ctx context.Context, projectID, issueIID int64,
 	return IssueNote{ID: note.ID, Body: note.Body}, nil
 }
 
+func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error) {
+	mr, _, err := g.client.MergeRequests.GetMergeRequest(projectID, mrIID, nil, gitlab.WithContext(ctx))
+	if err != nil {
+		return MergeRequest{}, g.redact.error(fmt.Errorf("gitlab: get merge request: %w", err))
+	}
+	return toMergeRequest(mr), nil
+}
+
 // toLabelEvent maps a client-go resource label event to the neutral domain type.
 // A nil CreatedAt yields the zero time; a system event with no user yields an
 // empty Username (the caller falls back to the issue author in that case).
@@ -253,6 +261,16 @@ func toLabelEvent(e *gitlab.LabelEvent) LabelEvent {
 		le.CreatedAt = *e.CreatedAt
 	}
 	return le
+}
+
+// toMergeRequest maps a client-go merge request to the neutral domain type. The
+// State field is one of the MRState* constants (opened|closed|merged|locked).
+func toMergeRequest(mr *gitlab.MergeRequest) MergeRequest {
+	return MergeRequest{
+		IID:    mr.IID,
+		State:  mr.State,
+		WebURL: mr.WebURL,
+	}
 }
 
 // toIssue maps a client-go issue to the neutral domain type. A nil author (rare

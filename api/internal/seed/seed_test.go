@@ -48,6 +48,9 @@ func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge
 func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
 	return forge.IssueNote{}, nil
 }
+func (f *fakeForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
+	return forge.MergeRequest{}, nil
+}
 
 // fakeSvc stands in for *forgesvc.Service. It records whether a client was built
 // (to prove the existing-connection path never re-verifies) and seals PATs with

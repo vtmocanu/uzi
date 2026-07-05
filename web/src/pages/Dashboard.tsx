@@ -4,10 +4,11 @@
 // table (moved to Settings), which told a new user nothing about what to do
 // next.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type RunListItem } from "../lib/api";
+import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
 
@@ -67,6 +68,10 @@ export function Dashboard() {
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
 
+  // First load fetches everything — volatile tiles plus the rarely-changing
+  // fields the onboarding checklist reads. An error here keeps `data` null so the
+  // skeletons stay (skeletons only ever show pre-first-load); the background poll
+  // below never reaches this path.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -98,6 +103,31 @@ export function Dashboard() {
       cancelled = true;
     };
   }, []);
+
+  // Liveness: re-fetch only the volatile endpoints (runs, workers) every 10s while
+  // the tab is visible, so a run moving to awaiting_approval or a worker dropping
+  // offline shows without a reload. Repos/templates/secrets/connections change
+  // rarely and stay mount-only. A poll failure keeps the last-good data — unlike
+  // the first load, a transient re-poll error must NOT blank the page back to
+  // skeletons.
+  const poll = useCallback(async () => {
+    try {
+      const [{ runs }, { workers }] = await Promise.all([api.listRuns(), api.listWorkers()]);
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              runs,
+              workersOnline: workers.filter((w) => w.status === "online").length,
+              workersTotal: workers.length,
+            }
+          : prev,
+      );
+    } catch {
+      // keep the last-good data
+    }
+  }, []);
+  usePollWhileVisible(poll, 10000);
 
   if (!user) return null;
 

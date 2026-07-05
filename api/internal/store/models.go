@@ -98,6 +98,7 @@ type Run struct {
 	OriginColumn     pgtype.Text        `json:"origin_column"`
 	BoardColumn      pgtype.Text        `json:"board_column"`
 	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
+	MrState          pgtype.Text        `json:"mr_state"`
 }
 
 type RunMessage struct {

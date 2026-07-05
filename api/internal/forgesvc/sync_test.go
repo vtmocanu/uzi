@@ -13,12 +13,30 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// fakeForge is a mocked Forge whose ListIssues is scripted; other methods are
-// unused by the sync paths under test.
+// fakeForge is a mocked Forge whose ListIssues and GetMergeRequest are scripted;
+// other methods are unused by the sync/watcher paths under test. The MR-watch
+// tests (mr_watch_test.go) drive mr/mrErr and updateErr.
 type fakeForge struct {
 	issues    []forge.Issue
 	listErr   error
 	listCalls []forge.ListIssuesOptions
+
+	// MR-close watcher (PRD #24) scripting. mr/mrErr are the default GetMergeRequest
+	// result; mrByIID/mrErrByIID override per mrIID (for multi-candidate tests).
+	mr          forge.MergeRequest
+	mrErr       error
+	mrByIID     map[int64]forge.MergeRequest
+	mrErrByIID  map[int64]error
+	mrCalls     []int64 // mrIIDs GetMergeRequest was asked for
+	updateErr   error   // makes AutoMove's UpdateIssueLabels fail (forge-move failure)
+	updateCalls []mrUpdateCall
+}
+
+// mrUpdateCall records one UpdateIssueLabels invocation so the watcher tests can
+// assert the exact label swap AutoMove planned.
+type mrUpdateCall struct {
+	add    []string
+	remove []string
 }
 
 func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
@@ -42,8 +60,22 @@ func (f *fakeForge) GetIssue(context.Context, int64, int64) (forge.Issue, error)
 func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
 	return forge.Issue{}, nil
 }
-func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
-	return nil
+func (f *fakeForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove []string) error {
+	f.updateCalls = append(f.updateCalls, mrUpdateCall{add: add, remove: remove})
+	return f.updateErr
+}
+func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.MergeRequest, error) {
+	f.mrCalls = append(f.mrCalls, mrIID)
+	if err, ok := f.mrErrByIID[mrIID]; ok {
+		return forge.MergeRequest{}, err
+	}
+	if mr, ok := f.mrByIID[mrIID]; ok {
+		return mr, nil
+	}
+	if f.mrErr != nil {
+		return forge.MergeRequest{}, f.mrErr
+	}
+	return f.mr, nil
 }
 func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return false, nil }
 func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
@@ -53,19 +85,44 @@ func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forg
 	return forge.IssueNote{}, nil
 }
 
-// fakeStore records what the sync writes, standing in for *store.Queries.
+// fakeStore records what the sync writes, standing in for *store.Queries. The
+// MR-close watcher fields (candidates/issue/columns/mrStateWrites) are exercised
+// by mr_watch_test.go; the sync tests leave them zero.
 type fakeStore struct {
 	upserts     []store.UpsertIssueParams
 	deleteCalls []store.DeleteIssuesNotInParams
+
+	// MR-close watcher (PRD #24) scripting + capture.
+	candidates    []store.ListMRWatchCandidatesRow
+	candidatesErr error
+	issue         store.Issue
+	issueErr      error
+	columns       []store.BoardColumn
+	columnsErr    error
+	mrStateWrites []store.SetRunMRStateParams
 }
 
 func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) (store.Issue, error) {
 	s.upserts = append(s.upserts, arg)
-	return store.Issue{}, nil
+	// Echo the labels back so AutoMove's re-cache returns the moved row.
+	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State, Labels: arg.Labels}, nil
 }
 func (s *fakeStore) DeleteIssuesNotIn(_ context.Context, arg store.DeleteIssuesNotInParams) (int64, error) {
 	s.deleteCalls = append(s.deleteCalls, arg)
 	return 0, nil
+}
+func (s *fakeStore) ListMRWatchCandidates(context.Context, uuid.UUID) ([]store.ListMRWatchCandidatesRow, error) {
+	return s.candidates, s.candidatesErr
+}
+func (s *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error) {
+	return s.issue, s.issueErr
+}
+func (s *fakeStore) ListBoardColumns(context.Context, uuid.UUID) ([]store.BoardColumn, error) {
+	return s.columns, s.columnsErr
+}
+func (s *fakeStore) SetRunMRState(_ context.Context, arg store.SetRunMRStateParams) (int64, error) {
+	s.mrStateWrites = append(s.mrStateWrites, arg)
+	return 1, nil
 }
 
 // fakeLabels is a fixed LabelConfig for the sync tests.

@@ -25,6 +25,20 @@ manual reload.
 below moves cards through; `Upcoming`/`Later` are plain backlog buckets it
 never touches except to restore a card to one.
 
+**Hide empty columns.** The board toolbar has a **Hide empty** tick box: turn
+it on and any column with no cards drops out, with a **`N hidden`** count next
+to the box. The choice is remembered per board. Hiding is recomputed on every
+poll, so a column reappears on its own the moment a card lands in it (a run
+auto-move, a change made in GitLab); while you drag a card, the hidden lanes
+reappear dimmed so you can still drop into them.
+
+## More room for the board
+
+The board uses the full width of the window. To reclaim the sidebar's 240px,
+collapse it to an icon rail with the toggle at the sidebar's bottom edge; every
+destination stays one click away, and it stays collapsed (on this browser)
+until you expand it again.
+
 ## Move a card
 
 Drag a card to another column. uzi writes the label change to GitLab first
@@ -46,6 +60,15 @@ never lost. A manual drag always wins — move a card by hand after a run has
 started and automation leaves it alone from then on. Moves are best-effort
 against the forge: one that fails (e.g. GitLab briefly unreachable) is
 retried in the background for up to 30 minutes, without blocking the run.
+
+Closing a completed run's merge request without merging it is treated as
+"rework needed": on the next poll its card moves from **Human Review** back
+to **In Progress**. Reopening that MR moves the card back to **Human
+Review**. Merging is untouched — the MR's `Closes #N` link closes the
+issue, and the regular issue sync moves the card to Closed. A manual drag
+always wins here too. A card stuck in Human Review from before this
+behavior existed (an MR close uzi never observed) needs one manual drag to
+unstick; automation keeps it in sync from then on.
 
 ## Run badges
 

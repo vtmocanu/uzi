@@ -178,6 +178,40 @@ WHERE r.repo_id = @repo_id AND r.issue_iid = @issue_iid
 ORDER BY r.created_at DESC
 LIMIT 1;
 
+-- name: ListMRWatchCandidates :many
+-- MR-close watcher candidates (PRD #24 M2, Decision 4). Per repo, the issue's
+-- LATEST run overall (DISTINCT ON, newest by created_at, riding
+-- idx_runs_issue_history) — and ONLY that run, watched only while it is
+-- completed with a known MR. The DISTINCT ON runs BEFORE the status/mr_iid
+-- filter on purpose: filtering status='completed' inside the DISTINCT ON would
+-- pick the latest COMPLETED run, silently watching a superseded MR while a newer
+-- non-completed (rework) run exists — exactly the mid-rework misfire Decision 4
+-- forbids. So a non-completed latest run yields NO candidate (the watch is
+-- suppressed), and a completed latest run whose own mr_iid is NULL yields none
+-- either (never fall back to an older run's MR).
+--
+-- The issue must be open, and a COARSE column prefilter keeps the polled set
+-- tiny: the card is either labelled Human Review (the close-edge watch) or the
+-- run already recorded mr_state='closed' (the reopen-edge watch, Decision 10).
+-- This prefilter is deliberately NOT board.ResolveColumn — highest-position-wins
+-- across multiple column labels is not cheaply expressible in SQL, so the
+-- authoritative source-column guard is the Go ResolveColumn check in the watcher;
+-- this only bounds how many MRs get polled.
+WITH latest AS (
+    SELECT DISTINCT ON (r.issue_iid)
+           r.id, r.issue_iid, r.status, r.mr_iid, r.mr_state
+    FROM runs r
+    WHERE r.repo_id = @repo_id
+    ORDER BY r.issue_iid, r.created_at DESC
+)
+SELECT l.id, l.issue_iid, l.mr_iid, l.mr_state
+FROM latest l
+JOIN issues i ON i.repo_id = @repo_id AND i.forge_issue_iid = l.issue_iid
+WHERE l.status = 'completed'
+  AND l.mr_iid IS NOT NULL
+  AND i.state = 'opened'
+  AND (jsonb_exists(i.labels, 'Human Review') OR l.mr_state = 'closed');
+
 -- name: GetIssueByIID :one
 SELECT * FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2;
 

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import type { ReactElement } from "react";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppShell, forgeIcon } from "./AppShell";
 import { GitIcon, GitLabIcon } from "./icons";
@@ -72,7 +72,25 @@ function renderShell(path: string) {
   );
 }
 
+// This jsdom build does not expose window.localStorage, so the sidebar-collapse
+// preference (prefs.ts) has nothing to read/write; back it with a Map-based stub
+// so the collapse state can be seeded and persisted in these tests.
+function makeStorage(): Storage {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+    clear: () => m.clear(),
+    key: (i: number) => [...m.keys()][i] ?? null,
+    get length() {
+      return m.size;
+    },
+  } as Storage;
+}
+
 beforeEach(() => {
+  Object.defineProperty(window, "localStorage", { configurable: true, value: makeStorage() });
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
@@ -141,6 +159,52 @@ describe("AppShell navigation", () => {
     await waitFor(() => expect(mockApi.listConnections).toHaveBeenCalled());
     expect(screen.getByRole("link", { name: "Workers" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("link", { name: "Settings" }).getAttribute("aria-current")).toBeNull();
+  });
+});
+
+describe("AppShell sidebar collapse", () => {
+  it("collapses to an icon rail via the footer toggle: board children and group labels drop, destinations stay reachable", async () => {
+    renderShell("/dashboard");
+    await screen.findByRole("link", { name: "vtmocanu/uzi" }); // expanded: board children present
+
+    const toggle = screen.getByRole("button", { name: "Collapse sidebar" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(toggle);
+
+    // Now collapsed: the toggle flips, board children and group labels are gone.
+    const expand = screen.getByRole("button", { name: "Expand sidebar" });
+    expect(expand.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByRole("link", { name: "vtmocanu/uzi" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "vtmocanu/atlas" })).toBeNull();
+    expect(screen.queryByText("Work")).toBeNull();
+    expect(screen.queryByText("Factory")).toBeNull();
+
+    // Every primary destination is still reachable (label survives as a title).
+    for (const item of ["Overview", "Boards", "Runs", "Agents", "Workers", "Settings", "Docs"]) {
+      expect(screen.getByRole("link", { name: item })).toBeTruthy();
+    }
+  });
+
+  it("initialises collapsed from a persisted preference (survives a reload)", async () => {
+    window.localStorage.setItem("uzi.sidebar.collapsed", "true");
+    renderShell("/dashboard");
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+
+    // Collapsed on first paint — no click — so the state persisted across the mount.
+    expect(screen.getByRole("button", { name: "Expand sidebar" })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "vtmocanu/uzi" })).toBeNull();
+    expect(screen.queryByText("Work")).toBeNull();
+  });
+
+  it("writes the collapsed state to localStorage each time it is toggled", async () => {
+    renderShell("/dashboard");
+    await screen.findByRole("link", { name: "vtmocanu/uzi" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(window.localStorage.getItem("uzi.sidebar.collapsed")).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(window.localStorage.getItem("uzi.sidebar.collapsed")).toBe("false");
   });
 });
 

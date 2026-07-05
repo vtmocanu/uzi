@@ -429,6 +429,49 @@ func TestNewMethodsRedactErrors(t *testing.T) {
 	}
 }
 
+func TestGetMergeRequestReturnsState(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/merge_requests/13": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 5005, "iid": 13, "state": "closed",
+				"web_url": "https://gl/grp/a/-/merge_requests/13",
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	mr, err := d.GetMergeRequest(context.Background(), 7, 13)
+	if err != nil {
+		t.Fatalf("GetMergeRequest: %v", err)
+	}
+	if mr.IID != 13 || mr.State != "closed" {
+		t.Fatalf("unexpected MR: %+v", mr)
+	}
+	if mr.WebURL != "https://gl/grp/a/-/merge_requests/13" {
+		t.Fatalf("unexpected MR web url: %q", mr.WebURL)
+	}
+}
+
+func TestGetMergeRequestRedactsError(t *testing.T) {
+	const token = "glpat-supersecret-mrtoken-XYZ" //gitleaks:allow // fake PAT fixture: proves GetMergeRequest redacts, never a real secret
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/merge_requests/13": func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "bad token " + token})
+		},
+	})
+	d := newTestDriver(t, m, token)
+
+	if _, err := d.GetMergeRequest(context.Background(), 7, 13); err == nil {
+		t.Fatal("expected an error from a 401")
+	} else if strings.Contains(err.Error(), token) {
+		t.Fatalf("error leaked the PAT: %q", err.Error())
+	}
+}
+
 func TestErrorsAreRedacted(t *testing.T) {
 	const token = "glpat-supersecret-eviltoken-XYZ"
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
