@@ -109,6 +109,13 @@ Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/done/14-multica-ui-redesig
 - A themed focus-visible ring (keyboard/AT focus indicator).
 - E2E testing includes a real-GitLab leg, scoped to the dedicated scratch project `vtmocanu/uzi-e2e-scratch` (created for this); the live-Anthropic capstone is skipped.
 
+## Feature #24 — MR closed without merging → card back to In Progress
+
+Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/24-mr-close-rework.md`.
+
+- When a reviewer closes an agent's MR without merging, move the board card back from Human Review to In Progress (the "rework needed" signal).
+- Target column is In Progress — user's explicit choice, over Open/backlog.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
