@@ -27,6 +27,10 @@
   --brand-hover: 253 186 116;
   --on-brand: 26 16 8;
 
+  /* Keyboard focus ring: brand-tinted so it reads as on-theme and stays
+     high-contrast against the near-black surfaces. */
+  --ring: var(--brand);
+
   /* Status colors */
   --ok: 52 211 153;
   --warn: 251 191 36;
@@ -51,6 +55,20 @@ body {
 * {
   scrollbar-width: thin;
   scrollbar-color: rgb(var(--edge)) transparent;
+}
+
+/* One themed keyboard-focus ring for every interactive surface (nav items,
+   cards-as-links, buttons, inputs), replacing the default UA outline. Scoped to
+   :focus-visible so it appears for keyboard/AT users, not on mouse click. */
+@layer base {
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  [tabindex]:not([tabindex="-1"]):focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-ink;
+  }
 }
 
 /* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules

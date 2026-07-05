@@ -25,6 +25,7 @@ export default {
         warn: token("warn"),
         danger: token("danger"),
         info: token("info"),
+        ring: token("ring"), // keyboard focus ring (see :focus-visible in index.css)
       },
       // Radii derive from the single --radius token (multica's calc scheme in
       // tokens.css), so a theme can densify or soften the whole UI at once.

@@ -199,7 +199,7 @@ export function AgentTemplateEditor({
           value={promptBody}
           onChange={(e) => setPromptBody(e.target.value)}
           rows={12}
-          className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-none focus:border-brand/70 focus:ring-1 focus:ring-brand/70"
+          className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-none focus:border-brand/70"
         />
       </div>
 

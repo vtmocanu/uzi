@@ -64,7 +64,7 @@ export function Button({
   return (
     <button
       className={cx(
-        "inline-flex shrink-0 select-none items-center justify-center rounded-lg font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand disabled:cursor-not-allowed",
+        "inline-flex shrink-0 select-none items-center justify-center rounded-lg font-medium transition-colors disabled:cursor-not-allowed",
         BUTTON_VARIANTS[variant],
         BUTTON_SIZES[size],
         className,
@@ -87,8 +87,10 @@ export function Field({ label, children }: { label: string; children: ReactNode 
   );
 }
 
+// The brand-tinted border marks the focused field on any focus (incl. mouse);
+// the keyboard-only ring comes from the global :focus-visible rule (index.css).
 const INPUT_CLASS =
-  "w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-fg placeholder:text-faint outline-none focus:border-brand/70 focus:ring-1 focus:ring-brand/70";
+  "w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-fg placeholder:text-faint outline-none focus:border-brand/70";
 
 export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={INPUT_CLASS} {...props} />;
