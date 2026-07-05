@@ -1389,3 +1389,214 @@ Serves human: operability ("how to see raw events"); PRD #4 testing-credentials 
 - The **live visual walkthrough** (plan approval, streaming activity, long tool call,
   reconnect, `docker logs` at debug) is a **manual-validation item for the tester** — it needs
   a real Anthropic session beyond the sandbox and must never be required to prove a milestone.
+
+---
+
+# PRD #12 — Board–Run Lifecycle: auto column moves, run-aware cards, in-app issue view
+
+Serves human Feature #12 — wires the PRD #2 board and the PRD #4 runtime together so
+the board reflects run state without hand-dragging. **Status: M1–M4 built, reviewed,
+audited APPROVED (2026-07-04/05); M5 (docs + live validation + spec sync + MR) in
+progress.** Adds one migration (`00021`) and one leaf package; no new
+services/containers/env vars. Full rationale + Decision Log: `prds/12-board-run-lifecycle.md`.
+
+## 67. Lifecycle notifier + column automation
+
+Serves human: "issues move columns automatically with the run lifecycle — In Progress
+while agents work, a review column once the MR is open; no hand-dragging".
+
+- **Single `runLifecycle.Notify(runID, status)` hook** at **every** status-write site
+  (7: SetState running/completed/failed; `SubmitInput` server-side cancel/reject;
+  `Sweep`; register orphan recovery; `MarkRunFailedByID`; `CreateRun` for queued).
+  AutoMove subscribes and reacts to `queued → In Progress`, `completed → Human Review`,
+  `failed`/`cancelled → origin`; ignores the rest.
+  - Why a status-change notifier, not a SetState hook: `cancelled` is unreachable
+    through SetState and five transition sites never pass through it (fact-check found
+    them). One hook at the write sites is the only point that sees all transitions.
+    (PRD Decision #4.)
+- **In Progress applied at run CREATION (queued), not first `running`.** The click is
+  the intent signal and gives instant board feedback; and the server cannot distinguish
+  a first `running` from a requeue-resume (`SetRunRunning` uses `COALESCE(started_at,
+  now())`, prior status gone), so a running-triggered move would re-drag the card on
+  every resume and fight manual placement. (PRD Decision #1.)
+- **Notify is inline at 5 sites; the 2 batch sites (Sweep, orphan recovery) stamp
+  `move_pending_since` only** and let the reconciler restore origin — the "no forge I/O
+  in the liveness sweep path" rule (§69) makes an inline forge call wrong there.
+- **`bcast.PublishState` stays an independent hook, NOT multiplexed through the
+  notifier** (despite PRD Decision #4's literal wording): verified no transition loses
+  its WS emission and none double-emits.
+- **AutoMove reuses the board drag's forge-first path** (`board.PlanLabelMove`: set the
+  target column label, strip other column labels, one atomic `UpdateIssueLabels`, then
+  the local snapshot). Credentials resolved server-side from the run's `user_id`+`repo_id`
+  (claim-context pattern, extended to also return `forge_project_id` + the repo's column
+  set, which the base claim query omits). Label writes attributed to the bot user
+  (run-starter ≠ label author misattribution accepted + documented). Closed-issue guard:
+  never auto-move a closed issue.
+
+## 68. Origin-column snapshot + restore
+
+Serves human: "a failed run must not silently strand the card or lose its backlog
+placement" (the restore rule behind Feature #12's automatic moves).
+
+- **`runs.origin_column` snapshotted at CreateRun** from the issue's current column
+  (`""` = Open/no column, `NULL` = unknown/pre-migration). Failed/cancelled restore this
+  column, never a hardcoded Open — a card run from "Later" returns to "Later".
+  (PRD Decision #2.)
+- **`NULL` origin never restores** (unknown snapshot ≠ Open; never strip a human's
+  column label on a guess).
+- **`runs.board_column`** records the column the automation last *successfully* wrote
+  (NULL until first success) — needed because "the automation's last column" is
+  otherwise not a stored fact and is undefined after a failed write.
+- **Manual-drag guard** (restores + every retry): move only iff the issue's current
+  column `== COALESCE(board_column, origin_column)`; any other value means a human
+  placed the card — skip and clear the pending marker.
+
+## 69. Move-retry reconciliation
+
+Serves human: "failed forge column moves are RETRIED via reconciliation — not dropped,
+not a persisted move queue" (2026-07-04 user review).
+
+- **Why retry at all**: `completed` is terminal, so a dropped `completed → Human Review`
+  write would never self-heal — the original "next lifecycle event heals it" stance was
+  wrong for the terminal event. (PRD Decision #3.)
+- **`runs.move_pending_since` (timestamptz) stamped in the SAME transaction as the
+  status write** at every AutoMove-reacting site — closes the crash window between
+  status-persist and AutoMove that a flag-on-failure would miss. A newer transition
+  re-stamps (new deadline); a retry failure never re-stamps (else the deadline never
+  elapses).
+- **Cleared** by AutoMove on success (records `board_column`), by the guard on
+  manual-drag detection, and by the board `MoveIssue` handler for the issue's runs on
+  any manual drag ("a manual drag heals it", literal).
+- **Reconciler uses its own TOTAL status→column map** ({queued, running,
+  awaiting_approval}→In Progress; completed→Human Review; failed/cancelled→origin), NOT
+  the notifier's partial map — by retry time a queued run has usually advanced to
+  `running`, which the live hook deliberately ignores (§67), so reusing the partial map
+  would no-op the most common retry forever. (PRD Decision #3, key review correction.)
+- **Own goroutine/ticker, isolated from the 15s liveness `Sweep`**: forge I/O (15s
+  timeout) against a down forge must not starve worker-loss recovery. Picks up markers
+  older than a short grace (avoid racing the inline AutoMove) within a 30-min window;
+  re-reads run status + issue labels immediately before the write to narrow the clobber
+  window (GitLab labels have no CAS — acknowledged residual race, ~15s cadence makes it
+  rare).
+- **30-min give-up LEAVES the marker** (a silent clear would hide the drift behind a
+  correct-looking badge); warn-log. The stale marker is cleared later by the next
+  transition or manual drag, and is available to a future "column out of sync" indicator.
+- Reconciliation, not a queue: no move payload is stored; recomputing from current
+  status is idempotent, survives restarts, and cannot apply a stale move.
+
+## 70. Human Review column + board-load retrofit
+
+Serves human: "the MR opening moves the issue to a review column".
+
+- **Board order everywhere: In Progress, Human Review, Upcoming, Later** (the two
+  workflow columns lead, backlog buckets follow). Fresh boards get it from
+  `DefaultColumns`.
+- **Idempotent board-load retrofit** (`GetBoard`): a repo with columns but no Human
+  Review gets the label ensured and the column inserted at In Progress's position + 1.
+  Because `board_columns.position` is not unique and `InsertBoardColumn` neither shifts
+  nor is position-keyed, the retrofit first bumps displaced columns up one
+  (`ShiftBoardColumnsFrom`) so Human Review lands directly after In Progress.
+- **Never created as a run side effect** — a run mutating curated column config was
+  reviewed as wrong.
+
+## 71. `internal/board` leaf package
+
+Serves human: best-practice (avoid a service→service import cycle).
+
+- Column constants + `ResolveColumn`/`PlanLabelMove` extracted into a leaf
+  `api/internal/board` package so both `forgesvc` (board handler) and `workersvc`
+  (AutoMove) call the shared move-planning logic without a service→service import.
+
+## 72. Run-aware board DTO
+
+Serves human: "the board must show that runs happened / are happening — badges + MR link".
+
+- **Each card gains `latest_run: {id, status, mr_iid, failure_reason, owner_name,
+  worker_name, created_at, updated_at, is_mine, run_count} | null`** (newest by
+  `created_at`).
+- **`DISTINCT ON (issue_iid) … ORDER BY created_at DESC`, NOT the PRD's `LEFT JOIN
+  LATERAL`**: sqlc v1.30 doesn't propagate LATERAL nullability (types the joined run
+  columns non-nullable → scan panic on a no-run issue). DISTINCT ON returns only
+  issues-that-ran, mapped onto cards Go-side (`assembleCards`), rides the M1 composite
+  index `runs (repo_id, issue_iid, created_at DESC)`; the created_at tie is unreachable
+  under the one-non-terminal-run-per-issue constraint.
+- **`is_mine`** server-computed (`run.user_id == viewer`) so the owner's user id is
+  never exposed; the run-view link renders only for the owner (a non-owner would 403 on
+  `GetRunByIDForUser`). **`run_count`** window count powers the ×N badge without a
+  client fan-in.
+- **`owner_name` falls back to the owner's email** — harmless today (per-connection
+  repos ⇒ every board self-owned) but a tracked multi-user revisit item: switch to a
+  neutral label before boards are ever shared.
+
+## 73. Board badges, attention strip, self-refresh
+
+Serves human: "the board must update itself (no manual Refresh)"; card badge/MR-link signal.
+
+- **Badge taxonomy** (`Board.tsx` IssueCard): queued (neutral, instant feedback);
+  running (pulsing + elapsed + worker name); awaiting_approval (amber, loudest card);
+  failed (rose + failure_reason tooltip); stopped (neutral, never rose — see §74);
+  completed → MR chip `!{mr_iid}` linking the MR, or a plain "completed" badge when
+  `mr_iid` is null (**completed-without-MR is never invisible**); a subtle ×N count when
+  an issue has >1 run.
+- **MR chip URL built client-side, `isHttpsUrl`-guarded** with a plain-text `!N`
+  fallback (same trust pattern as the docs/run-view link handling).
+- **Attention strip**: a persistent banner above the columns when any of the user's runs
+  on the repo is `awaiting_approval` ("N run(s) awaiting your approval →"),
+  column-independent — this is the state where a human is the blocker and a worker is
+  held busy. Fed by the `ListRuns` `?repo_id=&issue_iid=` filter.
+- **Self-refresh**: the board polls `getBoard` every ~10s while mounted,
+  **visibility-gated** (pause on `document.hidden`); this is what surfaces auto-moves +
+  badges without Refresh. The start-run gate switched off the `listRuns` fan-in onto
+  `latest_run` (one fewer request, no race).
+- Known limitation (out of scope, documented): no MR-state tracking — a chip can
+  advertise an already-merged MR, and Human Review never auto-drains on merge. Named
+  follow-up PRD.
+
+## 74. Deliberate-stop neutral styling (cross-surface)
+
+Serves human: "a deliberate human stop is not breakage" (consistent styling across
+board, Runs list, issue view).
+
+- A cancel or plan-rejection renders as a neutral "stopped" badge (never rose) **across
+  all three surfaces**, implemented as **exact server-literal matching in
+  `isStoppedRun`**: failure_reason ∈ {"run cancelled", "plan rejected"} or status
+  `cancelled`. Replaces the earlier `/cancel/i` substring heuristic (fragile,
+  surface-local).
+  - Why exact literals: a live-poller cancel reaches the server as SetState `failed`
+    with reason "run cancelled" (status `cancelled` only occurs via the server-side
+    no-poller branch), so the badge must be derived from status + failure_reason.
+    Matching the exact strings the server writes is deterministic where a substring
+    heuristic drifts.
+  - **Known residual** (documented in-code): a live-poller *plan reject* carrying the
+    user's verbatim free-text reason stays "failed" — no client heuristic can catch
+    arbitrary user text.
+- **Auto-move toast suppression for manual drags**: a `suppressToastIids` ref silences
+  the "#42 → column" toast for a card the user just dragged, released after 11s (> the
+  10s poll). Accepted tradeoff: a genuine auto-move of a just-dragged card inside the
+  window is applied silently.
+- **Tone logic single-sourced**: `runStatusTone` hoisted to `runBadge.ts`, consumed by
+  both RunsList and IssueView — kills cross-surface tone drift.
+
+## 75. In-app issue view
+
+Serves human: "clicking an issue stays in-platform (in-app view with its runs + a
+start-run action); GitLab reachable via an explicit icon".
+
+- **Route `/repos/:repoId/issues/:iid`** (`IssueView.tsx`): title, iid, column badge +
+  non-column label chips, author, description rendered as markdown (**mandatory** — it
+  carries the PRD link and is the run-decision basis), full run history (status, started,
+  duration, worker, MR link, → run view), gated Start run, explicit GitLab link.
+- **Card interaction** (`Board.tsx`): the title becomes an in-app `<Link
+  draggable={false}>` (a native `<a>` is draggable and hijacks the card's HTML5 drag
+  payload — a real bug, not cosmetic); a small GitLab glyph keeps the forge one click
+  away. RunView gains a breadcrumb back to its issue + board.
+- **Issue-detail endpoint `GET /api/repos/{id}/issues/{iid}`** returns card fields +
+  description only (no `latest_run`). The description is fetched **live via the
+  connection PAT, never cached**; behind the per-user forge rate budget; the forge's
+  PAT-redacted error text is reflected in the 502 body (conscious auditor-noted choice).
+- **Run-history MR rendered as a LINK** (not a bare chip): the project base is derived
+  client-side from `issue.web_url` by stripping `/-/issues/N` (`lib/forgeUrls.ts`),
+  https-guarded with a plain-text `!N` fallback — same trust pattern as the board chip.
+- **Run-history timestamp is `started_at ?? created_at`** (PRD §3 "started").
+- **Start-run gate derives from full history** (`activeRunInHistory`) — equivalent to
+  the board's `latest_run` gate under the one-non-terminal-run index.
