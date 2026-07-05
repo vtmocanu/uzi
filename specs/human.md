@@ -119,6 +119,17 @@ Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/done/14-multica-ui-redesig
 - A themed focus-visible ring (keyboard/AT focus indicator).
 - E2E testing includes a real-GitLab leg, scoped to the dedicated scratch project `vtmocanu/uzi-e2e-scratch` (created for this); the live-Anthropic capstone is skipped.
 
+## Feature #17 — Builtin lead template (opus) + worker model selection
+
+Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/17-lead-template-and-model-selection.md`.
+
+- Ship `lead` as a builtin agent template with a real orchestrator prompt, on model `opus`; editable and resettable in the UI like the other builtins.
+- Builtin templates are the single source of truth; `.claude/agents/` is the dev team's own roster only. Decouples the former 1:1 mirror. [user, 2026-07-05, supersedes the earlier "both dirs" choice]
+- Per-user default worker model: each user can pick the model for their own runs (Settings), stored per user.
+- Model choices offered as curated aliases plus a custom free-text escape hatch for any model ID.
+- Precedence: a user's default model wins over the lead template's model (unset = inherit the lead template's model, opus by default).
+- Sequence this PRD before PRD #16 so #16 inherits the decoupled-builtins convention.
+
 ## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
 
 Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-sidebar-board.md`.

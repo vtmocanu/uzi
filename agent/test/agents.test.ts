@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { assembleAgents } from "../src/agents.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { assembleAgents, LEAD_NAME_RE } from "../src/agents.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
 const coder: AgentTemplate = {
@@ -81,5 +83,21 @@ describe("assembleAgents", () => {
     const { subagents, leadSystemPrompt } = assembleAgents([]);
     assert.deepStrictEqual(subagents, {});
     assert.strictEqual(leadSystemPrompt, undefined);
+  });
+});
+
+describe("shipped lead builtin", () => {
+  // Guard the cross-package contract: the lead template the api ships
+  // (api/internal/agenttmpl/builtins/lead.md) must carry a name this worker
+  // recognizes as the lead, or it would be registered as an ordinary invokable
+  // subagent and its model/prompt would never reach the main thread. Read the
+  // real file so a rename on either side fails this test.
+  const builtinLead = join(import.meta.dirname, "..", "..", "api", "internal", "agenttmpl", "builtins", "lead.md");
+
+  it("names the lead so LEAD_NAME_RE routes it to the main thread", () => {
+    const raw = readFileSync(builtinLead, "utf8");
+    const name = raw.match(/^name:\s*(.+)$/m)?.[1]?.trim();
+    assert.ok(name, "lead.md must declare a name in its frontmatter");
+    assert.ok(LEAD_NAME_RE.test(name), `shipped lead name ${name} must match LEAD_NAME_RE`);
   });
 });

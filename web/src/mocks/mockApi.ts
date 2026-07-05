@@ -12,6 +12,7 @@ import {
   type RunInputKind,
   type SecretMeta,
   type User,
+  type UserSettings,
 } from "../lib/api";
 import {
   LIVE_RUN_ID,
@@ -42,6 +43,7 @@ function requireSession(): User {
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
+let userSettings: UserSettings = { default_model: null };
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
@@ -94,6 +96,12 @@ export const mockApi = {
   deleteAnthropicToken: async () => {
     secrets = secrets.filter((s) => s.kind !== "anthropic_token");
     return delay(null);
+  },
+  getMySettings: async () => delay({ settings: { ...userSettings } }),
+  putMySettings: async (defaultModel: string | null) => {
+    const trimmed = defaultModel?.trim() ?? "";
+    userSettings = { default_model: trimmed === "" ? null : trimmed };
+    return delay({ settings: { ...userSettings } });
   },
 
   // ── Agent templates ─────────────────────────────────────────────────────────

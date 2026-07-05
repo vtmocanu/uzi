@@ -57,3 +57,6 @@ shown again.
 - **Key rotation resets it.** If an operator rotates the server's master
   key, every stored token (yours included) must be re-pasted; see
   [configuration.md](./configuration.md).
+- **Which model runs against it?** See [Worker model](./worker-model.md),
+  right below this on the Settings page, to pick or override the Claude
+  model your runs use.

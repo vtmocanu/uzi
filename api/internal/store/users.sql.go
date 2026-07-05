@@ -38,7 +38,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model
 `
 
 type CreateUserParams struct {
@@ -66,12 +66,13 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.TokenVersion,
 		&i.CreatedAt,
 		&i.LastLogin,
+		&i.DefaultModel,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login FROM users WHERE email = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -87,12 +88,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.TokenVersion,
 		&i.CreatedAt,
 		&i.LastLogin,
+		&i.DefaultModel,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login FROM users WHERE id = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -108,12 +110,25 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.TokenVersion,
 		&i.CreatedAt,
 		&i.LastLogin,
+		&i.DefaultModel,
 	)
 	return i, err
 }
 
+const getUserDefaultModel = `-- name: GetUserDefaultModel :one
+SELECT default_model FROM users WHERE id = $1
+`
+
+// The current user's per-user default worker model (PRD #17); NULL = inherit.
+func (q *Queries) GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error) {
+	row := q.db.QueryRow(ctx, getUserDefaultModel, id)
+	var default_model pgtype.Text
+	err := row.Scan(&default_model)
+	return default_model, err
+}
+
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login FROM users ORDER BY created_at ASC
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model FROM users ORDER BY created_at ASC
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -135,6 +150,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.TokenVersion,
 			&i.CreatedAt,
 			&i.LastLogin,
+			&i.DefaultModel,
 		); err != nil {
 			return nil, err
 		}
@@ -162,7 +178,7 @@ SET is_active = $1,
     -- reactivation leaves it untouched.
     token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END
 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model
 `
 
 type SetUserActiveParams struct {
@@ -183,8 +199,28 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 		&i.TokenVersion,
 		&i.CreatedAt,
 		&i.LastLogin,
+		&i.DefaultModel,
 	)
 	return i, err
+}
+
+const setUserDefaultModel = `-- name: SetUserDefaultModel :one
+UPDATE users SET default_model = $1 WHERE id = $2
+RETURNING default_model
+`
+
+type SetUserDefaultModelParams struct {
+	DefaultModel pgtype.Text `json:"default_model"`
+	ID           uuid.UUID   `json:"id"`
+}
+
+// Sets (or clears, when @default_model is NULL) the current user's default
+// worker model. Own-user only; the caller passes the session user's id.
+func (q *Queries) SetUserDefaultModel(ctx context.Context, arg SetUserDefaultModelParams) (pgtype.Text, error) {
+	row := q.db.QueryRow(ctx, setUserDefaultModel, arg.DefaultModel, arg.ID)
+	var default_model pgtype.Text
+	err := row.Scan(&default_model)
+	return default_model, err
 }
 
 const updatePassword = `-- name: UpdatePassword :exec

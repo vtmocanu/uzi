@@ -104,6 +104,7 @@ type Store interface {
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) ([]byte, error)
+	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	ListAgentTemplates(ctx context.Context) ([]store.AgentTemplate, error)
 }
 
@@ -312,6 +313,14 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("list agent templates: %w", err)
 	}
 
+	// The run owner's per-user default model overrides the lead template's model
+	// on the worker (PRD #17 Decision 6). NULL ⇒ nil ⇒ omitted from the payload,
+	// so the worker falls back to the lead template's model.
+	defaultModel, err := s.q.GetUserDefaultModel(ctx, run.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("default model lookup: %w", err)
+	}
+
 	return &ClaimPayload{
 		RunID:            run.ID.String(),
 		IssueIID:         run.IssueIid,
@@ -340,6 +349,7 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 			RunTimeoutSeconds:  int(s.p.RunTimeout.Seconds()),
 			IdleTimeoutSeconds: int(s.p.RunIdleTimeout.Seconds()),
 			MaxIterations:      s.p.RunMaxIterations,
+			DefaultModel:       textPtr(defaultModel),
 		},
 	}, nil
 }
