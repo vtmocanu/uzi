@@ -1,7 +1,7 @@
 # PRD #22: PRDLESS Label — Run Issues Without a PRD Link
 
 **GitLab Issue**: [#22](https://gitlab.example.com/vtmocanu/uzi/-/issues/22)
-**Status**: Draft
+**Status**: In progress — M2/M4/M5 done (3/6); M1/M3/M6 blocked on prd-21 landing to main
 **Priority**: Medium
 **Created**: 2026-07-05
 
@@ -71,10 +71,10 @@ An admin-controlled escape-hatch label, default name **`PRDLESS`**:
 ## Milestones
 
 - [ ] **M1 — Settings keys + admin UI** *(after prd-21 lands, or owns the `Validate` switch)*: `Defaults` entries + typed bool accessor, per-key validation registration, validation matrix tests (bool parse, pairwise-distinct incl. while-disabled, post-merge atomic multi-key PUT), `ForceReconcile` exclusion, toggle + name field on the admin Settings page. Its landing commit also removes the "lands in a later milestone" caveats from `docs/admin-settings.md` (Validation section, Resync section) and the toggle-note in `docs/prdless.md` — the validation-matrix and `ForceReconcile`-exclusion claims those caveats guard become true then.
-- [ ] **M2 — Gate bypass end-to-end (manual + autopilot)**: caller-computed `allowWithoutPRD` → shared `createRun` enforcement, extended 422 message, unit tests (enabled/disabled × label present/absent × PRD link present/absent, both paths), both existing no-PRD-link tests updated, autopilot composition test.
+- [x] **M2 — Gate bypass end-to-end (manual + autopilot)** *(done: 4533a7d + 4a0def9, reviewed + audited clean)*: caller-computed `allowWithoutPRD` → shared `createRun` enforcement, extended 422 message, unit tests (enabled/disabled × label present/absent × PRD link present/absent, both paths), both existing no-PRD-link tests updated, autopilot composition test.
 - [ ] **M3 — Web badges + bootstrap**: `sessionPayload` fields, badges on Board + IssueView, label-suggestion exclusion, mock API + vitest coverage. Its landing commit also removes the toggle-visibility caveat in `docs/prdless.md`'s "Applying or removing the label" section — the IssueView/board-card toggle stops being hidden once `sessionPayload` carries the fields.
-- [ ] **M4 — UI label toggle**: forgesvc single-label helper + endpoint (forge-first, idempotent diff, EnsureLabels + color constant on apply, disabled→422, per-user forge limiter, MoveIssue-style card response), IssueView + board-card toggle affordances, handler + vitest coverage.
-- [ ] **M5 — Docs + specs**: docs page section, `specs/ai.md` update, `specs/human.md` proposal for user approval.
+- [x] **M4 — UI label toggle** *(done: af16f04, reviewed + audited clean; real-app visibility arrives with M3)*: forgesvc single-label helper + endpoint (forge-first, idempotent diff, EnsureLabels + color constant on apply, disabled→422, per-user forge limiter, MoveIssue-style card response), IssueView + board-card toggle affordances, handler + vitest coverage.
+- [x] **M5 — Docs + specs** *(done: fcf5b14 + 9fe868e docs, a581f01 specs/ai.md, b2162d0 specs/human.md user-approved; fact-checked, refutations fixed)*: docs page section, `specs/ai.md` update, `specs/human.md` proposal for user approval.
 - [ ] **M6 — E2E validation**: prdless disabled → 422; enabled + labeled → run starts without PRD link; UI toggle applies/removes the label on the fake forge. Preconditions to build into the harness: the fake forge serves the prdless label on the test issue, and the scenario drives `PUT /api/admin/settings` in the isolated stack.
 
 ## Open Questions
