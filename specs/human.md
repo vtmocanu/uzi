@@ -109,6 +109,19 @@ Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/done/14-multica-ui-redesig
 - A themed focus-visible ring (keyboard/AT focus indicator).
 - E2E testing includes a real-GitLab leg, scoped to the dedicated scratch project `vtmocanu/uzi-e2e-scratch` (created for this); the live-Anthropic capstone is skipped.
 
+## Feature #19 — Admin settings & autopilot label
+
+Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/19-admin-settings-and-autopilot.md`.
+
+- Generic admin-only instance-settings infrastructure; the PRD label and the autopilot label are its first two configurable keys.
+- Admins can change the PRD label and the autopilot label; the board reflects the new label set after a resync (no code fork).
+- Autopilot: adding the autopilot label (alongside the PRD label) to an issue in GitLab runs it end to end with zero uzi interaction.
+- Progress is visible via the existing board label moves; the user need never open uzi.
+- Outcome returns as one GitLab issue comment: MR link on success; on failure, one comment with a run link.
+- Consent is per-user opt-in, default off — a third party must never be able to spend your Anthropic tokens without your opt-in.
+- Each user self-declares their own forge (human) username on their connection (the mapping autopilot attributes runs to).
+- Attribution order: label adder first, issue author fallback.
+
 ## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
 
 Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-sidebar-board.md`.
