@@ -47,6 +47,15 @@ started and automation leaves it alone from then on. Moves are best-effort
 against the forge: one that fails (e.g. GitLab briefly unreachable) is
 retried in the background for up to 30 minutes, without blocking the run.
 
+Closing a completed run's merge request without merging it is treated as
+"rework needed": on the next poll its card moves from **Human Review** back
+to **In Progress**. Reopening that MR moves the card back to **Human
+Review**. Merging is untouched — the MR's `Closes #N` link closes the
+issue, and the regular issue sync moves the card to Closed. A manual drag
+always wins here too. A card stuck in Human Review from before this
+behavior existed (an MR close uzi never observed) needs one manual drag to
+unstick; automation keeps it in sync from then on.
+
 ## Run badges
 
 Each card shows its latest run at a glance: **queued**/**claimed** while
