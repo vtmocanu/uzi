@@ -15,11 +15,11 @@ who runs that role.
 
 ## Builtin roles
 
-uzi seeds seven builtin templates, mirroring this repo's own agent role
-library:
+uzi seeds eight builtin templates:
 
 | Name | What it does |
 |---|---|
+| `lead` | Plans the task, delegates to the other roles, and drives the run through the approval gate. |
 | `coder` | Implements features, fixes bugs, refactors code. |
 | `reviewer` | Reviews code changes for correctness, style, and edge cases. |
 | `auditor` | Audits code for security vulnerabilities and unsafe patterns. |
@@ -27,6 +27,13 @@ library:
 | `documenter` | Updates documentation only; never touches source code. |
 | `fact-checker` | Adversarially verifies factual claims against authoritative sources. |
 | `spec-keeper` | Keeps `specs/` in sync with implementation work. |
+
+The `lead` is the orchestrator: the main agent thread that plans, delegates
+to the invokable subagents, and holds the approval gate. It runs on `opus`
+by default, which is the single highest-leverage quality setting in the
+system. Editing its prompt only tunes its persona and workflow; the
+primary-directive guardrails (never touch `main`, no `git push`, the plan
+gate) are enforced by the worker regardless of what the template says.
 
 Builtins can be edited freely but not deleted; use **Reset to default** to
 re-apply the shipped definition instead.

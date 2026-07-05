@@ -33,6 +33,19 @@ func ReconcileBuiltinTemplates(ctx context.Context, q *Queries) error {
 		if err != nil {
 			return fmt.Errorf("insert builtin %q: %w", def.Name, err)
 		}
+		if n == 0 {
+			// ON CONFLICT (name) DO NOTHING: an existing row of the same name
+			// kept the seed out. That is normal when a prior boot already
+			// inserted this builtin, but on an upgrade a pre-existing admin
+			// template (is_builtin=false) can shadow a new builtin and never
+			// receive it — the worker still routes it by name, but it is not
+			// resettable to the shipped definition. Warn so an operator can
+			// rename or delete the custom row if they want the builtin.
+			if existing, gErr := q.GetAgentTemplateByName(ctx, def.Name); gErr == nil && !existing.IsBuiltin {
+				slog.Warn("builtin agent template shadowed by a custom row; skipping seed",
+					"name", def.Name)
+			}
+		}
 		inserted += int(n)
 	}
 	slog.Info("reconciled builtin agent templates", "builtins", len(agenttmpl.Builtins()), "inserted", inserted)
