@@ -7,21 +7,29 @@ import {
   ApiError,
   type AgentTemplate,
   type AgentTemplateInput,
+  type AllocatedSkill,
+  type AllocationsInput,
   type PrivilegeReport,
   type Run,
   type RunInputKind,
   type SecretMeta,
+  type Skill,
+  type SkillCreateInput,
+  type SkillUpdateInput,
   type User,
   type UserSettings,
 } from "../lib/api";
+import { bodyError, descriptionError, SKILL_NAME_RE } from "../lib/skills";
 import {
   LIVE_RUN_ID,
   mockAdmin,
   mockAdminWorkers,
+  mockAllocations,
   mockConnection,
   mockForgeConfig,
   mockRepos,
   mockSecrets,
+  mockSkills,
   mockTemplates,
   mockUsers,
   mockWorkers,
@@ -47,8 +55,30 @@ let userSettings: UserSettings = { default_model: null };
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
+let skills: Skill[] = mockSkills.map((s) => ({ ...s }));
+let allocations: Record<string, { shared: string[]; mine: string[] }> = Object.fromEntries(
+  Object.entries(mockAllocations).map(([k, v]) => [k, { shared: [...v.shared], mine: [...v.mine] }]),
+);
 let templateCounter = 0;
 let workerCounter = 0;
+let skillCounter = 0;
+
+// visibleSkills mirrors the real read: admins see every scope, everyone else
+// sees builtin ∪ global ∪ their own user skills.
+function visibleSkills(me: User): Skill[] {
+  return skills.filter((s) => me.is_admin || s.scope !== "user" || s.user_id === me.id);
+}
+
+function toAllocated(id: string): AllocatedSkill | null {
+  const s = skills.find((x) => x.id === id);
+  return s ? { skill_id: s.id, name: s.name, description: s.description, scope: s.scope } : null;
+}
+
+function allocationView(templateId: string): { shared: AllocatedSkill[]; mine: AllocatedSkill[] } {
+  const a = allocations[templateId] ?? { shared: [], mine: [] };
+  const map = (ids: string[]) => ids.map(toAllocated).filter((x): x is AllocatedSkill => x !== null);
+  return { shared: map(a.shared), mine: map(a.mine) };
+}
 
 function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
@@ -161,6 +191,130 @@ export const mockApi = {
     return delay({ template: { ...t } });
   },
 
+  // ── Agent skills (PRD #16) ────────────────────────────────────────────────
+  listSkills: async () => delay({ skills: visibleSkills(requireSession()).map((s) => ({ ...s })) }),
+  getSkill: async (id: string) => {
+    const me = requireSession();
+    const s = skills.find((x) => x.id === id);
+    if (!s || (!me.is_admin && s.scope === "user" && s.user_id !== me.id)) {
+      throw new ApiError(404, "skill not found");
+    }
+    return delay({ skill: { ...s } });
+  },
+  createSkill: async (input: SkillCreateInput) => {
+    const me = requireSession();
+    const name = input.name.trim();
+    if (!SKILL_NAME_RE.test(name)) {
+      throw new ApiError(400, "name must be kebab-case (lowercase letters, digits, hyphens; max 64 chars)");
+    }
+    if (input.scope === "global") {
+      if (!me.is_admin) throw new ApiError(403, "only admins can create global skills");
+    } else if (input.scope !== "user") {
+      throw new ApiError(400, "scope must be 'global' or 'user'");
+    }
+    const descErr = descriptionError(input.description);
+    if (descErr) throw new ApiError(400, descErr);
+    const bErr = bodyError(input.body);
+    if (bErr) throw new ApiError(400, bErr);
+    const clash = skills.some((s) =>
+      s.name === name &&
+      (input.scope === "user" ? s.scope === "user" && s.user_id === me.id : s.scope !== "user"),
+    );
+    if (clash) throw new ApiError(409, "a skill with that name already exists");
+    const now = new Date().toISOString();
+    const s: Skill = {
+      id: `skill-custom-${++skillCounter}`,
+      name,
+      description: input.description.trim(),
+      body: input.body,
+      scope: input.scope,
+      user_id: input.scope === "user" ? me.id : null,
+      updated_by: me.email,
+      created_at: now,
+      updated_at: now,
+    };
+    skills.push(s);
+    return delay({ skill: { ...s } }, 300);
+  },
+  updateSkill: async (id: string, input: SkillUpdateInput) => {
+    const me = requireSession();
+    const s = skills.find((x) => x.id === id);
+    if (!s) throw new ApiError(404, "skill not found");
+    if (s.scope === "builtin" || s.scope === "global") {
+      if (!me.is_admin) throw new ApiError(403, "you do not have permission to modify this skill");
+    } else if (s.user_id !== me.id) {
+      throw new ApiError(me.is_admin ? 403 : 404, me.is_admin ? "you do not have permission to modify this skill" : "skill not found");
+    }
+    const descErr = descriptionError(input.description);
+    if (descErr) throw new ApiError(400, descErr);
+    const bErr = bodyError(input.body);
+    if (bErr) throw new ApiError(400, bErr);
+    s.description = input.description.trim();
+    s.body = input.body;
+    s.updated_by = me.email;
+    s.updated_at = new Date().toISOString();
+    return delay({ skill: { ...s } });
+  },
+  deleteSkill: async (id: string) => {
+    const me = requireSession();
+    const s = skills.find((x) => x.id === id);
+    if (!s) throw new ApiError(404, "skill not found");
+    if (s.scope === "builtin") throw new ApiError(409, "builtin skills cannot be deleted; reset them instead");
+    if (s.scope === "global") {
+      if (!me.is_admin) throw new ApiError(403, "you do not have permission to modify this skill");
+    } else if (s.user_id !== me.id) {
+      throw new ApiError(me.is_admin ? 403 : 404, me.is_admin ? "you do not have permission to modify this skill" : "skill not found");
+    }
+    skills = skills.filter((x) => x.id !== id);
+    return delay(null);
+  },
+  resetSkill: async (id: string) => {
+    const me = requireSession();
+    const s = skills.find((x) => x.id === id);
+    if (!s) throw new ApiError(404, "skill not found");
+    if (s.scope !== "builtin") throw new ApiError(400, "only builtin skills can be reset");
+    if (!me.is_admin) throw new ApiError(403, "you do not have permission to modify this skill");
+    const shipped = mockSkills.find((x) => x.id === id)!;
+    s.description = shipped.description;
+    s.body = shipped.body;
+    s.updated_by = me.email;
+    s.updated_at = new Date().toISOString();
+    return delay({ skill: { ...s } });
+  },
+  getTemplateSkills: async (id: string) => {
+    requireSession();
+    if (!templates.some((t) => t.id === id)) throw new ApiError(404, "template not found");
+    return delay({ allocations: allocationView(id) });
+  },
+  setTemplateSkills: async (id: string, input: AllocationsInput) => {
+    const me = requireSession();
+    if (!templates.some((t) => t.id === id)) throw new ApiError(404, "template not found");
+    if (input.shared_skill_ids === undefined && input.my_skill_ids === undefined) {
+      throw new ApiError(400, "provide shared_skill_ids and/or my_skill_ids");
+    }
+    const a = allocations[id] ?? { shared: [], mine: [] };
+    if (input.shared_skill_ids !== undefined) {
+      if (!me.is_admin) throw new ApiError(403, "only admins can set shared skill allocations");
+      for (const sid of input.shared_skill_ids) {
+        const sk = skills.find((x) => x.id === sid);
+        if (!sk || (sk.scope !== "builtin" && sk.scope !== "global")) {
+          throw new ApiError(400, "one or more skills are not allocatable");
+        }
+      }
+      a.shared = [...new Set(input.shared_skill_ids)];
+    }
+    if (input.my_skill_ids !== undefined) {
+      for (const sid of input.my_skill_ids) {
+        const sk = skills.find((x) => x.id === sid);
+        const ok = sk && (sk.scope === "builtin" || sk.scope === "global" || (sk.scope === "user" && sk.user_id === me.id));
+        if (!ok) throw new ApiError(400, "one or more skills are not allocatable");
+      }
+      a.mine = [...new Set(input.my_skill_ids)];
+    }
+    allocations[id] = a;
+    return delay({ allocations: allocationView(id) });
+  },
+
   // ── Forge ───────────────────────────────────────────────────────────────────
   forgeConfig: async () => delay({ ...mockForgeConfig, allowed_base_urls: [...mockForgeConfig.allowed_base_urls] }),
   listConnections: async () => delay({ connections: connections.map((c) => ({ ...c })) }),
@@ -221,6 +375,12 @@ export const mockApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.enabled = enabled;
+    return delay({ repo: { ...r } });
+  },
+  setRepoSkillsEnabled: async (id: string, enabled: boolean) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.repo_skills_enabled = enabled;
     return delay({ repo: { ...r } });
   },
 

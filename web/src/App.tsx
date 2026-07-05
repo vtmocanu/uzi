@@ -10,6 +10,7 @@ import { Settings } from "./pages/Settings";
 import { Agents } from "./pages/Agents";
 import { AgentNew } from "./pages/AgentNew";
 import { AgentDetail } from "./pages/AgentDetail";
+import { Skills } from "./pages/Skills";
 import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
@@ -122,6 +123,14 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AgentDetail />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/skills"
+          element={
+            <ProtectedRoute>
+              <Skills />
             </ProtectedRoute>
           }
         />

@@ -1,7 +1,7 @@
 // Boards home: the projects the bot can see. Enabling one starts tracking its
 // PRD issues on a kanban board.
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo } from "../lib/api";
 import { repoFindings } from "../lib/privilege";
@@ -16,6 +16,10 @@ export function Repos() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // The repo whose "enable repo skills" warning is currently expanded (enabling
+  // is a trust decision, so it is gated behind a confirm; disabling is immediate).
+  const [warnRepoId, setWarnRepoId] = useState<string | null>(null);
+  const [skillsBusyId, setSkillsBusyId] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -59,6 +63,20 @@ export function Repos() {
       setError(err instanceof ApiError ? err.message : "Update failed");
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const setRepoSkills = async (repo: Repo, enabled: boolean) => {
+    setError("");
+    setSkillsBusyId(repo.id);
+    try {
+      const { repo: updated } = await api.setRepoSkillsEnabled(repo.id, enabled);
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+      setWarnRepoId(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setSkillsBusyId(null);
     }
   };
 
@@ -117,19 +135,21 @@ export function Repos() {
                     <th className="px-4 py-3 font-medium">Project</th>
                     <th className="px-4 py-3 font-medium">Default branch</th>
                     <th className="px-4 py-3 font-medium">Status</th>
+                    <th className="px-4 py-3 font-medium">Repo skills</th>
                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-edge">
                   {repos.length === 0 ? (
                     <tr>
-                      <td colSpan={4} className="px-4 py-6 text-center text-faint">
+                      <td colSpan={5} className="px-4 py-6 text-center text-faint">
                         {refreshing ? "Loading…" : "No projects found for this bot."}
                       </td>
                     </tr>
                   ) : (
                     repos.map((r) => (
-                      <tr key={r.id} className="transition-colors hover:bg-raised/30">
+                      <Fragment key={r.id}>
+                      <tr className="transition-colors hover:bg-raised/30">
                         <td className="px-4 py-3">
                           {isHttpsUrl(r.web_url) ? (
                             <a
@@ -170,6 +190,35 @@ export function Repos() {
                             })()}
                           </div>
                         </td>
+                        <td className="px-4 py-3">
+                          {!r.enabled ? (
+                            <span className="text-xs text-faint">—</span>
+                          ) : r.repo_skills_enabled ? (
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge tone="ok" dot>
+                                On
+                              </Badge>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                aria-label="Disable repo skills"
+                                disabled={skillsBusyId === r.id}
+                                onClick={() => setRepoSkills(r, false)}
+                              >
+                                Disable
+                              </Button>
+                            </div>
+                          ) : (
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              disabled={skillsBusyId === r.id}
+                              onClick={() => setWarnRepoId((id) => (id === r.id ? null : r.id))}
+                            >
+                              Load repo skills
+                            </Button>
+                          )}
+                        </td>
                         <td className="px-4 py-3 text-right">
                           <div className="flex justify-end gap-2">
                             {r.enabled && (
@@ -190,6 +239,44 @@ export function Repos() {
                           </div>
                         </td>
                       </tr>
+                      {warnRepoId === r.id && (
+                        <tr className="bg-warn/5">
+                          <td colSpan={5} className="px-4 py-4">
+                            <div className="space-y-3">
+                              <p className="text-sm text-fg">
+                                <span className="font-medium">Load skills from this repo?</span>{" "}
+                                Enabling this loads skills from the repo&rsquo;s own{" "}
+                                <code className="rounded bg-raised px-1 py-0.5 font-mono text-xs">
+                                  .claude/skills/
+                                </code>{" "}
+                                into every run on this repo. Only <code className="font-mono text-xs">SKILL.md</code>{" "}
+                                files load — never the repo&rsquo;s hooks, settings, commands, or{" "}
+                                <code className="font-mono text-xs">CLAUDE.md</code>. A skill can steer an
+                                agent, so enable this only for a repo whose merge-request review
+                                discipline you trust.
+                              </p>
+                              <div className="flex gap-2">
+                                <Button
+                                  size="sm"
+                                  disabled={skillsBusyId === r.id}
+                                  onClick={() => setRepoSkills(r, true)}
+                                >
+                                  {skillsBusyId === r.id ? "Enabling…" : "Enable repo skills"}
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  disabled={skillsBusyId === r.id}
+                                  onClick={() => setWarnRepoId(null)}
+                                >
+                                  Cancel
+                                </Button>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </Fragment>
                     ))
                   )}
                 </tbody>
