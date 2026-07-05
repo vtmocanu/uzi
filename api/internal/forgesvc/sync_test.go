@@ -20,9 +20,12 @@ type fakeForge struct {
 	listErr   error
 	listCalls []forge.ListIssuesOptions
 
-	// MR-close watcher (PRD #24) scripting.
+	// MR-close watcher (PRD #24) scripting. mr/mrErr are the default GetMergeRequest
+	// result; mrByIID/mrErrByIID override per mrIID (for multi-candidate tests).
 	mr          forge.MergeRequest
 	mrErr       error
+	mrByIID     map[int64]forge.MergeRequest
+	mrErrByIID  map[int64]error
 	mrCalls     []int64 // mrIIDs GetMergeRequest was asked for
 	updateErr   error   // makes AutoMove's UpdateIssueLabels fail (forge-move failure)
 	updateCalls []mrUpdateCall
@@ -62,6 +65,12 @@ func (f *fakeForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove
 }
 func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.MergeRequest, error) {
 	f.mrCalls = append(f.mrCalls, mrIID)
+	if err, ok := f.mrErrByIID[mrIID]; ok {
+		return forge.MergeRequest{}, err
+	}
+	if mr, ok := f.mrByIID[mrIID]; ok {
+		return mr, nil
+	}
 	if f.mrErr != nil {
 		return forge.MergeRequest{}, f.mrErr
 	}

@@ -263,6 +263,26 @@ func TestMRReopenEdgeManualDragConsumesEdge(t *testing.T) {
 	assertRecorded(t, st, runID, "opened")
 }
 
+func TestMRReopenEdgeForgeFailureLeavesEdge(t *testing.T) {
+	// Symmetry with the close-edge forge-failure case: a failed reopen move must
+	// NOT advance mr_state, so it stays 'closed' and the next tick retries the
+	// closed→opened edge. The poller cadence is the retry loop in both directions.
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("closed"))},
+		issue:      mrIssue(repoID, 9, "opened", "PRD", board.ColumnInProgress),
+		columns:    mrCols(),
+	}
+	f := &fakeForge{mr: forgeMR(13, "opened"), updateErr: errors.New("forge unreachable")}
+
+	run(t, st, f)
+
+	if len(f.updateCalls) != 1 {
+		t.Fatalf("the reopen move must be ATTEMPTED, got %+v", f.updateCalls)
+	}
+	assertNoRecord(t, st) // edge left unconsumed — mr_state stays 'closed'
+}
+
 // ── merged / locked no-ops (Risk: locked churn) ─────────────────────────────
 
 func TestMRMergedIsRecordedNeverMoves(t *testing.T) {
@@ -295,10 +315,11 @@ func TestMRLockedIsRecordedNeverMoves(t *testing.T) {
 	assertRecorded(t, st, runID, "locked")
 }
 
-func TestMRUnknownStateIsRecordedNeverMoves(t *testing.T) {
-	// Audit requirement: only the known opened<->closed edges may move a card. An
-	// unrecognized state string (a future/unexpected GitLab value) must be
-	// record-only, never a move — it falls through the switch's default.
+func TestMRUnknownStateInTransitionIsIgnored(t *testing.T) {
+	// Reviewer hardening (post-audit): an unrecognized state is ignored ENTIRELY —
+	// no move AND no write — so the prior baseline ("opened") is preserved and a
+	// later real "closed" still fires the edge. Recording garbage would instead
+	// mask the next close until a full reopen cycle re-synced the baseline.
 	runID, repoID := uuid.New(), uuid.New()
 	st := &fakeStore{
 		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("opened"))},
@@ -310,7 +331,24 @@ func TestMRUnknownStateIsRecordedNeverMoves(t *testing.T) {
 	run(t, st, f)
 
 	assertNoMove(t, f)
-	assertRecorded(t, st, runID, "some_new_state")
+	assertNoRecord(t, st) // baseline "opened" left intact — the glitch self-heals
+}
+
+func TestMRUnknownOrEmptyStateBootstrapIsIgnored(t *testing.T) {
+	// Same rule on the bootstrap path: an empty/unknown first observation writes
+	// nothing, so mr_state stays NULL and the next KNOWN state bootstraps cleanly.
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrNull())},
+		issue:      mrIssue(repoID, 9, "opened", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	f := &fakeForge{mr: forgeMR(13, "")} // empty state is not a known value
+
+	run(t, st, f)
+
+	assertNoMove(t, f)
+	assertNoRecord(t, st) // NULL baseline left intact
 }
 
 // ── read failure leaves the edge ────────────────────────────────────────────
@@ -349,6 +387,40 @@ func TestMRReworkSuppressionYieldsNoCandidates(t *testing.T) {
 	}
 	assertNoMove(t, f)
 	assertNoRecord(t, st)
+}
+
+func TestMRMultiCandidateIsolation(t *testing.T) {
+	// One bad candidate must never stall the rest of the loop (poller log-and-skip
+	// convention). Candidate A's MR read fails; candidate B still gets read, moved,
+	// and recorded. Both fakeStore.GetIssueByIID lookups return the same in-review
+	// issue — fine, the point is that B is processed despite A failing.
+	runA, runB := uuid.New(), uuid.New()
+	repoID := uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{
+			candidate(runA, 9, 13, mrTxt("opened")),
+			candidate(runB, 10, 14, mrTxt("opened")),
+		},
+		issue:   mrIssue(repoID, 10, "opened", "PRD", board.ColumnHumanReview),
+		columns: mrCols(),
+	}
+	f := &fakeForge{
+		mrErrByIID: map[int64]error{13: errors.New("forge down for this MR")},
+		mrByIID:    map[int64]forge.MergeRequest{14: forgeMR(14, "closed")},
+	}
+
+	run(t, st, f)
+
+	if len(f.mrCalls) != 2 {
+		t.Fatalf("both candidates must be read (A's failure must not stall the loop), got %v", f.mrCalls)
+	}
+	if len(f.updateCalls) != 1 {
+		t.Fatalf("only candidate B moves; A failed its read, got %+v", f.updateCalls)
+	}
+	// The single mr_state write belongs to B (A wrote nothing — its edge is left).
+	if len(st.mrStateWrites) != 1 || st.mrStateWrites[0].ID != runB || st.mrStateWrites[0].MrState.String != "closed" {
+		t.Fatalf("expected exactly B's 'closed' write, got %+v", st.mrStateWrites)
+	}
 }
 
 func TestMRCandidateListErrorPropagates(t *testing.T) {

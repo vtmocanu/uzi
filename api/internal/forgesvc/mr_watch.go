@@ -58,6 +58,18 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 	}
 	observed := mr.State
 
+	// Record and act on KNOWN states only (reviewer hardening, PRD #24 Decision
+	// Log). An unrecognized or empty state is ignored ENTIRELY — no write — in
+	// both the bootstrap and transition paths, leaving the prior baseline (or
+	// NULL) intact. Because edges fire on exact string compares, recording garbage
+	// would mask the next real close until a full reopen cycle re-synced the
+	// baseline; ignoring it instead lets a transient glitch self-heal
+	// (stored="opened" → glitch skipped → a later real "closed" still fires).
+	if !forge.IsKnownMRState(observed) {
+		slog.Warn("forgesvc: ignoring unknown MR state", "repo", repoID, "issue", c.IssueIid, "mr", c.MrIid.Int64, "state", observed)
+		return
+	}
+
 	if !c.MrState.Valid {
 		// Bootstrap (Decision 9): first observation records state WITHOUT moving.
 		// Acting on NULL→closed cannot distinguish "closed and stuck" from "closed
@@ -87,12 +99,10 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		}
 		s.recordMRState(ctx, c.ID, observed)
 	default:
-		// Every transition that is NOT one of the two actionable edges above —
-		// merged, locked, AND any unrecognized state string — is record-only,
-		// never a move: only the known opened↔closed edges may move a card. A
-		// merge closes the issue via `Closes #N`, which the existing issue-close
-		// sync owns; locked is transient during merge processing; an unknown
-		// state is still recorded so the next real edge is detected against it.
+		// A KNOWN non-edge transition (merged / locked): record, never move.
+		// Unknown states never reach here — they are ignored before the bootstrap
+		// check above. A merge closes the issue via `Closes #N`, which the existing
+		// issue-close sync owns; locked is transient during merge processing.
 		s.recordMRState(ctx, c.ID, observed)
 	}
 }

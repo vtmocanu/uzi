@@ -78,6 +78,19 @@ type MergeRequest struct {
 	WebURL string
 }
 
+// IsKnownMRState reports whether s is one of the MR states this integration
+// recognizes. The MR-close watcher records and acts on known states only; an
+// unrecognized or empty value is ignored so a transient forge glitch cannot
+// poison the watcher's edge baseline (reviewer hardening, PRD #24 Decision Log).
+func IsKnownMRState(s string) bool {
+	switch s {
+	case MRStateOpened, MRStateClosed, MRStateMerged, MRStateLocked:
+		return true
+	default:
+		return false
+	}
+}
+
 // ListIssuesOptions filters ListIssues. State is always queried as "all" by the
 // driver (the Closed column requires it), so it is not exposed here. Labels is
 // ANDed; an empty UpdatedAfter means "no lower bound" (full fetch).
