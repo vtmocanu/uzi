@@ -97,6 +97,11 @@ func run() error {
 	if err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
 		return err
 	}
+	// Same for the builtin agent skills (PRD #16): missing builtin skills are
+	// inserted, admin edits survive restarts.
+	if err := store.ReconcileBuiltinSkills(ctx, q); err != nil {
+		return err
+	}
 
 	box, err := secretbox.New(cfg.SecretKey)
 	if err != nil {

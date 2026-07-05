@@ -91,6 +91,19 @@ WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
 RETURNING *;
 
+-- name: SetRepoSkillsEnabledForUser :one
+-- Repo-skills opt-in toggle, authorized through the repo's owning connection.
+-- A non-owned or unknown id returns no rows (mapped to 404 in the handler).
+UPDATE repos SET repo_skills_enabled = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING *;
+
+-- name: SetRepoSkillsEnabled :one
+-- Admin path for the repo-skills toggle: not scoped to the owning user. The
+-- handler gates this on the caller being an admin.
+UPDATE repos SET repo_skills_enabled = $2 WHERE repos.id = $1 RETURNING *;
+
 -- name: ListEnabledReposWithConnections :many
 -- Every enabled repo across all users, with its connection, for the sync
 -- engine's poller set.
