@@ -7,7 +7,8 @@ audience: user
 # Admin settings
 
 uzi keeps a small set of instance-wide settings in the database, editable by
-an admin from **Admin → Instance settings**. Today: two forge labels.
+an admin from **Admin → Instance settings**. Today: two forge labels and a
+default theme.
 
 ## The two labels
 
@@ -15,6 +16,15 @@ an admin from **Admin → Instance settings**. Today: two forge labels.
 |---|---|---|
 | PRD label | `PRD` | Which GitLab label marks an issue as factory work; only issues carrying it appear on any board. |
 | Autopilot label | `autopilot` | Which GitLab label, added alongside the PRD label, triggers an unattended run for an opted-in user. See [Autopilot](./autopilot.md). |
+
+## Default theme
+
+Which theme a user with no personal choice sees — new users, and anyone who
+hasn't picked one under Settings → Appearance. A user's own pick, once made,
+always wins over this setting. Changing it restyles every un-overridden
+session live, no reload needed, since each session re-resolves its theme on
+its next `me` refresh. See [Theming](./theming.md) for how themes work and
+how to add one.
 
 ## Validation
 
@@ -41,7 +51,9 @@ repo's resync completes. See "Freshness contract" in
 [Configuration](./configuration.md) for how sync cadence otherwise works.
 This resync fires on either label changing, even the one (autopilot label)
 that doesn't yet affect what boards show — harmless, and simpler than
-special-casing which key mattered.
+special-casing which key mattered. A default-theme-only save does **not**
+trigger it: theming is presentation-only and never affects what a board
+shows.
 
 ## No secrets here
 
