@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -18,17 +19,22 @@ import (
 // RunStarter creates an autopilot run through workersvc's shared manual-start
 // path. *workersvc.Service satisfies it. Keeping run creation on the workersvc
 // side (rather than re-implementing it here) is what makes an autopilot run and a
-// manual run share one state machine and one set of gates.
+// manual run share one state machine and one set of gates. allowWithoutPRD is the
+// caller-computed PRDLESS bypass (PRD #22 Decision 3), threaded through exactly as
+// the manual handler threads it.
 type RunStarter interface {
-	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
+	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error)
 }
 
-// AutopilotLabeler resolves the configured autopilot label. *settings.Cache
-// satisfies it; a nil labeler or an empty/errored read falls back to the
-// compiled-in default, so a settings blip degrades to the default label rather
-// than filtering on an empty one.
-type AutopilotLabeler interface {
+// SettingsReader resolves the instance settings the autopilot detector needs: the
+// autopilot label it filters on, and the PRDLESS gate-bypass state (PRD #22).
+// *settings.Cache satisfies it; a nil reader or an empty/errored read falls back
+// to compiled-in defaults, so a settings blip degrades gracefully rather than
+// filtering on an empty label or mis-resolving the bypass.
+type SettingsReader interface {
 	AutopilotLabel(ctx context.Context) (string, error)
+	PrdlessEnabled(ctx context.Context) (bool, error)
+	PrdlessLabel(ctx context.Context) (string, error)
 }
 
 // autopilotStore is the subset of *store.Queries the detector reads and writes.
@@ -44,15 +50,16 @@ type autopilotStore interface {
 // stateless and safe for concurrent use across the per-repo sync goroutines: it
 // only reads its injected collaborators and touches distinct (repo, issue) rows.
 type Autopilot struct {
-	q      autopilotStore
-	runs   RunStarter
-	labels AutopilotLabeler
+	q    autopilotStore
+	runs RunStarter
+	set  SettingsReader
 }
 
 // NewAutopilot builds a detector. q is the store, runs creates the auto_approve
-// runs (workersvc), labels resolves the configured autopilot label (settings).
-func NewAutopilot(q autopilotStore, runs RunStarter, labels AutopilotLabeler) *Autopilot {
-	return &Autopilot{q: q, runs: runs, labels: labels}
+// runs (workersvc), set resolves the autopilot label and PRDLESS bypass state
+// (settings).
+func NewAutopilot(q autopilotStore, runs RunStarter, set SettingsReader) *Autopilot {
+	return &Autopilot{q: q, runs: runs, set: set}
 }
 
 // detect is the post-sync autopilot hook (review finding B3: detection lives HERE,
@@ -180,7 +187,12 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		return
 	}
 
-	_, err = a.runs.CreateAutopilotRun(ctx, cc.UserID, r.ID, iid, issue.Description)
+	// PRDLESS bypass (PRD #22 Decision 3): computed from THIS fresh GetIssue
+	// snapshot, exactly like the manual handler — so the PRD+autopilot+PRDLESS
+	// composition runs unattended with no PRD link (all three explicit opt-ins).
+	allowWithoutPRD := a.allowWithoutPRD(ctx, issue.Labels)
+
+	_, err = a.runs.CreateAutopilotRun(ctx, cc.UserID, r.ID, iid, issue.Description, allowWithoutPRD)
 	switch {
 	case err == nil:
 		// Create-then-record: a crash before recording leaves the created run active,
@@ -241,12 +253,33 @@ func (a *Autopilot) recordThenComment(ctx context.Context, r store.ListEnabledRe
 // forgesvc.prdLabel — the accessor already returns the default alongside a cold
 // error, so this is best-effort by design).
 func (a *Autopilot) autopilotLabel(ctx context.Context) string {
-	if a.labels != nil {
-		if l, _ := a.labels.AutopilotLabel(ctx); l != "" {
+	if a.set != nil {
+		if l, _ := a.set.AutopilotLabel(ctx); l != "" {
 			return l
 		}
 	}
 	return settings.DefaultAutopilotLabel
+}
+
+// allowWithoutPRD reports whether the PRDLESS gate bypass applies to this fresh
+// issue snapshot (PRD #22 Decision 3): the feature is enabled instance-wide and
+// the issue carries the configured prdless label (exact match, like the manual
+// path). Conservative when settings are unknowable: a nil reader means no bypass,
+// so a misconfigured detector never silently weakens the PRD gate. An empty label
+// read falls back to the compiled-in default.
+func (a *Autopilot) allowWithoutPRD(ctx context.Context, labels []string) bool {
+	if a.set == nil {
+		return false
+	}
+	enabled, _ := a.set.PrdlessEnabled(ctx)
+	if !enabled {
+		return false
+	}
+	label, _ := a.set.PrdlessLabel(ctx)
+	if label == "" {
+		label = settings.DefaultPrdlessLabel
+	}
+	return slices.Contains(labels, label)
 }
 
 // eligible reports whether the repo owner may run this issue under autopilot: they

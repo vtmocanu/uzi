@@ -66,6 +66,34 @@ func TestAccessorsFallBackToDefaults(t *testing.T) {
 	}
 }
 
+func TestPrdlessAccessors(t *testing.T) {
+	// Empty table → compiled-in defaults: enabled (true) + "PRDLESS".
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.PrdlessEnabled(context.Background()); err != nil || got != true {
+		t.Fatalf("PrdlessEnabled default = %v, %v; want true", got, err)
+	}
+	if got, err := c.PrdlessLabel(context.Background()); err != nil || got != DefaultPrdlessLabel {
+		t.Fatalf("PrdlessLabel default = %q, %v; want %q", got, err, DefaultPrdlessLabel)
+	}
+
+	// Stored "false" disables; a non-"true"/"false" value reads as false (strict).
+	for _, tc := range []struct {
+		stored string
+		want   bool
+	}{{"true", true}, {"false", false}, {"", true /* empty → default "true" */}, {"banana", false}} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyPrdlessEnabled, tc.stored)}}, time.Minute)
+		if got, _ := c.PrdlessEnabled(context.Background()); got != tc.want {
+			t.Errorf("PrdlessEnabled(stored=%q) = %v, want %v", tc.stored, got, tc.want)
+		}
+	}
+
+	// A configured custom label is returned verbatim.
+	c = New(&fakeStore{rows: []store.AppSetting{row(KeyPrdlessLabel, "NOSPEC")}}, time.Minute)
+	if got, _ := c.PrdlessLabel(context.Background()); got != "NOSPEC" {
+		t.Fatalf("PrdlessLabel = %q, want NOSPEC", got)
+	}
+}
+
 func TestAllReturnsStableShape(t *testing.T) {
 	fs := &fakeStore{rows: []store.AppSetting{row(KeyPRDLabel, "Feature")}}
 	c := New(fs, time.Minute)

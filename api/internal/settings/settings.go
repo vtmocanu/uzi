@@ -27,6 +27,10 @@ import (
 const (
 	KeyPRDLabel       = "prd_label"
 	KeyAutopilotLabel = "autopilot_label"
+	// PRDLESS gate-bypass keys (PRD #22). prdless_enabled stores the text
+	// "true"/"false"; prdless_label is the escape-hatch label name.
+	KeyPrdlessEnabled = "prdless_enabled"
+	KeyPrdlessLabel   = "prdless_label"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -35,6 +39,11 @@ const (
 const (
 	DefaultPRDLabel       = "PRD"
 	DefaultAutopilotLabel = "autopilot"
+	// PRD #22: on by default (Decision 1). An issue still bypasses the gate only
+	// when it carries the label, so default-on weakens nothing for unlabeled
+	// issues; admins wanting the strict PRD-only regime flip prdless_enabled off.
+	DefaultPrdlessEnabled = "true"
+	DefaultPrdlessLabel   = "PRDLESS"
 )
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
@@ -44,11 +53,16 @@ const maxLabelLen = 64
 // Go source of the default values: the accessors fall back to it and the
 // migration (00036_app_settings) seeds the same literals. Keep the two in sync —
 // SQL cannot reference these constants, so a change here that should also change
-// the seeded rows needs a follow-up migration. Ranging over Defaults is the
-// canonical way to enumerate the settings the API understands.
+// the seeded rows needs a follow-up migration. The PRD #22 prdless keys are the
+// exception: they have NO seeded row (Cache.All/Effective synthesize them from
+// these defaults), so an absent row is expected and no migration adds them.
+// Ranging over Defaults is the canonical way to enumerate the settings the API
+// understands.
 var Defaults = map[string]string{
 	KeyPRDLabel:       DefaultPRDLabel,
 	KeyAutopilotLabel: DefaultAutopilotLabel,
+	KeyPrdlessEnabled: DefaultPrdlessEnabled,
+	KeyPrdlessLabel:   DefaultPrdlessLabel,
 }
 
 // Known reports whether key is a setting the API recognizes.
@@ -156,6 +170,23 @@ func (c *Cache) PRDLabel(ctx context.Context) (string, error) {
 // DefaultAutopilotLabel.
 func (c *Cache) AutopilotLabel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyAutopilotLabel)
+}
+
+// PrdlessLabel returns the configured PRDLESS escape-hatch label (PRD #22).
+// Falls back to DefaultPrdlessLabel.
+func (c *Cache) PrdlessLabel(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyPrdlessLabel)
+}
+
+// PrdlessEnabled reports whether the PRDLESS gate-bypass feature is enabled
+// instance-wide (PRD #22, Decision 1). The value is stored as the text
+// "true"/"false"; anything other than "true" reads as false. A cold read error
+// returns the compiled-in default (true) alongside the error, so a best-effort
+// caller can ignore err — but an unlabeled issue is still gated, since the
+// bypass also requires the label on the fresh snapshot.
+func (c *Cache) PrdlessEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyPrdlessEnabled)
+	return v == "true", err
 }
 
 // All returns every known key with its effective value (row value or default).

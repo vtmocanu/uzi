@@ -604,27 +604,33 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 }
 
 // CreateRun queues a manually-started run from a board card. The issue must be a
-// cached PRD issue (with a PRD link) in a repo the user owns; its title is
-// snapshotted from the cache and its description from the request, so the run is
-// self-contained even if the issue cache is later evicted. The
+// cached PRD issue (with a PRD link, unless allowWithoutPRD) in a repo the user
+// owns; its title is snapshotted from the cache and its description from the
+// request, so the run is self-contained even if the issue cache is later
+// evicted. allowWithoutPRD is the caller-computed PRDLESS bypass (PRD #22
+// Decision 3): the handler sets it from the fresh forge snapshot's labels + the
+// prdless settings, and it exempts this run from the HasPrdLink gate. The
 // one-non-terminal-run-per-issue index rejects a duplicate active run.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, false)
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, false, allowWithoutPRD)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
 // user's behalf (PRD #19 M4). It is IDENTICAL to CreateRun — same ownership,
 // cached-PRD-issue, PRD-link, and one-active-run gates, same state machine, same
 // queued→In Progress column notify — except it sets auto_approve, which the worker
-// reads (M5) to resolve the plan gate without a human. Sharing one createRun body
-// is the whole point: the invariant that an autopilot run and a manual run are born
-// through the same path is enforced structurally, not by two implementations that
-// could drift.
-func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
-	return s.createRun(ctx, userID, repoID, issueIID, description, true)
+// reads (M5) to resolve the plan gate without a human. allowWithoutPRD threads the
+// PRDLESS bypass the same way the manual path does (PRD #22 Decision 3): the poller
+// computes it from its fresh GetIssue snapshot, so an autopilot issue carrying the
+// prdless label runs with no PRD link (the PRD+autopilot+PRDLESS composition, all
+// three explicit opt-ins). Sharing one createRun body is the whole point: the
+// invariant that an autopilot run and a manual run are born through the same path is
+// enforced structurally, not by two implementations that could drift.
+func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, allowWithoutPRD bool) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, true, allowWithoutPRD)
 }
 
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove, allowWithoutPRD bool) (store.Run, error) {
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
 	// first: it is pure input validation, independent of the repo/issue gates below.
@@ -644,7 +650,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
-	if !issue.HasPrdLink {
+	// The PRD-link gate (PRD invariant) with the PRDLESS exception (PRD #22):
+	// allowWithoutPRD is the caller's bypass decision, computed from the fresh
+	// forge snapshot's labels and the prdless settings. This is the single
+	// enforcement point; both the manual and autopilot callers pass the bool in.
+	if !issue.HasPrdLink && !allowWithoutPRD {
 		return store.Run{}, ErrNoPRDLink
 	}
 	run, err := s.q.CreateRun(ctx, store.CreateRunParams{
