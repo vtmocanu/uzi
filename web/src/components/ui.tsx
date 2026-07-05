@@ -78,7 +78,30 @@ export function Button({
 
 // ── Forms ────────────────────────────────────────────────────────────────────
 
-export function Field({ label, children }: { label: string; children: ReactNode }) {
+export function Field({
+  label,
+  htmlFor,
+  children,
+}: {
+  label: string;
+  htmlFor?: string;
+  children: ReactNode;
+}) {
+  // When htmlFor is set the label references a single control by id (a
+  // non-wrapping <label>), so a composite child like ModelSelect (a <select>
+  // plus a conditional custom <input>) does not put two controls under one
+  // wrapping label — which would pollute the select's accessible name. Without
+  // htmlFor the label wraps its single child, the default for simple inputs.
+  if (htmlFor) {
+    return (
+      <div className="space-y-1.5">
+        <label htmlFor={htmlFor} className="block text-sm font-medium text-muted">
+          {label}
+        </label>
+        {children}
+      </div>
+    );
+  }
   return (
     <label className="block space-y-1.5">
       <span className="text-sm font-medium text-muted">{label}</span>

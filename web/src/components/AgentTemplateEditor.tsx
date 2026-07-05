@@ -6,6 +6,7 @@ import {
   frontmatterFieldWarning,
   KNOWN_TOOLS,
   looseSecretWarning,
+  modelFieldWarning,
   renderSubagent,
   splitToolInput,
   unknownTools,
@@ -49,6 +50,7 @@ export function AgentTemplateEditor({
     [description, promptBody],
   );
   const unknown = useMemo(() => unknownTools(tools), [tools]);
+  const modelWarning = useMemo(() => modelFieldWarning(model), [model]);
   const injectionWarning = useMemo(
     () => frontmatterFieldWarning({ description, model, tools }),
     [description, model, tools],
@@ -122,9 +124,12 @@ export function AgentTemplateEditor({
         <Input value={description} onChange={(e) => setDescription(e.target.value)} />
       </Field>
 
-      <Field label="Model">
-        <ModelSelect value={model} onChange={setModel} />
-      </Field>
+      <div className="space-y-2">
+        <Field label="Model" htmlFor="template-model">
+          <ModelSelect id="template-model" value={model} onChange={setModel} />
+        </Field>
+        {modelWarning && <Alert message={modelWarning} tone="warning" />}
+      </div>
 
       <div className="space-y-1.5">
         <span className="text-sm font-medium text-muted">

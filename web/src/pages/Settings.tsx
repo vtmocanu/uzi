@@ -177,8 +177,8 @@ export function Settings() {
           <Skeleton className="h-9 w-full max-w-sm" />
         ) : (
           <div className="space-y-3">
-            <Field label="Model">
-              <ModelSelect value={defaultModel} onChange={setDefaultModel} />
+            <Field label="Model" htmlFor="worker-model">
+              <ModelSelect id="worker-model" value={defaultModel} onChange={setDefaultModel} />
             </Field>
             {modelWarning && <Alert message={modelWarning} tone="warning" />}
             <Button

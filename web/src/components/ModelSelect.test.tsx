@@ -3,6 +3,7 @@ import { afterEach, describe, it, expect } from "vitest";
 import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { ModelSelect } from "./ModelSelect";
+import { Field } from "./ui";
 
 afterEach(cleanup);
 
@@ -67,5 +68,27 @@ describe("ModelSelect", () => {
     fireEvent.change(combo(), { target: { value: "inherit" } });
     expect(value()).toBe("");
     expect(screen.queryByLabelText("Custom model ID")).toBeNull();
+  });
+});
+
+// Guards the S1 a11y fix: with Field htmlFor targeting the select's id, the
+// visible "Model" label names ONLY the select (accessible name stays "Model",
+// not "Model claude-fable-5"), and the custom input keeps its own name.
+describe("ModelSelect label association", () => {
+  function LabeledHarness({ initial }: { initial: string }) {
+    const [model, setModel] = useState(initial);
+    return (
+      <Field label="Model" htmlFor="m">
+        <ModelSelect id="m" value={model} onChange={setModel} />
+      </Field>
+    );
+  }
+
+  it("names only the select via the label, unpolluted in custom mode", () => {
+    render(<LabeledHarness initial="claude-fable-5" />);
+    const labeled = screen.getByLabelText("Model");
+    expect(labeled.tagName).toBe("SELECT");
+    expect((labeled as HTMLSelectElement).value).toBe("custom");
+    expect(screen.getByLabelText("Custom model ID")).not.toBeNull();
   });
 });
