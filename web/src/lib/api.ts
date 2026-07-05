@@ -275,6 +275,21 @@ function readCookie(name: string): string | null {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+// ── Global 401 handling ─────────────────────────────────────────────────────
+// Every authenticated request funnels its 401s through one app-registered
+// handler, so an expired or absent session is handled centrally — AuthContext
+// clears the user, and ProtectedRoute then redirects to /login — instead of each
+// page inventing its own 401 string. It fires inside request() before the error
+// propagates, so even a 401 the caller swallows (the board's background poll)
+// still trips it. Clearing the session (not an imperative redirect) is what
+// composes safely: the initial me() probe's expected 401 just clears an already
+// -empty session and never bounces a signed-out visitor off a public page.
+type UnauthorizedHandler = () => void;
+let unauthorizedHandler: UnauthorizedHandler | null = null;
+export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
+  unauthorizedHandler = handler;
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   if (body !== undefined) {
@@ -303,6 +318,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   }
 
   if (!res.ok) {
+    if (res.status === 401) unauthorizedHandler?.();
     const message =
       (payload as { error?: string } | null)?.error ?? `request failed (${res.status})`;
     throw new ApiError(res.status, message);

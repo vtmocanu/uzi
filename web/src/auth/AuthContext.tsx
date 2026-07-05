@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, ApiError, type User } from "../lib/api";
+import { api, ApiError, setUnauthorizedHandler, type User } from "../lib/api";
 
 interface AuthState {
   user: User | null;
@@ -33,6 +33,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(null);
       }
     }
+  }, []);
+
+  // Any authenticated request that comes back 401 (a session expired or deleted
+  // mid-session) clears the user here; a rendered ProtectedRoute then redirects
+  // to /login (replace). Because we only clear state — never navigate imperatively
+  // — the initial me() probe's expected 401 composes without looping: it clears an
+  // already-empty session and leaves a signed-out visitor on their public page.
+  useEffect(() => {
+    setUnauthorizedHandler(() => setUser(null));
+    return () => setUnauthorizedHandler(null);
   }, []);
 
   useEffect(() => {
