@@ -2570,3 +2570,185 @@ Serves human: "the run owner's default model wins over the lead template model"
   picks a model overrides it for their own runs only. Null-model **subagents follow
   the main thread**, so this governs them too; subagent templates carrying an explicit
   `model` are unaffected.
+
+---
+
+# PRD #21 — Mission-control theme (data-theme port of the ops-console identity)
+
+Serves human Feature #21 (a second, user-selectable theme on top of PRD #14's
+ember tokens; server-side theme preference with an admin default). PRD #14 shipped
+ember as the sole theme with all look-and-feel in CSS variables precisely so
+alternate identities could ship later as `data-theme` overrides; this PRD builds
+the switching mechanism and ports the mission-control prototype onto ember's token
+slots. Section numbers continue past PRD #19's #100. Realizes
+`prds/21-mission-control-theme.md` (its Decision Log carries build-time provenance);
+builds on PRD #14 (tokens), PRD #17 (`/api/me/settings`), and PRD #19 (`app_settings`).
+
+## 101. Theme = tokens only; the no-branch rule; base-selector hardening
+
+Serves human: "mission-control theme selectable"; PRD #14's token architecture.
+
+- **A theme is CSS-variable values and nothing else.** Every color, radius, font,
+  and the backdrop grid is a token in `web/src/index.css`; components reference only
+  the Tailwind names those tokens back (`bg-ink`, `text-fg`, `rounded-lg`, …), never
+  a variable or raw palette value. **No component file may branch on the active
+  theme** — `if (theme === "mission")` exists nowhere. This is the load-bearing rule:
+  a theme port that would need a component edit means the underlying feature belongs
+  in tokens. Mission's *structural* ideas (status bar, nav regrouping, kicker labels,
+  control density, agent-lane hues, gate-pulse ring) are deliberately out of scope.
+- **Base-selector hardening**: the default block is
+  `:root:not([data-theme]), [data-theme="ember"]` (was `:root, [data-theme="ember"]`),
+  so a `[data-theme="mission"]` override wins regardless of source order rather than by
+  specificity accident. A theme block is a **complete token set**, not a diff against
+  ember — `[data-theme="mission"]` redefines every token the base block defines.
+- **`[data-theme]` lives on `<html>`.** PRD #14's grep gate (zero raw palette
+  classes / ad-hoc hex/rgb outside `index.css`) stays green under this feature.
+
+## 102. Canonical Go theme registry + resolution chain (server-authoritative)
+
+Serves human: "resolution: user override > admin default > ember"; best-practice
+(two write surfaces must not drift).
+
+- **`api/internal/theme`** is the canonical theme list and the `theme.Resolve`
+  resolution chain (**user override → admin instance default → `ember`**), computed
+  server-side. The web theme module (`web/src/lib/theme.ts`, `resolveTheme`) mirrors
+  the same list + chain so the SPA re-derives the identical answer client-side without
+  a round trip.
+- **Both write surfaces validate against the Go registry** (admin `default_theme` PUT
+  and the user `theme` PUT), so a bogus value is rejected at write and can never fall
+  back silently at render — same shared-validator discipline PRD #17 uses for models.
+- Adding a theme within the existing slot set is **exactly four edits** (Success
+  Criterion 5): the Go registry entry (canonical), the web registry entry (mirror),
+  one `[data-theme]` CSS block, and one entry in the pre-paint allowlist (§106). No
+  handler/component/migration change. A theme needing a new slot is the two-step
+  Decision-3 pattern (§107): add the slot theme-agnostically first, then color it.
+
+## 103. Server-side persistence: instance default in #19's `app_settings`, user override on `users`
+
+Serves human: "theme preference is server-side with an admin-set instance default"
+(user, 2026-07-05, superseding a device-local draft).
+
+- **Instance default tenants into PRD #19's `app_settings`** (no new table, no new
+  settings endpoints — user-approved direction "update 21, 19 is in flight"):
+  `default_theme` is one seed row in `settings.Defaults` (`"ember"`), so `Known()`,
+  the GET shape, and the fallback all follow. If PRD #21 ever landed before #19 M1,
+  M1 here holds — a parallel settings table must not be built.
+- **User override is a nullable `users.theme` column** — migration
+  `00040_user_theme.sql` (drafted 00040 in the PRD ledger; renumbered to the next free
+  slot above the live head at land time per the CLAUDE.md goose convention). One
+  scalar per user ⇒ a column on `users`, not a table. `NULL` = "use default".
+- **Per-key validation dispatch** in #19's admin settings handler: the handler ran
+  `settings.ValidateLabel()` on every submitted key; this PRD refactors it to
+  `settings.Validate(key, value)` (switch: label rules for the label keys,
+  theme-registry check for `default_theme`) without touching `ValidateMerged`'s
+  cross-key label rule. Absorbed here as a small M1 refactor on #19's surface.
+- **A theme-only settings change does NOT `ForceReconcile`.** Only a label change
+  re-filters boards; `default_theme` is presentation-only. The dispatch is an
+  extracted `settings.LabelChanged` helper (a pure function unit-tested in the always-on
+  `go test` gate — a fake-reconciler handler test was declined because `h.pool` is a
+  concrete `*pgxpool.Pool` needing a live DB that would skip in the plain gate).
+
+## 104. Three theme fields on `/api/auth/me`; client re-resolves, ignores the server-resolved one
+
+Serves human: the Appearance picker must render "Use default (<name>)"; server-side
+resolution.
+
+- **`GET /api/auth/me` carries three theme fields**: the resolved theme, the user's
+  raw override (nullable), and the instance-default theme id. Resolved-only is not
+  enough (review blocker): with an override active the SPA could render neither
+  "Use default (<name>)" nor the picker's selected state, since the default otherwise
+  lives only in the admin-only settings endpoint. Non-admins get everything they need
+  from `/me`, so no admin read is required to render the picker.
+- **The client intentionally ignores the server's resolved field and re-resolves
+  itself** (§102 mirror). This is deliberate forward-compat, not dead code: a server
+  predating these fields degrades to `ember` rather than throwing on a missing field.
+- **Application point is session bootstrap** (`web/src/auth/AuthContext.tsx`, not the
+  originally-anticipated `main.tsx`): on every login/`me` refresh it re-resolves and
+  stamps `<html data-theme>`, so a change (the user's, or the admin default) restyles
+  live with no reload.
+
+## 105. User theme pref extends PRD #17's `/api/me/settings` (PATCH-like); no new route
+
+Serves human: server-side user override; PRD #17 coordination.
+
+- **No new `/me/prefs/*` route.** The pref is shaped exactly like `default_model`, so
+  `userSettingsDTO` gains `theme` next to `default_model` on the existing
+  `GET/PUT /api/me/settings` ("prefs" already names the localStorage helper
+  `web/src/lib/prefs.ts`, so a `/prefs` route would misname).
+- **`PUT` is PATCH-like, presence-detected via `json.RawMessage`**: a field present is
+  applied (`theme: null` clears the override), a field absent is left unchanged — so
+  the worker-model card and the Appearance picker save independently over the one
+  endpoint without clobbering each other. `default_model`'s prior behavior is unchanged
+  (the client always sends it on a model save). Own-user only; validates the theme
+  against the Go registry (§102).
+
+## 106. Pre-paint via an external CSP-safe script + localStorage cache
+
+Serves human: no flash-of-wrong-theme on cold load; best-practice (works in the
+nginx-served build, not just dev).
+
+- **`localStorage` (`uzi.theme`) is demoted to a pre-paint cache** of the last resolved
+  theme — the server value is authoritative. `web/public/theme-preinit.js` stamps
+  `data-theme` from the cache before first paint; `applyTheme()` refreshes the cache
+  each time the server-resolved value wins. Stored values are validated against the
+  registry (fallback `ember`), storage access is try/caught (private-mode safe); a
+  missing/blocked cache leaves `data-theme` unset ⇒ `ember`, never a half-themed page.
+- **External file, not an inline `<head>` script** (M1 auditor High): `web/nginx.conf`
+  / `web/nginx.mock.conf` set `script-src 'self'` with no `'unsafe-inline'`, so an
+  inline script is CSP-blocked and would silently never run in any nginx-served image
+  (it only worked under `vite dev`). Chosen over adding a `'sha256-…'` hash to both
+  confs plus a drift guard — the hash route is fragile (Vite can minify the inline
+  script at build so the source hash wouldn't match served bytes). Keeps "no inline
+  scripts" literally true with no CSP change; only the CSP comment is refreshed.
+- **The allowlist inside `theme-preinit.js` hardcodes the theme ids** and is a
+  deliberate fourth edit point (§102): the file runs before the app bundle, so it
+  can't import the web registry. A theme added without this edit still renders once
+  `me()` resolves — it just flashes `ember` for one frame on a cold load.
+
+## 107. queue/neutral status tones added theme-agnostically, as fg/border/surface triples
+
+Serves human: "mission's six-tone status language incl. the violet queue tone, added
+theme-agnostically" (user decision, 2026-07-05).
+
+- Ember had four status tones (`ok/warn/danger/info`); queued/stopped rendered via
+  palette neutrals hardcoded in `runBadge.ts`/`ui.tsx` that token values couldn't
+  reach. To carry mission's violet queue **without per-theme component logic**, two
+  slots are added to the existing tone maps: **`queue`** (queued) and **`neutral`**
+  (idle/stopped). `runBadge`/`RUN_STATUS_TONES` map `queued → "queue"` **once, for all
+  themes**; the `runBadge` tests update for the tone-name change only (PRD #14's
+  tone-unification discipline). Mission's cyan-run and sky-info both flow through
+  `--info`.
+- **Ember populates the new slots with its current neutral gray — zero visual change**;
+  mission populates them violet. With nothing set anywhere, everything renders ember
+  pixel-identical to before, the `--queue`=gray no-op included.
+- **Each slot is a border/surface/fg TRIPLE, not a single token** (supersedes the PRD's
+  earlier single-token phrasing; M2 reviewer confirmed "required, not
+  over-engineering"). A single hue-at-opacity token (the four original tones' pattern)
+  can't reproduce ember's solid `border-edge bg-raised text-muted` pill; the triple
+  keeps that pill pixel-identical while a theme can retint it, mirroring the mission
+  prototype's own `--uzi-status-*-{fg,border,surface}` schema.
+- **Tailwind `neutral` caution**: `tailwind.config.js` defines `neutral` as an object
+  (`neutral.{fg,border,surface}`) inside Tailwind's default palette, which already ships
+  a `neutral-50…950` gray scale. The two merge: `bg-neutral-border` resolves to the
+  token, but `bg-neutral-500` stays stock gray. Nothing in `web/src` uses a bare
+  `neutral-<number>` today; a future edit reaching for one expecting theme-awareness
+  gets untethered gray — use `queue-*` / `neutral-{fg,border,surface}` explicitly.
+- **Blueprint grid** ships as background tokens consumed by the existing `body` rule
+  (default themes set it to none); any `[data-theme="mission"]` CSS stays inside
+  `index.css` next to the token blocks.
+
+## 108. Mock parity + versioned mock persistence
+
+Serves human: "mock demo persists settings across reload" (user approved 2026-07-05,
+scoped settings-only); Decision 6 (the `VITE_UZI_MOCK=1` build is the review vehicle).
+
+- Mock mode always logs in as admin, so the admin flow must work. **mockApi implements
+  in-memory**: the `theme` field on its existing `getMySettings`/`putMySettings`, the
+  three theme fields on `/me`, and **#19's admin settings `default_theme` key** (if #19
+  lands a mock first, extend it; else this PRD adds it) — so the full picker flow (user
+  override + admin default) is exercised in the demo build without a real backend.
+- **Mock settings persist across reload** via a versioned `localStorage` key
+  `uzi.mock.v1` (`MOCK_SETTINGS_KEY`), **settings-only**, discard-on-version-mismatch.
+  It is **independent of the `uzi.theme` pre-paint cache key** (§106) — different key,
+  different purpose (mock backend state vs. real pre-paint cache), so they don't
+  interfere.
