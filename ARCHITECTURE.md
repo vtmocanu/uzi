@@ -169,6 +169,84 @@ recipe a later release renders into a running one.
   check in this release — but every row records `updated_by` and `updated_at`
   so concurrent edits are at least attributable after the fact.
 
+## Agent skills
+
+A skill is a named Markdown playbook (progressive disclosure: name +
+description sit cheaply in an agent's context; the body loads on demand) that
+attaches to agent templates rather than existing on its own. Full rationale
+in `prds/16-agent-skills.md` (Solution Overview, Technical Design, Trust
+model); this section is the map. User-facing usage is
+[docs/skills.md](docs/skills.md).
+
+- **Storage.** `skills` (`scope` ∈ `builtin`/`global`/`user`; `name` is
+  kebab-case and immutable; `body` is the raw SKILL.md content below the
+  frontmatter, which is synthesized at delivery, never stored) and
+  `agent_skill_allocations` (one row per `(template, skill)`, `user_id NULL`
+  for a shared/admin-managed allocation or a specific user's private overlay
+  row). `repos.repo_skills_enabled` is the opt-in flag for repo-borne skills,
+  below. Builtins are seeded/repaired by the same reconciler pattern as agent
+  templates (editable, resettable, never deletable), Go-embedded from
+  `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror, per the
+  builtins convention above) — starting with `ci-cd-norms`.
+- **Read authz is deliberately not the agent-templates pattern.** Templates
+  are all-shared; skills are not. Every read (`GET /api/skills*`) returns
+  builtin ∪ global ∪ the caller's own user skills; admins additionally see
+  other users' private skills (they can read the DB anyway). Allocation reads
+  follow the same rule: a template's shared allocations plus only the
+  caller's own overlay, never another user's.
+- **Claim payload delta** (`agent/src/protocol.ts`): `ClaimPayload.skills` is
+  the run's deduplicated skill union (`{name, description, body}`), assembled
+  server-side per the claiming user (shared allocations ∪ that user's
+  overlay, across every template, since every template ships in every
+  claim); `ClaimPayload.skills_dropped` carries assembly-time drops
+  (`{name, reason}` — `shadowed` or `over_limit`). Each `ClaimAgent.skills`
+  is that template's allocated skill names. `ClaimRepo.skills_enabled` mirrors
+  `repos.repo_skills_enabled`. `ClaimConfig.skill_max_bytes` /
+  `skills_max_per_run` carry the server's configured caps
+  (`SKILL_MAX_BYTES`/`SKILLS_MAX_PER_RUN`) so the worker enforces the same
+  limits the server assembled against, with no hardcoded drift. Name-collision
+  precedence at assembly is user > global > builtin; the loser is dropped as
+  `shadowed`. The server never writes `run_messages` for these drops — it
+  hands the worker the list, and the worker (which owns the gapless per-run
+  `seq`) logs each one as a run message.
+- **Worker delivery** (`agent/src/skills-plugin.ts`,
+  `agent/src/sdk-executor.ts`). Every claim (including a resume) rebuilds a
+  local SDK plugin directory **outside the clone**, a sibling of the
+  worktree: `.claude-plugin/plugin.json` plus `skills/<name>/SKILL.md` per
+  surviving skill, with `name`/`description` frontmatter synthesized as
+  quoted, fully-escaped YAML scalars (a frontmatter-injection guard covering
+  every YAML metacharacter class, not just newlines). The SDK's top-level
+  `skills` option is always sent as an explicit list — omitting it is not
+  "skills off" — set to the run's full plugin-qualified union; the `lead`
+  template runs on the main thread (not a subagent), so this union is also
+  its only allocation surface. Each subagent's `AgentDefinition.skills` scopes
+  it to its own allocated skills, re-filtered to what actually survived
+  materialization.
+- **Repo skills** (`agent/src/repo-skills.ts`), opt-in and default off. Only
+  when `ClaimRepo.skills_enabled`, the worker enumerates
+  `<clone>/.claude/skills/*/SKILL.md` after checkout, keeping only the `name`
+  and `description` frontmatter keys (every other key, e.g. `allowed-tools`,
+  is stripped — that is the security point) and re-synthesizing them through
+  the same escaped-YAML materializer as delivered skills. Repo skills carry
+  no allocation, so a surviving one attaches to **every** template in the
+  run; they rank at the lowest precedence (a name collision with any
+  delivered skill drops the repo skill) and are the first evicted if the
+  combined set exceeds `skills_max_per_run`. This is the **only** clone-borne
+  configuration the worker ever reads — no hooks, no settings, no commands,
+  no `CLAUDE.md` — and it is why the toggle exists per repo: a repo's
+  `.claude/` is exactly the config class `settingSources: []` (see Guardrail
+  layers, below) is built to keep closed, so loading even this much requires
+  the repo owner (or an admin) to vouch for that repo's review discipline.
+- **Trust boundary.** `settingSources: []` stays `[]` in every configuration,
+  with or without repo skills enabled — the plugin channel
+  (`plugins: [{type: 'local', ...}]`) is a separate SDK option, independent
+  of `settingSources`, so this delivery mechanism never has to loosen that
+  isolation. A hostile repo skill still cannot push code (the worker alone
+  holds the PAT), still hits the `PreToolUse` deny-hook, and still cannot
+  load hooks, settings, or commands from the repo — only its own SKILL.md
+  bodies, stripped to name + description, at the bottom of the precedence
+  order.
+
 ## Secrets: per-user credentials at rest
 
 `user_secrets` is a generic, kind-keyed table (`kind` currently only
