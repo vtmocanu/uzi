@@ -59,11 +59,30 @@ export function Board() {
   // Toasts announce auto-moves the poll observes ("#42 → Human Review").
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
   const toastSeq = useRef(0);
+  // Pending toast-removal timers, cleared on unmount so a dismissal never fires
+  // setState on an unmounted component.
+  const toastTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
   const pushToast = useCallback((text: string) => {
     const id = (toastSeq.current += 1);
     setToasts((t) => [...t, { id, text }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 6000);
+    const timer = setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 6000);
+    toastTimers.current.push(timer);
   }, []);
+
+  // iids the operator moved by hand within the last poll window. The column change
+  // is already applied locally, so the background poll must NOT re-announce it as
+  // an auto-move — this closes the false-toast window between a drag's server
+  // commit and move()'s local setBoard (reviewer SF2). Released after one poll
+  // interval; a genuine later auto-move on the same card still toasts.
+  const suppressToastIids = useRef<Set<number>>(new Set());
+  const suppressTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  useEffect(
+    () => () => {
+      toastTimers.current.forEach(clearTimeout);
+      suppressTimers.current.forEach(clearTimeout);
+    },
+    [],
+  );
 
   // boardRef mirrors the rendered board so the background poll can diff a fresh
   // payload against what the user is looking at. Manual drags are already applied
@@ -110,7 +129,11 @@ export function Board() {
       if (prev) {
         for (const card of fresh.cards) {
           const before = prev.cards.find((c) => c.iid === card.iid);
-          if (before && columnKeyForCard(before) !== columnKeyForCard(card)) {
+          if (
+            before &&
+            columnKeyForCard(before) !== columnKeyForCard(card) &&
+            !suppressToastIids.current.has(card.iid)
+          ) {
             pushToast(`#${card.iid} → ${columnLabel(card)}`);
           }
         }
@@ -175,6 +198,10 @@ export function Board() {
   const move = async (toKey: string, iid: number) => {
     if (toKey === CLOSED_KEY) return; // Closed is not a drop target in the MVP.
     setError("");
+    // Suppress the auto-move toast for this card: a poll landing between the
+    // server commit below and the local setBoard would otherwise diff the new
+    // column against the stale baseline and false-toast a move the user just made.
+    suppressToastIids.current.add(iid);
     try {
       const to = toKey === OPEN_KEY ? "open" : toKey;
       const { card } = await api.moveIssue(repoId, iid, to);
@@ -184,7 +211,12 @@ export function Board() {
       setBoard((prev) =>
         prev ? { ...prev, cards: prev.cards.map((c) => (c.iid === card.iid ? card : c)) } : prev,
       );
+      // Hold the suppression for one poll interval so an already-in-flight poll
+      // still sees the moved column as its baseline, then release it.
+      const timer = setTimeout(() => suppressToastIids.current.delete(iid), 11000);
+      suppressTimers.current.push(timer);
     } catch (err) {
+      suppressToastIids.current.delete(iid); // the move failed — nothing to suppress
       setError(err instanceof ApiError ? err.message : "Move failed");
     }
   };
@@ -343,7 +375,11 @@ export function Board() {
       </div>
 
       {toasts.length > 0 && (
-        <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2">
+        <div
+          role="status"
+          aria-live="polite"
+          className="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2"
+        >
           {toasts.map((t) => (
             <div
               key={t.id}
@@ -387,7 +423,7 @@ function IssueCard({
   const hint = run ? retryHint(run.run_count) : null;
   // awaiting_approval is the loudest card state: a human is the blocker while a
   // worker is held busy. Give the whole card an amber ring so it can't be missed.
-  const loud = run?.status === "awaiting_approval";
+  const loud = isAwaitingApproval(run?.status ?? "");
   const mrHref =
     badge?.kind === "mr" && isHttpsUrl(projectWebUrl)
       ? `${projectWebUrl}/-/merge_requests/${badge.mrIid}`
