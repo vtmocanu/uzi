@@ -1985,10 +1985,10 @@ Serves human Feature #24; no new surface required.
 # PRD #19 — Admin settings (app_settings) + autopilot label
 
 Serves human Feature #19 (instance settings infrastructure + the one-label-in-GitLab
-autopilot user story; user, 2026-07-05 — **the human.md autopilot entry + the
-failure-comment wording are pending user approval** at this spec sync). **Status:
-M1–M5 built, reviewed, and audited on branch `prd-19-admin-settings-autopilot`; M6
-(e2e + docs + specs) in progress.** Two threads land together: a generic key/value
+autopilot user story; user, 2026-07-05 — the human.md autopilot entry + the
+failure-comment wording were **approved by the user (2026-07-05)** and are recorded in
+`specs/human.md` Feature #19). **Status: M1–M5 built, reviewed, and audited on branch
+`prd-19-admin-settings-autopilot`; M6 (e2e + docs + specs) in progress.** Two threads land together: a generic key/value
 settings store whose first two tenants are the configurable `prd_label` and
 `autopilot_label`, and an autopilot path where adding a label in GitLab runs a PRD
 issue end to end with zero uzi interaction. Section numbers continue past PRD #24's
@@ -2245,8 +2245,8 @@ issue comment (MR link on success)" (user, 2026-07-05); primary directive unchan
   trusted values (run uuid, `mr_iid`, repo `web_url`, config `FrontendOrigin`) — never
   issue title/description or `failure_reason`. The run link is appended only when
   `FrontendOrigin` is set (a bare unroutable path is worse than none; the compose default
-  sets it). **This wording change to `specs/human.md`'s success criterion is pending user
-  approval** at this spec sync.
+  sets it). This wording (run link, not failure reason) was **approved by the user
+  (2026-07-05)** and is the recorded `specs/human.md` Feature #19 success criterion.
 
 ## 100. Autopilot web surface + docs
 
