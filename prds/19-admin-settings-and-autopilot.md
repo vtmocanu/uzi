@@ -37,7 +37,7 @@
 
 ### 1. app_settings (api + web)
 
-- Migration (reserve `00036`–`00039`; ledger: `00021` live head, `00022` #17, `00030+` #5, `00030`–`00035` #18, `00040+` #6, `00050+` #16 — note #5/#18 already overlap on 00030, a pre-existing conflict outside this PRD): `app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by UUID NULL REFERENCES users(id) ON DELETE SET NULL, updated_at TIMESTAMPTZ)`. Seed rows for `prd_label='PRD'`, `autopilot_label='autopilot'`.
+- Migration (reserve `00036`–`00039`; ledger: `00021` live head, `00022` #17, `00023`–`00028` #18, `00030+` #5, `00040+` #6, `00050+` #16): `app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by UUID NULL REFERENCES users(id) ON DELETE SET NULL, updated_at TIMESTAMPTZ)`. Seed rows for `prd_label='PRD'`, `autopilot_label='autopilot'`.
 - Go accessor in a new `api/internal/settings` package: read-through cache with short TTL (poller + handlers read every cycle; a settings PUT invalidates). Defaults compiled in — a missing row never breaks boot. The cache is per-process: correct for the single-`api` compose stack; a second replica would lag a PUT by up to the TTL (noted for the future k8s deployment).
 - The same range covers the autopilot tables/columns: `autopilot_triggers` (Decision 5), `forge_connections.human_username`, `users.autopilot_enabled`, `runs.auto_approve`.
 - Handlers: `GET /api/admin/settings`, `PUT /api/admin/settings` (admin-gated like `ListUsers`/`PatchUser`), validation per Decision 8.

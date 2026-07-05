@@ -77,7 +77,7 @@ Three tracks sharing one mental model (the PRD #16 scope+allocation pattern):
 - Handlers: user CRUD for `scope='user'` templates (same validation path as admin CRUD — kebab-case name, tools allowlist, model aliases, plus the reserved-name check from Decision 8); visibility = builtin + global + own.
 - Agents page: scope badges, "my agents" creation, allocation toggles per template; admin retains global/builtin management.
 - Worker: no routing changes (`assembleAgents` consumes whatever the claim delivers); tests: (a) a user-scoped template cannot be named `lead`/`orchestrator` (API-level), (b) a claim payload never contains two `LEAD_NAME_RE` matches (worker-level pin).
-- **Migration numbers**: reserve `00030`–`00035` for this PRD (current head `00021`; #17 reserves `00022`, #16 reserves `00050+`): workers template columns, tool_allowlist, repo_tool_profiles, agent_templates scope/user_id, agent_template_allocations.
+- **Migration numbers**: reserve `00023`–`00028` for this PRD (ledger: `00021` live head, `00022` #17, `00030+` #5, `00036`–`00039` #19, `00040+` #6, `00050+` #16): workers template columns, tool_allowlist, repo_tool_profiles, agent_templates scope/user_id, agent_template_allocations. (Renumbered 2026-07-05 from `00030`–`00035`, which collided with PRD #5's `00030+` reservation.)
 
 ### 5. Docs + specs
 
