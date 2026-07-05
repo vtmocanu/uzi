@@ -181,9 +181,12 @@ model); this section is the map. User-facing usage is
 - **Storage.** `skills` (`scope` ∈ `builtin`/`global`/`user`; `name` is
   kebab-case and immutable; `body` is the raw SKILL.md content below the
   frontmatter, which is synthesized at delivery, never stored) and
-  `agent_skill_allocations` (one row per `(template, skill)`, `user_id NULL`
-  for a shared/admin-managed allocation or a specific user's private overlay
-  row). `repos.repo_skills_enabled` is the opt-in flag for repo-borne skills,
+  `agent_skill_allocations` (`user_id NULL` for a shared/admin-managed
+  allocation, non-`NULL` for a specific user's private overlay; unique on
+  `(template_id, skill_id, COALESCE(user_id, sentinel))`, so a shared
+  allocation and a user's overlay allocation of the same skill to the same
+  template coexist as two distinct rows, no surrogate PK needed).
+  `repos.repo_skills_enabled` is the opt-in flag for repo-borne skills,
   below. Builtins are seeded/repaired by the same reconciler pattern as agent
   templates (editable, resettable, never deletable), Go-embedded from
   `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror, per the
@@ -194,7 +197,7 @@ model); this section is the map. User-facing usage is
   other users' private skills (they can read the DB anyway). Allocation reads
   follow the same rule: a template's shared allocations plus only the
   caller's own overlay, never another user's.
-- **Claim payload delta** (`agent/src/protocol.ts`): `ClaimPayload.skills` is
+- **Claim payload delta** (`api/internal/workersvc/claim.go`): `ClaimPayload.skills` is
   the run's deduplicated skill union (`{name, description, body}`), assembled
   server-side per the claiming user (shared allocations ∪ that user's
   overlay, across every template, since every template ships in every
