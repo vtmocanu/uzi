@@ -39,6 +39,8 @@ Open **Boards**, pick the connection, and enable each project you added the bot 
 
 If verification fails, check: the PAT's scope is `api`, it hasn't expired, and the bot is at least Developer on the target project.
 
+A connection also has a **"Your forge identity (for autopilot)"** field, separate from the bot's own credential — it's how uzi maps a label added on GitLab back to you. See [Autopilot](./autopilot.md).
+
 ## Protect your main branch
 
 If you'll run agents against a project, protect its default branch (**Settings → Repository → Protected branches**): allow only Maintainer+ to merge or push. Because the bot is Developer-only, it can open a merge request but can never merge or push there itself: the platform-enforced half of uzi's ["an agent can only ever open an MR" guarantee](../ARCHITECTURE.md#guardrail-layers-the-primary-directive).
