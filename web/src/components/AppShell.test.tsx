@@ -191,6 +191,17 @@ describe("AppShell sidebar collapse", () => {
     expect(screen.queryByRole("link", { name: "vtmocanu/uzi" })).toBeNull();
     expect(screen.queryByText("Work")).toBeNull();
   });
+
+  it("writes the collapsed state to localStorage each time it is toggled", async () => {
+    renderShell("/dashboard");
+    await screen.findByRole("link", { name: "vtmocanu/uzi" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(window.localStorage.getItem("uzi.sidebar.collapsed")).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(window.localStorage.getItem("uzi.sidebar.collapsed")).toBe("false");
+  });
 });
 
 describe("forgeIcon (Decision 2 mapping)", () => {

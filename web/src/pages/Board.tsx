@@ -286,9 +286,9 @@ export function Board() {
 
   // Columns to render: hide-empty is derived here from the freshly-polled cards,
   // never stored, so an auto-move that populates a hidden column reveals it on the
-  // next poll. A live drag reveals every lane so they stay drop targets. The hint
-  // reads columns.length - visible.length (so it shows "0 hidden" mid-drag — an
-  // accepted v1 cosmetic).
+  // next poll. A live drag reveals every lane so they stay drop targets, which
+  // drives hiddenCount to 0 — the toolbar hint (gated on hiddenCount > 0) simply
+  // disappears mid-drag rather than reading "0 hidden".
   const visible = visibleColumns(
     columns,
     (key) => cardsByColumn.get(key)?.length ?? 0,
