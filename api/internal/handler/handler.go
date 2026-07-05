@@ -15,6 +15,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -31,14 +32,17 @@ type Handler struct {
 	box  *secretbox.Box
 	svc  *forgesvc.Service
 	wsvc *workersvc.Service
+	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
+	// gate and the on-demand full connection check.
+	pcheck *privcheck.Service
 	// hub fans persisted run events out to browser WebSocket subscribers (M5). It
 	// is the same instance workersvc broadcasts to.
 	hub *hub.Hub
 }
 
 // New constructs a Handler.
-func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, h *hub.Hub) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, hub: h}
+func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, pcheck *privcheck.Service, h *hub.Hub) *Handler {
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h}
 }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
@@ -95,6 +99,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 		r.Route("/auth", func(r chi.Router) {
 			r.With(authLimiter.Middleware).Post("/register", h.Register)
 			r.With(authLimiter.Middleware).Post("/login", h.Login)
+			// Unauthenticated registration policy for the SPA: outside RequireAuth,
+			// behind the auth limiter. Reveals only operator-set, user-visible policy.
+			r.With(authLimiter.Middleware).Get("/config", h.AuthConfig)
 
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -155,6 +162,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/verify", h.VerifyConnection)
 				r.Delete("/{id}", h.DeleteConnection)
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/projects", h.ListProjects)
+				// Full least-privilege report (PRD #5): 2 + 2×repos upstream calls,
+				// so it rides the per-user forge budget like the other proxying routes.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/privilege-check", h.PrivilegeCheck)
 			})
 
 			r.Route("/repos", func(r chi.Router) {

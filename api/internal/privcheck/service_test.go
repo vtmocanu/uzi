@@ -1,0 +1,177 @@
+package privcheck
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+)
+
+// persisted captures one UpdatePrivilegeReport write.
+type persisted struct {
+	status string
+	report Report
+}
+
+// fakeStore stands in for *store.Queries: it serves a fixed connection + repo set
+// and records every privilege-report write.
+type fakeStore struct {
+	conns       []store.ForgeConnection
+	reposByConn map[uuid.UUID][]store.Repo
+	writes      map[uuid.UUID]persisted
+	updateRows  int64 // rows UpdatePrivilegeReport reports affected (default 1)
+	listErr     error
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{reposByConn: map[uuid.UUID][]store.Repo{}, writes: map[uuid.UUID]persisted{}, updateRows: 1}
+}
+
+func (s *fakeStore) ListAllForgeConnections(context.Context) ([]store.ForgeConnection, error) {
+	return s.conns, s.listErr
+}
+func (s *fakeStore) ListEnabledReposByConnection(_ context.Context, connID uuid.UUID) ([]store.Repo, error) {
+	return s.reposByConn[connID], nil
+}
+func (s *fakeStore) UpdatePrivilegeReport(_ context.Context, arg store.UpdatePrivilegeReportParams) (int64, error) {
+	var rep Report
+	_ = json.Unmarshal(arg.PrivilegeReport, &rep)
+	s.writes[arg.ID] = persisted{status: arg.PrivilegeStatus.String, report: rep}
+	return s.updateRows, nil
+}
+
+// fakeBuilder returns a preconfigured forge (or a build error).
+type fakeBuilder struct {
+	forge    forge.Forge
+	buildErr error
+}
+
+func (b *fakeBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, error) {
+	return b.forge, b.buildErr
+}
+
+func aConn() store.ForgeConnection {
+	return store.ForgeConnection{ID: uuid.New(), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com"}
+}
+
+func aRepo(projectID int64, branch string) store.Repo {
+	return store.Repo{
+		ID:                uuid.New(),
+		ForgeProjectID:    projectID,
+		PathWithNamespace: "g/p",
+		DefaultBranch:     pgtype.Text{String: branch, Valid: branch != ""},
+		Enabled:           true,
+	}
+}
+
+// TestCheckConnectionPersists: a clean connection yields StatusOK, written to the
+// store.
+func TestCheckConnectionPersists(t *testing.T) {
+	conn := aConn()
+	st := newFakeStore()
+	st.reposByConn[conn.ID] = []store.Repo{aRepo(1, "main")}
+	f := &fakeForge{
+		identity:  forge.BotIdentity{ForgeUserID: 42},
+		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
+		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true}}},
+	}
+	svc := NewService(st, &fakeBuilder{forge: f})
+
+	rep, err := svc.CheckConnection(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("CheckConnection: %v", err)
+	}
+	if rep.Status != StatusOK {
+		t.Fatalf("report status = %q, want ok", rep.Status)
+	}
+	if got := st.writes[conn.ID].status; got != string(StatusOK) {
+		t.Fatalf("persisted status = %q, want ok", got)
+	}
+}
+
+// TestSweepGrandfatheredAndDrift: the boot sweep checks a never-checked
+// (grandfathered) connection — turning a NULL status into a real one — and a
+// re-run flips ok→violations when the bot's role drifts to Maintainer.
+func TestSweepGrandfatheredAndDrift(t *testing.T) {
+	conn := aConn() // no privilege_status yet: the grandfathered case
+	st := newFakeStore()
+	st.conns = []store.ForgeConnection{conn}
+	st.reposByConn[conn.ID] = []store.Repo{aRepo(1, "main")}
+	f := &fakeForge{
+		identity:  forge.BotIdentity{ForgeUserID: 42},
+		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
+		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true}}},
+	}
+	svc := NewService(st, &fakeBuilder{forge: f})
+
+	// Boot pass back-fills the grandfathered connection.
+	res, err := svc.CheckAllConnections(context.Background())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if res.Checked != 1 || res.OK != 1 {
+		t.Fatalf("sweep result = %+v, want 1 checked / 1 ok", res)
+	}
+	if st.writes[conn.ID].status != string(StatusOK) {
+		t.Fatalf("grandfathered connection not back-filled to ok, got %q", st.writes[conn.ID].status)
+	}
+
+	// Drift: a teammate promotes the bot to Maintainer; the next sweep flips it.
+	f.roles[1] = roleResult{role: 40, member: true}
+	res, err = svc.CheckAllConnections(context.Background())
+	if err != nil {
+		t.Fatalf("sweep 2: %v", err)
+	}
+	if res.Violations != 1 {
+		t.Fatalf("post-drift sweep = %+v, want 1 violation", res)
+	}
+	if st.writes[conn.ID].status != string(StatusViolations) {
+		t.Fatalf("post-drift persisted status = %q, want violations", st.writes[conn.ID].status)
+	}
+}
+
+// TestCheckConnectionForgeBuildFailurePersistsError: an undecryptable token (key
+// rotated) is surfaced as a persisted StatusError report, not a crash.
+func TestCheckConnectionForgeBuildFailurePersistsError(t *testing.T) {
+	conn := aConn()
+	st := newFakeStore()
+	svc := NewService(st, &fakeBuilder{buildErr: errors.New("open: cipher: message authentication failed")})
+
+	rep, err := svc.CheckConnection(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("build failure must not be a returned error: %v", err)
+	}
+	if rep.Status != StatusError {
+		t.Fatalf("status = %q, want error", rep.Status)
+	}
+	if st.writes[conn.ID].status != string(StatusError) {
+		t.Fatalf("persisted status = %q, want error", st.writes[conn.ID].status)
+	}
+}
+
+// TestSweepToleratesDeletedMidSweep: a 0-row write-back (connection deleted mid
+// -sweep) is not an error.
+func TestSweepToleratesDeletedMidSweep(t *testing.T) {
+	conn := aConn()
+	st := newFakeStore()
+	st.updateRows = 0 // the UPDATE matched no rows
+	st.conns = []store.ForgeConnection{conn}
+	f := &fakeForge{identity: forge.BotIdentity{ForgeUserID: 42}, tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true}}
+	svc := NewService(st, &fakeBuilder{forge: f})
+
+	res, err := svc.CheckAllConnections(context.Background())
+	if err != nil {
+		t.Fatalf("a 0-row write-back must be tolerated, got %v", err)
+	}
+	if res.Errors != 0 {
+		t.Fatalf("0-row write must not tally an error, got %+v", res)
+	}
+}

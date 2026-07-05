@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -328,6 +329,194 @@ func TestGetMergeRequestRedactsError(t *testing.T) {
 		t.Fatal("expected an error from a 401")
 	} else if strings.Contains(err.Error(), token) {
 		t.Fatalf("error leaked the PAT: %q", err.Error())
+	}
+}
+
+func TestTokenInfoParsesIntrospection(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/personal_access_tokens/self": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "name": "uzi-bot", "revoked": false, "active": true,
+				"scopes": []string{"api"}, "expires_at": "2026-08-01",
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	info, err := d.TokenInfo(context.Background())
+	if err != nil {
+		t.Fatalf("TokenInfo: %v", err)
+	}
+	if len(info.Scopes) != 1 || info.Scopes[0] != "api" {
+		t.Fatalf("unexpected scopes: %v", info.Scopes)
+	}
+	if !info.Active {
+		t.Fatal("expected active token")
+	}
+	if info.ExpiresAt.IsZero() {
+		t.Fatal("expected expires_at to be parsed")
+	}
+}
+
+func TestTokenInfoUnsupportedReturnsSentinel(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		// GitLab < 15.5 has no such endpoint → 404.
+		"/api/v4/personal_access_tokens/self": func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	if _, err := d.TokenInfo(context.Background()); !errors.Is(err, ErrTokenIntrospectionUnsupported) {
+		t.Fatalf("a 404 must map to ErrTokenIntrospectionUnsupported, got %v", err)
+	}
+}
+
+func TestProjectRoleUsesEffectiveMembership(t *testing.T) {
+	var gotPath string
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/members/all/4242": func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "username": "bot", "access_level": 40})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	role, member, err := d.ProjectRole(context.Background(), 7, 4242)
+	if err != nil {
+		t.Fatalf("ProjectRole: %v", err)
+	}
+	if !member || role != 40 {
+		t.Fatalf("expected role=40 member=true, got role=%d member=%v", role, member)
+	}
+	// Effective membership (direct + inherited) is load-bearing — a group
+	// -inherited Maintainer role is invisible to the direct-members endpoint.
+	if !strings.Contains(gotPath, "/members/all/") {
+		t.Fatalf("must query the effective-membership endpoint, got %q", gotPath)
+	}
+}
+
+func TestProjectRoleNotAMember(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/members/all/4242": func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	role, member, err := d.ProjectRole(context.Background(), 7, 4242)
+	if err != nil {
+		t.Fatalf("a 404 (not a member) must be a nil error, got %v", err)
+	}
+	if member || role != 0 {
+		t.Fatalf("expected not-a-member (role 0, member false), got role=%d member=%v", role, member)
+	}
+}
+
+func TestDefaultBranchProtectionParsesPushLevels(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "name": "main",
+				"push_access_levels": []map[string]any{
+					{"access_level": 30},                  // Developers may push → DevelopersCanPush
+					{"access_level": 60, "user_id": 4242}, // a per-user grant naming the bot → BotCanPush
+				},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	bp, err := d.DefaultBranchProtection(context.Background(), 7, "main", 4242)
+	if err != nil {
+		t.Fatalf("DefaultBranchProtection: %v", err)
+	}
+	if !bp.Protected {
+		t.Fatal("expected Protected")
+	}
+	if !bp.DevelopersCanPush {
+		t.Fatal("the level-30 push entry must set DevelopersCanPush")
+	}
+	if !bp.BotCanPush {
+		t.Fatal("the per-user (user_id=4242) push entry must set BotCanPush")
+	}
+}
+
+func TestDefaultBranchProtectionCleanBranch(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "name": "main",
+				// Maintainer-only push, no per-user grant: a compliant protected main.
+				"push_access_levels": []map[string]any{{"access_level": 40}},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	bp, err := d.DefaultBranchProtection(context.Background(), 7, "main", 4242)
+	if err != nil {
+		t.Fatalf("DefaultBranchProtection: %v", err)
+	}
+	if !bp.Protected || bp.DevelopersCanPush || bp.BotCanPush {
+		t.Fatalf("Maintainer-only push should be clean, got %+v", bp)
+	}
+}
+
+func TestDefaultBranchProtectionUnprotected(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	bp, err := d.DefaultBranchProtection(context.Background(), 7, "main", 4242)
+	if err != nil {
+		t.Fatalf("a 404 (unprotected) must be a nil error, got %v", err)
+	}
+	if bp.Protected {
+		t.Fatal("a 404 must map to Protected=false")
+	}
+}
+
+// TestNewMethodErrorsAreRedacted covers the redaction discipline for the three
+// PRD #5 driver methods on their non-404 error paths, with the PAT echoed in the
+// upstream error body (Success Criterion: "redaction tests cover the new driver
+// methods").
+func TestNewMethodErrorsAreRedacted(t *testing.T) {
+	// A non-glpat, low-entropy literal (the redactor scrubs any secret >= 8 chars,
+	// not just real PAT formats) so this fixture carries no scanner-tripping token.
+	const token = "uzi-redaction-test-token-not-real"
+	// 403 (not 5xx/429) so the client-go retryable transport does not back off and
+	// retry — the driver still builds a redacted error from the echoed body.
+	leak := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": "upstream boom " + token})
+	}
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/personal_access_tokens/self":        leak,
+		"/api/v4/projects/7/members/all/4242":        leak,
+		"/api/v4/projects/7/protected_branches/main": leak,
+	})
+	d := newTestDriver(t, m, token)
+	ctx := context.Background()
+
+	_, err1 := d.TokenInfo(ctx)
+	_, _, err2 := d.ProjectRole(ctx, 7, 4242)
+	_, err3 := d.DefaultBranchProtection(ctx, 7, "main", 4242)
+
+	for _, c := range []struct {
+		name string
+		err  error
+	}{{"TokenInfo", err1}, {"ProjectRole", err2}, {"DefaultBranchProtection", err3}} {
+		if c.err == nil {
+			t.Errorf("%s: expected an error from a 500", c.name)
+			continue
+		}
+		if strings.Contains(c.err.Error(), token) {
+			t.Errorf("%s leaked the PAT: %q", c.name, c.err.Error())
+		}
 	}
 }
 

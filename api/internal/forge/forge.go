@@ -7,10 +7,18 @@ package forge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 )
+
+// ErrTokenIntrospectionUnsupported is returned by TokenInfo when the forge does
+// not expose the token-introspection endpoint (GitLab < 15.5, which 404s
+// GET /personal_access_tokens/self). It is a distinct sentinel — not a redacted
+// generic error — so the privilege checker can downgrade "cannot verify scopes"
+// to a warning instead of a hard block. It carries no secret material.
+var ErrTokenIntrospectionUnsupported = errors.New("forge: token introspection not supported by this forge version")
 
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
 // column, which is CHECK-constrained to the same set.
@@ -27,6 +35,43 @@ type BotIdentity struct {
 	ForgeUserID int64
 	// Username is the bot's login (e.g. "uzi-bot-vmocanu").
 	Username string
+	// IsAdmin reports whether the bot user is an instance administrator. GitLab
+	// includes is_admin on GET /user only when the caller is an admin, so an
+	// absent field decodes to false — exactly the non-admin (compliant) case. An
+	// instance-admin PAT is effectively god-mode, so the privilege checker treats
+	// true as a violation.
+	IsAdmin bool
+}
+
+// TokenInfo is PAT introspection returned by TokenInfo: the scopes it carries,
+// whether it is active, and when it expires. GitLab: GET
+// /personal_access_tokens/self.
+type TokenInfo struct {
+	// Scopes are the token's granted scopes (e.g. ["api"]).
+	Scopes []string
+	// Active is true when the token is usable (not revoked, not expired).
+	Active bool
+	// ExpiresAt is the token's expiry; the zero time means it never expires.
+	ExpiresAt time.Time
+}
+
+// BranchProtection reports a branch's protection state, returned by
+// DefaultBranchProtection.
+type BranchProtection struct {
+	// Protected is false when the branch has no protection rule at all (the
+	// driver maps a 404 from the protected-branches endpoint to this).
+	Protected bool
+	// DevelopersCanPush is true when the branch's push access levels admit the
+	// Developer role (access level 30) or lower-but-nonzero. It is load-bearing:
+	// a protected default branch that Developers may still push to does not
+	// protect main, so a Developer-role bot could push directly.
+	DevelopersCanPush bool
+	// BotCanPush is true when a push access level names the bot user directly (a
+	// per-user allow-to-push grant), which lets the bot push to the protected
+	// branch even at Developer role — a false negative the role/DevelopersCanPush
+	// checks alone would miss. Group-level push grants to the bot are NOT detected
+	// (they need an extra membership call); that gap is documented for manual audit.
+	BotCanPush bool
 }
 
 // Project is a repo the bot has membership on.
@@ -134,6 +179,22 @@ type Forge interface {
 	// MR-close watcher (PRD #24) polls this for cards parked in Human Review to
 	// detect an opened→closed (reviewer rejected the MR) edge.
 	GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error)
+	// TokenInfo returns introspection data for the PAT the client authenticates
+	// with: its scopes, whether it is active, and its expiry. GitLab: GET
+	// /personal_access_tokens/self. Returns ErrTokenIntrospectionUnsupported when
+	// the forge version lacks the endpoint (so the caller warns, not blocks).
+	TokenInfo(ctx context.Context) (TokenInfo, error)
+	// ProjectRole returns the bot's effective (direct or inherited) access level
+	// on a project, and whether the bot is a member at all. member is false with
+	// a nil error when the bot has no effective membership (a 404 from the
+	// members/all lookup). GitLab: GET /projects/:id/members/all/:user_id.
+	ProjectRole(ctx context.Context, projectID, forgeUserID int64) (role int, member bool, err error)
+	// DefaultBranchProtection reports whether the given branch is protected,
+	// whether Developer-level push is allowed on it, and whether the bot user has
+	// a direct per-user push grant on it. GitLab: GET
+	// /projects/:id/protected_branches/:name (a 404 means unprotected). botUserID
+	// is the bot's forge user id, used to flag a per-user allow-to-push entry.
+	DefaultBranchProtection(ctx context.Context, projectID int64, branch string, botUserID int64) (BranchProtection, error)
 }
 
 // New constructs a driver for the given forge type. baseURL must already be

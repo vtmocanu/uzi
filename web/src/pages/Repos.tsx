@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo } from "../lib/api";
+import { repoFindings } from "../lib/privilege";
 import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select } from "../components/ui";
 import { BoardIcon } from "../components/icons";
 
@@ -60,6 +61,10 @@ export function Repos() {
       setBusyId(null);
     }
   };
+
+  // The selected connection's latest privilege report drives the per-repo
+  // findings badges (null until a check has run).
+  const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
 
   return (
     <div className="space-y-6">
@@ -143,9 +148,27 @@ export function Repos() {
                           {r.default_branch ?? "—"}
                         </td>
                         <td className="px-4 py-3">
-                          <Badge tone={r.enabled ? "ok" : "neutral"} dot>
-                            {r.enabled ? "Enabled" : "Disabled"}
-                          </Badge>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <Badge tone={r.enabled ? "ok" : "neutral"} dot>
+                              {r.enabled ? "Enabled" : "Disabled"}
+                            </Badge>
+                            {(() => {
+                              const f = repoFindings(privilegeReport, r.id);
+                              if (!f) return null;
+                              const hasViolations = f.violations.length > 0;
+                              const n = hasViolations ? f.violations.length : f.warnings.length;
+                              return (
+                                <Badge
+                                  tone={hasViolations ? "danger" : "warning"}
+                                  dot
+                                  title={[...f.violations, ...f.warnings].join("\n")}
+                                >
+                                  {n} privilege {hasViolations ? "issue" : "warning"}
+                                  {n === 1 ? "" : "s"}
+                                </Badge>
+                              );
+                            })()}
+                          </div>
                         </td>
                         <td className="px-4 py-3 text-right">
                           <div className="flex justify-end gap-2">

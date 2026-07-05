@@ -7,6 +7,7 @@ import {
   ApiError,
   type AgentTemplate,
   type AgentTemplateInput,
+  type PrivilegeReport,
   type Run,
   type RunInputKind,
   type SecretMeta,
@@ -61,6 +62,8 @@ export const mockApi = {
     state.session = { ...mockAdmin, email: email || mockAdmin.email };
     return delay({ user: state.session });
   },
+  // Demo mode has registration open and unrestricted.
+  authConfig: async () => delay({ registration_enabled: true, allowed_email_domains: [] }),
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });
@@ -161,6 +164,10 @@ export const mockApi = {
       forge_type: forgeType,
       created_at: new Date().toISOString(),
       last_verified_at: new Date().toISOString(),
+      // A freshly connected bot is unchecked until the first privilege check.
+      privilege_status: null,
+      privilege_checked_at: null,
+      privilege_report: null,
     };
     connections = [conn];
     return delay({ connection: { ...conn } }, 600);
@@ -170,6 +177,30 @@ export const mockApi = {
     if (!c) throw new ApiError(404, "connection not found");
     c.last_verified_at = new Date().toISOString();
     return delay({ connection: { ...c } }, 500);
+  },
+  privilegeCheck: async (id: string) => {
+    const c = connections.find((x) => x.id === id);
+    if (!c) throw new ApiError(404, "connection not found");
+    const now = new Date().toISOString();
+    const report: PrivilegeReport = {
+      checked_at: now,
+      status: "ok",
+      token: { scopes: ["api"], active: true, violations: [], warnings: [] },
+      repos: repos
+        .filter((r) => r.enabled)
+        .map((r) => ({
+          repo_id: r.id,
+          path: r.path_with_namespace,
+          role: 30,
+          member: true,
+          violations: [],
+          warnings: [],
+        })),
+    };
+    c.privilege_status = "ok";
+    c.privilege_checked_at = now;
+    c.privilege_report = report;
+    return delay({ report }, 500);
   },
   deleteConnection: async (id: string) => {
     connections = connections.filter((x) => x.id !== id);
