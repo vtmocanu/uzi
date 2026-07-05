@@ -26,6 +26,7 @@ import {
   retryHint,
   runBadge,
 } from "../lib/runBadge";
+import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
 import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
 
@@ -163,25 +164,14 @@ export function Board() {
     loadPreconditions();
   }, [load, loadPreconditions]);
 
-  // Liveness: poll every ~10s while mounted, paused when the tab is hidden, so
+  // Liveness: poll every ~10s while visible, paused when the tab is hidden, so
   // auto-moves and badge changes appear without a manual Refresh. Becoming visible
-  // again triggers an immediate catch-up. No WebSocket (out of scope).
-  useEffect(() => {
-    const tick = () => {
-      if (document.hidden) return;
-      poll();
-      loadPreconditions();
-    };
-    const interval = setInterval(tick, 10000);
-    const onVisible = () => {
-      if (!document.hidden) tick();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [poll, loadPreconditions]);
+  // again triggers an immediate catch-up. No WebSocket (out of scope). The shared
+  // hook stashes this callback in a ref, so the inline arrow is safe.
+  usePollWhileVisible(() => {
+    poll();
+    loadPreconditions();
+  }, 10000);
 
   const startRun = async (card: CardData) => {
     setError("");
