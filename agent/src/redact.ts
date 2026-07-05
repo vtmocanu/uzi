@@ -22,22 +22,41 @@ const REDACTED = "***REDACTED***";
 // occurrence elsewhere would corrupt unrelated output.
 const MIN_SECRET_LEN = 8;
 
+export type TextRedactor = (s: string) => string;
 export type PayloadRedactor = (payload: Record<string, unknown>) => Record<string, unknown>;
 
-/**
- * Build a redactor over the given secrets. Returns an identity function when no
- * usable secret is supplied, so callers pay nothing when there is nothing to
- * scrub.
- */
-export function makeRedactor(secrets: Array<string | undefined | null>): PayloadRedactor {
-  const list = secrets.filter((s): s is string => typeof s === "string" && s.length >= MIN_SECRET_LEN);
-  if (list.length === 0) return (payload) => payload;
+// usableSecrets keeps only strings at/above the length floor; below it an
+// exact-substring replace would corrupt unrelated output.
+function usableSecrets(secrets: Array<string | undefined | null>): string[] {
+  return secrets.filter((s): s is string => typeof s === "string" && s.length >= MIN_SECRET_LEN);
+}
 
-  const scrubString = (s: string): string => {
+/**
+ * Build a string redactor over the given secrets (exact-substring, same 8-char
+ * floor as the logger). Identity when no usable secret is supplied. Use this for
+ * strings that reach the API OUTSIDE a run_message payload — e.g. a run's
+ * failure_reason, which goes straight to reportState and never passes through the
+ * batcher's PayloadRedactor.
+ */
+export function makeTextRedactor(secrets: Array<string | undefined | null>): TextRedactor {
+  const list = usableSecrets(secrets);
+  if (list.length === 0) return (s) => s;
+  return (s) => {
     let out = s;
     for (const secret of list) out = out.split(secret).join(REDACTED);
     return out;
   };
+}
+
+/**
+ * Build a payload redactor over the given secrets. Returns an identity function
+ * when no usable secret is supplied, so callers pay nothing when there is nothing
+ * to scrub.
+ */
+export function makeRedactor(secrets: Array<string | undefined | null>): PayloadRedactor {
+  if (usableSecrets(secrets).length === 0) return (payload) => payload;
+
+  const scrubString = makeTextRedactor(secrets);
   const walk = (value: unknown): unknown => {
     if (typeof value === "string") return scrubString(value);
     if (Array.isArray(value)) return value.map(walk);
