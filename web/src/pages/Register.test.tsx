@@ -36,6 +36,8 @@ beforeEach(() => {
     refresh: vi.fn(),
     prdLabel: "PRD",
     autopilotLabel: "autopilot",
+    prdlessLabel: "PRDLESS",
+    prdlessEnabled: false,
   });
 });
 

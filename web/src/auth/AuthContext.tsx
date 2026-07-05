@@ -13,6 +13,7 @@ import {
   setUnauthorizedHandler,
   DEFAULT_PRD_LABEL,
   DEFAULT_AUTOPILOT_LABEL,
+  DEFAULT_PRDLESS_LABEL,
   type SessionResponse,
   type User,
 } from "../lib/api";
@@ -25,6 +26,11 @@ interface AuthState {
   // consumers (Board, issue creation) can read them unconditionally.
   prdLabel: string;
   autopilotLabel: string;
+  // PRDLESS escape-hatch config (PRD #22). prdlessEnabled gates the label toggle's
+  // visibility; it defaults to false so a server that predates the bootstrap
+  // fields (M3) simply hides the toggle rather than showing one the backend 422s.
+  prdlessLabel: string;
+  prdlessEnabled: boolean;
   register: (email: string, password: string, displayName: string) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -38,14 +44,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [prdLabel, setPrdLabel] = useState(DEFAULT_PRD_LABEL);
   const [autopilotLabel, setAutopilotLabel] = useState(DEFAULT_AUTOPILOT_LABEL);
+  const [prdlessLabel, setPrdlessLabel] = useState(DEFAULT_PRDLESS_LABEL);
+  const [prdlessEnabled, setPrdlessEnabled] = useState(false);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
-  // the label fields.
+  // the label fields. prdless_enabled is a bool, so `?? false` (not `||`) keeps an
+  // explicit false; an absent field (older server) also reads as off.
   const applySession = useCallback((session: SessionResponse) => {
     setUser(session.user);
     setPrdLabel(session.prd_label || DEFAULT_PRD_LABEL);
     setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
+    setPrdlessLabel(session.prdless_label || DEFAULT_PRDLESS_LABEL);
+    setPrdlessEnabled(session.prdless_enabled ?? false);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -98,8 +109,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo<AuthState>(
-    () => ({ user, loading, prdLabel, autopilotLabel, register, login, logout, refresh }),
-    [user, loading, prdLabel, autopilotLabel, register, login, logout, refresh],
+    () => ({
+      user,
+      loading,
+      prdLabel,
+      autopilotLabel,
+      prdlessLabel,
+      prdlessEnabled,
+      register,
+      login,
+      logout,
+      refresh,
+    }),
+    [user, loading, prdLabel, autopilotLabel, prdlessLabel, prdlessEnabled, register, login, logout, refresh],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -55,6 +55,7 @@ function columnLabel(card: CardData): string {
 export function Board() {
   const { id: repoId = "" } = useParams();
   const navigate = useNavigate();
+  const { prdlessEnabled, prdlessLabel } = useAuth();
   const [board, setBoard] = useState<BoardData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -64,6 +65,7 @@ export function Board() {
   const [editingColumns, setEditingColumns] = useState(false);
   const [creatingIssue, setCreatingIssue] = useState(false);
   const [starting, setStarting] = useState<number | null>(null);
+  const [prdlessBusy, setPrdlessBusy] = useState<number | null>(null);
 
   // Hide-empty-columns toggle, persisted per repo. Initialised lazily from prefs;
   // re-read on repoId change because the route swaps :id without remounting the
@@ -242,6 +244,26 @@ export function Board() {
     } catch (err) {
       suppressToastIids.current.delete(iid); // the move failed — nothing to suppress
       setError(err instanceof ApiError ? err.message : "Move failed");
+    }
+  };
+
+  // PRDLESS toggle (PRD #22 M4): apply/remove the escape-hatch label on a card.
+  // Forge-first like move — replace the card with the server's authoritative copy
+  // on success, no optimistic update. The label change never moves a column, so
+  // unlike move() it needs no auto-move-toast suppression.
+  const togglePrdless = async (card: CardData) => {
+    setError("");
+    setPrdlessBusy(card.iid);
+    try {
+      const applying = !card.labels.includes(prdlessLabel);
+      const { card: updated } = await api.setIssuePrdless(repoId, card.iid, applying);
+      setBoard((prev) =>
+        prev ? { ...prev, cards: prev.cards.map((c) => (c.iid === updated.iid ? updated : c)) } : prev,
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not update the label");
+    } finally {
+      setPrdlessBusy(null);
     }
   };
 
@@ -438,6 +460,10 @@ export function Board() {
                     })}
                     starting={starting === card.iid}
                     onStart={() => startRun(card)}
+                    prdlessEnabled={prdlessEnabled}
+                    prdlessLabel={prdlessLabel}
+                    prdlessBusy={prdlessBusy === card.iid}
+                    onTogglePrdless={() => togglePrdless(card)}
                     onDragStart={(e) => {
                       e.dataTransfer.setData("text/plain", String(card.iid));
                       setDragIid(card.iid);
@@ -484,6 +510,10 @@ function IssueCard({
   gate,
   starting,
   onStart,
+  prdlessEnabled,
+  prdlessLabel,
+  prdlessBusy,
+  onTogglePrdless,
   onDragStart,
   onDragEnd,
   dimmed,
@@ -494,10 +524,15 @@ function IssueCard({
   gate: StartRunGate;
   starting: boolean;
   onStart: () => void;
+  prdlessEnabled: boolean;
+  prdlessLabel: string;
+  prdlessBusy: boolean;
+  onTogglePrdless: () => void;
   onDragStart: (e: React.DragEvent) => void;
   onDragEnd: () => void;
   dimmed: boolean;
 }) {
+  const prdlessApplied = card.labels.includes(prdlessLabel);
   // Closed cards are not movable (move-to-Closed is unsupported; close/reopen
   // stays on the forge), so they are not draggable.
   const draggable = !card.closed;
@@ -621,6 +656,22 @@ function IssueCard({
             {starting ? "Starting…" : gate.enabled ? "Start run" : "Start run (gated)"}
           </Button>
         </div>
+      )}
+      {prdlessEnabled && !card.closed && (
+        <button
+          type="button"
+          draggable={false}
+          disabled={prdlessBusy}
+          onClick={onTogglePrdless}
+          title={
+            prdlessApplied
+              ? `Remove the ${prdlessLabel} label and re-apply the PRD-link requirement`
+              : `Apply the ${prdlessLabel} label so a run can start without a PRD link`
+          }
+          className="mt-1.5 w-full rounded-md border border-edge px-2 py-1 text-[11px] text-muted transition-colors hover:border-brand/60 hover:text-fg disabled:opacity-50"
+        >
+          {prdlessBusy ? "…" : prdlessApplied ? `Remove ${prdlessLabel}` : `Mark ${prdlessLabel}`}
+        </button>
       )}
     </div>
   );

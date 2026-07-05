@@ -61,6 +61,10 @@ let allocations: Record<string, { shared: string[]; mine: string[] }> = Object.f
   Object.entries(mockAllocations).map(([k, v]) => [k, { shared: [...v.shared], mine: [...v.mine] }]),
 );
 let appSettings: AppSettings = { prd_label: "PRD", autopilot_label: "autopilot" };
+// PRDLESS escape-hatch config (PRD #22 M4). Enabled in the demo so the label
+// toggle is exercisable; the real server delivers these on the session bootstrap.
+let prdlessLabel = "PRDLESS";
+let prdlessEnabled = true;
 let templateCounter = 0;
 let workerCounter = 0;
 let skillCounter = 0;
@@ -93,6 +97,8 @@ function sessionBody() {
     user: requireSession(),
     prd_label: appSettings.prd_label,
     autopilot_label: appSettings.autopilot_label,
+    prdless_label: prdlessLabel,
+    prdless_enabled: prdlessEnabled,
   };
 }
 
@@ -478,6 +484,21 @@ export const mockApi = {
     card.labels = [prd, ...card.labels.filter((l) => l !== prd && !columnNames.includes(l)), ...(to ? [to] : [])];
     card.column = to;
     card.conflict = false;
+    return delay({ card: { ...card } }, 320);
+  },
+  // PRDLESS label toggle (PRD #22 M4): 422 when disabled, else an idempotent
+  // add/remove of the one label (mirrors the server's forge-first helper —
+  // has_prd_link is untouched, every other label preserved).
+  setIssuePrdless: async (repoId: string, iid: number, apply: boolean) => {
+    const b = state.boards.get(repoId);
+    const card = b?.cards.find((c) => c.iid === iid);
+    if (!b || !card) throw new ApiError(404, "issue not found");
+    if (!prdlessEnabled) throw new ApiError(422, "the PRDLESS label feature is disabled");
+    if (card.labels.includes(prdlessLabel) !== apply) {
+      card.labels = apply
+        ? [...card.labels, prdlessLabel]
+        : card.labels.filter((l) => l !== prdlessLabel);
+    }
     return delay({ card: { ...card } }, 320);
   },
   getIssue: async (repoId: string, iid: number) => {

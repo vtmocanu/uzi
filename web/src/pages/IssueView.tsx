@@ -7,6 +7,7 @@ import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { Markdown } from "../components/Markdown";
 import { formatDuration } from "../components/RunEvent";
 import { Alert, Badge, Button, Card } from "../components/ui";
+import { useAuth } from "../auth/AuthContext";
 
 // columnLabel names the column the issue sits in, for the header chip.
 function columnLabel(issue: IssueDetail): string {
@@ -27,6 +28,7 @@ export function IssueView() {
   const { repoId = "", iid = "" } = useParams();
   const iidNum = Number(iid);
   const navigate = useNavigate();
+  const { prdlessEnabled, prdlessLabel } = useAuth();
 
   const [issue, setIssue] = useState<IssueDetail | null>(null);
   const [runs, setRuns] = useState<RunListItem[]>([]);
@@ -35,6 +37,7 @@ export function IssueView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
+  const [prdlessBusy, setPrdlessBusy] = useState(false);
 
   const load = useCallback(async () => {
     setError("");
@@ -71,6 +74,24 @@ export function IssueView() {
       setError(err instanceof ApiError ? err.message : "Could not start run");
       setStarting(false);
       load();
+    }
+  };
+
+  // PRDLESS toggle (PRD #22 M4): apply/remove the escape-hatch label directly.
+  // Forge-first — wait for the 200 and adopt the returned card's labels; no
+  // optimistic update, so a failed write leaves the issue's labels untouched.
+  const prdlessApplied = !!issue && issue.labels.includes(prdlessLabel);
+  const togglePrdless = async () => {
+    if (!issue) return;
+    setError("");
+    setPrdlessBusy(true);
+    try {
+      const { card } = await api.setIssuePrdless(repoId, issue.iid, !prdlessApplied);
+      setIssue({ ...issue, labels: card.labels });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not update the label");
+    } finally {
+      setPrdlessBusy(false);
     }
   };
 
@@ -137,6 +158,20 @@ export function IssueView() {
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              {prdlessEnabled && !issue.closed && (
+                <Button
+                  variant={prdlessApplied ? "secondary" : "ghost"}
+                  disabled={prdlessBusy}
+                  title={
+                    prdlessApplied
+                      ? `Remove the ${prdlessLabel} label and re-apply the PRD-link requirement`
+                      : `Apply the ${prdlessLabel} label so a run can start without a PRD link`
+                  }
+                  onClick={togglePrdless}
+                >
+                  {prdlessBusy ? "…" : prdlessApplied ? `Remove ${prdlessLabel}` : `Mark ${prdlessLabel}`}
+                </Button>
+              )}
               {isHttpsUrl(issue.web_url) && (
                 <a href={issue.web_url} target="_blank" rel="noreferrer">
                   <Button variant="ghost">Open on GitLab</Button>

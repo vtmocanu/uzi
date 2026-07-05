@@ -60,6 +60,8 @@ function setAuth(u: User) {
     loading: false,
     prdLabel: "PRD",
     autopilotLabel: "autopilot",
+    prdlessLabel: "PRDLESS",
+    prdlessEnabled: false,
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
