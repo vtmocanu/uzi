@@ -17,7 +17,13 @@ docker compose up                    # web on http://127.0.0.1:8080
 docker compose --profile agent up    # additionally start a worker (needs join token)
 ```
 
-**Testing the stack: never run a bare `docker compose up` for smoke/test purposes.** It autoloads the real `./.env` and touches the real admin/forge data. Always use an explicit `--env-file` with dummy secrets, a unique `-p <project>` name, and a varied dummy `UZI_SECRET_KEY`. Each git worktree already gets its own compose project + `pgdata` volume.
+**Testing the stack: never run a bare `docker compose up` for smoke/test purposes.** It autoloads the real `./.env` and touches the real admin/forge data. **`--env-file` with dummy secrets is NOT sufficient on its own**: the developer's shell profile exports the real vars (`UZI_SEED_*`, `JWT_SECRET`, `UZI_SECRET_KEY`, `POSTGRES_PASSWORD`, …) and Compose ranks shell environment ABOVE `--env-file`, silently overriding the dummies (observed 2026-07-05: an "isolated" stack seeded the real admin + credentials). Use an empty base env plus a unique project name:
+
+```sh
+env -i HOME=$HOME PATH=$PATH docker compose --env-file <dummy.env> -p <unique> up
+```
+
+and verify with `... compose config` that the dummy admin is what will seed. `./e2e/run-e2e.sh` is immune (its overlay hardcodes seed vars). Each git worktree already gets its own compose project + `pgdata` volume.
 
 ### api (Go, chi + pgx + sqlc + goose)
 
