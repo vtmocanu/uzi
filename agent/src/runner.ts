@@ -1,8 +1,10 @@
+import fs from "node:fs/promises";
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
 import { gitBasicCredential } from "./git.js";
 import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
+import { skillsPluginDir } from "./skills-plugin.js";
 import type { Logger } from "./log.js";
 import type { ClaimResponse } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
@@ -113,6 +115,7 @@ export class RunRunner {
         agents: claim.agents,
         skills: claim.skills,
         skillsDropped: claim.skills_dropped,
+        repoSkillsEnabled: claim.repo.skills_enabled ?? false,
         config: claim.config,
         sessionId: claim.session_id,
         signal: cancel.signal,
@@ -185,6 +188,14 @@ export class RunRunner {
         await this.git
           .removeWorktree(barePath, worktreePath)
           .catch((e) => runLog.warn("worktree cleanup failed", { error: errMessage(e) }));
+      }
+      // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
+      // M4). It is OUTSIDE the worktree, so removeWorktree does not reach it; leave
+      // it and each run leaks a dir. Best-effort, like the worktree cleanup.
+      if (worktreePath) {
+        await fs
+          .rm(skillsPluginDir(worktreePath), { recursive: true, force: true })
+          .catch((e) => runLog.warn("skills plugin cleanup failed", { error: errMessage(e) }));
       }
     }
   }

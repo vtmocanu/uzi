@@ -33,7 +33,9 @@ import { buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt } from "./
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
 import { enforceSkillCaps, materializeSkillsPlugin, qualifiedSkillName, skillsPluginDir, type SkillDrop } from "./skills-plugin.js";
+import { DROP_REPO_COLLISION, enumerateRepoSkills, repoSkillsDir } from "./repo-skills.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
+import type { ClaimSkill } from "./protocol.js";
 import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
 import { errMessage } from "./util.js";
@@ -161,25 +163,53 @@ export class SdkExecutor implements Executor {
     await fs.mkdir(this.homeDir, { recursive: true });
 
     const env = buildSdkEnv(oauthToken, this.homeDir);
-    const assembled = assembleAgents(ctx.agents ?? []);
-    const subagentNames = Object.keys(assembled.subagents);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
 
-    // Skills (PRD #16 M4). Re-enforce the server-configured caps over the
-    // delivered union (a no-op for delivered-only — the server already capped —
-    // but the seam repo skills plug into at M6), then materialize a local plugin
-    // dir OUTSIDE the clone. The plugin channel loads under `settingSources: []`,
-    // so the injection defense never loosens. Rebuilt on every claim including
-    // resume. The worker owns the gapless seq, so it logs every dropped skill:
-    // the server's assembly drops (ctx.skillsDropped) plus these local cap drops.
+    // Skills (PRD #16 M4 + M6). Assemble the run's skill set, materialize a local
+    // plugin dir OUTSIDE the clone (loads under `settingSources: []`, so the
+    // injection defense never loosens), and rebuild it on every claim incl.
+    // resume. The worker owns the gapless seq, so it logs every dropped skill.
     const skillCaps = {
       maxBytes: positive(ctx.config?.skill_max_bytes, DEFAULT_SKILL_MAX_BYTES),
       maxPerRun: positive(ctx.config?.skills_max_per_run, DEFAULT_SKILLS_MAX_PER_RUN),
     };
-    const { kept: runSkills, dropped: localDrops } = enforceSkillCaps(ctx.skills ?? [], skillCaps);
+    const deliveredSkills = ctx.skills ?? [];
+
+    // M6: repo-borne skills — only when the repo owner opted in. Skills only, at
+    // LOWEST precedence: a repo skill whose name collides with a delivered skill
+    // (or an earlier repo skill) is dropped and logged. Frontmatter is stripped to
+    // name+description; nothing else under the repo's .claude/ is read.
+    const repoDrops: SkillDrop[] = [];
+    const repoKept: ClaimSkill[] = [];
+    if (ctx.repoSkillsEnabled) {
+      const repo = await enumerateRepoSkills(repoSkillsDir(ctx.worktreePath), skillCaps.maxBytes);
+      repoDrops.push(...repo.dropped);
+      const seen = new Set(deliveredSkills.map((s) => s.name));
+      for (const rs of repo.skills) {
+        if (seen.has(rs.name)) {
+          repoDrops.push({ name: rs.name, reason: DROP_REPO_COLLISION });
+          continue;
+        }
+        seen.add(rs.name);
+        repoKept.push(rs);
+      }
+    }
+
+    // Delivered skills first (higher precedence), repo skills last, so the per-run
+    // count cap evicts repo skills first (the server already capped the delivered
+    // set, so only repo skills can overflow it).
+    const { kept: runSkills, dropped: capDrops } = enforceSkillCaps([...deliveredSkills, ...repoKept], skillCaps);
+    const survivorNames = new Set(runSkills.map((s) => s.name));
     const skillsPluginPath = skillsPluginDir(ctx.worktreePath);
     await materializeSkillsPlugin(skillsPluginPath, runSkills);
-    this.emitSkillDrops(ctx, localDrops);
+    this.emitSkillDrops(ctx, [...repoDrops, ...capDrops]);
+
+    // Subagents: each def.skills is re-filtered to the materialized SURVIVORS, so a
+    // subagent can never list a uzi:<name> that isn't in the plugin dir (delivered
+    // skills never drop today, but repo overflow / a future worker-side drop must
+    // not leave a dangling reference).
+    const assembled = assembleAgents(ctx.agents ?? [], survivorNames);
+    const subagentNames = Object.keys(assembled.subagents);
 
     const baseOptions: SdkOptions = {
       cwd: ctx.worktreePath,
@@ -469,6 +499,10 @@ function describeSkillDrop(name: string, reason: string): string {
       return `skill "${name}" was dropped: the run exceeded the maximum number of skills`;
     case "too_large":
       return `skill "${name}" was dropped: its body exceeds the maximum allowed size`;
+    case "repo_collision":
+      return `repo skill "${name}" was skipped: a higher-precedence skill of the same name is already loaded`;
+    case "repo_invalid":
+      return `repo skill "${name}" was skipped: invalid name, description, or body`;
     default:
       return `skill "${name}" was dropped (${reason})`;
   }

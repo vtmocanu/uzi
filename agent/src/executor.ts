@@ -42,6 +42,10 @@ export interface RunContext {
   /** M4 (PRD #16): skills the server dropped at claim assembly (shadowed /
    *  over-limit). The worker owns the gapless seq, so it logs these. */
   skillsDropped?: ClaimSkillDrop[];
+  /** M6 (PRD #16): the repo owner opted in to loading skills from the clone's own
+   *  .claude/skills. Only then does the worker enumerate them (skills only, lowest
+   *  precedence); default off. */
+  repoSkillsEnabled?: boolean;
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** SDK session to resume; null/absent for a fresh run. */

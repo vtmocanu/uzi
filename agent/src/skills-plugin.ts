@@ -20,6 +20,12 @@ import type { ClaimSkill } from "./protocol.js";
  *  skills as `uzi:<name>` (plugin-qualified enable-list, sdk.d.ts:1876). */
 export const SKILLS_PLUGIN_NAME = "uzi";
 
+/** Kebab-case skill name — the identity + on-disk directory. Mirrors the server
+ *  regex (api/internal/skilltmpl NameRe). It also makes a name path-safe: the
+ *  charset excludes separators and dots, so an M6 repo-borne name can never write
+ *  a SKILL.md outside skills/. */
+export const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
 /** Reason codes for skills the WORKER drops locally (distinct from the server's
  *  assembly drops that ride the claim as skills_dropped). */
 export const DROP_TOO_LARGE = "too_large";

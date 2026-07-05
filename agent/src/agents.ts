@@ -56,8 +56,10 @@ export interface AssembledAgents {
   leadModel?: string;
 }
 
-/** Map one template's structured fields onto an SDK AgentDefinition. */
-function toDefinition(t: AgentTemplate): AgentDefinition {
+/** Map one template's structured fields onto an SDK AgentDefinition. When
+ *  availableSkills is provided, the template's skills are filtered to that set of
+ *  materialized survivor names first. */
+function toDefinition(t: AgentTemplate, availableSkills?: ReadonlySet<string>): AgentDefinition {
   const def: AgentDefinition = {
     description: t.description,
     prompt: t.prompt_body,
@@ -76,7 +78,10 @@ function toDefinition(t: AgentTemplate): AgentDefinition {
   // a skill via this field is sufficient; per sdk.d.ts:44 adding `'Skill'` to the
   // tools allowlist is deprecated and unnecessary, so a tools-restricted subagent
   // (reviewer/tester) still expands its allocated skill without a tools grant.
-  def.skills = (t.skills ?? []).map(qualifiedSkillName);
+  // The names are filtered to the worker's materialized survivors so a subagent
+  // never lists a skill that isn't in the plugin dir (M6 cap/collision drops).
+  const names = (t.skills ?? []).filter((n) => !availableSkills || availableSkills.has(n));
+  def.skills = names.map(qualifiedSkillName);
   return def;
 }
 
@@ -84,8 +89,10 @@ function toDefinition(t: AgentTemplate): AgentDefinition {
  * Partition templates into the lead (by name convention) and invokable
  * subagents, mapping each subagent to an SDK AgentDefinition. Duplicate names
  * collapse (last wins) — the SDK `agents` map is name-keyed regardless.
+ * availableSkills, when given, restricts each subagent's skills to the worker's
+ * materialized survivor set (bare names).
  */
-export function assembleAgents(templates: AgentTemplate[]): AssembledAgents {
+export function assembleAgents(templates: AgentTemplate[], availableSkills?: ReadonlySet<string>): AssembledAgents {
   const result: AssembledAgents = { subagents: {} };
   let leadSeen = false;
   for (const t of templates) {
@@ -95,7 +102,7 @@ export function assembleAgents(templates: AgentTemplate[]): AssembledAgents {
       if (t.model) result.leadModel = t.model;
       continue;
     }
-    result.subagents[t.name] = toDefinition(t);
+    result.subagents[t.name] = toDefinition(t, availableSkills);
   }
   return result;
 }
