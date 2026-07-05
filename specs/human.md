@@ -109,6 +109,16 @@ Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/done/14-multica-ui-redesig
 - A themed focus-visible ring (keyboard/AT focus indicator).
 - E2E testing includes a real-GitLab leg, scoped to the dedicated scratch project `vtmocanu/uzi-e2e-scratch` (created for this); the live-Anthropic capstone is skipped.
 
+## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
+
+Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-sidebar-board.md`.
+
+- Dashboard updates live: a run reaching `awaiting_approval` must show without a manual refresh.
+- Desktop sidebar is collapsible.
+- Empty board columns can be hidden.
+- Web-only; no API/schema/agent changes.
+- "Board columns should auto refresh" — already satisfied by existing polling; no change shipped.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
