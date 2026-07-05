@@ -16,12 +16,9 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
-
-// PRDLabel is the forge label that marks an issue as factory work. The board
-// and every sync only ever fetch issues carrying it.
-const PRDLabel = "PRD"
 
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
 // first time a repo's board is opened, in board order. Colors are required by
@@ -62,17 +59,42 @@ type IssueStore interface {
 	SetRunMRState(ctx context.Context, arg store.SetRunMRStateParams) (int64, error)
 }
 
+// LabelConfig resolves the configured PRD label the sync filters query by
+// (PRD #19). *settings.Cache satisfies it; the sync depends on the behavior, not
+// the concrete cache, so its tests can supply a fixed label. Resolution is
+// best-effort: a nil resolver or an empty/errored read falls back to
+// settings.DefaultPRDLabel, so a transient settings-store blip degrades a sync to
+// the default label rather than filtering on an empty one.
+type LabelConfig interface {
+	PRDLabel(ctx context.Context) (string, error)
+}
+
 // Service bundles the dependencies for building forge clients and syncing.
 type Service struct {
 	q       IssueStore
 	box     *secretbox.Box
 	timeout time.Duration
+	labels  LabelConfig
 }
 
 // New constructs a Service. box encrypts/decrypts stored PATs; timeout bounds
-// every forge HTTP call.
-func New(q IssueStore, box *secretbox.Box, timeout time.Duration) *Service {
-	return &Service{q: q, box: box, timeout: timeout}
+// every forge HTTP call; labels resolves the configured PRD label the sync
+// filters on (nil is tolerated and falls back to the compiled-in default).
+func New(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelConfig) *Service {
+	return &Service{q: q, box: box, timeout: timeout, labels: labels}
+}
+
+// prdLabel resolves the configured PRD label for the sync filters, falling back
+// to the compiled-in default when unconfigured or on a settings read error (the
+// accessor already returns the default alongside a cold error, so this is
+// best-effort by design).
+func (s *Service) prdLabel(ctx context.Context) string {
+	if s.labels != nil {
+		if l, _ := s.labels.PRDLabel(ctx); l != "" {
+			return l
+		}
+	}
+	return settings.DefaultPRDLabel
 }
 
 // EncryptToken seals a plaintext PAT for storage.
@@ -148,7 +170,7 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 // it doubles as the reconcile pass and the manual Refresh. Returns the max
 // forge updated_at seen, so a caller tracking a high-water-mark can advance it.
 func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (time.Time, error) {
-	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{PRDLabel}})
+	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{s.prdLabel(ctx)}})
 	if err != nil {
 		// Abort BEFORE any eviction: a failed/partial fetch must never be
 		// treated as an authoritative empty set, or a transient forge error
@@ -177,7 +199,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // hwm and the max updated_at returned by the forge). The bound is inclusive at
 // second granularity, so the boundary row is re-fetched and deduped by upsert.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, hwm time.Time) (time.Time, error) {
-	opts := forge.ListIssuesOptions{Labels: []string{PRDLabel}}
+	opts := forge.ListIssuesOptions{Labels: []string{s.prdLabel(ctx)}}
 	if !hwm.IsZero() {
 		opts.UpdatedAfter = &hwm
 	}

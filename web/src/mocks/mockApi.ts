@@ -9,6 +9,7 @@ import {
   type AgentTemplateInput,
   type AllocatedSkill,
   type AllocationsInput,
+  type AppSettings,
   type PrivilegeReport,
   type Run,
   type RunInputKind,
@@ -59,6 +60,7 @@ let skills: Skill[] = mockSkills.map((s) => ({ ...s }));
 let allocations: Record<string, { shared: string[]; mine: string[] }> = Object.fromEntries(
   Object.entries(mockAllocations).map(([k, v]) => [k, { shared: [...v.shared], mine: [...v.mine] }]),
 );
+let appSettings: AppSettings = { prd_label: "PRD", autopilot_label: "autopilot" };
 let templateCounter = 0;
 let workerCounter = 0;
 let skillCounter = 0;
@@ -84,11 +86,23 @@ function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
+// sessionBody is the auth/session bootstrap payload: the signed-in user plus the
+// current instance labels (PRD #19 M2).
+function sessionBody() {
+  return {
+    user: requireSession(),
+    prd_label: appSettings.prd_label,
+    autopilot_label: appSettings.autopilot_label,
+  };
+}
+
 export const mockApi = {
   // ── Auth: instant and fake. Any credentials sign in as the admin. ──────────
+  // The session bootstrap carries the instance labels alongside the user, mirroring
+  // the real API (PRD #19 M2), so the mocked SPA resolves them the same way.
   register: async (email: string, _password: string, displayName: string) => {
     state.session = { ...mockAdmin, email, display_name: displayName || mockAdmin.display_name };
-    return delay({ user: state.session });
+    return delay(sessionBody());
   },
   login: async (email: string, _password: string) => {
     // Persona switch for the demo: logging in as a seeded non-admin (e.g.
@@ -97,7 +111,7 @@ export const mockApi = {
     // browser-checkable. Any other email is the admin, as before.
     const persona = users.find((u) => u.email === email.trim().toLowerCase());
     state.session = persona ? { ...persona } : { ...mockAdmin, email: email || mockAdmin.email };
-    return delay({ user: state.session });
+    return delay(sessionBody());
   },
   // Demo mode has registration open and unrestricted.
   authConfig: async () => delay({ registration_enabled: true, allowed_email_domains: [] }),
@@ -107,7 +121,7 @@ export const mockApi = {
   },
   me: async () => {
     if (!state.session) throw new ApiError(401, "authentication required");
-    return delay({ user: state.session }, 40);
+    return delay(sessionBody(), 40);
   },
 
   // ── Admin: users ────────────────────────────────────────────────────────────
@@ -117,6 +131,34 @@ export const mockApi = {
     if (!u) throw new ApiError(404, "user not found");
     u.is_active = isActive;
     return delay({ user: { ...u } });
+  },
+
+  // ── Admin: instance settings (PRD #19) ───────────────────────────────────────
+  // Mirrors the server's Decision 8 validation so the demo surfaces the same
+  // rejection messages the real API would.
+  getSettings: async () => delay({ settings: { ...appSettings } }),
+  updateSettings: async (updates: Partial<AppSettings>) => {
+    const merged = { ...appSettings, ...updates };
+    for (const [key, value] of Object.entries(updates)) {
+      if (key !== "prd_label" && key !== "autopilot_label") {
+        throw new ApiError(400, `unknown setting: ${key}`);
+      }
+      if (!value || value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
+      if (value.length > 64) throw new ApiError(400, `${key}: must be at most 64 characters`);
+      if (value.includes(",")) throw new ApiError(400, `${key}: must not contain a comma`);
+    }
+    if (merged.prd_label === merged.autopilot_label) {
+      throw new ApiError(400, "prd_label and autopilot_label must differ");
+    }
+    appSettings = merged;
+    return delay({ settings: { ...appSettings } });
+  },
+
+  // ── Autopilot opt-in (PRD #19 M3) ────────────────────────────────────────────
+  setAutopilotEnabled: async (enabled: boolean) => {
+    const u = requireSession();
+    u.autopilot_enabled = enabled;
+    return delay({ user: { ...u } }, 200);
   },
 
   // ── Secrets ─────────────────────────────────────────────────────────────────
@@ -345,6 +387,29 @@ export const mockApi = {
     c.last_verified_at = new Date().toISOString();
     return delay({ connection: { ...c } }, 500);
   },
+  // Mirrors the real save path (PRD #19 M3): a collision on the same host is a hard
+  // 409, an unknown username still saves but returns a warning (verified-or-warned),
+  // and "" clears the mapping.
+  updateConnection: async (id: string, humanUsername: string) => {
+    const c = connections.find((x) => x.id === id);
+    if (!c) throw new ApiError(404, "connection not found");
+    const username = humanUsername.trim();
+    if (username) {
+      const clash = connections.some(
+        (x) => x.id !== id && x.base_url === c.base_url && x.human_username === username,
+      );
+      if (clash) {
+        throw new ApiError(409, "that forge username is already mapped by another user on this host");
+      }
+    }
+    c.human_username = username || null;
+    // Demo the warning branch for an obviously-fake username without a live forge.
+    const warning =
+      username && username.toLowerCase() === "ghost"
+        ? "Saved, but no forge account with this username was found — double-check it matches your own forge username."
+        : undefined;
+    return delay({ connection: { ...c }, ...(warning ? { warning } : {}) }, 400);
+  },
   privilegeCheck: async (id: string) => {
     const c = connections.find((x) => x.id === id);
     if (!c) throw new ApiError(404, "connection not found");
@@ -409,7 +474,8 @@ export const mockApi = {
     if (!b || !card) throw new ApiError(404, "issue not found");
     const to = toColumn === "open" ? "" : toColumn;
     const columnNames = b.columns.map((c) => c.label_name);
-    card.labels = ["PRD", ...card.labels.filter((l) => l !== "PRD" && !columnNames.includes(l)), ...(to ? [to] : [])];
+    const prd = appSettings.prd_label;
+    card.labels = [prd, ...card.labels.filter((l) => l !== prd && !columnNames.includes(l)), ...(to ? [to] : [])];
     card.column = to;
     card.conflict = false;
     return delay({ card: { ...card } }, 320);
@@ -440,7 +506,7 @@ export const mockApi = {
       iid,
       title,
       state: "opened",
-      labels: ["PRD"],
+      labels: [appSettings.prd_label],
       web_url: `${b.web_url}/-/issues/${iid}`,
       author: requireSession().display_name?.toLowerCase() ?? "you",
       has_prd_link: /prds\/[\w.-]+\.md/.test(description),
@@ -493,6 +559,7 @@ export const mockApi = {
       status: "queued",
       requeue_count: 0,
       iteration_count: 0,
+      auto_approve: false,
       worker_id: null,
       branch: null,
       mr_iid: null,

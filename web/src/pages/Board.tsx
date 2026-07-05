@@ -31,6 +31,7 @@ import { visibleColumns } from "../lib/boardColumns";
 import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
 import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
+import { useAuth } from "../auth/AuthContext";
 
 const OPEN_KEY = "";
 const CLOSED_KEY = "__closed__";
@@ -637,6 +638,7 @@ function CreateIssueForm({
   onCreated: () => void;
   onError: (m: string) => void;
 }) {
+  const { prdLabel } = useAuth();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [saving, setSaving] = useState(false);
@@ -659,8 +661,8 @@ function CreateIssueForm({
     <Card className="max-w-2xl space-y-3">
       <SectionTitle>Create a PRD issue</SectionTitle>
       <p className="text-xs text-faint">
-        Opened on GitLab with the <span className="font-medium text-muted">PRD</span> label. Link a{" "}
-        <code className="rounded bg-raised px-1 py-0.5 text-muted">prds/*.md</code> file in the
+        Opened on GitLab with the <span className="font-medium text-muted">{prdLabel}</span> label.
+        Link a <code className="rounded bg-raised px-1 py-0.5 text-muted">prds/*.md</code> file in the
         description so a run can be started from it.
       </p>
       <form onSubmit={submit} className="space-y-3">
@@ -692,16 +694,20 @@ function ColumnSettings({
   onSaved: (b: BoardData) => void;
   onError: (m: string) => void;
 }) {
+  const { prdLabel, autopilotLabel } = useAuth();
   const [names, setNames] = useState<string[]>(board.columns.map((c) => c.label_name));
   const [newName, setNewName] = useState("");
   const [saving, setSaving] = useState(false);
 
-  // Suggest labels seen on cards that are not already columns (and not "PRD").
+  // Suggest labels seen on cards that are not already columns and not the
+  // configured PRD/autopilot labels (those are workflow markers, never columns).
   const suggestions = useMemo(() => {
     const seen = new Set<string>();
     for (const c of board.cards) for (const l of c.labels) seen.add(l);
-    return [...seen].filter((l) => l !== "PRD" && !names.includes(l)).sort();
-  }, [board.cards, names]);
+    return [...seen]
+      .filter((l) => l !== prdLabel && l !== autopilotLabel && !names.includes(l))
+      .sort();
+  }, [board.cards, names, prdLabel, autopilotLabel]);
 
   const add = (name: string) => {
     const n = name.trim();

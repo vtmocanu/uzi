@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -76,6 +77,13 @@ func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.Me
 	}
 	return f.mr, nil
 }
+func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return false, nil }
+func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
+	return nil, nil
+}
+func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
+	return forge.IssueNote{}, nil
+}
 func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 	return forge.TokenInfo{}, nil
 }
@@ -126,10 +134,16 @@ func (s *fakeStore) SetRunMRState(_ context.Context, arg store.SetRunMRStatePara
 	return 1, nil
 }
 
+// fakeLabels is a fixed LabelConfig for the sync tests.
+type fakeLabels struct{ prd string }
+
+func (f fakeLabels) PRDLabel(context.Context) (string, error) { return f.prd, nil }
+
 func newTestService(st IssueStore) *Service {
 	// box is nil: FullSync/IncrementalSync operate on a passed-in Forge and
-	// never touch the encryption box.
-	return New(st, nil, time.Second)
+	// never touch the encryption box. Labels resolve to the default so the
+	// existing filter assertions hold.
+	return New(st, nil, time.Second, fakeLabels{prd: settings.DefaultPRDLabel})
 }
 
 func issueAt(iid int64, updated time.Time) forge.Issue {
@@ -207,8 +221,45 @@ func TestIncrementalSyncAdvancesHWM(t *testing.T) {
 	}
 	// It never queries incrementally without state=all being enforced by the
 	// driver; here we only assert the PRD label filter is applied.
-	if len(f.listCalls[0].Labels) != 1 || f.listCalls[0].Labels[0] != PRDLabel {
+	if len(f.listCalls[0].Labels) != 1 || f.listCalls[0].Labels[0] != settings.DefaultPRDLabel {
 		t.Fatalf("expected PRD label filter, got %v", f.listCalls[0].Labels)
+	}
+}
+
+// TestSyncFiltersOnConfiguredLabel proves the sync queries the label the settings
+// resolver reports, not a hardcoded constant (PRD #19 M2): a service configured
+// with a custom label filters ListIssues on it in both sync paths.
+func TestSyncFiltersOnConfiguredLabel(t *testing.T) {
+	const custom = "Feature"
+	svc := New(&fakeStore{}, nil, time.Second, fakeLabels{prd: custom})
+
+	full := &fakeForge{}
+	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, full); err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	if len(full.listCalls) != 1 || len(full.listCalls[0].Labels) != 1 || full.listCalls[0].Labels[0] != custom {
+		t.Fatalf("FullSync label filter = %v, want [%s]", full.listCalls[0].Labels, custom)
+	}
+
+	inc := &fakeForge{}
+	if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, inc, time.Time{}); err != nil {
+		t.Fatalf("IncrementalSync: %v", err)
+	}
+	if len(inc.listCalls) != 1 || len(inc.listCalls[0].Labels) != 1 || inc.listCalls[0].Labels[0] != custom {
+		t.Fatalf("IncrementalSync label filter = %v, want [%s]", inc.listCalls[0].Labels, custom)
+	}
+}
+
+// TestSyncFallsBackToDefaultLabel proves a nil resolver degrades to the
+// compiled-in default rather than filtering on an empty label.
+func TestSyncFallsBackToDefaultLabel(t *testing.T) {
+	svc := New(&fakeStore{}, nil, time.Second, nil)
+	f := &fakeForge{}
+	if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	if len(f.listCalls) != 1 || len(f.listCalls[0].Labels) != 1 || f.listCalls[0].Labels[0] != settings.DefaultPRDLabel {
+		t.Fatalf("nil resolver label filter = %v, want [%s]", f.listCalls[0].Labels, settings.DefaultPRDLabel)
 	}
 }
 

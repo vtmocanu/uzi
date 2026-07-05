@@ -34,6 +34,8 @@ beforeEach(() => {
     login: vi.fn(),
     logout: vi.fn(),
     refresh: vi.fn(),
+    prdLabel: "PRD",
+    autopilotLabel: "autopilot",
   });
 });
 

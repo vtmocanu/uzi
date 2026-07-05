@@ -170,6 +170,12 @@ export interface ClaimResponse {
   /** Skills dropped during assembly (shadowed or over the cap), for the worker to
    *  log (PRD #16). Always sent (possibly empty). */
   skills_dropped?: ClaimSkillDrop[];
+  /** Autopilot run (PRD #19): the worker resolves the plan gate with an approve
+   *  verdict instead of parking at awaiting_approval. Top-level (read from the
+   *  runs row), NOT inside config — config is instance caps, this is a per-run
+   *  fact. Re-delivered on every resume/requeue of the same run (the server reads
+   *  it from the row), so an unattended resume never hangs at the gate. */
+  auto_approve?: boolean;
 }
 
 /** One appended message; the server is idempotent on (run_id, seq). */

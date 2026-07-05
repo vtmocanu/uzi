@@ -33,6 +33,7 @@ const user = {
   display_name: "Admin",
   is_admin: false,
   is_active: true,
+  autopilot_enabled: false,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -47,6 +48,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     status: "running",
     requeue_count: 0,
     iteration_count: 0,
+    auto_approve: false,
     worker_id: "w1",
     branch: null,
     mr_iid: null,
@@ -88,6 +90,8 @@ beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
+    prdLabel: "PRD",
+    autopilotLabel: "autopilot",
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

@@ -66,6 +66,12 @@ type Config struct {
 	ForgeReconcileEvery int
 	// ForgeHTTPTimeout bounds every outbound forge HTTP call.
 	ForgeHTTPTimeout time.Duration
+	// SettingsCacheTTL is how long the app_settings read-through cache (PRD #19)
+	// serves a value before refetching. Short: an admin's label change should
+	// take effect within a poll cycle or two. A settings write also invalidates
+	// the cache immediately, so the TTL only bounds staleness from direct DB
+	// edits, not from the app's own writes.
+	SettingsCacheTTL time.Duration
 	// ForgeRateLimitMax/Window bound how often one authenticated user may hit
 	// the forge-proxying endpoints (verify/projects/sync/move), protecting the
 	// upstream forge from a single user's abuse.
@@ -194,6 +200,7 @@ func Load() (Config, error) {
 	cfg.ForgePollInterval = parseDuration("FORGE_POLL_INTERVAL", time.Minute)
 	cfg.ForgeReconcileEvery = parseInt("FORGE_RECONCILE_EVERY", 10)
 	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
+	cfg.SettingsCacheTTL = parseDuration("SETTINGS_CACHE_TTL", 5*time.Second)
 	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
 	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
 	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —

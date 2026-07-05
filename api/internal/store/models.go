@@ -29,6 +29,20 @@ type AgentTemplate struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type AppSetting struct {
+	Key       string             `json:"key"`
+	Value     string             `json:"value"`
+	UpdatedBy pgtype.UUID        `json:"updated_by"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type AutopilotTrigger struct {
+	RepoID      uuid.UUID          `json:"repo_id"`
+	IssueIid    int64              `json:"issue_iid"`
+	LastEventID int64              `json:"last_event_id"`
+	HandledAt   pgtype.Timestamptz `json:"handled_at"`
+}
+
 type BoardColumn struct {
 	ID        uuid.UUID `json:"id"`
 	RepoID    uuid.UUID `json:"repo_id"`
@@ -49,6 +63,7 @@ type ForgeConnection struct {
 	PrivilegeReport    []byte             `json:"privilege_report"`
 	PrivilegeCheckedAt pgtype.Timestamptz `json:"privilege_checked_at"`
 	PrivilegeStatus    pgtype.Text        `json:"privilege_status"`
+	HumanUsername      pgtype.Text        `json:"human_username"`
 }
 
 type Issue struct {
@@ -77,31 +92,33 @@ type Repo struct {
 }
 
 type Run struct {
-	ID               uuid.UUID          `json:"id"`
-	UserID           uuid.UUID          `json:"user_id"`
-	RepoID           uuid.UUID          `json:"repo_id"`
-	IssueIid         int64              `json:"issue_iid"`
-	IssueTitle       string             `json:"issue_title"`
-	IssueDescription string             `json:"issue_description"`
-	Status           string             `json:"status"`
-	RequeueCount     int32              `json:"requeue_count"`
-	WorkerID         pgtype.UUID        `json:"worker_id"`
-	SessionID        pgtype.Text        `json:"session_id"`
-	LastSeq          int32              `json:"last_seq"`
-	Branch           pgtype.Text        `json:"branch"`
-	MrIid            pgtype.Int8        `json:"mr_iid"`
-	FailureReason    pgtype.Text        `json:"failure_reason"`
-	PlanMd           pgtype.Text        `json:"plan_md"`
-	IterationCount   int32              `json:"iteration_count"`
-	ClaimedAt        pgtype.Timestamptz `json:"claimed_at"`
-	StartedAt        pgtype.Timestamptz `json:"started_at"`
-	FinishedAt       pgtype.Timestamptz `json:"finished_at"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	OriginColumn     pgtype.Text        `json:"origin_column"`
-	BoardColumn      pgtype.Text        `json:"board_column"`
-	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
-	MrState          pgtype.Text        `json:"mr_state"`
+	ID                   uuid.UUID          `json:"id"`
+	UserID               uuid.UUID          `json:"user_id"`
+	RepoID               uuid.UUID          `json:"repo_id"`
+	IssueIid             int64              `json:"issue_iid"`
+	IssueTitle           string             `json:"issue_title"`
+	IssueDescription     string             `json:"issue_description"`
+	Status               string             `json:"status"`
+	RequeueCount         int32              `json:"requeue_count"`
+	WorkerID             pgtype.UUID        `json:"worker_id"`
+	SessionID            pgtype.Text        `json:"session_id"`
+	LastSeq              int32              `json:"last_seq"`
+	Branch               pgtype.Text        `json:"branch"`
+	MrIid                pgtype.Int8        `json:"mr_iid"`
+	FailureReason        pgtype.Text        `json:"failure_reason"`
+	PlanMd               pgtype.Text        `json:"plan_md"`
+	IterationCount       int32              `json:"iteration_count"`
+	ClaimedAt            pgtype.Timestamptz `json:"claimed_at"`
+	StartedAt            pgtype.Timestamptz `json:"started_at"`
+	FinishedAt           pgtype.Timestamptz `json:"finished_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	OriginColumn         pgtype.Text        `json:"origin_column"`
+	BoardColumn          pgtype.Text        `json:"board_column"`
+	MovePendingSince     pgtype.Timestamptz `json:"move_pending_since"`
+	MrState              pgtype.Text        `json:"mr_state"`
+	AutoApprove          bool               `json:"auto_approve"`
+	AutopilotCommentedAt pgtype.Timestamptz `json:"autopilot_commented_at"`
 }
 
 type RunMessage struct {
@@ -136,16 +153,17 @@ type Skill struct {
 }
 
 type User struct {
-	ID           uuid.UUID          `json:"id"`
-	Email        string             `json:"email"`
-	PasswordHash string             `json:"password_hash"`
-	DisplayName  pgtype.Text        `json:"display_name"`
-	IsAdmin      bool               `json:"is_admin"`
-	IsActive     bool               `json:"is_active"`
-	TokenVersion int32              `json:"token_version"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	LastLogin    pgtype.Timestamptz `json:"last_login"`
-	DefaultModel pgtype.Text        `json:"default_model"`
+	ID               uuid.UUID          `json:"id"`
+	Email            string             `json:"email"`
+	PasswordHash     string             `json:"password_hash"`
+	DisplayName      pgtype.Text        `json:"display_name"`
+	IsAdmin          bool               `json:"is_admin"`
+	IsActive         bool               `json:"is_active"`
+	TokenVersion     int32              `json:"token_version"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	LastLogin        pgtype.Timestamptz `json:"last_login"`
+	DefaultModel     pgtype.Text        `json:"default_model"`
+	AutopilotEnabled bool               `json:"autopilot_enabled"`
 }
 
 type UserSecret struct {

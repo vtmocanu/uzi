@@ -256,6 +256,13 @@ function SidebarContent({
         {user?.is_admin && (
           <NavGroup label="Admin" collapsed={collapsed}>
             <NavItem to="/admin/users" icon={<UsersIcon />} label="Users" onNavigate={onNavigate} collapsed={collapsed} />
+            <NavItem
+              to="/admin/settings"
+              icon={<GearIcon />}
+              label="Instance settings"
+              onNavigate={onNavigate}
+              collapsed={collapsed}
+            />
           </NavGroup>
         )}
 

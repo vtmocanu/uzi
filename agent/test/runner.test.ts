@@ -11,7 +11,7 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
-import { StubExecutor, PlanRejectedError, type Executor } from "../src/executor.js";
+import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, type Executor } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { GitLabClient, type FetchFn } from "../src/gitlab.js";
@@ -282,6 +282,51 @@ describe("RunRunner — plan gate + steering end to end", () => {
     assert.strictEqual(calls.length, 1, "one MR opened after approval");
     // The plan reached the run stream exactly once.
     assert.strictEqual(api.messages(claim.run_id).filter((m) => m.kind === "plan").length, 1);
+  });
+
+  it("auto-approves the plan gate for an autopilot claim: never awaiting_approval, plan still recorded", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(26, { auto_approve: true });
+    // No inputs are set: an autopilot run must resolve the gate itself. If it
+    // parked at awaiting_approval it would hang until the (disabled) timeout.
+    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.ok(!statuses.includes("awaiting_approval"), "autopilot run never enters awaiting_approval");
+    assert.strictEqual(statuses.at(-1), "completed", "autopilot run runs to completion");
+    // The plan is still recorded as an audit message even though no human saw it.
+    assert.strictEqual(api.messages(claim.run_id).filter((m) => m.kind === "plan").length, 1);
+    const completed = api.states.find((s) => s.body.status === "completed")!.body;
+    assert.strictEqual(completed.mr_iid, 42);
+    assert.strictEqual(calls.length, 1, "one MR opened after auto-approval");
+  });
+
+  it("throws on the UZI_STUB_FAIL sentinel after the gate (drives the E2E failure path)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(28, {
+      auto_approve: true,
+      issue_description: `implement prds/x.md then ${STUB_FAIL_SENTINEL}`,
+    });
+    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.ok(!statuses.includes("awaiting_approval"), "auto-approved before it fails");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failed, "sentinel run should fail");
+    assert.match(failed!.body.failure_reason ?? "", /UZI_STUB_FAIL/);
+    assert.strictEqual(calls.length, 0, "no MR when the run fails");
+    // The plan is recorded before the failure (the throw is AFTER the gate).
+    assert.strictEqual(api.messages(claim.run_id).filter((m) => m.kind === "plan").length, 1);
+  });
+
+  it("still halts a NON-autopilot claim at the gate (auto_approve absent)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(27); // no auto_approve
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.deepStrictEqual(statuses, ["running", "awaiting_approval", "running", "completed"]);
   });
 
   it("stub executor with planGate fails verbatim when the plan is rejected", async () => {
