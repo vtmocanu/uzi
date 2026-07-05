@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -28,6 +30,12 @@ type connectionDTO struct {
 	BotForgeUserID int64      `json:"bot_forge_user_id"`
 	CreatedAt      time.Time  `json:"created_at"`
 	LastVerifiedAt *time.Time `json:"last_verified_at"`
+	// Privilege surfacing (PRD #5). A null status means never checked (the boot
+	// sweep back-fills it); the report carries the token + per-repo findings the
+	// UI expands and badges. checked_at is when the report was stamped.
+	PrivilegeStatus    *string           `json:"privilege_status"`
+	PrivilegeCheckedAt *time.Time        `json:"privilege_checked_at"`
+	PrivilegeReport    *privcheck.Report `json:"privilege_report"`
 }
 
 func connToDTO(c store.ForgeConnection) connectionDTO {
@@ -42,6 +50,20 @@ func connToDTO(c store.ForgeConnection) connectionDTO {
 	if c.LastVerifiedAt.Valid {
 		t := c.LastVerifiedAt.Time
 		dto.LastVerifiedAt = &t
+	}
+	if c.PrivilegeStatus.Valid {
+		s := c.PrivilegeStatus.String
+		dto.PrivilegeStatus = &s
+	}
+	if c.PrivilegeCheckedAt.Valid {
+		t := c.PrivilegeCheckedAt.Time
+		dto.PrivilegeCheckedAt = &t
+	}
+	if len(c.PrivilegeReport) > 0 {
+		var rep privcheck.Report
+		if err := json.Unmarshal(c.PrivilegeReport, &rep); err == nil {
+			dto.PrivilegeReport = &rep
+		}
 	}
 	return dto
 }
