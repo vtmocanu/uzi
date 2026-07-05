@@ -2,13 +2,55 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
+/* Semantic design tokens (multica-style: packages/ui/styles/tokens.css keeps
+   every color behind CSS variables; we do the same, with color channels as
+   space-separated RGB so Tailwind opacity modifiers work). Components carry
+   STRUCTURE only; all look-and-feel lives here, so an alternative redesign can
+   ship as a second `[data-theme="…"]` block overriding these variables over
+   the same component tree. This default theme is "ember": uzi is deliberately
+   dark-only — a dark factory — with molten-metal orange against near-black
+   steel. */
+:root,
+[data-theme="ember"] {
   color-scheme: dark;
+
+  /* Palette */
+  --bg: 8 10 15;
+  --surface: 15 18 26;
+  --raised: 23 27 38;
+  --edge: 39 45 60;
+  --edge-strong: 58 66 86;
+  --fg: 228 232 240;
+  --muted: 148 158 176;
+  --faint: 100 110 130;
+  --brand: 251 146 60;
+  --brand-hover: 253 186 116;
+  --on-brand: 26 16 8;
+
+  /* Status colors */
+  --ok: 52 211 153;
+  --warn: 251 191 36;
+  --danger: 251 113 133;
+  --info: 56 189 248;
+
+  /* Radii: one base value, everything derived (multica's --radius scheme). */
+  --radius: 0.625rem;
+
+  /* Typography */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 body {
-  @apply bg-ink text-slate-100 antialiased;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  @apply bg-ink text-fg antialiased;
+  font-family: var(--font-sans);
+}
+
+/* Thin, unobtrusive scrollbars for the activity feed / board overflow areas
+   (multica styles these via --scrollbar-* tokens; same intent). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--edge)) transparent;
 }
 
 /* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules

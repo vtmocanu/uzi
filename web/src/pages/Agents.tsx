@@ -3,7 +3,8 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type AgentTemplate } from "../lib/api";
 import { summarizeTools } from "../lib/agentTemplates";
-import { Alert, Button, Card } from "../components/ui";
+import { Alert, Badge, Button, Card, ListSkeleton, PageHeader } from "../components/ui";
+import { PlusIcon } from "../components/icons";
 
 export function Agents() {
   const { user } = useAuth();
@@ -28,82 +29,73 @@ export function Agents() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold">Agents</h1>
-          <p className="mt-1 text-slate-400">
-            Agent templates render to Claude Code subagent files. Everyone can view
-            them{user?.is_admin ? "; admins can edit, reset, and add new ones." : "."}
-          </p>
-        </div>
-        {user?.is_admin && (
-          <Link to="/agents/new">
-            <Button>New template</Button>
-          </Link>
-        )}
-      </div>
+      <PageHeader
+        title="Agents"
+        description={`Agent templates render to Claude Code subagent files. Everyone can view them${user?.is_admin ? "; admins can edit, reset, and add new ones." : "."}`}
+        actions={
+          user?.is_admin ? (
+            <Link to="/agents/new">
+              <Button size="sm">
+                <PlusIcon /> New template
+              </Button>
+            </Link>
+          ) : undefined
+        }
+      />
 
       {error && <Alert message={error} />}
 
-      <Card className="p-0">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <thead className="border-b border-slate-800 text-slate-400">
-              <tr>
-                <th className="px-4 py-3 font-medium">Name</th>
-                <th className="px-4 py-3 font-medium">Description</th>
-                <th className="px-4 py-3 font-medium">Model</th>
-                <th className="px-4 py-3 font-medium">Tools</th>
-                <th className="px-4 py-3 font-medium">Kind</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800">
-              {loading ? (
+      {loading ? (
+        <ListSkeleton rows={6} />
+      ) : (
+        <Card className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-edge text-muted">
                 <tr>
-                  <td colSpan={5} className="px-4 py-6 text-center text-slate-500">
-                    Loading…
-                  </td>
+                  <th className="px-4 py-3 font-medium">Name</th>
+                  <th className="px-4 py-3 font-medium">Description</th>
+                  <th className="px-4 py-3 font-medium">Model</th>
+                  <th className="px-4 py-3 font-medium">Tools</th>
+                  <th className="px-4 py-3 font-medium">Kind</th>
                 </tr>
-              ) : templates.length === 0 ? (
-                <tr>
-                  <td colSpan={5} className="px-4 py-6 text-center text-slate-500">
-                    No templates.
-                  </td>
-                </tr>
-              ) : (
-                templates.map((t) => (
-                  <tr key={t.id} className="hover:bg-slate-900/40">
-                    <td className="px-4 py-3">
-                      <Link
-                        to={`/agents/${t.id}`}
-                        className="font-mono text-indigo-300 hover:text-indigo-200"
-                      >
-                        {t.name}
-                      </Link>
-                    </td>
-                    <td className="px-4 py-3 text-slate-300">{t.description}</td>
-                    <td className="px-4 py-3 text-slate-400">{t.model ?? "inherit"}</td>
-                    <td className="max-w-xs truncate px-4 py-3 text-slate-400">
-                      {summarizeTools(t)}
-                    </td>
-                    <td className="px-4 py-3">
-                      {t.is_builtin ? (
-                        <span className="rounded bg-indigo-950 px-2 py-0.5 text-xs text-indigo-300">
-                          builtin
-                        </span>
-                      ) : (
-                        <span className="rounded bg-slate-800 px-2 py-0.5 text-xs text-slate-400">
-                          custom
-                        </span>
-                      )}
+              </thead>
+              <tbody className="divide-y divide-edge">
+                {templates.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-6 text-center text-faint">
+                      No templates.
                     </td>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+                ) : (
+                  templates.map((t) => (
+                    <tr key={t.id} className="transition-colors hover:bg-raised/30">
+                      <td className="px-4 py-3">
+                        <Link
+                          to={`/agents/${t.id}`}
+                          className="font-mono text-brand hover:text-brand-hover"
+                        >
+                          {t.name}
+                        </Link>
+                      </td>
+                      <td className="max-w-md px-4 py-3 text-muted">{t.description}</td>
+                      <td className="px-4 py-3 text-muted">{t.model ?? "inherit"}</td>
+                      <td className="max-w-xs truncate px-4 py-3 font-mono text-xs text-muted">
+                        {summarizeTools(t)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <Badge tone={t.is_builtin ? "brand" : "neutral"}>
+                          {t.is_builtin ? "builtin" : "custom"}
+                        </Badge>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
     </div>
   );
 }

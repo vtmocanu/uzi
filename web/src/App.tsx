@@ -1,5 +1,5 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Layout } from "./components/Layout";
+import { AppShell } from "./components/AppShell";
 import { AdminRoute, ProtectedRoute } from "./components/RouteGuards";
 import { Landing } from "./pages/Landing";
 import { Login } from "./pages/Login";
@@ -22,7 +22,7 @@ import { DocPage } from "./pages/DocPage";
 
 export default function App() {
   return (
-    <Layout>
+    <AppShell>
       <Routes>
         <Route path="/" element={<Landing />} />
         <Route path="/login" element={<Login />} />
@@ -136,6 +136,6 @@ export default function App() {
         />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-    </Layout>
+    </AppShell>
   );
 }

@@ -1,6 +1,7 @@
 import { memo, useEffect, useState } from "react";
 import type { RunMessage } from "../lib/api";
 import { Markdown } from "./Markdown";
+import { FileTextIcon, TerminalIcon, ThoughtIcon } from "./icons";
 
 // Terse, per-kind rendering of a run's event stream — one readable line per
 // event instead of a JSON dump. Kinds come from agent/src/sdk-messages.ts (the
@@ -208,7 +209,7 @@ function Expander({
       type="button"
       aria-expanded={open}
       onClick={onToggle}
-      className="text-[11px] font-medium text-slate-500 hover:text-slate-300"
+      className="text-[11px] font-medium text-faint hover:text-muted"
     >
       {label}
     </button>
@@ -229,11 +230,11 @@ function ToolResultBody({ result }: { result: RunMessage }) {
   const [open, setOpen] = useState(isError || !large);
 
   const mark = isError ? "✗" : "✓";
-  const markClass = isError ? "text-rose-400" : "text-emerald-400";
+  const markClass = isError ? "text-danger" : "text-ok";
   const body = text || (hadNonText ? "" : "(no output)");
 
   return (
-    <div className={`mt-1 rounded-md border px-2 py-1 ${isError ? "border-rose-900/70 bg-rose-950/30" : "border-slate-800 bg-slate-900/50"}`}>
+    <div className={`mt-1 rounded-md border px-2 py-1 ${isError ? "border-danger/40 bg-danger/10" : "border-edge bg-raised/50"}`}>
       <div className="flex items-center gap-2">
         <span className={`text-xs font-semibold ${markClass}`}>
           <span aria-hidden="true">{mark}</span>{" "}
@@ -248,11 +249,11 @@ function ToolResultBody({ result }: { result: RunMessage }) {
         )}
       </div>
       {open && body !== "" && (
-        <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words text-xs text-slate-300">
+        <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-muted">
           {body}
         </pre>
       )}
-      {hadNonText && <div className="mt-1 text-[11px] italic text-slate-500">non-text result (e.g. image) omitted</div>}
+      {hadNonText && <div className="mt-1 text-[11px] italic text-faint">non-text result (e.g. image) omitted</div>}
     </div>
   );
 }
@@ -264,10 +265,10 @@ function RunningIndicator({ start }: { start: string }) {
     return () => clearInterval(id);
   }, []);
   return (
-    <span className="inline-flex items-center gap-1.5 text-xs text-amber-300">
+    <span className="inline-flex items-center gap-1.5 text-xs text-warn">
       <span
         aria-hidden="true"
-        className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-amber-800 border-t-amber-300"
+        className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-warn/30 border-t-warn"
       />
       running… {formatDuration(elapsedMs(start, now))}
     </span>
@@ -284,11 +285,14 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
   return (
     <div className="text-sm">
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <span className="shrink-0 font-medium text-slate-200">
-          <span aria-hidden="true">⚙</span> {name}
+        <span className="inline-flex shrink-0 items-baseline gap-1.5 font-medium text-fg">
+          <span aria-hidden="true" className="self-center text-faint">
+            <TerminalIcon />
+          </span>
+          {name}
         </span>
         {full && (
-          <span className="min-w-0 break-words font-mono text-xs text-slate-400">
+          <span className="min-w-0 break-words font-mono text-xs text-muted">
             {open ? full : truncate(full)}
           </span>
         )}
@@ -297,13 +301,13 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
         )}
         <span className="ml-auto shrink-0">
           {result ? (
-            <span className="text-xs text-slate-500">
+            <span className="text-xs tabular-nums text-faint">
               {formatDuration(new Date(result.created_at).getTime() - new Date(msg.created_at).getTime())}
             </span>
           ) : live ? (
             <RunningIndicator start={msg.created_at} />
           ) : (
-            <span className="text-xs italic text-slate-600">no result</span>
+            <span className="text-xs italic text-faint">no result</span>
           )}
         </span>
       </div>
@@ -315,13 +319,18 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
 function ThinkingRow({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="text-sm text-slate-500">
+    <div className="text-sm text-faint">
       <div className="flex items-baseline gap-2">
-        <span className="italic">💭 thinking… {truncate(firstLine(text), 100)}</span>
+        <span className="inline-flex items-baseline gap-1.5 italic">
+          <span aria-hidden="true" className="self-center">
+            <ThoughtIcon />
+          </span>
+          thinking… {truncate(firstLine(text), 100)}
+        </span>
         <Expander open={open} onToggle={() => setOpen((o) => !o)} label={open ? "hide" : "show"} />
       </div>
       {open && (
-        <pre className="mt-1 whitespace-pre-wrap break-words text-xs italic text-slate-500">{text}</pre>
+        <pre className="mt-1 whitespace-pre-wrap break-words text-xs italic text-faint">{text}</pre>
       )}
     </div>
   );
@@ -331,7 +340,7 @@ function StandaloneResult({ result }: { result: RunMessage }) {
   const id = asString(asRecord(result.payload)?.["tool_use_id"]);
   return (
     <div className="text-sm">
-      <div className="text-xs text-slate-500">
+      <div className="text-xs text-faint">
         result{id ? ` for ${truncate(id, 24)}` : ""}
       </div>
       <ToolResultBody result={result} />
@@ -365,21 +374,28 @@ export const RunEventRow = memo(function RunEventRow({
       // Only reached for orphan results; folded ones are skipped by the parent.
       return <StandaloneResult result={msg} />;
     case "status":
-      return <div className="text-xs italic text-slate-500">{describeStatus(msg.payload)}</div>;
+      return <div className="text-xs italic text-faint">{describeStatus(msg.payload)}</div>;
     case "error":
       return (
-        <div className="rounded-md border border-rose-900/70 bg-rose-950/40 px-2 py-1 text-sm text-rose-200">
+        <div className="rounded-md border border-danger/40 bg-danger/10 px-2 py-1 text-sm text-danger">
           <span aria-hidden="true">✗</span> {describeError(msg.payload)}
         </div>
       );
     case "plan":
-      return <div className="text-xs italic text-slate-500">📋 plan submitted (awaiting approval)</div>;
+      return (
+        <div className="inline-flex items-center gap-1.5 rounded-md border border-warn/40 bg-warn/10 px-2 py-1 text-xs text-warn">
+          <span aria-hidden="true">
+            <FileTextIcon />
+          </span>
+          plan submitted (awaiting approval)
+        </div>
+      );
     default: {
       const extract = asString(rec?.["text"]) ?? asString(rec?.["message"]) ?? "";
       return (
-        <div className="text-xs text-slate-500">
+        <div className="text-xs text-faint">
           <span className="italic">unrenderable {msg.kind} event</span>
-          {extract && <span className="ml-1 text-slate-400">— {truncate(extract)}</span>}
+          {extract && <span className="ml-1 text-muted">— {truncate(extract)}</span>}
         </div>
       );
     }

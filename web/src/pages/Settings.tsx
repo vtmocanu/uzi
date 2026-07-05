@@ -1,12 +1,18 @@
+// Settings → Account & token: the account card (moved here from the old
+// dashboard) plus the Anthropic token lifecycle. Lives inside SettingsShell so
+// token/forge/workers are one discoverable area.
+
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type SecretMeta } from "../lib/api";
-import { Alert, Button, Card, Field, Input } from "../components/ui";
+import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "../components/ui";
+import { SettingsShell } from "../components/SettingsShell";
 
 const DOC_URL =
   "https://gitlab.example.com/vtmocanu/uzi/-/blob/main/docs/anthropic-token.md";
 
 export function Settings() {
+  const { user } = useAuth();
   const [meta, setMeta] = useState<SecretMeta | null>(null);
   const [loading, setLoading] = useState(true);
   const [token, setToken] = useState("");
@@ -62,38 +68,22 @@ export function Settings() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-end justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Settings</h1>
-          <p className="mt-1 text-slate-400">Your personal uzi configuration.</p>
-        </div>
-        <Link to="/settings/workers" className="text-sm text-indigo-400 hover:text-indigo-300">
-          Workers
-        </Link>
-      </div>
-
+    <SettingsShell description="Your personal uzi configuration.">
       {error && <Alert message={error} />}
-      {notice && (
-        <div className="rounded-lg border border-emerald-800 bg-emerald-950/60 px-3 py-2 text-sm text-emerald-200">
-          {notice}
-        </div>
-      )}
+      {notice && <Alert tone="success" message={notice} />}
 
       <Card className="space-y-5">
         <div>
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
-            Anthropic token
-          </h2>
-          <p className="mt-2 text-sm text-slate-400">
+          <SectionTitle>Anthropic token</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
             uzi runs your agents with your own Anthropic credentials. Paste an OAuth token from{" "}
-            <code className="rounded bg-slate-800 px-1 py-0.5 text-slate-200">claude setup-token</code>{" "}
-            or a Console API key. It is stored encrypted and validated on the first agent run.{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">claude setup-token</code> or a
+            Console API key. It is stored encrypted and validated on the first agent run.{" "}
             <a
               href={DOC_URL}
               target="_blank"
               rel="noreferrer"
-              className="text-indigo-400 hover:text-indigo-300"
+              className="text-brand hover:text-brand-hover"
             >
               How to obtain a token
             </a>
@@ -101,21 +91,21 @@ export function Settings() {
           </p>
         </div>
 
-        <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm">
+        <div className="flex items-center justify-between rounded-lg border border-edge bg-raised/60 px-4 py-3 text-sm">
           {loading ? (
-            <span className="text-slate-500">Loading…</span>
+            <Skeleton className="h-5 w-40" />
           ) : meta ? (
-            <div>
-              <span className="font-medium text-emerald-400">Set</span>
-              <span className="ml-2 text-slate-500">
-                updated {new Date(meta.updated_at).toLocaleString()}
-              </span>
+            <div className="flex items-center gap-2">
+              <Badge tone="ok" dot>
+                Set
+              </Badge>
+              <span className="text-faint">updated {new Date(meta.updated_at).toLocaleString()}</span>
             </div>
           ) : (
-            <span className="text-slate-400">Not set</span>
+            <Badge tone="neutral">Not set</Badge>
           )}
           {meta && !loading && (
-            <Button variant="danger" disabled={busy} onClick={remove}>
+            <Button variant="danger" size="sm" disabled={busy} onClick={remove}>
               Delete
             </Button>
           )}
@@ -136,6 +126,29 @@ export function Settings() {
           </Button>
         </form>
       </Card>
-    </div>
+
+      {user && (
+        <Card>
+          <SectionTitle>Your account</SectionTitle>
+          <dl className="mt-3 divide-y divide-edge">
+            {(
+              [
+                ["Email", user.email],
+                ["Display name", user.display_name ?? "—"],
+                ["Role", user.is_admin ? "Administrator" : "User"],
+                ["Account status", user.is_active ? "Active" : "Deactivated"],
+                ["Joined", new Date(user.created_at).toLocaleString()],
+                ["Last login", user.last_login ? new Date(user.last_login).toLocaleString() : "—"],
+              ] as [string, string][]
+            ).map(([k, v]) => (
+              <div key={k} className="flex justify-between py-2 text-sm">
+                <dt className="text-muted">{k}</dt>
+                <dd className="text-fg">{v}</dd>
+              </div>
+            ))}
+          </dl>
+        </Card>
+      )}
+    </SettingsShell>
   );
 }
