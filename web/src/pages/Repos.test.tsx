@@ -26,6 +26,7 @@ const CONN: ForgeConnection = {
   base_url: "https://gitlab.example.com",
   bot_username: "uzi-bot",
   bot_forge_user_id: 1,
+  human_username: null,
   created_at: "2026-01-01T00:00:00Z",
   last_verified_at: "2026-07-05T12:00:00Z",
   privilege_status: null,

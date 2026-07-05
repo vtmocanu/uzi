@@ -28,6 +28,10 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // Repo opt-in flag.
   assert.equal(claim.repo.skills_enabled, true);
 
+  // PRD #19's autopilot flag rides the same claim shape (post-landing merge): the
+  // worker must still parse the skills fields alongside it.
+  assert.equal(claim.auto_approve, true);
+
   // Config caps ride the claim (no worker-side hardcoded drift).
   assert.equal(claim.config?.skill_max_bytes, 65536);
   assert.equal(claim.config?.skills_max_per_run, 32);

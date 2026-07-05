@@ -34,6 +34,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 		IterationCount:   1,
 		RequeueCount:     0,
 		PlanMd:           strptr("# Plan\n"),
+		AutoApprove:      true, // PRD #19 autopilot; part of the same claim shape
 		Repo: ClaimRepo{
 			ID:            "22222222-2222-2222-2222-222222222222",
 			URL:           "https://gitlab.example.com/g/p",

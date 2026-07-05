@@ -30,6 +30,7 @@ const ADMIN: User = {
   display_name: "Admin",
   is_admin: true,
   is_active: true,
+  autopilot_enabled: false,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -57,6 +58,8 @@ function setAuth(u: User) {
   mockUseAuth.mockReturnValue({
     user: u,
     loading: false,
+    prdLabel: "PRD",
+    autopilotLabel: "autopilot",
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
