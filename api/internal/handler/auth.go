@@ -50,20 +50,70 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+// emailDomain returns the lowercased domain of a parsed addr-spec
+// (mail.Address.Address), taken as the substring after its final '@'. It must be
+// given the addr-spec, never the raw input: a quoted local part may itself
+// contain '@' (e.g. `"a@b"@x.com`), and a final-'@' split of the addr-spec still
+// yields the true domain, whereas the raw display-name/comment forms would not.
+func emailDomain(addrSpec string) string {
+	at := strings.LastIndex(addrSpec, "@")
+	if at < 0 {
+		return ""
+	}
+	return strings.ToLower(addrSpec[at+1:])
+}
+
+// emailDomainAllowed reports whether addrSpec's domain is permitted by the
+// allowlist. An empty allowlist permits every domain (preserving the open
+// default). Matching is exact and case-insensitive — no subdomain wildcards, so
+// a.example.com does not match example.com. The allowlist is already
+// lowercased by config parsing.
+func emailDomainAllowed(addrSpec string, allowed []string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	d := emailDomain(addrSpec)
+	for _, a := range allowed {
+		if d == a {
+			return true
+		}
+	}
+	return false
+}
+
 // Register creates a new account. The first account ever created becomes an
 // admin; the check-and-insert runs inside a transaction holding
 // pg_advisory_xact_lock so two concurrent first-registrations cannot both win
 // admin. On success the user is logged in (cookies set).
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
+	// Registration kill-switch: a well-formed request the policy forbids, so 403
+	// (not 400). Checked first, before the body is even inspected. Login is
+	// unaffected; the seed admin is created out-of-band (seedAdmin in main.go).
+	if !h.cfg.RegistrationEnabled {
+		httpx.Error(w, http.StatusForbidden, "registration is disabled")
+		return
+	}
+
 	var req registerRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	email := strings.TrimSpace(strings.ToLower(req.Email))
-	if _, err := mail.ParseAddress(email); err != nil {
+	addr, err := mail.ParseAddress(strings.TrimSpace(strings.ToLower(req.Email)))
+	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "a valid email is required")
+		return
+	}
+	// Canonicalize to the parsed addr-spec: mail.ParseAddress also accepts
+	// display-name/comment forms (e.g. "Alice <alice@x.com>") whose raw string
+	// carries junk; addr.Address is just the address, which is also what we match
+	// the domain allowlist against.
+	email := addr.Address
+	if !emailDomainAllowed(email, h.cfg.AllowedEmailDomains) {
+		// Domain-list disclosure is acceptable for an internal tool (the register
+		// page shows the same hint), and specific beats a generic denial.
+		httpx.Error(w, http.StatusForbidden, "registration is restricted to: "+strings.Join(h.cfg.AllowedEmailDomains, ", "))
 		return
 	}
 	if len(req.Password) < minPasswordLen {
@@ -234,6 +284,24 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		"prd_label":       prdLabel,
 		"autopilot_label": autopilotLabel,
 	}
+}
+
+// AuthConfig returns the operator-set registration policy the register page
+// needs to hide itself or hint the allowed domains before submit. It is uzi's
+// first unauthenticated JSON surface besides /health, so it is a security
+// boundary: it must expose ONLY operator-set, user-visible policy — never user
+// data, secrets, or anything derived from a request — and it sits outside
+// RequireAuth, behind the auth rate limiter like register/login.
+func (h *Handler) AuthConfig(w http.ResponseWriter, r *http.Request) {
+	// Always emit a JSON array (never null) so the SPA can index it directly.
+	domains := h.cfg.AllowedEmailDomains
+	if domains == nil {
+		domains = []string{}
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"registration_enabled":  h.cfg.RegistrationEnabled,
+		"allowed_email_domains": domains,
+	})
 }
 
 // issueSession mints a JWT at the user's current token_version and sets the

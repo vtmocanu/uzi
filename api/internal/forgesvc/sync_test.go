@@ -84,6 +84,15 @@ func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge
 func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
 	return forge.IssueNote{}, nil
 }
+func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
+	return forge.TokenInfo{}, nil
+}
+func (f *fakeForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
+	return 0, false, nil
+}
+func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
+	return forge.BranchProtection{}, nil
+}
 
 // fakeStore records what the sync writes, standing in for *store.Queries. The
 // MR-close watcher fields (candidates/issue/columns/mrStateWrites) are exercised

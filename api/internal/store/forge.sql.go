@@ -70,7 +70,7 @@ func (q *Queries) DeleteIssuesNotIn(ctx context.Context, arg DeleteIssuesNotInPa
 }
 
 const getForgeConnectionForUser = `-- name: GetForgeConnectionForUser :one
-SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username FROM forge_connections WHERE id = $1 AND user_id = $2
+SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections WHERE id = $1 AND user_id = $2
 `
 
 type GetForgeConnectionForUserParams struct {
@@ -91,6 +91,9 @@ func (q *Queries) GetForgeConnectionForUser(ctx context.Context, arg GetForgeCon
 		&i.TokenCiphertext,
 		&i.CreatedAt,
 		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
 		&i.HumanUsername,
 	)
 	return i, err
@@ -248,6 +251,46 @@ func (q *Queries) InsertBoardColumn(ctx context.Context, arg InsertBoardColumnPa
 	return err
 }
 
+const listAllForgeConnections = `-- name: ListAllForgeConnections :many
+SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections ORDER BY created_at ASC
+`
+
+// Every connection across all users, for the privilege-check sweep (single-API,
+// no leader election — same assumption as the poller/sweeper).
+func (q *Queries) ListAllForgeConnections(ctx context.Context) ([]ForgeConnection, error) {
+	rows, err := q.db.Query(ctx, listAllForgeConnections)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ForgeConnection{}
+	for rows.Next() {
+		var i ForgeConnection
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.ForgeType,
+			&i.BaseUrl,
+			&i.BotUsername,
+			&i.BotForgeUserID,
+			&i.TokenCiphertext,
+			&i.CreatedAt,
+			&i.LastVerifiedAt,
+			&i.PrivilegeReport,
+			&i.PrivilegeCheckedAt,
+			&i.PrivilegeStatus,
+			&i.HumanUsername,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listBoardColumns = `-- name: ListBoardColumns :many
 
 SELECT id, repo_id, label_name, position FROM board_columns WHERE repo_id = $1 ORDER BY position ASC
@@ -268,6 +311,42 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 			&i.RepoID,
 			&i.LabelName,
 			&i.Position,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled FROM repos WHERE connection_id = $1 AND enabled = true
+ORDER BY path_with_namespace ASC
+`
+
+// Enabled repos for one connection (privilege sweep + on-demand check). Caller
+// has already authorized access to the connection, so this is keyed by
+// connection id alone.
+func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID uuid.UUID) ([]Repo, error) {
+	rows, err := q.db.Query(ctx, listEnabledReposByConnection, connectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Repo{}
+	for rows.Next() {
+		var i Repo
+		if err := rows.Scan(
+			&i.ID,
+			&i.ConnectionID,
+			&i.ForgeProjectID,
+			&i.PathWithNamespace,
+			&i.WebUrl,
+			&i.DefaultBranch,
+			&i.Enabled,
 		); err != nil {
 			return nil, err
 		}
@@ -373,7 +452,7 @@ func (q *Queries) ListEnabledReposWithConnections(ctx context.Context) ([]ListEn
 }
 
 const listForgeConnectionsByUser = `-- name: ListForgeConnectionsByUser :many
-SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username FROM forge_connections WHERE user_id = $1 ORDER BY created_at ASC
+SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections WHERE user_id = $1 ORDER BY created_at ASC
 `
 
 func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UUID) ([]ForgeConnection, error) {
@@ -395,6 +474,9 @@ func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UU
 			&i.TokenCiphertext,
 			&i.CreatedAt,
 			&i.LastVerifiedAt,
+			&i.PrivilegeReport,
+			&i.PrivilegeCheckedAt,
+			&i.PrivilegeStatus,
 			&i.HumanUsername,
 		); err != nil {
 			return nil, err
@@ -627,7 +709,7 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 const setForgeConnectionHumanUsername = `-- name: SetForgeConnectionHumanUsername :one
 UPDATE forge_connections SET human_username = $3
 WHERE id = $1 AND user_id = $2
-RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username
 `
 
 type SetForgeConnectionHumanUsernameParams struct {
@@ -653,6 +735,9 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 		&i.TokenCiphertext,
 		&i.CreatedAt,
 		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
 		&i.HumanUsername,
 	)
 	return i, err
@@ -708,7 +793,7 @@ func (q *Queries) ShiftBoardColumnsFrom(ctx context.Context, arg ShiftBoardColum
 
 const touchForgeConnectionVerified = `-- name: TouchForgeConnectionVerified :one
 UPDATE forge_connections SET last_verified_at = now() WHERE id = $1 AND user_id = $2
-RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username
 `
 
 type TouchForgeConnectionVerifiedParams struct {
@@ -729,9 +814,42 @@ func (q *Queries) TouchForgeConnectionVerified(ctx context.Context, arg TouchFor
 		&i.TokenCiphertext,
 		&i.CreatedAt,
 		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
 		&i.HumanUsername,
 	)
 	return i, err
+}
+
+const updatePrivilegeReport = `-- name: UpdatePrivilegeReport :execrows
+UPDATE forge_connections
+SET privilege_report     = $2,
+    privilege_checked_at = $3,
+    privilege_status     = $4
+WHERE id = $1
+`
+
+type UpdatePrivilegeReportParams struct {
+	ID                 uuid.UUID          `json:"id"`
+	PrivilegeReport    []byte             `json:"privilege_report"`
+	PrivilegeCheckedAt pgtype.Timestamptz `json:"privilege_checked_at"`
+	PrivilegeStatus    pgtype.Text        `json:"privilege_status"`
+}
+
+// Stamp a connection's privilege report + denormalized status. :execrows so a
+// connection deleted mid-sweep is a tolerated 0-row write, not an error.
+func (q *Queries) UpdatePrivilegeReport(ctx context.Context, arg UpdatePrivilegeReportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updatePrivilegeReport,
+		arg.ID,
+		arg.PrivilegeReport,
+		arg.PrivilegeCheckedAt,
+		arg.PrivilegeStatus,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const upsertForgeConnection = `-- name: UpsertForgeConnection :one
@@ -744,7 +862,7 @@ SET bot_username      = EXCLUDED.bot_username,
     bot_forge_user_id = EXCLUDED.bot_forge_user_id,
     token_ciphertext  = EXCLUDED.token_ciphertext,
     last_verified_at  = now()
-RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username
 `
 
 type UpsertForgeConnectionParams struct {
@@ -780,6 +898,9 @@ func (q *Queries) UpsertForgeConnection(ctx context.Context, arg UpsertForgeConn
 		&i.TokenCiphertext,
 		&i.CreatedAt,
 		&i.LastVerifiedAt,
+		&i.PrivilegeReport,
+		&i.PrivilegeCheckedAt,
+		&i.PrivilegeStatus,
 		&i.HumanUsername,
 	)
 	return i, err

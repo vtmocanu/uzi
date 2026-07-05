@@ -329,7 +329,8 @@ const server = https.createServer(
     }
 
     // --- GitLab v4 subset -----------------------------------------------------
-    // Token verify (api seed + connect): CurrentUser.
+    // Token verify (api seed + connect): CurrentUser. is_admin is omitted (a
+    // compliant, non-admin bot) — GitLab only returns it for an admin caller.
     if (method === "GET" && path === "/api/v4/user") {
       return send(res, 200, { id: 1, username: "uzi-bot", name: "uzi bot" });
     }
@@ -340,6 +341,15 @@ const server = https.createServer(
     // hard reject), which is exactly the verified-or-warned path under test.
     if (method === "GET" && path === "/api/v4/users") {
       return send(res, 200, []);
+    }
+
+    // Token introspection (PRD #5 privilege check). Over-privileged iff the PAT
+    // itself signals it (contains "overpriv"), so the harness can drive both the
+    // compliant seed PAT and a rejected over-privileged one against one fake.
+    if (method === "GET" && path === "/api/v4/personal_access_tokens/self") {
+      const tok = req.headers["private-token"] || "";
+      const scopes = tok.includes("overpriv") ? ["api", "sudo"] : ["api"];
+      return send(res, 200, { id: 1, name: "uzi-bot", revoked: false, active: true, scopes, expires_at: null });
     }
 
     // Project listing (api seed / repo discovery).
@@ -411,6 +421,23 @@ const server = https.createServer(
         persist();
         log("issue created", iid, JSON.stringify(issue.title));
         return send(res, 201, issue);
+      }
+
+      // Privilege check (PRD #5): effective membership + protected-branch shape.
+      // Compliant fixtures: the bot is a Developer (30) on a protected default
+      // branch whose only push access level is Maintainer (40) — no Developer or
+      // per-user push, so the checker reports least-privilege.
+      const memberAll = rest.match(/^\/members\/all\/(\d+)$/);
+      if (method === "GET" && memberAll) {
+        return send(res, 200, { id: Number(memberAll[1]), username: "uzi-bot", access_level: 30 });
+      }
+      const protBranch = rest.match(/^\/protected_branches\/(.+)$/);
+      if (method === "GET" && protBranch) {
+        return send(res, 200, {
+          id: 1,
+          name: decodeURIComponent(protBranch[1]),
+          push_access_levels: [{ access_level: 40 }],
+        });
       }
 
       // Labels (defensive; not on the harness critical path).

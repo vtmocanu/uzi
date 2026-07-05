@@ -8,10 +8,12 @@ import {
   type AgentTemplate,
   type AgentTemplateInput,
   type AppSettings,
+  type PrivilegeReport,
   type Run,
   type RunInputKind,
   type SecretMeta,
   type User,
+  type UserSettings,
 } from "../lib/api";
 import {
   LIVE_RUN_ID,
@@ -42,6 +44,7 @@ function requireSession(): User {
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
+let userSettings: UserSettings = { default_model: null };
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
@@ -75,6 +78,8 @@ export const mockApi = {
     state.session = { ...mockAdmin, email: email || mockAdmin.email };
     return delay(sessionBody());
   },
+  // Demo mode has registration open and unrestricted.
+  authConfig: async () => delay({ registration_enabled: true, allowed_email_domains: [] }),
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });
@@ -133,6 +138,12 @@ export const mockApi = {
   deleteAnthropicToken: async () => {
     secrets = secrets.filter((s) => s.kind !== "anthropic_token");
     return delay(null);
+  },
+  getMySettings: async () => delay({ settings: { ...userSettings } }),
+  putMySettings: async (defaultModel: string | null) => {
+    const trimmed = defaultModel?.trim() ?? "";
+    userSettings = { default_model: trimmed === "" ? null : trimmed };
+    return delay({ settings: { ...userSettings } });
   },
 
   // ── Agent templates ─────────────────────────────────────────────────────────
@@ -203,6 +214,10 @@ export const mockApi = {
       forge_type: forgeType,
       created_at: new Date().toISOString(),
       last_verified_at: new Date().toISOString(),
+      // A freshly connected bot is unchecked until the first privilege check.
+      privilege_status: null,
+      privilege_checked_at: null,
+      privilege_report: null,
     };
     connections = [conn];
     return delay({ connection: { ...conn } }, 600);
@@ -235,6 +250,30 @@ export const mockApi = {
         ? "Saved, but no forge account with this username was found — double-check it matches your own forge username."
         : undefined;
     return delay({ connection: { ...c }, ...(warning ? { warning } : {}) }, 400);
+  },
+  privilegeCheck: async (id: string) => {
+    const c = connections.find((x) => x.id === id);
+    if (!c) throw new ApiError(404, "connection not found");
+    const now = new Date().toISOString();
+    const report: PrivilegeReport = {
+      checked_at: now,
+      status: "ok",
+      token: { scopes: ["api"], active: true, violations: [], warnings: [] },
+      repos: repos
+        .filter((r) => r.enabled)
+        .map((r) => ({
+          repo_id: r.id,
+          path: r.path_with_namespace,
+          role: 30,
+          member: true,
+          violations: [],
+          warnings: [],
+        })),
+    };
+    c.privilege_status = "ok";
+    c.privilege_checked_at = now;
+    c.privilege_report = report;
+    return delay({ report }, 500);
   },
   deleteConnection: async (id: string) => {
     connections = connections.filter((x) => x.id !== id);

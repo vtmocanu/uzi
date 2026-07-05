@@ -359,15 +359,11 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 		return f, errors.New("prompt body must not be empty")
 	}
 
-	if req.Model != nil {
-		m := strings.TrimSpace(*req.Model)
-		if m != "" {
-			if hasControlChar(m) {
-				return f, errors.New("model must not contain newlines or control characters")
-			}
-			f.model = pgtype.Text{String: m, Valid: true}
-		}
+	model, err := validateModel(req.Model)
+	if err != nil {
+		return f, err
 	}
+	f.model = model
 
 	// An empty (or absent) tools list normalizes to NULL = inherit all, so a
 	// direct-API empty array does not persist a `[]` that renders as inherit-all
@@ -395,6 +391,25 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 		return f, errors.New("template appears to contain a full Anthropic token; remove the credential")
 	}
 	return f, nil
+}
+
+// validateModel is the thin HTTP-facing wrapper over agenttmpl.ValidateModel
+// (the single source of the Decision 4 rules), shared by the template write path
+// (validateTemplateFields) and the per-user default-model endpoint. It maps the
+// neutral (string, error) core onto the storage type: a nil pointer or a blank
+// value becomes NULL (inherit); a valid value becomes a set pgtype.Text.
+func validateModel(raw *string) (pgtype.Text, error) {
+	if raw == nil {
+		return pgtype.Text{}, nil
+	}
+	m, err := agenttmpl.ValidateModel(*raw)
+	if err != nil {
+		return pgtype.Text{}, err
+	}
+	if m == "" {
+		return pgtype.Text{}, nil
+	}
+	return pgtype.Text{String: m, Valid: true}, nil
 }
 
 // storeColumns converts a builtin definition into the model/tools column types

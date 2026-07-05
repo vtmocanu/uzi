@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -34,6 +36,12 @@ type connectionDTO struct {
 	HumanUsername  *string    `json:"human_username"`
 	CreatedAt      time.Time  `json:"created_at"`
 	LastVerifiedAt *time.Time `json:"last_verified_at"`
+	// Privilege surfacing (PRD #5). A null status means never checked (the boot
+	// sweep back-fills it); the report carries the token + per-repo findings the
+	// UI expands and badges. checked_at is when the report was stamped.
+	PrivilegeStatus    *string           `json:"privilege_status"`
+	PrivilegeCheckedAt *time.Time        `json:"privilege_checked_at"`
+	PrivilegeReport    *privcheck.Report `json:"privilege_report"`
 }
 
 func connToDTO(c store.ForgeConnection) connectionDTO {
@@ -52,6 +60,20 @@ func connToDTO(c store.ForgeConnection) connectionDTO {
 	if c.LastVerifiedAt.Valid {
 		t := c.LastVerifiedAt.Time
 		dto.LastVerifiedAt = &t
+	}
+	if c.PrivilegeStatus.Valid {
+		s := c.PrivilegeStatus.String
+		dto.PrivilegeStatus = &s
+	}
+	if c.PrivilegeCheckedAt.Valid {
+		t := c.PrivilegeCheckedAt.Time
+		dto.PrivilegeCheckedAt = &t
+	}
+	if len(c.PrivilegeReport) > 0 {
+		var rep privcheck.Report
+		if err := json.Unmarshal(c.PrivilegeReport, &rep); err == nil {
+			dto.PrivilegeReport = &rep
+		}
 	}
 	return dto
 }
@@ -149,6 +171,17 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		httpx.Error(w, http.StatusBadGateway, "token verification failed: "+err.Error())
+		return
+	}
+
+	// Least-privilege gate (PRD #5): token-level violations block the save — this
+	// is the one moment uzi holds the plaintext and the user is present to fix it.
+	// Per-repo checks can't run here (no repos are enabled yet); those warn later.
+	if tr := h.pcheck.CheckToken(r.Context(), f, identity.IsAdmin); len(tr.Violations) > 0 {
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error":      "the bot token is over-privileged and was not saved; mint a least-privilege token (see the bot setup doc)",
+			"violations": tr.Violations,
+		})
 		return
 	}
 
@@ -339,6 +372,37 @@ func humanUsernameWarning(ctx context.Context, f forge.Forge, username string) s
 		return usernameNotFoundWarning
 	}
 	return ""
+}
+
+// PrivilegeCheck runs the full PAT least-privilege report for a connection
+// (token + every enabled repo), persists it, and returns it. Owner-only, behind
+// the per-user forge rate limiter (it is the heaviest forge-proxying route: two
+// token-level calls — VerifyToken + TokenInfo — plus two per enabled repo). It
+// never blocks — the report surfaces findings, the badge reflects them, and the
+// user acts.
+func (h *Handler) PrivilegeCheck(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid connection id")
+		return
+	}
+	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+		return
+	}
+	report, err := h.pcheck.CheckConnection(r.Context(), conn)
+	if err != nil {
+		slog.Error("privilege check", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"report": report})
 }
 
 // DeleteConnection removes a connection (cascading its repos, board columns, and

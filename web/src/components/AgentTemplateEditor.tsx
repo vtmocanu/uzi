@@ -1,16 +1,16 @@
 import { useMemo, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { AgentTemplateInput } from "../lib/api";
 import { Alert, Button, Field, Input } from "./ui";
+import { ModelSelect } from "./ModelSelect";
 import {
   frontmatterFieldWarning,
   KNOWN_TOOLS,
   looseSecretWarning,
+  modelFieldWarning,
   renderSubagent,
   splitToolInput,
   unknownTools,
 } from "../lib/agentTemplates";
-
-const MODEL_ALIASES = ["sonnet", "opus", "haiku", "fable"];
 
 export interface EditorInitial {
   name: string;
@@ -50,6 +50,7 @@ export function AgentTemplateEditor({
     [description, promptBody],
   );
   const unknown = useMemo(() => unknownTools(tools), [tools]);
+  const modelWarning = useMemo(() => modelFieldWarning(model), [model]);
   const injectionWarning = useMemo(
     () => frontmatterFieldWarning({ description, model, tools }),
     [description, model, tools],
@@ -123,21 +124,12 @@ export function AgentTemplateEditor({
         <Input value={description} onChange={(e) => setDescription(e.target.value)} />
       </Field>
 
-      <Field label="Model (blank = inherit)">
-        <>
-          <Input
-            list="model-aliases"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="inherit"
-          />
-          <datalist id="model-aliases">
-            {MODEL_ALIASES.map((m) => (
-              <option key={m} value={m} />
-            ))}
-          </datalist>
-        </>
-      </Field>
+      <div className="space-y-2">
+        <Field label="Model" htmlFor="template-model">
+          <ModelSelect id="template-model" value={model} onChange={setModel} />
+        </Field>
+        {modelWarning && <Alert message={modelWarning} tone="warning" />}
+      </div>
 
       <div className="space-y-1.5">
         <span className="text-sm font-medium text-muted">

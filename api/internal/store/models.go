@@ -44,16 +44,19 @@ type BoardColumn struct {
 }
 
 type ForgeConnection struct {
-	ID              uuid.UUID          `json:"id"`
-	UserID          uuid.UUID          `json:"user_id"`
-	ForgeType       string             `json:"forge_type"`
-	BaseUrl         string             `json:"base_url"`
-	BotUsername     string             `json:"bot_username"`
-	BotForgeUserID  int64              `json:"bot_forge_user_id"`
-	TokenCiphertext []byte             `json:"token_ciphertext"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	LastVerifiedAt  pgtype.Timestamptz `json:"last_verified_at"`
-	HumanUsername   pgtype.Text        `json:"human_username"`
+	ID                 uuid.UUID          `json:"id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	ForgeType          string             `json:"forge_type"`
+	BaseUrl            string             `json:"base_url"`
+	BotUsername        string             `json:"bot_username"`
+	BotForgeUserID     int64              `json:"bot_forge_user_id"`
+	TokenCiphertext    []byte             `json:"token_ciphertext"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	LastVerifiedAt     pgtype.Timestamptz `json:"last_verified_at"`
+	PrivilegeReport    []byte             `json:"privilege_report"`
+	PrivilegeCheckedAt pgtype.Timestamptz `json:"privilege_checked_at"`
+	PrivilegeStatus    pgtype.Text        `json:"privilege_status"`
+	HumanUsername      pgtype.Text        `json:"human_username"`
 }
 
 type Issue struct {
@@ -139,6 +142,7 @@ type User struct {
 	TokenVersion     int32              `json:"token_version"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	LastLogin        pgtype.Timestamptz `json:"last_login"`
+	DefaultModel     pgtype.Text        `json:"default_model"`
 	AutopilotEnabled bool               `json:"autopilot_enabled"`
 }
 

@@ -987,7 +987,8 @@ Serves human: "agents only ever create MRs, never write to main — primary dire
 
 Layered so no single layer is load-bearing, and none trusts the model:
 1. **GitLab role**: the bot is Developer and `main` is protected (documented project
-   config; PAT least-privilege verification is a plan.md fast-follow).
+   config; **now continuously verified by PRD #5's privcheck** — see §95–§97, which
+   turns this layer from documented-and-hoped into checked-at-save-and-periodically).
 2. **Worker-owned network git** (§45): the agent literally has no push credential, so
    protected-branch writes are impossible regardless of what the model attempts —
    **this is realized now** (M2), the strongest layer.
@@ -2265,3 +2266,307 @@ Serves human Feature #19; minimal new surface.
   gesture, what the fixed success/failure comments look like, closed-issue exclusion,
   multi-owner-same-project behavior, and the removing-label-mid-run / re-add-while-active
   semantics).
+
+---
+
+# PRD #5 — Access Control & PAT Least-Privilege Hardening
+
+Serves human Feature #5 (registration domain allowlist + registration toggle + PAT
+least-privilege verification; user chose this scope — option A — precisely so it runs
+parallel to PRD #4's M3–M7 with no file overlap). Two thin, same-theme workstreams:
+tighten who registers, and verify the bot PAT can do no more than open MRs — making
+PRD #4's "GitLab-side bot = Developer + protected main" guardrail (§50) *checked*
+instead of hoped. Section numbers continue past PRD #24's #92. Realizes
+`prds/5-access-control-pat-hardening.md`.
+
+## 93. Registration controls (server)
+
+Serves human: "allow registration only from configurable email domains"; "enable/disable registration".
+
+- **Env-var config, not a DB settings table** (`UZI_REGISTRATION_ENABLED` bool
+  default `true`; `UZI_ALLOWED_EMAIL_DOMAINS` comma list, empty = allow all,
+  reproducing today's behavior bit-for-bit). Why: matches every existing knob
+  (§13/§25); the compose MVP has one operator; a DB/admin-UI settings surface is
+  deferred with the SSO/KC work.
+- **Kill-switch is a security control ⇒ a set-but-malformed value aborts boot** (loud
+  misconfiguration, same stance as the seed guards) — unlike the mechanical tuning
+  knobs that silently default. `UZI_ALLOWED_EMAIL_DOMAINS` is lowercased,
+  **exact-match only** (no subdomain wildcards: `a.example.com` ≠ `example.com`),
+  IDN matched byte-wise (no IDNA folding — irrelevant for example.com, noted for
+  completeness).
+- **Enforcement lives only in `Register` (`handler/auth.go`), never a shared helper
+  the seed path could inherit**, after the existing `mail.ParseAddress`, before any
+  DB work. Both policy rejections (disabled, domain-not-allowed) return **403** with
+  distinct messages — the request is well-formed, the policy forbids it; **400 stays
+  for malformed input**. Domain-list disclosure in the message is acceptable for an
+  internal tool (the register page hints the same list anyway).
+- **Domain extracted from the parsed addr-spec** (`mail.ParseAddress(...).Address`,
+  final-`@` split), never the raw input — `mail.ParseAddress` also accepts
+  display-name/comment forms (`Alice <alice@example.com>`) whose raw final-`@`
+  suffix is junk; the stored email is **canonicalized to `addr.Address`** (the
+  handler previously stored the raw string).
+- **Seed admin exempt from the allowlist**: `seedAdmin()` (`api/cmd/server/main.go`)
+  calls `CreateUser` directly, never the handler. The operator sets both the seed
+  email and the allowlist, so gating one on the other would only create bootstrap
+  deadlocks (config-lockout guard).
+- **`GET /api/auth/config`** → `{registration_enabled, allowed_email_domains}` —
+  uzi's **first unauthenticated JSON surface besides `/health`** (the authed
+  `ForgeConfig`, §26, is not a precedent). Registered **outside `RequireAuth`**,
+  behind the **auth rate limiter** like register/login. Its shape is a security
+  boundary: only operator-set, user-visible policy — nothing else, ever.
+
+## 94. Registration UX (web)
+
+Serves human Feature #5 (registration controls, user-facing).
+
+- The register page consumes `/auth/config`: registration disabled → the register
+  form/route is replaced by a "registration is disabled" notice (**login flow
+  untouched**); domains restricted → a hint under the email field + client-side
+  pre-validation. The **server stays authoritative** (client checks are UX only); a
+  server rejection renders its message inline.
+
+## 95. PAT least-privilege verification — forge interface + rules
+
+Serves human: "can uzi verify the glpat does not have more permissions than needed
+for an MR — per repo, at save, and afterwards?" (plan.md line 48); primary directive
+(agents must not modify main).
+
+- **Three neutral-domain `Forge` methods** (GitLab driver only, same discipline as
+  the existing methods; Forgejo still deferred, §16): `TokenInfo`
+  (`GET /personal_access_tokens/self` — scopes/active/expiry), `ProjectRole`
+  (`GET /projects/:id/members/all/:user_id` — **effective** direct-or-inherited
+  access level, 404 = not a member), `DefaultBranchProtection`
+  (`GET /projects/:id/protected_branches/:name`, 404 = unprotected). The admin flag
+  needs **no new method**: `BotIdentity.IsAdmin` rides on the `GET /user` that
+  `VerifyToken` already makes (no second round-trip). All pass the existing
+  PAT-scrubbing redactor; reports carry scopes/roles/branch names but never token
+  material.
+- **Rules** (`PrivilegeReport`): scopes must equal exactly `{api}` (uzi's documented
+  minimum — `docs/gitlab-bot-setup.md`; more = over-privilege violation, fewer
+  already breaks connect); `active == true` and not expired (expiry within **14 days
+  = warning**, not violation); `is_admin == false` (absent field = non-admin = pass,
+  because GitLab emits `is_admin` only for admin callers). Per enabled repo:
+  effective role **exactly Developer(30)** (>30 = violation; <30 or **not-a-member
+  404** = explicit finding, since repos aren't auto-disabled on downgrade); default
+  branch **protected and not Developer(30)-pushable** — else Developer-role
+  enforcement is vacuous. **Direct per-user bot push grants** on the protected branch
+  are detected; **group-inherited push grants are NOT detected** (documented
+  limitation, deliberately not implemented).
+- **Two-tier model** (false-positive fatigue guard): *violations* are only things
+  that break the primary directive; everything advisory is a *warning*, visually
+  distinct.
+- **Introspection unsupported (GitLab <15.5, 404 on `/self`) = warning, never a hard
+  save-block** — older-instance tolerance; the only allowlisted forge
+  (gitlab.example.com) is ≥15.5.
+
+## 96. privcheck package: enforcement, persistence, periodic sweep
+
+Serves human Feature #5 ("at save, and afterwards").
+
+- **New `api/internal/privcheck` package** (keeps `forgesvc` sync-only): a `checker`
+  computes the report; `service`/`sweep` run and persist it. Report
+  `status = ok | warnings | violations` (plus an `error`/"check failed" state when the
+  forge call itself fails — a revoked token is exactly what the report must surface,
+  not a crash).
+- **Block-at-save vs warn-after tiering**: at `CreateConnection`, after
+  `VerifyToken`, token-level checks run against the plaintext; any token-level
+  **violation ⇒ 422, nothing stored** (the one moment uzi holds the plaintext and the
+  user is present to fix it). Per-repo findings **only warn** — membership changes
+  happen on the forge after save, repos are enabled/disabled over time, and blocking
+  issue-sync over a role finding would punish the wrong action.
+- **On-demand `POST /api/forge/connections/{id}/privilege-check`** — owner-only,
+  behind the per-user forge rate limiter (heaviest forge route: 1 + 2×repos upstream
+  calls); runs the full report (token + all enabled repos), persists, returns it.
+- **Periodic sweep** modeled on the **worker sweeper (§41), not the poller**: an
+  **async boot pass runs inside the sweep goroutine** at API start so
+  grandfathered/never-checked connections surface within seconds of deploy (not one
+  interval later), then it ticks on `UZI_PRIVILEGE_CHECK_INTERVAL` (default `24h`).
+  Per-repo fan-out uses **bounded concurrency 4** (poller discipline, polite to the
+  forge). **`0` disables the sweep AND the boot back-fill**; a malformed value
+  silently defaults (`parseNonNegDuration`, tuning-knob stance — `0` is a legitimate
+  value so `parseDuration`'s reject-0 is unusable). Failures are recorded *in the
+  report*; a connection/repo deleted mid-sweep is a tolerated 0-row write-back.
+  Single-instance assumption (no leader election — the shared gap with poller/sweeper,
+  deferred to the k8s work).
+- **Persistence: jsonb report on `forge_connections`** (migration **`00030`**,
+  merge-time numbering respected per the CLAUDE.md convention): `privilege_report
+  jsonb`, `privilege_checked_at`, `privilege_status` (denormalized for cheap
+  list/badge queries). One report per connection with repo findings embedded — **no
+  normalized findings table, no history** (current-state display only). All nullable:
+  **`NULL` status = never checked**, rendered as an explicit "unchecked" badge, never
+  as ✓; the boot sweep back-fills it right after deploy.
+
+## 97. Web privilege surfacing
+
+Serves human Feature #5 (drift becomes visible without anyone asking).
+
+- Settings → Forge: a per-connection badge (**least-privilege ✓ / N warnings / N
+  violations / unchecked / check failed**, with `checked_at`), expandable to the
+  finding list, plus a "Check privileges" button beside the existing "Verify". Repos
+  page: a per-repo badge on repos with role/branch-protection findings, tooltip with
+  the specific violation. A 422 save rejection renders the violations as the error
+  with a link to `docs/gitlab-bot-setup.md`. Admin fleet-wide privilege dashboard is
+  out of scope.
+
+## 98. Configuration additions (env, extends §13/§25)
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_REGISTRATION_ENABLED` | `true` | registration kill-switch; **malformed value aborts boot** |
+| `UZI_ALLOWED_EMAIL_DOMAINS` | — (empty = all) | comma list, lowercased exact-match, no wildcards; seed admin exempt |
+| `UZI_PRIVILEGE_CHECK_INTERVAL` | `24h` | periodic PAT re-check; **`0` disables sweep + boot back-fill**; malformed → silent default |
+
+---
+
+# PRD #17 — Builtin lead template (opus) + worker model selection from the UI
+
+Serves human Feature #17 (lead orchestrator as an editable builtin on opus;
+per-user default worker model; user, 2026-07-05). Before this PRD the lead /
+main-thread was the only agent role with no template: `agent_templates` held the
+seven subagents, the worker found no `lead` row, left `baseOptions.model` unset,
+and the SDK silently fell back to the account default (observed: `claude-sonnet-5`)
+— invisible and unconfigurable. This PRD ships `lead` as the **eighth** builtin on
+`opus`, makes it editable/resettable like the others, and adds a per-user
+default-model knob that overrides it for a user's own runs. Section numbers
+continue past PRD #24's #92; the decisions below realize the PRD's Design Decisions
+(`prds/17-lead-template-and-model-selection.md`), whose per-decision attributions
+carry provenance. Builds on PRD #3 (agent templates) and PRD #4 (runtime/claim).
+
+## 93. Decouple builtins from `.claude/agents/`; lead is the eighth builtin
+
+Serves human: "lead ships as a builtin with a real orchestrator prompt on opus";
+"builtins are the single source, `.claude/agents/` is the dev team's" (user,
+2026-07-05, superseding the same-day dual-home choice).
+
+- **`api/internal/agenttmpl/builtins/` is now the single source of truth** for
+  product templates (git-versioned, `go:embed`-shipped, boot-seeded). The earlier
+  1:1 mirror to `.claude/agents/*.md` is dissolved: `.claude/agents/` becomes purely
+  the repo's own Claude Code dev agent-team and is free to drift (it already carried
+  a `web-ux` role with no builtin twin). Rationale: a product `lead.md` under
+  `.claude/agents/` would masquerade as a spawnable dev teammate, and the dual-home
+  shipped nothing at runtime (only the embedded copy is ever used).
+- **Ordered before PRD #16 so #16 inherits the decoupled convention** (user). The
+  decouple is a small, self-contained first commit (PRD Risk: decouple-first).
+- **Tests: golden byte-match → parse/validity + round-trip.** The two tests pinning
+  builtins to the checked-in `.claude/agents/*.md` files (`TestRenderBuiltinsByteMatch`,
+  `TestEmbeddedCopiesMatchRepo`) are removed. Replacements: `TestBuiltinsParseAndValid`
+  (each embedded file parses; name/description non-empty; names unique; model passes
+  `ValidateModel`), `TestBuiltinsRoundTripRender` (parse→`Render` is byte-for-byte
+  stable), and `TestBuiltinsSetIsExactlyEight` (grown from Seven; `builtinNames` slice
+  now eight). `TestCoderInheritsAllTools` kept. Stale "mirrors `.claude/agents/`"
+  comments in `builtins.go`/`render.go` swept.
+- **`lead.md`**: `name: lead`, `model: opus`, **no `tools:` line** (null-tools =
+  inherit-all, the `coder` contract — the lead needs the full toolset). Body is a
+  **role-agnostic** orchestrator persona (plan-first, approval gate, `signal_done`,
+  never touch `main`); it deliberately does **not** hard-list the seven role names —
+  the invokable subagent set is injected per turn by the worker's `delegatesLine`
+  (`agent/src/prompt.ts`). The shipped name matches the worker's `LEAD_NAME_RE`
+  (`/^(lead|orchestrator)$/i`), asserted by an agent unit test, so `assembleAgents`
+  routes its `prompt_body`/`model` to the main thread rather than registering a
+  subagent — no worker change was needed for pickup.
+- **Upgrade seeding is automatic**: the idempotent boot reconciler
+  (`ReconcileBuiltinTemplates`, `ON CONFLICT (name) DO NOTHING`) inserts the lead into
+  existing DBs and preserves edited rows; `ResetAgentTemplate` works for it like any
+  builtin.
+- **Collision warning (AI):** when a builtin insert is skipped (`n==0`) the reconciler
+  reads the shadowing row back and warns **only when it is `is_builtin=false`** — an
+  admin's own custom `lead`/`orchestrator` blocks the builtin and can't be reset (the
+  worker still routes it by name; an operator can rename/delete it to adopt the
+  builtin). A failed read-back logs at **debug** rather than being silently dropped.
+  The reconciler's query dependency is narrowed to a `builtinReconcilerQueries`
+  interface so the collision path is unit-testable without a live DB.
+
+## 94. Lead prompt body augments, never replaces, the guardrails
+
+Serves human Feature #17 + the primary directive (`main` is never touched).
+
+- The worker composes the lead system prompt as **claude_code preset + template
+  `prompt_body` + `LEAD_GUARDRAIL_APPEND`** (`agent/src/prompt.ts`). The template body
+  is persona / workflow guidance only; the primary-directive guardrails are appended
+  by the worker regardless of what the template says, so **editing the lead template
+  cannot weaken guardrails** (asserted by existing + new tests). The four independent
+  guardrail layers (§45, §50) are untouched.
+
+## 95. Shared model validator homed in `agenttmpl` (single rule source)
+
+Serves human: "model choices offered as aliases + a custom escape hatch" (user);
+best-practice (two surfaces must not drift). AI-decided homing.
+
+- **`agenttmpl.ValidateModel` is the single server-side rule source**
+  (`api/internal/agenttmpl/model.go`), placed in this neutral, dependency-free package
+  so both the template-editor handler and the per-user default-model endpoint
+  thin-wrap it without an import cycle (the handler maps its result to
+  `pgtype.Text` + an HTTP error); the builtin validity tests call it directly. The
+  prior template-model check (allowed interior spaces, no length cap) is replaced by
+  it. The web `ModelSelect` mirror (§96) is a **client hint only** — the server rule
+  is authoritative.
+- **Decision-4 rules**: blank / whitespace-only ⇒ `("", nil)` = inherit (the caller
+  stores NULL); a non-blank value must be a **single token** — trimmed, no interior
+  whitespace, no control chars / U+FFFD, **≤ 100 bytes** (`MaxModelLen`, kept in
+  lockstep with the web `MAX_MODEL_LEN`) — returned trimmed. A typo in a custom ID is
+  accepted here and only surfaces as a run-time SDK error (the API cannot enumerate
+  valid IDs without calling Anthropic).
+
+## 96. Shared `ModelSelect` control (web)
+
+Serves human: aliases + custom escape hatch (user). AI-decided component shape.
+
+- **`web/src/components/ModelSelect.tsx`**: a select over `inherit` (empty), the
+  `MODEL_ALIASES` (`opus`, `sonnet`, `haiku`, `fable`) and `custom` (reveals a
+  free-text input for a full model ID). Used by both `AgentTemplateEditor` (replacing
+  the datalist-backed input) and the new Settings section. **`MODEL_ALIASES` is the
+  single source** of the curated set.
+- **Custom-init rule**: an incoming value not in the alias list (e.g.
+  `claude-fable-5`) initializes into the `custom` state with the text prefilled —
+  never silently reset to inherit. An intentionally-emptied custom field is not
+  re-derived back to the incoming value.
+- **Submit gating preserved**: the custom value keeps flowing through
+  `frontmatterFieldWarning`, so an injection-suspect model string still disables submit
+  in the template editor.
+- **Lead badged "orchestrator"** on the Agents page (a `brand`-tone badge, tooltip
+  "the main agent thread that plans and delegates") so it reads differently from
+  invokable subagents; otherwise it edits and resets like any other builtin.
+
+## 97. Per-user default worker model (api + web)
+
+Serves human: "per-user default worker model" (user, 2026-07-05 — the default follows
+per-user run ownership, not a global setting).
+
+- **`users.default_model text` (nullable; NULL = inherit)** — migration
+  `00030_user_default_model.sql` (drafted `00022`; renumbered to the next free slot
+  above the live head per the CLAUDE.md goose convention), with a `+goose Down`. One
+  scalar per user ⇒ a column on `users`, not a new table. (`SELECT *` / `RETURNING *`
+  on `users` regenerate the sqlc `User` struct — expected, harmless.)
+- **Companion `GetUserDefaultModel` + `UpdateUserDefaultModel` sqlc queries.** The
+  owner default is read at claim time via the companion `GetUserDefaultModel` (a
+  targeted lookup, **not** a JOIN widening of the claim-context query).
+- **API `GET` / `PUT /api/me/settings`**, session-authenticated (PRD #1 cookie +
+  CSRF), **own-user only** — no admin path to another user's value. `PUT` validates
+  through `ValidateModel` (§95) and stores `""` as NULL.
+- **Web**: a "Worker model" section on `Settings.tsx` under the Anthropic-token block,
+  using `ModelSelect`, explaining precedence (the per-user default overrides the lead
+  template's model; empty = inherit the lead template's model, opus by default).
+
+## 98. Claim plumbing + model precedence (api + agent)
+
+Serves human: "the run owner's default model wins over the lead template model"
+(Decision 6, review finding + user, 2026-07-05).
+
+- **`ClaimConfig.default_model *string` with `omitempty`**
+  (`api/internal/workersvc/claim.go`) — omitted on the wire when the owner's default is
+  NULL (absent ≠ explicit null), populated from `GetUserDefaultModel` at claim time.
+- **Agent**: `protocol.ts` `ClaimConfig` gains `default_model`; the runner threads it
+  into `RunContext.config`; `sdk-executor.ts` resolves it through the pure helper
+  **`resolveLeadModel(configModel, templateModel) = (configModel ?? templateModel) || undefined`**
+  and applies it **set-only-when-defined** (`if (leadModel) baseOptions.model = leadModel`)
+  — an unset model **omits** the SDK `model` key rather than sending an explicit empty
+  override, so it falls back to the SDK / account default.
+- **Precedence (lead / main thread)**: run owner's `default_model` → lead template
+  `model` → SDK / account default. **Why user-default-wins** (flipped from the earlier
+  template-wins draft): the builtin lead pins `opus`, so under template-wins the
+  per-user setting would be inert on a default install (only active after an admin
+  globally cleared the lead model). User-wins keeps both features live — `opus` is the
+  instance-wide default for every user with the setting unset (NULL), and a user who
+  picks a model overrides it for their own runs only. Null-model **subagents follow
+  the main thread**, so this governs them too; subagent templates carrying an explicit
+  `model` are unaffected.

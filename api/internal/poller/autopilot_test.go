@@ -160,6 +160,13 @@ func (f *apForge) UserExists(context.Context, string) (bool, error) { return fal
 func (f *apForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{}, nil
 }
+func (f *apForge) TokenInfo(context.Context) (forge.TokenInfo, error) { return forge.TokenInfo{}, nil }
+func (f *apForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
+	return 0, false, nil
+}
+func (f *apForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
+	return forge.BranchProtection{}, nil
+}
 func (f *apForge) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
 	return nil, nil
 }

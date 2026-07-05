@@ -100,6 +100,10 @@ export interface ClaimConfig {
   run_timeout_seconds?: number;
   idle_timeout_seconds?: number;
   max_iterations?: number;
+  /** The run owner's per-user default model (PRD #17). When present it overrides
+   *  the lead template's model for the main thread; absent when the owner set no
+   *  default, so the worker falls back to the lead template's model. */
+  default_model?: string;
 }
 
 /**

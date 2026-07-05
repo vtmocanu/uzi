@@ -24,6 +24,16 @@ UPDATE users SET last_login = now() WHERE id = $1;
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
 RETURNING *;
 
+-- name: GetUserDefaultModel :one
+-- The current user's per-user default worker model (PRD #17); NULL = inherit.
+SELECT default_model FROM users WHERE id = $1;
+
+-- name: SetUserDefaultModel :one
+-- Sets (or clears, when @default_model is NULL) the current user's default
+-- worker model. Own-user only; the caller passes the session user's id.
+UPDATE users SET default_model = @default_model WHERE id = @id
+RETURNING default_model;
+
 -- name: BumpTokenVersion :one
 UPDATE users SET token_version = token_version + 1 WHERE id = $1
 RETURNING token_version;

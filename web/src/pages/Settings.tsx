@@ -6,6 +6,8 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type SecretMeta } from "../lib/api";
 import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "../components/ui";
+import { ModelSelect } from "../components/ModelSelect";
+import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
 
 const DOC_URL =
@@ -36,10 +38,19 @@ export function Settings() {
     }
   };
 
+  // Worker model: "" = inherit. savedModel is the persisted value, so Save is
+  // only offered when the picker differs from what is stored.
+  const [defaultModel, setDefaultModel] = useState("");
+  const [savedModel, setSavedModel] = useState("");
+  const [modelBusy, setModelBusy] = useState(false);
+
   const load = useCallback(async () => {
     try {
-      const { secrets } = await api.listSecrets();
+      const [{ secrets }, { settings }] = await Promise.all([api.listSecrets(), api.getMySettings()]);
       setMeta(secrets.find((s) => s.kind === "anthropic_token") ?? null);
+      const model = settings.default_model ?? "";
+      setDefaultModel(model);
+      setSavedModel(model);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load settings");
     } finally {
@@ -80,6 +91,30 @@ export function Settings() {
       setError(err instanceof ApiError ? err.message : "Failed to remove token");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const modelWarning = modelFieldWarning(defaultModel);
+  const modelDirty = defaultModel.trim() !== savedModel;
+
+  const saveModel = async () => {
+    setError("");
+    setNotice("");
+    setModelBusy(true);
+    try {
+      const { settings } = await api.putMySettings(defaultModel.trim() || null);
+      const model = settings.default_model ?? "";
+      setDefaultModel(model);
+      setSavedModel(model);
+      setNotice(
+        model === ""
+          ? "Worker model cleared. Your runs now use the lead template's model."
+          : `Worker model set to ${model}. It applies to your next run.`,
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save worker model");
+    } finally {
+      setModelBusy(false);
     }
   };
 
@@ -170,6 +205,37 @@ export function Settings() {
           />
           <span className="text-fg">Enable autopilot for my account</span>
         </label>
+      </Card>
+
+      <Card className="space-y-5">
+        <div>
+          <SectionTitle>Worker model</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            The Claude model your runs use — the lead orchestrator and its subagents that
+            inherit the model. Picking one here overrides the lead template's model for your
+            own runs; other users are unaffected. Leave it on <em>Inherit</em> to use the lead
+            template's model (opus by default). An unrecognized custom ID only fails on the
+            first run.
+          </p>
+        </div>
+
+        {loading ? (
+          <Skeleton className="h-9 w-full max-w-sm" />
+        ) : (
+          <div className="space-y-3">
+            <Field label="Model" htmlFor="worker-model">
+              <ModelSelect id="worker-model" value={defaultModel} onChange={setDefaultModel} />
+            </Field>
+            {modelWarning && <Alert message={modelWarning} tone="warning" />}
+            <Button
+              type="button"
+              disabled={modelBusy || !modelDirty || modelWarning !== ""}
+              onClick={saveModel}
+            >
+              Save model
+            </Button>
+          </div>
+        )}
       </Card>
 
       {user && (

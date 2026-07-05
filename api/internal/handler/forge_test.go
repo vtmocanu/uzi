@@ -49,6 +49,15 @@ func (f *fakeUserForge) CreateIssueNote(context.Context, int64, int64, string) (
 func (f *fakeUserForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{}, nil
 }
+func (f *fakeUserForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
+	return forge.TokenInfo{}, nil
+}
+func (f *fakeUserForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
+	return 0, false, nil
+}
+func (f *fakeUserForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
+	return forge.BranchProtection{}, nil
+}
 
 // The save path is verified-or-warned (PRD #19 Decision 3): an existing user is
 // clean, a missing user warns, and a lookup failure warns rather than blocking.

@@ -84,6 +84,38 @@ func TestValidateTemplateFields(t *testing.T) {
 	}
 }
 
+// TestValidateModel covers only the handler wrapper's storage mapping onto
+// pgtype.Text; the Decision 4 rule cases live with the shared core in
+// agenttmpl.TestValidateModel (single source, no drift).
+func TestValidateModel(t *testing.T) {
+	strptr := func(s string) *string { return &s }
+
+	// nil pointer and blank string both map to NULL (inherit), no error.
+	for _, raw := range []*string{nil, strptr(""), strptr("   ")} {
+		got, err := validateModel(raw)
+		if err != nil {
+			t.Errorf("validateModel(%v) errored: %v", raw, err)
+		}
+		if got.Valid {
+			t.Errorf("validateModel(%v) = %q, want NULL (inherit)", raw, got.String)
+		}
+	}
+
+	// A valid value becomes a set pgtype.Text, trimmed.
+	got, err := validateModel(strptr("  sonnet  "))
+	if err != nil {
+		t.Fatalf("valid model rejected: %v", err)
+	}
+	if !got.Valid || got.String != "sonnet" {
+		t.Errorf("validateModel = (%q, valid=%v), want %q", got.String, got.Valid, "sonnet")
+	}
+
+	// An invalid value propagates the core error (rule coverage is in agenttmpl).
+	if _, err := validateModel(strptr("claude 3")); err == nil {
+		t.Error("expected rejection for a model with interior whitespace")
+	}
+}
+
 func TestRejectFrontmatterInjection(t *testing.T) {
 	strptr := func(s string) *string { return &s }
 	injections := map[string]templateWriteRequest{
