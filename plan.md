@@ -65,6 +65,7 @@ scan for command not found and report them somewhere so we can see what tools we
 
 ## later stuff
 
+- self improvement - we should have a general token for AI and that is used for a configurable (2day default) scheduled job, that can be enabled from admin settings, every run should spin up a team to identify an improvement (euther bug or new feature) and create a MR for it, if a selfimprovement already exists then it should reuse the existing one so everything is tested togheeter
 - cli to interact with running sessions, see them + chat with them
 - maybe have a label in glab and agents auto start working on issues? how would it work? by using the agent from the user which created the label?
 - dark/light theme with autodetect
