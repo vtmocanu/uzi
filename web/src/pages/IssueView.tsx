@@ -30,6 +30,16 @@ function runDuration(run: RunListItem): string | null {
   return formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime());
 }
 
+// projectWebUrlFromIssue recovers the project base URL from an issue's web_url.
+// GitLab issue URLs are `${projectWebUrl}/-/issues/${iid}`; stripping that suffix
+// gives the base used to build the run-history MR links (GitLab-only product, the
+// same `/-/merge_requests/` path the board hardcodes). "" when the shape doesn't
+// match, which isHttpsUrl then rejects so the MR renders as plain text.
+function projectWebUrlFromIssue(issueWebUrl: string): string {
+  const i = issueWebUrl.indexOf("/-/issues/");
+  return i >= 0 ? issueWebUrl.slice(0, i) : "";
+}
+
 export function IssueView() {
   const { repoId = "", iid = "" } = useParams();
   const iidNum = Number(iid);
@@ -178,7 +188,11 @@ export function IssueView() {
             ) : (
               <ul className="space-y-2">
                 {runs.map((run) => (
-                  <RunHistoryRow key={run.id} run={run} />
+                  <RunHistoryRow
+                    key={run.id}
+                    run={run}
+                    projectWebUrl={projectWebUrlFromIssue(issue.web_url)}
+                  />
                 ))}
               </ul>
             )}
@@ -189,9 +203,15 @@ export function IssueView() {
   );
 }
 
-function RunHistoryRow({ run }: { run: RunListItem }) {
+function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl: string }) {
   const stopped = isStoppedRun(run.status, run.failure_reason);
   const duration = runDuration(run);
+  // PRD §3 asks for an MR *link* in the history; link it when we can build an https
+  // URL (like the board), else fall back to a plain "!N" chip so it is never absent.
+  const mrHref =
+    run.mr_iid != null && isHttpsUrl(projectWebUrl)
+      ? `${projectWebUrl}/-/merge_requests/${run.mr_iid}`
+      : null;
   return (
     <li className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2">
       <div className="min-w-0">
@@ -199,7 +219,24 @@ function RunHistoryRow({ run }: { run: RunListItem }) {
           <span>{new Date(run.created_at).toLocaleString()}</span>
           {run.worker_name && <span>· {run.worker_name}</span>}
           {duration && <span>· {duration}</span>}
-          {run.mr_iid != null && <span>· !{run.mr_iid}</span>}
+          {run.mr_iid != null && (
+            <span>
+              ·{" "}
+              {mrHref ? (
+                <a
+                  href={mrHref}
+                  target="_blank"
+                  rel="noreferrer"
+                  title="Open the merge request on GitLab"
+                  className="text-indigo-400 hover:text-indigo-300"
+                >
+                  !{run.mr_iid}
+                </a>
+              ) : (
+                <>!{run.mr_iid}</>
+              )}
+            </span>
+          )}
         </div>
       </div>
       <div className="flex items-center gap-2">
