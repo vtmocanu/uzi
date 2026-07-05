@@ -28,8 +28,6 @@ __pycache__/
 .claude/scheduled_tasks.lock
 .claude/skill-stats.json
 .claude/worktrees/
-CLAUDE.md
-!/CLAUDE.md
 # just & task
 juster
 task-repo
