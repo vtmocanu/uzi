@@ -1600,3 +1600,132 @@ start-run action); GitLab reachable via an explicit icon".
 - **Run-history timestamp is `started_at ?? created_at`** (PRD §3 "started").
 - **Start-run gate derives from full history** (`activeRunInHistory`) — equivalent to
   the board's `latest_run` gate under the one-non-terminal-run index.
+
+---
+
+# PRD #14 — Multica-inspired "ember" UI redesign
+
+Serves human Feature #14 — reskins the whole web UI to the selected "ember" design.
+**Status: M1–M5 built, reviewed, audited, browser- and real-stack-validated; M6
+(review gate + merge) landed on `main` as `2efd83b`.** `web/` + docs only; no
+backend/schema/env changes. Full rationale + milestone log: `prds/14-multica-ui-redesign.md`.
+
+## 76. Ember design tokens (CSS-variable theme layer)
+
+Serves human: "multica-inspired ember design selected as the real UI"; best-practice
+(themeable, no palette sprawl).
+
+- **Design tokens are CSS custom properties** on `:root` / `[data-theme="ember"]`
+  in `web/src/index.css` (bg/surface/text/accent/ring …); **Tailwind reads the
+  variables only** (`bg-surface`, `text-muted`, `ring-ring`), never raw palette
+  classes.
+- **Enforced by a grep gate**: `grep -rE 'slate-|orange-|indigo-'` over `web/src/**`
+  (excluding `index.css`, the one sanctioned home for the variable definitions and
+  the token-backed `@apply` prose block) returns **zero hits** — no allowlist. Verified
+  green after the reskin.
+  - Why variables + one gate: a single token file makes a future light theme or the
+    deferred mission-control/minimal identities a `data-theme` override block, not a
+    refactor, and the gate keeps raw colors from creeping back page-by-page (the
+    original UI's failure mode).
+
+## 77. Design-over-logic merge with PRD #12
+
+Serves human: Feature #14 reskin **without** regressing Feature #12 behavior.
+
+- The prototype was authored before PRD #12 landed on `main`. Resolution rule when
+  the two disagree: **PRD #12's board/run-lifecycle behavior is authoritative; the
+  prototype's design vocabulary is re-applied on top** ("behavior wins, then restyle").
+  Prototype `Board.tsx`/`RunView.tsx`/`RunsList.tsx` were **not** applied wholesale —
+  their tokens/primitives were layered over #12's logic (badges, auto-move, attention
+  strip, in-app `IssueView`, drag semantics all preserved).
+  - Why: #12's vitest suite pins exactly the behavior the reskin must keep; the merge
+    order inverted from the PRD's original plan (#12 shipped first), so #12 is the base.
+
+## 78. Forge-type nav icon: web-side connection join
+
+Serves human: "board nav entries carry the GitLab logo, generic git icon fallback";
+"no backend change".
+
+- `GitLabIcon` (tanuki) and `GitIcon` (generic git mark) added as inline
+  single-path SVGs in `web/src/components/icons.tsx` (no new dependency).
+- **`forge_type` is not on the `Repo` DTO** the nav renders from, so `AppShell`
+  additionally calls `api.listConnections()` and maps `connection_id → forge_type` —
+  a **web-only join**, keeping the "no backend change" scope. `gitlab` → tanuki;
+  anything else (or a join failure) → `GitIcon` fallback.
+  - Why the join over a DTO field: avoids a schema/handler change for a cosmetic nav
+    detail; the fallback path is dormant today (`forge_types` is server-hardcoded to
+    `["gitlab"]`) but lets a future Forgejo driver light up the git mark automatically.
+
+## 79. Mock demo mode: inert behind `VITE_UZI_MOCK`
+
+Serves human: best-practice (cheap zero-backend demo) without touching real builds.
+
+- `web/src/mocks/` (`mockApi` + a mock WS `engine`/`socket` + fixture `data`/`store`),
+  `web/Dockerfile.mock`, `web/nginx.mock.conf` ship as an **opt-in demo build**
+  (`VITE_UZI_MOCK=1`). `web/src/lib/api.ts` gates on `import.meta.env.VITE_UZI_MOCK`
+  (`MOCK_MODE`): flag unset ⇒ `api = realApi`, `createRunSocket` returns a real
+  `WebSocket`.
+- **Real builds execute no mock behavior** — the mock module is a statically-dead
+  branch; its bytes still ship in the bundle (not tree-shaken; the size cost is
+  accepted). Neither mock file is referenced by the real `docker-compose.yml`.
+  Verified per-release by a `dist`-grep for a mock-only string (e.g. `andrei@uzi.local`).
+  - Why keep the bytes: the cheapest way to demo uzi with no backend and to prototype
+    future themes over the real component tree; correctness rests on unreachability,
+    not on stripping.
+
+## 80. Route guards: GuestRoute + global 401 handler
+
+Serves human: Feature #14 shell must degrade gracefully on session loss (real-stack
+validation item 4) — the mock hid every real-API auth seam.
+
+- **`GuestRoute`** (`web/src/components/RouteGuards.tsx`): an authenticated user
+  hitting `/`, `/login`, or `/register` is redirected to `/dashboard` (inverse of
+  `ProtectedRoute`).
+- **Global 401 handler**: `request()` fires one app-registered handler
+  (`setUnauthorizedHandler`) **before** throwing, so every 401 is handled centrally
+  instead of each page inventing its own 401 string. `AuthContext` registers it and
+  clears the user; the redirect then happens declaratively through the existing route
+  guards. Composes safely — the initial `me()` probe's expected 401 just clears an
+  already-null user; a background poll's swallowed 401 still triggers it.
+  - Why central: in this API a 401 uniformly means session-invalid (403 is authz), so
+    one handler is correct and avoids a wall of per-page 401 errors on session expiry.
+
+## 81. Unified run-status colors across surfaces
+
+Serves human: "run status colors unified across all surfaces".
+
+- One tone vocabulary in `web/src/lib/runBadge.ts` (`BadgeTone`:
+  neutral/info/warning/ok/danger) drives the badge color on **board card, runs list,
+  run view, and issue history** alike. Extends PRD #12's tones with **`info`**
+  (claimed/running) and **`ok`** (completed) so those states stop reading as the same
+  neutral gray. `runStatusTone` is the single source consumed by every surface, killing
+  cross-surface tone drift.
+
+## 82. Themed focus-visible ring
+
+Serves human: "a themed focus-visible ring".
+
+- A token-backed ring (`--ring` = brand) applied via `@apply outline-none ring-2
+  ring-ring ring-offset-2 ring-offset-ink` on `a/button/input/select/textarea` and
+  focusable `[tabindex]`, **scoped to `:focus-visible`** so it shows for keyboard/AT
+  users and not on mouse click, replacing the default UA outline.
+
+## 83. Dark-only for now
+
+Serves human: Feature #14 (ember is dark-only; light mode not requested).
+
+- The ember theme ships **dark-only**. A later light mode (or porting the deferred
+  mission-control/minimal identities) is a `data-theme` block over the §76 tokens, not
+  a refactor — the reason the tokens exist.
+
+## 84. Compose test isolation (`env -i`)
+
+Serves human: best-practice (real-stack validation must not touch the user's real
+data), reinforcing §27.
+
+- Real-stack test stacks are launched as
+  `env -i HOME=$HOME PATH=$PATH docker compose --env-file <dummy> -p <unique> …`:
+  a **shell-exported real secret overrides `--env-file`**, so a bare `--env-file` run
+  can still seed the real admin/forge. Stripping the environment (`env -i`) plus a
+  unique project name gives a fully isolated stack. Recorded in CLAUDE.md as a testing
+  convention after M4 surfaced the footgun.

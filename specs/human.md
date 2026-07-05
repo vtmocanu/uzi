@@ -98,6 +98,17 @@ Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/12-board-run-lifecycle.md`
 - Clicking an issue stays in-platform: an in-app issue view with its runs and a start-run action. GitLab remains reachable via an explicit icon.
 - Failed forge column moves are retried via reconciliation — not dropped, not a persisted move queue. (2026-07-04 user review; the "no retry, next lifecycle event heals it" stance was rejected because `completed` is terminal.)
 
+## Feature #14 — UI redesign: multica-inspired "ember" theme
+
+Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/14-multica-ui-redesign.md`.
+
+- Three UI redesign prototypes built and evaluated live in-browser; the multica-inspired "ember" design was selected as the real UI.
+- Board nav entries carry the GitLab logo; fall back to a generic git icon when no GitLab icon applies.
+- Forge sits only under Settings — no standalone Forge nav item.
+- Run status colors unified across all surfaces (board card, runs list, run view, issue history) — extends PRD #12's run badge tones.
+- A themed focus-visible ring (keyboard/AT focus indicator).
+- E2E testing includes a real-GitLab leg, scoped to the dedicated scratch project `vtmocanu/uzi-e2e-scratch` (created for this); the live-Anthropic capstone is skipped.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
