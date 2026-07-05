@@ -92,6 +92,43 @@ func TestAuthorizeSkillWrite(t *testing.T) {
 	}
 }
 
+// TestResetSkillStatus pins the existence-oracle fix: reset applies write authz
+// before the builtin-only 400, so another user's private skill returns 404 (same
+// as an absent id), never a 400 that would confirm the id exists.
+func TestResetSkillStatus(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	other := store.User{ID: uuid.New()}
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+
+	cases := []struct {
+		name       string
+		actor      store.User
+		skill      store.Skill
+		wantOK     bool
+		wantStatus int
+	}{
+		{"admin resets builtin", admin, store.Skill{Scope: "builtin"}, true, 0},
+		{"non-admin resets builtin", owner, store.Skill{Scope: "builtin"}, false, 403},
+		{"admin resets global -> 400 not-builtin", admin, store.Skill{Scope: "global"}, false, 400},
+		{"non-admin resets global -> 403", owner, store.Skill{Scope: "global"}, false, 403},
+		{"owner resets own user skill -> 400 not-builtin", owner, userSkill(owner.ID), false, 400},
+		// The oracle case: another user's private skill returns 404, NOT the 400
+		// that would leak its existence.
+		{"other resets private user skill -> 404", other, userSkill(owner.ID), false, 404},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, ok := resetSkillStatus(c.actor, c.skill)
+			if ok != c.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, c.wantOK)
+			}
+			if !ok && status != c.wantStatus {
+				t.Errorf("status = %d, want %d", status, c.wantStatus)
+			}
+		})
+	}
+}
+
 // TestAllocatableRules pins which skills may be allocated as a shared row vs a
 // user's own overlay. Shared: builtin/global only. Mine: builtin/global or the
 // caller's own user skill — never another user's private skill.

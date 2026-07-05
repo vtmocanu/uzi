@@ -129,6 +129,29 @@ func authorizeSkillWrite(actor store.User, s store.Skill) (int, bool) {
 	}
 }
 
+// resetSkillStatus decides the outcome of a reset for (actor, skill): it applies
+// the write authz FIRST (so a skill the caller may not see returns 404, hiding
+// existence), and only then the builtin-only rule (400 for a skill the caller can
+// see but that has no embedded default). ok=true carries status 0.
+func resetSkillStatus(actor store.User, s store.Skill) (int, bool) {
+	if status, ok := authorizeSkillWrite(actor, s); !ok {
+		return status, false
+	}
+	if s.Scope != "builtin" {
+		return http.StatusBadRequest, false
+	}
+	return 0, true
+}
+
+// resetSkillDenyMessage maps a reset-denial status to a user-facing message: the
+// builtin-only 400 has its own wording; 403/404 reuse the shared write messages.
+func resetSkillDenyMessage(status int) string {
+	if status == http.StatusBadRequest {
+		return "only builtin skills can be reset"
+	}
+	return skillWriteDenyMessage(status)
+}
+
 // ListSkills returns every skill visible to the caller: builtin ∪ global ∪ the
 // caller's own user skills. Admins see all scopes. This is deliberately NOT the
 // agent-templates all-shared read — that would leak private user skills.
@@ -312,12 +335,11 @@ func (h *Handler) ResetSkill(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.Scope != "builtin" {
-		httpx.Error(w, http.StatusBadRequest, "only builtin skills can be reset")
-		return
-	}
-	if status, ok := authorizeSkillWrite(actor, s); !ok {
-		httpx.Error(w, status, skillWriteDenyMessage(status))
+	// Authorize BEFORE the builtin-only rule: a skill the caller may not see
+	// (another user's private skill) must return 404, not a 400 that would confirm
+	// the id exists — an existence oracle. Consistent with Update/Delete.
+	if status, ok := resetSkillStatus(actor, s); !ok {
+		httpx.Error(w, status, resetSkillDenyMessage(status))
 		return
 	}
 	def, ok := skilltmpl.BuiltinByName(s.Name)
