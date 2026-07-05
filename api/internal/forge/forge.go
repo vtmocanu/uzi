@@ -103,6 +103,24 @@ type Issue struct {
 	UpdatedAt   time.Time
 }
 
+// LabelEvent is one resource label event on an issue: a record that a user added
+// or removed a single label at a point in time. Autopilot reads these to attribute
+// the autopilot label to the human who added it (PRD #19 Decision 3). Username is
+// the actor; it may be empty for a system-generated event.
+type LabelEvent struct {
+	ID        int64
+	Action    string // "add" | "remove"
+	LabelName string
+	Username  string
+	CreatedAt time.Time
+}
+
+// IssueNote is a comment created on an issue, returned by CreateIssueNote.
+type IssueNote struct {
+	ID   int64
+	Body string
+}
+
 // MR states as GitLab reports them on the single-MR GET. The MR-close watcher
 // (PRD #24) only acts on the opened↔closed edges; merged and locked are recorded
 // but never move a card (a merge closes the issue via `Closes #N`, which the
@@ -175,6 +193,22 @@ type Forge interface {
 	// GitLab this is atomic (a single add_labels/remove_labels update);
 	// single-column enforcement relies on that atomicity.
 	UpdateIssueLabels(ctx context.Context, projectID, issueIID int64, add, remove []string) error
+	// UserExists reports whether a user with the given username exists on the
+	// forge. It backs the best-effort verification of a user's self-declared
+	// human_username (PRD #19 M3): a false — or an error — downgrades a save to
+	// "saved with a warning", never a hard failure. A blank username is not a
+	// forge lookup; it returns (false, nil).
+	UserExists(ctx context.Context, username string) (bool, error)
+	// ListIssueLabelEvents returns the issue's resource label events (who added or
+	// removed which label, when), oldest first, paginated internally. Autopilot
+	// uses it to attribute the autopilot label to the human who added it (PRD #19
+	// Decision 3). No caller until the autopilot-trigger milestone.
+	ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]LabelEvent, error)
+	// CreateIssueNote posts a comment on an issue and returns it. Autopilot uses
+	// it to surface an outcome — no eligible user, a run failure, or the success MR
+	// link — back on the forge so a forge-only user is never left waiting (PRD #19
+	// Decision 6). No caller until the autopilot trigger/execution milestones.
+	CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error)
 	// GetMergeRequest returns one merge request by its project-scoped IID. The
 	// MR-close watcher (PRD #24) polls this for cards parked in Human Review to
 	// detect an opened→closed (reviewer rejected the MR) edge.

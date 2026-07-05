@@ -37,6 +37,7 @@ function fakeRun(): Run {
     status: "running",
     requeue_count: 0,
     iteration_count: 0,
+    auto_approve: false,
     worker_id: "worker-1",
     branch: null,
     mr_iid: null,

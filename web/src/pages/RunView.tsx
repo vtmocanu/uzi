@@ -154,6 +154,11 @@ export function RunView() {
                   "stopped" pill — StatusPill's default tone — so it stays calm and
                   agrees with the board/RunsList. */}
               <StatusPill status={stopped ? "stopped" : run.status} />
+              {run.auto_approve && (
+                <Badge tone="brand" title="Autopilot: started from the label, plan auto-approved">
+                  autopilot
+                </Badge>
+              )}
               {stage && (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info">
                   <Spinner /> {stage}…

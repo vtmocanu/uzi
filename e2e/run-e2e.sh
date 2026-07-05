@@ -98,6 +98,12 @@ login() {
 apiget()  { curl -fsS -b "$JAR" "$BASE$1"; }
 apipost() { curl -fsS -b "$JAR" -X POST "$BASE$1" -H 'Content-Type: application/json' \
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+apiput()  { curl -fsS -b "$JAR" -X PUT "$BASE$1" -H 'Content-Type: application/json' \
+  -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+# apiput_code — like apiput but never -f: echoes the HTTP status and swallows the
+# body, so the caller can assert on 200-vs-4xx (the concurrent-PUT race).
+apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$1" \
+  -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 
 wait_http() {
   local deadline=$((SECONDS + 90))
@@ -171,6 +177,104 @@ flip_mr() {
     req.on("error",e=>{console.error(e.message);process.exit(2)});
     req.write(data);req.end();
   ' "$iid" "$state" >/dev/null
+}
+
+# --- autopilot (PRD #19) helpers ---------------------------------------------
+# fake_post PATH JSON — POST to a forge-fake /_e2e mutator from inside the agent
+# (which resolves forge-fake.e2e and trusts its cert), echoing the response body.
+# Mirrors flip_mr; used to stage PRD/autopilot-labelled issues and label events
+# the way a human filing/labelling an issue would, which uzi's own CreateIssue
+# (PRD-label-only) cannot.
+fake_post() {
+  "${COMPOSE[@]}" exec -T agent node -e '
+    const https=require("https");
+    const data=process.argv[2];
+    const req=https.request({hostname:"forge-fake.e2e",port:443,method:"POST",
+      path:process.argv[1],
+      headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(data)}},
+      r=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>{
+        process.stdout.write(b);
+        if(r.statusCode>=300){console.error("fake_post",r.statusCode,b);process.exit(1)}});});
+    req.on("error",e=>{console.error(e.message);process.exit(2)});
+    req.write(data);req.end();
+  ' "$1" "$2"
+}
+
+# fake_state — the fake's persisted record (issues, MRs, notes, label events).
+fake_state() { "${COMPOSE[@]}" exec -T forge-fake cat /state/state.json; }
+
+# note_count IID / notes_text IID — issue-comment introspection.
+note_count() { fake_state | jq --argjson iid "$1" '[.notes[]? | select(.issue_iid==$iid)] | length'; }
+notes_text() { fake_state | jq -r --argjson iid "$1" '.notes[]? | select(.issue_iid==$iid) | .body'; }
+
+# add_label_event IID ACTION USERNAME — append an add/remove of the `autopilot`
+# label by USERNAME (a fresh, larger event id each time).
+add_label_event() {
+  fake_post "/_e2e/issues/$1/label-events" \
+    "$(jq -nc --arg ac "$2" --arg u "$3" '{action:$ac,label:"autopilot",username:$u}')" >/dev/null
+}
+
+# create_autopilot_issue TITLE DESC ADDER AUTHOR — stage a PRD+autopilot issue on
+# the fake authored by AUTHOR, then record the initial autopilot-label add by
+# ADDER. Echoes the new issue iid.
+create_autopilot_issue() {
+  local iid
+  iid="$(fake_post /_e2e/issues \
+    "$(jq -nc --arg t "$1" --arg d "$2" --arg a "$4" '{title:$t,description:$d,labels:["PRD","autopilot"],author:$a}')" \
+    | jq -r '.iid')"
+  [ -n "$iid" ] && [ "$iid" != null ] || fail "could not stage autopilot issue on the fake"
+  add_label_event "$iid" add "$3"
+  printf '%s' "$iid"
+}
+
+# wait_run_for_issue IID [TIMEOUT] — poll until an autopilot run exists for IID
+# (the poller creates it unattended); echoes the run id.
+wait_run_for_issue() {
+  local iid="$1" deadline=$((SECONDS + ${2:-40})) rid
+  while [ $SECONDS -lt $deadline ]; do
+    rid="$(apiget "/api/runs?issue_iid=$iid" | jq -r '.runs[0].id // empty')"
+    [ -n "$rid" ] && { printf '%s' "$rid"; return 0; }
+    sleep 1
+  done
+  fail "timeout: no autopilot run appeared for issue #$iid"
+}
+
+# assert_no_run_for_issue IID [SETTLE] — let a few detector ticks pass, then prove
+# the issue only drew a comment, never a run.
+assert_no_run_for_issue() {
+  sleep "${2:-8}"
+  local rid; rid="$(apiget "/api/runs?issue_iid=$1" | jq -r '.runs[0].id // empty')"
+  [ -z "$rid" ] || fail "issue #$1 unexpectedly spawned run $rid (autopilot should have only commented)"
+}
+
+# wait_autopilot_done RUN WANT [TIMEOUT] — like wait_status, but treats
+# awaiting_approval as a hard failure: an autopilot run that parks at the plan
+# gate means auto-approve is broken (the run would hang there forever).
+wait_autopilot_done() {
+  local run="$1" want="$2" deadline=$((SECONDS + ${3:-120})) s
+  while [ $SECONDS -lt $deadline ]; do
+    s="$(apiget "/api/runs/$run" | jq -r '.run.status')"
+    [ "$s" = "$want" ] && return 0
+    [ "$s" = awaiting_approval ] && fail "autopilot run $run parked at awaiting_approval — auto-approve did not fire"
+    case "$s" in
+      failed|cancelled) [ "$s" = "$want" ] || fail "autopilot run $run entered '$s' while waiting for '$want'";;
+    esac
+    sleep 1
+  done
+  fail "timeout: autopilot run $run never reached '$want' (last: ${s:-none})"
+}
+
+# wait_notes IID WANT [TIMEOUT] — poll until IID has exactly WANT comments; fail
+# fast if it ever exceeds WANT (the exactly-once guarantee is the whole point).
+wait_notes() {
+  local iid="$1" want="$2" deadline=$((SECONDS + ${3:-40})) n
+  while [ $SECONDS -lt $deadline ]; do
+    n="$(note_count "$iid")"
+    [ "$n" = "$want" ] && return 0
+    { [ -n "$n" ] && [ "$n" -gt "$want" ] 2>/dev/null; } && fail "issue #$iid has $n comments, expected $want (over-commented)"
+    sleep 1
+  done
+  fail "timeout: issue #$iid never reached $want comment(s) (last: ${n:-none})"
 }
 
 # =============================================================================
@@ -476,4 +580,147 @@ sleep 10
   || fail "watcher fought a manual drag: card #$IID left Later after the MR reopened"
 pass "manual drag wins: card #$IID stayed in Later despite the MR reopening"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close; executor=%s)\n' "$EXECUTOR"
+# =============================================================================
+# PRD #19 — admin settings + autopilot. The poller is already at ~2s (the phase
+# above); make the reconcile cadence tight too so the FullSync-eviction dedup
+# assertion has a bounded wait (a full reconcile every 2 ticks). Then map the
+# repo owner's forge username and opt them into autopilot: the two consent gates
+# an unattended run requires (Decision 4).
+say "PRD #19 autopilot: tighten reconcile cadence, map + opt-in the repo owner"
+printf 'FORGE_RECONCILE_EVERY=2\n' >> "$ENVFILE"
+"${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
+wait_http
+login
+wait_worker_online
+
+CONN_ID="$(apiget /api/forge/connections | jq -r '.connections[0].id // empty')"
+[ -n "$CONN_ID" ] || fail "no seeded forge connection to map"
+
+# Carry-item (M3): human_username saves verified-or-warned. The fake knows no human
+# accounts, so a real forge lookup runs and comes back empty → the value still saves,
+# WITH a warning (never a hard reject). This is also the owner→username mapping the
+# autopilot attribution needs.
+WARN="$(apiput "/api/forge/connections/$CONN_ID" '{"human_username":"owner-alice"}' | jq -r '.warning // empty')"
+[ -n "$WARN" ] || fail "human_username save should return a verified-or-warned warning"
+[ "$(apiget /api/forge/connections | jq -r '.connections[0].human_username')" = owner-alice ] \
+  || fail "human_username did not persist despite the warning"
+pass "owner mapped to owner-alice (unverifiable → saved WITH a warning)"
+
+[ "$(apiput /api/me/autopilot '{"enabled":true}' | jq -r '.user.autopilot_enabled')" = true ] \
+  || fail "autopilot opt-in did not stick"
+pass "repo owner opted into autopilot"
+
+# --- autopilot #1: happy path ------------------------------------------------
+say "autopilot #1: happy path — mapped+opted-in owner adds the label → unattended run → MR + success comment"
+IID_AP="$(create_autopilot_issue "E2E autopilot happy" \
+  "Implements prds/4-agent-runtime-workers.md under autopilot." owner-alice owner-alice)"
+RUN_AP="$(wait_run_for_issue "$IID_AP" 40)"
+[ "$(apiget "/api/runs/$RUN_AP" | jq -r '.run.auto_approve')" = true ] \
+  || fail "autopilot run is not marked auto_approve"
+pass "issue #$IID_AP: poller created an unattended auto_approve run ($RUN_AP) — no manual start"
+
+wait_autopilot_done "$RUN_AP" completed 120
+AP="$(apiget "/api/runs/$RUN_AP")"
+# The plan is recorded as a run MESSAGE (kind:"plan"), emitted+flushed before the
+# auto-approve verdict — NOT in run.plan_md, which only the awaiting_approval report
+# sets and autopilot deliberately skips (so the run never parks at the gate).
+apiget "/api/runs/$RUN_AP/messages" \
+  | jq -e '[.messages[]? | select(.kind=="plan")] | length >= 1' >/dev/null \
+  || fail "autopilot run recorded no plan message"
+[ "$(echo "$AP" | jq -r '.run.branch')" = "agent/issue-$IID_AP" ] || fail "autopilot branch mismatch"
+MR_AP="$(echo "$AP" | jq -r '.run.mr_iid')"
+{ [ "$MR_AP" != null ] && [ "$MR_AP" -gt 0 ]; } || fail "autopilot run opened no MR (got $MR_AP)"
+pass "run completed unattended (never parked at the gate), plan recorded, MR !$MR_AP opened"
+
+wait_notes "$IID_AP" 1 40
+notes_text "$IID_AP" | grep -qF "opened a merge request" || fail "expected the success comment with the MR link"
+pass "exactly one success comment referencing the MR"
+
+wait_card_column "$IID_AP" "Human Review" 40
+pass "board label moved: card #$IID_AP resolved to Human Review"
+
+# --- autopilot #2: no-consent (+ retry re-eval + eviction dedup) -------------
+say "autopilot #2: no-consent — label added by an unmapped user → one explanatory comment, no run"
+IID_NC="$(create_autopilot_issue "E2E autopilot no-consent" \
+  "Implements prds/4-agent-runtime-workers.md" someone-else someone-else)"
+wait_notes "$IID_NC" 1 40
+notes_text "$IID_NC" | grep -qF "did not start a run" || fail "expected the no-eligible-user comment"
+assert_no_run_for_issue "$IID_NC" 6
+pass "one 'no eligible user' comment, no run"
+
+# Retry gesture: remove + re-add mints a larger event id → re-evaluated exactly once.
+add_label_event "$IID_NC" remove someone-else
+add_label_event "$IID_NC" add someone-else
+wait_notes "$IID_NC" 2 40
+pass "label remove+re-add (new event id) → re-evaluated once → second comment"
+
+# A FullSync (eviction + resync of the issue cache) must NOT re-comment: the dedup
+# marker lives in autopilot_triggers, not the evictable issue cache. Several ticks
+# (>= one reconcile at FORGE_RECONCILE_EVERY=2) with no new label event → still 2.
+sleep 10
+[ "$(note_count "$IID_NC")" = 2 ] || fail "a FullSync eviction re-commented (trigger dedup must survive eviction)"
+assert_no_run_for_issue "$IID_NC" 0
+pass "no re-comment (and still no run) across a FullSync eviction"
+
+# --- autopilot #3: failure path ----------------------------------------------
+say "autopilot #3: failure path — the run fails (stub sentinel) → exactly one failure comment"
+IID_FL="$(create_autopilot_issue "E2E autopilot failure" \
+  "Implements prds/4-agent-runtime-workers.md then fails: UZI_STUB_FAIL" owner-alice owner-alice)"
+RUN_FL="$(wait_run_for_issue "$IID_FL" 40)"
+wait_status "$RUN_FL" failed 120
+wait_notes "$IID_FL" 1 40
+notes_text "$IID_FL" | grep -qF "could not complete" || fail "expected the failure comment"
+notes_text "$IID_FL" | grep -qF "/runs/$RUN_FL" || fail "failure comment is missing the run link"
+sleep 6   # a duplicate would appear within a couple of ticks
+[ "$(note_count "$IID_FL")" = 1 ] || fail "failure path posted more than one comment"
+pass "exactly one failure comment (fixed template + run link), no failure_reason echoed"
+
+# --- autopilot #5: PRD-link gate ---------------------------------------------
+say "autopilot #5: PRD-link gate — autopilot label on an issue with no PRD link → comment, no run"
+IID_NP="$(create_autopilot_issue "E2E autopilot no-prd" \
+  "This issue points at no plan file whatsoever." owner-alice owner-alice)"
+wait_notes "$IID_NP" 1 40
+notes_text "$IID_NP" | grep -qF "no PRD link" || fail "expected the no-PRD-link comment"
+assert_no_run_for_issue "$IID_NP" 6
+pass "one 'no PRD link' comment, no run"
+
+# --- autopilot #4: carry-item e2e (settings race + username collision) -------
+say "carry-item: concurrent cross-key settings PUT — the FOR UPDATE serialization rejects the equal-label race"
+# Two concurrent single-key PUTs that each pass the cache precheck but together would
+# land prd_label == autopilot_label. Exactly one commits; the other is rejected (400),
+# whether by the in-tx FOR UPDATE cross-key check (true race) or the cache precheck
+# (if it lost the race). Same admin session, two concurrent requests = two txns.
+( apiput_code /api/admin/settings '{"settings":{"prd_label":"SHARED"}}'       > "$RUNROOT/race.a" ) &
+( apiput_code /api/admin/settings '{"settings":{"autopilot_label":"SHARED"}}' > "$RUNROOT/race.b" ) &
+wait
+CA="$(cat "$RUNROOT/race.a")"; CB="$(cat "$RUNROOT/race.b")"
+ok=0; bad=0
+for c in "$CA" "$CB"; do
+  case "$c" in 200) ok=$((ok+1));; 400) bad=$((bad+1));; *) fail "unexpected settings PUT status: $c";; esac
+done
+{ [ "$ok" = 1 ] && [ "$bad" = 1 ]; } \
+  || fail "concurrent cross-key PUT: expected one 200 + one 400, got $CA and $CB"
+pass "concurrent cross-key settings PUT: exactly one accepted, one rejected (got $CA / $CB)"
+# Restore the defaults so nothing downstream sees a half-applied label swap.
+apiput /api/admin/settings '{"settings":{"prd_label":"PRD","autopilot_label":"autopilot"}}' >/dev/null
+
+say "carry-item: human_username collision — a second user claiming the same forge username on the same host is 409"
+JAR2="$RUNROOT/u2.jar"
+# Open registration issues a session (first user is the seeded admin, so this one is
+# a normal user). The cookie jar carries both the session and the CSRF token.
+curl -fsS -c "$JAR2" -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' \
+  -d '{"email":"user2@uzi.e2e","password":"e2e-user2-password-000000","display_name":"User Two"}' >/dev/null
+u2csrf="$(awk '$6=="uzi_csrf"{print $7}' "$JAR2")"
+CONN2="$(curl -fsS -b "$JAR2" -X POST "$BASE/api/forge/connections" -H 'Content-Type: application/json' \
+  -H "X-CSRF-Token: $u2csrf" \
+  -d "{\"forge_type\":\"gitlab\",\"base_url\":\"https://forge-fake.e2e\",\"token\":\"$DUMMY_FORGE_PAT\"}" \
+  | jq -r '.connection.id // empty')"
+[ -n "$CONN2" ] || fail "user2 could not connect to the fake forge"
+# The admin already mapped owner-alice above; user2 claiming it on the same host must 409.
+COLLIDE="$(curl -sS -o /dev/null -w '%{http_code}' -b "$JAR2" -X PUT "$BASE/api/forge/connections/$CONN2" \
+  -H 'Content-Type: application/json' -H "X-CSRF-Token: $u2csrf" \
+  -d '{"human_username":"owner-alice"}')"
+[ "$COLLIDE" = 409 ] || fail "second user mapping owner-alice should be 409, got $COLLIDE"
+pass "human_username collision on the same host is rejected (409)"
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #19 autopilot; executor=%s)\n' "$EXECUTOR"

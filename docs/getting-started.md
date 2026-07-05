@@ -40,3 +40,7 @@ Register a worker and start a run from a board card: see
 
 - [Agent templates](./agent-templates.md): the roles (`coder`, `reviewer`,
   ...) your agents play, and how an admin edits them.
+- [Admin settings](./admin-settings.md): the two forge labels an admin can
+  reconfigure instance-wide.
+- [Autopilot](./autopilot.md): skip the plan-approval step and let a labeled
+  issue run end to end unattended, on your own opt-in.

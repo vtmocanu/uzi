@@ -7,11 +7,24 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, ApiError, setUnauthorizedHandler, type User } from "../lib/api";
+import {
+  api,
+  ApiError,
+  setUnauthorizedHandler,
+  DEFAULT_PRD_LABEL,
+  DEFAULT_AUTOPILOT_LABEL,
+  type SessionResponse,
+  type User,
+} from "../lib/api";
 
 interface AuthState {
   user: User | null;
   loading: boolean;
+  // Instance forge labels delivered on the session bootstrap (PRD #19 M2). They
+  // hold the compiled-in defaults until the first session response resolves, so
+  // consumers (Board, issue creation) can read them unconditionally.
+  prdLabel: string;
+  autopilotLabel: string;
   register: (email: string, password: string, displayName: string) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -23,17 +36,27 @@ const AuthContext = createContext<AuthState | undefined>(undefined);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [prdLabel, setPrdLabel] = useState(DEFAULT_PRD_LABEL);
+  const [autopilotLabel, setAutopilotLabel] = useState(DEFAULT_AUTOPILOT_LABEL);
+
+  // applySession records the user and the instance labels from a session
+  // response, falling back to the compiled-in defaults for a server that predates
+  // the label fields.
+  const applySession = useCallback((session: SessionResponse) => {
+    setUser(session.user);
+    setPrdLabel(session.prd_label || DEFAULT_PRD_LABEL);
+    setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
-      const { user } = await api.me();
-      setUser(user);
+      applySession(await api.me());
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         setUser(null);
       }
     }
-  }, []);
+  }, [applySession]);
 
   // Any authenticated request that comes back 401 (a session expired or deleted
   // mid-session) clears the user here; a rendered ProtectedRoute then redirects
@@ -54,16 +77,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const register = useCallback(
     async (email: string, password: string, displayName: string) => {
-      const { user } = await api.register(email, password, displayName);
-      setUser(user);
+      applySession(await api.register(email, password, displayName));
     },
-    [],
+    [applySession],
   );
 
-  const login = useCallback(async (email: string, password: string) => {
-    const { user } = await api.login(email, password);
-    setUser(user);
-  }, []);
+  const login = useCallback(
+    async (email: string, password: string) => {
+      applySession(await api.login(email, password));
+    },
+    [applySession],
+  );
 
   const logout = useCallback(async () => {
     try {
@@ -74,8 +98,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo<AuthState>(
-    () => ({ user, loading, register, login, logout, refresh }),
-    [user, loading, register, login, logout, refresh],
+    () => ({ user, loading, prdLabel, autopilotLabel, register, login, logout, refresh }),
+    [user, loading, prdLabel, autopilotLabel, register, login, logout, refresh],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

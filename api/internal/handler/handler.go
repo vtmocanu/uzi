@@ -17,6 +17,7 @@ import (
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -38,32 +39,56 @@ type Handler struct {
 	// hub fans persisted run events out to browser WebSocket subscribers (M5). It
 	// is the same instance workersvc broadcasts to.
 	hub *hub.Hub
+	// settings is the read-through cache over app_settings (PRD #19), shared with
+	// the poller so both read the same configured labels.
+	settings *settings.Cache
+	// reconciler is signalled after a label-affecting settings change so the poller
+	// full-syncs every repo on its next cycle (PRD #19 M2). Optional: nil in tests
+	// that don't exercise the poller; UpdateSettings nil-guards the call.
+	reconciler Reconciler
+}
+
+// Reconciler receives the "labels changed, resync everything" signal from the
+// settings PUT handler. *poller.Engine satisfies it; the handler depends on the
+// behavior, not the concrete engine, so it stays decoupled from the poller
+// package and testable with a nil (or fake) reconciler.
+type Reconciler interface {
+	ForceReconcile()
 }
 
 // New constructs a Handler.
-func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, pcheck *privcheck.Service, h *hub.Hub) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h}
+func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, pcheck *privcheck.Service, h *hub.Hub, set *settings.Cache) *Handler {
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set}
 }
+
+// SetReconciler wires the poller's force-reconcile signal in after construction,
+// matching how the run-lifecycle collaborators are attached in main (the poller
+// is built after the handler's other deps). Safe to leave unset in tests.
+func (h *Handler) SetReconciler(r Reconciler) { h.reconciler = r }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
 // password hash or token_version.
 type userDTO struct {
-	ID          string     `json:"id"`
-	Email       string     `json:"email"`
-	DisplayName *string    `json:"display_name"`
-	IsAdmin     bool       `json:"is_admin"`
-	IsActive    bool       `json:"is_active"`
-	CreatedAt   time.Time  `json:"created_at"`
-	LastLogin   *time.Time `json:"last_login"`
+	ID          string  `json:"id"`
+	Email       string  `json:"email"`
+	DisplayName *string `json:"display_name"`
+	IsAdmin     bool    `json:"is_admin"`
+	IsActive    bool    `json:"is_active"`
+	// AutopilotEnabled is the user's per-user opt-in to unattended autopilot runs
+	// (PRD #19 M3, Decision 4). Default false; toggled from the user's Settings page.
+	AutopilotEnabled bool       `json:"autopilot_enabled"`
+	CreatedAt        time.Time  `json:"created_at"`
+	LastLogin        *time.Time `json:"last_login"`
 }
 
 func toDTO(u store.User) userDTO {
 	dto := userDTO{
-		ID:        u.ID.String(),
-		Email:     u.Email,
-		IsAdmin:   u.IsAdmin,
-		IsActive:  u.IsActive,
-		CreatedAt: u.CreatedAt.Time,
+		ID:               u.ID.String(),
+		Email:            u.Email,
+		IsAdmin:          u.IsAdmin,
+		IsActive:         u.IsActive,
+		AutopilotEnabled: u.AutopilotEnabled,
+		CreatedAt:        u.CreatedAt.Time,
 	}
 	if u.DisplayName.Valid {
 		dto.DisplayName = &u.DisplayName.String
@@ -119,6 +144,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
 		})
 
+		// Current-user autopilot opt-in (PRD #19): per-user consent to unattended
+		// runs, scoped to the authenticated user (no admin-toggles-for-you path).
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Put("/me/autopilot", h.SetAutopilotEnabled)
+		})
+
 		// Current-user settings (non-secret, own-user only): the per-user default
 		// worker model (PRD #17). Session-authenticated, no admin path.
 		r.Route("/me/settings", func(r chi.Router) {
@@ -150,6 +182,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Use(mw.RequireAdmin)
 			r.Get("/users", h.ListUsers)
 			r.Patch("/users/{id}", h.PatchUser)
+			// Instance settings (PRD #19): the configurable forge labels today.
+			r.Get("/settings", h.GetSettings)
+			r.Put("/settings", h.UpdateSettings)
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
 			r.Get("/runs", h.AdminListRuns)
@@ -170,6 +205,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/verify", h.VerifyConnection)
 				r.Delete("/{id}", h.DeleteConnection)
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/projects", h.ListProjects)
+				// human_username edit best-effort-verifies against the forge → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Put("/{id}", h.UpdateConnection)
 				// Full least-privilege report (PRD #5): 2 + 2×repos upstream calls,
 				// so it rides the per-user forge budget like the other proxying routes.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/privilege-check", h.PrivilegeCheck)
