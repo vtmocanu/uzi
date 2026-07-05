@@ -189,10 +189,15 @@ func run() error {
 	}()
 	if cfg.PrivilegeCheckInterval > 0 {
 		privSweep := privcheck.NewEngine(pcheck, cfg.PrivilegeCheckInterval)
-		privSweep.Boot(ctx)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()
+			// Boot pass runs INSIDE the goroutine (poller precedent), not on the
+			// boot path: it makes forge network calls, so a slow/down forge at
+			// deploy must not delay ListenAndServe or the /api/health endpoint (and
+			// trip the compose healthcheck chain). Async still back-fills
+			// grandfathered reports within seconds of a healthy forge.
+			privSweep.Boot(ctx)
 			privSweep.Run(ctx)
 		}()
 	} else {
