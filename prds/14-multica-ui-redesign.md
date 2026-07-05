@@ -1,7 +1,7 @@
 # PRD #14: Adopt the Multica-inspired UI Redesign (ember)
 
 **GitLab Issue**: [vtmocanu/uzi#14](https://gitlab.example.com/vtmocanu/uzi/-/issues/14)
-**Status**: In progress (2026-07-05). 2026-07-04: reviewed by 2 agents — adversarial fact-check + design review; all findings incorporated. 2026-07-05: PRD #12 landed on `main` before this PRD started, inverting Decision 6's planned merge order — Decision 6 and the Port plan rewritten accordingly (see below).
+**Status**: M1–M5 complete, M6 in progress (2026-07-05). Implementation by agent team: every milestone reviewed (reviewer 5 passes, all APPROVE) + audited (2 passes, clean) + browser-validated (web-ux, 8 flows, no blockers) + tested (M4 all green incl. real-GitLab scratch leg + 401-interceptor fix at 62f102d). Post-review additions, user-approved: unified run status colors across surfaces (runBadge info/ok tones), auth-page redirect guard, live-pill gating, themed focus-visible ring. M4 also surfaced a compose-isolation footgun (shell env overrides --env-file) — recorded in CLAUDE.md. 2026-07-05 earlier: PRD #12 landed on `main` before this PRD started, inverting Decision 6's planned merge order — Decision 6 and the Port plan rewritten accordingly (see below).
 **Priority**: High
 **Created**: 2026-07-04
 **Depends on**: PRD #12 (done, merged `9d35080`) — its board/run-lifecycle UI is now the base this PRD re-skins; see Design Decision 6.
@@ -81,12 +81,12 @@ Stale navigation language lives in `README.md:26` ("**Forge** (top nav)"), `docs
 
 ## Milestones
 
-- [ ] **M1 — Port lands on a PRD branch**: prototype commit cherry-picked onto current `main` with the Decision 6 design-over-logic merge (#12 behavior preserved, verified by its tests), mocks extended to #12's surfaces, `ux-review.md` dropped, typecheck + full vitest suite + real (non-mock) `npm run build` green.
-- [ ] **M2 — Nav adjustments**: GitLab/git icons on board nav entries (via the `listConnections` join), standalone Forge nav entry removed, `/settings/forge` reachable via Settings tabs with correct active states; page-level smoke tests added for shell nav + settings tabs.
-- [ ] **M3 — Reskin completed**: `Register`, `Docs`, `DocPage`, `AgentDetail`, `AgentNew`, `IssueView`, `AgentTemplateEditor`, `Markdown`, `RouteGuards`, and the `index.css` prose block converted to tokens; the scoped grep gate (Success Criterion 3) passes with an empty allowlist.
-- [ ] **M4 — Real-stack validation**: golden path items 1–5 green against the live compose stack; any real-API seams the mock hid (including the 401/session-expiry path) fixed.
-- [ ] **M5 — Docs refresh**: README + `docs/configuration.md` + `docs/gitlab-bot-setup.md` match the new navigation; `check-docs` green.
-- [ ] **M6 — Review gate + merge**: agent review round (reviewer + fact-check, same bar as PRD #12) on the final diff; findings resolved; MR merged to `main`; issue #14 closed.
+- [x] **M1 — Port lands on a PRD branch** (3aac410, dc2980a, 47a8fa2): design-over-logic merge, #12 behavior preserved (reviewer APPROVE, all 11 pre-flags cleared; auditor clean), mocks extended, 107/107 → gates green.
+- [x] **M2 — Nav adjustments** (2f33d9c, c4aafc8): tanuki/git icons via `listConnections` join, Forge nav removed, active states pinned by new smoke tests (reviewer APPROVE, auditor clean).
+- [x] **M3 — Reskin completed** (8e9847f, + f1eb50d NITs; polish f9237b6/08e31d1/eabfbec/ec96b75 user-approved): grep gate zero hits, no allowlist; web-ux browser validation of all 8 flows, no blockers.
+- [x] **M4 — Real-stack validation** (fix 62f102d): golden path 1–5 PASS headless (isolated stacks), e2e harness PASS, real-GitLab leg PASS on `vtmocanu/uzi-e2e-scratch` (real project untouched), 401 interceptor added + validated + reviewed.
+- [x] **M5 — Docs refresh** (3c80657): README/configuration/gitlab-bot-setup match the shipped nav (incl. Repos→Boards rename); check-docs green.
+- [ ] **M6 — Review gate + merge**: final coverage sweep + fact-check in progress; then MR to `main` (stops for user review per /prd-full); issue #14 closed on merge.
 - [ ] **M7 — Cleanup**: all three prototype containers stopped/removed, prototype worktrees removed; `specs/ai.md` updated with the token/theming decisions; `specs/human.md` addition (multica design selected, board icons, forge-under-settings-only) drafted and **explicitly confirmed with the user before writing** (per CLAUDE.md rule).
 
 ## Success Criteria
