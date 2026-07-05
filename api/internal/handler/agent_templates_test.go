@@ -84,10 +84,13 @@ func TestValidateTemplateFields(t *testing.T) {
 	}
 }
 
+// TestValidateModel covers only the handler wrapper's storage mapping onto
+// pgtype.Text; the Decision 4 rule cases live with the shared core in
+// agenttmpl.TestValidateModel (single source, no drift).
 func TestValidateModel(t *testing.T) {
 	strptr := func(s string) *string { return &s }
 
-	// nil and blank both mean inherit (NULL), no error.
+	// nil pointer and blank string both map to NULL (inherit), no error.
 	for _, raw := range []*string{nil, strptr(""), strptr("   ")} {
 		got, err := validateModel(raw)
 		if err != nil {
@@ -98,39 +101,18 @@ func TestValidateModel(t *testing.T) {
 		}
 	}
 
-	// A curated alias and a full custom ID both pass; surrounding whitespace is
-	// trimmed (matching the web control, which emits the raw text).
-	for in, want := range map[string]string{
-		"opus":                     "opus",
-		"claude-fable-5":           "claude-fable-5",
-		"  sonnet  ":               "sonnet",
-		"us.anthropic.claude-x:v1": "us.anthropic.claude-x:v1",
-	} {
-		got, err := validateModel(strptr(in))
-		if err != nil {
-			t.Errorf("validateModel(%q) errored: %v", in, err)
-		}
-		if !got.Valid || got.String != want {
-			t.Errorf("validateModel(%q) = (%q, valid=%v), want %q", in, got.String, got.Valid, want)
-		}
+	// A valid value becomes a set pgtype.Text, trimmed.
+	got, err := validateModel(strptr("  sonnet  "))
+	if err != nil {
+		t.Fatalf("valid model rejected: %v", err)
+	}
+	if !got.Valid || got.String != "sonnet" {
+		t.Errorf("validateModel = (%q, valid=%v), want %q", got.String, got.Valid, "sonnet")
 	}
 
-	// Interior whitespace, control chars, and over-length all reject (Decision 4).
-	rejects := map[string]string{
-		"interior space": "claude 3",
-		"tab":            "claude\t3",
-		"newline":        "opus\nmodel: sonnet",
-		"too long":       strings.Repeat("x", maxModelLen+1),
-	}
-	for name, in := range rejects {
-		if _, err := validateModel(strptr(in)); err == nil {
-			t.Errorf("%s: expected rejection for %q", name, in)
-		}
-	}
-
-	// Exactly maxModelLen is allowed (boundary).
-	if _, err := validateModel(strptr(strings.Repeat("x", maxModelLen))); err != nil {
-		t.Errorf("model of exactly maxModelLen should be allowed: %v", err)
+	// An invalid value propagates the core error (rule coverage is in agenttmpl).
+	if _, err := validateModel(strptr("claude 3")); err == nil {
+		t.Error("expected rejection for a model with interior whitespace")
 	}
 }
 

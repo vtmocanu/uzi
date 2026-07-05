@@ -48,8 +48,10 @@ func TestBuiltinsParseAndValid(t *testing.T) {
 			t.Errorf("duplicate builtin name %q", def.Name)
 		}
 		seen[def.Name] = true
-		if def.Model != "" && !saneModelAlias(def.Model) {
-			t.Errorf("builtin %q has an unsane model %q", def.Name, def.Model)
+		// Validate the model against the shared, authoritative rule (no separate
+		// test-local copy that could drift from the server validator).
+		if _, err := ValidateModel(def.Model); err != nil {
+			t.Errorf("builtin %q has an invalid model %q: %v", def.Name, def.Model, err)
 		}
 	}
 }
@@ -97,20 +99,6 @@ func TestLeadBuiltin(t *testing.T) {
 	if strings.Contains(string(Render(lead)), "\ntools:") {
 		t.Error("rendered lead must not contain a tools line")
 	}
-}
-
-// saneModelAlias mirrors the Decision 4 model rules at the coarse level M1 needs:
-// a model string is trimmed, non-empty, whitespace-free, and length-capped. The
-// full server/client validator (PRD #17 M2) tightens the same rules in one
-// shared place.
-func saneModelAlias(m string) bool {
-	if m == "" || m != strings.TrimSpace(m) {
-		return false
-	}
-	if len(m) > 100 {
-		return false
-	}
-	return !strings.ContainsAny(m, " \t\n")
 }
 
 // TestCoderInheritsAllTools pins the confirmed gotcha: coder.md carries no tools
