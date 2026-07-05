@@ -76,11 +76,20 @@ func TestPrdlessAccessors(t *testing.T) {
 		t.Fatalf("PrdlessLabel default = %q, %v; want %q", got, err, DefaultPrdlessLabel)
 	}
 
-	// Stored "false" disables; a non-"true"/"false" value reads as false (strict).
+	// "true"/"false" are honored verbatim; every other value (empty, junk, or a
+	// non-canonical spelling only reachable through the M1-deferred PUT) falls back
+	// to the compiled-in default (true) rather than silently reading as false.
 	for _, tc := range []struct {
 		stored string
 		want   bool
-	}{{"true", true}, {"false", false}, {"", true /* empty → default "true" */}, {"banana", false}} {
+	}{
+		{"true", true},
+		{"false", false},
+		{"", true},       // empty → default "true"
+		{"banana", true}, // junk → compiled-in default, NOT false
+		{"TRUE", true},   // non-canonical spelling → default, not a lenient parse
+		{"0", true},      // ditto
+	} {
 		c := New(&fakeStore{rows: []store.AppSetting{row(KeyPrdlessEnabled, tc.stored)}}, time.Minute)
 		if got, _ := c.PrdlessEnabled(context.Background()); got != tc.want {
 			t.Errorf("PrdlessEnabled(stored=%q) = %v, want %v", tc.stored, got, tc.want)

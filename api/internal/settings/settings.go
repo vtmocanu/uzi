@@ -180,13 +180,25 @@ func (c *Cache) PrdlessLabel(ctx context.Context) (string, error) {
 
 // PrdlessEnabled reports whether the PRDLESS gate-bypass feature is enabled
 // instance-wide (PRD #22, Decision 1). The value is stored as the text
-// "true"/"false"; anything other than "true" reads as false. A cold read error
-// returns the compiled-in default (true) alongside the error, so a best-effort
-// caller can ignore err — but an unlabeled issue is still gated, since the
-// bypass also requires the label on the fresh snapshot.
+// "true"/"false"; only those two are honored. Any OTHER value falls back to the
+// compiled-in default (true) rather than silently reading as false — this is a
+// deliberate junk-tolerance: until M1 lands per-key bool validation (deferred
+// behind prd-21), the settings PUT still runs the uniform label validator and
+// would accept e.g. prdless_enabled="banana", and a malformed value must not
+// silently flip a default-on feature off. A cold read error also returns the
+// default (true) alongside the error, so a best-effort caller can ignore err —
+// an unlabeled issue is still gated, since the bypass also requires the label on
+// the fresh snapshot.
 func (c *Cache) PrdlessEnabled(ctx context.Context) (bool, error) {
 	v, err := c.get(ctx, KeyPrdlessEnabled)
-	return v == "true", err
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultPrdlessEnabled == "true", err
+	}
 }
 
 // All returns every known key with its effective value (row value or default).
