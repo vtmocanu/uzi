@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -359,15 +360,11 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 		return f, errors.New("prompt body must not be empty")
 	}
 
-	if req.Model != nil {
-		m := strings.TrimSpace(*req.Model)
-		if m != "" {
-			if hasControlChar(m) {
-				return f, errors.New("model must not contain newlines or control characters")
-			}
-			f.model = pgtype.Text{String: m, Valid: true}
-		}
+	model, err := validateModel(req.Model)
+	if err != nil {
+		return f, err
 	}
+	f.model = model
 
 	// An empty (or absent) tools list normalizes to NULL = inherit all, so a
 	// direct-API empty array does not persist a `[]` that renders as inherit-all
@@ -395,6 +392,38 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 		return f, errors.New("template appears to contain a full Anthropic token; remove the credential")
 	}
 	return f, nil
+}
+
+// maxModelLen caps a model alias / full ID. Real model IDs (aliases like "opus"
+// through full bedrock IDs) sit well under this; the cap only bounds a pasted
+// blob. Kept in lockstep with the web MAX_MODEL_LEN (PRD #17 Decision 4).
+const maxModelLen = 100
+
+// validateModel enforces the Decision 4 model rules shared by agent templates
+// (validateTemplateFields) and the per-user default-model endpoint (PRD #17), so
+// the two write surfaces cannot drift. A nil or blank value means inherit
+// (NULL); otherwise the trimmed value must be a single whitespace-free token,
+// free of control characters, and at most maxModelLen bytes. A typo in a custom
+// ID is accepted here and only surfaces as a run-time SDK error — the API cannot
+// enumerate valid IDs without calling Anthropic.
+func validateModel(raw *string) (pgtype.Text, error) {
+	if raw == nil {
+		return pgtype.Text{}, nil
+	}
+	m := strings.TrimSpace(*raw)
+	if m == "" {
+		return pgtype.Text{}, nil
+	}
+	if len(m) > maxModelLen {
+		return pgtype.Text{}, fmt.Errorf("model must be at most %d characters", maxModelLen)
+	}
+	if hasControlChar(m) {
+		return pgtype.Text{}, errors.New("model must not contain newlines or control characters")
+	}
+	if strings.IndexFunc(m, unicode.IsSpace) >= 0 {
+		return pgtype.Text{}, errors.New("model must be a single token with no spaces")
+	}
+	return pgtype.Text{String: m, Valid: true}, nil
 }
 
 // storeColumns converts a builtin definition into the model/tools column types

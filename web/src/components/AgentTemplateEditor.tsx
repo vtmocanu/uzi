@@ -1,6 +1,7 @@
 import { useMemo, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { AgentTemplateInput } from "../lib/api";
 import { Alert, Button, Field, Input } from "./ui";
+import { ModelSelect } from "./ModelSelect";
 import {
   frontmatterFieldWarning,
   KNOWN_TOOLS,
@@ -9,8 +10,6 @@ import {
   splitToolInput,
   unknownTools,
 } from "../lib/agentTemplates";
-
-const MODEL_ALIASES = ["sonnet", "opus", "haiku", "fable"];
 
 export interface EditorInitial {
   name: string;
@@ -123,20 +122,8 @@ export function AgentTemplateEditor({
         <Input value={description} onChange={(e) => setDescription(e.target.value)} />
       </Field>
 
-      <Field label="Model (blank = inherit)">
-        <>
-          <Input
-            list="model-aliases"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="inherit"
-          />
-          <datalist id="model-aliases">
-            {MODEL_ALIASES.map((m) => (
-              <option key={m} value={m} />
-            ))}
-          </datalist>
-        </>
+      <Field label="Model">
+        <ModelSelect value={model} onChange={setModel} />
       </Field>
 
       <div className="space-y-1.5">

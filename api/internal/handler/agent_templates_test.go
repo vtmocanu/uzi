@@ -84,6 +84,56 @@ func TestValidateTemplateFields(t *testing.T) {
 	}
 }
 
+func TestValidateModel(t *testing.T) {
+	strptr := func(s string) *string { return &s }
+
+	// nil and blank both mean inherit (NULL), no error.
+	for _, raw := range []*string{nil, strptr(""), strptr("   ")} {
+		got, err := validateModel(raw)
+		if err != nil {
+			t.Errorf("validateModel(%v) errored: %v", raw, err)
+		}
+		if got.Valid {
+			t.Errorf("validateModel(%v) = %q, want NULL (inherit)", raw, got.String)
+		}
+	}
+
+	// A curated alias and a full custom ID both pass; surrounding whitespace is
+	// trimmed (matching the web control, which emits the raw text).
+	for in, want := range map[string]string{
+		"opus":                     "opus",
+		"claude-fable-5":           "claude-fable-5",
+		"  sonnet  ":               "sonnet",
+		"us.anthropic.claude-x:v1": "us.anthropic.claude-x:v1",
+	} {
+		got, err := validateModel(strptr(in))
+		if err != nil {
+			t.Errorf("validateModel(%q) errored: %v", in, err)
+		}
+		if !got.Valid || got.String != want {
+			t.Errorf("validateModel(%q) = (%q, valid=%v), want %q", in, got.String, got.Valid, want)
+		}
+	}
+
+	// Interior whitespace, control chars, and over-length all reject (Decision 4).
+	rejects := map[string]string{
+		"interior space": "claude 3",
+		"tab":            "claude\t3",
+		"newline":        "opus\nmodel: sonnet",
+		"too long":       strings.Repeat("x", maxModelLen+1),
+	}
+	for name, in := range rejects {
+		if _, err := validateModel(strptr(in)); err == nil {
+			t.Errorf("%s: expected rejection for %q", name, in)
+		}
+	}
+
+	// Exactly maxModelLen is allowed (boundary).
+	if _, err := validateModel(strptr(strings.Repeat("x", maxModelLen))); err != nil {
+		t.Errorf("model of exactly maxModelLen should be allowed: %v", err)
+	}
+}
+
 func TestRejectFrontmatterInjection(t *testing.T) {
 	strptr := func(s string) *string { return &s }
 	injections := map[string]templateWriteRequest{

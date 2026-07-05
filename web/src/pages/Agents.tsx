@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type AgentTemplate } from "../lib/api";
-import { summarizeTools } from "../lib/agentTemplates";
+import { isLeadTemplateName, summarizeTools } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card, ListSkeleton, PageHeader } from "../components/ui";
 import { PlusIcon } from "../components/icons";
 
@@ -71,12 +71,19 @@ export function Agents() {
                   templates.map((t) => (
                     <tr key={t.id} className="transition-colors hover:bg-raised/30">
                       <td className="px-4 py-3">
-                        <Link
-                          to={`/agents/${t.id}`}
-                          className="font-mono text-brand hover:text-brand-hover"
-                        >
-                          {t.name}
-                        </Link>
+                        <span className="inline-flex items-center gap-2">
+                          <Link
+                            to={`/agents/${t.id}`}
+                            className="font-mono text-brand hover:text-brand-hover"
+                          >
+                            {t.name}
+                          </Link>
+                          {isLeadTemplateName(t.name) && (
+                            <Badge tone="brand" title="The orchestrator: the main agent thread that plans and delegates.">
+                              orchestrator
+                            </Badge>
+                          )}
+                        </span>
                       </td>
                       <td className="max-w-md px-4 py-3 text-muted">{t.description}</td>
                       <td className="px-4 py-3 text-muted">{t.model ?? "inherit"}</td>
