@@ -24,6 +24,23 @@ function Icon({ children, ...props }: SVGProps<SVGSVGElement>) {
   );
 }
 
+// Brand glyphs are FILLED single paths (from simple-icons), unlike the stroked
+// lucide set above, so they get their own wrapper: fill:currentColor, no stroke.
+function LogoIcon({ children, ...props }: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      width="1em"
+      height="1em"
+      aria-hidden="true"
+      {...props}
+    >
+      {children}
+    </svg>
+  );
+}
+
 export const HomeIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
@@ -76,6 +93,22 @@ export const BranchIcon = (p: SVGProps<SVGSVGElement>) => (
     <circle cx="18" cy="6" r="3" />
     <path d="M6 9v6M18 9a9 9 0 0 1-9 9" />
   </Icon>
+);
+
+// GitLabIcon: the GitLab tanuki (simple-icons), used on board nav entries whose
+// forge connection is GitLab. Filled, single path.
+export const GitLabIcon = (p: SVGProps<SVGSVGElement>) => (
+  <LogoIcon {...p}>
+    <path d="m23.6004 9.5927-.0337-.0862L20.3.9814a.851.851 0 0 0-.3362-.405.8748.8748 0 0 0-.9997.0539.8748.8748 0 0 0-.29.4399l-2.2055 6.748H7.5375l-2.2057-6.748a.8573.8573 0 0 0-.29-.4412.8748.8748 0 0 0-.9997-.0537.8585.8585 0 0 0-.3362.4049L1.4332 9.5065l-.0325.0862-.0038.0089a6.0657 6.0657 0 0 0 2.0121 7.0105l.0111.0087.0294.0213 4.9764 3.7264 2.4624 1.8633 1.4999 1.1321a1.0085 1.0085 0 0 0 1.2192 0l1.4999-1.1321 2.4624-1.8633 5.0058-3.7489.0129-.0102a6.0682 6.0682 0 0 0 2.0119-7.003z" />
+  </LogoIcon>
+);
+
+// GitIcon: the generic Git mark (simple-icons), the fallback for non-GitLab
+// forge drivers. Distinct from BranchIcon, which keeps its stroked-branch uses.
+export const GitIcon = (p: SVGProps<SVGSVGElement>) => (
+  <LogoIcon {...p}>
+    <path d="M23.546 10.93 13.067.452c-.604-.603-1.582-.603-2.188 0L8.708 2.627l2.76 2.76c.645-.215 1.377-.07 1.889.441.516.515.658 1.258.438 1.9l2.658 2.66c.645-.223 1.387-.078 1.9.435.721.72.721 1.884 0 2.604-.719.719-1.881.719-2.6 0-.539-.541-.674-1.337-.404-1.996L12.86 8.955v6.525c.176.086.342.203.488.348.713.721.713 1.883 0 2.6-.719.721-1.889.721-2.609 0-.719-.719-.719-1.879 0-2.598.182-.18.387-.316.605-.406V8.835c-.217-.091-.424-.222-.6-.401-.545-.545-.676-1.342-.396-2.009L7.636 3.7.45 10.881c-.6.605-.6 1.584 0 2.189l10.48 10.477c.604.604 1.582.604 2.186 0l10.43-10.43c.605-.603.605-1.582 0-2.187" />
+  </LogoIcon>
 );
 
 export const BookIcon = (p: SVGProps<SVGSVGElement>) => (

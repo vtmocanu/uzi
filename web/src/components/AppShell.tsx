@@ -16,9 +16,10 @@ import {
   BoardIcon,
   BookIcon,
   BotIcon,
-  BranchIcon,
   FactoryIcon,
   GearIcon,
+  GitIcon,
+  GitLabIcon,
   HomeIcon,
   LogOutIcon,
   MenuIcon,
@@ -31,11 +32,20 @@ function isNavActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(href + "/");
 }
 
+// forgeIcon picks a board entry's glyph from its connection's forge type
+// (Decision 2): GitLab gets the tanuki, anything else (or an unknown/missing
+// type when the connections join is unavailable) falls back to the generic Git
+// mark. Exported so the mapping is unit-testable without the DOM.
+export function forgeIcon(forgeType: string | undefined): ReactNode {
+  return forgeType === "gitlab" ? <GitLabIcon /> : <GitIcon />;
+}
+
 function NavItem({
   to,
   icon,
   label,
   exactOnly = false,
+  excludeSubpath,
   indent = false,
   onNavigate,
 }: {
@@ -43,11 +53,16 @@ function NavItem({
   icon?: ReactNode;
   label: string;
   exactOnly?: boolean;
+  // excludeSubpath yields active state to a sibling that owns a nested route:
+  // "Settings" (/settings) stays lit on /settings/forge but hands /settings/workers
+  // to the Factory "Workers" entry, so the two never light up together.
+  excludeSubpath?: string;
   indent?: boolean;
   onNavigate?: () => void;
 }) {
   const { pathname } = useLocation();
-  const active = exactOnly ? pathname === to : isNavActive(pathname, to);
+  let active = exactOnly ? pathname === to : isNavActive(pathname, to);
+  if (active && excludeSubpath && isNavActive(pathname, excludeSubpath)) active = false;
   return (
     <Link
       to={to}
@@ -85,6 +100,10 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   const navigate = useNavigate();
   const location = useLocation();
   const [repos, setRepos] = useState<Repo[]>([]);
+  // connection_id → forge_type, joined web-side so board entries can show a forge
+  // glyph (the Repo DTO has no forge_type). Kept separate from repos so a failed
+  // connections call degrades to the Git fallback rather than blanking the boards.
+  const [forgeTypeById, setForgeTypeById] = useState<Record<string, string>>({});
 
   // Boards in the nav mirror the user's enabled repos; refetched on navigation
   // so enabling/disabling a repo shows up without a reload.
@@ -98,6 +117,22 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
       .then(({ repos }) => setRepos(repos))
       .catch(() => setRepos([]));
   }, [user, location.pathname]);
+
+  // Connections change rarely, so this join is fetched once per session, not per
+  // navigation. Failure is non-fatal: the map stays empty and every board falls
+  // back to the generic Git icon.
+  useEffect(() => {
+    if (!user) {
+      setForgeTypeById({});
+      return;
+    }
+    api
+      .listConnections()
+      .then(({ connections }) =>
+        setForgeTypeById(Object.fromEntries(connections.map((c) => [c.id, c.forge_type]))),
+      )
+      .catch(() => setForgeTypeById({}));
+  }, [user]);
 
   const handleLogout = async () => {
     onNavigate?.();
@@ -142,6 +177,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
             <NavItem
               key={r.id}
               to={`/repos/${r.id}/board`}
+              icon={forgeIcon(forgeTypeById[r.connection_id])}
               label={r.path_with_namespace}
               indent
               onNavigate={onNavigate}
@@ -156,8 +192,16 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
         </NavGroup>
 
         <NavGroup label="Configure">
-          <NavItem to="/settings" icon={<GearIcon />} label="Settings" exactOnly onNavigate={onNavigate} />
-          <NavItem to="/settings/forge" icon={<BranchIcon />} label="Forge" onNavigate={onNavigate} />
+          {/* Forge has no standalone entry (Decision 3): it lives only under the
+              Settings tabs. Settings therefore stays lit across /settings/* —
+              except /settings/workers, which the Factory "Workers" entry owns. */}
+          <NavItem
+            to="/settings"
+            icon={<GearIcon />}
+            label="Settings"
+            excludeSubpath="/settings/workers"
+            onNavigate={onNavigate}
+          />
         </NavGroup>
 
         {user?.is_admin && (
