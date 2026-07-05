@@ -76,6 +76,7 @@ type repoDTO struct {
 	WebURL            string  `json:"web_url"`
 	DefaultBranch     *string `json:"default_branch"`
 	Enabled           bool    `json:"enabled"`
+	RepoSkillsEnabled bool    `json:"repo_skills_enabled"`
 }
 
 func repoToDTO(r store.Repo) repoDTO {
@@ -86,6 +87,7 @@ func repoToDTO(r store.Repo) repoDTO {
 		PathWithNamespace: r.PathWithNamespace,
 		WebURL:            r.WebUrl,
 		Enabled:           r.Enabled,
+		RepoSkillsEnabled: r.RepoSkillsEnabled,
 	}
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
@@ -421,6 +423,56 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("set repo enabled", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
+}
+
+type patchRepoRequest struct {
+	// RepoSkillsEnabled is the repo-skills opt-in (PRD #16): load skills from the
+	// repo's own .claude/skills at run time. Pointer so an omitted field is a
+	// no-op rather than a silent disable.
+	RepoSkillsEnabled *bool `json:"repo_skills_enabled"`
+}
+
+// PatchRepo updates a repo's mutable settings. Today the only patchable field is
+// repo_skills_enabled. Authorization: the repo owner (via the owning connection)
+// or an admin. A non-owned, unknown id returns 404 for a non-admin; an admin may
+// target any repo.
+func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid repo id")
+		return
+	}
+	var req patchRepoRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.RepoSkillsEnabled == nil {
+		httpx.Error(w, http.StatusBadRequest, "no updatable fields provided")
+		return
+	}
+
+	var repo store.Repo
+	if user.IsAdmin {
+		repo, err = h.q.SetRepoSkillsEnabled(r.Context(), store.SetRepoSkillsEnabledParams{ID: id, RepoSkillsEnabled: *req.RepoSkillsEnabled})
+	} else {
+		repo, err = h.q.SetRepoSkillsEnabledForUser(r.Context(), store.SetRepoSkillsEnabledForUserParams{ID: id, RepoSkillsEnabled: *req.RepoSkillsEnabled, UserID: user.ID})
+	}
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "repo not found")
+			return
+		}
+		slog.Error("set repo skills enabled", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}

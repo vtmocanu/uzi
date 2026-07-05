@@ -110,6 +110,16 @@ type Config struct {
 	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
 	WorkerPollInterval      time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
+
+	// Agent skills (PRD #16). SkillMaxBytes caps a skill body at save (server) and
+	// is re-applied to repo-borne skills worker-side; SkillsMaxPerRun caps the
+	// per-run skill union, enforced at claim assembly (M3) and re-enforced
+	// worker-side (M4) over the delivered ∪ repo set. Both ride the claim payload
+	// so the worker enforces the same caps the server configured (no drift). M2
+	// consumes only SkillMaxBytes (save-time body check); SkillsMaxPerRun is
+	// declared here so M3 can consume it.
+	SkillMaxBytes   int
+	SkillsMaxPerRun int
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -198,6 +208,9 @@ func Load() (Config, error) {
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
+
+	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
+	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)
 
 	if err := loadSeedAdmin(&cfg); err != nil {
 		return Config{}, err
