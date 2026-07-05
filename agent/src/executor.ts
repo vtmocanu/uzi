@@ -91,6 +91,14 @@ export interface Executor {
   killAgentTree?(): void;
 }
 
+/**
+ * Sentinel in an issue's title/description that makes the stub executor throw
+ * after the plan gate, standing in for an agent that fails mid-implementation.
+ * The E2E harness uses it to drive the autopilot failure path (a failed run →
+ * exactly one terminal failure comment) with no live SDK. Off unless present.
+ */
+export const STUB_FAIL_SENTINEL = "UZI_STUB_FAIL";
+
 /** Options for the stub executor. */
 export interface StubExecutorOptions {
   /**
@@ -138,6 +146,12 @@ export class StubExecutor implements Executor {
       if (verdict.kind === "cancel") throw new Error("run cancelled");
       ctx.reportIteration?.(1);
       ctx.emit({ kind: "status", agent: "worker", payload: { text: "plan approved; implementing" } });
+    }
+
+    // E2E failure hook: throw AFTER the (auto-)approved plan so the run fails
+    // during "implementation", exercising the worker-terminated failure path.
+    if (ctx.issueDescription.includes(STUB_FAIL_SENTINEL) || ctx.issueTitle.includes(STUB_FAIL_SENTINEL)) {
+      throw new Error(`stub executor: forced failure (${STUB_FAIL_SENTINEL} sentinel present)`);
     }
 
     const markerPath = path.join(ctx.worktreePath, "UZI_RUN.md");

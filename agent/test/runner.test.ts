@@ -11,7 +11,7 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
-import { StubExecutor, PlanRejectedError, type Executor } from "../src/executor.js";
+import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, type Executor } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { GitLabClient, type FetchFn } from "../src/gitlab.js";
 import { RunRunner } from "../src/runner.js";
@@ -279,6 +279,24 @@ describe("RunRunner — plan gate + steering end to end", () => {
     const completed = api.states.find((s) => s.body.status === "completed")!.body;
     assert.strictEqual(completed.mr_iid, 42);
     assert.strictEqual(calls.length, 1, "one MR opened after auto-approval");
+  });
+
+  it("throws on the UZI_STUB_FAIL sentinel after the gate (drives the E2E failure path)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(28, {
+      auto_approve: true,
+      issue_description: `implement prds/x.md then ${STUB_FAIL_SENTINEL}`,
+    });
+    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    assert.ok(!statuses.includes("awaiting_approval"), "auto-approved before it fails");
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failed, "sentinel run should fail");
+    assert.match(failed!.body.failure_reason ?? "", /UZI_STUB_FAIL/);
+    assert.strictEqual(calls.length, 0, "no MR when the run fails");
+    // The plan is recorded before the failure (the throw is AFTER the gate).
+    assert.strictEqual(api.messages(claim.run_id).filter((m) => m.kind === "plan").length, 1);
   });
 
   it("still halts a NON-autopilot claim at the gate (auto_approve absent)", async () => {

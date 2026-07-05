@@ -57,15 +57,29 @@ const EXPECT_PAT = process.env.FORGE_FAKE_EXPECT_PAT || "";
 const state = {
   issues: /** @type {Record<number, any>} */ ({}),
   mrs: /** @type {any[]} */ ([]),
+  // Issue comments the autopilot terminal hook + poller post (GitLab "notes"). A
+  // flat list carrying issue_iid so the harness can count per issue (PRD #19 M6).
+  notes: /** @type {any[]} */ ([]),
+  // Resource label events per issue (iid -> [event]), the signal the autopilot
+  // detector reads to decide "who added the autopilot label, and which
+  // application" (ListIssueLabelEvents). GitLab returns them oldest-first with
+  // globally-monotonic ids; the fake preserves that (append-only, rising id).
+  labelEvents: /** @type {Record<number, any[]>} */ ({}),
   nextIssueIid: 1,
   nextMrIid: 1,
+  nextNoteId: 5000,
+  nextLabelEventId: 100,
 };
 
 function persist() {
   try {
     fs.writeFileSync(
       STATE_FILE,
-      JSON.stringify({ issues: Object.values(state.issues), mrs: state.mrs }, null, 2),
+      JSON.stringify(
+        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, labelEvents: state.labelEvents },
+        null,
+        2,
+      ),
     );
   } catch {
     /* best-effort introspection sink */
@@ -82,9 +96,18 @@ function load() {
     const saved = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
     for (const issue of saved.issues || []) state.issues[issue.iid] = issue;
     state.mrs = Array.isArray(saved.mrs) ? saved.mrs : [];
+    state.notes = Array.isArray(saved.notes) ? saved.notes : [];
+    state.labelEvents = saved.labelEvents && typeof saved.labelEvents === "object" ? saved.labelEvents : {};
     state.nextIssueIid = Math.max(0, ...Object.keys(state.issues).map(Number)) + 1;
     state.nextMrIid = Math.max(0, ...state.mrs.map((m) => m.iid)) + 1;
-    log("reloaded state:", Object.keys(state.issues).length, "issue(s),", state.mrs.length, "MR(s)");
+    state.nextNoteId = Math.max(4999, ...state.notes.map((n) => n.id)) + 1;
+    state.nextLabelEventId = Math.max(99, ...Object.values(state.labelEvents).flat().map((e) => e.id)) + 1;
+    log(
+      "reloaded state:",
+      Object.keys(state.issues).length, "issue(s),",
+      state.mrs.length, "MR(s),",
+      state.notes.length, "note(s)",
+    );
   } catch {
     /* no prior state (fresh run) — start empty */
   }
@@ -94,7 +117,7 @@ function log(...args) {
   console.log(new Date().toISOString(), "[forge-fake]", ...args);
 }
 
-function makeIssue({ iid, title, description, labels }) {
+function makeIssue({ iid, title, description, labels, author }) {
   return {
     id: 1000 + iid,
     iid,
@@ -104,7 +127,9 @@ function makeIssue({ iid, title, description, labels }) {
     state: "opened",
     labels: labels && labels.length ? labels : ["PRD"],
     web_url: `${PROJECT.web_url}/-/issues/${iid}`,
-    author: { id: 1, username: "uzi-bot" },
+    // author drives autopilot attribution (the fallback when the label adder is
+    // unmapped); default to the bot so the uzi-created issues are unchanged.
+    author: { id: author ? 2 : 1, username: author || "uzi-bot" },
     updated_at: new Date().toISOString(),
     created_at: new Date().toISOString(),
   };
@@ -228,10 +253,62 @@ const server = https.createServer(
 
     // --- introspection (harness reads this to assert recorded state) ---------
     if (method === "GET" && path === "/_e2e/state") {
-      return send(res, 200, { issues: Object.values(state.issues), mrs: state.mrs, project: PROJECT });
+      return send(res, 200, {
+        issues: Object.values(state.issues),
+        mrs: state.mrs,
+        notes: state.notes,
+        labelEvents: state.labelEvents,
+        project: PROJECT,
+      });
     }
     if (method === "GET" && (path === "/_e2e/health" || path === "/")) {
       return send(res, 200, { ok: true });
+    }
+
+    // Create an issue directly with explicit labels + author — the harness
+    // stand-in for a human filing a PRD/autopilot-labelled issue (uzi's own
+    // CreateIssue always stamps just the PRD label, so autopilot flows need this).
+    // E2E-only, matching the /_e2e/* mutator style.
+    if (method === "POST" && path === "/_e2e/issues") {
+      const body = await readBody(req);
+      const iid = state.nextIssueIid++;
+      const issue = makeIssue({
+        iid,
+        title: body.title || `issue ${iid}`,
+        description: body.description,
+        labels: normLabels(body.labels),
+        author: typeof body.author === "string" ? body.author : "",
+      });
+      state.issues[iid] = issue;
+      state.labelEvents[iid] = state.labelEvents[iid] || [];
+      persist();
+      log("_e2e issue created", iid, JSON.stringify(issue.title), "labels", JSON.stringify(issue.labels));
+      return send(res, 201, issue);
+    }
+
+    // Append a resource label event to an issue — the harness stand-in for a
+    // human adding/removing a label. The rising id models GitLab's globally-
+    // monotonic event ids, so a remove+re-add mints a larger id (the autopilot
+    // detector's transition-once retry signal).
+    const labelEv = method === "POST" && path.match(/^\/_e2e\/issues\/(\d+)\/label-events$/);
+    if (labelEv) {
+      const body = await readBody(req);
+      const iid = Number(labelEv[1]);
+      if (!state.issues[iid]) return send(res, 404, { message: "404 Not found (no such issue)" });
+      const action = body.action === "remove" ? "remove" : "add";
+      const ev = {
+        id: state.nextLabelEventId++,
+        action,
+        created_at: new Date().toISOString(),
+        resource_type: "Issue",
+        resource_id: state.issues[iid].id,
+        user: { id: 2, username: String(body.username || "") },
+        label: { id: 1, name: String(body.label || "") },
+      };
+      (state.labelEvents[iid] = state.labelEvents[iid] || []).push(ev);
+      persist();
+      log("_e2e label event", iid, action, ev.label.name, "by", ev.user.username, "id", ev.id);
+      return send(res, 201, ev);
     }
     // Flip an MR's state — the harness stand-in for a reviewer closing, reopening,
     // or merging an MR (uzi itself only ever GETs the MR). E2E-only mutator,
@@ -255,6 +332,14 @@ const server = https.createServer(
     // Token verify (api seed + connect): CurrentUser.
     if (method === "GET" && path === "/api/v4/user") {
       return send(res, 200, { id: 1, username: "uzi-bot", name: "uzi bot" });
+    }
+
+    // User lookup (human_username verified-or-warned save, PRD #19 M3): GitLab's
+    // ?username= exact filter. The fake knows no human accounts, so it always
+    // returns empty — every self-declared username saves WITH a warning (never a
+    // hard reject), which is exactly the verified-or-warned path under test.
+    if (method === "GET" && path === "/api/v4/users") {
+      return send(res, 200, []);
     }
 
     // Project listing (api seed / repo discovery).
@@ -292,6 +377,26 @@ const server = https.createServer(
         log("issue", issue.iid, "labels ->", JSON.stringify(issue.labels));
         return send(res, 200, issue);
       }
+      // Resource label events (autopilot detector: who added the autopilot label,
+      // and which application). Oldest-first with rising ids (see state.labelEvents).
+      const labelEvents = rest.match(/^\/issues\/(\d+)\/resource_label_events$/);
+      if (method === "GET" && labelEvents) {
+        return send(res, 200, state.labelEvents[Number(labelEvents[1])] || []);
+      }
+
+      // Issue notes (comments). POST records the autopilot pre-run / terminal
+      // comment; the harness reads them back via /_e2e/state to assert exactly-once.
+      const notesRoute = rest.match(/^\/issues\/(\d+)\/notes$/);
+      if (method === "POST" && notesRoute) {
+        const body = await readBody(req);
+        const iid = Number(notesRoute[1]);
+        const note = { id: state.nextNoteId++, issue_iid: iid, body: body.body || "", created_at: new Date().toISOString() };
+        state.notes.push(note);
+        persist();
+        log("note on issue", iid, JSON.stringify((body.body || "").slice(0, 72)));
+        return send(res, 201, note);
+      }
+
       if (method === "GET" && rest === "/issues") {
         // ListProjectIssues (poller/sync). Return all recorded issues; the caller
         // filters by label. Keeps a reconcile pass from evicting the cache.
