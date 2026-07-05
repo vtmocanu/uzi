@@ -3,8 +3,9 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { AgentTemplate, ClaimConfig, MessageKind } from "./protocol.js";
+import type { AgentTemplate, ClaimConfig, ClaimSkill, ClaimSkillDrop, MessageKind } from "./protocol.js";
 import type { PlanVerdict } from "./steering.js";
+import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -36,6 +37,16 @@ export interface RunContext {
   oauthToken?: string;
   /** PRD #3 templates (lead + subagents) mapped to SDK AgentDefinitions. */
   agents?: AgentTemplate[];
+  /** M4 (PRD #16): the per-run skill union — materialized into a local plugin dir
+   *  and enabled via the SDK `skills` list. */
+  skills?: ClaimSkill[];
+  /** M4 (PRD #16): skills the server dropped at claim assembly (shadowed /
+   *  over-limit). The worker owns the gapless seq, so it logs these. */
+  skillsDropped?: ClaimSkillDrop[];
+  /** M6 (PRD #16): the repo owner opted in to loading skills from the clone's own
+   *  .claude/skills. Only then does the worker enumerate them (skills only, lowest
+   *  precedence); default off. */
+  repoSkillsEnabled?: boolean;
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** SDK session to resume; null/absent for a fresh run. */
@@ -131,6 +142,23 @@ export class StubExecutor implements Executor {
   async run(ctx: RunContext): Promise<ExecutorResult> {
     ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub executor starting" } });
 
+    // Synthesize the skills plugin the SAME way the SDK executor does (shared
+    // prepareSkillPlugin), then read it back and report exactly what landed on
+    // disk. This makes skill delivery + the repo-skill opt-in observable in the M6
+    // E2E, which runs the stub (no live SDK session). Dropped skills are logged
+    // too. Non-fatal: a skills failure must never fail the stub's core commit path.
+    try {
+      const prepared = await prepareSkillPlugin(ctx, resolveSkillCaps(ctx.config));
+      const loaded = await readPluginSkillNames(prepared.pluginPath);
+      ctx.emit({ kind: "status", agent: "worker", payload: { text: `plugin skills: ${loaded.join(", ") || "(none)"}`, plugin_skills: loaded } });
+      const drops = [...(ctx.skillsDropped ?? []), ...prepared.drops];
+      for (const d of drops) {
+        ctx.emit({ kind: "status", agent: "worker", payload: { text: `skill dropped: ${d.name} (${d.reason})`, dropped_skill: d.name, dropped_reason: d.reason } });
+      }
+    } catch (err) {
+      this.log.warn("stub: skills plugin synthesis failed", { run_id: ctx.runId, error: String(err) });
+    }
+
     if (this.opts.planGate && ctx.gatePlan) {
       const planMd = [
         `## Stub plan for issue #${ctx.issueIid}`,
@@ -190,5 +218,18 @@ export class StubExecutor implements Executor {
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
       timeout: 60_000,
     });
+  }
+}
+
+/** Read back the skill directory names actually materialized under a plugin dir
+ *  (`<pluginPath>/skills/<name>/`), sorted. This reflects what is ON DISK, so the
+ *  E2E asserting on it proves the plugin was truly synthesized (not just that the
+ *  claim carried the names). Missing dir ⇒ no skills. */
+async function readPluginSkillNames(pluginPath: string): Promise<string[]> {
+  try {
+    const entries = await fs.readdir(path.join(pluginPath, "skills"), { withFileTypes: true });
+    return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  } catch {
+    return [];
   }
 }

@@ -522,6 +522,7 @@ const getRunClaimContext = `-- name: GetRunClaimContext :one
 SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.default_branch,
+       rp.repo_skills_enabled,
        c.forge_type,
        c.base_url,
        c.bot_username,
@@ -533,13 +534,14 @@ WHERE r.id = $1
 `
 
 type GetRunClaimContextRow struct {
-	RepoWebUrl      string      `json:"repo_web_url"`
-	RepoPath        string      `json:"repo_path"`
-	DefaultBranch   pgtype.Text `json:"default_branch"`
-	ForgeType       string      `json:"forge_type"`
-	BaseUrl         string      `json:"base_url"`
-	BotUsername     string      `json:"bot_username"`
-	TokenCiphertext []byte      `json:"token_ciphertext"`
+	RepoWebUrl        string      `json:"repo_web_url"`
+	RepoPath          string      `json:"repo_path"`
+	DefaultBranch     pgtype.Text `json:"default_branch"`
+	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
+	ForgeType         string      `json:"forge_type"`
+	BaseUrl           string      `json:"base_url"`
+	BotUsername       string      `json:"bot_username"`
+	TokenCiphertext   []byte      `json:"token_ciphertext"`
 }
 
 // The repo + connection facts the claim payload needs, alongside the run. The
@@ -552,6 +554,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.RepoWebUrl,
 		&i.RepoPath,
 		&i.DefaultBranch,
+		&i.RepoSkillsEnabled,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.BotUsername,

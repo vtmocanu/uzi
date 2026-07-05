@@ -168,6 +168,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Get("/{id}", h.GetAgentTemplate)
 			r.Get("/{id}/rendered", h.GetRenderedAgentTemplate)
 
+			// Skill allocations (PRD #16): the shared half is admin-only and the
+			// mine half is any user's own overlay, so authz is per-half inside the
+			// handler — these stay OUTSIDE the admin subgroup below.
+			r.Get("/{id}/skills", h.GetTemplateSkills)
+			r.Put("/{id}/skills", h.SetTemplateSkills)
+
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAdmin)
 				r.Post("/", h.CreateAgentTemplate)
@@ -175,6 +181,21 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.Delete("/{id}", h.DeleteAgentTemplate)
 				r.Post("/{id}/reset", h.ResetAgentTemplate)
 			})
+		})
+
+		// Skills (PRD #16): every authenticated user can read the skills visible
+		// to them (builtin ∪ global ∪ own) and manage their own user skills;
+		// global skills are admin-only, builtins are reset-not-deleted. The
+		// scope-based authz is per-row inside the handlers (not a blanket admin
+		// gate), so all routes share one authenticated group.
+		r.Route("/skills", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListSkills)
+			r.Post("/", h.CreateSkill)
+			r.Get("/{id}", h.GetSkill)
+			r.Put("/{id}", h.UpdateSkill)
+			r.Delete("/{id}", h.DeleteSkill)
+			r.Post("/{id}/reset", h.ResetSkill)
 		})
 
 		r.Route("/admin", func(r chi.Router) {
@@ -215,6 +236,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Route("/repos", func(r chi.Router) {
 				r.Get("/", h.ListRepos)
 				r.Put("/{id}", h.SetRepoEnabled)
+				// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
+				r.Patch("/{id}", h.PatchRepo)
 				r.Get("/{id}/board", h.GetBoard)
 				r.Put("/{id}/board/columns", h.ConfigureColumns)
 				// The in-app issue view fetches the issue (with its description) live

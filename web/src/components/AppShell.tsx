@@ -26,6 +26,7 @@ import {
   LogOutIcon,
   MenuIcon,
   ServerIcon,
+  SkillIcon,
   UsersIcon,
   XIcon,
 } from "./icons";
@@ -234,6 +235,7 @@ function SidebarContent({
 
         <NavGroup label="Factory" collapsed={collapsed}>
           <NavItem to="/agents" icon={<BotIcon />} label="Agents" onNavigate={onNavigate} collapsed={collapsed} />
+          <NavItem to="/skills" icon={<SkillIcon />} label="Skills" onNavigate={onNavigate} collapsed={collapsed} />
           <NavItem to="/settings/workers" icon={<ServerIcon />} label="Workers" onNavigate={onNavigate} collapsed={collapsed} />
         </NavGroup>
 

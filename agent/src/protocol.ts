@@ -62,6 +62,27 @@ export interface AgentTemplate {
   /** null/absent = inherit all tools; else an allowlist. */
   tools?: string[] | null;
   prompt_body: string;
+  /** This template's allocated skill names (PRD #16), restricted server-side to
+   *  names present in the run's skill union. The worker maps these onto the
+   *  subagent's AgentDefinition.skills (M4). Always sent (possibly empty). */
+  skills?: string[];
+}
+
+/** One delivered skill in the per-run union (PRD #16): the name+description the
+ *  model routes on plus the body it loads on demand. The worker synthesizes the
+ *  SKILL.md frontmatter from name+description (M4); the body is placed below it. */
+export interface ClaimSkill {
+  name: string;
+  description: string;
+  body: string;
+}
+
+/** A skill assembly dropped, with a stable reason code the worker turns into a
+ *  run-message log line (PRD #16): "shadowed" (a higher-precedence skill of the
+ *  same name won) or "over_limit" (past SKILLS_MAX_PER_RUN). */
+export interface ClaimSkillDrop {
+  name: string;
+  reason: string;
 }
 
 /** Repo coordinates for the clone (PRD #2 repos row). */
@@ -75,6 +96,11 @@ export interface ClaimRepo {
    *  embedded in the URL (so it can't rest in the bare repo's on-disk config). */
   clone_url: string;
   default_branch?: string | null;
+  /** Repo owner's opt-in (PRD #16): load skills from the repo's own
+   *  .claude/skills at run time. Default false. When true the worker enumerates
+   *  repo skills after checkout, applies the caps, and ranks them below every
+   *  delivered skill (M6). Skills only — repo hooks/settings/commands never load. */
+  skills_enabled?: boolean;
 }
 
 /**
@@ -104,6 +130,12 @@ export interface ClaimConfig {
    *  the lead template's model for the main thread; absent when the owner set no
    *  default, so the worker falls back to the lead template's model. */
   default_model?: string;
+  /** Skill caps the server configured (PRD #16), delivered so the worker enforces
+   *  the same limits (no drift): skill_max_bytes bounds a skill body (applied to
+   *  repo-borne skills worker-side), skills_max_per_run bounds the combined
+   *  delivered ∪ repo union (re-enforced worker-side, M4/M6). */
+  skill_max_bytes?: number;
+  skills_max_per_run?: number;
 }
 
 /**
@@ -130,6 +162,14 @@ export interface ClaimResponse {
    *  programmatically by M3 (mapped to SDK AgentDefinitions). M2 ignores them. */
   agents: AgentTemplate[];
   config?: ClaimConfig | null;
+  /** The per-run skill union (PRD #16): every skill allocated to any template for
+   *  this run's owner, deduped, precedence-resolved (user > global > builtin), and
+   *  capped. The worker builds a local plugin dir from these and passes their names
+   *  as the SDK's explicit top-level enable-list (M4). Always sent (possibly empty). */
+  skills?: ClaimSkill[];
+  /** Skills dropped during assembly (shadowed or over the cap), for the worker to
+   *  log (PRD #16). Always sent (possibly empty). */
+  skills_dropped?: ClaimSkillDrop[];
   /** Autopilot run (PRD #19): the worker resolves the plan gate with an approve
    *  verdict instead of parking at awaiting_approval. Top-level (read from the
    *  runs row), NOT inside config — config is instance caps, this is a per-run

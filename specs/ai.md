@@ -2573,6 +2573,272 @@ Serves human: "the run owner's default model wins over the lead template model"
 
 ---
 
+# PRD #16 — Agent Skills (builtin / global / user / repo) + first CICD skill
+
+Serves human Feature #16 (skills at global + per-user scope, allocatable to each
+agent; first builtin skill = ci-cd-norms; repo-borne skills the worker detects;
+builtin skills editable/resettable). Skills are SDK-native named Markdown playbooks:
+only `name`+`description` sit in context always, the body loads on demand
+(progressive disclosure). Section numbers continue past PRD #17's #98. Builds on
+PRD #3 (agent-template store + reconciler), PRD #4 (claim payload, SDK executor,
+guardrail layers), and PRD #17 (decoupled-builtins convention, `lead` as an
+existing builtin routed to the main thread). Full rationale in
+`prds/16-agent-skills.md` (Decision Log); user-facing guide in `docs/skills.md`;
+cross-service map in ARCHITECTURE.md "Agent skills".
+
+## 99. Skill scopes + storage schema (`skills`, `agent_skill_allocations`)
+
+Serves human: "skills at global scope and per-user scope; allocate global or user
+skills to each agent"; "repos may carry skills the worker detects".
+
+- **Three server scopes on one `skills` table** (`scope ∈ builtin|global|user`,
+  CHECK-constrained) plus a fourth **repo source** resolved worker-side (not a DB
+  row). Migration drafted `00050_skills.sql` (**renumber-at-merge** to the next free
+  slot above the live head per the CLAUDE.md goose convention; live head is
+  `00031` at time of writing, so it lands ~`00032`). One table, not three, because
+  scope is a discriminator column, not a shape difference.
+- **Columns**: `name` (kebab-case `^[a-z0-9][a-z0-9-]{0,63}$`, **immutable after
+  creation** — it is the skill identity + allocation key), `description` (one line,
+  always in context — what the model routes on), `body` (SKILL.md markdown **body
+  only**; frontmatter is synthesized at delivery, never stored — so a stored skill
+  can't carry capability-granting frontmatter keys), `user_id` (→users ON DELETE
+  CASCADE; `CHECK ((scope='user') = (user_id IS NOT NULL))` binds ownership to
+  scope), `updated_by` (→users ON DELETE SET NULL), timestamps.
+- **Two partial-unique name indexes**: `uq_skills_shared_name (name) WHERE scope <>
+  'user'` and `uq_skills_user_name (user_id, name) WHERE scope = 'user'`. Consequence
+  (**intended, not a bug**): a builtin and a global can never share a name; a user
+  may own a name that collides with a shared one (resolved by precedence at
+  assembly, §102).
+- **`agent_skill_allocations`** — the overlay model: `template_id` (→agent_templates
+  ON DELETE CASCADE), `skill_id` (→skills ON DELETE CASCADE), `user_id` (**NULL =
+  shared/admin-managed; non-NULL = that user's private overlay**). **No surrogate
+  PK**; row identity is `uq_allocations (template_id, skill_id, COALESCE(user_id,
+  '0000…'))`, so a shared allocation and a user's overlay of the same skill to the
+  same template coexist as distinct rows.
+  - Why the overlay shape (over multica's flat `agent_skill`): uzi runs belong to
+    users with private skills, so allocation must split shared (everyone) from
+    per-user overlay; multica is workspace-flat and has no such split.
+- **`repos.repo_skills_enabled BOOLEAN NOT NULL DEFAULT false`** added in the same
+  migration — the per-repo opt-in flag for repo-borne skills (§105).
+
+## 100. Builtin skills: `skilltmpl` reconciler, no `.claude/skills/` mirror
+
+Serves human: "builtin skills ship with uzi, editable and resettable like builtin
+agent templates".
+
+- **Builtin-ness is a `scope` value**, not an `is_builtin` bool (the deliberate
+  divergence from `agent_templates`): the reconciler keys on `(name, scope='builtin')`.
+- **`api/internal/skilltmpl/`** mirrors PRD #3's `agenttmpl`: builtin SKILL.md files
+  Go-embedded from `skilltmpl/builtins/<name>/SKILL.md` as the **single home**, parsed
+  at init. **Adopts PRD #17's decoupled convention from day one**: **no `.claude/skills/`
+  copy** (a product skill there would load into the dev team's own Claude Code sessions
+  — the masquerade #17 evicted `lead.md` for) and **no golden byte-match test**.
+  Instead **parse/validity tests** over the embedded files (frontmatter parses, name
+  matches the regex, description is a non-empty single line, names unique).
+- **Startup reconciler** with the same semantics as agent templates: idempotent
+  `ON CONFLICT DO NOTHING` insert of missing builtins, **never overwrites** an edited
+  row. Builtin lifecycle: **editable; resettable** (`POST /:id/reset` re-applies the
+  embedded definition, builtins only); **never deletable** (409). Guarantees the core
+  skills always exist.
+
+## 101. Read + allocation-read authz (viewer-scoped, NOT the templates all-shared read)
+
+Serves human: per-user private skills (a user's own skills are his); best-practice
+(no cross-user leak).
+
+- **This is explicitly NOT the agent-templates pattern.** Agent templates are all
+  all-shared reads; copying that handler verbatim would leak every user's private
+  skills. Instead **every skill read returns builtin ∪ global ∪ the caller's own user
+  skills** — nothing else. **Admins additionally see all users' private skills** (they
+  administer the system and can read the DB anyway — honest, not a hidden leak; surfaced
+  in the UI as a labelled "Other users" group, §108).
+- **Allocation reads follow the same rule**: `GET` on a template's skills returns the
+  shared rows plus **the caller's own overlay rows only** — never another user's overlay
+  rows nor the skill names behind them. Pinned by authz tests (a user's private skill
+  must never appear in another user's run, listing, or allocation view).
+
+## 102. Allocation write rules + name-collision precedence
+
+Serves human: "allocate global or user skills to each agent"; shared vs per-user overlay.
+
+- **`PUT /api/agent-templates/{id}/skills`** — replace-set semantics, split into a
+  **shared half (admin-only)** and a **mine half (any authenticated user)**. Server-enforced
+  reference rules: **shared rows may reference only builtin/global skills**; **user
+  overlay rows may reference builtin/global or the owner's own user skills**. A user's
+  runs get the **union** of shared ∪ their overlay for each template.
+- **Name-collision precedence: user > global > builtin > repo.** When two skills in a
+  run's assembled set share a `name`, the highest-precedence one's body wins and the
+  **shadowed skill is dropped entirely from the run** (one body per name ever loads —
+  run-wide shadowing, not a per-template override). Repo skills always rank last
+  (§105).
+
+## 103. Claim assembly: union / dedup / precedence / caps (`api/internal/workersvc`)
+
+Serves human: skills delivered to the agent for a run; caps.
+
+- For the claiming run's user, per template: allocated skills = shared rows ∪ that
+  user's overlay rows. `ClaimPayload.skills` is the **deduplicated union across all
+  templates** (`{name, description, body}`); each `ClaimAgent.skills` is that template's
+  allocated **names**; `ClaimRepo.skills_enabled` mirrors the repo flag;
+  `ClaimConfig.skill_max_bytes` / `skills_max_per_run` carry the server's configured
+  caps so the **worker enforces the same limits with no hardcoded drift**.
+- **`SKILLS_MAX_PER_RUN` is enforced here, at assembly** (not at save time): every
+  template ships in every claim, so the per-run union spans all templates and no single
+  allocation save can see the whole picture. Overflow is **dropped lowest-precedence-first**.
+- **Assembly-time drops (shadowed + over-limit) ride the claim as `ClaimPayload.skills_dropped`**
+  (`{name, reason}`, reason ∈ `shadowed` | `over_limit`) — **the server never writes
+  `run_messages`**; the **worker** emits the corresponding run-message log lines because
+  the worker owns the gapless per-run `seq` (ARCHITECTURE.md invariant).
+- **Skills re-assemble on every claim including resume.** A skill deleted between claim
+  and resume disappears from the resumed session even if the approved plan referenced it
+  — **accepted, one log line** (not a hard failure).
+- Both wire directions covered by a **cross-side contract test** (the PRD #4 M1/M2
+  lenient-fakes-drifted lesson), not two independent lenient fakes.
+
+## 104. Worker delivery: local plugin dir outside the clone, explicit `skills` list
+
+Serves human: worker delivers skills to the agent; primary directive (the injection
+defense — `settingSources: []` — never loosens).
+
+- **Delivery channel = a synthesized local SDK plugin dir materialized OUTSIDE the
+  clone** (sibling of the worktree, never inside it): `.claude-plugin/plugin.json`
+  (`{"name":"uzi"}`) + `skills/<name>/SKILL.md` per surviving skill. Chosen because
+  `settingSources: []` blocks all filesystem skill discovery (`~/.claude/skills`,
+  `<cwd>/.claude/skills`) — the repo-injection defense — and **must stay off**. multica's
+  native-discovery materialization into the workdir was **rejected** precisely because it
+  requires project-settings loading ON; `plugins: [{type:'local', path}]` loads skills
+  independent of `settingSources`, so the isolation knob is never touched. The dir is
+  **rebuilt from the claim on every claim, including resume** (plugins/skills are
+  re-applied to a resumed session, not baked into the original).
+- **Frontmatter synthesized as quoted, fully-escaped double-quoted YAML scalars** —
+  not merely newline-stripped. Escaped: YAML metacharacters (`:`,`#`,`|`,`>`,`&`,`*`,`!`,
+  leading spaces, `---`), **all C0 control chars (<0x20), DEL+C1 (0x7f–0x9f)**, and the
+  **Unicode line separators U+2028/U+2029** (some YAML parsers treat them as breaks). The
+  body sits below the frontmatter and can never redefine it. Full metacharacter matrix is
+  test-pinned (frontmatter-injection guard, an audit focus).
+- **Top-level `skills` option is ALWAYS an explicit list** — never omitted (omission is
+  **not** "skills off": the CLI's own defaults still apply) and never `'all'` (which
+  enables every discovered skill). It is set to the run's **full plugin-qualified union**
+  (`uzi:<name>` / `plugin:skill` qualifier). Correct under either reading of the SDK's
+  ambiguous top-level-vs-subagent gating docs, and it gives the main-thread `lead`
+  orchestrator visibility (the `lead` is the main session, routed there by
+  `assembleAgents`, so it has no `AgentDefinition.skills` slot — allocating a skill
+  specifically to `lead` only affects union membership).
+- **Per-subagent scoping via each `AgentDefinition.skills`** (delivered/allocated skills
+  are per-template), re-filtered to what actually survived precedence + caps. Repo skills
+  are the exception (all-templates, §105).
+- Shared assembly path `agent/src/skills-run.ts` is used by **both** the SDK executor
+  (production) and the stub executor (E2E) so they can't drift into two lenient
+  implementations.
+
+## 105. Repo-borne skills: opt-in, default off, skills-only, lowest precedence
+
+Serves human: "repos may carry skills the worker detects; per-repo opt-in, default off".
+
+- **Only when `ClaimRepo.skills_enabled`** (the repo owner or an admin flipped
+  `repos.repo_skills_enabled`): after checkout the worker enumerates
+  `<clone>/.claude/skills/*/SKILL.md`, parses **only `name` + `description`** from the
+  frontmatter, and **drops every other frontmatter key** (`allowed-tools` and friends
+  **grant capabilities** — stripping them is the security point, and it matches how
+  server-stored skills carry body-only). It re-synthesizes escaped frontmatter with the
+  same materializer, applies the same name regex + size cap, and places repo skills at
+  **lowest precedence** (a delivered skill of the same name always wins; the repo skill
+  is skipped + logged).
+- **Symlinks are never followed**: the skills dir itself must be a real directory (a
+  symlinked dir is skipped), and a symlinked `SKILL.md` is never read (`lstat` +
+  `isDirectory`/`isFile` guards) — a repo can't escape its tree via a link.
+- **Repo skills carry no allocation, so they apply to ALL templates in the run**
+  (appended to every subagent's `AgentDefinition.skills`, not just the lead's — the
+  top-level union only covers the main-thread session, so without this a repo skill would
+  never reach a subagent).
+- **Nothing else under the repo's `.claude/` is ever read for loading**: no hooks,
+  no settings, no commands, no `CLAUDE.md`. This is the **only** clone-borne config uzi
+  loads, and only through its own controlled channel.
+- **Caps re-enforced worker-side over the combined delivered ∪ repo set**: delivered DB
+  skills count against `SKILLS_MAX_PER_RUN`; repo skills (lowest precedence) evict first,
+  so a run can never reach 2× the cap.
+- **Trust rationale**: repo `.claude/` is exactly the config class `settingSources: []`
+  exists to block; repo skills are the mildest member but still get trusted-affordance
+  framing. They're trustworthy exactly when the repo's MR-review discipline is — which
+  uzi can't know for arbitrary repos — so the owner asserts it per repo, default off.
+  Loading skills-only through uzi's own channel weakens **no** existing guardrail: a
+  hostile repo skill still can't push (the worker holds the PAT), still hits the
+  `PreToolUse` deny-hook, and still can't load hooks/settings. Pinned by a hostile-repo
+  test (flag off ⇒ zero repo `.claude/` influence; flag on ⇒ skills only).
+
+## 106. SDK skill-loading model (verified against installed SDK; no allowlist widening)
+
+Serves human: primary directive (tools allowlists are a guardrail — not silently widened).
+
+- Verified against the installed `@anthropic-ai/claude-agent-sdk` during the M4 build:
+  a tools-`'Skill'` grant is **deprecated** (`sdk.d.ts:44`), and `AgentDefinition.skills`
+  is the **single enable switch** for a subagent to expand its allocated skill. The M4
+  integration test confirms a **tools-restricted subagent** (reviewer/tester allowlists
+  exclude many tools) can be wired to expand its allocated skill **with no allowlist
+  change**.
+- Consequence: the earlier open contingency ("if skill expansion needs a `Skill` grant,
+  the assembler must widen the allowlist") is **resolved as not needed** — **no tools
+  allowlist is widened anywhere in the landed code**, including with repo skills enabled.
+  The guardrail layers stay exactly as PRD #4/#17 left them.
+
+## 107. Skills configuration (env, extends §13/§25/§49)
+
+| Var | Default | Notes |
+|---|---|---|
+| `SKILL_MAX_BYTES` | `65536` | per-skill body cap; server checks at save, worker checks repo skills; delivered to worker via `ClaimConfig` |
+| `SKILLS_MAX_PER_RUN` | `32` | per-run union cap across all templates; enforced at claim assembly (drop lowest-precedence-first) and re-enforced worker-side over delivered ∪ repo |
+
+Both are server env, delivered to the worker in `ClaimConfig` so the two sides
+enforce identical limits (no drift). Admin raises either instance-wide.
+
+## 108. Web UI: Skills page, allocation panel, repo toggle
+
+Serves human: "users allocate global or their own skills to each agent"; skills UI.
+
+- **Skills page (`/skills`)**: groups **Builtin / Global / Mine** (create/edit,
+  markdown body editor, name locked after create; builtin rows show Edit + Reset, never
+  Delete; admin sees Global create, everyone sees Mine). Admins additionally get a
+  labelled, **view-only "Other users" group** listing other users' private skills — the
+  honest UI face of the admin-sees-all read (§101): admins can see them, but only the
+  owner can edit or delete, and the group is clearly marked as such.
+- **Agent template detail (`AgentDetail.tsx`)**: allocation panel with a **shared half
+  (admin-editable)** and a **"my skills for this agent" half (self-service)**, rendered as
+  the **union the user's runs will actually get**.
+- **Repos page**: a per-repo **"Load repo skills" toggle** (repo owner or admin) with
+  explicit warning copy stating what it trusts and what it still never loads.
+- Responsive + component (vitest) coverage, consistent with the rest of the web app.
+
+## 109. First builtin skill: `ci-cd-norms`
+
+Serves human: "the first builtin skill is ci-cd-norms, researched from internal-kb
+and the example-app repos, covering the example CI/CD norm and example-app as the worked exception".
+
+- Authored at `api/internal/skilltmpl/builtins/ci-cd-norms/SKILL.md` (researched from
+  internal-kb `shared/infrastructure/ci-pipeline.md`, `organizations/myorg/infrastructure/
+  deployments.md`, and the example-app + `argo-apps` repos). Structure: the **default
+  norm** (thin `.gitlab-ci.yml` including a bundle from private `myorg/pipelines`;
+  lint→build→audit→push→cleanup with `SKIP_*` toggles; Harbor `harbor.example.com` for
+  images + OCI charts; **CI never deploys** — ArgoCD app-of-apps in `myorg/k8s/argo-apps`
+  does; secrets via Infisical), an **exception-detection rule** (no `include:` of
+  `myorg/pipelines` ⇒ exception; follow its local convention, never "normalize" unasked),
+  **example-app as the worked exception** (hand-rolled DAG pipeline, kaniko with
+  protected-ref-only cache writes, tag-only 4-artifact publish, chart-in-repo consumed as
+  Harbor OCI via multi-source ArgoCD app, manual `targetRevision` release ritual), and a
+  **verify-live section** for facts the KB doesn't pin (bundle contents, pinned tool
+  versions, push-credential var names).
+- **No invented facts**: every claim traces to a internal-kb page or the repos; volatile
+  items sit in verify-live. Editable in place by admins (so infra drift is fixed without a
+  uzi release).
+
+## 110. Deferred (PRD #16 out of scope)
+
+- Multi-file skills (multica's `skill_file`; v1 is SKILL.md-only); skill import from hubs
+  / the Anthropic skills repo; a skills catalog/marketplace; per-run ad-hoc skill
+  selection (allocation is per-template); auto-detecting which skills a run *should* have
+  had; forgejo parity. Recorded so a rebuild knows these were consciously omitted.
+
+---
+
 # PRD #21 — Mission-control theme (data-theme port of the ops-console identity)
 
 Serves human Feature #21 (a second, user-selectable theme on top of PRD #14's
@@ -2580,11 +2846,11 @@ ember tokens; server-side theme preference with an admin default). PRD #14 shipp
 ember as the sole theme with all look-and-feel in CSS variables precisely so
 alternate identities could ship later as `data-theme` overrides; this PRD builds
 the switching mechanism and ports the mission-control prototype onto ember's token
-slots. Section numbers continue past PRD #19's #100. Realizes
+slots. Section numbers continue past PRD #16's #110. Realizes
 `prds/21-mission-control-theme.md` (its Decision Log carries build-time provenance);
 builds on PRD #14 (tokens), PRD #17 (`/api/me/settings`), and PRD #19 (`app_settings`).
 
-## 101. Theme = tokens only; the no-branch rule; base-selector hardening
+## 111. Theme = tokens only; the no-branch rule; base-selector hardening
 
 Serves human: "mission-control theme selectable"; PRD #14's token architecture.
 
@@ -2604,7 +2870,7 @@ Serves human: "mission-control theme selectable"; PRD #14's token architecture.
 - **`[data-theme]` lives on `<html>`.** PRD #14's grep gate (zero raw palette
   classes / ad-hoc hex/rgb outside `index.css`) stays green under this feature.
 
-## 102. Canonical Go theme registry + resolution chain (server-authoritative)
+## 112. Canonical Go theme registry + resolution chain (server-authoritative)
 
 Serves human: "resolution: user override > admin default > ember"; best-practice
 (two write surfaces must not drift).
@@ -2619,11 +2885,11 @@ Serves human: "resolution: user override > admin default > ember"; best-practice
   back silently at render — same shared-validator discipline PRD #17 uses for models.
 - Adding a theme within the existing slot set is **exactly four edits** (Success
   Criterion 5): the Go registry entry (canonical), the web registry entry (mirror),
-  one `[data-theme]` CSS block, and one entry in the pre-paint allowlist (§106). No
+  one `[data-theme]` CSS block, and one entry in the pre-paint allowlist (§116). No
   handler/component/migration change. A theme needing a new slot is the two-step
-  Decision-3 pattern (§107): add the slot theme-agnostically first, then color it.
+  Decision-3 pattern (§117): add the slot theme-agnostically first, then color it.
 
-## 103. Server-side persistence: instance default in #19's `app_settings`, user override on `users`
+## 113. Server-side persistence: instance default in #19's `app_settings`, user override on `users`
 
 Serves human: "theme preference is server-side with an admin-set instance default"
 (user, 2026-07-05, superseding a device-local draft).
@@ -2634,9 +2900,10 @@ Serves human: "theme preference is server-side with an admin-set instance defaul
   the GET shape, and the fallback all follow. If PRD #21 ever landed before #19 M1,
   M1 here holds — a parallel settings table must not be built.
 - **User override is a nullable `users.theme` column** — migration
-  `00040_user_theme.sql` (drafted 00040 in the PRD ledger; renumbered to the next free
-  slot above the live head at land time per the CLAUDE.md goose convention). One
-  scalar per user ⇒ a column on `users`, not a table. `NULL` = "use default".
+  `00041_user_theme.sql` (drafted 00040; PRD #16's `00040_skills` landed first, so it
+  renumbered to 00041, the next free slot above the live head at land time per the
+  CLAUDE.md goose convention). One scalar per user ⇒ a column on `users`, not a table.
+  `NULL` = "use default".
 - **Per-key validation dispatch** in #19's admin settings handler: the handler ran
   `settings.ValidateLabel()` on every submitted key; this PRD refactors it to
   `settings.Validate(key, value)` (switch: label rules for the label keys,
@@ -2648,7 +2915,7 @@ Serves human: "theme preference is server-side with an admin-set instance defaul
   `go test` gate — a fake-reconciler handler test was declined because `h.pool` is a
   concrete `*pgxpool.Pool` needing a live DB that would skip in the plain gate).
 
-## 104. Three theme fields on `/api/auth/me`; client re-resolves, ignores the server-resolved one
+## 114. Three theme fields on `/api/auth/me`; client re-resolves, ignores the server-resolved one
 
 Serves human: the Appearance picker must render "Use default (<name>)"; server-side
 resolution.
@@ -2660,14 +2927,14 @@ resolution.
   lives only in the admin-only settings endpoint. Non-admins get everything they need
   from `/me`, so no admin read is required to render the picker.
 - **The client intentionally ignores the server's resolved field and re-resolves
-  itself** (§102 mirror). This is deliberate forward-compat, not dead code: a server
+  itself** (§112 mirror). This is deliberate forward-compat, not dead code: a server
   predating these fields degrades to `ember` rather than throwing on a missing field.
 - **Application point is session bootstrap** (`web/src/auth/AuthContext.tsx`, not the
   originally-anticipated `main.tsx`): on every login/`me` refresh it re-resolves and
   stamps `<html data-theme>`, so a change (the user's, or the admin default) restyles
   live with no reload.
 
-## 105. User theme pref extends PRD #17's `/api/me/settings` (PATCH-like); no new route
+## 115. User theme pref extends PRD #17's `/api/me/settings` (PATCH-like); no new route
 
 Serves human: server-side user override; PRD #17 coordination.
 
@@ -2680,9 +2947,9 @@ Serves human: server-side user override; PRD #17 coordination.
   the worker-model card and the Appearance picker save independently over the one
   endpoint without clobbering each other. `default_model`'s prior behavior is unchanged
   (the client always sends it on a model save). Own-user only; validates the theme
-  against the Go registry (§102).
+  against the Go registry (§112).
 
-## 106. Pre-paint via an external CSP-safe script + localStorage cache
+## 116. Pre-paint via an external CSP-safe script + localStorage cache
 
 Serves human: no flash-of-wrong-theme on cold load; best-practice (works in the
 nginx-served build, not just dev).
@@ -2701,11 +2968,11 @@ nginx-served build, not just dev).
   script at build so the source hash wouldn't match served bytes). Keeps "no inline
   scripts" literally true with no CSP change; only the CSP comment is refreshed.
 - **The allowlist inside `theme-preinit.js` hardcodes the theme ids** and is a
-  deliberate fourth edit point (§102): the file runs before the app bundle, so it
+  deliberate fourth edit point (§112): the file runs before the app bundle, so it
   can't import the web registry. A theme added without this edit still renders once
   `me()` resolves — it just flashes `ember` for one frame on a cold load.
 
-## 107. queue/neutral status tones added theme-agnostically, as fg/border/surface triples
+## 117. queue/neutral status tones added theme-agnostically, as fg/border/surface triples
 
 Serves human: "mission's six-tone status language incl. the violet queue tone, added
 theme-agnostically" (user decision, 2026-07-05).
@@ -2737,7 +3004,7 @@ theme-agnostically" (user decision, 2026-07-05).
   (default themes set it to none); any `[data-theme="mission"]` CSS stays inside
   `index.css` next to the token blocks.
 
-## 108. Mock parity + versioned mock persistence
+## 118. Mock parity + versioned mock persistence
 
 Serves human: "mock demo persists settings across reload" (user approved 2026-07-05,
 scoped settings-only); Decision 6 (the `VITE_UZI_MOCK=1` build is the review vehicle).
@@ -2749,6 +3016,6 @@ scoped settings-only); Decision 6 (the `VITE_UZI_MOCK=1` build is the review veh
   override + admin default) is exercised in the demo build without a real backend.
 - **Mock settings persist across reload** via a versioned `localStorage` key
   `uzi.mock.v1` (`MOCK_SETTINGS_KEY`), **settings-only**, discard-on-version-mismatch.
-  It is **independent of the `uzi.theme` pre-paint cache key** (§106) — different key,
+  It is **independent of the `uzi.theme` pre-paint cache key** (§116) — different key,
   different purpose (mock backend state vs. real pre-paint cache), so they don't
   interfere.

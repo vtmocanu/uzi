@@ -5,6 +5,7 @@ import { api, ApiError, type AgentTemplate, type AgentTemplateInput } from "../l
 import { renderSubagent, summarizeTools } from "../lib/agentTemplates";
 import { Alert, Button, Card } from "../components/ui";
 import { AgentTemplateEditor } from "../components/AgentTemplateEditor";
+import { SkillAllocationPanel } from "../components/SkillAllocationPanel";
 
 export function AgentDetail() {
   const { id = "" } = useParams();
@@ -140,6 +141,8 @@ export function AgentDetail() {
       ) : (
         <ReadOnlyView template={template} />
       )}
+
+      <SkillAllocationPanel templateId={template.id} isAdmin={isAdmin} userId={user?.id} />
     </div>
   );
 }

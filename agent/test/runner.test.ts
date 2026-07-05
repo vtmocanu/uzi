@@ -13,6 +13,7 @@ import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, type Executor } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { skillsPluginDir } from "../src/skills-plugin.js";
 import { GitLabClient, type FetchFn } from "../src/gitlab.js";
 import { RunRunner } from "../src/runner.js";
 import type { UserInput } from "../src/protocol.js";
@@ -132,6 +133,25 @@ describe("RunRunner — worker-performed push + MR", () => {
     const log = execFileSync("git", ["-C", fx.originPath, "log", "--oneline", "agent/issue-7"], { encoding: "utf8" });
     assert.ok(log.includes("uzi stub: work on issue #7"));
     assert.strictEqual(fs.existsSync(worktreeDirFor(7)), false);
+  });
+
+  it("tears down the sibling skills plugin dir with the worktree (PRD #16 M6 follow-up)", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(11);
+    const pluginDir = skillsPluginDir(worktreeDirFor(11));
+    // An executor that materializes a plugin dir the way SdkExecutor does — the
+    // runner's finally must remove it (it is OUTSIDE the worktree, so the worktree
+    // teardown does not reach it).
+    const exec: Executor = {
+      run: async (ctx) => {
+        fs.mkdirSync(pluginDir, { recursive: true });
+        fs.writeFileSync(path.join(pluginDir, "marker"), "x");
+        return { branch: ctx.branch };
+      },
+    };
+    await runner(exec, gitlab).execute(claim);
+    assert.strictEqual(fs.existsSync(pluginDir), false, "skills plugin dir must be cleaned up");
+    assert.strictEqual(fs.existsSync(worktreeDirFor(11)), false, "worktree still cleaned up");
   });
 
   it("reports failed and opens NO merge request when the executor throws", async () => {

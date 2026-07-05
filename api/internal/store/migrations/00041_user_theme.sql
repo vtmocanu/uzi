@@ -5,8 +5,9 @@
 -- falls back to ember). One nullable scalar, so a column on users rather than a
 -- new table — the same shape as default_model (PRD #17 Decision 3).
 --
--- NOTE (goose numbering): drafted as 00040 above the live head; renumbered to
--- the next free number at the landing merge, per the CLAUDE.md convention.
+-- NOTE (goose numbering): drafted as 00040, renumbered to 00041 at the landing
+-- merge (PRD #16 landed 00040_skills first) — the next free number above the
+-- live head, per the CLAUDE.md convention.
 ALTER TABLE users ADD COLUMN theme text;
 
 -- +goose Down
