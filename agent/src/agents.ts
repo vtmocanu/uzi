@@ -37,6 +37,7 @@
 import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentTemplate } from "./protocol.js";
 import { NESTED_AGENT_TOOL } from "./guardrails.js";
+import { qualifiedSkillName } from "./skills-plugin.js";
 
 /**
  * A template is the lead orchestrator (routed to the main thread, not registered
@@ -69,6 +70,13 @@ function toDefinition(t: AgentTemplate): AgentDefinition {
   // unset so the SDK inherits all — the PRD #3 contract (see header).
   if (t.tools && t.tools.length > 0) def.tools = [...t.tools];
   if (t.model) def.model = t.model;
+  // Per-template skill scoping (PRD #16): this subagent preloads EXACTLY its
+  // allocated skills (plugin-qualified), always set explicitly (possibly []) so a
+  // subagent with no allocation gets none — never the run's whole union. Enabling
+  // a skill via this field is sufficient; per sdk.d.ts:44 adding `'Skill'` to the
+  // tools allowlist is deprecated and unnecessary, so a tools-restricted subagent
+  // (reviewer/tester) still expands its allocated skill without a tools grant.
+  def.skills = (t.skills ?? []).map(qualifiedSkillName);
   return def;
 }
 

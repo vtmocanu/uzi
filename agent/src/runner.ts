@@ -111,6 +111,8 @@ export class RunRunner {
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
         agents: claim.agents,
+        skills: claim.skills,
+        skillsDropped: claim.skills_dropped,
         config: claim.config,
         sessionId: claim.session_id,
         signal: cancel.signal,

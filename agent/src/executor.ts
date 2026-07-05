@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { AgentTemplate, ClaimConfig, MessageKind } from "./protocol.js";
+import type { AgentTemplate, ClaimConfig, ClaimSkill, ClaimSkillDrop, MessageKind } from "./protocol.js";
 import type { PlanVerdict } from "./steering.js";
 
 const execFileAsync = promisify(execFile);
@@ -36,6 +36,12 @@ export interface RunContext {
   oauthToken?: string;
   /** PRD #3 templates (lead + subagents) mapped to SDK AgentDefinitions. */
   agents?: AgentTemplate[];
+  /** M4 (PRD #16): the per-run skill union — materialized into a local plugin dir
+   *  and enabled via the SDK `skills` list. */
+  skills?: ClaimSkill[];
+  /** M4 (PRD #16): skills the server dropped at claim assembly (shadowed /
+   *  over-limit). The worker owns the gapless seq, so it logs these. */
+  skillsDropped?: ClaimSkillDrop[];
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** SDK session to resume; null/absent for a fresh run. */

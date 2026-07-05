@@ -32,6 +32,7 @@ import { assembleAgents } from "./agents.js";
 import { buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
+import { enforceSkillCaps, materializeSkillsPlugin, qualifiedSkillName, skillsPluginDir, type SkillDrop } from "./skills-plugin.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
@@ -42,6 +43,10 @@ import { errMessage } from "./util.js";
 const DEFAULT_RUN_TIMEOUT_SECONDS = 2 * 60 * 60; // 2h
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60; // 10m
 const DEFAULT_MAX_ITERATIONS = 5; // PRD: RUN_MAX_ITERATIONS default 5
+// Skill caps (PRD #16). Fallbacks only when the claim omits config; the server
+// normally supplies both via ClaimConfig so the worker enforces the same limits.
+const DEFAULT_SKILL_MAX_BYTES = 65536;
+const DEFAULT_SKILLS_MAX_PER_RUN = 32;
 
 // Static (content-free) failure reasons — safe to persist as failure_reason.
 const REASON_WALL = "run exceeded its wall-clock timeout";
@@ -130,6 +135,20 @@ export class SdkExecutor implements Executor {
     this.spawnedPids.clear();
   }
 
+  /**
+   * Log every dropped skill as a run message (PRD #16): the server's assembly
+   * drops that rode the claim (ctx.skillsDropped — shadowed / over-limit) plus the
+   * worker's own local cap drops (too_large / over_limit over the combined set).
+   * The worker owns the gapless per-run seq, so the SERVER never writes these; it
+   * hands the worker the {name, reason} list to emit. One status line per drop.
+   */
+  private emitSkillDrops(ctx: RunContext, localDrops: readonly SkillDrop[]): void {
+    const all: SkillDrop[] = [...(ctx.skillsDropped ?? []), ...localDrops];
+    for (const d of all) {
+      ctx.emit({ kind: "status", agent: "worker", payload: { text: describeSkillDrop(d.name, d.reason) } });
+    }
+  }
+
   async run(ctx: RunContext): Promise<ExecutorResult> {
     this.spawnedPids.clear();
     const oauthToken = ctx.oauthToken?.trim();
@@ -146,6 +165,22 @@ export class SdkExecutor implements Executor {
     const subagentNames = Object.keys(assembled.subagents);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
 
+    // Skills (PRD #16 M4). Re-enforce the server-configured caps over the
+    // delivered union (a no-op for delivered-only — the server already capped —
+    // but the seam repo skills plug into at M6), then materialize a local plugin
+    // dir OUTSIDE the clone. The plugin channel loads under `settingSources: []`,
+    // so the injection defense never loosens. Rebuilt on every claim including
+    // resume. The worker owns the gapless seq, so it logs every dropped skill:
+    // the server's assembly drops (ctx.skillsDropped) plus these local cap drops.
+    const skillCaps = {
+      maxBytes: positive(ctx.config?.skill_max_bytes, DEFAULT_SKILL_MAX_BYTES),
+      maxPerRun: positive(ctx.config?.skills_max_per_run, DEFAULT_SKILLS_MAX_PER_RUN),
+    };
+    const { kept: runSkills, dropped: localDrops } = enforceSkillCaps(ctx.skills ?? [], skillCaps);
+    const skillsPluginPath = skillsPluginDir(ctx.worktreePath);
+    await materializeSkillsPlugin(skillsPluginPath, runSkills);
+    this.emitSkillDrops(ctx, localDrops);
+
     const baseOptions: SdkOptions = {
       cwd: ctx.worktreePath,
       // Full replacement — only these keys reach the agent subprocess.
@@ -153,6 +188,16 @@ export class SdkExecutor implements Executor {
       // Repo-borne prompt-injection defense: nothing from the cloned repo's
       // .claude/{settings.json,agents,hooks} can grant the agent permissions.
       settingSources: [],
+      // Skills (PRD #16 M4): a local plugin dir OUTSIDE the clone, loaded
+      // independently of settingSources (SdkPluginConfig is a separate option),
+      // so the isolation above never loosens. skipMcpDiscovery: this plugin ships
+      // ONLY skills — the SDK host owns MCP, so never read a manifest/.mcp.json.
+      plugins: [{ type: "local", path: skillsPluginPath, skipMcpDiscovery: true }],
+      // ALWAYS an explicit list — the full plugin-qualified run union. Omitting it
+      // is NOT "skills off" (sdk.d.ts:1872: CLI defaults would apply); `[]` when the
+      // run has no skills disables all. Per-subagent scoping is each
+      // AgentDefinition.skills; the lead is the main thread, covered by this union.
+      skills: runSkills.map((s) => qualifiedSkillName(s.name)),
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt),
       agents: assembled.subagents,
       // In-process signalling tools the lead calls to gate the plan and mark done
@@ -412,6 +457,21 @@ function seconds(value: number | undefined, fallback: number): number {
 /** A positive integer override, else the fallback. */
 function positive(value: number | undefined, fallback: number): number {
   return typeof value === "number" && value > 0 ? Math.floor(value) : fallback;
+}
+
+/** Human-readable run-message text for a dropped skill, by reason code. Unknown
+ *  codes degrade to a generic line rather than dropping the log. */
+function describeSkillDrop(name: string, reason: string): string {
+  switch (reason) {
+    case "shadowed":
+      return `skill "${name}" was shadowed by a higher-precedence skill of the same name and will not be loaded`;
+    case "over_limit":
+      return `skill "${name}" was dropped: the run exceeded the maximum number of skills`;
+    case "too_large":
+      return `skill "${name}" was dropped: its body exceeds the maximum allowed size`;
+    default:
+      return `skill "${name}" was dropped (${reason})`;
+  }
 }
 
 /**
