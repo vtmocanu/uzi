@@ -428,3 +428,52 @@ func TestLoadRegistrationPolicy(t *testing.T) {
 		}
 	})
 }
+
+// TestPrivilegeCheckInterval covers the sweep-cadence knob, including the
+// reviewer-flagged 0=disabled case that parseDuration would wrongly reject.
+func TestPrivilegeCheckInterval(t *testing.T) {
+	setBase := func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+		t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+		varied := make([]byte, secretbox.KeySize)
+		for i := range varied {
+			varied[i] = byte(i + 1)
+		}
+		t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+	}
+
+	t.Run("default is 24h", func(t *testing.T) {
+		setBase(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.PrivilegeCheckInterval != 24*time.Hour {
+			t.Errorf("default = %v, want 24h", cfg.PrivilegeCheckInterval)
+		}
+	})
+
+	t.Run("0 disables (not rejected as parseDuration would)", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_PRIVILEGE_CHECK_INTERVAL", "0")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.PrivilegeCheckInterval != 0 {
+			t.Errorf("interval = %v, want 0 (disabled)", cfg.PrivilegeCheckInterval)
+		}
+	})
+
+	t.Run("explicit duration parses", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_PRIVILEGE_CHECK_INTERVAL", "6h")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.PrivilegeCheckInterval != 6*time.Hour {
+			t.Errorf("interval = %v, want 6h", cfg.PrivilegeCheckInterval)
+		}
+	})
+}

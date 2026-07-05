@@ -27,6 +27,20 @@ RETURNING *;
 -- name: DeleteForgeConnectionForUser :execrows
 DELETE FROM forge_connections WHERE id = $1 AND user_id = $2;
 
+-- name: ListAllForgeConnections :many
+-- Every connection across all users, for the privilege-check sweep (single-API,
+-- no leader election — same assumption as the poller/sweeper).
+SELECT * FROM forge_connections ORDER BY created_at ASC;
+
+-- name: UpdatePrivilegeReport :execrows
+-- Stamp a connection's privilege report + denormalized status. :execrows so a
+-- connection deleted mid-sweep is a tolerated 0-row write, not an error.
+UPDATE forge_connections
+SET privilege_report     = $2,
+    privilege_checked_at = $3,
+    privilege_status     = $4
+WHERE id = $1;
+
 -- Repos --------------------------------------------------------------------
 
 -- name: UpsertRepo :one
@@ -63,6 +77,13 @@ SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_u
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.id = $1 AND c.user_id = $2;
+
+-- name: ListEnabledReposByConnection :many
+-- Enabled repos for one connection (privilege sweep + on-demand check). Caller
+-- has already authorized access to the connection, so this is keyed by
+-- connection id alone.
+SELECT * FROM repos WHERE connection_id = $1 AND enabled = true
+ORDER BY path_with_namespace ASC;
 
 -- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2

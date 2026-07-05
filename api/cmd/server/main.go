@@ -26,6 +26,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
@@ -164,6 +165,14 @@ func run() error {
 	sweep := sweeper.New(wsvc, 0)
 	sweep.Boot(ctx)
 
+	// PAT least-privilege service + sweep (PRD #5). The service is shared by the
+	// on-demand handler and the sweep; it reuses forgesvc to build a driver from a
+	// stored connection. The sweep is the poller's/worker-sweeper's sibling: a Boot
+	// pass back-fills reports for grandfathered (never-checked) connections right
+	// after deploy, then it ticks on UZI_PRIVILEGE_CHECK_INTERVAL. 0 disables it
+	// entirely (no boot pass, no loop).
+	pcheck := privcheck.NewService(q, svc)
+
 	var bgWG sync.WaitGroup
 	bgWG.Add(3)
 	go func() {
@@ -178,10 +187,21 @@ func run() error {
 		defer bgWG.Done()
 		lifecycle.RunReconciler(ctx)
 	}()
+	if cfg.PrivilegeCheckInterval > 0 {
+		privSweep := privcheck.NewEngine(pcheck, cfg.PrivilegeCheckInterval)
+		privSweep.Boot(ctx)
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			privSweep.Run(ctx)
+		}()
+	} else {
+		slog.Info("privilege sweeper disabled (UZI_PRIVILEGE_CHECK_INTERVAL=0)")
+	}
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg, box, svc, wsvc, liveHub)
+	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

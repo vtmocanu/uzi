@@ -71,6 +71,11 @@ type Config struct {
 	// upstream forge from a single user's abuse.
 	ForgeRateLimitMax    int
 	ForgeRateLimitWindow time.Duration
+	// PrivilegeCheckInterval is the cadence of the background PAT least-privilege
+	// re-check sweep (PRD #5). Default 24h; 0 disables the sweep entirely (no boot
+	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
+	// connections get a report immediately.
+	PrivilegeCheckInterval time.Duration
 	// SeedEmail/SeedPassword/SeedName optionally provision an admin at startup.
 	// Empty SeedEmail disables seeding. Validated at boot (see Load).
 	SeedEmail    string
@@ -181,6 +186,9 @@ func Load() (Config, error) {
 	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
 	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
 	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
+	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —
+	// it disables the privilege sweep — and parseDuration rejects 0.
+	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)
 
 	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
@@ -484,6 +492,20 @@ func parseBool(key string, def bool) (bool, error) {
 		return false, fmt.Errorf("%s must be a boolean (true/false), got %q", key, raw)
 	}
 	return v, nil
+}
+
+// parseNonNegDuration is parseDuration but accepts 0 (a legitimate value for a
+// knob where 0 means "disabled", e.g. UZI_PRIVILEGE_CHECK_INTERVAL). A negative
+// or malformed value falls back to def.
+func parseNonNegDuration(key string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+		return d
+	}
+	return def
 }
 
 // parseNonNegInt is parseInt but accepts 0 (a legitimate value for e.g.

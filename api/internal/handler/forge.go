@@ -142,6 +142,17 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Least-privilege gate (PRD #5): token-level violations block the save — this
+	// is the one moment uzi holds the plaintext and the user is present to fix it.
+	// Per-repo checks can't run here (no repos are enabled yet); those warn later.
+	if tr := h.pcheck.CheckToken(r.Context(), f, identity.IsAdmin); len(tr.Violations) > 0 {
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error":      "the bot token is over-privileged and was not saved; mint a least-privilege token (see the bot setup doc)",
+			"violations": tr.Violations,
+		})
+		return
+	}
+
 	ciphertext, err := h.svc.EncryptToken(req.Token)
 	if err != nil {
 		slog.Error("encrypt token", "error", err)
@@ -220,6 +231,36 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"connection": connToDTO(updated)})
+}
+
+// PrivilegeCheck runs the full PAT least-privilege report for a connection
+// (token + every enabled repo), persists it, and returns it. Owner-only, behind
+// the per-user forge rate limiter (it is the heaviest forge-proxying route: one
+// token call plus two per enabled repo). It never blocks — the report surfaces
+// findings, the badge reflects them, and the user acts.
+func (h *Handler) PrivilegeCheck(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid connection id")
+		return
+	}
+	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+		return
+	}
+	report, err := h.pcheck.CheckConnection(r.Context(), conn)
+	if err != nil {
+		slog.Error("privilege check", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"report": report})
 }
 
 // DeleteConnection removes a connection (cascading its repos, board columns, and
