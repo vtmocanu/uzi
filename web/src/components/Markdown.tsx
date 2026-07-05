@@ -33,7 +33,7 @@ const components: Components = {
     if (url === "" || schemeIsDangerous(url)) {
       // Neutralized src: show the alt text as a placeholder rather than a broken
       // image icon.
-      return <span className="text-xs italic text-slate-500">{alt || "image"}</span>;
+      return <span className="text-xs italic text-faint">{alt || "image"}</span>;
     }
     return (
       <img
@@ -41,7 +41,7 @@ const components: Components = {
         src={url}
         alt={alt ?? ""}
         loading="lazy"
-        className="my-2 max-h-64 max-w-full rounded-md border border-slate-800"
+        className="my-2 max-h-64 max-w-full rounded-md border border-edge"
       />
     );
   },

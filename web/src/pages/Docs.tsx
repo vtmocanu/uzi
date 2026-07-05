@@ -11,23 +11,23 @@ export function Docs() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold">Docs</h1>
-        <p className="mt-1 text-slate-400">
+        <p className="mt-1 text-muted">
           Howtos for getting from nothing to a working board.
         </p>
       </div>
 
       {docs.length === 0 ? (
         <Card>
-          <p className="text-sm text-slate-500">No howtos published yet.</p>
+          <p className="text-sm text-faint">No howtos published yet.</p>
         </Card>
       ) : (
         <ul className="space-y-3">
           {docs.map((doc) => (
             <li key={doc.slug}>
               <Link to={`/docs/${doc.slug}`} className="block">
-                <Card className="transition-colors hover:border-indigo-700">
-                  <h2 className="font-medium text-slate-100">{doc.meta.title || doc.slug}</h2>
-                  {doc.summary && <p className="mt-1 text-sm text-slate-400">{doc.summary}</p>}
+                <Card className="transition-colors hover:border-edge-strong">
+                  <h2 className="font-medium text-fg">{doc.meta.title || doc.slug}</h2>
+                  {doc.summary && <p className="mt-1 text-sm text-muted">{doc.summary}</p>}
                 </Card>
               </Link>
             </li>

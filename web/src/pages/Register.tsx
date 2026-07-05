@@ -37,7 +37,9 @@ export function Register() {
     }
   };
 
-  const barColors = ["bg-rose-600", "bg-orange-500", "bg-amber-400", "bg-lime-500", "bg-emerald-500"];
+  // Weak→strong ramp mapped onto the status tokens: danger (very weak/weak),
+  // warn (fair), ok (good/strong). The bar width already encodes the 5 levels.
+  const barColors = ["bg-danger", "bg-danger", "bg-warn", "bg-ok", "bg-ok"];
 
   return (
     <div className="mx-auto max-w-md">
@@ -73,13 +75,13 @@ export function Register() {
           </Field>
           {password.length > 0 && (
             <div className="space-y-1">
-              <div className="h-1.5 w-full overflow-hidden rounded bg-slate-800">
+              <div className="h-1.5 w-full overflow-hidden rounded bg-raised">
                 <div
                   className={`h-full transition-all ${barColors[strength.score]}`}
                   style={{ width: `${((strength.score + 1) / 5) * 100}%` }}
                 />
               </div>
-              <p className={`text-xs ${tooShort ? "text-rose-300" : "text-slate-400"}`}>
+              <p className={`text-xs ${tooShort ? "text-danger" : "text-muted"}`}>
                 {tooShort ? `At least ${MIN_PASSWORD} characters` : `Strength: ${strength.label}`}
               </p>
             </div>
@@ -88,9 +90,9 @@ export function Register() {
             {submitting ? "Creating…" : "Create account"}
           </Button>
         </form>
-        <p className="mt-4 text-sm text-slate-400">
+        <p className="mt-4 text-sm text-muted">
           Already have an account?{" "}
-          <Link to="/login" className="text-indigo-400 hover:underline">
+          <Link to="/login" className="text-brand hover:underline">
             Log in
           </Link>
         </p>

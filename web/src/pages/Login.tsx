@@ -59,9 +59,9 @@ export function Login() {
             {submitting ? "Logging in…" : "Log in"}
           </Button>
         </form>
-        <p className="mt-4 text-sm text-slate-400">
+        <p className="mt-4 text-sm text-muted">
           No account?{" "}
-          <Link to="/register" className="text-indigo-400 hover:underline">
+          <Link to="/register" className="text-brand hover:underline">
             Register
           </Link>
         </p>
