@@ -95,6 +95,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 		r.Route("/auth", func(r chi.Router) {
 			r.With(authLimiter.Middleware).Post("/register", h.Register)
 			r.With(authLimiter.Middleware).Post("/login", h.Login)
+			// Unauthenticated registration policy for the SPA: outside RequireAuth,
+			// behind the auth limiter. Reveals only operator-set, user-visible policy.
+			r.With(authLimiter.Middleware).Get("/config", h.AuthConfig)
 
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))

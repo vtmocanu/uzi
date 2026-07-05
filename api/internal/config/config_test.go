@@ -324,3 +324,107 @@ func TestForgeBaseURLAllowed(t *testing.T) {
 		t.Error("http scheme must be rejected")
 	}
 }
+
+func TestParseEmailDomains(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want []string
+	}{
+		{"", nil},
+		{"   ", nil},
+		{"example.com", []string{"example.com"}},
+		{"example.COM", []string{"example.com"}},      // lowercased
+		{" a.com , b.com ", []string{"a.com", "b.com"}},   // trimmed
+		{"a.com,a.com,b.com", []string{"a.com", "b.com"}}, // deduped
+		{"a.com,,b.com,", []string{"a.com", "b.com"}},     // empty entries dropped
+		{"B.com,a.com", []string{"b.com", "a.com"}},       // first-seen order preserved
+	}
+	for _, tc := range cases {
+		got := parseEmailDomains(tc.raw)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("parseEmailDomains(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestParseBool(t *testing.T) {
+	t.Run("empty returns default", func(t *testing.T) {
+		t.Setenv("UZI_TEST_BOOL", "")
+		for _, def := range []bool{true, false} {
+			got, err := parseBool("UZI_TEST_BOOL", def)
+			if err != nil || got != def {
+				t.Errorf("empty with def=%v: got %v, err %v", def, got, err)
+			}
+		}
+	})
+	t.Run("valid forms parse", func(t *testing.T) {
+		valid := map[string]bool{"true": true, "false": false, "1": true, "0": false, "TRUE": true, "F": false}
+		for raw, want := range valid {
+			t.Setenv("UZI_TEST_BOOL", raw)
+			got, err := parseBool("UZI_TEST_BOOL", !want)
+			if err != nil || got != want {
+				t.Errorf("parseBool(%q) = %v, err %v; want %v", raw, got, err, want)
+			}
+		}
+	})
+	t.Run("malformed is a boot error", func(t *testing.T) {
+		t.Setenv("UZI_TEST_BOOL", "yes-please")
+		if _, err := parseBool("UZI_TEST_BOOL", true); err == nil {
+			t.Fatal("a malformed boolean must abort boot, got nil error")
+		}
+	})
+}
+
+// TestLoadRegistrationPolicy exercises the registration knobs end to end through
+// Load(): the default (open registration, no allowlist), an explicit disable, a
+// domain allowlist, and a malformed kill-switch aborting boot.
+func TestLoadRegistrationPolicy(t *testing.T) {
+	setBase := func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+		t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+		varied := make([]byte, secretbox.KeySize)
+		for i := range varied {
+			varied[i] = byte(i + 1)
+		}
+		t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+	}
+
+	t.Run("defaults: registration on, no allowlist", func(t *testing.T) {
+		setBase(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.RegistrationEnabled {
+			t.Error("RegistrationEnabled should default to true")
+		}
+		if len(cfg.AllowedEmailDomains) != 0 {
+			t.Errorf("AllowedEmailDomains should default to empty, got %v", cfg.AllowedEmailDomains)
+		}
+	})
+
+	t.Run("explicit disable + allowlist", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_REGISTRATION_ENABLED", "false")
+		t.Setenv("UZI_ALLOWED_EMAIL_DOMAINS", "example.com, example.org")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.RegistrationEnabled {
+			t.Error("RegistrationEnabled should be false")
+		}
+		want := []string{"example.com", "example.org"}
+		if !reflect.DeepEqual(cfg.AllowedEmailDomains, want) {
+			t.Errorf("AllowedEmailDomains = %v, want %v", cfg.AllowedEmailDomains, want)
+		}
+	})
+
+	t.Run("malformed kill-switch aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("UZI_REGISTRATION_ENABLED", "maybe")
+		if _, err := Load(); err == nil {
+			t.Fatal("a malformed UZI_REGISTRATION_ENABLED must abort boot")
+		}
+	})
+}

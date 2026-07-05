@@ -10,6 +10,7 @@ import (
 	"net/mail"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,16 @@ type Config struct {
 	FrontendOrigin string
 	// CookieSecure is derived from FrontendOrigin (https => true).
 	CookieSecure bool
+	// RegistrationEnabled is the registration kill-switch (UZI_REGISTRATION_ENABLED,
+	// default true). When false, POST /api/auth/register returns 403 and the SPA
+	// hides the register form; login is unaffected. The seed admin is created
+	// out-of-band (seedAdmin in main.go) and is never gated by this.
+	RegistrationEnabled bool
+	// AllowedEmailDomains is the registration email-domain allowlist
+	// (UZI_ALLOWED_EMAIL_DOMAINS), lowercased, exact-match, no subdomain
+	// wildcards. Empty means every domain is allowed (today's behavior; the
+	// compose demo stays zero-config). Enforced only in the register handler.
+	AllowedEmailDomains []string
 	// RateLimitMax is the request budget per window for auth endpoints.
 	RateLimitMax int
 	// RateLimitWindow is the fixed window for the rate limiter.
@@ -139,6 +150,17 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.JWTSecret = secret
+
+	// Registration policy. The kill-switch is a security control, so — unlike the
+	// tuning knobs below — a set-but-malformed value aborts boot (loud
+	// misconfiguration, same stance as the seed guards) rather than silently
+	// defaulting to open.
+	regEnabled, err := parseBool("UZI_REGISTRATION_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RegistrationEnabled = regEnabled
+	cfg.AllowedEmailDomains = parseEmailDomains(os.Getenv("UZI_ALLOWED_EMAIL_DOMAINS"))
 
 	// Boot guard for the at-rest encryption key, same stance as JWT_SECRET: a
 	// missing/short/mis-encoded UZI_SECRET_KEY aborts start rather than running
@@ -263,6 +285,28 @@ func loadSeedAnthropic(cfg *Config) error {
 	}
 	cfg.SeedAnthropicToken = token
 	return nil
+}
+
+// parseEmailDomains parses the registration email-domain allowlist: a
+// comma-separated list, lowercased and trimmed, empty entries dropped, first-seen
+// order preserved and de-duplicated. Empty/unset yields nil (allow all domains).
+// Matching is byte-wise after lowercasing — no IDNA folding, irrelevant for the
+// ASCII domains uzi targets.
+func parseEmailDomains(raw string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.ToLower(strings.TrimSpace(part))
+		if part == "" {
+			continue
+		}
+		if _, dup := seen[part]; dup {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return out
 }
 
 // parseCommaList splits a comma-separated env value into trimmed, non-empty,
@@ -424,6 +468,22 @@ func parseInt(key string, def int) int {
 		return n
 	}
 	return def
+}
+
+// parseBool parses a boolean env var via strconv.ParseBool (1/t/T/TRUE/true/...,
+// 0/f/F/FALSE/false/...). Empty/unset returns def. A set-but-unparseable value is
+// an error, so a security-relevant flag (e.g. UZI_REGISTRATION_ENABLED) fails boot
+// loudly on a typo instead of silently taking the default.
+func parseBool(key string, def bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean (true/false), got %q", key, raw)
+	}
+	return v, nil
 }
 
 // parseNonNegInt is parseInt but accepts 0 (a legitimate value for e.g.
