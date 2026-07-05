@@ -100,7 +100,7 @@ Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/12-board-run-lifecycle.md`
 
 ## Feature #14 — UI redesign: multica-inspired "ember" theme
 
-Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/14-multica-ui-redesign.md`.
+Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/done/14-multica-ui-redesign.md`.
 
 - Three UI redesign prototypes built and evaluated live in-browser; the multica-inspired "ember" design was selected as the real UI.
 - Board nav entries carry the GitLab logo; fall back to a generic git icon when no GitLab icon applies.
