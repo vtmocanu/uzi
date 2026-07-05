@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, type SdkQueryFn } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate } from "../src/protocol.js";
@@ -388,5 +388,58 @@ describe("SdkExecutor failure + watchdog paths", () => {
       new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ signal: controller.signal }).ctx),
       /run cancelled/,
     );
+  });
+});
+
+describe("resolveLeadModel (PRD #17 precedence)", () => {
+  it("prefers the run owner's per-user default over the lead template model", () => {
+    assert.strictEqual(resolveLeadModel("sonnet", "fable"), "sonnet");
+  });
+  it("falls back to the lead template model when there is no per-user default", () => {
+    assert.strictEqual(resolveLeadModel(undefined, "fable"), "fable");
+  });
+  it("uses the per-user default when the lead template has no model", () => {
+    assert.strictEqual(resolveLeadModel("sonnet", undefined), "sonnet");
+  });
+  it("returns undefined (omit the key) when neither is set", () => {
+    assert.strictEqual(resolveLeadModel(undefined, undefined), undefined);
+    assert.strictEqual(resolveLeadModel("", ""), undefined);
+  });
+});
+
+describe("SdkExecutor model precedence on baseOptions", () => {
+  // The resolved model must land on options.model exactly per precedence, and an
+  // unset model must OMIT the key (never `model: undefined`) so the SDK/account
+  // default applies.
+  async function modelForRun(overrides: Partial<RunContext>): Promise<string | undefined> {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx(overrides).ctx);
+    return turns[0]!.options.model;
+  }
+
+  it("user default wins over the lead template model", async () => {
+    assert.strictEqual(await modelForRun({ agents: [lead], config: { default_model: "sonnet" } }), "sonnet");
+  });
+
+  it("lead template model applies when the user has no default", async () => {
+    assert.strictEqual(await modelForRun({ agents: [lead], config: null }), "fable");
+  });
+
+  it("user default applies even with no lead template model", async () => {
+    assert.strictEqual(await modelForRun({ agents: [coder], config: { default_model: "haiku" } }), "haiku");
+  });
+
+  it("omits model entirely when neither is set", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ agents: [coder], config: null }).ctx);
+    const o = turns[0]!.options;
+    assert.strictEqual(o.model, undefined);
+    assert.ok(!("model" in o), "model key must be omitted, not set to undefined");
   });
 });

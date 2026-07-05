@@ -32,6 +32,7 @@ type fakeStore struct {
 	claimCtxErr  error
 	anthropic    []byte
 	anthropicErr error
+	defaultModel pgtype.Text
 	templates    []store.AgentTemplate
 	markedFailed *store.MarkRunFailedByIDParams
 
@@ -102,6 +103,9 @@ func (f *fakeStore) GetRunClaimContext(context.Context, uuid.UUID) (store.GetRun
 }
 func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) ([]byte, error) {
 	return f.anthropic, f.anthropicErr
+}
+func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
+	return f.defaultModel, nil
 }
 func (f *fakeStore) ListAgentTemplates(context.Context) ([]store.AgentTemplate, error) {
 	return f.templates, nil
@@ -291,7 +295,8 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 			DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
 			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
 		},
-		anthropic: sealedTok,
+		anthropic:    sealedTok,
+		defaultModel: pgText("sonnet"),
 		templates: []store.AgentTemplate{
 			{Name: "coder", Description: "writes code", PromptBody: "you code", Tools: []byte(`["Read","Edit"]`)},
 			{Name: "reviewer", Description: "reviews", PromptBody: "you review", Model: pgText("claude-opus-4-8")},
@@ -350,10 +355,49 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	if payload.Config.RunTimeoutSeconds != 7200 || payload.Config.MaxIterations != 5 {
 		t.Fatalf("config caps wrong: %+v", payload.Config)
 	}
+	// The run owner's per-user default model rides the config.
+	if payload.Config.DefaultModel == nil || *payload.Config.DefaultModel != "sonnet" {
+		t.Fatalf("owner default model not carried into config: %+v", payload.Config)
+	}
 
 	// The plaintext secrets must not appear in any log line.
 	if strings.Contains(logs.String(), pat) || strings.Contains(logs.String(), token) {
 		t.Fatal("a log line leaked a decrypted secret")
+	}
+}
+
+func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-OMITTEST-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-OMITTEST-abcdef1234567890"))
+
+	fs := &fakeStore{
+		claimRun: store.Run{ID: uuid.New(), IssueIid: 9, Status: "claimed"},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic: sealedTok,
+		// defaultModel left zero ⇒ NULL ⇒ the owner has no per-user default.
+	}
+
+	payload, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.Config.DefaultModel != nil {
+		t.Fatalf("expected nil default model, got %q", *payload.Config.DefaultModel)
+	}
+	// omitempty: an unset default must not appear on the wire at all, so the
+	// worker sees `config.default_model === undefined` and falls back to the lead
+	// template's model.
+	b, err := json.Marshal(payload.Config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if strings.Contains(string(b), "default_model") {
+		t.Fatalf("unset default_model should be omitted from the payload; got %s", b)
 	}
 }
 

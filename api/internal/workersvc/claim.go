@@ -71,11 +71,16 @@ type ClaimAgent struct {
 	Model       *string  `json:"model"`
 }
 
-// ClaimConfig are the caps the worker enforces (wall clock, idle, loop count).
+// ClaimConfig are the caps the worker enforces (wall clock, idle, loop count)
+// plus the run owner's per-user default model. DefaultModel is the SDK model the
+// worker applies to the lead/main thread, taking precedence over the lead
+// template's model (PRD #17 Decision 6); it is omitted when the owner has no
+// default set (NULL), so the worker falls back to the lead template's model.
 type ClaimConfig struct {
-	RunTimeoutSeconds  int `json:"run_timeout_seconds"`
-	IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-	MaxIterations      int `json:"max_iterations"`
+	RunTimeoutSeconds  int     `json:"run_timeout_seconds"`
+	IdleTimeoutSeconds int     `json:"idle_timeout_seconds"`
+	MaxIterations      int     `json:"max_iterations"`
+	DefaultModel       *string `json:"default_model,omitempty"`
 }
 
 // agentsFromTemplates maps stored templates to claim-payload agents, decoding

@@ -181,7 +181,12 @@ export class SdkExecutor implements Executor {
       // stream (the live-partial channel is M5, not M3).
       includePartialMessages: false,
     };
-    if (assembled.leadModel) baseOptions.model = assembled.leadModel;
+    // Model precedence (PRD #17 Decision 6): the run owner's per-user default
+    // model wins over the lead template's model for the main thread. Set the key
+    // ONLY when a model is resolved — `model: undefined` must stay omitted (never
+    // an explicit key), so an unset model falls back to the SDK/account default.
+    const leadModel = resolveLeadModel(ctx.config?.default_model, assembled.leadModel);
+    if (leadModel) baseOptions.model = leadModel;
 
     const state: RunDrive = {
       currentChild: {},
@@ -407,4 +412,16 @@ function seconds(value: number | undefined, fallback: number): number {
 /** A positive integer override, else the fallback. */
 function positive(value: number | undefined, fallback: number): number {
   return typeof value === "number" && value > 0 ? Math.floor(value) : fallback;
+}
+
+/**
+ * Resolve the model for the lead/main thread (PRD #17 Decision 6): the run
+ * owner's per-user default (`config.default_model`) wins over the lead template's
+ * model. Returns undefined when neither is set (or either is blank), so the
+ * caller omits the SDK `model` key entirely rather than sending an explicit
+ * empty override — an unset model must fall back to the SDK/account default.
+ * Null-model subagents follow the main thread, so this governs them too.
+ */
+export function resolveLeadModel(configModel?: string, templateModel?: string): string | undefined {
+  return (configModel ?? templateModel) || undefined;
 }
