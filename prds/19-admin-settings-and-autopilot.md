@@ -37,7 +37,7 @@
 
 ### 1. app_settings (api + web)
 
-- Migration (reserve `00036`–`00039`; ledger: `00021` live head, `00022` #17, `00023`–`00028` #18, `00030+` #5, `00040+` #6, `00050+` #16): `app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by UUID NULL REFERENCES users(id) ON DELETE SET NULL, updated_at TIMESTAMPTZ)`. Seed rows for `prd_label='PRD'`, `autopilot_label='autopilot'`.
+- Migration (drafted as `00036`–`00039`; **final number assigned at merge time** — next free above the live head, per the CLAUDE.md convention: strict goose refuses to boot on below-head versions, so a draft range is collision avoidance between parallel PRDs, not a landing guarantee; draft ledger in PRD #18): `app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by UUID NULL REFERENCES users(id) ON DELETE SET NULL, updated_at TIMESTAMPTZ)`. Seed rows for `prd_label='PRD'`, `autopilot_label='autopilot'`.
 - Go accessor in a new `api/internal/settings` package: read-through cache with short TTL (poller + handlers read every cycle; a settings PUT invalidates). Defaults compiled in — a missing row never breaks boot. The cache is per-process: correct for the single-`api` compose stack; a second replica would lag a PUT by up to the TTL (noted for the future k8s deployment).
 - The same range covers the autopilot tables/columns: `autopilot_triggers` (Decision 5), `forge_connections.human_username`, `users.autopilot_enabled`, `runs.auto_approve`.
 - Handlers: `GET /api/admin/settings`, `PUT /api/admin/settings` (admin-gated like `ListUsers`/`PatchUser`), validation per Decision 8.

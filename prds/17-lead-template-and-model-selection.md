@@ -52,7 +52,7 @@ The lead orchestrator — the main SDK thread that plans, delegates, and gates e
 
 ### 3. Per-user default model (api + web)
 
-- Migration `00022` (next free goose number), with a `+goose Down`: `ALTER TABLE users ADD COLUMN default_model text` (nullable; NULL = inherit SDK default). sqlc queries: get/update for the current user (note: `SELECT *`/`RETURNING *` queries on `users` regenerate the sqlc `User` struct — harmless, expected).
+- Migration (drafted as `00022`; **final number assigned at merge time** — next free above the live head, per the CLAUDE.md convention: PRD #24 landed `00029` after this draft, and strict goose refuses to boot on below-head versions), with a `+goose Down`: `ALTER TABLE users ADD COLUMN default_model text` (nullable; NULL = inherit SDK default). sqlc queries: get/update for the current user (note: `SELECT *`/`RETURNING *` queries on `users` regenerate the sqlc `User` struct — harmless, expected).
 - API: extend the existing current-user/settings surface with `GET`/`PUT` for the default model (session-authenticated, own-user only; no admin involvement). Validation server-side per Decision 4.
 - Web: "Worker model" section on `Settings.tsx` under the Anthropic token block, using `ModelSelect`; explains precedence (lead template overrides this; empty = account default).
 
