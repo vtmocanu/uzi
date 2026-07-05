@@ -19,8 +19,11 @@ CREATE TABLE app_settings (
 );
 
 -- Seed the two label keys at their compiled-in defaults so the admin Settings
--- page shows concrete values on first load. The accessor falls back to the same
--- defaults (internal/settings) if a row is ever absent.
+-- page shows concrete values on first load. These literals MUST match the single
+-- Go source of the defaults, settings.Default{PRDLabel,AutopilotLabel} (keys
+-- settings.Key{PRDLabel,AutopilotLabel}); the accessor falls back to the same
+-- values if a row is ever absent. SQL cannot reference the Go constants, so a
+-- change to those defaults that should reseed needs a follow-up migration.
 INSERT INTO app_settings (key, value) VALUES
     ('prd_label', 'PRD'),
     ('autopilot_label', 'autopilot');

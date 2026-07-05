@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,14 +14,16 @@ import (
 
 // fakeStore is an in-memory Store: it returns a fixed row set and counts calls
 // so the cache's refresh behavior is observable, and can be flipped to error.
+// calls is atomic so the concurrent test can race readers through it without the
+// fake itself tripping -race.
 type fakeStore struct {
 	rows  []store.AppSetting
 	err   error
-	calls int
+	calls atomic.Int64
 }
 
 func (f *fakeStore) ListAppSettings(context.Context) ([]store.AppSetting, error) {
-	f.calls++
+	f.calls.Add(1)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -95,8 +99,8 @@ func TestCacheServesWithinTTLAndRefetchesAfter(t *testing.T) {
 	if got, _ := c.PRDLabel(context.Background()); got != "v1" {
 		t.Fatalf("cached read = %q, want v1 (stale within TTL)", got)
 	}
-	if fs.calls != 1 {
-		t.Fatalf("store called %d times within TTL, want 1", fs.calls)
+	if fs.calls.Load() != 1 {
+		t.Fatalf("store called %d times within TTL, want 1", fs.calls.Load())
 	}
 
 	// Past the TTL the cache refetches and sees the new value.
@@ -104,8 +108,8 @@ func TestCacheServesWithinTTLAndRefetchesAfter(t *testing.T) {
 	if got, _ := c.PRDLabel(context.Background()); got != "v2" {
 		t.Fatalf("post-TTL read = %q, want v2", got)
 	}
-	if fs.calls != 2 {
-		t.Fatalf("store called %d times, want 2 after TTL expiry", fs.calls)
+	if fs.calls.Load() != 2 {
+		t.Fatalf("store called %d times, want 2 after TTL expiry", fs.calls.Load())
 	}
 }
 
@@ -117,13 +121,13 @@ func TestInvalidateForcesRefetch(t *testing.T) {
 	fs.rows = []store.AppSetting{row(KeyPRDLabel, "v2")}
 
 	// Still cached before invalidation.
-	if got, _ := c.PRDLabel(context.Background()); got != "v1" || fs.calls != 1 {
-		t.Fatalf("before invalidate: got %q calls %d; want v1/1", got, fs.calls)
+	if got, _ := c.PRDLabel(context.Background()); got != "v1" || fs.calls.Load() != 1 {
+		t.Fatalf("before invalidate: got %q calls %d; want v1/1", got, fs.calls.Load())
 	}
 
 	c.Invalidate()
-	if got, _ := c.PRDLabel(context.Background()); got != "v2" || fs.calls != 2 {
-		t.Fatalf("after invalidate: got %q calls %d; want v2/2", got, fs.calls)
+	if got, _ := c.PRDLabel(context.Background()); got != "v2" || fs.calls.Load() != 2 {
+		t.Fatalf("after invalidate: got %q calls %d; want v2/2", got, fs.calls.Load())
 	}
 }
 
@@ -154,6 +158,34 @@ func TestColdErrorReturnsDefaultAndError(t *testing.T) {
 	if got != DefaultPRDLabel {
 		t.Fatalf("cold error value = %q, want default %q", got, DefaultPRDLabel)
 	}
+}
+
+// TestConcurrentAccess exercises the RWMutex guard: many readers (the poller +
+// handlers pattern) racing writes/invalidations. Run under -race to catch an
+// unguarded field. A short TTL forces frequent refreshes so the fast and slow
+// paths both run concurrently.
+func TestConcurrentAccess(t *testing.T) {
+	fs := &fakeStore{rows: []store.AppSetting{
+		row(KeyPRDLabel, "PRD"),
+		row(KeyAutopilotLabel, "autopilot"),
+	}}
+	c := New(fs, time.Millisecond)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_, _ = c.PRDLabel(context.Background())
+				_, _ = c.All(context.Background())
+				if j%20 == 0 {
+					c.Invalidate()
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestValidateLabel(t *testing.T) {

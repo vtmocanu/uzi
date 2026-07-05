@@ -102,7 +102,10 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 			Value:     value,
 			UpdatedBy: pgUUID(actor.ID),
 		}); err != nil {
-			slog.Error("update settings: upsert", "key", key, "error", err)
+			// Deliberately omit the key/value from the log (audit pre-flag): settings
+			// values are not secrets today, but nothing in app_settings should ever
+			// be assumed loggable.
+			slog.Error("update settings: upsert failed", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

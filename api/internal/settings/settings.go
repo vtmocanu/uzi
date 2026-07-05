@@ -40,8 +40,12 @@ const (
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
 
-// Defaults maps every known key to its compiled-in default. Ranging over it is
-// the canonical way to enumerate the settings the API understands.
+// Defaults maps every known key to its compiled-in default. This is the single
+// Go source of the default values: the accessors fall back to it and the
+// migration (00036_app_settings) seeds the same literals. Keep the two in sync —
+// SQL cannot reference these constants, so a change here that should also change
+// the seeded rows needs a follow-up migration. Ranging over Defaults is the
+// canonical way to enumerate the settings the API understands.
 var Defaults = map[string]string{
 	KeyPRDLabel:       DefaultPRDLabel,
 	KeyAutopilotLabel: DefaultAutopilotLabel,
@@ -60,14 +64,17 @@ type Store interface {
 	ListAppSettings(ctx context.Context) ([]store.AppSetting, error)
 }
 
-// Cache is a per-process read-through cache over the app_settings table.
+// Cache is a per-process read-through cache over the app_settings table. It is
+// safe for concurrent use: the poller and the HTTP handlers read it on every
+// cycle, so the fast path (a fresh snapshot) is a read-locked pointer read, and
+// the mutex is never held across the store fetch.
 type Cache struct {
 	q   Store
 	ttl time.Duration
 	// now is the clock, overridable in tests for deterministic TTL expiry.
 	now func() time.Time
 
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	values  map[string]string // last fetched rows; replaced wholesale, never mutated in place
 	fetched time.Time
 	valid   bool
@@ -94,18 +101,18 @@ func (c *Cache) Invalidate() {
 // (stale-on-error keeps reads working through a transient DB blip); only a cold
 // cache with no prior snapshot propagates the error.
 func (c *Cache) snapshot(ctx context.Context) (map[string]string, error) {
-	c.mu.Lock()
+	c.mu.RLock()
 	if c.valid && c.now().Sub(c.fetched) < c.ttl {
 		m := c.values
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		return m, nil
 	}
-	c.mu.Unlock()
+	c.mu.RUnlock()
 
 	rows, err := c.q.ListAppSettings(ctx)
 	if err != nil {
-		c.mu.Lock()
-		defer c.mu.Unlock()
+		c.mu.RLock()
+		defer c.mu.RUnlock()
 		if c.valid {
 			return c.values, nil
 		}
