@@ -34,7 +34,7 @@ Ships with the first builtin skill, **`ci-cd-norms`** (authored in this PRD, sou
 
 ## Technical Design
 
-### Storage (migration `00050`+ — range reserved above PRD #6's `00040+`, same gap convention; see the cross-PRD migration ledger in PRD #18 §Technical Design — `00050+` is consistent with it and clear of #17's `00022`)
+### Storage (migration drafted as `00050`+ — final numbers assigned at merge time, next free above the live head, per the CLAUDE.md convention; draft ledger in PRD #18 §Technical Design)
 
 ```sql
 skills (
