@@ -1,7 +1,7 @@
 # PRD #16: Agent Skills (builtin / global / user / repo) + first CICD skill
 
 **GitLab Issue**: [vtmocanu/uzi#16](https://gitlab.example.com/vtmocanu/uzi/-/issues/16)
-**Status**: Draft
+**Status**: Complete (2026-07-05, MR !22 merged; all milestones M1–M7 done, final audit clean)
 **Priority**: High
 **Created**: 2026-07-05
 **Depends on**: PRD #3 (agent templates, done) for the storage/reconciler pattern and the templates the skills attach to; PRD #4 (agent runtime + workers, done) for the claim payload, SDK executor, and guardrail layers this extends; PRD #17 (runs first) for the decoupled builtins convention — `api/internal/*/builtins/` as single source of truth, parse/validity tests instead of golden byte-match vs `.claude/`, which this PRD's `skilltmpl` adopts from day one.
