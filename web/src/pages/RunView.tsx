@@ -150,29 +150,29 @@ export function RunView() {
               <span className="text-sm text-faint">#{run.issue_iid}</span>
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
-              {stopped ? (
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-edge bg-raised px-2 py-0.5 text-[11px] font-medium text-muted">
-                  <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current" />
-                  stopped
-                </span>
-              ) : (
-                <StatusPill status={run.status} />
-              )}
+              {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
+                  "stopped" pill — StatusPill's default tone — so it stays calm and
+                  agrees with the board/RunsList. */}
+              <StatusPill status={stopped ? "stopped" : run.status} />
               {stage && (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info">
                   <Spinner /> {stage}…
                 </span>
               )}
-              <span
-                title={connected ? "Live" : "Reconnecting…"}
-                className={cx(
-                  "inline-flex items-center gap-1 text-xs",
-                  connected ? "text-ok" : "text-faint",
-                )}
-              >
-                <span className={cx("h-1.5 w-1.5 rounded-full", connected ? "bg-ok" : "bg-faint")} />
-                {connected ? "live" : "offline"}
-              </span>
+              {/* The live/offline WS indicator is only meaningful while the run is
+                  active; a terminal run has no stream, so never show "completed • live". */}
+              {!terminal && (
+                <span
+                  title={connected ? "Live" : "Reconnecting…"}
+                  className={cx(
+                    "inline-flex items-center gap-1 text-xs",
+                    connected ? "text-ok" : "text-faint",
+                  )}
+                >
+                  <span className={cx("h-1.5 w-1.5 rounded-full", connected ? "bg-ok" : "bg-faint")} />
+                  {connected ? "live" : "offline"}
+                </span>
+              )}
               {run.status === "running" && run.started_at && <LiveElapsed since={run.started_at} />}
               {run.iteration_count > 0 && (
                 <Badge tone="neutral" title="implement ⇄ review iterations">
