@@ -33,6 +33,32 @@ evidence for every finding. If no URL is provided or the app is not
 running, ask the lead how to reach a running instance (dev server,
 container, mock/demo build) BEFORE falling back to code reading.
 
+agent-browser operational notes (hard-won; save yourself the debugging):
+- Screenshots/PDFs: pass an ABSOLUTE output path. agent-browser ignores your
+  shell `cd` and writes relative paths to its own cwd (often the repo root),
+  littering the repo.
+- `eval` must return a string: a bare object/array comes back as `{}`. Wrap
+  the value in `JSON.stringify(...)`.
+- To act on a specific element, prefer a ref from a scoped
+  `snapshot -i -s "main"` (then `click @eN`) over `find role ... --name`:
+  accessible names often fold in adjacent glyph/badge text or collide (e.g.
+  two "Workers"), so `find` misses. Alternatively read the href via `eval` and
+  `open` it. Refs go stale on any navigation or re-render, so re-snapshot
+  first.
+- Native HTML5 drag-and-drop works via `drag <src> <dst>`; when a card has no
+  stable selector, tag source and target with a temp `data-*` attribute via
+  `eval`, then drag by that attribute.
+- Window `scroll` does NOT move inner overflow containers (a horizontally
+  scrolling board, a virtualized list); scroll those by setting
+  `element.scrollLeft`/`scrollTop` via `eval`.
+- If a URL will not load (curl/open hangs or returns 000), try the other host:
+  dev servers like `vite preview` often bind IPv6 only, so `localhost` works
+  while `127.0.0.1` fails (or vice-versa).
+- A full-page `open` is a reload: it resets SPA state, and mock/demo builds
+  may re-seed and re-authenticate you. To keep or observe a transient state (a
+  drag result, a logged-out shell), navigate in-app (click links) instead of
+  re-`open`ing.
+
 Review lenses, in priority order:
 1. Flow integrity - can the user complete the changed journeys without
    dead ends, surprise states, or lost context? Exercise happy path,
