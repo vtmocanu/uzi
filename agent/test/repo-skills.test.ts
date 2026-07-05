@@ -75,6 +75,19 @@ describe("enumerateRepoSkills", () => {
     assert.ok(dropped.every((d) => d.reason === DROP_REPO_INVALID));
   });
 
+  it("drops a name with a colon (would break the uzi:<name> qualifier) or a space", async () => {
+    // A colon in the name would split the SDK's plugin:skill enable-list token;
+    // the regex forbids it (and every non-[a-z0-9-] char), so both are dropped.
+    writeSkill("colon", "---\nname: foo:bar\ndescription: x.\n---\n\nbody\n");
+    writeSkill("space", "---\nname: foo bar\ndescription: x.\n---\n\nbody\n");
+    const { skills, dropped } = await enumerate();
+    assert.equal(skills.length, 0);
+    assert.deepEqual(
+      dropped.map((d) => d.reason).sort(),
+      [DROP_REPO_INVALID, DROP_REPO_INVALID],
+    );
+  });
+
   it("drops a skill with an empty description or empty body", async () => {
     writeSkill("nodesc", "---\nname: nodesc\ndescription: \n---\n\nbody\n");
     writeSkill("nobody", "---\nname: nobody\ndescription: x.\n---\n\n");
