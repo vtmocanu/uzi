@@ -140,7 +140,7 @@ export function Skills() {
     );
   }
   if (edit?.mode === "view") {
-    return <SkillView skill={edit.skill} onBack={() => setEdit(null)} />;
+    return <SkillView skill={edit.skill} viewerId={user?.id} onBack={() => setEdit(null)} />;
   }
 
   return (
@@ -421,14 +421,27 @@ function SkillRow({
 
 // ── Read-only view ───────────────────────────────────────────────────────────
 
-function SkillView({ skill, onBack }: { skill: Skill; onBack: () => void }) {
+function SkillView({
+  skill,
+  viewerId,
+  onBack,
+}: {
+  skill: Skill;
+  viewerId: string | undefined;
+  onBack: () => void;
+}) {
+  // Don't label another user's private skill "Mine" (an admin can view one from
+  // the "Other users" group). The DTO has no owner name, only user_id, so the
+  // honest label without an API change is a generic "Other user".
+  const scopeLabel =
+    skill.scope === "user" && skill.user_id !== viewerId ? "Other user" : SCOPE_LABEL[skill.scope];
   return (
     <div className="space-y-6">
       <PageHeader
         titleNode={
           <div className="flex items-center gap-2">
             <h1 className="font-mono text-2xl font-semibold">{skill.name}</h1>
-            <Badge tone={scopeBadgeTone(skill.scope)}>{SCOPE_LABEL[skill.scope]}</Badge>
+            <Badge tone={scopeBadgeTone(skill.scope)}>{scopeLabel}</Badge>
           </div>
         }
         description={skill.description}

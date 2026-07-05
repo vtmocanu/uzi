@@ -203,6 +203,17 @@ describe("Skills page — name-locked edit", () => {
   });
 });
 
+describe("Skills page — Other users view badge", () => {
+  it("labels another user's skill 'Other user', not 'Mine', in the read-only view", async () => {
+    setAuth(ADMIN); // qdrant-kb is owned by u-mira, so it lands in "Other users"
+    renderPage();
+    await screen.findByText("qdrant-kb");
+    fireEvent.click(within(rowFor("qdrant-kb")).getByRole("button", { name: "View" }));
+    expect(screen.getByText("Other user")).toBeTruthy();
+    expect(screen.queryByText("Mine")).toBeNull();
+  });
+});
+
 describe("Skills page — builtin reset confirm", () => {
   it("confirms before resetting a builtin", async () => {
     setAuth(ADMIN);
