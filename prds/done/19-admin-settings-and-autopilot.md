@@ -1,7 +1,7 @@
 # PRD #19: Admin Settings (app_settings) + Autopilot Label
 
 **GitLab Issue**: [#19](https://gitlab.example.com/vtmocanu/uzi/-/issues/19)
-**Status**: Draft
+**Status**: Complete (landed 2026-07-05, MR !21, merge 58041ab)
 **Priority**: Medium
 **Created**: 2026-07-05
 
@@ -78,7 +78,7 @@
 - [x] **M3 — Mapping + consent surface**: `human_username` on forge connections, `autopilot_enabled` user toggle, UI copy; Forge interface gains label events + issue notes (GitLab driver + redactor tests). Landed `cd15a1c`; review + audit clean (no blocking findings, no Low).
 - [x] **M4 — Autopilot trigger in poller**: `autopilot_triggers` table, post-sync cache query, transition detection with label-event dedup, adder→author resolution, consent checks, run creation with `auto_approve`, no-match issue comment (record-then-comment). Landed `d1d0183`; both validators approved, no blocking findings.
 - [x] **M5 — Auto-approve in worker + terminal comments**: claim delivers the flag top-level (incl. on resume), gate resolves immediately without entering `awaiting_approval`, plan message still recorded; single terminal-state hook posts a run-link comment on both outcomes (see Decision Log — failure comment carries no failure reason); "autopilot" badge in run UI. Landed `09ebd11`; both validators approved, no blocking findings.
-- [ ] **M6 — Tests, docs, specs**: e2e: labeled issue → run starts unattended → MR created (stub forge asserts the full loop); failure path comments; docs + specs updated, `specs/human.md` change approved by user.
+- [x] **M6 — Tests, docs, specs**: e2e: labeled issue → run starts unattended → MR created (stub forge asserts the full loop); failure path comments; docs + specs updated, `specs/human.md` change approved by user.
 
 Phase note: M1→M2 sequential; M3 parallel to M1–M2; M4→M5 after M1+M3. M6 spans all.
 
