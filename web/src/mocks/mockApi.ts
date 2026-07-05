@@ -42,15 +42,90 @@ function requireSession(): User {
   return state.session;
 }
 
+// ── Settings persistence (demo build) ────────────────────────────────────────
+// The mock persists ONLY the settings maps to localStorage so a hard reload of
+// the demo keeps the picked theme (and labels / worker model) instead of snapping
+// back to seed — making no-flash + persistence witnessable end to end in the
+// sanctioned preview vehicle. Runs, issues, workers, secrets etc. are
+// deliberately NOT persisted. Versioned + shape-checked: a blob from an older
+// seed schema (or a corrupt one) is discarded and re-seeded, never served, so
+// stale demo state can't outlive a seed-schema change.
+const MOCK_SETTINGS_KEY = "uzi.mock.v1";
+const SEED_USER_SETTINGS: UserSettings = { default_model: null, theme: null };
+const SEED_APP_SETTINGS: AppSettings = {
+  prd_label: "PRD",
+  autopilot_label: "autopilot",
+  default_theme: "ember",
+};
+
+interface PersistedSettings {
+  v: 1;
+  userSettings: UserSettings;
+  appSettings: AppSettings;
+}
+
+// isPersistedSettings validates the version AND the shape (key presence + value
+// types) so only a blob matching the current schema is trusted; anything else
+// falls through to a fresh seed.
+function isPersistedSettings(p: unknown): p is PersistedSettings {
+  if (typeof p !== "object" || p === null) return false;
+  const o = p as Record<string, unknown>;
+  if (o.v !== 1) return false;
+  const us = o.userSettings;
+  const as = o.appSettings;
+  if (typeof us !== "object" || us === null || typeof as !== "object" || as === null) return false;
+  const u = us as Record<string, unknown>;
+  const a = as as Record<string, unknown>;
+  const okUser =
+    (u.default_model === null || typeof u.default_model === "string") &&
+    (u.theme === null || typeof u.theme === "string");
+  const okApp =
+    typeof a.prd_label === "string" &&
+    typeof a.autopilot_label === "string" &&
+    typeof a.default_theme === "string";
+  return okUser && okApp;
+}
+
+function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings } {
+  try {
+    const raw = localStorage.getItem(MOCK_SETTINGS_KEY);
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (isPersistedSettings(parsed)) {
+        return {
+          userSettings: { ...parsed.userSettings },
+          appSettings: { ...parsed.appSettings },
+        };
+      }
+    }
+  } catch {
+    // Storage unavailable (private mode) or a corrupt/legacy blob: re-seed.
+  }
+  return { userSettings: { ...SEED_USER_SETTINGS }, appSettings: { ...SEED_APP_SETTINGS } };
+}
+
+// persistSettings write-throughs the current settings maps. Called from the
+// putMySettings / updateSettings mock handlers after they mutate.
+function persistSettings(): void {
+  try {
+    const blob: PersistedSettings = { v: 1, userSettings, appSettings };
+    localStorage.setItem(MOCK_SETTINGS_KEY, JSON.stringify(blob));
+  } catch {
+    // Storage unavailable: the demo still works in-memory for this session.
+  }
+}
+
+const loadedSettings = loadSettings();
+
 // Mutable copies of seed collections (CRUD operates on these).
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
-let userSettings: UserSettings = { default_model: null, theme: null };
+let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
-let appSettings: AppSettings = { prd_label: "PRD", autopilot_label: "autopilot", default_theme: "ember" };
+let appSettings: AppSettings = loadedSettings.appSettings;
 let templateCounter = 0;
 let workerCounter = 0;
 
@@ -127,6 +202,7 @@ export const mockApi = {
       throw new ApiError(400, "prd_label and autopilot_label must differ");
     }
     appSettings = merged;
+    persistSettings();
     return delay({ settings: { ...appSettings } });
   },
 
@@ -163,6 +239,7 @@ export const mockApi = {
       if (t !== "" && !isTheme(t)) throw new ApiError(400, `unknown theme: "${t}"`);
       userSettings = { ...userSettings, theme: t === "" ? null : t };
     }
+    persistSettings();
     return delay({ settings: { ...userSettings } });
   },
 
