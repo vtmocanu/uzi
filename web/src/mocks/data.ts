@@ -224,7 +224,14 @@ export const mockBoards: Record<string, Board> = {
         column: "Ready",
         closed: false,
         conflict: false,
-        latest_run: null,
+        // Freshly queued, not yet claimed by a worker: renders the "queued" badge
+        // (violet under the mission theme, gray under ember) on the board card.
+        latest_run: latestRun({
+          id: "run-queued",
+          status: "queued",
+          created_at: minsAgo(1),
+          updated_at: minsAgo(1),
+        }),
       },
       {
         iid: 24,
@@ -480,6 +487,30 @@ export const mockTemplates: AgentTemplate[] = [
 // ── Runs ─────────────────────────────────────────────────────────────────────
 
 export const mockRuns: Run[] = [
+  {
+    // run-queued is parked in the queue, not yet claimed by a worker: it renders
+    // the "queued" status badge (PRD #21 SC3 — violet under mission, gray under
+    // ember) on issue 26's board card and in the runs list.
+    id: "run-queued",
+    repo_id: "repo-uzi",
+    issue_iid: 26,
+    issue_title: "Board card badges for MR pipeline status",
+    issue_description: "See prds/12-board-run-lifecycle.md.",
+    status: "queued",
+    requeue_count: 0,
+    iteration_count: 0,
+    auto_approve: false,
+    worker_id: null,
+    branch: null,
+    mr_iid: null,
+    failure_reason: null,
+    plan_md: null,
+    claimed_at: null,
+    started_at: null,
+    finished_at: null,
+    created_at: minsAgo(1),
+    updated_at: minsAgo(1),
+  },
   {
     id: LIVE_RUN_ID,
     repo_id: "repo-uzi",
