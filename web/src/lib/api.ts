@@ -1,6 +1,16 @@
 // Thin API client. All requests are same-origin (nginx proxies /api) and rely
 // on the HttpOnly auth cookie, so we always send credentials. State-changing
 // requests echo the readable CSRF cookie back in the X-CSRF-Token header.
+//
+// MOCK MODE: when built with VITE_UZI_MOCK=1 the exported `api` object and the
+// run socket factory are swapped for fully in-browser implementations
+// (src/mocks/*) — no request ever leaves the page. The flag is baked at build
+// time, so a mock bundle physically contains no code path to a live backend.
+
+import { mockApi } from "../mocks/mockApi";
+import { MockRunSocket } from "../mocks/socket";
+
+export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 
 export interface User {
   id: string;
@@ -224,6 +234,26 @@ export function runSocketUrl(runId: string): string {
   return `${proto}//${window.location.host}/api/ws?run=${encodeURIComponent(runId)}`;
 }
 
+// RunSocketLike is the exact socket surface useRunStream drives — satisfied by
+// a real WebSocket and by the timer-driven MockRunSocket.
+export interface RunSocketLike {
+  onopen: (() => void) | null;
+  onmessage: ((ev: { data: string }) => void) | null;
+  onclose: (() => void) | null;
+  onerror: (() => void) | null;
+  close(): void;
+}
+
+// createRunSocket is the single place a run socket is constructed, so mock mode
+// swaps the transport without touching the streaming hook.
+export function createRunSocket(runId: string): RunSocketLike {
+  if (MOCK_MODE) return new MockRunSocket(runId);
+  // A real WebSocket is runtime-compatible with RunSocketLike (the hook's
+  // handlers simply ignore the extra Event arguments); the cast bridges the
+  // nominal handler types.
+  return new WebSocket(runSocketUrl(runId)) as unknown as RunSocketLike;
+}
+
 // isHttpsUrl guards rendering forge-supplied URLs as links: only https URLs are
 // turned into anchors, so a hostile or malformed web_url (e.g. javascript:) is
 // never made clickable.
@@ -280,7 +310,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return payload as T;
 }
 
-export const api = {
+const realApi = {
   register: (email: string, password: string, displayName: string) =>
     request<{ user: User }>("POST", "/auth/register", {
       email,
@@ -368,3 +398,8 @@ export const api = {
   adminListWorkers: () => request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
   adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),
 };
+
+// The one client the app talks to. `mockApi` implements the identical surface
+// (typechecked against realApi's shape here), so pages never know which mode
+// they run in.
+export const api: typeof realApi = MOCK_MODE ? mockApi : realApi;

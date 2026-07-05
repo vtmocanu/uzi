@@ -1,38 +1,52 @@
+// Runs index. Active runs are always visible; past (terminal) runs collapse
+// behind "Show past runs (N)" — the pattern multica uses for per-issue
+// execution logs (packages/views/issues/components/execution-log-section.tsx),
+// including its sort rule that failed outranks cancelled outranks completed at
+// equal timestamps (PAST_STATUS_RANK there). The row status pill keeps PRD #12's
+// "a deliberate stop is not a failure" nuance: isStoppedRun collapses cancelled /
+// stop-reasoned-failed runs to a calm "stopped" pill instead of a scary "failed".
+
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import {
-  api,
-  ApiError,
-  isTerminalRun,
-  type AdminWorker,
-  type RunListItem,
-} from "../lib/api";
-import { Alert, Badge, Card } from "../components/ui";
-import { isStoppedRun, runStatusTone } from "../lib/runBadge";
+import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem } from "../lib/api";
+import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
+import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
+import { isStoppedRun } from "../lib/runBadge";
+
+const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
+
+function sortPast(a: RunListItem, b: RunListItem): number {
+  const t = b.updated_at.localeCompare(a.updated_at);
+  if (t !== 0) return t;
+  return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
+}
 
 function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
+  // PRD #12: a deliberate human stop (cancelled, or failed carrying a known stop
+  // reason) reads "stopped" / neutral, never "failed" / danger. Fold that into the
+  // pill's status so the shared StatusPill palette renders it calm.
+  const pillStatus = isStoppedRun(run.status, run.failure_reason) ? "stopped" : run.status;
   return (
-    <li className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2">
-      <div className="min-w-0">
-        <Link
-          to={`/runs/${run.id}`}
-          className="block truncate font-medium text-slate-100 hover:text-indigo-300"
-        >
-          {run.issue_title}
-        </Link>
-        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-slate-500">
-          <span>
-            {run.repo_path} #{run.issue_iid}
-          </span>
-          {run.worker_name && <span>· {run.worker_name}</span>}
-          {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
-          <span>· {new Date(run.updated_at).toLocaleString()}</span>
+    <li>
+      <Link
+        to={`/runs/${run.id}`}
+        className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70"
+      >
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-medium text-fg">{run.issue_title}</p>
+          <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
+            <span>
+              {run.repo_path} #{run.issue_iid}
+            </span>
+            {run.worker_name && <span>· {run.worker_name}</span>}
+            {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
+            <span>· {new Date(run.updated_at).toLocaleString()}</span>
+            {run.mr_iid != null && <span className="font-medium text-ok">· MR !{run.mr_iid}</span>}
+          </p>
         </div>
-      </div>
-      <Badge tone={runStatusTone(run.status, run.failure_reason)}>
-        {isStoppedRun(run.status, run.failure_reason) ? "stopped" : run.status.replace("_", " ")}
-      </Badge>
+        <StatusPill status={pillStatus} />
+      </Link>
     </li>
   );
 }
@@ -46,15 +60,14 @@ export function RunsList() {
   const [adminWorkers, setAdminWorkers] = useState<AdminWorker[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [showPast, setShowPast] = useState(false);
 
   const load = useCallback(async () => {
     setError("");
     try {
       const [{ runs }, admin] = await Promise.all([
         api.listRuns(),
-        isAdmin
-          ? Promise.all([api.adminListRuns(), api.adminListWorkers()])
-          : Promise.resolve(null),
+        isAdmin ? Promise.all([api.adminListRuns(), api.adminListWorkers()]) : Promise.resolve(null),
       ]);
       setRuns(runs);
       if (admin) {
@@ -73,61 +86,77 @@ export function RunsList() {
   }, [load]);
 
   const active = runs.filter((r) => !isTerminalRun(r.status));
-  const finished = runs.filter((r) => isTerminalRun(r.status));
+  const past = runs.filter((r) => isTerminalRun(r.status)).sort(sortPast);
 
   return (
     <div className="space-y-6">
-      <div className="flex items-end justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Runs</h1>
-          <p className="mt-1 text-slate-400">Your agent runs. Open one to watch it live.</p>
-        </div>
-        <Link to="/settings/workers" className="text-sm text-indigo-400 hover:text-indigo-300">
-          Workers
-        </Link>
-      </div>
+      <PageHeader title="Runs" description="Your agent runs. Open one to watch it live." />
 
       {error && <Alert message={error} />}
-      {loading && <p className="text-slate-500">Loading…</p>}
+      {loading && <ListSkeleton rows={4} />}
 
       {!loading && (
-        <Card className="space-y-4">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Active</h2>
-          {active.length === 0 ? (
-            <p className="text-sm text-slate-600">No active runs. Start one from a board card.</p>
+        <>
+          {active.length === 0 && past.length === 0 ? (
+            <EmptyState
+              icon={<ActivityIcon />}
+              title="No runs yet"
+              description="Open a board and press Start run on a PRD card — the agent plans, waits for your approval, then implements and opens an MR."
+              action={
+                <Link to="/repos" className="text-sm font-medium text-brand hover:text-brand-hover">
+                  Go to boards →
+                </Link>
+              }
+            />
           ) : (
-            <ul className="space-y-2">
-              {active.map((r) => (
-                <RunRow key={r.id} run={r} />
-              ))}
-            </ul>
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <SectionTitle>Active</SectionTitle>
+                {active.length === 0 ? (
+                  <p className="text-sm text-faint">Nothing in flight right now.</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {active.map((r) => (
+                      <RunRow key={r.id} run={r} />
+                    ))}
+                  </ul>
+                )}
+              </div>
+
+              {past.length > 0 && (
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowPast((v) => !v)}
+                    aria-expanded={showPast}
+                    className="inline-flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-faint transition-colors hover:text-muted"
+                  >
+                    {showPast ? <ChevronDownIcon /> : <ChevronRightIcon />}
+                    {showPast ? "Past runs" : `Show past runs (${past.length})`}
+                  </button>
+                  {showPast && (
+                    <ul className="space-y-2">
+                      {past.map((r) => (
+                        <RunRow key={r.id} run={r} />
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </div>
           )}
-          {finished.length > 0 && (
-            <>
-              <h2 className="pt-2 text-sm font-semibold uppercase tracking-wide text-slate-500">
-                Finished
-              </h2>
-              <ul className="space-y-2">
-                {finished.map((r) => (
-                  <RunRow key={r.id} run={r} />
-                ))}
-              </ul>
-            </>
-          )}
-        </Card>
+        </>
       )}
 
       {isAdmin && !loading && (
-        <Card className="space-y-4 border-indigo-900/60">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-indigo-300">
-            Agents status (admin)
-          </h2>
+        <Card className="space-y-4 border-brand/20">
+          <SectionTitle className="text-brand">Factory status (admin)</SectionTitle>
           <div>
-            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-faint">
               Active runs · all users
             </h3>
             {adminRuns.length === 0 ? (
-              <p className="text-sm text-slate-600">No active runs across the factory.</p>
+              <p className="text-sm text-faint">No active runs across the factory.</p>
             ) : (
               <ul className="space-y-2">
                 {adminRuns.map((r) => (
@@ -137,24 +166,26 @@ export function RunsList() {
             )}
           </div>
           <div>
-            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-faint">
               Workers · all users
             </h3>
             {adminWorkers.length === 0 ? (
-              <p className="text-sm text-slate-600">No workers registered.</p>
+              <p className="text-sm text-faint">No workers registered.</p>
             ) : (
               <ul className="space-y-2">
                 {adminWorkers.map((w) => (
                   <li
                     key={w.id}
-                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2 text-sm"
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2 text-sm"
                   >
                     <div>
-                      <span className="font-medium text-slate-100">{w.name}</span>
-                      <span className="ml-2 text-xs text-slate-500">{w.owner_email}</span>
+                      <span className="font-medium text-fg">{w.name}</span>
+                      <span className="ml-2 text-xs text-faint">{w.owner_email}</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <Badge tone={w.status === "online" ? "neutral" : "danger"}>{w.status}</Badge>
+                      <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
+                        {w.status}
+                      </Badge>
                       {w.busy && <Badge tone="warning">busy</Badge>}
                     </div>
                   </li>
