@@ -32,6 +32,8 @@ your setting.
 Leave it on **Inherit** (the default) to fall back to the `lead` template's
 model.
 
+![Settings, Worker model, showing the model dropdown and Save model button](img/worker-model-settings.png)
+
 ## Good to know
 
 - **Not verified at save time.** uzi doesn't check a custom model ID against
