@@ -417,11 +417,13 @@ function positive(value: number | undefined, fallback: number): number {
 /**
  * Resolve the model for the lead/main thread (PRD #17 Decision 6): the run
  * owner's per-user default (`config.default_model`) wins over the lead template's
- * model. Returns undefined when neither is set (or either is blank), so the
- * caller omits the SDK `model` key entirely rather than sending an explicit
- * empty override — an unset model must fall back to the SDK/account default.
- * Null-model subagents follow the main thread, so this governs them too.
+ * model. A blank config model falls back to the template (|| not ??), so a
+ * defensively empty string can't blank out the template's model — in practice
+ * the server sends NULL (omitted), never "". Returns undefined when nothing
+ * resolves, so the caller omits the SDK `model` key entirely rather than sending
+ * an explicit empty override (an unset model falls back to the SDK/account
+ * default). Null-model subagents follow the main thread, so this governs them too.
  */
 export function resolveLeadModel(configModel?: string, templateModel?: string): string | undefined {
-  return (configModel ?? templateModel) || undefined;
+  return configModel || templateModel || undefined;
 }

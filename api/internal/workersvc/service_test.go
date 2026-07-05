@@ -30,11 +30,12 @@ type fakeStore struct {
 	claimParams  *store.ClaimRunParams
 	claimCtx     store.GetRunClaimContextRow
 	claimCtxErr  error
-	anthropic    []byte
-	anthropicErr error
-	defaultModel pgtype.Text
-	templates    []store.AgentTemplate
-	markedFailed *store.MarkRunFailedByIDParams
+	anthropic       []byte
+	anthropicErr    error
+	defaultModel    pgtype.Text
+	defaultModelErr error
+	templates       []store.AgentTemplate
+	markedFailed    *store.MarkRunFailedByIDParams
 
 	// Ownership + messages + state.
 	runOwned         store.Run
@@ -105,7 +106,7 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 	return f.anthropic, f.anthropicErr
 }
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
-	return f.defaultModel, nil
+	return f.defaultModel, f.defaultModelErr
 }
 func (f *fakeStore) ListAgentTemplates(context.Context) ([]store.AgentTemplate, error) {
 	return f.templates, nil
@@ -398,6 +399,35 @@ func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 	}
 	if strings.Contains(string(b), "default_model") {
 		t.Fatalf("unset default_model should be omitted from the payload; got %s", b)
+	}
+}
+
+func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-DEFMODELERR-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-DEFMODELERR-abcdef1234567890"))
+	fs := &fakeStore{
+		claimRun: store.Run{ID: uuid.New(), IssueIid: 11, Status: "claimed"},
+		claimCtx: store.GetRunClaimContextRow{
+			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
+			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+			BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+		},
+		anthropic:       sealedTok,
+		defaultModelErr: errors.New("db down"),
+	}
+
+	_, err := New(fs, box, testParams()).Claim(context.Background(), worker())
+	if err == nil {
+		t.Fatal("expected Claim to fail when the default-model lookup errors")
+	}
+	// The service wraps it as "default model lookup: %w" and propagates (not a
+	// credential failure, so the run is not marked failed).
+	if !strings.Contains(err.Error(), "default model lookup") {
+		t.Fatalf("error should be wrapped as a default-model lookup failure, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "db down") {
+		t.Fatalf("error should wrap the underlying cause, got: %v", err)
 	}
 }
 

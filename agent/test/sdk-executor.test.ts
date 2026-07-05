@@ -401,9 +401,16 @@ describe("resolveLeadModel (PRD #17 precedence)", () => {
   it("uses the per-user default when the lead template has no model", () => {
     assert.strictEqual(resolveLeadModel("sonnet", undefined), "sonnet");
   });
+  it("falls back to the template when the config model is a blank string (|| not ??)", () => {
+    // The server sends NULL (omitted) for an unset default, never "", but the
+    // resolver must be correct in isolation: an empty config must not blank out
+    // the template model.
+    assert.strictEqual(resolveLeadModel("", "fable"), "fable");
+  });
   it("returns undefined (omit the key) when neither is set", () => {
     assert.strictEqual(resolveLeadModel(undefined, undefined), undefined);
     assert.strictEqual(resolveLeadModel("", ""), undefined);
+    assert.strictEqual(resolveLeadModel("", undefined), undefined);
   });
 });
 
