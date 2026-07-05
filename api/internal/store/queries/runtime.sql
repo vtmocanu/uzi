@@ -420,3 +420,14 @@ WHERE id = @id;
 -- the reconcile loop stops trying to move a card a human just placed.
 UPDATE runs SET move_pending_since = NULL, updated_at = now()
 WHERE repo_id = @repo_id AND issue_iid = @issue_iid AND move_pending_since IS NOT NULL;
+
+-- MR-close watcher (PRD #24) --------------------------------------------------
+
+-- name: SetRunMRState :execrows
+-- Record the merge-request state the watcher just observed for this run. This is
+-- the ONLY writer of runs.mr_state (the watcher-owned invariant, review finding
+-- 11): no run-status path writes it. The run itself stays terminal — closing an
+-- MR is review feedback, not a run-status event — so this touches mr_state (and
+-- updated_at) only.
+UPDATE runs SET mr_state = @mr_state, updated_at = now()
+WHERE id = @id;

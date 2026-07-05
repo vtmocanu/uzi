@@ -51,7 +51,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state
 `
 
 type ClaimRunParams struct {
@@ -94,6 +94,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.OriginColumn,
 		&i.BoardColumn,
 		&i.MovePendingSince,
+		&i.MrState,
 	)
 	return i, err
 }
@@ -210,7 +211,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since)
 VALUES ($1, $2, $3, $4, $5, $6, now())
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state
 `
 
 type CreateRunParams struct {
@@ -266,6 +267,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.OriginColumn,
 		&i.BoardColumn,
 		&i.MovePendingSince,
+		&i.MrState,
 	)
 	return i, err
 }
@@ -403,7 +405,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -437,12 +439,13 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.OriginColumn,
 		&i.BoardColumn,
 		&i.MovePendingSince,
+		&i.MrState,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -478,6 +481,7 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.OriginColumn,
 		&i.BoardColumn,
 		&i.MovePendingSince,
+		&i.MrState,
 	)
 	return i, err
 }
@@ -574,7 +578,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -611,6 +615,7 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.OriginColumn,
 		&i.BoardColumn,
 		&i.MovePendingSince,
+		&i.MrState,
 	)
 	return i, err
 }
@@ -743,7 +748,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -796,6 +801,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.OriginColumn,
 			&i.Run.BoardColumn,
 			&i.Run.MovePendingSince,
+			&i.Run.MrState,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -1000,7 +1006,7 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, rp.path_with_namespace AS repo_path, w.name AS worker_name
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -1063,6 +1069,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.OriginColumn,
 			&i.Run.BoardColumn,
 			&i.Run.MovePendingSince,
+			&i.Run.MrState,
 			&i.RepoPath,
 			&i.WorkerName,
 		); err != nil {
@@ -1392,6 +1399,31 @@ func (q *Queries) SetRunFailed(ctx context.Context, arg SetRunFailedParams) (int
 		arg.ID,
 		arg.WorkerID,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setRunMRState = `-- name: SetRunMRState :execrows
+
+UPDATE runs SET mr_state = $1, updated_at = now()
+WHERE id = $2
+`
+
+type SetRunMRStateParams struct {
+	MrState pgtype.Text `json:"mr_state"`
+	ID      uuid.UUID   `json:"id"`
+}
+
+// MR-close watcher (PRD #24) --------------------------------------------------
+// Record the merge-request state the watcher just observed for this run. This is
+// the ONLY writer of runs.mr_state (the watcher-owned invariant, review finding
+// 11): no run-status path writes it. The run itself stays terminal — closing an
+// MR is review feedback, not a run-status event — so this touches mr_state (and
+// updated_at) only.
+func (q *Queries) SetRunMRState(ctx context.Context, arg SetRunMRStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunMRState, arg.MrState, arg.ID)
 	if err != nil {
 		return 0, err
 	}

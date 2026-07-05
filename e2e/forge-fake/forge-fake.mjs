@@ -72,6 +72,24 @@ function persist() {
   }
 }
 
+// Reload persisted state at startup. The fake is in-memory, but when STATE_FILE
+// lives on a bind mount (the E2E overlay) this survives a container recreate — so
+// the restart-resilience down/up does not make the fake "forget" issues and MRs
+// (a real forge doesn't lose them when uzi restarts). Best-effort: a missing or
+// corrupt file just means a fresh start.
+function load() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    for (const issue of saved.issues || []) state.issues[issue.iid] = issue;
+    state.mrs = Array.isArray(saved.mrs) ? saved.mrs : [];
+    state.nextIssueIid = Math.max(0, ...Object.keys(state.issues).map(Number)) + 1;
+    state.nextMrIid = Math.max(0, ...state.mrs.map((m) => m.iid)) + 1;
+    log("reloaded state:", Object.keys(state.issues).length, "issue(s),", state.mrs.length, "MR(s)");
+  } catch {
+    /* no prior state (fresh run) — start empty */
+  }
+}
+
 function log(...args) {
   console.log(new Date().toISOString(), "[forge-fake]", ...args);
 }
@@ -215,6 +233,23 @@ const server = https.createServer(
     if (method === "GET" && (path === "/_e2e/health" || path === "/")) {
       return send(res, 200, { ok: true });
     }
+    // Flip an MR's state — the harness stand-in for a reviewer closing, reopening,
+    // or merging an MR (uzi itself only ever GETs the MR). E2E-only mutator,
+    // matching the /_e2e/* introspection style.
+    const mrState = method === "POST" && path.match(/^\/_e2e\/mrs\/(\d+)\/state$/);
+    if (mrState) {
+      const body = await readBody(req);
+      const want = String(body.state || "");
+      if (!["opened", "closed", "merged", "locked"].includes(want)) {
+        return send(res, 400, { message: `bad state ${JSON.stringify(want)}` });
+      }
+      const mr = state.mrs.find((m) => m.iid === Number(mrState[1]));
+      if (!mr) return send(res, 404, { message: "404 Not found (no such MR)" });
+      mr.state = want;
+      persist();
+      log("MR", mr.iid, "state ->", want);
+      return send(res, 200, mr);
+    }
 
     // --- GitLab v4 subset -----------------------------------------------------
     // Token verify (api seed + connect): CurrentUser.
@@ -241,11 +276,20 @@ const server = https.createServer(
         return issue ? send(res, 200, issue) : send(res, 404, { message: "404 Not found" });
       }
       if (method === "PUT" && issueGet) {
-        // UpdateIssue (label moves): echo back, best-effort.
+        // UpdateIssue (label moves). Apply add_labels/remove_labels FAITHFULLY so a
+        // poller reconcile (GET /issues) reflects the move: both the run-lifecycle
+        // automation and the MR-close watcher (PRD #24) move cards forge-first, and
+        // the column must survive the next re-sync instead of snapping back.
         const issue = state.issues[Number(issueGet[1])];
         if (!issue) return send(res, 404, { message: "404 Not found" });
+        const body = await readBody(req);
+        const remove = new Set(normLabels(body.remove_labels));
+        const next = (issue.labels || []).filter((l) => !remove.has(l));
+        for (const l of normLabels(body.add_labels)) if (!next.includes(l)) next.push(l);
+        issue.labels = next;
         issue.updated_at = new Date().toISOString();
         persist();
+        log("issue", issue.iid, "labels ->", JSON.stringify(issue.labels));
         return send(res, 200, issue);
       }
       if (method === "GET" && rest === "/issues") {
@@ -272,6 +316,14 @@ const server = https.createServer(
       }
 
       // Merge requests.
+      const mrGet = rest.match(/^\/merge_requests\/(\d+)$/);
+      if (method === "GET" && mrGet) {
+        // Single-MR GET (the MR-close watcher's GetMergeRequest). Returns the MR in
+        // ANY state (opened|closed|merged|locked), unlike the list route below which
+        // the worker uses and filters to opened.
+        const mr = state.mrs.find((m) => m.iid === Number(mrGet[1]));
+        return mr ? send(res, 200, mr) : send(res, 404, { message: "404 Not found" });
+      }
       if (method === "POST" && rest === "/merge_requests") {
         const body = await readBody(req);
         const iid = state.nextMrIid++;
@@ -303,5 +355,6 @@ const server = https.createServer(
   },
 );
 
+load();
 persist();
 server.listen(PORT, () => log(`listening on :${PORT} (base ${BASE}, project ${PROJECT.path_with_namespace})`));

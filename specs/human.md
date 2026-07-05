@@ -119,6 +119,13 @@ Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-s
 - Web-only; no API/schema/agent changes.
 - "Board columns should auto refresh" — already satisfied by existing polling; no change shipped.
 
+## Feature #24 — MR closed without merging → card back to In Progress
+
+Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/done/24-mr-close-rework.md`.
+
+- When a reviewer closes an agent's MR without merging, move the board card back from Human Review to In Progress (the "rework needed" signal).
+- Target column is In Progress — user's explicit choice, over Open/backlog.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
