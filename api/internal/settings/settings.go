@@ -175,6 +175,26 @@ func (c *Cache) All(ctx context.Context) (map[string]string, error) {
 	return out, err
 }
 
+// Effective computes the effective value map for a slice of stored rows: every
+// known key mapped to its row value when present and non-empty, else the
+// compiled-in default. Unknown-key rows are ignored. It is the row-slice form of
+// All (which applies the same rule to the cache snapshot), for a caller holding
+// freshly read rows — the settings PUT reading its own FOR UPDATE-locked rows
+// inside the write transaction — that must compute the committed effective state
+// without going through the (possibly stale) cache. See ValidateMerged.
+func Effective(rows []store.AppSetting) map[string]string {
+	out := make(map[string]string, len(Defaults))
+	for k, def := range Defaults {
+		out[k] = def
+	}
+	for _, r := range rows {
+		if _, known := Defaults[r.Key]; known && r.Value != "" {
+			out[r.Key] = r.Value
+		}
+	}
+	return out
+}
+
 // ValidateLabel checks a single label value against Decision 8's per-value
 // rules: non-empty, at most 64 characters, and no comma (GitLab's label-list
 // separator). It does not trim: a value with surrounding whitespace would not

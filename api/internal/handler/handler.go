@@ -38,12 +38,29 @@ type Handler struct {
 	// settings is the read-through cache over app_settings (PRD #19), shared with
 	// the poller so both read the same configured labels.
 	settings *settings.Cache
+	// reconciler is signalled after a label-affecting settings change so the poller
+	// full-syncs every repo on its next cycle (PRD #19 M2). Optional: nil in tests
+	// that don't exercise the poller; UpdateSettings nil-guards the call.
+	reconciler Reconciler
+}
+
+// Reconciler receives the "labels changed, resync everything" signal from the
+// settings PUT handler. *poller.Engine satisfies it; the handler depends on the
+// behavior, not the concrete engine, so it stays decoupled from the poller
+// package and testable with a nil (or fake) reconciler.
+type Reconciler interface {
+	ForceReconcile()
 }
 
 // New constructs a Handler.
 func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, h *hub.Hub, set *settings.Cache) *Handler {
 	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, hub: h, settings: set}
 }
+
+// SetReconciler wires the poller's force-reconcile signal in after construction,
+// matching how the run-lifecycle collaborators are attached in main (the poller
+// is built after the handler's other deps). Safe to leave unset in tests.
+func (h *Handler) SetReconciler(r Reconciler) { h.reconciler = r }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
 // password hash or token_version.

@@ -102,12 +102,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout)
 
 	// Instance settings (PRD #19): a per-process read-through cache over
-	// app_settings, shared by the HTTP handlers (read + invalidate on write) and,
-	// from M2, the poller. One process, so one cache.
+	// app_settings, shared by the HTTP handlers (read + invalidate on write) and
+	// the forge sync/poller (read the configured PRD label every cycle). One
+	// process, so one cache. Built before the forge service, which reads it.
 	settingsCache := settings.New(q, cfg.SettingsCacheTTL)
+
+	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 
 	// Optional startup admin seed. Runs after migrations, before serving. A
 	// failure here (e.g. DB error) aborts boot; an already-present seed user is
@@ -188,6 +190,10 @@ func run() error {
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, liveHub, settingsCache)
+	// The settings PUT handler asks the poller to full-sync every repo when a label
+	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
+	// the signal target is the handler.
+	h.SetReconciler(engine)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

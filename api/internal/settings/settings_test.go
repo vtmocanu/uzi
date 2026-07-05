@@ -208,6 +208,63 @@ func TestValidateLabel(t *testing.T) {
 	}
 }
 
+func TestEffective(t *testing.T) {
+	// A stored non-empty value overrides the default; an absent key and a
+	// present-but-empty value both fall back; an unknown-key row is ignored.
+	got := Effective([]store.AppSetting{
+		row(KeyPRDLabel, "Feature"),
+		row(KeyAutopilotLabel, ""), // empty → default
+		row("bogus", "x"),          // unknown → ignored
+	})
+	if len(got) != len(Defaults) {
+		t.Fatalf("Effective returned %d keys, want %d (only known keys)", len(got), len(Defaults))
+	}
+	if got[KeyPRDLabel] != "Feature" {
+		t.Errorf("prd_label = %q, want Feature", got[KeyPRDLabel])
+	}
+	if got[KeyAutopilotLabel] != DefaultAutopilotLabel {
+		t.Errorf("empty stored autopilot_label = %q, want default", got[KeyAutopilotLabel])
+	}
+	if _, ok := got["bogus"]; ok {
+		t.Error("unknown key leaked into Effective output")
+	}
+}
+
+// TestEffectiveDrivesMergedValidationFromCommittedRows encodes the TOCTOU the M2
+// PUT closes: the cross-key check must be a function of the committed rows the
+// handler reads under FOR UPDATE, not of a stale cache. Scenario: a concurrent
+// writer already committed prd_label="Feature"; a second PUT setting
+// autopilot_label="Feature" must be rejected — even though a cache still showing
+// the seeded default prd_label="PRD" would have wrongly accepted it.
+func TestEffectiveDrivesMergedValidationFromCommittedRows(t *testing.T) {
+	pending := map[string]string{KeyAutopilotLabel: "Feature"}
+
+	// Against the committed rows (prd_label already "Feature"), the merge collides.
+	committed := Effective([]store.AppSetting{
+		row(KeyPRDLabel, "Feature"),
+		row(KeyAutopilotLabel, DefaultAutopilotLabel),
+	})
+	for k, v := range pending {
+		committed[k] = v
+	}
+	if err := ValidateMerged(committed); err == nil {
+		t.Fatal("expected rejection: committed prd_label==autopilot_label after merge")
+	}
+
+	// Against a stale cache view (prd_label still the seeded "PRD"), the same merge
+	// would have passed — proving the committed rows, not the cache, decide it.
+	stale := Effective([]store.AppSetting{
+		row(KeyPRDLabel, DefaultPRDLabel),
+		row(KeyAutopilotLabel, DefaultAutopilotLabel),
+	})
+	for k, v := range pending {
+		stale[k] = v
+	}
+	if err := ValidateMerged(stale); err != nil {
+		t.Fatalf("stale view unexpectedly rejected (%v); the accept/reject contrast is the proof", err)
+	}
+}
+
 func TestValidateMergedRejectsEqualLabels(t *testing.T) {
 	if err := ValidateMerged(map[string]string{
 		KeyPRDLabel:       "same",

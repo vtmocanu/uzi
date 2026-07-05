@@ -73,7 +73,7 @@
 
 ## Milestones
 
-- [ ] **M1 — app_settings infra**: migration, settings package with cached accessors, admin GET/PUT API, admin Settings UI with the two label fields validated.
+- [x] **M1 — app_settings infra**: migration, settings package with cached accessors, admin GET/PUT API, admin Settings UI with the two label fields validated. Landed `1a51b6a` (+ hardening `f737858`); review + audit clean (no critical/high).
 - [ ] **M2 — prd_label configurable end-to-end**: forgesvc + issue creation read from settings, bootstrap delivers labels to web, Board uses it, label change triggers full resync.
 - [ ] **M3 — Mapping + consent surface**: `human_username` on forge connections, `autopilot_enabled` user toggle, UI copy; Forge interface gains label events + issue notes (GitLab driver + redactor tests).
 - [ ] **M4 — Autopilot trigger in poller**: `autopilot_triggers` table, post-sync cache query, transition detection with label-event dedup, adder→author resolution, consent checks, run creation with `auto_approve`, no-match issue comment (record-then-comment).
@@ -100,3 +100,9 @@ Phase note: M1→M2 sequential; M3 parallel to M1–M2; M4→M5 after M1+M3. M6 
 - **Silent skew between prd_label change and cached issues**: mitigated by the mandatory `ForceReconcile` on change; the settings PUT returns after signalling the poller, and the board converges on the next cycle.
 - **Two uzi users mapped to the same GitLab username**: enforce uniqueness on `human_username` per forge host at write time.
 - **Auto-approved bad plans**: the cost of hands-off mode; guardrails cap the blast radius at "an MR you have to review anyway" — the MR review stays the human gate.
+
+## Decision Log
+
+- 2026-07-05 (AI): M1 (app_settings infra) landed at `1a51b6a`, hardened in follow-up `f737858` (RWMutex cache guard, log redaction, default-source cross-ref). Reviewer + auditor signed off with no critical/high findings. The `settings.Cache` is a per-process read-through cache with compiled-in defaults, a copy-on-write snapshot, and stale-on-error reads; writes invalidate after commit. Defaults live once in Go (`settings.Defaults`); the migration seed is the one unavoidable SQL-literal copy, kept in sync by comment.
+- 2026-07-05 (review + audit): a cross-key TOCTOU on `prd_label != autopilot_label` was flagged in M1 (auditor LOW-1 / reviewer non-blocking) and deferred to M2: two concurrent single-key PUTs could each pass the cache-based merged check yet commit values that leave the two labels equal, because the check read outside the write transaction. Fixed in M2 (this milestone) by re-validating inside the tx against the settings rows read `FOR UPDATE` (`ListAppSettingsForUpdate`): the second writer blocks on the row lock and validates against the first's committed state. The pre-tx cache check remains only as a cheap best-effort fast-fail; the in-tx check is authoritative for both accept and reject.
+- 2026-07-05 (AI): M2 makes `prd_label` configurable end to end. The forge sync (`FullSync`/`IncrementalSync`) and issue creation read the label from the settings cache instead of a hardcoded constant (the `forgesvc.PRDLabel` const is removed; `settings.DefaultPRDLabel` is the sole compiled-in default). A label change signals `poller.Engine.ForceReconcile()` (non-blocking, coalescing) so the next cycle full-syncs every enabled repo; old-label issues drop off boards when that resync completes, not instantly. The session/bootstrap response (login/register/me) now carries `prd_label` + `autopilot_label`, delivered on the existing endpoint per Solution Overview 2; the web falls back to the compiled defaults until it resolves, and `Board.tsx` excludes both labels from column suggestions.

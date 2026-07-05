@@ -149,6 +149,21 @@ export interface AppSettings {
   autopilot_label: string;
 }
 
+// Compiled-in label defaults, mirroring the API's settings package. The SPA uses
+// them until the session bootstrap resolves the configured values (PRD #19 M2).
+export const DEFAULT_PRD_LABEL = "PRD";
+export const DEFAULT_AUTOPILOT_LABEL = "autopilot";
+
+// SessionResponse is the auth/session bootstrap body (login, register, me). It
+// carries the user plus the instance forge labels the board and issue-creation UI
+// need before their first call (PRD #19 M2 — delivered on the existing response,
+// no new endpoint).
+export interface SessionResponse {
+  user: User;
+  prd_label: string;
+  autopilot_label: string;
+}
+
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
 
 export interface Worker {
@@ -336,15 +351,15 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 const realApi = {
   register: (email: string, password: string, displayName: string) =>
-    request<{ user: User }>("POST", "/auth/register", {
+    request<SessionResponse>("POST", "/auth/register", {
       email,
       password,
       display_name: displayName,
     }),
   login: (email: string, password: string) =>
-    request<{ user: User }>("POST", "/auth/login", { email, password }),
+    request<SessionResponse>("POST", "/auth/login", { email, password }),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
-  me: () => request<{ user: User }>("GET", "/auth/me"),
+  me: () => request<SessionResponse>("GET", "/auth/me"),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),

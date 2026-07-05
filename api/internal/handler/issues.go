@@ -56,7 +56,10 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{forgesvc.PRDLabel})
+	// The created issue carries the configured PRD label (PRD #19): best-effort —
+	// a cold settings read yields the compiled-in default, never an empty label.
+	prdLabel, _ := h.settings.PRDLabel(r.Context())
+	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{prdLabel})
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())

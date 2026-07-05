@@ -74,6 +74,8 @@ beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
+    prdLabel: "PRD",
+    autopilotLabel: "autopilot",
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

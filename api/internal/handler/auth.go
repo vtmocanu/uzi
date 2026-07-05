@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -103,7 +104,7 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	if !h.issueSession(w, user) {
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"user": toDTO(user)})
+	httpx.JSON(w, http.StatusCreated, h.sessionPayload(r.Context(), user))
 }
 
 // createUserFirstAdmin performs the advisory-locked first-user-admin
@@ -191,7 +192,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	if !h.issueSession(w, user) {
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"user": toDTO(user)})
+	httpx.JSON(w, http.StatusOK, h.sessionPayload(r.Context(), user))
 }
 
 // Logout bumps the user's token_version (revoking every issued token) and
@@ -216,7 +217,23 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"user": toDTO(user)})
+	httpx.JSON(w, http.StatusOK, h.sessionPayload(r.Context(), user))
+}
+
+// sessionPayload builds the auth/session bootstrap body the SPA reads on
+// login, register, and the initial me() probe: the user plus the instance
+// forge labels the board and issue-creation UI need before their first API call
+// (PRD #19 M2 — delivered on the existing response, no new endpoint). Labels are
+// best-effort: a cold settings read yields the compiled-in defaults, never an
+// error, so a session response is never blocked on settings.
+func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[string]any {
+	prdLabel, _ := h.settings.PRDLabel(ctx)
+	autopilotLabel, _ := h.settings.AutopilotLabel(ctx)
+	return map[string]any{
+		"user":            toDTO(user),
+		"prd_label":       prdLabel,
+		"autopilot_label": autopilotLabel,
+	}
 }
 
 // issueSession mints a JWT at the user's current token_version and sets the

@@ -53,15 +53,27 @@ function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
+// sessionBody is the auth/session bootstrap payload: the signed-in user plus the
+// current instance labels (PRD #19 M2).
+function sessionBody() {
+  return {
+    user: requireSession(),
+    prd_label: appSettings.prd_label,
+    autopilot_label: appSettings.autopilot_label,
+  };
+}
+
 export const mockApi = {
   // ── Auth: instant and fake. Any credentials sign in as the admin. ──────────
+  // The session bootstrap carries the instance labels alongside the user, mirroring
+  // the real API (PRD #19 M2), so the mocked SPA resolves them the same way.
   register: async (email: string, _password: string, displayName: string) => {
     state.session = { ...mockAdmin, email, display_name: displayName || mockAdmin.display_name };
-    return delay({ user: state.session });
+    return delay(sessionBody());
   },
   login: async (email: string, _password: string) => {
     state.session = { ...mockAdmin, email: email || mockAdmin.email };
-    return delay({ user: state.session });
+    return delay(sessionBody());
   },
   logout: async () => {
     state.session = null;
@@ -69,7 +81,7 @@ export const mockApi = {
   },
   me: async () => {
     if (!state.session) throw new ApiError(401, "authentication required");
-    return delay({ user: state.session }, 40);
+    return delay(sessionBody(), 40);
   },
 
   // ── Admin: users ────────────────────────────────────────────────────────────
@@ -228,7 +240,8 @@ export const mockApi = {
     if (!b || !card) throw new ApiError(404, "issue not found");
     const to = toColumn === "open" ? "" : toColumn;
     const columnNames = b.columns.map((c) => c.label_name);
-    card.labels = ["PRD", ...card.labels.filter((l) => l !== "PRD" && !columnNames.includes(l)), ...(to ? [to] : [])];
+    const prd = appSettings.prd_label;
+    card.labels = [prd, ...card.labels.filter((l) => l !== prd && !columnNames.includes(l)), ...(to ? [to] : [])];
     card.column = to;
     card.conflict = false;
     return delay({ card: { ...card } }, 320);
@@ -259,7 +272,7 @@ export const mockApi = {
       iid,
       title,
       state: "opened",
-      labels: ["PRD"],
+      labels: [appSettings.prd_label],
       web_url: `${b.web_url}/-/issues/${iid}`,
       author: requireSession().display_name?.toLowerCase() ?? "you",
       has_prd_link: /prds\/[\w.-]+\.md/.test(description),
