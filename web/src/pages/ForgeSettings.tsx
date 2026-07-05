@@ -252,6 +252,7 @@ export function ForgeSettings() {
                               size="sm"
                               disabled={checkingId === c.id}
                               onClick={() => check(c.id)}
+                              title="Re-run the least-privilege check: token scopes and expiry, the bot's role on each enabled repo, and protected default branches"
                             >
                               {checkingId === c.id ? "Checking…" : "Check privileges"}
                             </Button>
@@ -260,6 +261,7 @@ export function ForgeSettings() {
                               size="sm"
                               disabled={busyId === c.id}
                               onClick={() => verify(c.id)}
+                              title="Re-check that the stored token still authenticates to the forge, and update Last verified"
                             >
                               Verify
                             </Button>
