@@ -9,6 +9,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, isTerminalRun, type Repo, type RunMessage } from "../lib/api";
+import { isStoppedRun } from "../lib/runBadge";
 import { useRunStream } from "../lib/useRunStream";
 import { formatDuration } from "../components/RunEvent";
 import { ActivityFeed } from "../components/ActivityFeed";
@@ -106,6 +107,10 @@ export function RunView() {
   }
 
   const terminal = isTerminalRun(run.status);
+  // A deliberate stop (cancel, or a stop-shaped `failed`) is calm, never rose:
+  // the header pill and the terminal banner both go neutral so they agree with
+  // the board/RunsList treatment (isStoppedRun).
+  const stopped = isStoppedRun(run.status, run.failure_reason);
   const mrUrl =
     run.mr_iid != null && isHttpsUrl(repoWebUrl)
       ? `${repoWebUrl}/-/merge_requests/${run.mr_iid}`
@@ -145,7 +150,14 @@ export function RunView() {
               <span className="text-sm text-faint">#{run.issue_iid}</span>
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
-              <StatusPill status={run.status} />
+              {stopped ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-edge bg-raised px-2 py-0.5 text-[11px] font-medium text-muted">
+                  <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current" />
+                  stopped
+                </span>
+              ) : (
+                <StatusPill status={run.status} />
+              )}
               {stage && (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info">
                   <Spinner /> {stage}…
@@ -204,13 +216,37 @@ export function RunView() {
         </div>
       )}
 
-      {(run.status === "failed" || run.status === "cancelled") && (
-        <div className="rounded-xl border border-danger/40 bg-danger/10 p-4">
-          <p className="text-sm font-semibold text-danger">
-            Run {run.status === "failed" ? "failed" : "cancelled"}
-          </p>
-          {run.failure_reason && <p className="mt-0.5 text-xs text-danger/80">{run.failure_reason}</p>}
-          {duration && <p className="mt-0.5 text-xs text-muted">Ran for {duration}.</p>}
+      {terminal && run.status !== "completed" && (
+        <div
+          className={cx(
+            "rounded-xl border p-4",
+            stopped ? "border-edge bg-raised/50" : "border-danger/40 bg-danger/10",
+          )}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className={cx("text-sm font-semibold", stopped ? "text-fg" : "text-danger")}>
+                Run {stopped ? "stopped" : "failed"}
+              </p>
+              {run.failure_reason && (
+                <p className={cx("mt-0.5 text-xs", stopped ? "text-muted" : "text-danger/80")}>
+                  {run.failure_reason}
+                </p>
+              )}
+              {duration && <p className="mt-0.5 text-xs text-muted">Ran for {duration}.</p>}
+            </div>
+            {/* The MR link is the run's whole output; surface it even on a failed or
+                stopped run, not just the completed hero (a calm secondary button). */}
+            {mrUrl ? (
+              <a href={mrUrl} target="_blank" rel="noreferrer">
+                <Button variant="secondary">
+                  Open merge request !{run.mr_iid} <ExternalLinkIcon />
+                </Button>
+              </a>
+            ) : (
+              run.mr_iid != null && <Badge tone="neutral">MR !{run.mr_iid}</Badge>
+            )}
+          </div>
         </div>
       )}
 
