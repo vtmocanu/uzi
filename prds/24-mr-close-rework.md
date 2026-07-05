@@ -5,6 +5,8 @@
 **Priority**: Medium
 **Created**: 2026-07-05
 
+**Depends on**: nothing in-flight. Independent of PRD #19 (admin settings/autopilot) and #23 (web UX) — no shared tables, no web surface. Coordination only: migration `00029` reserved (see ledger in Technical Design §2), and both #19 M4 and this PRD's M3 add post-sync calls in `poller.syncRepo` + methods in `forgesvc` — whichever lands second rebases (textual, not semantic). Composition note: a #19 autopilot rework run is a "latest non-completed run" and suppresses this PRD's watcher by design (Decision 4).
+
 ## Problem
 
 The board's column automation is driven exclusively by *run status* (`api/internal/runlifecycle/lifecycle.go`): `queued` → In Progress, `completed` → Human Review, `failed`/`cancelled` → origin. Nothing anywhere watches **MR state**. So when a reviewer closes an agent's MR *without merging* — the "rejected, redo it" signal — the card stays parked in Human Review forever, and the `Human Review` label lingers on the GitLab issue. Observed live: issue #9 / MR !13 (MR closed 2026-07-05, card stuck in Human Review).
@@ -37,7 +39,7 @@ Watch the MR each completed run reported (`runs.mr_iid`, written by the worker o
 
 ### 2. Schema + queries (api/internal/store)
 
-- Migration: `ALTER TABLE runs ADD COLUMN mr_state text;` (NULL = never observed). No backfill (Decision 9). `mr_state` is **watcher-owned**: no run-status path writes it (requeue paths, `runtime.sql:291-319`, touch only non-terminal runs; `SetRunCompleted` re-writes `mr_iid` but never `mr_state`) — assert this in query tests (review finding 11).
+- Migration **`00029`** (reserved; ledger: `00021` live head, `00022` #17, `00023`–`00028` #18, `00030+` #5, `00036`–`00039` #19, `00040+` #6, `00050+` #16): `ALTER TABLE runs ADD COLUMN mr_state text;` (NULL = never observed), with `+goose Down`. No backfill (Decision 9). `mr_state` is **watcher-owned**: no run-status path writes it (requeue paths, `runtime.sql:291-319`, touch only non-terminal runs; `SetRunCompleted` re-writes `mr_iid` but never `mr_state`) — assert this in query tests (review finding 11).
 - Queries: `ListMRWatchCandidates` — per repo, `DISTINCT ON (issue)` latest run overall, **then** filter `status = 'completed' AND mr_iid IS NOT NULL` (order matters, Decision 4), issue open, and a **coarse** column prefilter (issue labels contain `Human Review` **or** `mr_state = 'closed'` — reopen watch, Decision 10). The SQL prefilter is deliberately *not* `board.ResolveColumn` (highest-position-wins across multiple column labels is not cheaply expressible in SQL); the authoritative source-column check is the Go guard in the watcher (review finding 2). Plus `SetRunMRState(runID, state)`. Regenerate with sqlc.
 
 ### 3. Watcher (api/internal/forgesvc + poller)
