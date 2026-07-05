@@ -27,3 +27,27 @@ __pycache__/
 .claude/agent-team-tasks/
 .claude/scheduled_tasks.lock
 .claude/skill-stats.json
+.claude/worktrees/
+CLAUDE.md
+!/CLAUDE.md
+# just & task
+juster
+task-repo
+# Helm
+helm/charts/*.tgz
+charts/*.tgz
+# Infisical
+.infisical.json
+# Terraform
+.terraform
+# Ansible
+.ansible/.lock
+# Renovate
+renovate-local.log
+renovate-packages.csv
+# Coverage tests
+coverage.out
+# dot-ai agent deck
+.dot-agent-deck/
+# ignoreme folder
+ignoreme/

@@ -61,6 +61,8 @@ have a docs section on uzi  with relevant howtos (example how to create an agent
 
 user should be able to choose model for each agent defined including for lead
 
+scan for command not found and report them somewhere so we can see what tools we are missing
+
 ## later stuff
 
 - cli to interact with running sessions, see them + chat with them
