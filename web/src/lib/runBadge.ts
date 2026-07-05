@@ -76,6 +76,13 @@ export function hasActiveRun(run: LatestRun | null | undefined): boolean {
   return run != null && !isTerminalRun(run.status);
 }
 
+// activeRunInHistory is the issue view's start-run gate input (PRD §3): the board
+// reads a card's single latest_run, but the issue view already has full run
+// history, so it checks whether any run in that history is still non-terminal.
+export function activeRunInHistory(runs: { status: string }[]): boolean {
+  return runs.some((r) => !isTerminalRun(r.status));
+}
+
 // canOpenRunView gates the in-app run-view link: only the owner may open a run (a
 // non-owner would 403 on GetRunByIDForUser), so the link renders only when the
 // server flagged the latest run is_mine.

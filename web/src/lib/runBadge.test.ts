@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  activeRunInHistory,
   canOpenRunView,
   formatElapsed,
   hasActiveRun,
@@ -160,5 +161,21 @@ describe("isAwaitingApproval (attention strip filter)", () => {
   it("flags only awaiting_approval", () => {
     expect(isAwaitingApproval("awaiting_approval")).toBe(true);
     expect(isAwaitingApproval("running")).toBe(false);
+  });
+});
+
+describe("activeRunInHistory (issue-view start-run gate)", () => {
+  it("is true when any run in the history is still non-terminal", () => {
+    expect(activeRunInHistory([{ status: "completed" }, { status: "running" }])).toBe(true);
+    expect(activeRunInHistory([{ status: "awaiting_approval" }])).toBe(true);
+    expect(activeRunInHistory([{ status: "queued" }])).toBe(true);
+  });
+  it("is false when every run is terminal", () => {
+    expect(activeRunInHistory([{ status: "completed" }, { status: "failed" }, { status: "cancelled" }])).toBe(
+      false,
+    );
+  });
+  it("is false for an empty history (first run allowed)", () => {
+    expect(activeRunInHistory([])).toBe(false);
   });
 });

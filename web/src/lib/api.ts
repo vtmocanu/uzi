@@ -108,6 +108,24 @@ export interface Board {
   cards: Card[];
 }
 
+// IssueDetail is the in-app issue view payload (PRD #12 §3): the board card
+// fields plus the issue description (rendered as markdown; it carries the PRD
+// link). Fetched live from the forge, so unlike a board card it has no latest_run
+// — the issue view shows full run history from a separate listRuns call instead.
+export interface IssueDetail {
+  iid: number;
+  title: string;
+  state: string;
+  labels: string[];
+  web_url: string;
+  author: string | null;
+  has_prd_link: boolean;
+  column: string;
+  closed: boolean;
+  conflict: boolean;
+  description: string;
+}
+
 export interface ForgeConfig {
   allowed_base_urls: string[];
   forge_types: string[];
@@ -315,6 +333,8 @@ export const api = {
   getBoard: (repoId: string) => request<{ board: Board }>("GET", `/repos/${repoId}/board`),
   configureColumns: (repoId: string, columns: { label_name: string }[]) =>
     request<{ board: Board }>("PUT", `/repos/${repoId}/board/columns`, { columns }),
+  getIssue: (repoId: string, iid: number) =>
+    request<{ issue: IssueDetail }>("GET", `/repos/${repoId}/issues/${iid}`),
   moveIssue: (repoId: string, iid: number, toColumn: string) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/move`, { to_column: toColumn }),
   syncRepo: (repoId: string) => request<{ board: Board }>("POST", `/repos/${repoId}/sync`),

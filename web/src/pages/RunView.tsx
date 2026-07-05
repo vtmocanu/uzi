@@ -79,6 +79,20 @@ export function RunView() {
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
+          <nav className="mb-2 flex items-center gap-1.5 text-xs text-slate-500">
+            <Link to={`/repos/${run.repo_id}/board`} className="hover:text-indigo-300">
+              Board
+            </Link>
+            <span>/</span>
+            <Link
+              to={`/repos/${run.repo_id}/issues/${run.issue_iid}`}
+              className="hover:text-indigo-300"
+            >
+              #{run.issue_iid}
+            </Link>
+            <span>/</span>
+            <span className="text-slate-400">Run</span>
+          </nav>
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="truncate text-2xl font-semibold">{run.issue_title}</h1>
             <span className="text-sm text-slate-500">#{run.issue_iid}</span>
