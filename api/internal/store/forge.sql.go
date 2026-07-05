@@ -323,7 +323,7 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -347,6 +347,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.WebUrl,
 			&i.DefaultBranch,
 			&i.Enabled,
+			&i.RepoSkillsEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -359,7 +360,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -383,6 +384,7 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.WebUrl,
 			&i.DefaultBranch,
 			&i.Enabled,
+			&i.RepoSkillsEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -666,7 +668,7 @@ func (q *Queries) ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) (
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -695,6 +697,7 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.WebUrl,
 			&i.DefaultBranch,
 			&i.Enabled,
+			&i.RepoSkillsEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -747,7 +750,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -767,6 +770,65 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.WebUrl,
 		&i.DefaultBranch,
 		&i.Enabled,
+		&i.RepoSkillsEnabled,
+	)
+	return i, err
+}
+
+const setRepoSkillsEnabled = `-- name: SetRepoSkillsEnabled :one
+UPDATE repos SET repo_skills_enabled = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled
+`
+
+type SetRepoSkillsEnabledParams struct {
+	ID                uuid.UUID `json:"id"`
+	RepoSkillsEnabled bool      `json:"repo_skills_enabled"`
+}
+
+// Admin path for the repo-skills toggle: not scoped to the owning user. The
+// handler gates this on the caller being an admin.
+func (q *Queries) SetRepoSkillsEnabled(ctx context.Context, arg SetRepoSkillsEnabledParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoSkillsEnabled, arg.ID, arg.RepoSkillsEnabled)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+	)
+	return i, err
+}
+
+const setRepoSkillsEnabledForUser = `-- name: SetRepoSkillsEnabledForUser :one
+UPDATE repos SET repo_skills_enabled = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled
+`
+
+type SetRepoSkillsEnabledForUserParams struct {
+	ID                uuid.UUID `json:"id"`
+	RepoSkillsEnabled bool      `json:"repo_skills_enabled"`
+	UserID            uuid.UUID `json:"user_id"`
+}
+
+// Repo-skills opt-in toggle, authorized through the repo's owning connection.
+// A non-owned or unknown id returns no rows (mapped to 404 in the handler).
+func (q *Queries) SetRepoSkillsEnabledForUser(ctx context.Context, arg SetRepoSkillsEnabledForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoSkillsEnabledForUser, arg.ID, arg.RepoSkillsEnabled, arg.UserID)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
 	)
 	return i, err
 }
@@ -974,7 +1036,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled
 `
 
 type UpsertRepoParams struct {
@@ -1005,6 +1067,7 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.WebUrl,
 		&i.DefaultBranch,
 		&i.Enabled,
+		&i.RepoSkillsEnabled,
 	)
 	return i, err
 }

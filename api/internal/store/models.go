@@ -9,6 +9,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AgentSkillAllocation struct {
+	TemplateID uuid.UUID          `json:"template_id"`
+	SkillID    uuid.UUID          `json:"skill_id"`
+	UserID     pgtype.UUID        `json:"user_id"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
 type AgentTemplate struct {
 	ID          uuid.UUID          `json:"id"`
 	Name        string             `json:"name"`
@@ -81,6 +88,7 @@ type Repo struct {
 	WebUrl            string      `json:"web_url"`
 	DefaultBranch     pgtype.Text `json:"default_branch"`
 	Enabled           bool        `json:"enabled"`
+	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
 }
 
 type Run struct {
@@ -130,6 +138,18 @@ type RunUserInput struct {
 	Body       pgtype.Text        `json:"body"`
 	ConsumedAt pgtype.Timestamptz `json:"consumed_at"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+type Skill struct {
+	ID          uuid.UUID          `json:"id"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	Body        string             `json:"body"`
+	Scope       string             `json:"scope"`
+	UserID      pgtype.UUID        `json:"user_id"`
+	UpdatedBy   pgtype.UUID        `json:"updated_by"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
 type User struct {

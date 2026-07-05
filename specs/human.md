@@ -85,7 +85,7 @@ Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/7-docs-section-webui.md`.
 
 - A docs section on uzi with relevant howtos: how to create an agent/bot, how to do GitLab bots / give permissions, etc.
 - Include screenshots; screenshots are provided by the user (ask the user for them).
-- Skills howto is out of scope until a skills feature exists.
+- Skills howto now in scope and shipped (`docs/skills.md`) — Feature #16 added the skills feature.
 
 ## Feature #11 — Run view UX: markdown plan, boxed activity, terse events
 
@@ -118,6 +118,16 @@ Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/done/14-multica-ui-redesig
 - Run status colors unified across all surfaces (board card, runs list, run view, issue history) — extends PRD #12's run badge tones.
 - A themed focus-visible ring (keyboard/AT focus indicator).
 - E2E testing includes a real-GitLab leg, scoped to the dedicated scratch project `vtmocanu/uzi-e2e-scratch` (created for this); the live-Anthropic capstone is skipped.
+
+## Feature #16 — Agent skills (global / user / builtin / repo)
+
+Tracked as GitLab issue vtmocanu/uzi#16; PRD at `prds/16-agent-skills.md`.
+
+- Skills exist at global scope and per-user scope (plan.md line 44).
+- Users allocate global skills or their own skills to each agent.
+- First builtin skill: `ci-cd-norms`, researched from internal-kb and the example-app repos — the example CI/CD norm, with example-app as the worked exception.
+- Repos may carry skills the worker detects. Per-repo opt-in, default off. [capability: user; opt-in/default-off shape AI-proposed, user-accepted]
+- Builtin skills ship with uzi; editable and resettable like builtin agent templates.
 
 ## Feature #17 — Builtin lead template (opus) + worker model selection
 

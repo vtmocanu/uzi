@@ -14,6 +14,7 @@ import type {
   RunListItem,
   RunMessage,
   SecretMeta,
+  Skill,
   User,
   Worker,
 } from "../lib/api";
@@ -115,6 +116,7 @@ export const mockRepos: Repo[] = [
     web_url: "https://gitlab.example.com/vtmocanu/uzi",
     default_branch: "main",
     enabled: true,
+    repo_skills_enabled: true,
   },
   {
     id: "repo-atlas",
@@ -124,6 +126,7 @@ export const mockRepos: Repo[] = [
     web_url: "https://gitlab.example.com/vtmocanu/atlas-api",
     default_branch: "main",
     enabled: true,
+    repo_skills_enabled: false,
   },
   {
     id: "repo-www",
@@ -133,6 +136,7 @@ export const mockRepos: Repo[] = [
     web_url: "https://gitlab.example.com/example/website",
     default_branch: "main",
     enabled: false,
+    repo_skills_enabled: false,
   },
 ];
 
@@ -476,6 +480,82 @@ export const mockTemplates: AgentTemplate[] = [
     updated_at: daysAgo(2),
   }),
 ];
+
+// ── Agent skills (PRD #16) ────────────────────────────────────────────────────
+
+// Three scopes, exactly as the real read returns them: a builtin (shipped,
+// resettable, never deletable), a global (admin-managed), and one "Mine" skill
+// owned by the demo session (admin). The mock reconciler treats the builtin's
+// seed body as its reset target.
+export const mockSkills: Skill[] = [
+  {
+    id: "skill-mm-cicd",
+    name: "ci-cd-norms",
+    description:
+      "How CI/CD works at example: myorg/pipelines includes, Harbor registry, ArgoCD GitOps, and how to spot an exception repo.",
+    body: [
+      "# ci-cd-norms",
+      "",
+      "The default norm: a thin `.gitlab-ci.yml` that includes a bundle from the",
+      "private `myorg/pipelines` project (lint → build → audit → push → cleanup).",
+      "Images and OCI charts go to Harbor (`harbor.example.com`). **CI never",
+      "deploys** — the ArgoCD app-of-apps in `myorg/k8s/argo-apps` does.",
+      "",
+      "## Spotting an exception",
+      "",
+      "No `include:` of `myorg/pipelines` means the repo is an exception. Follow its",
+      "local convention; never \"normalize\" it unasked.",
+    ].join("\n"),
+    scope: "builtin",
+    user_id: null,
+    updated_by: null,
+    created_at: daysAgo(40),
+    updated_at: daysAgo(40),
+  },
+  {
+    id: "skill-argo-debug",
+    name: "argocd-debugging",
+    description:
+      "Diagnose a stuck ArgoCD sync: OutOfSync vs Degraded, hook failures, and where to read controller logs.",
+    body: "# argocd-debugging\n\nStart from the Application status, then the resource tree…",
+    scope: "global",
+    user_id: null,
+    updated_by: mockAdmin.email,
+    created_at: daysAgo(12),
+    updated_at: daysAgo(3),
+  },
+  {
+    id: "skill-qdrant-kb",
+    name: "qdrant-kb",
+    description: "My notes on the team's qdrant knowledge-base schema and the ingest CLI flags.",
+    body: "# qdrant-kb\n\nCollections, payload indexes, and the `kb ingest` flags I always forget…",
+    scope: "user",
+    user_id: mockAdmin.id,
+    updated_by: mockAdmin.email,
+    created_at: daysAgo(5),
+    updated_at: daysAgo(1),
+  },
+  {
+    // Owned by another user (Mira). The admin session sees it in the "Other
+    // users" group (view-only — admins can read but not edit others' private
+    // skills); signed in as Mira it is her "Mine".
+    id: "skill-mira-runbook",
+    name: "mira-deploy-runbook",
+    description: "Mira's personal runbook for the staging deploy dance.",
+    body: "# mira-deploy-runbook\n\nThe order I run the staging promotion steps in…",
+    scope: "user",
+    user_id: "u-mira",
+    updated_by: "mira@uzi.local",
+    created_at: daysAgo(4),
+    updated_at: daysAgo(2),
+  },
+];
+
+// Seed allocation: the builtin ci-cd-norms is shared onto the coder template
+// so the allocation panel shows a populated union out of the box.
+export const mockAllocations: Record<string, { shared: string[]; mine: string[] }> = {
+  "t-coder": { shared: ["skill-mm-cicd"], mine: [] },
+};
 
 // ── Runs ─────────────────────────────────────────────────────────────────────
 

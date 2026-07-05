@@ -64,6 +64,66 @@ export interface AgentTemplateInput {
   prompt_body: string;
 }
 
+// ── Agent skills (PRD #16) ────────────────────────────────────────────────
+
+export type SkillScope = "builtin" | "global" | "user";
+
+// Skill is a stored SKILL.md playbook. body is the markdown content (returned,
+// unlike a secret — it is user-authored and editable). user_id is set only for
+// scope "user"; updated_by tracks the last editor (null on a pristine builtin).
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  body: string;
+  scope: SkillScope;
+  user_id: string | null;
+  updated_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// SkillCreateInput is the create body. name and scope are set once (both
+// immutable afterwards); scope is "global" (admin) or "user" (owner) — "builtin"
+// is never creatable via the API.
+export interface SkillCreateInput {
+  name: string;
+  description: string;
+  body: string;
+  scope: "global" | "user";
+}
+
+// SkillUpdateInput is the edit body: only description and body are mutable.
+export interface SkillUpdateInput {
+  description: string;
+  body: string;
+}
+
+// AllocatedSkill is one skill allocated to an agent template, in the caller's
+// view (no body — the allocation view lists what is attached, not its content).
+export interface AllocatedSkill {
+  skill_id: string;
+  name: string;
+  description: string;
+  scope: SkillScope;
+}
+
+// TemplateSkills splits a template's allocations the caller may see into the
+// shared (admin-managed) half and the caller's own overlay half. The union of
+// the two is what the caller's runs on this template actually receive.
+export interface TemplateSkills {
+  shared: AllocatedSkill[];
+  mine: AllocatedSkill[];
+}
+
+// AllocationsInput is the replace-set write. Each half is optional: an omitted
+// (undefined) half is left untouched; a provided array fully replaces that half.
+// shared is admin-only; mine is any user's own overlay.
+export interface AllocationsInput {
+  shared_skill_ids?: string[];
+  my_skill_ids?: string[];
+}
+
 // Privilege report (PRD #5): the token-level and per-repo least-privilege
 // findings the checker produced. status is the denormalized worst-case tier.
 export type PrivilegeStatus = "ok" | "warnings" | "violations" | "error";
@@ -118,6 +178,10 @@ export interface Repo {
   web_url: string;
   default_branch: string | null;
   enabled: boolean;
+  // Repo-skills opt-in (PRD #16): when true, a run on this repo also loads
+  // skills from the repo's own .claude/skills/ (skills only, never hooks/
+  // settings/commands). Default false.
+  repo_skills_enabled: boolean;
 }
 
 export interface BoardColumn {
@@ -450,6 +514,20 @@ const realApi = {
   resetAgentTemplate: (id: string) =>
     request<{ template: AgentTemplate }>("POST", `/agent-templates/${id}/reset`),
 
+  // Agent skills (PRD #16).
+  listSkills: () => request<{ skills: Skill[] }>("GET", "/skills"),
+  getSkill: (id: string) => request<{ skill: Skill }>("GET", `/skills/${id}`),
+  createSkill: (input: SkillCreateInput) =>
+    request<{ skill: Skill }>("POST", "/skills", input),
+  updateSkill: (id: string, input: SkillUpdateInput) =>
+    request<{ skill: Skill }>("PUT", `/skills/${id}`, input),
+  deleteSkill: (id: string) => request<null>("DELETE", `/skills/${id}`),
+  resetSkill: (id: string) => request<{ skill: Skill }>("POST", `/skills/${id}/reset`),
+  getTemplateSkills: (id: string) =>
+    request<{ allocations: TemplateSkills }>("GET", `/agent-templates/${id}/skills`),
+  setTemplateSkills: (id: string, input: AllocationsInput) =>
+    request<{ allocations: TemplateSkills }>("PUT", `/agent-templates/${id}/skills`, input),
+
   // Forge integration.
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
   listConnections: () => request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
@@ -477,6 +555,8 @@ const realApi = {
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),
   setRepoEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PUT", `/repos/${id}`, { enabled }),
+  setRepoSkillsEnabled: (id: string, enabled: boolean) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, { repo_skills_enabled: enabled }),
 
   getBoard: (repoId: string) => request<{ board: Board }>("GET", `/repos/${repoId}/board`),
   configureColumns: (repoId: string, columns: { label_name: string }[]) =>

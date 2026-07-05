@@ -39,6 +39,7 @@ const repos = [
     web_url: "https://gitlab.example.com/vtmocanu/uzi",
     default_branch: "main",
     enabled: true,
+    repo_skills_enabled: false,
   },
   {
     id: "repo-atlas",
@@ -48,6 +49,7 @@ const repos = [
     web_url: "https://gitlab.example.com/vtmocanu/atlas",
     default_branch: "main",
     enabled: true,
+    repo_skills_enabled: false,
   },
 ];
 

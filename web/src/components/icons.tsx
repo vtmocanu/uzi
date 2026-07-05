@@ -230,6 +230,15 @@ export const InboxIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+// SkillIcon: a lucide "sparkles" glyph — curated knowledge that lights up in
+// context. Used for the Skills nav entry and page header.
+export const SkillIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3z" />
+    <path d="M5 3v4M3 5h4M19 17v4M17 19h4" />
+  </Icon>
+);
+
 export const KeyIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4" />

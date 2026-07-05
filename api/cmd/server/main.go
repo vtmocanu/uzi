@@ -98,6 +98,11 @@ func run() error {
 	if err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
 		return err
 	}
+	// Same for the builtin agent skills (PRD #16): missing builtin skills are
+	// inserted, admin edits survive restarts.
+	if err := store.ReconcileBuiltinSkills(ctx, q); err != nil {
+		return err
+	}
 
 	box, err := secretbox.New(cfg.SecretKey)
 	if err != nil {
@@ -146,6 +151,8 @@ func run() error {
 		RunMaxRequeues:       cfg.RunMaxRequeues,
 		WorkerHeartbeatStale: cfg.WorkerHeartbeatStale,
 		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
+		SkillMaxBytes:        cfg.SkillMaxBytes,
+		SkillsMaxPerRun:      cfg.SkillsMaxPerRun,
 	})
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to

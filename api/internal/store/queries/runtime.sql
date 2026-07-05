@@ -171,6 +171,7 @@ RETURNING *;
 SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.default_branch,
+       rp.repo_skills_enabled,
        c.forge_type,
        c.base_url,
        c.bot_username,
