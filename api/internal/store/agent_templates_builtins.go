@@ -11,12 +11,20 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
+// builtinReconcilerQueries is the query subset ReconcileBuiltinTemplates needs.
+// Narrowing to an interface (satisfied by *Queries) keeps the collision-warning
+// path unit-testable without a live database.
+type builtinReconcilerQueries interface {
+	InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error)
+	GetAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error)
+}
+
 // ReconcileBuiltinTemplates seeds the Go-embedded builtin agent templates into
 // the database. It is idempotent and edit-preserving: a missing builtin is
 // inserted with is_builtin=true, an existing row (builtin or admin-edited) is
 // never overwritten. It runs at startup alongside Migrate so future releases
 // can add or improve builtins without a re-run-unsafe SQL seed.
-func ReconcileBuiltinTemplates(ctx context.Context, q *Queries) error {
+func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) error {
 	var inserted int
 	for _, def := range agenttmpl.Builtins() {
 		model, tools, err := builtinColumns(def)
@@ -32,6 +40,26 @@ func ReconcileBuiltinTemplates(ctx context.Context, q *Queries) error {
 		})
 		if err != nil {
 			return fmt.Errorf("insert builtin %q: %w", def.Name, err)
+		}
+		if n == 0 {
+			// ON CONFLICT (name) DO NOTHING: an existing row of the same name
+			// kept the seed out. That is normal when a prior boot already
+			// inserted this builtin, but on an upgrade a pre-existing admin
+			// template (is_builtin=false) can shadow a new builtin and never
+			// receive it — the worker still routes it by name, but it is not
+			// resettable to the shipped definition. Warn so an operator can
+			// rename or delete the custom row if they want the builtin.
+			existing, gErr := q.GetAgentTemplateByName(ctx, def.Name)
+			switch {
+			case gErr != nil:
+				// The row exists (n==0) but the read-back to classify it failed;
+				// log at debug so the diagnostic is not silently dropped.
+				slog.Debug("reconcile: could not read back the shadowing row",
+					"name", def.Name, "error", gErr)
+			case !existing.IsBuiltin:
+				slog.Warn("builtin agent template shadowed by a custom row; skipping seed",
+					"name", def.Name)
+			}
 		}
 		inserted += int(n)
 	}

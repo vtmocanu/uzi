@@ -2,7 +2,7 @@
 // and holds the Go-embedded builtin role definitions. It has no database
 // dependency: Render is a pure function and the builtins are parsed from files
 // embedded in the binary, so the renderer can be exercised in isolation by the
-// golden-file tests.
+// parse/validity tests.
 package agenttmpl
 
 import "strings"
@@ -20,7 +20,8 @@ type Definition struct {
 	// frontmatter omits the tools line.
 	Tools []string
 	// PromptBody is the system prompt body (Markdown). It includes its own
-	// trailing newline so rendered output byte-matches the source file.
+	// trailing newline so rendered output byte-matches the embedded builtin
+	// source file (pinned by the parse->Render round-trip test).
 	PromptBody string
 }
 

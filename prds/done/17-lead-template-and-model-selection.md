@@ -1,7 +1,7 @@
 # PRD #17: Builtin Lead Template (opus) + Worker Model Selection from UI
 
 **GitLab Issue**: [vtmocanu/uzi#17](https://gitlab.example.com/vtmocanu/uzi/-/issues/17)
-**Status**: Draft
+**Status**: Complete (2026-07-05)
 **Priority**: High
 **Created**: 2026-07-05
 **Depends on**: PRD #3 (agent templates, done), PRD #4 (agent runtime/workers, done)
@@ -54,7 +54,7 @@ The lead orchestrator — the main SDK thread that plans, delegates, and gates e
 
 - Migration (drafted as `00022`; **final number assigned at merge time** — next free above the live head, per the CLAUDE.md convention: PRD #24 landed `00029` after this draft, and strict goose refuses to boot on below-head versions), with a `+goose Down`: `ALTER TABLE users ADD COLUMN default_model text` (nullable; NULL = inherit SDK default). sqlc queries: get/update for the current user (note: `SELECT *`/`RETURNING *` queries on `users` regenerate the sqlc `User` struct — harmless, expected).
 - API: extend the existing current-user/settings surface with `GET`/`PUT` for the default model (session-authenticated, own-user only; no admin involvement). Validation server-side per Decision 4.
-- Web: "Worker model" section on `Settings.tsx` under the Anthropic token block, using `ModelSelect`; explains precedence (lead template overrides this; empty = account default).
+- Web: "Worker model" section on `Settings.tsx` under the Anthropic token block, using `ModelSelect`; explains precedence (the per-user default overrides the lead template's model; empty = inherit the lead template's model, opus by default).
 
 ### 4. Claim plumbing (api + agent)
 
@@ -63,13 +63,13 @@ The lead orchestrator — the main SDK thread that plans, delegates, and gates e
 
 ## Milestones
 
-- [ ] **M1 — Decouple + builtin lead template lands**: both golden byte-match tests removed in favor of parse/validity tests, `TestBuiltinsSetIsExactlySeven`/`builtinNames` updated; CLAUDE.md + `docs/agent-templates.md` updated to the builtins-only convention; `lead.md` added to `api/internal/agenttmpl/builtins/` with `model: opus`; boot reconciler seeds it on a fresh and an upgraded DB (collision warning logged when a custom same-name row blocks it); worker pickup proven at unit level (`assembleAgents` routes the shipped lead's model to `leadModel`; live `run_messages` verification is M7's manual step).
-- [ ] **M2 — Lead editable from UI**: Agents page lists lead; admin can edit model/prompt and reset to builtin; `ModelSelect` (dropdown + custom) replaces the free-text model field in the template editor.
-- [ ] **M3 — Per-user default worker model**: migration + API get/put + Settings UI section working end to end; validation rejects junk input.
-- [ ] **M4 — Claim plumbing + precedence enforced**: `default_model` flows through ClaimConfig; worker applies user-default → lead-template-model → SDK-default precedence; covered by Go (workersvc) and agent (`node --test`) unit tests.
-- [ ] **M5 — Tests green across packages**: `go test ./...`, `npm test` (web), `npm test` (agent) all pass with the new coverage.
-- [ ] **M6 — Docs + specs updated**: `docs/agent-templates.md` covers the lead template and model precedence; `docs/configuration.md`/Settings docs cover the default model; `specs/ai.md` records the design decisions (specs/human.md untouched without approval).
-- [ ] **M7 — Validated**: automated: e2e (`./e2e/run-e2e.sh`) passes and unit tests assert the resolved `baseOptions.model` for each precedence case (the e2e stack runs a stub executor with dummy creds, so `run_messages` carry no real model — model resolution is proven at unit level). Manual (user-assisted, needs a real Anthropic token): one live run confirming the lead reports an `opus`-family model in `run_messages` and honors a changed user default.
+- [x] **M1 — Decouple + builtin lead template lands**: both golden byte-match tests removed in favor of parse/validity tests, `TestBuiltinsSetIsExactlySeven`/`builtinNames` updated; CLAUDE.md + `docs/agent-templates.md` updated to the builtins-only convention; `lead.md` added to `api/internal/agenttmpl/builtins/` with `model: opus`; boot reconciler seeds it on a fresh and an upgraded DB (collision warning logged when a custom same-name row blocks it); worker pickup proven at unit level (`assembleAgents` routes the shipped lead's model to `leadModel`; live `run_messages` verification is M7's manual step).
+- [x] **M2 — Lead editable from UI**: Agents page lists lead; admin can edit model/prompt and reset to builtin; `ModelSelect` (dropdown + custom) replaces the free-text model field in the template editor.
+- [x] **M3 — Per-user default worker model**: migration + API get/put + Settings UI section working end to end; validation rejects junk input.
+- [x] **M4 — Claim plumbing + precedence enforced**: `default_model` flows through ClaimConfig; worker applies user-default → lead-template-model → SDK-default precedence; covered by Go (workersvc) and agent (`node --test`) unit tests.
+- [x] **M5 — Tests green across packages**: `go test ./...`, `npm test` (web), `npm test` (agent) all pass with the new coverage.
+- [x] **M6 — Docs + specs updated**: `docs/agent-templates.md` covers the lead template and model precedence; `docs/configuration.md`/Settings docs cover the default model; `specs/ai.md` records the design decisions (specs/human.md untouched without approval).
+- [x] **M7 — Validated**: automated: e2e (`./e2e/run-e2e.sh`) passes and unit tests assert the resolved `baseOptions.model` for each precedence case (the e2e stack runs a stub executor with dummy creds, so `run_messages` carry no real model — model resolution is proven at unit level). Manual (user-assisted, needs a real Anthropic token): one live run confirming the lead reports an `opus`-family model in `run_messages` and honors a changed user default.
 
 ## Success Criteria
 
@@ -84,3 +84,5 @@ The lead orchestrator — the main SDK thread that plans, delegates, and gates e
 - **Model alias drift**: curated aliases go stale as Anthropic ships models — mitigated by the custom free-text escape hatch and keeping the alias list in one shared constant.
 - **Invalid custom model IDs** fail only at run time — mitigated by surfacing the SDK error in run messages (already the failure path for bad tokens).
 - **Convention change churn**: dropping the `.claude/agents/` ↔ builtins sync touches CLAUDE.md, dev docs, and tests in the same PRD as the feature — mitigated by doing it first (M1) as a small, self-contained commit. `.claude/agents/` drift after the decouple is intended, not a regression.
+
+- 2026-07-05 (completion): implemented via MR !20 (12 commits, a1f9615..9f5ba8a). All validation waves clean (reviewer, auditor, fact-checker, tester e2e 22/22, web-ux). M7 automated portion done; the manual live-run check (real Anthropic token, lead reports an opus-family model in run_messages and honors a changed user default) remains a post-merge user step.

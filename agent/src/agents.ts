@@ -38,7 +38,13 @@ import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentTemplate } from "./protocol.js";
 import { NESTED_AGENT_TOOL } from "./guardrails.js";
 
-const LEAD_NAME_RE = /^(lead|orchestrator)$/i;
+/**
+ * A template is the lead orchestrator (routed to the main thread, not registered
+ * as an invokable subagent) when its name matches this convention. The product
+ * ships exactly one such builtin (`lead`, in api/internal/agenttmpl/builtins/);
+ * a test pins that shipped name to this regex so the two never drift.
+ */
+export const LEAD_NAME_RE = /^(lead|orchestrator)$/i;
 
 export interface AssembledAgents {
   /** Invokable subagents, keyed by name, for `options.agents`. */

@@ -30,6 +30,12 @@ export interface SecretMeta {
   updated_at: string;
 }
 
+// UserSettings is the current user's own (non-secret) settings. default_model
+// is the per-user default worker model; null means inherit (PRD #17).
+export interface UserSettings {
+  default_model: string | null;
+}
+
 // AgentTemplate is a stored agent definition. tools is null when the template
 // inherits all tools; model is null when it inherits the model.
 export interface AgentTemplate {
@@ -390,6 +396,9 @@ const realApi = {
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
   deleteAnthropicToken: () => request<null>("DELETE", "/me/secrets/anthropic_token"),
+  getMySettings: () => request<{ settings: UserSettings }>("GET", "/me/settings"),
+  putMySettings: (defaultModel: string | null) =>
+    request<{ settings: UserSettings }>("PUT", "/me/settings", { default_model: defaultModel }),
   listAgentTemplates: () =>
     request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
   getAgentTemplate: (id: string) =>

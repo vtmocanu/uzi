@@ -9,11 +9,12 @@ import (
 	"strings"
 )
 
-// builtinFS holds byte-for-byte copies of this repo's own .claude/agents/*.md
-// files. They are copies (Go embed cannot reference paths outside the module
-// root) and a test enforces that they stay identical to the checked-in
-// originals — if .claude/agents/<name>.md is edited, resync the copy here or
-// the drift test fails.
+// builtinFS holds the product's builtin agent-template definitions. This
+// directory is the single source of truth for builtins: they are versioned in
+// git, shipped in the binary via go:embed, and boot-seeded into the database.
+// It is independent of this repo's own .claude/agents/ dev-team roster (which
+// is free to drift); parse/validity tests, not a byte-match against those
+// files, guard these definitions.
 //
 //go:embed builtins/*.md
 var builtinFS embed.FS
@@ -67,7 +68,7 @@ func BuiltinByName(name string) (Definition, bool) {
 // inverse of Render for the subset of frontmatter these files use (name,
 // description, tools, model). It is only ever fed the embedded builtin files;
 // user templates never go through it (they arrive as structured JSON). The
-// round-trip parse->Render is pinned byte-for-byte by the golden test.
+// round-trip parse->Render is pinned byte-for-byte by the parse/validity test.
 func parse(raw []byte) (Definition, error) {
 	const delim = "---\n"
 	content := string(raw)

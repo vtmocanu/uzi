@@ -112,14 +112,29 @@ agent can play: name, description, an optional model override, an optional
 tools allowlist, and a prompt body. It is not itself an agent; it is the
 recipe a later release renders into a running one.
 
-- **Source of truth split.** The seven builtin roles (`coder`, `reviewer`,
-  `auditor`, `tester`, `documenter`, `fact-checker`, `spec-keeper`) are
-  Go-embedded from copies of this repo's own `.claude/agents/*.md` files
-  (`api/internal/agenttmpl/builtins/`, parsed at package `init()`). At every
-  boot, `store.ReconcileBuiltinTemplates` inserts any builtin row missing from
-  the DB and never touches one that already exists, so an admin's edits to a
+- **`builtins/` is the single source of truth.** Eight builtin roles — the
+  `lead` orchestrator (`model: opus`) plus seven subagents (`coder`,
+  `reviewer`, `auditor`, `tester`, `documenter`, `fact-checker`,
+  `spec-keeper`) — are Go-embedded from `api/internal/agenttmpl/builtins/*.md`,
+  parsed at package `init()`. This directory is independent of this repo's own
+  `.claude/agents/*.md` dev-team roster (PRD #17): that roster is free to
+  drift and product changes never touch it. At every boot,
+  `store.ReconcileBuiltinTemplates` inserts any builtin row missing from the
+  DB and never touches one that already exists, so an admin's edits to a
   builtin survive restarts, and future releases can add or upgrade builtins
-  without a SQL seed that can't be re-run.
+  without a SQL seed that can't be re-run; a boot-time warning is logged if a
+  non-builtin row already occupies a builtin's name (e.g. a custom `lead`
+  template blocks the seed).
+- **The `lead` is the main thread, not a subagent.** The worker
+  (`agent/src/agents.ts`) partitions templates by name (`LEAD_NAME_RE`,
+  matching `lead`/`orchestrator`) and routes the matched template's
+  `prompt_body`/`model` into the run's main SDK thread instead of registering
+  it as an invokable subagent. Model precedence for that main thread: the run
+  owner's per-user default model (`users.default_model`, set from Settings,
+  carried through the claim payload) → the `lead` template's `model` → the
+  SDK/Anthropic-account default. A subagent's own template `model`, when set,
+  always wins for that subagent; unset, it inherits the resolved main-thread
+  model. See [docs/worker-model.md](docs/worker-model.md).
 - **Read/write split.** Any authenticated user can list, view, and preview
   templates (`GET /api/agent-templates*`); only an admin can create, edit,
   delete, or reset one (`RequireAdmin` in `api/internal/handler/handler.go`).
@@ -128,11 +143,12 @@ recipe a later release renders into a running one.
 - **Renderer.** `api/internal/agenttmpl/render.go` turns a template into
   Claude Code's subagent Markdown (fixed-order YAML frontmatter, `tools` as an
   inline comma-separated string, `tools`/`model` omitted when they inherit).
-  It is a pure function with no DB dependency, so golden-file tests pin a
-  builtin's rendered output to byte-match the checked-in `.claude/agents/*.md`
-  file. `GET /api/agent-templates/:id/rendered` serves this Markdown directly;
-  nothing in this release writes it to a filesystem or spawns anything from it
-  (that is a later release's job). See
+  It is a pure function with no DB dependency; parse/validity tests (not a
+  byte-match against `.claude/agents/`, dropped with the source-of-truth
+  split above) guard the embedded builtins directly. `GET
+  /api/agent-templates/:id/rendered` serves this Markdown directly; nothing
+  in this release writes it to a filesystem or spawns anything from it (that
+  is a later release's job). See
   [docs/agent-templates.md](docs/agent-templates.md).
 - **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique,
   and immutable after creation (it is the subagent's filename and identity;

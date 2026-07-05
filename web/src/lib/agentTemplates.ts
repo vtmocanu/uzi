@@ -79,10 +79,36 @@ function hasControlChar(s: string): boolean {
   return false;
 }
 
+// MAX_MODEL_LEN caps a model alias / full ID. Real IDs (aliases through full
+// bedrock IDs) sit well under this; the cap just bounds a pasted blob. Kept in
+// lockstep with the server's maxModelLen (PRD #17 Decision 4).
+export const MAX_MODEL_LEN = 100;
+
+// modelFieldWarning mirrors the server's validateModel (PRD #17 Decision 4): a
+// blank value is inherit (fine); otherwise the trimmed value must be a single
+// whitespace-free token, control-char-free, and at most MAX_MODEL_LEN chars.
+// The value is trimmed first, exactly as the server does, so a stray trailing
+// space does not warn on something the server would accept. "" means clean.
+export function modelFieldWarning(model: string): string {
+  const m = model.trim();
+  if (m === "") return "";
+  if (m.length > MAX_MODEL_LEN) {
+    return `Model is too long (max ${MAX_MODEL_LEN} characters); use a shorter alias or model ID.`;
+  }
+  if (hasControlChar(m)) {
+    return "Model contains a newline or control character; remove it before saving.";
+  }
+  if (/\s/.test(m)) {
+    return "Model must be a single token with no spaces.";
+  }
+  return "";
+}
+
 // frontmatterFieldWarning mirrors the server rejection of newline/control
-// characters (and commas in tool names) in the single-line frontmatter fields.
-// The server is authoritative; this blocks submit early with a clear message
-// (the usual vector is a paste into the description). "" means clean.
+// characters (and commas in tool names) in the single-line frontmatter fields,
+// plus the tightened model rules (modelFieldWarning). The server is
+// authoritative; this blocks submit early with a clear message (the usual
+// vector is a paste into the description). "" means clean.
 export function frontmatterFieldWarning(fields: {
   description: string;
   model: string;
@@ -91,15 +117,21 @@ export function frontmatterFieldWarning(fields: {
   if (hasControlChar(fields.description)) {
     return "Description contains a newline or control character; remove it before saving.";
   }
-  if (hasControlChar(fields.model)) {
-    return "Model contains a newline or control character; remove it before saving.";
-  }
+  const modelWarning = modelFieldWarning(fields.model);
+  if (modelWarning) return modelWarning;
   for (const t of fields.tools) {
     if (hasControlChar(t) || t.includes(",")) {
       return `Tool name "${t}" contains a comma, newline, or control character.`;
     }
   }
   return "";
+}
+
+// isLeadTemplateName mirrors the worker's LEAD_NAME_RE (agent/src/agents.ts): a
+// template with this name is the orchestrator routed to the main thread, not an
+// invokable subagent. Used to badge it distinctly in the Agents list.
+export function isLeadTemplateName(name: string): boolean {
+  return /^(lead|orchestrator)$/i.test(name);
 }
 
 // looseSecretWarning returns a warning string if the text looks like it might

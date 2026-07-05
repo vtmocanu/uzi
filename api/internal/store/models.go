@@ -125,6 +125,7 @@ type User struct {
 	TokenVersion int32              `json:"token_version"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 	LastLogin    pgtype.Timestamptz `json:"last_login"`
+	DefaultModel pgtype.Text        `json:"default_model"`
 }
 
 type UserSecret struct {

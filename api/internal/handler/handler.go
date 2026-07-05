@@ -119,6 +119,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
 		})
 
+		// Current-user settings (non-secret, own-user only): the per-user default
+		// worker model (PRD #17). Session-authenticated, no admin path.
+		r.Route("/me/settings", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.GetMySettings)
+			r.Put("/", h.PutMySettings)
+		})
+
 		// Agent templates: all authenticated users can read and preview; only
 		// admins can create, edit, delete, or reset (closes bottega's hole
 		// where any user rewrites the shared prompts everyone's agents run).
