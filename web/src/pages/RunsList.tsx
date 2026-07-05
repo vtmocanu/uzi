@@ -9,12 +9,7 @@ import {
   type RunListItem,
 } from "../lib/api";
 import { Alert, Badge, Card } from "../components/ui";
-
-function statusTone(status: string): "neutral" | "warning" | "danger" {
-  if (status === "awaiting_approval") return "warning";
-  if (status === "failed" || status === "cancelled") return "danger";
-  return "neutral";
-}
+import { isStoppedRun, runStatusTone } from "../lib/runBadge";
 
 function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
   return (
@@ -35,7 +30,9 @@ function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
           <span>· {new Date(run.updated_at).toLocaleString()}</span>
         </div>
       </div>
-      <Badge tone={statusTone(run.status)}>{run.status.replace("_", " ")}</Badge>
+      <Badge tone={runStatusTone(run.status, run.failure_reason)}>
+        {isStoppedRun(run.status, run.failure_reason) ? "stopped" : run.status.replace("_", " ")}
+      </Badge>
     </li>
   );
 }

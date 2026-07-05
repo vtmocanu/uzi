@@ -8,8 +8,12 @@ import type { ClaimResponse } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
 import { SteeringChannel, type PlanVerdict } from "./steering.js";
 import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
-import { makeRedactor } from "./redact.js";
+import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { errMessage } from "./util.js";
+
+/** Cap on a reported failure_reason, matching the GitLab error-body cap
+ *  (gitlab.ts) so a runaway SDK error can't bloat the run row or the stream. */
+const MAX_FAILURE_REASON_LEN = 512;
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
@@ -67,7 +71,11 @@ export class RunRunner {
     this.log.addSecret(gitBasic);
 
     const runLog = this.log.child({ run_id: runId, issue_iid: claim.issue_iid });
-    const redact = makeRedactor([claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, this.joinToken, gitBasic]);
+    // Same secret set for both redactors: the batcher scrubs run_message payloads;
+    // redactText scrubs strings that reach the API outside a payload (failure_reason).
+    const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, this.joinToken, gitBasic];
+    const redact = makeRedactor(secrets);
+    const redactText = makeTextRedactor(secrets);
     const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
 
     // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
@@ -156,13 +164,17 @@ export class RunRunner {
       await reportState({ status: "completed", branch: result.branch, mr_iid: mr.iid });
       runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
     } catch (err) {
-      // A plan rejection reports the user's reason verbatim; anything else reports
-      // its (static/redacted) message.
-      const reason = err instanceof PlanRejectedError ? err.reason : errMessage(err);
+      // failure_reason goes straight to reportState, bypassing the batcher's
+      // redactor, and the sdk-executor catch-all re-throws raw SDK errors into this
+      // path — so scrub it here with the run's own secret set. A plan rejection
+      // carries the user's verbatim reason; scrubbing it too is harmless for plain
+      // text and a safety net if the user pasted a secret.
+      const reason = redactText(err instanceof PlanRejectedError ? err.reason : errMessage(err));
       runLog.error("run failed", { error: reason });
       batcher.emit({ kind: "error", agent: "worker", payload: { text: reason } });
       await batcher.close().catch(() => undefined);
-      await reportState({ status: "failed", failure_reason: reason }).catch((e) =>
+      // Cap what lands in the run row (matches the GitLab error-body cap).
+      await reportState({ status: "failed", failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN) }).catch((e) =>
         runLog.error("could not report failed state", { error: errMessage(e) }),
       );
     } finally {

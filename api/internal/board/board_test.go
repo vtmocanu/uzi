@@ -1,4 +1,4 @@
-package handler
+package board
 
 import (
 	"reflect"
@@ -33,9 +33,9 @@ func TestResolveColumn(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			col, closed, conflict := resolveColumn(tc.labels, tc.state, pos)
+			col, closed, conflict := ResolveColumn(tc.labels, tc.state, pos)
 			if col != tc.wantColumn || closed != tc.wantClosed || conflict != tc.wantConflict {
-				t.Errorf("resolveColumn(%v,%q) = (%q,%v,%v), want (%q,%v,%v)",
+				t.Errorf("ResolveColumn(%v,%q) = (%q,%v,%v), want (%q,%v,%v)",
 					tc.labels, tc.state, col, closed, conflict, tc.wantColumn, tc.wantClosed, tc.wantConflict)
 			}
 		})
@@ -115,7 +115,7 @@ func TestPlanLabelMove(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			add, remove, newLabels := planLabelMove(tc.current, cols, tc.target)
+			add, remove, newLabels := PlanLabelMove(tc.current, cols, tc.target)
 			if !sortedEqual(add, tc.wantAdd) {
 				t.Errorf("add = %v, want %v", add, tc.wantAdd)
 			}

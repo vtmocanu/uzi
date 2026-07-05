@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 )
@@ -25,14 +27,34 @@ type adminWorkerDTO struct {
 	OwnerEmail string `json:"owner_email"`
 }
 
-// ListRuns returns the current user's runs, newest first.
+// ListRuns returns the current user's runs, newest first. Optional ?repo_id= and
+// ?issue_iid= narrow the list (repo scope for the board attention strip, repo +
+// issue for the in-app issue history); a malformed value is a 400.
 func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	rows, err := h.wsvc.ListRunsForUser(r.Context(), user.ID)
+	var repoID *uuid.UUID
+	if s := r.URL.Query().Get("repo_id"); s != "" {
+		id, err := uuid.Parse(s)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid repo_id")
+			return
+		}
+		repoID = &id
+	}
+	var issueIID *int64
+	if s := r.URL.Query().Get("issue_iid"); s != "" {
+		iid, err := parseInt64(s)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid issue_iid")
+			return
+		}
+		issueIID = &iid
+	}
+	rows, err := h.wsvc.ListRunsForUser(r.Context(), user.ID, repoID, issueIID)
 	if err != nil {
 		slog.Error("list runs", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

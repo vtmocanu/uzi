@@ -89,6 +89,15 @@ Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
 - No "show raw JSON" toggle in the web UI. [explicit user rejection]
 - Reuse PRD #7's markdown renderer rather than building a parallel one. [user coordination]
 
+## Feature #12 — Board–run lifecycle integration
+
+Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/12-board-run-lifecycle.md`.
+
+- Issues move board columns automatically with the run lifecycle: In Progress while agents work, a review column once the MR is open. Hand-dragging is the defect being fixed.
+- The board shows that runs happened/are happening: run badges + MR link on the card; the board updates itself (no manual Refresh).
+- Clicking an issue stays in-platform: an in-app issue view with its runs and a start-run action. GitLab remains reachable via an explicit icon.
+- Failed forge column moves are retried via reconciliation — not dropped, not a persisted move queue. (2026-07-04 user review; the "no retry, next lifecycle event heals it" stance was rejected because `completed` is terminal.)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

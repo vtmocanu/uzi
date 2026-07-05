@@ -1,14 +1,21 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import {
   api,
   ApiError,
   isHttpsUrl,
-  isTerminalRun,
   type Board as BoardData,
   type Card as CardData,
+  type RunListItem,
 } from "../lib/api";
 import { startRunGate, type StartRunGate } from "../lib/runStream";
+import {
+  canOpenRunView,
+  hasActiveRun,
+  isAwaitingApproval,
+  retryHint,
+  runBadge,
+} from "../lib/runBadge";
 import { Alert, Badge, Button, Card, Field, Input } from "../components/ui";
 
 const OPEN_KEY = "";
@@ -17,6 +24,13 @@ const CLOSED_KEY = "__closed__";
 // columnKeyForCard maps a card to the key of the column it renders in.
 function columnKeyForCard(card: CardData): string {
   if (card.closed) return CLOSED_KEY;
+  return card.column;
+}
+
+// columnLabel is the human name of the column a card sits in (for toasts).
+function columnLabel(card: CardData): string {
+  if (card.closed) return "Closed";
+  if (card.column === "") return "Open";
   return card.column;
 }
 
@@ -33,12 +47,50 @@ export function Board() {
   const [creatingIssue, setCreatingIssue] = useState(false);
   const [starting, setStarting] = useState<number | null>(null);
 
-  // Start-run preconditions, refreshed alongside the board: whether the user has
-  // a worker and an Anthropic token, and which of this repo's issues already have
-  // a non-terminal run.
+  // Start-run preconditions, refreshed alongside the board: whether the user has a
+  // worker and an Anthropic token. Whether an issue already has an active run now
+  // comes from the card's own latest_run (no separate listRuns fan-in).
   const [hasWorker, setHasWorker] = useState(false);
   const [hasToken, setHasToken] = useState(false);
-  const [activeIids, setActiveIids] = useState<Set<number>>(new Set());
+  // The viewer's runs on this repo blocked on their approval — drives the
+  // attention strip above the columns.
+  const [awaitingRuns, setAwaitingRuns] = useState<RunListItem[]>([]);
+
+  // Toasts announce auto-moves the poll observes ("#42 → Human Review").
+  const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
+  const toastSeq = useRef(0);
+  // Pending toast-removal timers, cleared on unmount so a dismissal never fires
+  // setState on an unmounted component.
+  const toastTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const pushToast = useCallback((text: string) => {
+    const id = (toastSeq.current += 1);
+    setToasts((t) => [...t, { id, text }]);
+    const timer = setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 6000);
+    toastTimers.current.push(timer);
+  }, []);
+
+  // iids the operator moved by hand within the last poll window. The column change
+  // is already applied locally, so the background poll must NOT re-announce it as
+  // an auto-move — this closes the false-toast window between a drag's server
+  // commit and move()'s local setBoard (reviewer SF2). Released after one poll
+  // interval; a genuine later auto-move on the same card still toasts.
+  const suppressToastIids = useRef<Set<number>>(new Set());
+  const suppressTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  useEffect(
+    () => () => {
+      toastTimers.current.forEach(clearTimeout);
+      suppressTimers.current.forEach(clearTimeout);
+    },
+    [],
+  );
+
+  // boardRef mirrors the rendered board so the background poll can diff a fresh
+  // payload against what the user is looking at. Manual drags are already applied
+  // here, so they never toast — only server-driven moves do.
+  const boardRef = useRef<BoardData | null>(null);
+  useEffect(() => {
+    boardRef.current = board;
+  }, [board]);
 
   const load = useCallback(async () => {
     setError("");
@@ -57,24 +109,65 @@ export function Board() {
       const [{ workers }, { secrets }, { runs }] = await Promise.all([
         api.listWorkers(),
         api.listSecrets(),
-        api.listRuns(),
+        api.listRuns({ repoId }),
       ]);
       setHasWorker(workers.length > 0);
       setHasToken(secrets.some((s) => s.kind === "anthropic_token"));
-      const active = new Set<number>();
-      for (const r of runs) {
-        if (r.repo_id === repoId && !isTerminalRun(r.status)) active.add(r.issue_iid);
-      }
-      setActiveIids(active);
+      setAwaitingRuns(runs.filter((r) => isAwaitingApproval(r.status)));
     } catch {
       // Non-fatal: the board still renders; Start-run stays gated conservatively.
     }
   }, [repoId]);
 
+  // poll is the background refresh: re-read the board, toast on any column change
+  // the user did not make, and refresh preconditions. Errors are swallowed (keep the
+  // last good board; the next tick retries) — only the foreground load surfaces them.
+  const poll = useCallback(async () => {
+    try {
+      const { board: fresh } = await api.getBoard(repoId);
+      const prev = boardRef.current;
+      if (prev) {
+        for (const card of fresh.cards) {
+          const before = prev.cards.find((c) => c.iid === card.iid);
+          if (
+            before &&
+            columnKeyForCard(before) !== columnKeyForCard(card) &&
+            !suppressToastIids.current.has(card.iid)
+          ) {
+            pushToast(`#${card.iid} → ${columnLabel(card)}`);
+          }
+        }
+      }
+      setBoard(fresh);
+    } catch {
+      // keep the last good board
+    }
+  }, [repoId, pushToast]);
+
   useEffect(() => {
     load();
     loadPreconditions();
   }, [load, loadPreconditions]);
+
+  // Liveness: poll every ~10s while mounted, paused when the tab is hidden, so
+  // auto-moves and badge changes appear without a manual Refresh. Becoming visible
+  // again triggers an immediate catch-up. No WebSocket (out of scope).
+  useEffect(() => {
+    const tick = () => {
+      if (document.hidden) return;
+      poll();
+      loadPreconditions();
+    };
+    const interval = setInterval(tick, 10000);
+    const onVisible = () => {
+      if (!document.hidden) tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [poll, loadPreconditions]);
 
   const startRun = async (card: CardData) => {
     setError("");
@@ -105,6 +198,10 @@ export function Board() {
   const move = async (toKey: string, iid: number) => {
     if (toKey === CLOSED_KEY) return; // Closed is not a drop target in the MVP.
     setError("");
+    // Suppress the auto-move toast for this card: a poll landing between the
+    // server commit below and the local setBoard would otherwise diff the new
+    // column against the stale baseline and false-toast a move the user just made.
+    suppressToastIids.current.add(iid);
     try {
       const to = toKey === OPEN_KEY ? "open" : toKey;
       const { card } = await api.moveIssue(repoId, iid, to);
@@ -114,7 +211,12 @@ export function Board() {
       setBoard((prev) =>
         prev ? { ...prev, cards: prev.cards.map((c) => (c.iid === card.iid ? card : c)) } : prev,
       );
+      // Hold the suppression for one poll interval so an already-in-flight poll
+      // still sees the moved column as its baseline, then release it.
+      const timer = setTimeout(() => suppressToastIids.current.delete(iid), 11000);
+      suppressTimers.current.push(timer);
     } catch (err) {
+      suppressToastIids.current.delete(iid); // the move failed — nothing to suppress
       setError(err instanceof ApiError ? err.message : "Move failed");
     }
   };
@@ -149,8 +251,9 @@ export function Board() {
         <div>
           <h1 className="text-2xl font-semibold">{board?.path_with_namespace ?? "Board"}</h1>
           <p className="mt-1 text-sm text-slate-400">
-            Columns are GitLab labels. Drag a card to change its label on the forge. Only
-            PRD-labeled issues appear here.{" "}
+            Columns are GitLab labels. Cards move automatically as their runs progress; you can
+            still drag a card to change its label on the forge. Only PRD-labeled issues appear
+            here.{" "}
             <Link to="/repos" className="text-indigo-400 hover:text-indigo-300">
               Back to repos
             </Link>
@@ -170,6 +273,23 @@ export function Board() {
       </div>
 
       {error && <Alert message={error} />}
+
+      {awaitingRuns.length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-amber-600 bg-amber-950/60 px-4 py-2.5 text-sm text-amber-200">
+          <span className="font-medium">
+            {awaitingRuns.length} run{awaitingRuns.length > 1 ? "s" : ""} awaiting your approval
+          </span>
+          {awaitingRuns.map((r) => (
+            <Link
+              key={r.id}
+              to={`/runs/${r.id}`}
+              className="rounded-md border border-amber-600/70 px-1.5 py-0.5 text-amber-100 hover:bg-amber-900/50"
+            >
+              #{r.issue_iid} →
+            </Link>
+          ))}
+        </div>
+      )}
 
       {creatingIssue && (
         <CreateIssueForm
@@ -226,12 +346,14 @@ export function Board() {
                   <IssueCard
                     key={card.iid}
                     card={card}
+                    repoId={repoId}
+                    projectWebUrl={board?.web_url}
                     gate={startRunGate({
                       hasPrdLink: card.has_prd_link,
                       closed: card.closed,
                       hasWorker,
                       hasToken,
-                      activeRunExists: activeIids.has(card.iid),
+                      activeRunExists: hasActiveRun(card.latest_run),
                     })}
                     starting={starting === card.iid}
                     onStart={() => startRun(card)}
@@ -251,12 +373,31 @@ export function Board() {
           );
         })}
       </div>
+
+      {toasts.length > 0 && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2"
+        >
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              className="rounded-lg border border-indigo-700 bg-slate-900/95 px-4 py-2 text-sm text-slate-100 shadow-xl"
+            >
+              {t.text}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 function IssueCard({
   card,
+  repoId,
+  projectWebUrl,
   gate,
   starting,
   onStart,
@@ -265,6 +406,8 @@ function IssueCard({
   dimmed,
 }: {
   card: CardData;
+  repoId: string;
+  projectWebUrl?: string;
   gate: StartRunGate;
   starting: boolean;
   onStart: () => void;
@@ -275,31 +418,99 @@ function IssueCard({
   // Closed cards are not movable (move-to-Closed is unsupported; close/reopen
   // stays on the forge), so they are not draggable.
   const draggable = !card.closed;
+  const run = card.latest_run;
+  const badge = run ? runBadge(run, Date.now()) : null;
+  const hint = run ? retryHint(run.run_count) : null;
+  // awaiting_approval is the loudest card state: a human is the blocker while a
+  // worker is held busy. Give the whole card an amber ring so it can't be missed.
+  const loud = isAwaitingApproval(run?.status ?? "");
+  const mrHref =
+    badge?.kind === "mr" && isHttpsUrl(projectWebUrl)
+      ? `${projectWebUrl}/-/merge_requests/${badge.mrIid}`
+      : null;
   return (
     <div
       draggable={draggable}
       onDragStart={draggable ? onDragStart : undefined}
       onDragEnd={draggable ? onDragEnd : undefined}
-      className={`rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm ${
-        draggable ? "cursor-grab active:cursor-grabbing" : "cursor-default"
-      } ${dimmed ? "opacity-40" : ""}`}
+      className={`rounded-lg border bg-slate-900 p-3 text-sm ${
+        loud ? "border-amber-600 ring-2 ring-amber-500/60" : "border-slate-700"
+      } ${draggable ? "cursor-grab active:cursor-grabbing" : "cursor-default"} ${
+        dimmed ? "opacity-40" : ""
+      }`}
     >
       <div className="flex items-start justify-between gap-2">
-        {isHttpsUrl(card.web_url) ? (
-          <a
-            href={card.web_url}
-            target="_blank"
-            rel="noreferrer"
-            className="font-medium text-slate-100 hover:text-indigo-300"
-          >
-            {card.title}
-          </a>
-        ) : (
-          <span className="font-medium text-slate-100">{card.title}</span>
-        )}
-        <span className="shrink-0 text-xs text-slate-500">#{card.iid}</span>
+        {/* In-app issue view. draggable={false}: a native <a> is draggable and
+            would hijack the card's HTML5 drag payload. */}
+        <Link
+          to={`/repos/${repoId}/issues/${card.iid}`}
+          draggable={false}
+          className="font-medium text-slate-100 hover:text-indigo-300"
+        >
+          {card.title}
+        </Link>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {isHttpsUrl(card.web_url) && (
+            <a
+              href={card.web_url}
+              target="_blank"
+              rel="noreferrer"
+              draggable={false}
+              aria-label="Open on GitLab"
+              title="Open on GitLab"
+              className="text-slate-500 hover:text-orange-400"
+            >
+              <svg
+                viewBox="0 0 20 20"
+                width="14"
+                height="14"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                aria-hidden="true"
+              >
+                <path
+                  d="M12 3h5v5M17 3l-8 8M8 4H5a2 2 0 00-2 2v9a2 2 0 002 2h9a2 2 0 002-2v-3"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </a>
+          )}
+          <span className="text-xs text-slate-500">#{card.iid}</span>
+        </div>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {badge &&
+          (badge.kind === "mr" ? (
+            mrHref ? (
+              <a
+                href={mrHref}
+                target="_blank"
+                rel="noreferrer"
+                draggable={false}
+                title="Open the merge request on GitLab"
+                className="inline-flex items-center rounded-md border border-emerald-700 bg-emerald-950/60 px-1.5 py-0.5 text-[11px] font-medium text-emerald-300 hover:bg-emerald-900/60"
+              >
+                !{badge.mrIid}
+              </a>
+            ) : (
+              <span className="inline-flex items-center rounded-md border border-emerald-700 bg-emerald-950/60 px-1.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                !{badge.mrIid}
+              </span>
+            )
+          ) : (
+            <span className={badge.pulse ? "animate-pulse" : ""}>
+              <Badge tone={badge.tone} title={badge.title}>
+                {badge.label}
+              </Badge>
+            </span>
+          ))}
+        {hint && (
+          <span className="text-[11px] text-slate-500" title="Number of runs on this issue">
+            {hint}
+          </span>
+        )}
         {!card.has_prd_link && (
           <Badge tone="warning" title="Description has no link to a prds/*.md file; excluded from agent pickup">
             no PRD link
@@ -310,8 +521,23 @@ function IssueCard({
             conflict
           </Badge>
         )}
-        {card.author && <span className="text-xs text-slate-500">{card.author}</span>}
       </div>
+      {(run || card.author) && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500">
+          {run?.status === "running" && run.worker_name && <span>{run.worker_name}</span>}
+          {run && !run.is_mine && run.owner_name && <span>started by {run.owner_name}</span>}
+          {run && canOpenRunView(run) && (
+            <Link
+              to={`/runs/${run.id}`}
+              draggable={false}
+              className="text-indigo-400 hover:text-indigo-300"
+            >
+              view run
+            </Link>
+          )}
+          {card.author && <span>{card.author}</span>}
+        </div>
+      )}
       {!card.closed && (
         <div className="mt-2">
           <Button

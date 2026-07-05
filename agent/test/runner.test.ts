@@ -147,6 +147,30 @@ describe("RunRunner — worker-performed push + MR", () => {
     assert.strictEqual(fs.existsSync(worktreeDirFor(9)), false);
   });
 
+  it("redacts and caps the failure_reason before it reaches reportState", async () => {
+    // failure_reason bypasses the batcher's payload redactor (it goes straight to
+    // reportState), so the runner scrubs it directly. A raw SDK error can carry a
+    // live secret and run long — this is the defense-in-depth gap PRD #12 widened.
+    const OAUTH = "dummy-oauth-secret-fail-000000";
+    const PAT = "fixture-forge-pat-000000";
+    const { gitlab, calls } = fakeGitlab();
+    const boom: Executor = {
+      run: async () => {
+        throw new Error(`clone failed: oauth=${OAUTH} pat=${PAT} ${"x".repeat(1000)}`);
+      },
+    };
+    const claim = gitlabClaim(41, { secrets: { forge_pat: PAT, anthropic_oauth_token: OAUTH } });
+    await runner(boom, gitlab).execute(claim);
+
+    const reason =
+      api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")!.body.failure_reason ?? "";
+    assert.ok(!reason.includes(OAUTH), "the OAuth token must not reach reportState");
+    assert.ok(!reason.includes(PAT), "the forge PAT must not reach reportState");
+    assert.ok(reason.includes("***REDACTED***"), "the secret should be redacted in place");
+    assert.ok(reason.length <= 512, `failure_reason must be capped at 512 (got ${reason.length})`);
+    assert.strictEqual(calls.length, 0, "no MR on failure");
+  });
+
   it("redacts the OAuth token AND the worker join token from emitted messages", async () => {
     const OAUTH = "dummy-oauth-token-runner-000000";
     const JOIN_TOKEN = "dummy-join-token-runner-111111";

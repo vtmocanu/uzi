@@ -26,6 +26,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -144,6 +145,14 @@ func run() error {
 	liveHub := hub.New()
 	wsvc.SetBroadcaster(liveHub)
 
+	// Board column automation (PRD #12): reacts to run status changes with
+	// forge-first label moves, plus a reconcile loop that retries moves a down
+	// forge dropped. Wired into workersvc as the status-change hook and run as its
+	// own goroutine, isolated from the liveness sweep so a stalled forge never
+	// delays worker-loss recovery.
+	lifecycle := runlifecycle.New(q, svc)
+	wsvc.SetLifecycle(lifecycle)
+
 	// Background sync engine: pulls forge changes into the issue cache for every
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
 	// pool is closed (a mid-tick query must not race pool.Close).
@@ -156,7 +165,7 @@ func run() error {
 	sweep.Boot(ctx)
 
 	var bgWG sync.WaitGroup
-	bgWG.Add(2)
+	bgWG.Add(3)
 	go func() {
 		defer bgWG.Done()
 		engine.Run(ctx)
@@ -164,6 +173,10 @@ func run() error {
 	go func() {
 		defer bgWG.Done()
 		sweep.Run(ctx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		lifecycle.RunReconciler(ctx)
 	}()
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
@@ -201,8 +214,12 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
 		runErr = err
 	}
-	stop() // cancel ctx so the poller + sweeper Run return (covers the server-error path too)
+	stop() // cancel ctx so the poller + sweeper + reconciler Run return (covers the server-error path too)
 	bgWG.Wait()
+	// The HTTP server has drained, so no new inline Notify can be fired; wait for
+	// any in-flight ones to finish before the deferred pool.Close so they don't
+	// race a closing pool.
+	lifecycle.Wait()
 	return runErr
 }
 

@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
@@ -52,6 +54,56 @@ type cardDTO struct {
 	// Conflict flags an issue that arrived carrying more than one column label;
 	// it is shown in the highest-positioned one until the next move normalizes it.
 	Conflict bool `json:"conflict"`
+	// LatestRun is the newest run for this issue, or null when it has never run.
+	// It carries only display state (no secrets); the run-view link is owner-only,
+	// so IsMine tells the client whether the viewer may open it.
+	LatestRun *latestRunDTO `json:"latest_run"`
+}
+
+// latestRunDTO is the run summary a card carries (PRD #12 M2), so the board needs
+// no second listRuns fan-in. OwnerName drives the "started by X" treatment;
+// IsMine gates the run-view link (a non-owner would 403 on GetRunByIDForUser).
+type latestRunDTO struct {
+	ID            string    `json:"id"`
+	Status        string    `json:"status"`
+	MrIID         *int64    `json:"mr_iid"`
+	FailureReason *string   `json:"failure_reason"`
+	OwnerName     string    `json:"owner_name"`
+	WorkerName    *string   `json:"worker_name"`
+	IsMine        bool      `json:"is_mine"`
+	// RunCount is how many runs the issue has had (this run being the newest). >1
+	// drives the board's "×N" retry hint; full history lives in the issue view.
+	RunCount      int64     `json:"run_count"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// mapLatestRun builds the card's run summary from the shared run + owner + worker
+// columns the board and single-card queries both return. viewerID is the board
+// viewer; IsMine is set when the run belongs to them (only then does the client
+// render the run-view link). ownerName prefers the display name, falling back to
+// the email, so "started by X" is never blank.
+func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, failureReason, ownerName, ownerEmail, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+	dto := &latestRunDTO{
+		ID:            runID.String(),
+		Status:        status,
+		FailureReason: textPtrValue(failureReason.Valid, failureReason.String),
+		WorkerName:    textPtrValue(workerName.Valid, workerName.String),
+		IsMine:        ownerID == viewerID,
+		RunCount:      runCount,
+		CreatedAt:     createdAt.Time,
+		UpdatedAt:     updatedAt.Time,
+	}
+	if mrIID.Valid {
+		v := mrIID.Int64
+		dto.MrIID = &v
+	}
+	if ownerName.Valid && ownerName.String != "" {
+		dto.OwnerName = ownerName.String
+	} else if ownerEmail.Valid {
+		dto.OwnerName = ownerEmail.String
+	}
+	return dto
 }
 
 type boardDTO struct {
@@ -85,13 +137,95 @@ func (h *Handler) GetBoard(w http.ResponseWriter, r *http.Request) {
 		if !h.seedBoard(w, r, repo) {
 			return
 		}
+	} else if !h.ensureHumanReviewColumn(w, r, repo) {
+		// Boards seeded before PRD #12 lack the Human Review column the automation
+		// parks completed runs in; add it on load. Freshly seeded boards already
+		// carry it (it is in DefaultColumns), so this only runs for older boards.
+		return
 	}
 
-	board, ok := h.buildBoard(w, r, repo)
+	b, ok := h.buildBoard(w, r, repo)
 	if !ok {
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"board": board})
+	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
+}
+
+// ensureHumanReviewColumn makes sure the repo's board has the Human Review column
+// (label on the forge + board_columns row), positioned right after In Progress.
+// It is idempotent: once present, later loads see it and return without touching
+// the forge. A forge outage is non-fatal — the board still renders with its
+// existing columns and the next successful load ensures the column. Returns false
+// (after writing an error) only on a DB failure.
+func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request, repo store.GetRepoForUserRow) bool {
+	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
+	if err != nil {
+		slog.Error("list board columns", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	pos, needed := humanReviewPlacement(cols)
+	if !needed {
+		return true // already present — idempotent, no forge or DB work
+	}
+
+	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		slog.Error("build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	// Color matches DefaultColumns' Human Review entry.
+	if err := f.EnsureLabels(r.Context(), repo.ForgeProjectID, []forge.Label{{Name: board.ColumnHumanReview, Color: "#6e49cb"}}); err != nil {
+		slog.Warn("ensure Human Review label on the forge", "repo", repo.PathWithNamespace, "error", err)
+		return true // non-fatal: render with existing columns, retry next load
+	}
+	// Bump the columns Human Review displaces (the backlog buckets) up one so the
+	// new column lands right after In Progress with a distinct position — the same
+	// order fresh boards seed (In Progress, Human Review, then the rest). The shift
+	// is a no-op when appending (In Progress absent).
+	if err := h.q.ShiftBoardColumnsFrom(r.Context(), store.ShiftBoardColumnsFromParams{
+		RepoID:       repo.ID,
+		FromPosition: int32(pos),
+	}); err != nil {
+		slog.Error("shift board columns for Human Review", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	if err := h.q.InsertBoardColumn(r.Context(), store.InsertBoardColumnParams{
+		RepoID:    repo.ID,
+		LabelName: board.ColumnHumanReview,
+		Position:  int32(pos),
+	}); err != nil {
+		slog.Error("insert Human Review board column", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	return true
+}
+
+// humanReviewPlacement decides whether the Human Review column must be added to a
+// board and at what position. needed is false when the column is already present
+// (which is what makes the retrofit idempotent — no re-shift on later loads).
+// Otherwise the position is right after In Progress, or the end of the board when
+// In Progress is somehow absent.
+func humanReviewPlacement(cols []store.BoardColumn) (pos int, needed bool) {
+	inProgressPos, maxPos := -1, -1
+	for _, c := range cols {
+		if c.LabelName == board.ColumnHumanReview {
+			return 0, false // already present
+		}
+		if c.LabelName == board.ColumnInProgress {
+			inProgressPos = int(c.Position)
+		}
+		if int(c.Position) > maxPos {
+			maxPos = int(c.Position)
+		}
+	}
+	if inProgressPos < 0 {
+		return maxPos + 1, true // In Progress absent → append at the end
+	}
+	return inProgressPos + 1, true
 }
 
 // seedBoard creates the default column labels on the forge, records them as
@@ -141,6 +275,12 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return boardDTO{}, false
 	}
+	runRows, err := h.q.ListLatestRunsForRepo(r.Context(), repo.ID)
+	if err != nil {
+		slog.Error("list latest runs", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return boardDTO{}, false
+	}
 
 	columns := make([]columnDTO, 0, len(cols))
 	position := make(map[string]int, len(cols))
@@ -149,30 +289,9 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		position[c.LabelName] = int(c.Position)
 	}
 
-	cards := make([]cardDTO, 0, len(issues))
-	for _, is := range issues {
-		var labels []string
-		if err := json.Unmarshal(is.Labels, &labels); err != nil {
-			labels = []string{}
-		}
-		col, closed, conflict := resolveColumn(labels, is.State, position)
-		card := cardDTO{
-			IID:        is.ForgeIssueIid,
-			Title:      is.Title,
-			State:      is.State,
-			Labels:     labels,
-			WebURL:     is.WebUrl,
-			HasPRDLink: is.HasPrdLink,
-			Column:     col,
-			Closed:     closed,
-			Conflict:   conflict,
-		}
-		if is.Author.Valid {
-			a := is.Author.String
-			card.Author = &a
-		}
-		cards = append(cards, card)
-	}
+	// repo.UserID is the board viewer (the connection owner); IsMine gates the
+	// owner-only run-view link.
+	cards := assembleCards(issues, runRows, position, repo.UserID)
 
 	return boardDTO{
 		RepoID:  repo.ID.String(),
@@ -183,30 +302,44 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	}, true
 }
 
-// resolveColumn decides which column a card belongs to. Closed issues go to the
-// implicit Closed column regardless of labels. Otherwise the card sits in its
-// single column label, or Open ("") if it has none. An issue carrying more than
-// one column label is shown in the highest-positioned one and flagged as a
-// conflict until the next move normalizes it.
-func resolveColumn(labels []string, state string, position map[string]int) (column string, closed bool, conflict bool) {
-	if state == "closed" {
-		return "", true, false
+// assembleCards builds the board's cards from the cached issues, the newest run
+// per issue (runRows, one row per issue that has run), the column position map,
+// and the board viewer. It is the pure, DB-free core of the board payload: it
+// keys each issue's latest_run by issue_iid (issues with no run get null), and
+// resolves each card's column. viewerID drives IsMine.
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, position map[string]int, viewerID uuid.UUID) []cardDTO {
+	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
+	for _, rr := range runRows {
+		latestByIID[rr.IssueIid] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
+			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
-	best := ""
-	bestPos := -1
-	matches := 0
-	for _, l := range labels {
-		pos, isCol := position[l]
-		if !isCol {
-			continue
+
+	cards := make([]cardDTO, 0, len(issues))
+	for _, is := range issues {
+		var labels []string
+		if err := json.Unmarshal(is.Labels, &labels); err != nil {
+			labels = []string{}
 		}
-		matches++
-		if pos > bestPos {
-			bestPos = pos
-			best = l
+		col, closed, conflict := board.ResolveColumn(labels, is.State, position)
+		card := cardDTO{
+			IID:        is.ForgeIssueIid,
+			Title:      is.Title,
+			State:      is.State,
+			Labels:     labels,
+			WebURL:     is.WebUrl,
+			HasPRDLink: is.HasPrdLink,
+			Column:     col,
+			Closed:     closed,
+			Conflict:   conflict,
+			LatestRun:  latestByIID[is.ForgeIssueIid],
 		}
+		if is.Author.Valid {
+			a := is.Author.String
+			card.Author = &a
+		}
+		cards = append(cards, card)
 	}
-	return best, false, matches > 1
+	return cards
 }
 
 type configureColumnsRequest struct {
@@ -283,11 +416,11 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	board, ok := h.buildBoard(w, r, repo)
+	b, ok := h.buildBoard(w, r, repo)
 	if !ok {
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"board": board})
+	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
 }
 
 // ── Move ────────────────────────────────────────────────────────────────────
@@ -352,12 +485,6 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	var labels []string
-	if err := json.Unmarshal(issue.Labels, &labels); err != nil {
-		labels = []string{}
-	}
-
-	add, remove, newLabels := planLabelMove(labels, columnSet, target)
 
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
@@ -365,81 +492,40 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// Forge-first: apply the label change remotely before touching the cache.
-	// On failure the cache is untouched and the client snaps the card back.
-	if err := f.UpdateIssueLabels(r.Context(), repo.ForgeProjectID, iid, add, remove); err != nil {
+	// Forge-first single-column move + cache snapshot, shared with the run
+	// automation (forgesvc.AutoMove). On failure the cache is untouched and the
+	// client snaps the card back.
+	updated, err := h.svc.AutoMove(r.Context(), f, repo.ForgeProjectID, issue, cols, target)
+	if err != nil {
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())
 		return
 	}
-
-	labelsJSON, err := json.Marshal(newLabels)
-	if err != nil {
-		slog.Error("marshal labels", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	updated, err := h.q.UpsertIssue(r.Context(), store.UpsertIssueParams{
-		RepoID:         repo.ID,
-		ForgeIssueIid:  issue.ForgeIssueIid,
-		Title:          issue.Title,
-		State:          issue.State,
-		Labels:         labelsJSON,
-		WebUrl:         issue.WebUrl,
-		Author:         issue.Author,
-		HasPrdLink:     issue.HasPrdLink,
-		ForgeUpdatedAt: issue.ForgeUpdatedAt,
-	})
-	if err != nil {
-		slog.Error("upsert issue after move", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+	// A manual drag is the operator's explicit intent and overrides any pending
+	// automatic move: clear the lifecycle's pending markers for this issue's runs
+	// so the reconcile loop stops trying to reposition the card the human placed.
+	if _, err := h.q.ClearIssueRunsMovePending(r.Context(), store.ClearIssueRunsMovePendingParams{
+		RepoID:   repo.ID,
+		IssueIid: iid,
+	}); err != nil {
+		// Non-fatal: the move already landed; a stray marker is at worst one
+		// reconcile attempt that the manual-drag guard itself skips.
+		slog.Warn("clear pending column moves after manual drag", "error", err)
 	}
 
 	position := make(map[string]int, len(cols))
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"card": issueToCard(updated, position)})
-}
-
-// planLabelMove computes the atomic add/remove sets for a single-column move and
-// the resulting label set for the cache. add is the target column (if not
-// already present); remove is every OTHER column label the issue currently
-// carries. Moving to Open (target == "") removes all column labels and adds none.
-func planLabelMove(current []string, columnSet map[string]struct{}, target string) (add, remove, newLabels []string) {
-	has := map[string]struct{}{}
-	for _, l := range current {
-		has[l] = struct{}{}
+	card := issueToCard(updated, position)
+	// Carry the issue's latest run on the single-card response too, so a drag never
+	// blanks the run badge the board is showing (the client replaces the card).
+	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: iid}); err == nil {
+		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
+			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Warn("latest run for moved card", "error", err)
 	}
-	// remove: current column labels that are not the target.
-	for _, l := range current {
-		if _, isCol := columnSet[l]; isCol && l != target {
-			remove = append(remove, l)
-		}
-	}
-	// add: the target, if set and not already present.
-	if target != "" {
-		if _, present := has[target]; !present {
-			add = append(add, target)
-		}
-	}
-	// newLabels: current minus removed, plus target.
-	removeSet := map[string]struct{}{}
-	for _, l := range remove {
-		removeSet[l] = struct{}{}
-	}
-	for _, l := range current {
-		if _, dropped := removeSet[l]; dropped {
-			continue
-		}
-		newLabels = append(newLabels, l)
-	}
-	if target != "" {
-		if _, present := has[target]; !present {
-			newLabels = append(newLabels, target)
-		}
-	}
-	return add, remove, newLabels
+	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 
 // issueToCard resolves a cached issue row into a card DTO.
@@ -448,7 +534,7 @@ func issueToCard(is store.Issue, position map[string]int) cardDTO {
 	if err := json.Unmarshal(is.Labels, &labels); err != nil {
 		labels = []string{}
 	}
-	col, closed, conflict := resolveColumn(labels, is.State, position)
+	col, closed, conflict := board.ResolveColumn(labels, is.State, position)
 	card := cardDTO{
 		IID:        is.ForgeIssueIid,
 		Title:      is.Title,
@@ -487,11 +573,11 @@ func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "sync failed: "+err.Error())
 		return
 	}
-	board, ok := h.buildBoard(w, r, repo)
+	b, ok := h.buildBoard(w, r, repo)
 	if !ok {
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"board": board})
+	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

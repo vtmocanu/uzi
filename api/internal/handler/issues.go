@@ -7,8 +7,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -105,4 +108,92 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		position[c.LabelName] = int(c.Position)
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position)})
+}
+
+// issueDetailDTO is the in-app issue view payload (PRD #12 §3): the board card
+// fields plus the issue Description. The description is fetched live from the
+// forge and never cached (it carries the PRD link and is the basis for deciding
+// to run); the SPA renders it as markdown.
+type issueDetailDTO struct {
+	IID         int64    `json:"iid"`
+	Title       string   `json:"title"`
+	State       string   `json:"state"`
+	Labels      []string `json:"labels"`
+	WebURL      string   `json:"web_url"`
+	Author      *string  `json:"author"`
+	HasPRDLink  bool     `json:"has_prd_link"`
+	Column      string   `json:"column"`
+	Closed      bool     `json:"closed"`
+	Conflict    bool     `json:"conflict"`
+	Description string   `json:"description"`
+}
+
+// buildIssueDetail assembles the issue-view payload from a freshly-fetched forge
+// issue and the repo's column position map, resolving the card's column and
+// computing has_prd_link the same way the board and sync paths do. Pure (no DB or
+// forge I/O) so the resolution is unit-tested directly — the handler itself can't
+// be, since h.q is a concrete *store.Queries.
+func buildIssueDetail(issue forge.Issue, position map[string]int) issueDetailDTO {
+	col, closed, conflict := board.ResolveColumn(issue.Labels, issue.State, position)
+	labels := issue.Labels
+	if labels == nil {
+		labels = []string{}
+	}
+	dto := issueDetailDTO{
+		IID:         issue.IID,
+		Title:       issue.Title,
+		State:       issue.State,
+		Labels:      labels,
+		WebURL:      issue.WebURL,
+		HasPRDLink:  forgesvc.HasPRDLink(issue.Description),
+		Column:      col,
+		Closed:      closed,
+		Conflict:    conflict,
+		Description: issue.Description,
+	}
+	if issue.Author != "" {
+		a := issue.Author
+		dto.Author = &a
+	}
+	return dto
+}
+
+// GetIssueDetail returns one issue's card fields plus its Description, read live
+// from the forge via the connection PAT (the description is never cached). Powers
+// the in-app issue view (PRD #12 §3); the run history is a separate ListRuns call
+// with the ?repo_id=&issue_iid= filters. Owner-scoped like the rest of the board
+// endpoints (repoForRequest authorizes the repo to the current user).
+func (h *Handler) GetIssueDetail(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	iid, err := parseInt64(chi.URLParam(r, "iid"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid issue id")
+		return
+	}
+	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		slog.Error("build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	issue, err := f.GetIssue(r.Context(), repo.ForgeProjectID, iid)
+	if err != nil {
+		// err is already PAT-redacted by the driver.
+		httpx.Error(w, http.StatusBadGateway, "could not read the issue from the forge: "+err.Error())
+		return
+	}
+	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
+	if err != nil {
+		slog.Error("list board columns", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	position := make(map[string]int, len(cols))
+	for _, c := range cols {
+		position[c.LabelName] = int(c.Position)
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"issue": buildIssueDetail(issue, position)})
 }

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { makeRedactor } from "../src/redact.js";
+import { makeRedactor, makeTextRedactor } from "../src/redact.js";
 
 const TOKEN = "dummy-oauth-token-do-not-scan-0000";
 const PAT = "dummy-forge-pat-do-not-scan-1111";
@@ -30,5 +30,20 @@ describe("makeRedactor", () => {
   it("ignores secrets shorter than 8 chars (would corrupt unrelated output)", () => {
     const redact = makeRedactor(["short"]);
     assert.deepStrictEqual(redact({ v: "short and sweet" }), { v: "short and sweet" });
+  });
+});
+
+describe("makeTextRedactor", () => {
+  it("scrubs secret substrings from a bare string (e.g. a failure_reason)", () => {
+    const redact = makeTextRedactor([TOKEN, PAT]);
+    assert.strictEqual(
+      redact(`fatal: auth failed with ${PAT} and ${TOKEN}`),
+      `fatal: auth failed with ${REDACTED} and ${REDACTED}`,
+    );
+  });
+
+  it("is an identity when no usable secret is supplied", () => {
+    const redact = makeTextRedactor([undefined, null, "", "short"]);
+    assert.strictEqual(redact(`keeps ${TOKEN}`), `keeps ${TOKEN}`);
   });
 });

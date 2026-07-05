@@ -29,9 +29,10 @@ type runsStore struct {
 	ownerID    uuid.UUID
 	run        store.Run
 	msgs       []store.RunMessage
-	userRuns   []store.ListRunsForUserRow
-	allWorkers []store.ListAllWorkersRow
-	activeRuns []store.ListActiveRunsAllRow
+	userRuns    []store.ListRunsForUserRow
+	lastRunsArg *store.ListRunsForUserParams
+	allWorkers  []store.ListAllWorkersRow
+	activeRuns  []store.ListActiveRunsAllRow
 }
 
 func (s *runsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -49,7 +50,8 @@ func (s *runsStore) GetRunByID(_ context.Context, id uuid.UUID) (store.Run, erro
 func (s *runsStore) ListRunMessagesAfter(context.Context, store.ListRunMessagesAfterParams) ([]store.RunMessage, error) {
 	return s.msgs, nil
 }
-func (s *runsStore) ListRunsForUser(context.Context, uuid.UUID) ([]store.ListRunsForUserRow, error) {
+func (s *runsStore) ListRunsForUser(_ context.Context, arg store.ListRunsForUserParams) ([]store.ListRunsForUserRow, error) {
+	s.lastRunsArg = &arg
 	return s.userRuns, nil
 }
 func (s *runsStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
@@ -198,6 +200,52 @@ func TestListRunsReturnsUsersRuns(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "grp/repo") || !strings.Contains(rec.Body.String(), "laptop") {
 		t.Fatalf("ListRuns body missing display fields: %q", rec.Body.String())
+	}
+	// No query params → both narrowings NULL (the unchanged full list).
+	if st.lastRunsArg == nil || st.lastRunsArg.RepoID.Valid || st.lastRunsArg.IssueIid.Valid {
+		t.Fatalf("unfiltered ListRuns must pass NULL narrowings, got %+v", st.lastRunsArg)
+	}
+	if st.lastRunsArg.UserID != user.ID {
+		t.Fatalf("ListRuns must scope to the requesting user")
+	}
+}
+
+func TestListRunsThreadsRepoIssueFilters(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	repoID := uuid.New()
+	st := &runsStore{}
+	h := newRunsHandler(t, st)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/runs?repo_id="+repoID.String()+"&issue_iid=42", nil)
+	h.ListRuns(rec, req.WithContext(mw.ContextWithUser(req.Context(), user)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListRuns = %d, want 200", rec.Code)
+	}
+	if st.lastRunsArg == nil {
+		t.Fatal("ListRunsForUser not called")
+	}
+	if !st.lastRunsArg.RepoID.Valid || uuid.UUID(st.lastRunsArg.RepoID.Bytes) != repoID {
+		t.Fatalf("repo_id filter not threaded: %+v", st.lastRunsArg.RepoID)
+	}
+	if !st.lastRunsArg.IssueIid.Valid || st.lastRunsArg.IssueIid.Int64 != 42 {
+		t.Fatalf("issue_iid filter not threaded: %+v", st.lastRunsArg.IssueIid)
+	}
+}
+
+func TestListRunsRejectsMalformedFilters(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	for _, q := range []string{"?repo_id=not-a-uuid", "?issue_iid=abc"} {
+		st := &runsStore{}
+		h := newRunsHandler(t, st)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/runs"+q, nil)
+		h.ListRuns(rec, req.WithContext(mw.ContextWithUser(req.Context(), user)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("ListRuns%s = %d, want 400", q, rec.Code)
+		}
+		if st.lastRunsArg != nil {
+			t.Fatalf("a malformed filter must reject before hitting the store (%s)", q)
+		}
 	}
 }
 

@@ -123,6 +123,61 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 	return i, err
 }
 
+const getLatestRunForIssue = `-- name: GetLatestRunForIssue :one
+SELECT r.id, r.user_id, r.status, r.mr_iid, r.failure_reason, r.created_at, r.updated_at,
+       ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
+       COUNT(*) OVER () AS run_count
+FROM runs r
+LEFT JOIN users ru ON ru.id = r.user_id
+LEFT JOIN workers rw ON rw.id = r.worker_id
+WHERE r.repo_id = $1 AND r.issue_iid = $2
+ORDER BY r.created_at DESC
+LIMIT 1
+`
+
+type GetLatestRunForIssueParams struct {
+	RepoID   uuid.UUID `json:"repo_id"`
+	IssueIid int64     `json:"issue_iid"`
+}
+
+type GetLatestRunForIssueRow struct {
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	Status        string             `json:"status"`
+	MrIid         pgtype.Int8        `json:"mr_iid"`
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	OwnerName     pgtype.Text        `json:"owner_name"`
+	OwnerEmail    pgtype.Text        `json:"owner_email"`
+	WorkerName    pgtype.Text        `json:"worker_name"`
+	RunCount      int64              `json:"run_count"`
+}
+
+// One issue's newest run with the same display fields as the board lateral join,
+// for the single-card responses (e.g. after a manual drag) so a card never loses
+// its run badge on partial updates. run_count mirrors ListLatestRunsForRepo (a
+// window count over the issue's runs, already scoped to one issue by the WHERE) so
+// the "×N" retry hint survives a drag. Returns no rows when the issue has never run.
+func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForIssueParams) (GetLatestRunForIssueRow, error) {
+	row := q.db.QueryRow(ctx, getLatestRunForIssue, arg.RepoID, arg.IssueIid)
+	var i GetLatestRunForIssueRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Status,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OwnerName,
+		&i.OwnerEmail,
+		&i.WorkerName,
+		&i.RunCount,
+	)
+	return i, err
+}
+
 const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
@@ -386,6 +441,79 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 	return items, nil
 }
 
+const listLatestRunsForRepo = `-- name: ListLatestRunsForRepo :many
+SELECT DISTINCT ON (r.issue_iid)
+       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.failure_reason,
+       r.created_at, r.updated_at,
+       ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
+       COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
+FROM runs r
+LEFT JOIN users ru ON ru.id = r.user_id
+LEFT JOIN workers rw ON rw.id = r.worker_id
+WHERE r.repo_id = $1
+ORDER BY r.issue_iid, r.created_at DESC
+`
+
+type ListLatestRunsForRepoRow struct {
+	IssueIid      int64              `json:"issue_iid"`
+	ID            uuid.UUID          `json:"id"`
+	UserID        uuid.UUID          `json:"user_id"`
+	Status        string             `json:"status"`
+	MrIid         pgtype.Int8        `json:"mr_iid"`
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	OwnerName     pgtype.Text        `json:"owner_name"`
+	OwnerEmail    pgtype.Text        `json:"owner_email"`
+	WorkerName    pgtype.Text        `json:"worker_name"`
+	RunCount      int64              `json:"run_count"`
+}
+
+// The board payload's run half (PRD #12 M2): the newest run per issue for a repo,
+// one row per issue that has ever run. DISTINCT ON picks the newest by created_at
+// via the composite index runs (repo_id, issue_iid, created_at DESC). Every row
+// here genuinely has a run, so id/user_id/status are non-null (a LEFT JOIN LATERAL
+// onto issues would leave them NULL for issues with no run, which sqlc mistypes as
+// non-null and would then panic on scan — so the caller maps these onto issues in
+// Go instead, and issues with no run simply render latest_run: null). owner
+// name/email + worker name ride along for the "started by X" treatment; user_id
+// lets the caller flag viewer ownership. run_count is a window count over each
+// issue's runs (evaluated before DISTINCT ON, so it survives the newest-row pick)
+// and drives the board's "×N" retry hint without a per-issue history fan-in. Only
+// display fields — never session_id, plan_md, or any secret.
+func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) ([]ListLatestRunsForRepoRow, error) {
+	rows, err := q.db.Query(ctx, listLatestRunsForRepo, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListLatestRunsForRepoRow{}
+	for rows.Next() {
+		var i ListLatestRunsForRepoRow
+		if err := rows.Scan(
+			&i.IssueIid,
+			&i.ID,
+			&i.UserID,
+			&i.Status,
+			&i.MrIid,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.OwnerName,
+			&i.OwnerEmail,
+			&i.WorkerName,
+			&i.RunCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -453,6 +581,26 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.Enabled,
 	)
 	return i, err
+}
+
+const shiftBoardColumnsFrom = `-- name: ShiftBoardColumnsFrom :exec
+UPDATE board_columns SET position = position + 1
+WHERE repo_id = $1 AND position >= $2
+`
+
+type ShiftBoardColumnsFromParams struct {
+	RepoID       uuid.UUID `json:"repo_id"`
+	FromPosition int32     `json:"from_position"`
+}
+
+// Make room to insert a column at @from_position by bumping every column at or
+// after it up by one. The Human Review retrofit (GetBoard) uses this so the new
+// column lands right after In Progress with a distinct position instead of tying
+// the column it displaces (position is not unique and ORDER BY would then be
+// arbitrary).
+func (q *Queries) ShiftBoardColumnsFrom(ctx context.Context, arg ShiftBoardColumnsFromParams) error {
+	_, err := q.db.Exec(ctx, shiftBoardColumnsFrom, arg.RepoID, arg.FromPosition)
+	return err
 }
 
 const touchForgeConnectionVerified = `-- name: TouchForgeConnectionVerified :one

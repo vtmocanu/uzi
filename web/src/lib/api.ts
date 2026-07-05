@@ -70,6 +70,22 @@ export interface BoardColumn {
   position: number;
 }
 
+// LatestRun is the newest run for a card's issue (PRD #12 M2), or null when the
+// issue has never run. Display-only: no secrets. is_mine gates the in-app run-view
+// link (a non-owner would 403 on the run); run_count drives the "×N" retry hint.
+export interface LatestRun {
+  id: string;
+  status: RunStatus;
+  mr_iid: number | null;
+  failure_reason: string | null;
+  owner_name: string;
+  worker_name: string | null;
+  is_mine: boolean;
+  run_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Card {
   iid: number;
   title: string;
@@ -81,6 +97,7 @@ export interface Card {
   column: string;
   closed: boolean;
   conflict: boolean;
+  latest_run: LatestRun | null;
 }
 
 export interface Board {
@@ -89,6 +106,24 @@ export interface Board {
   web_url: string;
   columns: BoardColumn[];
   cards: Card[];
+}
+
+// IssueDetail is the in-app issue view payload (PRD #12 §3): the board card
+// fields plus the issue description (rendered as markdown; it carries the PRD
+// link). Fetched live from the forge, so unlike a board card it has no latest_run
+// — the issue view shows full run history from a separate listRuns call instead.
+export interface IssueDetail {
+  iid: number;
+  title: string;
+  state: string;
+  labels: string[];
+  web_url: string;
+  author: string | null;
+  has_prd_link: boolean;
+  column: string;
+  closed: boolean;
+  conflict: boolean;
+  description: string;
 }
 
 export interface ForgeConfig {
@@ -298,6 +333,8 @@ export const api = {
   getBoard: (repoId: string) => request<{ board: Board }>("GET", `/repos/${repoId}/board`),
   configureColumns: (repoId: string, columns: { label_name: string }[]) =>
     request<{ board: Board }>("PUT", `/repos/${repoId}/board/columns`, { columns }),
+  getIssue: (repoId: string, iid: number) =>
+    request<{ issue: IssueDetail }>("GET", `/repos/${repoId}/issues/${iid}`),
   moveIssue: (repoId: string, iid: number, toColumn: string) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/move`, { to_column: toColumn }),
   syncRepo: (repoId: string) => request<{ board: Board }>("POST", `/repos/${repoId}/sync`),
@@ -312,7 +349,13 @@ export const api = {
 
   createRun: (repoId: string, issueIid: number) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, { issue_iid: issueIid }),
-  listRuns: () => request<{ runs: RunListItem[] }>("GET", "/runs"),
+  listRuns: (params?: { repoId?: string; issueIid?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.repoId) q.set("repo_id", params.repoId);
+    if (params?.issueIid != null) q.set("issue_iid", String(params.issueIid));
+    const qs = q.toString();
+    return request<{ runs: RunListItem[] }>("GET", qs ? `/runs?${qs}` : "/runs");
+  },
   getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),
   getRunMessages: (id: string, afterSeq = 0) =>
     request<{ messages: RunMessage[] }>(
