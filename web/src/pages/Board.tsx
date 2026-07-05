@@ -306,7 +306,7 @@ export function Board() {
         description="Columns are GitLab labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here."
         actions={
           <>
-            <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted">
+            <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
               <input
                 type="checkbox"
                 checked={hideEmpty}
@@ -314,7 +314,7 @@ export function Board() {
                 className="h-3.5 w-3.5 rounded border-edge accent-brand"
               />
               Hide empty
-              {hiddenCount > 0 && <span className="text-faint">({hiddenCount} hidden)</span>}
+              {hiddenCount > 0 && <span className="text-muted">({hiddenCount} hidden)</span>}
             </label>
             <Button size="sm" onClick={() => setCreatingIssue((v) => !v)}>
               {creatingIssue ? (
