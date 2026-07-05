@@ -69,6 +69,16 @@ Tracked as GitLab issue vtmocanu/uzi#4; PRD at `prds/4-agent-runtime-workers.md`
 - Live run visibility: which agents are live/idle (+ best-effort "next"), the messages, plan-approval gate, stop, follow-up corrections; admins see all agents/runs, users see their own.
 - Each user runs their own worker (container), connected outbound to the server; worker↔server link should be encrypted. (MVP: join-token auth now; transport TLS deferred to remote-worker/ingress — deferral accepted by user 2026-07-04.)
 
+## Feature #5 — Access control: registration restrictions & PAT least-privilege
+
+Tracked as GitLab issue vtmocanu/uzi#5; PRD at `prds/5-access-control-pat-hardening.md`.
+
+- Registration restricted to a configurable email-domain allowlist (plan.md: "allow registration only from @example.com - configurable"; empty = all domains).
+- Registration can be enabled/disabled (kill-switch).
+- uzi verifies the bot PAT has no more permissions than needed for MRs, per repo, at save time and periodically afterwards (plan.md line 48).
+- Serves the primary directive: agents must not be able to modify main.
+- Scope (option A) chosen to run parallel to PRD #4.
+
 ## Feature #7 — In-app docs section
 
 Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/7-docs-section-webui.md`.
@@ -135,6 +145,5 @@ Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/done/24-mr-close-rework.md
 
 - Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
 - Forgejo driver (interface is forge-generic; GitLab implemented first).
-- Enable/disable registration for users.
 - SSO with Keycloak.
 - Agent runtime/execution (spawn, file writes, Anthropic API calls) — PRD #4.
