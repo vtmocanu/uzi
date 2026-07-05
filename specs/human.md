@@ -153,6 +153,16 @@ Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/19-admin-settings-and-auto
 - Each user self-declares their own forge (human) username on their connection (the mapping autopilot attributes runs to).
 - Attribution order: label adder first, issue author fallback.
 
+## Feature #22 — PRDLESS label: run an issue without a PRD link
+
+Tracked as GitLab issue vtmocanu/uzi#22; PRD at `prds/22-prdless-label.md`.
+
+- An escape-hatch label lets an issue run without a `prds/*.md` link.
+- Label name is configurable; the feature can be toggled on/off — both in admin settings.
+- Enabled by default (available out of the box).
+- Default label name: `PRDLESS`.
+- The label can be added/removed directly from the uzi web UI, not only in GitLab.
+
 ## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
 
 Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-sidebar-board.md`.
