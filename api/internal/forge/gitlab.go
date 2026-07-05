@@ -3,10 +3,16 @@ package forge
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
+
+// developerAccessLevel is GitLab's Developer role access level. The privilege
+// checker requires the bot to sit at exactly this level, and a protected default
+// branch must not admit push at or below it.
+const developerAccessLevel = int(gitlab.DeveloperPermissions) // 30
 
 // perPage is the pagination page size for every list call. 100 is GitLab's
 // maximum, minimizing round-trips on busy projects.
@@ -42,7 +48,68 @@ func (g *gitLab) VerifyToken(ctx context.Context) (BotIdentity, error) {
 	if err != nil {
 		return BotIdentity{}, g.redact.error(fmt.Errorf("gitlab: verify token: %w", err))
 	}
-	return BotIdentity{ForgeUserID: u.ID, Username: u.Username}, nil
+	// IsAdmin rides on the same GET /user response VerifyToken already makes:
+	// GitLab only returns is_admin:true for an admin caller, and omits it for a
+	// regular user, so the decoded bool is false for every compliant bot.
+	return BotIdentity{ForgeUserID: u.ID, Username: u.Username, IsAdmin: u.IsAdmin}, nil
+}
+
+func (g *gitLab) TokenInfo(ctx context.Context) (TokenInfo, error) {
+	t, resp, err := g.client.PersonalAccessTokens.GetSinglePersonalAccessToken(gitlab.WithContext(ctx))
+	if err != nil {
+		// A 404 here means the endpoint itself is absent (GitLab < 15.5), not that
+		// the token is bad — surface the distinct sentinel so the checker warns
+		// rather than blocks. The sentinel carries no token material.
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return TokenInfo{}, ErrTokenIntrospectionUnsupported
+		}
+		return TokenInfo{}, g.redact.error(fmt.Errorf("gitlab: token info: %w", err))
+	}
+	info := TokenInfo{
+		Scopes: append([]string(nil), t.Scopes...),
+		Active: t.Active && !t.Revoked,
+	}
+	if t.ExpiresAt != nil {
+		info.ExpiresAt = time.Time(*t.ExpiresAt)
+	}
+	return info, nil
+}
+
+func (g *gitLab) ProjectRole(ctx context.Context, projectID, forgeUserID int64) (int, bool, error) {
+	// members/all resolves EFFECTIVE membership (direct + inherited group), which
+	// is what actually governs what the bot can do — a group-inherited Maintainer
+	// role would be invisible to the direct-members endpoint.
+	m, resp, err := g.client.ProjectMembers.GetInheritedProjectMember(projectID, forgeUserID, gitlab.WithContext(ctx))
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			// Not a member (removed or demoted below any membership after the repo
+			// was enabled). Reported as a finding by the checker, not an error.
+			return 0, false, nil
+		}
+		return 0, false, g.redact.error(fmt.Errorf("gitlab: project role: %w", err))
+	}
+	return int(m.AccessLevel), true, nil
+}
+
+func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, branch string) (BranchProtection, error) {
+	pb, resp, err := g.client.ProtectedBranches.GetProtectedBranch(projectID, branch, gitlab.WithContext(ctx))
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			// No protection rule for this branch at all.
+			return BranchProtection{Protected: false}, nil
+		}
+		return BranchProtection{}, g.redact.error(fmt.Errorf("gitlab: branch protection: %w", err))
+	}
+	bp := BranchProtection{Protected: true}
+	for _, pl := range pb.PushAccessLevels {
+		lvl := int(pl.AccessLevel)
+		// A push level of 0 is "No one"; >= Maintainer (40) excludes a Developer
+		// bot. Only a nonzero level at or below Developer (30) lets the bot push.
+		if lvl > 0 && lvl <= developerAccessLevel {
+			bp.DevelopersCanPush = true
+		}
+	}
+	return bp, nil
 }
 
 func (g *gitLab) ListProjects(ctx context.Context) ([]Project, error) {

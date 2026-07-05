@@ -41,6 +41,15 @@ func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string
 func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
 	return nil
 }
+func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
+	return forge.TokenInfo{}, nil
+}
+func (f *fakeForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
+	return 0, false, nil
+}
+func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string) (forge.BranchProtection, error) {
+	return forge.BranchProtection{}, nil
+}
 
 // fakeSvc stands in for *forgesvc.Service. It records whether a client was built
 // (to prove the existing-connection path never re-verifies) and seals PATs with
