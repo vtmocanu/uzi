@@ -15,7 +15,7 @@ side; this exercises the real wire).
 Requirements: Docker + Compose v2, and `openssl`, `jq`, `git`, `curl` on the
 host. First run builds the `api`/`web`/`agent` images plus the tiny `forge-fake`
 image (a few minutes); later runs reuse the layer cache. On success it prints
-`All M6 E2E checks passed.` and tears everything down.
+`All E2E checks passed.` and tears everything down.
 
 Knobs (env vars):
 
@@ -31,6 +31,28 @@ Knobs (env vars):
 - `UZI_E2E_COMPLETE_TIMEOUT=<seconds>` — override how long to wait for the run to
   reach `completed` (default `90` for the stub, `1800` for the `sdk` executor).
 - `UZI_E2E_EXECUTOR=sdk` — the OPTIONAL live capstone (see below).
+- `E2E_FORGE_POLL_INTERVAL=<dur>` — the api's poll cadence (overlay default `24h`;
+  the MR-close phase sets `2s` internally and recreates the api). Overlay-only; the
+  production default is untouched.
+
+## Live-DB candidate-selection test (`run-store-it.sh`)
+
+The MR-close watcher's candidate-selection query (`ListMRWatchCandidates`) is the
+one piece with no live-DB coverage from the fake-store unit tests. `run-store-it.sh`
+spins up a **throwaway Postgres**, applies the real migrations, and asserts
+candidate selection directly — including **rework suppression** (a non-completed
+latest run yields no candidate) and the **no-superseded-MR-fallback** rule (a
+latest *completed* run with a NULL `mr_iid` yields none, never falling back to an
+older run's MR). It is isolated (unique container + loopback port, torn down on
+exit) and self-contained:
+
+```sh
+./e2e/run-store-it.sh
+```
+
+The Go test (`api/internal/store/mr_watch_integration_test.go`) skips cleanly under
+a plain `go test ./...` when `UZI_TEST_DATABASE_URL` is unset. The full PRD #24 gate
+is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
 
 ## What it asserts
 
@@ -54,14 +76,25 @@ Knobs (env vars):
    (`UZI_WORKER_TOKEN_FILE`), so it is absent from every process's
    `/proc/<pid>/environ`, and its delivery file was unlinked after read. See
    [../docs/proc-hardening.md](../docs/proc-hardening.md).
+8. **MR-close watcher (PRD #24)**: with the poller sped to ~2s, closing the
+   completed run's MR *without merging* (via forge-fake's `/_e2e` mutator) moves
+   the card **Human Review → In Progress**; reopening restores it
+   **In Progress → Human Review**; and a **manual drag wins** — after the card is
+   dragged to another column, reopening the MR does not fight the placement (the
+   reopen edge's source-column guard backs off). The candidate-selection SQL is
+   covered separately against a real Postgres — see `run-store-it.sh` below.
 
 ## How the fakes are wired (no real GitLab, no live session)
 
 - **`forge-fake`** (`e2e/forge-fake/`) serves, over HTTPS on `forge-fake.e2e:443`,
-  the GitLab v4 subset the api (verify/list/get/create issue) and the worker
-  (create/list merge request) call, and records what it saw at
-  `/tmp/forge-fake-state.json` (read for the MR assertion). HTTPS is real: the
-  api trusts the self-signed cert via `SSL_CERT_FILE`, the worker's `fetch` via
+  the GitLab v4 subset the api (verify/list/get/create issue, **single-MR GET**)
+  and the worker (create/list merge request) call. It applies issue label
+  add/remove **faithfully** (so a card move survives a poller reconcile), exposes
+  an `/_e2e/mrs/<iid>/state` mutator to flip an MR's state (the PRD #24 reviewer
+  stand-in), and records what it saw at `/state/state.json` — **persisted on a
+  bind mount** so the restart-resilience `down`/`up` does not make it forget
+  issues/MRs (a real forge wouldn't). HTTPS is real: the api trusts the
+  self-signed cert via `SSL_CERT_FILE`, the worker's `fetch` via
   `NODE_EXTRA_CA_CERTS`, so the worker's https-only MR guard is genuinely
   exercised.
 - **The git remote** is a local bare repo the harness seeds on the host; the
