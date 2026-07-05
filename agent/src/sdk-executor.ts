@@ -32,10 +32,9 @@ import { assembleAgents } from "./agents.js";
 import { buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
-import { enforceSkillCaps, materializeSkillsPlugin, qualifiedSkillName, skillsPluginDir, type SkillDrop } from "./skills-plugin.js";
-import { DROP_REPO_COLLISION, enumerateRepoSkills, repoSkillsDir } from "./repo-skills.js";
+import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
+import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import type { ClaimSkill } from "./protocol.js";
 import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
 import { errMessage } from "./util.js";
@@ -45,10 +44,6 @@ import { errMessage } from "./util.js";
 const DEFAULT_RUN_TIMEOUT_SECONDS = 2 * 60 * 60; // 2h
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60; // 10m
 const DEFAULT_MAX_ITERATIONS = 5; // PRD: RUN_MAX_ITERATIONS default 5
-// Skill caps (PRD #16). Fallbacks only when the claim omits config; the server
-// normally supplies both via ClaimConfig so the worker enforces the same limits.
-const DEFAULT_SKILL_MAX_BYTES = 65536;
-const DEFAULT_SKILLS_MAX_PER_RUN = 32;
 
 // Static (content-free) failure reasons — safe to persist as failure_reason.
 const REASON_WALL = "run exceeded its wall-clock timeout";
@@ -165,57 +160,21 @@ export class SdkExecutor implements Executor {
     const env = buildSdkEnv(oauthToken, this.homeDir);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
 
-    // Skills (PRD #16 M4 + M6). Assemble the run's skill set, materialize a local
-    // plugin dir OUTSIDE the clone (loads under `settingSources: []`, so the
-    // injection defense never loosens), and rebuild it on every claim incl.
-    // resume. The worker owns the gapless seq, so it logs every dropped skill.
-    const skillCaps = {
-      maxBytes: positive(ctx.config?.skill_max_bytes, DEFAULT_SKILL_MAX_BYTES),
-      maxPerRun: positive(ctx.config?.skills_max_per_run, DEFAULT_SKILLS_MAX_PER_RUN),
-    };
-    const deliveredSkills = ctx.skills ?? [];
-
-    // M6: repo-borne skills — only when the repo owner opted in. Skills only, at
-    // LOWEST precedence: a repo skill whose name collides with a delivered skill
-    // (or an earlier repo skill) is dropped and logged. Frontmatter is stripped to
-    // name+description; nothing else under the repo's .claude/ is read.
-    const repoDrops: SkillDrop[] = [];
-    const repoKept: ClaimSkill[] = [];
-    if (ctx.repoSkillsEnabled) {
-      const repo = await enumerateRepoSkills(repoSkillsDir(ctx.worktreePath), skillCaps.maxBytes);
-      repoDrops.push(...repo.dropped);
-      const seen = new Set(deliveredSkills.map((s) => s.name));
-      for (const rs of repo.skills) {
-        if (seen.has(rs.name)) {
-          repoDrops.push({ name: rs.name, reason: DROP_REPO_COLLISION });
-          continue;
-        }
-        seen.add(rs.name);
-        repoKept.push(rs);
-      }
-    }
-
-    // Delivered skills first (higher precedence), repo skills last, so the per-run
-    // count cap evicts repo skills first (the server already capped the delivered
-    // set, so only repo skills can overflow it).
-    const { kept: runSkills, dropped: capDrops } = enforceSkillCaps([...deliveredSkills, ...repoKept], skillCaps);
-    const survivorNames = new Set(runSkills.map((s) => s.name));
-    const skillsPluginPath = skillsPluginDir(ctx.worktreePath);
-    await materializeSkillsPlugin(skillsPluginPath, runSkills);
-    this.emitSkillDrops(ctx, [...repoDrops, ...capDrops]);
-
-    // Repo skills that actually survived (repo-origin AND not cap-evicted) attach
-    // to EVERY subagent — they carry no allocation, so they are all-templates
-    // (PRD §Worker point 3, User Journey #5: the coder subagent uses the repo's
-    // deploy-notes skill). A cap-evicted repo skill is absent here, so it reaches
-    // no subagent either.
-    const repoKeptNames = new Set(repoKept.map((s) => s.name));
-    const repoSurvivorNames = runSkills.filter((s) => repoKeptNames.has(s.name)).map((s) => s.name);
+    // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
+    // local plugin dir OUTSIDE the clone (loads under `settingSources: []`, so the
+    // injection defense never loosens), rebuilt on every claim incl. resume. The
+    // same prepareSkillPlugin path the stub executor uses, so the two never drift.
+    // The worker owns the gapless seq, so it logs every dropped skill.
+    const prepared = await prepareSkillPlugin(ctx, resolveSkillCaps(ctx.config));
+    const runSkills = prepared.runSkills;
+    const skillsPluginPath = prepared.pluginPath;
+    this.emitSkillDrops(ctx, prepared.drops);
 
     // Subagents: each def.skills is its allocated delivered skills (re-filtered to
     // the materialized survivors, so it never lists a uzi:<name> not in the plugin
-    // dir) plus the all-templates repo survivors.
-    const assembled = assembleAgents(ctx.agents ?? [], survivorNames, repoSurvivorNames);
+    // dir) plus the all-templates repo survivors (PRD §Worker point 3).
+    const survivorNames = new Set(runSkills.map((s) => s.name));
+    const assembled = assembleAgents(ctx.agents ?? [], survivorNames, prepared.repoSurvivorNames);
     const subagentNames = Object.keys(assembled.subagents);
 
     const baseOptions: SdkOptions = {

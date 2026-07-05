@@ -98,6 +98,23 @@ login() {
 apiget()  { curl -fsS -b "$JAR" "$BASE$1"; }
 apipost() { curl -fsS -b "$JAR" -X POST "$BASE$1" -H 'Content-Type: application/json' \
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+apiput()  { curl -fsS -b "$JAR" -X PUT "$BASE$1" -H 'Content-Type: application/json' \
+  -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+apipatch() { curl -fsS -b "$JAR" -X PATCH "$BASE$1" -H 'Content-Type: application/json' \
+  -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+# fresh_code METHOD PATH [BODY] — a non-admin (fresh user) request; prints only the
+# HTTP status (no -f), for authz assertions. CSRF from the fresh user's jar.
+fresh_code() {
+  local method="$1" p="$2" body="${3:-}" tok
+  tok="$(awk '$6=="uzi_csrf"{print $7}' "$FRESHJAR")"
+  if [ -n "$body" ]; then
+    curl -sS -b "$FRESHJAR" -o /dev/null -w '%{http_code}' -X "$method" "$BASE$p" \
+      -H 'Content-Type: application/json' -H "X-CSRF-Token: $tok" -d "$body"
+  else
+    curl -sS -b "$FRESHJAR" -o /dev/null -w '%{http_code}' -X "$method" "$BASE$p" \
+      -H 'Content-Type: application/json' -H "X-CSRF-Token: $tok"
+  fi
+}
 
 wait_http() {
   local deadline=$((SECONDS + 90))
@@ -205,7 +222,13 @@ seedwc="$RUNROOT/.seedwc"
 git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/repo.git" .seedwc
 git -C "$seedwc" checkout -q -b main
 printf '# repo\n\nSeeded by the uzi M6 E2E harness.\n' > "$seedwc/README.md"
-git -C "$seedwc" add README.md
+# A repo-borne skill for the PRD #16 M6 opt-in path. Carries a capability key
+# (allowed-tools) that MUST be stripped when the flag is on; the worker loads only
+# name+description. It stays invisible unless the repo owner enables repo skills.
+mkdir -p "$seedwc/.claude/skills/e2e-repo-skill"
+printf -- '---\nname: e2e-repo-skill\ndescription: A repo-borne skill for the M6 opt-in E2E.\nallowed-tools: Bash, Write\n---\n\n# E2E repo skill\n\nProves the repo-skill opt-in path end to end.\n' \
+  > "$seedwc/.claude/skills/e2e-repo-skill/SKILL.md"
+git -C "$seedwc" add README.md .claude
 git -C "$seedwc" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit"
 git -C "$seedwc" push -q origin main
 rm -rf "$seedwc"
@@ -304,6 +327,33 @@ PRIV_REPORT="$(apipost "/api/forge/connections/$CONN_ID/privilege-check" '')"
 echo "$PRIV_REPORT" | jq -e '.report.status == "ok"' >/dev/null 2>&1 \
   || fail "compliant connection privilege-check not ok: $PRIV_REPORT"
 pass "compliant connection reports least-privilege ✓"
+
+# --- PRD #16: skills authz (HTTP-glue status codes, live) ---------------------
+# The reviewer's M2 ask: pin the authz boundaries end to end, not just in unit
+# tests. Uses the fresh non-admin user registered above (FRESHJAR).
+say "PRD #16 skills authz: a non-admin cannot reach admin / other-user surfaces"
+TID="$(apiget /api/agent-templates | jq -r '.templates[0].id // empty')"
+[ -n "$TID" ] || fail "no agent template to authorize against"
+
+C="$(fresh_code POST /api/skills '{"name":"e2e-nope","description":"x.","body":"b\n","scope":"global"}')"
+[ "$C" = 403 ] || fail "non-admin POST /skills scope=global: expected 403, got $C"
+pass "non-admin POST /skills scope=global ⇒ 403"
+
+# The admin owns a private (user-scope) skill; a non-admin GET of it must 404
+# (existence hidden), never 403.
+PRIV_ID="$(apipost /api/skills '{"name":"e2e-admin-private","description":"x.","body":"b\n","scope":"user"}' | jq -r '.skill.id')"
+[ -n "$PRIV_ID" ] && [ "$PRIV_ID" != null ] || fail "admin could not create a private skill"
+C="$(fresh_code GET "/api/skills/$PRIV_ID")"
+[ "$C" = 404 ] || fail "non-admin GET of another user's private skill: expected 404, got $C"
+pass "non-admin GET of another user's private skill ⇒ 404"
+
+C="$(fresh_code PUT "/api/agent-templates/$TID/skills" '{"shared_skill_ids":[]}')"
+[ "$C" = 403 ] || fail "non-admin shared allocation: expected 403, got $C"
+pass "non-admin PUT shared allocation half ⇒ 403"
+
+C="$(fresh_code PATCH "/api/repos/$REPO_ID" '{"repo_skills_enabled":true}')"
+[ "$C" = 404 ] || fail "non-owner repo PATCH: expected 404, got $C"
+pass "non-owner non-admin PATCH /repos/{id} ⇒ 404"
 
 # --- cancel path (server-side, before any worker is online) ------------------
 say "cancel path: a queued run is cancelled server-side (no live poller)"
@@ -476,4 +526,59 @@ sleep 10
   || fail "watcher fought a manual drag: card #$IID left Later after the MR reopened"
 pass "manual drag wins: card #$IID stayed in Later despite the MR reopening"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close; executor=%s)\n' "$EXECUTOR"
+# =============================================================================
+# PRD #16 — skill delivery + repo-skill opt-in, end to end. The stub executor
+# synthesizes the plugin dir the SAME way the SDK executor does (shared
+# prepareSkillPlugin) and reports the skill dirs it materialized on disk, so
+# delivery is observable without a live Anthropic session.
+say "PRD #16: skill delivery (builtin allocated → claim → synthesized plugin dir)"
+
+# Allocate the builtin ci-cd-norms (shared) to a template. Claim assembly unions
+# every template's allocations for the run's user, so this reaches every run.
+SKILL_CICD_ID="$(apiget /api/skills | jq -r '.skills[] | select(.name=="ci-cd-norms") | .id')"
+[ -n "$SKILL_CICD_ID" ] && [ "$SKILL_CICD_ID" != null ] || fail "builtin ci-cd-norms skill was not seeded"
+apiput "/api/agent-templates/$TID/skills" "{\"shared_skill_ids\":[\"$SKILL_CICD_ID\"]}" >/dev/null
+pass "allocated builtin ci-cd-norms (shared) to template $TID"
+
+# plugin_skills RUN — the flattened plugin_skills arrays the stub reported (exactly
+# the skill dirs materialized under the synthesized plugin dir).
+plugin_skills() { apiget "/api/runs/$1/messages" | jq -c '[.messages[].payload.plugin_skills // empty] | flatten'; }
+
+# skill_run TITLE — new issue+run, park at the gate (the stub reports skills at run
+# START, before the gate), approve, and drive to completed (freeing the worker).
+skill_run() {
+  local iid run
+  iid="$(apipost "/api/repos/$REPO_ID/issues" "{\"title\":\"$1\",\"description\":\"skill e2e — prds/16-agent-skills.md\"}" | jq -r '.card.iid')"
+  run="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$iid}" | jq -r '.run.id')"
+  wait_status "$run" awaiting_approval
+  echo "$run"
+}
+
+# Repo skills OFF (default): the delivered builtin is materialized; the repo skill
+# (seeded in the clone's .claude/skills) is NOT.
+RUN_S1="$(skill_run 'E2E skill delivery (repo off)')"
+PS1="$(plugin_skills "$RUN_S1")"
+echo "$PS1" | jq -e 'index("ci-cd-norms") != null' >/dev/null \
+  || fail "delivered builtin absent from the synthesized plugin dir: $PS1"
+echo "$PS1" | jq -e 'index("e2e-repo-skill") == null' >/dev/null \
+  || fail "repo skill loaded while the opt-in flag is OFF: $PS1"
+apipost "/api/runs/$RUN_S1/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_S1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "flag OFF: plugin dir has ci-cd-norms, NOT the repo skill ($PS1)"
+
+# Flip the repo-skills opt-in ON (repo owner = the seed admin) and confirm it stuck.
+apipatch "/api/repos/$REPO_ID" '{"repo_skills_enabled":true}' | jq -e '.repo.repo_skills_enabled == true' >/dev/null \
+  || fail "PATCH repo_skills_enabled=true did not stick"
+pass "repo owner enabled repo skills"
+
+# Repo skills ON: the repo skill now loads too, at lowest precedence, alongside the
+# delivered builtin.
+RUN_S2="$(skill_run 'E2E skill delivery (repo on)')"
+PS2="$(plugin_skills "$RUN_S2")"
+echo "$PS2" | jq -e '(index("ci-cd-norms") != null) and (index("e2e-repo-skill") != null)' >/dev/null \
+  || fail "repo skill not loaded at lowest precedence after opt-in: $PS2"
+apipost "/api/runs/$RUN_S2/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_S2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "flag ON: plugin dir has BOTH ci-cd-norms and e2e-repo-skill ($PS2)"
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills; executor=%s)\n' "$EXECUTOR"
