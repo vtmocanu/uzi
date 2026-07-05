@@ -2,7 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type IssueDetail, type RunListItem } from "../lib/api";
 import { startRunGate } from "../lib/runStream";
-import { activeRunInHistory, isStoppedRun } from "../lib/runBadge";
+import { activeRunInHistory, isStoppedRun, runStatusTone } from "../lib/runBadge";
+import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { Markdown } from "../components/Markdown";
 import { formatDuration } from "../components/RunEvent";
 import { Alert, Badge, Button, Card } from "../components/ui";
@@ -14,30 +15,12 @@ function columnLabel(issue: IssueDetail): string {
   return issue.column;
 }
 
-// runTone mirrors RunsList: a deliberate stop (cancelled, or a cancel-shaped
-// failed) is calm/neutral, never rose (PRD #12 §2).
-function runTone(status: string, failureReason: string | null): "neutral" | "warning" | "danger" {
-  if (status === "awaiting_approval") return "warning";
-  if (isStoppedRun(status, failureReason)) return "neutral";
-  if (status === "failed") return "danger";
-  return "neutral";
-}
-
 // runDuration renders a terminal run's wall-clock span, or null while it is still
-// running (no finished_at yet — the live elapsed lives on the run view).
+// running (no finished_at yet — the live elapsed lives on the run view). Thin
+// wrapper over formatDuration kept co-located with the history row it feeds.
 function runDuration(run: RunListItem): string | null {
   if (!run.started_at || !run.finished_at) return null;
   return formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime());
-}
-
-// projectWebUrlFromIssue recovers the project base URL from an issue's web_url.
-// GitLab issue URLs are `${projectWebUrl}/-/issues/${iid}`; stripping that suffix
-// gives the base used to build the run-history MR links (GitLab-only product, the
-// same `/-/merge_requests/` path the board hardcodes). "" when the shape doesn't
-// match, which isHttpsUrl then rejects so the MR renders as plain text.
-function projectWebUrlFromIssue(issueWebUrl: string): string {
-  const i = issueWebUrl.indexOf("/-/issues/");
-  return i >= 0 ? issueWebUrl.slice(0, i) : "";
 }
 
 export function IssueView() {
@@ -124,6 +107,16 @@ export function IssueView() {
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <Badge tone="neutral">{columnLabel(issue)}</Badge>
+                {issue.labels
+                  .filter((l) => l && l !== issue.column)
+                  .map((l) => (
+                    <span
+                      key={l}
+                      className="rounded-md border border-slate-700 bg-slate-800 px-1.5 py-0.5 text-[11px] text-slate-300"
+                    >
+                      {l}
+                    </span>
+                  ))}
                 {issue.author && <span className="text-xs text-slate-500">{issue.author}</span>}
                 {!issue.has_prd_link && (
                   <Badge
@@ -207,16 +200,16 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
   const stopped = isStoppedRun(run.status, run.failure_reason);
   const duration = runDuration(run);
   // PRD §3 asks for an MR *link* in the history; link it when we can build an https
-  // URL (like the board), else fall back to a plain "!N" chip so it is never absent.
-  const mrHref =
-    run.mr_iid != null && isHttpsUrl(projectWebUrl)
-      ? `${projectWebUrl}/-/merge_requests/${run.mr_iid}`
-      : null;
+  // URL, else fall back to a plain "!N" chip so it is never absent.
+  const mrHref = run.mr_iid != null ? mergeRequestUrl(projectWebUrl, run.mr_iid) : null;
+  // §3 "started": show when the run began; fall back to its queued time for a run
+  // that has not started yet (started_at null).
+  const stamp = run.started_at ?? run.created_at;
   return (
     <li className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2">
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-x-2 text-xs text-slate-500">
-          <span>{new Date(run.created_at).toLocaleString()}</span>
+          <span>{new Date(stamp).toLocaleString()}</span>
           {run.worker_name && <span>· {run.worker_name}</span>}
           {duration && <span>· {duration}</span>}
           {run.mr_iid != null && (
@@ -240,7 +233,7 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <Badge tone={runTone(run.status, run.failure_reason)}>
+        <Badge tone={runStatusTone(run.status, run.failure_reason)}>
           {stopped ? "stopped" : run.status.replace("_", " ")}
         </Badge>
         {/* Every run here is the viewer's own (the endpoint is owner-scoped), so

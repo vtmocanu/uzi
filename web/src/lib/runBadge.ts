@@ -37,6 +37,17 @@ export function isStoppedRun(status: string, failureReason: string | null | unde
   return false;
 }
 
+// runStatusTone maps a run status to a list-row badge tone (a simpler view than
+// runBadge, which also carries label/pulse/MR-chip). A deliberate stop is calm
+// neutral, awaiting-approval is amber, a genuine failure is rose. Shared by the
+// run-list and issue-view history rows so the tone stays consistent everywhere.
+export function runStatusTone(status: string, failureReason: string | null | undefined): BadgeTone {
+  if (status === "awaiting_approval") return "warning";
+  if (isStoppedRun(status, failureReason)) return "neutral";
+  if (status === "failed") return "danger";
+  return "neutral";
+}
+
 // formatElapsed renders a coarse duration for the running badge ("running 4m").
 export function formatElapsed(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));

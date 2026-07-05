@@ -8,6 +8,7 @@ import {
   isStoppedRun,
   retryHint,
   runBadge,
+  runStatusTone,
 } from "./runBadge";
 import type { LatestRun, RunStatus } from "./api";
 
@@ -108,6 +109,26 @@ describe("isStoppedRun (exact server stop reasons)", () => {
   it("false for non-terminal / completed", () => {
     expect(isStoppedRun("completed", null)).toBe(false);
     expect(isStoppedRun("running", null)).toBe(false);
+  });
+});
+
+describe("runStatusTone (list-row tone)", () => {
+  it("awaiting_approval → warning", () => {
+    expect(runStatusTone("awaiting_approval", null)).toBe("warning");
+  });
+  it("deliberate stops → neutral, never danger", () => {
+    expect(runStatusTone("cancelled", null)).toBe("neutral");
+    expect(runStatusTone("failed", "run cancelled")).toBe("neutral");
+    expect(runStatusTone("failed", "plan rejected")).toBe("neutral");
+  });
+  it("a genuine failure → danger", () => {
+    expect(runStatusTone("failed", "compile error")).toBe("danger");
+    expect(runStatusTone("failed", null)).toBe("danger");
+  });
+  it("other statuses → neutral", () => {
+    for (const s of ["queued", "claimed", "running", "completed"]) {
+      expect(runStatusTone(s, null)).toBe("neutral");
+    }
   });
 });
 
