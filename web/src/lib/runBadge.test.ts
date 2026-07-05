@@ -41,14 +41,14 @@ describe("runBadge taxonomy", () => {
     });
   });
 
-  it("claimed → neutral 'claimed'", () => {
+  it("claimed → info 'claimed'", () => {
     const b = runBadge(run({ status: "claimed" }), NOW);
-    expect(b).toMatchObject({ kind: "badge", label: "claimed", tone: "neutral", pulse: false });
+    expect(b).toMatchObject({ kind: "badge", label: "claimed", tone: "info", pulse: false });
   });
 
-  it("running → pulsing badge with elapsed since created_at", () => {
+  it("running → pulsing info badge with elapsed since created_at", () => {
     const b = runBadge(run({ status: "running", worker_name: "laptop" }), NOW);
-    expect(b).toMatchObject({ kind: "badge", tone: "neutral", pulse: true });
+    expect(b).toMatchObject({ kind: "badge", tone: "info", pulse: true });
     if (b.kind === "badge") expect(b.label).toBe("running 4m");
   });
 
@@ -81,9 +81,9 @@ describe("runBadge taxonomy", () => {
     });
   });
 
-  it("completed without an MR → plain 'completed' badge (never invisible)", () => {
+  it("completed without an MR → plain ok 'completed' badge (never invisible)", () => {
     const b = runBadge(run({ status: "completed", mr_iid: null }), NOW);
-    expect(b).toMatchObject({ kind: "badge", label: "completed", tone: "neutral" });
+    expect(b).toMatchObject({ kind: "badge", label: "completed", tone: "ok" });
   });
 });
 
@@ -125,10 +125,11 @@ describe("runStatusTone (list-row tone)", () => {
     expect(runStatusTone("failed", "compile error")).toBe("danger");
     expect(runStatusTone("failed", null)).toBe("danger");
   });
-  it("other statuses → neutral", () => {
-    for (const s of ["queued", "claimed", "running", "completed"]) {
-      expect(runStatusTone(s, null)).toBe("neutral");
-    }
+  it("completed → ok, claimed/running → info, queued → neutral (matches StatusPill)", () => {
+    expect(runStatusTone("completed", null)).toBe("ok");
+    expect(runStatusTone("claimed", null)).toBe("info");
+    expect(runStatusTone("running", null)).toBe("info");
+    expect(runStatusTone("queued", null)).toBe("neutral");
   });
 });
 
