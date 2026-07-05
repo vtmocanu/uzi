@@ -81,6 +81,19 @@ export const mockConnection: ForgeConnection = {
   bot_forge_user_id: 4021,
   created_at: daysAgo(30),
   last_verified_at: minsAgo(42),
+  // Demo happy path: least-privilege ✓ — api-only token, Developer on protected
+  // mains. The finding states are exercised in the component tests.
+  privilege_status: "ok",
+  privilege_checked_at: minsAgo(20),
+  privilege_report: {
+    checked_at: minsAgo(20),
+    status: "ok",
+    token: { scopes: ["api"], active: true, violations: [], warnings: [] },
+    repos: [
+      { repo_id: "repo-uzi", path: "vtmocanu/uzi", role: 30, member: true, violations: [], warnings: [] },
+      { repo_id: "repo-atlas", path: "vtmocanu/atlas-api", role: 30, member: true, violations: [], warnings: [] },
+    ],
+  },
 };
 
 export const mockForgeConfig = {

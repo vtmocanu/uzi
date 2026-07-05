@@ -50,6 +50,17 @@ Because the session lives in a cookie, the browser attaches it automatically to 
 
 `POST /api/auth/register` (`api/internal/handler/auth.go`) counts existing users and inserts the new row inside one transaction that first takes `pg_advisory_xact_lock(RegistrationLockKey)` (`api/internal/store/migrate.go`, key `0x757A69`, i.e. "uzi"). Bottega's SQLite version gets away with a plain in-transaction count-then-insert because SQLite serializes writers; on Postgres, READ COMMITTED would let two concurrent first registrations both see zero users and both become admin. The advisory lock serializes the count-and-insert across concurrent callers, so exactly one registration ever wins admin — verified by `scripts/smoke.sh`'s 5-way concurrent registration race.
 
+## Registration controls
+
+Two operator-set knobs (PRD #5) gate who may register, enforced server-side in the register handler (`api/internal/handler/auth.go`) and surfaced to the SPA so the form can hide itself or hint the policy before submit:
+
+- **`UZI_REGISTRATION_ENABLED`** (default `true`) — a kill-switch. When `false`, `POST /api/auth/register` returns **403** with a static message and the register route shows a "registration is disabled" notice; login is untouched. A malformed value refuses to start (a security switch fails loud, not silently open).
+- **`UZI_ALLOWED_EMAIL_DOMAINS`** (default empty = allow all) — a case-insensitive, exact-match domain allowlist (no subdomain wildcards). A non-allowlisted address is rejected with **403** naming the allowed domains. The domain is taken from the *parsed* addr-spec (`mail.ParseAddress(...).Address`, split on its final `@`), never the raw input, so display-name/comment forms (`Alice <alice@x>`) and quoted local parts still yield the true domain; the stored email is canonicalized to that addr-spec.
+
+Both policy rejections use **403** (the request is well-formed, the policy forbids it); `400` remains for malformed input and `409` for a duplicate email. Enforcement lives **only** in `Register` — never in a shared helper — so the operator-provisioned admin seed (`seedAdmin()` in `api/cmd/server/main.go`, a direct `CreateUser`) is exempt by construction: the operator sets both the seed email and the allowlist, so gating one on the other would only create bootstrap deadlocks.
+
+A new unauthenticated endpoint **`GET /api/auth/config`** returns `{registration_enabled, allowed_email_domains}` — uzi's first unauthenticated JSON surface besides `/health`. It sits *outside* `RequireAuth`, behind the same auth rate limiter as register/login, and exposes only operator-set, user-visible policy (never user data or secrets — this endpoint's shape is a security boundary). The register page consumes it to disable itself or hint the allowed domains, with client-side pre-validation; the server stays authoritative.
+
 ## Rate limiting and the X-Forwarded-For trust model
 
 `api/internal/middleware/ratelimit.go` is an in-process, per-`(route, client IP)` fixed-window limiter (`RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW`, default 10/minute) applied to `/api/auth/register` and `/api/auth/login`. No Redis dependency, unlike multica.

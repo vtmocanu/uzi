@@ -76,6 +76,15 @@ func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.Me
 	}
 	return f.mr, nil
 }
+func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
+	return forge.TokenInfo{}, nil
+}
+func (f *fakeForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
+	return 0, false, nil
+}
+func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
+	return forge.BranchProtection{}, nil
+}
 
 // fakeStore records what the sync writes, standing in for *store.Queries. The
 // MR-close watcher fields (candidates/issue/columns/mrStateWrites) are exercised

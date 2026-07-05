@@ -58,6 +58,9 @@ const gitlabConnection = {
   bot_forge_user_id: 1,
   created_at: "2026-01-01T00:00:00Z",
   last_verified_at: null,
+  privilege_status: null,
+  privilege_checked_at: null,
+  privilege_report: null,
 };
 
 function renderShell(path: string) {

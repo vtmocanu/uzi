@@ -61,6 +61,34 @@ export interface AgentTemplateInput {
   prompt_body: string;
 }
 
+// Privilege report (PRD #5): the token-level and per-repo least-privilege
+// findings the checker produced. status is the denormalized worst-case tier.
+export type PrivilegeStatus = "ok" | "warnings" | "violations" | "error";
+
+export interface PrivilegeTokenReport {
+  scopes: string[];
+  active: boolean;
+  expires_at?: string;
+  violations: string[];
+  warnings: string[];
+}
+
+export interface PrivilegeRepoReport {
+  repo_id: string;
+  path: string;
+  role: number;
+  member: boolean;
+  violations: string[];
+  warnings: string[];
+}
+
+export interface PrivilegeReport {
+  checked_at: string;
+  token: PrivilegeTokenReport;
+  repos: PrivilegeRepoReport[];
+  status: PrivilegeStatus;
+}
+
 export interface ForgeConnection {
   id: string;
   forge_type: string;
@@ -69,6 +97,11 @@ export interface ForgeConnection {
   bot_forge_user_id: number;
   created_at: string;
   last_verified_at: string | null;
+  // Least-privilege surfacing. A null status means never checked (unchecked
+  // badge, never a tick); the report is null until the first check.
+  privilege_status: PrivilegeStatus | null;
+  privilege_checked_at: string | null;
+  privilege_report: PrivilegeReport | null;
 }
 
 export interface Repo {
@@ -145,6 +178,14 @@ export interface IssueDetail {
 export interface ForgeConfig {
   allowed_base_urls: string[];
   forge_types: string[];
+}
+
+// AuthConfig is the unauthenticated registration policy the register page reads
+// to hide itself or hint the allowed domains before submit. The server stays
+// authoritative; this is display + pre-validation only.
+export interface AuthConfig {
+  registration_enabled: boolean;
+  allowed_email_domains: string[];
 }
 
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
@@ -269,9 +310,13 @@ export function isHttpsUrl(url: string | null | undefined): boolean {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  // body is the full parsed error payload, so a caller can read structured
+  // fields beyond the message (e.g. a 422's `violations` array).
+  body: unknown;
+  constructor(status: number, message: string, body: unknown = null) {
     super(message);
     this.status = status;
+    this.body = body;
     this.name = "ApiError";
   }
 }
@@ -327,7 +372,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     if (res.status === 401) unauthorizedHandler?.();
     const message =
       (payload as { error?: string } | null)?.error ?? `request failed (${res.status})`;
-    throw new ApiError(res.status, message);
+    throw new ApiError(res.status, message, payload);
   }
   return payload as T;
 }
@@ -341,6 +386,7 @@ const realApi = {
     }),
   login: (email: string, password: string) =>
     request<{ user: User }>("POST", "/auth/login", { email, password }),
+  authConfig: () => request<AuthConfig>("GET", "/auth/config"),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
   me: () => request<{ user: User }>("GET", "/auth/me"),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
@@ -377,6 +423,8 @@ const realApi = {
     }),
   verifyConnection: (id: string) =>
     request<{ connection: ForgeConnection }>("POST", `/forge/connections/${id}/verify`),
+  privilegeCheck: (id: string) =>
+    request<{ report: PrivilegeReport }>("POST", `/forge/connections/${id}/privilege-check`),
   deleteConnection: (id: string) => request<null>("DELETE", `/forge/connections/${id}`),
   listProjects: (connectionId: string) =>
     request<{ repos: Repo[] }>("GET", `/forge/connections/${connectionId}/projects`),
