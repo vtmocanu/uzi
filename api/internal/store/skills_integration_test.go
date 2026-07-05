@@ -168,4 +168,86 @@ func mustCreateSkill(ctx context.Context, t *testing.T, q *store.Queries, name, 
 	return s
 }
 
+// TestListRunSkillAllocationsHardeningLiveDB pins the auditor's M3 Low
+// defense-in-depth: even if a future handler bug wrote a bad allocation row, the
+// claim-assembly query must never ship a private skill body. It inserts corrupted
+// rows DIRECTLY (bypassing the handler): a shared row (user_id NULL) pointing at a
+// user-scope skill, and one user's overlay pointing at ANOTHER user's private
+// skill — and asserts neither is delivered.
+func TestListRunSkillAllocationsHardeningLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	suffix := uuid.NewString()[:8]
+	userA, userB, userC := uuid.New(), uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{userA, userB, userC} {
+		mustExec(ctx, t, pool,
+			`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			id, fmt.Sprintf("hard-%s-%s@e2e", suffix, id))
+	}
+	global := mustCreateSkill(ctx, t, q, "g-"+suffix, "global.", "global", uuid.Nil)
+	a1 := mustCreateSkill(ctx, t, q, "a-"+suffix, "a private.", "user", userA)
+	b1 := mustCreateSkill(ctx, t, q, "b-"+suffix, "b private.", "user", userB)
+
+	templateID := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO agent_templates (id, name, description, prompt_body) VALUES ($1, $2, 'd', 'b')`,
+		templateID, "tmpl-"+suffix)
+	alloc := func(skillID uuid.UUID, userID *uuid.UUID) {
+		if userID == nil {
+			mustExec(ctx, t, pool, `INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, NULL)`, templateID, skillID)
+		} else {
+			mustExec(ctx, t, pool, `INSERT INTO agent_skill_allocations (template_id, skill_id, user_id) VALUES ($1, $2, $3)`, templateID, skillID, *userID)
+		}
+	}
+	alloc(global.ID, nil)   // legit shared
+	alloc(a1.ID, nil)       // CORRUPTED shared → points at userA's private skill
+	alloc(a1.ID, &userA)    // legit overlay (userA's own skill)
+	alloc(b1.ID, &userA)    // CORRUPTED overlay → userA overlay pointing at userB's private
+
+	namesFor := func(who uuid.UUID) map[string]bool {
+		rows, err := q.ListRunSkillAllocations(ctx, pgUUID(who))
+		if err != nil {
+			t.Fatalf("list run skill allocations: %v", err)
+		}
+		out := map[string]bool{}
+		for _, r := range rows {
+			out[r.SkillName] = true
+		}
+		return out
+	}
+
+	// A neutral user's run: the legit global shared row is delivered, but the
+	// corrupted shared row pointing at userA's private skill is NOT.
+	c := namesFor(userC)
+	if !c[global.Name] {
+		t.Errorf("userC run must receive the global shared skill; got %v", c)
+	}
+	if c[a1.Name] {
+		t.Error("a shared allocation pointing at a user-scope skill must NOT ship its private body")
+	}
+
+	// userA's run: the global shared row and userA's own overlay are delivered, but
+	// the corrupted overlay pointing at userB's private skill is NOT.
+	a := namesFor(userA)
+	if !a[global.Name] || !a[a1.Name] {
+		t.Errorf("userA run must receive global + own overlay skill; got %v", a)
+	}
+	if a[b1.Name] {
+		t.Error("a user's overlay pointing at ANOTHER user's private skill must NOT ship its body")
+	}
+}
+
 func pgUUID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: true} }

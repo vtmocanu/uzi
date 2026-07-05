@@ -93,6 +93,14 @@ ON CONFLICT DO NOTHING;
 -- per-template scoping, and the precedence/cap drops). A skill allocated to a
 -- template both as shared and as this user's overlay yields two rows; assembly
 -- dedupes by (template, skill). Ordered for a stable claim payload.
+--
+-- Defense-in-depth (auditor M3 Low): the scope predicates make a private body
+-- unshippable even if a future handler bug wrote a bad allocation row. A shared
+-- row (user_id NULL) may only carry a builtin/global skill; a user's overlay row
+-- may only carry a builtin/global skill or that SAME user's own user skill. The
+-- M2 handler already enforces this at write time; this is the second layer (the
+-- shared-branch blast radius is all users, so the belt-and-suspenders is
+-- warranted).
 SELECT at.name AS template_name,
        s.id    AS skill_id,
        s.name  AS skill_name,
@@ -102,5 +110,6 @@ SELECT at.name AS template_name,
 FROM agent_skill_allocations a
 JOIN agent_templates at ON at.id = a.template_id
 JOIN skills s ON s.id = a.skill_id
-WHERE a.user_id IS NULL OR a.user_id = @user_id
+WHERE (a.user_id IS NULL AND s.scope <> 'user')
+   OR (a.user_id = @user_id AND (s.scope <> 'user' OR s.user_id = @user_id))
 ORDER BY at.name, s.name;
