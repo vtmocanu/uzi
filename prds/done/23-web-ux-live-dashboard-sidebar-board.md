@@ -1,7 +1,7 @@
 # PRD #23: Web UX polish — live dashboard, collapsible sidebar, hide empty board columns
 
 **GitLab Issue**: [vtmocanu/uzi#23](https://gitlab.example.com/vtmocanu/uzi/-/issues/23)
-**Status**: Draft
+**Status**: Complete (2026-07-05, MR !16)
 **Priority**: Medium
 **Created**: 2026-07-05
 **Depends on**: PRD #12 (board run lifecycle, done) for the board poll/toast machinery this extends; PRD #14 (multica UI redesign, done) for the sidebar shell being made collapsible.
@@ -56,16 +56,16 @@ Three self-contained web changes; no API, schema, agent, or Go changes anywhere.
 
 Phase 1 (parallel — disjoint file sets):
 
-- [ ] **M1: Live dashboard** — `usePollWhileVisible` extracted with jsdom + fake-timer unit tests (interval fire, hidden pause, visibility catch-up, teardown), Board's inline poll effect refactored onto it, Dashboard polling volatile endpoints with the first-load/re-poll error split (no skeleton flash, last-good kept). *(Files: `web/src/lib/usePollWhileVisible.ts(+test)`, `Dashboard.tsx`, `Board.tsx`)*
-- [ ] **M2: Collapsible sidebar** — icon-rail collapse, lazily-initialized persisted state, a11y-labeled toggle, board children folded into "Boards" when collapsed, mobile unchanged. *(Files: `AppShell.tsx`, `web/src/lib/prefs.ts(+test)`)*
+- [x] **M1: Live dashboard** — `usePollWhileVisible` extracted with jsdom + fake-timer unit tests (interval fire, hidden pause, visibility catch-up, teardown), Board's inline poll effect refactored onto it, Dashboard polling volatile endpoints with the first-load/re-poll error split (no skeleton flash, last-good kept). *(Files: `web/src/lib/usePollWhileVisible.ts(+test)`, `Dashboard.tsx`, `Board.tsx`)*
+- [x] **M2: Collapsible sidebar** — icon-rail collapse, lazily-initialized persisted state, a11y-labeled toggle, board children folded into "Boards" when collapsed, mobile unchanged. *(Files: `AppShell.tsx`, `web/src/lib/prefs.ts(+test)`)*
 
 Phase 2 (after M1 — **M3 also edits `Board.tsx`, so it must not run parallel to M1**; M2 may still be in flight):
 
-- [ ] **M3: Hide empty columns** — persisted per-repo tick box, derived filtering from `cardsByColumn` with auto-unhide, drag-reveal, hidden-count hint; filtering logic split pure (runBadge-style) and unit-tested. *(Files: `Board.tsx`, new pure-logic module + test; consumes M2's `prefs.ts`)*
+- [x] **M3: Hide empty columns** — persisted per-repo tick box, derived filtering from `cardsByColumn` with auto-unhide, drag-reveal, hidden-count hint; filtering logic split pure (runBadge-style) and unit-tested. *(Files: `Board.tsx`, new pure-logic module + test; consumes M2's `prefs.ts`)*
 
 Phase 3 (after M1-M3):
 
-- [ ] **M4: Verification + docs** — `npm run typecheck` + `npm test` + `npm run build` green; user-facing docs (`docs/`, `audience: user` pages describing dashboard/board) updated where they describe the affected screens; specs sync (`specs/ai.md`).
+- [x] **M4: Verification + docs** — `npm run typecheck` + `npm test` + `npm run build` green; user-facing docs (`docs/`, `audience: user` pages describing dashboard/board) updated where they describe the affected screens; specs sync (`specs/ai.md`).
 
 Dependencies: M3 → M1 (shared `Board.tsx`) and M3 → M2 (`prefs.ts`; M3 may inline a fallback if M2 lags, reconciled in M4). Note the codebase has **no existing Board/Dashboard component tests** — the "existing tests stay green" gate covers the pure-logic suites (`runBadge.test.ts` etc.) plus the new tests these milestones add, nothing more.
 

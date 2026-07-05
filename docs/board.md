@@ -25,6 +25,20 @@ manual reload.
 below moves cards through; `Upcoming`/`Later` are plain backlog buckets it
 never touches except to restore a card to one.
 
+**Hide empty columns.** The board toolbar has a **Hide empty** tick box: turn
+it on and any column with no cards drops out, with a **`N hidden`** count next
+to the box. The choice is remembered per board. Hiding is recomputed on every
+poll, so a column reappears on its own the moment a card lands in it (a run
+auto-move, a change made in GitLab); while you drag a card, the hidden lanes
+reappear dimmed so you can still drop into them.
+
+## More room for the board
+
+The board uses the full width of the window. To reclaim the sidebar's 240px,
+collapse it to an icon rail with the toggle at the sidebar's bottom edge; every
+destination stays one click away, and it stays collapsed (on this browser)
+until you expand it again.
+
 ## Move a card
 
 Drag a card to another column. uzi writes the label change to GitLab first
