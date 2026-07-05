@@ -114,6 +114,13 @@ export const mockApi = {
     return delay({ settings: { ...appSettings } });
   },
 
+  // ── Autopilot opt-in (PRD #19 M3) ────────────────────────────────────────────
+  setAutopilotEnabled: async (enabled: boolean) => {
+    const u = requireSession();
+    u.autopilot_enabled = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+
   // ── Secrets ─────────────────────────────────────────────────────────────────
   listSecrets: async () => delay({ secrets: secrets.map((s) => ({ ...s })) }),
   putAnthropicToken: async (_token: string) => {
@@ -205,6 +212,29 @@ export const mockApi = {
     if (!c) throw new ApiError(404, "connection not found");
     c.last_verified_at = new Date().toISOString();
     return delay({ connection: { ...c } }, 500);
+  },
+  // Mirrors the real save path (PRD #19 M3): a collision on the same host is a hard
+  // 409, an unknown username still saves but returns a warning (verified-or-warned),
+  // and "" clears the mapping.
+  updateConnection: async (id: string, humanUsername: string) => {
+    const c = connections.find((x) => x.id === id);
+    if (!c) throw new ApiError(404, "connection not found");
+    const username = humanUsername.trim();
+    if (username) {
+      const clash = connections.some(
+        (x) => x.id !== id && x.base_url === c.base_url && x.human_username === username,
+      );
+      if (clash) {
+        throw new ApiError(409, "that forge username is already mapped by another user on this host");
+      }
+    }
+    c.human_username = username || null;
+    // Demo the warning branch for an obviously-fake username without a live forge.
+    const warning =
+      username && username.toLowerCase() === "ghost"
+        ? "Saved, but no forge account with this username was found — double-check it matches your own forge username."
+        : undefined;
+    return delay({ connection: { ...c }, ...(warning ? { warning } : {}) }, 400);
   },
   deleteConnection: async (id: string) => {
     connections = connections.filter((x) => x.id !== id);

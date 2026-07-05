@@ -38,7 +38,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, autopilot_enabled
 `
 
 type CreateUserParams struct {
@@ -66,12 +66,13 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.TokenVersion,
 		&i.CreatedAt,
 		&i.LastLogin,
+		&i.AutopilotEnabled,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login FROM users WHERE email = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, autopilot_enabled FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -87,12 +88,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.TokenVersion,
 		&i.CreatedAt,
 		&i.LastLogin,
+		&i.AutopilotEnabled,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login FROM users WHERE id = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, autopilot_enabled FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -108,12 +110,13 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.TokenVersion,
 		&i.CreatedAt,
 		&i.LastLogin,
+		&i.AutopilotEnabled,
 	)
 	return i, err
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login FROM users ORDER BY created_at ASC
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, autopilot_enabled FROM users ORDER BY created_at ASC
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -135,6 +138,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.TokenVersion,
 			&i.CreatedAt,
 			&i.LastLogin,
+			&i.AutopilotEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -162,7 +166,7 @@ SET is_active = $1,
     -- reactivation leaves it untouched.
     token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END
 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, autopilot_enabled
 `
 
 type SetUserActiveParams struct {
@@ -183,6 +187,37 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 		&i.TokenVersion,
 		&i.CreatedAt,
 		&i.LastLogin,
+		&i.AutopilotEnabled,
+	)
+	return i, err
+}
+
+const setUserAutopilotEnabled = `-- name: SetUserAutopilotEnabled :one
+UPDATE users SET autopilot_enabled = $2 WHERE id = $1
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, autopilot_enabled
+`
+
+type SetUserAutopilotEnabledParams struct {
+	ID               uuid.UUID `json:"id"`
+	AutopilotEnabled bool      `json:"autopilot_enabled"`
+}
+
+// Flip a user's autopilot opt-in (PRD #19 M3, Decision 4). Per-user consent to
+// unattended runs; default false, set from the user's own Settings page.
+func (q *Queries) SetUserAutopilotEnabled(ctx context.Context, arg SetUserAutopilotEnabledParams) (User, error) {
+	row := q.db.QueryRow(ctx, setUserAutopilotEnabled, arg.ID, arg.AutopilotEnabled)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.IsAdmin,
+		&i.IsActive,
+		&i.TokenVersion,
+		&i.CreatedAt,
+		&i.LastLogin,
+		&i.AutopilotEnabled,
 	)
 	return i, err
 }

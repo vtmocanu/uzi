@@ -18,6 +18,9 @@ export interface User {
   display_name: string | null;
   is_admin: boolean;
   is_active: boolean;
+  // autopilot_enabled is the per-user opt-in to unattended autopilot runs (PRD #19
+  // M3). Default false; toggled from the user's own Settings page.
+  autopilot_enabled: boolean;
   created_at: string;
   last_login: string | null;
 }
@@ -61,6 +64,9 @@ export interface ForgeConnection {
   base_url: string;
   bot_username: string;
   bot_forge_user_id: number;
+  // human_username is the owning user's own forge account, used for autopilot
+  // attribution (PRD #19 M3). Null until the user declares it.
+  human_username: string | null;
   created_at: string;
   last_verified_at: string | null;
 }
@@ -366,6 +372,9 @@ const realApi = {
   getSettings: () => request<{ settings: AppSettings }>("GET", "/admin/settings"),
   updateSettings: (settings: Partial<AppSettings>) =>
     request<{ settings: AppSettings }>("PUT", "/admin/settings", { settings }),
+  // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
+  setAutopilotEnabled: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
@@ -394,6 +403,13 @@ const realApi = {
     }),
   verifyConnection: (id: string) =>
     request<{ connection: ForgeConnection }>("POST", `/forge/connections/${id}/verify`),
+  // Set (or clear, with "") the connecting user's own forge username for autopilot
+  // attribution. The API best-effort-verifies it and may return a `warning` while
+  // still saving (verified-or-warned, PRD #19 M3).
+  updateConnection: (id: string, humanUsername: string) =>
+    request<{ connection: ForgeConnection; warning?: string }>("PUT", `/forge/connections/${id}`, {
+      human_username: humanUsername,
+    }),
   deleteConnection: (id: string) => request<null>("DELETE", `/forge/connections/${id}`),
   listProjects: (connectionId: string) =>
     request<{ repos: Repo[] }>("GET", `/forge/connections/${connectionId}/projects`),

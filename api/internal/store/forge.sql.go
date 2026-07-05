@@ -70,7 +70,7 @@ func (q *Queries) DeleteIssuesNotIn(ctx context.Context, arg DeleteIssuesNotInPa
 }
 
 const getForgeConnectionForUser = `-- name: GetForgeConnectionForUser :one
-SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at FROM forge_connections WHERE id = $1 AND user_id = $2
+SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username FROM forge_connections WHERE id = $1 AND user_id = $2
 `
 
 type GetForgeConnectionForUserParams struct {
@@ -91,6 +91,7 @@ func (q *Queries) GetForgeConnectionForUser(ctx context.Context, arg GetForgeCon
 		&i.TokenCiphertext,
 		&i.CreatedAt,
 		&i.LastVerifiedAt,
+		&i.HumanUsername,
 	)
 	return i, err
 }
@@ -372,7 +373,7 @@ func (q *Queries) ListEnabledReposWithConnections(ctx context.Context) ([]ListEn
 }
 
 const listForgeConnectionsByUser = `-- name: ListForgeConnectionsByUser :many
-SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at FROM forge_connections WHERE user_id = $1 ORDER BY created_at ASC
+SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username FROM forge_connections WHERE user_id = $1 ORDER BY created_at ASC
 `
 
 func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UUID) ([]ForgeConnection, error) {
@@ -394,6 +395,7 @@ func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UU
 			&i.TokenCiphertext,
 			&i.CreatedAt,
 			&i.LastVerifiedAt,
+			&i.HumanUsername,
 		); err != nil {
 			return nil, err
 		}
@@ -555,6 +557,40 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 	return items, nil
 }
 
+const setForgeConnectionHumanUsername = `-- name: SetForgeConnectionHumanUsername :one
+UPDATE forge_connections SET human_username = $3
+WHERE id = $1 AND user_id = $2
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username
+`
+
+type SetForgeConnectionHumanUsernameParams struct {
+	ID            uuid.UUID   `json:"id"`
+	UserID        uuid.UUID   `json:"user_id"`
+	HumanUsername pgtype.Text `json:"human_username"`
+}
+
+// Set or clear (NULL $3) the connecting user's own forge username on their
+// connection, scoped to the owner (PRD #19 M3). The partial unique index on
+// (base_url, human_username) rejects a value another user already mapped on the
+// same host with a 23505 the handler surfaces as a hard 409.
+func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetForgeConnectionHumanUsernameParams) (ForgeConnection, error) {
+	row := q.db.QueryRow(ctx, setForgeConnectionHumanUsername, arg.ID, arg.UserID, arg.HumanUsername)
+	var i ForgeConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ForgeType,
+		&i.BaseUrl,
+		&i.BotUsername,
+		&i.BotForgeUserID,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+		&i.HumanUsername,
+	)
+	return i, err
+}
+
 const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
@@ -605,7 +641,7 @@ func (q *Queries) ShiftBoardColumnsFrom(ctx context.Context, arg ShiftBoardColum
 
 const touchForgeConnectionVerified = `-- name: TouchForgeConnectionVerified :one
 UPDATE forge_connections SET last_verified_at = now() WHERE id = $1 AND user_id = $2
-RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username
 `
 
 type TouchForgeConnectionVerifiedParams struct {
@@ -626,6 +662,7 @@ func (q *Queries) TouchForgeConnectionVerified(ctx context.Context, arg TouchFor
 		&i.TokenCiphertext,
 		&i.CreatedAt,
 		&i.LastVerifiedAt,
+		&i.HumanUsername,
 	)
 	return i, err
 }
@@ -640,7 +677,7 @@ SET bot_username      = EXCLUDED.bot_username,
     bot_forge_user_id = EXCLUDED.bot_forge_user_id,
     token_ciphertext  = EXCLUDED.token_ciphertext,
     last_verified_at  = now()
-RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at
+RETURNING id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, human_username
 `
 
 type UpsertForgeConnectionParams struct {
@@ -676,6 +713,7 @@ func (q *Queries) UpsertForgeConnection(ctx context.Context, arg UpsertForgeConn
 		&i.TokenCiphertext,
 		&i.CreatedAt,
 		&i.LastVerifiedAt,
+		&i.HumanUsername,
 	)
 	return i, err
 }

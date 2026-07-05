@@ -288,6 +288,147 @@ func TestEnsureLabelsCreatesOnlyMissing(t *testing.T) {
 	}
 }
 
+func TestUserExistsByUsername(t *testing.T) {
+	var gotUsername string
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/users": func(w http.ResponseWriter, r *http.Request) {
+			gotUsername = r.URL.Query().Get("username")
+			if gotUsername == "ghost" {
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 77, "username": gotUsername},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	exists, err := d.UserExists(context.Background(), "alice")
+	if err != nil {
+		t.Fatalf("UserExists: %v", err)
+	}
+	if !exists {
+		t.Error("expected alice to exist")
+	}
+	if gotUsername != "alice" {
+		t.Errorf("expected the username filter to be sent, got %q", gotUsername)
+	}
+
+	// A username the forge does not know comes back as an empty list → not found.
+	missing, err := d.UserExists(context.Background(), "ghost")
+	if err != nil {
+		t.Fatalf("UserExists(ghost): %v", err)
+	}
+	if missing {
+		t.Error("expected ghost to not exist")
+	}
+
+	// A blank username is not a forge lookup at all.
+	if exists, err := d.UserExists(context.Background(), "  "); err != nil || exists {
+		t.Errorf("blank username: got (%v, %v), want (false, nil)", exists, err)
+	}
+}
+
+func TestListIssueLabelEventsParses(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/issues/11/resource_label_events": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			w.Header().Set("X-Next-Page", "")
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"id": 501, "action": "add", "created_at": "2026-07-04T09:00:00Z",
+					"user":  map[string]any{"id": 42, "username": "carol"},
+					"label": map[string]any{"id": 9, "name": "autopilot"},
+				},
+				{
+					"id": 502, "action": "remove", "created_at": "2026-07-04T10:00:00Z",
+					"user":  map[string]any{"id": 42, "username": "carol"},
+					"label": map[string]any{"id": 9, "name": "autopilot"},
+				},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	events, err := d.ListIssueLabelEvents(context.Background(), 7, 11)
+	if err != nil {
+		t.Fatalf("ListIssueLabelEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	add := events[0]
+	if add.ID != 501 || add.Action != "add" || add.LabelName != "autopilot" || add.Username != "carol" {
+		t.Fatalf("unexpected add event: %+v", add)
+	}
+	if add.CreatedAt.IsZero() {
+		t.Error("expected a non-zero CreatedAt on the add event")
+	}
+	if events[1].Action != "remove" {
+		t.Errorf("expected the second event to be a remove, got %q", events[1].Action)
+	}
+}
+
+func TestCreateIssueNoteSendsBody(t *testing.T) {
+	var gotBody string
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/issues/11/notes": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotBody = body.Body
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001, "body": body.Body})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	note, err := d.CreateIssueNote(context.Background(), 7, 11, "autopilot could not resolve a user")
+	if err != nil {
+		t.Fatalf("CreateIssueNote: %v", err)
+	}
+	if note.ID != 9001 {
+		t.Fatalf("expected created note id 9001, got %d", note.ID)
+	}
+	if gotBody != "autopilot could not resolve a user" {
+		t.Fatalf("wrong note body sent: %q", gotBody)
+	}
+}
+
+// The redaction contract must hold for the new methods too: even if the forge
+// echoes the PAT back in an error body, the driver must not surface it. The probe
+// token below is a fake, long enough for the redactor to act on (it ignores
+// secrets under 8 chars); its exact shape is irrelevant to what redaction proves.
+func TestNewMethodsRedactErrors(t *testing.T) {
+	const token = "fake-pat-redaction-probe-0123456789"
+	leak := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": "boom " + token})
+	}
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/users": leak,
+		"/api/v4/projects/7/issues/11/resource_label_events": leak,
+		"/api/v4/projects/7/issues/11/notes":                 leak,
+	})
+	d := newTestDriver(t, m, token)
+
+	if _, err := d.UserExists(context.Background(), "alice"); err == nil || strings.Contains(err.Error(), token) {
+		t.Fatalf("UserExists leaked or did not error: %v", err)
+	}
+	if _, err := d.ListIssueLabelEvents(context.Background(), 7, 11); err == nil || strings.Contains(err.Error(), token) {
+		t.Fatalf("ListIssueLabelEvents leaked or did not error: %v", err)
+	}
+	if _, err := d.CreateIssueNote(context.Background(), 7, 11, "x"); err == nil || strings.Contains(err.Error(), token) {
+		t.Fatalf("CreateIssueNote leaked or did not error: %v", err)
+	}
+}
+
 func TestErrorsAreRedacted(t *testing.T) {
 	const token = "glpat-supersecret-eviltoken-XYZ"
 	m := newMockGitLab(t, map[string]http.HandlerFunc{

@@ -65,22 +65,26 @@ func (h *Handler) SetReconciler(r Reconciler) { h.reconciler = r }
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
 // password hash or token_version.
 type userDTO struct {
-	ID          string     `json:"id"`
-	Email       string     `json:"email"`
-	DisplayName *string    `json:"display_name"`
-	IsAdmin     bool       `json:"is_admin"`
-	IsActive    bool       `json:"is_active"`
-	CreatedAt   time.Time  `json:"created_at"`
-	LastLogin   *time.Time `json:"last_login"`
+	ID          string  `json:"id"`
+	Email       string  `json:"email"`
+	DisplayName *string `json:"display_name"`
+	IsAdmin     bool    `json:"is_admin"`
+	IsActive    bool    `json:"is_active"`
+	// AutopilotEnabled is the user's per-user opt-in to unattended autopilot runs
+	// (PRD #19 M3, Decision 4). Default false; toggled from the user's Settings page.
+	AutopilotEnabled bool       `json:"autopilot_enabled"`
+	CreatedAt        time.Time  `json:"created_at"`
+	LastLogin        *time.Time `json:"last_login"`
 }
 
 func toDTO(u store.User) userDTO {
 	dto := userDTO{
-		ID:        u.ID.String(),
-		Email:     u.Email,
-		IsAdmin:   u.IsAdmin,
-		IsActive:  u.IsActive,
-		CreatedAt: u.CreatedAt.Time,
+		ID:               u.ID.String(),
+		Email:            u.Email,
+		IsAdmin:          u.IsAdmin,
+		IsActive:         u.IsActive,
+		AutopilotEnabled: u.AutopilotEnabled,
+		CreatedAt:        u.CreatedAt.Time,
 	}
 	if u.DisplayName.Valid {
 		dto.DisplayName = &u.DisplayName.String
@@ -133,6 +137,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
 		})
 
+		// Current-user autopilot opt-in (PRD #19): per-user consent to unattended
+		// runs, scoped to the authenticated user (no admin-toggles-for-you path).
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Put("/me/autopilot", h.SetAutopilotEnabled)
+		})
+
 		// Agent templates: all authenticated users can read and preview; only
 		// admins can create, edit, delete, or reset (closes bottega's hole
 		// where any user rewrites the shared prompts everyone's agents run).
@@ -179,6 +190,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/verify", h.VerifyConnection)
 				r.Delete("/{id}", h.DeleteConnection)
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/projects", h.ListProjects)
+				// human_username edit best-effort-verifies against the forge → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Put("/{id}", h.UpdateConnection)
 			})
 
 			r.Route("/repos", func(r chi.Router) {

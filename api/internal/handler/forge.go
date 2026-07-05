@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -21,11 +23,15 @@ import (
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
 type connectionDTO struct {
-	ID             string     `json:"id"`
-	ForgeType      string     `json:"forge_type"`
-	BaseURL        string     `json:"base_url"`
-	BotUsername    string     `json:"bot_username"`
-	BotForgeUserID int64      `json:"bot_forge_user_id"`
+	ID             string `json:"id"`
+	ForgeType      string `json:"forge_type"`
+	BaseURL        string `json:"base_url"`
+	BotUsername    string `json:"bot_username"`
+	BotForgeUserID int64  `json:"bot_forge_user_id"`
+	// HumanUsername is the owning user's own forge account, used for autopilot
+	// attribution (PRD #19 M3). Null until the user declares it; distinct from the
+	// bot identity above.
+	HumanUsername  *string    `json:"human_username"`
 	CreatedAt      time.Time  `json:"created_at"`
 	LastVerifiedAt *time.Time `json:"last_verified_at"`
 }
@@ -38,6 +44,10 @@ func connToDTO(c store.ForgeConnection) connectionDTO {
 		BotUsername:    c.BotUsername,
 		BotForgeUserID: c.BotForgeUserID,
 		CreatedAt:      c.CreatedAt.Time,
+	}
+	if c.HumanUsername.Valid {
+		s := c.HumanUsername.String
+		dto.HumanUsername = &s
 	}
 	if c.LastVerifiedAt.Valid {
 		t := c.LastVerifiedAt.Time
@@ -220,6 +230,115 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"connection": connToDTO(updated)})
+}
+
+type updateConnectionRequest struct {
+	HumanUsername string `json:"human_username"`
+}
+
+// maxHumanUsernameLen bounds the self-declared username; GitLab usernames top out
+// well under this, so it only fences off absurd input written to a TEXT column.
+const maxHumanUsernameLen = 255
+
+const (
+	// usernameNotFoundWarning is surfaced when the forge has no such account. The
+	// value is still saved (verified-or-warned, PRD #19 Decision 3) — a warning,
+	// not a hard reject, because a user may connect before their account is visible
+	// to the bot, and hard-failing would be worse than a stored typo.
+	usernameNotFoundWarning = "Saved, but no forge account with this username was found — double-check it matches your own forge username."
+	// usernameUnverifiedWarning is surfaced when the lookup itself fails (forge
+	// unreachable, rate-limited). The save is not blocked on our ability to verify.
+	usernameUnverifiedWarning = "Saved, but the username could not be verified against the forge right now."
+)
+
+// UpdateConnection edits a connection's mutable fields — today only
+// human_username, the owning user's own forge account used for autopilot
+// attribution (PRD #19 M3). Saving is verified-or-warned: a value that does not
+// resolve to a forge user is still stored, with a warning, never hard-rejected
+// (Decision 3 — identity is self-declared). A value another uzi user has already
+// mapped on the same host IS hard-rejected (409) by the partial unique index. An
+// empty value clears the mapping (and skips the forge round-trip).
+func (h *Handler) UpdateConnection(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid connection id")
+		return
+	}
+	var req updateConnectionRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	username := strings.TrimSpace(req.HumanUsername)
+	if utf8.RuneCountInString(username) > maxHumanUsernameLen {
+		httpx.Error(w, http.StatusBadRequest, "username is too long")
+		return
+	}
+
+	conn, err := h.q.GetForgeConnectionForUser(r.Context(), store.GetForgeConnectionForUserParams{ID: id, UserID: user.ID})
+	if err != nil {
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+		return
+	}
+
+	// Best-effort verify BEFORE the write so the warning describes exactly the
+	// value we are about to store. Skip the round-trip entirely when clearing.
+	var warning string
+	if username != "" {
+		f, ferr := h.svc.ForgeForConnection(conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
+		if ferr != nil {
+			slog.Error("build forge for connection", "error", ferr)
+			warning = usernameUnverifiedWarning
+		} else {
+			warning = humanUsernameWarning(r.Context(), f, username)
+		}
+	}
+
+	updated, err := h.q.SetForgeConnectionHumanUsername(r.Context(), store.SetForgeConnectionHumanUsernameParams{
+		ID:            id,
+		UserID:        user.ID,
+		HumanUsername: pgtypeTextOrNull(username),
+	})
+	if err != nil {
+		if isUniqueViolation(err) {
+			httpx.Error(w, http.StatusConflict, "that forge username is already mapped by another user on this host")
+			return
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The connection was deleted between the read above and this write.
+			httpx.Error(w, http.StatusNotFound, "connection not found")
+			return
+		}
+		slog.Error("set connection human username", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	resp := map[string]any{"connection": connToDTO(updated)}
+	if warning != "" {
+		resp["warning"] = warning
+	}
+	httpx.JSON(w, http.StatusOK, resp)
+}
+
+// humanUsernameWarning best-effort confirms username resolves to a forge account.
+// It returns "" when the user exists, and a warning string when the forge says no
+// such user or the lookup itself fails — a forge blip must never block the save
+// (PRD #19 Decision 3, verified-or-warned).
+func humanUsernameWarning(ctx context.Context, f forge.Forge, username string) string {
+	exists, err := f.UserExists(ctx, username)
+	if err != nil {
+		return usernameUnverifiedWarning
+	}
+	if !exists {
+		return usernameNotFoundWarning
+	}
+	return ""
 }
 
 // DeleteConnection removes a connection (cascading its repos, board columns, and

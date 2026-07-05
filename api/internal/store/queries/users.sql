@@ -18,6 +18,12 @@ SELECT * FROM users ORDER BY created_at ASC;
 -- name: SetLastLogin :exec
 UPDATE users SET last_login = now() WHERE id = $1;
 
+-- name: SetUserAutopilotEnabled :one
+-- Flip a user's autopilot opt-in (PRD #19 M3, Decision 4). Per-user consent to
+-- unattended runs; default false, set from the user's own Settings page.
+UPDATE users SET autopilot_enabled = $2 WHERE id = $1
+RETURNING *;
+
 -- name: BumpTokenVersion :one
 UPDATE users SET token_version = token_version + 1 WHERE id = $1
 RETURNING token_version;
