@@ -260,6 +260,62 @@ func (q *Queries) ListAllocationsForTemplateForViewer(ctx context.Context, arg L
 	return items, nil
 }
 
+const listRunSkillAllocations = `-- name: ListRunSkillAllocations :many
+SELECT at.name AS template_name,
+       s.id    AS skill_id,
+       s.name  AS skill_name,
+       s.description,
+       s.body,
+       s.scope
+FROM agent_skill_allocations a
+JOIN agent_templates at ON at.id = a.template_id
+JOIN skills s ON s.id = a.skill_id
+WHERE a.user_id IS NULL OR a.user_id = $1
+ORDER BY at.name, s.name
+`
+
+type ListRunSkillAllocationsRow struct {
+	TemplateName string    `json:"template_name"`
+	SkillID      uuid.UUID `json:"skill_id"`
+	SkillName    string    `json:"skill_name"`
+	Description  string    `json:"description"`
+	Body         string    `json:"body"`
+	Scope        string    `json:"scope"`
+}
+
+// Every skill allocated to any agent template for this run's owner: the shared
+// rows (user_id NULL, admin-managed, all users) plus this user's private overlay
+// rows, joined to the skill body. Feeds claim assembly (the per-run union, the
+// per-template scoping, and the precedence/cap drops). A skill allocated to a
+// template both as shared and as this user's overlay yields two rows; assembly
+// dedupes by (template, skill). Ordered for a stable claim payload.
+func (q *Queries) ListRunSkillAllocations(ctx context.Context, userID pgtype.UUID) ([]ListRunSkillAllocationsRow, error) {
+	rows, err := q.db.Query(ctx, listRunSkillAllocations, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunSkillAllocationsRow{}
+	for rows.Next() {
+		var i ListRunSkillAllocationsRow
+		if err := rows.Scan(
+			&i.TemplateName,
+			&i.SkillID,
+			&i.SkillName,
+			&i.Description,
+			&i.Body,
+			&i.Scope,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSkillsForViewer = `-- name: ListSkillsForViewer :many
 
 SELECT id, name, description, body, scope, user_id, updated_by, created_at, updated_at FROM skills

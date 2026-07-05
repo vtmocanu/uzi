@@ -25,17 +25,19 @@ type fakeStore struct {
 	Store
 
 	// Claim path.
-	claimRun     store.Run
-	claimErr     error
-	claimParams  *store.ClaimRunParams
-	claimCtx     store.GetRunClaimContextRow
-	claimCtxErr  error
-	anthropic       []byte
-	anthropicErr    error
-	defaultModel    pgtype.Text
-	defaultModelErr error
-	templates       []store.AgentTemplate
-	markedFailed    *store.MarkRunFailedByIDParams
+	claimRun            store.Run
+	claimErr            error
+	claimParams         *store.ClaimRunParams
+	claimCtx            store.GetRunClaimContextRow
+	claimCtxErr         error
+	anthropic           []byte
+	anthropicErr        error
+	defaultModel        pgtype.Text
+	defaultModelErr     error
+	templates           []store.AgentTemplate
+	skillAllocations    []store.ListRunSkillAllocationsRow
+	skillAllocationsErr error
+	markedFailed        *store.MarkRunFailedByIDParams
 
 	// Ownership + messages + state.
 	runOwned         store.Run
@@ -110,6 +112,9 @@ func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text
 }
 func (f *fakeStore) ListAgentTemplates(context.Context) ([]store.AgentTemplate, error) {
 	return f.templates, nil
+}
+func (f *fakeStore) ListRunSkillAllocations(context.Context, pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error) {
+	return f.skillAllocations, f.skillAllocationsErr
 }
 func (f *fakeStore) MarkRunFailedByID(_ context.Context, arg store.MarkRunFailedByIDParams) (int64, error) {
 	f.markedFailed = &arg
@@ -249,6 +254,8 @@ func testParams() Params {
 		WorkerHeartbeatStale: 45 * time.Second,
 		WorkerAffinityGrace:  2 * time.Minute,
 		ClaimGrace:           5 * time.Minute,
+		SkillMaxBytes:        65536,
+		SkillsMaxPerRun:      32,
 	}
 }
 

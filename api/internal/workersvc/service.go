@@ -106,6 +106,7 @@ type Store interface {
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) ([]byte, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	ListAgentTemplates(ctx context.Context) ([]store.AgentTemplate, error)
+	ListRunSkillAllocations(ctx context.Context, userID pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error)
 }
 
 // Params are the runtime knobs the service needs, mirrored from config.
@@ -119,6 +120,11 @@ type Params struct {
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
 	// PRD env var (the PRD fixes it at 5m in prose); defaulted in New.
 	ClaimGrace time.Duration
+	// SkillMaxBytes / SkillsMaxPerRun are the skill caps (PRD #16), mirrored from
+	// config. SkillsMaxPerRun bounds the per-run union at claim assembly; both ride
+	// the claim so the worker enforces the same limits (no server/worker drift).
+	SkillMaxBytes   int
+	SkillsMaxPerRun int
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -321,6 +327,17 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("default model lookup: %w", err)
 	}
 
+	// Skills (PRD #16): the per-run union of every skill allocated to any template
+	// for this run's owner (shared ∪ overlay), after precedence + the per-run cap.
+	// Re-assembled on every claim, including resume — a skill deleted between claim
+	// and resume simply disappears from the resumed session (accepted; the worker
+	// logs it). All skill content is user data, never a secret.
+	skillRows, err := s.q.ListRunSkillAllocations(ctx, pgUUID(run.UserID))
+	if err != nil {
+		return nil, fmt.Errorf("list run skill allocations: %w", err)
+	}
+	skills := assembleRunSkills(skillRows, s.p.SkillsMaxPerRun)
+
 	return &ClaimPayload{
 		RunID:            run.ID.String(),
 		IssueIID:         run.IssueIid,
@@ -338,18 +355,23 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 			URL:           rc.RepoWebUrl,
 			CloneURL:      rc.RepoWebUrl + ".git",
 			DefaultBranch: textPtr(rc.DefaultBranch),
+			SkillsEnabled: rc.RepoSkillsEnabled,
 		},
 		Secrets: ClaimSecrets{
 			ForgeUsername:       rc.BotUsername,
 			ForgePAT:            string(botPAT),
 			AnthropicOAuthToken: string(anthropic),
 		},
-		Agents: agentsFromTemplates(templates),
+		Agents:        agentsFromTemplates(templates, skills.perTemplate),
+		Skills:        skills.union,
+		SkillsDropped: skills.dropped,
 		Config: ClaimConfig{
 			RunTimeoutSeconds:  int(s.p.RunTimeout.Seconds()),
 			IdleTimeoutSeconds: int(s.p.RunIdleTimeout.Seconds()),
 			MaxIterations:      s.p.RunMaxIterations,
 			DefaultModel:       textPtr(defaultModel),
+			SkillMaxBytes:      s.p.SkillMaxBytes,
+			SkillsMaxPerRun:    s.p.SkillsMaxPerRun,
 		},
 	}, nil
 }

@@ -143,6 +143,8 @@ func run() error {
 		RunMaxRequeues:       cfg.RunMaxRequeues,
 		WorkerHeartbeatStale: cfg.WorkerHeartbeatStale,
 		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
+		SkillMaxBytes:        cfg.SkillMaxBytes,
+		SkillsMaxPerRun:      cfg.SkillsMaxPerRun,
 	})
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
