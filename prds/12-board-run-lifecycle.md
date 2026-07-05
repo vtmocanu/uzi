@@ -27,7 +27,7 @@ Note on the existing column model: seeded columns are **In Progress, Upcoming, L
 
 1. **Server-driven column automation** (forge-first, best-effort):
    - run created (queued) → **In Progress** label; origin column snapshotted;
-   - run completed (MR opened) → **Human Review** label;
+   - run completed (typically with an MR open) → **Human Review** label;
    - run failed or cancelled → restore **origin column** (skip if the user manually dragged the card after the run started — see "manual drags win");
    - never auto-move a closed issue (guard).
 2. **Run-aware, self-refreshing board**: cards carry `latest_run`; badges/MR chip render run state; the board polls while mounted; an **attention strip** surfaces approval-blocked runs board-wide.
@@ -94,7 +94,7 @@ Note on the existing column model: seeded columns are **In Progress, Upcoming, L
 
 ## Implementation notes (deviations accepted in review, 2026-07-04)
 
-- **`latest_run` uses `DISTINCT ON`, not `LEFT JOIN LATERAL`** (§2 as written): sqlc v1.30 does not propagate LATERAL nullability (lateral run columns typed non-nullable → scan panic on no-run issues). `DISTINCT ON (issue_iid … ORDER BY created_at DESC)` + Go-side mapping (`assembleCards`) is equivalent, rides the same composite index, and the created_at tie is unreachable (one-non-terminal-run-per-issue constraint serializes creation). Reviewer-verified.
+- **`latest_run` uses `DISTINCT ON`, not `LEFT JOIN LATERAL`** (§2 as written): sqlc v1.30 does not propagate LATERAL nullability (lateral run columns typed non-nullable → scan panic on no-run issues). `DISTINCT ON (issue_iid … ORDER BY issue_iid, created_at DESC)` + Go-side mapping (`assembleCards`) is equivalent, rides the same composite index, and the created_at tie is unreachable (one-non-terminal-run-per-issue constraint serializes creation). Reviewer-verified.
 - **DTO additions beyond §2**: `is_mine` (server-computed `run.user_id == viewer`; avoids exposing the owner's user id) and `run_count` (window count powering the ×N badge without a client fan-in).
 - **Notify is inline at 5 of the 7 status-write sites**; the two batch sites (Sweep, orphan recovery) stamp `move_pending_since` in the same statement and let the reconciler restore origin — the spec's own "no forge I/O in the sweep path" rule makes inline notify wrong there.
 - **`bcast.PublishState` was NOT multiplexed through the notifier** (§Design Decision 4's literal wording): two independent hooks, verified no transition lost its WS emission and none double-emits.
@@ -103,7 +103,7 @@ Note on the existing column model: seeded columns are **In Progress, Upcoming, L
 
 ## Success Criteria
 
-- Starting a run moves the issue to **In Progress** (visible on the board within one poll interval, and on GitLab labels) without human action; the MR opening moves it to **Human Review**.
+- Starting a run moves the issue to **In Progress** (visible on the board within one poll interval, and on GitLab labels) without human action; the run completing moves it to **Human Review** (typically with an MR open).
 - A failed/cancelled run returns the card to **the column it started from** with a visible badge — never a silently stuck In Progress card, never a lost backlog placement.
 - `awaiting_approval` is impossible to miss: attention strip + loudest card treatment.
 - Every card with run history shows it at a glance; completed-without-MR is never invisible; cancelled is never styled as failure.
