@@ -68,7 +68,12 @@ export function yamlQuote(value: string): string {
     else if (ch === "\n") out += "\\n";
     else if (ch === "\r") out += "\\r";
     else if (ch === "\t") out += "\\t";
-    else if (code < 0x20 || code === 0x7f) out += "\\u" + code.toString(16).padStart(4, "0");
+    // Escape every control char (C0 <0x20, DEL+C1 0x7f-0x9f) AND the Unicode line
+    // separators U+2028/U+2029, which some YAML parsers treat as line breaks.
+    // None can close the quoted scalar, but escaping them keeps the round-trip
+    // byte-exact and parser-independent (M4 auditor hardening).
+    else if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029)
+      out += "\\u" + code.toString(16).padStart(4, "0");
     else out += ch;
   }
   return out + '"';
