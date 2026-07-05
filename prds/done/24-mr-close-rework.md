@@ -1,7 +1,7 @@
 # PRD #24: MR Closed Without Merging → Card Back to In Progress
 
 **GitLab Issue**: [#24](https://gitlab.example.com/vtmocanu/uzi/-/issues/24)
-**Status**: Draft
+**Status**: Complete (2026-07-05)
 **Priority**: Medium
 **Created**: 2026-07-05
 
