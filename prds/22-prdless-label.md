@@ -9,7 +9,7 @@
 
 ## Problem
 
-Every run requires a `prds/*.md` link in the issue description. The gate is enforced server-side in the shared `createRun` (`api/internal/workersvc/service.go:647-648` → `ErrNoPRDLink`), which both the manual `CreateRun` and the autopilot `CreateAutopilotRun` paths call; the handler maps it to a 422 (`api/internal/handler/workers.go:293-294`). The web app surfaces it as "no PRD link" warning badges (`web/src/pages/Board.tsx`, `web/src/pages/IssueView.tsx`). (Line refs approximate; the tree moves.)
+Every run requires a `prds/*.md` link in the issue description. The gate is enforced server-side in the shared `createRun` (`api/internal/workersvc/service.go:657-658` → `ErrNoPRDLink`), which both the manual `CreateRun` and the autopilot `CreateAutopilotRun` paths call; the handler maps it to a 422 (`api/internal/handler/workers.go:292-294`). The web app surfaces it as "no PRD link" warning badges (`web/src/pages/Board.tsx`, `web/src/pages/IssueView.tsx`). (Line refs approximate; the tree moves.)
 
 That gate is the right default — the PRD is the agent's spec, and issues without one produce aimless runs. But for genuinely small work (a typo fix, a one-file tweak, a smoke test like issue #20's `vlad-test.txt` file) the gate forces authoring a throwaway `prds/*.md` file whose entire content restates the issue description. The workaround people actually use — a fake link to a nonexistent PRD file — is worse than an explicit escape hatch: it satisfies the regex (`forgesvc.prdLinkRe` matches the path shape, not file existence) while lying on the board.
 
@@ -45,9 +45,9 @@ An admin-controlled escape-hatch label, default name **`PRDLESS`**:
 
 ### 2. Gate bypass (api)
 
-- Per Decision 3: both callers compute `allowWithoutPRD` from their fresh snapshot and pass the bool in — `CreateRun` (manual, handler) and `CreateAutopilotRun` (poller, `api/internal/poller/autopilot.go:176-197`); the shared `createRun` gate (`api/internal/workersvc/service.go:647-648`) becomes `if !issue.HasPrdLink && !allowWithoutPRD { return ErrNoPRDLink }`. `workersvc` gains no settings dependency.
+- Per Decision 3: both callers compute `allowWithoutPRD` from their fresh snapshot and pass the bool in — `CreateRun` (manual, handler) and `CreateAutopilotRun` (poller, `api/internal/poller/autopilot.go:176-197`); the shared `createRun` gate (`api/internal/workersvc/service.go:657-658`) becomes `if !issue.HasPrdLink && !allowWithoutPRD { return ErrNoPRDLink }`. `workersvc` gains no settings dependency.
 - The signature changes touch the existing no-PRD-link tests — now two of them, manual (`api/internal/workersvc/service_test.go:~879`) and autopilot (`:~909-912`) — update them in M2, don't bolt on parallel ones. Add the composition test (PRD + autopilot + PRDLESS labels, no PRD link → unattended run) in M2 as well.
-- The 422 message (`workers.go:293-294`) is extended when prdless is enabled instance-wide: `"issue has no PRD link; add a prds/*.md link (or the PRDLESS label) before starting a run"` — the label name interpolated from settings.
+- The 422 message (`workers.go:292-294`) is extended when prdless is enabled instance-wide: `"issue has no PRD link; add a prds/*.md link (or the PRDLESS label) before starting a run"` — the label name interpolated from settings.
 
 ### 3. UI label toggle (api + web)
 
@@ -70,9 +70,9 @@ An admin-controlled escape-hatch label, default name **`PRDLESS`**:
 
 ## Milestones
 
-- [ ] **M1 — Settings keys + admin UI** *(after prd-21 lands, or owns the `Validate` switch)*: `Defaults` entries + typed bool accessor, per-key validation registration, validation matrix tests (bool parse, pairwise-distinct incl. while-disabled, post-merge atomic multi-key PUT), `ForceReconcile` exclusion, toggle + name field on the admin Settings page.
+- [ ] **M1 — Settings keys + admin UI** *(after prd-21 lands, or owns the `Validate` switch)*: `Defaults` entries + typed bool accessor, per-key validation registration, validation matrix tests (bool parse, pairwise-distinct incl. while-disabled, post-merge atomic multi-key PUT), `ForceReconcile` exclusion, toggle + name field on the admin Settings page. Its landing commit also removes the "lands in a later milestone" caveats from `docs/admin-settings.md` (Validation section, Resync section) and the toggle-note in `docs/prdless.md` — the validation-matrix and `ForceReconcile`-exclusion claims those caveats guard become true then.
 - [ ] **M2 — Gate bypass end-to-end (manual + autopilot)**: caller-computed `allowWithoutPRD` → shared `createRun` enforcement, extended 422 message, unit tests (enabled/disabled × label present/absent × PRD link present/absent, both paths), both existing no-PRD-link tests updated, autopilot composition test.
-- [ ] **M3 — Web badges + bootstrap**: `sessionPayload` fields, badges on Board + IssueView, label-suggestion exclusion, mock API + vitest coverage.
+- [ ] **M3 — Web badges + bootstrap**: `sessionPayload` fields, badges on Board + IssueView, label-suggestion exclusion, mock API + vitest coverage. Its landing commit also removes the toggle-visibility caveat in `docs/prdless.md`'s "Applying or removing the label" section — the IssueView/board-card toggle stops being hidden once `sessionPayload` carries the fields.
 - [ ] **M4 — UI label toggle**: forgesvc single-label helper + endpoint (forge-first, idempotent diff, EnsureLabels + color constant on apply, disabled→422, per-user forge limiter, MoveIssue-style card response), IssueView + board-card toggle affordances, handler + vitest coverage.
 - [ ] **M5 — Docs + specs**: docs page section, `specs/ai.md` update, `specs/human.md` proposal for user approval.
 - [ ] **M6 — E2E validation**: prdless disabled → 422; enabled + labeled → run starts without PRD link; UI toggle applies/removes the label on the fake forge. Preconditions to build into the harness: the fake forge serves the prdless label on the test issue, and the scenario drives `PUT /api/admin/settings` in the isolated stack.

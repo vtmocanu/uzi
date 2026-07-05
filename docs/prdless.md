@@ -38,10 +38,13 @@ move a card between board columns. Two places:
 1. **Issue view**: open the issue and use the PRDLESS toggle.
 2. **Board card**: the same toggle appears on the card itself.
 
-The toggle only appears when the feature is enabled instance-wide. Applying
-or removing writes the label to GitLab first; the button only reflects the
-new state once the forge confirms it, so a failed write never shows a
-change that didn't really happen.
+The toggle only appears when the feature is enabled instance-wide. *(Note:
+the toggle itself lands in a later milestone of this release — until then
+IssueView and the board card have no way to know the feature is enabled, so
+it stays hidden even when it is.)* Applying or removing writes the label to
+GitLab first; the button only reflects the new state once the forge
+confirms it, so a failed write never shows a change that didn't really
+happen.
 
 The first time the label is applied from uzi, it's auto-created on the
 GitLab project (amber) — no manual setup needed. Applying it from GitLab's
