@@ -44,6 +44,9 @@ func (f *fakeForge) CreateIssue(context.Context, int64, string, string, []string
 func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
 	return nil
 }
+func (f *fakeForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
+	return forge.MergeRequest{}, nil
+}
 
 // fakeStore records what the sync writes, standing in for *store.Queries.
 type fakeStore struct {
