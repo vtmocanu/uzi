@@ -116,6 +116,24 @@ describe("Repos — repo-skills opt-in", () => {
     await waitFor(() => expect(mockApi.setRepoSkillsEnabled).toHaveBeenCalledWith("repo-uzi", true));
   });
 
+  it("renders the warning OUTSIDE the horizontal-scroll container (never clipped)", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /Load repo skills/ }));
+    const warning = screen.getByRole("group", { name: /Load repo skills for vtmocanu\/uzi/ });
+    // The security caveats must not sit inside an overflow-x-auto region.
+    expect(warning.closest(".overflow-x-auto")).toBeNull();
+  });
+
+  it("moves focus into the warning when it opens", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /Load repo skills/ }));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Enable repo skills" })),
+    );
+  });
+
   it("disabling repo skills is immediate (no warning)", async () => {
     mockApi.setRepoSkillsEnabled.mockResolvedValue({
       repo: { ...REPOS[1], repo_skills_enabled: false },

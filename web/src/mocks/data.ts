@@ -530,6 +530,20 @@ export const mockSkills: Skill[] = [
     created_at: daysAgo(5),
     updated_at: daysAgo(1),
   },
+  {
+    // Owned by another user (Mira). The admin session sees it in the "Other
+    // users" group (view-only — admins can read but not edit others' private
+    // skills); signed in as Mira it is her "Mine".
+    id: "skill-mira-runbook",
+    name: "mira-deploy-runbook",
+    description: "Mira's personal runbook for the staging deploy dance.",
+    body: "# mira-deploy-runbook\n\nThe order I run the staging promotion steps in…",
+    scope: "user",
+    user_id: "u-mira",
+    updated_by: "mira@uzi.local",
+    created_at: daysAgo(4),
+    updated_at: daysAgo(2),
+  },
 ];
 
 // Seed allocation: the builtin ci-cd-norms is shared onto the coder template

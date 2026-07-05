@@ -91,7 +91,12 @@ export const mockApi = {
     return delay({ user: state.session });
   },
   login: async (email: string, _password: string) => {
-    state.session = { ...mockAdmin, email: email || mockAdmin.email };
+    // Persona switch for the demo: logging in as a seeded non-admin (e.g.
+    // mira@uzi.local) signs in AS that user, so the non-admin rendering paths
+    // (no Global create, view-only builtin/global, own-skills-only) are
+    // browser-checkable. Any other email is the admin, as before.
+    const persona = users.find((u) => u.email === email.trim().toLowerCase());
+    state.session = persona ? { ...persona } : { ...mockAdmin, email: email || mockAdmin.email };
     return delay({ user: state.session });
   },
   // Demo mode has registration open and unrestricted.

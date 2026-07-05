@@ -1,7 +1,7 @@
 // Boards home: the projects the bot can see. Enabling one starts tracking its
 // PRD issues on a kanban board.
 
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo } from "../lib/api";
 import { repoFindings } from "../lib/privilege";
@@ -18,8 +18,22 @@ export function Repos() {
   const [busyId, setBusyId] = useState<string | null>(null);
   // The repo whose "enable repo skills" warning is currently expanded (enabling
   // is a trust decision, so it is gated behind a confirm; disabling is immediate).
+  // The warning renders OUTSIDE the horizontally-scrolling table so its security
+  // caveats are never clipped at narrow widths.
   const [warnRepoId, setWarnRepoId] = useState<string | null>(null);
   const [skillsBusyId, setSkillsBusyId] = useState<string | null>(null);
+  // Focus management: remember the "Load repo skills" trigger so focus returns to
+  // it on cancel, and move focus into the warning (its first button) when it opens.
+  const warnTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const warnBannerRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (warnRepoId) warnBannerRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [warnRepoId]);
+
+  const cancelWarn = () => {
+    setWarnRepoId(null);
+    warnTriggerRef.current?.focus();
+  };
 
   useEffect(() => {
     (async () => {
@@ -83,6 +97,10 @@ export function Repos() {
   // The selected connection's latest privilege report drives the per-repo
   // findings badges (null until a check has run).
   const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
+
+  // The repo whose trust warning is expanded (rendered as a banner below the
+  // table, outside its horizontal scroll container).
+  const warnRepo = repos.find((r) => r.id === warnRepoId) ?? null;
 
   return (
     <div className="space-y-6">
@@ -148,8 +166,7 @@ export function Repos() {
                     </tr>
                   ) : (
                     repos.map((r) => (
-                      <Fragment key={r.id}>
-                      <tr className="transition-colors hover:bg-raised/30">
+                      <tr key={r.id} className="transition-colors hover:bg-raised/30">
                         <td className="px-4 py-3">
                           {isHttpsUrl(r.web_url) ? (
                             <a
@@ -212,8 +229,12 @@ export function Repos() {
                             <Button
                               variant="secondary"
                               size="sm"
+                              aria-expanded={warnRepoId === r.id}
                               disabled={skillsBusyId === r.id}
-                              onClick={() => setWarnRepoId((id) => (id === r.id ? null : r.id))}
+                              onClick={(e) => {
+                                warnTriggerRef.current = e.currentTarget;
+                                setWarnRepoId((id) => (id === r.id ? null : r.id));
+                              }}
                             >
                               Load repo skills
                             </Button>
@@ -239,49 +260,54 @@ export function Repos() {
                           </div>
                         </td>
                       </tr>
-                      {warnRepoId === r.id && (
-                        <tr className="bg-warn/5">
-                          <td colSpan={5} className="px-4 py-4">
-                            <div className="space-y-3">
-                              <p className="text-sm text-fg">
-                                <span className="font-medium">Load skills from this repo?</span>{" "}
-                                Enabling this loads skills from the repo&rsquo;s own{" "}
-                                <code className="rounded bg-raised px-1 py-0.5 font-mono text-xs">
-                                  .claude/skills/
-                                </code>{" "}
-                                into every run on this repo. Only <code className="font-mono text-xs">SKILL.md</code>{" "}
-                                files load — never the repo&rsquo;s hooks, settings, commands, or{" "}
-                                <code className="font-mono text-xs">CLAUDE.md</code>. A skill can steer an
-                                agent, so enable this only for a repo whose merge-request review
-                                discipline you trust.
-                              </p>
-                              <div className="flex gap-2">
-                                <Button
-                                  size="sm"
-                                  disabled={skillsBusyId === r.id}
-                                  onClick={() => setRepoSkills(r, true)}
-                                >
-                                  {skillsBusyId === r.id ? "Enabling…" : "Enable repo skills"}
-                                </Button>
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  disabled={skillsBusyId === r.id}
-                                  onClick={() => setWarnRepoId(null)}
-                                >
-                                  Cancel
-                                </Button>
-                              </div>
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                      </Fragment>
                     ))
                   )}
                 </tbody>
               </table>
             </div>
+
+            {/* Rendered OUTSIDE the overflow-x-auto div above so the security
+                caveats stay fully readable at any width (never clipped behind a
+                horizontal scroll). Only one repo's warning shows at a time. */}
+            {warnRepo && (
+              <div
+                ref={warnBannerRef}
+                role="group"
+                aria-label={`Load repo skills for ${warnRepo.path_with_namespace}`}
+                className="space-y-3 border-t border-edge bg-warn/5 p-4"
+              >
+                <p className="text-sm text-fg">
+                  <span className="font-medium">
+                    Load skills from {warnRepo.path_with_namespace}?
+                  </span>{" "}
+                  Enabling this loads skills from the repo&rsquo;s own{" "}
+                  <code className="rounded bg-raised px-1 py-0.5 font-mono text-xs">
+                    .claude/skills/
+                  </code>{" "}
+                  into every run on this repo. Only <code className="font-mono text-xs">SKILL.md</code>{" "}
+                  files load, never the repo&rsquo;s hooks, settings, commands, or{" "}
+                  <code className="font-mono text-xs">CLAUDE.md</code>. A skill can steer an agent, so
+                  enable this only for a repo whose merge-request review discipline you trust.
+                </p>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    disabled={skillsBusyId === warnRepo.id}
+                    onClick={() => setRepoSkills(warnRepo, true)}
+                  >
+                    {skillsBusyId === warnRepo.id ? "Enabling…" : "Enable repo skills"}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={skillsBusyId === warnRepo.id}
+                    onClick={cancelWarn}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
           </Card>
         </>
       )}

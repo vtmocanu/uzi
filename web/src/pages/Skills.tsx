@@ -586,6 +586,7 @@ function SkillEditor({
               value={body}
               onChange={(e) => setBody(e.target.value)}
               rows={16}
+              aria-label="Body (Markdown, SKILL.md)"
               placeholder={"# my-skill\n\nWhat this playbook covers and the steps to follow."}
               className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-none focus:border-brand/70"
             />
