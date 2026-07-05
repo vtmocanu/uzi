@@ -25,6 +25,19 @@ export default {
         warn: token("warn"),
         danger: token("danger"),
         info: token("info"),
+        // Queue + idle/stopped tones carry border/surface/fg triples (not the
+        // single-hue opacity pattern of the four above) so ember reproduces its
+        // solid neutral pill exactly while a theme can retint them (index.css).
+        queue: {
+          fg: token("queue-fg"),
+          border: token("queue-border"),
+          surface: token("queue-surface"),
+        },
+        neutral: {
+          fg: token("neutral-fg"),
+          border: token("neutral-border"),
+          surface: token("neutral-surface"),
+        },
         ring: token("ring"), // keyboard focus ring (see :focus-visible in index.css)
       },
       // Radii derive from the single --radius token (multica's calc scheme in

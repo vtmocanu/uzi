@@ -32,11 +32,11 @@ function run(over: Partial<LatestRun> = {}): LatestRun {
 const NOW = Date.parse("2026-07-04T12:04:00Z"); // 4m after the default created_at
 
 describe("runBadge taxonomy", () => {
-  it("queued → neutral 'queued'", () => {
+  it("queued → queue 'queued'", () => {
     expect(runBadge(run({ status: "queued" }), NOW)).toEqual({
       kind: "badge",
       label: "queued",
-      tone: "neutral",
+      tone: "queue",
       pulse: false,
     });
   });
@@ -125,11 +125,11 @@ describe("runStatusTone (list-row tone)", () => {
     expect(runStatusTone("failed", "compile error")).toBe("danger");
     expect(runStatusTone("failed", null)).toBe("danger");
   });
-  it("completed → ok, claimed/running → info, queued → neutral (matches StatusPill)", () => {
+  it("completed → ok, claimed/running → info, queued → queue (matches StatusPill)", () => {
     expect(runStatusTone("completed", null)).toBe("ok");
     expect(runStatusTone("claimed", null)).toBe("info");
     expect(runStatusTone("running", null)).toBe("info");
-    expect(runStatusTone("queued", null)).toBe("neutral");
+    expect(runStatusTone("queued", null)).toBe("queue");
   });
 });
 
