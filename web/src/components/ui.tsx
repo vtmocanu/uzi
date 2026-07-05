@@ -146,10 +146,14 @@ export function Alert({ message, tone = "danger" }: { message: string; tone?: Al
   );
 }
 
-export type BadgeTone = "neutral" | "warning" | "danger" | "ok" | "info" | "brand";
+export type BadgeTone = "neutral" | "queue" | "warning" | "danger" | "ok" | "info" | "brand";
 
+// neutral and queue carry a border/surface/fg triple (theme tokens set all
+// three), so ember renders its solid gray pill while a theme can retint just
+// these — the others tint a single hue by opacity. See index.css.
 const BADGE_TONES: Record<BadgeTone, string> = {
-  neutral: "border-edge bg-raised text-muted",
+  neutral: "border-neutral-border bg-neutral-surface text-neutral-fg",
+  queue: "border-queue-border bg-queue-surface text-queue-fg",
   warning: "border-warn/40 bg-warn/10 text-warn",
   danger: "border-danger/40 bg-danger/10 text-danger",
   ok: "border-ok/40 bg-ok/10 text-ok",
@@ -186,7 +190,7 @@ export function Badge({
 // status an icon color via issues/components/status-icon.tsx; the pill shape
 // follows its chat/components/task-status-pill.tsx).
 const RUN_STATUS_TONES: Record<string, { tone: BadgeTone; pulse?: boolean }> = {
-  queued: { tone: "neutral" },
+  queued: { tone: "queue" },
   claimed: { tone: "info" },
   running: { tone: "info", pulse: true },
   awaiting_approval: { tone: "warning", pulse: true },

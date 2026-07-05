@@ -188,6 +188,68 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+func TestDefaultThemeAccessor(t *testing.T) {
+	// A stored value wins.
+	c := New(&fakeStore{rows: []store.AppSetting{row(KeyDefaultTheme, "mission")}}, time.Minute)
+	if got, err := c.DefaultTheme(context.Background()); err != nil || got != "mission" {
+		t.Fatalf("DefaultTheme = %q, %v; want mission", got, err)
+	}
+	// An empty table falls back to the registry default ("ember"), so an instance
+	// that never set a theme renders the original look.
+	c = New(&fakeStore{}, time.Minute)
+	if got, err := c.DefaultTheme(context.Background()); err != nil || got != "ember" {
+		t.Fatalf("DefaultTheme = %q, %v; want default ember", got, err)
+	}
+}
+
+func TestValidateDispatch(t *testing.T) {
+	// Label keys route to the label rules: a comma is rejected.
+	if err := Validate(KeyPRDLabel, "a,b"); err == nil {
+		t.Error("Validate(prd_label, \"a,b\") = nil, want a label rejection")
+	}
+	if err := Validate(KeyAutopilotLabel, "autopilot"); err != nil {
+		t.Errorf("Validate(autopilot_label, valid) = %v, want nil", err)
+	}
+	// default_theme routes to the theme registry, not the label rules.
+	if err := Validate(KeyDefaultTheme, "mission"); err != nil {
+		t.Errorf("Validate(default_theme, mission) = %v, want nil", err)
+	}
+	if err := Validate(KeyDefaultTheme, "neon"); err == nil {
+		t.Error("Validate(default_theme, neon) = nil, want an unknown-theme rejection")
+	}
+	// A theme value that a label rule would ACCEPT (no comma, short) must still be
+	// rejected by the theme registry — proving the dispatch, not just length.
+	if err := Validate(KeyDefaultTheme, "PRD"); err == nil {
+		t.Error("Validate(default_theme, \"PRD\") = nil; a valid label is not a valid theme")
+	}
+}
+
+func TestLabelChanged(t *testing.T) {
+	committed := map[string]string{
+		KeyPRDLabel:       "PRD",
+		KeyAutopilotLabel: "autopilot",
+		KeyDefaultTheme:   "ember",
+	}
+	cases := []struct {
+		name    string
+		updates map[string]string
+		want    bool
+	}{
+		{"a label change forces a resync", map[string]string{KeyPRDLabel: "Feature"}, true},
+		{"a theme-only change does NOT force a resync", map[string]string{KeyDefaultTheme: "mission"}, false},
+		{"an idempotent label write does not", map[string]string{KeyPRDLabel: "PRD"}, false},
+		{"label + theme together still resyncs on the label", map[string]string{KeyPRDLabel: "Feature", KeyDefaultTheme: "mission"}, true},
+		{"an empty update does not", map[string]string{}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := LabelChanged(committed, c.updates); got != c.want {
+				t.Fatalf("LabelChanged(%v) = %v, want %v", c.updates, got, c.want)
+			}
+		})
+	}
+}
+
 func TestValidateLabel(t *testing.T) {
 	if err := ValidateLabel("PRD"); err != nil {
 		t.Errorf("plain label rejected: %v", err)

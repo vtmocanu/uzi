@@ -6,7 +6,9 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { api, ApiError, type AppSettings } from "../lib/api";
-import { Alert, Button, Card, Field, Input, PageHeader, SectionTitle, Skeleton } from "../components/ui";
+import { useAuth } from "../auth/AuthContext";
+import { Alert, Button, Card, Field, Input, PageHeader, SectionTitle, Select, Skeleton } from "../components/ui";
+import { THEMES, THEME_LABELS } from "../lib/theme";
 
 // clientValidate reproduces the server's per-value + cross-key rules so an
 // obviously-bad edit is caught before the round-trip. Returns an error message
@@ -25,9 +27,11 @@ function clientValidate(prdLabel: string, autopilotLabel: string): string | null
 }
 
 export function AdminSettings() {
+  const { refresh } = useAuth();
   const [saved, setSaved] = useState<AppSettings | null>(null);
   const [prdLabel, setPrdLabel] = useState("");
   const [autopilotLabel, setAutopilotLabel] = useState("");
+  const [defaultTheme, setDefaultTheme] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -39,6 +43,7 @@ export function AdminSettings() {
       setSaved(settings);
       setPrdLabel(settings.prd_label);
       setAutopilotLabel(settings.autopilot_label);
+      setDefaultTheme(settings.default_theme);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load settings");
     } finally {
@@ -51,7 +56,10 @@ export function AdminSettings() {
   }, [load]);
 
   const dirty =
-    saved !== null && (prdLabel !== saved.prd_label || autopilotLabel !== saved.autopilot_label);
+    saved !== null &&
+    (prdLabel !== saved.prd_label ||
+      autopilotLabel !== saved.autopilot_label ||
+      defaultTheme !== saved.default_theme);
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
@@ -67,11 +75,16 @@ export function AdminSettings() {
       const { settings } = await api.updateSettings({
         prd_label: prdLabel,
         autopilot_label: autopilotLabel,
+        default_theme: defaultTheme,
       });
       setSaved(settings);
       setPrdLabel(settings.prd_label);
       setAutopilotLabel(settings.autopilot_label);
+      setDefaultTheme(settings.default_theme);
       setNotice("Settings saved. Boards reflect a changed PRD label after the next sync.");
+      // Re-resolve this admin's own theme: with no personal override, a changed
+      // instance default restyles their session live.
+      await refresh();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to save settings");
     } finally {
@@ -131,6 +144,25 @@ export function AdminSettings() {
               <p className="text-xs text-faint">
                 Adding this label to a PRD issue lets an opted-in user run it end to end, with no
                 plan-approval step.
+              </p>
+            </div>
+            <div className="space-y-1.5 border-t border-edge pt-4">
+              <Field label="Default theme" htmlFor="default-theme">
+                <Select
+                  id="default-theme"
+                  value={defaultTheme}
+                  onChange={(e) => setDefaultTheme(e.target.value)}
+                >
+                  {THEMES.map((t) => (
+                    <option key={t} value={t}>
+                      {THEME_LABELS[t]}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <p className="text-xs text-faint">
+                The theme new users, and anyone without a personal choice, see. Each user can
+                override it under Settings → Appearance.
               </p>
             </div>
             <Button type="submit" disabled={busy || !dirty}>

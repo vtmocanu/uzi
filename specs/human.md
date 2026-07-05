@@ -153,6 +153,17 @@ Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/19-admin-settings-and-auto
 - Each user self-declares their own forge (human) username on their connection (the mapping autopilot attributes runs to).
 - Attribution order: label adder first, issue author fallback.
 
+## Feature #21 — Mission-control theme (second selectable theme)
+
+Tracked as GitLab issue vtmocanu/uzi#21; PRD at `prds/21-mission-control-theme.md`.
+
+- Mission-control theme (one of three evaluated prototypes) must be selectable in the product.
+- Prototype branches preserved on origin: `prototype/mission-control` and `prototype/minimal`.
+- Theme preference is server-side with an admin-set instance default. Resolution: user override > admin default > ember. [user 2026-07-05, supersedes a device-local draft]
+- Mission's six-tone status language, incl. the violet queue tone, added theme-agnostically. [user 2026-07-05]
+- Theme settings tenant into PRD #19's `app_settings` — no parallel settings table. [user-approved 2026-07-05, "update 21, 19 is in flight"]
+- Mock demo persists settings across reload (settings-only). [user approved 2026-07-05]
+
 ## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
 
 Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-sidebar-board.md`.

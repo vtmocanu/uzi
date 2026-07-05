@@ -19,7 +19,9 @@ import {
   type SkillUpdateInput,
   type User,
   type UserSettings,
+  type UserSettingsPatch,
 } from "../lib/api";
+import { isTheme, resolveTheme } from "../lib/theme";
 import { bodyError, descriptionError, SKILL_NAME_RE } from "../lib/skills";
 import {
   LIVE_RUN_ID,
@@ -48,11 +50,86 @@ function requireSession(): User {
   return state.session;
 }
 
+// ── Settings persistence (demo build) ────────────────────────────────────────
+// The mock persists ONLY the settings maps to localStorage so a hard reload of
+// the demo keeps the picked theme (and labels / worker model) instead of snapping
+// back to seed — making no-flash + persistence witnessable end to end in the
+// sanctioned preview vehicle. Runs, issues, workers, secrets etc. are
+// deliberately NOT persisted. Versioned + shape-checked: a blob from an older
+// seed schema (or a corrupt one) is discarded and re-seeded, never served, so
+// stale demo state can't outlive a seed-schema change.
+const MOCK_SETTINGS_KEY = "uzi.mock.v1";
+const SEED_USER_SETTINGS: UserSettings = { default_model: null, theme: null };
+const SEED_APP_SETTINGS: AppSettings = {
+  prd_label: "PRD",
+  autopilot_label: "autopilot",
+  default_theme: "ember",
+};
+
+interface PersistedSettings {
+  v: 1;
+  userSettings: UserSettings;
+  appSettings: AppSettings;
+}
+
+// isPersistedSettings validates the version AND the shape (key presence + value
+// types) so only a blob matching the current schema is trusted; anything else
+// falls through to a fresh seed.
+function isPersistedSettings(p: unknown): p is PersistedSettings {
+  if (typeof p !== "object" || p === null) return false;
+  const o = p as Record<string, unknown>;
+  if (o.v !== 1) return false;
+  const us = o.userSettings;
+  const as = o.appSettings;
+  if (typeof us !== "object" || us === null || typeof as !== "object" || as === null) return false;
+  const u = us as Record<string, unknown>;
+  const a = as as Record<string, unknown>;
+  const okUser =
+    (u.default_model === null || typeof u.default_model === "string") &&
+    (u.theme === null || typeof u.theme === "string");
+  const okApp =
+    typeof a.prd_label === "string" &&
+    typeof a.autopilot_label === "string" &&
+    typeof a.default_theme === "string";
+  return okUser && okApp;
+}
+
+function loadSettings(): { userSettings: UserSettings; appSettings: AppSettings } {
+  try {
+    const raw = localStorage.getItem(MOCK_SETTINGS_KEY);
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (isPersistedSettings(parsed)) {
+        return {
+          userSettings: { ...parsed.userSettings },
+          appSettings: { ...parsed.appSettings },
+        };
+      }
+    }
+  } catch {
+    // Storage unavailable (private mode) or a corrupt/legacy blob: re-seed.
+  }
+  return { userSettings: { ...SEED_USER_SETTINGS }, appSettings: { ...SEED_APP_SETTINGS } };
+}
+
+// persistSettings write-throughs the current settings maps. Called from the
+// putMySettings / updateSettings mock handlers after they mutate.
+function persistSettings(): void {
+  try {
+    const blob: PersistedSettings = { v: 1, userSettings, appSettings };
+    localStorage.setItem(MOCK_SETTINGS_KEY, JSON.stringify(blob));
+  } catch {
+    // Storage unavailable: the demo still works in-memory for this session.
+  }
+}
+
+const loadedSettings = loadSettings();
+
 // Mutable copies of seed collections (CRUD operates on these).
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
-let userSettings: UserSettings = { default_model: null };
+let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
@@ -60,7 +137,7 @@ let skills: Skill[] = mockSkills.map((s) => ({ ...s }));
 let allocations: Record<string, { shared: string[]; mine: string[] }> = Object.fromEntries(
   Object.entries(mockAllocations).map(([k, v]) => [k, { shared: [...v.shared], mine: [...v.mine] }]),
 );
-let appSettings: AppSettings = { prd_label: "PRD", autopilot_label: "autopilot" };
+let appSettings: AppSettings = loadedSettings.appSettings;
 let templateCounter = 0;
 let workerCounter = 0;
 let skillCounter = 0;
@@ -86,13 +163,17 @@ function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
-// sessionBody is the auth/session bootstrap payload: the signed-in user plus the
-// current instance labels (PRD #19 M2).
+// sessionBody is the auth/session bootstrap payload: the signed-in user, the
+// current instance labels (PRD #19 M2), and the three resolved theme fields (PRD
+// #21), mirroring the real API so the mocked SPA resolves them the same way.
 function sessionBody() {
   return {
     user: requireSession(),
     prd_label: appSettings.prd_label,
     autopilot_label: appSettings.autopilot_label,
+    theme: resolveTheme(userSettings.theme, appSettings.default_theme),
+    theme_override: userSettings.theme,
+    default_theme: appSettings.default_theme,
   };
 }
 
@@ -140,6 +221,11 @@ export const mockApi = {
   updateSettings: async (updates: Partial<AppSettings>) => {
     const merged = { ...appSettings, ...updates };
     for (const [key, value] of Object.entries(updates)) {
+      // default_theme routes to the theme registry, not the label rules (PRD #21).
+      if (key === "default_theme") {
+        if (!isTheme(value)) throw new ApiError(400, `default_theme: unknown theme: "${value}"`);
+        continue;
+      }
       if (key !== "prd_label" && key !== "autopilot_label") {
         throw new ApiError(400, `unknown setting: ${key}`);
       }
@@ -151,6 +237,7 @@ export const mockApi = {
       throw new ApiError(400, "prd_label and autopilot_label must differ");
     }
     appSettings = merged;
+    persistSettings();
     return delay({ settings: { ...appSettings } });
   },
 
@@ -175,9 +262,19 @@ export const mockApi = {
     return delay(null);
   },
   getMySettings: async () => delay({ settings: { ...userSettings } }),
-  putMySettings: async (defaultModel: string | null) => {
-    const trimmed = defaultModel?.trim() ?? "";
-    userSettings = { default_model: trimmed === "" ? null : trimmed };
+  putMySettings: async (patch: UserSettingsPatch) => {
+    // PATCH-like: apply only the fields present in the body, mirroring the real
+    // handler so a theme-only save never clears the model and vice versa.
+    if (patch.default_model !== undefined) {
+      const trimmed = patch.default_model?.trim() ?? "";
+      userSettings = { ...userSettings, default_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.theme !== undefined) {
+      const t = patch.theme?.trim() ?? "";
+      if (t !== "" && !isTheme(t)) throw new ApiError(400, `unknown theme: "${t}"`);
+      userSettings = { ...userSettings, theme: t === "" ? null : t };
+    }
+    persistSettings();
     return delay({ settings: { ...userSettings } });
   },
 

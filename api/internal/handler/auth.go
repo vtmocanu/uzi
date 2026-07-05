@@ -16,6 +16,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/theme"
 )
 
 // minPasswordLen is the server-side minimum; the client adds strength
@@ -279,10 +280,24 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[string]any {
 	prdLabel, _ := h.settings.PRDLabel(ctx)
 	autopilotLabel, _ := h.settings.AutopilotLabel(ctx)
+	// Theme resolution (PRD #21 Decision 2): the SPA needs three values, not just
+	// the resolved theme. With an override active, the Appearance picker also has
+	// to render "Use default (<name>)" and set its selected state, and the default
+	// lives in an admin-only endpoint — so carry the resolved theme, the user's
+	// raw override (nullable), and the instance default here. Best-effort like the
+	// labels: a cold settings read yields the registry default, never an error.
+	defaultTheme, _ := h.settings.DefaultTheme(ctx)
+	override := ""
+	if user.Theme.Valid {
+		override = user.Theme.String
+	}
 	return map[string]any{
 		"user":            toDTO(user),
 		"prd_label":       prdLabel,
 		"autopilot_label": autopilotLabel,
+		"theme":           theme.Resolve(override, defaultTheme),
+		"theme_override":  textPtrValue(override != "", override),
+		"default_theme":   defaultTheme,
 	}
 }
 

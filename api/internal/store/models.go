@@ -164,6 +164,7 @@ type User struct {
 	LastLogin        pgtype.Timestamptz `json:"last_login"`
 	DefaultModel     pgtype.Text        `json:"default_model"`
 	AutopilotEnabled bool               `json:"autopilot_enabled"`
+	Theme            pgtype.Text        `json:"theme"`
 }
 
 type UserSecret struct {
