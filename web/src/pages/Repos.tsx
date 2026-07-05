@@ -1,7 +1,11 @@
+// Boards home: the projects the bot can see. Enabling one starts tracking its
+// PRD issues on a kanban board.
+
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo } from "../lib/api";
-import { Alert, Button, Card, Select } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select } from "../components/ui";
+import { BoardIcon } from "../components/icons";
 
 export function Repos() {
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
@@ -59,34 +63,33 @@ export function Repos() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold">Repos</h1>
-          <p className="mt-1 text-slate-400">
-            Projects your bot can see. Enable one to track its PRD issues on a board.
-          </p>
-        </div>
-        {connectionId && (
-          <Button variant="ghost" disabled={refreshing} onClick={() => loadProjects(connectionId)}>
-            {refreshing ? "Refreshing…" : "Refresh list"}
-          </Button>
-        )}
-      </div>
+      <PageHeader
+        title="Boards"
+        description="Projects your bot can see. Enable one to track its PRD issues on a board."
+        actions={
+          connectionId ? (
+            <Button variant="secondary" size="sm" disabled={refreshing} onClick={() => loadProjects(connectionId)}>
+              {refreshing ? "Refreshing…" : "Refresh list"}
+            </Button>
+          ) : undefined
+        }
+      />
 
       {error && <Alert message={error} />}
 
       {loading ? (
-        <p className="text-slate-500">Loading…</p>
+        <ListSkeleton rows={4} />
       ) : connections.length === 0 ? (
-        <Card>
-          <p className="text-slate-400">
-            No forge connection yet. Add one under{" "}
-            <Link to="/settings/forge" className="text-indigo-400 hover:text-indigo-300">
-              Settings → Forge
+        <EmptyState
+          icon={<BoardIcon />}
+          title="No forge connection yet"
+          description="uzi needs a GitLab bot before it can see any projects."
+          action={
+            <Link to="/settings/forge">
+              <Button size="sm">Connect the forge</Button>
             </Link>
-            .
-          </p>
-        </Card>
+          }
+        />
       ) : (
         <>
           {connections.length > 1 && (
@@ -104,7 +107,7 @@ export function Repos() {
           <Card className="p-0">
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
-                <thead className="border-b border-slate-800 text-slate-400">
+                <thead className="border-b border-edge text-muted">
                   <tr>
                     <th className="px-4 py-3 font-medium">Project</th>
                     <th className="px-4 py-3 font-medium">Default branch</th>
@@ -112,47 +115,50 @@ export function Repos() {
                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-800">
+                <tbody className="divide-y divide-edge">
                   {repos.length === 0 ? (
                     <tr>
-                      <td colSpan={4} className="px-4 py-6 text-center text-slate-500">
+                      <td colSpan={4} className="px-4 py-6 text-center text-faint">
                         {refreshing ? "Loading…" : "No projects found for this bot."}
                       </td>
                     </tr>
                   ) : (
                     repos.map((r) => (
-                      <tr key={r.id}>
+                      <tr key={r.id} className="transition-colors hover:bg-raised/30">
                         <td className="px-4 py-3">
                           {isHttpsUrl(r.web_url) ? (
                             <a
                               href={r.web_url}
                               target="_blank"
                               rel="noreferrer"
-                              className="font-medium text-slate-100 hover:text-indigo-300"
+                              className="font-medium text-fg hover:text-brand-hover"
                             >
                               {r.path_with_namespace}
                             </a>
                           ) : (
-                            <span className="font-medium text-slate-100">
-                              {r.path_with_namespace}
-                            </span>
+                            <span className="font-medium text-fg">{r.path_with_namespace}</span>
                           )}
                         </td>
-                        <td className="px-4 py-3 text-slate-400">{r.default_branch ?? "—"}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-muted">
+                          {r.default_branch ?? "—"}
+                        </td>
                         <td className="px-4 py-3">
-                          <span className={r.enabled ? "text-emerald-400" : "text-slate-500"}>
+                          <Badge tone={r.enabled ? "ok" : "neutral"} dot>
                             {r.enabled ? "Enabled" : "Disabled"}
-                          </span>
+                          </Badge>
                         </td>
                         <td className="px-4 py-3 text-right">
                           <div className="flex justify-end gap-2">
                             {r.enabled && (
                               <Link to={`/repos/${r.id}/board`}>
-                                <Button variant="ghost">Open board</Button>
+                                <Button variant="secondary" size="sm">
+                                  Open board
+                                </Button>
                               </Link>
                             )}
                             <Button
                               variant={r.enabled ? "danger" : "primary"}
+                              size="sm"
                               disabled={busyId === r.id}
                               onClick={() => toggle(r)}
                             >

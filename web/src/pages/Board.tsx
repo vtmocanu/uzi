@@ -1,3 +1,13 @@
+// Kanban board of PRD-labeled issues. Columns are GitLab labels; moves are
+// forge-first (the server writes the label, then returns the authoritative
+// card — a failed move snaps back because nothing moved optimistically).
+// Column identity follows multica's status-color language
+// (packages/views/issues/components/status-icon.tsx / status-heading.tsx):
+// every column gets a stable accent dot, Open is neutral, Closed is muted and
+// not a drop target. Cards are content-first (multica board-card.tsx): title,
+// meta, badges. Live behavior (latest_run badges, 10s visibility-gated polling,
+// auto-move toasts, the attention strip, in-app issue links) is PRD #12 M2/M3.
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import {
@@ -16,10 +26,14 @@ import {
   retryHint,
   runBadge,
 } from "../lib/runBadge";
-import { Alert, Badge, Button, Card, Field, Input } from "../components/ui";
+import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
+import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
 
 const OPEN_KEY = "";
 const CLOSED_KEY = "__closed__";
+
+// Stable accents for working columns, cycled by position.
+const COLUMN_ACCENTS = ["bg-info", "bg-brand", "bg-warn", "bg-ok", "bg-danger"];
 
 // columnKeyForCard maps a card to the key of the column it renders in.
 function columnKeyForCard(card: CardData): string {
@@ -222,13 +236,18 @@ export function Board() {
   };
 
   const columns = useMemo(() => {
-    const cols: { key: string; label: string; droppable: boolean }[] = [
-      { key: OPEN_KEY, label: "Open", droppable: true },
+    const cols: { key: string; label: string; droppable: boolean; accent: string }[] = [
+      { key: OPEN_KEY, label: "Open", droppable: true, accent: "bg-faint" },
     ];
-    for (const c of board?.columns ?? []) {
-      cols.push({ key: c.label_name, label: c.label_name, droppable: true });
-    }
-    cols.push({ key: CLOSED_KEY, label: "Closed", droppable: false });
+    (board?.columns ?? []).forEach((c, i) => {
+      cols.push({
+        key: c.label_name,
+        label: c.label_name,
+        droppable: true,
+        accent: COLUMN_ACCENTS[i % COLUMN_ACCENTS.length],
+      });
+    });
+    cols.push({ key: CLOSED_KEY, label: "Closed", droppable: false, accent: "bg-edge-strong" });
     return cols;
   }, [board]);
 
@@ -243,39 +262,53 @@ export function Board() {
     return map;
   }, [board]);
 
-  if (loading) return <p className="text-slate-500">Loading board…</p>;
+  if (loading) {
+    return (
+      <div className="space-y-5">
+        <Skeleton className="h-8 w-64" />
+        <div className="flex gap-4">
+          {Array.from({ length: 4 }, (_, i) => (
+            <Skeleton key={i} className="h-72 w-72 shrink-0" />
+          ))}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold">{board?.path_with_namespace ?? "Board"}</h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Columns are GitLab labels. Cards move automatically as their runs progress; you can
-            still drag a card to change its label on the forge. Only PRD-labeled issues appear
-            here.{" "}
-            <Link to="/repos" className="text-indigo-400 hover:text-indigo-300">
-              Back to repos
-            </Link>
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Button onClick={() => setCreatingIssue((v) => !v)}>
-            {creatingIssue ? "Close" : "Create issue"}
-          </Button>
-          <Button variant="ghost" onClick={() => setEditingColumns((v) => !v)}>
-            {editingColumns ? "Close settings" : "Columns"}
-          </Button>
-          <Button variant="ghost" disabled={syncing} onClick={refresh}>
-            {syncing ? "Refreshing…" : "Refresh"}
-          </Button>
-        </div>
-      </div>
+      <PageHeader
+        backTo="/repos"
+        backLabel="Boards"
+        title={board?.path_with_namespace ?? "Board"}
+        description="Columns are GitLab labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here."
+        actions={
+          <>
+            <Button size="sm" onClick={() => setCreatingIssue((v) => !v)}>
+              {creatingIssue ? (
+                <>
+                  <XIcon /> Close
+                </>
+              ) : (
+                <>
+                  <PlusIcon /> Create issue
+                </>
+              )}
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => setEditingColumns((v) => !v)}>
+              {editingColumns ? "Close settings" : "Columns"}
+            </Button>
+            <Button variant="secondary" size="sm" disabled={syncing} onClick={refresh}>
+              {syncing ? "Refreshing…" : "Refresh"}
+            </Button>
+          </>
+        }
+      />
 
       {error && <Alert message={error} />}
 
       {awaitingRuns.length > 0 && (
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-amber-600 bg-amber-950/60 px-4 py-2.5 text-sm text-amber-200">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn">
           <span className="font-medium">
             {awaitingRuns.length} run{awaitingRuns.length > 1 ? "s" : ""} awaiting your approval
           </span>
@@ -283,7 +316,7 @@ export function Board() {
             <Link
               key={r.id}
               to={`/runs/${r.id}`}
-              className="rounded-md border border-amber-600/70 px-1.5 py-0.5 text-amber-100 hover:bg-amber-900/50"
+              className="rounded-md border border-warn/40 px-1.5 py-0.5 text-warn transition-colors hover:bg-warn/20"
             >
               #{r.issue_iid} →
             </Link>
@@ -314,10 +347,11 @@ export function Board() {
         />
       )}
 
-      <div className="flex gap-4 overflow-x-auto pb-4">
+      <div className="flex items-start gap-4 overflow-x-auto pb-4">
         {columns.map((col) => {
           const cards = cardsByColumn.get(col.key) ?? [];
           const isTarget = dropTarget === col.key && col.droppable;
+          const closedCol = col.key === CLOSED_KEY;
           return (
             <div
               key={col.key || "open"}
@@ -333,13 +367,23 @@ export function Board() {
                 const iid = Number(e.dataTransfer.getData("text/plain"));
                 if (iid) move(col.key, iid);
               }}
-              className={`flex w-72 shrink-0 flex-col rounded-xl border p-3 ${
-                isTarget ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-panel/40"
-              }`}
+              className={cx(
+                "flex w-72 shrink-0 flex-col rounded-xl border p-2.5 transition-colors",
+                isTarget
+                  ? "border-brand/70 bg-brand/5 ring-1 ring-brand/40"
+                  : closedCol
+                    ? "border-dashed border-edge bg-transparent"
+                    : "border-edge bg-surface/60",
+              )}
             >
-              <div className="mb-3 flex items-center justify-between">
-                <span className="text-sm font-semibold text-slate-200">{col.label}</span>
-                <span className="text-xs text-slate-500">{cards.length}</span>
+              <div className="mb-2.5 flex items-center gap-2 px-1">
+                <span aria-hidden="true" className={cx("h-2 w-2 rounded-full", col.accent)} />
+                <span className={cx("text-sm font-semibold", closedCol ? "text-faint" : "text-fg")}>
+                  {col.label}
+                </span>
+                <span className="ml-auto rounded-md bg-raised px-1.5 py-0.5 text-[11px] tabular-nums text-faint">
+                  {cards.length}
+                </span>
               </div>
               <div className="flex flex-col gap-2">
                 {cards.map((card) => (
@@ -366,7 +410,9 @@ export function Board() {
                   />
                 ))}
                 {cards.length === 0 && (
-                  <p className="py-6 text-center text-xs text-slate-600">Empty</p>
+                  <p className="rounded-lg border border-dashed border-edge py-6 text-center text-xs text-faint">
+                    {col.droppable ? "Drop a card here" : "Nothing closed yet"}
+                  </p>
                 )}
               </div>
             </div>
@@ -383,7 +429,7 @@ export function Board() {
           {toasts.map((t) => (
             <div
               key={t.id}
-              className="rounded-lg border border-indigo-700 bg-slate-900/95 px-4 py-2 text-sm text-slate-100 shadow-xl"
+              className="rounded-lg border border-brand/40 bg-surface px-4 py-2 text-sm text-fg shadow-xl"
             >
               {t.text}
             </div>
@@ -422,7 +468,7 @@ function IssueCard({
   const badge = run ? runBadge(run, Date.now()) : null;
   const hint = run ? retryHint(run.run_count) : null;
   // awaiting_approval is the loudest card state: a human is the blocker while a
-  // worker is held busy. Give the whole card an amber ring so it can't be missed.
+  // worker is held busy. Give the whole card a warn ring so it can't be missed.
   const loud = isAwaitingApproval(run?.status ?? "");
   const mrHref =
     badge?.kind === "mr" && isHttpsUrl(projectWebUrl)
@@ -433,11 +479,12 @@ function IssueCard({
       draggable={draggable}
       onDragStart={draggable ? onDragStart : undefined}
       onDragEnd={draggable ? onDragEnd : undefined}
-      className={`rounded-lg border bg-slate-900 p-3 text-sm ${
-        loud ? "border-amber-600 ring-2 ring-amber-500/60" : "border-slate-700"
-      } ${draggable ? "cursor-grab active:cursor-grabbing" : "cursor-default"} ${
-        dimmed ? "opacity-40" : ""
-      }`}
+      className={cx(
+        "group rounded-lg border bg-raised/80 p-3 text-sm transition-colors",
+        loud ? "border-warn/60 ring-2 ring-warn/40" : "border-edge",
+        draggable ? "cursor-grab hover:border-edge-strong active:cursor-grabbing" : "cursor-default",
+        dimmed && "opacity-40",
+      )}
     >
       <div className="flex items-start justify-between gap-2">
         {/* In-app issue view. draggable={false}: a native <a> is draggable and
@@ -445,7 +492,7 @@ function IssueCard({
         <Link
           to={`/repos/${repoId}/issues/${card.iid}`}
           draggable={false}
-          className="font-medium text-slate-100 hover:text-indigo-300"
+          className="font-medium leading-snug text-fg hover:text-brand-hover"
         >
           {card.title}
         </Link>
@@ -458,26 +505,12 @@ function IssueCard({
               draggable={false}
               aria-label="Open on GitLab"
               title="Open on GitLab"
-              className="text-slate-500 hover:text-orange-400"
+              className="text-faint transition-colors hover:text-brand"
             >
-              <svg
-                viewBox="0 0 20 20"
-                width="14"
-                height="14"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.6"
-                aria-hidden="true"
-              >
-                <path
-                  d="M12 3h5v5M17 3l-8 8M8 4H5a2 2 0 00-2 2v9a2 2 0 002 2h9a2 2 0 002-2v-3"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
+              <ExternalLinkIcon />
             </a>
           )}
-          <span className="text-xs text-slate-500">#{card.iid}</span>
+          <span className="font-mono text-xs text-faint">#{card.iid}</span>
         </div>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -490,12 +523,12 @@ function IssueCard({
                 rel="noreferrer"
                 draggable={false}
                 title="Open the merge request on GitLab"
-                className="inline-flex items-center rounded-md border border-emerald-700 bg-emerald-950/60 px-1.5 py-0.5 text-[11px] font-medium text-emerald-300 hover:bg-emerald-900/60"
+                className="inline-flex items-center rounded-md border border-ok/40 bg-ok/10 px-1.5 py-0.5 text-[11px] font-medium text-ok transition-colors hover:bg-ok/20"
               >
                 !{badge.mrIid}
               </a>
             ) : (
-              <span className="inline-flex items-center rounded-md border border-emerald-700 bg-emerald-950/60 px-1.5 py-0.5 text-[11px] font-medium text-emerald-300">
+              <span className="inline-flex items-center rounded-md border border-ok/40 bg-ok/10 px-1.5 py-0.5 text-[11px] font-medium text-ok">
                 !{badge.mrIid}
               </span>
             )
@@ -507,7 +540,7 @@ function IssueCard({
             </span>
           ))}
         {hint && (
-          <span className="text-[11px] text-slate-500" title="Number of runs on this issue">
+          <span className="text-[11px] text-faint" title="Number of runs on this issue">
             {hint}
           </span>
         )}
@@ -523,14 +556,14 @@ function IssueCard({
         )}
       </div>
       {(run || card.author) && (
-        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500">
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-faint">
           {run?.status === "running" && run.worker_name && <span>{run.worker_name}</span>}
           {run && !run.is_mine && run.owner_name && <span>started by {run.owner_name}</span>}
           {run && canOpenRunView(run) && (
             <Link
               to={`/runs/${run.id}`}
               draggable={false}
-              className="text-indigo-400 hover:text-indigo-300"
+              className="text-brand transition-colors hover:text-brand-hover"
             >
               view run
             </Link>
@@ -539,17 +572,17 @@ function IssueCard({
         </div>
       )}
       {!card.closed && (
-        <div className="mt-2">
+        <div className="mt-2.5">
           <Button
-            variant={gate.enabled ? "primary" : "ghost"}
+            variant={gate.enabled ? "primary" : "secondary"}
+            size="sm"
             disabled={!gate.enabled || starting}
             title={gate.enabled ? "Queue an agent run for this issue" : gate.reason}
             onClick={onStart}
             className="w-full"
           >
-            {starting ? "Starting…" : "Start run"}
+            {starting ? "Starting…" : gate.enabled ? "Start run" : "Start run (gated)"}
           </Button>
-          {!gate.enabled && <p className="mt-1 text-[11px] text-slate-500">{gate.reason}</p>}
         </div>
       )}
     </div>
@@ -587,13 +620,11 @@ function CreateIssueForm({
   };
 
   return (
-    <Card className="space-y-3">
-      <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
-        Create a PRD issue
-      </h2>
-      <p className="text-xs text-slate-500">
-        Opened on GitLab with the <span className="font-medium">PRD</span> label. Link a{" "}
-        <code className="rounded bg-slate-800 px-1 py-0.5 text-slate-200">prds/*.md</code> file in the
+    <Card className="max-w-2xl space-y-3">
+      <SectionTitle>Create a PRD issue</SectionTitle>
+      <p className="text-xs text-faint">
+        Opened on GitLab with the <span className="font-medium text-muted">PRD</span> label. Link a{" "}
+        <code className="rounded bg-raised px-1 py-0.5 text-muted">prds/*.md</code> file in the
         description so a run can be started from it.
       </p>
       <form onSubmit={submit} className="space-y-3">
@@ -601,8 +632,7 @@ function CreateIssueForm({
           <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Issue title" />
         </Field>
         <Field label="Description">
-          <textarea
-            className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-400"
+          <Textarea
             rows={5}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -667,29 +697,39 @@ function ColumnSettings({
   };
 
   return (
-    <Card>
-      <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Columns</h2>
-      <p className="mt-1 text-xs text-slate-500">
+    <Card className="max-w-2xl">
+      <SectionTitle>Columns</SectionTitle>
+      <p className="mt-1 text-xs text-faint">
         Each column is a label. Order is left-to-right. New names are created as labels on the forge.
       </p>
       <ul className="mt-3 space-y-2">
         {names.map((name, i) => (
           <li key={name} className="flex items-center gap-2">
-            <span className="flex-1 rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm">
+            <span className="flex flex-1 items-center gap-2 rounded-md border border-edge bg-raised px-3 py-1.5 text-sm">
+              <span
+                aria-hidden="true"
+                className={cx("h-2 w-2 rounded-full", COLUMN_ACCENTS[i % COLUMN_ACCENTS.length])}
+              />
               {name}
             </span>
-            <Button variant="ghost" onClick={() => swap(i, i - 1)} disabled={i === 0}>
+            <Button variant="ghost" size="sm" onClick={() => swap(i, i - 1)} disabled={i === 0} aria-label={`Move ${name} up`}>
               ↑
             </Button>
-            <Button variant="ghost" onClick={() => swap(i, i + 1)} disabled={i === names.length - 1}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => swap(i, i + 1)}
+              disabled={i === names.length - 1}
+              aria-label={`Move ${name} down`}
+            >
               ↓
             </Button>
-            <Button variant="danger" onClick={() => removeAt(i)}>
+            <Button variant="danger" size="sm" onClick={() => removeAt(i)}>
               Remove
             </Button>
           </li>
         ))}
-        {names.length === 0 && <li className="text-xs text-slate-600">No columns.</li>}
+        {names.length === 0 && <li className="text-xs text-faint">No columns.</li>}
       </ul>
 
       <div className="mt-4 flex gap-2">
@@ -704,19 +744,19 @@ function ColumnSettings({
             }
           }}
         />
-        <Button variant="ghost" onClick={() => add(newName)} disabled={!newName.trim()}>
+        <Button variant="secondary" onClick={() => add(newName)} disabled={!newName.trim()}>
           Add
         </Button>
       </div>
 
       {suggestions.length > 0 && (
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          <span className="text-xs text-slate-500">Suggestions:</span>
+          <span className="text-xs text-faint">Suggestions:</span>
           {suggestions.map((s) => (
             <button
               key={s}
               onClick={() => add(s)}
-              className="rounded-md border border-slate-700 bg-slate-800 px-2 py-0.5 text-xs text-slate-300 hover:border-indigo-500"
+              className="rounded-md border border-edge bg-raised px-2 py-0.5 text-xs text-muted transition-colors hover:border-brand/60 hover:text-fg"
             >
               + {s}
             </button>

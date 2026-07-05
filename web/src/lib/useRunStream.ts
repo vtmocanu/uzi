@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   ApiError,
+  createRunSocket,
   isTerminalRun,
-  runSocketUrl,
   type Run,
   type RunInputKind,
   type RunMessage,
+  type RunSocketLike,
   type WsEvent,
 } from "./api";
 import { applyFrame, emptyStream, ingestMany, type StreamState } from "./runStream";
@@ -56,7 +57,7 @@ export function useRunStream(runId: string) {
 
   useEffect(() => {
     let closed = false;
-    let ws: WebSocket | null = null;
+    let ws: RunSocketLike | null = null;
     let reconnect: number | null = null;
     let catchup: number | null = null;
 
@@ -83,7 +84,7 @@ export function useRunStream(runId: string) {
 
     const connect = () => {
       if (closed) return;
-      ws = new WebSocket(runSocketUrl(runId));
+      ws = createRunSocket(runId);
       ws.onopen = () => {
         setConnected(true);
         void replay();

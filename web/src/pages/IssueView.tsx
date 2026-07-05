@@ -86,16 +86,16 @@ export function IssueView() {
 
   return (
     <div className="space-y-5">
-      <nav className="flex items-center gap-1.5 text-xs text-slate-500">
-        <Link to={`/repos/${repoId}/board`} className="hover:text-indigo-300">
+      <nav className="flex items-center gap-1.5 text-xs text-faint">
+        <Link to={`/repos/${repoId}/board`} className="hover:text-fg">
           Board
         </Link>
         <span>/</span>
-        <span className="text-slate-400">#{iid}</span>
+        <span className="text-muted">#{iid}</span>
       </nav>
 
       {error && <Alert message={error} />}
-      {loading && <p className="text-slate-500">Loading issue…</p>}
+      {loading && <p className="text-faint">Loading issue…</p>}
 
       {issue && (
         <>
@@ -103,7 +103,7 @@ export function IssueView() {
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
                 <h1 className="truncate text-2xl font-semibold">{issue.title}</h1>
-                <span className="text-sm text-slate-500">#{issue.iid}</span>
+                <span className="text-sm text-faint">#{issue.iid}</span>
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <Badge tone="neutral">{columnLabel(issue)}</Badge>
@@ -112,12 +112,12 @@ export function IssueView() {
                   .map((l) => (
                     <span
                       key={l}
-                      className="rounded-md border border-slate-700 bg-slate-800 px-1.5 py-0.5 text-[11px] text-slate-300"
+                      className="rounded-md border border-edge bg-raised px-1.5 py-0.5 text-[11px] text-muted"
                     >
                       {l}
                     </span>
                   ))}
-                {issue.author && <span className="text-xs text-slate-500">{issue.author}</span>}
+                {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
                 {!issue.has_prd_link && (
                   <Badge
                     tone="warning"
@@ -146,7 +146,7 @@ export function IssueView() {
           </div>
 
           <Card className="space-y-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-faint">
               Description
             </h2>
             {issue.description.trim() ? (
@@ -154,7 +154,7 @@ export function IssueView() {
                 <Markdown content={issue.description} />
               </div>
             ) : (
-              <p className="text-sm text-slate-600">This issue has no description.</p>
+              <p className="text-sm text-faint">This issue has no description.</p>
             )}
           </Card>
 
@@ -168,16 +168,16 @@ export function IssueView() {
               >
                 {starting ? "Starting…" : "Start run"}
               </Button>
-              {!gate.enabled && <p className="mt-1 text-xs text-slate-500">{gate.reason}</p>}
+              {!gate.enabled && <p className="mt-1 text-xs text-faint">{gate.reason}</p>}
             </div>
           )}
 
           <Card className="space-y-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-faint">
               Run history
             </h2>
             {runs.length === 0 ? (
-              <p className="text-sm text-slate-600">No runs yet for this issue.</p>
+              <p className="text-sm text-faint">No runs yet for this issue.</p>
             ) : (
               <ul className="space-y-2">
                 {runs.map((run) => (
@@ -206,9 +206,9 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
   // that has not started yet (started_at null).
   const stamp = run.started_at ?? run.created_at;
   return (
-    <li className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-900/40 px-3 py-2">
+    <li className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2">
       <div className="min-w-0">
-        <div className="flex flex-wrap items-center gap-x-2 text-xs text-slate-500">
+        <div className="flex flex-wrap items-center gap-x-2 text-xs text-faint">
           <span>{new Date(stamp).toLocaleString()}</span>
           {run.worker_name && <span>· {run.worker_name}</span>}
           {duration && <span>· {duration}</span>}
@@ -221,7 +221,7 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
                   target="_blank"
                   rel="noreferrer"
                   title="Open the merge request on GitLab"
-                  className="text-indigo-400 hover:text-indigo-300"
+                  className="text-brand hover:text-brand-hover"
                 >
                   !{run.mr_iid}
                 </a>
@@ -238,7 +238,7 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
         </Badge>
         {/* Every run here is the viewer's own (the endpoint is owner-scoped), so
             the run view is always reachable — no is_mine gate needed. */}
-        <Link to={`/runs/${run.id}`} className="text-xs text-indigo-400 hover:text-indigo-300">
+        <Link to={`/runs/${run.id}`} className="text-xs text-brand hover:text-brand-hover">
           view →
         </Link>
       </div>

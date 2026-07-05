@@ -2,13 +2,73 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
+/* Semantic design tokens (multica-style: packages/ui/styles/tokens.css keeps
+   every color behind CSS variables; we do the same, with color channels as
+   space-separated RGB so Tailwind opacity modifiers work). Components carry
+   STRUCTURE only; all look-and-feel lives here, so an alternative redesign can
+   ship as a second `[data-theme="…"]` block overriding these variables over
+   the same component tree. This default theme is "ember": uzi is deliberately
+   dark-only — a dark factory — with molten-metal orange against near-black
+   steel. */
+:root,
+[data-theme="ember"] {
   color-scheme: dark;
+
+  /* Palette */
+  --bg: 8 10 15;
+  --surface: 15 18 26;
+  --raised: 23 27 38;
+  --edge: 39 45 60;
+  --edge-strong: 58 66 86;
+  --fg: 228 232 240;
+  --muted: 148 158 176;
+  --faint: 100 110 130;
+  --brand: 251 146 60;
+  --brand-hover: 253 186 116;
+  --on-brand: 26 16 8;
+
+  /* Keyboard focus ring: brand-tinted so it reads as on-theme and stays
+     high-contrast against the near-black surfaces. */
+  --ring: var(--brand);
+
+  /* Status colors */
+  --ok: 52 211 153;
+  --warn: 251 191 36;
+  --danger: 251 113 133;
+  --info: 56 189 248;
+
+  /* Radii: one base value, everything derived (multica's --radius scheme). */
+  --radius: 0.625rem;
+
+  /* Typography */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 body {
-  @apply bg-ink text-slate-100 antialiased;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  @apply bg-ink text-fg antialiased;
+  font-family: var(--font-sans);
+}
+
+/* Thin, unobtrusive scrollbars for the activity feed / board overflow areas
+   (multica styles these via --scrollbar-* tokens; same intent). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--edge)) transparent;
+}
+
+/* One themed keyboard-focus ring for every interactive surface (nav items,
+   cards-as-links, buttons, inputs), replacing the default UA outline. Scoped to
+   :focus-visible so it appears for keyboard/AT users, not on mouse click. */
+@layer base {
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  [tabindex]:not([tabindex="-1"]):focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-ink;
+  }
 }
 
 /* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules
@@ -16,31 +76,31 @@ body {
    dependency. Interactive/asset elements (a, img, table) are handled in
    DocMarkdown; everything else is styled here. */
 .docs-prose {
-  @apply max-w-none text-slate-300;
+  @apply max-w-none text-muted;
 }
 .docs-prose > :first-child {
   @apply mt-0;
 }
 .docs-prose h1 {
-  @apply mb-4 mt-8 text-3xl font-bold tracking-tight text-slate-100;
+  @apply mb-4 mt-8 text-3xl font-bold tracking-tight text-fg;
 }
 .docs-prose h2 {
-  @apply mb-3 mt-8 border-b border-slate-800 pb-1.5 text-xl font-semibold text-slate-100;
+  @apply mb-3 mt-8 border-b border-edge pb-1.5 text-xl font-semibold text-fg;
 }
 .docs-prose h3 {
-  @apply mb-2 mt-6 text-lg font-semibold text-slate-100;
+  @apply mb-2 mt-6 text-lg font-semibold text-fg;
 }
 .docs-prose h4 {
-  @apply mb-2 mt-4 text-base font-semibold text-slate-200;
+  @apply mb-2 mt-4 text-base font-semibold text-fg;
 }
 .docs-prose p {
   @apply my-4 leading-7;
 }
 .docs-prose a {
-  @apply text-indigo-400 underline underline-offset-2 hover:text-indigo-300;
+  @apply text-brand underline underline-offset-2 hover:text-brand-hover;
 }
 .docs-prose strong {
-  @apply font-semibold text-slate-100;
+  @apply font-semibold text-fg;
 }
 .docs-prose ul {
   @apply my-4 list-disc space-y-1.5 pl-6;
@@ -56,33 +116,33 @@ body {
   @apply my-1.5;
 }
 .docs-prose blockquote {
-  @apply my-4 border-l-2 border-slate-700 pl-4 italic text-slate-400;
+  @apply my-4 border-l-2 border-edge-strong pl-4 italic text-muted;
 }
 .docs-prose hr {
-  @apply my-8 border-slate-800;
+  @apply my-8 border-edge;
 }
 .docs-prose code {
-  @apply rounded bg-slate-800 px-1.5 py-0.5 text-[0.85em] text-slate-200;
+  @apply rounded bg-raised px-1.5 py-0.5 text-[0.85em] text-fg;
 }
 .docs-prose pre {
-  @apply my-4 overflow-x-auto rounded-lg border border-slate-800 bg-slate-900 p-4 text-sm leading-6;
+  @apply my-4 overflow-x-auto rounded-lg border border-edge bg-ink p-4 text-sm leading-6;
 }
 .docs-prose pre code {
-  @apply bg-transparent p-0 text-slate-200;
+  @apply bg-transparent p-0 text-fg;
 }
 .docs-prose img {
-  @apply my-4 max-w-full rounded-lg border border-slate-800;
+  @apply my-4 max-w-full rounded-lg border border-edge;
 }
 .docs-prose table {
   @apply my-0 w-full border-collapse text-sm;
 }
 .docs-prose thead {
-  @apply bg-slate-900;
+  @apply bg-raised;
 }
 .docs-prose th,
 .docs-prose td {
-  @apply border border-slate-800 px-3 py-2 text-left align-top;
+  @apply border border-edge px-3 py-2 text-left align-top;
 }
 .docs-prose th {
-  @apply font-semibold text-slate-200;
+  @apply font-semibold text-fg;
 }

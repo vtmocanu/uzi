@@ -5,7 +5,10 @@
 
 import { isTerminalRun, type LatestRun } from "./api";
 
-export type BadgeTone = "neutral" | "warning" | "danger";
+// Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
+// color everywhere: neutral (queued/stopped), info (claimed/running), warning
+// (awaiting), ok (completed), danger (failure).
+export type BadgeTone = "neutral" | "warning" | "danger" | "info" | "ok";
 
 // RunBadge is a card's primary status pill. kind "mr" is the completed-with-MR
 // chip (rendered as a link to the merge request); kind "badge" is a plain pill.
@@ -38,13 +41,16 @@ export function isStoppedRun(status: string, failureReason: string | null | unde
 }
 
 // runStatusTone maps a run status to a list-row badge tone (a simpler view than
-// runBadge, which also carries label/pulse/MR-chip). A deliberate stop is calm
-// neutral, awaiting-approval is amber, a genuine failure is rose. Shared by the
-// run-list and issue-view history rows so the tone stays consistent everywhere.
+// runBadge, which also carries label/pulse/MR-chip). Same taxonomy as StatusPill
+// and the board badge so one status is one color everywhere: a deliberate stop is
+// calm neutral, awaiting-approval is amber, a genuine failure is rose, completed
+// is green, claimed/running are sky. Shared by the issue-view history rows.
 export function runStatusTone(status: string, failureReason: string | null | undefined): BadgeTone {
   if (status === "awaiting_approval") return "warning";
   if (isStoppedRun(status, failureReason)) return "neutral";
   if (status === "failed") return "danger";
+  if (status === "completed") return "ok";
+  if (status === "claimed" || status === "running") return "info";
   return "neutral";
 }
 
@@ -70,10 +76,10 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
     case "queued":
       return { kind: "badge", label: "queued", tone: "neutral", pulse: false };
     case "claimed":
-      return { kind: "badge", label: "claimed", tone: "neutral", pulse: false };
+      return { kind: "badge", label: "claimed", tone: "info", pulse: false };
     case "running": {
       const elapsed = formatElapsed(nowMs - Date.parse(run.created_at));
-      return { kind: "badge", label: `running ${elapsed}`, tone: "neutral", pulse: true };
+      return { kind: "badge", label: `running ${elapsed}`, tone: "info", pulse: true };
     }
     case "awaiting_approval":
       return { kind: "badge", label: "awaiting approval", tone: "warning", pulse: false };
@@ -86,10 +92,10 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         title: run.failure_reason ?? undefined,
       };
     case "completed":
-      // A completed run with an MR becomes a link chip; without one it must still
-      // be visible, so a plain "completed" badge stands in (never invisible).
+      // A completed run with an MR becomes a link chip (ok-accented); without one
+      // it must still be visible, so a plain ok "completed" badge stands in.
       if (run.mr_iid != null) return { kind: "mr", mrIid: run.mr_iid };
-      return { kind: "badge", label: "completed", tone: "neutral", pulse: false };
+      return { kind: "badge", label: "completed", tone: "ok", pulse: false };
     default:
       return { kind: "badge", label: run.status.replace(/_/g, " "), tone: "neutral", pulse: false };
   }

@@ -4,7 +4,7 @@ import { useAuth } from "../auth/AuthContext";
 
 function Loading() {
   return (
-    <div className="flex min-h-screen items-center justify-center text-slate-500">Loading…</div>
+    <div className="flex min-h-screen items-center justify-center text-faint">Loading…</div>
   );
 }
 
@@ -22,5 +22,15 @@ export function AdminRoute({ children }: { children: ReactNode }) {
   if (loading) return <Loading />;
   if (!user) return <Navigate to="/login" replace />;
   if (!user.is_admin) return <Navigate to="/dashboard" replace />;
+  return <>{children}</>;
+}
+
+// GuestRoute is the inverse of ProtectedRoute: the landing/login/register pages
+// are for signed-out visitors, so a signed-in user is bounced to the dashboard
+// instead of seeing a public page rendered inside the authenticated shell.
+export function GuestRoute({ children }: { children: ReactNode }) {
+  const { user, loading } = useAuth();
+  if (loading) return <Loading />;
+  if (user) return <Navigate to="/dashboard" replace />;
   return <>{children}</>;
 }

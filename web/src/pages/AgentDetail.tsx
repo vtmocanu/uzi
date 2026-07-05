@@ -76,7 +76,7 @@ export function AgentDetail() {
     }
   };
 
-  if (loading) return <p className="text-slate-500">Loading…</p>;
+  if (loading) return <p className="text-faint">Loading…</p>;
   if (error) return <Alert message={error} />;
   if (!template) return <Alert message="Template not found." />;
 
@@ -85,7 +85,7 @@ export function AgentDetail() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="font-mono text-2xl font-semibold">{template.name}</h1>
-          <p className="mt-1 text-slate-400">
+          <p className="mt-1 text-muted">
             {template.is_builtin ? "Builtin template" : "Custom template"} · updated{" "}
             {new Date(template.updated_at).toLocaleString()}
           </p>
@@ -95,16 +95,12 @@ export function AgentDetail() {
         </Button>
       </div>
 
-      {notice && (
-        <div className="rounded-lg border border-emerald-800 bg-emerald-950/60 px-3 py-2 text-sm text-emerald-200">
-          {notice}
-        </div>
-      )}
+      {notice && <Alert message={notice} tone="success" />}
 
       {isAdmin ? (
         <>
           <Card className="space-y-5">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-faint">
               Edit
             </h2>
             <AgentTemplateEditor
@@ -121,7 +117,7 @@ export function AgentDetail() {
           <Card className="flex items-center justify-between gap-4">
             {template.is_builtin ? (
               <>
-                <p className="text-sm text-slate-400">
+                <p className="text-sm text-muted">
                   Builtins cannot be deleted. Reset restores this template to its
                   shipped definition.
                 </p>
@@ -131,7 +127,7 @@ export function AgentDetail() {
               </>
             ) : (
               <>
-                <p className="text-sm text-slate-400">
+                <p className="text-sm text-muted">
                   Deleting a custom template is permanent.
                 </p>
                 <Button variant="danger" disabled={busy} onClick={remove}>
@@ -153,21 +149,21 @@ function ReadOnlyView({ template }: { template: AgentTemplate }) {
     <Card className="space-y-4">
       <dl className="space-y-3 text-sm">
         <div>
-          <dt className="text-slate-500">Description</dt>
-          <dd className="text-slate-200">{template.description}</dd>
+          <dt className="text-faint">Description</dt>
+          <dd className="text-fg">{template.description}</dd>
         </div>
         <div>
-          <dt className="text-slate-500">Model</dt>
-          <dd className="text-slate-200">{template.model ?? "inherit"}</dd>
+          <dt className="text-faint">Model</dt>
+          <dd className="text-fg">{template.model ?? "inherit"}</dd>
         </div>
         <div>
-          <dt className="text-slate-500">Tools</dt>
-          <dd className="text-slate-200">{summarizeTools(template)}</dd>
+          <dt className="text-faint">Tools</dt>
+          <dd className="text-fg">{summarizeTools(template)}</dd>
         </div>
       </dl>
       <div>
-        <span className="text-sm font-medium text-slate-300">Rendered subagent file</span>
-        <pre className="mt-1.5 overflow-x-auto rounded-lg border border-slate-800 bg-slate-950 p-3 text-xs text-slate-300">
+        <span className="text-sm font-medium text-muted">Rendered subagent file</span>
+        <pre className="mt-1.5 overflow-x-auto rounded-lg border border-edge bg-ink p-3 text-xs text-muted">
           {renderSubagent(template)}
         </pre>
       </div>

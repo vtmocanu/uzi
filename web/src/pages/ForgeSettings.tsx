@@ -1,6 +1,11 @@
+// Settings → Forge: connect/verify/delete the GitLab bot PAT. Inside
+// SettingsShell; per-row busy state instead of one page-wide busy flag.
+
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, type ForgeConnection } from "../lib/api";
-import { Alert, Badge, Button, Card, Field, Input, Select } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
+import { SettingsShell } from "../components/SettingsShell";
+import { BranchIcon } from "../components/icons";
 
 export function ForgeSettings() {
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
@@ -9,7 +14,8 @@ export function ForgeSettings() {
   const [token, setToken] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
@@ -33,7 +39,7 @@ export function ForgeSettings() {
     e.preventDefault();
     setError("");
     setNotice("");
-    setBusy(true);
+    setConnecting(true);
     try {
       const { connection } = await api.createConnection(baseUrl, token);
       setToken("");
@@ -42,14 +48,14 @@ export function ForgeSettings() {
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Connect failed");
     } finally {
-      setBusy(false);
+      setConnecting(false);
     }
   };
 
   const verify = async (id: string) => {
     setError("");
     setNotice("");
-    setBusy(true);
+    setBusyId(id);
     try {
       const { connection } = await api.verifyConnection(id);
       setNotice(`Verified ${connection.bot_username}.`);
@@ -57,46 +63,37 @@ export function ForgeSettings() {
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Verify failed");
     } finally {
-      setBusy(false);
+      setBusyId(null);
     }
   };
 
   const remove = async (id: string) => {
     setError("");
     setNotice("");
-    setBusy(true);
+    setBusyId(id);
     try {
       await api.deleteConnection(id);
       await load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Delete failed");
     } finally {
-      setBusy(false);
+      setBusyId(null);
     }
   };
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold">Forge</h1>
-        <p className="mt-1 text-slate-400">
-          Connect your GitLab bot account. Create a bot, give it a personal access token with the{" "}
-          <code className="text-slate-300">api</code> scope, and add it as Developer to the projects
-          uzi should see. The token is stored encrypted and never shown again.
-        </p>
-      </div>
-
+    <SettingsShell description="Connect the GitLab bot account uzi acts through.">
       {error && <Alert message={error} />}
-      {notice && (
-        <div className="rounded-lg border border-emerald-800 bg-emerald-950/50 px-3 py-2 text-sm text-emerald-200">
-          {notice}
-        </div>
-      )}
+      {notice && <Alert tone="success" message={notice} />}
 
       <Card>
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
-          Connect a bot PAT
-        </h2>
+        <SectionTitle>Connect a bot PAT</SectionTitle>
+        <p className="mt-2 text-sm text-muted">
+          Create a bot account, give it a personal access token with the{" "}
+          <code className="rounded bg-raised px-1 py-0.5 text-fg">api</code> scope, and add it as
+          Developer to the projects uzi should see. The token is stored encrypted and never shown
+          again.
+        </p>
         <form className="mt-4 space-y-4" onSubmit={connect}>
           <Field label="Forge base URL">
             <Select value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}>
@@ -116,67 +113,76 @@ export function ForgeSettings() {
               onChange={(e) => setToken(e.target.value)}
             />
           </Field>
-          <Button type="submit" disabled={busy || !baseUrl || !token}>
-            {busy ? "Verifying…" : "Connect"}
+          <Button type="submit" disabled={connecting || !baseUrl || !token}>
+            {connecting ? "Verifying…" : "Connect"}
           </Button>
         </form>
       </Card>
 
-      <Card className="p-0">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <thead className="border-b border-slate-800 text-slate-400">
-              <tr>
-                <th className="px-4 py-3 font-medium">Bot</th>
-                <th className="px-4 py-3 font-medium">Base URL</th>
-                <th className="px-4 py-3 font-medium">Last verified</th>
-                <th className="px-4 py-3 text-right font-medium">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800">
-              {loading ? (
+      {loading ? (
+        <Card>
+          <Skeleton className="h-5 w-full" />
+          <Skeleton className="mt-3 h-5 w-2/3" />
+        </Card>
+      ) : connections.length === 0 ? (
+        <EmptyState
+          icon={<BranchIcon />}
+          title="No forge connection yet"
+          description="Connect a bot PAT above — repos the bot can see become boards."
+        />
+      ) : (
+        <Card className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-edge text-muted">
                 <tr>
-                  <td colSpan={4} className="px-4 py-6 text-center text-slate-500">
-                    Loading…
-                  </td>
+                  <th className="px-4 py-3 font-medium">Bot</th>
+                  <th className="px-4 py-3 font-medium">Base URL</th>
+                  <th className="px-4 py-3 font-medium">Last verified</th>
+                  <th className="px-4 py-3 text-right font-medium">Actions</th>
                 </tr>
-              ) : connections.length === 0 ? (
-                <tr>
-                  <td colSpan={4} className="px-4 py-6 text-center text-slate-500">
-                    No connections yet.
-                  </td>
-                </tr>
-              ) : (
-                connections.map((c) => (
+              </thead>
+              <tbody className="divide-y divide-edge">
+                {connections.map((c) => (
                   <tr key={c.id}>
                     <td className="px-4 py-3">
-                      <span className="font-medium text-slate-100">{c.bot_username}</span>{" "}
+                      <span className="font-medium text-fg">{c.bot_username}</span>{" "}
                       <Badge>{c.forge_type}</Badge>
                     </td>
-                    <td className="px-4 py-3 text-slate-400">{c.base_url}</td>
-                    <td className="px-4 py-3 text-slate-400">
+                    <td className="px-4 py-3 text-muted">{c.base_url}</td>
+                    <td className="px-4 py-3 text-muted">
                       {c.last_verified_at ? new Date(c.last_verified_at).toLocaleString() : "—"}
                     </td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-2">
-                        <Button variant="ghost" disabled={busy} onClick={() => verify(c.id)}>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          disabled={busyId === c.id}
+                          onClick={() => verify(c.id)}
+                        >
                           Verify
                         </Button>
-                        <Button variant="danger" disabled={busy} onClick={() => remove(c.id)}>
+                        <Button
+                          variant="danger"
+                          size="sm"
+                          disabled={busyId === c.id}
+                          onClick={() => remove(c.id)}
+                        >
                           Delete
                         </Button>
                       </div>
                     </td>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </Card>
-      <p className="text-xs text-slate-600">
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+      <p className="text-xs text-faint">
         To rotate a token, connect again with the same base URL — the new PAT replaces the old one.
       </p>
-    </div>
+    </SettingsShell>
   );
 }

@@ -1,6 +1,6 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Layout } from "./components/Layout";
-import { AdminRoute, ProtectedRoute } from "./components/RouteGuards";
+import { AppShell } from "./components/AppShell";
+import { AdminRoute, GuestRoute, ProtectedRoute } from "./components/RouteGuards";
 import { Landing } from "./pages/Landing";
 import { Login } from "./pages/Login";
 import { Register } from "./pages/Register";
@@ -22,11 +22,34 @@ import { DocPage } from "./pages/DocPage";
 
 export default function App() {
   return (
-    <Layout>
+    <AppShell>
       <Routes>
-        <Route path="/" element={<Landing />} />
-        <Route path="/login" element={<Login />} />
-        <Route path="/register" element={<Register />} />
+        {/* Signed-out only: a signed-in user is redirected to /dashboard rather
+            than rendering the public page inside the authenticated shell. */}
+        <Route
+          path="/"
+          element={
+            <GuestRoute>
+              <Landing />
+            </GuestRoute>
+          }
+        />
+        <Route
+          path="/login"
+          element={
+            <GuestRoute>
+              <Login />
+            </GuestRoute>
+          }
+        />
+        <Route
+          path="/register"
+          element={
+            <GuestRoute>
+              <Register />
+            </GuestRoute>
+          }
+        />
         {/* Public, unauthenticated: onboarding howtos are needed before login. */}
         <Route path="/docs" element={<Docs />} />
         <Route path="/docs/:slug" element={<DocPage />} />
@@ -136,6 +159,6 @@ export default function App() {
         />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-    </Layout>
+    </AppShell>
   );
 }

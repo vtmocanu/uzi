@@ -13,10 +13,10 @@ export function DocPage() {
     return (
       <div className="space-y-4">
         <h1 className="text-2xl font-semibold">Doc not found</h1>
-        <p className="text-slate-400">
+        <p className="text-muted">
           There is no published doc at <code>/docs/{slug}</code>.
         </p>
-        <Link to="/docs" className="text-sm text-indigo-400 hover:text-indigo-300">
+        <Link to="/docs" className="text-sm text-brand hover:text-brand-hover">
           ← All docs
         </Link>
       </div>
@@ -25,7 +25,7 @@ export function DocPage() {
 
   return (
     <div className="space-y-6">
-      <Link to="/docs" className="text-sm text-indigo-400 hover:text-indigo-300">
+      <Link to="/docs" className="text-sm text-brand hover:text-brand-hover">
         ← All docs
       </Link>
       <article>

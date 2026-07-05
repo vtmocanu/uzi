@@ -1,10 +1,10 @@
 # PRD #14: Adopt the Multica-inspired UI Redesign (ember)
 
 **GitLab Issue**: [vtmocanu/uzi#14](https://gitlab.example.com/vtmocanu/uzi/-/issues/14)
-**Status**: Ready (2026-07-04: reviewed by 2 agents — adversarial fact-check + design review; all findings incorporated: completed-reskin milestone added, PRD #12 collision resolved via merge-order decision, git-history/nav-group/docs-list corrections, forge_type wiring specified)
+**Status**: M1–M5 complete, M6 in progress (2026-07-05). Implementation by agent team: every milestone reviewed (reviewer 5 passes, all APPROVE) + audited (2 passes, clean) + browser-validated (web-ux, 8 flows, no blockers) + tested (M4 all green incl. real-GitLab scratch leg + 401-interceptor fix at 62f102d). Post-review additions, user-approved: unified run status colors across surfaces (runBadge info/ok tones), auth-page redirect guard, live-pill gating, themed focus-visible ring. M4 also surfaced a compose-isolation footgun (shell env overrides --env-file) — recorded in CLAUDE.md. 2026-07-05 earlier: PRD #12 landed on `main` before this PRD started, inverting Decision 6's planned merge order — Decision 6 and the Port plan rewritten accordingly (see below).
 **Priority**: High
 **Created**: 2026-07-04
-**Depends on**: no open PRD blocks this one, but **PRD #12 (Ready, not started) rewrites the same `web/src/pages/Board.tsx` this PRD re-skins** — see Design Decision 6 for the merge-order resolution.
+**Depends on**: PRD #12 (done, merged `9d35080`) — its board/run-lifecycle UI is now the base this PRD re-skins; see Design Decision 6.
 
 ## Problem
 
@@ -20,7 +20,8 @@ Three mock redesigns were built in parallel worktrees and evaluated live. The **
 
 ## Source material
 
-- **Prototype**: worktree `.claude/worktrees/agent-a099da95ae7695658`, branch `worktree-agent-a099da95ae7695658`, commit `baaecdf` (parent `092794c`) — 32 files, +3492/−786 vs its parent. `main` has since gained only `CLAUDE.md` and two e2e-harness fixes (`05b3727`, `1c637c6`, merge `99bb913`) — no file overlap with the prototype's diff (`ux-review.md` + `web/**` only), so the rebase is conflict-free (verified, not assumed).
+- **Prototype**: worktree `.claude/worktrees/agent-a099da95ae7695658`, branch `worktree-agent-a099da95ae7695658`, commit `baaecdf` (parent `092794c`) — 32 files, +3492/−786 vs its parent.
+- **The port is no longer a clean rebase** (2026-07-05): `main` has since gained PRD #12's full implementation (merge `9d35080`), which rewrote `Board.tsx` (+290 lines: `latest_run` badges via the new `runBadge.ts`, 10s visibility-gated polling, attention strip, auto-move toasts, in-app issue links), added `IssueView.tsx`, `runBadge.ts`, `forgeUrls.ts`, and touched `App.tsx`, `api.ts`, `RunView.tsx`, `RunsList.tsx` — five of which the prototype also rewrites. The port is therefore a **design-over-logic merge**: #12's behavior is authoritative, the prototype's design system is applied on top.
 - The prototype's **non-mock build is wired to the real API client**: `web/src/lib/api.ts:13` gates on `import.meta.env.VITE_UZI_MOCK === "1"`; with the flag unset, `api = realApi` and `createRunSocket` returns a real `WebSocket`. Mock *behavior* is unreachable in real builds; mock *bytes* do ship in the bundle (not tree-shaken — verified by grepping `dist` for mock-only strings). 67/67 vitest green in both modes.
 - **The prototype worktree and its container (`uzi-ux-multica`, :8081) stay alive as reference until this PRD completes**, then are cleaned up (final milestone), together with the other two prototypes' worktrees/containers (`uzi-ux-mission` :8084, `uzi-ux-minimal` :8083). Their identities can return later as `data-theme` overrides (out of scope).
 
@@ -31,7 +32,7 @@ Three mock redesigns were built in parallel worktrees and evaluated live. The **
 3. **Forge lives only under Settings** (user requirement, 2026-07-04): the standalone `Forge` nav item (`AppShell.tsx:160`, under Configure) is removed. Forge configuration is reachable exclusively via **Settings** — the prototype's `SettingsShell` already tabs Account & token / Forge / Workers (`SettingsShell.tsx:11-15`). The `/settings/forge` and `/settings/workers` routes keep working unchanged (`App.tsx:49,57`); only the nav entry goes. Discoverability holds: the dashboard onboarding checklist links to `/settings/forge` directly (`Dashboard.tsx:163`). The `Workers` nav shortcut under **Factory** stays (operational surface, not just config).
 4. **Mock mode ships, inert by default.** `web/src/mocks/`, `Dockerfile.mock`, `nginx.mock.conf` land on main as an opt-in demo build (`VITE_UZI_MOCK=1`): the cheapest way to demo uzi with zero backend and to prototype future themes over the real component tree. Real builds contain **no reachable mock behavior** (the mock module is a runtime-dead branch; its bytes ship and that bundle-size cost is accepted). Neither mock file is referenced by the real `docker-compose.yml`. Verified per-release by the M4 dist-grep check.
 5. **Dark-only for now.** The ember theme does not add a light mode. Tokens make a later light theme (or porting the minimal/mission identities) a `data-theme` block, not a refactor.
-6. **Merge order vs PRD #12: this PRD lands first.** #12 ("Ready", not started) plans `latest_run` cards, 10s polling, an attention strip, and in-app issue links — all in `Board.tsx`, which this PRD re-skins in its *pre-#12* shape (still the `api.listRuns()` fan-in). Re-skinning first means #12 builds its features directly on the new design system (StatusPill, tokens, EmptyState) instead of the components it would otherwise have to restyle later; the reverse order would have #14 wholesale-rewriting freshly-landed #12 logic. #12's implementer rebases its Board plan onto the redesigned `Board.tsx` and should reuse the new primitives.
+6. **Merge order vs PRD #12 — inverted by events (2026-07-05).** The PRD originally scheduled #14 first; in fact **#12 landed on `main` first** (merge `9d35080`, done and archived). The resolution flips accordingly: **#12's behavior is authoritative and must survive the reskin intact** — `latest_run` badges (`runBadge.ts` tone mapping), 10s visibility-gated board polling, the attention strip, auto-move toasts with a11y, manual-drag semantics, the in-app `IssueView`, and the card title as in-app `<Link draggable={false}>` with the GitLab glyph. The prototype's `Board.tsx`/`RunView.tsx`/`RunsList.tsx` are **not** applied wholesale; their design vocabulary (tokens, StatusPill, EmptyState, column accent identity, collapsed past runs) is re-applied over #12's logic. `runBadge.ts` tone names map onto the token-backed StatusPill palette. Conflict-resolution rule for the port: when prototype design and #12 behavior disagree, behavior wins, then restyle.
 
 ## Solution Overview
 
@@ -41,7 +42,8 @@ Port the prototype commit onto a PRD branch off current `main`, apply the two na
 
 ### Port
 
-- Rebase/cherry-pick `baaecdf` onto `main` (verified conflict-free: the intervening main commits touch only `CLAUDE.md`, `e2e/README.md`, `e2e/run-e2e.sh`).
+- Cherry-pick `baaecdf` onto the PRD branch; expected conflicts in `Board.tsx`, `RunView.tsx`, `RunsList.tsx`, `App.tsx`, `api.ts` (PRD #12 overlap). Resolve per Decision 6: #12 behavior wins, prototype design is re-applied over it. Files without #12 overlap (AppShell, tokens, ui.tsx, icons, Dashboard, Settings*, mocks, Dockerfile.mock) apply cleanly.
+- The full vitest suite on `main` (grown past the prototype's 67 by #12's `runBadge`/board/forgeUrls tests) must stay green — those tests pin exactly the #12 behavior the merge must preserve. The mock layer (`web/src/mocks/`) must be extended to cover #12's new surfaces (`latest_run` on board payloads, `IssueView` data) so the demo build still exercises every page.
 - Keep `ux-review.md` out of `main` (prototype artifact) — its durable content is this PRD's Problem section; drop the file during the port.
 
 ### Nav adjustments
@@ -52,7 +54,7 @@ Port the prototype commit onto a PRD branch off current `main`, apply the two na
 
 ### Complete the reskin (prototype gap)
 
-The prototype re-skinned roughly half the surface. Still on the legacy slate/indigo palette: `web/src/pages/{Register,Docs,DocPage,AgentDetail,AgentNew}.tsx`, `web/src/components/{AgentTemplateEditor,Markdown,RouteGuards}.tsx` (~48 raw palette literals), and the Markdown prose `@apply` block inside `index.css` itself. `Register` is a logged-out first-impression page sitting next to the already-ember `Landing`/`Login` — the clash is user-visible, so this is in scope, not deferred. All of these convert to the token vocabulary; the prose `@apply` block converts to token-backed values so rendered Markdown (docs, agent prompts, plans) matches the theme.
+The prototype re-skinned roughly half the surface. Still on the legacy slate/indigo palette: `web/src/pages/{Register,Docs,DocPage,AgentDetail,AgentNew}.tsx`, `web/src/components/{AgentTemplateEditor,Markdown,RouteGuards}.tsx` (~48 raw palette literals), **`web/src/pages/IssueView.tsx` (new in PRD #12, 16 legacy palette refs)**, and the Markdown prose `@apply` block inside `index.css` itself. `Register` is a logged-out first-impression page sitting next to the already-ember `Landing`/`Login` — the clash is user-visible, so this is in scope, not deferred. All of these convert to the token vocabulary; the prose `@apply` block converts to token-backed values so rendered Markdown (docs, agent prompts, plans) matches the theme.
 
 ### Real-stack validation (the risk center)
 
@@ -74,17 +76,17 @@ Stale navigation language lives in `README.md:26` ("**Forge** (top nav)"), `docs
 
 - Light theme; porting the mission-control or minimal identities as additional `data-theme`s (future PRD — tokens make it cheap).
 - Touch/keyboard drag-and-drop for the board (native HTML5 DnD kept; noted as follow-up in the prototype review).
-- A toast system; MR-state tracking on cards and all other board–run lifecycle features (PRD #12, which lands after this per Decision 6).
+- MR-state tracking on cards (deferred by PRD #12 too). PRD #12's toast pattern stays as-is (restyled, not rearchitected).
 - Any API/backend change: this PRD is `web/` + docs only (Decision 2's icon wiring is a web-side join for exactly this reason).
 
 ## Milestones
 
-- [ ] **M1 — Port lands on a PRD branch**: prototype commit rebased onto current `main`, `ux-review.md` dropped, typecheck + 67/67 vitest + real (non-mock) `npm run build` green.
-- [ ] **M2 — Nav adjustments**: GitLab/git icons on board nav entries (via the `listConnections` join), standalone Forge nav entry removed, `/settings/forge` reachable via Settings tabs with correct active states; page-level smoke tests added for shell nav + settings tabs.
-- [ ] **M3 — Reskin completed**: `Register`, `Docs`, `DocPage`, `AgentDetail`, `AgentNew`, `AgentTemplateEditor`, `Markdown`, `RouteGuards`, and the `index.css` prose block converted to tokens; the scoped grep gate (Success Criterion 3) passes with an empty allowlist.
-- [ ] **M4 — Real-stack validation**: golden path items 1–5 green against the live compose stack; any real-API seams the mock hid (including the 401/session-expiry path) fixed.
-- [ ] **M5 — Docs refresh**: README + `docs/configuration.md` + `docs/gitlab-bot-setup.md` match the new navigation; `check-docs` green.
-- [ ] **M6 — Review gate + merge**: agent review round (reviewer + fact-check, same bar as PRD #12) on the final diff; findings resolved; MR merged to `main`; issue #14 closed.
+- [x] **M1 — Port lands on a PRD branch** (3aac410, dc2980a, 47a8fa2): design-over-logic merge, #12 behavior preserved (reviewer APPROVE, all 11 pre-flags cleared; auditor clean), mocks extended, 107/107 → gates green.
+- [x] **M2 — Nav adjustments** (2f33d9c, c4aafc8): tanuki/git icons via `listConnections` join, Forge nav removed, active states pinned by new smoke tests (reviewer APPROVE, auditor clean).
+- [x] **M3 — Reskin completed** (8e9847f, + f1eb50d NITs; polish f9237b6/08e31d1/eabfbec/ec96b75 user-approved): grep gate zero hits, no allowlist; web-ux browser validation of all 8 flows, no blockers.
+- [x] **M4 — Real-stack validation** (fix 62f102d): golden path 1–5 PASS headless (isolated stacks), e2e harness PASS, real-GitLab leg PASS on `vtmocanu/uzi-e2e-scratch` (real project untouched), 401 interceptor added + validated + reviewed.
+- [x] **M5 — Docs refresh** (3c80657): README/configuration/gitlab-bot-setup match the shipped nav (incl. Repos→Boards rename); check-docs green.
+- [ ] **M6 — Review gate + merge**: final coverage sweep + fact-check in progress; then MR to `main` (stops for user review per /prd-full); issue #14 closed on merge.
 - [ ] **M7 — Cleanup**: all three prototype containers stopped/removed, prototype worktrees removed; `specs/ai.md` updated with the token/theming decisions; `specs/human.md` addition (multica design selected, board icons, forge-under-settings-only) drafted and **explicitly confirmed with the user before writing** (per CLAUDE.md rule).
 
 ## Success Criteria

@@ -2,7 +2,24 @@ import { useMemo, useState } from "react";
 import type { RunMessage } from "../lib/api";
 import { useFollowScroll, useReconnectingBanner } from "../lib/useFollowScroll";
 import { buildToolIndex, RunEventRow } from "./RunEvent";
-import { Badge } from "./ui";
+import { Badge, cx } from "./ui";
+
+// Each agent gets a stable accent so consecutive blocks are scannable — the
+// same role that avatars + status colors play on multica's message lists
+// (packages/views/chat/components/chat-message-list.tsx uses ActorAvatar).
+const AGENT_ACCENTS = [
+  "text-brand border-brand/40",
+  "text-info border-info/40",
+  "text-ok border-ok/40",
+  "text-warn border-warn/40",
+  "text-danger border-danger/40",
+];
+
+function agentAccent(agent: string): string {
+  let h = 0;
+  for (let i = 0; i < agent.length; i++) h = (h * 31 + agent.charCodeAt(i)) | 0;
+  return AGENT_ACCENTS[Math.abs(h) % AGENT_ACCENTS.length];
+}
 
 // agentGroup is a run of consecutive messages produced by the same agent.
 interface AgentGroup {
@@ -70,29 +87,29 @@ export function ActivityFeed({
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Activity</h2>
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Activity</h2>
         <div className="flex items-center gap-2">
           {follow.paused && follow.newCount > 0 && (
             <button
               type="button"
               onClick={follow.jumpToBottom}
-              className="rounded-full bg-indigo-500 px-2.5 py-0.5 text-xs font-medium text-white hover:bg-indigo-400"
+              className="rounded-full bg-brand px-2.5 py-0.5 text-xs font-medium text-on-brand hover:bg-brand-hover"
             >
               {follow.newCount} new ↓
             </button>
           )}
-          <span className="text-xs text-slate-500">{messages.length} messages</span>
+          <span className="text-xs text-faint">{messages.length} messages</span>
         </div>
       </div>
 
       {reconnecting && (
-        <div className="rounded-md border border-amber-800 bg-amber-950/50 px-3 py-1.5 text-xs text-amber-300">
+        <div className="rounded-md border border-warn/40 bg-warn/10 px-3 py-1.5 text-xs text-warn">
           Reconnecting… live updates are paused.
         </div>
       )}
 
       {groups.length === 0 ? (
-        <p className="py-6 text-center text-sm text-slate-600">
+        <p className="py-6 text-center text-sm text-faint">
           {terminal ? "No messages were recorded for this run." : "Waiting for the agent…"}
         </p>
       ) : (
@@ -102,13 +119,13 @@ export function ActivityFeed({
           role="log"
           aria-live="polite"
           aria-label="Run activity"
-          className="max-h-[65vh] space-y-3 overflow-auto rounded-lg border border-slate-800 bg-slate-900/60 p-3 [overscroll-behavior:contain]"
+          className="max-h-[65vh] space-y-3 overflow-auto rounded-lg border border-edge bg-ink/60 p-3 [overscroll-behavior:contain]"
         >
           {capped && (
             <button
               type="button"
               onClick={() => setShowAll(true)}
-              className="w-full rounded-md border border-slate-800 bg-slate-900 px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200"
+              className="w-full rounded-md border border-edge bg-raised px-3 py-1.5 text-xs text-muted hover:text-fg"
             >
               Show {hiddenCount} earlier messages
             </button>
@@ -139,14 +156,15 @@ function AgentBlock({
   toolIndex: ReturnType<typeof buildToolIndex>;
   visibleToolUseIds: Set<string>;
 }) {
+  const accent = agentAccent(group.agent);
   return (
-    <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+    <div className={cx("rounded-lg border-l-2 bg-surface/60 py-3 pl-3 pr-3", accent)}>
       <div className="mb-2 flex items-center gap-2">
-        <span className="text-sm font-semibold text-slate-200">{group.agent}</span>
+        <span className={cx("text-sm font-semibold", accent.split(" ")[0])}>{group.agent}</span>
         <Badge tone={live ? "warning" : "neutral"} title={live ? "Most recent activity" : "Idle"}>
           {live ? "active" : "idle"}
         </Badge>
-        <span className="ml-auto text-[11px] text-slate-600" title={group.startedAt}>
+        <span className="ml-auto text-[11px] text-faint" title={group.startedAt}>
           {group.startedAt ? new Date(group.startedAt).toLocaleTimeString() : ""}
         </span>
       </div>

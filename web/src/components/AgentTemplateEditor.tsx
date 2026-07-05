@@ -114,8 +114,8 @@ export function AgentTemplateEditor({
         </Field>
       ) : (
         <div>
-          <span className="text-sm font-medium text-slate-300">Name</span>
-          <p className="mt-1 font-mono text-sm text-slate-400">{name}</p>
+          <span className="text-sm font-medium text-muted">Name</span>
+          <p className="mt-1 font-mono text-sm text-muted">{name}</p>
         </div>
       )}
 
@@ -140,10 +140,10 @@ export function AgentTemplateEditor({
       </Field>
 
       <div className="space-y-1.5">
-        <span className="text-sm font-medium text-slate-300">
+        <span className="text-sm font-medium text-muted">
           Tools (blank = inherit all)
         </span>
-        <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-2 py-2">
+        <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-edge bg-raised px-2 py-2">
           {tools.map((t) => {
             const bad = !KNOWN_TOOLS.includes(t);
             return (
@@ -151,15 +151,15 @@ export function AgentTemplateEditor({
                 key={t}
                 className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-xs ${
                   bad
-                    ? "bg-amber-950/60 text-amber-200"
-                    : "bg-slate-800 text-slate-200"
+                    ? "bg-warn/10 text-warn"
+                    : "bg-edge text-fg"
                 }`}
               >
                 {t}
                 <button
                   type="button"
                   onClick={() => setTools(tools.filter((x) => x !== t))}
-                  className="text-slate-500 hover:text-slate-200"
+                  className="text-faint hover:text-fg"
                   aria-label={`Remove ${t}`}
                 >
                   ×
@@ -174,7 +174,7 @@ export function AgentTemplateEditor({
             onKeyDown={onToolKey}
             onBlur={() => toolDraft && addTool(toolDraft)}
             placeholder={tools.length ? "" : "Bash, Read, …"}
-            className="min-w-[8rem] flex-1 bg-transparent text-sm text-slate-100 outline-none"
+            className="min-w-[8rem] flex-1 bg-transparent text-sm text-fg outline-none"
             autoCapitalize="off"
             autoCorrect="off"
             spellCheck={false}
@@ -186,7 +186,7 @@ export function AgentTemplateEditor({
           </datalist>
         </div>
         {unknown.length > 0 && (
-          <p className="text-xs text-amber-300">
+          <p className="text-xs text-warn">
             Unrecognised tool{unknown.length > 1 ? "s" : ""}: {unknown.join(", ")}. MCP
             tool names are fine; double-check for typos in core tools.
           </p>
@@ -194,32 +194,24 @@ export function AgentTemplateEditor({
       </div>
 
       <div className="space-y-1.5">
-        <span className="text-sm font-medium text-slate-300">Prompt body (Markdown)</span>
+        <span className="text-sm font-medium text-muted">Prompt body (Markdown)</span>
         <textarea
           value={promptBody}
           onChange={(e) => setPromptBody(e.target.value)}
           rows={12}
-          className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-sm text-slate-100 outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400"
+          className="w-full rounded-lg border border-edge bg-raised px-3 py-2 font-mono text-sm text-fg outline-none focus:border-brand/70"
         />
       </div>
 
-      {secretWarning && (
-        <div className="rounded-lg border border-amber-800 bg-amber-950/60 px-3 py-2 text-sm text-amber-200">
-          {secretWarning}
-        </div>
-      )}
+      {secretWarning && <Alert message={secretWarning} tone="warning" />}
 
-      {injectionWarning && (
-        <div className="rounded-lg border border-rose-800 bg-rose-950/60 px-3 py-2 text-sm text-rose-200">
-          {injectionWarning}
-        </div>
-      )}
+      {injectionWarning && <Alert message={injectionWarning} tone="danger" />}
 
       <div>
-        <span className="text-sm font-medium text-slate-300">
+        <span className="text-sm font-medium text-muted">
           Rendered subagent file (preview)
         </span>
-        <pre className="mt-1.5 overflow-x-auto rounded-lg border border-slate-800 bg-slate-950 p-3 text-xs text-slate-300">
+        <pre className="mt-1.5 overflow-x-auto rounded-lg border border-edge bg-ink p-3 text-xs text-muted">
           {preview}
         </pre>
       </div>
