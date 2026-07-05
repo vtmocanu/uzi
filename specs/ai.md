@@ -1732,6 +1732,120 @@ data), reinforcing §27.
 
 ---
 
+# PRD #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
+
+Serves human Feature #23 (the three UX gaps observed during the issue-#20 smoke test;
+human.md entry pending user confirmation). **Status: M1–M4 built, reviewed, audited,
+and browser-validated on branch `prd-23-web-ux-polish`.** `web/` + `docs/` only — no
+API, schema, agent, env, or Go change anywhere. Full rationale + Decision Log:
+`prds/23-web-ux-live-dashboard-sidebar-board.md`.
+
+## 85. Shared visibility-aware poll hook + live dashboard
+
+Serves human: "the dashboard should update live — a run reaching `awaiting_approval`
+must show without a manual refresh."
+
+- **Liveness is polling, not `/api/ws`.** The WS endpoint is per-run
+  (`/api/ws?run=<id>`); a fleet-wide event channel is out of scope, and the board
+  (PRD #12/#73) already proved a 10s visibility-gated poll. The dashboard reuses that
+  precedent rather than inventing a new push transport.
+- **`web/src/lib/usePollWhileVisible(cb, intervalMs)`**: the board's inline poll effect
+  extracted to one hook (pure logic split out for tests, the `runBadge.ts` discipline).
+  Fires `cb` every `intervalMs`, **skips a tick while `document.hidden`**, and fires an
+  **immediate catch-up on `visibilitychange` → visible**. Both Board and Dashboard
+  consume it; Board's hand-rolled copy is deleted.
+  - **Latest-cb-in-ref (useInterval pattern)**: the interval effect keys only on
+    `[intervalMs]` and reads `cb` through a ref updated each render. Keying on `[cb]`
+    would tear down and recreate the interval every render for an inline-arrow caller
+    (resetting the clock, never firing); the hook must not silently depend on callers
+    memoising with `useCallback`.
+- **First-load vs re-poll error split** (both consumers): skeletons show **only
+  pre-first-load**. A first-load failure leaves state null so skeletons stay; a
+  **background re-poll failure keeps the last-good data** — a transient poll error must
+  never blank a populated page back to skeletons. (The board's `load()`/`poll()`
+  split, now mirrored on the dashboard; its old `catch { setData(null) }` was
+  deliberately not reused for re-polls.)
+- **Re-poll fetches only the volatile endpoints** (`listRuns` + `listWorkers`).
+  Repos/templates/secrets/connections change rarely and stay **mount-only**; the poll
+  merges runs + derived worker counts into the existing overview. (Trimmed to these two
+  on review — reviewer #10.)
+- **Test net**: there were **no existing Board/Dashboard component tests**, so the
+  refactor is not covered for free. M1 adds jsdom + fake-timer tests for the hook
+  (interval fire, hidden pause, visibility catch-up, latest-cb-without-interval-reset,
+  teardown) plus a Dashboard test pinning the first-load/re-poll error split — the
+  safety net for both consumers.
+
+## 86. Collapsible desktop sidebar (icon rail)
+
+Serves human: "the desktop sidebar should be collapsible."
+
+- **Collapse = icon rail, not fully hidden** (`w-14`, was `w-60`): logo mark only,
+  icon-only nav items with native `title` tooltips, thin `border-t` separators instead
+  of group labels, avatar-only footer. Every destination stays one click away — the
+  pattern matches the multica-derived shell language rather than removing nav.
+- **State lives in `AppShell`, initialised lazily** (`useState(() => prefs.get(...))`,
+  §87) — not a post-mount effect, which would flash expanded→collapsed on first paint.
+  Persisted per browser under `uzi.sidebar.collapsed`.
+- **Width/padding classes are literal strings in a ternary**
+  (`collapsed ? "lg:pl-14" : "lg:pl-60"`, same for `w-14`/`w-60`) so Tailwind's JIT
+  emits both — never interpolated class names.
+- **Board children fold into the "Boards" parent when collapsed**: on the rail every
+  repo would render as an identical forge glyph, so per-repo board entries are hidden
+  and `/repos` stands in (reviewer #7).
+- **Toggle** is a real `<button>` at the footer edge (persistent, not hover-only) with
+  `aria-expanded={!collapsed}` (tracks the sidebar, not a popup) + an `aria-label`;
+  keyboard/AT operable. **The mobile sheet is unchanged** — it is already a full-width
+  overlay that collapses by nature and passes neither collapse prop.
+
+## 87. UI preferences in localStorage (`web/src/lib/prefs.ts`)
+
+Serves human: the two toggles above must survive a reload; best-practice (no schema
+churn for cosmetics).
+
+- **Preferences are per-browser `localStorage`, not the API** — cosmetic, per-device,
+  not worth a table or endpoints. Revisit only if cross-device settings become a theme.
+- **Typed helper** `prefs.get<T>(key, fallback)` / `prefs.set<T>(key, value)`:
+  JSON-encoded, every access guarded by `typeof window` (SSR/test without a DOM) and
+  wrapped in `try/catch` so a disabled/quota-full store returns the fallback / silently
+  drops the write and **can never throw into render**. First localStorage use in the
+  app; later prefs reuse it. (multica's localStorage helpers guard the same way;
+  their `useSyncExternalStore` reactivity is skipped — no two components watch one key.)
+- Keys: `uzi.sidebar.collapsed` (§86) and `uzi.board.<repoId>.hideEmpty` (§88).
+
+## 88. Derived hide-empty board columns (`web/src/lib/boardColumns.ts`)
+
+Serves human: "empty board columns should be hideable." (The adjacent "columns should
+auto refresh" ask needed **no change** — the board already polls every 10s while
+visible and the server poller syncs the forge every ~1m; forge-side changes appear
+within ~70s worst case. What this feature adds is that the hide/unhide decision is
+recomputed on every one of those polls, so a hidden column can never go stale.)
+
+- **A "Hide empty" toolbar tick box**, persisted per repo (`uzi.board.<repoId>.hideEmpty`
+  via §87). State is re-read on `repoId` change (the route swaps `:id` **without
+  remounting**, so a lazy init alone would keep the first repo's value).
+- **Emptiness is derived at render from the freshly-polled `cardsByColumn`, never
+  stored per column.** Pure `visibleColumns(columns, count, hideEmpty, dragActive)`
+  (`boardColumns.ts`, unit-tested runBadge-style; `Board.tsx` owns the DOM):
+  keep a column iff `!hideEmpty || count > 0 || dragActive`. Because there is no stored
+  per-column state, a column that **gains** a card (auto-move, forge sync, another
+  user) reappears on the next poll and one that **empties** disappears — there is no
+  unhide event to handle, and it is unfailable. **No column is exempt** (an empty Open
+  or Closed lane hides too — the tick box is the user's choice).
+- **Drag reveals hidden empties as drop targets**: while a drag is active
+  (`dragIid != null`) every column renders, and a lane visible only because of the drag
+  is **dimmed** (`opacity-60`) so it reads as a transient target. A **"N hidden" hint**
+  next to the box keeps hidden lanes discoverable.
+- **Accepted v1 cosmetics** (reviewer #6/#12): revealing empties on drag-start shifts
+  the lane row mid-drag (reserved-ghost-space is more code than the feature); the hint
+  reads "0 hidden" during a drag (`columns.length - visible.length` with all lanes
+  shown). Revisit only if either annoys in practice.
+- **A11y bar applied post-validation** (M4 follow-up, non-blocking): the checkbox label
+  gets `py-1.5` so its hit target clears the WCAG 2.5.8 24px minimum; the "N hidden"
+  hint uses `text-muted` (not `text-faint`) for AA contrast at 12px — both stay within
+  the §76 theme tokens, no hardcoded colors.
+
+---
+
 # PRD #24 — MR closed without merging → card back to In Progress
 
 Serves human Feature #24 (close-unmerged → In Progress; user, 2026-07-05). The

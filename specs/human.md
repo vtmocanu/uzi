@@ -109,9 +109,19 @@ Tracked as GitLab issue vtmocanu/uzi#14; PRD at `prds/done/14-multica-ui-redesig
 - A themed focus-visible ring (keyboard/AT focus indicator).
 - E2E testing includes a real-GitLab leg, scoped to the dedicated scratch project `vtmocanu/uzi-e2e-scratch` (created for this); the live-Anthropic capstone is skipped.
 
+## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
+
+Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/23-web-ux-live-dashboard-sidebar-board.md`.
+
+- Dashboard updates live: a run reaching `awaiting_approval` must show without a manual refresh.
+- Desktop sidebar is collapsible.
+- Empty board columns can be hidden.
+- Web-only; no API/schema/agent changes.
+- "Board columns should auto refresh" — already satisfied by existing polling; no change shipped.
+
 ## Feature #24 — MR closed without merging → card back to In Progress
 
-Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/24-mr-close-rework.md`.
+Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/done/24-mr-close-rework.md`.
 
 - When a reviewer closes an agent's MR without merging, move the board card back from Human Review to In Progress (the "rework needed" signal).
 - Target column is In Progress — user's explicit choice, over Open/backlog.
