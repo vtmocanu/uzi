@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
@@ -265,12 +266,73 @@ func (g *gitLab) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 	return nil
 }
 
+func (g *gitLab) UserExists(ctx context.Context, username string) (bool, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return false, nil
+	}
+	// GitLab's username filter is an exact match, so a non-empty result means the
+	// account exists. We only need to know if any row came back.
+	users, _, err := g.client.Users.ListUsers(&gitlab.ListUsersOptions{
+		Username: gitlab.Ptr(username),
+	}, gitlab.WithContext(ctx))
+	if err != nil {
+		return false, g.redact.error(fmt.Errorf("gitlab: lookup user: %w", err))
+	}
+	return len(users) > 0, nil
+}
+
+func (g *gitLab) ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]LabelEvent, error) {
+	opt := &gitlab.ListLabelEventsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
+	var out []LabelEvent
+	for {
+		events, resp, err := g.client.ResourceLabelEvents.ListIssueLabelEvents(projectID, issueIID, opt, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list issue label events: %w", err))
+		}
+		for _, e := range events {
+			out = append(out, toLabelEvent(e))
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+	return out, nil
+}
+
+func (g *gitLab) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error) {
+	note, _, err := g.client.Notes.CreateIssueNote(projectID, issueIID, &gitlab.CreateIssueNoteOptions{
+		Body: gitlab.Ptr(body),
+	}, gitlab.WithContext(ctx))
+	if err != nil {
+		return IssueNote{}, g.redact.error(fmt.Errorf("gitlab: create issue note: %w", err))
+	}
+	return IssueNote{ID: note.ID, Body: note.Body}, nil
+}
+
 func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error) {
 	mr, _, err := g.client.MergeRequests.GetMergeRequest(projectID, mrIID, nil, gitlab.WithContext(ctx))
 	if err != nil {
 		return MergeRequest{}, g.redact.error(fmt.Errorf("gitlab: get merge request: %w", err))
 	}
 	return toMergeRequest(mr), nil
+}
+
+// toLabelEvent maps a client-go resource label event to the neutral domain type.
+// A nil CreatedAt yields the zero time; a system event with no user yields an
+// empty Username (the caller falls back to the issue author in that case).
+func toLabelEvent(e *gitlab.LabelEvent) LabelEvent {
+	le := LabelEvent{
+		ID:        e.ID,
+		Action:    e.Action,
+		LabelName: e.Label.Name,
+		Username:  e.User.Username,
+	}
+	if e.CreatedAt != nil {
+		le.CreatedAt = *e.CreatedAt
+	}
+	return le
 }
 
 // toMergeRequest maps a client-go merge request to the neutral domain type. The

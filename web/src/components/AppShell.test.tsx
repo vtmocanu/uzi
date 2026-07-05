@@ -25,6 +25,7 @@ const user = {
   display_name: "Admin",
   is_admin: false,
   is_active: true,
+  autopilot_enabled: false,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -56,6 +57,7 @@ const gitlabConnection = {
   base_url: "https://gitlab.example.com",
   bot_username: "bot",
   bot_forge_user_id: 1,
+  human_username: null,
   created_at: "2026-01-01T00:00:00Z",
   last_verified_at: null,
   privilege_status: null,
@@ -95,6 +97,8 @@ beforeEach(() => {
   vi.mocked(useAuth).mockReturnValue({
     user,
     loading: false,
+    prdLabel: "PRD",
+    autopilotLabel: "autopilot",
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

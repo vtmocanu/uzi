@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,9 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
+
+// testOrigin is the frontend origin the terminal-comment hook builds run links from.
+const testOrigin = "https://uzi.test"
 
 // ── fakes ─────────────────────────────────────────────────────────────────────
 
@@ -31,6 +35,13 @@ type fakeStore struct {
 	cleared    []uuid.UUID
 	pendingArg *store.ListPendingColumnMovesParams
 	gaveUpArg  *store.ListGaveUpColumnMovesParams
+
+	// Terminal-comment claim (M5). claimErr forces the record step to fail; else the
+	// first caller wins the row (returns 1) and every later caller reads 0, modelling
+	// the atomic once-only UPDATE.
+	claimCalls int
+	claimErr   error
+	claimed    bool
 }
 
 func (f *fakeStore) GetRunMoveContext(context.Context, uuid.UUID) (store.GetRunMoveContextRow, error) {
@@ -58,15 +69,35 @@ func (f *fakeStore) ListGaveUpColumnMoves(_ context.Context, arg store.ListGaveU
 	f.gaveUpArg = &arg
 	return f.gaveUp, nil
 }
+func (f *fakeStore) ClaimAutopilotTerminalComment(context.Context, uuid.UUID) (int64, error) {
+	f.claimCalls++
+	if f.claimErr != nil {
+		return 0, f.claimErr
+	}
+	if f.claimed {
+		return 0, nil // a peer invocation already claimed it
+	}
+	f.claimed = true
+	return 1, nil
+}
 
 type fakeMover struct {
 	forgeErr    error
 	autoMoveErr error
 	moves       []string
+	// forge is returned by ForgeForConnection (lazily created), so the
+	// terminal-comment hook's CreateIssueNote calls are observable.
+	forge *fakeForge
 }
 
 func (m *fakeMover) ForgeForConnection(string, string, []byte) (forge.Forge, error) {
-	return nil, m.forgeErr
+	if m.forgeErr != nil {
+		return nil, m.forgeErr
+	}
+	if m.forge == nil {
+		m.forge = &fakeForge{}
+	}
+	return m.forge, nil
 }
 func (m *fakeMover) AutoMove(_ context.Context, _ forge.Forge, _ int64, issue store.Issue, _ []store.BoardColumn, target string) (store.Issue, error) {
 	m.moves = append(m.moves, target)
@@ -76,19 +107,37 @@ func (m *fakeMover) AutoMove(_ context.Context, _ forge.Forge, _ int64, issue st
 	return issue, nil
 }
 
+// fakeForge records the issue comments the terminal-comment hook posts. Only
+// CreateIssueNote is exercised, so the rest of forge.Forge is left embedded-nil.
+type fakeNote struct {
+	projectID, issueIID int64
+	body                string
+}
+
+type fakeForge struct {
+	forge.Forge
+	notes   []fakeNote
+	noteErr error
+}
+
+func (f *fakeForge) CreateIssueNote(_ context.Context, projectID, issueIID int64, body string) (forge.IssueNote, error) {
+	f.notes = append(f.notes, fakeNote{projectID, issueIID, body})
+	return forge.IssueNote{}, f.noteErr
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 var testNow = time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
 
 func newTestLifecycle(fs *fakeStore, fm *fakeMover) *Lifecycle {
-	l := New(fs, fm)
+	l := New(fs, fm, testOrigin)
 	l.now = func() time.Time { return testNow }
 	return l
 }
 
-func txt(s string) pgtype.Text            { return pgtype.Text{String: s, Valid: true} }
-func nullText() pgtype.Text               { return pgtype.Text{} }
-func ts(t time.Time) pgtype.Timestamptz   { return pgtype.Timestamptz{Time: t, Valid: true} }
+func txt(s string) pgtype.Text          { return pgtype.Text{String: s, Valid: true} }
+func nullText() pgtype.Text             { return pgtype.Text{} }
+func ts(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, Valid: true} }
 func defaultCols() []store.BoardColumn {
 	names := []string{board.ColumnInProgress, "Upcoming", "Later", board.ColumnHumanReview}
 	cols := make([]store.BoardColumn, len(names))
@@ -389,5 +438,174 @@ func TestReconcileGiveUpLeavesMarker(t *testing.T) {
 	}
 	if !fs.gaveUpArg.PriorCutoff.Time.Equal(testNow.Add(-l.giveup - l.interval)) {
 		t.Fatalf("prior cutoff = %v, want now-giveup-interval", fs.gaveUpArg.PriorCutoff.Time)
+	}
+}
+
+// ── autopilot terminal comments (PRD #19 M5) ───────────────────────────────────
+
+// autopilotMoveCtx is moveCtx with the autopilot facts the terminal-comment hook
+// reads (auto_approve, and the MR link parts on success).
+func autopilotMoveCtx(repoID uuid.UUID, iid int64, status string, mrIID int64, webURL string) store.GetRunMoveContextRow {
+	mc := moveCtx(repoID, iid, status, txt("Later"), nullText())
+	mc.AutoApprove = true
+	if mrIID > 0 {
+		mc.MrIid = pgtype.Int8{Int64: mrIID, Valid: true}
+	}
+	mc.RepoWebUrl = webURL
+	return mc
+}
+
+func TestTerminalCommentWorkerFailurePostsRunLink(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx: autopilotMoveCtx(repoID, 4, "failed", 0, ""),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+
+	l.notifyOnce(context.Background(), runID, "failed")
+
+	if fs.claimCalls != 1 {
+		t.Fatalf("expected one atomic claim, got %d", fs.claimCalls)
+	}
+	if fm.forge == nil || len(fm.forge.notes) != 1 {
+		t.Fatalf("expected one failure comment, got %v", fm.forge)
+	}
+	note := fm.forge.notes[0]
+	if note.issueIID != 4 || note.projectID != 77 {
+		t.Fatalf("comment posted to wrong issue/project: %+v", note)
+	}
+	if !strings.Contains(note.body, "could not complete") {
+		t.Fatalf("failure comment missing fixed reason: %q", note.body)
+	}
+	if !strings.Contains(note.body, testOrigin+"/runs/"+runID.String()) {
+		t.Fatalf("failure comment missing run link: %q", note.body)
+	}
+	// Fixed template only — the untrusted issue text must never be echoed.
+	if strings.Contains(note.body, "PRD") {
+		t.Fatalf("failure comment must not interpolate issue labels/text: %q", note.body)
+	}
+}
+
+func TestTerminalCommentSweeperFailurePostsViaReconcile(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx: autopilotMoveCtx(repoID, 4, "failed", 0, ""),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+
+	// The sweeper never calls the inline notify; it stamps move_pending_since and the
+	// reconcile loop is the funnel. reconcileOne stands in for one reconcile pass.
+	l.reconcileOne(context.Background(), runID)
+
+	if fs.claimCalls != 1 || fm.forge == nil || len(fm.forge.notes) != 1 {
+		t.Fatalf("sweeper path must post exactly one comment via reconcile, claims=%d forge=%v", fs.claimCalls, fm.forge)
+	}
+}
+
+func TestTerminalCommentSuccessPostsMRLink(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx: autopilotMoveCtx(repoID, 4, "completed", 42, "https://gitlab.example.com/group/proj"),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+
+	l.notifyOnce(context.Background(), runID, "completed")
+
+	if fm.forge == nil || len(fm.forge.notes) != 1 {
+		t.Fatalf("expected one success comment, got %v", fm.forge)
+	}
+	body := fm.forge.notes[0].body
+	if !strings.Contains(body, "merge request") || !strings.Contains(body, "!42") ||
+		!strings.Contains(body, "https://gitlab.example.com/group/proj/-/merge_requests/42") {
+		t.Fatalf("success comment missing the MR link: %q", body)
+	}
+}
+
+func TestTerminalCommentNonAutopilotSilent(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		// auto_approve defaults false → a manual run.
+		moveCtx: moveCtx(repoID, 4, "completed", txt("Later"), nullText()),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+
+	l.notifyOnce(context.Background(), runID, "completed")
+
+	if fs.claimCalls != 0 {
+		t.Fatalf("a manual run must never claim a terminal comment, got %d", fs.claimCalls)
+	}
+	if fm.forge != nil && len(fm.forge.notes) != 0 {
+		t.Fatalf("a manual run must never comment, got %d", len(fm.forge.notes))
+	}
+}
+
+func TestTerminalCommentCancelledSilent(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx: autopilotMoveCtx(repoID, 4, "cancelled", 0, ""),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+
+	l.notifyOnce(context.Background(), runID, "cancelled")
+
+	if fs.claimCalls != 0 {
+		t.Fatalf("cancelled is a human stop, not an autopilot outcome — no comment, got %d", fs.claimCalls)
+	}
+}
+
+func TestTerminalCommentClaimedOnceAcrossPaths(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx: autopilotMoveCtx(repoID, 4, "failed", 0, ""),
+		issue:   issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns: defaultCols(),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+
+	// Worker path claims and posts; the reconcile retry then finds the claim taken.
+	l.notifyOnce(context.Background(), runID, "failed")
+	l.reconcileOne(context.Background(), runID)
+
+	if fs.claimCalls != 2 {
+		t.Fatalf("both paths attempt the atomic claim, got %d", fs.claimCalls)
+	}
+	if len(fm.forge.notes) != 1 {
+		t.Fatalf("exactly one comment across both paths, got %d", len(fm.forge.notes))
+	}
+}
+
+func TestTerminalCommentRecordFailsNoComment(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		moveCtx:  autopilotMoveCtx(repoID, 4, "failed", 0, ""),
+		issue:    issueWith(repoID, 4, "opened", "PRD", "Later"),
+		columns:  defaultCols(),
+		claimErr: errors.New("db unavailable"),
+	}
+	fm := &fakeMover{}
+	l := newTestLifecycle(fs, fm)
+
+	l.notifyOnce(context.Background(), runID, "failed")
+
+	// Record-then-comment: a failed record must never post (a comment without its
+	// record could double-post on a later pass).
+	if fm.forge != nil && len(fm.forge.notes) != 0 {
+		t.Fatalf("a failed claim must not post a comment, got %d", len(fm.forge.notes))
 	}
 }

@@ -18,6 +18,9 @@ export interface User {
   display_name: string | null;
   is_admin: boolean;
   is_active: boolean;
+  // autopilot_enabled is the per-user opt-in to unattended autopilot runs (PRD #19
+  // M3). Default false; toggled from the user's own Settings page.
+  autopilot_enabled: boolean;
   created_at: string;
   last_login: string | null;
 }
@@ -95,6 +98,9 @@ export interface ForgeConnection {
   base_url: string;
   bot_username: string;
   bot_forge_user_id: number;
+  // human_username is the owning user's own forge account, used for autopilot
+  // attribution (PRD #19 M3). Null until the user declares it.
+  human_username: string | null;
   created_at: string;
   last_verified_at: string | null;
   // Least-privilege surfacing. A null status means never checked (unchecked
@@ -180,6 +186,29 @@ export interface ForgeConfig {
   forge_types: string[];
 }
 
+// AppSettings is the instance-level settings surface (PRD #19). Admin-only. The
+// API always returns every known key (a missing row reads as its default), so
+// both fields are always present.
+export interface AppSettings {
+  prd_label: string;
+  autopilot_label: string;
+}
+
+// Compiled-in label defaults, mirroring the API's settings package. The SPA uses
+// them until the session bootstrap resolves the configured values (PRD #19 M2).
+export const DEFAULT_PRD_LABEL = "PRD";
+export const DEFAULT_AUTOPILOT_LABEL = "autopilot";
+
+// SessionResponse is the auth/session bootstrap body (login, register, me). It
+// carries the user plus the instance forge labels the board and issue-creation UI
+// need before their first call (PRD #19 M2 — delivered on the existing response,
+// no new endpoint).
+export interface SessionResponse {
+  user: User;
+  prd_label: string;
+  autopilot_label: string;
+}
+
 // AuthConfig is the unauthenticated registration policy the register page reads
 // to hide itself or hint the allowed domains before submit. The server stays
 // authoritative; this is display + pre-validation only.
@@ -229,6 +258,9 @@ export interface Run {
   status: RunStatus;
   requeue_count: number;
   iteration_count: number;
+  /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
+   *  "autopilot" badge; a manually-started run is false. */
+  auto_approve: boolean;
   worker_id: string | null;
   branch: string | null;
   mr_iid: number | null;
@@ -379,19 +411,25 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 const realApi = {
   register: (email: string, password: string, displayName: string) =>
-    request<{ user: User }>("POST", "/auth/register", {
+    request<SessionResponse>("POST", "/auth/register", {
       email,
       password,
       display_name: displayName,
     }),
   login: (email: string, password: string) =>
-    request<{ user: User }>("POST", "/auth/login", { email, password }),
+    request<SessionResponse>("POST", "/auth/login", { email, password }),
   authConfig: () => request<AuthConfig>("GET", "/auth/config"),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
-  me: () => request<{ user: User }>("GET", "/auth/me"),
+  me: () => request<SessionResponse>("GET", "/auth/me"),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
+  getSettings: () => request<{ settings: AppSettings }>("GET", "/admin/settings"),
+  updateSettings: (settings: Partial<AppSettings>) =>
+    request<{ settings: AppSettings }>("PUT", "/admin/settings", { settings }),
+  // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
+  setAutopilotEnabled: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
@@ -423,6 +461,13 @@ const realApi = {
     }),
   verifyConnection: (id: string) =>
     request<{ connection: ForgeConnection }>("POST", `/forge/connections/${id}/verify`),
+  // Set (or clear, with "") the connecting user's own forge username for autopilot
+  // attribution. The API best-effort-verifies it and may return a `warning` while
+  // still saving (verified-or-warned, PRD #19 M3).
+  updateConnection: (id: string, humanUsername: string) =>
+    request<{ connection: ForgeConnection; warning?: string }>("PUT", `/forge/connections/${id}`, {
+      human_username: humanUsername,
+    }),
   privilegeCheck: (id: string) =>
     request<{ report: PrivilegeReport }>("POST", `/forge/connections/${id}/privilege-check`),
   deleteConnection: (id: string) => request<null>("DELETE", `/forge/connections/${id}`),

@@ -895,6 +895,128 @@ func TestCreateRunSnapshotsTitleAndRejectsMissingPRDLink(t *testing.T) {
 	}
 }
 
+func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+
+	// Same PRD-link gate as the manual path.
+	fsNoLink := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: false}}
+	svc := New(fsNoLink, newBox(t), testParams())
+	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc"); err != ErrNoPRDLink {
+		t.Fatalf("err = %v, want ErrNoPRDLink (autopilot must enforce the same gate)", err)
+	}
+
+	// Happy path → auto_approve set, description snapshotted.
+	fs := &fakeStore{
+		issueByID:       store.Issue{Title: "Real Title", HasPrdLink: true},
+		createRunResult: store.Run{ID: uuid.New()},
+	}
+	svc = New(fs, newBox(t), testParams())
+	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "the description"); err != nil {
+		t.Fatalf("CreateAutopilotRun: %v", err)
+	}
+	if fs.createRunParams == nil {
+		t.Fatal("CreateRun not called")
+	}
+	if !fs.createRunParams.AutoApprove {
+		t.Fatal("autopilot run must set auto_approve = true")
+	}
+	if fs.createRunParams.IssueDescription != "the description" {
+		t.Fatalf("description should be the snapshot passed in, got %q", fs.createRunParams.IssueDescription)
+	}
+
+	// A manual run leaves auto_approve false.
+	fsManual := &fakeStore{
+		issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+		createRunResult: store.Run{ID: uuid.New()},
+	}
+	svc = New(fsManual, newBox(t), testParams())
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d"); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if fsManual.createRunParams.AutoApprove {
+		t.Fatal("manual run must keep auto_approve = false")
+	}
+}
+
+func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-AUTOAPPROVETEST-abcdef1234567890"))
+	sealedTok, _ := box.Seal([]byte("anthropic-oauth-AUTOAPPROVETEST-abcdef1234567890"))
+
+	newFS := func(run store.Run) *fakeStore {
+		return &fakeStore{
+			claimRun: run,
+			claimCtx: store.GetRunClaimContextRow{
+				RepoWebUrl: "https://gitlab.example.com/grp/proj", RepoPath: "grp/proj",
+				DefaultBranch: pgText("main"), ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
+				BotUsername: "uzi-bot", TokenCiphertext: sealedPAT,
+			},
+			anthropic: sealedTok,
+		}
+	}
+
+	// Fresh autopilot run: no branch/session yet, auto_approve set on the row.
+	fresh := newFS(store.Run{ID: uuid.New(), IssueIid: 4, Status: "claimed", AutoApprove: true})
+	p, err := New(fresh, box, testParams()).Claim(context.Background(), worker())
+	if err != nil || p == nil {
+		t.Fatalf("fresh Claim: payload=%v err=%v", p, err)
+	}
+	if !p.AutoApprove {
+		t.Fatal("a fresh autopilot claim must deliver auto_approve top-level")
+	}
+
+	// Resume/requeue of the SAME run (branch + session persisted): auto_approve is
+	// read from the row again, so it re-delivers — an unattended resume would
+	// otherwise hang forever at the plan gate.
+	resume := newFS(store.Run{
+		ID: uuid.New(), IssueIid: 4, Status: "claimed", AutoApprove: true,
+		Branch: pgText("agent/issue-4"), SessionID: pgText("sess-xyz"), RequeueCount: 1,
+	})
+	p, err = New(resume, box, testParams()).Claim(context.Background(), worker())
+	if err != nil || p == nil {
+		t.Fatalf("resume Claim: payload=%v err=%v", p, err)
+	}
+	if p.Branch == nil || !p.AutoApprove {
+		t.Fatalf("a resumed autopilot claim must re-deliver auto_approve, got %+v", p)
+	}
+
+	// A manual run never carries it.
+	manual := newFS(store.Run{ID: uuid.New(), IssueIid: 4, Status: "claimed"})
+	p, err = New(manual, box, testParams()).Claim(context.Background(), worker())
+	if err != nil || p == nil {
+		t.Fatalf("manual Claim: payload=%v err=%v", p, err)
+	}
+	if p.AutoApprove {
+		t.Fatal("a manual claim must not set auto_approve")
+	}
+}
+
+func TestCreateRunRejectsOversizeDescription(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	big := strings.Repeat("x", MaxIssueDescriptionBytes+1)
+
+	// Manual and autopilot both reject at the one shared cap, before any run is made.
+	fs := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}}
+	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big); err != ErrDescriptionTooLarge {
+		t.Fatalf("CreateRun err = %v, want ErrDescriptionTooLarge", err)
+	}
+	if fs.createRunParams != nil {
+		t.Fatal("an oversize description must be rejected before CreateRun")
+	}
+
+	fsAuto := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}}
+	if _, err := New(fsAuto, newBox(t), testParams()).CreateAutopilotRun(context.Background(), user, repo, 4, big); err != ErrDescriptionTooLarge {
+		t.Fatalf("CreateAutopilotRun err = %v, want ErrDescriptionTooLarge", err)
+	}
+
+	// Exactly at the cap is accepted (boundary).
+	ok := strings.Repeat("x", MaxIssueDescriptionBytes)
+	fsOK := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}, createRunResult: store.Run{ID: uuid.New()}}
+	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok); err != nil {
+		t.Fatalf("a description exactly at the cap must be accepted, got %v", err)
+	}
+}
+
 func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 	fs := &fakeStore{

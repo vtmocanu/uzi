@@ -68,6 +68,13 @@ func (f *fakeForge) UpdateIssueLabels(context.Context, int64, int64, []string, [
 func (f *fakeForge) GetMergeRequest(context.Context, int64, int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{}, nil
 }
+func (f *fakeForge) UserExists(context.Context, string) (bool, error) { return false, nil }
+func (f *fakeForge) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
+	return nil, nil
+}
+func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
+	return forge.IssueNote{}, nil
+}
 
 var now = time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
 

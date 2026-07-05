@@ -35,6 +35,20 @@ type Engine struct {
 	maxConcurrency int
 
 	states map[uuid.UUID]*repoState
+
+	// forceReconcile carries an admin's "labels changed, resync everything" signal
+	// from the settings PUT handler to the Run loop. Capacity 1 + a non-blocking
+	// send (ForceReconcile) means the handler never blocks and rapid successive
+	// PUTs coalesce into a single pending reconcile. Only the Run goroutine reads
+	// it, and it mutates states in that same goroutine, so states needs no lock.
+	forceReconcile chan struct{}
+
+	// autopilot runs the post-sync autopilot detection (PRD #19 M4) as a sibling of
+	// the MR-close watcher. Optional (nil-safe): nil disables detection, so tests
+	// and any deployment without autopilot wiring keep the plain sync behaviour.
+	// Set via SetAutopilot, mirroring workersvc's SetBroadcaster/SetLifecycle so
+	// New's signature — and its existing callers — stay unchanged.
+	autopilot *Autopilot
 }
 
 type repoState struct {
@@ -59,6 +73,35 @@ func New(svc *forgesvc.Service, q *store.Queries, interval time.Duration, reconc
 		reconcileEvery: reconcileEvery,
 		maxConcurrency: defaultMaxConcurrency,
 		states:         make(map[uuid.UUID]*repoState),
+		forceReconcile: make(chan struct{}, 1),
+	}
+}
+
+// SetAutopilot wires the post-sync autopilot detector (PRD #19 M4). Call once at
+// startup, before Run. A nil detector (the default) disables autopilot: the sync
+// still runs, no runs are auto-created and no autopilot comments are posted.
+func (e *Engine) SetAutopilot(a *Autopilot) { e.autopilot = a }
+
+// ForceReconcile requests that the next tick full-syncs every enabled repo,
+// dropping the incremental fast-path so a changed prd_label immediately re-filters
+// each board (PRD #19 M2). It is non-blocking: it drops the signal when one is
+// already pending (the Run loop will reconcile once regardless), so a caller — the
+// settings PUT handler — never blocks on the poller. A no-op if the poller is not
+// running (the buffered send simply fills or is dropped).
+func (e *Engine) ForceReconcile() {
+	select {
+	case e.forceReconcile <- struct{}{}:
+	default:
+	}
+}
+
+// resetReconcileState makes the next tick a full reconcile for every repo by
+// zeroing each known repo's poll counter (reconcileDue treats pollCount==1 — the
+// value after the next tick's increment — as a reconcile). Runs only in the Run
+// goroutine, the sole mutator of states, so no lock is needed.
+func (e *Engine) resetReconcileState() {
+	for _, st := range e.states {
+		st.pollCount = 0
 	}
 }
 
@@ -81,6 +124,12 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-ctx.Done():
 			slog.Info("poller stopped")
 			return
+		case <-e.forceReconcile:
+			// A settings change asked for a resync: forget the incremental state so
+			// the next tick full-syncs every repo. Cheap and in-goroutine; the tick
+			// itself does the forge work.
+			slog.Info("poller: force reconcile requested")
+			e.resetReconcileState()
 		case <-ticker.C:
 			e.tick(ctx)
 		}
@@ -174,5 +223,14 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// only a candidate-enumeration failure surfaces here.
 	if err := e.svc.SyncMRStates(ctx, r.ID, r.ForgeProjectID, f); err != nil {
 		slog.Error("poller: sync MR states", "repo", r.PathWithNamespace, "error", err)
+	}
+
+	// Autopilot detection (PRD #19 M4): also post-sync, a sibling of the MR-close
+	// watcher, reading the same fresh issue cache. It turns an autopilot-label
+	// application on a PRD issue into an auto_approve run for the mapped consenting
+	// user (or one explanatory issue comment). All per-issue errors are handled
+	// inside; nothing surfaces here.
+	if e.autopilot != nil {
+		e.autopilot.detect(ctx, r, f)
 	}
 }

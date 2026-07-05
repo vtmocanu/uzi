@@ -24,6 +24,15 @@ SELECT * FROM forge_connections WHERE id = $1 AND user_id = $2;
 UPDATE forge_connections SET last_verified_at = now() WHERE id = $1 AND user_id = $2
 RETURNING *;
 
+-- name: SetForgeConnectionHumanUsername :one
+-- Set or clear (NULL $3) the connecting user's own forge username on their
+-- connection, scoped to the owner (PRD #19 M3). The partial unique index on
+-- (base_url, human_username) rejects a value another user already mapped on the
+-- same host with a 23505 the handler surfaces as a hard 409.
+UPDATE forge_connections SET human_username = $3
+WHERE id = $1 AND user_id = $2
+RETURNING *;
+
 -- name: DeleteForgeConnectionForUser :execrows
 DELETE FROM forge_connections WHERE id = $1 AND user_id = $2;
 

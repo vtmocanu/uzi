@@ -1983,6 +1983,292 @@ Serves human Feature #24; no new surface required.
 
 ---
 
+# PRD #19 — Admin settings (app_settings) + autopilot label
+
+Serves human Feature #19 (instance settings infrastructure + the one-label-in-GitLab
+autopilot user story; user, 2026-07-05 — the human.md autopilot entry + the
+failure-comment wording were **approved by the user (2026-07-05)** and are recorded in
+`specs/human.md` Feature #19). **Status: M1–M5 built, reviewed, and audited on branch
+`prd-19-admin-settings-autopilot`; M6 (e2e + docs + specs) in progress.** Two threads land together: a generic key/value
+settings store whose first two tenants are the configurable `prd_label` and
+`autopilot_label`, and an autopilot path where adding a label in GitLab runs a PRD
+issue end to end with zero uzi interaction. Section numbers continue past PRD #24's
+#92. Full rationale + Decision Log: `prds/19-admin-settings-and-autopilot.md`.
+
+## 93. app_settings: generic KV store + cached accessor (`api/internal/settings`)
+
+Serves human: "settings infrastructure with the two labels as its first tenants"
+(user, 2026-07-05); best-practice (no one-off `prd_label` column, no speculative
+framework).
+
+- **Generic key/value table, two seeded tenants** (migration `00036_app_settings`):
+  `app_settings(key TEXT PK, value TEXT NOT NULL, updated_by UUID NULL REFERENCES
+  users ON DELETE SET NULL, updated_at TIMESTAMPTZ)`, seeded `prd_label='PRD'` +
+  `autopilot_label='autopilot'`. Chosen over a typed column so the next setting
+  (registration policy, self-improvement toggle) slots in with no schema change.
+  **No secret material ever** lives here — values are admin-readable plaintext;
+  secrets stay in env / secretbox (§17/§29).
+- **Read-through, per-process, TTL cache** (`settings.Cache`, `SETTINGS_CACHE_TTL`
+  default `5s`): RWMutex-guarded fast path reads a **copy-on-write snapshot** pointer
+  under `RLock`; the store fetch never runs under the lock (fetch happens between an
+  `RUnlock` and a `Lock`), so concurrent poller + handler reads never serialize.
+  **Stale-on-error**: a refresh past TTL that fails serves the prior snapshot with a
+  nil error; only a *cold* cache + DB error propagates. **Invalidate-after-commit**:
+  a settings PUT invalidates only after `tx.Commit`.
+- **Defaults compiled in, once** (`settings.Defaults` / `DefaultPRDLabel` /
+  `DefaultAutopilotLabel`): accessors return `(value, error)` where the value is the
+  compiled-in default even on a cold error, so every caller can treat resolution as
+  best-effort (ignore the error, still get a usable label). A missing row never
+  breaks boot. The migration seed is the one unavoidable SQL-literal copy of the
+  defaults, kept in sync by comment; changing a default needs a **new** migration
+  (00036 is immutable once shipped).
+- **Admin API** `GET /api/admin/settings` + `PUT /api/admin/settings` (admin-gated
+  like `ListUsers`/`PatchUser`). PUT body is a **partial** `{settings:{<key>:<value>}}`
+  map (UI sends both keys, API tolerates one). Web: an admin-only "Instance settings"
+  page (its own route/nav, **not** the per-user Settings shell).
+- **Per-process cache is correct for the single-`api` compose stack**; a second
+  replica would lag a PUT by up to the TTL — noted for a future k8s deployment, not
+  fixed in the MVP.
+
+## 94. Label validation + cross-key TOCTOU fix (`settings.ValidateLabel` / `Effective` / `ValidateMerged`)
+
+Serves human: the two labels are user-editable and must never collapse to a state
+that auto-runs every PRD issue; best-practice (concurrent-write safety on Postgres).
+
+- **Per-value rules** (`ValidateLabel`): non-empty / not whitespace-only, ≤ 64 runes,
+  **no comma** (GitLab's label-list separator). **Cross-key rule** (Decision 8):
+  `prd_label != autopilot_label` — equal values would make every PRD issue also an
+  autopilot issue. Changing a label **never creates it on the forge** (users create
+  labels in GitLab themselves, as with columns §20); an autopilot label without the
+  PRD label is invisible to uzi (the sync filter only sees PRD issues) — no run, no
+  comment.
+- **The cross-key check is authoritative inside the write tx**, against the two rows
+  read `FOR UPDATE` (`ListAppSettingsForUpdate` → `settings.Effective(rows)` builds
+  the committed effective map, merged with the pending writes, then `ValidateMerged`).
+  A second concurrent single-key PUT **blocks on the row lock** and validates against
+  the first writer's committed value, so two PUTs can never both pass and land
+  `prd_label == autopilot_label`. The pre-tx cache check is kept only as a cheap
+  fast-fail (and to keep the nil-pool handler tests valid); a stale cache can at worst
+  false-reject a change the committed state would accept.
+- **Proof without a live-Postgres harness**: this repo has no live-DB handler harness
+  (handlers hold concrete `*store.Queries`/`*pgxpool.Pool`; the discipline is to
+  extract pure helpers). `settings.TestEffectiveDrivesMergedValidationFromCommittedRows`
+  proves the merge/validate reads the passed committed rows, not the cache; the real
+  two-connection race is exercised in the M6 e2e stack.
+- **Constraint for future settings keys** (carry-item): `FOR UPDATE` locks only
+  *existing* rows. Both label rows exist because migration 00036 seeds them and
+  nothing deletes them. Any future delete/reset-to-absent path, or a new
+  cross-validated key **without a seed row**, reopens the race for concurrent INSERTs
+  — seed every cross-validated key, and revisit this fix before adding a settings-row
+  delete path.
+
+## 95. Configurable prd_label end-to-end: LabelConfig injection + bootstrap delivery
+
+Serves human: "an instance that wants a different PRD convention must not have to
+fork the code."
+
+- **`forgesvc.PRDLabel` const removed**; `forgesvc` depends on a small `LabelConfig`
+  interface (`PRDLabel(ctx) (string, error)`) injected at `New`, resolving through the
+  shared settings cache at the three use sites (both sync paths + issue creation). The
+  const is gone; `settings.DefaultPRDLabel` is the sole compiled-in default.
+- **Fail-safe label fallback**: `New` tolerates a **nil** resolver and the accessor
+  returns the default even on a cold-cache error, so a settings outage degrades to the
+  default label rather than an empty filter that would match nothing (or everything).
+  Resolution is best-effort everywhere — the sync must never fail because settings are
+  briefly unreachable.
+- **Web receives the labels on the existing session/bootstrap response** (login /
+  register / me now return `{user, prd_label, autopilot_label}`) — no new endpoint.
+  `AuthContext` holds both, falling back to compiled defaults per field until they
+  resolve; `Board.tsx` reads them instead of hardcoding `"PRD"` and excludes **both**
+  labels from column suggestions.
+- **Board effect of a change is documented, not instant**: old-label issues drop off
+  boards only after the forced resync completes (§96) — the forge is the source of
+  truth (§22), so this is correct, not a bug.
+
+## 96. ForceReconcile: coalescing resync signal on a label change (`poller.Engine`)
+
+Serves human: a `prd_label` change must reconverge the board without a restart or a
+manual refresh.
+
+- **No forced-resync mechanism existed** (the poller decided FullSync from an
+  in-memory `pollCount % reconcileEvery` private to the Engine goroutine, unreachable
+  from the settings handler). Added `Engine.ForceReconcile()` — a **non-blocking send**
+  on a **cap-1 buffered** `forceReconcile chan struct{}`, handled in the Run
+  goroutine's `select` (same goroutine that runs a tick, so the per-repo state reset
+  needs no lock). The reset zeroes every enabled repo's `pollCount`; the next tick
+  full-syncs all of them (FullSync ignores the HWM, so leaving it intact is fine).
+- **The PUT returns after signalling** — it does not block on the sync itself, which
+  needs each connection's decrypted PAT and belongs in the poller. **Coalescing**: a
+  burst of PUTs collapses to a single pending reconcile (cap-1 + non-blocking send).
+  The handler signals only when a submitted value actually differs from the committed
+  one.
+- **Fires on any label change** (prd or autopilot), though only `prd_label` affects the
+  sync filter until autopilot ships — spec-endorsed and harmless (a redundant
+  full-sync at worst).
+
+## 97. Autopilot mapping + consent surface (`human_username`, `autopilot_enabled`, forge methods)
+
+Serves human: "a third party must never be able to spend your Anthropic tokens without
+your opt-in"; "self-declared forge username mapping" (user, 2026-07-05).
+
+- **Consent is per-user opt-in, default off** (Decision 4/7). `users.autopilot_enabled
+  BOOLEAN NOT NULL DEFAULT false`; no mapping or no opt-in → no run. A per-repo toggle
+  would add surface without adding consent — the per-user switch plus "the repo must be
+  connected by that user" already bounds who can trigger a run under one's token. The
+  opt-in UI copy states the honest trade (Decision 7): autopilot removes the
+  pre-execution human review of untrusted issue text, leaving the MR review as the
+  remaining human gate; the repo guardrails (Developer role + protected `main`,
+  worker-held PAT, deny-hook, `settingSources:[]`) are unchanged, so the blast radius
+  stays "an MR you must review."
+- **Self-declared human username** (`forge_connections.human_username TEXT NULL`): uzi
+  only knows the *bot* identity from the PAT, so attribution to a human GitLab account
+  needs a stored mapping. **Per-host partial unique index**
+  `uq_forge_connections_host_human_username ON (base_url, human_username) WHERE
+  human_username IS NOT NULL` (NULLs exempt) — a duplicate mapping is a **409**.
+  Uniqueness is **exact-match, trimmed, case-sensitive**: a case-variant squat is not
+  blocked, consistent with the PRD's accepted v1 identity-squat risk (documented;
+  revisit case-folding only if it bites).
+- **Verified-or-warned save** (`humanUsernameWarning`, a pure helper): before writing,
+  best-effort `UserExists` on the forge — `""` (exists) stores clean, `not-found`
+  stores with a warning, a lookup *error* stores with a different warning (a forge blip
+  must never block the save). The write's unique-index violation is the authoritative
+  uniqueness gate; verification only ever warns. Sending `human_username: ""` clears the
+  mapping.
+- **Forge interface additions** (GitLab driver only, all errors through the
+  PAT-scrubbing redactor §16): `UserExists`, `ListIssueLabelEvents` (resource label
+  events — who added which label when), `CreateIssueNote`. Neutral types `LabelEvent`
+  and `IssueNote`. `ListIssueLabelEvents`/`CreateIssueNote` are consumed by the trigger
+  (§98) and terminal hook (§99).
+
+## 98. Autopilot trigger in the poller: transition-once detection (`poller.Autopilot`)
+
+Serves human: "add one label in GitLab → uzi runs the PRD end to end; never re-run or
+re-comment spuriously" (user, 2026-07-05); primary directive unchanged.
+
+- **Detection runs only in the poller, after sync** (never in shared `forgesvc` — that
+  is reached by `CreateIssue` and manual board refresh, which must never spawn runs).
+  `syncRepo` calls the detector after the issue sync each tick, as a sibling of the
+  PRD #24 MR-close watcher (§91), so it reads the freshest issue cache. Candidates come
+  from a cache query (`ListAutopilotCandidateIssues`: open issues carrying the
+  autopilot label).
+- **Transition-once, event-id dedup, in a dedicated ledger** (Decision 5). The `issues`
+  cache is evictable (§22), so "never re-trigger / never re-comment" state cannot live
+  there. `autopilot_triggers(repo_id, issue_iid, last_event_id, handled_at)` (PK
+  `(repo_id, issue_iid)`) records the last handled label-event id and survives cache
+  eviction. `detectOne` skips when `stored_last_event_id >= current_add_event_id`:
+  GitLab resource-label-event ids are a **global monotonic sequence**, so a larger id
+  is strictly a later application. A remove+re-add mints a larger id → re-handled — the
+  **only** retry path (failed runs never auto-retry; remove+re-add is the deliberate
+  human retry gesture, and the natural GitLab one).
+- **Latest-wins add resolution**: events are read oldest-first; the detector keeps the
+  *last* event touching the label and acts only if its action is `add`. If the latest
+  touch is a `remove` while the cache still lists the label (a sync race), it returns
+  nil → clean skip (no run, no comment, **no record**), self-healing next sync.
+- **Active-run pre-check before eligibility** (`HasActiveRunForIssue`): an active run →
+  record the event and return, **swallowing silently** (no comment). This stops an
+  active *manual* run from drawing a spurious "no eligible user" autopilot comment, and
+  consumes the event so a re-add during a run never queues a post-run re-run (Decision
+  5: no queued re-runs in v1; removing the label mid-run does not cancel).
+- **Eligibility collapses to the repo owner**: the connection context is keyed by the
+  repo's `connection_id`, and a repo is connected by exactly one user, so the only user
+  who can satisfy "repo connected by that user" is the owner. Attribution therefore
+  matches the owner's `human_username` against **adder-first, issue-author-fallback**
+  (Decision 3) — both resolve to the same owner, so the ordering is preserved but does
+  not change the outcome. The owner must be opted in and hold an Anthropic token.
+- **Two ordering disciplines, one per outcome** (Decision 6):
+  - **create-then-record** (a run starts): create the run, *then* record the event id.
+    A crash between leaves the run active, so the next tick's active-run pre-check
+    swallows the re-detection and records — never a double run.
+  - **record-then-comment** (no eligible user / no PRD link / description too large):
+    record the event id *first*, post the one explanatory comment only if the record
+    persisted. A crash between loses one comment, never double-posts. These comments
+    are fixed em-dash-free templates that spell out the remove+re-add retry gesture.
+- **Closed-issue exclusion is an intentional asymmetry** (Decision, reviewer M4): the
+  candidate query filters `state = 'opened'`, so a closed issue is never (re)detected
+  even if relabeled — a stricter gate than the manual **Start run** path, justified
+  because autopilot spends a user's tokens unattended.
+- **Multi-owner-same-project behavior** (documented, carry-item): two users connecting
+  the same forge project = two repo rows; one label add can produce a run per eligible
+  owner and a factually-wrong "no eligible user" comment from the other connection.
+  Consent never crosses (each connection spends only its own owner's tokens); this
+  mirrors uzi's existing manual multi-owner model. Documented; if it bites, dedup
+  comments or widen the active-run check by forge project id.
+- **`MaxIssueDescriptionBytes` unified** (validator M4 follow-up): the description cap
+  (256 KiB) is a single exported `workersvc.MaxIssueDescriptionBytes`, enforced as the
+  first statement inside the shared `createRun`, so the manual path (→ 422) and the
+  autopilot path (→ oversize routes to a `too large` comment) hit the identical cap in
+  one place instead of two mirrored consts.
+
+## 99. Autopilot execution: server-authoritative auto-approve + terminal comments
+
+Serves human: "the run happens with zero uzi interaction; the outcome comes back as one
+issue comment (MR link on success)" (user, 2026-07-05); primary directive unchanged.
+
+- **`auto_approve` is a server-authoritative, run-scoped claim flag.** `runs.auto_approve
+  BOOLEAN NOT NULL DEFAULT false` is set only by the autopilot trigger; the API delivers
+  it **top-level in `ClaimPayload`** (next to `Status`/`Branch`), read from the runs row
+  — deliberately **not** in `ClaimConfig`, which is documented as worker-enforced caps
+  from instance params, not from the run. The worker cannot set or spoof it. **Resume
+  invariant** (structural, not a special path): `assembleClaim` re-reads
+  `run.AutoApprove` on every claim, so a requeued/resumed autopilot run re-delivers
+  `auto_approve = true` — otherwise an unattended resume would hang at the plan gate
+  forever.
+- **Auto-approve is a verdict source at the existing gate, not a bypass.** When the
+  claim carries the flag, the worker still emits the `kind:"plan"` run_message (the plan
+  stays in the audit trail, Decision 2) and **flushes it** before deciding; `gatePlan`
+  then resolves immediately with an approve verdict. The run **never enters
+  `awaiting_approval`** (no state flicker, no column-automation churn) and never waits on
+  `/inputs`. The manual path and the executor are unchanged — the gate is still
+  worker-enforced.
+- **Terminal comments post from one run-lifecycle hook** (Decision 6). A run reaches
+  terminal-failed via two mutually exclusive paths (worker `SetState('failed')` → inline
+  notify → `notifyOnce`; the sweeper's bulk terminal write → the reconcile loop →
+  `reconcileOne`), so both funnel through a single `maybeTerminalComment` — never
+  duplicated per call site. Only `completed` (success + MR link) and `failed` comment;
+  `cancelled` is a human stop, not an autopilot outcome. The comment rides the row both
+  lifecycle observers already load, so no second query.
+- **Per-run comment marker, claimed atomically** (Decision 6 split, validator-affirmed
+  *more* correct than the PRD's literal `autopilot_triggers`). Terminal-comment dedup
+  lives on `runs.autopilot_commented_at`, claimed by `ClaimAutopilotTerminalComment`
+  (`:execrows`, `WHERE id=@id AND auto_approve = true AND autopilot_commented_at IS
+  NULL`). The `WHERE` does double duty: a manual run is never claimed, and of racing
+  invocations exactly one gets `rows == 1`. Record-then-comment (claim first, post only
+  on `rows > 0`): a failed forge post after a successful claim loses ≤ 1 comment, never
+  double-posts. The marker is **per-run**, not per-issue, deliberately: a retry
+  (remove+re-add → new run, same issue) posts its own outcome comment — a per-issue
+  marker would suppress it.
+- **Template-only comments, no `failure_reason` interpolation** (Decision 6, reviewer
+  M5, security-positive). The failure comment is a **fixed template plus a run link
+  only**. `failure_reason` can be worker-supplied free text and only the forge-driver
+  error path goes through the PAT-scrubbing redactor, so echoing it into a member-visible
+  GitLab comment would be an unredacted info-leak / injection surface; the
+  access-controlled run page carries the detail. Both comment bodies interpolate only
+  trusted values (run uuid, `mr_iid`, repo `web_url`, config `FrontendOrigin`) — never
+  issue title/description or `failure_reason`. The run link is appended only when
+  `FrontendOrigin` is set (a bare unroutable path is worse than none; the compose default
+  sets it). This wording (run link, not failure reason) was **approved by the user
+  (2026-07-05)** and is the recorded `specs/human.md` Feature #19 success criterion.
+
+## 100. Autopilot web surface + docs
+
+Serves human Feature #19; minimal new surface.
+
+- **Web**: a per-connection "Your forge identity (for autopilot)" username field on the
+  Forge settings page (verified-or-warned save, §97); an "Autopilot" per-user opt-in card
+  on Settings with the honest Decision-7 copy; an "autopilot" badge in the run views
+  (`RunView`/`RunsList`) reading `run.auto_approve`. The admin "Instance settings" page
+  (§93) carries the two label fields with client-side mirror validation (server stays the
+  source of truth).
+- **Docs**: `docs/admin-settings.md` (the two labels, validation rules, resync-on-change
+  board effect, "create labels in GitLab yourself", no secrets in settings) and
+  `docs/autopilot.md` (label workflow, verified-or-warned case-sensitive mapping with the
+  identity-squat note, per-user opt-in with the honest consent framing, retry-by-re-add
+  gesture, what the fixed success/failure comments look like, closed-issue exclusion,
+  multi-owner-same-project behavior, and the removing-label-mid-run / re-add-while-active
+  semantics).
+
+---
+
 # PRD #5 — Access Control & PAT Least-Privilege Hardening
 
 Serves human Feature #5 (registration domain allowlist + registration toggle + PAT

@@ -20,6 +20,7 @@ export function ForgeSettings() {
   const [token, setToken] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [warning, setWarning] = useState("");
   // A 422 over-privilege rejection carries a violation list we render with a doc
   // link, distinct from the plain string errors above.
   const [connectViolations, setConnectViolations] = useState<string[] | null>(null);
@@ -28,6 +29,10 @@ export function ForgeSettings() {
   const [checkingId, setCheckingId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // Per-connection draft of the user's own forge username (PRD #19 M3). Seeded from
+  // the stored value on load; keyed by connection id so multiple connections edit
+  // independently.
+  const [usernameDrafts, setUsernameDrafts] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     try {
@@ -35,6 +40,9 @@ export function ForgeSettings() {
       setAllowedUrls(cfg.allowed_base_urls);
       setBaseUrl((prev) => prev || cfg.allowed_base_urls[0] || "");
       setConnections(conns.connections);
+      setUsernameDrafts(
+        Object.fromEntries(conns.connections.map((c) => [c.id, c.human_username ?? ""])),
+      );
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load forge settings");
     } finally {
@@ -49,6 +57,7 @@ export function ForgeSettings() {
   const resetMessages = () => {
     setError("");
     setNotice("");
+    setWarning("");
     setConnectViolations(null);
   };
 
@@ -123,6 +132,30 @@ export function ForgeSettings() {
     }
   };
 
+  const saveUsername = async (id: string) => {
+    setError("");
+    setNotice("");
+    setWarning("");
+    setBusyId(id);
+    try {
+      const { connection, warning: w } = await api.updateConnection(id, usernameDrafts[id] ?? "");
+      if (w) {
+        setWarning(w);
+      } else {
+        setNotice(
+          connection.human_username
+            ? `Saved your forge username: ${connection.human_username}.`
+            : "Forge username cleared.",
+        );
+      }
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Save failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   return (
     <SettingsShell description="Connect the GitLab bot account uzi acts through.">
       {error && <Alert message={error} />}
@@ -145,6 +178,7 @@ export function ForgeSettings() {
         </Card>
       )}
       {notice && <Alert tone="success" message={notice} />}
+      {warning && <Alert tone="warning" message={warning} />}
 
       <Card>
         <SectionTitle>Connect a bot PAT</SectionTitle>
@@ -291,6 +325,41 @@ export function ForgeSettings() {
           </div>
         </Card>
       )}
+      {connections.length > 0 && (
+        <Card>
+          <SectionTitle>Your forge identity (for autopilot)</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            From the bot token, uzi only knows the bot account — not you. To let autopilot attribute an{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">autopilot</code>-labeled issue to you and
+            run it under your Anthropic token, tell uzi your own forge username. It is checked against the
+            forge on save; a username that does not resolve is still saved, with a warning. Autopilot itself
+            stays off until you opt in on your <span className="text-fg">Account &amp; token</span> settings.
+          </p>
+          <div className="mt-4 space-y-5">
+            {connections.map((c) => (
+              <div key={c.id} className="space-y-3">
+                <Field label={`Your username on ${c.base_url}`}>
+                  <Input
+                    autoComplete="off"
+                    placeholder="your-forge-username"
+                    value={usernameDrafts[c.id] ?? ""}
+                    onChange={(e) => setUsernameDrafts((d) => ({ ...d, [c.id]: e.target.value }))}
+                  />
+                </Field>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={busyId === c.id || (usernameDrafts[c.id] ?? "") === (c.human_username ?? "")}
+                  onClick={() => saveUsername(c.id)}
+                >
+                  {busyId === c.id ? "Saving…" : "Save username"}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
       <p className="text-xs text-faint">
         To rotate a token, connect again with the same base URL — the new PAT replaces the old one.
       </p>

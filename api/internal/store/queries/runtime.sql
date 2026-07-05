@@ -78,9 +78,10 @@ WHERE status = 'online'
 -- NULL for a caller that cannot resolve it. move_pending_since is stamped in this
 -- same INSERT — queued is a status the column automation reacts to (→ In
 -- Progress), and the same-statement stamp closes the crash window before the
--- forge move.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since)
-VALUES (@user_id, @repo_id, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now())
+-- forge move. auto_approve is true only for autopilot-created runs (PRD #19 M4):
+-- the worker reads it to resolve the plan gate without a human.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
+VALUES (@user_id, @repo_id, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -368,13 +369,32 @@ SELECT id, kind, body, created_at FROM consumed ORDER BY id ASC;
 -- (the sibling) deliberately lacks forge_project_id and the column snapshot, so
 -- this is its own query. token_ciphertext is decrypted by the service, never
 -- selected in the clear.
+--
+-- It also carries the facts the M5 terminal-comment hook needs from the same read:
+-- auto_approve gates the comment to autopilot runs, mr_iid links the success
+-- comment, and rp.web_url builds that merge-request link. Both lifecycle observers
+-- (the inline notify and the reconcile loop) already load this row, so the terminal
+-- comment rides along without a second query.
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
-       rp.forge_project_id,
+       r.auto_approve, r.mr_iid,
+       rp.forge_project_id, rp.web_url AS repo_web_url,
        c.forge_type, c.base_url, c.token_ciphertext
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id
 WHERE r.id = @run_id;
+
+-- name: ClaimAutopilotTerminalComment :execrows
+-- Atomically claim the single terminal issue comment for an autopilot run (PRD #19
+-- M5, Decision 6 record-then-comment). Records the marker FIRST; the caller posts
+-- the comment only when this returns 1. The auto_approve + IS NULL guard makes it
+-- both the autopilot gate and the concurrency claim: a manual run is never claimed,
+-- and of the possibly-racing lifecycle invocations (inline notify vs reconcile
+-- retry) exactly one gets the row — the rest read 0 and do not re-post. A crash
+-- after this commits but before the forge post loses that one comment, never
+-- double-posts.
+UPDATE runs SET autopilot_commented_at = now()
+WHERE id = @id AND auto_approve = true AND autopilot_commented_at IS NULL;
 
 -- name: ListPendingColumnMoves :many
 -- Reconcile-loop candidates: runs with a pending column move that is older than a

@@ -38,11 +38,6 @@ func timePtr(valid bool, t time.Time) *time.Time {
 // maxWorkerNameBytes bounds a worker's human label.
 const maxWorkerNameBytes = 200
 
-// maxIssueDescriptionBytes bounds the snapshotted issue description carried in a
-// run. Generous for a PRD-shaped issue body; a secondary guard under the 1 MiB
-// whole-body cap DecodeJSON already enforces.
-const maxIssueDescriptionBytes = 256 * 1024
-
 // runInputKinds is the accepted steering-input set (mirrors the DB CHECK).
 var runInputKinds = map[string]bool{
 	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true,
@@ -97,6 +92,7 @@ type runDTO struct {
 	Status           string     `json:"status"`
 	RequeueCount     int32      `json:"requeue_count"`
 	IterationCount   int32      `json:"iteration_count"`
+	AutoApprove      bool       `json:"auto_approve"`
 	WorkerID         *string    `json:"worker_id"`
 	Branch           *string    `json:"branch"`
 	MrIID            *int64     `json:"mr_iid"`
@@ -119,6 +115,7 @@ func runToDTO(r store.Run) runDTO {
 		Status:           r.Status,
 		RequeueCount:     r.RequeueCount,
 		IterationCount:   r.IterationCount,
+		AutoApprove:      r.AutoApprove,
 		Branch:           textPtrValue(r.Branch.Valid, r.Branch.String),
 		FailureReason:    textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
 		PlanMd:           textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
@@ -281,11 +278,9 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadGateway, "could not read the issue from the forge: "+err.Error())
 		return
 	}
-	if len(issue.Description) > maxIssueDescriptionBytes {
-		httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
-		return
-	}
 
+	// The description cap is enforced inside CreateRun (shared with the autopilot
+	// path), surfaced here as ErrDescriptionTooLarge → 422.
 	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description)
 	if err != nil {
 		switch {
@@ -293,6 +288,8 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "repo not found")
 		case errors.Is(err, workersvc.ErrIssueNotFound):
 			httpx.Error(w, http.StatusNotFound, "issue not found on this repo's board")
+		case errors.Is(err, workersvc.ErrDescriptionTooLarge):
+			httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
 		case errors.Is(err, workersvc.ErrNoPRDLink):
 			httpx.Error(w, http.StatusUnprocessableEntity, "issue has no PRD link; add a prds/*.md link before starting a run")
 		case errors.Is(err, workersvc.ErrActiveRunExists):

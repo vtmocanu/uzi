@@ -6,6 +6,7 @@ import { Login } from "./pages/Login";
 import { Register } from "./pages/Register";
 import { Dashboard } from "./pages/Dashboard";
 import { AdminUsers } from "./pages/AdminUsers";
+import { AdminSettings } from "./pages/AdminSettings";
 import { Settings } from "./pages/Settings";
 import { Agents } from "./pages/Agents";
 import { AgentNew } from "./pages/AgentNew";
@@ -154,6 +155,14 @@ export default function App() {
           element={
             <AdminRoute>
               <AdminUsers />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="/admin/settings"
+          element={
+            <AdminRoute>
+              <AdminSettings />
             </AdminRoute>
           }
         />

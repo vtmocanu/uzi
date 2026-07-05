@@ -30,6 +30,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -102,7 +103,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout)
+
+	// Instance settings (PRD #19): a per-process read-through cache over
+	// app_settings, shared by the HTTP handlers (read + invalidate on write) and
+	// the forge sync/poller (read the configured PRD label every cycle). One
+	// process, so one cache. Built before the forge service, which reads it.
+	settingsCache := settings.New(q, cfg.SettingsCacheTTL)
+
+	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 
 	// Optional startup admin seed. Runs after migrations, before serving. A
 	// failure here (e.g. DB error) aborts boot; an already-present seed user is
@@ -151,13 +159,19 @@ func run() error {
 	// forge dropped. Wired into workersvc as the status-change hook and run as its
 	// own goroutine, isolated from the liveness sweep so a stalled forge never
 	// delays worker-loss recovery.
-	lifecycle := runlifecycle.New(q, svc)
+	lifecycle := runlifecycle.New(q, svc, cfg.FrontendOrigin)
 	wsvc.SetLifecycle(lifecycle)
 
 	// Background sync engine: pulls forge changes into the issue cache for every
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
 	// pool is closed (a mid-tick query must not race pool.Close).
 	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
+	// Autopilot (PRD #19 M4): the poller's post-sync detector turns an autopilot-label
+	// application on a PRD issue into an auto_approve run for the mapped consenting
+	// user (or one explanatory issue comment). Wired post-construction like the other
+	// optional poller collaborators; run creation reuses workersvc's manual-start path
+	// (same state machine and gates) and the label comes from the settings cache.
+	engine.SetAutopilot(poller.NewAutopilot(q, wsvc, settingsCache))
 
 	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
 	// immediately, then the goroutine sweeps on its own interval. Both lifetimes
@@ -206,7 +220,11 @@ func run() error {
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub)
+	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	// The settings PUT handler asks the poller to full-sync every repo when a label
+	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
+	// the signal target is the handler.
+	h.SetReconciler(engine)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

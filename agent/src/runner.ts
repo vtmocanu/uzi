@@ -124,8 +124,9 @@ export class RunRunner {
         },
         // The plan gate: surface the plan, post awaiting_approval, and return the
         // verdict the steering channel resolves (bounded so an abandoned plan
-        // fails rather than wedging the worker).
-        gatePlan: (planMd) => this.gatePlan(runId, planMd, batcher, steering, reportState, runLog),
+        // fails rather than wedging the worker). An autopilot claim short-circuits
+        // to an approve verdict (see gatePlan) — the run never parks at the gate.
+        gatePlan: (planMd) => this.gatePlan(runId, planMd, batcher, steering, reportState, runLog, claim.auto_approve ?? false),
         pullFollowUp: () => steering.pullFollowUp(),
         reportIteration: (iteration) => {
           void reportState({ status: "running", iteration_count: iteration }).catch((e) =>
@@ -187,7 +188,9 @@ export class RunRunner {
     }
   }
 
-  /** Post awaiting_approval with the plan and await the steering verdict, bounded. */
+  /** Post awaiting_approval with the plan and await the steering verdict, bounded.
+   *  For an autopilot run, the plan is still recorded but the gate resolves with an
+   *  approve verdict immediately — no awaiting_approval report, no /inputs wait. */
   private async gatePlan(
     runId: string,
     planMd: string,
@@ -195,10 +198,21 @@ export class RunRunner {
     steering: SteeringChannel,
     reportState: (body: { status: "awaiting_approval"; plan_md: string }) => Promise<void>,
     runLog: Logger,
+    autoApprove: boolean,
   ): Promise<PlanVerdict> {
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
-    // Get the plan message onto the stream before the run parks at the gate.
+    // Get the plan message onto the stream regardless of mode — it is the audit
+    // record of what the agent intended, autopilot or not.
     await batcher.flush().catch(() => undefined);
+
+    if (autoApprove) {
+      // Auto-approve is a VERDICT SOURCE at the existing gate, not a bypass around
+      // it: the plan was recorded above; the run just never enters awaiting_approval
+      // (no state flicker, no column-automation churn) and never waits on a human.
+      runLog.info("plan gate: auto-approved (autopilot)", { run_id: runId });
+      return { kind: "approve" };
+    }
+
     await reportState({ status: "awaiting_approval", plan_md: planMd });
     runLog.info("plan gate: awaiting approval", { run_id: runId });
 

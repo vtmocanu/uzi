@@ -30,6 +30,13 @@ type ClaimPayload struct {
 	IterationCount   int32   `json:"iteration_count"`
 	RequeueCount     int32   `json:"requeue_count"`
 	PlanMd           *string `json:"plan_md"` // resume: plan already captured
+	// AutoApprove flags an autopilot run (PRD #19): the worker resolves the plan
+	// gate with an approve verdict instead of parking at awaiting_approval. It is
+	// top-level (read from the runs row), NOT in ClaimConfig — ClaimConfig is
+	// worker-enforced instance caps, this is a per-run fact. Because assembleClaim
+	// reads it from the row, a requeued/resumed autopilot run re-delivers it
+	// unchanged; without that an unattended resume would hang at the gate forever.
+	AutoApprove bool `json:"auto_approve"`
 
 	Repo    ClaimRepo    `json:"repo"`
 	Secrets ClaimSecrets `json:"secrets"`

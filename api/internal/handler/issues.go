@@ -15,6 +15,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // maxIssueTitleBytes bounds a created issue's title (GitLab caps titles at 255).
@@ -45,7 +46,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "title must be non-empty and at most 255 characters")
 		return
 	}
-	if len(req.Description) > maxIssueDescriptionBytes {
+	if len(req.Description) > workersvc.MaxIssueDescriptionBytes {
 		httpx.Error(w, http.StatusBadRequest, "description is too large")
 		return
 	}
@@ -56,7 +57,10 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{forgesvc.PRDLabel})
+	// The created issue carries the configured PRD label (PRD #19): best-effort —
+	// a cold settings read yields the compiled-in default, never an empty label.
+	prdLabel, _ := h.settings.PRDLabel(r.Context())
+	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{prdLabel})
 	if err != nil {
 		// err is already PAT-redacted by the driver.
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
