@@ -66,9 +66,11 @@ describe("runBadge taxonomy", () => {
     expect(b).toMatchObject({ kind: "badge", label: "stopped", tone: "neutral" });
   });
 
-  it("failed with a cancel-shaped reason → 'stopped', never danger (heuristic)", () => {
-    const b = runBadge(run({ status: "failed", failure_reason: "run cancelled by user" }), NOW);
+  it("failed with a known server stop reason → 'stopped', never danger", () => {
+    const b = runBadge(run({ status: "failed", failure_reason: "run cancelled" }), NOW);
     expect(b).toMatchObject({ kind: "badge", label: "stopped", tone: "neutral" });
+    const r = runBadge(run({ status: "failed", failure_reason: "plan rejected" }), NOW);
+    expect(r).toMatchObject({ kind: "badge", label: "stopped", tone: "neutral" });
   });
 
   it("completed with an MR → MR chip", () => {
@@ -84,13 +86,20 @@ describe("runBadge taxonomy", () => {
   });
 });
 
-describe("isStoppedRun heuristic", () => {
-  it("true for cancelled", () => {
+describe("isStoppedRun (exact server stop reasons)", () => {
+  it("true for cancelled status", () => {
     expect(isStoppedRun("cancelled", null)).toBe(true);
   });
-  it("true for failed with a 'cancel' reason", () => {
+  it("true for failed with an exact server stop reason", () => {
     expect(isStoppedRun("failed", "run cancelled")).toBe(true);
-    expect(isStoppedRun("failed", "Cancelled by poller")).toBe(true);
+    expect(isStoppedRun("failed", "plan rejected")).toBe(true);
+  });
+  it("false for a failed reason that merely contains 'cancel' (no false stop)", () => {
+    // An arbitrary agent error containing the word must NOT masquerade as a
+    // deliberate stop — only the exact server literals do.
+    expect(isStoppedRun("failed", "Cancelled by poller")).toBe(false);
+    expect(isStoppedRun("failed", "operation cancel failed")).toBe(false);
+    expect(isStoppedRun("failed", "run cancelled by user")).toBe(false);
   });
   it("false for a genuine failure", () => {
     expect(isStoppedRun("failed", "compile error")).toBe(false);

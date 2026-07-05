@@ -13,13 +13,27 @@ export type RunBadge =
   | { kind: "mr"; mrIid: number }
   | { kind: "badge"; label: string; tone: BadgeTone; pulse: boolean; title?: string };
 
-// isStoppedRun folds the cancelled nuance (PRD §1): a live-poller cancel reaches
-// the server as `failed` with a "run cancelled" reason, while the no-poller branch
-// yields a true `cancelled` status. Both are deliberate human stops — never
-// breakage — so the board and RunsList style them calm/neutral, never rose.
+// STOPPED_FAILURE_REASONS are the exact failure_reason strings the SERVER writes
+// for a deliberate stop that surfaces as status `failed`: a live-poller cancel
+// ("run cancelled" — agent/src/executor.ts, sdk-executor.ts) and a server-side
+// plan rejection ("plan rejected" — workersvc SubmitInput reject branch). Matched
+// exactly, not by substring, so an arbitrary agent error that merely contains the
+// word "cancel" is NOT mistaken for a deliberate stop.
+const STOPPED_FAILURE_REASONS = new Set(["run cancelled", "plan rejected"]);
+
+// isStoppedRun folds the cancelled nuance (PRD §1): a deliberate human stop is not
+// breakage, so the board and RunsList style it calm/neutral, never rose. It covers
+// status `cancelled` (server-side no-poller cancel) and status `failed` carrying
+// one of the server's known stop reasons above.
+//
+// Known limitation (same class as the PRD's "known soft heuristic" note): a
+// live-poller plan rejection carries the user's VERBATIM reject reason
+// (agent/src/steering.ts), which no client-side match can recognize — it stays
+// rose "failed". Only an empty-reason reject falls back to the literal "plan
+// rejected" and is caught here.
 export function isStoppedRun(status: string, failureReason: string | null | undefined): boolean {
   if (status === "cancelled") return true;
-  if (status === "failed" && failureReason != null && /cancel/i.test(failureReason)) return true;
+  if (status === "failed" && failureReason != null && STOPPED_FAILURE_REASONS.has(failureReason)) return true;
   return false;
 }
 
