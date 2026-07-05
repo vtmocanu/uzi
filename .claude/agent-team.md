@@ -59,13 +59,18 @@ against the actual submodule code, not from memory.
 
 ## Project signals
 
-- Test command: TBD (greenfield; no framework yet). MVP validation = local
-  `docker compose up` smoke + verify data persistence across restarts.
-- Lint command: TBD
+- Test commands (see CLAUDE.md for detail): `cd api && go test ./...`;
+  `cd web && npm test && npm run typecheck`; `cd agent && npm test && npm run typecheck`;
+  integration: `./e2e/run-e2e.sh` (isolated stack, dummy creds) and
+  `./scripts/smoke.sh` (needs a fresh stack). Never bare `docker compose up`
+  for testing — `--env-file` with dummy secrets + unique `-p` project.
+- Lint command: none dedicated; `npm run build` in web/ runs the
+  check-docs + tsc gate
 - Release flow: none
-- Spec dir: `specs/` (created by spec-keeper on first dispatch)
-- Authoring rules: none yet (no CLAUDE.md / CONTRIBUTING.md); plan.md is the
-  working plan and the seed for the spec contract
+- Spec dir: `specs/` (`human.md` = user contract, edits need user approval;
+  `ai.md` = AI design decisions)
+- Authoring rules: `CLAUDE.md` at the repo root (commands, architecture map,
+  conventions); plan.md is the working plan
 - CI: none; remote is GitLab (`gitlab.example.com:vtmocanu/uzi`, use
   `glab`, never `gh`/`tea`)
 - MVP shape: local laptop demo via docker-compose, PostgreSQL DB, persistent
