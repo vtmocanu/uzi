@@ -61,6 +61,8 @@ export const mockApi = {
     state.session = { ...mockAdmin, email: email || mockAdmin.email };
     return delay({ user: state.session });
   },
+  // Demo mode has registration open and unrestricted.
+  authConfig: async () => delay({ registration_enabled: true, allowed_email_domains: [] }),
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });

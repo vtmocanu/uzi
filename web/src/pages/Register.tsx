@@ -1,9 +1,10 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { ApiError } from "../lib/api";
+import { api, ApiError, type AuthConfig } from "../lib/api";
+import { emailDomainAllowed } from "../lib/emailDomain";
 import { scorePassword } from "../lib/passwordStrength";
-import { Alert, Button, Card, Field, Input } from "../components/ui";
+import { Alert, Button, Card, Field, Input, Skeleton } from "../components/ui";
 
 const MIN_PASSWORD = 12;
 
@@ -15,15 +16,39 @@ export function Register() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [config, setConfig] = useState<AuthConfig | null>(null);
+
+  // Load the registration policy so the form can hide itself when registration is
+  // off, or hint the allowed domains. On a fetch failure we fall open (permissive
+  // defaults): the server stays authoritative, so a transient config blip must not
+  // wall off a legitimate signup.
+  useEffect(() => {
+    let live = true;
+    api
+      .authConfig()
+      .then((c) => live && setConfig(c))
+      .catch(() => live && setConfig({ registration_enabled: true, allowed_email_domains: [] }));
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const strength = scorePassword(password);
   const tooShort = password.length > 0 && password.length < MIN_PASSWORD;
+  const domains = config?.allowed_email_domains ?? [];
+  const domainRestricted = domains.length > 0;
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
     if (password.length < MIN_PASSWORD) {
       setError(`Password must be at least ${MIN_PASSWORD} characters`);
+      return;
+    }
+    // Client-side pre-validation of the domain allowlist. The server enforces the
+    // same rule authoritatively; this just avoids a round-trip and a late 403.
+    if (domainRestricted && !emailDomainAllowed(email, domains)) {
+      setError(`Registration is restricted to: ${domains.join(", ")}`);
       return;
     }
     setSubmitting(true);
@@ -41,6 +66,41 @@ export function Register() {
   // warn (fair), ok (good/strong). The bar width already encodes the 5 levels.
   const barColors = ["bg-danger", "bg-danger", "bg-warn", "bg-ok", "bg-ok"];
 
+  // Still loading the policy: keep the card shape stable rather than flashing a
+  // form we might immediately replace with the disabled notice.
+  if (config === null) {
+    return (
+      <div className="mx-auto max-w-md">
+        <Card>
+          <Skeleton className="h-8 w-2/3" />
+          <div className="mt-6 space-y-4">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  if (!config.registration_enabled) {
+    return (
+      <div className="mx-auto max-w-md">
+        <Card>
+          <h1 className="text-2xl font-semibold">Registration is disabled</h1>
+          <p className="mt-4 text-sm text-muted">
+            New accounts are not being accepted right now. If you already have an account,
+            you can still log in.
+          </p>
+          <p className="mt-4 text-sm text-muted">
+            <Link to="/login" className="text-brand hover:underline">
+              Go to log in
+            </Link>
+          </p>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto max-w-md">
       <Card>
@@ -55,6 +115,11 @@ export function Register() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
             />
+            {domainRestricted && (
+              <p className="mt-1 text-xs text-muted">
+                Only {domains.join(", ")} addresses may register.
+              </p>
+            )}
           </Field>
           <Field label="Display name (optional)">
             <Input

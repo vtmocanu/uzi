@@ -141,6 +141,14 @@ export interface ForgeConfig {
   forge_types: string[];
 }
 
+// AuthConfig is the unauthenticated registration policy the register page reads
+// to hide itself or hint the allowed domains before submit. The server stays
+// authoritative; this is display + pre-validation only.
+export interface AuthConfig {
+  registration_enabled: boolean;
+  allowed_email_domains: string[];
+}
+
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
 
 export interface Worker {
@@ -335,6 +343,7 @@ const realApi = {
     }),
   login: (email: string, password: string) =>
     request<{ user: User }>("POST", "/auth/login", { email, password }),
+  authConfig: () => request<AuthConfig>("GET", "/auth/config"),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
   me: () => request<{ user: User }>("GET", "/auth/me"),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
