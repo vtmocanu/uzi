@@ -1,7 +1,7 @@
 # PRD #12: Board–Run Lifecycle Integration — Auto Column Moves, Run-aware Cards, In-app Issue View
 
 **GitLab Issue**: [vtmocanu/uzi#12](https://gitlab.example.com/vtmocanu/uzi/-/issues/12)
-**Status**: In progress — 4/5 milestones done (M1–M4 implemented, reviewed, audited, APPROVED; 2026-07-04/05). Branch `prd-12-board-run-lifecycle` (worktree `uzi-prd-12`), tip dec5795. **M5 (docs + live validation + spec sync + MR) in progress.** (Spec history: reviewed by 2 agents pre-implementation; move-retry reconciliation added by user review, hardened by a second agent round; see Design Decisions.)
+**Status**: Complete (2026-07-05) — all 5 milestones done. MR !12 merged to main (merge commit 9d35080); issue #12 closed. Live validation performed by the user on the rebuilt stack (migration 00021 applied to the live DB). Follow-up candidates tracked in issue #15. (Spec history: reviewed by 2 agents pre-implementation; move-retry reconciliation added by user review, hardened by a second agent round; see Design Decisions.)
 **Priority**: High
 **Created**: 2026-07-04
 **Depends on**: PRD #2 (board/forge sync, done), PRD #4 (agent runtime, done). Reuses PRD #11's Markdown component if landed.
@@ -90,7 +90,7 @@ Note on the existing column model: seeded columns are **In Progress, Upcoming, L
 - [x] **M2 — Run-aware board payload** (done 2026-07-04, commits bbfcfb8 + 661de3b; reviewer APPROVED + auditor clean): `latest_run` newest-per-issue query (+ owner/worker names, `is_mine`), `ListRuns` repo/issue filters; board gate switched off the listRuns fan-in; tests.
 - [x] **M3 — Board UI** (code done 2026-07-04, commits 8a43ed9 + 59050fa, reviewed + audited APPROVED): badge taxonomy (queued/running+elapsed/awaiting/failed/stopped/MR-chip/completed/×N via server-side `run_count`), attention strip, 10s visibility-gated polling + auto-move toast, title→in-app link with `draggable={false}` + GitLab icon, subtitle copy; RunsList cancelled-tone fix; vitest for badges and gate.
 - [x] **M4 — In-app issue view** (done 2026-07-05, commits e6debe4 + 1650786 + 4238df5 + 921c0a1 + 9d192b5 + dec5795, reviewed + audited APPROVED): issue endpoint, `IssueView` page (markdown description, column + non-column label chips, run history with start timestamp/duration/worker/MR link, gated Start run), breadcrumb back to the board; RunsList tone helper hoisted and shared with the issue view; vitest.
-- [ ] **M5 — Docs + live validation**: docs updated (board howto / README flow); full live loop verified — start from board (queued badge appears ≤10s), In Progress during run, approval surfaces in the attention strip, Human Review + MR chip on completion, failed run restores its origin column with a rose badge, issue click → history in-app.
+- [x] **M5 — Docs + live validation** (docs 74531e4 + 535395f + 40494b3, adversarially fact-checked; spec sync 25ecc82 + cd14212; failure_reason hardening 476657e; e2e harness PASS; live loop validated by the user on the rebuilt stack): docs updated (board howto / README flow); full live loop verified — start from board (queued badge appears ≤10s), In Progress during run, approval surfaces in the attention strip, Human Review + MR chip on completion, failed run restores its origin column with a rose badge, issue click → history in-app.
 
 ## Implementation notes (deviations accepted in review, 2026-07-04)
 
