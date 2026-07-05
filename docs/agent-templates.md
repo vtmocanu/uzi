@@ -30,8 +30,9 @@ uzi seeds eight builtin templates:
 
 The `lead` is the orchestrator: the main agent thread that plans, delegates
 to the invokable subagents, and holds the approval gate. It runs on `opus`
-by default, which is the single highest-leverage quality setting in the
-system. Editing its prompt only tunes its persona and workflow; the
+by default, the instance-wide default model, unless a user picks a personal
+override in [Worker model](./worker-model.md), which takes precedence.
+Editing its prompt only tunes its persona and workflow; the
 primary-directive guardrails (never touch `main`, no `git push`, the plan
 gate) are enforced by the worker regardless of what the template says.
 
