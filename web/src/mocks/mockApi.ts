@@ -7,6 +7,7 @@ import {
   ApiError,
   type AgentTemplate,
   type AgentTemplateInput,
+  type AppSettings,
   type Run,
   type RunInputKind,
   type SecretMeta,
@@ -44,6 +45,7 @@ let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
+let appSettings: AppSettings = { prd_label: "PRD", autopilot_label: "autopilot" };
 let templateCounter = 0;
 let workerCounter = 0;
 
@@ -77,6 +79,27 @@ export const mockApi = {
     if (!u) throw new ApiError(404, "user not found");
     u.is_active = isActive;
     return delay({ user: { ...u } });
+  },
+
+  // ── Admin: instance settings (PRD #19) ───────────────────────────────────────
+  // Mirrors the server's Decision 8 validation so the demo surfaces the same
+  // rejection messages the real API would.
+  getSettings: async () => delay({ settings: { ...appSettings } }),
+  updateSettings: async (updates: Partial<AppSettings>) => {
+    const merged = { ...appSettings, ...updates };
+    for (const [key, value] of Object.entries(updates)) {
+      if (key !== "prd_label" && key !== "autopilot_label") {
+        throw new ApiError(400, `unknown setting: ${key}`);
+      }
+      if (!value || value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
+      if (value.length > 64) throw new ApiError(400, `${key}: must be at most 64 characters`);
+      if (value.includes(",")) throw new ApiError(400, `${key}: must not contain a comma`);
+    }
+    if (merged.prd_label === merged.autopilot_label) {
+      throw new ApiError(400, "prd_label and autopilot_label must differ");
+    }
+    appSettings = merged;
+    return delay({ settings: { ...appSettings } });
   },
 
   // ── Secrets ─────────────────────────────────────────────────────────────────

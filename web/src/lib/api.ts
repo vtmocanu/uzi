@@ -141,6 +141,14 @@ export interface ForgeConfig {
   forge_types: string[];
 }
 
+// AppSettings is the instance-level settings surface (PRD #19). Admin-only. The
+// API always returns every known key (a missing row reads as its default), so
+// both fields are always present.
+export interface AppSettings {
+  prd_label: string;
+  autopilot_label: string;
+}
+
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
 
 export interface Worker {
@@ -340,6 +348,9 @@ const realApi = {
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
+  getSettings: () => request<{ settings: AppSettings }>("GET", "/admin/settings"),
+  updateSettings: (settings: Partial<AppSettings>) =>
+    request<{ settings: AppSettings }>("PUT", "/admin/settings", { settings }),
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),

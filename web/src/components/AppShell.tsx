@@ -207,6 +207,12 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
         {user?.is_admin && (
           <NavGroup label="Admin">
             <NavItem to="/admin/users" icon={<UsersIcon />} label="Users" onNavigate={onNavigate} />
+            <NavItem
+              to="/admin/settings"
+              icon={<GearIcon />}
+              label="Instance settings"
+              onNavigate={onNavigate}
+            />
           </NavGroup>
         )}
 

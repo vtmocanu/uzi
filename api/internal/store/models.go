@@ -22,6 +22,13 @@ type AgentTemplate struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type AppSetting struct {
+	Key       string             `json:"key"`
+	Value     string             `json:"value"`
+	UpdatedBy pgtype.UUID        `json:"updated_by"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type BoardColumn struct {
 	ID        uuid.UUID `json:"id"`
 	RepoID    uuid.UUID `json:"repo_id"`

@@ -16,6 +16,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -34,11 +35,14 @@ type Handler struct {
 	// hub fans persisted run events out to browser WebSocket subscribers (M5). It
 	// is the same instance workersvc broadcasts to.
 	hub *hub.Hub
+	// settings is the read-through cache over app_settings (PRD #19), shared with
+	// the poller so both read the same configured labels.
+	settings *settings.Cache
 }
 
 // New constructs a Handler.
-func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, h *hub.Hub) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, hub: h}
+func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, h *hub.Hub, set *settings.Cache) *Handler {
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, hub: h, settings: set}
 }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
@@ -135,6 +139,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Use(mw.RequireAdmin)
 			r.Get("/users", h.ListUsers)
 			r.Patch("/users/{id}", h.PatchUser)
+			// Instance settings (PRD #19): the configurable forge labels today.
+			r.Get("/settings", h.GetSettings)
+			r.Put("/settings", h.UpdateSettings)
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
 			r.Get("/runs", h.AdminListRuns)

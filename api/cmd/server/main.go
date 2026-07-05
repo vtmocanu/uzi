@@ -29,6 +29,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -102,6 +103,11 @@ func run() error {
 		return err
 	}
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout)
+
+	// Instance settings (PRD #19): a per-process read-through cache over
+	// app_settings, shared by the HTTP handlers (read + invalidate on write) and,
+	// from M2, the poller. One process, so one cache.
+	settingsCache := settings.New(q, cfg.SettingsCacheTTL)
 
 	// Optional startup admin seed. Runs after migrations, before serving. A
 	// failure here (e.g. DB error) aborts boot; an already-present seed user is
@@ -181,7 +187,7 @@ func run() error {
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg, box, svc, wsvc, liveHub)
+	h := handler.New(pool, q, cfg, box, svc, wsvc, liveHub, settingsCache)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
