@@ -38,8 +38,9 @@ and board views.
 ## Automatic moves
 
 Starting a run moves its issue for you: **Start run** puts the card in **In
-Progress**; the run opening a merge request moves it to **Human Review**; a
-failed or cancelled run moves it back to wherever it started (Open,
+Progress**; when the run completes, it moves to **Human Review** (with or
+without a merge request); a failed or cancelled run moves it back to
+wherever it started (Open,
 Upcoming, Later) rather than a hardcoded column, so a backlog placement is
 never lost. A manual drag always wins — move a card by hand after a run has
 started and automation leaves it alone from then on. Moves are best-effort
