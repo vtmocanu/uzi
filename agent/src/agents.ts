@@ -56,10 +56,15 @@ export interface AssembledAgents {
   leadModel?: string;
 }
 
-/** Map one template's structured fields onto an SDK AgentDefinition. When
- *  availableSkills is provided, the template's skills are filtered to that set of
- *  materialized survivor names first. */
-function toDefinition(t: AgentTemplate, availableSkills?: ReadonlySet<string>): AgentDefinition {
+/** Map one template's structured fields onto an SDK AgentDefinition. availableSkills
+ *  (when given) restricts the template's ALLOCATED skills to the worker's
+ *  materialized survivors; repoSkillNames are the repo-borne skills, which carry no
+ *  allocation and so attach to EVERY subagent. */
+function toDefinition(
+  t: AgentTemplate,
+  availableSkills?: ReadonlySet<string>,
+  repoSkillNames: readonly string[] = [],
+): AgentDefinition {
   const def: AgentDefinition = {
     description: t.description,
     prompt: t.prompt_body,
@@ -69,18 +74,21 @@ function toDefinition(t: AgentTemplate, availableSkills?: ReadonlySet<string>): 
   };
   // A non-empty template list is an explicit allowlist honored verbatim (and is
   // what makes reviewer/tester read-only). null/absent/empty ⇒ leave `tools`
-  // unset so the SDK inherits all — the PRD #3 contract (see header).
+  // unset so the SDK inherits all — the PRD #3 contract (see header). Repo skills
+  // do NOT touch this allowlist: enabling a skill via `skills` is sufficient (per
+  // sdk.d.ts:44 a tools-`Skill` grant is deprecated), so a read-only subagent
+  // (reviewer/tester) still expands a repo skill without any tools widening.
   if (t.tools && t.tools.length > 0) def.tools = [...t.tools];
   if (t.model) def.model = t.model;
-  // Per-template skill scoping (PRD #16): this subagent preloads EXACTLY its
-  // allocated skills (plugin-qualified), always set explicitly (possibly []) so a
-  // subagent with no allocation gets none — never the run's whole union. Enabling
-  // a skill via this field is sufficient; per sdk.d.ts:44 adding `'Skill'` to the
-  // tools allowlist is deprecated and unnecessary, so a tools-restricted subagent
-  // (reviewer/tester) still expands its allocated skill without a tools grant.
-  // The names are filtered to the worker's materialized survivors so a subagent
-  // never lists a skill that isn't in the plugin dir (M6 cap/collision drops).
-  const names = (t.skills ?? []).filter((n) => !availableSkills || availableSkills.has(n));
+  // Skill scoping (PRD #16): a subagent preloads its own ALLOCATED delivered
+  // skills (filtered to the materialized survivors, so it never lists a skill
+  // dropped by cap/collision) PLUS every repo-borne skill — repo skills carry no
+  // allocation and are enabled for ALL templates in the run (PRD §Worker point 3).
+  // Delivered skills stay per-template; only repo skills are all-templates. Always
+  // set explicitly (possibly []). The lead is the main thread, covered by the
+  // top-level union, so it is not registered here.
+  const allocated = (t.skills ?? []).filter((n) => !availableSkills || availableSkills.has(n));
+  const names = repoSkillNames.length > 0 ? [...new Set([...allocated, ...repoSkillNames])] : allocated;
   def.skills = names.map(qualifiedSkillName);
   return def;
 }
@@ -89,10 +97,15 @@ function toDefinition(t: AgentTemplate, availableSkills?: ReadonlySet<string>): 
  * Partition templates into the lead (by name convention) and invokable
  * subagents, mapping each subagent to an SDK AgentDefinition. Duplicate names
  * collapse (last wins) — the SDK `agents` map is name-keyed regardless.
- * availableSkills, when given, restricts each subagent's skills to the worker's
- * materialized survivor set (bare names).
+ * availableSkills, when given, restricts each subagent's allocated skills to the
+ * worker's materialized survivor set (bare names); repoSkillNames are the
+ * materialized repo-borne survivors, attached to every subagent (all-templates).
  */
-export function assembleAgents(templates: AgentTemplate[], availableSkills?: ReadonlySet<string>): AssembledAgents {
+export function assembleAgents(
+  templates: AgentTemplate[],
+  availableSkills?: ReadonlySet<string>,
+  repoSkillNames: readonly string[] = [],
+): AssembledAgents {
   const result: AssembledAgents = { subagents: {} };
   let leadSeen = false;
   for (const t of templates) {
@@ -102,7 +115,7 @@ export function assembleAgents(templates: AgentTemplate[], availableSkills?: Rea
       if (t.model) result.leadModel = t.model;
       continue;
     }
-    result.subagents[t.name] = toDefinition(t, availableSkills);
+    result.subagents[t.name] = toDefinition(t, availableSkills, repoSkillNames);
   }
   return result;
 }

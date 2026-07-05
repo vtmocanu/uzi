@@ -602,28 +602,34 @@ describe("SdkExecutor repo skills (PRD #16 M6)", () => {
   // team-kb is a DELIVERED skill; the repo "collide" tries to shadow it.
   const delivered: ClaimSkill[] = [{ name: "team-kb", description: "delivered kb.", body: "# Delivered\n" }];
 
-  function runRepo(repoSkillsEnabled: boolean) {
+  // reviewer is a READ-ONLY subagent (tools: ["Read","Grep"]) — repo skills must
+  // reach it too, without widening its allowlist.
+  function runRepo(repoSkillsEnabled: boolean, config: Record<string, number> = { skill_max_bytes: 65536, skills_max_per_run: 32 }) {
     const { queryFn, turns } = fakeTurns([
       [submitPlan("plan"), resultSuccess()],
       [signalDone(), resultSuccess()],
     ]);
     const probe = makeCtx({
       worktreePath: worktree,
-      agents: [lead, coder],
+      agents: [lead, coder, reviewer],
       skills: delivered,
       repoSkillsEnabled,
-      config: { skill_max_bytes: 65536, skills_max_per_run: 32 },
+      config,
     });
     return { probe, turns, run: new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx) };
   }
+  const subagent = (o: SdkOptions, name: string) => o.agents![name] as { tools?: string[]; skills?: string[] };
 
-  it("flag OFF ⇒ NO repo skill loads and settingSources stays []", async () => {
+  it("flag OFF ⇒ NO repo skill loads (top-level or any subagent) and settingSources stays []", async () => {
     const { turns, run } = runRepo(false);
     await run;
     const o = turns[0]!.options;
     assert.deepStrictEqual(o.skills, ["uzi:team-kb"], "only the delivered skill");
     assert.deepStrictEqual(o.settingSources, []);
     assert.ok(!fs.existsSync(path.join(skillsPluginDir(worktree), "skills", "deploy-notes")), "repo skill not materialized");
+    // No subagent lists any repo skill when the flag is off.
+    assert.deepStrictEqual(subagent(o, "coder").skills, []);
+    assert.deepStrictEqual(subagent(o, "reviewer").skills, []);
   });
 
   it("flag ON ⇒ ONLY valid repo skills load (stripped), precedence + caps applied, settingSources still []", async () => {
@@ -650,5 +656,29 @@ describe("SdkExecutor repo skills (PRD #16 M6)", () => {
     const texts = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
     assert.ok(texts.some((t) => t.includes("team-kb") && /skipped|shadow|precedence/i.test(t)), "collision logged");
     assert.ok(texts.some((t) => /escape|invalid/i.test(t)), "invalid repo skill logged");
+  });
+
+  it("flag ON ⇒ the repo skill reaches EVERY subagent (all-templates), read-only tools untouched", async () => {
+    const { turns, run } = runRepo(true);
+    await run;
+    const o = turns[0]!.options;
+    // Repo skills carry no allocation ⇒ enabled for every template (PRD §Worker 3).
+    assert.deepStrictEqual(subagent(o, "coder").skills, ["uzi:deploy-notes"]);
+    assert.deepStrictEqual(subagent(o, "reviewer").skills, ["uzi:deploy-notes"]);
+    // The read-only subagent's allowlist is NOT widened (no 'Skill' grant needed).
+    assert.deepStrictEqual(subagent(o, "reviewer").tools, ["Read", "Grep"]);
+    assert.ok(!subagent(o, "reviewer").tools!.includes("Skill"));
+  });
+
+  it("a repo skill evicted by the per-run cap reaches NO subagent", async () => {
+    // maxPerRun=1: the delivered team-kb fills the cap, so the repo deploy-notes is
+    // evicted (over_limit) and must appear in neither the top-level list nor any
+    // subagent (the survivor re-filter guarantees this).
+    const { turns, run } = runRepo(true, { skill_max_bytes: 65536, skills_max_per_run: 1 });
+    await run;
+    const o = turns[0]!.options;
+    assert.deepStrictEqual(o.skills, ["uzi:team-kb"], "repo skill evicted by the cap");
+    assert.deepStrictEqual(subagent(o, "coder").skills, [], "evicted repo skill reaches no subagent");
+    assert.deepStrictEqual(subagent(o, "reviewer").skills, []);
   });
 });

@@ -204,11 +204,18 @@ export class SdkExecutor implements Executor {
     await materializeSkillsPlugin(skillsPluginPath, runSkills);
     this.emitSkillDrops(ctx, [...repoDrops, ...capDrops]);
 
-    // Subagents: each def.skills is re-filtered to the materialized SURVIVORS, so a
-    // subagent can never list a uzi:<name> that isn't in the plugin dir (delivered
-    // skills never drop today, but repo overflow / a future worker-side drop must
-    // not leave a dangling reference).
-    const assembled = assembleAgents(ctx.agents ?? [], survivorNames);
+    // Repo skills that actually survived (repo-origin AND not cap-evicted) attach
+    // to EVERY subagent — they carry no allocation, so they are all-templates
+    // (PRD §Worker point 3, User Journey #5: the coder subagent uses the repo's
+    // deploy-notes skill). A cap-evicted repo skill is absent here, so it reaches
+    // no subagent either.
+    const repoKeptNames = new Set(repoKept.map((s) => s.name));
+    const repoSurvivorNames = runSkills.filter((s) => repoKeptNames.has(s.name)).map((s) => s.name);
+
+    // Subagents: each def.skills is its allocated delivered skills (re-filtered to
+    // the materialized survivors, so it never lists a uzi:<name> not in the plugin
+    // dir) plus the all-templates repo survivors.
+    const assembled = assembleAgents(ctx.agents ?? [], survivorNames, repoSurvivorNames);
     const subagentNames = Object.keys(assembled.subagents);
 
     const baseOptions: SdkOptions = {
