@@ -23,8 +23,8 @@ Each git checkout/worktree gets its own isolated compose stack and `pgdata` volu
 The board works against GitLab issues, via a per-user bot account:
 
 1. Create a bot account and an `api`-scoped PAT, add it as Developer to a project — see [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md) (`scripts/create-gitlab-bot.sh` automates the admin path).
-2. In uzi: **Forge** (top nav), pick a base URL and paste the PAT.
-3. **Repos**, enable the project you added the bot to.
+2. In uzi: **Settings → Forge**, pick a base URL and paste the PAT.
+3. **Boards**, enable the project you added the bot to.
 4. Open its board from the sidebar — `PRD`-labeled issues appear as cards; drag between columns to relabel on the forge, or let a run move them for you (see [docs/board.md](docs/board.md)).
 
 ### Run an agent

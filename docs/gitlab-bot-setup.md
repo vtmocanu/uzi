@@ -27,7 +27,7 @@ Project → **Manage → Members → Invite members**, add the bot with role **D
 
 ## 4. Connect the bot in uzi
 
-1. Log in and open **Forge** from the top nav.
+1. Log in and open **Settings → Forge**.
 2. Pick a base URL: only the operator-configured allowlist is offered (the SSRF guard; see [ARCHITECTURE.md](../ARCHITECTURE.md#forge-integration)).
 3. Paste the bot's PAT and submit. uzi verifies it immediately and shows the bot's username; the token itself is never shown again.
 
@@ -35,7 +35,7 @@ Project → **Manage → Members → Invite members**, add the bot with role **D
 
 ## 5. Enable the repo
 
-Open **Repos**, pick the connection, and enable each project you added the bot to. This makes its board appear in the sidebar and starts syncing its `PRD`-labeled issues (see [Board](./board.md)).
+Open **Boards**, pick the connection, and enable each project you added the bot to. This makes its board appear in the sidebar and starts syncing its `PRD`-labeled issues (see [Board](./board.md)).
 
 If verification fails, check: the PAT's scope is `api`, it hasn't expired, and the bot is at least Developer on the target project.
 
