@@ -5,16 +5,17 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type SecretMeta } from "../lib/api";
-import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Skeleton } from "../components/ui";
+import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { ModelSelect } from "../components/ModelSelect";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
+import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
 
 const DOC_URL =
   "https://gitlab.example.com/vtmocanu/uzi/-/blob/main/docs/anthropic-token.md";
 
 export function Settings() {
-  const { user, refresh } = useAuth();
+  const { user, refresh, themeOverride, defaultTheme } = useAuth();
   const [meta, setMeta] = useState<SecretMeta | null>(null);
   const [loading, setLoading] = useState(true);
   const [token, setToken] = useState("");
@@ -97,12 +98,35 @@ export function Settings() {
   const modelWarning = modelFieldWarning(defaultModel);
   const modelDirty = defaultModel.trim() !== savedModel;
 
+  // Appearance: the per-user theme override. "" = use the instance default. The
+  // change is applied live (optimistic) then persisted; a failed save re-syncs
+  // from the server, reverting the optimistic stamp.
+  const [themeBusy, setThemeBusy] = useState(false);
+  const [themeError, setThemeError] = useState("");
+
+  const changeTheme = async (value: string) => {
+    setThemeError("");
+    const override = value === "" ? null : value;
+    // Apply immediately so the switch feels live; the server value reconciles.
+    applyTheme(resolveTheme(override, defaultTheme));
+    setThemeBusy(true);
+    try {
+      await api.putMySettings({ theme: override });
+      await refresh(); // sync themeOverride + re-apply the authoritative theme
+    } catch (err) {
+      setThemeError(err instanceof ApiError ? err.message : "Failed to save theme");
+      await refresh(); // revert the optimistic stamp to the server's truth
+    } finally {
+      setThemeBusy(false);
+    }
+  };
+
   const saveModel = async () => {
     setError("");
     setNotice("");
     setModelBusy(true);
     try {
-      const { settings } = await api.putMySettings(defaultModel.trim() || null);
+      const { settings } = await api.putMySettings({ default_model: defaultModel.trim() || null });
       const model = settings.default_model ?? "";
       setDefaultModel(model);
       setSavedModel(model);
@@ -236,6 +260,36 @@ export function Settings() {
             </Button>
           </div>
         )}
+      </Card>
+
+      <Card className="space-y-5">
+        <div>
+          <SectionTitle>Appearance</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            The theme uzi renders for you. It follows you across browsers. Leave it on{" "}
+            <em>Use default</em> to track the instance default your admin sets.
+          </p>
+        </div>
+
+        {themeError && <Alert message={themeError} />}
+
+        <div className="max-w-sm">
+          <Field label="Theme" htmlFor="appearance-theme">
+            <Select
+              id="appearance-theme"
+              value={isTheme(themeOverride) ? themeOverride : ""}
+              disabled={themeBusy}
+              onChange={(e) => changeTheme(e.target.value)}
+            >
+              <option value="">Use default ({THEME_LABELS[defaultTheme]})</option>
+              {THEMES.map((t) => (
+                <option key={t} value={t}>
+                  {THEME_LABELS[t]}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
       </Card>
 
       {user && (

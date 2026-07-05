@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/theme"
 )
 
 // Setting keys. These are the only keys the API recognizes; writes to any other
@@ -27,6 +28,10 @@ import (
 const (
 	KeyPRDLabel       = "prd_label"
 	KeyAutopilotLabel = "autopilot_label"
+	// KeyDefaultTheme is the instance-default UI theme (PRD #21). It tenants into
+	// this same table rather than a parallel settings store; its value is a theme
+	// id validated against the canonical theme registry, not a label.
+	KeyDefaultTheme = "default_theme"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -49,6 +54,11 @@ const maxLabelLen = 64
 var Defaults = map[string]string{
 	KeyPRDLabel:       DefaultPRDLabel,
 	KeyAutopilotLabel: DefaultAutopilotLabel,
+	// The instance default theme falls back to the registry's Default ("ember"),
+	// so an instance with no seeded row renders exactly as before (PRD #21). No
+	// migration seed is needed — this fallback plus the stable GET shape follow
+	// automatically from the entry here.
+	KeyDefaultTheme: theme.Default,
 }
 
 // Known reports whether key is a setting the API recognizes.
@@ -158,6 +168,12 @@ func (c *Cache) AutopilotLabel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyAutopilotLabel)
 }
 
+// DefaultTheme returns the configured instance-default theme id (PRD #21).
+// Falls back to the theme registry's Default ("ember").
+func (c *Cache) DefaultTheme(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyDefaultTheme)
+}
+
 // All returns every known key with its effective value (row value or default).
 // The shape is stable — always one entry per key in Defaults — so the admin UI
 // never has to reason about missing rows. A cold refresh error is returned so
@@ -193,6 +209,20 @@ func Effective(rows []store.AppSetting) map[string]string {
 		}
 	}
 	return out
+}
+
+// Validate applies the per-key write rules, dispatching on key (PRD #21): the
+// label keys use the Decision 8 label rules; default_theme must be a known theme
+// id. Unknown keys are the caller's responsibility (guard with Known first);
+// this only dispatches recognized keys. The cross-key label rule stays in
+// ValidateMerged — this is the single-value gate the settings PUT runs per key.
+func Validate(key, value string) error {
+	switch key {
+	case KeyDefaultTheme:
+		return theme.Validate(value)
+	default:
+		return ValidateLabel(value)
+	}
 }
 
 // ValidateLabel checks a single label value against Decision 8's per-value

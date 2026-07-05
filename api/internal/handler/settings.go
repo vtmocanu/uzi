@@ -54,13 +54,14 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-key validation: known key + per-value rules.
+	// Per-key validation: known key + per-value rules dispatched by key (label
+	// rules for the label keys, the theme registry for default_theme — PRD #21).
 	for key, value := range req.Settings {
 		if !settings.Known(key) {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unknown setting: %s", key))
 			return
 		}
-		if err := settings.ValidateLabel(value); err != nil {
+		if err := settings.Validate(key, value); err != nil {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("%s: %s", key, err))
 			return
 		}
@@ -119,10 +120,12 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	// changed tracks whether any submitted key actually differs from committed
 	// state, so an idempotent PUT (or one racing another writer's identical change)
-	// does not needlessly force a full resync of every repo.
+	// does not needlessly force a full resync of every repo. Only a LABEL change
+	// re-filters boards; default_theme is presentation-only (PRD #21), so a
+	// theme-only edit must not trigger a repo resync.
 	changed := false
 	for k, v := range req.Settings {
-		if committed[k] != v {
+		if committed[k] != v && k != settings.KeyDefaultTheme {
 			changed = true
 		}
 		merged[k] = v

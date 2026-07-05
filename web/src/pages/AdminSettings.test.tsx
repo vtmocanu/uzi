@@ -11,12 +11,14 @@ vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
   return { ...actual, api: { getSettings: vi.fn(), updateSettings: vi.fn() } };
 });
+// The page re-resolves the admin's own theme after a save via useAuth().refresh.
+vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ refresh: vi.fn().mockResolvedValue(undefined) }) }));
 
 const mockApi = vi.mocked(api);
 
 beforeEach(() => {
   mockApi.getSettings.mockResolvedValue({
-    settings: { prd_label: "PRD", autopilot_label: "autopilot" },
+    settings: { prd_label: "PRD", autopilot_label: "autopilot", default_theme: "ember" },
   });
 });
 
@@ -48,7 +50,7 @@ describe("AdminSettings", () => {
 
   it("saves edited labels and shows a success notice", async () => {
     mockApi.updateSettings.mockResolvedValue({
-      settings: { prd_label: "Feature", autopilot_label: "autopilot" },
+      settings: { prd_label: "Feature", autopilot_label: "autopilot", default_theme: "ember" },
     });
     renderPage();
     await screen.findByLabelText("PRD label");
@@ -61,6 +63,7 @@ describe("AdminSettings", () => {
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         prd_label: "Feature",
         autopilot_label: "autopilot",
+        default_theme: "ember",
       }),
     );
     expect(await screen.findByText(/Settings saved/i)).toBeTruthy();

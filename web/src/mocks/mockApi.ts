@@ -14,7 +14,9 @@ import {
   type SecretMeta,
   type User,
   type UserSettings,
+  type UserSettingsPatch,
 } from "../lib/api";
+import { isTheme, resolveTheme } from "../lib/theme";
 import {
   LIVE_RUN_ID,
   mockAdmin,
@@ -44,11 +46,11 @@ function requireSession(): User {
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
-let userSettings: UserSettings = { default_model: null };
+let userSettings: UserSettings = { default_model: null, theme: null };
 let workers = mockWorkers.map((w) => ({ ...w }));
 let connections = [{ ...mockConnection }];
 let repos = mockRepos.map((r) => ({ ...r }));
-let appSettings: AppSettings = { prd_label: "PRD", autopilot_label: "autopilot" };
+let appSettings: AppSettings = { prd_label: "PRD", autopilot_label: "autopilot", default_theme: "ember" };
 let templateCounter = 0;
 let workerCounter = 0;
 
@@ -56,13 +58,17 @@ function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
-// sessionBody is the auth/session bootstrap payload: the signed-in user plus the
-// current instance labels (PRD #19 M2).
+// sessionBody is the auth/session bootstrap payload: the signed-in user, the
+// current instance labels (PRD #19 M2), and the three resolved theme fields (PRD
+// #21), mirroring the real API so the mocked SPA resolves them the same way.
 function sessionBody() {
   return {
     user: requireSession(),
     prd_label: appSettings.prd_label,
     autopilot_label: appSettings.autopilot_label,
+    theme: resolveTheme(userSettings.theme, appSettings.default_theme),
+    theme_override: userSettings.theme,
+    default_theme: appSettings.default_theme,
   };
 }
 
@@ -105,6 +111,11 @@ export const mockApi = {
   updateSettings: async (updates: Partial<AppSettings>) => {
     const merged = { ...appSettings, ...updates };
     for (const [key, value] of Object.entries(updates)) {
+      // default_theme routes to the theme registry, not the label rules (PRD #21).
+      if (key === "default_theme") {
+        if (!isTheme(value)) throw new ApiError(400, `default_theme: unknown theme: "${value}"`);
+        continue;
+      }
       if (key !== "prd_label" && key !== "autopilot_label") {
         throw new ApiError(400, `unknown setting: ${key}`);
       }
@@ -140,9 +151,18 @@ export const mockApi = {
     return delay(null);
   },
   getMySettings: async () => delay({ settings: { ...userSettings } }),
-  putMySettings: async (defaultModel: string | null) => {
-    const trimmed = defaultModel?.trim() ?? "";
-    userSettings = { default_model: trimmed === "" ? null : trimmed };
+  putMySettings: async (patch: UserSettingsPatch) => {
+    // PATCH-like: apply only the fields present in the body, mirroring the real
+    // handler so a theme-only save never clears the model and vice versa.
+    if (patch.default_model !== undefined) {
+      const trimmed = patch.default_model?.trim() ?? "";
+      userSettings = { ...userSettings, default_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.theme !== undefined) {
+      const t = patch.theme?.trim() ?? "";
+      if (t !== "" && !isTheme(t)) throw new ApiError(400, `unknown theme: "${t}"`);
+      userSettings = { ...userSettings, theme: t === "" ? null : t };
+    }
     return delay({ settings: { ...userSettings } });
   },
 
