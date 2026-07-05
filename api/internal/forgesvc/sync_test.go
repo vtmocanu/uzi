@@ -50,7 +50,7 @@ func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 func (f *fakeForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
 	return 0, false, nil
 }
-func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string) (forge.BranchProtection, error) {
+func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
 	return forge.BranchProtection{}, nil
 }
 

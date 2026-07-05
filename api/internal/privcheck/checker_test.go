@@ -42,7 +42,7 @@ func (f *fakeForge) ProjectRole(_ context.Context, projectID, _ int64) (int, boo
 	r := f.roles[projectID]
 	return r.role, r.member, r.err
 }
-func (f *fakeForge) DefaultBranchProtection(_ context.Context, projectID int64, _ string) (forge.BranchProtection, error) {
+func (f *fakeForge) DefaultBranchProtection(_ context.Context, projectID int64, _ string, _ int64) (forge.BranchProtection, error) {
 	p := f.prots[projectID]
 	return p.bp, p.err
 }
@@ -91,8 +91,8 @@ func TestEvaluateToken(t *testing.T) {
 		wantWarning   string // substring expected in warnings, "" if none
 	}{
 		{"exactly api is clean", forge.TokenInfo{Scopes: []string{"api"}, Active: true}, false, "", ""},
-		{"extra scope is a violation", forge.TokenInfo{Scopes: []string{"api", "sudo"}, Active: true}, false, "exceed the required [api]", ""},
-		{"read_api instead of api is a violation", forge.TokenInfo{Scopes: []string{"read_api"}, Active: true}, false, "exceed the required [api]", ""},
+		{"extra scope is a violation", forge.TokenInfo{Scopes: []string{"api", "sudo"}, Active: true}, false, "are not exactly [api]", ""},
+		{"read_api instead of api is a violation", forge.TokenInfo{Scopes: []string{"read_api"}, Active: true}, false, "are not exactly [api]", ""},
 		{"instance admin is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: true}, true, "instance admin", ""},
 		{"inactive is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: false}, false, "not active", ""},
 		{"expired is a violation", forge.TokenInfo{Scopes: []string{"api"}, Active: true, ExpiresAt: expired}, false, "has expired", ""},
@@ -199,6 +199,22 @@ func TestCheckDevelopersCanPushIsViolation(t *testing.T) {
 	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
 	if !hasFinding(rep.Repos[0].Violations, "Developers may push") {
 		t.Fatalf("want developers-can-push violation, got %v", rep.Repos[0].Violations)
+	}
+}
+
+// TestCheckBotDirectPushGrantIsViolation: a protected branch that Developers
+// cannot push, but which grants the bot a direct per-user push, is still a
+// violation (the false negative the role check alone would miss).
+func TestCheckBotDirectPushGrantIsViolation(t *testing.T) {
+	f := &fakeForge{
+		identity:  forge.BotIdentity{ForgeUserID: 42},
+		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
+		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false, BotCanPush: true}}},
+	}
+	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
+	if !hasFinding(rep.Repos[0].Violations, "direct push grant") {
+		t.Fatalf("want bot direct-push-grant violation, got %v", rep.Repos[0].Violations)
 	}
 }
 

@@ -91,7 +91,7 @@ func (g *gitLab) ProjectRole(ctx context.Context, projectID, forgeUserID int64) 
 	return int(m.AccessLevel), true, nil
 }
 
-func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, branch string) (BranchProtection, error) {
+func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, branch string, botUserID int64) (BranchProtection, error) {
 	pb, resp, err := g.client.ProtectedBranches.GetProtectedBranch(projectID, branch, gitlab.WithContext(ctx))
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
@@ -107,6 +107,11 @@ func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, b
 		// bot. Only a nonzero level at or below Developer (30) lets the bot push.
 		if lvl > 0 && lvl <= developerAccessLevel {
 			bp.DevelopersCanPush = true
+		}
+		// A per-user allow-to-push entry naming the bot lets it push regardless of
+		// role (a false negative the role check alone would miss).
+		if botUserID != 0 && pl.UserID == botUserID {
+			bp.BotCanPush = true
 		}
 	}
 	return bp, nil

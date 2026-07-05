@@ -162,7 +162,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/verify", h.VerifyConnection)
 				r.Delete("/{id}", h.DeleteConnection)
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/projects", h.ListProjects)
-				// Full least-privilege report (PRD #5): 1 + 2×repos upstream calls,
+				// Full least-privilege report (PRD #5): 2 + 2×repos upstream calls,
 				// so it rides the per-user forge budget like the other proxying routes.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/privilege-check", h.PrivilegeCheck)
 			})

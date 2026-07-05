@@ -132,16 +132,20 @@ func (c *Checker) checkRepo(ctx context.Context, f forge.Forge, botUserID int64,
 		rr.Warnings = append(rr.Warnings, "repo has no default branch; branch-protection check skipped")
 		return rr
 	}
-	bp, err := f.DefaultBranchProtection(ctx, repo.ForgeProjectID, repo.DefaultBranch)
+	bp, err := f.DefaultBranchProtection(ctx, repo.ForgeProjectID, repo.DefaultBranch, botUserID)
 	if err != nil {
 		rr.Warnings = append(rr.Warnings, "could not read default-branch protection on this repo")
 		return rr
 	}
-	switch {
-	case !bp.Protected:
+	if !bp.Protected {
 		rr.Violations = append(rr.Violations, fmt.Sprintf("default branch %q is not protected", repo.DefaultBranch))
-	case bp.DevelopersCanPush:
+		return rr
+	}
+	if bp.DevelopersCanPush {
 		rr.Violations = append(rr.Violations, fmt.Sprintf("Developers may push to protected %q", repo.DefaultBranch))
+	}
+	if bp.BotCanPush {
+		rr.Violations = append(rr.Violations, fmt.Sprintf("the bot has a direct push grant on protected %q", repo.DefaultBranch))
 	}
 	return rr
 }
@@ -171,7 +175,7 @@ func evaluateToken(info forge.TokenInfo, isAdmin bool, now time.Time, warnWindow
 	}
 
 	if !scopesEqualRequired(info.Scopes) {
-		tr.Violations = append(tr.Violations, fmt.Sprintf("token scopes %v exceed the required [%s]", info.Scopes, requiredScope))
+		tr.Violations = append(tr.Violations, fmt.Sprintf("token scopes %v are not exactly [%s]", info.Scopes, requiredScope))
 	}
 	if !info.Active {
 		tr.Violations = append(tr.Violations, "token is not active")

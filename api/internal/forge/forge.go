@@ -66,6 +66,12 @@ type BranchProtection struct {
 	// a protected default branch that Developers may still push to does not
 	// protect main, so a Developer-role bot could push directly.
 	DevelopersCanPush bool
+	// BotCanPush is true when a push access level names the bot user directly (a
+	// per-user allow-to-push grant), which lets the bot push to the protected
+	// branch even at Developer role — a false negative the role/DevelopersCanPush
+	// checks alone would miss. Group-level push grants to the bot are NOT detected
+	// (they need an extra membership call); that gap is documented for manual audit.
+	BotCanPush bool
 }
 
 // Project is a repo the bot has membership on.
@@ -146,10 +152,12 @@ type Forge interface {
 	// a nil error when the bot has no effective membership (a 404 from the
 	// members/all lookup). GitLab: GET /projects/:id/members/all/:user_id.
 	ProjectRole(ctx context.Context, projectID, forgeUserID int64) (role int, member bool, err error)
-	// DefaultBranchProtection reports whether the given branch is protected and
-	// whether Developer-level push is allowed on it. GitLab: GET
-	// /projects/:id/protected_branches/:name (a 404 means unprotected).
-	DefaultBranchProtection(ctx context.Context, projectID int64, branch string) (BranchProtection, error)
+	// DefaultBranchProtection reports whether the given branch is protected,
+	// whether Developer-level push is allowed on it, and whether the bot user has
+	// a direct per-user push grant on it. GitLab: GET
+	// /projects/:id/protected_branches/:name (a 404 means unprotected). botUserID
+	// is the bot's forge user id, used to flag a per-user allow-to-push entry.
+	DefaultBranchProtection(ctx context.Context, projectID int64, branch string, botUserID int64) (BranchProtection, error)
 }
 
 // New constructs a driver for the given forge type. baseURL must already be

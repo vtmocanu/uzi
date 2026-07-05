@@ -257,9 +257,10 @@ func (h *Handler) VerifyConnection(w http.ResponseWriter, r *http.Request) {
 
 // PrivilegeCheck runs the full PAT least-privilege report for a connection
 // (token + every enabled repo), persists it, and returns it. Owner-only, behind
-// the per-user forge rate limiter (it is the heaviest forge-proxying route: one
-// token call plus two per enabled repo). It never blocks — the report surfaces
-// findings, the badge reflects them, and the user acts.
+// the per-user forge rate limiter (it is the heaviest forge-proxying route: two
+// token-level calls — VerifyToken + TokenInfo — plus two per enabled repo). It
+// never blocks — the report surfaces findings, the badge reflects them, and the
+// user acts.
 func (h *Handler) PrivilegeCheck(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
