@@ -21,6 +21,8 @@ vi.mock("../lib/api", async (importActual) => {
       putAnthropicToken: vi.fn(),
       deleteAnthropicToken: vi.fn(),
       setAutopilotEnabled: vi.fn(),
+      getMySettings: vi.fn(),
+      putMySettings: vi.fn(),
     },
   };
 });
@@ -58,12 +60,15 @@ function mockAuth(user: User) {
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, theme: "mission" } });
   mockAuth(baseUser);
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  document.documentElement.removeAttribute("data-theme");
 });
 
 const toggle = () =>
@@ -132,5 +137,52 @@ describe("Settings — autopilot opt-in (PRD #19 M3, Decision 7)", () => {
 
     expect(await screen.findByText("internal error")).toBeTruthy();
     expect(toggle().disabled).toBe(false);
+  });
+});
+
+describe("Settings — Appearance theme picker (PRD #21)", () => {
+  const themeSelect = () => screen.getByLabelText("Theme") as HTMLSelectElement;
+
+  it("offers 'Use default (<name>)' plus each theme and selects a null override as default", async () => {
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(themeSelect()).toBeTruthy());
+    // The default option is labelled with the instance default's name.
+    expect(screen.getByRole("option", { name: /Use default \(Ember\)/i })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Mission control" })).toBeTruthy();
+    // A null override selects "use default" (value "").
+    expect(themeSelect().value).toBe("");
+  });
+
+  it("applies live (optimistic) and persists the override on change", async () => {
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(themeSelect()).toBeTruthy());
+    fireEvent.change(themeSelect(), { target: { value: "mission" } });
+    // Optimistic: <html data-theme> flips immediately, before the request resolves.
+    expect(document.documentElement.dataset.theme).toBe("mission");
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ theme: "mission" }));
+    // Reconciled by a session refresh (syncs the override + re-applies authoritative).
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it("surfaces an error and refreshes (reverts) on a failed save", async () => {
+    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "unknown theme"));
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(themeSelect()).toBeTruthy());
+    fireEvent.change(themeSelect(), { target: { value: "mission" } });
+    expect(await screen.findByText("unknown theme")).toBeTruthy();
+    // refresh is the revert mechanism: re-fetch me() and re-apply the server truth.
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
   });
 });

@@ -280,3 +280,22 @@ func TestPutMySettingsThemeOnlyLeavesModelUntouched(t *testing.T) {
 		t.Fatalf("response default_model = %v, want the untouched \"opus\"", got)
 	}
 }
+
+// The mirror: a model-only PUT must not clobber the stored theme override.
+func TestPutMySettingsModelOnlyLeavesThemeUntouched(t *testing.T) {
+	db := &fakeSettingsDB{theme: pgtype.Text{String: "mission", Valid: true}}
+	h := &Handler{q: store.New(db)}
+	rec := httptest.NewRecorder()
+	req := authed(httptest.NewRequest(http.MethodPut, "/api/me/settings", bytes.NewReader([]byte(`{"default_model":"opus"}`))))
+	h.PutMySettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !db.theme.Valid || db.theme.String != "mission" {
+		t.Fatalf("theme must be untouched by a model-only PUT, got %+v", db.theme)
+	}
+	if got := decodeTheme(t, rec.Body.Bytes()); got == nil || *got != "mission" {
+		t.Fatalf("response theme = %v, want the untouched \"mission\"", got)
+	}
+}

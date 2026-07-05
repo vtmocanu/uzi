@@ -243,6 +243,25 @@ func ValidateLabel(value string) error {
 	return nil
 }
 
+// LabelChanged reports whether any submitted setting that affects the boards
+// actually changed value: a label key (anything other than default_theme) in
+// updates whose value differs from committed. The settings PUT uses it to decide
+// whether to force a full repo resync — only a label change re-filters boards, so
+// a theme-only edit is presentation-only and must NOT trigger one (PRD #21). An
+// idempotent label write (same value) returns false, matching the prior "only
+// resync on a real change" behavior.
+func LabelChanged(committed, updates map[string]string) bool {
+	for k, v := range updates {
+		if k == KeyDefaultTheme {
+			continue
+		}
+		if committed[k] != v {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateMerged enforces the cross-key rule (Decision 8): prd_label and
 // autopilot_label must differ, since equal values would make every PRD-labeled
 // issue also autopilot-labeled and auto-run. It runs on the effective

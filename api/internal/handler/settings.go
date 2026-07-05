@@ -118,18 +118,14 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	for k, v := range committed {
 		merged[k] = v
 	}
-	// changed tracks whether any submitted key actually differs from committed
-	// state, so an idempotent PUT (or one racing another writer's identical change)
-	// does not needlessly force a full resync of every repo. Only a LABEL change
-	// re-filters boards; default_theme is presentation-only (PRD #21), so a
-	// theme-only edit must not trigger a repo resync.
-	changed := false
 	for k, v := range req.Settings {
-		if committed[k] != v && k != settings.KeyDefaultTheme {
-			changed = true
-		}
 		merged[k] = v
 	}
+	// changed decides whether to force a full repo resync after commit. Only a
+	// LABEL change re-filters boards; default_theme is presentation-only (PRD #21)
+	// and an idempotent write is a no-op, so neither forces a resync. Computed
+	// against the committed (FOR UPDATE-locked) rows, not the cache.
+	changed := settings.LabelChanged(committed, req.Settings)
 	if err := settings.ValidateMerged(merged); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return

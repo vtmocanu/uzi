@@ -71,6 +71,31 @@ describe("AdminSettings", () => {
     expect(saveButton().disabled).toBe(true);
   });
 
+  it("saves the default theme selection (PRD #21)", async () => {
+    mockApi.updateSettings.mockResolvedValue({
+      settings: { prd_label: "PRD", autopilot_label: "autopilot", default_theme: "mission" },
+    });
+    renderPage();
+    await screen.findByLabelText("PRD label");
+    const theme = screen.getByLabelText("Default theme") as HTMLSelectElement;
+    // Loads at the current instance default.
+    expect(theme.value).toBe("ember");
+    fireEvent.change(theme, { target: { value: "mission" } });
+
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({
+        prd_label: "PRD",
+        autopilot_label: "autopilot",
+        default_theme: "mission",
+      }),
+    );
+    expect(await screen.findByText(/Settings saved/i)).toBeTruthy();
+    expect(saveButton().disabled).toBe(true);
+  });
+
   it("surfaces a server validation error", async () => {
     mockApi.updateSettings.mockRejectedValue(new ApiError(400, "prd_label already in use"));
     renderPage();
