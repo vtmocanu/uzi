@@ -78,9 +78,10 @@ WHERE status = 'online'
 -- NULL for a caller that cannot resolve it. move_pending_since is stamped in this
 -- same INSERT — queued is a status the column automation reacts to (→ In
 -- Progress), and the same-statement stamp closes the crash window before the
--- forge move.
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since)
-VALUES (@user_id, @repo_id, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now())
+-- forge move. auto_approve is true only for autopilot-created runs (PRD #19 M4):
+-- the worker reads it to resolve the plan gate without a human.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
+VALUES (@user_id, @repo_id, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one

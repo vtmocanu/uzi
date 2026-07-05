@@ -29,6 +29,13 @@ type AppSetting struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type AutopilotTrigger struct {
+	RepoID      uuid.UUID          `json:"repo_id"`
+	IssueIid    int64              `json:"issue_iid"`
+	LastEventID int64              `json:"last_event_id"`
+	HandledAt   pgtype.Timestamptz `json:"handled_at"`
+}
+
 type BoardColumn struct {
 	ID        uuid.UUID `json:"id"`
 	RepoID    uuid.UUID `json:"repo_id"`
@@ -99,6 +106,7 @@ type Run struct {
 	BoardColumn      pgtype.Text        `json:"board_column"`
 	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
 	MrState          pgtype.Text        `json:"mr_state"`
+	AutoApprove      bool               `json:"auto_approve"`
 }
 
 type RunMessage struct {

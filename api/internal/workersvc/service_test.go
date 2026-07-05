@@ -821,6 +821,49 @@ func TestCreateRunSnapshotsTitleAndRejectsMissingPRDLink(t *testing.T) {
 	}
 }
 
+func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+
+	// Same PRD-link gate as the manual path.
+	fsNoLink := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: false}}
+	svc := New(fsNoLink, newBox(t), testParams())
+	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc"); err != ErrNoPRDLink {
+		t.Fatalf("err = %v, want ErrNoPRDLink (autopilot must enforce the same gate)", err)
+	}
+
+	// Happy path → auto_approve set, description snapshotted.
+	fs := &fakeStore{
+		issueByID:       store.Issue{Title: "Real Title", HasPrdLink: true},
+		createRunResult: store.Run{ID: uuid.New()},
+	}
+	svc = New(fs, newBox(t), testParams())
+	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "the description"); err != nil {
+		t.Fatalf("CreateAutopilotRun: %v", err)
+	}
+	if fs.createRunParams == nil {
+		t.Fatal("CreateRun not called")
+	}
+	if !fs.createRunParams.AutoApprove {
+		t.Fatal("autopilot run must set auto_approve = true")
+	}
+	if fs.createRunParams.IssueDescription != "the description" {
+		t.Fatalf("description should be the snapshot passed in, got %q", fs.createRunParams.IssueDescription)
+	}
+
+	// A manual run leaves auto_approve false.
+	fsManual := &fakeStore{
+		issueByID:       store.Issue{Title: "T", HasPrdLink: true},
+		createRunResult: store.Run{ID: uuid.New()},
+	}
+	svc = New(fsManual, newBox(t), testParams())
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d"); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if fsManual.createRunParams.AutoApprove {
+		t.Fatal("manual run must keep auto_approve = false")
+	}
+}
+
 func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 	fs := &fakeStore{

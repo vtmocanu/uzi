@@ -165,6 +165,12 @@ func run() error {
 	// enabled repo. Its lifetime is tracked so shutdown waits for it before the
 	// pool is closed (a mid-tick query must not race pool.Close).
 	engine := poller.New(svc, q, cfg.ForgePollInterval, cfg.ForgeReconcileEvery)
+	// Autopilot (PRD #19 M4): the poller's post-sync detector turns an autopilot-label
+	// application on a PRD issue into an auto_approve run for the mapped consenting
+	// user (or one explanatory issue comment). Wired post-construction like the other
+	// optional poller collaborators; run creation reuses workersvc's manual-start path
+	// (same state machine and gates) and the label comes from the settings cache.
+	engine.SetAutopilot(poller.NewAutopilot(q, wsvc, settingsCache))
 
 	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
 	// immediately, then the goroutine sweeps on its own interval. Both lifetimes

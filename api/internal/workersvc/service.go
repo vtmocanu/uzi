@@ -562,12 +562,28 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	return nil
 }
 
-// CreateRun queues a run from a board card. The issue must be a cached PRD issue
-// (with a PRD link) in a repo the user owns; its title is snapshotted from the
-// cache and its description from the request, so the run is self-contained even
-// if the issue cache is later evicted. The one-non-terminal-run-per-issue index
-// rejects a duplicate active run.
+// CreateRun queues a manually-started run from a board card. The issue must be a
+// cached PRD issue (with a PRD link) in a repo the user owns; its title is
+// snapshotted from the cache and its description from the request, so the run is
+// self-contained even if the issue cache is later evicted. The
+// one-non-terminal-run-per-issue index rejects a duplicate active run.
 func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, false)
+}
+
+// CreateAutopilotRun queues a run the poller's autopilot detection started on a
+// user's behalf (PRD #19 M4). It is IDENTICAL to CreateRun — same ownership,
+// cached-PRD-issue, PRD-link, and one-active-run gates, same state machine, same
+// queued→In Progress column notify — except it sets auto_approve, which the worker
+// reads (M5) to resolve the plan gate without a human. Sharing one createRun body
+// is the whole point: the invariant that an autopilot run and a manual run are born
+// through the same path is enforced structurally, not by two implementations that
+// could drift.
+func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
+	return s.createRun(ctx, userID, repoID, issueIID, description, true)
+}
+
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, autoApprove bool) (store.Run, error) {
 	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
@@ -591,6 +607,7 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		IssueTitle:       issue.Title,
 		IssueDescription: description,
 		OriginColumn:     s.originColumn(ctx, repoID, issue),
+		AutoApprove:      autoApprove,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -598,8 +615,8 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
-	// queued is the operator's click intent → In Progress. The move marker is
-	// already stamped in the CreateRun statement; Notify performs the move.
+	// queued is the start intent → In Progress. The move marker is already stamped
+	// in the CreateRun statement; Notify performs the move.
 	s.notify(run.ID, "queued")
 	return run, nil
 }
