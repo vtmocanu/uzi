@@ -1979,3 +1979,158 @@ Serves human Feature #24; no new surface required.
   PR-status enum (precompute a display status, don't surface the raw forge string).
 - **Docs**: `docs/board.md` gains the MR-close/reopen automation and the Decision 9
   note (pre-existing stuck cards heal with one manual drag).
+
+---
+
+# PRD #17 — Builtin lead template (opus) + worker model selection from the UI
+
+Serves human Feature #17 (lead orchestrator as an editable builtin on opus;
+per-user default worker model; user, 2026-07-05). Before this PRD the lead /
+main-thread was the only agent role with no template: `agent_templates` held the
+seven subagents, the worker found no `lead` row, left `baseOptions.model` unset,
+and the SDK silently fell back to the account default (observed: `claude-sonnet-5`)
+— invisible and unconfigurable. This PRD ships `lead` as the **eighth** builtin on
+`opus`, makes it editable/resettable like the others, and adds a per-user
+default-model knob that overrides it for a user's own runs. Section numbers
+continue past PRD #24's #92; the decisions below realize the PRD's Design Decisions
+(`prds/17-lead-template-and-model-selection.md`), whose per-decision attributions
+carry provenance. Builds on PRD #3 (agent templates) and PRD #4 (runtime/claim).
+
+## 93. Decouple builtins from `.claude/agents/`; lead is the eighth builtin
+
+Serves human: "lead ships as a builtin with a real orchestrator prompt on opus";
+"builtins are the single source, `.claude/agents/` is the dev team's" (user,
+2026-07-05, superseding the same-day dual-home choice).
+
+- **`api/internal/agenttmpl/builtins/` is now the single source of truth** for
+  product templates (git-versioned, `go:embed`-shipped, boot-seeded). The earlier
+  1:1 mirror to `.claude/agents/*.md` is dissolved: `.claude/agents/` becomes purely
+  the repo's own Claude Code dev agent-team and is free to drift (it already carried
+  a `web-ux` role with no builtin twin). Rationale: a product `lead.md` under
+  `.claude/agents/` would masquerade as a spawnable dev teammate, and the dual-home
+  shipped nothing at runtime (only the embedded copy is ever used).
+- **Ordered before PRD #16 so #16 inherits the decoupled convention** (user). The
+  decouple is a small, self-contained first commit (PRD Risk: decouple-first).
+- **Tests: golden byte-match → parse/validity + round-trip.** The two tests pinning
+  builtins to the checked-in `.claude/agents/*.md` files (`TestRenderBuiltinsByteMatch`,
+  `TestEmbeddedCopiesMatchRepo`) are removed. Replacements: `TestBuiltinsParseAndValid`
+  (each embedded file parses; name/description non-empty; names unique; model passes
+  `ValidateModel`), `TestBuiltinsRoundTripRender` (parse→`Render` is byte-for-byte
+  stable), and `TestBuiltinsSetIsExactlyEight` (grown from Seven; `builtinNames` slice
+  now eight). `TestCoderInheritsAllTools` kept. Stale "mirrors `.claude/agents/`"
+  comments in `builtins.go`/`render.go` swept.
+- **`lead.md`**: `name: lead`, `model: opus`, **no `tools:` line** (null-tools =
+  inherit-all, the `coder` contract — the lead needs the full toolset). Body is a
+  **role-agnostic** orchestrator persona (plan-first, approval gate, `signal_done`,
+  never touch `main`); it deliberately does **not** hard-list the seven role names —
+  the invokable subagent set is injected per turn by the worker's `delegatesLine`
+  (`agent/src/prompt.ts`). The shipped name matches the worker's `LEAD_NAME_RE`
+  (`/^(lead|orchestrator)$/i`), asserted by an agent unit test, so `assembleAgents`
+  routes its `prompt_body`/`model` to the main thread rather than registering a
+  subagent — no worker change was needed for pickup.
+- **Upgrade seeding is automatic**: the idempotent boot reconciler
+  (`ReconcileBuiltinTemplates`, `ON CONFLICT (name) DO NOTHING`) inserts the lead into
+  existing DBs and preserves edited rows; `ResetAgentTemplate` works for it like any
+  builtin.
+- **Collision warning (AI):** when a builtin insert is skipped (`n==0`) the reconciler
+  reads the shadowing row back and warns **only when it is `is_builtin=false`** — an
+  admin's own custom `lead`/`orchestrator` blocks the builtin and can't be reset (the
+  worker still routes it by name; an operator can rename/delete it to adopt the
+  builtin). A failed read-back logs at **debug** rather than being silently dropped.
+  The reconciler's query dependency is narrowed to a `builtinReconcilerQueries`
+  interface so the collision path is unit-testable without a live DB.
+
+## 94. Lead prompt body augments, never replaces, the guardrails
+
+Serves human Feature #17 + the primary directive (`main` is never touched).
+
+- The worker composes the lead system prompt as **claude_code preset + template
+  `prompt_body` + `LEAD_GUARDRAIL_APPEND`** (`agent/src/prompt.ts`). The template body
+  is persona / workflow guidance only; the primary-directive guardrails are appended
+  by the worker regardless of what the template says, so **editing the lead template
+  cannot weaken guardrails** (asserted by existing + new tests). The four independent
+  guardrail layers (§45, §50) are untouched.
+
+## 95. Shared model validator homed in `agenttmpl` (single rule source)
+
+Serves human: "model choices offered as aliases + a custom escape hatch" (user);
+best-practice (two surfaces must not drift). AI-decided homing.
+
+- **`agenttmpl.ValidateModel` is the single server-side rule source**
+  (`api/internal/agenttmpl/model.go`), placed in this neutral, dependency-free package
+  so both the template-editor handler and the per-user default-model endpoint
+  thin-wrap it without an import cycle (the handler maps its result to
+  `pgtype.Text` + an HTTP error); the builtin validity tests call it directly. The
+  prior template-model check (allowed interior spaces, no length cap) is replaced by
+  it. The web `ModelSelect` mirror (§96) is a **client hint only** — the server rule
+  is authoritative.
+- **Decision-4 rules**: blank / whitespace-only ⇒ `("", nil)` = inherit (the caller
+  stores NULL); a non-blank value must be a **single token** — trimmed, no interior
+  whitespace, no control chars / U+FFFD, **≤ 100 bytes** (`MaxModelLen`, kept in
+  lockstep with the web `MAX_MODEL_LEN`) — returned trimmed. A typo in a custom ID is
+  accepted here and only surfaces as a run-time SDK error (the API cannot enumerate
+  valid IDs without calling Anthropic).
+
+## 96. Shared `ModelSelect` control (web)
+
+Serves human: aliases + custom escape hatch (user). AI-decided component shape.
+
+- **`web/src/components/ModelSelect.tsx`**: a select over `inherit` (empty), the
+  `MODEL_ALIASES` (`opus`, `sonnet`, `haiku`, `fable`) and `custom` (reveals a
+  free-text input for a full model ID). Used by both `AgentTemplateEditor` (replacing
+  the datalist-backed input) and the new Settings section. **`MODEL_ALIASES` is the
+  single source** of the curated set.
+- **Custom-init rule**: an incoming value not in the alias list (e.g.
+  `claude-fable-5`) initializes into the `custom` state with the text prefilled —
+  never silently reset to inherit. An intentionally-emptied custom field is not
+  re-derived back to the incoming value.
+- **Submit gating preserved**: the custom value keeps flowing through
+  `frontmatterFieldWarning`, so an injection-suspect model string still disables submit
+  in the template editor.
+- **Lead badged "orchestrator"** on the Agents page (a `brand`-tone badge, tooltip
+  "the main agent thread that plans and delegates") so it reads differently from
+  invokable subagents; otherwise it edits and resets like any other builtin.
+
+## 97. Per-user default worker model (api + web)
+
+Serves human: "per-user default worker model" (user, 2026-07-05 — the default follows
+per-user run ownership, not a global setting).
+
+- **`users.default_model text` (nullable; NULL = inherit)** — migration
+  `00030_user_default_model.sql` (drafted `00022`; renumbered to the next free slot
+  above the live head per the CLAUDE.md goose convention), with a `+goose Down`. One
+  scalar per user ⇒ a column on `users`, not a new table. (`SELECT *` / `RETURNING *`
+  on `users` regenerate the sqlc `User` struct — expected, harmless.)
+- **Companion `GetUserDefaultModel` + `UpdateUserDefaultModel` sqlc queries.** The
+  owner default is read at claim time via the companion `GetUserDefaultModel` (a
+  targeted lookup, **not** a JOIN widening of the claim-context query).
+- **API `GET` / `PUT /api/me/settings`**, session-authenticated (PRD #1 cookie +
+  CSRF), **own-user only** — no admin path to another user's value. `PUT` validates
+  through `ValidateModel` (§95) and stores `""` as NULL.
+- **Web**: a "Worker model" section on `Settings.tsx` under the Anthropic-token block,
+  using `ModelSelect`, explaining precedence (the per-user default overrides the lead
+  template's model; empty = inherit the lead template's model, opus by default).
+
+## 98. Claim plumbing + model precedence (api + agent)
+
+Serves human: "the run owner's default model wins over the lead template model"
+(Decision 6, review finding + user, 2026-07-05).
+
+- **`ClaimConfig.default_model *string` with `omitempty`**
+  (`api/internal/workersvc/claim.go`) — omitted on the wire when the owner's default is
+  NULL (absent ≠ explicit null), populated from `GetUserDefaultModel` at claim time.
+- **Agent**: `protocol.ts` `ClaimConfig` gains `default_model`; the runner threads it
+  into `RunContext.config`; `sdk-executor.ts` resolves it through the pure helper
+  **`resolveLeadModel(configModel, templateModel) = (configModel ?? templateModel) || undefined`**
+  and applies it **set-only-when-defined** (`if (leadModel) baseOptions.model = leadModel`)
+  — an unset model **omits** the SDK `model` key rather than sending an explicit empty
+  override, so it falls back to the SDK / account default.
+- **Precedence (lead / main thread)**: run owner's `default_model` → lead template
+  `model` → SDK / account default. **Why user-default-wins** (flipped from the earlier
+  template-wins draft): the builtin lead pins `opus`, so under template-wins the
+  per-user setting would be inert on a default install (only active after an admin
+  globally cleared the lead model). User-wins keeps both features live — `opus` is the
+  instance-wide default for every user with the setting unset (NULL), and a user who
+  picks a model overrides it for their own runs only. Null-model **subagents follow
+  the main thread**, so this governs them too; subagent templates carrying an explicit
+  `model` are unaffected.
