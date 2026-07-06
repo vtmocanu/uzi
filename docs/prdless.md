@@ -22,12 +22,9 @@ thinner plan for you to review before clicking Start.
 
 An admin enables or disables the feature instance-wide, and sets the label's
 name, from **Admin → Instance settings** — see
-[Admin settings](./admin-settings.md). *(Note: the toggle and name field
-land on the Settings page in a later milestone of this release; until then
-the feature runs at its compiled-in default — on, named `PRDLESS`.)*
-Turning it off only blocks *new* runs — one already queued, claimed,
-running, or awaiting approval when the label is removed or the feature is
-disabled keeps going.
+[Admin settings](./admin-settings.md). Turning it off only blocks *new* runs
+— one already queued, claimed, running, or awaiting approval when the label
+is removed or the feature is disabled keeps going.
 
 ## Applying or removing the label
 
@@ -38,13 +35,14 @@ move a card between board columns. Two places:
 1. **Issue view**: open the issue and use the PRDLESS toggle.
 2. **Board card**: the same toggle appears on the card itself.
 
-The toggle only appears when the feature is enabled instance-wide. *(Note:
-the toggle itself lands in a later milestone of this release — until then
-IssueView and the board card have no way to know the feature is enabled, so
-it stays hidden even when it is.)* Applying or removing writes the label to
-GitLab first; the button only reflects the new state once the forge
-confirms it, so a failed write never shows a change that didn't really
-happen.
+The toggle only appears when the feature is enabled instance-wide. Applying
+or removing writes the label to GitLab first; the button only reflects the
+new state once the forge confirms it, so a failed write never shows a change
+that didn't really happen.
+
+Once the label is applied, the card and issue view swap the "no PRD link"
+warning badge for a `PRDLESS` badge, so at a glance you can tell a run may
+start without a PRD link.
 
 The first time the label is applied from uzi, it's auto-created on the
 GitLab project (amber) — no manual setup needed. Applying it from GitLab's

@@ -616,11 +616,16 @@ function IssueCard({
             {hint}
           </span>
         )}
-        {!card.has_prd_link && (
-          <Badge tone="warning" title="Description has no link to a prds/*.md file; excluded from agent pickup">
-            no PRD link
-          </Badge>
-        )}
+        {!card.has_prd_link &&
+          (prdlessEnabled && prdlessApplied ? (
+            <Badge tone="brand" title="PRD-link gate bypassed by label">
+              {prdlessLabel}
+            </Badge>
+          ) : (
+            <Badge tone="warning" title="Description has no link to a prds/*.md file; excluded from agent pickup">
+              no PRD link
+            </Badge>
+          ))}
         {card.conflict && (
           <Badge tone="danger" title="Issue carries multiple column labels; shown in the highest column until the next move">
             conflict
@@ -745,20 +750,21 @@ function ColumnSettings({
   onSaved: (b: BoardData) => void;
   onError: (m: string) => void;
 }) {
-  const { prdLabel, autopilotLabel } = useAuth();
+  const { prdLabel, autopilotLabel, prdlessLabel } = useAuth();
   const [names, setNames] = useState<string[]>(board.columns.map((c) => c.label_name));
   const [newName, setNewName] = useState("");
   const [saving, setSaving] = useState(false);
 
   // Suggest labels seen on cards that are not already columns and not the
-  // configured PRD/autopilot labels (those are workflow markers, never columns).
+  // configured PRD/autopilot/PRDLESS labels (those are workflow markers, never
+  // columns).
   const suggestions = useMemo(() => {
     const seen = new Set<string>();
     for (const c of board.cards) for (const l of c.labels) seen.add(l);
     return [...seen]
-      .filter((l) => l !== prdLabel && l !== autopilotLabel && !names.includes(l))
+      .filter((l) => l !== prdLabel && l !== autopilotLabel && l !== prdlessLabel && !names.includes(l))
       .sort();
-  }, [board.cards, names, prdLabel, autopilotLabel]);
+  }, [board.cards, names, prdLabel, autopilotLabel, prdlessLabel]);
 
   const add = (name: string) => {
     const n = name.trim();

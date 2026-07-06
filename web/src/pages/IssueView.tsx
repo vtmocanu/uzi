@@ -139,14 +139,19 @@ export function IssueView() {
                     </span>
                   ))}
                 {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
-                {!issue.has_prd_link && (
-                  <Badge
-                    tone="warning"
-                    title="Description has no link to a prds/*.md file; excluded from agent pickup"
-                  >
-                    no PRD link
-                  </Badge>
-                )}
+                {!issue.has_prd_link &&
+                  (prdlessEnabled && prdlessApplied ? (
+                    <Badge tone="brand" title="PRD-link gate bypassed by label">
+                      {prdlessLabel}
+                    </Badge>
+                  ) : (
+                    <Badge
+                      tone="warning"
+                      title="Description has no link to a prds/*.md file; excluded from agent pickup"
+                    >
+                      no PRD link
+                    </Badge>
+                  ))}
                 {issue.conflict && (
                   <Badge
                     tone="danger"

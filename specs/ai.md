@@ -3031,8 +3031,8 @@ from the uzi web UI). User-stated 2026-07-05. Section numbers continue past PRD 
 **Status (branch `prd-22-prdless-label`):** prd-21 landed on main and is merged into this
 branch. M1 (strict per-key validation + admin-settings toggle/name UI), M2 (gate bypass,
 manual + autopilot), M4 (UI label toggle endpoint + forgesvc helper), and M5 (docs) are
-built. M3 (bootstrap fields + web badges) is the in-flight milestone, and M6 (e2e)
-follows — each decision below flags the milestone that owns it.
+built. M3 (bootstrap fields + web badges) is built too; M6 (e2e) is the remaining
+milestone — each decision below flags the milestone that owns it.
 
 ## 119. prdless settings keys + on-by-default resolution
 
@@ -3120,15 +3120,12 @@ Serves human: "add/remove the label directly from the uzi web UI, not only in Gi
 - **Card response** built like `MoveIssue`'s — column-position map + `latest_run`
   re-hydration — so a single-card replace doesn't blank the run badge. **No optimistic
   update** on the web side (wait for the 200; forge-first).
-- **Toggle affordance wired, lit by M3.** The web toggle (IssueView primary, board card
-  secondary) is visible only when `prdless_enabled`, which the SPA reads from the session
-  bootstrap — delivered by M3 (§122). Until M3 emits the field, the toggle reads its
-  client-side default (`false`) and stays hidden through the real app (the endpoint is
-  live, exercised in mock mode). **Generic arbitrary-label editing from uzi is out of
-  scope**: labels are board semantics (columns, PRD, autopilot, prdless); free-form label
-  management stays in GitLab.
+- **Toggle affordance.** The web toggle (IssueView primary, board card secondary) is
+  visible only when `prdless_enabled`, which the SPA reads from the session bootstrap
+  (§122). **Generic arbitrary-label editing from uzi is out of scope**: labels are board
+  semantics (columns, PRD, autopilot, prdless); free-form label management stays in GitLab.
 
-## 122. Web bootstrap + badges, and the quality-gate framing (M3)
+## 122. Web bootstrap + badges, and the quality-gate framing (M3, built)
 
 Serves human: the escape hatch is discoverable in the UI without weakening the primary
 directive (agents never touch `main`).
@@ -3139,9 +3136,10 @@ directive (agents never touch `main`).
   knows the label name. A server predating the fields omits both; the SPA treats the
   feature as off.
 - **Badge** (M3): the board card and issue view replace the "no PRD link" warning badge
-  with a distinct `PRDLESS` badge (tone accent, title "PRD-link gate bypassed by label")
-  when the feature is enabled and the issue carries the label. The board column-suggestion
-  filter also excludes `prdless_label` (it is a workflow marker, never a column).
+  with a distinct badge showing the configured label name (tone `brand` — uzi's accent,
+  Open Question 1 resolved; title "PRD-link gate bypassed by label") when the feature is
+  enabled and the issue carries the label. The board column-suggestion filter also excludes
+  `prdless_label` (it is a workflow marker, never a column).
 - **Quality gate, not a security boundary.** The bypass is a **gate exception, not a mode**,
   and never weakens any of the four `main`-protection layers; the human still clicks Start
   and approves the plan. Who can apply the label is bounded by GitLab membership (Reporter+)

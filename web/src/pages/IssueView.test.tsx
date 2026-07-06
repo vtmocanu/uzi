@@ -148,3 +148,36 @@ describe("IssueView PRDLESS toggle (PRD #22 M4)", () => {
     await screen.findByText("Mark PRDLESS");
   });
 });
+
+describe("IssueView PRDLESS badge (PRD #22 M3)", () => {
+  // The badge is queried by its distinctive title, since the issue also renders a
+  // label chip named "PRDLESS" — the title disambiguates the badge from the chip.
+  const BADGE_TITLE = "PRD-link gate bypassed by label";
+
+  it("shows the PRDLESS badge, not 'no PRD link', when enabled and labeled", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD", "PRDLESS"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByTitle(BADGE_TITLE)).toBeTruthy();
+    expect(screen.queryByText("no PRD link")).toBeNull();
+  });
+
+  it("shows 'no PRD link' when enabled but the label is absent", async () => {
+    setAuth(true);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("no PRD link")).toBeTruthy();
+    expect(screen.queryByTitle(BADGE_TITLE)).toBeNull();
+  });
+
+  it("shows 'no PRD link' when the feature is disabled even if labeled", async () => {
+    setAuth(false);
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD", "PRDLESS"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByText("no PRD link")).toBeTruthy();
+    expect(screen.queryByTitle(BADGE_TITLE)).toBeNull();
+  });
+});
