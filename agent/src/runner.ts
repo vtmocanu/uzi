@@ -99,15 +99,17 @@ export class RunRunner {
       steering.start();
 
       barePath = await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
-      const worktree = await this.git.createOrAttachWorktree(barePath, claim.issue_iid);
+      const worktree = await this.worktreeForClaim(barePath, claim);
       worktreePath = worktree.path;
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `worktree ready on ${worktree.branch}` } });
 
       const ctx: RunContext = {
         runId,
+        kind: claim.kind ?? "issue",
         issueIid: claim.issue_iid,
         issueTitle: claim.issue_title,
         issueDescription: claim.issue_description,
+        pipeline: claim.pipeline,
         worktreePath: worktree.path,
         branch: worktree.branch,
         emit: (m) => batcher.emit(m),
@@ -149,12 +151,27 @@ export class RunRunner {
       // at the security boundary.
       this.executor.killAgentTree?.();
 
+      // A ci_fix run that judged the failure not a code problem (PRD #6) completes
+      // with the diagnosis and NO push/MR — there is nothing to land.
+      if (result.fixVerdict === "not_code") {
+        this.executor.killAgentTree?.();
+        batcher.emit({ kind: "status", agent: "worker", payload: { text: "not a code problem: completing with the diagnosis, no merge request" } });
+        await batcher.close();
+        await reportState({ status: "completed", fix_verdict: "not_code" });
+        runLog.info("ci_fix run completed with not_code verdict", { run_id: runId });
+        return;
+      }
+
       // The agent signalled done. The WORKER now performs the authenticated push
       // + MR with the PAT — the agent never had a credential.
       batcher.emit({ kind: "status", agent: "worker", payload: { text: "work complete; pushing branch and opening merge request" } });
       await this.git.pushBranch(barePath, result.branch, claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
       const targetBranch =
         claim.repo.default_branch?.trim() || (await this.git.defaultBranchName(barePath)) || "main";
+      // createMergeRequest is idempotent: for a ci_fix on an existing agent branch it
+      // returns the EXISTING MR (no second MR, PRD #6); for a fresh ci-fix/pipeline-N
+      // or agent/issue-N branch it opens one. Reporting its iid keeps the fix branch
+      // watched so the verification sync can stamp the verdict.
       const mr = await this.gitlab.createMergeRequest({
         baseUrl: gitlabBaseUrl(claim.repo.url),
         projectPath: gitlabProjectPath(claim.repo.url),
@@ -199,6 +216,25 @@ export class RunRunner {
           .catch((e) => runLog.warn("skills plugin cleanup failed", { error: errMessage(e) }));
       }
     }
+  }
+
+  /**
+   * Resolve the run's worktree + branch. An issue run works agent/issue-{iid}. A
+   * ci_fix run (PRD #6) targets a fresh `ci-fix/pipeline-{id}` branch when fixing
+   * the default branch, or the existing agent branch (updating its MR) when fixing
+   * a run branch — keyed by pipeline.ref vs the repo's default branch.
+   */
+  private async worktreeForClaim(barePath: string, claim: ClaimResponse) {
+    if (claim.kind === "ci_fix" && claim.pipeline) {
+      const defaultBranch = claim.repo.default_branch?.trim();
+      const fixBranch =
+        defaultBranch && claim.pipeline.ref === defaultBranch
+          ? `ci-fix/pipeline-${claim.pipeline.id}`
+          : claim.pipeline.ref;
+      return this.git.worktreeForBranch(barePath, fixBranch, fixBranch.replace(/\//g, "-"));
+    }
+    if (claim.issue_iid == null) throw new Error("issue run claim is missing issue_iid");
+    return this.git.createOrAttachWorktree(barePath, claim.issue_iid);
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
@@ -246,17 +282,31 @@ export class RunRunner {
 /** MR title from the issue snapshot (never empty). */
 function mrTitle(claim: ClaimResponse): string {
   const t = claim.issue_title?.trim();
-  return t ? t : `Resolve issue #${claim.issue_iid}`;
+  if (t) return t;
+  if (claim.kind === "ci_fix" && claim.pipeline) return `Fix CI: pipeline #${claim.pipeline.id} on ${claim.pipeline.ref}`;
+  return `Resolve issue #${claim.issue_iid}`;
 }
 
-/** MR body: links + closes the issue, and states the primary directive (humans merge). */
+/** MR body: links + closes the issue (issue run) or links the failing pipeline
+ *  (ci_fix, PRD #6), and states the primary directive (humans merge). */
 function mrDescription(claim: ClaimResponse, branch: string): string {
+  const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
+  if (claim.kind === "ci_fix" && claim.pipeline) {
+    return [
+      `Fixes the failed CI pipeline for \`${claim.pipeline.ref}\`.`,
+      "",
+      `Failing pipeline: ${claim.pipeline.web_url}`,
+      "",
+      "---",
+      footer,
+    ].join("\n");
+  }
   return [
     `Implements issue #${claim.issue_iid}.`,
     "",
     `Closes #${claim.issue_iid}`,
     "",
     "---",
-    `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`,
+    footer,
   ].join("\n");
 }
