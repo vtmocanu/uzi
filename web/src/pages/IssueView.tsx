@@ -81,6 +81,10 @@ export function IssueView() {
   // Forge-first — wait for the 200 and adopt the returned card's labels; no
   // optimistic update, so a failed write leaves the issue's labels untouched.
   const prdlessApplied = !!issue && issue.labels.includes(prdlessLabel);
+  // The bypass badge stands in for the "no PRD link" warning when the feature is
+  // on and the label is applied. When it shows, the PRDLESS label is filtered out
+  // of the raw chip list below so it never renders twice (S1).
+  const showPrdlessBadge = !!issue && !issue.has_prd_link && prdlessEnabled && prdlessApplied;
   const togglePrdless = async () => {
     if (!issue) return;
     setError("");
@@ -98,6 +102,7 @@ export function IssueView() {
   const gate = issue
     ? startRunGate({
         hasPrdLink: issue.has_prd_link,
+        prdlessBypass: prdlessEnabled && prdlessApplied,
         closed: issue.closed,
         hasWorker,
         hasToken,
@@ -129,7 +134,7 @@ export function IssueView() {
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <Badge tone="neutral">{columnLabel(issue)}</Badge>
                 {issue.labels
-                  .filter((l) => l && l !== issue.column)
+                  .filter((l) => l && l !== issue.column && !(showPrdlessBadge && l === prdlessLabel))
                   .map((l) => (
                     <span
                       key={l}
@@ -163,7 +168,10 @@ export function IssueView() {
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {prdlessEnabled && !issue.closed && (
+              {/* Show the toggle when applying is meaningful (no PRD link) or the
+                  label is already applied (so it can be removed); hide the pure
+                  no-op case — an issue that already has a PRD link and no label (S2). */}
+              {prdlessEnabled && !issue.closed && (prdlessApplied || !issue.has_prd_link) && (
                 <Button
                   variant={prdlessApplied ? "secondary" : "ghost"}
                   disabled={prdlessBusy}

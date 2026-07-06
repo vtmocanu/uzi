@@ -74,7 +74,8 @@ describe("AdminSettings", () => {
         prdless_label: "PRDLESS",
       }),
     );
-    expect(await screen.findByText(/Settings saved/i)).toBeTruthy();
+    // A changed label mentions the next-sync propagation (N1).
+    expect(await screen.findByText(/Boards reflect the label change after the next sync/i)).toBeTruthy();
     // Back to a clean (non-dirty) state after a successful save.
     expect(saveButton().disabled).toBe(true);
   });
@@ -100,7 +101,9 @@ describe("AdminSettings", () => {
         prdless_label: "PRDLESS",
       }),
     );
-    expect(await screen.findByText(/Settings saved/i)).toBeTruthy();
+    // A theme-only change is presentation-only: the notice must NOT claim a resync (N1).
+    expect(await screen.findByText("Settings saved.")).toBeTruthy();
+    expect(screen.queryByText(/next sync/i)).toBeNull();
     expect(saveButton().disabled).toBe(true);
   });
 

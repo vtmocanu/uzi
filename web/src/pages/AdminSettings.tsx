@@ -82,6 +82,12 @@ export function AdminSettings() {
       return;
     }
     setBusy(true);
+    // Only a board-filtering label (PRD or autopilot) triggers a repo resync;
+    // theme and the prdless keys are presentation-/gate-only (mirrors the server's
+    // settings.LabelChanged). Computed against the pre-save `saved` so the notice
+    // only mentions propagation when it actually happens (N1).
+    const labelChanged =
+      saved !== null && (prdLabel !== saved.prd_label || autopilotLabel !== saved.autopilot_label);
     try {
       const { settings } = await api.updateSettings({
         prd_label: prdLabel,
@@ -96,7 +102,11 @@ export function AdminSettings() {
       setDefaultTheme(settings.default_theme);
       setPrdlessEnabled(settings.prdless_enabled === "true");
       setPrdlessLabel(settings.prdless_label);
-      setNotice("Settings saved. Boards reflect a changed PRD label after the next sync.");
+      setNotice(
+        labelChanged
+          ? "Settings saved. Boards reflect the label change after the next sync."
+          : "Settings saved.",
+      );
       // Re-resolve this admin's own theme: with no personal override, a changed
       // instance default restyles their session live.
       await refresh();

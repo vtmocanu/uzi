@@ -453,6 +453,7 @@ export function Board() {
                     projectWebUrl={board?.web_url}
                     gate={startRunGate({
                       hasPrdLink: card.has_prd_link,
+                      prdlessBypass: prdlessEnabled && card.labels.includes(prdlessLabel),
                       closed: card.closed,
                       hasWorker,
                       hasToken,
@@ -662,7 +663,10 @@ function IssueCard({
           </Button>
         </div>
       )}
-      {prdlessEnabled && !card.closed && (
+      {/* Show when applying is meaningful (no PRD link) or the label is already
+          applied (so it can be removed); hide the no-op case — has a PRD link and
+          no label (S2). */}
+      {prdlessEnabled && !card.closed && (prdlessApplied || !card.has_prd_link) && (
         <button
           type="button"
           draggable={false}

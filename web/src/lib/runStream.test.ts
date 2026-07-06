@@ -131,6 +131,29 @@ describe("startRunGate", () => {
     expect(g.reason).toMatch(/prds/i);
   });
 
+  // PRD #22: the prdless bypass short-circuits the PRD-link requirement — the full
+  // bypass × hasPrdLink matrix.
+  it("prdless bypass lets a no-PRD-link issue through the PRD-link gate", () => {
+    // no link + bypass → the PRD-link precondition is skipped (other preconditions met → enabled).
+    expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: true })).toEqual({
+      enabled: true,
+      reason: "",
+    });
+    // no link + no bypass → still blocked on the link.
+    expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: false }).reason).toMatch(/prds/i);
+    // link + bypass → enabled (bypass is a no-op when a link already satisfies the gate).
+    expect(startRunGate({ ...ok, hasPrdLink: true, prdlessBypass: true }).enabled).toBe(true);
+    // link + no bypass → enabled (the pre-prdless baseline).
+    expect(startRunGate({ ...ok, hasPrdLink: true, prdlessBypass: false }).enabled).toBe(true);
+  });
+
+  it("prdless bypass does not skip the OTHER preconditions", () => {
+    // A bypassed no-PRD-link issue with no worker is still blocked on the worker.
+    expect(startRunGate({ ...ok, hasPrdLink: false, prdlessBypass: true, hasWorker: false }).reason).toMatch(
+      /worker/i,
+    );
+  });
+
   it("requires a connected worker", () => {
     expect(startRunGate({ ...ok, hasWorker: false }).reason).toMatch(/worker/i);
   });

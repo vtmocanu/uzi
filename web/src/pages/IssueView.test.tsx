@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { IssueView } from "./IssueView";
-import { api, type Card, type IssueDetail } from "../lib/api";
+import { api, type Card, type IssueDetail, type SecretMeta, type Worker } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
 // IssueView loads four endpoints and, for the PRDLESS toggle (PRD #22 M4), calls
@@ -179,5 +179,41 @@ describe("IssueView PRDLESS badge (PRD #22 M3)", () => {
     await screen.findByText("A small typo fix");
     expect(screen.getByText("no PRD link")).toBeTruthy();
     expect(screen.queryByTitle(BADGE_TITLE)).toBeNull();
+  });
+});
+
+describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
+  const aWorker = (): Worker => ({
+    id: "w1",
+    name: "laptop",
+    status: "online",
+    busy: false,
+    version: null,
+    last_heartbeat_at: null,
+    created_at: "2026-01-01T00:00:00Z",
+  });
+  const aToken = (): SecretMeta => ({
+    kind: "anthropic_token",
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+
+  it("enables Start once the PRDLESS label is applied on a no-PRD-link issue", async () => {
+    setAuth(true);
+    // Make the missing PRD link the ONLY blocker: give the user a worker + token.
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["PRD"] }) }); // no link, no label
+    mockApi.setIssuePrdless.mockResolvedValue({ card: aCard(["PRD", "PRDLESS"]) });
+    renderIssueView();
+
+    const startBtn = () => screen.getByRole("button", { name: /start run/i }) as HTMLButtonElement;
+    await screen.findByText("A small typo fix");
+    // Gated on the missing PRD link, despite the worker + token being present.
+    expect(startBtn().disabled).toBe(true);
+
+    fireEvent.click(screen.getByText("Mark PRDLESS"));
+    // Once the label lands, the bypass enables Start.
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
   });
 });
