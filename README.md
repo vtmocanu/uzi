@@ -38,6 +38,16 @@ With a forge connected and your Anthropic token saved (**Settings**), have uzi w
 5. Watch the implement ⇄ review loop stream per agent; send a follow-up message if it needs steering.
 6. On completion, a branch and MR are open, linked from the run view and the card, and the issue moves to **Human Review**. `main` is never touched: see [ARCHITECTURE.md](ARCHITECTURE.md#guardrail-layers-the-primary-directive) for why that holds even under an adversarial prompt.
 
+### Fix a broken pipeline
+
+Every poll tick, uzi caches each watched ref's latest CI pipeline and renders a status badge on the repos list, the board header, and each run's card. When a pipeline goes red:
+
+1. A **Fix CI** button appears next to the failed badge. Click it — a plan-gated `ci_fix` agent run queues, and the run view streams the lead agent reading the failed jobs' logs and reproducing the failure locally.
+2. It gates like any run: approve the root-cause + fix plan (or the agent reports the failure is **not a code problem** — a diagnosis with no MR). On approval the fix lands on a branch and the worker opens an MR linking the failing pipeline.
+3. uzi verifies its work: once the fix branch's pipeline concludes, the run's verdict chip flips to **verified ✓** (or **fix failed ✗**). Merge the MR yourself — uzi never merges.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md#ci-status--fix-agent-prd-6) and [configuration](docs/configuration.md#ci-status-integration-prd-6) for the pipeline-sync + verification design and its knobs.
+
 ## Documentation
 
 Full docs live in [docs/](docs/), and the same golden-path pages are
