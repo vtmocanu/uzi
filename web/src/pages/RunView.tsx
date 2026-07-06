@@ -10,8 +10,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, isTerminalRun, type Repo, type RunMessage } from "../lib/api";
 import { isStoppedRun } from "../lib/runBadge";
-import { fixVerdictChip } from "../lib/fixVerdict";
 import { useRunStream } from "../lib/useRunStream";
+import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { formatDuration } from "../components/RunEvent";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { Markdown } from "../components/Markdown";
@@ -172,28 +172,9 @@ export function RunView() {
                   autopilot
                 </Badge>
               )}
-              {/* ci_fix runs (PRD #6): link the failing pipeline and show the fix
-                  verdict once the run has settled. */}
-              {run.kind === "ci_fix" && run.pipeline_web_url && (
-                <a
-                  href={run.pipeline_web_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={`Failing pipeline${run.pipeline_ref ? ` on ${run.pipeline_ref}` : ""}`}
-                  className="inline-flex items-center rounded-md border border-danger/40 bg-danger/10 px-2 py-0.5 text-[11px] font-medium text-danger transition-colors hover:bg-danger/20"
-                >
-                  failing pipeline
-                </a>
-              )}
-              {run.kind === "ci_fix" &&
-                (() => {
-                  const chip = fixVerdictChip(run.fix_verdict, terminal);
-                  return chip ? (
-                    <Badge tone={chip.tone} title={chip.title}>
-                      {chip.label}
-                    </Badge>
-                  ) : null;
-                })()}
+              {/* ci_fix runs (PRD #6): the failing-pipeline link (isHttpsUrl-guarded)
+                  and the verdict chip, extracted for isolated testing. */}
+              <CIFixRunHeader run={run} terminal={terminal} />
               {stage && (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info">
                   <Spinner /> {stage}…

@@ -91,6 +91,26 @@ func TestSetStateCompletedCarriesNotCodeVerdict(t *testing.T) {
 	}
 }
 
+func TestSetStateCompletedClampsForgedVerdict(t *testing.T) {
+	// Integrity (PRD #6): verified/fix_failed are pipeline-sync-authoritative — a
+	// worker reporting 'verified' on the wire must NOT be able to forge the badge.
+	for _, forged := range []string{"verified", "fix_failed", "totally_fixed"} {
+		w := worker()
+		fs := &fakeStore{
+			runOwned:         store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Kind: RunKindCIFix, Status: "running"},
+			setCompletedRows: 1,
+		}
+		svc := New(fs, newBox(t), testParams())
+		v := forged
+		if _, _, err := svc.SetState(context.Background(), w, fs.runOwned.ID, StateRequest{State: "completed", FixVerdict: &v}); err != nil {
+			t.Fatalf("SetState: %v", err)
+		}
+		if fs.setCompleted == nil || fs.setCompleted.FixVerdict.Valid {
+			t.Fatalf("a wire-reported %q must be clamped to NULL, got %+v", forged, fs.setCompleted)
+		}
+	}
+}
+
 // ciFixWireFixture is the golden JSON for a ci_fix claim payload. It is the
 // server side of the cross-side wire contract (PRD #6): the worker's own test pins
 // the SAME file, so a ci_fix-specific field (kind, pipeline, null issue_iid,

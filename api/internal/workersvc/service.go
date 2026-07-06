@@ -512,7 +512,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	case "completed":
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), SessionID: sessionID,
-			FixVerdict: textParam(req.FixVerdict), ID: runID, WorkerID: pgUUID(wkr.ID),
+			FixVerdict: clampWireFixVerdict(req.FixVerdict), ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "failed":
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{

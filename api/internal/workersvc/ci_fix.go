@@ -19,6 +19,19 @@ const (
 	RunKindCIFix = "ci_fix"
 )
 
+// clampWireFixVerdict permits ONLY 'not_code' from a worker's completed state
+// report (PRD #6 integrity). verified / fix_failed are stamped server-side by the
+// pipeline sync from the actual post-fix pipeline and are NOT worker-reportable —
+// so a compromised or buggy worker cannot forge a 'verified' badge by reporting
+// it on the wire. Any other value (verified, fix_failed, garbage, or absent) is
+// dropped to NULL.
+func clampWireFixVerdict(v *string) pgtype.Text {
+	if v != nil && *v == "not_code" {
+		return pgtype.Text{String: "not_code", Valid: true}
+	}
+	return pgtype.Text{}
+}
+
 // agentIssueBranch is the worktree/branch an issue run uses, mirroring the
 // worker's naming (agent/src/git.ts: `agent/issue-${iid}`). The server needs it
 // only for the cross-kind same-branch exclusion; it is not otherwise coupled to

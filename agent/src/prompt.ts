@@ -170,6 +170,20 @@ export function isNotCodePlan(planMd: string): boolean {
   return firstLine === NOT_CODE_MARKER;
 }
 
+// sanitizeJobField neutralizes a job name/stage that is interpolated into prompt
+// PROSE (outside the untrusted fence): backticks and newlines are collapsed to
+// spaces so an attacker-chosen `.gitlab-ci.yml` job name cannot break out of the
+// surrounding markdown into instruction text.
+function sanitizeJobField(s: string): string {
+  return s.replace(/[`\r\n]+/g, " ").trim();
+}
+
+// defangJobLogFence prevents a job trace from closing its own <job_log> fence early
+// and smuggling following bytes out as prose (the delimiter-injection concern).
+function defangJobLogFence(tail: string): string {
+  return tail.replace(/<\/job_log>/gi, "<\\/job_log>");
+}
+
 export interface CIFixPlanPromptInput {
   ref: string;
   branch: string;
@@ -207,7 +221,17 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
     "",
   ];
   for (const job of input.failedJobs) {
-    lines.push(`Failed job \`${job.name}\` (stage \`${job.stage}\`):`, "<job_log>", job.logTail, "</job_log>", "");
+    // job.name / job.stage come from .gitlab-ci.yml (attacker-influenceable), and
+    // they sit in prose OUTSIDE the fence — strip backticks/newlines so they cannot
+    // break the surrounding markdown into instruction text. The tail's own closing
+    // delimiter is defanged so log content cannot end the fence early.
+    lines.push(
+      `Failed job \`${sanitizeJobField(job.name)}\` (stage \`${sanitizeJobField(job.stage)}\`):`,
+      "<job_log>",
+      defangJobLogFence(job.logTail),
+      "</job_log>",
+      "",
+    );
   }
   lines.push(
     delegatesLine(input.subagentNames),
