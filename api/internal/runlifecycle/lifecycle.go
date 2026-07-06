@@ -223,6 +223,11 @@ func (l *Lifecycle) notifyOnce(ctx context.Context, runID uuid.UUID, status stri
 		}
 		return
 	}
+	// A ci_fix run (PRD #6) carries no issue_iid and has no board card, so neither
+	// the column automation nor the terminal issue-comment applies — skip both.
+	if !mc.IssueIid.Valid {
+		return
+	}
 	l.apply(ctx, runID, contextFromRow(mc), notifierDecision(status, mc.OriginColumn))
 	// The worker's Set('completed'|'failed') funnels the terminal comment here; the
 	// passed status is the just-written one (see notifyOnce's doc).
@@ -232,7 +237,7 @@ func (l *Lifecycle) notifyOnce(ctx context.Context, runID uuid.UUID, status stri
 func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 	return moveContext{
 		repoID:          mc.RepoID,
-		issueIID:        mc.IssueIid,
+		issueIID:        mc.IssueIid.Int64, // valid: notifyOnce skips ci_fix runs (NULL issue_iid)
 		forgeProjectID:  mc.ForgeProjectID,
 		forgeType:       mc.ForgeType,
 		baseURL:         mc.BaseUrl,
@@ -397,7 +402,7 @@ func (l *Lifecycle) maybeTerminalComment(ctx context.Context, runID uuid.UUID, s
 		return
 	}
 	body := l.terminalCommentBody(status, runID, mc)
-	if _, err := f.CreateIssueNote(ctx, mc.ForgeProjectID, mc.IssueIid, body); err != nil {
+	if _, err := f.CreateIssueNote(ctx, mc.ForgeProjectID, mc.IssueIid.Int64, body); err != nil {
 		// Already PAT-redacted by the driver. Recorded but lost (never retried).
 		slog.Warn("run lifecycle: post autopilot terminal comment", "run", runID, "error", err)
 	}

@@ -40,7 +40,7 @@ func mrIssue(repoID uuid.UUID, iid int64, state string, labels ...string) store.
 func candidate(runID uuid.UUID, iid, mrIID int64, stored pgtype.Text) store.ListMRWatchCandidatesRow {
 	return store.ListMRWatchCandidatesRow{
 		ID:       runID,
-		IssueIid: iid,
+		IssueIid: pgtype.Int8{Int64: iid, Valid: true},
 		MrIid:    pgtype.Int8{Int64: mrIID, Valid: true},
 		MrState:  stored,
 	}

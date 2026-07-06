@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
@@ -149,5 +150,51 @@ func (s *Service) syncOneRef(ctx context.Context, repoID uuid.UUID, forgeProject
 		slog.Warn("forgesvc: pipeline upsert failed", "repo", repoID, "ref", ref, "error", err)
 		return true // preserve the existing row
 	}
+
+	// "uzi verifies it's work" (PRD #6): if this ref is a ci_fix run's fix branch and
+	// the observed pipeline concluded, stamp the run's verdict. A cheap column update
+	// inside the sync — no worker involvement, no second loop.
+	s.maybeStampFixVerdict(ctx, repoID, ref, p)
 	return true
+}
+
+// maybeStampFixVerdict closes the verification loop for a ci_fix run whose fix
+// branch is ref (PRD #6). It keys on runs.branch (the fix branch), NOT pipeline_ref
+// (the failed ref) — for a default-branch fix these differ, and keying on the
+// failed ref would false-stamp from unrelated commits. It stamps only when the
+// observed pipeline is TERMINAL and newer than the failure that spawned the run
+// (id > the run's snapshot pipeline id — see FindCIFixStampTarget), so a fix
+// branch's own original failing pipeline never triggers a stamp. success →
+// verified, failed → fix_failed; canceled/skipped/in-flight leave the run
+// unverified (NULL). All errors are contained: verification is best-effort and must
+// not stall the sync.
+func (s *Service) maybeStampFixVerdict(ctx context.Context, repoID uuid.UUID, ref string, p forge.Pipeline) {
+	var verdict string
+	switch p.Status {
+	case "success":
+		verdict = "verified"
+	case "failed":
+		verdict = "fix_failed"
+	default:
+		return // not a terminal pass/fail — nothing to stamp yet
+	}
+	target, err := s.q.FindCIFixStampTarget(ctx, store.FindCIFixStampTargetParams{
+		RepoID:             repoID,
+		Branch:             pgtype.Text{String: ref, Valid: true},
+		ObservedPipelineID: pgtype.Int8{Int64: p.ID, Valid: true},
+	})
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("forgesvc: find ci_fix stamp target", "repo", repoID, "ref", ref, "error", err)
+		}
+		return // no ci_fix run awaiting verification on this ref
+	}
+	if _, err := s.q.StampFixVerdict(ctx, store.StampFixVerdictParams{
+		ID:         target.ID,
+		FixVerdict: pgtype.Text{String: verdict, Valid: true},
+	}); err != nil {
+		slog.Warn("forgesvc: stamp fix verdict", "run", target.ID, "verdict", verdict, "error", err)
+		return
+	}
+	slog.Info("forgesvc: ci_fix verified", "run", target.ID, "ref", ref, "verdict", verdict, "pipeline", p.ID)
 }

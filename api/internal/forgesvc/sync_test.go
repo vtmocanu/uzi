@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
@@ -156,6 +157,14 @@ type fakeStore struct {
 	watchedRefsParam store.ListWatchedRunRefsForRepoParams // last args (cap/window assertions)
 	pipelineUpserts  []store.UpsertPipelineStatusParams
 	pipelineDeletes  []store.DeletePipelineStatusesNotInParams
+
+	// CI-fix verification (PRD #6) scripting + capture. stampTarget is returned by
+	// FindCIFixStampTarget (with stampTargetErr, default pgx.ErrNoRows meaning "no
+	// run awaiting verification"); stamps records StampFixVerdict calls.
+	stampTarget    store.Run
+	stampTargetErr error
+	stampParams    []store.FindCIFixStampTargetParams
+	stamps         []store.StampFixVerdictParams
 }
 
 func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) (store.Issue, error) {
@@ -191,6 +200,20 @@ func (s *fakeStore) UpsertPipelineStatus(_ context.Context, arg store.UpsertPipe
 func (s *fakeStore) DeletePipelineStatusesNotIn(_ context.Context, arg store.DeletePipelineStatusesNotInParams) (int64, error) {
 	s.pipelineDeletes = append(s.pipelineDeletes, arg)
 	return 0, nil
+}
+func (s *fakeStore) FindCIFixStampTarget(_ context.Context, arg store.FindCIFixStampTargetParams) (store.Run, error) {
+	s.stampParams = append(s.stampParams, arg)
+	if s.stampTargetErr != nil {
+		return store.Run{}, s.stampTargetErr
+	}
+	if s.stampTarget.ID == (uuid.UUID{}) {
+		return store.Run{}, pgx.ErrNoRows // no ci_fix run awaiting verification
+	}
+	return s.stampTarget, nil
+}
+func (s *fakeStore) StampFixVerdict(_ context.Context, arg store.StampFixVerdictParams) (int64, error) {
+	s.stamps = append(s.stamps, arg)
+	return 1, nil
 }
 
 // fakeLabels is a fixed LabelConfig for the sync tests.

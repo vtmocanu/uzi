@@ -107,7 +107,7 @@ type Run struct {
 	ID                   uuid.UUID          `json:"id"`
 	UserID               uuid.UUID          `json:"user_id"`
 	RepoID               uuid.UUID          `json:"repo_id"`
-	IssueIid             int64              `json:"issue_iid"`
+	IssueIid             pgtype.Int8        `json:"issue_iid"`
 	IssueTitle           string             `json:"issue_title"`
 	IssueDescription     string             `json:"issue_description"`
 	Status               string             `json:"status"`
@@ -131,6 +131,11 @@ type Run struct {
 	MrState              pgtype.Text        `json:"mr_state"`
 	AutoApprove          bool               `json:"auto_approve"`
 	AutopilotCommentedAt pgtype.Timestamptz `json:"autopilot_commented_at"`
+	Kind                 string             `json:"kind"`
+	PipelineID           pgtype.Int8        `json:"pipeline_id"`
+	PipelineRef          pgtype.Text        `json:"pipeline_ref"`
+	FailureSnapshot      []byte             `json:"failure_snapshot"`
+	FixVerdict           pgtype.Text        `json:"fix_verdict"`
 }
 
 type RunMessage struct {

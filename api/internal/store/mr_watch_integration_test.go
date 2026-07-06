@@ -132,7 +132,7 @@ func TestListMRWatchCandidatesLiveDB(t *testing.T) {
 	}
 	got := make(map[int64]store.ListMRWatchCandidatesRow, len(rows))
 	for _, r := range rows {
-		got[r.IssueIid] = r
+		got[r.IssueIid.Int64] = r
 	}
 
 	for _, iid := range []int64{101, 106} {

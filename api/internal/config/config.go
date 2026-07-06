@@ -125,6 +125,11 @@ type Config struct {
 	// behaviour for operators who want CI awareness off.
 	CIWatchRunWindow time.Duration
 	CIWatchMaxRefs   int
+	// CIFixMaxJobs caps how many failed jobs a Fix CI snapshot captures;
+	// CIFixLogTailBytes caps each job's captured log tail. Both bound the snapshot
+	// size (jobs × tail) frozen onto a ci_fix run at queue time.
+	CIFixMaxJobs      int
+	CIFixLogTailBytes int
 
 	// Agent skills (PRD #16). SkillMaxBytes caps a skill body at save (server) and
 	// is re-applied to repo-borne skills worker-side; SkillsMaxPerRun caps the
@@ -231,6 +236,8 @@ func Load() (Config, error) {
 	cfg.CIWatchRunWindow = parseDuration("CI_WATCH_RUN_WINDOW", 14*24*time.Hour)
 	// parseNonNegInt: 0 is legitimate here — it disables the pipeline sync.
 	cfg.CIWatchMaxRefs = parseNonNegInt("CI_WATCH_MAX_REFS", 20)
+	cfg.CIFixMaxJobs = parseInt("CI_FIX_MAX_JOBS", 10)
+	cfg.CIFixLogTailBytes = parseInt("CI_FIX_LOG_TAIL_BYTES", 32768)
 
 	if err := loadSeedAdmin(&cfg); err != nil {
 		return Config{}, err

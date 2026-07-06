@@ -120,7 +120,7 @@ WHERE lr.branch IS NOT NULL AND lr.branch <> ''
 `
 
 type ListRunPipelineStatusesForRepoRow struct {
-	IssueIid   int64              `json:"issue_iid"`
+	IssueIid   pgtype.Int8        `json:"issue_iid"`
 	Status     string             `json:"status"`
 	WebUrl     string             `json:"web_url"`
 	PipelineID int64              `json:"pipeline_id"`

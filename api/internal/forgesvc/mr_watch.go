@@ -53,7 +53,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 	mr, err := f.GetMergeRequest(ctx, forgeProjectID, c.MrIid.Int64)
 	if err != nil {
 		// A read failure is not an edge: log-and-skip, leave mr_state for next tick.
-		slog.Warn("forgesvc: MR-state read failed", "repo", repoID, "issue", c.IssueIid, "mr", c.MrIid.Int64, "error", err)
+		slog.Warn("forgesvc: MR-state read failed", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", err)
 		return
 	}
 	observed := mr.State
@@ -66,7 +66,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 	// baseline; ignoring it instead lets a transient glitch self-heal
 	// (stored="opened" → glitch skipped → a later real "closed" still fires).
 	if !forge.IsKnownMRState(observed) {
-		slog.Warn("forgesvc: ignoring unknown MR state", "repo", repoID, "issue", c.IssueIid, "mr", c.MrIid.Int64, "state", observed)
+		slog.Warn("forgesvc: ignoring unknown MR state", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "state", observed)
 		return
 	}
 
@@ -87,14 +87,14 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 	case stored == forge.MRStateOpened && observed == forge.MRStateClosed:
 		// close-edge: reviewer rejected the MR → rework needed → In Progress,
 		// guarded from Human Review (where the completed run parked the card).
-		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid, f, board.ColumnHumanReview, board.ColumnInProgress) == moveDeferred {
+		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, f, board.ColumnHumanReview, board.ColumnInProgress) == moveDeferred {
 			return // forge failure / vanished card: leave the edge for next-tick retry
 		}
 		s.recordMRState(ctx, c.ID, observed)
 	case stored == forge.MRStateClosed && observed == forge.MRStateOpened:
 		// reopen-edge (Decision 6): restore the card Human Review-ward,
 		// symmetrically, guarded from In Progress (where the close-edge left it).
-		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid, f, board.ColumnInProgress, board.ColumnHumanReview) == moveDeferred {
+		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, f, board.ColumnInProgress, board.ColumnHumanReview) == moveDeferred {
 			return
 		}
 		s.recordMRState(ctx, c.ID, observed)

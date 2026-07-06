@@ -167,7 +167,7 @@ func TestPipelineStatusesLiveDB(t *testing.T) {
 	}
 	byIssue := map[int64]store.ListRunPipelineStatusesForRepoRow{}
 	for _, r := range cardRows {
-		byIssue[r.IssueIid] = r
+		byIssue[r.IssueIid.Int64] = r
 	}
 	// issue-1's newest run is agent/issue-1, which has a cached pipeline → present.
 	if byIssue[1].PipelineID != 200 {

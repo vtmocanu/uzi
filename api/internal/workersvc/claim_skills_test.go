@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -131,7 +132,7 @@ func TestClaimDeliversSkills(t *testing.T) {
 	kbID := uuid.New()
 
 	fs := &fakeStore{
-		claimRun: store.Run{ID: uuid.New(), IssueIid: 5, Status: "claimed"},
+		claimRun: store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 5, Valid: true}, Status: "claimed"},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
 			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",

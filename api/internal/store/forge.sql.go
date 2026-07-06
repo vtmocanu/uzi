@@ -140,8 +140,8 @@ LIMIT 1
 `
 
 type GetLatestRunForIssueParams struct {
-	RepoID   uuid.UUID `json:"repo_id"`
-	IssueIid int64     `json:"issue_iid"`
+	RepoID   uuid.UUID   `json:"repo_id"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
 }
 
 type GetLatestRunForIssueRow struct {
@@ -536,12 +536,12 @@ SELECT DISTINCT ON (r.issue_iid)
 FROM runs r
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
-WHERE r.repo_id = $1
+WHERE r.repo_id = $1 AND r.issue_iid IS NOT NULL   -- issue runs only; ci_fix runs (PRD #6) have no card
 ORDER BY r.issue_iid, r.created_at DESC
 `
 
 type ListLatestRunsForRepoRow struct {
-	IssueIid      int64              `json:"issue_iid"`
+	IssueIid      pgtype.Int8        `json:"issue_iid"`
 	ID            uuid.UUID          `json:"id"`
 	UserID        uuid.UUID          `json:"user_id"`
 	Status        string             `json:"status"`
@@ -619,7 +619,7 @@ WHERE l.status = 'completed'
 
 type ListMRWatchCandidatesRow struct {
 	ID       uuid.UUID   `json:"id"`
-	IssueIid int64       `json:"issue_iid"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
 	MrIid    pgtype.Int8 `json:"mr_iid"`
 	MrState  pgtype.Text `json:"mr_state"`
 }

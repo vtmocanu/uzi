@@ -95,9 +95,9 @@ func TestAssembleCards(t *testing.T) {
 	// Deliberately NOT in issue order (20 before 10): a correct assembly keys by
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
-		{IssueIid: 20, ID: run20, UserID: other, Status: "completed", MrIid: i8(5),
+		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", MrIid: i8(5),
 			OwnerName: nullTxt(), OwnerEmail: txt("o@example.com"), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
-		{IssueIid: 10, ID: run10, UserID: viewer, Status: "running",
+		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running",
 			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 	}
 	position := map[string]int{"In Progress": 0}

@@ -84,9 +84,12 @@ func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
 // runDTO is the web view of a run. session_id and last_seq are intentionally
 // omitted — they are worker-internal (resume plumbing), not browser state.
 type runDTO struct {
-	ID               string     `json:"id"`
-	RepoID           string     `json:"repo_id"`
-	IssueIID         int64      `json:"issue_iid"`
+	ID   string `json:"id"`
+	RepoID string `json:"repo_id"`
+	// Kind is issue|ci_fix (PRD #6). IssueIID is null for a ci_fix run (no issue);
+	// the ci_fix fields below carry its pipeline context instead.
+	Kind             string     `json:"kind"`
+	IssueIID         *int64     `json:"issue_iid"`
 	IssueTitle       string     `json:"issue_title"`
 	IssueDescription string     `json:"issue_description"`
 	Status           string     `json:"status"`
@@ -98,18 +101,24 @@ type runDTO struct {
 	MrIID            *int64     `json:"mr_iid"`
 	FailureReason    *string    `json:"failure_reason"`
 	PlanMd           *string    `json:"plan_md"`
-	ClaimedAt        *time.Time `json:"claimed_at"`
-	StartedAt        *time.Time `json:"started_at"`
-	FinishedAt       *time.Time `json:"finished_at"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
+	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
+	// (verified|fix_failed|not_code|null-while-unverified).
+	PipelineRef    *string    `json:"pipeline_ref"`
+	PipelineWebURL *string    `json:"pipeline_web_url"`
+	FixVerdict     *string    `json:"fix_verdict"`
+	ClaimedAt      *time.Time `json:"claimed_at"`
+	StartedAt      *time.Time `json:"started_at"`
+	FinishedAt     *time.Time `json:"finished_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 func runToDTO(r store.Run) runDTO {
 	dto := runDTO{
 		ID:               r.ID.String(),
 		RepoID:           r.RepoID.String(),
-		IssueIID:         r.IssueIid,
+		Kind:             r.Kind,
 		IssueTitle:       r.IssueTitle,
 		IssueDescription: r.IssueDescription,
 		Status:           r.Status,
@@ -119,11 +128,17 @@ func runToDTO(r store.Run) runDTO {
 		Branch:           textPtrValue(r.Branch.Valid, r.Branch.String),
 		FailureReason:    textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
 		PlanMd:           textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
+		PipelineRef:      textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
+		FixVerdict:       textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),
 		ClaimedAt:        timePtr(r.ClaimedAt.Valid, r.ClaimedAt.Time),
 		StartedAt:        timePtr(r.StartedAt.Valid, r.StartedAt.Time),
 		FinishedAt:       timePtr(r.FinishedAt.Valid, r.FinishedAt.Time),
 		CreatedAt:        r.CreatedAt.Time,
 		UpdatedAt:        r.UpdatedAt.Time,
+	}
+	if r.IssueIid.Valid {
+		v := r.IssueIid.Int64
+		dto.IssueIID = &v
 	}
 	if r.WorkerID.Valid {
 		s := uuid.UUID(r.WorkerID.Bytes).String()
@@ -133,7 +148,29 @@ func runToDTO(r store.Run) runDTO {
 		v := r.MrIid.Int64
 		dto.MrIID = &v
 	}
+	// The failing pipeline's URL rides the frozen snapshot, not a column (the
+	// pipeline cache row is transient). Best-effort decode; a ci_fix run always has
+	// one, an issue run has no snapshot.
+	if url := failureSnapshotWebURL(r.FailureSnapshot); url != "" {
+		dto.PipelineWebURL = &url
+	}
 	return dto
+}
+
+// failureSnapshotWebURL pulls just the pipeline web URL out of a run's
+// failure_snapshot jsonb for the run-view header link. Returns "" for an issue run
+// (no snapshot) or a malformed one.
+func failureSnapshotWebURL(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var snap struct {
+		WebURL string `json:"web_url"`
+	}
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return ""
+	}
+	return snap.WebURL
 }
 
 type messageDTO struct {

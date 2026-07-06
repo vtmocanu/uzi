@@ -78,7 +78,7 @@ func (s *apStore) HasActiveRunForIssue(_ context.Context, arg store.HasActiveRun
 	if s.activeErr != nil {
 		return false, s.activeErr
 	}
-	return s.active[arg.IssueIid], nil
+	return s.active[arg.IssueIid.Int64], nil
 }
 
 type apRunCall struct {

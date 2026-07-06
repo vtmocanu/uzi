@@ -346,7 +346,7 @@ func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*pi
 		return out
 	}
 	for _, row := range rows {
-		out[row.IssueIid] = pipelineDTOFrom(row.Status, row.WebUrl, row.PipelineID, row.SyncedAt)
+		out[row.IssueIid.Int64] = pipelineDTOFrom(row.Status, row.WebUrl, row.PipelineID, row.SyncedAt)
 	}
 	return out
 }
@@ -359,7 +359,7 @@ func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*pi
 func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*pipelineDTO, position map[string]int, viewerID uuid.UUID) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
-		latestByIID[rr.IssueIid] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
+		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
 			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
 
@@ -555,7 +555,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// so the reconcile loop stops trying to reposition the card the human placed.
 	if _, err := h.q.ClearIssueRunsMovePending(r.Context(), store.ClearIssueRunsMovePendingParams{
 		RepoID:   repo.ID,
-		IssueIid: iid,
+		IssueIid: pgtype.Int8{Int64: iid, Valid: true},
 	}); err != nil {
 		// Non-fatal: the move already landed; a stray marker is at worst one
 		// reconcile attempt that the manual-drag guard itself skips.
@@ -569,7 +569,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	card := issueToCard(updated, position)
 	// Carry the issue's latest run on the single-card response too, so a drag never
 	// blanks the run badge the board is showing (the client replaces the card).
-	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: iid}); err == nil {
+	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
 			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {

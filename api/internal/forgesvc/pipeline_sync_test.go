@@ -184,6 +184,68 @@ func TestSyncPipelinesDisabledWhenMaxRefsZero(t *testing.T) {
 	}
 }
 
+func TestSyncPipelinesVerifiesFixBranch(t *testing.T) {
+	fixRun := store.Run{ID: uuid.New()}
+	// A ci_fix run's fix branch is watched (its run has an MR). Its post-fix pipeline
+	// PASSED, with an id newer than the failure that spawned the run.
+	st := &fakeStore{
+		watchedRefs: []store.ListWatchedRunRefsForRepoRow{runRef("ci-fix/pipeline-4200", 77)},
+		stampTarget: fixRun,
+	}
+	svc := newTestService(st)
+	f := &fakeForge{pipelineByMR: map[int64]forge.Pipeline{77: pipelineAt(4300, "success")}}
+
+	if err := svc.SyncPipelines(context.Background(), uuid.New(), 7, f, syncOpts(false)); err != nil {
+		t.Fatalf("SyncPipelines: %v", err)
+	}
+	if len(st.stamps) != 1 {
+		t.Fatalf("expected exactly one verdict stamp, got %d", len(st.stamps))
+	}
+	if st.stamps[0].ID != fixRun.ID || st.stamps[0].FixVerdict.String != "verified" {
+		t.Fatalf("expected 'verified' stamped on the fix run, got %+v", st.stamps[0])
+	}
+	// The target selector must be keyed on the FIX BRANCH and the observed pipeline
+	// id (the "newer than the failure" guard).
+	last := st.stampParams[len(st.stampParams)-1]
+	if last.Branch.String != "ci-fix/pipeline-4200" || last.ObservedPipelineID.Int64 != 4300 {
+		t.Fatalf("stamp-target selection must key on the fix branch + observed id, got %+v", last)
+	}
+}
+
+func TestSyncPipelinesStampsFixFailedOnRedPipeline(t *testing.T) {
+	fixRun := store.Run{ID: uuid.New()}
+	st := &fakeStore{
+		watchedRefs: []store.ListWatchedRunRefsForRepoRow{runRef("ci-fix/pipeline-4200", 77)},
+		stampTarget: fixRun,
+	}
+	svc := newTestService(st)
+	f := &fakeForge{pipelineByMR: map[int64]forge.Pipeline{77: pipelineAt(4300, "failed")}}
+
+	if err := svc.SyncPipelines(context.Background(), uuid.New(), 7, f, syncOpts(false)); err != nil {
+		t.Fatalf("SyncPipelines: %v", err)
+	}
+	if len(st.stamps) != 1 || st.stamps[0].FixVerdict.String != "fix_failed" {
+		t.Fatalf("a red post-fix pipeline must stamp 'fix_failed', got %+v", st.stamps)
+	}
+}
+
+func TestSyncPipelinesDoesNotStampWhileRunning(t *testing.T) {
+	st := &fakeStore{
+		watchedRefs: []store.ListWatchedRunRefsForRepoRow{runRef("ci-fix/pipeline-4200", 77)},
+		stampTarget: store.Run{ID: uuid.New()}, // a target exists...
+	}
+	svc := newTestService(st)
+	// ...but the pipeline has not concluded, so no verdict is stamped yet.
+	f := &fakeForge{pipelineByMR: map[int64]forge.Pipeline{77: pipelineAt(4300, "running")}}
+
+	if err := svc.SyncPipelines(context.Background(), uuid.New(), 7, f, syncOpts(false)); err != nil {
+		t.Fatalf("SyncPipelines: %v", err)
+	}
+	if len(st.stamps) != 0 {
+		t.Fatalf("a still-running pipeline must not stamp a verdict, got %+v", st.stamps)
+	}
+}
+
 func TestSyncPipelinesPassesWindowAndCapToQuery(t *testing.T) {
 	st := &fakeStore{}
 	svc := newTestService(st)

@@ -1,0 +1,51 @@
+{
+  "run_id": "33333333-3333-3333-3333-333333333333",
+  "kind": "ci_fix",
+  "issue_iid": null,
+  "issue_title": "Fix CI: main pipeline #4200",
+  "issue_description": "Diagnose and fix the failed pipeline for `main`.",
+  "status": "claimed",
+  "branch": null,
+  "session_id": null,
+  "last_seq": 0,
+  "iteration_count": 0,
+  "requeue_count": 0,
+  "plan_md": null,
+  "auto_approve": false,
+  "pipeline": {
+    "id": 4200,
+    "ref": "main",
+    "sha": "deadbeef",
+    "web_url": "https://gitlab.example.com/g/p/-/pipelines/4200",
+    "failed_jobs": [
+      {
+        "name": "unit",
+        "stage": "test",
+        "web_url": "https://gitlab.example.com/g/p/-/jobs/1",
+        "log_tail": "--- FAIL: TestFoo\n"
+      }
+    ]
+  },
+  "repo": {
+    "id": "22222222-2222-2222-2222-222222222222",
+    "url": "https://gitlab.example.com/g/p",
+    "clone_url": "https://gitlab.example.com/g/p.git",
+    "default_branch": "main",
+    "skills_enabled": false
+  },
+  "secrets": {
+    "forge_username": "uzi-bot",
+    "forge_pat": "FORGE-PAT-PLACEHOLDER",
+    "anthropic_oauth_token": "ANTHROPIC-OAUTH-PLACEHOLDER"
+  },
+  "agents": [],
+  "config": {
+    "run_timeout_seconds": 7200,
+    "idle_timeout_seconds": 600,
+    "max_iterations": 5,
+    "skill_max_bytes": 65536,
+    "skills_max_per_run": 32
+  },
+  "skills": [],
+  "skills_dropped": []
+}
