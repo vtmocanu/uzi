@@ -119,6 +119,10 @@ fresh_code() {
 # body, so the caller can assert on 200-vs-4xx (the concurrent-PUT race).
 apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+# apipost_code — like apipost but never -f: echoes only the HTTP status, for
+# asserting a 422 (the PRDLESS run-create gate and the disabled label endpoint).
+apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
+  -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 
 wait_http() {
   local deadline=$((SECONDS + 90))
@@ -157,10 +161,6 @@ wait_status() {
   done
   fail "timeout: run $run never reached '$want' (last: ${s:-none})"
 }
-
-# apipost_code — like apipost but never -f: echoes the HTTP status (for 409 asserts).
-apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
-  -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 
 # wait_board_pipeline STATUS [TIMEOUT] — wait until the board header's default-branch
 # CI badge reaches STATUS (the pipeline sync is poller-driven, PRD #6).
@@ -968,4 +968,73 @@ fake_post "/_e2e/pipelines" "{\"ref\":\"$AGENTBRANCH\",\"status\":\"success\"}" 
 wait_verdict "$AFIX" verified 20
 pass "agent-branch fix pipeline passed -> run $AFIX stamped verified"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #19 autopilot + PRD #6 CI-fix; executor=%s)\n' "$EXECUTOR"
+# =============================================================================
+# PRD #22 — PRDLESS escape hatch: an issue carrying the PRDLESS label runs with no
+# prds/*.md link, gated by the admin toggle; the label is applied/removed from
+# uzi's own UI (forge-first) via POST .../prdless. Exercises the run-create gate
+# (422 when disabled, run when enabled) and the toggle endpoint (apply/remove on
+# the fake forge + 422 when the feature is off).
+say "PRD #22: PRDLESS escape hatch (gate bypass + UI label toggle)"
+
+# Stage a PRD+PRDLESS issue with NO prds/*.md link (a human labelling it for the
+# escape hatch — uzi's own CreateIssue only stamps the PRD label), then FullSync so
+# uzi caches it (has_prd_link=false). The fresh GetIssue the run-create path reads
+# returns the PRDLESS label from the fake, which is what the bypass decides on.
+IID_PL="$(fake_post /_e2e/issues \
+  "$(jq -nc '{title:"E2E prdless run",description:"tiny fix, no plan file here",labels:["PRD","PRDLESS"]}')" | jq -r '.iid')"
+[ -n "$IID_PL" ] && [ "$IID_PL" != null ] || fail "could not stage the PRDLESS issue on the fake"
+apipost "/api/repos/$REPO_ID/sync" '' >/dev/null
+apiget "/api/repos/$REPO_ID/board" | jq -e --argjson iid "$IID_PL" \
+  '.board.cards[] | select(.iid==$iid) | .has_prd_link==false' >/dev/null \
+  || fail "staged PRDLESS issue #$IID_PL not cached with has_prd_link=false"
+pass "staged PRD+PRDLESS issue #$IID_PL (no PRD link), cached"
+
+# A uzi-created issue for the toggle path — starts with only the PRD label.
+IID_TG="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E prdless toggle","description":"no plan file here either"}' | jq -r '.card.iid')"
+[ -n "$IID_TG" ] && [ "$IID_TG" != null ] || fail "could not create the toggle issue"
+
+# --- feature OFF: the label bypasses nothing, and the endpoint refuses ---------
+apiput /api/admin/settings '{"settings":{"prdless_enabled":"false"}}' >/dev/null
+C="$(apipost_code "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_PL}")"
+[ "$C" = 422 ] || fail "prdless disabled: run-create on the labelled no-PRD issue should 422, got $C"
+pass "feature off: run-create on the PRDLESS-labelled no-PRD issue → 422"
+
+C="$(apipost_code "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":true}')"
+[ "$C" = 422 ] || fail "prdless disabled: the label endpoint should 422, got $C"
+pass "feature off: POST .../prdless → 422"
+
+# --- feature ON: the label bypasses the gate; the endpoint applies/removes ------
+apiput /api/admin/settings '{"settings":{"prdless_enabled":"true"}}' >/dev/null
+
+RUN_PL="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_PL}" | jq -r '.run.id')"
+[ -n "$RUN_PL" ] && [ "$RUN_PL" != null ] || fail "prdless-enabled run was not created (gate bypass failed)"
+wait_status "$RUN_PL" awaiting_approval
+pass "feature on: run $RUN_PL started with no PRD link and reached the plan gate"
+apipost "/api/runs/$RUN_PL/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_PL" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(apiget "/api/runs/$RUN_PL" | jq -r '.run.branch')" = "agent/issue-$IID_PL" ] \
+  || fail "PRDLESS run did not push agent/issue-$IID_PL"
+MR_PL="$(apiget "/api/runs/$RUN_PL" | jq -r '.run.mr_iid')"
+{ [ "$MR_PL" != null ] && [ "$MR_PL" -gt 0 ]; } || fail "PRDLESS run opened no MR (got $MR_PL)"
+pass "PRDLESS run completed the normal lifecycle (branch agent/issue-$IID_PL, MR !$MR_PL)"
+
+# UI toggle apply: the label lands on the fake forge and the returned card reflects it.
+CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":true}')"
+echo "$CARD" | jq -e '.card.labels | index("PRDLESS") != null' >/dev/null \
+  || fail "apply: returned card labels missing PRDLESS: $(echo "$CARD" | jq -c '.card.labels')"
+fake_state | jq -e --argjson iid "$IID_TG" \
+  '.issues[] | select(.iid==$iid) | .labels | index("PRDLESS") != null' >/dev/null \
+  || fail "apply: PRDLESS label not written to the fake forge issue #$IID_TG"
+pass "toggle apply: PRDLESS on the fake forge + reflected in the card"
+
+# UI toggle remove: the label is gone from the fake forge and the card.
+CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":false}')"
+echo "$CARD" | jq -e '.card.labels | index("PRDLESS") == null' >/dev/null \
+  || fail "remove: returned card still carries PRDLESS"
+fake_state | jq -e --argjson iid "$IID_TG" \
+  '.issues[] | select(.iid==$iid) | .labels | index("PRDLESS") == null' >/dev/null \
+  || fail "remove: PRDLESS label still on the fake forge issue #$IID_TG"
+pass "toggle remove: PRDLESS gone from the fake forge + the card"
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS; executor=%s)\n' "$EXECUTOR"

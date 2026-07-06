@@ -66,6 +66,43 @@ func TestAccessorsFallBackToDefaults(t *testing.T) {
 	}
 }
 
+func TestPrdlessAccessors(t *testing.T) {
+	// Empty table → compiled-in defaults: enabled (true) + "PRDLESS".
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.PrdlessEnabled(context.Background()); err != nil || got != true {
+		t.Fatalf("PrdlessEnabled default = %v, %v; want true", got, err)
+	}
+	if got, err := c.PrdlessLabel(context.Background()); err != nil || got != DefaultPrdlessLabel {
+		t.Fatalf("PrdlessLabel default = %q, %v; want %q", got, err, DefaultPrdlessLabel)
+	}
+
+	// "true"/"false" are honored verbatim; every other value (empty, junk, or a
+	// non-canonical spelling only reachable through the M1-deferred PUT) falls back
+	// to the compiled-in default (true) rather than silently reading as false.
+	for _, tc := range []struct {
+		stored string
+		want   bool
+	}{
+		{"true", true},
+		{"false", false},
+		{"", true},       // empty → default "true"
+		{"banana", true}, // junk → compiled-in default, NOT false
+		{"TRUE", true},   // non-canonical spelling → default, not a lenient parse
+		{"0", true},      // ditto
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyPrdlessEnabled, tc.stored)}}, time.Minute)
+		if got, _ := c.PrdlessEnabled(context.Background()); got != tc.want {
+			t.Errorf("PrdlessEnabled(stored=%q) = %v, want %v", tc.stored, got, tc.want)
+		}
+	}
+
+	// A configured custom label is returned verbatim.
+	c = New(&fakeStore{rows: []store.AppSetting{row(KeyPrdlessLabel, "NOSPEC")}}, time.Minute)
+	if got, _ := c.PrdlessLabel(context.Background()); got != "NOSPEC" {
+		t.Fatalf("PrdlessLabel = %q, want NOSPEC", got)
+	}
+}
+
 func TestAllReturnsStableShape(t *testing.T) {
 	fs := &fakeStore{rows: []store.AppSetting{row(KeyPRDLabel, "Feature")}}
 	c := New(fs, time.Minute)
@@ -222,6 +259,26 @@ func TestValidateDispatch(t *testing.T) {
 	if err := Validate(KeyDefaultTheme, "PRD"); err == nil {
 		t.Error("Validate(default_theme, \"PRD\") = nil; a valid label is not a valid theme")
 	}
+	// prdless_enabled routes to the strict bool parse, NOT the label rules — so a
+	// value a label rule would accept (short, no comma) is still rejected unless it
+	// is exactly "true"/"false" (PRD #22).
+	for _, ok := range []string{"true", "false"} {
+		if err := Validate(KeyPrdlessEnabled, ok); err != nil {
+			t.Errorf("Validate(prdless_enabled, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "banana", "1", "0", "TRUE", "yes"} {
+		if err := Validate(KeyPrdlessEnabled, bad); err == nil {
+			t.Errorf("Validate(prdless_enabled, %q) = nil, want a non-bool rejection", bad)
+		}
+	}
+	// prdless_label routes to the label rules like the other labels.
+	if err := Validate(KeyPrdlessLabel, "a,b"); err == nil {
+		t.Error("Validate(prdless_label, \"a,b\") = nil, want a label rejection")
+	}
+	if err := Validate(KeyPrdlessLabel, "PRDLESS"); err != nil {
+		t.Errorf("Validate(prdless_label, valid) = %v, want nil", err)
+	}
 }
 
 func TestLabelChanged(t *testing.T) {
@@ -229,6 +286,8 @@ func TestLabelChanged(t *testing.T) {
 		KeyPRDLabel:       "PRD",
 		KeyAutopilotLabel: "autopilot",
 		KeyDefaultTheme:   "ember",
+		KeyPrdlessEnabled: "true",
+		KeyPrdlessLabel:   "PRDLESS",
 	}
 	cases := []struct {
 		name    string
@@ -240,6 +299,10 @@ func TestLabelChanged(t *testing.T) {
 		{"an idempotent label write does not", map[string]string{KeyPRDLabel: "PRD"}, false},
 		{"label + theme together still resyncs on the label", map[string]string{KeyPRDLabel: "Feature", KeyDefaultTheme: "mission"}, true},
 		{"an empty update does not", map[string]string{}, false},
+		// PRD #22 Decision 9: prdless keys never re-filter a board, so neither forces a resync.
+		{"a prdless_enabled change does NOT force a resync", map[string]string{KeyPrdlessEnabled: "false"}, false},
+		{"a prdless_label change does NOT force a resync", map[string]string{KeyPrdlessLabel: "NOSPEC"}, false},
+		{"label + prdless together still resyncs on the label", map[string]string{KeyAutopilotLabel: "hands-off", KeyPrdlessLabel: "NOSPEC"}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -339,5 +402,43 @@ func TestValidateMergedRejectsEqualLabels(t *testing.T) {
 		KeyAutopilotLabel: "autopilot",
 	}); err != nil {
 		t.Errorf("distinct labels rejected: %v", err)
+	}
+}
+
+// TestValidateMergedThreeWayDistinct covers PRD #22 Decision 7: prdless_label must
+// be pairwise-distinct from prd_label and autopilot_label, the rejection names the
+// offending key, and distinctness holds regardless of the toggle state (the merged
+// map carries no prdless_enabled).
+func TestValidateMergedThreeWayDistinct(t *testing.T) {
+	base := func() map[string]string {
+		return map[string]string{
+			KeyPRDLabel:       "PRD",
+			KeyAutopilotLabel: "autopilot",
+			KeyPrdlessLabel:   "PRDLESS",
+		}
+	}
+
+	// prdless colliding with either other label is rejected, naming prdless_label.
+	for _, collideWith := range []string{"PRD", "autopilot"} {
+		m := base()
+		m[KeyPrdlessLabel] = collideWith
+		err := ValidateMerged(m)
+		if err == nil || !strings.Contains(err.Error(), "prdless_label") {
+			t.Errorf("prdless_label==%q: err = %v, want a rejection naming prdless_label", collideWith, err)
+		}
+	}
+
+	// Three distinct labels pass.
+	if err := ValidateMerged(base()); err != nil {
+		t.Errorf("three distinct labels rejected: %v", err)
+	}
+
+	// Post-merge atomic + toggle-independent: an admin renaming prd_label onto the
+	// (possibly disabled) prdless label collides on the merged set and is rejected —
+	// keeping a later re-enable always safe. ValidateMerged never reads the toggle.
+	m := base()
+	m[KeyPRDLabel] = "PRDLESS"
+	if err := ValidateMerged(m); err == nil {
+		t.Error("prd_label renamed onto the prdless label must be rejected on the merged set")
 	}
 }

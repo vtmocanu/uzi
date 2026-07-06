@@ -291,6 +291,13 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 	if user.Theme.Valid {
 		override = user.Theme.String
 	}
+	// PRDLESS bootstrap (PRD #22 M3): the SPA gates the label toggle and the
+	// PRDLESS badge on prdless_enabled and needs the label name. prdless_enabled is
+	// this payload's first bool field (the labels are strings); the typed accessor
+	// backs it. Best-effort like the rest: a cold settings read yields the
+	// compiled-in defaults (enabled, "PRDLESS"), never an error.
+	prdlessLabel, _ := h.settings.PrdlessLabel(ctx)
+	prdlessEnabled, _ := h.settings.PrdlessEnabled(ctx)
 	return map[string]any{
 		"user":            toDTO(user),
 		"prd_label":       prdLabel,
@@ -298,6 +305,8 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		"theme":           theme.Resolve(override, defaultTheme),
 		"theme_override":  textPtrValue(override != "", override),
 		"default_theme":   defaultTheme,
+		"prdless_label":   prdlessLabel,
+		"prdless_enabled": prdlessEnabled,
 	}
 }
 

@@ -43,6 +43,10 @@ type fakeForge struct {
 	pipelineMRErr  map[int64]error
 	latestPipeRefs []string
 	latestPipeMRs  []int64
+
+	// SetIssueLabel (PRD #22 M4) scripting + capture.
+	ensureErr   error           // makes SetIssueLabel's EnsureLabels fail
+	ensureCalls [][]forge.Label // one entry per EnsureLabels call, for the apply path
 }
 
 // mrUpdateCall records one UpdateIssueLabels invocation so the watcher tests can
@@ -59,7 +63,10 @@ func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) { ret
 func (f *fakeForge) ListLabels(context.Context, int64) ([]forge.Label, error) {
 	return nil, nil
 }
-func (f *fakeForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
+func (f *fakeForge) EnsureLabels(_ context.Context, _ int64, labels []forge.Label) error {
+	f.ensureCalls = append(f.ensureCalls, labels)
+	return f.ensureErr
+}
 func (f *fakeForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	f.listCalls = append(f.listCalls, opts)
 	if f.listErr != nil {

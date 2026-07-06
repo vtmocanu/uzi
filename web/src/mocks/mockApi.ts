@@ -64,6 +64,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   prd_label: "PRD",
   autopilot_label: "autopilot",
   default_theme: "ember",
+  prdless_enabled: "true",
+  prdless_label: "PRDLESS",
 };
 
 interface PersistedSettings {
@@ -90,7 +92,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
   const okApp =
     typeof a.prd_label === "string" &&
     typeof a.autopilot_label === "string" &&
-    typeof a.default_theme === "string";
+    typeof a.default_theme === "string" &&
+    typeof a.prdless_enabled === "string" &&
+    typeof a.prdless_label === "string";
   return okUser && okApp;
 }
 
@@ -174,6 +178,8 @@ function sessionBody() {
     theme: resolveTheme(userSettings.theme, appSettings.default_theme),
     theme_override: userSettings.theme,
     default_theme: appSettings.default_theme,
+    prdless_label: appSettings.prdless_label,
+    prdless_enabled: appSettings.prdless_enabled === "true",
   };
 }
 
@@ -226,15 +232,29 @@ export const mockApi = {
         if (!isTheme(value)) throw new ApiError(400, `default_theme: unknown theme: "${value}"`);
         continue;
       }
-      if (key !== "prd_label" && key !== "autopilot_label") {
+      // prdless_enabled is a strict bool, not a label (PRD #22 M1).
+      if (key === "prdless_enabled") {
+        if (value !== "true" && value !== "false") {
+          throw new ApiError(400, `prdless_enabled: must be "true" or "false"`);
+        }
+        continue;
+      }
+      if (key !== "prd_label" && key !== "autopilot_label" && key !== "prdless_label") {
         throw new ApiError(400, `unknown setting: ${key}`);
       }
       if (!value || value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
       if (value.length > 64) throw new ApiError(400, `${key}: must be at most 64 characters`);
       if (value.includes(",")) throw new ApiError(400, `${key}: must not contain a comma`);
     }
+    // The label triple must be pairwise-distinct (Decision 8 + PRD #22 Decision 7).
     if (merged.prd_label === merged.autopilot_label) {
       throw new ApiError(400, "prd_label and autopilot_label must differ");
+    }
+    if (merged.prdless_label === merged.prd_label) {
+      throw new ApiError(400, "prdless_label must differ from prd_label");
+    }
+    if (merged.prdless_label === merged.autopilot_label) {
+      throw new ApiError(400, "prdless_label must differ from autopilot_label");
     }
     appSettings = merged;
     persistSettings();
@@ -575,6 +595,22 @@ export const mockApi = {
     card.labels = [prd, ...card.labels.filter((l) => l !== prd && !columnNames.includes(l)), ...(to ? [to] : [])];
     card.column = to;
     card.conflict = false;
+    return delay({ card: { ...card } }, 320);
+  },
+  // PRDLESS label toggle (PRD #22 M4): 422 when disabled, else an idempotent
+  // add/remove of the one label (mirrors the server's forge-first helper —
+  // has_prd_link is untouched, every other label preserved).
+  setIssuePrdless: async (repoId: string, iid: number, apply: boolean) => {
+    const b = state.boards.get(repoId);
+    const card = b?.cards.find((c) => c.iid === iid);
+    if (!b || !card) throw new ApiError(404, "issue not found");
+    if (appSettings.prdless_enabled !== "true") {
+      throw new ApiError(422, "the PRDLESS label feature is disabled");
+    }
+    const label = appSettings.prdless_label;
+    if (card.labels.includes(label) !== apply) {
+      card.labels = apply ? [...card.labels, label] : card.labels.filter((l) => l !== label);
+    }
     return delay({ card: { ...card } }, 320);
   },
   getIssue: async (repoId: string, iid: number) => {

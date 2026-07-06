@@ -89,6 +89,7 @@ scan for command not found and report them somewhere so we can see what tools we
 - lanfuse integration
 - for CICD code generation uzi should plug to qdrant KB? how do we say this? we tell agents? skills better? myabe only skills?
 - have a way to analize sessions (like a LLM judge) - that checks if tools/permissions are missing and does some recommandations (maybe have a message inbox - both for user and admins, admins should see all notifications)
+- agents/skills maybe should sit in dedicated git repos? and be cloned to uzi? u should be able to add one or more repos? maybe users can bring their own repos?
 
 ## later - later
 

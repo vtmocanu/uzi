@@ -3,8 +3,10 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -316,9 +318,21 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PRDLESS bypass (PRD #22 Decision 3): compute allowWithoutPRD from the fresh
+	// forge snapshot's labels and the prdless settings, then thread it into the
+	// shared createRun gate. Reading the fresh labels (not the cache) means a
+	// just-added label works immediately, without waiting for a poller cycle;
+	// matching is exact, like board column labels. Settings reads are best-effort
+	// (the accessors return the default alongside a cold error): a settings blip
+	// falls back to the default label / enabled=true, and an unlabeled issue is
+	// still gated.
+	prdlessEnabled, _ := h.settings.PrdlessEnabled(r.Context())
+	prdlessLabel, _ := h.settings.PrdlessLabel(r.Context())
+	allowWithoutPRD := prdlessEnabled && slices.Contains(issue.Labels, prdlessLabel)
+
 	// The description cap is enforced inside CreateRun (shared with the autopilot
 	// path), surfaced here as ErrDescriptionTooLarge → 422.
-	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description)
+	run, err := h.wsvc.CreateRun(r.Context(), user.ID, repo.ID, req.IssueIID, issue.Description, allowWithoutPRD)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
@@ -328,7 +342,13 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrDescriptionTooLarge):
 			httpx.Error(w, http.StatusUnprocessableEntity, "issue description is too large to run")
 		case errors.Is(err, workersvc.ErrNoPRDLink):
-			httpx.Error(w, http.StatusUnprocessableEntity, "issue has no PRD link; add a prds/*.md link before starting a run")
+			// Extend the hint with the escape-hatch label only when the feature is
+			// enabled instance-wide, so a strict-regime instance never advertises it.
+			msg := "issue has no PRD link; add a prds/*.md link before starting a run"
+			if prdlessEnabled {
+				msg = fmt.Sprintf("issue has no PRD link; add a prds/*.md link (or the %s label) before starting a run", prdlessLabel)
+			}
+			httpx.Error(w, http.StatusUnprocessableEntity, msg)
 		case errors.Is(err, workersvc.ErrActiveRunExists):
 			httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
 		case errors.Is(err, workersvc.ErrBranchInUse):

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,13 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
+
+// PrdlessLabelColor is the GitLab label color EnsureLabels pins when the PRDLESS
+// label is auto-created on first apply from the uzi UI (PRD #22 Decision 8:
+// EnsureLabels requires a color, the way board columns pin theirs). Amber, chosen
+// distinct from the DefaultColumns palette (blues/purple/grey) so the escape-hatch
+// label reads as an exception, not a column.
+const PrdlessLabelColor = "#ec9a29"
 
 // DefaultColumns are the kanban columns seeded on the forge (as labels) the
 // first time a repo's board is opened, in board order. Colors are required by
@@ -167,6 +175,80 @@ func (s *Service) AutoMove(ctx context.Context, f forge.Forge, forgeProjectID in
 		WebUrl:         issue.WebUrl,
 		Author:         issue.Author,
 		HasPrdLink:     issue.HasPrdLink,
+		ForgeUpdatedAt: issue.ForgeUpdatedAt,
+	})
+}
+
+// SetIssueLabel adds or removes ONE named label on an issue forge-first, then
+// updates the cache incrementally — the mechanic behind the PRDLESS UI toggle
+// (PRD #22 Decision 10). Unlike AutoMove (which strips every other column label to
+// enforce single-column membership) it touches only the one label and preserves
+// everything else, so it must never be used for column moves.
+//
+// Idempotent by a cached-labels diff: when the desired state already holds (apply
+// and the label is already present, or remove and already absent) it is a local
+// no-op success with NO forge call. Otherwise, on apply it first EnsureLabels the
+// label (auto-creating it on the project the first time, pinned to
+// PrdlessLabelColor), then issues one UpdateIssueLabels with a single-element add
+// or remove set. Only on forge success does it upsert the incrementally-updated
+// label set — the one label added to / removed from the current cached set, never
+// a wholesale recompute from stale data — carrying HasPrdLink through verbatim
+// (this path never re-derives it). Returns the re-cached row; on a forge error the
+// cache is untouched, so a failed toggle never desyncs the cache from the forge.
+func (s *Service) SetIssueLabel(ctx context.Context, f forge.Forge, forgeProjectID int64, issue store.Issue, label string, apply bool) (store.Issue, error) {
+	var current []string
+	if err := json.Unmarshal(issue.Labels, &current); err != nil {
+		current = []string{}
+	}
+
+	// Diff-first: if the cache already reflects the desired state, skip the forge
+	// entirely and return the row unchanged (idempotent apply/remove).
+	if slices.Contains(current, label) == apply {
+		return issue, nil
+	}
+
+	var add, remove []string
+	if apply {
+		// Auto-create the label on the project the first time it is applied from
+		// uzi (board columns do the same); GitLab label creation needs a color.
+		if err := f.EnsureLabels(ctx, forgeProjectID, []forge.Label{{Name: label, Color: PrdlessLabelColor}}); err != nil {
+			return store.Issue{}, err
+		}
+		add = []string{label}
+	} else {
+		remove = []string{label}
+	}
+	if err := f.UpdateIssueLabels(ctx, forgeProjectID, issue.ForgeIssueIid, add, remove); err != nil {
+		return store.Issue{}, err
+	}
+
+	// Incremental cache update on success only: add/remove the one label on the
+	// current set (order preserved, every other label kept), never an overwrite
+	// computed from a possibly-stale snapshot.
+	next := make([]string, 0, len(current)+1)
+	if apply {
+		next = append(next, current...)
+		next = append(next, label)
+	} else {
+		for _, l := range current {
+			if l != label {
+				next = append(next, l)
+			}
+		}
+	}
+	labelsJSON, err := json.Marshal(next)
+	if err != nil {
+		return store.Issue{}, err
+	}
+	return s.q.UpsertIssue(ctx, store.UpsertIssueParams{
+		RepoID:         issue.RepoID,
+		ForgeIssueIid:  issue.ForgeIssueIid,
+		Title:          issue.Title,
+		State:          issue.State,
+		Labels:         labelsJSON,
+		WebUrl:         issue.WebUrl,
+		Author:         issue.Author,
+		HasPrdLink:     issue.HasPrdLink, // preserved verbatim; this path never re-derives it
 		ForgeUpdatedAt: issue.ForgeUpdatedAt,
 	})
 }
