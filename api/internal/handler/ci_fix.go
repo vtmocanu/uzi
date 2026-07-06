@@ -24,14 +24,14 @@ import (
 // pattern-based pass runs BEFORE any tail is frozen into failure_snapshot or a
 // claim payload. It targets the token SHAPES a teammate's pipeline might print:
 //   - GitLab token families (glpat-, gloas-, glrt-, glcbt-, glptt-, glsoat-,
-//     glimt-, glagent-) — a long base62/underscore/dash body.
+//     glimt-, glagent-, gldt- deploy tokens) — a long base62/underscore/dash body.
 //   - Anthropic keys (sk-ant-...), the shape of a printed per-user token.
 //   - Auth header lines a `curl -v` / `set -x` echo would emit: PRIVATE-TOKEN,
 //     Authorization (Bearer ...), and a bare "Bearer <token>".
 // Arbitrary third-party secrets with no recognizable shape remain the documented
 // residual risk (docs/configuration.md); the snapshot is owner/admin-visible only.
 var snapshotSecretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`gl(pat|oas|rt|cbt|ptt|soat|imt|agent)-[A-Za-z0-9_\-]{16,}`),
+	regexp.MustCompile(`gl(pat|oas|rt|cbt|ptt|soat|imt|agent|dt)-[A-Za-z0-9_\-]{16,}`),
 	regexp.MustCompile(`sk-ant-[A-Za-z0-9_\-]{16,}`),
 	// Header lines a `curl -v` / `set -x` echoes — redact the WHOLE value to EOL
 	// (`.` excludes newline, so `.*` stops at the line end), never just the first word.

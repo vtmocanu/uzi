@@ -70,7 +70,7 @@ uzi caches the latest pipeline per **watched ref** (a repo's default branch, plu
 
 **Verification caveat**: `verified` means "the fix MR's latest pipeline passed". A merge-result failure that only surfaces on `main` (a semantic conflict) is caught only if the project runs [merged-results pipelines](https://docs.gitlab.com/ee/ci/pipelines/merged_results_pipelines.html) — a GitLab-config concern, not a uzi setting.
 
-**Secrets-in-logs residual risk**: uzi redacts its own credentials (bot PAT, join token, Anthropic token) and known `glpat-*` shapes from snapshots, but cannot know every secret shape a teammate's pipeline might print. A snapshot is stored server-side like any run message, visible only to the run's owner and admins.
+**Secrets-in-logs residual risk**: the snapshot scrubber strips uzi's bot PAT by value (the forge driver's connection-PAT redactor) plus known token *shapes* (GitLab `glpat-`/`gloas-`/`glrt-`/`glcbt-`/`glptt-`/`glsoat-`/`glimt-`/`glagent-`/`gldt-`, Anthropic `sk-ant-`) and any `Authorization`/`PRIVATE-TOKEN`/`Bearer` header line. It does NOT scrub the worker join token or a per-user Anthropic token by value — those are caught only if a pipeline echoes them inside one of those header lines — and it cannot know every third-party secret shape a teammate's pipeline might print. A snapshot is stored server-side like any run message, visible only to the run's owner and admins.
 
 ## Access control (PRD #5)
 

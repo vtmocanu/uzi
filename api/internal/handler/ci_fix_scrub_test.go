@@ -17,6 +17,7 @@ func TestScrubKnownTokensRedactsTokenFamilies(t *testing.T) {
 		"glcbt":         "glcbt-" + secret,
 		"glptt":         "glptt-" + secret,
 		"glsoat":        "glsoat-" + secret,
+		"gldt":          "gldt-" + secret,
 		"sk-ant":        "ANTHROPIC_API_KEY=sk-ant-" + secret,
 		"private-token": "PRIVATE-TOKEN: " + secret,
 		"authorization": "Authorization: Bearer " + secret,

@@ -331,6 +331,10 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusUnprocessableEntity, "issue has no PRD link; add a prds/*.md link before starting a run")
 		case errors.Is(err, workersvc.ErrActiveRunExists):
 			httpx.Error(w, http.StatusConflict, "a run is already in progress for this issue")
+		case errors.Is(err, workersvc.ErrBranchInUse):
+			// Cross-kind exclusion (PRD #6): a ci_fix run is already holding this
+			// issue's agent branch/worktree.
+			httpx.Error(w, http.StatusConflict, "a CI-fix run is already working this issue's branch; cancel it before starting an issue run")
 		default:
 			slog.Error("create run", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

@@ -547,6 +547,17 @@ const server = https.createServer(
       }
       if (method === "POST" && rest === "/merge_requests") {
         const body = await readBody(req);
+        // GitLab returns 409 when an OPEN MR already exists for this
+        // source->target branch pair; the worker catches it and reuses the existing
+        // MR (findOpenMr) instead of stacking a second one. Emulate that so a ci_fix
+        // landing on an agent branch updates the existing MR (PRD #6), not a dupe.
+        const dup = state.mrs.find(
+          (m) => m.source_branch === body.source_branch && m.target_branch === body.target_branch && m.state === "opened",
+        );
+        if (dup) {
+          log("MR create 409 (open MR exists)", dup.iid, body.source_branch);
+          return send(res, 409, { message: [`Another open merge request already exists for this source branch: !${dup.iid}`] });
+        }
         const iid = state.nextMrIid++;
         const mr = {
           id: 5000 + iid,
