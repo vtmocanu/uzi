@@ -186,6 +186,9 @@ export interface ForgeConnection {
 // pipeline status; the web layer collapses it to a badge tone (pipelineBadge.ts).
 // web_url links to the pipeline on the forge; synced_at drives badge staleness.
 export interface PipelineStatus {
+  /** The watched ref this pipeline is for (default branch or an agent branch) —
+   *  what the Fix CI trigger POSTs to fix it (PRD #6). */
+  ref: string;
   status: string;
   web_url: string;
   pipeline_id: number;
@@ -351,10 +354,19 @@ export function isTerminalRun(status: string): boolean {
   return (TERMINAL_RUN_STATUSES as string[]).includes(status);
 }
 
+// FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
+// server-side from the post-fix pipeline; not_code is the agent's "not a code
+// problem" verdict; null means the fix is not yet verified.
+export type FixVerdict = "verified" | "fix_failed" | "not_code";
+
 export interface Run {
   id: string;
   repo_id: string;
-  issue_iid: number;
+  /** Run kind (PRD #6): "issue" works issue_iid's card; "ci_fix" fixes a failed
+   *  pipeline (pipeline_ref/pipeline_web_url/fix_verdict below). */
+  kind: string;
+  /** The worked issue for an issue run; null for a ci_fix run (no issue). */
+  issue_iid: number | null;
   issue_title: string;
   issue_description: string;
   status: RunStatus;
@@ -367,6 +379,11 @@ export interface Run {
   branch: string | null;
   mr_iid: number | null;
   failure_reason: string | null;
+  /** ci_fix (PRD #6): the failing ref, the failing pipeline's web URL (from the
+   *  snapshot), and the fix verdict. All null on an issue run. */
+  pipeline_ref: string | null;
+  pipeline_web_url: string | null;
+  fix_verdict: FixVerdict | null;
   plan_md: string | null;
   claimed_at: string | null;
   started_at: string | null;
@@ -615,6 +632,9 @@ const realApi = {
 
   createRun: (repoId: string, issueIid: number) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, { issue_iid: issueIid }),
+  /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
+  createCIFixRun: (repoId: string, ref: string) =>
+    request<{ run: Run }>("POST", `/repos/${repoId}/ci-fix-runs`, { ref }),
   listRuns: (params?: { repoId?: string; issueIid?: number }) => {
     const q = new URLSearchParams();
     if (params?.repoId) q.set("repo_id", params.repoId);

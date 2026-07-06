@@ -346,7 +346,7 @@ func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*pi
 		return out
 	}
 	for _, row := range rows {
-		out[row.IssueIid.Int64] = pipelineDTOFrom(row.Status, row.WebUrl, row.PipelineID, row.SyncedAt)
+		out[row.IssueIid.Int64] = pipelineDTOFrom(row.Ref, row.Status, row.WebUrl, row.PipelineID, row.SyncedAt)
 	}
 	return out
 }

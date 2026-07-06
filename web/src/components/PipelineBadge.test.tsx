@@ -1,13 +1,14 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { PipelineBadge } from "./PipelineBadge";
+import { FixCiButton, PipelineBadge } from "./PipelineBadge";
 import type { PipelineStatus } from "../lib/api";
 
 afterEach(cleanup);
 
 function pipeline(over: Partial<PipelineStatus> = {}): PipelineStatus {
   return {
+    ref: "main",
     status: "failed",
     web_url: "https://gitlab.example.com/g/r/-/pipelines/4242",
     pipeline_id: 4242,
@@ -36,5 +37,26 @@ describe("PipelineBadge", () => {
     render(<PipelineBadge pipeline={pipeline({ status: "running", synced_at: synced })} />);
     const link = screen.getByRole("link", { name: /CI running/i });
     expect(link.getAttribute("title")).toMatch(/^Pipeline running · synced .*ago$/);
+  });
+});
+
+describe("FixCiButton", () => {
+  it("renders only for a failed pipeline and fires onClick", () => {
+    let clicked = 0;
+    const { rerender } = render(
+      <FixCiButton pipeline={pipeline({ status: "failed" })} busy={false} onClick={() => (clicked += 1)} />,
+    );
+    const btn = screen.getByRole("button", { name: /fix ci/i });
+    btn.click();
+    expect(clicked).toBe(1);
+
+    // A passing pipeline shows no Fix CI affordance.
+    rerender(<FixCiButton pipeline={pipeline({ status: "success" })} busy={false} onClick={() => {}} />);
+    expect(screen.queryByRole("button", { name: /fix ci/i })).toBeNull();
+  });
+
+  it("disables while busy", () => {
+    render(<FixCiButton pipeline={pipeline({ status: "failed" })} busy={true} onClick={() => {}} />);
+    expect((screen.getByRole("button", { name: /starting/i }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

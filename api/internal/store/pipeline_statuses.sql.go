@@ -61,7 +61,7 @@ func (q *Queries) GetPipelineStatusByRef(ctx context.Context, arg GetPipelineSta
 }
 
 const listDefaultBranchPipelineStatuses = `-- name: ListDefaultBranchPipelineStatuses :many
-SELECT ps.repo_id, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
+SELECT ps.repo_id, ps.ref, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
 FROM pipeline_statuses ps
 JOIN repos r ON r.id = ps.repo_id
 WHERE ps.repo_id = ANY($1::uuid[]) AND ps.ref = r.default_branch
@@ -69,6 +69,7 @@ WHERE ps.repo_id = ANY($1::uuid[]) AND ps.ref = r.default_branch
 
 type ListDefaultBranchPipelineStatusesRow struct {
 	RepoID     uuid.UUID          `json:"repo_id"`
+	Ref        string             `json:"ref"`
 	Status     string             `json:"status"`
 	WebUrl     string             `json:"web_url"`
 	PipelineID int64              `json:"pipeline_id"`
@@ -91,6 +92,7 @@ func (q *Queries) ListDefaultBranchPipelineStatuses(ctx context.Context, repoIds
 		var i ListDefaultBranchPipelineStatusesRow
 		if err := rows.Scan(
 			&i.RepoID,
+			&i.Ref,
 			&i.Status,
 			&i.WebUrl,
 			&i.PipelineID,
@@ -113,7 +115,7 @@ WITH latest_run AS (
     WHERE r.repo_id = $1 AND r.issue_iid IS NOT NULL
     ORDER BY r.issue_iid, r.created_at DESC
 )
-SELECT lr.issue_iid, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
+SELECT lr.issue_iid, ps.ref, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
 FROM latest_run lr
 JOIN pipeline_statuses ps ON ps.repo_id = $1 AND ps.ref = lr.branch
 WHERE lr.branch IS NOT NULL AND lr.branch <> ''
@@ -121,6 +123,7 @@ WHERE lr.branch IS NOT NULL AND lr.branch <> ''
 
 type ListRunPipelineStatusesForRepoRow struct {
 	IssueIid   pgtype.Int8        `json:"issue_iid"`
+	Ref        string             `json:"ref"`
 	Status     string             `json:"status"`
 	WebUrl     string             `json:"web_url"`
 	PipelineID int64              `json:"pipeline_id"`
@@ -143,6 +146,7 @@ func (q *Queries) ListRunPipelineStatusesForRepo(ctx context.Context, repoID uui
 		var i ListRunPipelineStatusesForRepoRow
 		if err := rows.Scan(
 			&i.IssueIid,
+			&i.Ref,
 			&i.Status,
 			&i.WebUrl,
 			&i.PipelineID,

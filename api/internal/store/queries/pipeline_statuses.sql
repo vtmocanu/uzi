@@ -32,7 +32,7 @@ SELECT * FROM pipeline_statuses WHERE repo_id = $1 AND ref = $2;
 -- default-branch row is returned (run-branch rows share the table). Repos with no
 -- default branch, or no cached default-branch pipeline, simply produce no row and
 -- render a null badge.
-SELECT ps.repo_id, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
+SELECT ps.repo_id, ps.ref, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
 FROM pipeline_statuses ps
 JOIN repos r ON r.id = ps.repo_id
 WHERE ps.repo_id = ANY(@repo_ids::uuid[]) AND ps.ref = r.default_branch;
@@ -75,7 +75,7 @@ WITH latest_run AS (
     WHERE r.repo_id = @repo_id AND r.issue_iid IS NOT NULL
     ORDER BY r.issue_iid, r.created_at DESC
 )
-SELECT lr.issue_iid, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
+SELECT lr.issue_iid, ps.ref, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
 FROM latest_run lr
 JOIN pipeline_statuses ps ON ps.repo_id = @repo_id AND ps.ref = lr.branch
 WHERE lr.branch IS NOT NULL AND lr.branch <> '';

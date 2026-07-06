@@ -15,6 +15,9 @@ import (
 // pipeline's web URL, its id, and when uzi last synced it (badge staleness). A
 // null pipeline on a DTO means "no CI, or not yet synced" for that ref.
 type pipelineDTO struct {
+	// Ref is the watched ref this pipeline is for (default branch or an agent
+	// branch) — what the Fix CI trigger POSTs to fix this pipeline (PRD #6).
+	Ref        string    `json:"ref"`
 	Status     string    `json:"status"`
 	WebURL     string    `json:"web_url"`
 	PipelineID int64     `json:"pipeline_id"`
@@ -23,13 +26,13 @@ type pipelineDTO struct {
 
 // pipelineFromStatus maps a full cache row to the DTO.
 func pipelineFromStatus(s store.PipelineStatus) *pipelineDTO {
-	return &pipelineDTO{Status: s.Status, WebURL: s.WebUrl, PipelineID: s.PipelineID, SyncedAt: s.SyncedAt.Time}
+	return &pipelineDTO{Ref: s.Ref, Status: s.Status, WebURL: s.WebUrl, PipelineID: s.PipelineID, SyncedAt: s.SyncedAt.Time}
 }
 
 // pipelineDTOFrom maps the projected columns the list/board queries return (they
 // select only the display fields, not the whole row) to the DTO.
-func pipelineDTOFrom(status, webURL string, pipelineID int64, syncedAt pgtype.Timestamptz) *pipelineDTO {
-	return &pipelineDTO{Status: status, WebURL: webURL, PipelineID: pipelineID, SyncedAt: syncedAt.Time}
+func pipelineDTOFrom(ref, status, webURL string, pipelineID int64, syncedAt pgtype.Timestamptz) *pipelineDTO {
+	return &pipelineDTO{Ref: ref, Status: status, WebURL: webURL, PipelineID: pipelineID, SyncedAt: syncedAt.Time}
 }
 
 // defaultBranchPipelines returns default-branch CI badges keyed by repo id for the
@@ -47,7 +50,7 @@ func (h *Handler) defaultBranchPipelines(ctx context.Context, repoIDs []uuid.UUI
 		return out, err
 	}
 	for _, r := range rows {
-		out[r.RepoID] = pipelineDTOFrom(r.Status, r.WebUrl, r.PipelineID, r.SyncedAt)
+		out[r.RepoID] = pipelineDTOFrom(r.Ref, r.Status, r.WebUrl, r.PipelineID, r.SyncedAt)
 	}
 	return out, nil
 }

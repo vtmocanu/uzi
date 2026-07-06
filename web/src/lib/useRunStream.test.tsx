@@ -31,6 +31,7 @@ function fakeRun(): Run {
   return {
     id: "run-1",
     repo_id: "repo-1",
+    kind: "issue",
     issue_iid: 7,
     issue_title: "Wire the runtime",
     issue_description: "",
@@ -42,6 +43,9 @@ function fakeRun(): Run {
     branch: null,
     mr_iid: null,
     failure_reason: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
     plan_md: null,
     claimed_at: null,
     started_at: null,

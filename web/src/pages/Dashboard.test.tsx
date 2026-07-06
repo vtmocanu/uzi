@@ -42,6 +42,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
   return {
     id: "run-1",
     repo_id: "repo-1",
+    kind: "issue",
     issue_iid: 7,
     issue_title: "Live run row",
     issue_description: "",
@@ -53,6 +54,9 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     branch: null,
     mr_iid: null,
     failure_reason: null,
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
     plan_md: null,
     claimed_at: null,
     started_at: null,
