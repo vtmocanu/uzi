@@ -117,6 +117,12 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: true,
+    pipeline: {
+      status: "failed",
+      web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242",
+      pipeline_id: 4242,
+      synced_at: minsAgo(1),
+    },
   },
   {
     id: "repo-atlas",
@@ -127,6 +133,12 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    pipeline: {
+      status: "success",
+      web_url: "https://gitlab.example.com/vtmocanu/atlas-api/-/pipelines/3311",
+      pipeline_id: 3311,
+      synced_at: minsAgo(2),
+    },
   },
   {
     id: "repo-www",
@@ -137,6 +149,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: false,
     repo_skills_enabled: false,
+    pipeline: null,
   },
 ];
 
@@ -190,6 +203,7 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
       {
         iid: 29,
@@ -203,6 +217,7 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
       {
         iid: 27,
@@ -216,6 +231,7 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
       {
         iid: 26,
@@ -236,6 +252,7 @@ export const mockBoards: Record<string, Board> = {
           created_at: minsAgo(1),
           updated_at: minsAgo(1),
         }),
+        pipeline: null,
       },
       {
         iid: 24,
@@ -255,6 +272,13 @@ export const mockBoards: Record<string, Board> = {
           created_at: minsAgo(2),
           updated_at: minsAgo(1),
         }),
+        // The agent branch's MR pipeline is still running.
+        pipeline: {
+          status: "running",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4239",
+          pipeline_id: 4239,
+          synced_at: minsAgo(1),
+        },
       },
       {
         iid: 22,
@@ -268,6 +292,13 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: true,
         latest_run: null,
+        // A red per-card pipeline: the Fix CI affordance (M6) will hang off this.
+        pipeline: {
+          status: "failed",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4201",
+          pipeline_id: 4201,
+          synced_at: minsAgo(3),
+        },
       },
       {
         iid: 21,
@@ -287,6 +318,7 @@ export const mockBoards: Record<string, Board> = {
           created_at: minsAgo(10),
           updated_at: minsAgo(6),
         }),
+        pipeline: null,
       },
       {
         iid: 18,
@@ -307,6 +339,7 @@ export const mockBoards: Record<string, Board> = {
           created_at: minsAgo(225),
           updated_at: minsAgo(184),
         }),
+        pipeline: null,
       },
       {
         iid: 15,
@@ -320,8 +353,15 @@ export const mockBoards: Record<string, Board> = {
         closed: true,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
     ],
+    pipeline: {
+      status: "failed",
+      web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242",
+      pipeline_id: 4242,
+      synced_at: minsAgo(1),
+    },
   },
   "repo-atlas": {
     repo_id: "repo-atlas",
@@ -344,6 +384,7 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
       {
         iid: 8,
@@ -357,6 +398,7 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
       {
         iid: 7,
@@ -378,6 +420,7 @@ export const mockBoards: Record<string, Board> = {
           created_at: daysAgo(1.3),
           updated_at: daysAgo(1.1),
         }),
+        pipeline: null,
       },
       {
         iid: 5,
@@ -396,8 +439,10 @@ export const mockBoards: Record<string, Board> = {
           created_at: daysAgo(3.1),
           updated_at: daysAgo(3),
         }),
+        pipeline: null,
       },
     ],
+    pipeline: null,
   },
 };
 

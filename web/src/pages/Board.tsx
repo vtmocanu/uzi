@@ -30,6 +30,7 @@ import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { visibleColumns } from "../lib/boardColumns";
 import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
+import { PipelineBadge } from "../components/PipelineBadge";
 import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
 
@@ -303,7 +304,12 @@ export function Board() {
       <PageHeader
         backTo="/repos"
         backLabel="Boards"
-        title={board?.path_with_namespace ?? "Board"}
+        titleNode={
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-xl font-semibold tracking-tight">{board?.path_with_namespace ?? "Board"}</h1>
+            {board?.pipeline && <PipelineBadge pipeline={board.pipeline} />}
+          </div>
+        }
         description="Columns are GitLab labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here."
         actions={
           <>
@@ -591,6 +597,7 @@ function IssueCard({
             conflict
           </Badge>
         )}
+        {card.pipeline && <PipelineBadge pipeline={card.pipeline} />}
       </div>
       {(run || card.author) && (
         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-faint">

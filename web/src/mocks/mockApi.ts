@@ -611,6 +611,7 @@ export const mockApi = {
       closed: false,
       conflict: false,
       latest_run: null,
+      pipeline: null,
     };
     b.cards.unshift(card);
     return delay({ card: { ...card } }, 450);

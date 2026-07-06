@@ -181,6 +181,17 @@ export interface ForgeConnection {
   privilege_report: PrivilegeReport | null;
 }
 
+// PipelineStatus is a watched ref's latest CI pipeline (PRD #6), or null on a DTO
+// when the ref has no CI or has not been synced yet. status is the raw GitLab
+// pipeline status; the web layer collapses it to a badge tone (pipelineBadge.ts).
+// web_url links to the pipeline on the forge; synced_at drives badge staleness.
+export interface PipelineStatus {
+  status: string;
+  web_url: string;
+  pipeline_id: number;
+  synced_at: string;
+}
+
 export interface Repo {
   id: string;
   connection_id: string;
@@ -193,6 +204,9 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  // Default-branch CI status (PRD #6), null when there is no cached default-branch
+  // pipeline (no CI, MR-only pipelines, or not yet synced).
+  pipeline: PipelineStatus | null;
 }
 
 export interface BoardColumn {
@@ -228,6 +242,10 @@ export interface Card {
   closed: boolean;
   conflict: boolean;
   latest_run: LatestRun | null;
+  // CI status of the card's most-recent run's branch (PRD #6), null when that run
+  // has no branch, no CI, or the card has never run. Drives the per-card badge and
+  // the Fix CI affordance.
+  pipeline: PipelineStatus | null;
 }
 
 export interface Board {
@@ -236,6 +254,9 @@ export interface Board {
   web_url: string;
   columns: BoardColumn[];
   cards: Card[];
+  // Repo default-branch CI status (PRD #6, the board header badge), null when
+  // there is no cached default-branch pipeline.
+  pipeline: PipelineStatus | null;
 }
 
 // IssueDetail is the in-app issue view payload (PRD #12 §3): the board card
