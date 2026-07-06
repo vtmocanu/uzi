@@ -183,7 +183,11 @@ export class StubExecutor implements Executor {
     const label = isCIFix ? `CI fix on \`${ctx.branch}\`` : `issue #${ctx.issueIid}`;
     // A ci_fix run can conclude that the failure is not a code problem (PRD #6):
     // the E2E drives that path via the sentinel.
-    const notCode = isCIFix && (ctx.issueDescription.includes(STUB_NOT_CODE_SENTINEL) || ctx.issueTitle.includes(STUB_NOT_CODE_SENTINEL));
+    const notCode =
+      isCIFix &&
+      (ctx.issueDescription.includes(STUB_NOT_CODE_SENTINEL) ||
+        ctx.issueTitle.includes(STUB_NOT_CODE_SENTINEL) ||
+        (ctx.pipeline?.failed_jobs ?? []).some((j) => j.log_tail.includes(STUB_NOT_CODE_SENTINEL)));
 
     if (this.opts.planGate && ctx.gatePlan) {
       const planMd = [

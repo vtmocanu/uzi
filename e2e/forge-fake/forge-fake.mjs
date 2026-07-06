@@ -65,10 +65,17 @@ const state = {
   // application" (ListIssueLabelEvents). GitLab returns them oldest-first with
   // globally-monotonic ids; the fake preserves that (append-only, rising id).
   labelEvents: /** @type {Record<number, any[]>} */ ({}),
+  // CI pipelines per ref (PRD #6). Keyed by ref (a branch name); each value is a
+  // GitLab-shaped pipeline plus its jobs (with traces). The harness seeds/flips
+  // these via the /_e2e/pipelines mutator to drive the CI-status + Fix CI +
+  // verification flow. LatestMRPipeline resolves an MR to its source_branch's ref.
+  pipelines: /** @type {Record<string, any>} */ ({}),
   nextIssueIid: 1,
   nextMrIid: 1,
   nextNoteId: 5000,
   nextLabelEventId: 100,
+  nextPipelineId: 900,
+  nextJobId: 700,
 };
 
 function persist() {
@@ -76,7 +83,7 @@ function persist() {
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(
-        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, labelEvents: state.labelEvents },
+        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, labelEvents: state.labelEvents, pipelines: state.pipelines },
         null,
         2,
       ),
@@ -98,6 +105,8 @@ function load() {
     state.mrs = Array.isArray(saved.mrs) ? saved.mrs : [];
     state.notes = Array.isArray(saved.notes) ? saved.notes : [];
     state.labelEvents = saved.labelEvents && typeof saved.labelEvents === "object" ? saved.labelEvents : {};
+    state.pipelines = saved.pipelines && typeof saved.pipelines === "object" ? saved.pipelines : {};
+    state.nextPipelineId = Math.max(899, ...Object.values(state.pipelines).map((p) => p.id)) + 1;
     state.nextIssueIid = Math.max(0, ...Object.keys(state.issues).map(Number)) + 1;
     state.nextMrIid = Math.max(0, ...state.mrs.map((m) => m.iid)) + 1;
     state.nextNoteId = Math.max(4999, ...state.notes.map((n) => n.id)) + 1;
@@ -153,6 +162,20 @@ function send(res, status, body) {
   const payload = body === undefined ? "" : JSON.stringify(body);
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(payload);
+}
+
+// pipelineInfo strips the internal jobs list to the GitLab PipelineInfo shape the
+// list endpoints return (PRD #6).
+function pipelineInfo(p) {
+  return {
+    id: p.id, iid: p.iid, project_id: p.project_id, status: p.status,
+    ref: p.ref, sha: p.sha, web_url: p.web_url, created_at: p.created_at, updated_at: p.updated_at,
+  };
+}
+
+// jobInfo maps an internal job to the GitLab Job shape ListPipelineJobs returns.
+function jobInfo(j) {
+  return { id: j.id, name: j.name, stage: j.stage, status: j.status, web_url: j.web_url };
 }
 
 // labels may arrive as a JSON array or a comma-joined string, depending on the
@@ -328,6 +351,41 @@ const server = https.createServer(
       return send(res, 200, mr);
     }
 
+    // Set/flip a ref's pipeline — the harness stand-in for CI running (PRD #6).
+    // Body: {ref, status, sha?, jobs?} where jobs is [{name, stage, status, trace}].
+    // The id auto-increments (so a re-flip after a fix gets an id > the failure's,
+    // which is what the verification "observed id > snapshot id" guard needs); pass
+    // id explicitly to pin it. E2E-only mutator.
+    if (method === "POST" && path === "/_e2e/pipelines") {
+      const body = await readBody(req);
+      const ref = String(body.ref || "");
+      if (!ref) return send(res, 400, { message: "ref is required" });
+      const id = Number.isFinite(body.id) ? body.id : state.nextPipelineId++;
+      const jobs = (body.jobs || []).map((j) => ({
+        id: state.nextJobId++,
+        name: j.name || "job",
+        stage: j.stage || "test",
+        status: j.status || "failed",
+        web_url: `${PROJECT.web_url}/-/jobs/${state.nextJobId}`,
+        trace: j.trace || "",
+      }));
+      state.pipelines[ref] = {
+        id,
+        iid: id,
+        project_id: PROJECT.id,
+        ref,
+        sha: body.sha || `sha-${id}`,
+        status: String(body.status || "failed"),
+        web_url: `${PROJECT.web_url}/-/pipelines/${id}`,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        jobs,
+      };
+      persist();
+      log("pipeline set", ref, "->", state.pipelines[ref].status, "#" + id);
+      return send(res, 200, state.pipelines[ref]);
+    }
+
     // --- GitLab v4 subset -----------------------------------------------------
     // Token verify (api seed + connect): CurrentUser. is_admin is omitted (a
     // compliant, non-admin bot) — GitLab only returns it for an admin caller.
@@ -445,6 +503,37 @@ const server = https.createServer(
       if (method === "POST" && rest === "/labels") {
         const body = await readBody(req);
         return send(res, 201, { id: 1, name: body.name || "label", color: body.color || "#cccccc" });
+      }
+
+      // Pipelines (PRD #6). LatestPipeline: newest branch pipeline for a ref
+      // (the driver asks per_page=1, so the single cached pipeline suffices).
+      if (method === "GET" && rest === "/pipelines") {
+        const ref = url.searchParams.get("ref");
+        const p = ref ? state.pipelines[ref] : null;
+        return send(res, 200, p ? [pipelineInfo(p)] : []);
+      }
+      // ListPipelineJobs — only at Fix CI snapshot time.
+      const pjobs = rest.match(/^\/pipelines\/(\d+)\/jobs$/);
+      if (method === "GET" && pjobs) {
+        const p = Object.values(state.pipelines).find((x) => x.id === Number(pjobs[1]));
+        return send(res, 200, p ? p.jobs.map(jobInfo) : []);
+      }
+      // JobLogTail — plain text trace, like GitLab.
+      const jtrace = rest.match(/^\/jobs\/(\d+)\/trace$/);
+      if (method === "GET" && jtrace) {
+        const job = Object.values(state.pipelines)
+          .flatMap((x) => x.jobs)
+          .find((j) => j.id === Number(jtrace[1]));
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        return res.end(job ? job.trace : "");
+      }
+      // LatestMRPipeline — resolve MR -> source_branch -> that ref's pipeline. This
+      // is how a fix branch's post-fix pipeline is observed for verification.
+      const mrPipes = rest.match(/^\/merge_requests\/(\d+)\/pipelines$/);
+      if (method === "GET" && mrPipes) {
+        const mr = state.mrs.find((m) => m.iid === Number(mrPipes[1]));
+        const p = mr ? state.pipelines[mr.source_branch] : null;
+        return send(res, 200, p ? [pipelineInfo(p)] : []);
       }
 
       // Merge requests.
