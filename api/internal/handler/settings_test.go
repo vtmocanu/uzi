@@ -91,6 +91,12 @@ func TestUpdateSettingsValidationRejections(t *testing.T) {
 		// Current autopilot_label is its default "autopilot"; setting prd_label to
 		// the same value must trip the cross-key rule.
 		"equal labels": `{"settings":{"prd_label":"autopilot"}}`,
+		// PRD #22 M1: prdless_enabled is a strict bool; a non-bool is rejected.
+		"non-bool prdless_enabled": `{"settings":{"prdless_enabled":"banana"}}`,
+		// prdless_label must be pairwise-distinct from the other two (defaults PRD /
+		// autopilot), even against their stored values on a single-key PUT.
+		"prdless equals prd default":       `{"settings":{"prdless_label":"PRD"}}`,
+		"prdless equals autopilot default": `{"settings":{"prdless_label":"autopilot"}}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

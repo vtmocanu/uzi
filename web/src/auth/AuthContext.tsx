@@ -13,6 +13,7 @@ import {
   setUnauthorizedHandler,
   DEFAULT_PRD_LABEL,
   DEFAULT_AUTOPILOT_LABEL,
+  DEFAULT_PRDLESS_LABEL,
   type SessionResponse,
   type User,
 } from "../lib/api";
@@ -34,6 +35,11 @@ interface AuthState {
   theme: Theme;
   themeOverride: string | null;
   defaultTheme: Theme;
+  // PRDLESS escape-hatch config (PRD #22). prdlessEnabled gates the label toggle's
+  // visibility; it defaults to false so a server that predates the bootstrap
+  // fields simply hides the toggle rather than showing one the backend 422s.
+  prdlessLabel: string;
+  prdlessEnabled: boolean;
   register: (email: string, password: string, displayName: string) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -50,13 +56,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<Theme>(DEFAULT_THEME);
   const [themeOverride, setThemeOverride] = useState<string | null>(null);
   const [defaultTheme, setDefaultTheme] = useState<Theme>(DEFAULT_THEME);
+  const [prdlessLabel, setPrdlessLabel] = useState(DEFAULT_PRDLESS_LABEL);
+  const [prdlessEnabled, setPrdlessEnabled] = useState(false);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
   // the label fields. It also resolves and applies the theme (PRD #21): the
   // server sends the resolved theme, but we re-resolve from the override +
   // default so a server that predates the theme fields still yields ember, then
-  // stamp <html data-theme> so a login/refresh restyles live.
+  // stamp <html data-theme> so a login/refresh restyles live. prdless_enabled is a
+  // bool, so `?? false` (not `||`) keeps an explicit false; an absent field (older
+  // server) also reads as off.
   const applySession = useCallback((session: SessionResponse) => {
     setUser(session.user);
     setPrdLabel(session.prd_label || DEFAULT_PRD_LABEL);
@@ -66,6 +76,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setDefaultTheme(resolveTheme(session.default_theme, DEFAULT_THEME));
     setTheme(resolved);
     applyTheme(resolved);
+    setPrdlessLabel(session.prdless_label || DEFAULT_PRDLESS_LABEL);
+    setPrdlessEnabled(session.prdless_enabled ?? false);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -126,6 +138,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       theme,
       themeOverride,
       defaultTheme,
+      prdlessLabel,
+      prdlessEnabled,
       register,
       login,
       logout,
@@ -139,6 +153,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       theme,
       themeOverride,
       defaultTheme,
+      prdlessLabel,
+      prdlessEnabled,
       register,
       login,
       logout,

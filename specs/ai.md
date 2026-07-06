@@ -3019,3 +3019,134 @@ scoped settings-only); Decision 6 (the `VITE_UZI_MOCK=1` build is the review veh
   It is **independent of the `uzi.theme` pre-paint cache key** (§116) — different key,
   different purpose (mock backend state vs. real pre-paint cache), so they don't
   interfere.
+
+# PRD #22 — PRDLESS label: run an issue without a PRD link
+
+Serves human Feature #22 (an admin-controlled escape-hatch label that lets an issue run
+without a `prds/*.md` link — configurable name, feature on/off, both in admin settings;
+enabled out of the box; default name `PRDLESS`; the label can be added/removed directly
+from the uzi web UI). User-stated 2026-07-05. Section numbers continue past PRD #21's
+#118. Full rationale + Decision Log: `prds/22-prdless-label.md`.
+
+**Status (branch `prd-22-prdless-label`):** prd-21 landed on main and is merged into this
+branch. M1 (strict per-key validation + admin-settings toggle/name UI), M2 (gate bypass,
+manual + autopilot), M4 (UI label toggle endpoint + forgesvc helper), and M5 (docs) are
+built. M3 (bootstrap fields + web badges) is built too; M6 (e2e) is the remaining
+milestone — each decision below flags the milestone that owns it.
+
+## 119. prdless settings keys + on-by-default resolution
+
+Serves human: "name configurable, feature toggleable on/off, both in admin settings";
+"enabled out of the box"; "default name PRDLESS".
+
+- **Two `app_settings` keys** on the PRD #19 KV store (§93): `prdless_enabled`
+  (`"true"`/`"false"`) and `prdless_label`, with **compiled-in defaults** (`true`,
+  `"PRDLESS"`) in `settings.Defaults` and typed accessors alongside `PRDLabel`/
+  `AutopilotLabel`. **No migration, no seed rows**: `Cache.All`/`Effective` range over
+  `Defaults`, so absent rows are synthesized server-side and `GET /api/admin/settings`
+  always returns both keys. On-by-default falls straight out of the default map — an
+  absent `prdless_enabled` row means enabled.
+- **Unspecified = on is the single meaning.** A malformed stored `prdless_enabled` value
+  (not `"true"`/`"false"`) resolves to the compiled default (enabled), exactly like an
+  absent row — a junk value can never silently flip a default-on feature *off*. The
+  accessor keeps this tolerance as defense-in-depth alongside the strict write validation
+  (below), so a value written directly to the DB (bypassing the handler) still resolves
+  safely.
+- **Strict per-key validation (M1)** registers into prd-21's `settings.Validate(key, value)`
+  per-key switch: `prdless_enabled` → strict bool parse (exactly `"true"`/`"false"`);
+  `prdless_label` → label rules (non-empty, ≤ 64 runes, no comma) **plus pairwise-distinct**
+  (in `ValidateMerged`) from both `prd_label` and `autopilot_label`, validated on the
+  **post-merge** set and **regardless of the toggle state** (a disabled-but-colliding label
+  must be renamed first, so re-enabling is always safe; equal to `prd_label` would exempt
+  every issue, equal to `autopilot_label` would conflate "hands-off" with "spec-less"). Each
+  distinctness rejection names the key to change.
+- **prdless keys excluded from the `ForceReconcile` `changed` set** (§96, M1): they don't
+  affect the poller's PRD-label filter, so a prdless PUT must not trigger a repo resync
+  (the precedent prd-21's presentation-only `default_theme` key sets via `LabelChanged`).
+
+## 120. Gate bypass: policy in the callers, enforcement in the shared service (M2, built)
+
+Serves human: "the label lets an issue run without a prds/*.md link."
+
+- **One enforcement point, two policy sites.** `workersvc` gains **no settings
+  dependency**. Each caller that already holds a forge-fresh issue snapshot computes
+  `allowWithoutPRD := prdlessEnabled && contains(issue.Labels, prdlessLabel)` and passes
+  that single bool down; the shared `createRun` gate becomes
+  `if !issue.HasPrdLink && !allowWithoutPRD { return ErrNoPRDLink }`. The manual handler
+  passes it into `CreateRun`, the autopilot poller into `CreateAutopilotRun` — **both
+  paths**, since the shared gate means the signature change touches both anyway.
+- **Decided on the forge-fresh snapshot, exact match.** Both callers already re-fetch the
+  issue from the forge immediately before run creation (manual handler; autopilot poller's
+  `GetIssue`), so a just-added label takes effect without waiting for a poller cycle. Match
+  is **exact — case- and whitespace-sensitive** — the same discipline board column labels
+  use. `has_prd_link` **cache semantics are untouched** (the flag still means "description
+  links a PRD file"; the bypass is layered at the decision point, never baked into the
+  cached flag).
+- **Evaluated once, at run creation.** Disabling the feature or removing the label neither
+  stops nor re-gates an already queued/claimed/running/awaiting-approval run — prdless
+  inherits the existing invariant that resume/requeue/claim never re-check `HasPrdLink`.
+  Toggling off blocks only *new* runs. Deliberate.
+- **Run is otherwise identical.** No new run flag, no claim-payload change, no prompt
+  variant: same state machine, planning turn, approval gate, guardrails. A thin
+  description is caught by the retained planning turn + human approval.
+- **422 message extended** when the feature is enabled instance-wide, interpolating the
+  label name from settings ("...add a prds/*.md link (or the PRDLESS label) before starting
+  a run").
+- **Best-effort settings read, fails OPEN to the default.** A settings read error at the
+  run-create gate degrades to enabled=true (the already-safe default) rather than blocking
+  every run start on a settings hiccup — deliberately the opposite of the mutating endpoint
+  (§121).
+
+## 121. UI label toggle: endpoint + forge-first single-label helper (M4, built)
+
+Serves human: "add/remove the label directly from the uzi web UI, not only in GitLab."
+
+- **Dedicated endpoint** `POST /api/repos/{id}/issues/{iid}/prdless`, body `{"apply": bool}`,
+  under `RequireAuth` + CSRF **plus the per-user forge limiter** like every other
+  forge-writing route. The **label name is resolved server-side from settings** — the
+  client never names a label. Returns **422 when the feature is disabled**.
+- **New single-label forgesvc helper, NOT the column-move path.** `AutoMove`/
+  `PlanLabelMove` strip all *other* column labels to enforce single-column membership;
+  reusing them would clobber columns. The helper adds or removes **only** the one prdless
+  label and preserves everything else, keeping forge-first discipline:
+  - **Idempotent cached-labels diff first**: already-present-on-apply / already-absent-on-
+    remove → local no-op success, **no forge call**.
+  - Otherwise **`EnsureLabels` on apply only** (auto-creates the label the first time it is
+    applied from uzi, color **`#ec9a29`** = `forgesvc.PrdlessLabelColor`), then **one**
+    `UpdateIssueLabels` with a single-element add-or-remove set.
+  - **Cache updated incrementally on forge success only** — add/remove the one label on the
+    current cached set, never a wholesale overwrite from stale data. `HasPrdLink` carried
+    verbatim.
+- **Card response** built like `MoveIssue`'s — column-position map + `latest_run`
+  re-hydration — so a single-card replace doesn't blank the run badge. **No optimistic
+  update** on the web side (wait for the 200; forge-first).
+- **Toggle affordance.** The web toggle (IssueView primary, board card secondary) is
+  visible only when `prdless_enabled`, which the SPA reads from the session bootstrap
+  (§122). **Generic arbitrary-label editing from uzi is out of scope**: labels are board
+  semantics (columns, PRD, autopilot, prdless); free-form label management stays in GitLab.
+
+## 122. Web bootstrap + badges, and the quality-gate framing (M3, built)
+
+Serves human: the escape hatch is discoverable in the UI without weakening the primary
+directive (agents never touch `main`).
+
+- **Session bootstrap** (`sessionPayload`, `handler/auth.go`, M3) gains `prdless_label`
+  (string) and `prdless_enabled` (bool — its first bool field), alongside the existing
+  labels + theme fields, so the SPA gates the toggle and badge on `prdless_enabled` and
+  knows the label name. A server predating the fields omits both; the SPA treats the
+  feature as off.
+- **Badge** (M3): the board card and issue view replace the "no PRD link" warning badge
+  with a distinct badge showing the configured label name (tone `brand` — uzi's accent,
+  Open Question 1 resolved; title "PRD-link gate bypassed by label") when the feature is
+  enabled and the issue carries the label. The board column-suggestion filter also excludes
+  `prdless_label` (it is a workflow marker, never a column).
+- **Quality gate, not a security boundary.** The bypass is a **gate exception, not a mode**,
+  and never weakens any of the four `main`-protection layers; the human still clicks Start
+  and approves the plan. Who can apply the label is bounded by GitLab membership (Reporter+)
+  plus any uzi session on a connected repo — the **same population that already moves board
+  cards** (also a forge label write). The two "toggles" are different populations: the
+  *settings* toggle is admin-only; the *label* apply/remove is any uzi session on a
+  connected repo.
+- **Composition is allowed by design**: an issue carrying PRD + autopilot + PRDLESS runs
+  unattended with no PRD link — all three are explicit opt-ins; M2 covers it with a
+  composition test. Called out as a docs caveat.

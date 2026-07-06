@@ -269,18 +269,26 @@ export interface AppSettings {
   prd_label: string;
   autopilot_label: string;
   default_theme: string;
+  // PRDLESS escape hatch (PRD #22). prdless_enabled is the text "true"/"false"
+  // (the API serves every setting as a string); prdless_label is the label name.
+  prdless_enabled: string;
+  prdless_label: string;
 }
 
 // Compiled-in label defaults, mirroring the API's settings package. The SPA uses
-// them until the session bootstrap resolves the configured values (PRD #19 M2).
+// them until the session bootstrap resolves the configured values (PRD #19 M2,
+// PRD #22 for prdless).
 export const DEFAULT_PRD_LABEL = "PRD";
 export const DEFAULT_AUTOPILOT_LABEL = "autopilot";
+export const DEFAULT_PRDLESS_LABEL = "PRDLESS";
 
 // SessionResponse is the auth/session bootstrap body (login, register, me). It
 // carries the user, the instance forge labels the board and issue-creation UI
-// need before their first call (PRD #19 M2), and the three theme fields the
-// Appearance picker needs (PRD #21): the resolved theme the SPA renders, the
-// user's raw override (null = none), and the instance default.
+// need before their first call (PRD #19 M2), the three theme fields the
+// Appearance picker needs (PRD #21: resolved theme, the user's raw override with
+// null = none, and the instance default), and the prdless fields (PRD #22,
+// optional: a server that predates them omits both and the SPA treats the feature
+// as off).
 export interface SessionResponse {
   user: User;
   prd_label: string;
@@ -288,6 +296,8 @@ export interface SessionResponse {
   theme: string;
   theme_override: string | null;
   default_theme: string;
+  prdless_label?: string;
+  prdless_enabled?: boolean;
 }
 
 // AuthConfig is the unauthenticated registration policy the register page reads
@@ -582,6 +592,11 @@ const realApi = {
     request<{ issue: IssueDetail }>("GET", `/repos/${repoId}/issues/${iid}`),
   moveIssue: (repoId: string, iid: number, toColumn: string) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/move`, { to_column: toColumn }),
+  // Apply/remove the PRDLESS label from the UI (PRD #22 M4). Forge-first, so the
+  // returned card is authoritative — the caller replaces its card with it (no
+  // optimistic update).
+  setIssuePrdless: (repoId: string, iid: number, apply: boolean) =>
+    request<{ card: Card }>("POST", `/repos/${repoId}/issues/${iid}/prdless`, { apply }),
   syncRepo: (repoId: string) => request<{ board: Board }>("POST", `/repos/${repoId}/sync`),
   createIssue: (repoId: string, title: string, description: string) =>
     request<{ card: Card }>("POST", `/repos/${repoId}/issues`, { title, description }),

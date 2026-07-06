@@ -82,9 +82,10 @@ func (s *apStore) HasActiveRunForIssue(_ context.Context, arg store.HasActiveRun
 }
 
 type apRunCall struct {
-	userID, repoID uuid.UUID
-	iid            int64
-	desc           string
+	userID, repoID  uuid.UUID
+	iid             int64
+	desc            string
+	allowWithoutPRD bool
 }
 
 type apRuns struct {
@@ -93,8 +94,8 @@ type apRuns struct {
 	ops   *[]string
 }
 
-func (r *apRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, iid int64, desc string) (store.Run, error) {
-	r.calls = append(r.calls, apRunCall{userID, repoID, iid, desc})
+func (r *apRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, iid int64, desc string, allowWithoutPRD bool) (store.Run, error) {
+	r.calls = append(r.calls, apRunCall{userID, repoID, iid, desc, allowWithoutPRD})
 	if r.ops != nil {
 		*r.ops = append(*r.ops, "create")
 	}
@@ -104,9 +105,15 @@ func (r *apRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID,
 	return store.Run{ID: uuid.New()}, nil
 }
 
-type apLabeler struct{ label string }
+type apLabeler struct {
+	label          string
+	prdlessEnabled bool
+	prdlessLabel   string
+}
 
 func (l apLabeler) AutopilotLabel(context.Context) (string, error) { return l.label, nil }
+func (l apLabeler) PrdlessEnabled(context.Context) (bool, error)   { return l.prdlessEnabled, nil }
+func (l apLabeler) PrdlessLabel(context.Context) (string, error)   { return l.prdlessLabel, nil }
 
 type apNote struct {
 	iid  int64
@@ -416,6 +423,79 @@ func TestAutopilotNoPRDLinkComments(t *testing.T) {
 	// The run-create attempt happens, then record-then-comment: create, record, comment.
 	if strings.Join(ops, ",") != "create,record,comment" {
 		t.Fatalf("op order = %v, want [create record comment]", ops)
+	}
+}
+
+// TestAutopilotPRDLESSComposition covers PRD #22 Decision 6's composition case: an
+// issue carrying PRD + autopilot + PRDLESS labels but NO prds/*.md link runs
+// unattended. The detector computes allowWithoutPRD=true from the fresh GetIssue
+// snapshot (not the cache) and threads it into CreateAutopilotRun, so the shared
+// gate exempts it. Without the PRDLESS label (or with the feature off), the same
+// issue would surface ErrNoPRDLink and a comment instead (TestAutopilotNoPRDLinkComments).
+func TestAutopilotPRDLESSComposition(t *testing.T) {
+	st := &apStore{
+		candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "alice")},
+		cc:         ccOwner("alice", true, true),
+	}
+	runs := &apRuns{}
+	// Fresh snapshot: all three opt-in labels, description has no PRD link.
+	f := &apForge{
+		events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}},
+		issue:  forge.Issue{Description: "small typo fix, no PRD", Labels: []string{"PRD", apLabel, "PRDLESS"}},
+	}
+	lab := apLabeler{label: apLabel, prdlessEnabled: true, prdlessLabel: "PRDLESS"}
+
+	NewAutopilot(st, runs, lab).detect(context.Background(), repoRow(), f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("CreateAutopilotRun calls = %d, want 1 (PRDLESS must let the run start)", len(runs.calls))
+	}
+	if !runs.calls[0].allowWithoutPRD {
+		t.Fatal("PRDLESS label on the fresh snapshot must set allowWithoutPRD=true")
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("a run started; expected no no-PRD-link comment, got %+v", f.notes)
+	}
+}
+
+// TestAutopilotPRDLESSDisabledOrUnlabeled asserts the bypass does NOT engage when
+// the feature is off or the fresh snapshot lacks the prdless label: allowWithoutPRD
+// stays false, so a no-PRD-link issue is gated exactly as before.
+func TestAutopilotPRDLESSDisabledOrUnlabeled(t *testing.T) {
+	cases := []struct {
+		name string
+		lab  apLabeler
+		iss  forge.Issue
+	}{
+		{
+			name: "feature off, label present",
+			lab:  apLabeler{label: apLabel, prdlessEnabled: false, prdlessLabel: "PRDLESS"},
+			iss:  forge.Issue{Description: "no PRD", Labels: []string{apLabel, "PRDLESS"}},
+		},
+		{
+			name: "feature on, label absent",
+			lab:  apLabeler{label: apLabel, prdlessEnabled: true, prdlessLabel: "PRDLESS"},
+			iss:  forge.Issue{Description: "no PRD", Labels: []string{apLabel}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &apStore{
+				candidates: []store.ListAutopilotCandidateIssuesRow{candIssue(7, "alice")},
+				cc:         ccOwner("alice", true, true),
+			}
+			runs := &apRuns{}
+			f := &apForge{events: map[int64][]forge.LabelEvent{7: {addEvt(100, "alice")}}, issue: tc.iss}
+
+			NewAutopilot(st, runs, tc.lab).detect(context.Background(), repoRow(), f)
+
+			if len(runs.calls) != 1 {
+				t.Fatalf("CreateAutopilotRun calls = %d, want 1", len(runs.calls))
+			}
+			if runs.calls[0].allowWithoutPRD {
+				t.Fatal("allowWithoutPRD must be false when the feature is off or the label is absent")
+			}
+		})
 	}
 }
 

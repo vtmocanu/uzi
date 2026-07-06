@@ -245,6 +245,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/issues/{iid}", h.GetIssueDetail)
 				// move + sync write/read through to the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/move", h.MoveIssue)
+				// Apply/remove the PRDLESS label from the UI (PRD #22 M4): a forge
+				// label write, so it rides the per-user budget like move.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues/{iid}/prdless", h.SetIssuePrdless)
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
 				// Create a PRD issue on the forge (source of truth) → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues", h.CreateIssue)

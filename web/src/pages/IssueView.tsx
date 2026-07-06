@@ -7,6 +7,7 @@ import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { Markdown } from "../components/Markdown";
 import { formatDuration } from "../components/RunEvent";
 import { Alert, Badge, Button, Card } from "../components/ui";
+import { useAuth } from "../auth/AuthContext";
 
 // columnLabel names the column the issue sits in, for the header chip.
 function columnLabel(issue: IssueDetail): string {
@@ -27,6 +28,7 @@ export function IssueView() {
   const { repoId = "", iid = "" } = useParams();
   const iidNum = Number(iid);
   const navigate = useNavigate();
+  const { prdlessEnabled, prdlessLabel } = useAuth();
 
   const [issue, setIssue] = useState<IssueDetail | null>(null);
   const [runs, setRuns] = useState<RunListItem[]>([]);
@@ -35,6 +37,7 @@ export function IssueView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
+  const [prdlessBusy, setPrdlessBusy] = useState(false);
 
   const load = useCallback(async () => {
     setError("");
@@ -74,9 +77,32 @@ export function IssueView() {
     }
   };
 
+  // PRDLESS toggle (PRD #22 M4): apply/remove the escape-hatch label directly.
+  // Forge-first — wait for the 200 and adopt the returned card's labels; no
+  // optimistic update, so a failed write leaves the issue's labels untouched.
+  const prdlessApplied = !!issue && issue.labels.includes(prdlessLabel);
+  // The bypass badge stands in for the "no PRD link" warning when the feature is
+  // on and the label is applied. When it shows, the PRDLESS label is filtered out
+  // of the raw chip list below so it never renders twice (S1).
+  const showPrdlessBadge = !!issue && !issue.has_prd_link && prdlessEnabled && prdlessApplied;
+  const togglePrdless = async () => {
+    if (!issue) return;
+    setError("");
+    setPrdlessBusy(true);
+    try {
+      const { card } = await api.setIssuePrdless(repoId, issue.iid, !prdlessApplied);
+      setIssue({ ...issue, labels: card.labels });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not update the label");
+    } finally {
+      setPrdlessBusy(false);
+    }
+  };
+
   const gate = issue
     ? startRunGate({
         hasPrdLink: issue.has_prd_link,
+        prdlessBypass: prdlessEnabled && prdlessApplied,
         closed: issue.closed,
         hasWorker,
         hasToken,
@@ -108,7 +134,7 @@ export function IssueView() {
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 <Badge tone="neutral">{columnLabel(issue)}</Badge>
                 {issue.labels
-                  .filter((l) => l && l !== issue.column)
+                  .filter((l) => l && l !== issue.column && !(showPrdlessBadge && l === prdlessLabel))
                   .map((l) => (
                     <span
                       key={l}
@@ -118,14 +144,19 @@ export function IssueView() {
                     </span>
                   ))}
                 {issue.author && <span className="text-xs text-faint">{issue.author}</span>}
-                {!issue.has_prd_link && (
-                  <Badge
-                    tone="warning"
-                    title="Description has no link to a prds/*.md file; excluded from agent pickup"
-                  >
-                    no PRD link
-                  </Badge>
-                )}
+                {!issue.has_prd_link &&
+                  (prdlessEnabled && prdlessApplied ? (
+                    <Badge tone="brand" title="PRD-link gate bypassed by label">
+                      {prdlessLabel}
+                    </Badge>
+                  ) : (
+                    <Badge
+                      tone="warning"
+                      title="Description has no link to a prds/*.md file; excluded from agent pickup"
+                    >
+                      no PRD link
+                    </Badge>
+                  ))}
                 {issue.conflict && (
                   <Badge
                     tone="danger"
@@ -137,6 +168,23 @@ export function IssueView() {
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              {/* Show the toggle when applying is meaningful (no PRD link) or the
+                  label is already applied (so it can be removed); hide the pure
+                  no-op case — an issue that already has a PRD link and no label (S2). */}
+              {prdlessEnabled && !issue.closed && (prdlessApplied || !issue.has_prd_link) && (
+                <Button
+                  variant={prdlessApplied ? "secondary" : "ghost"}
+                  disabled={prdlessBusy}
+                  title={
+                    prdlessApplied
+                      ? `Remove the ${prdlessLabel} label and re-apply the PRD-link requirement`
+                      : `Apply the ${prdlessLabel} label so a run can start without a PRD link`
+                  }
+                  onClick={togglePrdless}
+                >
+                  {prdlessBusy ? "…" : prdlessApplied ? `Remove ${prdlessLabel}` : `Mark ${prdlessLabel}`}
+                </Button>
+              )}
               {isHttpsUrl(issue.web_url) && (
                 <a href={issue.web_url} target="_blank" rel="noreferrer">
                   <Button variant="ghost">Open on GitLab</Button>

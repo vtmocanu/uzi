@@ -875,10 +875,10 @@ func TestSubmitInputRejectsTerminalRun(t *testing.T) {
 func TestCreateRunSnapshotsTitleAndRejectsMissingPRDLink(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 
-	// No PRD link → rejected.
+	// No PRD link, no bypass → rejected.
 	fsNoLink := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: false}}
 	svc := New(fsNoLink, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc"); err != ErrNoPRDLink {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false); err != ErrNoPRDLink {
 		t.Fatalf("err = %v, want ErrNoPRDLink", err)
 	}
 
@@ -888,7 +888,7 @@ func TestCreateRunSnapshotsTitleAndRejectsMissingPRDLink(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description"); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", false); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -905,10 +905,10 @@ func TestCreateRunSnapshotsTitleAndRejectsMissingPRDLink(t *testing.T) {
 func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 	user, repo := uuid.New(), uuid.New()
 
-	// Same PRD-link gate as the manual path.
+	// Same PRD-link gate as the manual path (no bypass).
 	fsNoLink := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: false}}
 	svc := New(fsNoLink, newBox(t), testParams())
-	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc"); err != ErrNoPRDLink {
+	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc", false); err != ErrNoPRDLink {
 		t.Fatalf("err = %v, want ErrNoPRDLink (autopilot must enforce the same gate)", err)
 	}
 
@@ -918,7 +918,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fs, newBox(t), testParams())
-	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "the description"); err != nil {
+	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "the description", false); err != nil {
 		t.Fatalf("CreateAutopilotRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -937,11 +937,69 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fsManual, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d"); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", false); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fsManual.createRunParams.AutoApprove {
 		t.Fatal("manual run must keep auto_approve = false")
+	}
+}
+
+// TestCreateRunPRDLESSGateMatrix pins the shared createRun gate (PRD #22
+// Decision 3): the single enforcement point is `!HasPrdLink && !allowWithoutPRD`,
+// identical for the manual and autopilot paths. The callers compute
+// allowWithoutPRD (handler from the fresh forge snapshot, poller from its fresh
+// GetIssue); here we drive the resulting bool directly across the 2×2 of
+// (HasPrdLink × allowWithoutPRD) for both entry points.
+func TestCreateRunPRDLESSGateMatrix(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	cases := []struct {
+		name            string
+		hasPRDLink      bool
+		allowWithoutPRD bool
+		wantCreated     bool // false → ErrNoPRDLink
+	}{
+		{"link, no bypass", true, false, true},
+		{"link, bypass", true, true, true},
+		{"no link, no bypass", false, false, false},
+		{"no link, bypass", false, true, true}, // the PRDLESS escape hatch
+	}
+	for _, tc := range cases {
+		for _, path := range []string{"manual", "autopilot"} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				fs := &fakeStore{
+					issueByID:       store.Issue{Title: "T", HasPrdLink: tc.hasPRDLink},
+					createRunResult: store.Run{ID: uuid.New()},
+				}
+				svc := New(fs, newBox(t), testParams())
+
+				var err error
+				if path == "manual" {
+					_, err = svc.CreateRun(context.Background(), user, repo, 4, "desc", tc.allowWithoutPRD)
+				} else {
+					_, err = svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc", tc.allowWithoutPRD)
+				}
+
+				if tc.wantCreated {
+					if err != nil {
+						t.Fatalf("want run created, got err %v", err)
+					}
+					if fs.createRunParams == nil {
+						t.Fatal("run not created")
+					}
+					if path == "autopilot" && !fs.createRunParams.AutoApprove {
+						t.Fatal("autopilot run must set auto_approve")
+					}
+				} else {
+					if err != ErrNoPRDLink {
+						t.Fatalf("want ErrNoPRDLink, got %v", err)
+					}
+					if fs.createRunParams != nil {
+						t.Fatal("gated run must not reach CreateRun")
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -1004,7 +1062,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 
 	// Manual and autopilot both reject at the one shared cap, before any run is made.
 	fs := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}}
-	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big); err != ErrDescriptionTooLarge {
+	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, false); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateRun err = %v, want ErrDescriptionTooLarge", err)
 	}
 	if fs.createRunParams != nil {
@@ -1012,14 +1070,14 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 	}
 
 	fsAuto := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}}
-	if _, err := New(fsAuto, newBox(t), testParams()).CreateAutopilotRun(context.Background(), user, repo, 4, big); err != ErrDescriptionTooLarge {
+	if _, err := New(fsAuto, newBox(t), testParams()).CreateAutopilotRun(context.Background(), user, repo, 4, big, false); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateAutopilotRun err = %v, want ErrDescriptionTooLarge", err)
 	}
 
 	// Exactly at the cap is accepted (boundary).
 	ok := strings.Repeat("x", MaxIssueDescriptionBytes)
 	fsOK := &fakeStore{issueByID: store.Issue{Title: "T", HasPrdLink: true}, createRunResult: store.Run{ID: uuid.New()}}
-	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok); err != nil {
+	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, false); err != nil {
 		t.Fatalf("a description exactly at the cap must be accepted, got %v", err)
 	}
 }
@@ -1031,7 +1089,7 @@ func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 		createRunErr: &pgconn.PgError{Code: "23505"},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d"); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", false); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists", err)
 	}
 }
@@ -1039,7 +1097,7 @@ func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 func TestCreateRunRepoNotOwned(t *testing.T) {
 	fs := &fakeStore{repoErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d"); err != ErrRepoNotFound {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", false); err != ErrRepoNotFound {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
 	}
 }
@@ -1245,7 +1303,7 @@ func TestCreateRunNotifiesQueuedWithOriginSnapshot(t *testing.T) {
 	lc := &fakeLifecycle{}
 	svc.SetLifecycle(lc)
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc"); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	// origin_column snapshots the issue's current column ("Later"), always a valid
@@ -1272,7 +1330,7 @@ func TestCreateRunOriginNullWhenColumnsUnavailable(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc"); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", false); err != nil {
 		t.Fatalf("CreateRun should not be blocked by a column-list error: %v", err)
 	}
 	if fs.createRunParams == nil {

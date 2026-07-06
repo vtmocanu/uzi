@@ -28,6 +28,10 @@ import (
 const (
 	KeyPRDLabel       = "prd_label"
 	KeyAutopilotLabel = "autopilot_label"
+	// PRDLESS gate-bypass keys (PRD #22). prdless_enabled stores the text
+	// "true"/"false"; prdless_label is the escape-hatch label name.
+	KeyPrdlessEnabled = "prdless_enabled"
+	KeyPrdlessLabel   = "prdless_label"
 	// KeyDefaultTheme is the instance-default UI theme (PRD #21). It tenants into
 	// this same table rather than a parallel settings store; its value is a theme
 	// id validated against the canonical theme registry, not a label.
@@ -40,6 +44,11 @@ const (
 const (
 	DefaultPRDLabel       = "PRD"
 	DefaultAutopilotLabel = "autopilot"
+	// PRD #22: on by default (Decision 1). An issue still bypasses the gate only
+	// when it carries the label, so default-on weakens nothing for unlabeled
+	// issues; admins wanting the strict PRD-only regime flip prdless_enabled off.
+	DefaultPrdlessEnabled = "true"
+	DefaultPrdlessLabel   = "PRDLESS"
 )
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
@@ -49,11 +58,16 @@ const maxLabelLen = 64
 // Go source of the default values: the accessors fall back to it and the
 // migration (00036_app_settings) seeds the same literals. Keep the two in sync —
 // SQL cannot reference these constants, so a change here that should also change
-// the seeded rows needs a follow-up migration. Ranging over Defaults is the
-// canonical way to enumerate the settings the API understands.
+// the seeded rows needs a follow-up migration. The PRD #22 prdless keys are the
+// exception: they have NO seeded row (Cache.All/Effective synthesize them from
+// these defaults), so an absent row is expected and no migration adds them.
+// Ranging over Defaults is the canonical way to enumerate the settings the API
+// understands.
 var Defaults = map[string]string{
 	KeyPRDLabel:       DefaultPRDLabel,
 	KeyAutopilotLabel: DefaultAutopilotLabel,
+	KeyPrdlessEnabled: DefaultPrdlessEnabled,
+	KeyPrdlessLabel:   DefaultPrdlessLabel,
 	// The instance default theme falls back to the registry's Default ("ember"),
 	// so an instance with no seeded row renders exactly as before (PRD #21). No
 	// migration seed is needed — this fallback plus the stable GET shape follow
@@ -168,6 +182,32 @@ func (c *Cache) AutopilotLabel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyAutopilotLabel)
 }
 
+// PrdlessLabel returns the configured PRDLESS escape-hatch label (PRD #22).
+// Falls back to DefaultPrdlessLabel.
+func (c *Cache) PrdlessLabel(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyPrdlessLabel)
+}
+
+// PrdlessEnabled reports whether the PRDLESS gate-bypass feature is enabled
+// instance-wide (PRD #22, Decision 1). The value is stored as the text
+// "true"/"false"; only those two are honored. Any OTHER value falls back to the
+// compiled-in default (true) rather than silently reading as false — a deliberate
+// junk-tolerance so a malformed value never silently flips a default-on feature
+// off. A cold read error also returns the default (true) alongside the error, so
+// a best-effort caller can ignore err — an unlabeled issue is still gated, since
+// the bypass also requires the label on the fresh snapshot.
+func (c *Cache) PrdlessEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyPrdlessEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultPrdlessEnabled == "true", err
+	}
+}
+
 // DefaultTheme returns the configured instance-default theme id (PRD #21).
 // Falls back to the theme registry's Default ("ember").
 func (c *Cache) DefaultTheme(ctx context.Context) (string, error) {
@@ -220,9 +260,23 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
+	case KeyPrdlessEnabled:
+		return validateBool(value)
 	default:
+		// The label keys (prd_label, autopilot_label, prdless_label) all use the
+		// Decision 8 label rules; cross-key distinctness is ValidateMerged's job.
 		return ValidateLabel(value)
 	}
+}
+
+// validateBool is the strict on/off parse for a boolean setting (PRD #22): exactly
+// "true" or "false", nothing else (no "1"/"yes"/case variants), so a stored
+// prdless_enabled is always one of the two values the typed accessor honors.
+func validateBool(value string) error {
+	if value != "true" && value != "false" {
+		return errors.New(`must be "true" or "false"`)
+	}
+	return nil
 }
 
 // ValidateLabel checks a single label value against Decision 8's per-value
@@ -243,16 +297,18 @@ func ValidateLabel(value string) error {
 	return nil
 }
 
-// LabelChanged reports whether any submitted setting that affects the boards
-// actually changed value: a label key (anything other than default_theme) in
-// updates whose value differs from committed. The settings PUT uses it to decide
-// whether to force a full repo resync — only a label change re-filters boards, so
-// a theme-only edit is presentation-only and must NOT trigger one (PRD #21). An
-// idempotent label write (same value) returns false, matching the prior "only
+// LabelChanged reports whether any submitted setting that affects which issues a
+// board shows actually changed value: a board-filtering label (prd_label or
+// autopilot_label) in updates whose value differs from committed. The settings PUT
+// uses it to decide whether to force a full repo resync. Presentation- and
+// gate-only keys never re-filter a board and are excluded: default_theme (PRD #21,
+// presentation-only) and the prdless keys (PRD #22 Decision 9 — they change only
+// whether a run can start without a PRD link, never which issues appear on a
+// board). An idempotent write (same value) returns false, matching the prior "only
 // resync on a real change" behavior.
 func LabelChanged(committed, updates map[string]string) bool {
 	for k, v := range updates {
-		if k == KeyDefaultTheme {
+		if k == KeyDefaultTheme || k == KeyPrdlessEnabled || k == KeyPrdlessLabel {
 			continue
 		}
 		if committed[k] != v {
@@ -262,14 +318,26 @@ func LabelChanged(committed, updates map[string]string) bool {
 	return false
 }
 
-// ValidateMerged enforces the cross-key rule (Decision 8): prd_label and
-// autopilot_label must differ, since equal values would make every PRD-labeled
-// issue also autopilot-labeled and auto-run. It runs on the effective
-// post-update state (current values overlaid with the pending update), so a
-// PUT touching only one key is still checked against the other's stored value.
+// ValidateMerged enforces the cross-key label rules on the effective post-update
+// state (current values overlaid with the pending update), so a PUT touching one
+// key is still checked against the others' stored values. The label triple —
+// prd_label, autopilot_label, prdless_label — must be pairwise-distinct (Decision 8
+// + PRD #22 Decision 7): equal prd/autopilot would autopilot every PRD issue; a
+// prdless label equal to prd_label would exempt every issue from the gate, equal to
+// autopilot_label would conflate "hands-off" with "spec-less". prdless distinctness
+// is enforced REGARDLESS of prdless_enabled — this map carries no toggle state — so
+// a disabled-but-colliding label must be renamed before the colliding prd/autopilot
+// value can be saved, keeping a later re-enable always safe. Each error names the
+// key to change.
 func ValidateMerged(merged map[string]string) error {
 	if merged[KeyPRDLabel] == merged[KeyAutopilotLabel] {
 		return errors.New("prd_label and autopilot_label must differ")
+	}
+	if merged[KeyPrdlessLabel] == merged[KeyPRDLabel] {
+		return errors.New("prdless_label must differ from prd_label")
+	}
+	if merged[KeyPrdlessLabel] == merged[KeyAutopilotLabel] {
+		return errors.New("prdless_label must differ from autopilot_label")
 	}
 	return nil
 }

@@ -42,7 +42,13 @@ describe("mockApi settings persistence (demo survives reload)", () => {
       [KEY]: JSON.stringify({
         v: 1,
         userSettings: { default_model: "opus", theme: "mission" },
-        appSettings: { prd_label: "Feature", autopilot_label: "autopilot", default_theme: "mission" },
+        appSettings: {
+          prd_label: "Feature",
+          autopilot_label: "autopilot",
+          default_theme: "mission",
+          prdless_enabled: "false",
+          prdless_label: "NOSPEC",
+        },
       }),
     });
     const api = await reload();
@@ -54,6 +60,9 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     const app = (await api.getSettings()).settings;
     expect(app.default_theme).toBe("mission");
     expect(app.prd_label).toBe("Feature");
+    // The prdless keys round-trip too (PRD #22 M1 brought them into app_settings).
+    expect(app.prdless_enabled).toBe("false");
+    expect(app.prdless_label).toBe("NOSPEC");
   });
 
   it("falls back to seed on a corrupt blob", async () => {

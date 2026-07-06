@@ -528,6 +528,101 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 
+// ── PRDLESS label toggle ──────────────────────────────────────────────────────
+
+type prdlessRequest struct {
+	Apply bool `json:"apply"`
+}
+
+// SetIssuePrdless applies or removes the configured PRDLESS label on an issue
+// directly from the uzi UI (PRD #22 M4, Decision 10). The label name is resolved
+// server-side from settings — the client never names it — so this endpoint only
+// ever touches the one escape-hatch label, never arbitrary labels. It is
+// forge-first (the label write lands on GitLab before the cache) and rides the
+// per-user forge limiter like move/sync. When the feature is disabled
+// instance-wide it 422s (the label could still be applied from GitLab's own UI,
+// but uzi will not). Returns the refreshed card with its latest_run re-hydrated,
+// exactly like MoveIssue, so a single-card replace never blanks the run badge.
+func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
+	repo, ok := h.repoForRequest(w, r)
+	if !ok {
+		return
+	}
+	iid, err := parseInt64(chi.URLParam(r, "iid"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid issue id")
+		return
+	}
+	var req prdlessRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Feature gate: the label endpoint is inert when prdless is disabled
+	// instance-wide (Decision 10).
+	enabled, err := h.settings.PrdlessEnabled(r.Context())
+	if err != nil {
+		slog.Error("prdless: read settings", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !enabled {
+		httpx.Error(w, http.StatusUnprocessableEntity, "the PRDLESS label feature is disabled")
+		return
+	}
+	// PrdlessLabel already falls back to the compiled-in default when unset, so
+	// label is never empty here.
+	label, _ := h.settings.PrdlessLabel(r.Context())
+
+	issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "issue not found")
+			return
+		}
+		slog.Error("prdless: get issue", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if err != nil {
+		slog.Error("build forge for connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// Forge-first single-label add/remove + incremental cache update
+	// (forgesvc.SetIssueLabel). On failure the cache is untouched and the client
+	// keeps showing the pre-toggle state (no optimistic update on the web side).
+	updated, err := h.svc.SetIssueLabel(r.Context(), f, repo.ForgeProjectID, issue, label, req.Apply)
+	if err != nil {
+		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
+		return
+	}
+
+	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
+	if err != nil {
+		slog.Error("list board columns", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	position := make(map[string]int, len(cols))
+	for _, c := range cols {
+		position[c.LabelName] = int(c.Position)
+	}
+	card := issueToCard(updated, position)
+	// Carry the issue's latest run on the single-card response (like MoveIssue), so
+	// a toggle never blanks the run badge the board/issue view is showing.
+	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: iid}); err == nil {
+		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
+			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Warn("latest run for prdless card", "error", err)
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
+}
+
 // issueToCard resolves a cached issue row into a card DTO.
 func issueToCard(is store.Issue, position map[string]int) cardDTO {
 	var labels []string

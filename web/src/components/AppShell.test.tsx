@@ -104,6 +104,8 @@ beforeEach(() => {
     theme: "ember",
     themeOverride: null,
     defaultTheme: "ember",
+    prdlessLabel: "PRDLESS",
+    prdlessEnabled: false,
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

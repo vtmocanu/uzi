@@ -108,6 +108,12 @@ export function applyFrame(
 // StartRunPreconditions are the facts the board knows about an issue + the user.
 export interface StartRunPreconditions {
   hasPrdLink: boolean;
+  // prdlessBypass short-circuits the PRD-link requirement (PRD #22): the issue
+  // carries the PRDLESS label and the feature is enabled, so the server creates
+  // the run with no prds/*.md link. When true, the missing-link precondition is
+  // skipped — mirroring the server's allowWithoutPRD gate. Optional: absent means
+  // no bypass (unchanged behavior for callers that don't compute it).
+  prdlessBypass?: boolean;
   closed: boolean;
   hasWorker: boolean;
   hasToken: boolean;
@@ -127,7 +133,7 @@ export function startRunGate(p: StartRunPreconditions): StartRunGate {
   if (p.closed) {
     return { enabled: false, reason: "This issue is closed." };
   }
-  if (!p.hasPrdLink) {
+  if (!p.hasPrdLink && !p.prdlessBypass) {
     return { enabled: false, reason: "Add a link to a prds/*.md file in the description first." };
   }
   if (!p.hasWorker) {
