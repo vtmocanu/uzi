@@ -70,16 +70,19 @@ func TestLatestMRPipelineCatchesDetachedPipeline(t *testing.T) {
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		// A detached MR pipeline runs on refs/merge-requests/:iid/head and never
 		// appears under the source-branch ref — only the MR-pipelines endpoint sees
-		// it. GitLab returns these newest-first, so the first row is the latest.
+		// it. GitLab groups merge_request_event pipelines FIRST (then id-desc), NOT a
+		// plain id-desc, so the FIRST row is NOT necessarily the highest id: here the
+		// MR-event pipeline 5099 leads, but a later push pipeline 5100 has a higher id.
+		// The driver must pick the MAX BY ID (5100), so verification never misses it.
 		"/api/v4/projects/7/merge_requests/13/pipelines": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{
-					"id": 5100, "status": "success", "ref": "refs/merge-requests/13/head",
-					"sha": "cafef00d", "web_url": "https://gl/grp/a/-/pipelines/5100",
+					"id": 5099, "status": "failed", "ref": "refs/merge-requests/13/head",
+					"sha": "mrEvent", "web_url": "https://gl/grp/a/-/pipelines/5099",
 				},
 				{
-					"id": 5099, "status": "failed", "ref": "refs/merge-requests/13/head",
-					"sha": "0ldsha", "web_url": "https://gl/grp/a/-/pipelines/5099",
+					"id": 5100, "status": "success", "ref": "main",
+					"sha": "pushNewer", "web_url": "https://gl/grp/a/-/pipelines/5100",
 				},
 			})
 		},
@@ -91,10 +94,7 @@ func TestLatestMRPipelineCatchesDetachedPipeline(t *testing.T) {
 		t.Fatalf("LatestMRPipeline: %v", err)
 	}
 	if p.ID != 5100 || p.Status != "success" {
-		t.Fatalf("expected the newest (first) MR pipeline 5100/success, got %+v", p)
-	}
-	if p.Ref != "refs/merge-requests/13/head" {
-		t.Fatalf("expected the detached-pipeline ref, got %q", p.Ref)
+		t.Fatalf("expected the max-by-id MR pipeline 5100/success (NOT the leading row 5099), got %+v", p)
 	}
 }
 

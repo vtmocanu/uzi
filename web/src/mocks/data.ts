@@ -219,7 +219,14 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
-        pipeline: null,
+        // "canceled" → the neutral tone (also covers skipped / no-CI).
+        pipeline: {
+          ref: "agent/issue-29",
+          status: "canceled",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4188",
+          pipeline_id: 4188,
+          synced_at: minsAgo(6),
+        },
       },
       {
         iid: 27,
@@ -233,7 +240,14 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
-        pipeline: null,
+        // "manual" → the attention tone (a human must click play in GitLab).
+        pipeline: {
+          ref: "agent/issue-27",
+          status: "manual",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4190",
+          pipeline_id: 4190,
+          synced_at: minsAgo(4),
+        },
       },
       {
         iid: 26,

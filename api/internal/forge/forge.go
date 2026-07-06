@@ -268,12 +268,14 @@ type Forge interface {
 	// GitLab: GET /projects/:id/pipelines?ref=<ref>&per_page=1 (default
 	// order_by=id desc, so the first row is newest).
 	LatestPipeline(ctx context.Context, projectID int64, ref string) (Pipeline, error)
-	// LatestMRPipeline returns the newest pipeline attached to a merge request.
-	// This is what catches detached MR pipelines (refs/merge-requests/:iid/head)
-	// and merged-results pipelines, which never appear under the source-branch
+	// LatestMRPipeline returns the newest (max-by-id) pipeline attached to a merge
+	// request. This is what catches detached MR pipelines (refs/merge-requests/:iid/
+	// head) and merged-results pipelines, which never appear under the source-branch
 	// ref — so run-branch status and fix verification key on the run's MR, not its
 	// branch ref. Returns ErrNoPipeline when the MR has no pipeline. GitLab: GET
-	// /projects/:id/merge_requests/:iid/pipelines (newest first).
+	// /projects/:id/merge_requests/:iid/pipelines — note this endpoint groups
+	// merge_request_event pipelines first (then id-desc within a group), NOT a plain
+	// id-desc, so the driver picks the max id rather than trusting the first row.
 	LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (Pipeline, error)
 	// ListPipelineJobs returns the pipeline's jobs with status/stage/name,
 	// paginated internally. GitLab: GET /projects/:id/pipelines/:pipeline_id/jobs.
@@ -281,10 +283,14 @@ type Forge interface {
 	// tick.
 	ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error)
 	// JobLogTail returns at most maxBytes from the END of a job's trace (a
-	// failure's cause concludes its log). GitLab: GET /projects/:id/jobs/:job_id/
-	// trace — the endpoint has no range/tail parameter, so this is a full download
-	// truncated client-side; acceptable because it runs only at fix-trigger time,
-	// never on the poll tick. The returned tail passes through the PAT redactor.
+	// failure's cause concludes its log); maxBytes <= 0 returns the whole trace.
+	// GitLab: GET /projects/:id/jobs/:job_id/trace — the endpoint has no range/tail
+	// parameter, so this is a full download truncated client-side, capped by a
+	// fail-closed download ceiling; acceptable because it runs only at fix-trigger
+	// time, never on the poll tick. The returned tail passes through the driver's
+	// PAT redactor (the snapshot path applies a second, pattern-based scrub). NOTE:
+	// the returned tail is NOT itself a secret-safe log scrubber for arbitrary
+	// third-party tokens — see the snapshot scrubber in the ci-fix handler.
 	JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error)
 }
 

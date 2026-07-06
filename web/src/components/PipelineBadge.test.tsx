@@ -26,6 +26,13 @@ describe("PipelineBadge", () => {
     expect(link.textContent).toContain("CI failed");
   });
 
+  it("does NOT link a non-https web_url (forge-URL scheme guard) — renders a plain pill", () => {
+    render(<PipelineBadge pipeline={pipeline({ status: "failed", web_url: "javascript:alert(1)" })} />);
+    expect(screen.queryByRole("link")).toBeNull();
+    // The status is still shown, just not as an anchor.
+    expect(screen.getByText(/CI failed/i)).toBeTruthy();
+  });
+
   it("renders GitLab 'success' as the friendlier 'passed'", () => {
     render(<PipelineBadge pipeline={pipeline({ status: "success" })} />);
     // getByRole throws if the accessible-named link is absent, so this is the assertion.

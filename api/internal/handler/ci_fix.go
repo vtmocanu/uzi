@@ -18,16 +18,33 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// glpatRe matches GitLab PAT-shaped tokens (glpat- + a long base62 body). A
-// snapshot's log tails already pass the driver's connection-PAT scrub (M1); this
-// second pass strips any OTHER GitLab token a teammate's pipeline may have printed,
-// before it is frozen onto the run. Arbitrary third-party secrets uzi cannot
-// recognize remain the documented residual risk (PRD #6 Risks).
-var glpatRe = regexp.MustCompile(`glpat-[A-Za-z0-9_-]{20,}`)
+// snapshotSecretPatterns is the dedicated log-tail scrubber for the failure
+// snapshot (PRD #6). A job trace is a SUCCESS body, so the forge driver's
+// error-only, connection-PAT-only redactor does not cover it — this second,
+// pattern-based pass runs BEFORE any tail is frozen into failure_snapshot or a
+// claim payload. It targets the token SHAPES a teammate's pipeline might print:
+//   - GitLab token families (glpat-, gloas-, glrt-, glcbt-, glptt-, glsoat-,
+//     glimt-, glagent-) — a long base62/underscore/dash body.
+//   - Anthropic keys (sk-ant-...), the shape of a printed per-user token.
+//   - Auth header lines a `curl -v` / `set -x` echo would emit: PRIVATE-TOKEN,
+//     Authorization (Bearer ...), and a bare "Bearer <token>".
+// Arbitrary third-party secrets with no recognizable shape remain the documented
+// residual risk (docs/configuration.md); the snapshot is owner/admin-visible only.
+var snapshotSecretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`gl(pat|oas|rt|cbt|ptt|soat|imt|agent)-[A-Za-z0-9_\-]{16,}`),
+	regexp.MustCompile(`sk-ant-[A-Za-z0-9_\-]{16,}`),
+	// Header lines a `curl -v` / `set -x` echoes — redact the WHOLE value to EOL
+	// (`.` excludes newline, so `.*` stops at the line end), never just the first word.
+	regexp.MustCompile(`(?i)(private-token|authorization)\s*[:=].*`),
+	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-]{16,}`),
+}
 
 // scrubKnownTokens redacts known token shapes from snapshot log-tail content.
 func scrubKnownTokens(s string) string {
-	return glpatRe.ReplaceAllString(s, "[REDACTED]")
+	for _, re := range snapshotSecretPatterns {
+		s = re.ReplaceAllString(s, "[REDACTED]")
+	}
+	return s
 }
 
 // CreateCIFixRun queues a ci_fix run for a failed pipeline on a watched ref (PRD

@@ -4,25 +4,38 @@
 // taxonomy is the pure, tested pipelineBadge() mapping; this component is only the
 // presentation (an anchor wrapping the shared Badge).
 
-import type { PipelineStatus } from "../lib/api";
+import { isHttpsUrl, type PipelineStatus } from "../lib/api";
 import { pipelineBadge, pipelineTitle, pipelineTone } from "../lib/pipelineBadge";
 import { Badge } from "./ui";
 
 export function PipelineBadge({ pipeline }: { pipeline: PipelineStatus }) {
   const { label, tone, pulse } = pipelineBadge(pipeline.status);
   const title = pipelineTitle(pipeline.status, pipeline.synced_at, Date.now());
+  const badge = (
+    <Badge tone={tone} dot pulse={pulse}>
+      CI {label}
+    </Badge>
+  );
+  // web_url is forge-provided; only link it when it is a real https URL (the
+  // codebase-wide guard for every forge link — Board/Repos/RunView all use it).
+  // A non-https value renders as a plain, un-linked pill, never an anchor.
+  if (!isHttpsUrl(pipeline.web_url)) {
+    return (
+      <span title={title} aria-label={`CI ${label}`}>
+        {badge}
+      </span>
+    );
+  }
   return (
     <a
       href={pipeline.web_url}
       target="_blank"
       rel="noreferrer"
       title={title}
-      aria-label={`CI ${label}`}
+      aria-label={`CI ${label} (opens the pipeline on the forge in a new tab)`}
       className="inline-flex rounded-md transition-[filter] hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/50"
     >
-      <Badge tone={tone} dot pulse={pulse}>
-        CI {label}
-      </Badge>
+      {badge}
     </a>
   );
 }

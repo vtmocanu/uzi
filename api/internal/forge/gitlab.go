@@ -20,6 +20,12 @@ const developerAccessLevel = int(gitlab.DeveloperPermissions) // 30
 // maximum, minimizing round-trips on busy projects.
 const perPage = 100
 
+// maxTraceBytes is the fail-closed ceiling on a single job trace JobLogTail will
+// process. Well above any real CI log's tail need (the snapshot keeps only the
+// last CI_FIX_LOG_TAIL_BYTES, 32 KiB), so a legitimate trace never trips it; a
+// pathologically large one errors rather than being scanned/truncated.
+const maxTraceBytes = 16 << 20 // 16 MiB
+
 // gitLab is the GitLab REST driver. The embedded redactor scrubs the PAT out of
 // every error the underlying client hands back before it leaves this package.
 type gitLab struct {
@@ -340,8 +346,14 @@ func (g *gitLab) LatestPipeline(ctx context.Context, projectID int64, ref string
 }
 
 func (g *gitLab) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (Pipeline, error) {
-	// GitLab returns an MR's pipelines newest-first, so the first row is the latest
-	// — including detached and merged-results pipelines the branch-ref query misses.
+	// GitLab does NOT order an MR's pipelines by a simple id-desc: merge_request_event
+	// pipelines are grouped FIRST, then id-desc within each group (Ci::
+	// PipelinesForMergeRequestFinder). So pipelines[0] is the newest MR-EVENT pipeline
+	// if any exist — which, on a project running BOTH push and MR-event pipelines, can
+	// be OLDER by id than a later push pipeline. We therefore select the MAX BY ID, so
+	// "latest" is unambiguous and the verification guard (observed id > snapshot id)
+	// can never miss a newer pipeline. This still catches detached and merged-results
+	// pipelines the branch-ref query misses.
 	pipelines, _, err := g.client.MergeRequests.ListMergeRequestPipelines(projectID, mrIID, gitlab.WithContext(ctx))
 	if err != nil {
 		return Pipeline{}, g.redact.error(fmt.Errorf("gitlab: latest MR pipeline: %w", err))
@@ -349,7 +361,13 @@ func (g *gitLab) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 	if len(pipelines) == 0 {
 		return Pipeline{}, ErrNoPipeline
 	}
-	return toPipeline(pipelines[0]), nil
+	newest := pipelines[0]
+	for _, p := range pipelines[1:] {
+		if p.ID > newest.ID {
+			newest = p
+		}
+	}
+	return toPipeline(newest), nil
 }
 
 func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
@@ -381,9 +399,17 @@ func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxByte
 	if err != nil {
 		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: %w", err))
 	}
-	data, err := io.ReadAll(reader)
+	// Fail closed past a hard ceiling. client-go buffers the whole trace, so the
+	// transient download is bounded by FORGE_HTTP_TIMEOUT (time), not bytes; this
+	// guards the processing/storage path against a pathologically large trace rather
+	// than scanning/truncating an unbounded buffer. The returned tail is separately
+	// capped to maxBytes below.
+	data, err := io.ReadAll(io.LimitReader(reader, maxTraceBytes+1))
 	if err != nil {
 		return "", g.redact.error(fmt.Errorf("gitlab: read job trace: %w", err))
+	}
+	if len(data) > maxTraceBytes {
+		return "", g.redact.error(fmt.Errorf("gitlab: job %d trace exceeds the %d-byte ceiling", jobID, maxTraceBytes))
 	}
 	if maxBytes > 0 && len(data) > maxBytes {
 		data = data[len(data)-maxBytes:]
