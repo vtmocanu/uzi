@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/theme"
 )
 
 // Setting keys. These are the only keys the API recognizes; writes to any other
@@ -31,6 +32,10 @@ const (
 	// "true"/"false"; prdless_label is the escape-hatch label name.
 	KeyPrdlessEnabled = "prdless_enabled"
 	KeyPrdlessLabel   = "prdless_label"
+	// KeyDefaultTheme is the instance-default UI theme (PRD #21). It tenants into
+	// this same table rather than a parallel settings store; its value is a theme
+	// id validated against the canonical theme registry, not a label.
+	KeyDefaultTheme = "default_theme"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -63,6 +68,11 @@ var Defaults = map[string]string{
 	KeyAutopilotLabel: DefaultAutopilotLabel,
 	KeyPrdlessEnabled: DefaultPrdlessEnabled,
 	KeyPrdlessLabel:   DefaultPrdlessLabel,
+	// The instance default theme falls back to the registry's Default ("ember"),
+	// so an instance with no seeded row renders exactly as before (PRD #21). No
+	// migration seed is needed — this fallback plus the stable GET shape follow
+	// automatically from the entry here.
+	KeyDefaultTheme: theme.Default,
 }
 
 // Known reports whether key is a setting the API recognizes.
@@ -181,14 +191,11 @@ func (c *Cache) PrdlessLabel(ctx context.Context) (string, error) {
 // PrdlessEnabled reports whether the PRDLESS gate-bypass feature is enabled
 // instance-wide (PRD #22, Decision 1). The value is stored as the text
 // "true"/"false"; only those two are honored. Any OTHER value falls back to the
-// compiled-in default (true) rather than silently reading as false — this is a
-// deliberate junk-tolerance: until M1 lands per-key bool validation (deferred
-// behind prd-21), the settings PUT still runs the uniform label validator and
-// would accept e.g. prdless_enabled="banana", and a malformed value must not
-// silently flip a default-on feature off. A cold read error also returns the
-// default (true) alongside the error, so a best-effort caller can ignore err —
-// an unlabeled issue is still gated, since the bypass also requires the label on
-// the fresh snapshot.
+// compiled-in default (true) rather than silently reading as false — a deliberate
+// junk-tolerance so a malformed value never silently flips a default-on feature
+// off. A cold read error also returns the default (true) alongside the error, so
+// a best-effort caller can ignore err — an unlabeled issue is still gated, since
+// the bypass also requires the label on the fresh snapshot.
 func (c *Cache) PrdlessEnabled(ctx context.Context) (bool, error) {
 	v, err := c.get(ctx, KeyPrdlessEnabled)
 	switch v {
@@ -199,6 +206,12 @@ func (c *Cache) PrdlessEnabled(ctx context.Context) (bool, error) {
 	default:
 		return DefaultPrdlessEnabled == "true", err
 	}
+}
+
+// DefaultTheme returns the configured instance-default theme id (PRD #21).
+// Falls back to the theme registry's Default ("ember").
+func (c *Cache) DefaultTheme(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyDefaultTheme)
 }
 
 // All returns every known key with its effective value (row value or default).
@@ -238,6 +251,20 @@ func Effective(rows []store.AppSetting) map[string]string {
 	return out
 }
 
+// Validate applies the per-key write rules, dispatching on key (PRD #21): the
+// label keys use the Decision 8 label rules; default_theme must be a known theme
+// id. Unknown keys are the caller's responsibility (guard with Known first);
+// this only dispatches recognized keys. The cross-key label rule stays in
+// ValidateMerged — this is the single-value gate the settings PUT runs per key.
+func Validate(key, value string) error {
+	switch key {
+	case KeyDefaultTheme:
+		return theme.Validate(value)
+	default:
+		return ValidateLabel(value)
+	}
+}
+
 // ValidateLabel checks a single label value against Decision 8's per-value
 // rules: non-empty, at most 64 characters, and no comma (GitLab's label-list
 // separator). It does not trim: a value with surrounding whitespace would not
@@ -254,6 +281,25 @@ func ValidateLabel(value string) error {
 		return errors.New("must not contain a comma")
 	}
 	return nil
+}
+
+// LabelChanged reports whether any submitted setting that affects the boards
+// actually changed value: a label key (anything other than default_theme) in
+// updates whose value differs from committed. The settings PUT uses it to decide
+// whether to force a full repo resync — only a label change re-filters boards, so
+// a theme-only edit is presentation-only and must NOT trigger one (PRD #21). An
+// idempotent label write (same value) returns false, matching the prior "only
+// resync on a real change" behavior.
+func LabelChanged(committed, updates map[string]string) bool {
+	for k, v := range updates {
+		if k == KeyDefaultTheme {
+			continue
+		}
+		if committed[k] != v {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateMerged enforces the cross-key rule (Decision 8): prd_label and

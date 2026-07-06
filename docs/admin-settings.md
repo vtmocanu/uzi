@@ -7,7 +7,8 @@ audience: user
 # Admin settings
 
 uzi keeps a small set of instance-wide settings in the database, editable by
-an admin from **Admin → Instance settings**. Today: three forge labels.
+an admin from **Admin → Instance settings**. Today: three forge labels and a
+default theme.
 
 ## The three labels
 
@@ -25,6 +26,15 @@ every run on this instance to have a real PRD link again; it doesn't touch a
 run already in flight. *(Note: this toggle and the label-name field land on
 the Settings page in a later milestone of this release; until then the
 feature runs at its compiled-in default — on, named `PRDLESS`.)*
+
+## Default theme
+
+Which theme a user with no personal choice sees — new users, and anyone who
+hasn't picked one under Settings → Appearance. A user's own pick, once made,
+always wins over this setting. Saving restyles the admin's own session live;
+every other un-overridden user picks up the change on their next `me`
+refresh (in practice, their next login or reload — there's no push). See
+[Theming](./theming.md) for how themes work and how to add one.
 
 ## Validation
 
@@ -55,12 +65,14 @@ enabled repo, not just the next incremental poll, so the effect isn't
 instant: boards drop issues that only carried the old label and pick up the
 new set once that repo's resync completes. See "Freshness contract" in
 [Configuration](./configuration.md) for how sync cadence otherwise works.
-This resync fires on any changed setting today, even ones that don't affect
-what boards show (the autopilot label, and for now the two PRDLESS keys) —
-harmless, and simpler than special-casing which key mattered. *(Note: a
-later milestone of this release excludes the PRDLESS keys from triggering
-this resync, since neither changes which issues a board shows, only whether
-a run can start without a PRD link.)*
+This resync fires on any changed label (the PRD label, the autopilot label,
+and for now the two PRDLESS keys), even the autopilot label, which doesn't
+affect what boards show — harmless, and simpler than special-casing which key
+mattered. A default-theme-only save does **not** trigger it: theming is
+presentation-only and never affects what a board shows. *(Note: a later
+milestone of this release also excludes the PRDLESS keys from triggering this
+resync, since neither changes which issues a board shows, only whether a run
+can start without a PRD link.)*
 
 ## No secrets here
 

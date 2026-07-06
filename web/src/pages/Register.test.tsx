@@ -36,6 +36,9 @@ beforeEach(() => {
     refresh: vi.fn(),
     prdLabel: "PRD",
     autopilotLabel: "autopilot",
+    theme: "ember",
+    themeOverride: null,
+    defaultTheme: "ember",
     prdlessLabel: "PRDLESS",
     prdlessEnabled: false,
   });

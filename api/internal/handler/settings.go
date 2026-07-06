@@ -54,13 +54,14 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-key validation: known key + per-value rules.
+	// Per-key validation: known key + per-value rules dispatched by key (label
+	// rules for the label keys, the theme registry for default_theme — PRD #21).
 	for key, value := range req.Settings {
 		if !settings.Known(key) {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unknown setting: %s", key))
 			return
 		}
-		if err := settings.ValidateLabel(value); err != nil {
+		if err := settings.Validate(key, value); err != nil {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("%s: %s", key, err))
 			return
 		}
@@ -117,16 +118,14 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	for k, v := range committed {
 		merged[k] = v
 	}
-	// changed tracks whether any submitted key actually differs from committed
-	// state, so an idempotent PUT (or one racing another writer's identical change)
-	// does not needlessly force a full resync of every repo.
-	changed := false
 	for k, v := range req.Settings {
-		if committed[k] != v {
-			changed = true
-		}
 		merged[k] = v
 	}
+	// changed decides whether to force a full repo resync after commit. Only a
+	// LABEL change re-filters boards; default_theme is presentation-only (PRD #21)
+	// and an idempotent write is a no-op, so neither forces a resync. Computed
+	// against the committed (FOR UPDATE-locked) rows, not the cache.
+	changed := settings.LabelChanged(committed, req.Settings)
 	if err := settings.ValidateMerged(merged); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return

@@ -38,7 +38,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme
 `
 
 type CreateUserParams struct {
@@ -68,12 +68,13 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.LastLogin,
 		&i.DefaultModel,
 		&i.AutopilotEnabled,
+		&i.Theme,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled FROM users WHERE email = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -91,12 +92,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.LastLogin,
 		&i.DefaultModel,
 		&i.AutopilotEnabled,
+		&i.Theme,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled FROM users WHERE id = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -114,6 +116,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.LastLogin,
 		&i.DefaultModel,
 		&i.AutopilotEnabled,
+		&i.Theme,
 	)
 	return i, err
 }
@@ -130,8 +133,27 @@ func (q *Queries) GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype
 	return default_model, err
 }
 
+const getUserSettings = `-- name: GetUserSettings :one
+SELECT default_model, theme FROM users WHERE id = $1
+`
+
+type GetUserSettingsRow struct {
+	DefaultModel pgtype.Text `json:"default_model"`
+	Theme        pgtype.Text `json:"theme"`
+}
+
+// The current user's own (non-secret) settings surface: default worker model
+// (PRD #17) and UI theme override (PRD #21). Both NULL = inherit / use the
+// instance default. Own-user only; the caller passes the session user's id.
+func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSettingsRow, error) {
+	row := q.db.QueryRow(ctx, getUserSettings, id)
+	var i GetUserSettingsRow
+	err := row.Scan(&i.DefaultModel, &i.Theme)
+	return i, err
+}
+
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled FROM users ORDER BY created_at ASC
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme FROM users ORDER BY created_at ASC
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -155,6 +177,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.LastLogin,
 			&i.DefaultModel,
 			&i.AutopilotEnabled,
+			&i.Theme,
 		); err != nil {
 			return nil, err
 		}
@@ -182,7 +205,7 @@ SET is_active = $1,
     -- reactivation leaves it untouched.
     token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END
 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme
 `
 
 type SetUserActiveParams struct {
@@ -205,13 +228,14 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 		&i.LastLogin,
 		&i.DefaultModel,
 		&i.AutopilotEnabled,
+		&i.Theme,
 	)
 	return i, err
 }
 
 const setUserAutopilotEnabled = `-- name: SetUserAutopilotEnabled :one
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme
 `
 
 type SetUserAutopilotEnabledParams struct {
@@ -236,6 +260,7 @@ func (q *Queries) SetUserAutopilotEnabled(ctx context.Context, arg SetUserAutopi
 		&i.LastLogin,
 		&i.DefaultModel,
 		&i.AutopilotEnabled,
+		&i.Theme,
 	)
 	return i, err
 }
@@ -257,6 +282,25 @@ func (q *Queries) SetUserDefaultModel(ctx context.Context, arg SetUserDefaultMod
 	var default_model pgtype.Text
 	err := row.Scan(&default_model)
 	return default_model, err
+}
+
+const setUserTheme = `-- name: SetUserTheme :one
+UPDATE users SET theme = $1 WHERE id = $2
+RETURNING theme
+`
+
+type SetUserThemeParams struct {
+	Theme pgtype.Text `json:"theme"`
+	ID    uuid.UUID   `json:"id"`
+}
+
+// Sets (or clears, when @theme is NULL) the current user's theme override.
+// NULL falls the user back to the instance default. Own-user only.
+func (q *Queries) SetUserTheme(ctx context.Context, arg SetUserThemeParams) (pgtype.Text, error) {
+	row := q.db.QueryRow(ctx, setUserTheme, arg.Theme, arg.ID)
+	var theme pgtype.Text
+	err := row.Scan(&theme)
+	return theme, err
 }
 
 const updatePassword = `-- name: UpdatePassword :exec

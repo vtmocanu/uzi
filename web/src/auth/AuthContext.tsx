@@ -17,6 +17,7 @@ import {
   type SessionResponse,
   type User,
 } from "../lib/api";
+import { applyTheme, resolveTheme, DEFAULT_THEME, type Theme } from "../lib/theme";
 
 interface AuthState {
   user: User | null;
@@ -26,9 +27,17 @@ interface AuthState {
   // consumers (Board, issue creation) can read them unconditionally.
   prdLabel: string;
   autopilotLabel: string;
+  // Theme state from the session bootstrap (PRD #21). theme is the resolved
+  // theme currently applied to <html>; themeOverride is the user's raw pick
+  // (null = "use default"); defaultTheme is the instance default the Appearance
+  // picker labels its "Use default (<name>)" option with. Applying the attribute
+  // itself happens in applySession — no component reads `theme` to branch.
+  theme: Theme;
+  themeOverride: string | null;
+  defaultTheme: Theme;
   // PRDLESS escape-hatch config (PRD #22). prdlessEnabled gates the label toggle's
   // visibility; it defaults to false so a server that predates the bootstrap
-  // fields (M3) simply hides the toggle rather than showing one the backend 422s.
+  // fields simply hides the toggle rather than showing one the backend 422s.
   prdlessLabel: string;
   prdlessEnabled: boolean;
   register: (email: string, password: string, displayName: string) => Promise<void>;
@@ -44,17 +53,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [prdLabel, setPrdLabel] = useState(DEFAULT_PRD_LABEL);
   const [autopilotLabel, setAutopilotLabel] = useState(DEFAULT_AUTOPILOT_LABEL);
+  const [theme, setTheme] = useState<Theme>(DEFAULT_THEME);
+  const [themeOverride, setThemeOverride] = useState<string | null>(null);
+  const [defaultTheme, setDefaultTheme] = useState<Theme>(DEFAULT_THEME);
   const [prdlessLabel, setPrdlessLabel] = useState(DEFAULT_PRDLESS_LABEL);
   const [prdlessEnabled, setPrdlessEnabled] = useState(false);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
-  // the label fields. prdless_enabled is a bool, so `?? false` (not `||`) keeps an
-  // explicit false; an absent field (older server) also reads as off.
+  // the label fields. It also resolves and applies the theme (PRD #21): the
+  // server sends the resolved theme, but we re-resolve from the override +
+  // default so a server that predates the theme fields still yields ember, then
+  // stamp <html data-theme> so a login/refresh restyles live. prdless_enabled is a
+  // bool, so `?? false` (not `||`) keeps an explicit false; an absent field (older
+  // server) also reads as off.
   const applySession = useCallback((session: SessionResponse) => {
     setUser(session.user);
     setPrdLabel(session.prd_label || DEFAULT_PRD_LABEL);
     setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
+    const resolved = resolveTheme(session.theme_override, session.default_theme);
+    setThemeOverride(session.theme_override ?? null);
+    setDefaultTheme(resolveTheme(session.default_theme, DEFAULT_THEME));
+    setTheme(resolved);
+    applyTheme(resolved);
     setPrdlessLabel(session.prdless_label || DEFAULT_PRDLESS_LABEL);
     setPrdlessEnabled(session.prdless_enabled ?? false);
   }, []);
@@ -114,6 +135,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       loading,
       prdLabel,
       autopilotLabel,
+      theme,
+      themeOverride,
+      defaultTheme,
       prdlessLabel,
       prdlessEnabled,
       register,
@@ -121,7 +145,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       logout,
       refresh,
     }),
-    [user, loading, prdLabel, autopilotLabel, prdlessLabel, prdlessEnabled, register, login, logout, refresh],
+    [
+      user,
+      loading,
+      prdLabel,
+      autopilotLabel,
+      theme,
+      themeOverride,
+      defaultTheme,
+      prdlessLabel,
+      prdlessEnabled,
+      register,
+      login,
+      logout,
+      refresh,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

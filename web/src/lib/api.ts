@@ -34,9 +34,20 @@ export interface SecretMeta {
 }
 
 // UserSettings is the current user's own (non-secret) settings. default_model
-// is the per-user default worker model; null means inherit (PRD #17).
+// is the per-user default worker model; null means inherit (PRD #17). theme is
+// the per-user UI theme override; null means "use the instance default" (PRD
+// #21).
 export interface UserSettings {
   default_model: string | null;
+  theme: string | null;
+}
+
+// UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
+// is applied (null clears it), a field absent is left unchanged — so the model
+// card and the Appearance picker save independently over the one endpoint.
+export interface UserSettingsPatch {
+  default_model?: string | null;
+  theme?: string | null;
 }
 
 // AgentTemplate is a stored agent definition. tools is null when the template
@@ -252,10 +263,12 @@ export interface ForgeConfig {
 
 // AppSettings is the instance-level settings surface (PRD #19). Admin-only. The
 // API always returns every known key (a missing row reads as its default), so
-// both fields are always present.
+// every field is always present. default_theme is the instance-default UI theme
+// (PRD #21).
 export interface AppSettings {
   prd_label: string;
   autopilot_label: string;
+  default_theme: string;
 }
 
 // Compiled-in label defaults, mirroring the API's settings package. The SPA uses
@@ -266,14 +279,19 @@ export const DEFAULT_AUTOPILOT_LABEL = "autopilot";
 export const DEFAULT_PRDLESS_LABEL = "PRDLESS";
 
 // SessionResponse is the auth/session bootstrap body (login, register, me). It
-// carries the user plus the instance forge labels the board and issue-creation UI
-// need before their first call (PRD #19 M2 — delivered on the existing response,
-// no new endpoint). The prdless fields (PRD #22) are optional: a server that
-// predates them omits both, and the SPA then treats the feature as off.
+// carries the user, the instance forge labels the board and issue-creation UI
+// need before their first call (PRD #19 M2), the three theme fields the
+// Appearance picker needs (PRD #21: resolved theme, the user's raw override with
+// null = none, and the instance default), and the prdless fields (PRD #22,
+// optional: a server that predates them omits both and the SPA treats the feature
+// as off).
 export interface SessionResponse {
   user: User;
   prd_label: string;
   autopilot_label: string;
+  theme: string;
+  theme_override: string | null;
+  default_theme: string;
   prdless_label?: string;
   prdless_enabled?: boolean;
 }
@@ -504,8 +522,8 @@ const realApi = {
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
   deleteAnthropicToken: () => request<null>("DELETE", "/me/secrets/anthropic_token"),
   getMySettings: () => request<{ settings: UserSettings }>("GET", "/me/settings"),
-  putMySettings: (defaultModel: string | null) =>
-    request<{ settings: UserSettings }>("PUT", "/me/settings", { default_model: defaultModel }),
+  putMySettings: (patch: UserSettingsPatch) =>
+    request<{ settings: UserSettings }>("PUT", "/me/settings", patch),
   listAgentTemplates: () =>
     request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
   getAgentTemplate: (id: string) =>

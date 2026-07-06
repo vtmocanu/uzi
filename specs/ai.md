@@ -2839,23 +2839,203 @@ and the example-app repos, covering the example CI/CD norm and example-app as th
 
 ---
 
+# PRD #21 — Mission-control theme (data-theme port of the ops-console identity)
+
+Serves human Feature #21 (a second, user-selectable theme on top of PRD #14's
+ember tokens; server-side theme preference with an admin default). PRD #14 shipped
+ember as the sole theme with all look-and-feel in CSS variables precisely so
+alternate identities could ship later as `data-theme` overrides; this PRD builds
+the switching mechanism and ports the mission-control prototype onto ember's token
+slots. Section numbers continue past PRD #16's #110. Realizes
+`prds/21-mission-control-theme.md` (its Decision Log carries build-time provenance);
+builds on PRD #14 (tokens), PRD #17 (`/api/me/settings`), and PRD #19 (`app_settings`).
+
+## 111. Theme = tokens only; the no-branch rule; base-selector hardening
+
+Serves human: "mission-control theme selectable"; PRD #14's token architecture.
+
+- **A theme is CSS-variable values and nothing else.** Every color, radius, font,
+  and the backdrop grid is a token in `web/src/index.css`; components reference only
+  the Tailwind names those tokens back (`bg-ink`, `text-fg`, `rounded-lg`, …), never
+  a variable or raw palette value. **No component file may branch on the active
+  theme** — `if (theme === "mission")` exists nowhere. This is the load-bearing rule:
+  a theme port that would need a component edit means the underlying feature belongs
+  in tokens. Mission's *structural* ideas (status bar, nav regrouping, kicker labels,
+  control density, agent-lane hues, gate-pulse ring) are deliberately out of scope.
+- **Base-selector hardening**: the default block is
+  `:root:not([data-theme]), [data-theme="ember"]` (was `:root, [data-theme="ember"]`),
+  so a `[data-theme="mission"]` override wins regardless of source order rather than by
+  specificity accident. A theme block is a **complete token set**, not a diff against
+  ember — `[data-theme="mission"]` redefines every token the base block defines.
+- **`[data-theme]` lives on `<html>`.** PRD #14's grep gate (zero raw palette
+  classes / ad-hoc hex/rgb outside `index.css`) stays green under this feature.
+
+## 112. Canonical Go theme registry + resolution chain (server-authoritative)
+
+Serves human: "resolution: user override > admin default > ember"; best-practice
+(two write surfaces must not drift).
+
+- **`api/internal/theme`** is the canonical theme list and the `theme.Resolve`
+  resolution chain (**user override → admin instance default → `ember`**), computed
+  server-side. The web theme module (`web/src/lib/theme.ts`, `resolveTheme`) mirrors
+  the same list + chain so the SPA re-derives the identical answer client-side without
+  a round trip.
+- **Both write surfaces validate against the Go registry** (admin `default_theme` PUT
+  and the user `theme` PUT), so a bogus value is rejected at write and can never fall
+  back silently at render — same shared-validator discipline PRD #17 uses for models.
+- Adding a theme within the existing slot set is **exactly four edits** (Success
+  Criterion 5): the Go registry entry (canonical), the web registry entry (mirror),
+  one `[data-theme]` CSS block, and one entry in the pre-paint allowlist (§116). No
+  handler/component/migration change. A theme needing a new slot is the two-step
+  Decision-3 pattern (§117): add the slot theme-agnostically first, then color it.
+
+## 113. Server-side persistence: instance default in #19's `app_settings`, user override on `users`
+
+Serves human: "theme preference is server-side with an admin-set instance default"
+(user, 2026-07-05, superseding a device-local draft).
+
+- **Instance default tenants into PRD #19's `app_settings`** (no new table, no new
+  settings endpoints — user-approved direction "update 21, 19 is in flight"):
+  `default_theme` is one seed row in `settings.Defaults` (`"ember"`), so `Known()`,
+  the GET shape, and the fallback all follow. If PRD #21 ever landed before #19 M1,
+  M1 here holds — a parallel settings table must not be built.
+- **User override is a nullable `users.theme` column** — migration
+  `00041_user_theme.sql` (drafted 00040; PRD #16's `00040_skills` landed first, so it
+  renumbered to 00041, the next free slot above the live head at land time per the
+  CLAUDE.md goose convention). One scalar per user ⇒ a column on `users`, not a table.
+  `NULL` = "use default".
+- **Per-key validation dispatch** in #19's admin settings handler: the handler ran
+  `settings.ValidateLabel()` on every submitted key; this PRD refactors it to
+  `settings.Validate(key, value)` (switch: label rules for the label keys,
+  theme-registry check for `default_theme`) without touching `ValidateMerged`'s
+  cross-key label rule. Absorbed here as a small M1 refactor on #19's surface.
+- **A theme-only settings change does NOT `ForceReconcile`.** Only a label change
+  re-filters boards; `default_theme` is presentation-only. The dispatch is an
+  extracted `settings.LabelChanged` helper (a pure function unit-tested in the always-on
+  `go test` gate — a fake-reconciler handler test was declined because `h.pool` is a
+  concrete `*pgxpool.Pool` needing a live DB that would skip in the plain gate).
+
+## 114. Three theme fields on `/api/auth/me`; client re-resolves, ignores the server-resolved one
+
+Serves human: the Appearance picker must render "Use default (<name>)"; server-side
+resolution.
+
+- **`GET /api/auth/me` carries three theme fields**: the resolved theme, the user's
+  raw override (nullable), and the instance-default theme id. Resolved-only is not
+  enough (review blocker): with an override active the SPA could render neither
+  "Use default (<name>)" nor the picker's selected state, since the default otherwise
+  lives only in the admin-only settings endpoint. Non-admins get everything they need
+  from `/me`, so no admin read is required to render the picker.
+- **The client intentionally ignores the server's resolved field and re-resolves
+  itself** (§112 mirror). This is deliberate forward-compat, not dead code: a server
+  predating these fields degrades to `ember` rather than throwing on a missing field.
+- **Application point is session bootstrap** (`web/src/auth/AuthContext.tsx`, not the
+  originally-anticipated `main.tsx`): on every login/`me` refresh it re-resolves and
+  stamps `<html data-theme>`, so a change (the user's, or the admin default) restyles
+  live with no reload.
+
+## 115. User theme pref extends PRD #17's `/api/me/settings` (PATCH-like); no new route
+
+Serves human: server-side user override; PRD #17 coordination.
+
+- **No new `/me/prefs/*` route.** The pref is shaped exactly like `default_model`, so
+  `userSettingsDTO` gains `theme` next to `default_model` on the existing
+  `GET/PUT /api/me/settings` ("prefs" already names the localStorage helper
+  `web/src/lib/prefs.ts`, so a `/prefs` route would misname).
+- **`PUT` is PATCH-like, presence-detected via `json.RawMessage`**: a field present is
+  applied (`theme: null` clears the override), a field absent is left unchanged — so
+  the worker-model card and the Appearance picker save independently over the one
+  endpoint without clobbering each other. `default_model`'s prior behavior is unchanged
+  (the client always sends it on a model save). Own-user only; validates the theme
+  against the Go registry (§112).
+
+## 116. Pre-paint via an external CSP-safe script + localStorage cache
+
+Serves human: no flash-of-wrong-theme on cold load; best-practice (works in the
+nginx-served build, not just dev).
+
+- **`localStorage` (`uzi.theme`) is demoted to a pre-paint cache** of the last resolved
+  theme — the server value is authoritative. `web/public/theme-preinit.js` stamps
+  `data-theme` from the cache before first paint; `applyTheme()` refreshes the cache
+  each time the server-resolved value wins. Stored values are validated against the
+  registry (fallback `ember`), storage access is try/caught (private-mode safe); a
+  missing/blocked cache leaves `data-theme` unset ⇒ `ember`, never a half-themed page.
+- **External file, not an inline `<head>` script** (M1 auditor High): `web/nginx.conf`
+  / `web/nginx.mock.conf` set `script-src 'self'` with no `'unsafe-inline'`, so an
+  inline script is CSP-blocked and would silently never run in any nginx-served image
+  (it only worked under `vite dev`). Chosen over adding a `'sha256-…'` hash to both
+  confs plus a drift guard — the hash route is fragile (Vite can minify the inline
+  script at build so the source hash wouldn't match served bytes). Keeps "no inline
+  scripts" literally true with no CSP change; only the CSP comment is refreshed.
+- **The allowlist inside `theme-preinit.js` hardcodes the theme ids** and is a
+  deliberate fourth edit point (§112): the file runs before the app bundle, so it
+  can't import the web registry. A theme added without this edit still renders once
+  `me()` resolves — it just flashes `ember` for one frame on a cold load.
+
+## 117. queue/neutral status tones added theme-agnostically, as fg/border/surface triples
+
+Serves human: "mission's six-tone status language incl. the violet queue tone, added
+theme-agnostically" (user decision, 2026-07-05).
+
+- Ember had four status tones (`ok/warn/danger/info`); queued/stopped rendered via
+  palette neutrals hardcoded in `runBadge.ts`/`ui.tsx` that token values couldn't
+  reach. To carry mission's violet queue **without per-theme component logic**, two
+  slots are added to the existing tone maps: **`queue`** (queued) and **`neutral`**
+  (idle/stopped). `runBadge`/`RUN_STATUS_TONES` map `queued → "queue"` **once, for all
+  themes**; the `runBadge` tests update for the tone-name change only (PRD #14's
+  tone-unification discipline). Mission's cyan-run and sky-info both flow through
+  `--info`.
+- **Ember populates the new slots with its current neutral gray — zero visual change**;
+  mission populates them violet. With nothing set anywhere, everything renders ember
+  pixel-identical to before, the `--queue`=gray no-op included.
+- **Each slot is a border/surface/fg TRIPLE, not a single token** (supersedes the PRD's
+  earlier single-token phrasing; M2 reviewer confirmed "required, not
+  over-engineering"). A single hue-at-opacity token (the four original tones' pattern)
+  can't reproduce ember's solid `border-edge bg-raised text-muted` pill; the triple
+  keeps that pill pixel-identical while a theme can retint it, mirroring the mission
+  prototype's own `--uzi-status-*-{fg,border,surface}` schema.
+- **Tailwind `neutral` caution**: `tailwind.config.js` defines `neutral` as an object
+  (`neutral.{fg,border,surface}`) inside Tailwind's default palette, which already ships
+  a `neutral-50…950` gray scale. The two merge: `bg-neutral-border` resolves to the
+  token, but `bg-neutral-500` stays stock gray. Nothing in `web/src` uses a bare
+  `neutral-<number>` today; a future edit reaching for one expecting theme-awareness
+  gets untethered gray — use `queue-*` / `neutral-{fg,border,surface}` explicitly.
+- **Blueprint grid** ships as background tokens consumed by the existing `body` rule
+  (default themes set it to none); any `[data-theme="mission"]` CSS stays inside
+  `index.css` next to the token blocks.
+
+## 118. Mock parity + versioned mock persistence
+
+Serves human: "mock demo persists settings across reload" (user approved 2026-07-05,
+scoped settings-only); Decision 6 (the `VITE_UZI_MOCK=1` build is the review vehicle).
+
+- Mock mode always logs in as admin, so the admin flow must work. **mockApi implements
+  in-memory**: the `theme` field on its existing `getMySettings`/`putMySettings`, the
+  three theme fields on `/me`, and **#19's admin settings `default_theme` key** (if #19
+  lands a mock first, extend it; else this PRD adds it) — so the full picker flow (user
+  override + admin default) is exercised in the demo build without a real backend.
+- **Mock settings persist across reload** via a versioned `localStorage` key
+  `uzi.mock.v1` (`MOCK_SETTINGS_KEY`), **settings-only**, discard-on-version-mismatch.
+  It is **independent of the `uzi.theme` pre-paint cache key** (§116) — different key,
+  different purpose (mock backend state vs. real pre-paint cache), so they don't
+  interfere.
+
 # PRD #22 — PRDLESS label: run an issue without a PRD link
 
 Serves human Feature #22 (an admin-controlled escape-hatch label that lets an issue run
 without a `prds/*.md` link — configurable name, feature on/off, both in admin settings;
 enabled out of the box; default name `PRDLESS`; the label can be added/removed directly
-from the uzi web UI). User-stated 2026-07-05; the corresponding `specs/human.md` entry is
-**pending user approval** at the time of writing. Section numbers continue past PRD #16's
-#110. Full rationale + Decision Log: `prds/22-prdless-label.md`.
+from the uzi web UI). User-stated 2026-07-05. Section numbers continue past PRD #21's
+#118. Full rationale + Decision Log: `prds/22-prdless-label.md`.
 
 **Status (branch `prd-22-prdless-label`):** M2 (gate bypass, manual + autopilot) and M4
-(UI label toggle endpoint + forgesvc helper) are built; M5 (docs) shipped. M1 (strict
-per-key validation + the admin-settings toggle/name UI), M3 (bootstrap fields + web
-badges), and M6 (e2e) are **deferred behind the in-flight prd-21 branch** (they share the
-same files) and are **not yet realized in code** — each decision below flags the milestone
-that owns it, so this section is not read as claiming more than is built.
+(UI label toggle endpoint + forgesvc helper) are built; M5 (docs) shipped. With prd-21
+now landed on main and merged into this branch, M1 (strict per-key validation + the
+admin-settings toggle/name UI) and M3 (bootstrap fields + web badges) are the in-flight
+milestones, and M6 (e2e) follows — each decision below flags the milestone that owns it,
+so this section is not read as claiming more than is built at a given commit.
 
-## 111. prdless settings keys + on-by-default resolution
+## 119. prdless settings keys + on-by-default resolution
 
 Serves human: "name configurable, feature toggleable on/off, both in admin settings";
 "enabled out of the box"; "default name PRDLESS".
@@ -2869,23 +3049,24 @@ Serves human: "name configurable, feature toggleable on/off, both in admin setti
   absent `prdless_enabled` row means enabled.
 - **Unspecified = on is the single meaning.** A malformed stored `prdless_enabled` value
   (not `"true"`/`"false"`) resolves to the compiled default (enabled), exactly like an
-  absent row — a junk value can never silently flip a default-on feature *off*. This
-  window exists only because strict validation is M1 (not yet landed); it closes when M1
-  lands.
-- **Strict per-key validation is M1 scope** (deferred behind prd-21, which introduces the
-  `settings.Validate(key, value)` per-key switch): `prdless_enabled` → strict bool parse;
+  absent row — a junk value can never silently flip a default-on feature *off*. The
+  accessor keeps this tolerance as defense-in-depth even once strict write validation
+  lands, so a value written directly to the DB (bypassing the handler) still resolves
+  safely.
+- **Strict per-key validation is M1 scope**, registering into prd-21's now-landed
+  `settings.Validate(key, value)` per-key switch: `prdless_enabled` → strict bool parse;
   `prdless_label` → label rules (non-empty, ≤ 64 runes, no comma) **plus pairwise-distinct**
   from both `prd_label` and `autopilot_label`, validated on the **post-merge** set and
-  **regardless of the toggle state** (a disabled-but-colliding label must be renamed
-  first, so re-enabling is always safe; equal to `prd_label` would exempt every issue,
-  equal to `autopilot_label` would conflate "hands-off" with "spec-less"). Until M1 lands,
-  main's uniform `ValidateLabel` path would accept a non-bool enabled value — tolerated
+  **regardless of the toggle state** (a disabled-but-colliding label must be renamed first,
+  so re-enabling is always safe; equal to `prd_label` would exempt every issue, equal to
+  `autopilot_label` would conflate "hands-off" with "spec-less"). Until M1 lands, the
+  uniform `ValidateLabel` default arm would accept a non-bool enabled value — tolerated
   only because of the resolve-to-default rule above.
-- **prdless keys excluded from the `ForceReconcile` `changed` set** (§96): they don't
+- **prdless keys excluded from the `ForceReconcile` `changed` set** (§96, M1): they don't
   affect the poller's PRD-label filter, so a prdless PUT must not trigger a repo resync
-  (the precedent prd-21's presentation-only `default_theme` key sets).
+  (the precedent prd-21's presentation-only `default_theme` key sets via `LabelChanged`).
 
-## 112. Gate bypass: policy in the callers, enforcement in the shared service (M2, built)
+## 120. Gate bypass: policy in the callers, enforcement in the shared service (M2, built)
 
 Serves human: "the label lets an issue run without a prds/*.md link."
 
@@ -2916,9 +3097,9 @@ Serves human: "the label lets an issue run without a prds/*.md link."
 - **Best-effort settings read, fails OPEN to the default.** A settings read error at the
   run-create gate degrades to enabled=true (the already-safe default) rather than blocking
   every run start on a settings hiccup — deliberately the opposite of the mutating endpoint
-  (§113).
+  (§121).
 
-## 113. UI label toggle: endpoint + forge-first single-label helper (M4, built)
+## 121. UI label toggle: endpoint + forge-first single-label helper (M4, built)
 
 Serves human: "add/remove the label directly from the uzi web UI, not only in GitLab."
 
@@ -2926,9 +3107,6 @@ Serves human: "add/remove the label directly from the uzi web UI, not only in Gi
   under `RequireAuth` + CSRF **plus the per-user forge limiter** like every other
   forge-writing route. The **label name is resolved server-side from settings** — the
   client never names a label. Returns **422 when the feature is disabled**.
-- **Fails CLOSED on a settings read error** (500, refuses to touch the forge) —
-  deliberately stricter than the run-create gate's fail-open (§112): the mutating,
-  forge-writing endpoint is the stricter of the two.
 - **New single-label forgesvc helper, NOT the column-move path.** `AutoMove`/
   `PlanLabelMove` strip all *other* column labels to enforce single-column membership;
   reusing them would clobber columns. The helper adds or removes **only** the one prdless
@@ -2944,26 +3122,35 @@ Serves human: "add/remove the label directly from the uzi web UI, not only in Gi
 - **Card response** built like `MoveIssue`'s — column-position map + `latest_run`
   re-hydration — so a single-card replace doesn't blank the run badge. **No optimistic
   update** on the web side (wait for the 200; forge-first).
-- **Not yet reachable through the UI until M3.** M4 shipped without touching `auth.go`, so
-  `sessionPayload` does not yet emit `prdless_enabled`/`prdless_label` (that is M3). The web
-  toggle affordance (IssueView primary, board card secondary; visible only when enabled)
-  therefore reads its client-side default (`false`) and stays hidden end-to-end until M3
-  delivers the bootstrap fields — the endpoint is live but currently reachable only
-  directly, not through the UI. **Generic arbitrary-label editing from uzi is out of
+- **Toggle affordance wired, lit by M3.** The web toggle (IssueView primary, board card
+  secondary) is visible only when `prdless_enabled`, which the SPA reads from the session
+  bootstrap — delivered by M3 (§122). Until M3 emits the field, the toggle reads its
+  client-side default (`false`) and stays hidden through the real app (the endpoint is
+  live, exercised in mock mode). **Generic arbitrary-label editing from uzi is out of
   scope**: labels are board semantics (columns, PRD, autopilot, prdless); free-form label
   management stays in GitLab.
 
-## 114. Quality gate, not a security boundary
+## 122. Web bootstrap + badges, and the quality-gate framing (M3)
 
-Serves human: the escape hatch must not weaken the primary directive (agents never touch
-`main`).
+Serves human: the escape hatch is discoverable in the UI without weakening the primary
+directive (agents never touch `main`).
 
-- The bypass is a **gate exception, not a mode**, and never weakens any of the four
-  `main`-protection layers; the human still clicks Start and approves the plan. Who can
-  apply the label is bounded by GitLab membership (Reporter+) plus any uzi session on a
-  connected repo — the **same population that already moves board cards** (also a forge
-  label write). The two "toggles" are different populations: the *settings* toggle is
-  admin-only; the *label* apply/remove is any uzi session on a connected repo.
+- **Session bootstrap** (`sessionPayload`, `handler/auth.go`, M3) gains `prdless_label`
+  (string) and `prdless_enabled` (bool — its first bool field), alongside the existing
+  labels + theme fields, so the SPA gates the toggle and badge on `prdless_enabled` and
+  knows the label name. A server predating the fields omits both; the SPA treats the
+  feature as off.
+- **Badge** (M3): the board card and issue view replace the "no PRD link" warning badge
+  with a distinct `PRDLESS` badge (tone accent, title "PRD-link gate bypassed by label")
+  when the feature is enabled and the issue carries the label. The board column-suggestion
+  filter also excludes `prdless_label` (it is a workflow marker, never a column).
+- **Quality gate, not a security boundary.** The bypass is a **gate exception, not a mode**,
+  and never weakens any of the four `main`-protection layers; the human still clicks Start
+  and approves the plan. Who can apply the label is bounded by GitLab membership (Reporter+)
+  plus any uzi session on a connected repo — the **same population that already moves board
+  cards** (also a forge label write). The two "toggles" are different populations: the
+  *settings* toggle is admin-only; the *label* apply/remove is any uzi session on a
+  connected repo.
 - **Composition is allowed by design**: an issue carrying PRD + autopilot + PRDLESS runs
   unattended with no PRD link — all three are explicit opt-ins; M2 covers it with a
   composition test. Called out as a docs caveat.

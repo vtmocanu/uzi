@@ -6,9 +6,9 @@
 import { isTerminalRun, type LatestRun } from "./api";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
-// color everywhere: neutral (queued/stopped), info (claimed/running), warning
-// (awaiting), ok (completed), danger (failure).
-export type BadgeTone = "neutral" | "warning" | "danger" | "info" | "ok";
+// color everywhere: queue (queued), neutral (stopped/idle), info
+// (claimed/running), warning (awaiting), ok (completed), danger (failure).
+export type BadgeTone = "neutral" | "queue" | "warning" | "danger" | "info" | "ok";
 
 // RunBadge is a card's primary status pill. kind "mr" is the completed-with-MR
 // chip (rendered as a link to the merge request); kind "badge" is a plain pill.
@@ -51,6 +51,7 @@ export function runStatusTone(status: string, failureReason: string | null | und
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
   if (status === "claimed" || status === "running") return "info";
+  if (status === "queued") return "queue";
   return "neutral";
 }
 
@@ -74,7 +75,7 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
   }
   switch (run.status) {
     case "queued":
-      return { kind: "badge", label: "queued", tone: "neutral", pulse: false };
+      return { kind: "badge", label: "queued", tone: "queue", pulse: false };
     case "claimed":
       return { kind: "badge", label: "claimed", tone: "info", pulse: false };
     case "running": {

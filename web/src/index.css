@@ -9,8 +9,9 @@
    ship as a second `[data-theme="…"]` block overriding these variables over
    the same component tree. This default theme is "ember": uzi is deliberately
    dark-only — a dark factory — with molten-metal orange against near-black
-   steel. */
-:root,
+   steel. The `:not([data-theme])` guard means a set data-theme (e.g. mission)
+   fully replaces this block instead of racing it on source order. */
+:root:not([data-theme]),
 [data-theme="ember"] {
   color-scheme: dark;
 
@@ -37,17 +38,96 @@
   --danger: 251 113 133;
   --info: 56 189 248;
 
+  /* Queue + idle/stopped status tones. Unlike the four tinted tones above
+     (a single hue at low opacity for border/bg/text), these reproduce ember's
+     solid neutral pill — border/surface/fg mapped onto edge/raised/muted, so
+     the queued and stopped badges stay pixel-identical to before. Split out as
+     their own slots (which a hardcoded neutral could not be) so a theme
+     (mission) can recolor just these pills — violet queue — with no component
+     branching. */
+  --queue-fg: var(--muted);
+  --queue-border: var(--edge);
+  --queue-surface: var(--raised);
+  --neutral-fg: var(--muted);
+  --neutral-border: var(--edge);
+  --neutral-surface: var(--raised);
+
   /* Radii: one base value, everything derived (multica's --radius scheme). */
   --radius: 0.625rem;
 
   /* Typography */
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Backdrop grid: ember has none. The body rule consumes these tokens; a theme
+     (mission) supplies a blueprint grid without touching any component. */
+  --grid-image: none;
+  --grid-size: auto;
+}
+
+/* ── Mission-control theme ─────────────────────────────────────────────────
+   The ops-console identity ported from the `prototype/mission-control` branch
+   (PRD #21): near-black ink, a faint cyan blueprint grid, a six-tone status
+   language with a violet queue, sharpened 0.25rem corners, cyan accent.
+   Mission's *values* mapped onto ember's existing slots — same component tree,
+   no per-theme component logic. This is a full token set: the base block above
+   does NOT apply once data-theme is set, so every token the app reads is
+   redefined here. */
+[data-theme="mission"] {
+  color-scheme: dark;
+
+  /* Palette: near-black ink, layered panels, hairline slate borders, cyan accent */
+  --bg: 5 8 15;
+  --surface: 11 17 32;
+  --raised: 16 26 48;
+  --edge: 28 42 69;
+  --edge-strong: 71 85 105;
+  --fg: 241 245 249;
+  --muted: 148 163 184;
+  --faint: 100 116 139;
+  --brand: 34 211 238;
+  --brand-hover: 103 232 249;
+  --on-brand: 2 6 23;
+
+  --ring: var(--brand);
+
+  /* Status colors. Mission's cyan run and sky info both collapse onto --info
+     (Decision 3); danger is mission's rose-500. */
+  --ok: 52 211 153;
+  --warn: 251 191 36;
+  --danger: 244 63 94;
+  --info: 34 211 238;
+
+  /* The signature violet queue and a lighter slate idle/stopped. */
+  --queue-fg: 196 181 253;
+  --queue-border: 91 33 182;
+  --queue-surface: 46 16 101;
+  --neutral-fg: 203 213 225;
+  --neutral-border: 51 65 85;
+  --neutral-surface: 30 41 59;
+
+  /* Sharper corners (every radius derives from this one value). */
+  --radius: 0.25rem;
+
+  /* Typography */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Faint blueprint grid, drawn by the body rule; reads as "console" while
+     staying far below content contrast. */
+  --grid-line: rgb(var(--brand) / 0.025);
+  --grid-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  --grid-size: 36px 36px;
 }
 
 body {
   @apply bg-ink text-fg antialiased;
   font-family: var(--font-sans);
+  /* Theme-supplied backdrop grid (none for ember); mission draws a blueprint. */
+  background-image: var(--grid-image, none);
+  background-size: var(--grid-size, auto);
 }
 
 /* Thin, unobtrusive scrollbars for the activity feed / board overflow areas

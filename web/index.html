@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Uzi — AI dark factory</title>
+    <!-- Pre-paint theme stamp (PRD #21). External same-origin classic script,
+         blocking so it runs before first paint; kept external (not inline) so the
+         nginx CSP stays script-src 'self' with no 'unsafe-inline'. -->
+    <script src="/theme-preinit.js"></script>
   </head>
   <body>
     <div id="root"></div>

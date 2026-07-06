@@ -60,3 +60,5 @@ shown again.
 - **Which model runs against it?** See [Worker model](./worker-model.md),
   right below this on the Settings page, to pick or override the Claude
   model your runs use.
+- **Looking for the theme picker?** It's the **Appearance** section further
+  down this same Settings page; see [Theming](./theming.md).
