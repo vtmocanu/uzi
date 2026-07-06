@@ -3022,213 +3022,6 @@ scoped settings-only); Decision 6 (the `VITE_UZI_MOCK=1` build is the review veh
 
 ---
 
-# PRD #6 — CI status integration & CI-fix agent
-
-Serves human Feature #6 (CI status visible in uzi + an agent that fixes broken CI
-and uzi verifies the fix) and the "uzi keeps its own dummy CI" item. Two halves along
-the PRD #4 dependency boundary: a display half on PRD #2 machinery only (M1–M3), and a
-fix-agent half riding PRD #4's run machinery (M4–M7). Section numbers continue past PRD
-#21's #118. Realizes `prds/6-ci-status-integration.md` (its Decision Log carries the
-user-vs-AI provenance and full rationale); builds on PRD #2 (forge layer + poller), PRD
-#4 (runs, worker protocol, plan gate, MR flow), and PRD #12 (`runs.mr_iid`/`mr_state`).
-
-## 119. Forge pipeline read methods (`forge.go` + `gitlab.go`)
-
-Serves human: "check and display CI status" — read the forge's pipeline state through
-the same neutral-domain + redaction discipline as every other forge call.
-
-- **Four additive methods** behind the existing `Forge` interface (pure additions —
-  `forge.go` is a three-way merge point with PRD #4/#5, all rebased trivially):
-  `LatestPipeline(projectID, ref)`, `LatestMRPipeline(projectID, mrIID)`,
-  `ListPipelineJobs(projectID, pipelineID)`, `JobLogTail(projectID, jobID, maxBytes)`.
-  Plus `Pipeline{ID,Ref,SHA,Status,WebURL,CreatedAt,UpdatedAt}` / `Job{ID,Name,Stage,
-  Status,WebURL}` domain types and `ErrNoPipeline` (ref has no CI ⇒ "no CI" in the
-  cache, not an error).
-- **`LatestMRPipeline` exists because branch-ref filtering misses detached and
-  merged-results pipelines** (they run on `refs/merge-requests/:iid/head`, never under
-  the source-branch ref). GitLab groups `merge_request_event` pipelines first in the
-  list response, so `[0]` is NOT newest — the driver selects **max-by-id** from the
-  returned page.
-- **`JobLogTail` is a full-download-then-client-truncate**: the trace endpoint has no
-  range/tail parameter, so it downloads the trace (with a **16 MiB fail-closed
-  ceiling**) and keeps the last `maxBytes`. Tail, not head, because failures conclude
-  logs. Confined to fix-trigger time, never the poll tick.
-- Redaction: the four methods pass through the driver's existing PAT-scrubbing redactor
-  like all forge calls (snapshot-specific scrubbing is §125).
-
-## 120. Pipeline sync + `pipeline_statuses` cache (poller tick)
-
-Serves human: "display CI status" on the board/repo view, within one poll interval.
-
-- **`pipeline_statuses`** (migration drafted `00040`, final number assigned at land time
-  per the goose convention): a **latest-per-`(repo_id, ref)`** cache, `UNIQUE(repo_id,
-  ref)`, upserted every tick. Forge is the source of truth; uzi caches, never invents.
-- **Rides the existing poller tick** — `forgesvc.SyncPipelines` runs after the issue sync
-  inside `poller.Engine.syncRepo`; no second ticker, no new interval knob, same bounded
-  concurrency + jitter. Refs no longer watched are **evicted on the reconcile tick**
-  (mirrors the issues-cache eviction).
-- **Watched refs per enabled repo** = `default_branch` (via `LatestPipeline`) + the
-  `runs.branch` of that repo's runs that are non-terminal, or terminal-with-an-MR within
-  `CI_WATCH_RUN_WINDOW`, each read via `LatestMRPipeline(mr_iid)` when the run has an MR
-  else `LatestPipeline(branch)`. Newest first, capped at `CI_WATCH_MAX_REFS` (hitting the
-  cap is logged, not silent). `CI_WATCH_MAX_REFS=0` disables pipeline sync entirely
-  (badges + Fix CI gone) — reproduces pre-PRD-#6 behavior bit-for-bit.
-- **`CI_WATCH_RUN_WINDOW` default is `336h`, NOT `14d`** — Go `time.ParseDuration` has no
-  `d` unit; the docs carry this footgun note.
-- **DTO enrichment (read paths)**: `repoDTO` gains `pipeline` (default branch) so both
-  `GET /repos` and the per-connection projects listing carry it (non-enabled projects ⇒
-  `null`); `GET /repos/{id}/board` gains it at board level and per-card for the most
-  recent run's branch.
-
-## 121. `ci_fix` run kind: schema, trigger, failure snapshot
-
-Serves human: "spin up an agent to review what happened and if it can fix it".
-
-- **Schema evolution on PRD #4's `runs`** (migration in the same `00040`+ landing group):
-  `kind text NOT NULL DEFAULT 'issue'` (`issue|ci_fix`), `issue_iid` **DROP NOT NULL**,
-  `pipeline_id`/`pipeline_ref`/`failure_snapshot(jsonb)`/`fix_verdict` columns, and a
-  `runs_kind_shape` CHECK (issue ⇒ issue_iid present; ci_fix ⇒ pipeline_id+pipeline_ref
-  present). `DEFAULT 'issue'` backfills existing rows untouched.
-- **`ci_fix` as a run kind with nullable `issue_iid`, NOT auto-created GitLab issues**
-  (rejected alternative, PRD Decision Log): auto-creating a forge issue per CI failure
-  would spam the board and make the PRD-link check meaningless. Nullable `issue_iid` +
-  CHECK is the honest shape.
-- **Exclusion**: a partial unique index `uq_runs_one_active_ci_fix (repo_id,
-  pipeline_ref) WHERE kind='ci_fix' AND status NOT IN terminal` (mirrors the
-  one-active-per-issue index, which also gains a `kind='issue'` predicate —
-  defensive-only, NULL `issue_iid` never collides). The two partial indexes are disjoint
-  and can't express the **cross-kind same-branch** rule (an issue run and a ci_fix run
-  targeting the same branch would collide in one worktree), so **both `CreateRun` and the
-  trigger endpoint check it at trigger time**; `ErrBranchInUse` maps to **409**, and git's
-  "branch already checked out" is the race backstop. (The e2e surfaced this.)
-- **Trigger**: `POST /api/repos/{id}/ci-fix-runs {ref}` (under `/api`, no `/v1`) —
-  validates the cache shows `failed` for the ref, no active fix for the ref, no active
-  run of any kind on that branch, and the same worker+token preconditions as `CreateRun`.
-- **Failure snapshot frozen at queue time** (self-containment, same reason PRD #4
-  snapshots issues — the cache row gets overwritten): pipeline id/sha/web_url + up to
-  `CI_FIX_MAX_JOBS` failed jobs, each with `JobLogTail(…, CI_FIX_LOG_TAIL_BYTES)`.
-- **Manual trigger only in MVP**; auto-spawn on failure deferred (burns tokens
-  unattended — `multica`'s ungated autopilot is the audited weakness). The plan gate keeps
-  a human in the loop.
-
-## 122. Wire contract: claim payload + `fix_verdict` state report
-
-Serves human: server/worker split; best-practice (two lenient fakes each invent a field
-differently — the PRD #4 M1+M2 lesson).
-
-- **Claim payload** gains `kind` and, for `ci_fix`, `pipeline: {id, ref, sha, web_url,
-  failed_jobs: [{name, stage, web_url, log_tail}]}`.
-- **State report (worker→server)** gains an optional `fix_verdict` on the `completed`
-  report so a `not_code` outcome travels the wire (`SetRunCompleted` extended). Both
-  directions are pinned by a **cross-side contract test**, not two independent fakes.
-- **Inbound `fix_verdict` is clamped to `not_code` only** — `verified`/`fix_failed` are
-  pipeline-sync-authoritative (§124); a forged inbound `verified`/`fix_failed` drops to
-  NULL so the worker can't self-certify a passing fix.
-
-## 123. Worker `ci_fix` workflow (extends PRD #4's executor, guardrails verbatim)
-
-Serves human: "spin up an agent to fix it"; PRIMARY DIRECTIVE holds for ci_fix exactly
-as for issue runs.
-
-- **Kind-aware executor**: worktree on the failing ref → lead diagnoses from the snapshot
-  (may re-run failing commands locally via Bash; cannot touch the forge) → plan gate
-  posts root cause + fix **or** a `not_code` verdict → on approval, implement⇄review as in
-  PRD #4.
-  - **ref = default branch** → fix on new branch `ci-fix/pipeline-{id}`, worker pushes +
-    opens a new MR linking the failing pipeline (no issue to link).
-  - **ref = an agent run branch** → fix commits land **on that same branch**, the existing
-    MR updates (no second MR — bottega's PR-feedback shape).
-  - **`not_code`** (infra/flaky/secret/runner) → run completes with the diagnosis as its
-    result, `fix_verdict='not_code'`, no MR.
-- **Log tails are untrusted data, never instructions**: the lead prompt frames the
-  snapshot as quoted evidence. Fencing uses a **per-prompt random nonce tag
-  `<job_log_{hex}>`**; `job.name`/`stage` are sanitized (backticks/CRLF stripped) before
-  prose interpolation.
-- **Every PRD #4 guardrail holds unchanged** (worker-held PAT, `PreToolUse` deny-hook,
-  `bypassPermissions`+`disallowedTools`, `settingSources:[]`, sparse env, iteration cap,
-  watchdogs). Push targets are non-protected branches, so no guardrail loosening; a ci_fix
-  attempting `git push origin main` fails identically to an issue run. The M7 auditor pass
-  proved hostile log content cannot steer a push to `main`.
-
-## 124. Verification loop — passive stamp keyed on `runs.branch`
-
-Serves human: "if the code was bad ⇒ uzi verifies its work", mechanically.
-
-- **Passive stamp inside the pipeline sync step** (no new loop, no worker involvement,
-  no auto-retry): when the sync sees a terminal pipeline on a fix run's branch, it stamps
-  `fix_verdict` — `success ⇒ 'verified'`, `failed ⇒ 'fix_failed'`.
-- **Keyed on `runs.branch` (the fix branch), not `pipeline_ref` (the failed ref)** — they
-  differ for a default-branch fix (`pipeline_ref='main'`, `branch='ci-fix/pipeline-{id}'`);
-  keying on `pipeline_ref` would never stamp or false-stamp from unrelated `main` commits.
-- **`observed pipeline id > snapshot pipeline id` guard** ensures the stamp reacts to the
-  fix push, not the original failing pipeline — this is also what disambiguates the
-  agent-branch case where `branch == pipeline_ref`.
-- Observed via `LatestMRPipeline` of the fix run's MR (catches detached/merged-results
-  pipelines); the max-by-id pipeline must be **terminal** to stamp.
-- **Stamp-target selection** (a branch can host sequential fix runs over time): the ci_fix
-  run with `branch = ref AND fix_verdict IS NULL AND snapshot id < observed id`, newest
-  first.
-- `fix_failed` is **surfaced, not auto-retried** (user fires another fix run, which gets
-  the new snapshot). A fix branch that ages out of the window before a terminal pipeline
-  keeps `fix_verdict = NULL`, shown as "unverified" — honest, not fabricated.
-
-## 125. Snapshot redaction (dedicated scrubber over the driver scrub)
-
-Serves human: best-practice — job logs are the most attacker-influenceable text uzi feeds
-an agent, and teammates' pipelines may print tokens.
-
-- A **dedicated snapshot log scrubber** runs on top of the driver's by-value PAT scrub,
-  because a snapshot can contain secrets the driver never saw: **9 GitLab token families**
-  (`glpat`/`gloas`/`glrt`/`glcbt`/`glptt`/`glsoat`/`glimt`/`glagent`/`gldt-`), `sk-ant-`,
-  and `PRIVATE-TOKEN`/`Authorization`/`Bearer` header lines to EOL.
-- **Join tokens and Anthropic tokens have no by-value scrub** in the snapshot path (they
-  aren't in the failure snapshot's provenance) — header-shape coverage only; documented.
-- **Arbitrary third-party secrets** a pipeline prints are the documented residual risk:
-  size-capped, stored server-side like any run message (owner/admin-only authz), but uzi
-  can't know every secret shape.
-
-## 126. Web: pipeline badges + Fix CI + verdict chips
-
-Serves human: "display CI status" on cards/repo view; the fix affordance.
-
-- **Five-tone badge taxonomy** (`web/src/lib/pipelineBadge.ts`): `passed` (success),
-  `failed`, `running` (created/waiting/preparing/pending/running/scheduled), `attention`
-  (manual), `neutral` (canceled/skipped/no CI); **unknown status ⇒ neutral**; success is
-  **labeled "passed"**. Reuses `ui.tsx` `Badge` tones; shows `synced_at` staleness on
-  hover.
-- Badge per Repos row (default branch), board header (default branch), and per card
-  whose run branch has a status. A **failed** state renders the **Fix CI** button,
-  precondition-disabled with a reason (mirroring "Start run").
-- **Fix-run view** reuses PRD #4's `/runs/:id` as-is; the header shows the failing
-  pipeline link + a **verdict chip** (`verified ✓` / `fix failed ✗` / `not a code problem`
-  / `unverified`).
-- **All forge-provided `web_url` links guarded by `isHttpsUrl`** (PipelineBadge +
-  CIFixRunHeader) — a forge-supplied URL is not trusted into an `href` unchecked.
-
-## 127. Configuration (env, extends §13/§25)
-
-| Var | Default | Notes |
-|---|---|---|
-| `CI_WATCH_RUN_WINDOW` | `336h` | run-branch watch window (`14d`; Go has no `d` unit) |
-| `CI_WATCH_MAX_REFS` | `20` | cap on watched refs/repo; **`0` disables pipeline sync + Fix CI** |
-| `CI_FIX_MAX_JOBS` | `10` | failed jobs captured per snapshot |
-| `CI_FIX_LOG_TAIL_BYTES` | `32768` | trailing bytes of each job trace snapshotted |
-
-Pipeline sync rides `FORGE_POLL_INTERVAL` — no new interval.
-
-## 128. Dummy CI pipeline for the uzi repo itself
-
-Serves human: "setup a local dummy CI for uzi, kept (merged to main), so we can see the
-PRD working" (user, 2026-07-06).
-
-- A minimal committed `.gitlab-ci.yml` at the repo root — kept, not throwaway — so uzi's
-  own repo produces real pipeline statuses for the feature to display and fix against.
-- **`lint`/`smoke` echo-placeholder stages** named for future real gates + a **`demo-fail`
-  job gated on `UZI_CI_DEMO_FAIL=1`** so a red pipeline can be produced on demand to
-  exercise the Fix-CI path end to end.
-
----
-
 # PRD #22 — PRDLESS label: run an issue without a PRD link
 
 Serves human Feature #22 (an admin-controlled escape-hatch label that lets an issue run
@@ -3359,3 +3152,210 @@ directive (agents never touch `main`).
 - **Composition is allowed by design**: an issue carrying PRD + autopilot + PRDLESS runs
   unattended with no PRD link — all three are explicit opt-ins; M2 covers it with a
   composition test. Called out as a docs caveat.
+
+---
+
+# PRD #6 — CI status integration & CI-fix agent
+
+Serves human Feature #6 (CI status visible in uzi + an agent that fixes broken CI
+and uzi verifies the fix) and the "uzi keeps its own dummy CI" item. Two halves along
+the PRD #4 dependency boundary: a display half on PRD #2 machinery only (M1–M3), and a
+fix-agent half riding PRD #4's run machinery (M4–M7). Section numbers continue past PRD
+#22's #122. Realizes `prds/6-ci-status-integration.md` (its Decision Log carries the
+user-vs-AI provenance and full rationale); builds on PRD #2 (forge layer + poller), PRD
+#4 (runs, worker protocol, plan gate, MR flow), and PRD #12 (`runs.mr_iid`/`mr_state`).
+
+## 123. Forge pipeline read methods (`forge.go` + `gitlab.go`)
+
+Serves human: "check and display CI status" — read the forge's pipeline state through
+the same neutral-domain + redaction discipline as every other forge call.
+
+- **Four additive methods** behind the existing `Forge` interface (pure additions —
+  `forge.go` is a three-way merge point with PRD #4/#5, all rebased trivially):
+  `LatestPipeline(projectID, ref)`, `LatestMRPipeline(projectID, mrIID)`,
+  `ListPipelineJobs(projectID, pipelineID)`, `JobLogTail(projectID, jobID, maxBytes)`.
+  Plus `Pipeline{ID,Ref,SHA,Status,WebURL,CreatedAt,UpdatedAt}` / `Job{ID,Name,Stage,
+  Status,WebURL}` domain types and `ErrNoPipeline` (ref has no CI ⇒ "no CI" in the
+  cache, not an error).
+- **`LatestMRPipeline` exists because branch-ref filtering misses detached and
+  merged-results pipelines** (they run on `refs/merge-requests/:iid/head`, never under
+  the source-branch ref). GitLab groups `merge_request_event` pipelines first in the
+  list response, so `[0]` is NOT newest — the driver selects **max-by-id** from the
+  returned page.
+- **`JobLogTail` is a full-download-then-client-truncate**: the trace endpoint has no
+  range/tail parameter, so it downloads the trace (with a **16 MiB fail-closed
+  ceiling**) and keeps the last `maxBytes`. Tail, not head, because failures conclude
+  logs. Confined to fix-trigger time, never the poll tick.
+- Redaction: the four methods pass through the driver's existing PAT-scrubbing redactor
+  like all forge calls (snapshot-specific scrubbing is §129).
+
+## 124. Pipeline sync + `pipeline_statuses` cache (poller tick)
+
+Serves human: "display CI status" on the board/repo view, within one poll interval.
+
+- **`pipeline_statuses`** (migration drafted `00040`, final number assigned at land time
+  per the goose convention): a **latest-per-`(repo_id, ref)`** cache, `UNIQUE(repo_id,
+  ref)`, upserted every tick. Forge is the source of truth; uzi caches, never invents.
+- **Rides the existing poller tick** — `forgesvc.SyncPipelines` runs after the issue sync
+  inside `poller.Engine.syncRepo`; no second ticker, no new interval knob, same bounded
+  concurrency + jitter. Refs no longer watched are **evicted on the reconcile tick**
+  (mirrors the issues-cache eviction).
+- **Watched refs per enabled repo** = `default_branch` (via `LatestPipeline`) + the
+  `runs.branch` of that repo's runs that are non-terminal, or terminal-with-an-MR within
+  `CI_WATCH_RUN_WINDOW`, each read via `LatestMRPipeline(mr_iid)` when the run has an MR
+  else `LatestPipeline(branch)`. Newest first, capped at `CI_WATCH_MAX_REFS` (hitting the
+  cap is logged, not silent). `CI_WATCH_MAX_REFS=0` disables pipeline sync entirely
+  (badges + Fix CI gone) — reproduces pre-PRD-#6 behavior bit-for-bit.
+- **`CI_WATCH_RUN_WINDOW` default is `336h`, NOT `14d`** — Go `time.ParseDuration` has no
+  `d` unit; the docs carry this footgun note.
+- **DTO enrichment (read paths)**: `repoDTO` gains `pipeline` (default branch) so both
+  `GET /repos` and the per-connection projects listing carry it (non-enabled projects ⇒
+  `null`); `GET /repos/{id}/board` gains it at board level and per-card for the most
+  recent run's branch.
+
+## 125. `ci_fix` run kind: schema, trigger, failure snapshot
+
+Serves human: "spin up an agent to review what happened and if it can fix it".
+
+- **Schema evolution on PRD #4's `runs`** (migration in the same `00040`+ landing group):
+  `kind text NOT NULL DEFAULT 'issue'` (`issue|ci_fix`), `issue_iid` **DROP NOT NULL**,
+  `pipeline_id`/`pipeline_ref`/`failure_snapshot(jsonb)`/`fix_verdict` columns, and a
+  `runs_kind_shape` CHECK (issue ⇒ issue_iid present; ci_fix ⇒ pipeline_id+pipeline_ref
+  present). `DEFAULT 'issue'` backfills existing rows untouched.
+- **`ci_fix` as a run kind with nullable `issue_iid`, NOT auto-created GitLab issues**
+  (rejected alternative, PRD Decision Log): auto-creating a forge issue per CI failure
+  would spam the board and make the PRD-link check meaningless. Nullable `issue_iid` +
+  CHECK is the honest shape.
+- **Exclusion**: a partial unique index `uq_runs_one_active_ci_fix (repo_id,
+  pipeline_ref) WHERE kind='ci_fix' AND status NOT IN terminal` (mirrors the
+  one-active-per-issue index, which also gains a `kind='issue'` predicate —
+  defensive-only, NULL `issue_iid` never collides). The two partial indexes are disjoint
+  and can't express the **cross-kind same-branch** rule (an issue run and a ci_fix run
+  targeting the same branch would collide in one worktree), so **both `CreateRun` and the
+  trigger endpoint check it at trigger time**; `ErrBranchInUse` maps to **409**, and git's
+  "branch already checked out" is the race backstop. (The e2e surfaced this.)
+- **Trigger**: `POST /api/repos/{id}/ci-fix-runs {ref}` (under `/api`, no `/v1`) —
+  validates the cache shows `failed` for the ref, no active fix for the ref, no active
+  run of any kind on that branch, and the same worker+token preconditions as `CreateRun`.
+- **Failure snapshot frozen at queue time** (self-containment, same reason PRD #4
+  snapshots issues — the cache row gets overwritten): pipeline id/sha/web_url + up to
+  `CI_FIX_MAX_JOBS` failed jobs, each with `JobLogTail(…, CI_FIX_LOG_TAIL_BYTES)`.
+- **Manual trigger only in MVP**; auto-spawn on failure deferred (burns tokens
+  unattended — `multica`'s ungated autopilot is the audited weakness). The plan gate keeps
+  a human in the loop.
+
+## 126. Wire contract: claim payload + `fix_verdict` state report
+
+Serves human: server/worker split; best-practice (two lenient fakes each invent a field
+differently — the PRD #4 M1+M2 lesson).
+
+- **Claim payload** gains `kind` and, for `ci_fix`, `pipeline: {id, ref, sha, web_url,
+  failed_jobs: [{name, stage, web_url, log_tail}]}`.
+- **State report (worker→server)** gains an optional `fix_verdict` on the `completed`
+  report so a `not_code` outcome travels the wire (`SetRunCompleted` extended). Both
+  directions are pinned by a **cross-side contract test**, not two independent fakes.
+- **Inbound `fix_verdict` is clamped to `not_code` only** — `verified`/`fix_failed` are
+  pipeline-sync-authoritative (§128); a forged inbound `verified`/`fix_failed` drops to
+  NULL so the worker can't self-certify a passing fix.
+
+## 127. Worker `ci_fix` workflow (extends PRD #4's executor, guardrails verbatim)
+
+Serves human: "spin up an agent to fix it"; PRIMARY DIRECTIVE holds for ci_fix exactly
+as for issue runs.
+
+- **Kind-aware executor**: worktree on the failing ref → lead diagnoses from the snapshot
+  (may re-run failing commands locally via Bash; cannot touch the forge) → plan gate
+  posts root cause + fix **or** a `not_code` verdict → on approval, implement⇄review as in
+  PRD #4.
+  - **ref = default branch** → fix on new branch `ci-fix/pipeline-{id}`, worker pushes +
+    opens a new MR linking the failing pipeline (no issue to link).
+  - **ref = an agent run branch** → fix commits land **on that same branch**, the existing
+    MR updates (no second MR — bottega's PR-feedback shape).
+  - **`not_code`** (infra/flaky/secret/runner) → run completes with the diagnosis as its
+    result, `fix_verdict='not_code'`, no MR.
+- **Log tails are untrusted data, never instructions**: the lead prompt frames the
+  snapshot as quoted evidence. Fencing uses a **per-prompt random nonce tag
+  `<job_log_{hex}>`**; `job.name`/`stage` are sanitized (backticks/CRLF stripped) before
+  prose interpolation.
+- **Every PRD #4 guardrail holds unchanged** (worker-held PAT, `PreToolUse` deny-hook,
+  `bypassPermissions`+`disallowedTools`, `settingSources:[]`, sparse env, iteration cap,
+  watchdogs). Push targets are non-protected branches, so no guardrail loosening; a ci_fix
+  attempting `git push origin main` fails identically to an issue run. The M7 auditor pass
+  proved hostile log content cannot steer a push to `main`.
+
+## 128. Verification loop — passive stamp keyed on `runs.branch`
+
+Serves human: "if the code was bad ⇒ uzi verifies its work", mechanically.
+
+- **Passive stamp inside the pipeline sync step** (no new loop, no worker involvement,
+  no auto-retry): when the sync sees a terminal pipeline on a fix run's branch, it stamps
+  `fix_verdict` — `success ⇒ 'verified'`, `failed ⇒ 'fix_failed'`.
+- **Keyed on `runs.branch` (the fix branch), not `pipeline_ref` (the failed ref)** — they
+  differ for a default-branch fix (`pipeline_ref='main'`, `branch='ci-fix/pipeline-{id}'`);
+  keying on `pipeline_ref` would never stamp or false-stamp from unrelated `main` commits.
+- **`observed pipeline id > snapshot pipeline id` guard** ensures the stamp reacts to the
+  fix push, not the original failing pipeline — this is also what disambiguates the
+  agent-branch case where `branch == pipeline_ref`.
+- Observed via `LatestMRPipeline` of the fix run's MR (catches detached/merged-results
+  pipelines); the max-by-id pipeline must be **terminal** to stamp.
+- **Stamp-target selection** (a branch can host sequential fix runs over time): the ci_fix
+  run with `branch = ref AND fix_verdict IS NULL AND snapshot id < observed id`, newest
+  first.
+- `fix_failed` is **surfaced, not auto-retried** (user fires another fix run, which gets
+  the new snapshot). A fix branch that ages out of the window before a terminal pipeline
+  keeps `fix_verdict = NULL`, shown as "unverified" — honest, not fabricated.
+
+## 129. Snapshot redaction (dedicated scrubber over the driver scrub)
+
+Serves human: best-practice — job logs are the most attacker-influenceable text uzi feeds
+an agent, and teammates' pipelines may print tokens.
+
+- A **dedicated snapshot log scrubber** runs on top of the driver's by-value PAT scrub,
+  because a snapshot can contain secrets the driver never saw: **9 GitLab token families**
+  (`glpat`/`gloas`/`glrt`/`glcbt`/`glptt`/`glsoat`/`glimt`/`glagent`/`gldt-`), `sk-ant-`,
+  and `PRIVATE-TOKEN`/`Authorization`/`Bearer` header lines to EOL.
+- **Join tokens and Anthropic tokens have no by-value scrub** in the snapshot path (they
+  aren't in the failure snapshot's provenance) — header-shape coverage only; documented.
+- **Arbitrary third-party secrets** a pipeline prints are the documented residual risk:
+  size-capped, stored server-side like any run message (owner/admin-only authz), but uzi
+  can't know every secret shape.
+
+## 130. Web: pipeline badges + Fix CI + verdict chips
+
+Serves human: "display CI status" on cards/repo view; the fix affordance.
+
+- **Five-tone badge taxonomy** (`web/src/lib/pipelineBadge.ts`): `passed` (success),
+  `failed`, `running` (created/waiting/preparing/pending/running/scheduled), `attention`
+  (manual), `neutral` (canceled/skipped/no CI); **unknown status ⇒ neutral**; success is
+  **labeled "passed"**. Reuses `ui.tsx` `Badge` tones; shows `synced_at` staleness on
+  hover.
+- Badge per Repos row (default branch), board header (default branch), and per card
+  whose run branch has a status. A **failed** state renders the **Fix CI** button,
+  precondition-disabled with a reason (mirroring "Start run").
+- **Fix-run view** reuses PRD #4's `/runs/:id` as-is; the header shows the failing
+  pipeline link + a **verdict chip** (`verified ✓` / `fix failed ✗` / `not a code problem`
+  / `unverified`).
+- **All forge-provided `web_url` links guarded by `isHttpsUrl`** (PipelineBadge +
+  CIFixRunHeader) — a forge-supplied URL is not trusted into an `href` unchecked.
+
+## 131. Configuration (env, extends §13/§25)
+
+| Var | Default | Notes |
+|---|---|---|
+| `CI_WATCH_RUN_WINDOW` | `336h` | run-branch watch window (`14d`; Go has no `d` unit) |
+| `CI_WATCH_MAX_REFS` | `20` | cap on watched refs/repo; **`0` disables pipeline sync + Fix CI** |
+| `CI_FIX_MAX_JOBS` | `10` | failed jobs captured per snapshot |
+| `CI_FIX_LOG_TAIL_BYTES` | `32768` | trailing bytes of each job trace snapshotted |
+
+Pipeline sync rides `FORGE_POLL_INTERVAL` — no new interval.
+
+## 132. Dummy CI pipeline for the uzi repo itself
+
+Serves human: "setup a local dummy CI for uzi, kept (merged to main), so we can see the
+PRD working" (user, 2026-07-06).
+
+- A minimal committed `.gitlab-ci.yml` at the repo root — kept, not throwaway — so uzi's
+  own repo produces real pipeline statuses for the feature to display and fix against.
+- **`lint`/`smoke` echo-placeholder stages** named for future real gates + a **`demo-fail`
+  job gated on `UZI_CI_DEMO_FAIL=1`** so a red pipeline can be produced on demand to
+  exercise the Fix-CI path end to end.
