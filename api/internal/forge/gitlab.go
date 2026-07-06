@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -317,6 +318,103 @@ func (g *gitLab) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (M
 		return MergeRequest{}, g.redact.error(fmt.Errorf("gitlab: get merge request: %w", err))
 	}
 	return toMergeRequest(mr), nil
+}
+
+func (g *gitLab) LatestPipeline(ctx context.Context, projectID int64, ref string) (Pipeline, error) {
+	// per_page=1 + the default order_by=id,sort=desc means the single returned row
+	// is the newest BRANCH pipeline for the ref. Detached MR pipelines never appear
+	// here (they live under refs/merge-requests/:iid/head) — LatestMRPipeline covers
+	// those; a ref with no branch pipeline yields an empty list → ErrNoPipeline.
+	opt := &gitlab.ListProjectPipelinesOptions{
+		ListOptions: gitlab.ListOptions{Page: 1, PerPage: 1},
+		Ref:         gitlab.Ptr(ref),
+	}
+	pipelines, _, err := g.client.Pipelines.ListProjectPipelines(projectID, opt, gitlab.WithContext(ctx))
+	if err != nil {
+		return Pipeline{}, g.redact.error(fmt.Errorf("gitlab: latest pipeline: %w", err))
+	}
+	if len(pipelines) == 0 {
+		return Pipeline{}, ErrNoPipeline
+	}
+	return toPipeline(pipelines[0]), nil
+}
+
+func (g *gitLab) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (Pipeline, error) {
+	// GitLab returns an MR's pipelines newest-first, so the first row is the latest
+	// — including detached and merged-results pipelines the branch-ref query misses.
+	pipelines, _, err := g.client.MergeRequests.ListMergeRequestPipelines(projectID, mrIID, gitlab.WithContext(ctx))
+	if err != nil {
+		return Pipeline{}, g.redact.error(fmt.Errorf("gitlab: latest MR pipeline: %w", err))
+	}
+	if len(pipelines) == 0 {
+		return Pipeline{}, ErrNoPipeline
+	}
+	return toPipeline(pipelines[0]), nil
+}
+
+func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
+	opt := &gitlab.ListJobsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
+	var out []Job
+	for {
+		jobs, resp, err := g.client.Jobs.ListPipelineJobs(projectID, pipelineID, opt, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, g.redact.error(fmt.Errorf("gitlab: list pipeline jobs: %w", err))
+		}
+		for _, j := range jobs {
+			out = append(out, Job{ID: j.ID, Name: j.Name, Stage: j.Stage, Status: j.Status, WebURL: j.WebURL})
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+	return out, nil
+}
+
+func (g *gitLab) JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error) {
+	// The trace endpoint streams the WHOLE log (no server-side range/tail), so we
+	// download it and keep only the last maxBytes. Confined to fix-trigger time
+	// (never the poll tick), so the full download is acceptable. The tail runs
+	// through the PAT redactor: a hostile pipeline could echo the bot's own token
+	// into its log, and it must not survive into a snapshot.
+	reader, _, err := g.client.Jobs.GetTraceFile(projectID, jobID, gitlab.WithContext(ctx))
+	if err != nil {
+		return "", g.redact.error(fmt.Errorf("gitlab: job log tail: %w", err))
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", g.redact.error(fmt.Errorf("gitlab: read job trace: %w", err))
+	}
+	if maxBytes > 0 && len(data) > maxBytes {
+		data = data[len(data)-maxBytes:]
+		// The byte cut may land mid-rune; drop leading UTF-8 continuation bytes so
+		// the returned tail stays valid UTF-8 (a log tail need not be exact to the
+		// byte, and "at most maxBytes" tolerates dropping a few).
+		for len(data) > 0 && data[0]&0xC0 == 0x80 {
+			data = data[1:]
+		}
+	}
+	return g.redact.string(string(data)), nil
+}
+
+// toPipeline maps a client-go PipelineInfo (the list-endpoint shape returned by
+// both ListProjectPipelines and ListMergeRequestPipelines) to the neutral domain
+// type. Nil timestamps yield the zero time, which the cache stores as NULL.
+func toPipeline(p *gitlab.PipelineInfo) Pipeline {
+	pl := Pipeline{
+		ID:     p.ID,
+		Ref:    p.Ref,
+		SHA:    p.SHA,
+		Status: p.Status,
+		WebURL: p.WebURL,
+	}
+	if p.CreatedAt != nil {
+		pl.CreatedAt = *p.CreatedAt
+	}
+	if p.UpdatedAt != nil {
+		pl.UpdatedAt = *p.UpdatedAt
+	}
+	return pl
 }
 
 // toLabelEvent maps a client-go resource label event to the neutral domain type.

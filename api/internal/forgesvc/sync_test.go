@@ -94,6 +94,19 @@ func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int6
 	return forge.BranchProtection{}, nil
 }
 
+// Pipeline reads (PRD #6). Default to "no CI" (ErrNoPipeline); the pipeline-sync
+// milestone (M2) gives this fake scriptable pipeline behaviour.
+func (f *fakeForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
+	return nil, nil
+}
+func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
+
 // fakeStore records what the sync writes, standing in for *store.Queries. The
 // MR-close watcher fields (candidates/issue/columns/mrStateWrites) are exercised
 // by mr_watch_test.go; the sync tests leave them zero.

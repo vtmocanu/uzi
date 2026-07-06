@@ -167,6 +167,18 @@ func (f *apForge) ProjectRole(context.Context, int64, int64) (int, bool, error) 
 func (f *apForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
 	return forge.BranchProtection{}, nil
 }
+
+// Pipeline reads (PRD #6) are unused by this fake — stubbed to satisfy forge.Forge.
+func (f *apForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *apForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *apForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
+	return nil, nil
+}
+func (f *apForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
 func (f *apForge) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
 	return nil, nil
 }
