@@ -102,7 +102,7 @@ func TestAssembleCards(t *testing.T) {
 	}
 	position := map[string]int{"In Progress": 0}
 
-	cards := assembleCards(issues, runRows, position, viewer)
+	cards := assembleCards(issues, runRows, nil, position, viewer)
 	byIID := make(map[int64]cardDTO, len(cards))
 	for _, c := range cards {
 		byIID[c.IID] = c

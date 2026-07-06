@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Live-DB coverage for the PRD #24 MR-close watcher's candidate-selection query
-# (ListMRWatchCandidates) — the SQL the fake-store unit tests cannot exercise.
+# Live-DB coverage for the store queries the fake-store unit tests cannot exercise
+# (the SQL itself): the PRD #24 MR-close watcher's candidate selection
+# (ListMRWatchCandidates) and the PRD #6 pipeline-status cache
+# (ListWatchedRunRefsForRepo window/cap/DISTINCT-ON, the per-card most-recent-run
+# join, default-branch projection, upsert-latest-per-ref, reconcile eviction).
 #
-# Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, and runs the
-# store integration test (TestListMRWatchCandidatesLiveDB), which applies the real
-# goose migrations, seeds fixtures, and asserts candidate selection — including
-# rework suppression (a non-completed latest run yields no candidate) and the
-# no-superseded-MR-fallback rule (a latest completed run with NULL mr_iid yields
-# none). Isolated: unique container + published loopback port, torn down on exit;
-# never touches the user's own stacks or DBs.
+# Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
+# real goose migrations, seeds fixtures, and runs every store integration test
+# (the *LiveDB set). Isolated: unique container + published loopback port, torn
+# down on exit; never touches the user's own stacks or DBs.
 #
-# Run standalone, or alongside ./e2e/run-e2e.sh as the full PRD #24 E2E gate.
+# Run standalone, or alongside ./e2e/run-e2e.sh as the full store-SQL E2E gate.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,11 +43,11 @@ done
 docker exec "$NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1 \
   || { echo "postgres never became ready"; exit 1; }
 
-say "running the store candidate-selection integration test"
+say "running the store live-DB integration tests"
 cd "$ROOT/api"
 # -buildvcs=false: this linked worktree confuses go's VCS stamping (git run from
 # $HOME); it only affects the embedded commit hash, never compile/test behavior.
 UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v \
-  -run TestListMRWatchCandidatesLiveDB ./internal/store/...
+  -run 'LiveDB$' ./internal/store/...
 
-printf '\n\033[32mStore integration test passed.\033[0m\n'
+printf '\n\033[32mStore integration tests passed.\033[0m\n'

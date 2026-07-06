@@ -87,6 +87,10 @@ type repoDTO struct {
 	DefaultBranch     *string `json:"default_branch"`
 	Enabled           bool    `json:"enabled"`
 	RepoSkillsEnabled bool    `json:"repo_skills_enabled"`
+	// Pipeline is the repo's default-branch CI status (PRD #6), null when there is
+	// no cached default-branch pipeline (no CI configured, MR-only pipelines, or not
+	// yet synced). Set by the list handlers, which enrich from the pipeline cache.
+	Pipeline *pipelineDTO `json:"pipeline"`
 }
 
 func repoToDTO(r store.Repo) repoDTO {
@@ -484,8 +488,19 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]repoDTO, 0, len(repos))
+	repoIDs := make([]uuid.UUID, len(repos))
+	for i, rp := range repos {
+		repoIDs[i] = rp.ID
+	}
+	pipelines, err := h.defaultBranchPipelines(r.Context(), repoIDs)
+	if err != nil {
+		// Non-fatal: badges are enrichment, not the payload. Render without them.
+		slog.Warn("list projects: default-branch pipelines", "error", err)
+	}
 	for _, rp := range repos {
-		out = append(out, repoToDTO(rp))
+		d := repoToDTO(rp)
+		d.Pipeline = pipelines[rp.ID]
+		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
 }
@@ -506,8 +521,18 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]repoDTO, 0, len(repos))
+	repoIDs := make([]uuid.UUID, len(repos))
+	for i, rp := range repos {
+		repoIDs[i] = rp.ID
+	}
+	pipelines, err := h.defaultBranchPipelines(r.Context(), repoIDs)
+	if err != nil {
+		slog.Warn("list repos: default-branch pipelines", "error", err)
+	}
 	for _, rp := range repos {
-		out = append(out, repoToDTO(rp))
+		d := repoToDTO(rp)
+		d.Pipeline = pipelines[rp.ID]
+		out = append(out, d)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
 }

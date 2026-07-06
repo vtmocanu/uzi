@@ -30,6 +30,18 @@ type fakeForge struct {
 	mrCalls     []int64 // mrIIDs GetMergeRequest was asked for
 	updateErr   error   // makes AutoMove's UpdateIssueLabels fail (forge-move failure)
 	updateCalls []mrUpdateCall
+
+	// Pipeline sync (PRD #6) scripting + capture. pipelineByRef keys on a branch
+	// ref, pipelineByMR on an MR iid; a missing key returns ErrNoPipeline (the
+	// no-CI case). pipelineRefErr/pipelineMRErr force a fetch error for a key.
+	// latestPipeRefs/latestPipeMRs record what was queried (branch-vs-MR routing,
+	// cap assertions).
+	pipelineByRef  map[string]forge.Pipeline
+	pipelineByMR   map[int64]forge.Pipeline
+	pipelineRefErr map[string]error
+	pipelineMRErr  map[int64]error
+	latestPipeRefs []string
+	latestPipeMRs  []int64
 }
 
 // mrUpdateCall records one UpdateIssueLabels invocation so the watcher tests can
@@ -94,12 +106,27 @@ func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int6
 	return forge.BranchProtection{}, nil
 }
 
-// Pipeline reads (PRD #6). Default to "no CI" (ErrNoPipeline); the pipeline-sync
-// milestone (M2) gives this fake scriptable pipeline behaviour.
-func (f *fakeForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
+// Pipeline reads (PRD #6). LatestPipeline/LatestMRPipeline are scriptable via the
+// pipelineBy* maps; a missing key is the no-CI case (ErrNoPipeline). ListPipelineJobs
+// and JobLogTail stay no-ops (unused by the sync milestone).
+func (f *fakeForge) LatestPipeline(_ context.Context, _ int64, ref string) (forge.Pipeline, error) {
+	f.latestPipeRefs = append(f.latestPipeRefs, ref)
+	if err, ok := f.pipelineRefErr[ref]; ok {
+		return forge.Pipeline{}, err
+	}
+	if p, ok := f.pipelineByRef[ref]; ok {
+		return p, nil
+	}
 	return forge.Pipeline{}, forge.ErrNoPipeline
 }
-func (f *fakeForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
+func (f *fakeForge) LatestMRPipeline(_ context.Context, _, mrIID int64) (forge.Pipeline, error) {
+	f.latestPipeMRs = append(f.latestPipeMRs, mrIID)
+	if err, ok := f.pipelineMRErr[mrIID]; ok {
+		return forge.Pipeline{}, err
+	}
+	if p, ok := f.pipelineByMR[mrIID]; ok {
+		return p, nil
+	}
 	return forge.Pipeline{}, forge.ErrNoPipeline
 }
 func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
@@ -122,6 +149,13 @@ type fakeStore struct {
 	columns       []store.BoardColumn
 	columnsErr    error
 	mrStateWrites []store.SetRunMRStateParams
+
+	// Pipeline sync (PRD #6) scripting + capture.
+	watchedRefs      []store.ListWatchedRunRefsForRepoRow
+	watchedRefsErr   error
+	watchedRefsParam store.ListWatchedRunRefsForRepoParams // last args (cap/window assertions)
+	pipelineUpserts  []store.UpsertPipelineStatusParams
+	pipelineDeletes  []store.DeletePipelineStatusesNotInParams
 }
 
 func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) (store.Issue, error) {
@@ -145,6 +179,18 @@ func (s *fakeStore) ListBoardColumns(context.Context, uuid.UUID) ([]store.BoardC
 func (s *fakeStore) SetRunMRState(_ context.Context, arg store.SetRunMRStateParams) (int64, error) {
 	s.mrStateWrites = append(s.mrStateWrites, arg)
 	return 1, nil
+}
+func (s *fakeStore) ListWatchedRunRefsForRepo(_ context.Context, arg store.ListWatchedRunRefsForRepoParams) ([]store.ListWatchedRunRefsForRepoRow, error) {
+	s.watchedRefsParam = arg
+	return s.watchedRefs, s.watchedRefsErr
+}
+func (s *fakeStore) UpsertPipelineStatus(_ context.Context, arg store.UpsertPipelineStatusParams) (store.PipelineStatus, error) {
+	s.pipelineUpserts = append(s.pipelineUpserts, arg)
+	return store.PipelineStatus{RepoID: arg.RepoID, Ref: arg.Ref, PipelineID: arg.PipelineID, Status: arg.Status}, nil
+}
+func (s *fakeStore) DeletePipelineStatusesNotIn(_ context.Context, arg store.DeletePipelineStatusesNotInParams) (int64, error) {
+	s.pipelineDeletes = append(s.pipelineDeletes, arg)
+	return 0, nil
 }
 
 // fakeLabels is a fixed LabelConfig for the sync tests.

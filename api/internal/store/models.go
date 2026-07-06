@@ -80,6 +80,18 @@ type Issue struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 }
 
+type PipelineStatus struct {
+	ID             int64              `json:"id"`
+	RepoID         uuid.UUID          `json:"repo_id"`
+	Ref            string             `json:"ref"`
+	PipelineID     int64              `json:"pipeline_id"`
+	Sha            string             `json:"sha"`
+	Status         string             `json:"status"`
+	WebUrl         string             `json:"web_url"`
+	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
+	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
+}
+
 type Repo struct {
 	ID                uuid.UUID   `json:"id"`
 	ConnectionID      uuid.UUID   `json:"connection_id"`

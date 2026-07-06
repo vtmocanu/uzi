@@ -117,6 +117,15 @@ type Config struct {
 	WorkerPollInterval      time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace     time.Duration // a re-queued run waits this long for its prior worker
 
+	// CI status integration (PRD #6). The pipeline sync rides the existing poller
+	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
+	// branch stays watched after it completes; CIWatchMaxRefs caps how many run
+	// branches are watched per repo per tick and, set to 0, disables the pipeline
+	// sync (and with it the badges + Fix CI) entirely — reproducing pre-PRD-6
+	// behaviour for operators who want CI awareness off.
+	CIWatchRunWindow time.Duration
+	CIWatchMaxRefs   int
+
 	// Agent skills (PRD #16). SkillMaxBytes caps a skill body at save (server) and
 	// is re-applied to repo-borne skills worker-side; SkillsMaxPerRun caps the
 	// per-run skill union, enforced at claim assembly (M3) and re-enforced
@@ -218,6 +227,10 @@ func Load() (Config, error) {
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)
+
+	cfg.CIWatchRunWindow = parseDuration("CI_WATCH_RUN_WINDOW", 14*24*time.Hour)
+	// parseNonNegInt: 0 is legitimate here — it disables the pipeline sync.
+	cfg.CIWatchMaxRefs = parseNonNegInt("CI_WATCH_MAX_REFS", 20)
 
 	if err := loadSeedAdmin(&cfg); err != nil {
 		return Config{}, err

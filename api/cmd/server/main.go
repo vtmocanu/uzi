@@ -179,6 +179,10 @@ func run() error {
 	// optional poller collaborators; run creation reuses workersvc's manual-start path
 	// (same state machine and gates) and the label comes from the settings cache.
 	engine.SetAutopilot(poller.NewAutopilot(q, wsvc, settingsCache))
+	// CI status sync (PRD #6): the poller tick also refreshes the pipeline-status
+	// cache (default branch + watched run branches). CI_WATCH_MAX_REFS=0 disables it
+	// (and the badges + Fix CI), preserving today's behaviour.
+	engine.SetPipelineWatch(cfg.CIWatchRunWindow, cfg.CIWatchMaxRefs)
 
 	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
 	// immediately, then the goroutine sweeps on its own interval. Both lifetimes
