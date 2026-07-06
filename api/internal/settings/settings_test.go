@@ -259,6 +259,26 @@ func TestValidateDispatch(t *testing.T) {
 	if err := Validate(KeyDefaultTheme, "PRD"); err == nil {
 		t.Error("Validate(default_theme, \"PRD\") = nil; a valid label is not a valid theme")
 	}
+	// prdless_enabled routes to the strict bool parse, NOT the label rules — so a
+	// value a label rule would accept (short, no comma) is still rejected unless it
+	// is exactly "true"/"false" (PRD #22).
+	for _, ok := range []string{"true", "false"} {
+		if err := Validate(KeyPrdlessEnabled, ok); err != nil {
+			t.Errorf("Validate(prdless_enabled, %q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "banana", "1", "0", "TRUE", "yes"} {
+		if err := Validate(KeyPrdlessEnabled, bad); err == nil {
+			t.Errorf("Validate(prdless_enabled, %q) = nil, want a non-bool rejection", bad)
+		}
+	}
+	// prdless_label routes to the label rules like the other labels.
+	if err := Validate(KeyPrdlessLabel, "a,b"); err == nil {
+		t.Error("Validate(prdless_label, \"a,b\") = nil, want a label rejection")
+	}
+	if err := Validate(KeyPrdlessLabel, "PRDLESS"); err != nil {
+		t.Errorf("Validate(prdless_label, valid) = %v, want nil", err)
+	}
 }
 
 func TestLabelChanged(t *testing.T) {
@@ -266,6 +286,8 @@ func TestLabelChanged(t *testing.T) {
 		KeyPRDLabel:       "PRD",
 		KeyAutopilotLabel: "autopilot",
 		KeyDefaultTheme:   "ember",
+		KeyPrdlessEnabled: "true",
+		KeyPrdlessLabel:   "PRDLESS",
 	}
 	cases := []struct {
 		name    string
@@ -277,6 +299,10 @@ func TestLabelChanged(t *testing.T) {
 		{"an idempotent label write does not", map[string]string{KeyPRDLabel: "PRD"}, false},
 		{"label + theme together still resyncs on the label", map[string]string{KeyPRDLabel: "Feature", KeyDefaultTheme: "mission"}, true},
 		{"an empty update does not", map[string]string{}, false},
+		// PRD #22 Decision 9: prdless keys never re-filter a board, so neither forces a resync.
+		{"a prdless_enabled change does NOT force a resync", map[string]string{KeyPrdlessEnabled: "false"}, false},
+		{"a prdless_label change does NOT force a resync", map[string]string{KeyPrdlessLabel: "NOSPEC"}, false},
+		{"label + prdless together still resyncs on the label", map[string]string{KeyAutopilotLabel: "hands-off", KeyPrdlessLabel: "NOSPEC"}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -376,5 +402,43 @@ func TestValidateMergedRejectsEqualLabels(t *testing.T) {
 		KeyAutopilotLabel: "autopilot",
 	}); err != nil {
 		t.Errorf("distinct labels rejected: %v", err)
+	}
+}
+
+// TestValidateMergedThreeWayDistinct covers PRD #22 Decision 7: prdless_label must
+// be pairwise-distinct from prd_label and autopilot_label, the rejection names the
+// offending key, and distinctness holds regardless of the toggle state (the merged
+// map carries no prdless_enabled).
+func TestValidateMergedThreeWayDistinct(t *testing.T) {
+	base := func() map[string]string {
+		return map[string]string{
+			KeyPRDLabel:       "PRD",
+			KeyAutopilotLabel: "autopilot",
+			KeyPrdlessLabel:   "PRDLESS",
+		}
+	}
+
+	// prdless colliding with either other label is rejected, naming prdless_label.
+	for _, collideWith := range []string{"PRD", "autopilot"} {
+		m := base()
+		m[KeyPrdlessLabel] = collideWith
+		err := ValidateMerged(m)
+		if err == nil || !strings.Contains(err.Error(), "prdless_label") {
+			t.Errorf("prdless_label==%q: err = %v, want a rejection naming prdless_label", collideWith, err)
+		}
+	}
+
+	// Three distinct labels pass.
+	if err := ValidateMerged(base()); err != nil {
+		t.Errorf("three distinct labels rejected: %v", err)
+	}
+
+	// Post-merge atomic + toggle-independent: an admin renaming prd_label onto the
+	// (possibly disabled) prdless label collides on the merged set and is rejected —
+	// keeping a later re-enable always safe. ValidateMerged never reads the toggle.
+	m := base()
+	m[KeyPRDLabel] = "PRDLESS"
+	if err := ValidateMerged(m); err == nil {
+		t.Error("prd_label renamed onto the prdless label must be rejected on the merged set")
 	}
 }

@@ -269,6 +269,10 @@ export interface AppSettings {
   prd_label: string;
   autopilot_label: string;
   default_theme: string;
+  // PRDLESS escape hatch (PRD #22). prdless_enabled is the text "true"/"false"
+  // (the API serves every setting as a string); prdless_label is the label name.
+  prdless_enabled: string;
+  prdless_label: string;
 }
 
 // Compiled-in label defaults, mirroring the API's settings package. The SPA uses

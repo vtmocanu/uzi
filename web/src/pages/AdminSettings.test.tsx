@@ -16,10 +16,18 @@ vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ refresh: vi.fn().mockR
 
 const mockApi = vi.mocked(api);
 
+// A full AppSettings fixture; tests override the fields they exercise.
+const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
+  prd_label: "PRD",
+  autopilot_label: "autopilot",
+  default_theme: "ember",
+  prdless_enabled: "true",
+  prdless_label: "PRDLESS",
+  ...over,
+});
+
 beforeEach(() => {
-  mockApi.getSettings.mockResolvedValue({
-    settings: { prd_label: "PRD", autopilot_label: "autopilot", default_theme: "ember" },
-  });
+  mockApi.getSettings.mockResolvedValue({ settings: settings() });
 });
 
 afterEach(() => {
@@ -49,9 +57,7 @@ describe("AdminSettings", () => {
   });
 
   it("saves edited labels and shows a success notice", async () => {
-    mockApi.updateSettings.mockResolvedValue({
-      settings: { prd_label: "Feature", autopilot_label: "autopilot", default_theme: "ember" },
-    });
+    mockApi.updateSettings.mockResolvedValue({ settings: settings({ prd_label: "Feature" }) });
     renderPage();
     await screen.findByLabelText("PRD label");
     fireEvent.change(input("PRD label"), { target: { value: "Feature" } });
@@ -64,6 +70,8 @@ describe("AdminSettings", () => {
         prd_label: "Feature",
         autopilot_label: "autopilot",
         default_theme: "ember",
+        prdless_enabled: "true",
+        prdless_label: "PRDLESS",
       }),
     );
     expect(await screen.findByText(/Settings saved/i)).toBeTruthy();
@@ -72,9 +80,7 @@ describe("AdminSettings", () => {
   });
 
   it("saves the default theme selection (PRD #21)", async () => {
-    mockApi.updateSettings.mockResolvedValue({
-      settings: { prd_label: "PRD", autopilot_label: "autopilot", default_theme: "mission" },
-    });
+    mockApi.updateSettings.mockResolvedValue({ settings: settings({ default_theme: "mission" }) });
     renderPage();
     await screen.findByLabelText("PRD label");
     const theme = screen.getByLabelText("Default theme") as HTMLSelectElement;
@@ -90,10 +96,35 @@ describe("AdminSettings", () => {
         prd_label: "PRD",
         autopilot_label: "autopilot",
         default_theme: "mission",
+        prdless_enabled: "true",
+        prdless_label: "PRDLESS",
       }),
     );
     expect(await screen.findByText(/Settings saved/i)).toBeTruthy();
     expect(saveButton().disabled).toBe(true);
+  });
+
+  it("disables the PRDLESS name field while the toggle is off (PRD #22 M1)", async () => {
+    renderPage();
+    const name = (await screen.findByLabelText("PRDLESS label")) as HTMLInputElement;
+    const toggle = screen.getByLabelText(/Enable the PRDLESS escape hatch/i) as HTMLInputElement;
+    // Loads enabled → name editable.
+    expect(toggle.checked).toBe(true);
+    expect(name.disabled).toBe(false);
+    // Turning the feature off disables the name field.
+    fireEvent.click(toggle);
+    expect(name.disabled).toBe(true);
+  });
+
+  it("blocks a PRDLESS label colliding with the PRD label client-side", async () => {
+    renderPage();
+    await screen.findByLabelText("PRDLESS label");
+    fireEvent.change(input("PRDLESS label"), { target: { value: "PRD" } });
+    fireEvent.click(saveButton());
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/PRDLESS label must differ from the PRD label/i);
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 
   it("surfaces a server validation error", async () => {

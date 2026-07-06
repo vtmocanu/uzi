@@ -3028,12 +3028,11 @@ enabled out of the box; default name `PRDLESS`; the label can be added/removed d
 from the uzi web UI). User-stated 2026-07-05. Section numbers continue past PRD #21's
 #118. Full rationale + Decision Log: `prds/22-prdless-label.md`.
 
-**Status (branch `prd-22-prdless-label`):** M2 (gate bypass, manual + autopilot) and M4
-(UI label toggle endpoint + forgesvc helper) are built; M5 (docs) shipped. With prd-21
-now landed on main and merged into this branch, M1 (strict per-key validation + the
-admin-settings toggle/name UI) and M3 (bootstrap fields + web badges) are the in-flight
-milestones, and M6 (e2e) follows — each decision below flags the milestone that owns it,
-so this section is not read as claiming more than is built at a given commit.
+**Status (branch `prd-22-prdless-label`):** prd-21 landed on main and is merged into this
+branch. M1 (strict per-key validation + admin-settings toggle/name UI), M2 (gate bypass,
+manual + autopilot), M4 (UI label toggle endpoint + forgesvc helper), and M5 (docs) are
+built. M3 (bootstrap fields + web badges) is the in-flight milestone, and M6 (e2e)
+follows — each decision below flags the milestone that owns it.
 
 ## 119. prdless settings keys + on-by-default resolution
 
@@ -3050,18 +3049,17 @@ Serves human: "name configurable, feature toggleable on/off, both in admin setti
 - **Unspecified = on is the single meaning.** A malformed stored `prdless_enabled` value
   (not `"true"`/`"false"`) resolves to the compiled default (enabled), exactly like an
   absent row — a junk value can never silently flip a default-on feature *off*. The
-  accessor keeps this tolerance as defense-in-depth even once strict write validation
-  lands, so a value written directly to the DB (bypassing the handler) still resolves
+  accessor keeps this tolerance as defense-in-depth alongside the strict write validation
+  (below), so a value written directly to the DB (bypassing the handler) still resolves
   safely.
-- **Strict per-key validation is M1 scope**, registering into prd-21's now-landed
-  `settings.Validate(key, value)` per-key switch: `prdless_enabled` → strict bool parse;
+- **Strict per-key validation (M1)** registers into prd-21's `settings.Validate(key, value)`
+  per-key switch: `prdless_enabled` → strict bool parse (exactly `"true"`/`"false"`);
   `prdless_label` → label rules (non-empty, ≤ 64 runes, no comma) **plus pairwise-distinct**
-  from both `prd_label` and `autopilot_label`, validated on the **post-merge** set and
-  **regardless of the toggle state** (a disabled-but-colliding label must be renamed first,
-  so re-enabling is always safe; equal to `prd_label` would exempt every issue, equal to
-  `autopilot_label` would conflate "hands-off" with "spec-less"). Until M1 lands, the
-  uniform `ValidateLabel` default arm would accept a non-bool enabled value — tolerated
-  only because of the resolve-to-default rule above.
+  (in `ValidateMerged`) from both `prd_label` and `autopilot_label`, validated on the
+  **post-merge** set and **regardless of the toggle state** (a disabled-but-colliding label
+  must be renamed first, so re-enabling is always safe; equal to `prd_label` would exempt
+  every issue, equal to `autopilot_label` would conflate "hands-off" with "spec-less"). Each
+  distinctness rejection names the key to change.
 - **prdless keys excluded from the `ForceReconcile` `changed` set** (§96, M1): they don't
   affect the poller's PRD-label filter, so a prdless PUT must not trigger a repo resync
   (the precedent prd-21's presentation-only `default_theme` key sets via `LabelChanged`).

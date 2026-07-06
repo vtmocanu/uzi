@@ -9,7 +9,7 @@
 
 ## Problem
 
-Every run requires a `prds/*.md` link in the issue description. The gate is enforced server-side in the shared `createRun` (`api/internal/workersvc/service.go:657-658` → `ErrNoPRDLink`), which both the manual `CreateRun` and the autopilot `CreateAutopilotRun` paths call; the handler maps it to a 422 (`api/internal/handler/workers.go:292-294`). The web app surfaces it as "no PRD link" warning badges (`web/src/pages/Board.tsx`, `web/src/pages/IssueView.tsx`). (Line refs approximate; the tree moves.)
+Every run requires a `prds/*.md` link in the issue description. The gate is enforced server-side in the shared `createRun` (`api/internal/workersvc/service.go:657-658` → `ErrNoPRDLink`), which both the manual `CreateRun` and the autopilot `CreateAutopilotRun` paths call; the handler maps it to a 422 (`api/internal/handler/workers.go:307-314`). The web app surfaces it as "no PRD link" warning badges (`web/src/pages/Board.tsx`, `web/src/pages/IssueView.tsx`). (Line refs approximate; the tree moves.)
 
 That gate is the right default — the PRD is the agent's spec, and issues without one produce aimless runs. But for genuinely small work (a typo fix, a one-file tweak, a smoke test like issue #20's `vlad-test.txt` file) the gate forces authoring a throwaway `prds/*.md` file whose entire content restates the issue description. The workaround people actually use — a fake link to a nonexistent PRD file — is worse than an explicit escape hatch: it satisfies the regex (`forgesvc.prdLinkRe` matches the path shape, not file existence) while lying on the board.
 
@@ -47,7 +47,7 @@ An admin-controlled escape-hatch label, default name **`PRDLESS`**:
 
 - Per Decision 3: both callers compute `allowWithoutPRD` from their fresh snapshot and pass the bool in — `CreateRun` (manual, handler) and `CreateAutopilotRun` (poller, `api/internal/poller/autopilot.go:176-197`); the shared `createRun` gate (`api/internal/workersvc/service.go:657-658`) becomes `if !issue.HasPrdLink && !allowWithoutPRD { return ErrNoPRDLink }`. `workersvc` gains no settings dependency.
 - The signature changes touch the existing no-PRD-link tests — now two of them, manual (`api/internal/workersvc/service_test.go:~879`) and autopilot (`:~909-912`) — update them in M2, don't bolt on parallel ones. Add the composition test (PRD + autopilot + PRDLESS labels, no PRD link → unattended run) in M2 as well.
-- The 422 message (`workers.go:292-294`) is extended when prdless is enabled instance-wide: `"issue has no PRD link; add a prds/*.md link (or the PRDLESS label) before starting a run"` — the label name interpolated from settings.
+- The 422 message (`workers.go:307-314`) is extended when prdless is enabled instance-wide: `"issue has no PRD link; add a prds/*.md link (or the PRDLESS label) before starting a run"` — the label name interpolated from settings.
 
 ### 3. UI label toggle (api + web)
 

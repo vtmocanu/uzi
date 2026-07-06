@@ -23,9 +23,7 @@ default theme.
 Unlike the other two, the PRDLESS label also has its own instance-wide on/off
 switch, separate from its name — **on** by default. Turning it off requires
 every run on this instance to have a real PRD link again; it doesn't touch a
-run already in flight. *(Note: this toggle and the label-name field land on
-the Settings page in a later milestone of this release; until then the
-feature runs at its compiled-in default — on, named `PRDLESS`.)*
+run already in flight. The name field is editable only while the switch is on.
 
 ## Default theme
 
@@ -40,12 +38,13 @@ refresh (in practice, their next login or reload — there's no push). See
 
 - A label value (PRD, autopilot, or PRDLESS) may not be empty, longer than 64
   characters, or contain a comma (GitLab's own label-list separator).
-- PRD and autopilot must differ — equal values would autopilot every PRD
-  issue. *(Note: the same later milestone that brings the PRDLESS toggle to
-  the Settings page also makes PRDLESS pairwise-distinct from both other
-  labels — checked even while its toggle is off, so re-enabling it later is
-  always safe — and gives the toggle a strict on/off parse. Until then
-  neither check is enforced.)*
+- The three labels must be pairwise-distinct. Equal PRD and autopilot would
+  autopilot every PRD issue; a PRDLESS label equal to the PRD label would
+  exempt every issue from the gate, equal to the autopilot label would
+  conflate "hands-off" with "spec-less". The PRDLESS label stays distinct
+  even while its toggle is off, so re-enabling it later is always safe.
+- The PRDLESS on/off switch stores a strict `true` or `false` — nothing else
+  is accepted.
 - An invalid save is rejected before anything is written. The same rules run
   client-side first for immediate feedback, but the server is the source of
   truth.
@@ -65,14 +64,12 @@ enabled repo, not just the next incremental poll, so the effect isn't
 instant: boards drop issues that only carried the old label and pick up the
 new set once that repo's resync completes. See "Freshness contract" in
 [Configuration](./configuration.md) for how sync cadence otherwise works.
-This resync fires on any changed label (the PRD label, the autopilot label,
-and for now the two PRDLESS keys), even the autopilot label, which doesn't
-affect what boards show — harmless, and simpler than special-casing which key
-mattered. A default-theme-only save does **not** trigger it: theming is
-presentation-only and never affects what a board shows. *(Note: a later
-milestone of this release also excludes the PRDLESS keys from triggering this
-resync, since neither changes which issues a board shows, only whether a run
-can start without a PRD link.)*
+This resync fires only on a changed board-filtering label — the PRD label or
+the autopilot label — since only those change which issues a board shows.
+A PRDLESS change (its name or its on/off switch) and a default-theme-only save
+do **not** trigger it: the PRDLESS keys change only whether a run can start
+without a PRD link, and theming is presentation-only, so neither affects what
+a board shows.
 
 ## No secrets here
 
