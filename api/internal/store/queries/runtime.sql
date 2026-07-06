@@ -212,6 +212,10 @@ UPDATE runs SET
     branch             = @branch,
     mr_iid             = @mr_iid,
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
+    -- fix_verdict carries a ci_fix run's outbound 'not_code' verdict on completion
+    -- (PRD #6); NULL for every issue run and for a ci_fix that produced a fix (its
+    -- verdict is stamped verified/fix_failed later by the pipeline sync).
+    fix_verdict        = COALESCE(sqlc.narg('fix_verdict'), fix_verdict),
     move_pending_since = now(),
     finished_at        = now(),
     updated_at         = now()

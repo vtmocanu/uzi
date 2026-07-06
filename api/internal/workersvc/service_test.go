@@ -86,6 +86,14 @@ type fakeStore struct {
 	createRunErr    error
 	createRunParams *store.CreateRunParams
 
+	// CI-fix (PRD #6). Counts default to 0 (no active run/fix) so existing
+	// CreateRun tests are unaffected by the new cross-kind checks.
+	ciFixRunResult   store.Run
+	ciFixRunErr      error
+	ciFixRunParams   *store.CreateCIFixRunParams
+	activeBranchRuns int64 // CountActiveRunsWithBranch
+	activeCIFixRuns  int64 // CountActiveCIFixForRef
+
 	// Create worker.
 	createWorkerResult store.Worker
 	createWorkerParams *store.CreateWorkerParams
@@ -231,6 +239,16 @@ func (f *fakeStore) CreateRun(_ context.Context, arg store.CreateRunParams) (sto
 	f.createRunParams = &arg
 	return f.createRunResult, f.createRunErr
 }
+func (f *fakeStore) CreateCIFixRun(_ context.Context, arg store.CreateCIFixRunParams) (store.Run, error) {
+	f.ciFixRunParams = &arg
+	return f.ciFixRunResult, f.ciFixRunErr
+}
+func (f *fakeStore) CountActiveRunsWithBranch(context.Context, store.CountActiveRunsWithBranchParams) (int64, error) {
+	return f.activeBranchRuns, nil
+}
+func (f *fakeStore) CountActiveCIFixForRef(context.Context, store.CountActiveCIFixForRefParams) (int64, error) {
+	return f.activeCIFixRuns, nil
+}
 func (f *fakeStore) CreateWorker(_ context.Context, arg store.CreateWorkerParams) (store.Worker, error) {
 	f.createWorkerParams = &arg
 	return f.createWorkerResult, nil
@@ -293,7 +311,7 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	branch := "agent/issue-4"
 	fs := &fakeStore{
 		claimRun: store.Run{
-			ID: uuid.New(), IssueIid: 4, IssueTitle: "Do the thing",
+			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, IssueTitle: "Do the thing",
 			IssueDescription: "see prds/4.md", Status: "claimed",
 			LastSeq: 7, IterationCount: 2, RequeueCount: 1,
 			SessionID: pgText("sess-abc"), Branch: pgText(branch),
@@ -380,7 +398,7 @@ func TestClaimOmitsDefaultModelWhenOwnerHasNone(t *testing.T) {
 	sealedTok, _ := box.Seal([]byte("anthropic-OMITTEST-abcdef1234567890"))
 
 	fs := &fakeStore{
-		claimRun: store.Run{ID: uuid.New(), IssueIid: 9, Status: "claimed"},
+		claimRun: store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 9, Valid: true}, Status: "claimed"},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
 			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
@@ -414,7 +432,7 @@ func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 	sealedPAT, _ := box.Seal([]byte("bot-pat-DEFMODELERR-abcdef1234567890"))
 	sealedTok, _ := box.Seal([]byte("anthropic-DEFMODELERR-abcdef1234567890"))
 	fs := &fakeStore{
-		claimRun: store.Run{ID: uuid.New(), IssueIid: 11, Status: "claimed"},
+		claimRun: store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 11, Valid: true}, Status: "claimed"},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
 			ForgeType: "gitlab", BaseUrl: "https://gitlab.example.com",
@@ -1021,7 +1039,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 	}
 
 	// Fresh autopilot run: no branch/session yet, auto_approve set on the row.
-	fresh := newFS(store.Run{ID: uuid.New(), IssueIid: 4, Status: "claimed", AutoApprove: true})
+	fresh := newFS(store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true})
 	p, err := New(fresh, box, testParams()).Claim(context.Background(), worker())
 	if err != nil || p == nil {
 		t.Fatalf("fresh Claim: payload=%v err=%v", p, err)
@@ -1034,7 +1052,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 	// read from the row again, so it re-delivers — an unattended resume would
 	// otherwise hang forever at the plan gate.
 	resume := newFS(store.Run{
-		ID: uuid.New(), IssueIid: 4, Status: "claimed", AutoApprove: true,
+		ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed", AutoApprove: true,
 		Branch: pgText("agent/issue-4"), SessionID: pgText("sess-xyz"), RequeueCount: 1,
 	})
 	p, err = New(resume, box, testParams()).Claim(context.Background(), worker())
@@ -1046,7 +1064,7 @@ func TestClaimDeliversAutoApproveTopLevelFreshAndResume(t *testing.T) {
 	}
 
 	// A manual run never carries it.
-	manual := newFS(store.Run{ID: uuid.New(), IssueIid: 4, Status: "claimed"})
+	manual := newFS(store.Run{ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, Status: "claimed"})
 	p, err = New(manual, box, testParams()).Claim(context.Background(), worker())
 	if err != nil || p == nil {
 		t.Fatalf("manual Claim: payload=%v err=%v", p, err)

@@ -193,7 +193,7 @@ SELECT DISTINCT ON (r.issue_iid)
 FROM runs r
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
-WHERE r.repo_id = @repo_id
+WHERE r.repo_id = @repo_id AND r.issue_iid IS NOT NULL   -- issue runs only; ci_fix runs (PRD #6) have no card
 ORDER BY r.issue_iid, r.created_at DESC;
 
 -- name: GetLatestRunForIssue :one

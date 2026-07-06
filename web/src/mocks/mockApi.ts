@@ -647,6 +647,7 @@ export const mockApi = {
       closed: false,
       conflict: false,
       latest_run: null,
+      pipeline: null,
     };
     b.cards.unshift(card);
     return delay({ card: { ...card } }, 450);
@@ -686,6 +687,7 @@ export const mockApi = {
     const run: Run = {
       id: nextRunId(),
       repo_id: repoId,
+      kind: "issue",
       issue_iid: issueIid,
       issue_title: card.title,
       issue_description: "See the linked PRD.",
@@ -697,6 +699,45 @@ export const mockApi = {
       branch: null,
       mr_iid: null,
       failure_reason: null,
+      pipeline_ref: null,
+      pipeline_web_url: null,
+      fix_verdict: null,
+      plan_md: null,
+      claimed_at: null,
+      started_at: null,
+      finished_at: null,
+      created_at: now,
+      updated_at: now,
+    };
+    state.runs.set(run.id, run);
+    startNewRun(run.id);
+    return delay({ run: { ...run } }, 350);
+  },
+  createCIFixRun: async (repoId: string, ref: string) => {
+    if (!state.boards.get(repoId)) throw new ApiError(404, "repo not found");
+    const active = [...state.runs.values()].some(
+      (r) => r.repo_id === repoId && r.kind === "ci_fix" && r.pipeline_ref === ref && !["completed", "failed", "cancelled"].includes(r.status),
+    );
+    if (active) throw new ApiError(409, "an active CI-fix run already exists for this ref");
+    const now = new Date().toISOString();
+    const run: Run = {
+      id: nextRunId(),
+      repo_id: repoId,
+      kind: "ci_fix",
+      issue_iid: null,
+      issue_title: `Fix CI: ${ref} pipeline`,
+      issue_description: `Diagnose and fix the failed pipeline for \`${ref}\`.`,
+      status: "queued",
+      requeue_count: 0,
+      iteration_count: 0,
+      auto_approve: false,
+      worker_id: null,
+      branch: null,
+      mr_iid: null,
+      failure_reason: null,
+      pipeline_ref: ref,
+      pipeline_web_url: `https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242`,
+      fix_verdict: null,
       plan_md: null,
       claimed_at: null,
       started_at: null,

@@ -79,6 +79,19 @@ Tracked as GitLab issue vtmocanu/uzi#5; PRD at `prds/5-access-control-pat-harden
 - Serves the primary directive: agents must not be able to modify main.
 - Scope (option A) chosen to run parallel to PRD #4.
 
+## Feature #6 — CI status integration & CI-fix agent
+
+Tracked as GitLab issue vtmocanu/uzi#6; PRD at `prds/6-ci-status-integration.md`.
+
+- Check and display GitLab CI/pipeline status in uzi (repo view, board header, per-card).
+- When CI is broken, spin up an agent to review what happened and fix it if it can.
+- If the code was bad, uzi verifies its own fix (the fix's pipeline must pass).
+- Source: plan.md line 52.
+
+## uzi's own CI (dummy, kept)
+
+- uzi's repo ships a minimal dummy `.gitlab-ci.yml`, merged to main and kept (not throwaway), so the CI feature is demonstrable against real pipelines. [user, 2026-07-06]
+
 ## Feature #7 — In-app docs section
 
 Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/7-docs-section-webui.md`.

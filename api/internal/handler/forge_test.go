@@ -59,6 +59,20 @@ func (f *fakeUserForge) DefaultBranchProtection(context.Context, int64, string, 
 	return forge.BranchProtection{}, nil
 }
 
+// Pipeline reads (PRD #6) are unused by this fake — stubbed to satisfy forge.Forge.
+func (f *fakeUserForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeUserForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeUserForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
+	return nil, nil
+}
+func (f *fakeUserForge) JobLogTail(context.Context, int64, int64, int) (string, error) {
+	return "", nil
+}
+
 // The save path is verified-or-warned (PRD #19 Decision 3): an existing user is
 // clean, a missing user warns, and a lookup failure warns rather than blocking.
 func TestHumanUsernameWarning(t *testing.T) {

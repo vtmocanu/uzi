@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
@@ -30,6 +31,18 @@ type fakeForge struct {
 	mrCalls     []int64 // mrIIDs GetMergeRequest was asked for
 	updateErr   error   // makes AutoMove's UpdateIssueLabels fail (forge-move failure)
 	updateCalls []mrUpdateCall
+
+	// Pipeline sync (PRD #6) scripting + capture. pipelineByRef keys on a branch
+	// ref, pipelineByMR on an MR iid; a missing key returns ErrNoPipeline (the
+	// no-CI case). pipelineRefErr/pipelineMRErr force a fetch error for a key.
+	// latestPipeRefs/latestPipeMRs record what was queried (branch-vs-MR routing,
+	// cap assertions).
+	pipelineByRef  map[string]forge.Pipeline
+	pipelineByMR   map[int64]forge.Pipeline
+	pipelineRefErr map[string]error
+	pipelineMRErr  map[int64]error
+	latestPipeRefs []string
+	latestPipeMRs  []int64
 
 	// SetIssueLabel (PRD #22 M4) scripting + capture.
 	ensureErr   error           // makes SetIssueLabel's EnsureLabels fail
@@ -101,6 +114,34 @@ func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int6
 	return forge.BranchProtection{}, nil
 }
 
+// Pipeline reads (PRD #6). LatestPipeline/LatestMRPipeline are scriptable via the
+// pipelineBy* maps; a missing key is the no-CI case (ErrNoPipeline). ListPipelineJobs
+// and JobLogTail stay no-ops (unused by the sync milestone).
+func (f *fakeForge) LatestPipeline(_ context.Context, _ int64, ref string) (forge.Pipeline, error) {
+	f.latestPipeRefs = append(f.latestPipeRefs, ref)
+	if err, ok := f.pipelineRefErr[ref]; ok {
+		return forge.Pipeline{}, err
+	}
+	if p, ok := f.pipelineByRef[ref]; ok {
+		return p, nil
+	}
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeForge) LatestMRPipeline(_ context.Context, _, mrIID int64) (forge.Pipeline, error) {
+	f.latestPipeMRs = append(f.latestPipeMRs, mrIID)
+	if err, ok := f.pipelineMRErr[mrIID]; ok {
+		return forge.Pipeline{}, err
+	}
+	if p, ok := f.pipelineByMR[mrIID]; ok {
+		return p, nil
+	}
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
+	return nil, nil
+}
+func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
+
 // fakeStore records what the sync writes, standing in for *store.Queries. The
 // MR-close watcher fields (candidates/issue/columns/mrStateWrites) are exercised
 // by mr_watch_test.go; the sync tests leave them zero.
@@ -116,6 +157,21 @@ type fakeStore struct {
 	columns       []store.BoardColumn
 	columnsErr    error
 	mrStateWrites []store.SetRunMRStateParams
+
+	// Pipeline sync (PRD #6) scripting + capture.
+	watchedRefs      []store.ListWatchedRunRefsForRepoRow
+	watchedRefsErr   error
+	watchedRefsParam store.ListWatchedRunRefsForRepoParams // last args (cap/window assertions)
+	pipelineUpserts  []store.UpsertPipelineStatusParams
+	pipelineDeletes  []store.DeletePipelineStatusesNotInParams
+
+	// CI-fix verification (PRD #6) scripting + capture. stampTarget is returned by
+	// FindCIFixStampTarget (with stampTargetErr, default pgx.ErrNoRows meaning "no
+	// run awaiting verification"); stamps records StampFixVerdict calls.
+	stampTarget    store.Run
+	stampTargetErr error
+	stampParams    []store.FindCIFixStampTargetParams
+	stamps         []store.StampFixVerdictParams
 }
 
 func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) (store.Issue, error) {
@@ -138,6 +194,32 @@ func (s *fakeStore) ListBoardColumns(context.Context, uuid.UUID) ([]store.BoardC
 }
 func (s *fakeStore) SetRunMRState(_ context.Context, arg store.SetRunMRStateParams) (int64, error) {
 	s.mrStateWrites = append(s.mrStateWrites, arg)
+	return 1, nil
+}
+func (s *fakeStore) ListWatchedRunRefsForRepo(_ context.Context, arg store.ListWatchedRunRefsForRepoParams) ([]store.ListWatchedRunRefsForRepoRow, error) {
+	s.watchedRefsParam = arg
+	return s.watchedRefs, s.watchedRefsErr
+}
+func (s *fakeStore) UpsertPipelineStatus(_ context.Context, arg store.UpsertPipelineStatusParams) (store.PipelineStatus, error) {
+	s.pipelineUpserts = append(s.pipelineUpserts, arg)
+	return store.PipelineStatus{RepoID: arg.RepoID, Ref: arg.Ref, PipelineID: arg.PipelineID, Status: arg.Status}, nil
+}
+func (s *fakeStore) DeletePipelineStatusesNotIn(_ context.Context, arg store.DeletePipelineStatusesNotInParams) (int64, error) {
+	s.pipelineDeletes = append(s.pipelineDeletes, arg)
+	return 0, nil
+}
+func (s *fakeStore) FindCIFixStampTarget(_ context.Context, arg store.FindCIFixStampTargetParams) (store.Run, error) {
+	s.stampParams = append(s.stampParams, arg)
+	if s.stampTargetErr != nil {
+		return store.Run{}, s.stampTargetErr
+	}
+	if s.stampTarget.ID == (uuid.UUID{}) {
+		return store.Run{}, pgx.ErrNoRows // no ci_fix run awaiting verification
+	}
+	return s.stampTarget, nil
+}
+func (s *fakeStore) StampFixVerdict(_ context.Context, arg store.StampFixVerdictParams) (int64, error) {
+	s.stamps = append(s.stamps, arg)
 	return 1, nil
 }
 

@@ -65,6 +65,13 @@ type IssueStore interface {
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	SetRunMRState(ctx context.Context, arg store.SetRunMRStateParams) (int64, error)
+	// Pipeline-status cache (PRD #6): the poller-tick pipeline sync.
+	ListWatchedRunRefsForRepo(ctx context.Context, arg store.ListWatchedRunRefsForRepoParams) ([]store.ListWatchedRunRefsForRepoRow, error)
+	UpsertPipelineStatus(ctx context.Context, arg store.UpsertPipelineStatusParams) (store.PipelineStatus, error)
+	DeletePipelineStatusesNotIn(ctx context.Context, arg store.DeletePipelineStatusesNotInParams) (int64, error)
+	// CI-fix verification (PRD #6): stamp a fix run's verdict from its post-fix pipeline.
+	FindCIFixStampTarget(ctx context.Context, arg store.FindCIFixStampTargetParams) (store.Run, error)
+	StampFixVerdict(ctx context.Context, arg store.StampFixVerdictParams) (int64, error)
 }
 
 // LabelConfig resolves the configured PRD label the sync filters query by

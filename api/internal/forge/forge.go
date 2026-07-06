@@ -20,6 +20,13 @@ import (
 // to a warning instead of a hard block. It carries no secret material.
 var ErrTokenIntrospectionUnsupported = errors.New("forge: token introspection not supported by this forge version")
 
+// ErrNoPipeline is returned by LatestPipeline / LatestMRPipeline when the ref (or
+// MR) has no pipeline at all: a project with no CI configured, or a ref/MR that
+// has never triggered one. It is a distinct sentinel — not a redacted generic
+// error — so the pipeline sync (PRD #6) can cache "no CI" for the ref instead of
+// treating it as a failure. It carries no secret material.
+var ErrNoPipeline = errors.New("forge: no pipeline for ref")
+
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
 // column, which is CHECK-constrained to the same set.
 type Type string
@@ -154,6 +161,33 @@ func IsKnownMRState(s string) bool {
 	}
 }
 
+// Pipeline is the latest pipeline uzi caches for a watched ref (PRD #6). Status
+// is the raw GitLab pipeline status — one of created|waiting_for_resource|
+// preparing|pending|running|success|failed|canceled|skipped|manual|scheduled —
+// which the web layer collapses to a handful of badge tones; the cache stores it
+// verbatim so uzi never invents a status the forge did not report. CreatedAt /
+// UpdatedAt are zero when the forge omitted them.
+type Pipeline struct {
+	ID        int64
+	Ref       string
+	SHA       string
+	Status    string
+	WebURL    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// Job is one job of a pipeline (PRD #6). The CI-fix path snapshots a failed
+// pipeline's jobs (name/stage/status/url) plus each one's log tail so the run
+// stays self-contained. Status is the raw GitLab job status.
+type Job struct {
+	ID     int64
+	Name   string
+	Stage  string
+	Status string
+	WebURL string
+}
+
 // ListIssuesOptions filters ListIssues. State is always queried as "all" by the
 // driver (the Closed column requires it), so it is not exposed here. Labels is
 // ANDed; an empty UpdatedAfter means "no lower bound" (full fetch).
@@ -229,6 +263,35 @@ type Forge interface {
 	// /projects/:id/protected_branches/:name (a 404 means unprotected). botUserID
 	// is the bot's forge user id, used to flag a per-user allow-to-push entry.
 	DefaultBranchProtection(ctx context.Context, projectID int64, branch string, botUserID int64) (BranchProtection, error)
+	// LatestPipeline returns the newest branch pipeline for a ref, or
+	// ErrNoPipeline when the ref has none (no CI configured, or it never ran).
+	// GitLab: GET /projects/:id/pipelines?ref=<ref>&per_page=1 (default
+	// order_by=id desc, so the first row is newest).
+	LatestPipeline(ctx context.Context, projectID int64, ref string) (Pipeline, error)
+	// LatestMRPipeline returns the newest (max-by-id) pipeline attached to a merge
+	// request. This is what catches detached MR pipelines (refs/merge-requests/:iid/
+	// head) and merged-results pipelines, which never appear under the source-branch
+	// ref — so run-branch status and fix verification key on the run's MR, not its
+	// branch ref. Returns ErrNoPipeline when the MR has no pipeline. GitLab: GET
+	// /projects/:id/merge_requests/:iid/pipelines — note this endpoint groups
+	// merge_request_event pipelines first (then id-desc within a group), NOT a plain
+	// id-desc, so the driver picks the max id rather than trusting the first row.
+	LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (Pipeline, error)
+	// ListPipelineJobs returns the pipeline's jobs with status/stage/name,
+	// paginated internally. GitLab: GET /projects/:id/pipelines/:pipeline_id/jobs.
+	// Called only at fix-trigger time (to snapshot failed jobs), never on the poll
+	// tick.
+	ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error)
+	// JobLogTail returns at most maxBytes from the END of a job's trace (a
+	// failure's cause concludes its log); maxBytes <= 0 returns the whole trace.
+	// GitLab: GET /projects/:id/jobs/:job_id/trace — the endpoint has no range/tail
+	// parameter, so this is a full download truncated client-side, capped by a
+	// fail-closed download ceiling; acceptable because it runs only at fix-trigger
+	// time, never on the poll tick. The returned tail passes through the driver's
+	// PAT redactor (the snapshot path applies a second, pattern-based scrub). NOTE:
+	// the returned tail is NOT itself a secret-safe log scrubber for arbitrary
+	// third-party tokens — see the snapshot scrubber in the ci-fix handler.
+	JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error)
 }
 
 // New constructs a driver for the given forge type. baseURL must already be

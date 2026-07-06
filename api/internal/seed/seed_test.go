@@ -61,6 +61,18 @@ func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int6
 	return forge.BranchProtection{}, nil
 }
 
+// Pipeline reads (PRD #6) are unused by this fake — stubbed to satisfy forge.Forge.
+func (f *fakeForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
+	return nil, nil
+}
+func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
+
 // fakeSvc stands in for *forgesvc.Service. It records whether a client was built
 // (to prove the existing-connection path never re-verifies) and seals PATs with
 // a recognizable prefix so the stored ciphertext can be asserted.

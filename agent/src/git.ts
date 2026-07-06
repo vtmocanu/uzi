@@ -90,10 +90,23 @@ export class GitCache {
    * a stale one at the target path is removed and recreated cleanly.
    */
   async createOrAttachWorktree(barePath: string, issueIid: number): Promise<WorktreeResult> {
+    return this.worktreeForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`);
+  }
+
+  /**
+   * Create/attach a worktree for an EXPLICIT branch — the PRD #6 ci_fix targets:
+   * a fresh `ci-fix/pipeline-{id}` branch (default-branch fix), or an existing
+   * `agent/issue-{iid}` branch (run-branch fix, updating its MR). branch may or may
+   * not already exist in the bare repo: existing ⇒ attach; absent ⇒ create off the
+   * default branch. worktreeKey names the on-disk worktree dir (branch names carry
+   * `/`, so callers pass a filesystem-safe key). The cross-kind same-branch
+   * exclusion (server-side) guarantees no other active run holds this branch, so a
+   * prune + force-remove is enough to avoid git's "branch already checked out".
+   */
+  async worktreeForBranch(barePath: string, branch: string, worktreeKey: string): Promise<WorktreeResult> {
     return this.withLock(barePath, async () => {
-      const branch = `agent/issue-${issueIid}`;
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
-      const worktreePath = path.join(this.worktreesRoot, repoDir, `issue-${issueIid}`);
+      const worktreePath = path.join(this.worktreesRoot, repoDir, worktreeKey);
       await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
       // Clear any stale worktree at the path and prune dangling admin entries so

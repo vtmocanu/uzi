@@ -22,9 +22,11 @@ const wireContractFixture = "testdata/claim_skills_wire.json"
 // non-credentials so scanners never flag the fixture.
 func sampleClaimPayloadWithSkills() ClaimPayload {
 	strptr := func(s string) *string { return &s }
+	i64ptr := func(v int64) *int64 { return &v }
 	return ClaimPayload{
 		RunID:            "11111111-1111-1111-1111-111111111111",
-		IssueIID:         42,
+		Kind:             RunKindIssue,
+		IssueIID:         i64ptr(42),
 		IssueTitle:       "Extend the pipeline",
 		IssueDescription: "PRD: add a job",
 		Status:           "claimed",

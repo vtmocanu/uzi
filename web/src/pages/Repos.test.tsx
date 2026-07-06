@@ -42,6 +42,7 @@ function repo(over: Partial<Repo> & Pick<Repo, "id" | "path_with_namespace">): R
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    pipeline: null,
     ...over,
   };
 }

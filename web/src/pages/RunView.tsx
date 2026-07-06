@@ -11,6 +11,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, isTerminalRun, type Repo, type RunMessage } from "../lib/api";
 import { isStoppedRun } from "../lib/runBadge";
 import { useRunStream } from "../lib/useRunStream";
+import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { formatDuration } from "../components/RunEvent";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { Markdown } from "../components/Markdown";
@@ -135,19 +136,31 @@ export function RunView() {
               <Link to={`/repos/${run.repo_id}/board`} className="transition-colors hover:text-fg">
                 Board
               </Link>
-              <span>/</span>
-              <Link
-                to={`/repos/${run.repo_id}/issues/${run.issue_iid}`}
-                className="transition-colors hover:text-fg"
-              >
-                #{run.issue_iid}
-              </Link>
+              {/* An issue run links its card; a ci_fix run (PRD #6) has no issue —
+                  its breadcrumb tail is just "CI fix". */}
+              {run.kind !== "ci_fix" && run.issue_iid != null && (
+                <>
+                  <span>/</span>
+                  <Link
+                    to={`/repos/${run.repo_id}/issues/${run.issue_iid}`}
+                    className="transition-colors hover:text-fg"
+                  >
+                    #{run.issue_iid}
+                  </Link>
+                </>
+              )}
+              {run.kind === "ci_fix" && (
+                <>
+                  <span>/</span>
+                  <span className="text-muted">CI fix</span>
+                </>
+              )}
               <span>/</span>
               <span className="text-muted">Run</span>
             </nav>
             <div className="flex flex-wrap items-center gap-x-2">
               <h1 className="truncate text-xl font-semibold tracking-tight">{run.issue_title}</h1>
-              <span className="text-sm text-faint">#{run.issue_iid}</span>
+              {run.issue_iid != null && <span className="text-sm text-faint">#{run.issue_iid}</span>}
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
               {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
@@ -159,6 +172,9 @@ export function RunView() {
                   autopilot
                 </Badge>
               )}
+              {/* ci_fix runs (PRD #6): the failing-pipeline link (isHttpsUrl-guarded)
+                  and the verdict chip, extracted for isolated testing. */}
+              <CIFixRunHeader run={run} terminal={terminal} />
               {stage && (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-info/40 bg-info/10 px-2 py-0.5 text-[11px] font-medium text-info">
                   <Spinner /> {stage}…

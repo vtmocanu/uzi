@@ -66,6 +66,7 @@ function aCard(labels: string[]): Card {
     closed: false,
     conflict: false,
     latest_run: null,
+    pipeline: null,
   };
 }
 

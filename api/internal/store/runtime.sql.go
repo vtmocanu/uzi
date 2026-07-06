@@ -72,7 +72,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict
 `
 
 type ClaimRunParams struct {
@@ -118,6 +118,11 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.MrState,
 		&i.AutoApprove,
 		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
 	)
 	return i, err
 }
@@ -128,8 +133,8 @@ WHERE repo_id = $1 AND issue_iid = $2 AND move_pending_since IS NOT NULL
 `
 
 type ClearIssueRunsMovePendingParams struct {
-	RepoID   uuid.UUID `json:"repo_id"`
-	IssueIid int64     `json:"issue_iid"`
+	RepoID   uuid.UUID   `json:"repo_id"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
 }
 
 // A manual drag heals it: clear the pending marker for every run of this issue so
@@ -234,13 +239,13 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
 VALUES ($1, $2, $3, $4, $5, $6, now(), $7)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict
 `
 
 type CreateRunParams struct {
 	UserID           uuid.UUID   `json:"user_id"`
 	RepoID           uuid.UUID   `json:"repo_id"`
-	IssueIid         int64       `json:"issue_iid"`
+	IssueIid         pgtype.Int8 `json:"issue_iid"`
 	IssueTitle       string      `json:"issue_title"`
 	IssueDescription string      `json:"issue_description"`
 	OriginColumn     pgtype.Text `json:"origin_column"`
@@ -296,6 +301,11 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.MrState,
 		&i.AutoApprove,
 		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
 	)
 	return i, err
 }
@@ -433,7 +443,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -470,12 +480,17 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.MrState,
 		&i.AutoApprove,
 		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -514,6 +529,11 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.MrState,
 		&i.AutoApprove,
 		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
 	)
 	return i, err
 }
@@ -577,7 +597,7 @@ WHERE r.id = $1
 
 type GetRunMoveContextRow struct {
 	Status           string             `json:"status"`
-	IssueIid         int64              `json:"issue_iid"`
+	IssueIid         pgtype.Int8        `json:"issue_iid"`
 	RepoID           uuid.UUID          `json:"repo_id"`
 	OriginColumn     pgtype.Text        `json:"origin_column"`
 	BoardColumn      pgtype.Text        `json:"board_column"`
@@ -626,7 +646,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -666,6 +686,11 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.MrState,
 		&i.AutoApprove,
 		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
 	)
 	return i, err
 }
@@ -798,7 +823,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -854,6 +879,11 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.MrState,
 			&i.Run.AutoApprove,
 			&i.Run.AutopilotCommentedAt,
+			&i.Run.Kind,
+			&i.Run.PipelineID,
+			&i.Run.PipelineRef,
+			&i.Run.FailureSnapshot,
+			&i.Run.FixVerdict,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -938,7 +968,7 @@ type ListGaveUpColumnMovesParams struct {
 type ListGaveUpColumnMovesRow struct {
 	ID               uuid.UUID          `json:"id"`
 	RepoID           uuid.UUID          `json:"repo_id"`
-	IssueIid         int64              `json:"issue_iid"`
+	IssueIid         pgtype.Int8        `json:"issue_iid"`
 	Status           string             `json:"status"`
 	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
 }
@@ -1058,7 +1088,7 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, rp.path_with_namespace AS repo_path, w.name AS worker_name
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -1124,6 +1154,11 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.MrState,
 			&i.Run.AutoApprove,
 			&i.Run.AutopilotCommentedAt,
+			&i.Run.Kind,
+			&i.Run.PipelineID,
+			&i.Run.PipelineRef,
+			&i.Run.FailureSnapshot,
+			&i.Run.FixVerdict,
 			&i.RepoPath,
 			&i.WorkerName,
 		); err != nil {
@@ -1393,19 +1428,24 @@ UPDATE runs SET
     branch             = $1,
     mr_iid             = $2,
     session_id         = COALESCE($3, session_id),
+    -- fix_verdict carries a ci_fix run's outbound 'not_code' verdict on completion
+    -- (PRD #6); NULL for every issue run and for a ci_fix that produced a fix (its
+    -- verdict is stamped verified/fix_failed later by the pipeline sync).
+    fix_verdict        = COALESCE($4, fix_verdict),
     move_pending_since = now(),
     finished_at        = now(),
     updated_at         = now()
-WHERE id = $4 AND worker_id = $5
+WHERE id = $5 AND worker_id = $6
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunCompletedParams struct {
-	Branch    pgtype.Text `json:"branch"`
-	MrIid     pgtype.Int8 `json:"mr_iid"`
-	SessionID pgtype.Text `json:"session_id"`
-	ID        uuid.UUID   `json:"id"`
-	WorkerID  pgtype.UUID `json:"worker_id"`
+	Branch     pgtype.Text `json:"branch"`
+	MrIid      pgtype.Int8 `json:"mr_iid"`
+	SessionID  pgtype.Text `json:"session_id"`
+	FixVerdict pgtype.Text `json:"fix_verdict"`
+	ID         uuid.UUID   `json:"id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
 }
 
 // completed is the terminal MR-opened event → Human Review. move_pending_since is
@@ -1416,6 +1456,7 @@ func (q *Queries) SetRunCompleted(ctx context.Context, arg SetRunCompletedParams
 		arg.Branch,
 		arg.MrIid,
 		arg.SessionID,
+		arg.FixVerdict,
 		arg.ID,
 		arg.WorkerID,
 	)

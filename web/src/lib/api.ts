@@ -181,6 +181,20 @@ export interface ForgeConnection {
   privilege_report: PrivilegeReport | null;
 }
 
+// PipelineStatus is a watched ref's latest CI pipeline (PRD #6), or null on a DTO
+// when the ref has no CI or has not been synced yet. status is the raw GitLab
+// pipeline status; the web layer collapses it to a badge tone (pipelineBadge.ts).
+// web_url links to the pipeline on the forge; synced_at drives badge staleness.
+export interface PipelineStatus {
+  /** The watched ref this pipeline is for (default branch or an agent branch) —
+   *  what the Fix CI trigger POSTs to fix it (PRD #6). */
+  ref: string;
+  status: string;
+  web_url: string;
+  pipeline_id: number;
+  synced_at: string;
+}
+
 export interface Repo {
   id: string;
   connection_id: string;
@@ -193,6 +207,9 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  // Default-branch CI status (PRD #6), null when there is no cached default-branch
+  // pipeline (no CI, MR-only pipelines, or not yet synced).
+  pipeline: PipelineStatus | null;
 }
 
 export interface BoardColumn {
@@ -228,6 +245,10 @@ export interface Card {
   closed: boolean;
   conflict: boolean;
   latest_run: LatestRun | null;
+  // CI status of the card's most-recent run's branch (PRD #6), null when that run
+  // has no branch, no CI, or the card has never run. Drives the per-card badge and
+  // the Fix CI affordance.
+  pipeline: PipelineStatus | null;
 }
 
 export interface Board {
@@ -236,6 +257,9 @@ export interface Board {
   web_url: string;
   columns: BoardColumn[];
   cards: Card[];
+  // Repo default-branch CI status (PRD #6, the board header badge), null when
+  // there is no cached default-branch pipeline.
+  pipeline: PipelineStatus | null;
 }
 
 // IssueDetail is the in-app issue view payload (PRD #12 §3): the board card
@@ -340,10 +364,19 @@ export function isTerminalRun(status: string): boolean {
   return (TERMINAL_RUN_STATUSES as string[]).includes(status);
 }
 
+// FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
+// server-side from the post-fix pipeline; not_code is the agent's "not a code
+// problem" verdict; null means the fix is not yet verified.
+export type FixVerdict = "verified" | "fix_failed" | "not_code";
+
 export interface Run {
   id: string;
   repo_id: string;
-  issue_iid: number;
+  /** Run kind (PRD #6): "issue" works issue_iid's card; "ci_fix" fixes a failed
+   *  pipeline (pipeline_ref/pipeline_web_url/fix_verdict below). */
+  kind: string;
+  /** The worked issue for an issue run; null for a ci_fix run (no issue). */
+  issue_iid: number | null;
   issue_title: string;
   issue_description: string;
   status: RunStatus;
@@ -356,6 +389,11 @@ export interface Run {
   branch: string | null;
   mr_iid: number | null;
   failure_reason: string | null;
+  /** ci_fix (PRD #6): the failing ref, the failing pipeline's web URL (from the
+   *  snapshot), and the fix verdict. All null on an issue run. */
+  pipeline_ref: string | null;
+  pipeline_web_url: string | null;
+  fix_verdict: FixVerdict | null;
   plan_md: string | null;
   claimed_at: string | null;
   started_at: string | null;
@@ -609,6 +647,9 @@ const realApi = {
 
   createRun: (repoId: string, issueIid: number) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, { issue_iid: issueIid }),
+  /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
+  createCIFixRun: (repoId: string, ref: string) =>
+    request<{ run: Run }>("POST", `/repos/${repoId}/ci-fix-runs`, { ref }),
   listRuns: (params?: { repoId?: string; issueIid?: number }) => {
     const q = new URLSearchParams();
     if (params?.repoId) q.set("repo_id", params.repoId);

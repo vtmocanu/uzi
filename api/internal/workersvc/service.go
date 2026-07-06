@@ -76,6 +76,10 @@ type Store interface {
 
 	// Runs.
 	CreateRun(ctx context.Context, arg store.CreateRunParams) (store.Run, error)
+	// CI-fix runs (PRD #6).
+	CreateCIFixRun(ctx context.Context, arg store.CreateCIFixRunParams) (store.Run, error)
+	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
+	CountActiveCIFixForRef(ctx context.Context, arg store.CountActiveCIFixForRefParams) (int64, error)
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
 	GetRunByID(ctx context.Context, id uuid.UUID) (store.Run, error)
 	ListRunsForUser(ctx context.Context, arg store.ListRunsForUserParams) ([]store.ListRunsForUserRow, error)
@@ -346,12 +350,26 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 	}
 	skills := assembleRunSkills(skillRows, s.p.SkillsMaxPerRun)
 
+	// A ci_fix run carries no issue and instead delivers the failed-pipeline
+	// snapshot; an issue run carries its issue iid and no pipeline (PRD #6).
+	var issueIID *int64
+	if run.IssueIid.Valid {
+		v := run.IssueIid.Int64
+		issueIID = &v
+	}
+	var pipeline *ClaimPipeline
+	if run.Kind == RunKindCIFix {
+		pipeline = claimPipelineFromSnapshot(run.FailureSnapshot)
+	}
+
 	return &ClaimPayload{
 		RunID:            run.ID.String(),
-		IssueIID:         run.IssueIid,
+		Kind:             run.Kind,
+		IssueIID:         issueIID,
 		IssueTitle:       run.IssueTitle,
 		IssueDescription: run.IssueDescription,
 		Status:           run.Status,
+		Pipeline:         pipeline,
 		Branch:           textPtr(run.Branch),
 		SessionID:        textPtr(run.SessionID),
 		LastSeq:          run.LastSeq,
@@ -462,6 +480,11 @@ type StateRequest struct {
 	// (the run keeps whatever session_id it already had); when set it is persisted
 	// atomically with this state transition.
 	SessionID *string `json:"session_id"`
+	// FixVerdict travels the outbound 'not_code' verdict for a ci_fix run (PRD #6):
+	// the agent judged the failure not a code problem, so the run completes with the
+	// diagnosis and no MR. Only 'not_code' is expected here — verified/fix_failed are
+	// stamped later by the pipeline sync; a completed report on an issue run omits it.
+	FixVerdict *string `json:"fix_verdict"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -488,7 +511,8 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		})
 	case "completed":
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
-			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
+			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), SessionID: sessionID,
+			FixVerdict: clampWireFixVerdict(req.FixVerdict), ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "failed":
 		rows, err = s.q.SetRunFailed(ctx, store.SetRunFailedParams{
@@ -657,10 +681,24 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	if !issue.HasPrdLink && !allowWithoutPRD {
 		return store.Run{}, ErrNoPRDLink
 	}
+	// Cross-kind same-branch exclusion (PRD #6): this issue run will use the
+	// worktree agent/issue-<iid>; refuse if an active ci_fix run is already fixing
+	// that ref. The reverse check lives in CreateCIFixRun; the two partial unique
+	// indexes are disjoint and cannot express this cross-kind rule.
+	fixing, err := s.q.CountActiveCIFixForRef(ctx, store.CountActiveCIFixForRefParams{
+		RepoID:      repoID,
+		PipelineRef: pgtype.Text{String: agentIssueBranch(issueIID), Valid: true},
+	})
+	if err != nil {
+		return store.Run{}, err
+	}
+	if fixing > 0 {
+		return store.Run{}, ErrBranchInUse
+	}
 	run, err := s.q.CreateRun(ctx, store.CreateRunParams{
 		UserID:           userID,
 		RepoID:           repoID,
-		IssueIid:         issueIID,
+		IssueIid:         pgtype.Int8{Int64: issueIID, Valid: true},
 		IssueTitle:       issue.Title,
 		IssueDescription: description,
 		OriginColumn:     s.originColumn(ctx, repoID, issue),

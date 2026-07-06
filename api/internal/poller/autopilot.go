@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
@@ -154,7 +155,7 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 	// terminal (retry is a deliberate remove+re-add, which mints a new event id).
 	// Checked before eligibility so an active manual run never draws a spurious
 	// autopilot comment.
-	active, err := a.q.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{RepoID: r.ID, IssueIid: iid})
+	active, err := a.q.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{RepoID: r.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}})
 	if err != nil {
 		slog.Error("poller: autopilot active-run check", "repo", r.PathWithNamespace, "issue", iid, "error", err)
 		return

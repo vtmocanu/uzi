@@ -37,6 +37,31 @@ export type MessageKind =
 /** run_user_inputs.kind (PRD #4 §Schema). */
 export type InputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
 
+/** runs.kind (PRD #6). */
+export type RunKind = "issue" | "ci_fix";
+
+/** A ci_fix run's outbound verdict (PRD #6). Only "not_code" travels the wire;
+ *  verified/fix_failed are stamped server-side from the post-fix pipeline. */
+export type FixVerdict = "not_code";
+
+/** The failed-pipeline snapshot a ci_fix run works from (PRD #6). Frozen at queue
+ *  time so the run is self-contained. Log tails are UNTRUSTED (quoted evidence). */
+export interface ClaimPipeline {
+  id: number;
+  ref: string;
+  sha: string;
+  web_url: string;
+  failed_jobs: ClaimFailedJob[];
+}
+
+/** One failed job in a ClaimPipeline: identity + a bounded tail of its trace. */
+export interface ClaimFailedJob {
+  name: string;
+  stage: string;
+  web_url: string;
+  log_tail: string;
+}
+
 export interface RegisterRequest {
   name: string;
   version: string;
@@ -146,10 +171,19 @@ export interface ClaimConfig {
  */
 export interface ClaimResponse {
   run_id: string;
-  issue_iid: number;
-  /** Snapshotted at queue time so the run is self-contained (PRD §Schema). */
+  /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
+   *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */
+  kind?: RunKind;
+  /** The worked issue for an issue run; null for a ci_fix run (no issue). */
+  issue_iid: number | null;
+  /** Snapshotted at queue time so the run is self-contained (PRD §Schema). For a
+   *  ci_fix run these carry a synthesized summary, not a real issue. */
   issue_title: string;
   issue_description: string;
+  /** The failed-pipeline snapshot for a ci_fix run (PRD #6): what the agent
+   *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED
+   *  data — quoted evidence, never instructions. */
+  pipeline?: ClaimPipeline | null;
   repo: ClaimRepo;
   secrets: ClaimSecrets;
   /** Existing branch on resume/attach; usually `agent/issue-{iid}`. */
@@ -206,6 +240,11 @@ export interface StateRequest {
   iteration_count?: number;
   /** Pinned mid-flight so a resume has the SDK session (M3). */
   session_id?: string;
+  /** A ci_fix run's outbound verdict on completion (PRD #6): only "not_code" (the
+   *  agent judged the failure not a code problem — the run completes with the
+   *  diagnosis and no MR). verified/fix_failed are stamped server-side by the
+   *  pipeline sync, never reported here; an issue run omits this. */
+  fix_verdict?: FixVerdict;
 }
 
 export interface UserInput {

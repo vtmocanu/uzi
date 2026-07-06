@@ -29,7 +29,7 @@ import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { assembleAgents } from "./agents.js";
-import { buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt } from "./prompt.js";
+import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
@@ -249,14 +249,27 @@ export class SdkExecutor implements Executor {
 
     try {
       // --- Phase 1: planning turn ------------------------------------------
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: "starting SDK agent (planning)" } });
-      const plan = await this.driveTurn(ctx, baseOptions, resumeId, buildPlanPrompt({
-        issueIid: ctx.issueIid,
-        issueTitle: ctx.issueTitle,
-        issueDescription: ctx.issueDescription,
-        branch: ctx.branch,
-        subagentNames,
-      }), state, idleMs);
+      // A ci_fix run (PRD #6) diagnoses a failed pipeline from its frozen snapshot
+      // (untrusted job logs) instead of a forge issue; everything else — the plan
+      // gate, the implement⇄review loop, the guardrails — is identical.
+      const isCIFix = ctx.kind === "ci_fix" && ctx.pipeline != null;
+      const planPrompt = isCIFix
+        ? buildCIFixPlanPrompt({
+            ref: ctx.pipeline!.ref,
+            branch: ctx.branch,
+            pipelineWebURL: ctx.pipeline!.web_url,
+            failedJobs: ctx.pipeline!.failed_jobs.map((j) => ({ name: j.name, stage: j.stage, logTail: j.log_tail })),
+            subagentNames,
+          })
+        : buildPlanPrompt({
+            issueIid: ctx.issueIid ?? 0,
+            issueTitle: ctx.issueTitle,
+            issueDescription: ctx.issueDescription,
+            branch: ctx.branch,
+            subagentNames,
+          });
+      ctx.emit({ kind: "status", agent: "worker", payload: { text: `starting SDK agent (${isCIFix ? "diagnosing CI failure" : "planning"})` } });
+      const plan = await this.driveTurn(ctx, baseOptions, resumeId, planPrompt, state, idleMs);
       resumeId = plan.sessionId ?? resumeId;
       // A planning turn that ends without a plan is an error — never push
       // un-gated work, even if the lead prematurely signalled done.
@@ -267,6 +280,15 @@ export class SdkExecutor implements Executor {
       const verdict = await ctx.gatePlan(plan.plan);
       if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
       if (verdict.kind === "cancel") throw new Error(REASON_CANCELLED);
+
+      // A ci_fix run whose approved plan is a not_code verdict is done: no code to
+      // implement, no branch to push. The run completes with the diagnosis as its
+      // value (PRD #6). Detected AFTER approval so a human confirmed the verdict.
+      if (isCIFix && isNotCodePlan(plan.plan)) {
+        ctx.emit({ kind: "status", agent: "worker", payload: { text: "diagnosis: not a code problem — completing with no fix" } });
+        this.log.info("ci_fix run: not_code verdict", { run_id: ctx.runId });
+        return { branch: ctx.branch, fixVerdict: "not_code" };
+      }
 
       // --- Phase 2: implement ⇄ review loop --------------------------------
       let iteration = 0;

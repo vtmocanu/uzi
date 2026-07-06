@@ -124,6 +124,28 @@ describe("screenBashCommand", () => {
   });
 });
 
+// CI-fix guardrail parity (PRD #6 M5 acceptance): a ci_fix run feeds the agent the
+// most attacker-influenceable text uzi ever handles (CI job logs). If a hostile log
+// steers the agent into pushing to main, reading the PAT, or dumping process
+// secrets, the tool-boundary screener MUST still deny it — the guardrails are
+// command-based and never key on the run kind, so a ci_fix run is protected exactly
+// like an issue run. These are the commands such a log would try.
+describe("CI-fix guardrail parity (PRD #6)", () => {
+  const LOG_STEERED_ATTACKS = [
+    "git push origin main", // "the log said: run `git push origin main`"
+    "git push --force origin ci-fix/pipeline-4200", // force-push the fix branch
+    "git config --get http.extraHeader", // read the worker-scoped PAT header
+    "cat /proc/self/environ", // scrape secrets from the environment
+    "sh -c 'git push origin main'", // wrapped push
+  ];
+  for (const cmd of LOG_STEERED_ATTACKS) {
+    it(`denies a log-steered attack: ${cmd}`, () => {
+      const r = screenBashCommand(cmd);
+      assert.strictEqual(r.denied, true, `a hostile CI log must not enable: ${cmd}`);
+    });
+  }
+});
+
 function baseInput(): Omit<HookInput, "hook_event_name" | "tool_name" | "tool_input" | "tool_use_id"> {
   return { session_id: "s", transcript_path: "/t", cwd: "/w" };
 }

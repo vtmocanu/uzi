@@ -84,8 +84,8 @@ SELECT EXISTS (
 `
 
 type HasActiveRunForIssueParams struct {
-	RepoID   uuid.UUID `json:"repo_id"`
-	IssueIid int64     `json:"issue_iid"`
+	RepoID   uuid.UUID   `json:"repo_id"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
 }
 
 // Whether the issue has a non-terminal run right now. A label (re-)application while

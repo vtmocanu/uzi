@@ -6,6 +6,7 @@ import { Link } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo } from "../lib/api";
 import { repoFindings } from "../lib/privilege";
 import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select } from "../components/ui";
+import { PipelineBadge } from "../components/PipelineBadge";
 import { BoardIcon } from "../components/icons";
 
 export function Repos() {
@@ -182,7 +183,10 @@ export function Repos() {
                           )}
                         </td>
                         <td className="px-4 py-3 font-mono text-xs text-muted">
-                          {r.default_branch ?? "—"}
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span>{r.default_branch ?? "—"}</span>
+                            {r.pipeline && <PipelineBadge pipeline={r.pipeline} />}
+                          </div>
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex flex-wrap items-center gap-1.5">

@@ -47,6 +47,18 @@ func (f *fakeForge) DefaultBranchProtection(_ context.Context, projectID int64, 
 	return p.bp, p.err
 }
 
+// Pipeline reads (PRD #6) are unused by this fake — stubbed to satisfy forge.Forge.
+func (f *fakeForge) LatestPipeline(context.Context, int64, string) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeForge) LatestMRPipeline(context.Context, int64, int64) (forge.Pipeline, error) {
+	return forge.Pipeline{}, forge.ErrNoPipeline
+}
+func (f *fakeForge) ListPipelineJobs(context.Context, int64, int64) ([]forge.Job, error) {
+	return nil, nil
+}
+func (f *fakeForge) JobLogTail(context.Context, int64, int64, int) (string, error) { return "", nil }
+
 // Unused-by-checker methods.
 func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) { return nil, nil }
 func (f *fakeForge) ListLabels(context.Context, int64) ([]forge.Label, error) {

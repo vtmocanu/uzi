@@ -166,11 +166,15 @@ export function Badge({
   tone = "neutral",
   title,
   dot = false,
+  pulse = false,
 }: {
   children: ReactNode;
   tone?: BadgeTone;
   title?: string;
   dot?: boolean;
+  // pulse animates the dot (dot must also be set) — used for a still-running state,
+  // mirroring StatusPill's running pulse.
+  pulse?: boolean;
 }) {
   return (
     <span
@@ -180,7 +184,7 @@ export function Badge({
         BADGE_TONES[tone],
       )}
     >
-      {dot && <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current" />}
+      {dot && <span aria-hidden="true" className={cx("h-1.5 w-1.5 rounded-full bg-current", pulse && "animate-pulse")} />}
       {children}
     </span>
   );

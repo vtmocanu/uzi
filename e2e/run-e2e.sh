@@ -162,6 +162,42 @@ wait_status() {
   fail "timeout: run $run never reached '$want' (last: ${s:-none})"
 }
 
+# wait_board_pipeline STATUS [TIMEOUT] — wait until the board header's default-branch
+# CI badge reaches STATUS (the pipeline sync is poller-driven, PRD #6).
+wait_board_pipeline() {
+  local want="$1" deadline=$((SECONDS + ${2:-30})) s
+  while [ $SECONDS -lt $deadline ]; do
+    s="$(apiget "/api/repos/$REPO_ID/board" | jq -r '.board.pipeline.status // empty')"
+    [ "$s" = "$want" ] && return 0
+    sleep 2
+  done
+  fail "timeout: board pipeline never reached '$want' (last: ${s:-none})"
+}
+
+# wait_card_pipeline IID STATUS [TIMEOUT] — wait until the board CARD for issue IID
+# shows STATUS on its per-card CI badge (the card's most-recent run branch, PRD #6).
+wait_card_pipeline() {
+  local iid="$1" want="$2" deadline=$((SECONDS + ${3:-30})) s
+  while [ $SECONDS -lt $deadline ]; do
+    s="$(apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$iid" '.board.cards[] | select(.iid==$iid) | .pipeline.status // empty')"
+    [ "$s" = "$want" ] && return 0
+    sleep 2
+  done
+  fail "timeout: card #$iid pipeline never reached '$want' (last: ${s:-none})"
+}
+
+# wait_verdict RUN WANT [TIMEOUT] — wait for a ci_fix run's fix_verdict (the
+# verification stamp is poller-driven, PRD #6).
+wait_verdict() {
+  local run="$1" want="$2" deadline=$((SECONDS + ${3:-30})) v
+  while [ $SECONDS -lt $deadline ]; do
+    v="$(apiget "/api/runs/$run" | jq -r '.run.fix_verdict // empty')"
+    [ "$v" = "$want" ] && return 0
+    sleep 2
+  done
+  fail "timeout: run $run fix_verdict never reached '$want' (last: ${v:-none})"
+}
+
 # card_column IID — the board's resolved column for one issue (empty = Open).
 card_column() {
   apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" \
@@ -831,6 +867,108 @@ COLLIDE="$(curl -sS -o /dev/null -w '%{http_code}' -b "$JAR2" -X PUT "$BASE/api/
 pass "human_username collision on the same host is rejected (409)"
 
 # =============================================================================
+# PRD #6 — CI status sync, Fix CI (plan-gated ci_fix run), and verification. The
+# poller is already at ~2s (the MR-close phase sped it up), so the pipeline sync
+# ticks fast; forge-fake serves the pipeline endpoints and the /_e2e/pipelines
+# mutator seeds/flips a ref's status.
+say "PRD #6: CI status sync + Fix CI + the verification stamp"
+
+# 1) A red pipeline on main becomes visible on the board header within a tick.
+fake_post "/_e2e/pipelines" '{"ref":"main","status":"failed","jobs":[{"name":"unit","stage":"test","status":"failed","trace":"=== RUN TestFoo\n--- FAIL: TestFoo (nil guard removed)\nFAIL\n"}]}' >/dev/null
+wait_board_pipeline failed 20
+pass "red main pipeline is visible on the board header within a poll interval"
+
+# 2) Fix CI queues a plan-gated ci_fix run; a second one on the same ref is a 409.
+FIXRUN="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}' | jq -r '.run.id')"
+{ [ -n "$FIXRUN" ] && [ "$FIXRUN" != null ]; } || fail "ci_fix run was not created"
+[ "$(apiget "/api/runs/$FIXRUN" | jq -r '.run.kind')" = ci_fix ] || fail "run kind is not ci_fix"
+DUP="$(apipost_code "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}')"
+[ "$DUP" = 409 ] || fail "a second active Fix CI on main should be 409, got $DUP"
+pass "Fix CI queued ci_fix run $FIXRUN; a duplicate on the same ref is 409"
+
+# 3) Plan gate → approve → the worker pushes the fix branch + opens an MR.
+wait_status "$FIXRUN" awaiting_approval
+[ "$(apiget "/api/runs/$FIXRUN" | jq -r '.run.plan_md // empty')" != "" ] || fail "ci_fix run carried no plan"
+apipost "/api/runs/$FIXRUN/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$FIXRUN" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+FIXBRANCH="$(apiget "/api/runs/$FIXRUN" | jq -r '.run.branch')"
+case "$FIXBRANCH" in ci-fix/pipeline-*) : ;; *) fail "ci_fix fix branch not ci-fix/pipeline-* (got $FIXBRANCH)";; esac
+FIXMR="$(apiget "/api/runs/$FIXRUN" | jq -r '.run.mr_iid')"
+{ [ "$FIXMR" != null ] && [ "$FIXMR" -gt 0 ]; } || fail "ci_fix run.mr_iid not set (got $FIXMR)"
+[ "$(fake_state | jq -r --arg b "$FIXBRANCH" '[.mrs[] | select(.source_branch==$b)] | length')" -ge 1 ] \
+  || fail "fake GitLab recorded no MR from $FIXBRANCH"
+pass "ci_fix completed on $FIXBRANCH with MR !$FIXMR (default-branch fix)"
+
+# 4) uzi verifies its work: the fix branch's post-fix pipeline passes → verdict.
+fake_post "/_e2e/pipelines" "{\"ref\":\"$FIXBRANCH\",\"status\":\"success\"}" >/dev/null
+wait_verdict "$FIXRUN" verified 20
+pass "fix branch pipeline passed → run $FIXRUN stamped verified"
+
+# 5) not_code path: a red main whose log says it is not a code problem. Flip main
+#    GREEN first so the following red is unambiguously the NEW, sentinel-bearing
+#    pipeline the sync must cache (a stale "still failed" would let the ci_fix
+#    snapshot the previous, clean pipeline).
+fake_post "/_e2e/pipelines" '{"ref":"main","status":"success"}' >/dev/null
+wait_board_pipeline success 20
+fake_post "/_e2e/pipelines" '{"ref":"main","status":"failed","jobs":[{"name":"deploy","stage":"deploy","status":"failed","trace":"runner disk full UZI_STUB_NOT_CODE"}]}' >/dev/null
+wait_board_pipeline failed 20
+NCRUN="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}' | jq -r '.run.id')"
+wait_status "$NCRUN" awaiting_approval
+apipost "/api/runs/$NCRUN/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$NCRUN" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(apiget "/api/runs/$NCRUN" | jq -r '.run.fix_verdict')" = not_code ] || fail "not_code run verdict is not not_code"
+[ "$(apiget "/api/runs/$NCRUN" | jq -r '.run.mr_iid')" = null ] || fail "a not_code run must open no MR"
+pass "not_code path: run $NCRUN completed with fix_verdict=not_code and no MR"
+
+# 6) Agent-MR fix + cross-kind race. An issue run leaves an open MR on
+#    agent/issue-N; a red pipeline on that MR gets a ci_fix run whose commits land
+#    on the SAME branch (the existing MR updates, no second MR) and whose
+#    verification stamps on it. While that ci_fix is active, an issue run on the
+#    same issue is refused (they would share the worktree).
+say "PRD #6: agent-MR same-branch fix + cross-kind race"
+
+AIID="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E agent-MR fix","description":"implements prds/6-ci-status-integration.md"}' | jq -r '.card.iid')"
+ARUN="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$AIID}" | jq -r '.run.id')"
+wait_status "$ARUN" awaiting_approval
+apipost "/api/runs/$ARUN/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$ARUN" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+AGENTBRANCH="agent/issue-$AIID"
+AMR="$(apiget "/api/runs/$ARUN" | jq -r '.run.mr_iid')"
+{ [ "$AMR" != null ] && [ "$AMR" -gt 0 ]; } || fail "issue run left no MR on $AGENTBRANCH (got $AMR)"
+pass "issue run left an open MR !$AMR on $AGENTBRANCH"
+
+# Red pipeline on the agent branch's MR (LatestMRPipeline resolves MR->source_branch).
+fake_post "/_e2e/pipelines" "{\"ref\":\"$AGENTBRANCH\",\"status\":\"failed\",\"jobs\":[{\"name\":\"unit\",\"stage\":\"test\",\"status\":\"failed\",\"trace\":\"--- FAIL: TestBar\\n\"}]}" >/dev/null
+wait_card_pipeline "$AIID" failed 20
+pass "red pipeline on $AGENTBRANCH is visible on card #$AIID"
+
+AFIX="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" "{\"ref\":\"$AGENTBRANCH\"}" | jq -r '.run.id')"
+wait_status "$AFIX" awaiting_approval
+
+# Cross-kind race: an issue run on the SAME issue must 409 while the ci_fix holds
+# the agent branch/worktree.
+RACE="$(apipost_code "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$AIID}")"
+[ "$RACE" = 409 ] || fail "issue run on #$AIID while a ci_fix holds $AGENTBRANCH must 409, got $RACE"
+pass "cross-kind race: an issue run on #$AIID is refused (409) while a ci_fix holds $AGENTBRANCH"
+
+MRS_BEFORE="$(fake_state | jq --arg b "$AGENTBRANCH" '[.mrs[] | select(.source_branch==$b)] | length')"
+apipost "/api/runs/$AFIX/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$AFIX" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(apiget "/api/runs/$AFIX" | jq -r '.run.branch')" = "$AGENTBRANCH" ] \
+  || fail "agent-branch ci_fix did not land on $AGENTBRANCH"
+[ "$(apiget "/api/runs/$AFIX" | jq -r '.run.mr_iid')" = "$AMR" ] \
+  || fail "agent-branch ci_fix must reuse the existing MR !$AMR, no second MR"
+MRS_AFTER="$(fake_state | jq --arg b "$AGENTBRANCH" '[.mrs[] | select(.source_branch==$b)] | length')"
+[ "$MRS_AFTER" = "$MRS_BEFORE" ] || fail "agent-branch ci_fix opened a SECOND MR ($MRS_BEFORE -> $MRS_AFTER)"
+pass "agent-branch ci_fix landed on $AGENTBRANCH, reused MR !$AMR, opened no second MR"
+
+# Verification stamps on the agent branch too (the fix pipeline outranks the failure).
+fake_post "/_e2e/pipelines" "{\"ref\":\"$AGENTBRANCH\",\"status\":\"success\"}" >/dev/null
+wait_verdict "$AFIX" verified 20
+pass "agent-branch fix pipeline passed -> run $AFIX stamped verified"
+
+# =============================================================================
 # PRD #22 — PRDLESS escape hatch: an issue carrying the PRDLESS label runs with no
 # prds/*.md link, gated by the admin toggle; the label is applied/removed from
 # uzi's own UI (forge-first) via POST .../prdless. Exercises the run-create gate
@@ -899,4 +1037,4 @@ fake_state | jq -e --argjson iid "$IID_TG" \
   || fail "remove: PRDLESS label still on the fake forge issue #$IID_TG"
 pass "toggle remove: PRDLESS gone from the fake forge + the card"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #19 autopilot + PRD #22 PRDLESS; executor=%s)\n' "$EXECUTOR"
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS; executor=%s)\n' "$EXECUTOR"

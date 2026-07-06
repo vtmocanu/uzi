@@ -1,5 +1,6 @@
 {
   "run_id": "11111111-1111-1111-1111-111111111111",
+  "kind": "issue",
   "issue_iid": 42,
   "issue_title": "Extend the pipeline",
   "issue_description": "PRD: add a job",

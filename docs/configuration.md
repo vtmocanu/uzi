@@ -57,6 +57,21 @@ The first time a repo's board is opened, uzi ensures three labels exist on that 
 - GitLab throttles how often it bumps an issue's `updated_at` to roughly once per ~60-second window, regardless of whether the triggering change is a label add or a label remove (verified against gitlab.example.com — see the PRD's Sync engine section for the full finding). Multiple edits landing inside the same throttle window collapse to a single bump, so only the latest of them is guaranteed to be caught incrementally; earlier ones in that window are caught by the next reconcile pass instead. `FORGE_POLL_INTERVAL`'s default (`60s`) is the same order of magnitude as the throttle window, so normal editing cadence is still caught incrementally almost all the time.
 - De-labeling, issue deletion, and any edit whose `updated_at` bump the incremental filter missed are only guaranteed to be visible within one `FORGE_RECONCILE_EVERY`-th poll (the full reconcile), because eviction — noticing a previously-cached issue is now absent from the forge's current set — is structurally impossible for an `updated_after`-filtered incremental query to do.
 
+## CI status integration (PRD #6)
+
+uzi caches the latest pipeline per **watched ref** (a repo's default branch, plus the branches of that repo's recent agent runs) on the same poll tick as the issue sync — no second loop or interval — and renders it as a status badge on the repos list, the board header, and each card. A failed pipeline offers a **Fix CI** button that queues a plan-gated `ci_fix` agent run; when that run's fix branch pipeline concludes, the sync stamps the run `verified` or `fix_failed` ("uzi verifies its work"). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full pipeline-sync + verification design.
+
+| Var | Default | Notes |
+|---|---|---|
+| `CI_WATCH_MAX_REFS` | `20` | Max agent run branches watched per repo per tick (newest first). **Set to `0` to disable the pipeline sync entirely** — no CI badges, no Fix CI — reproducing pre-PRD-6 behaviour bit-for-bit for operators who want CI awareness off. Hitting the cap is logged, never silent. |
+| `CI_WATCH_RUN_WINDOW` | `336h` (14 days) | How long a **finished** run's branch keeps being watched for CI after it completes (a non-terminal run is watched regardless). Go duration syntax only (`h`/`m`/`s`, no `d`), so 14 days is written `336h`; a literal `14d` is unparseable and silently falls back to the default. Long enough to cover review cycles, bounded so dead branches age out of the cache. |
+| `CI_FIX_MAX_JOBS` | `10` | Max failed jobs a Fix CI snapshot captures from the failed pipeline. Bounds the snapshot (jobs × tail) frozen onto the `ci_fix` run at queue time. |
+| `CI_FIX_LOG_TAIL_BYTES` | `32768` (32 KiB) | Bytes captured from the **end** of each failed job's trace (a failure concludes its log). Tails are treated as untrusted evidence and pass a PAT + known-token redaction pass before they are stored. |
+
+**Verification caveat**: `verified` means "the fix MR's latest pipeline passed". A merge-result failure that only surfaces on `main` (a semantic conflict) is caught only if the project runs [merged-results pipelines](https://docs.gitlab.com/ee/ci/pipelines/merged_results_pipelines.html) — a GitLab-config concern, not a uzi setting.
+
+**Secrets-in-logs residual risk**: the snapshot scrubber strips uzi's bot PAT by value (the forge driver's connection-PAT redactor) plus known token *shapes* (GitLab `glpat-`/`gloas-`/`glrt-`/`glcbt-`/`glptt-`/`glsoat-`/`glimt-`/`glagent-`/`gldt-`, Anthropic `sk-ant-`) and any `Authorization`/`PRIVATE-TOKEN`/`Bearer` header line. It does NOT scrub the worker join token or a per-user Anthropic token by value — those are caught only if a pipeline echoes them inside one of those header lines — and it cannot know every third-party secret shape a teammate's pipeline might print. A snapshot is stored server-side like any run message, visible only to the run's owner and admins.
+
 ## Access control (PRD #5)
 
 Registration controls and PAT least-privilege verification. See [auth-design.md](auth-design.md#registration-controls) for the registration policy and [gitlab-bot-setup.md](gitlab-bot-setup.md#least-privilege-what-uzi-verifies) for what the privilege checker enforces.

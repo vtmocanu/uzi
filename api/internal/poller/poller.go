@@ -49,6 +49,13 @@ type Engine struct {
 	// Set via SetAutopilot, mirroring workersvc's SetBroadcaster/SetLifecycle so
 	// New's signature — and its existing callers — stay unchanged.
 	autopilot *Autopilot
+
+	// Pipeline-status watch (PRD #6). Set via SetPipelineWatch, same optional-
+	// collaborator pattern as autopilot: pipelineMaxRefs <= 0 (the zero value when
+	// unset, or CI_WATCH_MAX_REFS=0) disables the per-tick pipeline sync entirely,
+	// so a poller built without SetPipelineWatch behaves exactly as before PRD #6.
+	pipelineWindow  time.Duration
+	pipelineMaxRefs int
 }
 
 type repoState struct {
@@ -81,6 +88,16 @@ func New(svc *forgesvc.Service, q *store.Queries, interval time.Duration, reconc
 // startup, before Run. A nil detector (the default) disables autopilot: the sync
 // still runs, no runs are auto-created and no autopilot comments are posted.
 func (e *Engine) SetAutopilot(a *Autopilot) { e.autopilot = a }
+
+// SetPipelineWatch wires the PRD #6 pipeline-status sync into each tick. Call once
+// at startup, before Run. maxRefs <= 0 (the default when unset, or an operator's
+// CI_WATCH_MAX_REFS=0) disables it: the per-tick pipeline step is skipped and no
+// badge cache is produced, reproducing pre-PRD-6 behaviour bit-for-bit. window is
+// CI_WATCH_RUN_WINDOW, maxRefs is CI_WATCH_MAX_REFS.
+func (e *Engine) SetPipelineWatch(window time.Duration, maxRefs int) {
+	e.pipelineWindow = window
+	e.pipelineMaxRefs = maxRefs
+}
 
 // ForceReconcile requests that the next tick full-syncs every enabled repo,
 // dropping the incremental fast-path so a changed prd_label immediately re-filters
@@ -223,6 +240,25 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// only a candidate-enumeration failure surfaces here.
 	if err := e.svc.SyncMRStates(ctx, r.ID, r.ForgeProjectID, f); err != nil {
 		slog.Error("poller: sync MR states", "repo", r.PathWithNamespace, "error", err)
+	}
+
+	// Pipeline-status sync (PRD #6): refresh the CI-badge cache for the repo's
+	// default branch + its watched agent run branches. Rides this tick (no second
+	// loop, no new interval); disabled when SetPipelineWatch was not called or
+	// CI_WATCH_MAX_REFS=0. Eviction aligns with the issue reconcile (same pollCount).
+	if e.pipelineMaxRefs > 0 {
+		defaultBranch := ""
+		if r.DefaultBranch.Valid {
+			defaultBranch = r.DefaultBranch.String
+		}
+		if err := e.svc.SyncPipelines(ctx, r.ID, r.ForgeProjectID, f, forgesvc.PipelineSyncOptions{
+			DefaultBranch: defaultBranch,
+			Window:        e.pipelineWindow,
+			MaxRefs:       e.pipelineMaxRefs,
+			Evict:         reconcileDue(st.pollCount, e.reconcileEvery),
+		}); err != nil {
+			slog.Error("poller: sync pipelines", "repo", r.PathWithNamespace, "error", err)
+		}
 	}
 
 	// Autopilot detection (PRD #19 M4): also post-sync, a sibling of the MR-close

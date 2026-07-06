@@ -58,6 +58,10 @@ type cardDTO struct {
 	// It carries only display state (no secrets); the run-view link is owner-only,
 	// so IsMine tells the client whether the viewer may open it.
 	LatestRun *latestRunDTO `json:"latest_run"`
+	// Pipeline is the CI status of the card's MOST RECENT run's branch (PRD #6),
+	// null when that run has no branch, no CI, or the card has never run. It is what
+	// renders the per-card badge and gates the "Fix CI" affordance.
+	Pipeline *pipelineDTO `json:"pipeline"`
 }
 
 // latestRunDTO is the run summary a card carries (PRD #12 M2), so the board needs
@@ -112,6 +116,9 @@ type boardDTO struct {
 	WebURL  string      `json:"web_url"`
 	Columns []columnDTO `json:"columns"`
 	Cards   []cardDTO   `json:"cards"`
+	// Pipeline is the repo's default-branch CI status (PRD #6, the board header
+	// badge), null when there is no cached default-branch pipeline.
+	Pipeline *pipelineDTO `json:"pipeline"`
 }
 
 // ── Board ───────────────────────────────────────────────────────────────────
@@ -289,17 +296,59 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		position[c.LabelName] = int(c.Position)
 	}
 
+	// CI badges (PRD #6): the board header shows the repo's default-branch pipeline;
+	// each card shows its most-recent run's branch pipeline. Both are enrichment —
+	// a cache-read failure logs and renders the board without badges.
+	repoPipeline := h.defaultBranchPipeline(r, repo)
+	cardPipelines := h.cardPipelines(r, repo.ID)
+
 	// repo.UserID is the board viewer (the connection owner); IsMine gates the
 	// owner-only run-view link.
-	cards := assembleCards(issues, runRows, position, repo.UserID)
+	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID)
 
 	return boardDTO{
-		RepoID:  repo.ID.String(),
-		Path:    repo.PathWithNamespace,
-		WebURL:  repo.WebUrl,
-		Columns: columns,
-		Cards:   cards,
+		RepoID:   repo.ID.String(),
+		Path:     repo.PathWithNamespace,
+		WebURL:   repo.WebUrl,
+		Columns:  columns,
+		Cards:    cards,
+		Pipeline: repoPipeline,
 	}, true
+}
+
+// defaultBranchPipeline reads the repo's default-branch CI status from the cache
+// for the board header (PRD #6). Returns nil when the repo has no default branch,
+// no cached pipeline for it, or on a read error (logged) — the badge is enrichment.
+func (h *Handler) defaultBranchPipeline(r *http.Request, repo store.GetRepoForUserRow) *pipelineDTO {
+	if !repo.DefaultBranch.Valid || repo.DefaultBranch.String == "" {
+		return nil
+	}
+	ps, err := h.q.GetPipelineStatusByRef(r.Context(), store.GetPipelineStatusByRefParams{
+		RepoID: repo.ID, Ref: repo.DefaultBranch.String,
+	})
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("board default-branch pipeline", "repo", repo.PathWithNamespace, "error", err)
+		}
+		return nil
+	}
+	return pipelineFromStatus(ps)
+}
+
+// cardPipelines reads the per-card CI statuses (each issue's most-recent run's
+// branch pipeline) keyed by issue iid (PRD #6). A read error logs and yields an
+// empty map so cards render without badges.
+func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*pipelineDTO {
+	out := map[int64]*pipelineDTO{}
+	rows, err := h.q.ListRunPipelineStatusesForRepo(r.Context(), repoID)
+	if err != nil {
+		slog.Warn("board card pipelines", "repo", repoID, "error", err)
+		return out
+	}
+	for _, row := range rows {
+		out[row.IssueIid.Int64] = pipelineDTOFrom(row.Ref, row.Status, row.WebUrl, row.PipelineID, row.SyncedAt)
+	}
+	return out
 }
 
 // assembleCards builds the board's cards from the cached issues, the newest run
@@ -307,10 +356,10 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 // and the board viewer. It is the pure, DB-free core of the board payload: it
 // keys each issue's latest_run by issue_iid (issues with no run get null), and
 // resolves each card's column. viewerID drives IsMine.
-func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, position map[string]int, viewerID uuid.UUID) []cardDTO {
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*pipelineDTO, position map[string]int, viewerID uuid.UUID) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
-		latestByIID[rr.IssueIid] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
+		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
 			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
 
@@ -332,6 +381,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			Closed:     closed,
 			Conflict:   conflict,
 			LatestRun:  latestByIID[is.ForgeIssueIid],
+			Pipeline:   cardPipelines[is.ForgeIssueIid],
 		}
 		if is.Author.Valid {
 			a := is.Author.String
@@ -505,7 +555,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// so the reconcile loop stops trying to reposition the card the human placed.
 	if _, err := h.q.ClearIssueRunsMovePending(r.Context(), store.ClearIssueRunsMovePendingParams{
 		RepoID:   repo.ID,
-		IssueIid: iid,
+		IssueIid: pgtype.Int8{Int64: iid, Valid: true},
 	}); err != nil {
 		// Non-fatal: the move already landed; a stray marker is at worst one
 		// reconcile attempt that the manual-drag guard itself skips.
@@ -519,12 +569,15 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	card := issueToCard(updated, position)
 	// Carry the issue's latest run on the single-card response too, so a drag never
 	// blanks the run badge the board is showing (the client replaces the card).
-	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: iid}); err == nil {
+	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
 			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
 	}
+	// Carry the card's CI badge too (PRD #6), so a manual drag never blanks it (a
+	// drag touches neither runs nor pipelines — the client replaces the whole card).
+	card.Pipeline = h.cardPipelines(r, repo.ID)[iid]
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 
@@ -614,7 +667,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	card := issueToCard(updated, position)
 	// Carry the issue's latest run on the single-card response (like MoveIssue), so
 	// a toggle never blanks the run badge the board/issue view is showing.
-	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: iid}); err == nil {
+	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
 			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {

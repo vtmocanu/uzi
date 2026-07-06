@@ -254,6 +254,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				// Queue an agent run from a card (PRD #4). Fetches the issue snapshot
 				// from the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/runs", h.CreateRun)
+				// Queue a CI-fix run for a failed pipeline (PRD #6). Snapshots the
+				// failed pipeline's jobs + logs from the forge → per-user budget.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
 			})
 
 			// Agent-runtime: the user's workers and their runs. Every route is

@@ -30,6 +30,7 @@ import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { visibleColumns } from "../lib/boardColumns";
 import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
+import { FixCiButton, PipelineBadge } from "../components/PipelineBadge";
 import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
 
@@ -208,6 +209,22 @@ export function Board() {
     }
   };
 
+  // Fix CI (PRD #6): queue a plan-gated ci_fix run for a failed pipeline's ref.
+  // The server enforces the "no active fix / branch free" preconditions and returns
+  // a 409 the ApiError surfaces; on success we open the new run.
+  const [fixingRef, setFixingRef] = useState<string | null>(null);
+  const fixCi = async (ref: string) => {
+    setError("");
+    setFixingRef(ref);
+    try {
+      const { run } = await api.createCIFixRun(repoId, ref);
+      navigate(`/runs/${run.id}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not start CI fix");
+      setFixingRef(null);
+    }
+  };
+
   const refresh = async () => {
     setSyncing(true);
     setError("");
@@ -325,7 +342,19 @@ export function Board() {
       <PageHeader
         backTo="/repos"
         backLabel="Boards"
-        title={board?.path_with_namespace ?? "Board"}
+        titleNode={
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-xl font-semibold tracking-tight">{board?.path_with_namespace ?? "Board"}</h1>
+            {board?.pipeline && <PipelineBadge pipeline={board.pipeline} />}
+            {board?.pipeline && (
+              <FixCiButton
+                pipeline={board.pipeline}
+                busy={fixingRef === board.pipeline.ref}
+                onClick={() => fixCi(board.pipeline!.ref)}
+              />
+            )}
+          </div>
+        }
         description="Columns are GitLab labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here."
         actions={
           <>
@@ -461,6 +490,8 @@ export function Board() {
                     })}
                     starting={starting === card.iid}
                     onStart={() => startRun(card)}
+                    fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
+                    onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
                     prdlessEnabled={prdlessEnabled}
                     prdlessLabel={prdlessLabel}
                     prdlessBusy={prdlessBusy === card.iid}
@@ -511,6 +542,8 @@ function IssueCard({
   gate,
   starting,
   onStart,
+  fixCiBusy,
+  onFixCi,
   prdlessEnabled,
   prdlessLabel,
   prdlessBusy,
@@ -525,6 +558,8 @@ function IssueCard({
   gate: StartRunGate;
   starting: boolean;
   onStart: () => void;
+  fixCiBusy: boolean;
+  onFixCi: () => void;
   prdlessEnabled: boolean;
   prdlessLabel: string;
   prdlessBusy: boolean;
@@ -632,6 +667,8 @@ function IssueCard({
             conflict
           </Badge>
         )}
+        {card.pipeline && <PipelineBadge pipeline={card.pipeline} />}
+        {card.pipeline && <FixCiButton pipeline={card.pipeline} busy={fixCiBusy} onClick={onFixCi} />}
       </div>
       {(run || card.author) && (
         <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-faint">

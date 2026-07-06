@@ -40,6 +40,7 @@ const repos = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    pipeline: null,
   },
   {
     id: "repo-atlas",
@@ -50,6 +51,7 @@ const repos = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    pipeline: null,
   },
 ];
 

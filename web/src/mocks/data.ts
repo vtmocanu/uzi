@@ -117,6 +117,13 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: true,
+    pipeline: {
+      status: "failed",
+      web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242",
+      ref: "main",
+      pipeline_id: 4242,
+      synced_at: minsAgo(1),
+    },
   },
   {
     id: "repo-atlas",
@@ -127,6 +134,13 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    pipeline: {
+      status: "success",
+      web_url: "https://gitlab.example.com/vtmocanu/atlas-api/-/pipelines/3311",
+      ref: "main",
+      pipeline_id: 3311,
+      synced_at: minsAgo(2),
+    },
   },
   {
     id: "repo-www",
@@ -137,6 +151,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: false,
     repo_skills_enabled: false,
+    pipeline: null,
   },
 ];
 
@@ -190,6 +205,7 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
       {
         iid: 29,
@@ -203,6 +219,14 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        // "canceled" → the neutral tone (also covers skipped / no-CI).
+        pipeline: {
+          ref: "agent/issue-29",
+          status: "canceled",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4188",
+          pipeline_id: 4188,
+          synced_at: minsAgo(6),
+        },
       },
       {
         iid: 27,
@@ -216,6 +240,14 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        // "manual" → the attention tone (a human must click play in GitLab).
+        pipeline: {
+          ref: "agent/issue-27",
+          status: "manual",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4190",
+          pipeline_id: 4190,
+          synced_at: minsAgo(4),
+        },
       },
       {
         iid: 26,
@@ -236,6 +268,7 @@ export const mockBoards: Record<string, Board> = {
           created_at: minsAgo(1),
           updated_at: minsAgo(1),
         }),
+        pipeline: null,
       },
       {
         iid: 24,
@@ -255,6 +288,14 @@ export const mockBoards: Record<string, Board> = {
           created_at: minsAgo(2),
           updated_at: minsAgo(1),
         }),
+        // The agent branch's MR pipeline is still running.
+        pipeline: {
+          status: "running",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4239",
+          ref: "agent/issue-24",
+          pipeline_id: 4239,
+          synced_at: minsAgo(1),
+        },
       },
       {
         iid: 22,
@@ -268,6 +309,14 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: true,
         latest_run: null,
+        // A red per-card pipeline: the Fix CI affordance (M6) will hang off this.
+        pipeline: {
+          status: "failed",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4201",
+          ref: "agent/issue-22",
+          pipeline_id: 4201,
+          synced_at: minsAgo(3),
+        },
       },
       {
         iid: 21,
@@ -287,6 +336,7 @@ export const mockBoards: Record<string, Board> = {
           created_at: minsAgo(10),
           updated_at: minsAgo(6),
         }),
+        pipeline: null,
       },
       {
         iid: 18,
@@ -307,6 +357,7 @@ export const mockBoards: Record<string, Board> = {
           created_at: minsAgo(225),
           updated_at: minsAgo(184),
         }),
+        pipeline: null,
       },
       {
         iid: 15,
@@ -320,8 +371,16 @@ export const mockBoards: Record<string, Board> = {
         closed: true,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
     ],
+    pipeline: {
+      status: "failed",
+      web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242",
+      ref: "main",
+      pipeline_id: 4242,
+      synced_at: minsAgo(1),
+    },
   },
   "repo-atlas": {
     repo_id: "repo-atlas",
@@ -344,6 +403,7 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
       {
         iid: 8,
@@ -357,6 +417,7 @@ export const mockBoards: Record<string, Board> = {
         closed: false,
         conflict: false,
         latest_run: null,
+        pipeline: null,
       },
       {
         iid: 7,
@@ -378,6 +439,7 @@ export const mockBoards: Record<string, Board> = {
           created_at: daysAgo(1.3),
           updated_at: daysAgo(1.1),
         }),
+        pipeline: null,
       },
       {
         iid: 5,
@@ -396,8 +458,10 @@ export const mockBoards: Record<string, Board> = {
           created_at: daysAgo(3.1),
           updated_at: daysAgo(3),
         }),
+        pipeline: null,
       },
     ],
+    pipeline: null,
   },
 };
 
@@ -576,6 +640,10 @@ export const mockRuns: Run[] = [
     issue_iid: 26,
     issue_title: "Board card badges for MR pipeline status",
     issue_description: "See prds/12-board-run-lifecycle.md.",
+    kind: "issue",
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
     status: "queued",
     requeue_count: 0,
     iteration_count: 0,
@@ -597,6 +665,10 @@ export const mockRuns: Run[] = [
     issue_iid: 24,
     issue_title: "Worker heartbeat metrics endpoint",
     issue_description: "Expose worker heartbeat freshness as a metrics endpoint. See prds/13-worker-metrics.md.",
+    kind: "issue",
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
     status: "running",
     requeue_count: 0,
     iteration_count: 0,
@@ -620,6 +692,10 @@ export const mockRuns: Run[] = [
     issue_iid: 21,
     issue_title: "Plan-approval notifications via email",
     issue_description: "Notify a run's owner when their plan is parked awaiting approval. See prds/9-approval-notify.md.",
+    kind: "issue",
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
     status: "awaiting_approval",
     requeue_count: 0,
     iteration_count: 0,
@@ -641,6 +717,10 @@ export const mockRuns: Run[] = [
     issue_iid: 18,
     issue_title: "Run view: fold tool results under their calls",
     issue_description: "See prds/11-run-view-ux.md.",
+    kind: "issue",
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
     status: "completed",
     requeue_count: 0,
     iteration_count: 2,
@@ -662,6 +742,10 @@ export const mockRuns: Run[] = [
     issue_iid: 7,
     issue_title: "Postgres connection pool tuning",
     issue_description: "See prds/3-pool-tuning.md.",
+    kind: "issue",
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
     status: "failed",
     requeue_count: 1,
     iteration_count: 4,
@@ -683,6 +767,10 @@ export const mockRuns: Run[] = [
     issue_iid: 5,
     issue_title: "Healthcheck should ping the DB pool",
     issue_description: "See prds/2-health.md.",
+    kind: "issue",
+    pipeline_ref: null,
+    pipeline_web_url: null,
+    fix_verdict: null,
     status: "cancelled",
     requeue_count: 0,
     iteration_count: 0,

@@ -19,8 +19,14 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	RunID            string  `json:"run_id"`
-	IssueIID         int64   `json:"issue_iid"`
+	RunID string `json:"run_id"`
+	// Kind is the run kind (issue|ci_fix, PRD #6). The worker branches on it: an
+	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
+	Kind string `json:"kind"`
+	// IssueIID is the worked issue for an issue run, null for a ci_fix run (which
+	// has no issue). IssueTitle/IssueDescription always carry a human summary (for
+	// ci_fix, a synthesized one) so the run stays displayable and self-contained.
+	IssueIID         *int64  `json:"issue_iid"`
 	IssueTitle       string  `json:"issue_title"`
 	IssueDescription string  `json:"issue_description"`
 	Status           string  `json:"status"`
@@ -37,6 +43,12 @@ type ClaimPayload struct {
 	// reads it from the row, a requeued/resumed autopilot run re-delivers it
 	// unchanged; without that an unattended resume would hang at the gate forever.
 	AutoApprove bool `json:"auto_approve"`
+
+	// Pipeline is the failed-pipeline snapshot for a ci_fix run (PRD #6): the
+	// pipeline the agent diagnoses + fixes, with its failed jobs and log tails.
+	// Present only for kind=ci_fix (omitted for issue runs). Log tails are untrusted
+	// data — the worker frames them as quoted evidence, never instructions.
+	Pipeline *ClaimPipeline `json:"pipeline,omitempty"`
 
 	Repo    ClaimRepo    `json:"repo"`
 	Secrets ClaimSecrets `json:"secrets"`
