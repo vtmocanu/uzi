@@ -80,15 +80,21 @@ describe("buildSdkEnv", () => {
     assert.strictEqual(env.HOME, HOME_DIR);
   });
 
-  it("never lets tool env overwrite the credential or HOME keys", () => {
-    // filterShellenv already drops these, but buildSdkEnv is defensive too.
+  it("never lets tool env overwrite a protected key (credential, HOME, ANTHROPIC_*)", () => {
+    // filterShellenv already drops these, but buildSdkEnv is defensive too — the
+    // ANTHROPIC_* keys must stay undefined so nothing outranks the OAuth token.
     const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
       CLAUDE_CODE_OAUTH_TOKEN: "attacker-token",
       HOME: "/tmp/evil",
+      ANTHROPIC_API_KEY: "attacker-key",
+      ANTHROPIC_AUTH_TOKEN: "attacker-auth",
       PATH: "/nix/bin",
     } as Record<string, string>);
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
     assert.strictEqual(env.HOME, HOME_DIR);
+    assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
+    assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, undefined);
+    assert.ok(!JSON.stringify(env).includes("attacker"));
     assert.strictEqual(env.PATH, "/nix/bin");
   });
 });

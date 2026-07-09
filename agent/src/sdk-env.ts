@@ -21,6 +21,16 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
+/** Keys a provisioned tool env may NEVER set (PRD #18 M3): the OAuth credential,
+ *  HOME, and the two ANTHROPIC_* keys pinned to undefined so nothing outranks the
+ *  OAuth token in the SDK's auth precedence. */
+const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "HOME",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+]);
+
 /** Exactly the keys the SDK subprocess is allowed to see. The index signature
  *  carries the PRD #18 M3 provisioned tool vars, which are added ONLY from
  *  provision.ts's explicit allowlist (PATH override + NIX_SSL_CERT_FILE /
@@ -56,9 +66,12 @@ export function buildSdkEnv(oauthToken: string, homeDir: string, toolEnv: Record
   };
   // Fold in the provisioned tool env. Only allowlisted keys reach here; PATH (if
   // present) is devbox's PATH with the tool bins prepended, so it replaces the
-  // inherited one. Never overwrite the credential/HOME keys above.
+  // inherited one. Never let a provisioned var overwrite a PROTECTED key: the
+  // credential, HOME, and the ANTHROPIC_* keys we deliberately pin to undefined so
+  // they can't outrank the OAuth token — even if the provision allowlist ever
+  // drifts, this second layer keeps the invariant.
   for (const [k, v] of Object.entries(toolEnv)) {
-    if (k === "CLAUDE_CODE_OAUTH_TOKEN" || k === "HOME") continue;
+    if (PROTECTED_ENV_KEYS.has(k)) continue;
     env[k] = v;
   }
   return env;

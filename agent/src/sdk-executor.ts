@@ -56,6 +56,10 @@ const REASON_NO_PLAN = "the agent ended the planning turn without submitting a p
 const REASON_MAX_ITERATIONS = "run reached the maximum implement/review iterations without completing";
 const REASON_PROVISION_FAILED = "tool provisioning failed before the agent could start";
 
+// A run id is a server-issued UUID; pinned here because it becomes a path segment
+// for the per-run provisioning dir.
+const RUN_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 /**
  * Injectable seam over the SDK's `query`. The return only needs to be async
  * iterable for the executor; cancellation goes through `options.abortController`
@@ -180,6 +184,10 @@ export class SdkExecutor implements Executor {
     let toolEnv: Record<string, string> = {};
     let provisionDir: string | undefined;
     if (toolPackages.length > 0) {
+      // Defense-in-depth: ctx.runId is a server-issued UUID, but it becomes a path
+      // segment here — reject anything not UUID-shaped so a malformed id can never
+      // traverse out of provisionRoot.
+      if (!RUN_ID_RE.test(ctx.runId)) throw new Error(`${REASON_PROVISION_FAILED}: invalid run id`);
       provisionDir = path.join(this.provisionRoot, ctx.runId);
       ctx.emit({ kind: "status", agent: "worker", payload: { text: `provisioning ${toolPackages.length} tool(s): ${toolPackages.join(", ")}` } });
       try {

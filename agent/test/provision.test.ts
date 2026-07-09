@@ -65,6 +65,12 @@ describe("filterShellenv (output allowlist)", () => {
     assert.strictEqual(filtered.HOME, undefined);
     for (const k of Object.keys(filtered)) assert.ok(PROVISION_ENV_ALLOWLIST.has(k));
   });
+
+  it("inserts a $-containing base PATH literally (no replacement-pattern interpretation)", () => {
+    // A basePath with `$&`/`$1` must not be interpreted by String.replace.
+    const filtered = filterShellenv('export PATH="/nix/bin:$PATH"\n', "/weird/$&/$1/bin");
+    assert.strictEqual(filtered.PATH, "/nix/bin:/weird/$&/$1/bin");
+  });
 });
 
 describe("provisionTools", () => {

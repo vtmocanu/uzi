@@ -694,7 +694,11 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
       [submitPlan("# plan"), resultSuccess()],
       [assistantText("impl"), signalDone(), resultSuccess()],
     ]);
-    const probe = makeCtx({ agents: [lead, coder], config: { tool_packages: ["kubectl@1.31", "jq"] } });
+    const probe = makeCtx({
+      runId: "11111111-1111-1111-1111-111111111111",
+      agents: [lead, coder],
+      config: { tool_packages: ["kubectl@1.31", "jq"] },
+    });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
 
     assert.strictEqual(calls.length, 1);
@@ -728,9 +732,25 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
     const { queryFn } = fakeTurns([[submitPlan("# plan"), resultSuccess()]]);
     await assert.rejects(
       new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(
-        makeCtx({ config: { tool_packages: ["kubectl"] } }).ctx,
+        makeCtx({ runId: "22222222-2222-2222-2222-222222222222", config: { tool_packages: ["kubectl"] } }).ctx,
       ),
       /tool provisioning failed/,
     );
+  });
+
+  it("rejects a non-UUID run id before provisioning (path-traversal guard)", async () => {
+    let called = false;
+    const provision: SdkExecutorOptions["provision"] = async () => {
+      called = true;
+      return { toolEnv: {} };
+    };
+    const { queryFn } = fakeTurns([[submitPlan("# plan"), resultSuccess()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(
+        makeCtx({ runId: "../../etc", config: { tool_packages: ["kubectl"] } }).ctx,
+      ),
+      /invalid run id/,
+    );
+    assert.strictEqual(called, false, "provisioning must not run for a malformed run id");
   });
 });

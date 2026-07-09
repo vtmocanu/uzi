@@ -7,12 +7,24 @@
 // the join-token file. Two invariants make it safe (Decision 3):
 //
 //   1. The install subprocess runs with a REPLACEMENT env built from an explicit
-//      allowlist — never `process.env` spread — so the join token (and anything
-//      else) can't leak into it. The PAT + Anthropic token are held in worker
-//      memory (never in process.env), so a replacement env excludes them by
+//      allowlist — never `process.env` spread — so the join-token ENV VAR (and
+//      anything else) can't leak into it. The PAT + Anthropic token are held in
+//      worker memory (never in process.env), so a replacement env excludes them by
 //      construction; this also drops UZI_WORKER_TOKEN[_FILE].
 //   2. Only a synthesized packages-only devbox.json is used, written OUTSIDE the
 //      clone. A repo's own devbox.json (init_hook/scripts) is never executed here.
+//
+// RESIDUAL (not closed by the above, same class as the /proc note in
+// docker-compose.yml): the join-token FILE at /run/secrets/worker_token stays
+// same-uid readable, so a nix build hook running as the uzi user could read it —
+// a surface NOT behind the agent's PreToolUse deny-hook. Bounded in M4+ by the
+// admin allowlist (only vetted packages install, and their build hooks run in this
+// scrubbed env), but the structural close is the k8s uid-split (agent under a
+// DISTINCT uid from the worker), deferred to the remote-worker phase.
+//
+// PATH assumption: nix/devbox tooling needs /sbin on PATH (e.g. Alpine's addgroup
+// lives there). The image PATH passed through by buildProvisionEnv includes it
+// today; a future PATH trim must keep /sbin or provisioning breaks.
 //
 // The env we export back INTO the SDK is likewise an explicit allowlist
 // (PROVISION_ENV_ALLOWLIST) — never a blind merge of devbox's shellenv, which
@@ -129,7 +141,9 @@ export function filterShellenv(output: string, basePath: string): Record<string,
     if (!m) continue;
     const key = m[1];
     if (!key || !PROVISION_ENV_ALLOWLIST.has(key)) continue;
-    const value = unquote(m[2] ?? "").replace(/\$\{?PATH\}?/g, basePath);
+    // Function replacer so a `$&`/`$1` sequence in basePath is inserted literally,
+    // not interpreted as a replacement pattern.
+    const value = unquote(m[2] ?? "").replace(/\$\{?PATH\}?/g, () => basePath);
     out[key] = value;
   }
   return out;
