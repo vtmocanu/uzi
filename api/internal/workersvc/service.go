@@ -98,10 +98,10 @@ type Store interface {
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
-	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
-	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) (int64, error)
-	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) (int64, error)
-	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) (int64, error)
+	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error)
+	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
+	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
+	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) (int64, error)
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
 
@@ -916,31 +916,69 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	if res.WorkersOffline, err = s.q.MarkStaleWorkersOffline(ctx, staleCutoff); err != nil {
 		return res, fmt.Errorf("mark stale workers offline: %w", err)
 	}
-	if res.ClaimedReset, err = s.q.SweepClaimedNeverStarted(ctx, claimCutoff); err != nil {
+
+	claimed, err := s.q.SweepClaimedNeverStarted(ctx, claimCutoff)
+	if err != nil {
 		return res, fmt.Errorf("sweep claimed-never-started: %w", err)
 	}
-	if res.RunningTimeout, err = s.q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
+	res.ClaimedReset = int64(len(claimed))
+	for _, r := range claimed {
+		s.publishSwept(r.ID, r.Status)
+	}
+
+	timedOut, err := s.q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
 		FailureReason: pgText("run exceeded RUN_TIMEOUT"),
 		Cutoff:        runCutoff,
-	}); err != nil {
+	})
+	if err != nil {
 		return res, fmt.Errorf("sweep running-timeout: %w", err)
 	}
+	res.RunningTimeout = int64(len(timedOut))
+	for _, r := range timedOut {
+		s.publishSwept(r.ID, r.Status)
+	}
+
 	// Fail-over-cap before re-queue: the two are disjoint on requeue_count, but
 	// failing first keeps a run that just hit the cap from being re-queued.
-	if res.StaleFailed, err = s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
+	failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
 		FailureReason: pgText("worker lost; exceeded re-queue budget"),
 		MaxRequeues:   max,
 		Cutoff:        staleCutoff,
-	}); err != nil {
+	})
+	if err != nil {
 		return res, fmt.Errorf("fail stale-worker runs over cap: %w", err)
 	}
-	if res.StaleRequeued, err = s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
+	res.StaleFailed = int64(len(failed))
+	for _, r := range failed {
+		s.publishSwept(r.ID, r.Status)
+	}
+
+	requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
 		MaxRequeues: max,
 		Cutoff:      staleCutoff,
-	}); err != nil {
+	})
+	if err != nil {
 		return res, fmt.Errorf("re-queue stale-worker runs: %w", err)
 	}
+	res.StaleRequeued = int64(len(requeued))
+	for _, r := range requeued {
+		s.publishSwept(r.ID, r.Status)
+	}
 	return res, nil
+}
+
+// publishSwept fans a sweeper-driven run transition out to the same seams a
+// worker-reported transition uses: the live WS hub (PublishState) and, once the
+// Slack notifier is wired behind the fan-out, the per-owner DM. Before PRD #25 M3
+// these bulk transitions returned counts only and never reached the Broadcaster,
+// so timeout/worker-loss failures — exactly the "failed" events a user most wants
+// pushed — were silently missed. Best-effort and non-blocking (the Broadcaster
+// contract), so a slow consumer never delays the sweep.
+func (s *Service) publishSwept(runID uuid.UUID, status string) {
+	if s.bcast != nil {
+		s.bcast.PublishState(runID, status)
+	}
+	s.notify(runID, status)
 }
 
 // -------------------------------------------------------------------------
