@@ -1,7 +1,7 @@
 # PRD #18: Worker Templates (git-curated) + Devbox Tool Tiers + Agent Template Scopes
 
 **GitLab Issue**: [#18](https://gitlab.example.com/vtmocanu/uzi/-/issues/18)
-**Status**: Draft
+**Status**: In Progress
 **Priority**: Medium
 **Created**: 2026-07-05
 
@@ -86,8 +86,8 @@ Three tracks sharing one mental model (the PRD #16 scope+allocation pattern):
 
 ## Milestones
 
-- [ ] **M1 — Worker template variants in git**: `agent/templates/` layout with `base` + at least one heavy-dep variant (e.g. `jvm`), compose `WORKER_TEMPLATE` plumbing, register-payload `template` field stored per worker. Docs updated.
-- [ ] **M2 — Template choice in UI + drift surfacing**: per-worker declared template at join-token issuance; workers page shows declared vs reported with mismatch badge.
+- [x] **M1 — Worker template variants in git**: `agent/templates/` layout with `base` + at least one heavy-dep variant (e.g. `jvm`), compose `WORKER_TEMPLATE` plumbing, register-payload `template` field stored per worker. Docs updated.
+- [x] **M2 — Template choice in UI + drift surfacing**: per-worker declared template at join-token issuance; workers page shows declared vs reported with mismatch badge.
 - [ ] **M3 — Devbox engine in the worker**: base image ships devbox/nix with store on `agentdata`; worker provisions from a claim-delivered package list in a secret-scrubbed env and exposes tools to the SDK env via the filtered shellenv allowlist; provision failure fails the run cleanly. (Tier 1 end-to-end with a hardcoded allowlist.)
 - [ ] **M4 — Tool profiles + admin allowlist (api + web)**: allowlist CRUD, per-(user,repo) package profiles, claim-time validation, repo settings UI.
 - [ ] **M5 — Tier 2 repo `devbox.json` packages opt-in**: per-repo trust toggle (default off), packages-only extraction, union-merge with tier-1 precedence, trust warning in UI + docs.
