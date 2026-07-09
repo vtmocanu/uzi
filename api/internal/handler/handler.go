@@ -221,6 +221,18 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Put("/", h.PutMySettings)
 		})
 
+		// Current-user Slack linking (PRD #25 M3): the Notifications settings —
+		// link status, per-user notify toggle, manual member-ID override (409 on
+		// a collision with another user's id), and a self-test DM. All own-user
+		// only via UserFromContext; no user can touch another's mapping.
+		r.Route("/me/slack", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.GetMySlack)
+			r.Put("/notify", h.PutMySlackNotify)
+			r.Put("/override", h.PutMySlackOverride)
+			r.Post("/test-dm", h.PostMySlackTestDM)
+		})
+
 		// Agent templates: all authenticated users can read and preview; only
 		// admins can create, edit, delete, or reset (closes bottega's hole
 		// where any user rewrites the shared prompts everyone's agents run).
@@ -268,6 +280,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			// Instance settings (PRD #19): the configurable forge labels today.
 			r.Get("/settings", h.GetSettings)
 			r.Put("/settings", h.UpdateSettings)
+			// Lightweight live Slack connection state for the admin webui chip's poll
+			// (PRD #25 M3), so it need not re-fetch the whole settings blob every 5s.
+			r.Get("/slack/status", h.GetAdminSlackStatus)
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
 			r.Get("/runs", h.AdminListRuns)
