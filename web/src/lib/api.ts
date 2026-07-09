@@ -297,7 +297,35 @@ export interface AppSettings {
   // (the API serves every setting as a string); prdless_label is the label name.
   prdless_enabled: string;
   prdless_label: string;
+  // Slack integration non-secret keys (PRD #25). slack_enabled is the text
+  // "true"/"false"; public_base_url is the http(s) base for deep links in Slack
+  // messages. The two Slack TOKENS are secret and never returned here — see
+  // `secrets` on SettingsResponse.
+  slack_enabled: string;
+  public_base_url: string;
 }
+
+// SettingSource reports where a setting's effective value comes from (PRD #25):
+// an env var, the DB app_settings row, or the compiled-in default. An env-sourced
+// key is greyed in the admin UI and a PUT to it is rejected (409).
+export type SettingSource = "env" | "db" | "default";
+
+// SettingsResponse is the admin GET/PUT body (PRD #25). `settings` carries the
+// non-secret effective values; `secrets` reports, per secret key, whether a value
+// is configured (never the value itself); `sources` reports every key's source.
+export interface SettingsResponse {
+  settings: AppSettings;
+  secrets: Record<string, boolean>;
+  sources: Record<string, SettingSource>;
+}
+
+// UpdateSettingsPayload extends the non-secret settings with the write-only
+// secret token fields, sent only when the admin enters a new value (an omitted or
+// empty token leaves the stored one unchanged).
+export type UpdateSettingsPayload = Partial<AppSettings> & {
+  slack_bot_token?: string;
+  slack_app_token?: string;
+};
 
 // Compiled-in label defaults, mirroring the API's settings package. The SPA uses
 // them until the session bootstrap resolves the configured values (PRD #19 M2,
@@ -553,9 +581,9 @@ const realApi = {
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
-  getSettings: () => request<{ settings: AppSettings }>("GET", "/admin/settings"),
-  updateSettings: (settings: Partial<AppSettings>) =>
-    request<{ settings: AppSettings }>("PUT", "/admin/settings", { settings }),
+  getSettings: () => request<SettingsResponse>("GET", "/admin/settings"),
+  updateSettings: (settings: UpdateSettingsPayload) =>
+    request<SettingsResponse>("PUT", "/admin/settings", { settings }),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),

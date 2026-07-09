@@ -12,6 +12,9 @@ import {
   type AppSettings,
   type PrivilegeReport,
   type Run,
+  type SettingSource,
+  type SettingsResponse,
+  type UpdateSettingsPayload,
   type RunInputKind,
   type SecretMeta,
   type Skill,
@@ -66,6 +69,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   default_theme: "ember",
   prdless_enabled: "true",
   prdless_label: "PRDLESS",
+  slack_enabled: "false",
+  public_base_url: "http://127.0.0.1:8080",
 };
 
 interface PersistedSettings {
@@ -94,7 +99,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.autopilot_label === "string" &&
     typeof a.default_theme === "string" &&
     typeof a.prdless_enabled === "string" &&
-    typeof a.prdless_label === "string";
+    typeof a.prdless_label === "string" &&
+    typeof a.slack_enabled === "string" &&
+    typeof a.public_base_url === "string";
   return okUser && okApp;
 }
 
@@ -142,6 +149,20 @@ let allocations: Record<string, { shared: string[]; mine: string[] }> = Object.f
   Object.entries(mockAllocations).map(([k, v]) => [k, { shared: [...v.shared], mine: [...v.mine] }]),
 );
 let appSettings: AppSettings = loadedSettings.appSettings;
+// Slack secret tokens (PRD #25) are write-only: the demo tracks only whether one
+// is configured, never a value, mirroring the real API's `secrets` map. There is
+// no ENV overlay in the demo, so every key's source is db/default.
+const slackSecrets: Record<string, boolean> = { slack_bot_token: false, slack_app_token: false };
+
+// settingsResponse builds the admin SettingsResponse from the mock's current
+// state: readable non-secret values, per-secret configured flags, and per-key
+// sources (all db/default — the demo has no ENV overlay).
+function settingsResponse(): SettingsResponse {
+  const sources: Record<string, SettingSource> = {};
+  for (const key of Object.keys(appSettings)) sources[key] = "db";
+  for (const key of Object.keys(slackSecrets)) sources[key] = slackSecrets[key] ? "db" : "default";
+  return { settings: { ...appSettings }, secrets: { ...slackSecrets }, sources };
+}
 let templateCounter = 0;
 let workerCounter = 0;
 let skillCounter = 0;
@@ -223,20 +244,41 @@ export const mockApi = {
   // ── Admin: instance settings (PRD #19) ───────────────────────────────────────
   // Mirrors the server's Decision 8 validation so the demo surfaces the same
   // rejection messages the real API would.
-  getSettings: async () => delay({ settings: { ...appSettings } }),
-  updateSettings: async (updates: Partial<AppSettings>) => {
-    const merged = { ...appSettings, ...updates };
-    for (const [key, value] of Object.entries(updates)) {
+  getSettings: async () => delay(settingsResponse()),
+  updateSettings: async (updates: UpdateSettingsPayload) => {
+    // Secret tokens are write-only: validated + recorded as configured, never
+    // merged into the readable settings (mirrors the real structural exclusion).
+    const nonSecret: Partial<AppSettings> = {};
+    for (const [key, raw] of Object.entries(updates)) {
+      const value = raw ?? "";
+      if (key === "slack_bot_token" || key === "slack_app_token") {
+        const prefix = key === "slack_bot_token" ? "xoxb-" : "xapp-";
+        if (!value.startsWith(prefix)) {
+          throw new ApiError(400, `${key}: token must start with ${prefix}`);
+        }
+        slackSecrets[key] = true;
+        continue;
+      }
       // default_theme routes to the theme registry, not the label rules (PRD #21).
       if (key === "default_theme") {
         if (!isTheme(value)) throw new ApiError(400, `default_theme: unknown theme: "${value}"`);
+        nonSecret.default_theme = value;
         continue;
       }
-      // prdless_enabled is a strict bool, not a label (PRD #22 M1).
-      if (key === "prdless_enabled") {
+      // prdless_enabled / slack_enabled are strict bools, not labels.
+      if (key === "prdless_enabled" || key === "slack_enabled") {
         if (value !== "true" && value !== "false") {
-          throw new ApiError(400, `prdless_enabled: must be "true" or "false"`);
+          throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
+        (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      // public_base_url must be http(s) (PRD #25).
+      if (key === "public_base_url") {
+        if (!/^https?:\/\/.+/.test(value)) {
+          throw new ApiError(400, "public_base_url: must use http or https");
+        }
+        nonSecret.public_base_url = value;
         continue;
       }
       if (key !== "prd_label" && key !== "autopilot_label" && key !== "prdless_label") {
@@ -245,7 +287,9 @@ export const mockApi = {
       if (!value || value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
       if (value.length > 64) throw new ApiError(400, `${key}: must be at most 64 characters`);
       if (value.includes(",")) throw new ApiError(400, `${key}: must not contain a comma`);
+      (nonSecret as Record<string, string>)[key] = value;
     }
+    const merged = { ...appSettings, ...nonSecret };
     // The label triple must be pairwise-distinct (Decision 8 + PRD #22 Decision 7).
     if (merged.prd_label === merged.autopilot_label) {
       throw new ApiError(400, "prd_label and autopilot_label must differ");
@@ -258,7 +302,7 @@ export const mockApi = {
     }
     appSettings = merged;
     persistSettings();
-    return delay({ settings: { ...appSettings } });
+    return delay(settingsResponse());
   },
 
   // ── Autopilot opt-in (PRD #19 M3) ────────────────────────────────────────────
