@@ -151,6 +151,22 @@ export function Repos() {
     }
   };
 
+  // Tier-2 opt-in (PRD #18 M5): trust the repo's own devbox.json packages. Applied
+  // immediately (a trust decision, like the repo-skills toggle) and reflected in
+  // repo state so the checkbox stays in sync.
+  const setRepoDevbox = async (repo: Repo, enabled: boolean) => {
+    setError("");
+    setToolsBusy(true);
+    try {
+      const { repo: updated } = await api.setRepoDevboxOptIn(repo.id, enabled);
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Update failed");
+    } finally {
+      setToolsBusy(false);
+    }
+  };
+
   // The selected connection's latest privilege report drives the per-repo
   // findings badges (null until a check has run).
   const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
@@ -428,6 +444,31 @@ export function Repos() {
                   <Button variant="ghost" size="sm" disabled={toolsBusy} onClick={() => setToolsRepoId(null)}>
                     Cancel
                   </Button>
+                </div>
+
+                {/* Tier-2 opt-in (PRD #18 M5): trust the repo's own devbox.json. */}
+                <div className="space-y-1.5 border-t border-edge pt-3">
+                  <label className="flex items-start gap-2 text-sm text-fg">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={toolsRepo.repo_devbox_opt_in}
+                      disabled={toolsBusy}
+                      onChange={(e) => setRepoDevbox(toolsRepo, e.target.checked)}
+                    />
+                    <span>
+                      Also trust this repo&rsquo;s own{" "}
+                      <code className="rounded bg-raised px-1 py-0.5 font-mono text-xs">devbox.json</code> packages
+                    </span>
+                  </label>
+                  <p className="pl-6 text-xs text-muted">
+                    Only the <code className="font-mono">packages</code> list is read from the repo&rsquo;s{" "}
+                    <code className="font-mono">devbox.json</code>; its <code className="font-mono">shell.init_hook</code>,{" "}
+                    <code className="font-mono">scripts</code>, flake references, and every other key are ignored and
+                    never run. Even so, a package it lists gets installed on your worker (bypassing the admin allowlist),
+                    so enable this only for a repo whose review discipline you trust. Your tools above always win a version
+                    conflict.
+                  </p>
                 </div>
               </div>
             )}

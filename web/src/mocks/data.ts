@@ -118,6 +118,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: true,
+    repo_devbox_opt_in: true,
     pipeline: {
       status: "failed",
       web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242",
@@ -135,6 +136,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    repo_devbox_opt_in: false,
     pipeline: {
       status: "success",
       web_url: "https://gitlab.example.com/vtmocanu/atlas-api/-/pipelines/3311",
@@ -152,6 +154,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: false,
     repo_skills_enabled: false,
+    repo_devbox_opt_in: false,
     pipeline: null,
   },
 ];

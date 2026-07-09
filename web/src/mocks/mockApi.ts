@@ -580,6 +580,12 @@ export const mockApi = {
     r.repo_skills_enabled = enabled;
     return delay({ repo: { ...r } });
   },
+  setRepoDevboxOptIn: async (id: string, enabled: boolean) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.repo_devbox_opt_in = enabled;
+    return delay({ repo: { ...r } });
+  },
 
   // ── Tool allowlist + repo tool profiles (PRD #18 M4) ─────────────────────────
   listToolAllowlist: async () => delay({ allowlist: toolAllowlist.map((e) => ({ ...e })) }),

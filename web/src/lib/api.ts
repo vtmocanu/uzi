@@ -207,6 +207,9 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  // Tier-2 opt-in (PRD #18 M5): when true, a run on this repo also unions the
+  // packages from the repo's own devbox.json (packages-only). Default false.
+  repo_devbox_opt_in: boolean;
   // Default-branch CI status (PRD #6), null when there is no cached default-branch
   // pipeline (no CI, MR-only pipelines, or not yet synced).
   pipeline: PipelineStatus | null;
@@ -661,6 +664,9 @@ const realApi = {
     request<{ repo: Repo }>("PUT", `/repos/${id}`, { enabled }),
   setRepoSkillsEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, { repo_skills_enabled: enabled }),
+  // Tier-2 repo devbox.json opt-in (PRD #18 M5). Owner or admin.
+  setRepoDevboxOptIn: (id: string, enabled: boolean) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, { repo_devbox_opt_in: enabled }),
 
   getBoard: (repoId: string) => request<{ board: Board }>("GET", `/repos/${repoId}/board`),
   configureColumns: (repoId: string, columns: { label_name: string }[]) =>

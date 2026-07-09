@@ -40,6 +40,7 @@ const repos = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    repo_devbox_opt_in: false,
     pipeline: null,
   },
   {
@@ -51,6 +52,7 @@ const repos = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    repo_devbox_opt_in: false,
     pipeline: null,
   },
 ];
