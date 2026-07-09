@@ -3359,3 +3359,98 @@ PRD working" (user, 2026-07-06).
 - **`lint`/`smoke` echo-placeholder stages** named for future real gates + a **`demo-fail`
   job gated on `UZI_CI_DEMO_FAIL=1`** so a red pipeline can be produced on demand to
   exercise the Fix-CI path end to end.
+
+---
+
+# PRD #28 — Docs Search (client-side full-text search on /docs)
+
+Serves human Feature #28 ("a search box for the docs page; full-text with snippets;
+on the `/docs` index only"). **Status: M1–M3 built and merged on `feature/prd-28-docs-search`;
+M4 (this spec sync) closing out.** Adds **zero** new services, API routes, DB tables,
+env vars, or dependencies — a pure web-side extension of PRD #7's bundled-docs corpus.
+Extends §54–60.
+
+## 133. Search core — pure tokenized substring search (`web/src/lib/docsearch.ts`)
+
+Serves human: "full-text search with snippets" (not a title/summary filter).
+Best-practice at this scale (11 short in-memory pages); the pure module keeps a
+library swap contained if the corpus outgrows substring search.
+
+- **Hand-rolled client-side search, zero new deps** — rejected `fuse.js` (bottega's is a
+  declared-but-unused dependency, nothing to copy) and multica's server-route
+  Fumadocs/Orama search (uzi has no docs backend by design; PRD #7 rejected a docs
+  service/framework). The corpus is already fully in the browser as raw strings, so
+  search needs no network at all.
+- **Corpus = `audience: user` pages only** (`listUserDocs()` — exactly what the index
+  lists). Same pure/bound split as §54's docs.ts: `buildIndex` + `searchIndex` are
+  fixture-testable; `searchDocs()` binds them to the real corpus, memoized once (the
+  bundle's corpus is fixed).
+- **Matching**: case-insensitive, multi-token AND — every whitespace token must appear
+  as a substring in title, headings, or body. Matching/counting use **`indexOf` loops,
+  never `new RegExp(token)`** — query tokens are user input full of regex metacharacters
+  by design (`.env`, `--profile`, `c++`); a test pins literal matching.
+- **Short-query + length guards**: whole query under `MIN_QUERY_LENGTH` (2) chars → no
+  search (normal index shown); tokens shorter than 2 chars are dropped after tokenizing
+  (so `"a b"` doesn't match near-every doc); query truncated at `MAX_QUERY_LENGTH` (256)
+  before scanning (defensive; no real query approaches it).
+- **Ranking**: title-hit tier > heading-hit tier > body-only tier; within a tier, more
+  total token occurrences first; slug `localeCompare` as stable tiebreak (same spirit as
+  §55's `sortDocsForIndex`).
+- **Markdown stripping for indexing** (`stripDocBody`, single fence-tracked pass):
+  reduces links/images to their label and drops emphasis/backtick markers (reusing
+  §56's `summarize()` regex approach), but **keeps fenced-code and table-cell text**
+  (users search for commands like `docker compose --profile agent up`) and **preserves
+  intra-word underscores** (`\b_+|_+\b` only strips word-boundary underscores) so
+  identifiers like `UZI_WORKER_TOKEN` stay searchable — a deliberate deviation from
+  `summarize()`'s blanket underscore strip. Fence delimiter and GFM table-alignment
+  rows are dropped; heading markers dropped but heading text retained (and collected
+  separately for the ranking tier). A `#` inside a fence is code, not a heading.
+- **Snippet**: `SearchResult = { doc, snippet, ranges }`. Snippet is a ~160-char window
+  (`SNIPPET_WINDOW`, `SNIPPET_LEAD` 60 chars of pre-match context) centered on the
+  earliest body match, word-boundary trimmed with leading/trailing `…`; a **title/
+  heading-only hit falls back to the doc's existing `summary`**. `ranges` are
+  **snippet-relative, sorted, and merged/non-overlapping** (overlapping tokens like
+  `work` + `worker` collapse into one range) so the UI's split-and-mark is a straight
+  fold with no nested `<mark>`s. A token matching only in title/headings simply
+  contributes no body range (tested via the mixed title-token + body-token case).
+
+## 134. Index UI — search box on `/docs` (`web/src/pages/Docs.tsx`)
+
+Serves human: "search box on the `/docs` index only" (not on `/docs/:slug`, not global
+nav — 2026-07-09). Best-practice a11y + dark-theme consistency.
+
+- The repo's `Input` primitive with `type="search"`, labelled, placeholder "Search
+  docs…" at the top of the index — not a bare `<input>`, so focus/border styling stays
+  consistent. **No debounce** (11 docs, synchronous, instantaneous).
+- **Empty/short query renders the existing ordered card list unchanged**; an active
+  query renders result cards (same `Card` language): title + snippet with matched tokens
+  wrapped in `<mark>`. A no-results state lives inside a `Card`, matching the existing
+  empty state.
+- **`<mark>` highlighting via React elements only** (split text + `<mark>` nodes),
+  **never `dangerouslySetInnerHTML`**. Explicitly styled `bg-warn/25 text-fg` — there is
+  no highlight token in the theme and the UA-default opaque yellow is unusable on the
+  dark theme, so the UA background/color is overridden.
+- **A11y**: `aria-live="polite"` scoped to the **result-count/no-results line only**
+  (not the result list), so screen readers announce "N docs match" per keystroke without
+  re-reading every snippet. Input is labelled.
+- **Keyboard**: `Escape` clears the query; `/` anywhere on the index focuses the box,
+  skipped when focus is already in an input/textarea.
+- No nginx/CSP change (no new asset types, no inline script).
+
+## 135. Test & docs surface
+
+Serves human: the behavioral gate must be automated (no browser automation in-repo).
+
+- **jsdom component tests are the behavioral gate** (`Docs.test.tsx`, existing vitest +
+  testing-library) — a body-only term from a real bundled page is found, snippet marked,
+  clear restores the index. Unit tests (`docsearch.test.ts`) pin stripping edge cases
+  (code fences, tables, links, intra-word underscores), ranking tiers, multi-token AND,
+  snippet windowing, the short-query/length guards, regex-metachar tokens, overlapping-
+  range merging, and the mixed title-token + body-token snippet.
+- **M3 compose smoke rescoped to curl-assertable checks** (the built image serves `/docs`
+  HTML + JS bundle); search itself is client-side JS with no browser automation in-repo,
+  so jsdom (M2) is the automated gate and a manual browser check is a nice-to-have, not a
+  gate.
+- **Adding a future docs page requires no search work** — the corpus derives from the
+  same glob/frontmatter pipeline as the index (§54–55). `docs/README.md`'s add-a-page
+  section notes that `user` pages are automatically searchable (nothing to register).
