@@ -65,6 +65,11 @@ export interface ClaimFailedJob {
 export interface RegisterRequest {
   name: string;
   version: string;
+  /** The template this worker's image was built from (PRD #18), baked in as
+   *  ENV WORKER_TEMPLATE. Optional: omitted by images without it (older workers),
+   *  in which case the server stores NULL for template_reported. Soft signal for
+   *  drift display only — never an authn/authz input. */
+  template?: string;
 }
 
 export interface RegisterResponse {

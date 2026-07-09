@@ -28,15 +28,35 @@ docker compose --profile agent up
 
 This starts the `agent` service pointed at the compose network's `api`, with its data on the named volume `agentdata`. Once it registers, **Settings → Workers** shows it as **online**.
 
-**Standalone**, for a different host or a remote server:
+**Standalone**, for a different host or a remote server (note the `-f` selecting the template Dockerfile, see [Worker templates](#worker-templates) below):
 
 ```sh
-docker build -t uzi-agent ./agent
+docker build -t uzi-agent -f agent/templates/base/Dockerfile agent
 docker run -d -e UZI_API_URL=https://uzi.example.com -e UZI_WORKER_TOKEN=<the join token> \
   -v uzi-agent-data:/data --cap-drop ALL --security-opt no-new-privileges:true uzi-agent
 ```
 
 Put a TLS-terminating proxy in front of a worker reached over an untrusted network: `api` itself listens plain HTTP.
+
+## Worker templates
+
+A worker image is built from a **template**: a curated, code-reviewed Dockerfile under `agent/templates/<name>/`. Templates exist for heavy or system-level dependencies a per-repo tool provisioner can't supply well (a JDK, system libraries); everyday CLI tools belong to the repo, not the image. Two ship today:
+
+| Template | What it adds | Use it when |
+|---|---|---|
+| `base` (default) | Node 22 + git + bash — the minimal worker | Most repos |
+| `jvm` | `base` plus a JDK (`java`/`javac`) | Repos that build or test Java |
+
+Pick a template at build time with the `WORKER_TEMPLATE` variable, which selects `agent/templates/<name>/Dockerfile`:
+
+```sh
+WORKER_TEMPLATE=jvm docker compose --profile agent build agent
+WORKER_TEMPLATE=jvm docker compose --profile agent up
+```
+
+With `WORKER_TEMPLATE` unset, compose builds `base`. Standalone, point `docker build -f` at the template's Dockerfile (e.g. `-f agent/templates/jvm/Dockerfile agent`).
+
+The chosen name is baked into the image and the worker **reports** it when it registers, so **Settings → Workers** shows each worker's template. This is observability only: the join token is still the sole trust anchor, so a worker's reported template is never used to accept or reject it.
 
 ## Online, offline, busy
 

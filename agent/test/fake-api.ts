@@ -11,6 +11,9 @@ import type {
 interface RecordedRegister {
   name: string;
   version: string;
+  /** The self-reported worker template (PRD #18), or undefined when the worker
+   *  sends no `template` field (older image). */
+  template?: string;
   authorized: boolean;
 }
 
@@ -103,7 +106,11 @@ export class FakeApi {
     const p = url.pathname;
 
     if (req.method === "POST" && p === "/api/worker/register") {
-      this.registers.push({ name: String(json.name), version: String(json.version), authorized: true });
+      const rec: RecordedRegister = { name: String(json.name), version: String(json.version), authorized: true };
+      // Only record the key when the worker actually sent one, so an old-style
+      // {name,version} register stays byte-for-byte that shape (PRD #18).
+      if (json.template !== undefined) rec.template = String(json.template);
+      this.registers.push(rec);
       return send(res, 200, { worker_id: randomUUID() });
     }
     if (req.method === "POST" && p === "/api/worker/heartbeat") {

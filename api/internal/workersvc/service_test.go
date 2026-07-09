@@ -733,7 +733,7 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3"); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm"); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	want := []string{"fail_over_cap", "requeue_worker", "register"}
@@ -748,6 +748,25 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	}
 	if fs.registerParams == nil || !fs.registerParams.Version.Valid || fs.registerParams.Version.String != "1.2.3" {
 		t.Fatalf("register version wrong: %+v", fs.registerParams)
+	}
+	// The self-reported template rides into template_reported (PRD #18).
+	if !fs.registerParams.TemplateReported.Valid || fs.registerParams.TemplateReported.String != "jvm" {
+		t.Fatalf("register template_reported wrong: %+v", fs.registerParams.TemplateReported)
+	}
+}
+
+func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
+	// An older image reports no template ⇒ template_reported stays NULL, never an
+	// empty string.
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", ""); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {
+		t.Fatalf("empty template must be NULL, got %+v", fs.registerParams.TemplateReported)
 	}
 }
 
@@ -1162,7 +1181,7 @@ func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
 func TestCreateWorkerReturnsTokenOnce(t *testing.T) {
 	fs := &fakeStore{createWorkerResult: store.Worker{ID: uuid.New(), Name: "laptop"}}
 	svc := New(fs, newBox(t), testParams())
-	_, token, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop")
+	_, token, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop", "jvm")
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)
 	}
@@ -1172,6 +1191,21 @@ func TestCreateWorkerReturnsTokenOnce(t *testing.T) {
 	// The stored hash must not be the plaintext token.
 	if fs.createWorkerParams == nil || bytes.Contains(fs.createWorkerParams.TokenHash, []byte(token)) {
 		t.Fatal("stored token_hash must not contain the plaintext token")
+	}
+	// The declared template is persisted (PRD #18).
+	if !fs.createWorkerParams.TemplateDeclared.Valid || fs.createWorkerParams.TemplateDeclared.String != "jvm" {
+		t.Fatalf("declared template wrong: %+v", fs.createWorkerParams.TemplateDeclared)
+	}
+}
+
+func TestCreateWorkerEmptyTemplateStoresNull(t *testing.T) {
+	fs := &fakeStore{createWorkerResult: store.Worker{ID: uuid.New(), Name: "laptop"}}
+	svc := New(fs, newBox(t), testParams())
+	if _, _, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop", ""); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+	if fs.createWorkerParams == nil || fs.createWorkerParams.TemplateDeclared.Valid {
+		t.Fatalf("no declared choice must be NULL, got %+v", fs.createWorkerParams.TemplateDeclared)
 	}
 }
 

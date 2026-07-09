@@ -28,8 +28,12 @@ export class Worker {
     let attempt = 0;
     while (!signal.aborted) {
       try {
-        const res = await this.client.register(this.config.workerName);
-        this.log.info("registered", { name: this.config.workerName, worker_id: res.worker_id ?? null });
+        const res = await this.client.register(this.config.workerName, this.config.workerTemplate);
+        this.log.info("registered", {
+          name: this.config.workerName,
+          template: this.config.workerTemplate ?? null,
+          worker_id: res.worker_id ?? null,
+        });
         return;
       } catch (err) {
         attempt++;

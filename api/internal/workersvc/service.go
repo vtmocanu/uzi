@@ -218,7 +218,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // (affinity) to be re-claimed and resumed from the persisted session. This is
 // what makes `docker compose down && up` recover — the out-of-process worker's
 // fresh-start signal, which the server cannot infer from heartbeats alone.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version string) (store.Worker, error) {
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
 	if _, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
@@ -233,7 +233,13 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version string
 	}); err != nil {
 		return store.Worker{}, err
 	}
-	return s.q.RegisterWorker(ctx, store.RegisterWorkerParams{Version: pgText(version), ID: wkr.ID})
+	// template is the worker's self-reported image template (PRD #18); empty →
+	// NULL (older image sends none). Soft signal only; never rejected here.
+	return s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		Version:          pgText(version),
+		TemplateReported: pgText(template),
+		ID:               wkr.ID,
+	})
 }
 
 // Heartbeat refreshes liveness and returns the (possibly updated) worker.
@@ -584,12 +590,19 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 
 // CreateWorker issues a worker for the user and returns the plaintext join token
 // exactly once (only its hash is stored).
-func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name string) (store.Worker, string, error) {
+func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, templateDeclared string) (store.Worker, string, error) {
 	token, hash, err := jointoken.Generate()
 	if err != nil {
 		return store.Worker{}, "", err
 	}
-	wkr, err := s.q.CreateWorker(ctx, store.CreateWorkerParams{UserID: userID, Name: name, TokenHash: hash})
+	// templateDeclared is the UI-chosen worker template (PRD #18), validated
+	// against the registry by the caller; empty → NULL (no choice made).
+	wkr, err := s.q.CreateWorker(ctx, store.CreateWorkerParams{
+		UserID:           userID,
+		Name:             name,
+		TokenHash:        hash,
+		TemplateDeclared: pgText(templateDeclared),
+	})
 	if err != nil {
 		return store.Worker{}, "", err
 	}

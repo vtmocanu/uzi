@@ -58,8 +58,12 @@ export class WorkerClient {
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
   }
 
-  async register(name: string): Promise<RegisterResponse> {
+  async register(name: string, template?: string): Promise<RegisterResponse> {
     const body: RegisterRequest = { name, version: this.version };
+    // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
+    // no template, and the server stores NULL (PRD #18). The server's decoder
+    // rejects unknown fields but accepts an absent optional one.
+    if (template) body.template = template;
     return (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
   }
 

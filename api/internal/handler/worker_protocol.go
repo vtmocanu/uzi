@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -30,12 +31,17 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// worker may overwrite. DecodeJSON rejects unknown fields, so this must be
 		// declared even though nothing reads it.
 		Name string `json:"name"`
+		// Template is the worker's self-reported image template (PRD #18). Unlike
+		// Name, it IS read + persisted (as template_reported): it is observability
+		// the server surfaces and badges drift on, never an authn/authz input.
+		// Optional — an older image omits it and the column stays NULL.
+		Template string `json:"template"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, req.Version)
+	updated, err := h.wsvc.Register(r.Context(), wkr, req.Version, strings.TrimSpace(req.Template))
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

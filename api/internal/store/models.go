@@ -194,13 +194,15 @@ type UserSecret struct {
 }
 
 type Worker struct {
-	ID              uuid.UUID          `json:"id"`
-	UserID          uuid.UUID          `json:"user_id"`
-	Name            string             `json:"name"`
-	TokenHash       []byte             `json:"token_hash"`
-	Status          string             `json:"status"`
-	LastHeartbeatAt pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version         pgtype.Text        `json:"version"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	Name             string             `json:"name"`
+	TokenHash        []byte             `json:"token_hash"`
+	Status           string             `json:"status"`
+	LastHeartbeatAt  pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version          pgtype.Text        `json:"version"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared pgtype.Text        `json:"template_declared"`
+	TemplateReported pgtype.Text        `json:"template_reported"`
 }

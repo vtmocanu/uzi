@@ -2,9 +2,10 @@
 
 -- name: CreateWorker :one
 -- Issue a worker: the plaintext join token is shown once by the caller; only its
--- sha256 (token_hash) is stored.
-INSERT INTO workers (user_id, name, token_hash)
-VALUES (@user_id, @name, @token_hash)
+-- sha256 (token_hash) is stored. template_declared is the UI-chosen template
+-- (PRD #18), NULL when the caller made no choice.
+INSERT INTO workers (user_id, name, token_hash, template_declared)
+VALUES (@user_id, @name, @token_hash, @template_declared)
 RETURNING *;
 
 -- name: GetWorkerByTokenHash :one
@@ -31,10 +32,14 @@ WHERE w.user_id = @user_id
 ORDER BY w.created_at ASC;
 
 -- name: RegisterWorker :one
--- Worker announces version and comes online; heartbeat is stamped now.
+-- Worker announces version + its self-reported template and comes online;
+-- heartbeat is stamped now. template_reported is what the image bakes in (PRD
+-- #18), NULL when the worker sends none (older image) — stored as-is; drift vs
+-- template_declared is surfaced, never rejected.
 UPDATE workers SET
     status            = 'online',
     version           = @version,
+    template_reported = @template_reported,
     last_heartbeat_at = now(),
     updated_at        = now()
 WHERE id = @id
