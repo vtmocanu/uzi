@@ -48,6 +48,7 @@ export function WorkersSettings() {
       setNewToken({ worker: worker.name, token });
       setCopied(false);
       setName("");
+      setTemplate(DEFAULT_WORKER_TEMPLATE);
       await load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to create worker");

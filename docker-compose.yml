@@ -131,9 +131,10 @@ services:
   agent:
     # Worker template selection (PRD #18): WORKER_TEMPLATE picks which curated
     # Dockerfile under agent/templates/<name>/ builds the worker image. Default
-    # `base` (today's minimal image); `jvm` adds a JDK. The chosen name is baked
-    # into the image as ENV WORKER_TEMPLATE and self-reported at register so the
-    # server can badge drift from the per-worker declared choice. `docker compose
+    # `base` (today's minimal image); `jvm` adds a JDK. Each template's Dockerfile
+    # bakes its own name as ENV UZI_WORKER_TEMPLATE (a fixed literal, distinct from
+    # this WORKER_TEMPLATE build var), self-reported at register so the server can
+    # badge drift from the per-worker declared choice. `docker compose
     # build` with no env set still works (defaults to base).
     build:
       context: ./agent

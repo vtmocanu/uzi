@@ -58,3 +58,32 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
     });
   }
 });
+
+// The template name set lives in THREE places (PRD #18): the agent/templates/<name>/
+// dirs (the images), api/internal/workertmpl.Names (server registry, validates the
+// declared choice), and web/src/lib/workerTemplates.ts (the issuance dropdown). This
+// test pins them equal so a new template can't be added in one place and silently
+// diverge — the duplication-drift + triple-registry concern.
+function parseStringList(text: string, anchor: RegExp): string[] {
+  const m = anchor.exec(text);
+  if (!m || m[1] === undefined) return [];
+  return [...m[1].matchAll(/["']([^"']+)["']/g)].map((x) => x[1]!).sort();
+}
+
+describe("worker template registry stays in sync (three sources)", () => {
+  const dirNames = templateDockerfiles()
+    .map((d) => d.name)
+    .sort();
+
+  it("agent/templates/ dirs match the server registry (workertmpl.Names)", () => {
+    const goFile = path.resolve(templatesDir, "../../api/internal/workertmpl/workertmpl.go");
+    const names = parseStringList(fs.readFileSync(goFile, "utf8"), /var Names = \[\]string\{([^}]*)\}/);
+    assert.deepStrictEqual(names, dirNames, "template dirs must equal workertmpl.Names");
+  });
+
+  it("agent/templates/ dirs match the web registry (WORKER_TEMPLATES)", () => {
+    const webFile = path.resolve(templatesDir, "../../web/src/lib/workerTemplates.ts");
+    const names = parseStringList(fs.readFileSync(webFile, "utf8"), /WORKER_TEMPLATES\s*=\s*\[([^\]]*)\]/);
+    assert.deepStrictEqual(names, dirNames, "template dirs must equal web WORKER_TEMPLATES");
+  });
+});
