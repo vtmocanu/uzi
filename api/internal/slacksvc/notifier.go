@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/slack-go/slack"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -35,6 +36,14 @@ type Poster interface {
 	Post(ctx context.Context, channelID, threadTS, text string) (string, error)
 	// Update edits a message in place.
 	Update(ctx context.Context, channelID, ts, text string) error
+	// PostBlocks posts a Block Kit message (threadTS "" = top level); fallbackText
+	// is the notification/plain-text fallback. Used for the link-confirmation DM
+	// (Confirm / Not me) — M4 reuses it for the approval gate.
+	PostBlocks(ctx context.Context, channelID, threadTS, fallbackText string, blocks []slack.Block) (string, error)
+	// LookupUserByEmail resolves a workspace member's email to their Slack user id
+	// (users.lookupByEmail), for the email auto-match pass. A not-found or any other
+	// Slack error is returned to the caller, which treats it as "no match".
+	LookupUserByEmail(ctx context.Context, email string) (string, error)
 }
 
 // notifierQueue bounds the in-memory event backlog. PublishState drops when full

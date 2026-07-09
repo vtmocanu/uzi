@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -155,6 +156,34 @@ func TestManagerConnects(t *testing.T) {
 	waitState(t, m, StateConnecting)
 	c.onConnected()
 	waitState(t, m, StateConnected)
+}
+
+// The production dialer fires onConnected for both the Connected and the Hello
+// event, so the once-per-session hook (the email auto-match pass) must fire
+// exactly once per live session, not per event.
+func TestManagerFiresOnConnectedOncePerSession(t *testing.T) {
+	fs := &fakeSettings{enabled: true, bot: "xoxb-1", app: "xapp-1"}
+	fd := newFakeDialer()
+	var calls atomic.Int32
+	m := NewManager(fs, Config{
+		Poll:        5 * time.Millisecond,
+		BackoffMin:  5 * time.Millisecond,
+		BackoffMax:  20 * time.Millisecond,
+		Dial:        fd.dial,
+		OnConnected: func(context.Context) { calls.Add(1) },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Run(ctx)
+
+	c := fd.await(t)
+	c.onConnected() // Connected
+	c.onConnected() // Hello — must not fire the hook a second time
+	waitState(t, m, StateConnected)
+	time.Sleep(30 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("OnConnected fired %d times, want exactly 1 per session", got)
+	}
 }
 
 func TestManagerHotReloadOnTokenChange(t *testing.T) {

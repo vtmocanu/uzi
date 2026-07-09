@@ -61,6 +61,12 @@ type Manager struct {
 	dial       DialFunc
 	logger     *slog.Logger
 
+	// onConnected (may be nil) fires once each time a session becomes live — the
+	// email auto-match pass hooks here. It runs in its own goroutine bound to the
+	// connection context, so a slow pass never blocks the socket and a hot restart
+	// cancels an in-flight pass.
+	onConnected func(context.Context)
+
 	mu    sync.RWMutex
 	state string
 }
@@ -80,6 +86,14 @@ type Config struct {
 	// a slow/unreachable Slack cannot wedge the connect path; zero uses 15s. It
 	// does NOT bound the long-lived websocket itself. Ignored when Dial is set.
 	HTTPTimeout time.Duration
+	// Inbound (may be nil) routes inbound Block Kit actions (the link Confirm /
+	// Not-me handler; M4/M5 add gate + reply kinds). It is captured once by the
+	// real dialer — static, not part of the token fingerprint — so a hot restart
+	// keeps the same handler. Ignored when Dial is set.
+	Inbound InboundHandler
+	// OnConnected (may be nil) fires once each time a session becomes live (the
+	// email auto-match pass), in a goroutine bound to the connection context.
+	OnConnected func(context.Context)
 	// Logger receives redacted connection-state warnings; nil uses slog.Default.
 	Logger *slog.Logger
 }
@@ -87,16 +101,17 @@ type Config struct {
 // NewManager builds a Manager. It does not connect; call Run in a goroutine.
 func NewManager(s SettingsSource, cfg Config) *Manager {
 	m := &Manager{
-		settings:   s,
-		poll:       orDuration(cfg.Poll, 5*time.Second),
-		backoffMin: orDuration(cfg.BackoffMin, time.Second),
-		backoffMax: orDuration(cfg.BackoffMax, time.Minute),
-		dial:       cfg.Dial,
-		logger:     cfg.Logger,
-		state:      StateDisabled,
+		settings:    s,
+		poll:        orDuration(cfg.Poll, 5*time.Second),
+		backoffMin:  orDuration(cfg.BackoffMin, time.Second),
+		backoffMax:  orDuration(cfg.BackoffMax, time.Minute),
+		dial:        cfg.Dial,
+		onConnected: cfg.OnConnected,
+		logger:      cfg.Logger,
+		state:       StateDisabled,
 	}
 	if m.dial == nil {
-		m.dial = newSocketDialer(orDuration(cfg.HTTPTimeout, 15*time.Second))
+		m.dial = newSocketDialer(orDuration(cfg.HTTPTimeout, 15*time.Second), cfg.Inbound)
 	}
 	if m.logger == nil {
 		m.logger = slog.Default()
@@ -198,8 +213,14 @@ func (m *Manager) serve(ctx context.Context, want desired) (bool, error) {
 	var connected atomic.Bool
 	onConnecting := func() { m.setState(StateConnecting) }
 	onConnected := func() {
-		connected.Store(true)
 		m.setState(StateConnected)
+		// The production dialer fires onConnected for both Connected and Hello, so
+		// gate the once-per-session hook on the first transition; the reconnect path
+		// builds a fresh atomic, so a later connection fires it again (subject to the
+		// hook's own cooldown).
+		if connected.CompareAndSwap(false, true) && m.onConnected != nil {
+			go m.onConnected(connCtx)
+		}
 	}
 	err := m.dial(connCtx, want.bot, want.app, onConnecting, onConnected)
 	return connected.Load(), err

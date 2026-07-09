@@ -79,3 +79,30 @@ func (p *slackPoster) Update(ctx context.Context, channelID, ts, text string) er
 	_, _, _, err = c.UpdateMessageContext(ctx, channelID, ts, slack.MsgOptionText(text, false))
 	return err
 }
+
+func (p *slackPoster) PostBlocks(ctx context.Context, channelID, threadTS, fallbackText string, blocks []slack.Block) (string, error) {
+	c, err := p.api(ctx)
+	if err != nil {
+		return "", err
+	}
+	// fallbackText is the plain-text fallback (notifications, no-blocks clients);
+	// the blocks carry the actual buttons.
+	opts := []slack.MsgOption{slack.MsgOptionText(fallbackText, false), slack.MsgOptionBlocks(blocks...)}
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	_, ts, err := c.PostMessageContext(ctx, channelID, opts...)
+	return ts, err
+}
+
+func (p *slackPoster) LookupUserByEmail(ctx context.Context, email string) (string, error) {
+	c, err := p.api(ctx)
+	if err != nil {
+		return "", err
+	}
+	u, err := c.GetUserByEmailContext(ctx, email)
+	if err != nil {
+		return "", err
+	}
+	return u.ID, nil
+}

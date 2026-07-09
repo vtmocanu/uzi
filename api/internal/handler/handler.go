@@ -56,7 +56,25 @@ type Handler struct {
 	// (PRD #25 M2). Wired to the slacksvc manager's State in main; nil (tests, or
 	// before wiring) reads as "disabled".
 	slackStatus func() string
+	// slackLinker sends the Slack DMs the /me/slack endpoints need (PRD #25 M3): a
+	// link-confirmation DM after a manual override, and the test DM. Wired to the
+	// slacksvc linker in main; nil (tests, or Slack off) makes those endpoints
+	// report Slack as unavailable rather than panic.
+	slackLinker SlackLinker
 }
+
+// SlackLinker is the slice of the slacksvc linker the /me/slack endpoints drive
+// (PRD #25 M3): re-send the Confirm / Not-me DM to a newly set override target,
+// and send the user-initiated test DM. *slacksvc.Linker satisfies it.
+type SlackLinker interface {
+	SendLinkConfirmation(ctx context.Context, slackID, accountLabel string)
+	SendTestDM(ctx context.Context, slackID string) error
+}
+
+// SetSlackLinker wires the account linker in after construction (built alongside
+// the Slack manager in main). Safe to leave unset — the /me/slack DM-sending
+// endpoints then report Slack as unavailable.
+func (h *Handler) SetSlackLinker(l SlackLinker) { h.slackLinker = l }
 
 // SetSlackStatus wires the Slack manager's connection-state accessor in after
 // construction (the manager is built alongside the handler's other run-lifecycle

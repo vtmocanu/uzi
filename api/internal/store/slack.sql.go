@@ -218,6 +218,43 @@ func (q *Queries) ListSlackNotifiableUsers(ctx context.Context) ([]ListSlackNoti
 	return items, nil
 }
 
+const listUsersForSlackLink = `-- name: ListUsersForSlackLink :many
+SELECT id, email, slack_resolved_id
+FROM users
+WHERE slack_member_id IS NULL AND is_active = true
+`
+
+type ListUsersForSlackLinkRow struct {
+	ID              uuid.UUID   `json:"id"`
+	Email           string      `json:"email"`
+	SlackResolvedID pgtype.Text `json:"slack_resolved_id"`
+}
+
+// Override-free, active users for the email auto-match pass: id + email to look
+// up in Slack, and the current resolved id for the compare-then-write guard (an
+// unchanged match is skipped so a reconnect never un-confirms the user). Manual
+// override users (slack_member_id NOT NULL) are excluded — their id is
+// authoritative and must not be overwritten by an email match.
+func (q *Queries) ListUsersForSlackLink(ctx context.Context) ([]ListUsersForSlackLinkRow, error) {
+	rows, err := q.db.Query(ctx, listUsersForSlackLink)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUsersForSlackLinkRow{}
+	for rows.Next() {
+		var i ListUsersForSlackLinkRow
+		if err := rows.Scan(&i.ID, &i.Email, &i.SlackResolvedID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setSlackRunGate = `-- name: SetSlackRunGate :one
 UPDATE slack_run_messages
 SET gate_ts = $1, gate_state = $2, updated_at = now()

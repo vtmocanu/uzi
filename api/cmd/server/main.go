@@ -131,12 +131,29 @@ func run() error {
 	}
 	settingsCache.ConfigureSecrets(box, slackEnv)
 
+	// Shared bot-token Slack surface (PRD #25 M3): the run notifier, the account
+	// linker, and the /me/slack test-DM endpoint all post through it. It reads the
+	// CURRENT bot token per call (hot-rotation safe), bounded by the Slack HTTP
+	// timeout.
+	slackPoster := slacksvc.NewPoster(settingsCache.SlackBotToken, &http.Client{Timeout: cfg.SlackHTTPTimeout})
+
+	// Account linker (PRD #25 M3): the email auto-match pass (fired on every socket
+	// connect) plus the link-confirmation DM round-trip (Confirm / Not-me). It is
+	// the Manager's inbound Block Kit handler and its on-connected hook, and it
+	// backs the user-settings override / test-DM endpoints. Best-effort throughout —
+	// it never affects a run or the socket.
+	slackLinker := slacksvc.NewLinker(q, slackPoster, slog.Default())
+
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
 	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
 	// token/enable change); otherwise it idles as a strict no-op. It never touches
 	// the run lifecycle — Slack is best-effort. Run in the background WaitGroup below.
-	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{HTTPTimeout: cfg.SlackHTTPTimeout})
+	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{
+		HTTPTimeout: cfg.SlackHTTPTimeout,
+		Inbound:     slackLinker,
+		OnConnected: slackLinker.AutoMatch,
+	})
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 
@@ -191,7 +208,7 @@ func run() error {
 	// dropped silently, so this is a strict no-op until linking is set up.
 	slackNotifier := slacksvc.NewNotifier(
 		q,
-		slacksvc.NewPoster(settingsCache.SlackBotToken, &http.Client{Timeout: cfg.SlackHTTPTimeout}),
+		slackPoster,
 		settingsCache.PublicBaseURL,
 		slog.Default(),
 	)
@@ -282,6 +299,10 @@ func run() error {
 	h.SetReconciler(engine)
 	// Surface the live Slack connection state on the admin settings DTO (PRD #25 M2).
 	h.SetSlackStatus(slackManager.State)
+	// Wire the account linker so the /me/slack override + test-DM endpoints can send
+	// their Slack DMs (PRD #25 M3). Best-effort: a nil linker (never in production)
+	// would make those endpoints report Slack as unavailable.
+	h.SetSlackLinker(slackLinker)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

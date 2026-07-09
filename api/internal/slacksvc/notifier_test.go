@@ -2,6 +2,7 @@ package slacksvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/slack-go/slack"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
@@ -40,13 +42,23 @@ func (f *fakeNotifStore) UpsertSlackRunMessage(_ context.Context, arg store.Upse
 
 type postCall struct{ channel, thread, text string }
 type updateCall struct{ channel, ts, text string }
+type blockCall struct {
+	channel, thread, fallback string
+	actionIDs                 []string
+}
 
 type fakePoster struct {
 	dmChannel string
 	posts     []postCall
 	updates   []updateCall
+	blocks    []blockCall
 	openErr   error
+	postErr   error
 	tsSeq     int
+	// emailToID maps an email to a Slack id for LookupUserByEmail; a miss returns
+	// lookupErr (defaulting to a not-found-style error).
+	emailToID map[string]string
+	lookupErr error
 }
 
 func (p *fakePoster) OpenDM(context.Context, string) (string, error) {
@@ -58,11 +70,35 @@ func (p *fakePoster) OpenDM(context.Context, string) (string, error) {
 func (p *fakePoster) Post(_ context.Context, ch, thread, text string) (string, error) {
 	p.posts = append(p.posts, postCall{ch, thread, text})
 	p.tsSeq++
-	return fmt.Sprintf("ts%d", p.tsSeq), nil
+	return fmt.Sprintf("ts%d", p.tsSeq), p.postErr
 }
 func (p *fakePoster) Update(_ context.Context, ch, ts, text string) error {
 	p.updates = append(p.updates, updateCall{ch, ts, text})
 	return nil
+}
+func (p *fakePoster) PostBlocks(_ context.Context, ch, thread, fallback string, blks []slack.Block) (string, error) {
+	ids := []string{}
+	for _, b := range blks {
+		if ab, ok := b.(*slack.ActionBlock); ok && ab.Elements != nil {
+			for _, el := range ab.Elements.ElementSet {
+				if btn, ok := el.(*slack.ButtonBlockElement); ok {
+					ids = append(ids, btn.ActionID)
+				}
+			}
+		}
+	}
+	p.blocks = append(p.blocks, blockCall{channel: ch, thread: thread, fallback: fallback, actionIDs: ids})
+	p.tsSeq++
+	return fmt.Sprintf("ts%d", p.tsSeq), p.postErr
+}
+func (p *fakePoster) LookupUserByEmail(_ context.Context, email string) (string, error) {
+	if id, ok := p.emailToID[email]; ok {
+		return id, nil
+	}
+	if p.lookupErr != nil {
+		return "", p.lookupErr
+	}
+	return "", errors.New("users_not_found")
 }
 
 func fixedBase(context.Context) (string, error) { return "https://uzi.example", nil }

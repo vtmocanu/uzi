@@ -56,6 +56,16 @@ WHERE slack_resolved_id = @slack_resolved_id;
 SELECT * FROM users
 WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL;
 
+-- name: ListUsersForSlackLink :many
+-- Override-free, active users for the email auto-match pass: id + email to look
+-- up in Slack, and the current resolved id for the compare-then-write guard (an
+-- unchanged match is skipped so a reconnect never un-confirms the user). Manual
+-- override users (slack_member_id NOT NULL) are excluded — their id is
+-- authoritative and must not be overwritten by an email match.
+SELECT id, email, slack_resolved_id
+FROM users
+WHERE slack_member_id IS NULL AND is_active = true;
+
 -- name: ListSlackNotifiableUsers :many
 -- Users eligible for run-notification delivery: notify on, link confirmed. Used
 -- to resolve a run owner's delivery target; the notifier still re-checks per run.
