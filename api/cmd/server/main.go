@@ -136,7 +136,7 @@ func run() error {
 	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
 	// token/enable change); otherwise it idles as a strict no-op. It never touches
 	// the run lifecycle — Slack is best-effort. Run in the background WaitGroup below.
-	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{})
+	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{HTTPTimeout: cfg.SlackHTTPTimeout})
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 

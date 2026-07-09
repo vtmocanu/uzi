@@ -142,6 +142,11 @@ type Config struct {
 	SlackBotToken string
 	SlackAppToken string
 	PublicBaseURL string
+	// SlackHTTPTimeout bounds every outbound Slack HTTP call (the admin PUT's
+	// live token validation and the manager's Socket Mode handshake), so a slow or
+	// unreachable Slack can never hang a request or wedge the connect path. Mirrors
+	// ForgeHTTPTimeout for the forge layer.
+	SlackHTTPTimeout time.Duration
 
 	// Agent skills (PRD #16). SkillMaxBytes caps a skill body at save (server) and
 	// is re-applied to repo-borne skills worker-side; SkillsMaxPerRun caps the
@@ -257,6 +262,7 @@ func Load() (Config, error) {
 	// failure rather than a broken button in every DM.
 	cfg.SlackBotToken = strings.TrimSpace(os.Getenv("SLACK_BOT_TOKEN"))
 	cfg.SlackAppToken = strings.TrimSpace(os.Getenv("SLACK_APP_TOKEN"))
+	cfg.SlackHTTPTimeout = parseDuration("SLACK_HTTP_TIMEOUT", 15*time.Second)
 	if pub := strings.TrimSpace(os.Getenv("UZI_PUBLIC_BASE_URL")); pub != "" {
 		if err := settings.ValidatePublicBaseURL(pub); err != nil {
 			return Config{}, fmt.Errorf("UZI_PUBLIC_BASE_URL %s", err)

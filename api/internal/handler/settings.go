@@ -98,31 +98,16 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Live-validate submitted Slack tokens against Slack BEFORE opening a
-	// transaction (a network call must not run inside the write tx). The error is
-	// scrubbed of any token bytes and never echoes the submitted value.
 	ctx := r.Context()
-	if token, ok := req.Settings[settings.KeySlackBotToken]; ok {
-		if err := h.slackVal().ValidateBotToken(ctx, token); err != nil {
-			slog.Warn("settings: slack bot token validation failed", "error", slacksvc.ScrubTokens(err.Error()))
-			httpx.Error(w, http.StatusBadRequest, "slack_bot_token: Slack rejected the token ("+slacksvc.ScrubTokens(err.Error())+")")
-			return
-		}
-	}
-	if token, ok := req.Settings[settings.KeySlackAppToken]; ok {
-		if err := h.slackVal().ValidateAppToken(ctx, token); err != nil {
-			slog.Warn("settings: slack app token validation failed", "error", slacksvc.ScrubTokens(err.Error()))
-			httpx.Error(w, http.StatusBadRequest, "slack_app_token: Slack rejected the token ("+slacksvc.ScrubTokens(err.Error())+")")
-			return
-		}
-	}
 
 	// Cheap pre-transaction cross-key check against the cache: rejects the obvious
-	// equal-label case without opening a transaction. Only non-secret keys enter
-	// the merged map — a secret token's plaintext never participates in a label
-	// check. Best-effort only (the cache can be stale); the authoritative check
-	// runs below inside the write tx against the FOR UPDATE-locked rows.
-	current, err := h.settings.All(r.Context())
+	// equal-label case without opening a transaction, and BEFORE the live Slack
+	// call below — so a label-collision PUT never wastes a network round-trip. Only
+	// non-secret keys enter the merged map (a secret token's plaintext never
+	// participates in a label check). Best-effort only (the cache can be stale);
+	// the authoritative check runs below inside the write tx against the FOR UPDATE
+	// rows.
+	current, err := h.settings.All(ctx)
 	if err != nil {
 		slog.Error("update settings: read current", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -141,6 +126,25 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if err := settings.ValidateMerged(precheck); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	// Live-validate submitted Slack tokens against Slack after the cheap label
+	// precheck and BEFORE opening a transaction (a network call must not run inside
+	// the write tx). The error is scrubbed of any token bytes and never echoes the
+	// submitted value.
+	if token, ok := req.Settings[settings.KeySlackBotToken]; ok {
+		if err := h.slackVal().ValidateBotToken(ctx, token); err != nil {
+			slog.Warn("settings: slack bot token validation failed", "error", slacksvc.ScrubTokens(err.Error()))
+			httpx.Error(w, http.StatusBadRequest, "slack_bot_token: Slack rejected the token ("+slacksvc.ScrubTokens(err.Error())+")")
+			return
+		}
+	}
+	if token, ok := req.Settings[settings.KeySlackAppToken]; ok {
+		if err := h.slackVal().ValidateAppToken(ctx, token); err != nil {
+			slog.Warn("settings: slack app token validation failed", "error", slacksvc.ScrubTokens(err.Error()))
+			httpx.Error(w, http.StatusBadRequest, "slack_app_token: Slack rejected the token ("+slacksvc.ScrubTokens(err.Error())+")")
+			return
+		}
 	}
 
 	tx, err := h.pool.Begin(ctx)

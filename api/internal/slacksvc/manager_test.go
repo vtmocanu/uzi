@@ -259,6 +259,27 @@ func TestManagerStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+// TestNewManagerBuildsBoundedDialer exercises the production path (no injected
+// Dial): NewManager must build the real socket dialer from HTTPTimeout without
+// panicking, and idle cleanly while unconfigured (it never dials).
+func TestNewManagerBuildsBoundedDialer(t *testing.T) {
+	m := NewManager(&fakeSettings{enabled: false}, Config{
+		Poll:        5 * time.Millisecond,
+		HTTPTimeout: 10 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	waitState(t, m, StateDisabled)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
 func TestClassifyState(t *testing.T) {
 	cases := map[string]string{
 		"slack: invalid_auth":                  StateErrorAuth,

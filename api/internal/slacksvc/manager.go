@@ -76,6 +76,10 @@ type Config struct {
 	// Dial overrides the socket dialer (tests inject a fake); nil uses the real
 	// socketmode implementation.
 	Dial DialFunc
+	// HTTPTimeout bounds the socketmode HTTP handshake (apps.connections.open) so
+	// a slow/unreachable Slack cannot wedge the connect path; zero uses 15s. It
+	// does NOT bound the long-lived websocket itself. Ignored when Dial is set.
+	HTTPTimeout time.Duration
 	// Logger receives redacted connection-state warnings; nil uses slog.Default.
 	Logger *slog.Logger
 }
@@ -92,7 +96,7 @@ func NewManager(s SettingsSource, cfg Config) *Manager {
 		state:      StateDisabled,
 	}
 	if m.dial == nil {
-		m.dial = dialSocketMode
+		m.dial = newSocketDialer(orDuration(cfg.HTTPTimeout, 15*time.Second))
 	}
 	if m.logger == nil {
 		m.logger = slog.Default()

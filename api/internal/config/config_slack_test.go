@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/base64"
 	"testing"
+	"time"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 )
@@ -51,6 +52,11 @@ func TestLoadSlackDefaultsEmpty(t *testing.T) {
 	if cfg.SlackBotToken != "" || cfg.SlackAppToken != "" || cfg.PublicBaseURL != "" {
 		t.Errorf("unset Slack env should leave empty fields; got %q/%q/%q",
 			cfg.SlackBotToken, cfg.SlackAppToken, cfg.PublicBaseURL)
+	}
+	// The outbound Slack HTTP bound has a safe non-zero default so live validation
+	// and the socket handshake are never unbounded.
+	if cfg.SlackHTTPTimeout != 15*time.Second {
+		t.Errorf("SlackHTTPTimeout default = %v, want 15s", cfg.SlackHTTPTimeout)
 	}
 }
 

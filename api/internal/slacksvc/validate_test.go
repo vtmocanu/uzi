@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stubSlack serves the two Web API methods the Validator hits (auth.test,
@@ -73,5 +74,27 @@ func TestValidateAppToken(t *testing.T) {
 	vb := Validator{APIURL: bad.URL}
 	if err := vb.ValidateAppToken(context.Background(), "xapp-bad"); err == nil {
 		t.Error("ValidateAppToken(rejected) = nil, want an error")
+	}
+}
+
+// TestValidatorBoundedByTimeout proves the default client is bounded: against a
+// server slower than the timeout, validation fails rather than hanging (reviewer
+// M2 requirement — no http.DefaultClient fallback that could hang the admin PUT).
+func TestValidatorBoundedByTimeout(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"url":"https://x/","team_id":"T","user_id":"U","bot_id":"B"}`))
+	}))
+	t.Cleanup(slow.Close)
+
+	v := Validator{APIURL: slow.URL, Timeout: 20 * time.Millisecond}
+	start := time.Now()
+	err := v.ValidateBotToken(context.Background(), "xoxb-good")
+	if err == nil {
+		t.Fatal("ValidateBotToken did not time out against a slow server")
+	}
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Errorf("validation took %v; the bounded client should have cut it off near 20ms", elapsed)
 	}
 }

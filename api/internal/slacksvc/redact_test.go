@@ -35,6 +35,19 @@ func TestScrubTokens(t *testing.T) {
 	}
 }
 
+func TestScrubSecretsCoversAllFamilies(t *testing.T) {
+	in := "leak xoxb-bottok xapp-apptok sk-ant-not-a-real-key glpat-not-a-real-pat end"
+	got := ScrubSecrets(in)
+	for _, secret := range []string{"xoxb-bottok", "xapp-apptok", "sk-ant-not-a-real-key", "glpat-not-a-real-pat"} {
+		if contains(got, secret) {
+			t.Errorf("ScrubSecrets left %q in %q", secret, got)
+		}
+	}
+	if !contains(got, "leak") || !contains(got, "end") {
+		t.Errorf("ScrubSecrets removed non-secret content: %q", got)
+	}
+}
+
 func TestRedactScrubsSocketURLAndTicket(t *testing.T) {
 	in := `connect failed to wss://wss-primary.slack.com/link/?ticket=SECRETTICKET123&app_id=A0 for xoxb-tok`
 	got := Redact(in)

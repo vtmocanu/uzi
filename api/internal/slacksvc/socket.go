@@ -3,15 +3,28 @@ package slacksvc
 import (
 	"context"
 	"errors"
+	"net/http"
+	"time"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/socketmode"
 )
 
-// dialSocketMode is the production DialFunc: it opens ONE Socket Mode connection
-// authenticated with the app-level token and runs its receive loop until ctx is
-// cancelled or the link fails/drops. It mirrors multica's per-connection Connect
-// (cancellable run context + RunContext goroutine), scoped to uzi's single app.
+// newSocketDialer returns the production DialFunc bound to a client whose Timeout
+// caps the Socket Mode HTTP handshake (apps.connections.open). The websocket
+// itself is not bounded by the client timeout — its liveness is the deadman
+// ping — so a healthy long-lived connection is unaffected.
+func newSocketDialer(timeout time.Duration) DialFunc {
+	client := &http.Client{Timeout: timeout}
+	return func(ctx context.Context, botToken, appToken string, onConnecting, onConnected func()) error {
+		return dialSocketMode(ctx, client, botToken, appToken, onConnecting, onConnected)
+	}
+}
+
+// dialSocketMode opens ONE Socket Mode connection authenticated with the
+// app-level token and runs its receive loop until ctx is cancelled or the link
+// fails/drops. It mirrors multica's per-connection Connect (cancellable run
+// context + RunContext goroutine), scoped to uzi's single app.
 //
 // slack-go's RunContext reconnects internally on a Slack-requested disconnect and
 // returns an error only on a HARD failure (e.g. a rejected token) — exactly the
@@ -24,9 +37,9 @@ import (
 // from re-delivering an un-ACKed envelope every ~3s. The bot token is unused in
 // M2 (the socket authenticates with the app token alone) and is threaded through
 // for M3's outbound Web API client.
-func dialSocketMode(ctx context.Context, botToken, appToken string, onConnecting, onConnected func()) error {
+func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken string, onConnecting, onConnected func()) error {
 	_ = botToken // M3 builds the outbound bot-token client from this.
-	api := slack.New("", slack.OptionAppLevelToken(appToken))
+	api := slack.New("", slack.OptionAppLevelToken(appToken), slack.OptionHTTPClient(client))
 	sm := socketmode.New(api)
 
 	// Each connection runs under its own cancellable context; every exit path

@@ -8,6 +8,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -21,20 +22,26 @@ import (
 // The zero value talks to the real Slack API. Tests set APIURL to an httptest
 // server (and optionally HTTPClient) so validation runs offline.
 type Validator struct {
-	// HTTPClient overrides the outbound client; nil uses http.DefaultClient.
+	// HTTPClient overrides the outbound client; nil builds a bounded client from
+	// Timeout so a slow/unreachable Slack cannot hang the admin PUT.
 	HTTPClient *http.Client
 	// APIURL overrides the Slack Web API base (must be reachable; a trailing
 	// slash is added if missing, since the SDK appends the method name). Empty
 	// targets the real Slack API.
 	APIURL string
+	// Timeout bounds each Slack call when HTTPClient is not supplied; zero uses a
+	// 15s default (never http.DefaultClient, which has no timeout).
+	Timeout time.Duration
 }
 
 // opts builds the slack.Client options shared by both checks, honoring the
-// APIURL/HTTPClient overrides. A fresh slice is returned each call.
+// APIURL/HTTPClient overrides. A fresh slice is returned each call. When no
+// client is supplied it defaults to a BOUNDED one — never http.DefaultClient —
+// so live validation cannot hang indefinitely.
 func (v Validator) opts() []slack.Option {
 	hc := v.HTTPClient
 	if hc == nil {
-		hc = http.DefaultClient
+		hc = &http.Client{Timeout: orDuration(v.Timeout, 15*time.Second)}
 	}
 	opts := []slack.Option{slack.OptionHTTPClient(hc)}
 	if v.APIURL != "" {

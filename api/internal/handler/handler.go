@@ -87,7 +87,9 @@ func (h *Handler) slackVal() SlackValidator {
 	if h.slackValidator != nil {
 		return h.slackValidator
 	}
-	return slacksvc.Validator{}
+	// Bounded by the configured Slack HTTP timeout (Validator defaults it to 15s
+	// when zero), so live token validation can never hang the admin PUT.
+	return slacksvc.Validator{Timeout: h.cfg.SlackHTTPTimeout}
 }
 
 // Reconciler receives the "labels changed, resync everything" signal from the

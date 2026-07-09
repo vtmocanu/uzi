@@ -215,6 +215,28 @@ func TestUpdateSettingsRejectsMalformedToken(t *testing.T) {
 	}
 }
 
+// TestUpdateSettingsPrecheckBeforeLiveValidation proves the cheap cross-key label
+// precheck runs BEFORE the live Slack call: a PUT that both collides a label and
+// carries a token is rejected on the label without ever hitting Slack.
+func TestUpdateSettingsPrecheckBeforeLiveValidation(t *testing.T) {
+	admin := adminUser()
+	fake := &fakeSlackValidator{}
+	cache := settings.New(&settingsStore{}, time.Minute)
+	cache.ConfigureSecrets(slackTestBox(t), nil)
+	h := &Handler{settings: cache, slackValidator: fake}
+
+	rec := httptest.NewRecorder()
+	// autopilot_label == the default prd_label "PRD" collides; a valid-format token
+	// rides along. The label precheck must reject first.
+	h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"autopilot_label":"PRD","slack_bot_token":"xoxb-x"}}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+	}
+	if fake.gotBot != "" {
+		t.Error("live Slack validation ran before the label precheck; reorder regressed")
+	}
+}
+
 // TestUpdateSettingsRejectsBadSlackEnabled covers the slack_enabled strict-bool
 // branch routed through the settings registry.
 func TestUpdateSettingsRejectsBadSlackEnabled(t *testing.T) {
