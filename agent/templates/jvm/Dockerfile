@@ -33,8 +33,9 @@ COPY src ./src
 ENV UZI_DATA_DIR=/data
 
 # Bake the template identity into the image so the worker self-reports the image
-# it was actually built from (PRD #18 register `template`). See templates/base.
-ENV WORKER_TEMPLATE=jvm
+# it was actually built from (PRD #18 register `template`). Hardcoded literal, not
+# the build arg echoed back — see templates/base.
+ENV UZI_WORKER_TEMPLATE=jvm
 RUN mkdir -p /data \
     && addgroup -S uzi && adduser -S -G uzi -h /home/uzi uzi \
     && chown -R uzi:uzi /app /data

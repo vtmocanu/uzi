@@ -111,6 +111,21 @@ func TestWorkerRegisterReadsTemplate(t *testing.T) {
 	}
 }
 
+func TestWorkerRegisterDropsMalformedTemplate(t *testing.T) {
+	// A hostile/misconfigured worker sends junk in `template`. Register must still
+	// succeed (a soft field never wedges the register-retry loop) but the malformed
+	// value must NOT reach the DB/UI — it is dropped, so template_reported is null.
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3","template":"../../etc/passwd"}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (malformed template must not fail register), body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"template_reported":null`) {
+		t.Fatalf("malformed template must be dropped to null, got %q", rec.Body.String())
+	}
+}
+
 func TestWorkerStateAlreadyTerminalReturns409(t *testing.T) {
 	runID := uuid.New()
 	// Owned run is cancelled; the guarded completed-update touches 0 rows.

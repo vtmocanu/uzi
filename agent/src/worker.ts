@@ -31,7 +31,7 @@ export class Worker {
         const res = await this.client.register(this.config.workerName, this.config.workerTemplate);
         this.log.info("registered", {
           name: this.config.workerName,
-          template: this.config.workerTemplate ?? null,
+          template: this.config.workerTemplate,
           worker_id: res.worker_id ?? null,
         });
         return;

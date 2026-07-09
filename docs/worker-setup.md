@@ -54,9 +54,9 @@ WORKER_TEMPLATE=jvm docker compose --profile agent build agent
 WORKER_TEMPLATE=jvm docker compose --profile agent up
 ```
 
-With `WORKER_TEMPLATE` unset, compose builds `base`. Standalone, point `docker build -f` at the template's Dockerfile (e.g. `-f agent/templates/jvm/Dockerfile agent`).
+With `WORKER_TEMPLATE` unset, compose builds `base`. Set it to a **bare template name** only (one of the names above): it is interpolated into the Dockerfile path, so a value with `/`, `..`, or an absolute path is unsupported and would resolve outside `agent/templates/`. Standalone, point `docker build -f` at the template's Dockerfile (e.g. `-f agent/templates/jvm/Dockerfile agent`).
 
-The chosen name is baked into the image and the worker **reports** it when it registers, so **Settings → Workers** shows each worker's template. This is observability only: the join token is still the sole trust anchor, so a worker's reported template is never used to accept or reject it.
+Each template's Dockerfile bakes its own name into the image as `UZI_WORKER_TEMPLATE` (a fixed literal, independent of the `WORKER_TEMPLATE` build variable), and the worker **reports** that at register, so **Settings → Workers** shows each worker's template. Because the reported value is the image's own baked-in identity, it flags a genuine mismatch when you build with one `WORKER_TEMPLATE` but declared another at issuance. This is observability only: the join token is still the sole trust anchor, so a worker's reported template is never used to accept or reject it.
 
 ## Online, offline, busy
 

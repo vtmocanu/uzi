@@ -30,11 +30,13 @@ COPY src ./src
 ENV UZI_DATA_DIR=/data
 
 # Bake the template identity into the image so the worker self-reports the image
-# it was actually built from (PRD #18 register `template`). Each template's
-# Dockerfile hardcodes its own name; the server compares this reported value with
-# the declared choice and badges drift. Soft signal only (observability, not
-# security — a hostile worker can lie); the join token stays the trust anchor.
-ENV WORKER_TEMPLATE=base
+# it was actually built from (PRD #18 register `template`). This is a HARDCODED
+# literal per template — deliberately NOT the WORKER_TEMPLATE build arg echoed
+# back (that would make reported==declared always and kill the drift signal). The
+# server compares this reported value with the declared choice and badges drift.
+# Soft signal only (observability, not security — a hostile worker can lie); the
+# join token stays the trust anchor.
+ENV UZI_WORKER_TEMPLATE=base
 RUN mkdir -p /data \
     && addgroup -S uzi && adduser -S -G uzi -h /home/uzi uzi \
     && chown -R uzi:uzi /app /data

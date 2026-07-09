@@ -13,6 +13,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workertmpl"
 )
 
 // WorkerRegister brings the worker online (and recovers any runs it orphaned by
@@ -41,7 +42,17 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, req.Version, strings.TrimSpace(req.Template))
+	// template is untrusted worker self-report bound for the DB + web UI. Bound it
+	// to a tight charset (workertmpl.WellFormed) and DROP anything else to empty
+	// (persisted as NULL) rather than 400 — a soft observability field must never
+	// wedge a worker's register-retry loop. Membership is NOT checked here: an
+	// unknown-but-well-formed name is the drift signal, not an error.
+	reported := strings.TrimSpace(req.Template)
+	if reported != "" && !workertmpl.WellFormed(reported) {
+		slog.Warn("worker reported a malformed template; dropping", "worker_id", wkr.ID.String())
+		reported = ""
+	}
+	updated, err := h.wsvc.Register(r.Context(), wkr, req.Version, reported)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
