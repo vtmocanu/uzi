@@ -88,14 +88,29 @@ Three tracks sharing one mental model (the PRD #16 scope+allocation pattern):
 
 - [x] **M1 — Worker template variants in git**: `agent/templates/` layout with `base` + at least one heavy-dep variant (e.g. `jvm`), compose `WORKER_TEMPLATE` plumbing, register-payload `template` field stored per worker. Docs updated.
 - [x] **M2 — Template choice in UI + drift surfacing**: per-worker declared template at join-token issuance; workers page shows declared vs reported with mismatch badge.
-- [ ] **M3 — Devbox engine in the worker**: base image ships devbox/nix with store on `agentdata`; worker provisions from a claim-delivered package list in a secret-scrubbed env and exposes tools to the SDK env via the filtered shellenv allowlist; provision failure fails the run cleanly. (Tier 1 end-to-end with a hardcoded allowlist.)
-- [ ] **M4 — Tool profiles + admin allowlist (api + web)**: allowlist CRUD, per-(user,repo) package profiles, claim-time validation, repo settings UI.
-- [ ] **M5 — Tier 2 repo `devbox.json` packages opt-in**: per-repo trust toggle (default off), packages-only extraction, union-merge with tier-1 precedence, trust warning in UI + docs.
+- [x] **M3 — Devbox engine in the worker**: base image ships devbox/nix with store on `agentdata`; worker provisions from a claim-delivered package list in a secret-scrubbed env and exposes tools to the SDK env via the filtered shellenv allowlist; provision failure fails the run cleanly. (Tier 1 end-to-end with a hardcoded allowlist.)
+- [x] **M4 — Tool profiles + admin allowlist (api + web)**: allowlist CRUD, per-(user,repo) package profiles, claim-time validation, repo settings UI.
+- [x] **M5 — Tier 2 repo `devbox.json` packages opt-in**: per-repo trust toggle (default off), packages-only extraction, union-merge with tier-1 precedence, trust warning in UI + docs.
 - [ ] **M6 — Agent template scopes migration + user CRUD** *(blocked by PRD #16 schema landing, or explicitly takes over the shared shapes)*: scope/user_id migration, partial uniques, reconciler conflict-target fix, reserved-name validation, user-scoped CRUD.
 - [ ] **M7 — Template allocation + claim filtering** *(same blocker as M6)*: allocation table with explicit seeded defaults, overlay resolution, claim payload delivers only allocated templates, Agents page allocation UI.
 - [ ] **M8 — Tests, specs, docs complete**: e2e covering a provisioned-tool run (devbox stubbed in the isolated e2e stack — no substituter egress there; a separate opt-in integration test does a real `devbox install`) and a run using a user-scoped template; `specs/ai.md` + `ARCHITECTURE.md` + user docs updated.
 
 Phase note: M1–M2 (worker templates) and M3–M5 (tooling) are independent tracks touching disjoint files and can run in parallel; M6–M7 (scopes) is sequenced against PRD #16/#17 per the notes above. M8 spans all.
+
+### Progress + agent-validation ledger (2026-07-10, paused for resume)
+
+Work runs on `feature/prd-18-worker-templates` (worktree `../prd-18-worker-templates`), agent-team workflow (coder + reviewer + auditor + tester). PRDs #16/#17 landed before this started, so the M6–M7 blockers are lifted; migrations renumbered `00044+` (live head was `00043`).
+
+| Scope | Commits | Agent validation |
+|---|---|---|
+| M1+M2 templates + drift UI | `ca93b17` `a1dca44` `7baaece` | reviewer PASS, auditor PASS, tester PASS (images, compose default, e2e w/ 00044) |
+| M3 devbox engine + hardening | `f8779d1` `84fa838` `13591c4` | reviewer PASS, auditor PASS (secret-scrub core confirmed) |
+| M3 image packaging | `ef21dee` + pending final fix | tester: LOGIC PASS (rootless uzi install, warm-start via `agentnix:/nix`, pinned devbox 0.17.5) but **as committed the Dockerfiles don't build** — checksum-filename bug + hardcoded amd64; fix commit was being landed at pause time. **Needs: fix landed + real `docker build` of both templates (native amd64 ideally) + reviewer pass over `ef21dee`+fix** |
+| M4 tool profiles + allowlist | `c846116` `342520b` | reviewer PASS, auditor PASS |
+| M4 audit ride-alongs (denylist, caps, shared rules loader) | `a45a9fd` | **NOT yet agent-reviewed** |
+| M5 tier-2 repo opt-in | `a0b7ba9` `ec12c96` | **NOT yet reviewed/audited/tested — first validation wave on resume** |
+
+Resume plan: (1) confirm the coder's final Dockerfile-fix commit + checkpoint (`.claude/agent-team-tasks/prd-18-coder-checkpoint.md`); (2) reviewer+auditor wave over `a45a9fd`+`a0b7ba9`+`ec12c96`+fix, tester on the tier-2 hostile-manifest path + a real build; (3) M6–M7 with a FRESH coder (mirror the landed #16 skills shapes; reconciler conflict-target change per §4); (4) M8. Open question for tomorrow: apply the credential-CLI denylist to tier-2 packages too (belt-and-suspenders; coder shipped PRD-posture = no).
 
 ## Success Criteria
 
