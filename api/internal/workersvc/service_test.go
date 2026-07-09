@@ -515,12 +515,9 @@ func TestResolveToolingResolvesAllowedProfilePackages(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}, {Name: "jq"}},
 	}
 	svc := New(fs, newBox(t), testParams())
-	pkgs, optIn, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
 	if err != nil {
 		t.Fatalf("resolveTooling: %v", err)
-	}
-	if optIn {
-		t.Fatal("repo_devbox_opt_in must be false until M5")
 	}
 	// Deduped + sorted.
 	if strings.Join(pkgs, ",") != "jq,kubectl@1.31" {
@@ -534,7 +531,7 @@ func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}}, // terraform removed after the profile was saved
 	}
 	svc := New(fs, newBox(t), testParams())
-	_, _, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
 	if !errors.Is(err, errToolPackagesRejected) {
 		t.Fatalf("err = %v, want errToolPackagesRejected", err)
 	}
@@ -546,7 +543,7 @@ func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
 func TestResolveToolingNoProfileMeansNoProvisioning(t *testing.T) {
 	fs := &fakeStore{toolProfileErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	pkgs, _, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
 	if err != nil {
 		t.Fatalf("resolveTooling: %v", err)
 	}

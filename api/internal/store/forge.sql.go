@@ -323,7 +323,7 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -348,6 +348,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.DefaultBranch,
 			&i.Enabled,
 			&i.RepoSkillsEnabled,
+			&i.RepoDevboxOptIn,
 		); err != nil {
 			return nil, err
 		}
@@ -360,7 +361,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -385,6 +386,7 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.DefaultBranch,
 			&i.Enabled,
 			&i.RepoSkillsEnabled,
+			&i.RepoDevboxOptIn,
 		); err != nil {
 			return nil, err
 		}
@@ -668,7 +670,7 @@ func (q *Queries) ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) (
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -698,6 +700,7 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.DefaultBranch,
 			&i.Enabled,
 			&i.RepoSkillsEnabled,
+			&i.RepoDevboxOptIn,
 		); err != nil {
 			return nil, err
 		}
@@ -746,11 +749,71 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 	return i, err
 }
 
+const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
+`
+
+type SetRepoDevboxOptInParams struct {
+	ID              uuid.UUID `json:"id"`
+	RepoDevboxOptIn bool      `json:"repo_devbox_opt_in"`
+}
+
+// Admin path for the tier-2 opt-in toggle: not scoped to the owning user; gated on
+// the caller being an admin in the handler.
+func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptInParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoDevboxOptIn, arg.ID, arg.RepoDevboxOptIn)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+	)
+	return i, err
+}
+
+const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
+UPDATE repos SET repo_devbox_opt_in = $2
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
+`
+
+type SetRepoDevboxOptInForUserParams struct {
+	ID              uuid.UUID `json:"id"`
+	RepoDevboxOptIn bool      `json:"repo_devbox_opt_in"`
+	UserID          uuid.UUID `json:"user_id"`
+}
+
+// Tier-2 repo devbox.json opt-in toggle (PRD #18 M5), authorized through the
+// repo's owning connection. A non-owned or unknown id returns no rows (404).
+func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevboxOptInForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, setRepoDevboxOptInForUser, arg.ID, arg.RepoDevboxOptIn, arg.UserID)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+	)
+	return i, err
+}
+
 const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -771,12 +834,13 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.DefaultBranch,
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
 	)
 	return i, err
 }
 
 const setRepoSkillsEnabled = `-- name: SetRepoSkillsEnabled :one
-UPDATE repos SET repo_skills_enabled = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled
+UPDATE repos SET repo_skills_enabled = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
 `
 
 type SetRepoSkillsEnabledParams struct {
@@ -798,6 +862,7 @@ func (q *Queries) SetRepoSkillsEnabled(ctx context.Context, arg SetRepoSkillsEna
 		&i.DefaultBranch,
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
 	)
 	return i, err
 }
@@ -806,7 +871,7 @@ const setRepoSkillsEnabledForUser = `-- name: SetRepoSkillsEnabledForUser :one
 UPDATE repos SET repo_skills_enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
 `
 
 type SetRepoSkillsEnabledForUserParams struct {
@@ -829,6 +894,7 @@ func (q *Queries) SetRepoSkillsEnabledForUser(ctx context.Context, arg SetRepoSk
 		&i.DefaultBranch,
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
 	)
 	return i, err
 }
@@ -1036,7 +1102,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in
 `
 
 type UpsertRepoParams struct {
@@ -1068,6 +1134,7 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.DefaultBranch,
 		&i.Enabled,
 		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
 	)
 	return i, err
 }

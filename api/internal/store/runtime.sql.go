@@ -552,6 +552,7 @@ SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.default_branch,
        rp.repo_skills_enabled,
+       rp.repo_devbox_opt_in,
        c.forge_type,
        c.base_url,
        c.bot_username,
@@ -567,6 +568,7 @@ type GetRunClaimContextRow struct {
 	RepoPath          string      `json:"repo_path"`
 	DefaultBranch     pgtype.Text `json:"default_branch"`
 	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
+	RepoDevboxOptIn   bool        `json:"repo_devbox_opt_in"`
 	ForgeType         string      `json:"forge_type"`
 	BaseUrl           string      `json:"base_url"`
 	BotUsername       string      `json:"bot_username"`
@@ -584,6 +586,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.RepoPath,
 		&i.DefaultBranch,
 		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.BotUsername,

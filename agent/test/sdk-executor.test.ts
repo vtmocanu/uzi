@@ -738,6 +738,62 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
     );
   });
 
+  it("tier-2: unions the repo's devbox.json packages when opted in (tier-1 wins conflicts)", async () => {
+    const calls: Array<{ packages: string[] }> = [];
+    const provision: SdkExecutorOptions["provision"] = async (input) => {
+      calls.push(input);
+      return { toolEnv: {} };
+    };
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-wt-"));
+    fs.writeFileSync(
+      path.join(worktree, "devbox.json"),
+      JSON.stringify({ packages: ["jq", "kubectl@9.9"], shell: { init_hook: "echo evil" } }),
+    );
+    try {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({
+        runId: "33333333-3333-3333-3333-333333333333",
+        worktreePath: worktree,
+        config: { tool_packages: ["kubectl@1.31"], repo_devbox_opt_in: true },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+      assert.strictEqual(calls.length, 1);
+      // tier-1 kubectl@1.31 wins the base-name conflict; tier-2 jq is added.
+      assert.deepStrictEqual(calls[0]!.packages, ["kubectl@1.31", "jq"]);
+    } finally {
+      fs.rmSync(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it("does not read the repo devbox.json when opt-in is off", async () => {
+    const calls: Array<{ packages: string[] }> = [];
+    const provision: SdkExecutorOptions["provision"] = async (input) => {
+      calls.push(input);
+      return { toolEnv: {} };
+    };
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-wt-"));
+    fs.writeFileSync(path.join(worktree, "devbox.json"), JSON.stringify({ packages: ["jq"] }));
+    try {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({
+        runId: "44444444-4444-4444-4444-444444444444",
+        worktreePath: worktree,
+        config: { tool_packages: ["kubectl@1.31"], repo_devbox_opt_in: false },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+      // Only tier-1 — the repo's jq is NOT merged (opt-in off).
+      assert.deepStrictEqual(calls[0]!.packages, ["kubectl@1.31"]);
+    } finally {
+      fs.rmSync(worktree, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a non-UUID run id before provisioning (path-traversal guard)", async () => {
     let called = false;
     const provision: SdkExecutorOptions["provision"] = async () => {

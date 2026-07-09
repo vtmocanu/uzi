@@ -101,6 +101,7 @@ type Repo struct {
 	DefaultBranch     pgtype.Text `json:"default_branch"`
 	Enabled           bool        `json:"enabled"`
 	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
+	RepoDevboxOptIn   bool        `json:"repo_devbox_opt_in"`
 }
 
 type RepoToolProfile struct {

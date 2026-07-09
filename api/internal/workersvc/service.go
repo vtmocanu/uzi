@@ -364,11 +364,11 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 	}
 	skills := assembleRunSkills(skillRows, s.p.SkillsMaxPerRun)
 
-	// Tier-1 tool packages + repo devbox opt-in for the worker's provisioning
-	// engine (PRD #18 M4): the owner's per-repo profile, re-validated against the
-	// current allowlist. A rejected package fails the claim (errToolPackagesRejected
-	// → the run is failed in Claim, not delivered).
-	toolPackages, repoDevboxOptIn, err := s.resolveTooling(ctx, run)
+	// Tier-1 tool packages for the worker's provisioning engine (PRD #18 M4): the
+	// owner's per-repo profile, re-validated against the current allowlist. A
+	// rejected package fails the claim (errToolPackagesRejected → the run is failed
+	// in Claim, not delivered). The tier-2 opt-in flag rides from the repos row.
+	toolPackages, err := s.resolveTooling(ctx, run)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +423,7 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 			SkillMaxBytes:      s.p.SkillMaxBytes,
 			SkillsMaxPerRun:    s.p.SkillsMaxPerRun,
 			ToolPackages:       toolPackages,
-			RepoDevboxOptIn:    repoDevboxOptIn,
+			RepoDevboxOptIn:    rc.RepoDevboxOptIn,
 		},
 	}, nil
 }
@@ -434,36 +434,37 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 // bytes) so the owner fixes the profile or an admin restores the allowlist entry.
 var errToolPackagesRejected = errors.New("tool packages no longer allowed")
 
-// resolveTooling resolves the run's tier-1 tool packages + repo devbox opt-in for
-// the claim payload (PRD #18). M4 makes this DB-backed: the desired list is the run
-// owner's per-(user,repo) repo_tool_profiles, RE-VALIDATED against the current
-// tool_allowlist (it can shrink after the profile was saved — Technical §3). A
-// rejected package fails the claim (Success Criteria 5), not silently drops.
-// repo_devbox_opt_in stays false until M5 wires the per-repo toggle.
-func (s *Service) resolveTooling(ctx context.Context, run store.Run) (toolPackages []string, repoDevboxOptIn bool, err error) {
+// resolveTooling resolves the run's TIER-1 tool packages for the claim payload
+// (PRD #18 M4). The desired list is the run owner's per-(user,repo)
+// repo_tool_profiles, RE-VALIDATED against the current tool_allowlist (it can
+// shrink after the profile was saved — Technical §3). A rejected package fails the
+// claim (Success Criteria 5), not silently drops. The tier-2 repo_devbox_opt_in
+// flag rides separately (set from the repos row in assembleClaim); the worker does
+// the tier-2 extraction after clone (PRD #18 M5).
+func (s *Service) resolveTooling(ctx context.Context, run store.Run) (toolPackages []string, err error) {
 	profile, err := s.q.GetRepoToolProfile(ctx, store.GetRepoToolProfileParams{UserID: run.UserID, RepoID: run.RepoID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return []string{}, false, nil // no profile ⇒ no provisioning
+			return []string{}, nil // no profile ⇒ no tier-1 provisioning
 		}
-		return nil, false, fmt.Errorf("get repo tool profile: %w", err)
+		return nil, fmt.Errorf("get repo tool profile: %w", err)
 	}
 	desired := decodePackageList(profile.Packages)
 	if len(desired) == 0 {
-		return []string{}, false, nil
+		return []string{}, nil
 	}
 	rules, err := s.loadToolRules(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	allowed, rejected := toolprofile.Resolve(desired, rules)
 	if len(rejected) > 0 {
-		return nil, false, fmt.Errorf("%w: %s", errToolPackagesRejected, strings.Join(rejected, ", "))
+		return nil, fmt.Errorf("%w: %s", errToolPackagesRejected, strings.Join(rejected, ", "))
 	}
 	if allowed == nil {
 		allowed = []string{} // always send an array, never null (wire contract)
 	}
-	return allowed, false, nil
+	return allowed, nil
 }
 
 // loadToolRules projects the DB tool_allowlist into the toolprofile.Rules map the

@@ -87,6 +87,10 @@ type repoDTO struct {
 	DefaultBranch     *string `json:"default_branch"`
 	Enabled           bool    `json:"enabled"`
 	RepoSkillsEnabled bool    `json:"repo_skills_enabled"`
+	// RepoDevboxOptIn is the tier-2 opt-in (PRD #18 M5): when true, a run on this
+	// repo also unions the packages from the repo's own devbox.json (packages-only,
+	// never its hooks/scripts). Default false.
+	RepoDevboxOptIn bool `json:"repo_devbox_opt_in"`
 	// Pipeline is the repo's default-branch CI status (PRD #6), null when there is
 	// no cached default-branch pipeline (no CI configured, MR-only pipelines, or not
 	// yet synced). Set by the list handlers, which enrich from the pipeline cache.
@@ -102,6 +106,7 @@ func repoToDTO(r store.Repo) repoDTO {
 		WebURL:            r.WebUrl,
 		Enabled:           r.Enabled,
 		RepoSkillsEnabled: r.RepoSkillsEnabled,
+		RepoDevboxOptIn:   r.RepoDevboxOptIn,
 	}
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
@@ -578,12 +583,16 @@ type patchRepoRequest struct {
 	// repo's own .claude/skills at run time. Pointer so an omitted field is a
 	// no-op rather than a silent disable.
 	RepoSkillsEnabled *bool `json:"repo_skills_enabled"`
+	// RepoDevboxOptIn is the tier-2 opt-in (PRD #18 M5): union the repo's own
+	// devbox.json packages (packages-only) into provisioning. Pointer = omitted is a
+	// no-op. Exactly one field is patched per request.
+	RepoDevboxOptIn *bool `json:"repo_devbox_opt_in"`
 }
 
-// PatchRepo updates a repo's mutable settings. Today the only patchable field is
-// repo_skills_enabled. Authorization: the repo owner (via the owning connection)
-// or an admin. A non-owned, unknown id returns 404 for a non-admin; an admin may
-// target any repo.
+// PatchRepo updates one of a repo's mutable opt-in settings (repo_skills_enabled
+// OR repo_devbox_opt_in). Authorization: the repo owner (via the owning
+// connection) or an admin. A non-owned, unknown id returns 404 for a non-admin; an
+// admin may target any repo. Exactly one field must be present.
 func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -600,23 +609,32 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.RepoSkillsEnabled == nil {
-		httpx.Error(w, http.StatusBadRequest, "no updatable fields provided")
+	if (req.RepoSkillsEnabled == nil) == (req.RepoDevboxOptIn == nil) {
+		httpx.Error(w, http.StatusBadRequest, "provide exactly one of repo_skills_enabled or repo_devbox_opt_in")
 		return
 	}
 
 	var repo store.Repo
-	if user.IsAdmin {
-		repo, err = h.q.SetRepoSkillsEnabled(r.Context(), store.SetRepoSkillsEnabledParams{ID: id, RepoSkillsEnabled: *req.RepoSkillsEnabled})
-	} else {
-		repo, err = h.q.SetRepoSkillsEnabledForUser(r.Context(), store.SetRepoSkillsEnabledForUserParams{ID: id, RepoSkillsEnabled: *req.RepoSkillsEnabled, UserID: user.ID})
+	switch {
+	case req.RepoSkillsEnabled != nil:
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoSkillsEnabled(r.Context(), store.SetRepoSkillsEnabledParams{ID: id, RepoSkillsEnabled: *req.RepoSkillsEnabled})
+		} else {
+			repo, err = h.q.SetRepoSkillsEnabledForUser(r.Context(), store.SetRepoSkillsEnabledForUserParams{ID: id, RepoSkillsEnabled: *req.RepoSkillsEnabled, UserID: user.ID})
+		}
+	case req.RepoDevboxOptIn != nil:
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoDevboxOptIn(r.Context(), store.SetRepoDevboxOptInParams{ID: id, RepoDevboxOptIn: *req.RepoDevboxOptIn})
+		} else {
+			repo, err = h.q.SetRepoDevboxOptInForUser(r.Context(), store.SetRepoDevboxOptInForUserParams{ID: id, RepoDevboxOptIn: *req.RepoDevboxOptIn, UserID: user.ID})
+		}
 	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			httpx.Error(w, http.StatusNotFound, "repo not found")
 			return
 		}
-		slog.Error("set repo skills enabled", "error", err)
+		slog.Error("patch repo settings", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}

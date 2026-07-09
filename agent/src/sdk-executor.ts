@@ -30,6 +30,7 @@ import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { provisionTools, type ProvisionResult } from "./provision.js";
+import { extractRepoDevboxPackages, mergeToolPackages } from "./repo-tools.js";
 import { assembleAgents } from "./agents.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
@@ -180,7 +181,22 @@ export class SdkExecutor implements Executor {
     // tier-1 packages in a secret-scrubbed subprocess and fold the resulting
     // (allowlisted) tool env into the SDK env. No packages ⇒ exactly today's
     // behavior. A provision failure FAILS the run — never silent degradation.
-    const toolPackages = ctx.config?.tool_packages ?? [];
+    let toolPackages = ctx.config?.tool_packages ?? [];
+    // Tier-2 (PRD #18 M5): when the repo owner opted in, union the repo's own
+    // devbox.json packages (packages-only, shape-validated, hooks/scripts/flakes
+    // ignored) with tier-1 — tier-1 wins version conflicts. Pure JSON extraction;
+    // nothing from the manifest is executed.
+    if (ctx.config?.repo_devbox_opt_in) {
+      const repoPackages = await extractRepoDevboxPackages(ctx.worktreePath);
+      if (repoPackages.length > 0) {
+        const before = toolPackages.length;
+        toolPackages = mergeToolPackages(toolPackages, repoPackages);
+        const added = toolPackages.length - before;
+        if (added > 0) {
+          ctx.emit({ kind: "status", agent: "worker", payload: { text: `merged ${added} package(s) from this repo's devbox.json` } });
+        }
+      }
+    }
     let toolEnv: Record<string, string> = {};
     let provisionDir: string | undefined;
     if (toolPackages.length > 0) {
