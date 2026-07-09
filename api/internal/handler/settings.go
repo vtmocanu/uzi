@@ -181,15 +181,13 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for key, value := range req.Settings {
-		toStore := value
-		if settings.IsSecret(key) {
-			sealed, sealErr := settings.SealSecret(h.box, value)
-			if sealErr != nil {
-				slog.Error("update settings: seal secret failed", "key", key, "error", sealErr)
-				httpx.Error(w, http.StatusInternalServerError, "internal error")
-				return
-			}
-			toStore = sealed
+		// Secret keys are sealed here (never stored in the clear); non-secret keys
+		// pass through verbatim. Single write-side seam — see settings.ValueForStorage.
+		toStore, sealErr := settings.ValueForStorage(h.box, key, value)
+		if sealErr != nil {
+			slog.Error("update settings: seal secret failed", "key", key, "error", sealErr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
 		}
 		if _, err := qtx.UpsertAppSetting(ctx, store.UpsertAppSettingParams{
 			Key:       key,

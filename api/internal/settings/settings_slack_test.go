@@ -295,3 +295,68 @@ func TestSealDecodeRoundtrip(t *testing.T) {
 		t.Error("DecodeSecret with the wrong key should fail")
 	}
 }
+
+// TestValueForStorage is the write-side seam the settings PUT uses: a secret key
+// is sealed (the stored bytes are NOT the token, and decode round-trips), while a
+// non-secret key is stored verbatim.
+func TestValueForStorage(t *testing.T) {
+	box := testBox(t)
+
+	// Secret: stored form is not the plaintext, and decodes back to it.
+	const token = "xoxb-store-me-please"
+	stored, err := ValueForStorage(box, KeySlackBotToken, token)
+	if err != nil {
+		t.Fatalf("ValueForStorage(secret): %v", err)
+	}
+	if stored == token || strings.Contains(stored, token) {
+		t.Fatal("secret stored in the clear")
+	}
+	if got, err := DecodeSecret(box, stored); err != nil || got != token {
+		t.Fatalf("round-trip = %q, %v; want %q", got, err, token)
+	}
+
+	// Non-secret: stored verbatim (no sealing).
+	if stored, err := ValueForStorage(box, KeyPRDLabel, "Feature"); err != nil || stored != "Feature" {
+		t.Fatalf("ValueForStorage(non-secret) = %q, %v; want verbatim", stored, err)
+	}
+}
+
+// TestLabelChangedIgnoresNonBoardKeys pins auditor pre-flag #5: only the two
+// board-filtering labels force a resync; the Slack keys (and every other
+// non-label key) never do.
+func TestLabelChangedIgnoresNonBoardKeys(t *testing.T) {
+	committed := map[string]string{
+		KeyPRDLabel:       "PRD",
+		KeyAutopilotLabel: "autopilot",
+		KeySlackEnabled:   "false",
+		KeyPublicBaseURL:  DefaultPublicBaseURL,
+	}
+	for _, updates := range []map[string]string{
+		{KeySlackEnabled: "true"},
+		{KeyPublicBaseURL: "https://uzi.example"},
+		{KeySlackBotToken: "xoxb-whatever"},
+		{KeySlackAppToken: "xapp-whatever"},
+	} {
+		if LabelChanged(committed, updates) {
+			t.Errorf("LabelChanged(%v) = true; a Slack-key change must not force a resync", updates)
+		}
+	}
+	// A real label change still triggers, alongside a Slack key.
+	if !LabelChanged(committed, map[string]string{KeyPRDLabel: "Feature", KeySlackEnabled: "true"}) {
+		t.Error("a prd_label change must still force a resync")
+	}
+}
+
+// TestValidateMergedIgnoresSlackKeys confirms the pairwise-distinct label rule
+// does not reach the Slack keys: a slack value equal to a label value is fine.
+func TestValidateMergedIgnoresSlackKeys(t *testing.T) {
+	if err := ValidateMerged(map[string]string{
+		KeyPRDLabel:       "PRD",
+		KeyAutopilotLabel: "autopilot",
+		KeyPrdlessLabel:   "PRDLESS",
+		KeySlackEnabled:   "PRD",       // colliding value, but not a label key
+		KeyPublicBaseURL:  "autopilot", // ditto
+	}); err != nil {
+		t.Errorf("ValidateMerged rejected on a non-label key collision: %v", err)
+	}
+}

@@ -115,6 +115,29 @@ func TestUpdateSettingsRejectsEnvSourcedKey(t *testing.T) {
 	}
 }
 
+// TestUpdateSettingsRejectsEnvSourcedSecretKey covers the PUT-409 for a SECRET
+// key fixed by the environment (auditor pre-flag #6): the 409 gate runs for
+// every key, secrets included, and before any validation or live check.
+func TestUpdateSettingsRejectsEnvSourcedSecretKey(t *testing.T) {
+	admin := adminUser()
+	fake := &fakeSlackValidator{}
+	cache := settings.New(&settingsStore{}, time.Minute)
+	cache.ConfigureSecrets(slackTestBox(t), map[string]string{
+		settings.KeySlackBotToken: "xoxb-from-env",
+	})
+	h := &Handler{settings: cache, slackValidator: fake}
+
+	rec := httptest.NewRecorder()
+	h.UpdateSettings(rec, putSettings(&admin, `{"settings":{"slack_bot_token":"xoxb-new"}}`))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body %s)", rec.Code, rec.Body.String())
+	}
+	// The 409 short-circuits before live validation ever runs.
+	if fake.gotBot != "" {
+		t.Error("env-sourced secret reached live validation; the 409 gate must run first")
+	}
+}
+
 // TestUpdateSettingsLiveValidationScrubsToken proves the live-validation branch
 // runs, is fed the submitted plaintext, and that a validation error NEVER echoes
 // the token — even a poorly-behaved error that embeds it.

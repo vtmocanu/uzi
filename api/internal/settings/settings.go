@@ -410,6 +410,18 @@ func DecodeSecret(box *secretbox.Box, encoded string) (string, error) {
 	return string(plain), nil
 }
 
+// ValueForStorage prepares a setting value for its app_settings row: a secret key
+// is sealed (secretbox+base64) so the stored bytes are never the token itself;
+// every other key is stored verbatim. This is the single write-side seam — the
+// counterpart to the read-side structural exclusion — so the settings PUT cannot
+// persist a secret in the clear even by omission.
+func ValueForStorage(box *secretbox.Box, key, plaintext string) (string, error) {
+	if IsSecret(key) {
+		return SealSecret(box, plaintext)
+	}
+	return plaintext, nil
+}
+
 // All returns every known NON-SECRET key with its effective value (ENV over row
 // over default). The shape is stable — one entry per key in Defaults, secret keys
 // structurally excluded — so the admin UI never has to reason about missing rows
