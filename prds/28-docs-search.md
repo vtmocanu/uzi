@@ -1,7 +1,7 @@
 # PRD #28: Docs Search — Client-side Full-text Search on /docs
 
 **GitLab Issue**: [vtmocanu/uzi#28](https://gitlab.example.com/vtmocanu/uzi/-/issues/28)
-**Status**: In progress (2026-07-09). M1-M3 done (commits 63b10e5, 2bba76f); review + audit + hardening complete; M4 spec sync pending.
+**Status**: In review (2026-07-09). M1-M3 done (commits 63b10e5, 2bba76f); review + audit + web-ux browser validation clean; M4 docs note + specs/ai.md done (d42504b, a564c97); specs/human.md proposal awaiting user approval; MR open.
 **Priority**: Medium
 **Created**: 2026-07-09
 **Depends on**: PRD #7 (docs viewer, done). No API/DB/service changes.
