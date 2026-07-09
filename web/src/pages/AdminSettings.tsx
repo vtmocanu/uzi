@@ -125,13 +125,14 @@ export function AdminSettings() {
   }, [load]);
 
   // Poll only the live Slack connection state so the chip reflects connecting →
-  // connected without a manual reload. Deliberately does NOT call applyResponse
-  // (which would reset the form fields and clobber an in-progress edit).
+  // connected without a manual reload. Uses the dedicated status endpoint (not the
+  // whole settings blob) and deliberately does NOT call applyResponse (which would
+  // reset the form fields and clobber an in-progress edit).
   useEffect(() => {
     const id = setInterval(async () => {
       try {
-        const resp = await api.getSettings();
-        setSlackStatus(resp.slack_status ?? "disabled");
+        const { slack_status } = await api.getSlackStatus();
+        setSlackStatus(slack_status ?? "disabled");
       } catch {
         // Best-effort: keep the last known status on a transient failure.
       }

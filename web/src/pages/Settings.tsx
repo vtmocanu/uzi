@@ -9,6 +9,7 @@ import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleto
 import { ModelSelect } from "../components/ModelSelect";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
+import { SlackNotifications } from "../components/SlackNotifications";
 import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
 
 const DOC_URL =
@@ -291,6 +292,8 @@ export function Settings() {
           </Field>
         </div>
       </Card>
+
+      <SlackNotifications />
 
       {user && (
         <Card>

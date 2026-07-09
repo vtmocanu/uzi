@@ -14,6 +14,7 @@ import {
   type Run,
   type SettingSource,
   type SettingsResponse,
+  type SlackLink,
   type UpdateSettingsPayload,
   type RunInputKind,
   type SecretMeta,
@@ -153,6 +154,22 @@ let appSettings: AppSettings = loadedSettings.appSettings;
 // is configured, never a value, mirroring the real API's `secrets` map. There is
 // no ENV overlay in the demo, so every key's source is db/default.
 const slackSecrets: Record<string, boolean> = { slack_bot_token: false, slack_app_token: false };
+
+// The current user's Slack linking state (PRD #25 M3). The demo starts unlinked;
+// setting an override moves it to "pending" (a real deployment would then DM the
+// target a Confirm card), and there is no inbound socket here to confirm it.
+let slackLink: Omit<SlackLink, "state"> = { member_id: null, notify: true, resolved_id: null, confirmed: false };
+
+// slackLinkResponse derives the state field the real API returns, so the mock and
+// the server never disagree on how member_id/resolved_id/confirmed map to a state.
+function slackLinkResponse(): { slack: SlackLink } {
+  const state: SlackLink["state"] = !slackLink.resolved_id
+    ? "unlinked"
+    : slackLink.confirmed
+      ? "confirmed"
+      : "pending";
+  return { slack: { ...slackLink, state } };
+}
 
 // settingsResponse builds the admin SettingsResponse from the mock's current
 // state: readable non-secret values, per-secret configured flags, and per-key
@@ -342,6 +359,30 @@ export const mockApi = {
     persistSettings();
     return delay({ settings: { ...userSettings } });
   },
+
+  // ── Slack linking (PRD #25 M3) ───────────────────────────────────────────────
+  getMySlack: async () => delay(slackLinkResponse()),
+  setMySlackNotify: async (notify: boolean) => {
+    slackLink = { ...slackLink, notify };
+    return delay(slackLinkResponse());
+  },
+  setMySlackOverride: async (memberId: string | null) => {
+    const member = memberId?.trim() ?? "";
+    if (member === "") {
+      // Clear the override: fall back to email auto-match (nothing resolved here).
+      slackLink = { ...slackLink, member_id: null, resolved_id: null, confirmed: false };
+    } else {
+      if (!/^[A-Za-z0-9]{1,64}$/.test(member)) throw new ApiError(400, "invalid Slack member ID");
+      // A set resets confirmation: the target must Confirm before content flows.
+      slackLink = { ...slackLink, member_id: member, resolved_id: member, confirmed: false };
+    }
+    return delay(slackLinkResponse());
+  },
+  testMySlackDM: async () => {
+    if (!slackLink.resolved_id) throw new ApiError(400, "no linked Slack account to send a test DM to");
+    return delay({ status: "sent" });
+  },
+  getSlackStatus: async () => delay({ slack_status: "disabled" }),
 
   // ── Agent templates ─────────────────────────────────────────────────────────
   listAgentTemplates: async () => delay({ templates: templates.map((t) => ({ ...t })) }),
