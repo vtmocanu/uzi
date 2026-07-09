@@ -24,9 +24,10 @@ const maxSelfReportedBytes = 64
 
 // sanitizeSelfReported bounds an untrusted worker-reported string: trim, drop
 // control characters (so no terminal escapes reach a log or the UI), and truncate
-// to max runes. It sanitizes rather than rejects — these fields are observability,
-// and a register must never fail over cosmetic input (it would wedge the worker's
-// retry loop).
+// to max bytes (the length check runs after each whole rune is written, so it
+// never splits a multi-byte rune — the cap is max..max+3 bytes). It sanitizes
+// rather than rejects — these fields are observability, and a register must never
+// fail over cosmetic input (it would wedge the worker's retry loop).
 func sanitizeSelfReported(s string, max int) string {
 	s = strings.TrimSpace(s)
 	var b strings.Builder
