@@ -111,6 +111,37 @@ func TestWorkerRegisterReadsTemplate(t *testing.T) {
 	}
 }
 
+func TestSanitizeSelfReported(t *testing.T) {
+	// Trims, strips control chars, caps length.
+	if got := sanitizeSelfReported("  1.2.3\x07-m4 \n ", maxSelfReportedBytes); got != "1.2.3-m4" {
+		t.Fatalf("sanitizeSelfReported = %q, want %q", got, "1.2.3-m4")
+	}
+	long := strings.Repeat("a", 100)
+	if got := sanitizeSelfReported(long, maxSelfReportedBytes); len(got) > maxSelfReportedBytes+4 {
+		t.Fatalf("sanitizeSelfReported did not cap length: got %d bytes", len(got))
+	}
+	if got := sanitizeSelfReported("", maxSelfReportedBytes); got != "" {
+		t.Fatalf("empty in must stay empty, got %q", got)
+	}
+}
+
+func TestWorkerRegisterSanitizesVersion(t *testing.T) {
+	// A hostile worker smuggles a control char (terminal escape) in `version`.
+	// Register succeeds and the persisted/echoed version is stripped clean.
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, workerReq(http.MethodPost, "{\"name\":\"laptop\",\"version\":\"1.2.3\\u0007evil\"}", uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "\x07") {
+		t.Fatalf("control char must be stripped from version, got %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"version":"1.2.3evil"`) {
+		t.Fatalf("expected sanitized version 1.2.3evil, got %q", rec.Body.String())
+	}
+}
+
 func TestWorkerRegisterDropsMalformedTemplate(t *testing.T) {
 	// A hostile/misconfigured worker sends junk in `template`. Register must still
 	// succeed (a soft field never wedges the register-retry loop) but the malformed

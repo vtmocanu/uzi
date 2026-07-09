@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -15,6 +16,31 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workertmpl"
 )
+
+// maxSelfReportedBytes caps a worker's free-form self-reported string fields
+// (version) before they reach the DB / worker-list UI. Generous for any real
+// version string, tight enough to bound abuse.
+const maxSelfReportedBytes = 64
+
+// sanitizeSelfReported bounds an untrusted worker-reported string: trim, drop
+// control characters (so no terminal escapes reach a log or the UI), and truncate
+// to max runes. It sanitizes rather than rejects — these fields are observability,
+// and a register must never fail over cosmetic input (it would wedge the worker's
+// retry loop).
+func sanitizeSelfReported(s string, max int) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+		if b.Len() >= max {
+			break
+		}
+	}
+	return b.String()
+}
 
 // WorkerRegister brings the worker online (and recovers any runs it orphaned by
 // restarting). Accepts an optional {version} body.
@@ -52,7 +78,12 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("worker reported a malformed template; dropping", "worker_id", wkr.ID.String())
 		reported = ""
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, req.Version, reported)
+	// version is the sibling self-reported field from the same join-token-
+	// authenticated (but untrusted) worker, bound for the DB + worker list UI.
+	// Cap + strip control chars so a hostile worker can't smuggle unbounded text
+	// or terminal escapes there. Sanitize (never reject) — it is observability.
+	version := sanitizeSelfReported(req.Version, maxSelfReportedBytes)
+	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
