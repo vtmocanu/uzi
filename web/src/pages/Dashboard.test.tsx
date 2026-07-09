@@ -75,6 +75,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     name: "laptop",
     status: "online",
     busy: false,
+    template_declared: null,
+    template_reported: null,
     version: null,
     last_heartbeat_at: null,
     created_at: "2026-07-05T12:00:00Z",

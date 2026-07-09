@@ -655,12 +655,15 @@ export const mockApi = {
 
   // ── Workers ─────────────────────────────────────────────────────────────────
   listWorkers: async () => delay({ workers: workers.map((w) => ({ ...w })) }),
-  createWorker: async (name: string) => {
+  createWorker: async (name: string, template?: string) => {
     const w = {
       id: `w-new-${++workerCounter}`,
       name,
       status: "offline",
       busy: false,
+      // Declared at issuance; reported stays null until the worker registers.
+      template_declared: template ?? null,
+      template_reported: null,
       version: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),

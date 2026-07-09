@@ -3,14 +3,19 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { api, ApiError, type Worker } from "../lib/api";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Skeleton } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
 import { ServerIcon } from "../components/icons";
+import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [loading, setLoading] = useState(true);
   const [name, setName] = useState("");
+  // The declared worker template (PRD #18): what image the user says this worker
+  // will run. Defaults to the base image; the worker later self-reports its
+  // actual template and any mismatch shows as a drift badge.
+  const [template, setTemplate] = useState<string>(DEFAULT_WORKER_TEMPLATE);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   // newToken holds the plaintext join token for the just-created worker. It is
@@ -39,7 +44,7 @@ export function WorkersSettings() {
     setError("");
     setBusy(true);
     try {
-      const { worker, token } = await api.createWorker(name.trim());
+      const { worker, token } = await api.createWorker(name.trim(), template);
       setNewToken({ worker: worker.name, token });
       setCopied(false);
       setName("");
@@ -112,10 +117,32 @@ export function WorkersSettings() {
               />
             </Field>
           </div>
+          <div className="min-w-[10rem]">
+            <Field label="Template">
+              <Select
+                aria-label="Worker template"
+                value={template}
+                onChange={(e) => setTemplate(e.target.value)}
+              >
+                {WORKER_TEMPLATES.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          </div>
           <Button type="submit" disabled={busy || name.trim() === ""}>
             {busy ? "Creating…" : "Generate join token"}
           </Button>
         </form>
+        <p className="text-xs text-muted">
+          The template is the worker image to build (<code className="rounded bg-raised px-1 py-0.5 text-fg">base</code> plus
+          heavy-dependency variants like <code className="rounded bg-raised px-1 py-0.5 text-fg">jvm</code>). Build the
+          worker with a matching{" "}
+          <code className="rounded bg-raised px-1 py-0.5 text-fg">WORKER_TEMPLATE</code>; if the worker reports a different
+          one it is flagged below, never rejected.
+        </p>
       </Card>
 
       <Card className="space-y-3">
@@ -141,13 +168,26 @@ export function WorkersSettings() {
                 <div>
                   <span className="font-medium text-fg">{w.name}</span>
                   <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-                    {w.version && <span>v{w.version}</span>}
+                    {w.template_reported ? (
+                      <span>template {w.template_reported}</span>
+                    ) : (
+                      w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
+                    )}
+                    {w.version && <span>· v{w.version}</span>}
                     {w.last_heartbeat_at && (
                       <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
                     )}
                   </div>
                 </div>
                 <div className="flex items-center gap-1.5">
+                  {hasTemplateDrift(w.template_declared, w.template_reported) && (
+                    <Badge
+                      tone="warning"
+                      title={`Declared ${w.template_declared}, but the worker reports ${w.template_reported}. Rebuild it with WORKER_TEMPLATE=${w.template_declared} to match.`}
+                    >
+                      template drift
+                    </Badge>
+                  )}
                   <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                     {w.status}
                   </Badge>

@@ -339,6 +339,11 @@ export interface Worker {
   name: string;
   status: string; // "offline" | "online"
   busy: boolean; // derived: holds a claimed/running/awaiting_approval run
+  // Worker template (PRD #18): the choice recorded at issuance and the value the
+  // worker self-reports at register. Either may be null (no choice / older
+  // image); a mismatch is surfaced as a drift badge, never a rejection.
+  template_declared: string | null;
+  template_reported: string | null;
   version: string | null;
   last_heartbeat_at: string | null;
   created_at: string;
@@ -641,8 +646,8 @@ const realApi = {
 
   // Agent runtime (PRD #4).
   listWorkers: () => request<{ workers: Worker[] }>("GET", "/workers"),
-  createWorker: (name: string) =>
-    request<{ worker: Worker; token: string }>("POST", "/workers", { name }),
+  createWorker: (name: string, template?: string) =>
+    request<{ worker: Worker; token: string }>("POST", "/workers", { name, template }),
   deleteWorker: (id: string) => request<null>("DELETE", `/workers/${id}`),
 
   createRun: (repoId: string, issueIid: number) =>
