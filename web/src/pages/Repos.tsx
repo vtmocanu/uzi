@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo } from "../lib/api";
+import { api, ApiError, isHttpsUrl, type ForgeConnection, type Repo, type ToolAllowlistEntry } from "../lib/api";
 import { repoFindings } from "../lib/privilege";
 import { Alert, Badge, Button, Card, EmptyState, ListSkeleton, PageHeader, Select } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
@@ -23,6 +23,13 @@ export function Repos() {
   // caveats are never clipped at narrow widths.
   const [warnRepoId, setWarnRepoId] = useState<string | null>(null);
   const [skillsBusyId, setSkillsBusyId] = useState<string | null>(null);
+  // Tool profile picker (PRD #18 M4): the repo whose package picker is open, the
+  // admin allowlist (loaded once), the currently-selected package strings for the
+  // open repo, and the in-flight save.
+  const [toolsRepoId, setToolsRepoId] = useState<string | null>(null);
+  const [allowlist, setAllowlist] = useState<ToolAllowlistEntry[] | null>(null);
+  const [toolSelection, setToolSelection] = useState<Set<string>>(new Set());
+  const [toolsBusy, setToolsBusy] = useState(false);
   // Focus management: remember the "Load repo skills" trigger so focus returns to
   // it on cancel, and move focus into the warning (its first button) when it opens.
   const warnTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -95,6 +102,55 @@ export function Repos() {
     }
   };
 
+  // The package string an allowlist entry contributes: name@version when the entry
+  // pins a version, else the bare name (any version).
+  const entryPkg = (e: ToolAllowlistEntry): string =>
+    e.pinned_version ? `${e.name}@${e.pinned_version}` : e.name;
+
+  const openTools = async (repo: Repo) => {
+    if (toolsRepoId === repo.id) {
+      setToolsRepoId(null);
+      return;
+    }
+    setError("");
+    setToolsBusy(true);
+    try {
+      const [profile, list] = await Promise.all([
+        api.getRepoToolProfile(repo.id),
+        allowlist ? Promise.resolve({ allowlist }) : api.listToolAllowlist(),
+      ]);
+      setAllowlist(list.allowlist);
+      setToolSelection(new Set(profile.packages));
+      setToolsRepoId(repo.id);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to load the tool profile");
+    } finally {
+      setToolsBusy(false);
+    }
+  };
+
+  const toggleTool = (pkg: string) => {
+    setToolSelection((prev) => {
+      const next = new Set(prev);
+      if (next.has(pkg)) next.delete(pkg);
+      else next.add(pkg);
+      return next;
+    });
+  };
+
+  const saveTools = async (repoId: string) => {
+    setError("");
+    setToolsBusy(true);
+    try {
+      await api.setRepoToolProfile(repoId, [...toolSelection]);
+      setToolsRepoId(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save the tool profile");
+    } finally {
+      setToolsBusy(false);
+    }
+  };
+
   // The selected connection's latest privilege report drives the per-repo
   // findings badges (null until a check has run).
   const privilegeReport = connections.find((c) => c.id === connectionId)?.privilege_report ?? null;
@@ -102,6 +158,8 @@ export function Repos() {
   // The repo whose trust warning is expanded (rendered as a banner below the
   // table, outside its horizontal scroll container).
   const warnRepo = repos.find((r) => r.id === warnRepoId) ?? null;
+  // The repo whose tool-profile picker is expanded (rendered below the table).
+  const toolsRepo = repos.find((r) => r.id === toolsRepoId) ?? null;
 
   return (
     <div className="space-y-6">
@@ -155,13 +213,14 @@ export function Repos() {
                     <th className="px-4 py-3 font-medium">Default branch</th>
                     <th className="px-4 py-3 font-medium">Status</th>
                     <th className="px-4 py-3 font-medium">Repo skills</th>
+                    <th className="px-4 py-3 font-medium">Tools</th>
                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-edge">
                   {repos.length === 0 ? (
                     <tr>
-                      <td colSpan={5} className="px-4 py-6 text-center text-faint">
+                      <td colSpan={6} className="px-4 py-6 text-center text-faint">
                         {refreshing ? "Loading…" : "No projects found for this bot."}
                       </td>
                     </tr>
@@ -244,6 +303,21 @@ export function Repos() {
                             </Button>
                           )}
                         </td>
+                        <td className="px-4 py-3">
+                          {!r.enabled ? (
+                            <span className="text-xs text-faint">—</span>
+                          ) : (
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              aria-expanded={toolsRepoId === r.id}
+                              disabled={toolsBusy && toolsRepoId !== r.id}
+                              onClick={() => openTools(r)}
+                            >
+                              {toolsRepoId === r.id ? "Close" : "Tools"}
+                            </Button>
+                          )}
+                        </td>
                         <td className="px-4 py-3 text-right">
                           <div className="flex justify-end gap-2">
                             {r.enabled && (
@@ -307,6 +381,51 @@ export function Repos() {
                     disabled={skillsBusyId === warnRepo.id}
                     onClick={cancelWarn}
                   >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Tool-profile picker for one repo, below the table so the checkbox
+                list is never clipped by the horizontal scroll. The selectable set
+                is the admin allowlist; saving replaces the repo's package list. */}
+            {toolsRepo && (
+              <div
+                role="group"
+                aria-label={`Tool profile for ${toolsRepo.path_with_namespace}`}
+                className="space-y-3 border-t border-edge bg-raised/20 p-4"
+              >
+                <p className="text-sm text-fg">
+                  <span className="font-medium">Tools for {toolsRepo.path_with_namespace}</span> — the worker installs
+                  these with devbox before every run on this repo. The list is what an admin has allowed.
+                </p>
+                {allowlist && allowlist.length === 0 ? (
+                  <p className="text-sm text-faint">
+                    No packages are on the allowlist yet. An admin adds them under Admin → Tool allowlist.
+                  </p>
+                ) : (
+                  <div className="flex flex-wrap gap-x-6 gap-y-2">
+                    {(allowlist ?? []).map((e) => {
+                      const pkg = entryPkg(e);
+                      return (
+                        <label key={e.id} className="flex items-center gap-2 text-sm text-fg">
+                          <input
+                            type="checkbox"
+                            checked={toolSelection.has(pkg)}
+                            onChange={() => toggleTool(pkg)}
+                          />
+                          <span className="font-mono text-xs">{pkg}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+                <div className="flex gap-2">
+                  <Button size="sm" disabled={toolsBusy} onClick={() => saveTools(toolsRepo.id)}>
+                    {toolsBusy ? "Saving…" : "Save tools"}
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={toolsBusy} onClick={() => setToolsRepoId(null)}>
                     Cancel
                   </Button>
                 </div>

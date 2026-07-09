@@ -15,6 +15,7 @@ import type {
   RunMessage,
   SecretMeta,
   Skill,
+  ToolAllowlistEntry,
   User,
   Worker,
 } from "../lib/api";
@@ -509,6 +510,19 @@ export const mockAdminWorkers: AdminWorker[] = [
     owner_email: "mira@uzi.local",
   },
 ];
+
+// ── Tool allowlist + repo tool profiles (PRD #18 M4) ─────────────────────────
+
+export const mockToolAllowlist: ToolAllowlistEntry[] = [
+  { id: "tal-kubectl", name: "kubectl", pinned_version: null, note: "For the k8s repos", updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
+  { id: "tal-terraform", name: "terraform", pinned_version: "1.7", note: null, updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
+  { id: "tal-jq", name: "jq", pinned_version: null, note: null, updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
+];
+
+// A seed profile so the demo repo shows a couple of selected tools.
+export const mockRepoToolProfiles: Record<string, string[]> = {
+  "repo-uzi": ["jq", "kubectl"],
+};
 
 // ── Agent templates ──────────────────────────────────────────────────────────
 

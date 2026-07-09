@@ -217,6 +217,24 @@ export interface BoardColumn {
   position: number;
 }
 
+// Tool allowlist entry (PRD #18 M4): an admin-permitted package. pinned_version,
+// when set, requires the profile to request exactly that version.
+export interface ToolAllowlistEntry {
+  id: string;
+  name: string;
+  pinned_version: string | null;
+  note: string | null;
+  updated_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ToolAllowlistWriteInput {
+  name?: string; // create only; ignored on update
+  pinned_version?: string;
+  note?: string;
+}
+
 // LatestRun is the newest run for a card's issue (PRD #12 M2), or null when the
 // issue has never run. Display-only: no secrets. is_mine gates the in-app run-view
 // link (a non-owner would 403 on the run); run_count drives the "×N" retry hint.
@@ -597,6 +615,22 @@ const realApi = {
     request<{ allocations: TemplateSkills }>("GET", `/agent-templates/${id}/skills`),
   setTemplateSkills: (id: string, input: AllocationsInput) =>
     request<{ allocations: TemplateSkills }>("PUT", `/agent-templates/${id}/skills`, input),
+
+  // Tool allowlist + per-repo tool profiles (PRD #18 M4). The allowlist is readable
+  // by any user (the repo picker needs it); writes are admin-only. A repo's profile
+  // is owner-only.
+  listToolAllowlist: () =>
+    request<{ allowlist: ToolAllowlistEntry[] }>("GET", "/tool-allowlist"),
+  createToolAllowlistEntry: (input: ToolAllowlistWriteInput) =>
+    request<{ entry: ToolAllowlistEntry }>("POST", "/tool-allowlist", input),
+  updateToolAllowlistEntry: (id: string, input: ToolAllowlistWriteInput) =>
+    request<{ entry: ToolAllowlistEntry }>("PUT", `/tool-allowlist/${id}`, input),
+  deleteToolAllowlistEntry: (id: string) =>
+    request<null>("DELETE", `/tool-allowlist/${id}`),
+  getRepoToolProfile: (repoId: string) =>
+    request<{ packages: string[] }>("GET", `/repos/${repoId}/tool-profile`),
+  setRepoToolProfile: (repoId: string, packages: string[]) =>
+    request<{ packages: string[] }>("PUT", `/repos/${repoId}/tool-profile`, { packages }),
 
   // Forge integration.
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),

@@ -17,6 +17,8 @@ import {
   type Skill,
   type SkillCreateInput,
   type SkillUpdateInput,
+  type ToolAllowlistEntry,
+  type ToolAllowlistWriteInput,
   type User,
   type UserSettings,
   type UserSettingsPatch,
@@ -31,9 +33,11 @@ import {
   mockConnection,
   mockForgeConfig,
   mockRepos,
+  mockRepoToolProfiles,
   mockSecrets,
   mockSkills,
   mockTemplates,
+  mockToolAllowlist,
   mockUsers,
   mockWorkers,
   runListItem,
@@ -145,6 +149,12 @@ let appSettings: AppSettings = loadedSettings.appSettings;
 let templateCounter = 0;
 let workerCounter = 0;
 let skillCounter = 0;
+// Tool allowlist + per-repo profiles (PRD #18 M4).
+let toolAllowlist: ToolAllowlistEntry[] = mockToolAllowlist.map((e) => ({ ...e }));
+const repoToolProfiles = new Map<string, string[]>(
+  Object.entries(mockRepoToolProfiles).map(([k, v]) => [k, [...v]]),
+);
+let toolEntryCounter = 0;
 
 // visibleSkills mirrors the real read: admins see every scope, everyone else
 // sees builtin ∪ global ∪ their own user skills.
@@ -569,6 +579,53 @@ export const mockApi = {
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_skills_enabled = enabled;
     return delay({ repo: { ...r } });
+  },
+
+  // ── Tool allowlist + repo tool profiles (PRD #18 M4) ─────────────────────────
+  listToolAllowlist: async () => delay({ allowlist: toolAllowlist.map((e) => ({ ...e })) }),
+  createToolAllowlistEntry: async (input: ToolAllowlistWriteInput) => {
+    const name = (input.name ?? "").trim();
+    if (name === "") throw new ApiError(400, "name is required");
+    if (toolAllowlist.some((e) => e.name === name)) throw new ApiError(409, "that package is already on the allowlist");
+    const now = new Date().toISOString();
+    const entry: ToolAllowlistEntry = {
+      id: `tal-${++toolEntryCounter}`,
+      name,
+      pinned_version: input.pinned_version?.trim() || null,
+      note: input.note?.trim() || null,
+      updated_by: requireSession().id,
+      created_at: now,
+      updated_at: now,
+    };
+    toolAllowlist = [...toolAllowlist, entry].sort((a, b) => a.name.localeCompare(b.name));
+    return delay({ entry: { ...entry } });
+  },
+  updateToolAllowlistEntry: async (id: string, input: ToolAllowlistWriteInput) => {
+    const entry = toolAllowlist.find((e) => e.id === id);
+    if (!entry) throw new ApiError(404, "allowlist entry not found");
+    entry.pinned_version = input.pinned_version?.trim() || null;
+    entry.note = input.note?.trim() || null;
+    entry.updated_at = new Date().toISOString();
+    return delay({ entry: { ...entry } });
+  },
+  deleteToolAllowlistEntry: async (id: string) => {
+    toolAllowlist = toolAllowlist.filter((e) => e.id !== id);
+    return delay(null);
+  },
+  getRepoToolProfile: async (repoId: string) => {
+    if (!repos.some((r) => r.id === repoId)) throw new ApiError(404, "repo not found");
+    return delay({ packages: [...(repoToolProfiles.get(repoId) ?? [])] });
+  },
+  setRepoToolProfile: async (repoId: string, packages: string[]) => {
+    if (!repos.some((r) => r.id === repoId)) throw new ApiError(404, "repo not found");
+    // Mirror the server's allowlist validation so the demo rejects the same way.
+    const allowed = new Set<string>();
+    for (const e of toolAllowlist) allowed.add(e.pinned_version ? `${e.name}@${e.pinned_version}` : e.name);
+    const rejected = packages.filter((p) => !allowed.has(p));
+    if (rejected.length > 0) throw new ApiError(400, "these packages are not on the allowlist: " + rejected.join(", "));
+    const cleaned = [...new Set(packages)].sort();
+    repoToolProfiles.set(repoId, cleaned);
+    return delay({ packages: cleaned });
   },
 
   // ── Board ───────────────────────────────────────────────────────────────────
