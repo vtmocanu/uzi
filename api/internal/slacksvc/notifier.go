@@ -170,10 +170,13 @@ func (n *Notifier) logf(what string, err error) {
 }
 
 // renderRoot builds the content-minimized root line: repo#iid «title» — status,
-// plus an Open-in-uzi deep link. No plan/diff — the plan is one click away.
+// plus an Open-in-uzi deep link. No plan/diff — the plan is one click away. The
+// forge-controlled repo path and issue title are mrkdwn-escaped individually so
+// they cannot inject a spoofed <url|label> link or a <@Uxxx> mention into the DM;
+// the deep-link markup below stays raw (its base is operator-set, its id a uuid).
 func renderRoot(rc store.GetSlackRunContextRow, base string) string {
 	head := fmt.Sprintf("[uzi] run on %s#%d «%s» — %s",
-		rc.PathWithNamespace, iid(rc.IssueIid), rc.IssueTitle, statusLabel(rc))
+		EscapeMrkdwn(rc.PathWithNamespace), iid(rc.IssueIid), EscapeMrkdwn(rc.IssueTitle), statusLabel(rc))
 	if link := runLink(base, rc.ID); link != "" {
 		head += "\n" + link
 	}
@@ -181,7 +184,9 @@ func renderRoot(rc store.GetSlackRunContextRow, base string) string {
 }
 
 // renderThread returns the threaded outcome event for a terminal transition, or
-// "" for a non-terminal one. Completed carries the MR link; failed the reason.
+// "" for a non-terminal one. Completed carries the MR link; failed the reason. The
+// worker-originated failure reason is length-bounded and mrkdwn-escaped before it
+// goes out (it is untrusted free text with no source-side length bound).
 func renderThread(rc store.GetSlackRunContextRow, base string) string {
 	switch rc.Status {
 	case "completed":
@@ -195,7 +200,7 @@ func renderThread(rc store.GetSlackRunContextRow, base string) string {
 			return "🚫 cancelled"
 		}
 		if reason != "" {
-			return "❌ failed: " + reason
+			return "❌ failed: " + EscapeMrkdwn(boundReason(reason))
 		}
 		return "❌ failed"
 	case "cancelled":
@@ -203,6 +208,21 @@ func renderThread(rc store.GetSlackRunContextRow, base string) string {
 	default:
 		return ""
 	}
+}
+
+// maxFailureReason bounds the worker-originated failure reason before it reaches
+// Slack. Free text with no source-side limit, so cap it defensively (full
+// source-side sanitization is a separate follow-up).
+const maxFailureReason = 500
+
+// boundReason truncates an over-long failure reason on a rune boundary, appending
+// an ellipsis so the DM stays readable and can't be flooded.
+func boundReason(s string) string {
+	r := []rune(s)
+	if len(r) <= maxFailureReason {
+		return s
+	}
+	return string(r[:maxFailureReason]) + "…"
 }
 
 // statusLabel is the compact status shown on the root line.
@@ -242,12 +262,14 @@ func runLink(base string, runID uuid.UUID) string {
 	return fmt.Sprintf("<%s/runs/%s|Open in uzi>", base, runID.String())
 }
 
-// mrLink builds the forge merge-request URL from the repo web url + mr iid.
+// mrLink builds the forge merge-request URL from the repo web url + mr iid. The
+// web url is forge-controlled, so it is mrkdwn-escaped too (a normal URL has no
+// & < >, so this is a no-op for legit links and only neutralizes a hostile one).
 func mrLink(rc store.GetSlackRunContextRow) string {
 	if !rc.MrIid.Valid || rc.WebUrl == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s/-/merge_requests/%d", strings.TrimRight(rc.WebUrl, "/"), rc.MrIid.Int64)
+	return fmt.Sprintf("%s/-/merge_requests/%d", EscapeMrkdwn(strings.TrimRight(rc.WebUrl, "/")), rc.MrIid.Int64)
 }
 
 func iid(v pgtype.Int8) int64 {

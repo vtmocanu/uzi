@@ -44,6 +44,7 @@ type postCall struct{ channel, thread, text string }
 type updateCall struct{ channel, ts, text string }
 type blockCall struct {
 	channel, thread, fallback string
+	sectionText               string
 	actionIDs                 []string
 }
 
@@ -78,16 +79,24 @@ func (p *fakePoster) Update(_ context.Context, ch, ts, text string) error {
 }
 func (p *fakePoster) PostBlocks(_ context.Context, ch, thread, fallback string, blks []slack.Block) (string, error) {
 	ids := []string{}
+	sectionText := ""
 	for _, b := range blks {
-		if ab, ok := b.(*slack.ActionBlock); ok && ab.Elements != nil {
-			for _, el := range ab.Elements.ElementSet {
-				if btn, ok := el.(*slack.ButtonBlockElement); ok {
-					ids = append(ids, btn.ActionID)
+		switch bl := b.(type) {
+		case *slack.ActionBlock:
+			if bl.Elements != nil {
+				for _, el := range bl.Elements.ElementSet {
+					if btn, ok := el.(*slack.ButtonBlockElement); ok {
+						ids = append(ids, btn.ActionID)
+					}
 				}
+			}
+		case *slack.SectionBlock:
+			if bl.Text != nil {
+				sectionText += bl.Text.Text
 			}
 		}
 	}
-	p.blocks = append(p.blocks, blockCall{channel: ch, thread: thread, fallback: fallback, actionIDs: ids})
+	p.blocks = append(p.blocks, blockCall{channel: ch, thread: thread, fallback: fallback, sectionText: sectionText, actionIDs: ids})
 	p.tsSeq++
 	return fmt.Sprintf("ts%d", p.tsSeq), p.postErr
 }
@@ -181,6 +190,67 @@ func TestNotifierPublishStateNeverBlocks(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("PublishState blocked when the queue was full")
+	}
+}
+
+// A forge-controlled issue title (and repo path) must not be able to smuggle a
+// clickable spoofed link or a mention into the trusted bot DM: the dynamic fields
+// are mrkdwn-escaped, while the real Open-in-uzi deep link stays raw.
+func TestNotifierEscapesHostileTitleAndPath(t *testing.T) {
+	rc := baseRun("running")
+	rc.IssueTitle = "Fix bug <https://phishing.example|Open in uzi> ping <@U123>"
+	rc.PathWithNamespace = "grp/<@channel>"
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msgErr: pgx.ErrNoRows}
+	fp := &fakePoster{}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.posts) != 1 {
+		t.Fatalf("want a post, got %+v", fp.posts)
+	}
+	body := fp.posts[0].text
+	// The hostile markup must appear only in escaped form.
+	if strings.Contains(body, "<https://phishing.example|Open in uzi>") {
+		t.Errorf("raw spoofed link survived into the DM: %q", body)
+	}
+	if strings.Contains(body, "<@U123>") || strings.Contains(body, "<@channel>") {
+		t.Errorf("raw mention survived into the DM: %q", body)
+	}
+	if !strings.Contains(body, "&lt;https://phishing.example|Open in uzi&gt;") || !strings.Contains(body, "&lt;@U123&gt;") {
+		t.Errorf("hostile fields were not mrkdwn-escaped: %q", body)
+	}
+	// The genuine deep link (trusted base + uuid) must stay raw and clickable.
+	if !strings.Contains(body, "<https://uzi.example/runs/"+rc.ID.String()+"|Open in uzi>") {
+		t.Errorf("legit deep link was broken by over-escaping: %q", body)
+	}
+}
+
+// The worker-originated failure reason is untrusted free text with no source-side
+// length bound: the notifier escapes it AND caps its length.
+func TestNotifierEscapesAndBoundsFailureReason(t *testing.T) {
+	rc := baseRun("failed")
+	rc.FailureReason = txt("boom <@U9> " + strings.Repeat("x", 600))
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "failed"})
+
+	if len(fp.posts) != 1 {
+		t.Fatalf("want one threaded failure event, got %+v", fp.posts)
+	}
+	evt := fp.posts[0].text
+	if strings.Contains(evt, "<@U9>") {
+		t.Errorf("raw mention survived in the failure event: %q", evt)
+	}
+	if !strings.Contains(evt, "&lt;@U9&gt;") {
+		t.Errorf("failure reason was not escaped: %q", evt)
+	}
+	if !strings.Contains(evt, "…") || strings.Contains(evt, strings.Repeat("x", 501)) {
+		t.Errorf("failure reason was not length-bounded: %q", evt)
 	}
 }
 

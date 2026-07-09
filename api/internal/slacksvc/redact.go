@@ -1,6 +1,23 @@
 package slacksvc
 
-import "regexp"
+import (
+	"regexp"
+
+	"github.com/slack-go/slack/slackutilsx"
+)
+
+// EscapeMrkdwn neutralizes the Slack mrkdwn control characters (& < >) in an
+// UNTRUSTED dynamic field before it is interpolated into a message that also
+// carries trusted <url|label> deep-link markup. Without it a forge- or
+// worker-controlled value (an issue title, repo path, failure reason, or a linked
+// account label) could smuggle a clickable <https://phishing|Open in uzi> link or
+// a <@Uxxx> mention into the trusted bot DM. Apply it to each dynamic field
+// individually — NEVER to the whole rendered string, which would also break the
+// intended deep-link markup. It is orthogonal to ScrubSecrets (which redacts
+// credential patterns, not markup); both run on outbound text.
+func EscapeMrkdwn(s string) string {
+	return slackutilsx.EscapeMessage(s)
+}
 
 // Secret-value patterns uzi must never let reach a log or Slack. slackToken
 // covers xoxb- bot / xapp- app-level tokens (plus the other xox* families);

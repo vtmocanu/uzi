@@ -149,6 +149,26 @@ func TestLinkerAutoMatchCooldown(t *testing.T) {
 	}
 }
 
+// The account label named in the confirmation DM is escaped too, so a
+// registration email carrying mrkdwn markup can't inject a link/mention into the
+// trusted bot DM.
+func TestLinkerConfirmDMEscapesAccountLabel(t *testing.T) {
+	fp := &fakePoster{}
+	l := NewLinker(&fakeLinkerStore{}, fp, nil)
+	l.SendLinkConfirmation(context.Background(), "U1", "evil <@U999> <https://phishing.example|click>")
+
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one confirmation DM, got %+v", fp.blocks)
+	}
+	sec := fp.blocks[0].sectionText
+	if strings.Contains(sec, "<@U999>") || strings.Contains(sec, "<https://phishing.example|click>") {
+		t.Errorf("raw markup survived in the confirmation DM: %q", sec)
+	}
+	if !strings.Contains(sec, "&lt;@U999&gt;") {
+		t.Errorf("account label was not mrkdwn-escaped: %q", sec)
+	}
+}
+
 func TestLinkerConfirmMarksLinkedAndEditsDM(t *testing.T) {
 	fs := &fakeLinkerStore{confirmRows: 1}
 	fp := &fakePoster{}

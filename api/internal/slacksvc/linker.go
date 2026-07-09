@@ -233,9 +233,11 @@ func (l *Linker) logf(what string, err error) {
 
 // linkConfirmBlocks builds the Confirm / Not-me card. It names the uzi account so
 // the recipient can tell whether the link is theirs (the anti-squatting decision
-// the PRD requires); accountLabel is scrubbed of any secret before it goes out.
+// the PRD requires); accountLabel is a uzi-account-controlled string, so it is
+// mrkdwn-escaped (no injected <url|label> / <@Uxxx>) as well as secret-scrubbed
+// before it goes into the mrkdwn section.
 func linkConfirmBlocks(accountLabel string) []slack.Block {
-	prompt := fmt.Sprintf("uzi wants to send you run notifications for the uzi account *%s*. Is this you?", ScrubSecrets(accountLabel))
+	prompt := fmt.Sprintf("uzi wants to send you run notifications for the uzi account *%s*. Is this you?", EscapeMrkdwn(ScrubSecrets(accountLabel)))
 	section := slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, prompt, false, false), nil, nil)
 	confirm := slack.NewButtonBlockElement(ActionLinkConfirm, "", slack.NewTextBlockObject(slack.PlainTextType, "Confirm", false, false))
 	confirm.Style = slack.StylePrimary
