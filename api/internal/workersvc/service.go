@@ -467,21 +467,14 @@ func (s *Service) resolveTooling(ctx context.Context, run store.Run) (toolPackag
 }
 
 // loadToolRules projects the DB tool_allowlist into the toolprofile.Rules map the
-// pure resolver consumes.
+// pure resolver consumes, via the shared loader (identical to the write-time
+// loader in the handler, so save and claim can never diverge).
 func (s *Service) loadToolRules(ctx context.Context) (toolprofile.Rules, error) {
 	rows, err := s.q.ListToolAllowlist(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list tool allowlist: %w", err)
 	}
-	rules := make(toolprofile.Rules, len(rows))
-	for _, row := range rows {
-		var pinned string
-		if row.PinnedVersion.Valid {
-			pinned = row.PinnedVersion.String
-		}
-		rules[row.Name] = toolprofile.AllowRule{PinnedVersion: pinned}
-	}
-	return rules, nil
+	return toolprofile.RulesFromRows(rows), nil
 }
 
 // decodePackageList decodes a repo_tool_profiles.packages JSONB array into a slice.

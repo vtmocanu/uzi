@@ -22,7 +22,14 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
+
+// maxPkgLen bounds a package token (name or name@version). The regex charset is
+// otherwise unbounded; a length cap keeps a profile entry from being arbitrarily
+// large.
+const maxPkgLen = 128
 
 // AllowRule is one allowlist entry's policy. PinnedVersion, when non-empty,
 // requires a package to be requested at exactly that version (name@version); empty
@@ -35,25 +42,61 @@ type AllowRule struct {
 // projected into a lookup the pure functions here consume.
 type Rules map[string]AllowRule
 
+// RulesFromRows projects the DB allowlist rows into a Rules map. The SINGLE shared
+// loader used at BOTH write time (the profile-save handler) and claim time (the
+// worker's claim assembly), so the two can never drift — their agreement is
+// load-bearing (a package allowed at save must resolve the same way at claim).
+func RulesFromRows(rows []store.ToolAllowlist) Rules {
+	rules := make(Rules, len(rows))
+	for _, row := range rows {
+		var pinned string
+		if row.PinnedVersion.Valid {
+			pinned = row.PinnedVersion.String
+		}
+		rules[row.Name] = AllowRule{PinnedVersion: pinned}
+	}
+	return rules
+}
+
+// denylist is the set of package BASE names that ship a pre-authenticated,
+// credential-bearing CLI (Decision 6). They are rejected even if an admin
+// allowlists one — a logged-in glab/gh/aws/az/gcloud reachable by the agent's Bash
+// tool would bypass the "worker holds the PAT, agent doesn't" boundary. This turns
+// Decision 6 from advisory prose into enforced policy. Keep it short + reviewed.
+var denylist = map[string]bool{
+	"glab": true, "gh": true, "hub": true, "tea": true,
+	"awscli": true, "awscli2": true, "aws-sam-cli": true,
+	"azure-cli": true, "google-cloud-sdk": true, "gcloud": true,
+	"kubelogin": true, "oci-cli": true, "doctl": true, "flyctl": true,
+	"heroku": true, "vault": true, "op": true, "bw": true,
+}
+
+// Denied reports whether pkg's base name is a credential-bearing CLI barred by
+// Decision 6, regardless of the allowlist.
+func Denied(pkg string) bool {
+	base, _ := Split(pkg)
+	return denylist[base]
+}
+
 // pkgNameRe bounds a well-formed package token: a nix-ish package name with an
 // optional `@version` suffix. Rejects shell metacharacters, paths, and spaces so a
 // desired entry can't smuggle anything past the allowlist check.
 var pkgNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._+-]*(@[a-zA-Z0-9][a-zA-Z0-9._+-]*)?$`)
 
-// WellFormed reports whether pkg is a syntactically valid package token (name or
-// name@version). Used at profile write time to reject junk entries before the
-// allowlist check.
+// WellFormed reports whether pkg is a syntactically valid, bounded package token
+// (name or name@version). Used at profile write time to reject junk entries before
+// the allowlist check.
 func WellFormed(pkg string) bool {
-	return pkgNameRe.MatchString(pkg)
+	return len(pkg) <= maxPkgLen && pkgNameRe.MatchString(pkg)
 }
 
 // versionRe bounds a version token (the pinned_version of an allowlist entry).
 var versionRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._+-]*$`)
 
-// WellFormedVersion reports whether v is a safe version token — no metacharacters,
-// paths, or spaces that could escape the allowlist match.
+// WellFormedVersion reports whether v is a safe, bounded version token — no
+// metacharacters, paths, or spaces that could escape the allowlist match.
 func WellFormedVersion(v string) bool {
-	return versionRe.MatchString(v)
+	return len(v) <= maxPkgLen && versionRe.MatchString(v)
 }
 
 // Split separates a package token into its base name and version (empty when there
@@ -65,13 +108,17 @@ func Split(pkg string) (base, version string) {
 	return pkg, ""
 }
 
-// Allowed reports whether pkg is well-formed AND permitted by rules: its base name
-// must be present, and if that rule pins a version, pkg must request exactly it.
+// Allowed reports whether pkg is well-formed, NOT denied (Decision 6), AND
+// permitted by rules: its base name must be on the allowlist, and if that rule pins
+// a version, pkg must request exactly it.
 func Allowed(pkg string, rules Rules) bool {
-	if !pkgNameRe.MatchString(pkg) {
+	if !WellFormed(pkg) {
 		return false
 	}
 	base, version := Split(pkg)
+	if denylist[base] {
+		return false // credential-bearing CLI, barred regardless of the allowlist
+	}
 	rule, ok := rules[base]
 	if !ok {
 		return false

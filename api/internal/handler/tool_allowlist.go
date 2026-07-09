@@ -110,6 +110,10 @@ func (h *Handler) CreateToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	if !actor.IsAdmin { // defense-in-depth beside the RequireAdmin route group
+		httpx.Error(w, http.StatusForbidden, "admin only")
+		return
+	}
 	var req toolAllowlistWriteRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -118,6 +122,12 @@ func (h *Handler) CreateToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 	name := strings.TrimSpace(req.Name)
 	if !toolprofile.WellFormed(name) || strings.Contains(name, "@") {
 		httpx.Error(w, http.StatusBadRequest, "name must be a bare package name (no version); pin the version with pinned_version")
+		return
+	}
+	// Decision 6: a credential-bearing CLI may never be allowlisted, even by an
+	// admin — it would give the agent a pre-authenticated tool.
+	if toolprofile.Denied(name) {
+		httpx.Error(w, http.StatusBadRequest, "that package ships a credential-bearing CLI and may not be allowlisted")
 		return
 	}
 	pinned, note, err := validateAllowlistWrite(req)
@@ -149,6 +159,10 @@ func (h *Handler) UpdateToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 	actor, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !actor.IsAdmin { // defense-in-depth beside the RequireAdmin route group
+		httpx.Error(w, http.StatusForbidden, "admin only")
 		return
 	}
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
@@ -188,8 +202,13 @@ func (h *Handler) UpdateToolAllowlistEntry(w http.ResponseWriter, r *http.Reques
 // still lists the removed package will fail its next claim (claim-time
 // re-validation) — that is the intended, visible consequence of shrinking the list.
 func (h *Handler) DeleteToolAllowlistEntry(w http.ResponseWriter, r *http.Request) {
-	if _, ok := mw.UserFromContext(r.Context()); !ok {
+	actor, ok := mw.UserFromContext(r.Context())
+	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !actor.IsAdmin { // defense-in-depth beside the RequireAdmin route group
+		httpx.Error(w, http.StatusForbidden, "admin only")
 		return
 	}
 	id, err := uuid.Parse(chi.URLParam(r, "id"))

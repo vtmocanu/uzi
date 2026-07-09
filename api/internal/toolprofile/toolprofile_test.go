@@ -2,7 +2,12 @@ package toolprofile
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
 // rules used across the tests: kubectl any-version, terraform pinned to 1.7, jq
@@ -61,6 +66,61 @@ func TestResolveEmptyIsNil(t *testing.T) {
 	allowed, rejected := Resolve(nil, testRules)
 	if allowed != nil || rejected != nil {
 		t.Fatalf("Resolve(nil) = (%v, %v), want (nil, nil)", allowed, rejected)
+	}
+}
+
+func TestDeniedCredentialClIsRejectedEvenIfAllowlisted(t *testing.T) {
+	// Decision 6: a credential-bearing CLI is barred even if an admin allowlists it.
+	rules := Rules{"glab": {}, "gh": {}, "kubectl": {}}
+	for _, denied := range []string{"glab", "gh", "gh@2.0", "awscli", "gcloud", "vault"} {
+		if !Denied(denied) {
+			t.Errorf("Denied(%q) = false, want true", denied)
+		}
+		if Allowed(denied, rules) {
+			t.Errorf("Allowed(%q) = true despite being on the denylist", denied)
+		}
+	}
+	// A non-denied allowlisted package still passes.
+	if !Allowed("kubectl", rules) {
+		t.Error("kubectl should be allowed (not denied)")
+	}
+}
+
+func TestWellFormedLengthCap(t *testing.T) {
+	long := strings.Repeat("a", maxPkgLen+1)
+	if WellFormed(long) {
+		t.Errorf("WellFormed(%d chars) = true, want false (over cap)", len(long))
+	}
+	if WellFormedVersion(strings.Repeat("1", maxPkgLen+1)) {
+		t.Error("over-length version should be rejected")
+	}
+	if !WellFormed(strings.Repeat("a", maxPkgLen)) {
+		t.Error("a package exactly at the cap should be allowed")
+	}
+}
+
+func TestRulesFromRows(t *testing.T) {
+	rows := []store.ToolAllowlist{
+		{Name: "kubectl"},
+		{Name: "terraform", PinnedVersion: pgtype.Text{String: "1.7", Valid: true}},
+	}
+	rules := RulesFromRows(rows)
+	if len(rules) != 2 {
+		t.Fatalf("rules len = %d, want 2", len(rules))
+	}
+	if rules["kubectl"].PinnedVersion != "" {
+		t.Errorf("kubectl should have no pinned version, got %q", rules["kubectl"].PinnedVersion)
+	}
+	if rules["terraform"].PinnedVersion != "1.7" {
+		t.Errorf("terraform pinned = %q, want 1.7", rules["terraform"].PinnedVersion)
+	}
+	// The projected rules drive Resolve identically at write + claim time.
+	allowed, rejected := Resolve([]string{"kubectl", "terraform@1.7", "terraform@9"}, rules)
+	if !reflect.DeepEqual(allowed, []string{"kubectl", "terraform@1.7"}) {
+		t.Fatalf("allowed = %v", allowed)
+	}
+	if !reflect.DeepEqual(rejected, []string{"terraform@9"}) {
+		t.Fatalf("rejected = %v", rejected)
 	}
 }
 

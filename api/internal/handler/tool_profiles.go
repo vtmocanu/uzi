@@ -22,21 +22,14 @@ import (
 const maxProfilePackages = 64
 
 // loadToolRules projects the DB allowlist into a toolprofile.Rules map for
-// write-time package validation (mirrors workersvc's claim-time loader).
+// write-time package validation, via the shared loader (identical to the
+// claim-time loader in workersvc, so save and claim can never diverge).
 func (h *Handler) loadToolRules(r *http.Request) (toolprofile.Rules, error) {
 	rows, err := h.q.ListToolAllowlist(r.Context())
 	if err != nil {
 		return nil, err
 	}
-	rules := make(toolprofile.Rules, len(rows))
-	for _, e := range rows {
-		var pinned string
-		if e.PinnedVersion.Valid {
-			pinned = e.PinnedVersion.String
-		}
-		rules[e.Name] = toolprofile.AllowRule{PinnedVersion: pinned}
-	}
-	return rules, nil
+	return toolprofile.RulesFromRows(rows), nil
 }
 
 // GetRepoToolProfile returns the caller's tool packages for a repo they own
