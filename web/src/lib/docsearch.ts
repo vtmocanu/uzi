@@ -11,8 +11,13 @@
 import { listUserDocs, type Doc } from "./docs";
 
 // A query shorter than this shows the normal index instead of searching — a
-// single character matches almost everything and is never a real query.
+// single character matches almost everything and is never a real query. Applied
+// both to the whole query and to each token.
 export const MIN_QUERY_LENGTH = 2;
+
+// Defensive upper bound: a query past this is truncated before any scanning. No
+// real docs query approaches it; the cap only bounds pathological input.
+const MAX_QUERY_LENGTH = 256;
 
 // ~160-char snippet window centered on the first body match, with some context
 // ahead of the match so the matched term does not sit flush against the `…`.
@@ -176,9 +181,11 @@ function buildSnippet(entry: IndexedDoc, tokens: string[]): { snippet: string; r
 // appears somewhere (title, headings, or body), and ranks
 // title > heading > body, then by total occurrences, then slug.
 export function searchIndex(index: IndexedDoc[], query: string): SearchResult[] {
-  const trimmed = query.trim();
+  const trimmed = query.slice(0, MAX_QUERY_LENGTH).trim();
   if (trimmed.length < MIN_QUERY_LENGTH) return [];
-  const tokens = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
+  // Drop sub-MIN_QUERY_LENGTH tokens too, so "a b" does not search lone
+  // characters that match almost every doc.
+  const tokens = trimmed.toLowerCase().split(/\s+/).filter((t) => t.length >= MIN_QUERY_LENGTH);
   if (tokens.length === 0) return [];
 
   const scored: { entry: IndexedDoc; tier: number; total: number }[] = [];

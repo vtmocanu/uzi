@@ -87,14 +87,16 @@ export function Docs() {
       />
 
       {searching ? (
-        <div aria-live="polite" className="space-y-3">
+        // aria-live is scoped to the count/no-results line only — announcing the
+        // whole result list per keystroke re-reads every snippet, too chatty.
+        <div className="space-y-3">
           {results.length === 0 ? (
             <Card>
-              <p className="text-sm text-faint">No docs match “{query.trim()}”.</p>
+              <p aria-live="polite" className="text-sm text-faint">No docs match “{query.trim()}”.</p>
             </Card>
           ) : (
             <>
-              <p className="text-sm text-faint">
+              <p aria-live="polite" className="text-sm text-faint">
                 {results.length === 1 ? "1 doc matches" : `${results.length} docs match`}
               </p>
               <ul className="space-y-3">

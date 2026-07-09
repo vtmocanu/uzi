@@ -54,12 +54,15 @@ describe("Docs index — search", () => {
     expect(within(result).getByText(new RegExp(BODY_ONLY_TERM))).toBeTruthy();
   });
 
-  it("announces the result count in an aria-live region", () => {
+  it("announces the count in an aria-live region scoped to the count line, not the list", () => {
     const { container } = renderPage();
     fireEvent.change(searchBox(), { target: { value: BODY_ONLY_TERM } });
     const live = container.querySelector('[aria-live="polite"]');
     expect(live).toBeTruthy();
-    expect(live!.textContent).toContain("1 doc matches");
+    expect(live!.textContent).toBe("1 doc matches");
+    // The snippet list is outside the live region — not re-announced per keystroke.
+    expect(live!.textContent).not.toContain(BODY_ONLY_TERM);
+    expect(live!.querySelector("mark")).toBeNull();
   });
 
   it("shows a no-results card for a query nothing matches", () => {

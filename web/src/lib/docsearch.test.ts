@@ -67,6 +67,26 @@ describe("searchIndex — short-query guard", () => {
   });
 });
 
+describe("searchIndex — per-token minimum length", () => {
+  const idx = index(doc("wk", "WK", "the worker runs"), doc("no", "No", "nothing here"));
+  it("drops sub-MIN_QUERY_LENGTH tokens so a lone char does not match everything", () => {
+    // "a b" is two 1-char tokens: both dropped, nothing left to search.
+    expect(searchIndex(idx, "a b")).toEqual([]);
+  });
+  it("keeps the meaningful token when mixed with a dropped short one", () => {
+    expect(slugs(idx, "worker x")).toEqual(["wk"]);
+  });
+});
+
+describe("searchIndex — query length cap", () => {
+  it("truncates the query before tokenizing, ignoring trailing junk past the cap", () => {
+    const idx = index(doc("wk", "WK", "the worker runs"));
+    // Without the cap the trailing non-matching token would fail the AND.
+    const longQuery = `worker${" ".repeat(300)}zzznomatch`;
+    expect(slugs(idx, longQuery)).toEqual(["wk"]);
+  });
+});
+
 describe("searchIndex — matching is plain substring, not regex", () => {
   it("matches regex-metacharacter tokens literally (.env, --profile)", () => {
     const idx = index(
