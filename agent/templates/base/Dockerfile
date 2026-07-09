@@ -14,37 +14,65 @@ FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb
 WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool (M3); tini as PID 1 so
-# SIGTERM reaches the worker and it shuts down cleanly. curl + xz for the devbox
-# installer below.
-RUN apk add --no-cache git bash tini curl xz
+# SIGTERM reaches the worker and it shuts down cleanly. curl + xz + tar for the
+# pinned nix/devbox downloads below.
+RUN apk add --no-cache git bash tini curl xz tar
 
-# --- PRD #18 M3: devbox + nix for per-run tool provisioning ---------------------
+# The non-root runtime user, created EARLY so the nix store can be chowned to it
+# below (the worker realizes packages as this user at run time).
+RUN addgroup -S uzi && adduser -S -G uzi -h /home/uzi uzi
+
+# --- PRD #18 M3/M4: nix + devbox for per-run tool provisioning ------------------
 # The worker installs a run's tier-1 tool packages with devbox (nix under the hood)
-# before the SDK starts (see agent/src/provision.ts). devbox is the single-user
-# engine; the nix store is relocated under UZI_DATA_DIR so the persistent
-# `agentdata` volume warm-starts it across runs (Success Criteria: a worker's 2nd
-# run is warm).
+# before the SDK starts (see agent/src/provision.ts). Alpine/musl is CONFIRMED
+# working for nix (tester live smoke: nix closures ship their own glibc). Two hard
+# rules learned from that smoke:
+#   * Everything is installed at BUILD time and PINNED — no floating install
+#     script piped to a shell, no runtime downloads (both were blockers: the
+#     self-updating launcher fetched an unpinned devbox + tried to sudo-bootstrap
+#     nix at first run).
+#   * The /nix store stays at its DEFAULT path — relocating it (NIX_STORE_DIR)
+#     changes store-path hashes and forfeits cache.nixos.org binary substitution.
+#     Warm-start across container recreation is instead provided by a named volume
+#     at /nix (docker-compose `agentnix`), which Docker seeds from this image's /nix
+#     on first use.
 #
-# !! UNVERIFIED + KNOWN RISK !!  This layer is NOT built in the dev workspace
-# (docker builds aren't run here) AND nix/devbox officially target glibc while this
-# base is Alpine/musl. If nix will not run on musl, the base FROM must move to a
-# glibc image (e.g. node:22-bookworm-slim) — a guardrail-base change (this digest is
-# shared with web/Dockerfile) to be decided before this ships. The provisioning
-# ENGINE (agent/src/provision.ts) is base-agnostic and fully unit-tested; only this
-# install + the runtime store location need a real `docker compose build agent` and
-# a live provisioned-tool run to confirm. New egress: nix substituters
-# (cache.nixos.org) — see ARCHITECTURE.md + docs/worker-tools.md.
-ENV DEVBOX_VERSION=0.13.0
-RUN curl -fsSL https://get.jetify.com/devbox -o /tmp/devbox-install.sh \
-    && FORCE=1 DEVBOX_USE_VERSION=${DEVBOX_VERSION} bash /tmp/devbox-install.sh -f \
-    && rm -f /tmp/devbox-install.sh
-# nix + devbox keep their store/state/cache under UZI_DATA_DIR (the volume), not the
-# ephemeral image layer, so installs persist across runs. The store dir itself is
-# created at first run by the worker (the volume is empty until then).
-ENV XDG_CACHE_HOME=/data/.cache \
-    XDG_DATA_HOME=/data/.local/share \
-    XDG_STATE_HOME=/data/.local/state \
-    DEVBOX_DEBUG=0
+# NOTE: the exact installer invocation + store ownership below are implemented per
+# the tester's B1/B2/B3 findings but are NOT built in this workspace — the tester
+# re-runs the live uzi-user provision + warm-start smoke against this image.
+
+# nix, single-user, installed as root then chowned to uzi (the lead-approved path)
+# so the non-root worker can realize packages without a daemon. Determinate
+# nix-installer, pinned by release tag; `--init none` = no systemd (container),
+# sandbox off (can't nest in a build), flakes on (devbox needs them).
+ARG NIX_INSTALLER_VERSION=3.21.5
+RUN curl -fsSL -o /tmp/nix-installer \
+      "https://github.com/DeterminateSystems/nix-installer/releases/download/v${NIX_INSTALLER_VERSION}/nix-installer-x86_64-linux" \
+    && chmod +x /tmp/nix-installer \
+    && /tmp/nix-installer install linux --init none --no-confirm \
+        --extra-conf "sandbox = false" \
+        --extra-conf "experimental-features = nix-command flakes" \
+    && rm -f /tmp/nix-installer \
+    && chown -R uzi:uzi /nix
+# Single-user runtime (no daemon in the container): empty NIX_REMOTE = direct store
+# access, and the default profile bin is on PATH so `nix` resolves for uzi. /sbin
+# must remain on PATH — nix build tooling shells out to it (see provision.ts).
+ENV NIX_REMOTE=""
+ENV PATH="/nix/var/nix/profiles/default/bin:${PATH}"
+
+# devbox: the pinned release BINARY (not the self-updating launcher), verified
+# against the release's own checksums, installed mode 0755 so the non-owner uzi
+# user can exec it (the launcher shipped 0711 root-owned → "Permission denied").
+ARG DEVBOX_VERSION=0.17.5
+RUN curl -fsSL -o /tmp/devbox.tar.gz \
+      "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/devbox_${DEVBOX_VERSION}_linux_amd64.tar.gz" \
+    && curl -fsSL -o /tmp/devbox-checksums.txt \
+      "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/checksums.txt" \
+    && (cd /tmp && grep "devbox_${DEVBOX_VERSION}_linux_amd64.tar.gz\$" devbox-checksums.txt | sha256sum -c -) \
+    && mkdir -p /tmp/devbox-extract \
+    && tar -xzf /tmp/devbox.tar.gz -C /tmp/devbox-extract \
+    && install -m 0755 "$(find /tmp/devbox-extract -type f -name devbox | head -n1)" /usr/local/bin/devbox \
+    && rm -rf /tmp/devbox.tar.gz /tmp/devbox-checksums.txt /tmp/devbox-extract
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.
@@ -55,7 +83,9 @@ COPY tsconfig.json ./
 COPY src ./src
 
 # UZI_DATA_DIR holds the bare-clone cache, worktrees, and (M3) the pinned SDK
-# session dir; it is expected to be a persistent volume.
+# session dir; it is expected to be a persistent volume. devbox/nix per-user
+# metadata (profiles, GC roots) lands HOME-derived under here too; the big store is
+# on the separate /nix volume.
 ENV UZI_DATA_DIR=/data
 
 # Bake the template identity into the image so the worker self-reports the image
@@ -66,11 +96,11 @@ ENV UZI_DATA_DIR=/data
 # Soft signal only (observability, not security — a hostile worker can lie); the
 # join token stays the trust anchor.
 ENV UZI_WORKER_TEMPLATE=base
-RUN mkdir -p /data \
-    && addgroup -S uzi && adduser -S -G uzi -h /home/uzi uzi \
-    && chown -R uzi:uzi /app /data
+RUN mkdir -p /data && chown -R uzi:uzi /app /data
 USER uzi:uzi
-VOLUME ["/data"]
+# /data persists the clone cache + devbox/nix per-user metadata; /nix persists the
+# nix store (warm-start). Compose backs these with the agentdata + agentnix volumes.
+VOLUME ["/data", "/nix"]
 
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["npm", "run", "start"]

@@ -50,13 +50,31 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       );
     });
 
-    it(`${name}: installs the devbox provisioning engine (PRD #18 M3)`, () => {
-      // Every template gains devbox so per-run tool provisioning works regardless of
-      // which image a worker runs. The self-contained-per-template layout means this
-      // must stay mirrored across all Dockerfiles; this pins that.
-      assert.match(text, /get\.jetify\.com\/devbox/, `${name}/Dockerfile must install devbox`);
+    it(`${name}: installs the pinned devbox binary + nix at build (PRD #18)`, () => {
+      // Every template gains the provisioning stack so it works regardless of which
+      // image a worker runs. Pinned build-time installs only — no floating
+      // `curl | bash`, no runtime download (the prior blockers). Mirrored across all
+      // Dockerfiles (self-contained layout); this pins that.
+      assert.match(text, /jetify-com\/devbox\/releases\/download/, `${name}/Dockerfile must download the pinned devbox release`);
+      assert.match(text, /install -m 0755 .*\/usr\/local\/bin\/devbox/, `${name}/Dockerfile must install devbox mode 0755 (non-owner exec)`);
+      assert.match(text, /nix-installer/, `${name}/Dockerfile must install nix at build time`);
+      assert.doesNotMatch(text, /get\.jetify\.com\/devbox/, `${name}/Dockerfile must NOT use the floating devbox launcher`);
     });
   }
+});
+
+// The provisioning stack must be identical across templates (self-contained
+// layout). Pin the devbox version equal everywhere so base/jvm can't drift — now
+// meaningful because the version is a real pin, not a dead ENV.
+describe("worker templates pin the same devbox version", () => {
+  it("ARG DEVBOX_VERSION matches across every template", () => {
+    const versions = templateDockerfiles().map(({ name, text }) => {
+      const m = /ARG\s+DEVBOX_VERSION=(\S+)/.exec(text);
+      assert.ok(m, `${name}/Dockerfile must pin ARG DEVBOX_VERSION`);
+      return m![1];
+    });
+    assert.strictEqual(new Set(versions).size, 1, `templates pin different devbox versions: ${versions.join(", ")}`);
+  });
 });
 
 // The template name set lives in THREE places (PRD #18): the agent/templates/<name>/

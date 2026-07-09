@@ -162,6 +162,11 @@ services:
       UZI_LOG_LEVEL: ${UZI_LOG_LEVEL:-info}
     volumes:
       - agentdata:/data
+      # Persist the nix store across container recreation so per-run tool
+      # provisioning warm-starts (PRD #18 M3). The store stays at its default /nix
+      # path (relocating it forfeits cache.nixos.org substitution); Docker seeds
+      # this named volume from the image's build-time /nix on first use.
+      - agentnix:/nix
     secrets:
       - worker_token
     depends_on:
@@ -171,6 +176,9 @@ services:
 volumes:
   pgdata:
   agentdata:
+  # The worker's nix store (PRD #18): seeded from the image on first use, then
+  # persisted so provisioning is a first-run-only fetch.
+  agentnix:
 
 secrets:
   # The worker join token, delivered to the agent as a FILE (mounted read-only at
