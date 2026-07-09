@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -46,6 +48,28 @@ type Handler struct {
 	// full-syncs every repo on its next cycle (PRD #19 M2). Optional: nil in tests
 	// that don't exercise the poller; UpdateSettings nil-guards the call.
 	reconciler Reconciler
+	// slackValidator live-validates Slack tokens on save (PRD #25 M1). Optional:
+	// nil falls back to the real slacksvc.Validator (see slackVal); tests inject a
+	// fake so the settings PUT is exercised without a network call to Slack.
+	slackValidator SlackValidator
+}
+
+// SlackValidator live-checks a pasted Slack token against Slack at save time
+// (PRD #25). The settings PUT calls it before sealing a token; slacksvc.Validator
+// is the production implementation, a fake stands in for tests.
+type SlackValidator interface {
+	ValidateBotToken(ctx context.Context, token string) error
+	ValidateAppToken(ctx context.Context, token string) error
+}
+
+// slackVal returns the injected validator, or the real Slack-backed one. The
+// real Validator is stateless, so defaulting here keeps handler.New's signature
+// unchanged while tests still override via the field.
+func (h *Handler) slackVal() SlackValidator {
+	if h.slackValidator != nil {
+		return h.slackValidator
+	}
+	return slacksvc.Validator{}
 }
 
 // Reconciler receives the "labels changed, resync everything" signal from the

@@ -114,6 +114,21 @@ func run() error {
 	// the forge sync/poller (read the configured PRD label every cycle). One
 	// process, so one cache. Built before the forge service, which reads it.
 	settingsCache := settings.New(q, cfg.SettingsCacheTTL)
+	// Wire the secret cipher + ENV-source overlay (PRD #25): the Slack tokens and
+	// public base URL an operator set via environment win over their DB rows, and
+	// the box seals/opens the secret keys. Only keys actually set appear in the
+	// overlay, so an unconfigured Slack instance stays a strict no-op.
+	slackEnv := map[string]string{}
+	if cfg.SlackBotToken != "" {
+		slackEnv[settings.KeySlackBotToken] = cfg.SlackBotToken
+	}
+	if cfg.SlackAppToken != "" {
+		slackEnv[settings.KeySlackAppToken] = cfg.SlackAppToken
+	}
+	if cfg.PublicBaseURL != "" {
+		slackEnv[settings.KeyPublicBaseURL] = cfg.PublicBaseURL
+	}
+	settingsCache.ConfigureSecrets(box, slackEnv)
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 

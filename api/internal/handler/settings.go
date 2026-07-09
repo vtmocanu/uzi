@@ -8,35 +8,57 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
 // updateSettingsRequest is a partial map of setting key → value. Any subset of
-// the known keys may be sent; unknown keys are rejected. The web Settings page
-// sends both label keys together, but the API tolerates a single-key update.
+// the known keys may be sent; unknown keys are rejected. Secret keys (the Slack
+// tokens) carry the plaintext token to store; non-secret keys carry the value
+// verbatim. The web Settings page sends the label keys together and the Slack
+// card separately, but the API tolerates any single-key update.
 type updateSettingsRequest struct {
 	Settings map[string]string `json:"settings"`
 }
 
-// GetSettings returns every known setting with its effective value (admin only).
-// The shape is stable — one entry per known key — so a missing row reads as its
-// compiled-in default rather than an absent field.
+// settingsResponse is the admin GET/PUT body (PRD #25). `settings` carries only
+// the non-secret effective values; `secrets` reports whether each secret key is
+// configured (never its value); `sources` reports, per key, whether the effective
+// value comes from an env var, the DB, or the compiled default. The split of
+// values from secrets is what makes a token leak structurally impossible — the
+// value map cannot hold a secret's bytes.
+type settingsResponse struct {
+	Settings map[string]string `json:"settings"`
+	Secrets  map[string]bool   `json:"secrets"`
+	Sources  map[string]string `json:"sources"`
+}
+
+func newSettingsResponse(v settings.AdminView) settingsResponse {
+	return settingsResponse{Settings: v.Values, Secrets: v.Secrets, Sources: v.Sources}
+}
+
+// GetSettings returns every known setting (admin only): non-secret effective
+// values, per-secret `configured` flags (never the token itself), and per-key
+// source. The shape is stable — one entry per known key — so a missing row reads
+// as its compiled-in default rather than an absent field.
 func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
-	all, err := h.settings.All(r.Context())
+	view, err := h.settings.AdminView(r.Context())
 	if err != nil {
 		slog.Error("get settings", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"settings": all})
+	httpx.JSON(w, http.StatusOK, newSettingsResponse(view))
 }
 
-// UpdateSettings writes one or more settings (admin only), validating per
-// Decision 8: each value non-empty, ≤ 64 chars, no comma; unknown keys
-// rejected; and the cross-key rule prd_label != autopilot_label checked against
-// the effective post-update state. The writes commit in a single transaction so
-// a two-key swap can never leave the two labels transiently equal (the exact
-// state the cross-key rule forbids).
+// UpdateSettings writes one or more settings (admin only). It validates per key
+// (label rules, the theme registry, the strict bool, the URL rule, or the token
+// format), rejects unknown keys, rejects a write to an env-sourced key with 409
+// (the value is fixed by the environment), live-validates any submitted Slack
+// token against Slack before storing it, seals secret keys with secretbox+base64,
+// and enforces the cross-key label rule against the effective post-update state.
+// The writes commit in a single transaction so a two-key swap can never leave the
+// two labels transiently equal.
 func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	actor, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -54,11 +76,16 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-key validation: known key + per-value rules dispatched by key (label
-	// rules for the label keys, the theme registry for default_theme — PRD #21).
+	// Per-key gate: known key, not env-fixed, and per-value valid. The env check
+	// runs before validation so an env-sourced key is refused as policy (409)
+	// rather than incidentally passing/failing a value rule.
 	for key, value := range req.Settings {
 		if !settings.Known(key) {
 			httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("unknown setting: %s", key))
+			return
+		}
+		if h.settings.IsEnvSourced(key) {
+			httpx.Error(w, http.StatusConflict, fmt.Sprintf("%s is set from the environment and cannot be changed here", key))
 			return
 		}
 		if err := settings.Validate(key, value); err != nil {
@@ -67,12 +94,30 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Live-validate submitted Slack tokens against Slack BEFORE opening a
+	// transaction (a network call must not run inside the write tx). The error is
+	// scrubbed of any token bytes and never echoes the submitted value.
+	ctx := r.Context()
+	if token, ok := req.Settings[settings.KeySlackBotToken]; ok {
+		if err := h.slackVal().ValidateBotToken(ctx, token); err != nil {
+			slog.Warn("settings: slack bot token validation failed", "error", slacksvc.ScrubTokens(err.Error()))
+			httpx.Error(w, http.StatusBadRequest, "slack_bot_token: Slack rejected the token ("+slacksvc.ScrubTokens(err.Error())+")")
+			return
+		}
+	}
+	if token, ok := req.Settings[settings.KeySlackAppToken]; ok {
+		if err := h.slackVal().ValidateAppToken(ctx, token); err != nil {
+			slog.Warn("settings: slack app token validation failed", "error", slacksvc.ScrubTokens(err.Error()))
+			httpx.Error(w, http.StatusBadRequest, "slack_app_token: Slack rejected the token ("+slacksvc.ScrubTokens(err.Error())+")")
+			return
+		}
+	}
+
 	// Cheap pre-transaction cross-key check against the cache: rejects the obvious
-	// equal-label case without opening a transaction. Best-effort only — the cache
-	// can be stale — so the authoritative check runs below inside the write tx
-	// against the FOR UPDATE-locked rows. A stale cache here can at worst fast-fail
-	// a change the committed state would accept; the admin retries, and the in-tx
-	// check remains the source of truth for both accept and reject.
+	// equal-label case without opening a transaction. Only non-secret keys enter
+	// the merged map — a secret token's plaintext never participates in a label
+	// check. Best-effort only (the cache can be stale); the authoritative check
+	// runs below inside the write tx against the FOR UPDATE-locked rows.
 	current, err := h.settings.All(r.Context())
 	if err != nil {
 		slog.Error("update settings: read current", "error", err)
@@ -84,6 +129,9 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		precheck[k] = v
 	}
 	for k, v := range req.Settings {
+		if settings.IsSecret(k) {
+			continue
+		}
 		precheck[k] = v
 	}
 	if err := settings.ValidateMerged(precheck); err != nil {
@@ -91,7 +139,6 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		slog.Error("update settings: begin tx", "error", err)
@@ -103,10 +150,8 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	// Authoritative cross-key check (Decision 8) against committed state: lock the
 	// settings rows FOR UPDATE, so a concurrent PUT blocks here and we read its
-	// committed values rather than a possibly-stale cache snapshot. Merging the
-	// pending writes over the locked committed state and validating THAT closes the
-	// TOCTOU where two concurrent single-key PUTs each pass a cache check yet land
-	// prd_label == autopilot_label (auditor LOW-1 / reviewer non-blocking, M1).
+	// committed values rather than a possibly-stale cache snapshot. Only non-secret
+	// updates merge into the label map (Effective already excludes secrets).
 	locked, err := qtx.ListAppSettingsForUpdate(ctx)
 	if err != nil {
 		slog.Error("update settings: lock rows", "error", err)
@@ -118,28 +163,41 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	for k, v := range committed {
 		merged[k] = v
 	}
+	nonSecretUpdates := make(map[string]string, len(req.Settings))
 	for k, v := range req.Settings {
+		if settings.IsSecret(k) {
+			continue
+		}
 		merged[k] = v
+		nonSecretUpdates[k] = v
 	}
 	// changed decides whether to force a full repo resync after commit. Only a
-	// LABEL change re-filters boards; default_theme is presentation-only (PRD #21)
-	// and an idempotent write is a no-op, so neither forces a resync. Computed
-	// against the committed (FOR UPDATE-locked) rows, not the cache.
-	changed := settings.LabelChanged(committed, req.Settings)
+	// LABEL change re-filters boards; every other key (theme, prdless, slack) is a
+	// no-op here. Computed against the committed (FOR UPDATE-locked) rows.
+	changed := settings.LabelChanged(committed, nonSecretUpdates)
 	if err := settings.ValidateMerged(merged); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	for key, value := range req.Settings {
+		toStore := value
+		if settings.IsSecret(key) {
+			sealed, sealErr := settings.SealSecret(h.box, value)
+			if sealErr != nil {
+				slog.Error("update settings: seal secret failed", "key", key, "error", sealErr)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			toStore = sealed
+		}
 		if _, err := qtx.UpsertAppSetting(ctx, store.UpsertAppSettingParams{
 			Key:       key,
-			Value:     value,
+			Value:     toStore,
 			UpdatedBy: pgUUID(actor.ID),
 		}); err != nil {
-			// Deliberately omit the key/value from the log (audit pre-flag): settings
-			// values are not secrets today, but nothing in app_settings should ever
-			// be assumed loggable.
+			// Deliberately omit the key/value from the log: a secret value must never
+			// be logged, and nothing in app_settings should be assumed loggable.
 			slog.Error("update settings: upsert failed", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
@@ -155,20 +213,18 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// reflects the write immediately rather than lagging by the TTL.
 	h.settings.Invalidate()
 
-	// A changed label re-filters every board (the sync's PRD-label filter, the
-	// autopilot detector in a later milestone), so ask the poller to full-sync all
+	// A changed label re-filters every board, so ask the poller to full-sync all
 	// repos next cycle. Non-blocking: the resync needs each connection's decrypted
-	// PAT and belongs in the poller; the PUT returns after signalling. Old-label
-	// issues drop off boards when that resync completes, not instantly (documented).
+	// PAT and belongs in the poller; the PUT returns after signalling.
 	if changed && h.reconciler != nil {
 		h.reconciler.ForceReconcile()
 	}
 
-	all, err := h.settings.All(ctx)
+	view, err := h.settings.AdminView(ctx)
 	if err != nil {
 		slog.Error("update settings: read back", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"settings": all})
+	httpx.JSON(w, http.StatusOK, newSettingsResponse(view))
 }

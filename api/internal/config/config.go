@@ -16,6 +16,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 )
 
 // Config holds all runtime settings derived from the environment.
@@ -131,6 +132,17 @@ type Config struct {
 	CIFixMaxJobs      int
 	CIFixLogTailBytes int
 
+	// Slack integration ENV overlay (PRD #25). When set, each wins over its DB
+	// app_settings row (enforced in the settings cache) and the webui field renders
+	// greyed with a "set from environment" hint (a PUT to it is rejected 409).
+	// SlackBotToken (SLACK_BOT_TOKEN, xoxb-) and SlackAppToken (SLACK_APP_TOKEN,
+	// xapp-) are secrets held only in api memory; PublicBaseURL (UZI_PUBLIC_BASE_URL)
+	// is the http(s) base for webui deep links in Slack messages. All optional and
+	// empty by default (Slack is off until configured).
+	SlackBotToken string
+	SlackAppToken string
+	PublicBaseURL string
+
 	// Agent skills (PRD #16). SkillMaxBytes caps a skill body at save (server) and
 	// is re-applied to repo-borne skills worker-side; SkillsMaxPerRun caps the
 	// per-run skill union, enforced at claim assembly (M3) and re-enforced
@@ -238,6 +250,19 @@ func Load() (Config, error) {
 	cfg.CIWatchMaxRefs = parseNonNegInt("CI_WATCH_MAX_REFS", 20)
 	cfg.CIFixMaxJobs = parseInt("CI_FIX_MAX_JOBS", 10)
 	cfg.CIFixLogTailBytes = parseInt("CI_FIX_LOG_TAIL_BYTES", 32768)
+
+	// Slack ENV overlay (PRD #25). The tokens are passed through verbatim (their
+	// live validity is surfaced by slacksvc when it connects, not at boot); the
+	// public base URL is scheme-checked here so a bad deep-link base is a loud boot
+	// failure rather than a broken button in every DM.
+	cfg.SlackBotToken = strings.TrimSpace(os.Getenv("SLACK_BOT_TOKEN"))
+	cfg.SlackAppToken = strings.TrimSpace(os.Getenv("SLACK_APP_TOKEN"))
+	if pub := strings.TrimSpace(os.Getenv("UZI_PUBLIC_BASE_URL")); pub != "" {
+		if err := settings.ValidatePublicBaseURL(pub); err != nil {
+			return Config{}, fmt.Errorf("UZI_PUBLIC_BASE_URL %s", err)
+		}
+		cfg.PublicBaseURL = pub
+	}
 
 	if err := loadSeedAdmin(&cfg); err != nil {
 		return Config{}, err
