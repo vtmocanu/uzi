@@ -182,7 +182,20 @@ func run() error {
 	// it, and the WS handler fans them out to subscribed browsers. In-process and
 	// stateless — every event is already durable in the DB.
 	liveHub := hub.New()
-	wsvc.SetBroadcaster(liveHub)
+
+	// Slack run-notifier (PRD #25 M3): a Broadcaster that turns run state
+	// transitions into per-owner DMs. It shares the workersvc broadcast seam with
+	// the WS hub via MultiBroadcaster, so a persisted transition fans out to both
+	// the browser and Slack. PublishState never blocks (it enqueues); a Slack
+	// failure is logged redacted and never affects the run. Unconfigured users are
+	// dropped silently, so this is a strict no-op until linking is set up.
+	slackNotifier := slacksvc.NewNotifier(
+		q,
+		slacksvc.NewPoster(settingsCache.SlackBotToken, &http.Client{Timeout: cfg.SlackHTTPTimeout}),
+		settingsCache.PublicBaseURL,
+		slog.Default(),
+	)
+	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier})
 
 	// Board column automation (PRD #12): reacts to run status changes with
 	// forge-first label moves, plus a reconcile loop that retries moves a down
@@ -222,7 +235,7 @@ func run() error {
 	pcheck := privcheck.NewService(q, svc)
 
 	var bgWG sync.WaitGroup
-	bgWG.Add(4)
+	bgWG.Add(5)
 	go func() {
 		defer bgWG.Done()
 		engine.Run(ctx)
@@ -238,6 +251,10 @@ func run() error {
 	go func() {
 		defer bgWG.Done()
 		slackManager.Run(ctx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		slackNotifier.Run(ctx)
 	}()
 	if cfg.PrivilegeCheckInterval > 0 {
 		privSweep := privcheck.NewEngine(pcheck, cfg.PrivilegeCheckInterval)

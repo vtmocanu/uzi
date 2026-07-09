@@ -150,6 +150,24 @@ type Broadcaster interface {
 	PublishState(runID uuid.UUID, status string)
 }
 
+// MultiBroadcaster fans each event out to several Broadcasters — the WS hub AND
+// the Slack notifier (PRD #25 M3). Each is best-effort and non-blocking by its
+// own contract, so the fan-out is a plain iteration. A nil or empty value is a
+// valid no-op broadcaster.
+type MultiBroadcaster []Broadcaster
+
+func (m MultiBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time) {
+	for _, b := range m {
+		b.PublishMessage(runID, seq, kind, agent, payload, createdAt)
+	}
+}
+
+func (m MultiBroadcaster) PublishState(runID uuid.UUID, status string) {
+	for _, b := range m {
+		b.PublishState(runID, status)
+	}
+}
+
 // RunLifecycle is notified after each run status write so the board's column
 // automation can react (queued → In Progress, completed → Human Review,
 // failed/cancelled → origin). It is the seam onto runlifecycle; nil in tests and

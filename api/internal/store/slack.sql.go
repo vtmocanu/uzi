@@ -89,6 +89,52 @@ func (q *Queries) GetSlackDeliveryForUser(ctx context.Context, id uuid.UUID) (pg
 	return slack_resolved_id, err
 }
 
+const getSlackRunContext = `-- name: GetSlackRunContext :one
+SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
+       r.mr_iid, r.branch, r.failure_reason, r.kind,
+       rp.path_with_namespace, rp.web_url
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+WHERE r.id = $1
+`
+
+type GetSlackRunContextRow struct {
+	ID                uuid.UUID   `json:"id"`
+	UserID            uuid.UUID   `json:"user_id"`
+	Status            string      `json:"status"`
+	IssueIid          pgtype.Int8 `json:"issue_iid"`
+	IssueTitle        string      `json:"issue_title"`
+	MrIid             pgtype.Int8 `json:"mr_iid"`
+	Branch            pgtype.Text `json:"branch"`
+	FailureReason     pgtype.Text `json:"failure_reason"`
+	Kind              string      `json:"kind"`
+	PathWithNamespace string      `json:"path_with_namespace"`
+	WebUrl            string      `json:"web_url"`
+}
+
+// Everything the notifier renders into a run DM (content-minimized): owner,
+// status, issue identity + title, the outcome (MR iid / branch / failure reason),
+// and the repo path + web url for the deep link and MR link. One join, keyed by
+// run id.
+func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlackRunContextRow, error) {
+	row := q.db.QueryRow(ctx, getSlackRunContext, id)
+	var i GetSlackRunContextRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Status,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.MrIid,
+		&i.Branch,
+		&i.FailureReason,
+		&i.Kind,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+	)
+	return i, err
+}
+
 const getSlackRunMessage = `-- name: GetSlackRunMessage :one
 SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at FROM slack_run_messages WHERE run_id = $1
 `

@@ -1,0 +1,249 @@
+package slacksvc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+)
+
+// NotifierStore is the slice of generated queries the notifier reads/writes.
+// *store.Queries satisfies it.
+type NotifierStore interface {
+	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
+	GetSlackDeliveryForUser(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (store.SlackRunMessage, error)
+	UpsertSlackRunMessage(ctx context.Context, arg store.UpsertSlackRunMessageParams) (store.SlackRunMessage, error)
+}
+
+// Poster is the outbound Slack surface the notifier drives: open a DM channel and
+// post / edit messages with the bot token. The production implementation
+// (slackPoster) reads the current bot token from settings per call so a hot
+// token rotation is picked up; tests inject a recording fake.
+type Poster interface {
+	// OpenDM returns the DM channel id for a Slack user id.
+	OpenDM(ctx context.Context, slackUserID string) (string, error)
+	// Post posts text to a channel (threadTS "" = top level) and returns its ts.
+	Post(ctx context.Context, channelID, threadTS, text string) (string, error)
+	// Update edits a message in place.
+	Update(ctx context.Context, channelID, ts, text string) error
+}
+
+// notifierQueue bounds the in-memory event backlog. PublishState drops when full
+// rather than block the request path (Slack is strictly best-effort).
+const notifierQueue = 256
+
+// Notifier turns run state transitions into per-owner Slack DMs (PRD #25 M3). It
+// implements workersvc.Broadcaster: PublishState enqueues and returns
+// immediately (never blocks the run lifecycle), and a drain goroutine does the
+// run/owner loads and the Slack calls. A Slack failure is logged (redacted) and
+// never affects the run. Messages are content-minimized: status + issue title +
+// links only, never plan/diff content, and every outbound string is scrubbed of
+// secrets.
+type Notifier struct {
+	store   NotifierStore
+	poster  Poster
+	baseURL func(context.Context) (string, error)
+	logger  *slog.Logger
+	ch      chan stateEvent
+}
+
+type stateEvent struct {
+	runID  uuid.UUID
+	status string
+}
+
+// NewNotifier builds a Notifier. baseURL supplies the public base URL for deep
+// links (settings.PublicBaseURL). Call Run in a goroutine.
+func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (string, error), logger *slog.Logger) *Notifier {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Notifier{store: s, poster: poster, baseURL: baseURL, logger: logger, ch: make(chan stateEvent, notifierQueue)}
+}
+
+// PublishState implements workersvc.Broadcaster. It MUST NOT block: it enqueues
+// and returns, dropping the event if the queue is full.
+func (n *Notifier) PublishState(runID uuid.UUID, status string) {
+	select {
+	case n.ch <- stateEvent{runID: runID, status: status}:
+	default:
+		n.logger.Warn("slack: notifier queue full, dropping transition", "run", runID.String(), "status", status)
+	}
+}
+
+// PublishMessage is a deliberate no-op: run message CONTENT never goes to Slack
+// (content minimization — only status/title/links do).
+func (n *Notifier) PublishMessage(uuid.UUID, int32, string, string, []byte, time.Time) {}
+
+// Run drains the queue until ctx is cancelled. Wire it into the background
+// WaitGroup alongside the socket manager.
+func (n *Notifier) Run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-n.ch:
+			n.handle(ctx, ev)
+		}
+	}
+}
+
+// handle processes one transition: resolve the owner's delivery target, then
+// post the root DM (first time) or edit it and thread the outcome. Every failure
+// path logs redacted and returns — a run is never affected.
+func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
+	rc, err := n.store.GetSlackRunContext(ctx, ev.runID)
+	if err != nil {
+		n.logf("load run context", err)
+		return
+	}
+	target, err := n.store.GetSlackDeliveryForUser(ctx, rc.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return // unlinked, opted out, or unconfirmed → drop silently
+	}
+	if err != nil {
+		n.logf("resolve delivery target", err)
+		return
+	}
+	if !target.Valid || target.String == "" {
+		return
+	}
+	slackID := target.String
+
+	channel, err := n.poster.OpenDM(ctx, slackID)
+	if err != nil {
+		n.logf("open dm", err)
+		return
+	}
+
+	base, _ := n.baseURL(ctx)
+	root := ScrubSecrets(renderRoot(rc, base))
+
+	existing, err := n.store.GetSlackRunMessage(ctx, ev.runID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		ts, perr := n.poster.Post(ctx, channel, "", root)
+		if perr != nil {
+			n.logf("post root", perr)
+			return
+		}
+		if _, uerr := n.store.UpsertSlackRunMessage(ctx, store.UpsertSlackRunMessageParams{
+			RunID: rc.ID, ChannelID: channel, RootTs: ts,
+		}); uerr != nil {
+			n.logf("record anchor", uerr)
+		}
+	case err != nil:
+		n.logf("load anchor", err)
+		return
+	default:
+		if uerr := n.poster.Update(ctx, existing.ChannelID, existing.RootTs, root); uerr != nil {
+			n.logf("update root", uerr)
+		}
+		if evt := renderThread(rc, base); evt != "" {
+			if _, perr := n.poster.Post(ctx, existing.ChannelID, existing.RootTs, ScrubSecrets(evt)); perr != nil {
+				n.logf("post thread event", perr)
+			}
+		}
+	}
+}
+
+func (n *Notifier) logf(what string, err error) {
+	n.logger.Warn("slack notifier: "+what+" failed (best-effort)", "error", Redact(err.Error()))
+}
+
+// renderRoot builds the content-minimized root line: repo#iid «title» — status,
+// plus an Open-in-uzi deep link. No plan/diff — the plan is one click away.
+func renderRoot(rc store.GetSlackRunContextRow, base string) string {
+	head := fmt.Sprintf("[uzi] run on %s#%d «%s» — %s",
+		rc.PathWithNamespace, iid(rc.IssueIid), rc.IssueTitle, statusLabel(rc))
+	if link := runLink(base, rc.ID); link != "" {
+		head += "\n" + link
+	}
+	return head
+}
+
+// renderThread returns the threaded outcome event for a terminal transition, or
+// "" for a non-terminal one. Completed carries the MR link; failed the reason.
+func renderThread(rc store.GetSlackRunContextRow, base string) string {
+	switch rc.Status {
+	case "completed":
+		if mr := mrLink(rc); mr != "" {
+			return "✅ completed — " + mr
+		}
+		return "✅ completed"
+	case "failed":
+		reason := strings.TrimSpace(rc.FailureReason.String)
+		if reason == "run cancelled" {
+			return "🚫 cancelled"
+		}
+		if reason != "" {
+			return "❌ failed: " + reason
+		}
+		return "❌ failed"
+	case "cancelled":
+		return "🚫 cancelled"
+	default:
+		return ""
+	}
+}
+
+// statusLabel is the compact status shown on the root line.
+func statusLabel(rc store.GetSlackRunContextRow) string {
+	switch rc.Status {
+	case "queued":
+		return "queued"
+	case "claimed", "running":
+		return "▶ running"
+	case "awaiting_approval":
+		return "⏸ needs your approval"
+	case "completed":
+		if rc.MrIid.Valid {
+			return fmt.Sprintf("✅ completed (MR !%d)", rc.MrIid.Int64)
+		}
+		return "✅ completed"
+	case "failed":
+		reason := strings.TrimSpace(rc.FailureReason.String)
+		if reason == "run cancelled" {
+			return "🚫 cancelled"
+		}
+		return "❌ failed"
+	case "cancelled":
+		return "🚫 cancelled"
+	default:
+		return rc.Status
+	}
+}
+
+// runLink is the webui deep link to the run view, as a Slack mrkdwn link. Empty
+// when no base URL resolves.
+func runLink(base string, runID uuid.UUID) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" {
+		return ""
+	}
+	return fmt.Sprintf("<%s/runs/%s|Open in uzi>", base, runID.String())
+}
+
+// mrLink builds the forge merge-request URL from the repo web url + mr iid.
+func mrLink(rc store.GetSlackRunContextRow) string {
+	if !rc.MrIid.Valid || rc.WebUrl == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/-/merge_requests/%d", strings.TrimRight(rc.WebUrl, "/"), rc.MrIid.Int64)
+}
+
+func iid(v pgtype.Int8) int64 {
+	if v.Valid {
+		return v.Int64
+	}
+	return 0
+}

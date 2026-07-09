@@ -81,6 +81,18 @@ ON CONFLICT (run_id) DO UPDATE
         updated_at = now()
 RETURNING *;
 
+-- name: GetSlackRunContext :one
+-- Everything the notifier renders into a run DM (content-minimized): owner,
+-- status, issue identity + title, the outcome (MR iid / branch / failure reason),
+-- and the repo path + web url for the deep link and MR link. One join, keyed by
+-- run id.
+SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
+       r.mr_iid, r.branch, r.failure_reason, r.kind,
+       rp.path_with_namespace, rp.web_url
+FROM runs r
+JOIN repos rp ON rp.id = r.repo_id
+WHERE r.id = $1;
+
 -- name: GetSlackRunMessage :one
 -- The DM anchor for a run (threading + edit target). Absent = not yet notified.
 SELECT * FROM slack_run_messages WHERE run_id = $1;
