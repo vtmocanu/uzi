@@ -317,6 +317,9 @@ export interface SettingsResponse {
   settings: AppSettings;
   secrets: Record<string, boolean>;
   sources: Record<string, SettingSource>;
+  // Live Slack socket connection state (PRD #25 M2): "disabled" | "connecting" |
+  // "connected" | "error:<class>". The admin Slack card renders it as a chip.
+  slack_status: string;
 }
 
 // UpdateSettingsPayload extends the non-secret settings with the write-only

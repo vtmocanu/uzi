@@ -161,7 +161,8 @@ function settingsResponse(): SettingsResponse {
   const sources: Record<string, SettingSource> = {};
   for (const key of Object.keys(appSettings)) sources[key] = "db";
   for (const key of Object.keys(slackSecrets)) sources[key] = slackSecrets[key] ? "db" : "default";
-  return { settings: { ...appSettings }, secrets: { ...slackSecrets }, sources };
+  // The demo has no real socket, so Slack is always "disabled" here.
+  return { settings: { ...appSettings }, secrets: { ...slackSecrets }, sources, slack_status: "disabled" };
 }
 let templateCounter = 0;
 let workerCounter = 0;

@@ -14,8 +14,44 @@ import {
   type UpdateSettingsPayload,
 } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
-import { Alert, Badge, Button, Card, Field, Input, PageHeader, SectionTitle, Select, Skeleton } from "../components/ui";
+import {
+  Alert,
+  Badge,
+  type BadgeTone,
+  Button,
+  Card,
+  Field,
+  Input,
+  PageHeader,
+  SectionTitle,
+  Select,
+  Skeleton,
+} from "../components/ui";
 import { THEMES, THEME_LABELS } from "../lib/theme";
+
+// slackStatusChip renders the live Slack connection state (PRD #25 M2) as a
+// tone-coded Badge. Error states (error:auth | error:connection) collapse to a
+// danger chip whose full class is in the title.
+function slackStatusChip(status: string) {
+  if (status.startsWith("error")) {
+    return (
+      <Badge tone="danger" dot title={`Slack connection: ${status}`}>
+        {status.replace("error:", "error · ")}
+      </Badge>
+    );
+  }
+  const map: Record<string, { tone: BadgeTone; pulse?: boolean }> = {
+    connected: { tone: "ok" },
+    connecting: { tone: "warning", pulse: true },
+    disabled: { tone: "neutral" },
+  };
+  const cfg = map[status] ?? { tone: "neutral" as BadgeTone };
+  return (
+    <Badge tone={cfg.tone} dot pulse={cfg.pulse} title={`Slack connection: ${status}`}>
+      {status}
+    </Badge>
+  );
+}
 
 // clientValidate reproduces the server's per-value + cross-key rules so an
 // obviously-bad edit is caught before the round-trip. Returns an error message
@@ -45,6 +81,9 @@ export function AdminSettings() {
   // card for its "configured ✓" and env-greying behavior.
   const [secrets, setSecrets] = useState<Record<string, boolean>>({});
   const [sources, setSources] = useState<Record<string, SettingSource>>({});
+  // Live Slack socket state for the status chip (PRD #25 M2), polled separately
+  // so it updates without clobbering in-progress form edits.
+  const [slackStatus, setSlackStatus] = useState("disabled");
   const [prdLabel, setPrdLabel] = useState("");
   const [autopilotLabel, setAutopilotLabel] = useState("");
   const [defaultTheme, setDefaultTheme] = useState("");
@@ -63,6 +102,7 @@ export function AdminSettings() {
     setSaved(settings);
     setSecrets(sec ?? {});
     setSources(src ?? {});
+    setSlackStatus(resp.slack_status ?? "disabled");
     setPrdLabel(settings.prd_label);
     setAutopilotLabel(settings.autopilot_label);
     setDefaultTheme(settings.default_theme);
@@ -83,6 +123,21 @@ export function AdminSettings() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Poll only the live Slack connection state so the chip reflects connecting →
+  // connected without a manual reload. Deliberately does NOT call applyResponse
+  // (which would reset the form fields and clobber an in-progress edit).
+  useEffect(() => {
+    const id = setInterval(async () => {
+      try {
+        const resp = await api.getSettings();
+        setSlackStatus(resp.slack_status ?? "disabled");
+      } catch {
+        // Best-effort: keep the last known status on a transient failure.
+      }
+    }, 5000);
+    return () => clearInterval(id);
+  }, []);
 
   const dirty =
     saved !== null &&
@@ -242,7 +297,13 @@ export function AdminSettings() {
       </Card>
 
       {!loading && saved && (
-        <SlackSettingsCard settings={saved} secrets={secrets} sources={sources} onSaved={applyResponse} />
+        <SlackSettingsCard
+          settings={saved}
+          secrets={secrets}
+          sources={sources}
+          status={slackStatus}
+          onSaved={applyResponse}
+        />
       )}
     </div>
   );
@@ -260,11 +321,13 @@ function SlackSettingsCard({
   settings,
   secrets,
   sources,
+  status,
   onSaved,
 }: {
   settings: AppSettings;
   secrets: Record<string, boolean>;
   sources: Record<string, SettingSource>;
+  status: string;
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.slack_enabled === "true");
@@ -325,10 +388,7 @@ function SlackSettingsCard({
             again.
           </p>
         </div>
-        {/* Connection status — stubbed until the socket manager lands (M2). */}
-        <Badge tone="neutral" dot title="Slack connection status">
-          disabled
-        </Badge>
+        {slackStatusChip(status)}
       </div>
 
       {error && <Alert message={error} />}

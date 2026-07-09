@@ -36,6 +36,7 @@ const response = (
   over: Partial<import("../lib/api").AppSettings> = {},
   secrets: Record<string, boolean> = {},
   sources: Record<string, Src> = {},
+  slack_status = "disabled",
 ) => ({
   settings: settings(over),
   secrets: { slack_bot_token: false, slack_app_token: false, ...secrets },
@@ -51,6 +52,7 @@ const response = (
     slack_app_token: "default",
     ...sources,
   } as Record<string, Src>,
+  slack_status,
 });
 
 beforeEach(() => {
@@ -200,6 +202,14 @@ describe("AdminSettings", () => {
     // Write-only: the stored token is never pre-filled, only signalled.
     expect(bot.value).toBe("");
     expect(bot.placeholder).toMatch(/configured/i);
+  });
+
+  it("renders the live Slack connection status chip (PRD #25 M2)", async () => {
+    mockApi.getSettings.mockResolvedValue(response({}, {}, {}, "connected"));
+    renderPage();
+    // The chip reflects the DTO's slack_status, not a hardcoded stub.
+    expect(await screen.findByText("connected")).toBeTruthy();
+    expect(screen.queryByText("disabled")).toBeNull();
   });
 
   it("saves the Slack card, sending only the entered token", async () => {
