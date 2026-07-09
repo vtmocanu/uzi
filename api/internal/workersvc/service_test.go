@@ -98,6 +98,13 @@ type fakeStore struct {
 	createWorkerResult store.Worker
 	createWorkerParams *store.CreateWorkerParams
 
+	// Tool provisioning (PRD #18 M4). Defaults (zero profile, nil error, empty
+	// allowlist) resolve to no provisioning, so claim tests that don't opt in are
+	// unaffected.
+	toolProfile    store.RepoToolProfile
+	toolProfileErr error
+	toolAllowlist  []store.ToolAllowlist
+
 	// Delete worker.
 	countActiveRuns    int64
 	countActiveParams  *store.CountWorkerNonTerminalRunsParams
@@ -260,6 +267,12 @@ func (f *fakeStore) CountWorkerNonTerminalRuns(_ context.Context, arg store.Coun
 func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorkerForUserParams) (int64, error) {
 	f.deleteWorkerParams = &arg
 	return f.deleteWorkerRows, nil
+}
+func (f *fakeStore) GetRepoToolProfile(_ context.Context, _ store.GetRepoToolProfileParams) (store.RepoToolProfile, error) {
+	return f.toolProfile, f.toolProfileErr
+}
+func (f *fakeStore) ListToolAllowlist(_ context.Context) ([]store.ToolAllowlist, error) {
+	return f.toolAllowlist, nil
 }
 
 // testParams are sane fixed knobs for the tests.
@@ -489,6 +502,85 @@ func TestClaimFailsRunWhenAnthropicTokenMissing(t *testing.T) {
 	}
 	if !fs.markedFailed.FailureReason.Valid || !strings.Contains(fs.markedFailed.FailureReason.String, "Anthropic token") {
 		t.Fatalf("failure reason unclear: %+v", fs.markedFailed.FailureReason)
+	}
+}
+
+// -------------------------------------------------------------------------
+// Tool provisioning resolution (PRD #18 M4)
+// -------------------------------------------------------------------------
+
+func TestResolveToolingResolvesAllowedProfilePackages(t *testing.T) {
+	fs := &fakeStore{
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["kubectl@1.31","jq","kubectl@1.31"]`)},
+		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}, {Name: "jq"}},
+	}
+	svc := New(fs, newBox(t), testParams())
+	pkgs, optIn, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	if err != nil {
+		t.Fatalf("resolveTooling: %v", err)
+	}
+	if optIn {
+		t.Fatal("repo_devbox_opt_in must be false until M5")
+	}
+	// Deduped + sorted.
+	if strings.Join(pkgs, ",") != "jq,kubectl@1.31" {
+		t.Fatalf("pkgs = %v, want [jq kubectl@1.31]", pkgs)
+	}
+}
+
+func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
+	fs := &fakeStore{
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["kubectl@1.31","terraform"]`)},
+		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}}, // terraform removed after the profile was saved
+	}
+	svc := New(fs, newBox(t), testParams())
+	_, _, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	if !errors.Is(err, errToolPackagesRejected) {
+		t.Fatalf("err = %v, want errToolPackagesRejected", err)
+	}
+	if !strings.Contains(err.Error(), "terraform") {
+		t.Fatalf("error should name the rejected package: %v", err)
+	}
+}
+
+func TestResolveToolingNoProfileMeansNoProvisioning(t *testing.T) {
+	fs := &fakeStore{toolProfileErr: pgx.ErrNoRows}
+	svc := New(fs, newBox(t), testParams())
+	pkgs, _, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	if err != nil {
+		t.Fatalf("resolveTooling: %v", err)
+	}
+	if len(pkgs) != 0 {
+		t.Fatalf("no profile ⇒ no packages, got %v", pkgs)
+	}
+}
+
+func TestClaimFailsRunWhenToolPackagesRejected(t *testing.T) {
+	// A grandfathered package that fell out of the allowlist fails the CLAIM (the
+	// run is failed, no payload handed out) with a message naming the package.
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-something-long-enough"))
+	sealedTok, _ := box.Seal([]byte("anthropic-oauth-something-long-enough"))
+	fs := &fakeStore{
+		claimRun:      store.Run{ID: uuid.New(), Status: "claimed"},
+		claimCtx:      store.GetRunClaimContextRow{TokenCiphertext: sealedPAT, RepoWebUrl: "https://x/y", BotUsername: "uzi-bot"},
+		anthropic:     sealedTok,
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["terraform"]`)},
+		toolAllowlist: []store.ToolAllowlist{}, // shrank to nothing
+	}
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload != nil {
+		t.Fatal("a rejected tool package must not hand out a payload")
+	}
+	if fs.markedFailed == nil {
+		t.Fatal("the run should have been marked failed")
+	}
+	if !strings.Contains(fs.markedFailed.FailureReason.String, "terraform") {
+		t.Fatalf("failure reason should name the rejected package: %+v", fs.markedFailed.FailureReason)
 	}
 }
 

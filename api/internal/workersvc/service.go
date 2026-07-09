@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -120,6 +122,10 @@ type Store interface {
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	ListAgentTemplates(ctx context.Context) ([]store.AgentTemplate, error)
 	ListRunSkillAllocations(ctx context.Context, userID pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error)
+	// Tier-1 tool provisioning (PRD #18 M4): the run owner's per-repo package list
+	// and the admin allowlist it is re-validated against at claim time.
+	GetRepoToolProfile(ctx context.Context, arg store.GetRepoToolProfileParams) (store.RepoToolProfile, error)
+	ListToolAllowlist(ctx context.Context) ([]store.ToolAllowlist, error)
 }
 
 // Params are the runtime knobs the service needs, mirrored from config.
@@ -270,9 +276,10 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 
 	payload, err := s.assembleClaim(ctx, run)
 	if err != nil {
-		// A missing/undecryptable credential is not retryable: fail the run and
-		// report idle. The failure reason never carries secret bytes.
-		if errors.Is(err, errCredentialUnavailable) {
+		// A missing/undecryptable credential OR a tool package that fell out of the
+		// allowlist is not retryable: fail the run and report idle. Both failure
+		// reasons are safe to store (no secret bytes; package names only).
+		if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) {
 			if _, ferr := s.q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{
 				ID:            run.ID,
 				FailureReason: pgText(err.Error()),
@@ -358,8 +365,13 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 	skills := assembleRunSkills(skillRows, s.p.SkillsMaxPerRun)
 
 	// Tier-1 tool packages + repo devbox opt-in for the worker's provisioning
-	// engine (PRD #18 M3). Resolution seam; empty in M3 (see resolveTooling).
-	toolPackages, repoDevboxOptIn := s.resolveTooling(ctx, run)
+	// engine (PRD #18 M4): the owner's per-repo profile, re-validated against the
+	// current allowlist. A rejected package fails the claim (errToolPackagesRejected
+	// → the run is failed in Claim, not delivered).
+	toolPackages, repoDevboxOptIn, err := s.resolveTooling(ctx, run)
+	if err != nil {
+		return nil, err
+	}
 
 	// A ci_fix run carries no issue and instead delivers the failed-pipeline
 	// snapshot; an issue run carries its issue iid and no pipeline (PRD #6).
@@ -416,22 +428,75 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 	}, nil
 }
 
+// errToolPackagesRejected marks a claim whose grandfathered tool packages fell out
+// of the (possibly shrunk) allowlist at claim time. Non-retryable: the run is
+// failed with this message (which lists the rejected package names — never secret
+// bytes) so the owner fixes the profile or an admin restores the allowlist entry.
+var errToolPackagesRejected = errors.New("tool packages no longer allowed")
+
 // resolveTooling resolves the run's tier-1 tool packages + repo devbox opt-in for
-// the claim payload (PRD #18 M3) — the single resolution seam the later
-// milestones fill in:
-//   - M3: no DB desire source exists yet, so the desired set is empty and Resolve
-//     returns nothing (real runs provision nothing; the worker path is exercised by
-//     tests). repo_devbox_opt_in is always false until M5.
-//   - M4 replaces the empty desired set with the per-(user,repo) repo_tool_profiles
-//     packages validated against the DB tool_allowlist; M5 sets repoDevboxOptIn from
-//     the per-repo trust toggle. The claim payload shape does not change.
-func (s *Service) resolveTooling(_ context.Context, _ store.Run) (toolPackages []string, repoDevboxOptIn bool) {
-	var desired []string // M4: load from repo_tool_profiles for (run.UserID, run.RepoID)
-	allowed, _ := toolprofile.Resolve(desired)
+// the claim payload (PRD #18). M4 makes this DB-backed: the desired list is the run
+// owner's per-(user,repo) repo_tool_profiles, RE-VALIDATED against the current
+// tool_allowlist (it can shrink after the profile was saved — Technical §3). A
+// rejected package fails the claim (Success Criteria 5), not silently drops.
+// repo_devbox_opt_in stays false until M5 wires the per-repo toggle.
+func (s *Service) resolveTooling(ctx context.Context, run store.Run) (toolPackages []string, repoDevboxOptIn bool, err error) {
+	profile, err := s.q.GetRepoToolProfile(ctx, store.GetRepoToolProfileParams{UserID: run.UserID, RepoID: run.RepoID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return []string{}, false, nil // no profile ⇒ no provisioning
+		}
+		return nil, false, fmt.Errorf("get repo tool profile: %w", err)
+	}
+	desired := decodePackageList(profile.Packages)
+	if len(desired) == 0 {
+		return []string{}, false, nil
+	}
+	rules, err := s.loadToolRules(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	allowed, rejected := toolprofile.Resolve(desired, rules)
+	if len(rejected) > 0 {
+		return nil, false, fmt.Errorf("%w: %s", errToolPackagesRejected, strings.Join(rejected, ", "))
+	}
 	if allowed == nil {
 		allowed = []string{} // always send an array, never null (wire contract)
 	}
-	return allowed, false
+	return allowed, false, nil
+}
+
+// loadToolRules projects the DB tool_allowlist into the toolprofile.Rules map the
+// pure resolver consumes.
+func (s *Service) loadToolRules(ctx context.Context) (toolprofile.Rules, error) {
+	rows, err := s.q.ListToolAllowlist(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list tool allowlist: %w", err)
+	}
+	rules := make(toolprofile.Rules, len(rows))
+	for _, row := range rows {
+		var pinned string
+		if row.PinnedVersion.Valid {
+			pinned = row.PinnedVersion.String
+		}
+		rules[row.Name] = toolprofile.AllowRule{PinnedVersion: pinned}
+	}
+	return rules, nil
+}
+
+// decodePackageList decodes a repo_tool_profiles.packages JSONB array into a slice.
+// A NULL/empty/malformed column yields an empty list (never fails the claim on
+// bad data — an out-of-band write can't wedge a run).
+func decodePackageList(raw []byte) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal(raw, &out); err != nil {
+		slog.Error("workersvc: decode repo tool profile packages", "error", err)
+		return nil
+	}
+	return out
 }
 
 // IncomingMessage is one seq-numbered message a worker appends.

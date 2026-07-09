@@ -103,6 +103,15 @@ type Repo struct {
 	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
 }
 
+type RepoToolProfile struct {
+	ID        uuid.UUID          `json:"id"`
+	UserID    uuid.UUID          `json:"user_id"`
+	RepoID    uuid.UUID          `json:"repo_id"`
+	Packages  []byte             `json:"packages"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Run struct {
 	ID                   uuid.UUID          `json:"id"`
 	UserID               uuid.UUID          `json:"user_id"`
@@ -167,6 +176,16 @@ type Skill struct {
 	UpdatedBy   pgtype.UUID        `json:"updated_by"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ToolAllowlist struct {
+	ID            uuid.UUID          `json:"id"`
+	Name          string             `json:"name"`
+	PinnedVersion pgtype.Text        `json:"pinned_version"`
+	Note          pgtype.Text        `json:"note"`
+	UpdatedBy     pgtype.UUID        `json:"updated_by"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
 type User struct {

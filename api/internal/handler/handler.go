@@ -198,6 +198,20 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Post("/{id}/reset", h.ResetSkill)
 		})
 
+		// Tool allowlist (PRD #18 M4): any authenticated user can READ it (the repo
+		// package picker needs the selectable set); only admins write. Same
+		// read-all / write-admin split as agent-templates.
+		r.Route("/tool-allowlist", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListToolAllowlist)
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAdmin)
+				r.Post("/", h.CreateToolAllowlistEntry)
+				r.Put("/{id}", h.UpdateToolAllowlistEntry)
+				r.Delete("/{id}", h.DeleteToolAllowlistEntry)
+			})
+		})
+
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Use(mw.RequireAdmin)
@@ -238,6 +252,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.Put("/{id}", h.SetRepoEnabled)
 				// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 				r.Patch("/{id}", h.PatchRepo)
+				// Per-repo tool profile (PRD #18 M4): the owner's tier-1 package list.
+				// Owner-only (a repo belongs to one user's connection).
+				r.Get("/{id}/tool-profile", h.GetRepoToolProfile)
+				r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
 				r.Get("/{id}/board", h.GetBoard)
 				r.Put("/{id}/board/columns", h.ConfigureColumns)
 				// The in-app issue view fetches the issue (with its description) live
