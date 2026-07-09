@@ -1,7 +1,7 @@
 # PRD #28: Docs Search — Client-side Full-text Search on /docs
 
 **GitLab Issue**: [vtmocanu/uzi#28](https://gitlab.example.com/vtmocanu/uzi/-/issues/28)
-**Status**: In review (2026-07-09). M1-M3 done (commits 63b10e5, 2bba76f); review + audit + web-ux browser validation clean; M4 docs note + specs/ai.md done (d42504b, a564c97); specs/human.md proposal awaiting user approval; MR open.
+**Status**: Complete (2026-07-09). All milestones done; review + audit + web-ux browser validation clean; specs synced (ai.md a564c97, human.md 62e3238, user-approved); merged to main via MR !30.
 **Priority**: Medium
 **Created**: 2026-07-09
 **Depends on**: PRD #7 (docs viewer, done). No API/DB/service changes.
@@ -56,7 +56,7 @@ Deliberately not copied: multica's server-route search (uzi has no docs backend 
 - [x] **M1 — Search core**: `web/src/lib/docsearch.ts` with markdown stripping, tokenized AND matching (substring scanning, no `new RegExp(token)`), tier ranking, and snippet + merged-range extraction; unit tests (`docsearch.test.ts`) covering stripping edge cases (code fences, tables, links), ranking tiers, multi-token AND, snippet windowing, the short-query guard, regex-metachar tokens (`.env`, `--profile`), overlapping-token range merging, and the mixed title-token + body-token snippet case. *Files: `web/src/lib/docsearch.ts`, `web/src/lib/docsearch.test.ts`.*
 - [x] **M2 — Index UI**: search box on `/docs` (via the `Input` primitive) with live results, `<mark>` highlighting (explicit dark-theme styling), no-results state, `aria-live` result count, `Escape`/`/` keyboard handling; empty query renders the existing card list byte-for-byte; jsdom component tests (`Docs.test.tsx`, existing vitest + testing-library infra) for query → results (body-only term from `worker-setup` found, snippet marked) → clear flow. **These component tests are the behavioral gate for search** — see M3. *Files: `web/src/pages/Docs.tsx`, `web/src/pages/Docs.test.tsx` (new). Depends on M1.*
 - [x] **M3 — Whole-suite green + smoke**: `npm run typecheck`, `npm test`, `npm run build` (includes `check-docs.mjs`) green; compose smoke limited to what curl can assert — the built image serves `/docs` (HTML + JS bundle load). Search behavior itself is client-side JS and the repo has no browser automation, so the automated behavioral gate is M2's jsdom tests; a manual browser check of one body-only search is a nice-to-have, not a gate.
-- [ ] **M4 — Docs & spec sync**: one-line note in `docs/README.md`'s add-a-page section that `user` pages are automatically searchable (nothing to register); `specs/ai.md` records the design decisions; PRD closed out, moved to `prds/done/`.
+- [x] **M4 — Docs & spec sync**: one-line note in `docs/README.md`'s add-a-page section that `user` pages are automatically searchable (nothing to register); `specs/ai.md` records the design decisions; PRD closed out, moved to `prds/done/`.
 
 ### Parallelization
 
