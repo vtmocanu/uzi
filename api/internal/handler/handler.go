@@ -52,6 +52,24 @@ type Handler struct {
 	// nil falls back to the real slacksvc.Validator (see slackVal); tests inject a
 	// fake so the settings PUT is exercised without a network call to Slack.
 	slackValidator SlackValidator
+	// slackStatus reports the live Slack socket connection state for the admin DTO
+	// (PRD #25 M2). Wired to the slacksvc manager's State in main; nil (tests, or
+	// before wiring) reads as "disabled".
+	slackStatus func() string
+}
+
+// SetSlackStatus wires the Slack manager's connection-state accessor in after
+// construction (the manager is built alongside the handler's other run-lifecycle
+// collaborators). Safe to leave unset — the DTO then reports "disabled".
+func (h *Handler) SetSlackStatus(state func() string) { h.slackStatus = state }
+
+// slackState returns the live connection state, or "disabled" when no manager is
+// wired (Slack off, or a test handler).
+func (h *Handler) slackState() string {
+	if h.slackStatus != nil {
+		return h.slackStatus()
+	}
+	return "disabled"
 }
 
 // SlackValidator live-checks a pasted Slack token against Slack at save time

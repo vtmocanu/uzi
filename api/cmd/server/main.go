@@ -31,6 +31,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -130,6 +131,13 @@ func run() error {
 	}
 	settingsCache.ConfigureSecrets(box, slackEnv)
 
+	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
+	// connection: it polls the settings cache and, while Slack is enabled with both
+	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
+	// token/enable change); otherwise it idles as a strict no-op. It never touches
+	// the run lifecycle — Slack is best-effort. Run in the background WaitGroup below.
+	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{})
+
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 
 	// Optional startup admin seed. Runs after migrations, before serving. A
@@ -214,7 +222,7 @@ func run() error {
 	pcheck := privcheck.NewService(q, svc)
 
 	var bgWG sync.WaitGroup
-	bgWG.Add(3)
+	bgWG.Add(4)
 	go func() {
 		defer bgWG.Done()
 		engine.Run(ctx)
@@ -226,6 +234,10 @@ func run() error {
 	go func() {
 		defer bgWG.Done()
 		lifecycle.RunReconciler(ctx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		slackManager.Run(ctx)
 	}()
 	if cfg.PrivilegeCheckInterval > 0 {
 		privSweep := privcheck.NewEngine(pcheck, cfg.PrivilegeCheckInterval)
@@ -251,6 +263,8 @@ func run() error {
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
 	// the signal target is the handler.
 	h.SetReconciler(engine)
+	// Surface the live Slack connection state on the admin settings DTO (PRD #25 M2).
+	h.SetSlackStatus(slackManager.State)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

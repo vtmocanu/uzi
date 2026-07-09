@@ -98,6 +98,34 @@ func TestGetSettingsSecretShape(t *testing.T) {
 	}
 }
 
+// TestGetSettingsReportsSlackStatus asserts the wired manager state surfaces on
+// the admin DTO (PRD #25 M2), and that an unwired handler reports "disabled".
+func TestGetSettingsReportsSlackStatus(t *testing.T) {
+	cache := settings.New(&settingsStore{}, time.Minute)
+	cache.ConfigureSecrets(slackTestBox(t), nil)
+
+	// Default (no manager wired) → disabled.
+	h := &Handler{settings: cache}
+	rec := httptest.NewRecorder()
+	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
+	var resp struct {
+		SlackStatus string `json:"slack_status"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.SlackStatus != "disabled" {
+		t.Errorf("unwired slack_status = %q, want disabled", resp.SlackStatus)
+	}
+
+	// Wired to a live state accessor.
+	h.SetSlackStatus(func() string { return "connected" })
+	rec = httptest.NewRecorder()
+	h.GetSettings(rec, httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil))
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.SlackStatus != "connected" {
+		t.Errorf("wired slack_status = %q, want connected", resp.SlackStatus)
+	}
+}
+
 // TestUpdateSettingsRejectsEnvSourcedKey covers the PUT-409: an env-fixed key
 // cannot be written from the webui (the greying reflects enforced policy).
 func TestUpdateSettingsRejectsEnvSourcedKey(t *testing.T) {

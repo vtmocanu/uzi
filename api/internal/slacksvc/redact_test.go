@@ -35,6 +35,20 @@ func TestScrubTokens(t *testing.T) {
 	}
 }
 
+func TestRedactScrubsSocketURLAndTicket(t *testing.T) {
+	in := `connect failed to wss://wss-primary.slack.com/link/?ticket=SECRETTICKET123&app_id=A0 for xoxb-tok`
+	got := Redact(in)
+	for _, secret := range []string{"SECRETTICKET123", "wss-primary.slack.com", "xoxb-tok"} {
+		if contains(got, secret) {
+			t.Errorf("Redact left %q in %q", secret, got)
+		}
+	}
+	// A plain message with no credentials is unchanged.
+	if got := Redact("connection_error: timeout"); got != "connection_error: timeout" {
+		t.Errorf("Redact altered a clean string: %q", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

@@ -31,10 +31,14 @@ type settingsResponse struct {
 	Settings map[string]string `json:"settings"`
 	Secrets  map[string]bool   `json:"secrets"`
 	Sources  map[string]string `json:"sources"`
+	// SlackStatus is the live Slack socket connection state (PRD #25 M2):
+	// "disabled" | "connecting" | "connected" | "error:<class>". The webui chip
+	// renders it.
+	SlackStatus string `json:"slack_status"`
 }
 
-func newSettingsResponse(v settings.AdminView) settingsResponse {
-	return settingsResponse{Settings: v.Values, Secrets: v.Secrets, Sources: v.Sources}
+func newSettingsResponse(v settings.AdminView, slackStatus string) settingsResponse {
+	return settingsResponse{Settings: v.Values, Secrets: v.Secrets, Sources: v.Sources, SlackStatus: slackStatus}
 }
 
 // GetSettings returns every known setting (admin only): non-secret effective
@@ -48,7 +52,7 @@ func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, newSettingsResponse(view))
+	httpx.JSON(w, http.StatusOK, newSettingsResponse(view, h.slackState()))
 }
 
 // UpdateSettings writes one or more settings (admin only). It validates per key
@@ -224,5 +228,5 @@ func (h *Handler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, newSettingsResponse(view))
+	httpx.JSON(w, http.StatusOK, newSettingsResponse(view, h.slackState()))
 }
