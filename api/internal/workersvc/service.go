@@ -26,6 +26,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
 )
 
 // anthropicTokenKind mirrors the secret kind PRD #3's handler stores under.
@@ -356,6 +357,10 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 	}
 	skills := assembleRunSkills(skillRows, s.p.SkillsMaxPerRun)
 
+	// Tier-1 tool packages + repo devbox opt-in for the worker's provisioning
+	// engine (PRD #18 M3). Resolution seam; empty in M3 (see resolveTooling).
+	toolPackages, repoDevboxOptIn := s.resolveTooling(ctx, run)
+
 	// A ci_fix run carries no issue and instead delivers the failed-pipeline
 	// snapshot; an issue run carries its issue iid and no pipeline (PRD #6).
 	var issueIID *int64
@@ -405,8 +410,28 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 			DefaultModel:       textPtr(defaultModel),
 			SkillMaxBytes:      s.p.SkillMaxBytes,
 			SkillsMaxPerRun:    s.p.SkillsMaxPerRun,
+			ToolPackages:       toolPackages,
+			RepoDevboxOptIn:    repoDevboxOptIn,
 		},
 	}, nil
+}
+
+// resolveTooling resolves the run's tier-1 tool packages + repo devbox opt-in for
+// the claim payload (PRD #18 M3) — the single resolution seam the later
+// milestones fill in:
+//   - M3: no DB desire source exists yet, so the desired set is empty and Resolve
+//     returns nothing (real runs provision nothing; the worker path is exercised by
+//     tests). repo_devbox_opt_in is always false until M5.
+//   - M4 replaces the empty desired set with the per-(user,repo) repo_tool_profiles
+//     packages validated against the DB tool_allowlist; M5 sets repoDevboxOptIn from
+//     the per-repo trust toggle. The claim payload shape does not change.
+func (s *Service) resolveTooling(_ context.Context, _ store.Run) (toolPackages []string, repoDevboxOptIn bool) {
+	var desired []string // M4: load from repo_tool_profiles for (run.UserID, run.RepoID)
+	allowed, _ := toolprofile.Resolve(desired)
+	if allowed == nil {
+		allowed = []string{} // always send an array, never null (wire contract)
+	}
+	return allowed, false
 }
 
 // IncomingMessage is one seq-numbered message a worker appends.

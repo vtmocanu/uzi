@@ -81,6 +81,8 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			DefaultModel:       strptr("sonnet"),
 			SkillMaxBytes:      65536,
 			SkillsMaxPerRun:    32,
+			ToolPackages:       []string{"kubectl@1.31", "jq"}, // PRD #18 M3 tier-1 list
+			RepoDevboxOptIn:    false,                          // M5 wires the toggle; false until then
 		},
 	}
 }

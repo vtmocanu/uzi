@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill } from "../src/protocol.js";
@@ -680,5 +680,57 @@ describe("SdkExecutor repo skills (PRD #16 M6)", () => {
     assert.deepStrictEqual(o.skills, ["uzi:team-kb"], "repo skill evicted by the cap");
     assert.deepStrictEqual(subagent(o, "coder").skills, [], "evicted repo skill reaches no subagent");
     assert.deepStrictEqual(subagent(o, "reviewer").skills, []);
+  });
+});
+
+describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
+  it("provisions before the SDK and folds the tool env into the SDK env", async () => {
+    const calls: Array<{ packages: string[]; runDir: string; homeDir: string }> = [];
+    const provision: SdkExecutorOptions["provision"] = async (input) => {
+      calls.push(input);
+      return { toolEnv: { PATH: "/nix/kubectl/bin:/usr/bin", NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem" } };
+    };
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [assistantText("impl"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder], config: { tool_packages: ["kubectl@1.31", "jq"] } });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+
+    assert.strictEqual(calls.length, 1);
+    assert.deepStrictEqual(calls[0]!.packages, ["kubectl@1.31", "jq"]);
+    // The provisioned (allowlisted) tool env reached the SDK subprocess env.
+    const env = turns[0]!.options.env as Record<string, string>;
+    assert.strictEqual(env.PATH, "/nix/kubectl/bin:/usr/bin");
+    assert.strictEqual(env.NIX_SSL_CERT_FILE, "/etc/ssl/cert.pem");
+    // The credential is still there and untouched by provisioning.
+    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, OAUTH);
+  });
+
+  it("does not provision when the run has no tool packages (today's behavior)", async () => {
+    let called = false;
+    const provision: SdkExecutorOptions["provision"] = async () => {
+      called = true;
+      return { toolEnv: {} };
+    };
+    const { queryFn } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(makeCtx({ config: null }).ctx);
+    assert.strictEqual(called, false, "provisioning must be skipped when no packages");
+  });
+
+  it("fails the run with a clear message when provisioning throws", async () => {
+    const provision: SdkExecutorOptions["provision"] = async () => {
+      throw new Error("devbox exploded");
+    };
+    const { queryFn } = fakeTurns([[submitPlan("# plan"), resultSuccess()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(
+        makeCtx({ config: { tool_packages: ["kubectl"] } }).ctx,
+      ),
+      /tool provisioning failed/,
+    );
   });
 });

@@ -44,7 +44,9 @@
     "idle_timeout_seconds": 600,
     "max_iterations": 5,
     "skill_max_bytes": 65536,
-    "skills_max_per_run": 32
+    "skills_max_per_run": 32,
+    "tool_packages": [],
+    "repo_devbox_opt_in": false
   },
   "skills": [],
   "skills_dropped": []

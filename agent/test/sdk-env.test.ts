@@ -67,4 +67,28 @@ describe("buildSdkEnv", () => {
     assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
     assert.ok(!JSON.stringify(env).includes(FAKE_API_KEY));
   });
+
+  it("folds in provisioned tool env (PRD #18 M3): PATH replaced, nix vars added", () => {
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+      PATH: "/nix/store/kubectl/bin:/usr/bin",
+      NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem",
+    });
+    assert.strictEqual(env.PATH, "/nix/store/kubectl/bin:/usr/bin");
+    assert.strictEqual(env.NIX_SSL_CERT_FILE, "/etc/ssl/cert.pem");
+    // Credentials + HOME are unchanged and still present.
+    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+    assert.strictEqual(env.HOME, HOME_DIR);
+  });
+
+  it("never lets tool env overwrite the credential or HOME keys", () => {
+    // filterShellenv already drops these, but buildSdkEnv is defensive too.
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+      CLAUDE_CODE_OAUTH_TOKEN: "attacker-token",
+      HOME: "/tmp/evil",
+      PATH: "/nix/bin",
+    } as Record<string, string>);
+    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+    assert.strictEqual(env.HOME, HOME_DIR);
+    assert.strictEqual(env.PATH, "/nix/bin");
+  });
 });

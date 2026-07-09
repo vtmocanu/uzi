@@ -58,6 +58,16 @@ With `WORKER_TEMPLATE` unset, compose builds `base`. Set it to a **bare template
 
 Each template's Dockerfile bakes its own name into the image as `UZI_WORKER_TEMPLATE` (a fixed literal, independent of the `WORKER_TEMPLATE` build variable), and the worker **reports** that at register, so **Settings → Workers** shows each worker's template. Because the reported value is the image's own baked-in identity, it flags a genuine mismatch when you build with one `WORKER_TEMPLATE` but declared another at issuance. This is observability only: the join token is still the sole trust anchor, so a worker's reported template is never used to accept or reject it.
 
+## Tool provisioning
+
+Beyond the image's baked-in tools, a run can be given **per-repo CLI tools** (kubectl, terraform, jq, and so on) that the worker installs on demand with [devbox](https://www.jetify.com/devbox) (nix under the hood). The full profile UI lands in a later milestone; the mechanics you should know as an operator:
+
+- **New outbound egress.** When a run has tool packages to install, the worker fetches them from **nix substituters**: `https://cache.nixos.org` (the default) plus any you configure. This is the one place the worker reaches beyond `api`, so allow it through an egress firewall if you run one. The nix store is cached on the `agentdata` volume, so it is a **first-run-only** download; the same worker's later runs warm-start.
+- **Provisioning is secret-scrubbed.** The install runs in a subprocess whose environment is stripped of the forge token, the Anthropic token, and the join token, so a package's build hook cannot read your credentials. Only an explicit allowlist of tool environment variables (`PATH` and nix's TLS/locale vars) is passed back to the agent.
+- **Provisioning failure fails the run.** A missing or disallowed package stops the run with a clear message rather than silently continuing without the tool.
+
+> Status note: the worker image installs devbox/nix, but that layer is not yet validated on the Alpine base and may require a glibc base image. See PRD #18 for the open item.
+
 ## Online, offline, busy
 
 - **online**: a recent heartbeat arrived within the server's staleness window.

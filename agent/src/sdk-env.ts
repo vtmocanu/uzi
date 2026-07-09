@@ -21,13 +21,17 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
-/** Exactly the keys the SDK subprocess is allowed to see. */
+/** Exactly the keys the SDK subprocess is allowed to see. The index signature
+ *  carries the PRD #18 M3 provisioned tool vars, which are added ONLY from
+ *  provision.ts's explicit allowlist (PATH override + NIX_SSL_CERT_FILE /
+ *  LOCALE_ARCHIVE) — never a blind merge of devbox's shellenv. */
 export interface SdkEnv {
   CLAUDE_CODE_OAUTH_TOKEN: string;
   HOME: string;
   PATH: string | undefined;
   ANTHROPIC_API_KEY: undefined;
   ANTHROPIC_AUTH_TOKEN: undefined;
+  [key: string]: string | undefined;
 }
 
 /**
@@ -35,9 +39,14 @@ export interface SdkEnv {
  *
  * @param oauthToken the Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN)
  * @param homeDir    the pinned HOME (a dir on $UZI_DATA_DIR) for session persistence
+ * @param toolEnv    PRD #18 M3: allowlisted vars from devbox provisioning. Already
+ *                   filtered by provision.ts (only PROVISION_ENV_ALLOWLIST keys),
+ *                   so widening the agent env stays deliberate. PATH here REPLACES
+ *                   the inherited PATH (devbox's PATH already prepends tool bins to
+ *                   it). Empty ⇒ today's behavior exactly.
  */
-export function buildSdkEnv(oauthToken: string, homeDir: string): SdkEnv {
-  return {
+export function buildSdkEnv(oauthToken: string, homeDir: string, toolEnv: Record<string, string> = {}): SdkEnv {
+  const env: SdkEnv = {
     CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
     HOME: homeDir,
     // Inherited so the bundled CLI can resolve git/bash/coreutils on PATH.
@@ -45,4 +54,12 @@ export function buildSdkEnv(oauthToken: string, homeDir: string): SdkEnv {
     ANTHROPIC_API_KEY: undefined,
     ANTHROPIC_AUTH_TOKEN: undefined,
   };
+  // Fold in the provisioned tool env. Only allowlisted keys reach here; PATH (if
+  // present) is devbox's PATH with the tool bins prepended, so it replaces the
+  // inherited one. Never overwrite the credential/HOME keys above.
+  for (const [k, v] of Object.entries(toolEnv)) {
+    if (k === "CLAUDE_CODE_OAUTH_TOKEN" || k === "HOME") continue;
+    env[k] = v;
+  }
+  return env;
 }

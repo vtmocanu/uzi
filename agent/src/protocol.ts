@@ -166,6 +166,15 @@ export interface ClaimConfig {
    *  delivered ∪ repo union (re-enforced worker-side, M4/M6). */
   skill_max_bytes?: number;
   skills_max_per_run?: number;
+  /** Tier-1 tool packages (PRD #18 M3): the resolved, allowlist-validated devbox
+   *  package list the worker provisions before the SDK starts. Empty/absent ⇒ no
+   *  provisioning (today's behavior). The server resolves this; the worker only
+   *  installs it (in a secret-scrubbed subprocess). */
+  tool_packages?: string[];
+  /** Repo devbox.json packages opt-in (PRD #18 M5): whether the worker may union
+   *  the repo's own devbox.json packages (packages-only) into the provisioned set.
+   *  Delivered from M3 but always false until M5 wires the per-repo toggle. */
+  repo_devbox_opt_in?: boolean;
 }
 
 /**

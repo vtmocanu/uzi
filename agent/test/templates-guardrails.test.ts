@@ -49,5 +49,12 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must bake ENV UZI_WORKER_TEMPLATE=${name}`,
       );
     });
+
+    it(`${name}: installs the devbox provisioning engine (PRD #18 M3)`, () => {
+      // Every template gains devbox so per-run tool provisioning works regardless of
+      // which image a worker runs. The self-contained-per-template layout means this
+      // must stay mirrored across all Dockerfiles; this pins that.
+      assert.match(text, /get\.jetify\.com\/devbox/, `${name}/Dockerfile must install devbox`);
+    });
   }
 });
