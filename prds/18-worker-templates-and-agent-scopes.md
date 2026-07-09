@@ -105,7 +105,7 @@ Work runs on `feature/prd-18-worker-templates` (worktree `../prd-18-worker-templ
 |---|---|---|
 | M1+M2 templates + drift UI | `ca93b17` `a1dca44` `7baaece` | reviewer PASS, auditor PASS, tester PASS (images, compose default, e2e w/ 00044) |
 | M3 devbox engine + hardening | `f8779d1` `84fa838` `13591c4` | reviewer PASS, auditor PASS (secret-scrub core confirmed) |
-| M3 image packaging | `ef21dee` + pending final fix | tester: LOGIC PASS (rootless uzi install, warm-start via `agentnix:/nix`, pinned devbox 0.17.5) but **as committed the Dockerfiles don't build** — checksum-filename bug + hardcoded amd64; fix commit was being landed at pause time. **Needs: fix landed + real `docker build` of both templates (native amd64 ideally) + reviewer pass over `ef21dee`+fix** |
+| M3 image packaging | `ef21dee` `989755f` | tester: LOGIC PASS at `ef21dee` (rootless uzi install, warm-start via `agentnix:/nix`, pinned devbox 0.17.5); the two build blockers it found (checksum-filename verify, hardcoded amd64/no TARGETARCH) are fixed in `989755f`. **`989755f` not yet agent-reviewed; still needs a real `docker build` of both templates (native amd64 ideally)** |
 | M4 tool profiles + allowlist | `c846116` `342520b` | reviewer PASS, auditor PASS |
 | M4 audit ride-alongs (denylist, caps, shared rules loader) | `a45a9fd` | **NOT yet agent-reviewed** |
 | M5 tier-2 repo opt-in | `a0b7ba9` `ec12c96` | **NOT yet reviewed/audited/tested — first validation wave on resume** |
