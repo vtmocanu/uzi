@@ -34,12 +34,22 @@ VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, @worker_i
 RETURNING *;
 
 -- name: ListChatRunsForUser :many
--- The user's chat conversations, newest first (the Chat page's conversation list).
--- No repo join — a chat run has no repo (repo_id NULL), so it never appears in the
--- repo-joined Runs index and is listed only here.
-SELECT * FROM runs
-WHERE user_id = @user_id AND kind = 'chat'
-ORDER BY created_at DESC
+-- The user's chat conversations for the Chat page's conversation list, ordered by
+-- LAST ACTIVITY (the list renders and sorts on it). Each row carries turn_count (the
+-- persisted follow_up inputs, i.e. user turns incl. the seeded first message) and
+-- last_message_at (the newest run_message time, NULL until the worker emits one) via
+-- scalar subqueries — no repo join (a chat has no repo). A conversation with no
+-- messages yet falls back to its created_at for ordering, so a just-created chat
+-- still sorts to the top. Wrapped in a subselect so the ORDER BY can reference the
+-- computed last_message_at.
+SELECT * FROM (
+    SELECT r.id, r.title, r.status, r.resume_of_run_id, r.created_at, r.updated_at,
+           (SELECT count(*) FROM run_user_inputs i WHERE i.run_id = r.id AND i.kind = 'follow_up') AS turn_count,
+           (SELECT max(m.created_at) FROM run_messages m WHERE m.run_id = r.id)::timestamptz AS last_message_at
+    FROM runs r
+    WHERE r.user_id = @user_id AND r.kind = 'chat'
+) chat
+ORDER BY COALESCE(chat.last_message_at, chat.created_at) DESC
 LIMIT 200;
 
 -- name: ClaimChatRun :one

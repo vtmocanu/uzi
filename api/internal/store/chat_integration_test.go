@@ -176,6 +176,30 @@ func TestChatRunsLiveDB(t *testing.T) {
 		t.Fatalf("idle sweep must complete exactly the old-message chat, got %v", swept)
 	}
 
+	// ── list DTO: turn_count, last_message_at, and last-activity ordering ──
+	list, err := q.ListChatRunsForUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListChatRunsForUser: %v", err)
+	}
+	byID := map[uuid.UUID]store.ListChatRunsForUserRow{}
+	for _, row := range list {
+		byID[row.ID] = row
+	}
+	if got := byID[freshChat.ID].TurnCount; got != 4 {
+		t.Fatalf("freshChat turn_count = %d, want 4 (seeded + 3)", got)
+	}
+	if !byID[activeChat.ID].LastMessageAt.Valid {
+		t.Fatalf("activeChat has a message, so last_message_at must be set")
+	}
+	if byID[freshChat.ID].LastMessageAt.Valid {
+		t.Fatalf("freshChat has no run_messages, so last_message_at must be NULL")
+	}
+	// activeChat's message is the newest activity across all the user's chats, so it
+	// sorts first (last-activity DESC, message-less chats falling back to created_at).
+	if len(list) == 0 || list[0].ID != activeChat.ID {
+		t.Fatalf("chat list must sort by last activity (activeChat first), got first=%v", list[0].ID)
+	}
+
 	// ── proposals: user-scoped lookup + confirm/dismiss idempotency guards ──
 	propID := uuid.New()
 	mustExec(ctx, t, pool,

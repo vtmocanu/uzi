@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -50,7 +51,24 @@ func (h *Handler) CreateChat(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, map[string]any{"run": runToDTO(run)})
 }
 
-// ListChats returns the current user's chat conversations, newest first.
+// chatListDTO is one conversation in the Chat page's list: the display + activity
+// fields the list needs, distinct from the full runDTO (a chat has no repo/issue/MR
+// context to carry). turn_count is the user-turn count (persisted follow_ups incl.
+// the seeded first message); last_message_at is the newest run_message time (null
+// until the worker emits one) the list sorts on.
+type chatListDTO struct {
+	ID            string     `json:"id"`
+	Title         *string    `json:"title"`
+	Status        string     `json:"status"`
+	TurnCount     int64      `json:"turn_count"`
+	LastMessageAt *time.Time `json:"last_message_at"`
+	ResumeOfRunID *string    `json:"resume_of_run_id"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+// ListChats returns the current user's chat conversations, ordered by last activity.
+// The instance-wide turn cap rides the envelope (a constant, not per-chat).
 func (h *Handler) ListChats(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -63,12 +81,23 @@ func (h *Handler) ListChats(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]runDTO, 0, len(rows))
-	for _, run := range rows {
-		out = append(out, runToDTO(run))
+	out := make([]chatListDTO, 0, len(rows))
+	for _, c := range rows {
+		dto := chatListDTO{
+			ID:            c.ID.String(),
+			Title:         textPtrValue(c.Title.Valid, c.Title.String),
+			Status:        c.Status,
+			TurnCount:     c.TurnCount,
+			LastMessageAt: timePtr(c.LastMessageAt.Valid, c.LastMessageAt.Time),
+			CreatedAt:     c.CreatedAt.Time,
+			UpdatedAt:     c.UpdatedAt.Time,
+		}
+		if c.ResumeOfRunID.Valid {
+			s := uuid.UUID(c.ResumeOfRunID.Bytes).String()
+			dto.ResumeOfRunID = &s
+		}
+		out = append(out, dto)
 	}
-	// max_turns is the instance-wide cap the UI shows the turn counter against
-	// (an instance constant, not per-chat), so it rides the list envelope.
 	httpx.JSON(w, http.StatusOK, map[string]any{"chats": out, "max_turns": h.cfg.ChatMaxTurns})
 }
 

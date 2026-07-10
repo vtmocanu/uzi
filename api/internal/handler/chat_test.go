@@ -6,11 +6,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -54,9 +57,22 @@ func (s *chatStore) MarkProposalDismissed(_ context.Context, id uuid.UUID) (stor
 	s.dismissed = &id
 	return store.IssueProposal{}, nil
 }
+func (s *chatStore) ListChatRunsForUser(_ context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error) {
+	if userID != s.ownerID {
+		return nil, nil
+	}
+	return []store.ListChatRunsForUserRow{{
+		ID: s.chatRun.ID, Title: pgtype.Text{String: "How does the plan gate work?", Valid: true},
+		Status: "running", TurnCount: 3,
+		LastMessageAt: pgtype.Timestamptz{Time: time.Unix(1700000000, 0), Valid: true},
+	}}, nil
+}
 
 func newChatHandler(st workersvc.Store) *Handler {
-	return &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{ChatMaxTurns: 50})}
+	return &Handler{
+		wsvc: workersvc.New(st, nil, workersvc.Params{ChatMaxTurns: 50}),
+		cfg:  config.Config{ChatMaxTurns: 50}, // the ListChats envelope reads max_turns from cfg
+	}
 }
 
 // chatReq builds a request authenticated as user with optional chi {id}/{pid}
@@ -77,6 +93,29 @@ func chatReq(method string, user store.User, id, pid uuid.UUID, body string) *ht
 	}
 	ctx := context.WithValue(mw.ContextWithUser(r.Context(), user), chi.RouteCtxKey, rctx)
 	return r.WithContext(ctx)
+}
+
+func TestListChatsShapeAndEnvelope(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: uuid.New(), UserID: owner.ID}}
+	h := newChatHandler(st)
+
+	rec := httptest.NewRecorder()
+	h.ListChats(rec, chatReq(http.MethodGet, owner, uuid.Nil, uuid.Nil, ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListChats = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	// Envelope carries the instance-wide turn cap.
+	if !strings.Contains(body, `"max_turns":50`) {
+		t.Fatalf("ListChats envelope must carry max_turns; got %s", body)
+	}
+	// The chat list DTO carries turn_count + last_message_at (the list's sort key).
+	for _, want := range []string{`"turn_count":3`, `"last_message_at":`, `"title":"How does the plan gate work?"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("ListChats body missing %s; got %s", want, body)
+		}
+	}
 }
 
 func TestCreateChatRequiresAuthAndMessage(t *testing.T) {

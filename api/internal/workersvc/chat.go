@@ -211,8 +211,9 @@ func (s *Service) CreateChatRun(ctx context.Context, userID uuid.UUID, message s
 	})
 }
 
-// ListChatRuns returns the user's chat conversations, newest first.
-func (s *Service) ListChatRuns(ctx context.Context, userID uuid.UUID) ([]store.Run, error) {
+// ListChatRuns returns the user's chat conversations for the Chat page's list,
+// ordered by last activity, each with its turn_count and last_message_at.
+func (s *Service) ListChatRuns(ctx context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error) {
 	return s.q.ListChatRunsForUser(ctx, userID)
 }
 

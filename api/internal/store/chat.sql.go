@@ -318,60 +318,54 @@ func (q *Queries) GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (
 }
 
 const listChatRunsForUser = `-- name: ListChatRunsForUser :many
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, title, resume_of_run_id FROM runs
-WHERE user_id = $1 AND kind = 'chat'
-ORDER BY created_at DESC
+SELECT id, title, status, resume_of_run_id, created_at, updated_at, turn_count, last_message_at FROM (
+    SELECT r.id, r.title, r.status, r.resume_of_run_id, r.created_at, r.updated_at,
+           (SELECT count(*) FROM run_user_inputs i WHERE i.run_id = r.id AND i.kind = 'follow_up') AS turn_count,
+           (SELECT max(m.created_at) FROM run_messages m WHERE m.run_id = r.id)::timestamptz AS last_message_at
+    FROM runs r
+    WHERE r.user_id = $1 AND r.kind = 'chat'
+) chat
+ORDER BY COALESCE(chat.last_message_at, chat.created_at) DESC
 LIMIT 200
 `
 
-// The user's chat conversations, newest first (the Chat page's conversation list).
-// No repo join — a chat run has no repo (repo_id NULL), so it never appears in the
-// repo-joined Runs index and is listed only here.
-func (q *Queries) ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]Run, error) {
+type ListChatRunsForUserRow struct {
+	ID            uuid.UUID          `json:"id"`
+	Title         pgtype.Text        `json:"title"`
+	Status        string             `json:"status"`
+	ResumeOfRunID pgtype.UUID        `json:"resume_of_run_id"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	TurnCount     int64              `json:"turn_count"`
+	LastMessageAt pgtype.Timestamptz `json:"last_message_at"`
+}
+
+// The user's chat conversations for the Chat page's conversation list, ordered by
+// LAST ACTIVITY (the list renders and sorts on it). Each row carries turn_count (the
+// persisted follow_up inputs, i.e. user turns incl. the seeded first message) and
+// last_message_at (the newest run_message time, NULL until the worker emits one) via
+// scalar subqueries — no repo join (a chat has no repo). A conversation with no
+// messages yet falls back to its created_at for ordering, so a just-created chat
+// still sorts to the top. Wrapped in a subselect so the ORDER BY can reference the
+// computed last_message_at.
+func (q *Queries) ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]ListChatRunsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listChatRunsForUser, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Run{}
+	items := []ListChatRunsForUserRow{}
 	for rows.Next() {
-		var i Run
+		var i ListChatRunsForUserRow
 		if err := rows.Scan(
 			&i.ID,
-			&i.UserID,
-			&i.RepoID,
-			&i.IssueIid,
-			&i.IssueTitle,
-			&i.IssueDescription,
+			&i.Title,
 			&i.Status,
-			&i.RequeueCount,
-			&i.WorkerID,
-			&i.SessionID,
-			&i.LastSeq,
-			&i.Branch,
-			&i.MrIid,
-			&i.FailureReason,
-			&i.PlanMd,
-			&i.IterationCount,
-			&i.ClaimedAt,
-			&i.StartedAt,
-			&i.FinishedAt,
+			&i.ResumeOfRunID,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.OriginColumn,
-			&i.BoardColumn,
-			&i.MovePendingSince,
-			&i.MrState,
-			&i.AutoApprove,
-			&i.AutopilotCommentedAt,
-			&i.Kind,
-			&i.PipelineID,
-			&i.PipelineRef,
-			&i.FailureSnapshot,
-			&i.FixVerdict,
-			&i.StopKind,
-			&i.Title,
-			&i.ResumeOfRunID,
+			&i.TurnCount,
+			&i.LastMessageAt,
 		); err != nil {
 			return nil, err
 		}
