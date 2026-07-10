@@ -417,6 +417,30 @@ func (q *Queries) GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (
 	return resume_session_id, err
 }
 
+const getRepoIDByPathForUser = `-- name: GetRepoIDByPathForUser :one
+SELECT r.id
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.path_with_namespace = $1 AND c.user_id = $2
+`
+
+type GetRepoIDByPathForUserParams struct {
+	Path   string    `json:"path"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Resolve a repo's internal id from its path_with_namespace, scoped to the owning
+// user (a repo belongs to a user via its forge connection). The worker's propose_issue
+// tool sends the human-readable repo path — it never sees internal UUIDs (Decision 7)
+// — so the proposal endpoint resolves it here with the SAME ownership rule as
+// GetRepoForUser, just keyed by path. No row = unknown path, or not this user's repo.
+func (q *Queries) GetRepoIDByPathForUser(ctx context.Context, arg GetRepoIDByPathForUserParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getRepoIDByPathForUser, arg.Path, arg.UserID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const listChatRunsForUser = `-- name: ListChatRunsForUser :many
 SELECT id, title, status, resume_of_run_id, created_at, updated_at, turn_count, last_message_at FROM (
     SELECT r.id, r.title, r.status, r.resume_of_run_id, r.created_at, r.updated_at,

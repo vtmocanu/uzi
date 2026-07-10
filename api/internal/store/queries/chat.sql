@@ -127,6 +127,17 @@ FROM issue_proposals p
 JOIN runs r ON r.id = p.run_id
 WHERE p.id = @id AND p.run_id = @run_id AND r.user_id = @user_id AND r.kind = 'chat';
 
+-- name: GetRepoIDByPathForUser :one
+-- Resolve a repo's internal id from its path_with_namespace, scoped to the owning
+-- user (a repo belongs to a user via its forge connection). The worker's propose_issue
+-- tool sends the human-readable repo path — it never sees internal UUIDs (Decision 7)
+-- — so the proposal endpoint resolves it here with the SAME ownership rule as
+-- GetRepoForUser, just keyed by path. No row = unknown path, or not this user's repo.
+SELECT r.id
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.path_with_namespace = @path AND c.user_id = @user_id;
+
 -- name: CreateIssueProposal :one
 -- The worker's propose_issue tool creates a PENDING proposal (PRD #39 M3, Decision
 -- 8). It NEVER touches the forge — only the browser's confirm does. The handler has

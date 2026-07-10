@@ -301,6 +301,15 @@ func TestChatRunsLiveDB(t *testing.T) {
 	if err != nil || len(page) != 1 {
 		t.Fatalf("ListRunMessagesForWorkerPage = %d msgs, %v; want 1", len(page), err)
 	}
+
+	// ── repo path resolution (M3): the proposal endpoint resolves repo_path -> id,
+	// user-scoped (the agent never sees internal UUIDs) ──
+	if gotID, err := q.GetRepoIDByPathForUser(ctx, store.GetRepoIDByPathForUserParams{Path: "g/r", UserID: userID}); err != nil || gotID != repoID {
+		t.Fatalf("GetRepoIDByPathForUser(own repo) = %v, %v; want %v", gotID, err, repoID)
+	}
+	if _, err := q.GetRepoIDByPathForUser(ctx, store.GetRepoIDByPathForUserParams{Path: "g/r", UserID: uuid.New()}); err != pgx.ErrNoRows {
+		t.Fatalf("a foreign user must not resolve another user's repo path, got %v", err)
+	}
 }
 
 // insertRunShape inserts a run with a caller-supplied set of extra columns/values

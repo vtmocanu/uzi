@@ -25,9 +25,17 @@ type workerChatStore struct {
 	userID       uuid.UUID
 	chatRun      store.Run
 	repoID       uuid.UUID
+	repoPath     string
 	pendingCount int64
 	created      *store.CreateIssueProposalParams
 	lastMsgLim   int32
+}
+
+func (s *workerChatStore) GetRepoIDByPathForUser(_ context.Context, arg store.GetRepoIDByPathForUserParams) (uuid.UUID, error) {
+	if arg.Path == s.repoPath && arg.Path != "" && arg.UserID == s.userID {
+		return s.repoID, nil
+	}
+	return uuid.Nil, pgx.ErrNoRows
 }
 
 func (s *workerChatStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -91,7 +99,7 @@ func TestWorkerCreateProposalAuthzAndCaps(t *testing.T) {
 	uid, runID, repoID := uuid.New(), uuid.New(), uuid.New()
 	wkr := store.Worker{ID: uuid.New(), UserID: uid}
 	base := func() *workerChatStore {
-		return &workerChatStore{userID: uid, repoID: repoID, chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
+		return &workerChatStore{userID: uid, repoID: repoID, repoPath: "g/r", chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
 	}
 	body := `{"repo_id":"` + repoID.String() + `","title":"Add a job","description":"d","labels":["enhancement"]}`
 
@@ -147,6 +155,43 @@ func TestWorkerCreateProposalAuthzAndCaps(t *testing.T) {
 	newWorkerChatHandler(st).WorkerCreateProposal(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/proposals", wkr, runID, body))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("capped proposal = %d, want 409", rec.Code)
+	}
+}
+
+// TestWorkerCreateProposalViaRepoPath: the agent sends repo_path (not an internal
+// UUID); the endpoint resolves it to the repo id, user-scoped. An unknown/foreign
+// path is 404; a missing repo entirely is 400.
+func TestWorkerCreateProposalViaRepoPath(t *testing.T) {
+	uid, runID, repoID := uuid.New(), uuid.New(), uuid.New()
+	wkr := store.Worker{ID: uuid.New(), UserID: uid}
+	st := &workerChatStore{userID: uid, repoID: repoID, repoPath: "g/r", chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
+	h := newWorkerChatHandler(st)
+
+	// repo_path resolves and creates the proposal against the resolved id.
+	rec := httptest.NewRecorder()
+	h.WorkerCreateProposal(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/proposals", wkr, runID,
+		`{"repo_path":"g/r","title":"Add a job","description":"d","labels":[]}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("repo_path proposal = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	if st.created == nil || st.created.RepoID != repoID {
+		t.Fatalf("proposal must be created against the resolved repo id, got %v", st.created)
+	}
+
+	// An unknown/foreign path → 404.
+	rec = httptest.NewRecorder()
+	h.WorkerCreateProposal(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/proposals", wkr, runID,
+		`{"repo_path":"other/repo","title":"t","description":"d","labels":[]}`))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown repo_path = %d, want 404", rec.Code)
+	}
+
+	// Neither repo_path nor repo_id → 400.
+	rec = httptest.NewRecorder()
+	h.WorkerCreateProposal(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/proposals", wkr, runID,
+		`{"title":"t","description":"d","labels":[]}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing repo = %d, want 400", rec.Code)
 	}
 }
 

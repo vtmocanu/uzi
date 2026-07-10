@@ -458,6 +458,21 @@ func (s *Service) CreateProposal(ctx context.Context, wkr store.Worker, runID, r
 	})
 }
 
+// ResolveRepoForWorker resolves a repo PATH (path_with_namespace) to its internal id,
+// scoped to the worker's user — the propose_issue tool sends the repo path the read
+// endpoints expose, never an internal UUID (Decision 7). An unknown or non-owned path
+// is ErrRepoNotFound.
+func (s *Service) ResolveRepoForWorker(ctx context.Context, wkr store.Worker, repoPath string) (uuid.UUID, error) {
+	id, err := s.q.GetRepoIDByPathForUser(ctx, store.GetRepoIDByPathForUserParams{Path: repoPath, UserID: wkr.UserID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, ErrRepoNotFound
+		}
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
 // ListRunsForWorker returns a bounded, newest-first list of the worker's USER's runs
 // (both kinds — the chat agent investigates issue runs too), Decision 7. limit is
 // clamped to [1, workerRunsMaxLimit].
