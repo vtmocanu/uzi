@@ -4,7 +4,23 @@ import {
   frontmatterFieldWarning,
   isLeadTemplateName,
   modelFieldWarning,
+  TEMPLATE_SCOPE_LABEL,
+  templateScopeBadgeTone,
 } from "./agentTemplates";
+
+describe("template scope helpers", () => {
+  it("labels each scope for the UI", () => {
+    expect(TEMPLATE_SCOPE_LABEL.builtin).toBe("Builtin");
+    expect(TEMPLATE_SCOPE_LABEL.global).toBe("Global");
+    expect(TEMPLATE_SCOPE_LABEL.user).toBe("Mine");
+  });
+
+  it("maps each scope to a distinct badge tone", () => {
+    expect(templateScopeBadgeTone("builtin")).toBe("brand");
+    expect(templateScopeBadgeTone("global")).toBe("info");
+    expect(templateScopeBadgeTone("user")).toBe("neutral");
+  });
+});
 
 describe("modelFieldWarning", () => {
   it("accepts blank (inherit), curated aliases, and full IDs", () => {

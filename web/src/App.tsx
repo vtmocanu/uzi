@@ -115,9 +115,9 @@ export default function App() {
         <Route
           path="/agents/new"
           element={
-            <AdminRoute>
+            <ProtectedRoute>
               <AgentNew />
-            </AdminRoute>
+            </ProtectedRoute>
           }
         />
         <Route

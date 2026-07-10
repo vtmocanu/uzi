@@ -50,8 +50,13 @@ export interface UserSettingsPatch {
   theme?: string | null;
 }
 
+// AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
+// global (admin, visible to all), user (self-service, owner-visible).
+export type AgentTemplateScope = "builtin" | "global" | "user";
+
 // AgentTemplate is a stored agent definition. tools is null when the template
-// inherits all tools; model is null when it inherits the model.
+// inherits all tools; model is null when it inherits the model. scope/user_id
+// carry the M6 ownership model; is_builtin is retained (== scope 'builtin').
 export interface AgentTemplate {
   id: string;
   name: string;
@@ -60,19 +65,46 @@ export interface AgentTemplate {
   tools: string[] | null;
   prompt_body: string;
   is_builtin: boolean;
+  scope: AgentTemplateScope;
+  user_id: string | null;
   updated_by: string | null;
   created_at: string;
   updated_at: string;
 }
 
-// AgentTemplateInput is the admin-editable shape. name is only sent on create
-// (it is immutable afterwards).
+// AgentTemplateInput is the create/edit shape. name and scope are only sent on
+// create (both immutable afterwards); scope is "global" (admin) or "user"
+// (owner) — "builtin" is never creatable via the API. A blank/absent scope
+// defaults to global server-side (the pre-M6 admin create).
 export interface AgentTemplateInput {
   name?: string;
   description: string;
   model: string | null;
   tools: string[] | null;
   prompt_body: string;
+  scope?: "global" | "user";
+}
+
+// TemplateAllocation is one template in the caller's allocation view (PRD #18
+// M7): whether it is a global default, the caller's own overlay (null = none),
+// and the resolved effective decision (overlay wins, else the global default).
+export interface TemplateAllocation {
+  id: string;
+  name: string;
+  description: string;
+  scope: AgentTemplateScope;
+  is_builtin: boolean;
+  global_default: boolean;
+  my_override: boolean | null;
+  effective: boolean;
+}
+
+// TemplateAllocationsInput is the replace-set write. Each half is optional: an
+// omitted half is left untouched. global_default_ids is admin-only (the shared
+// default set); my_overrides is the caller's own overlay.
+export interface TemplateAllocationsInput {
+  global_default_ids?: string[];
+  my_overrides?: { template_id: string; enabled: boolean }[];
 }
 
 // ── Agent skills (PRD #16) ────────────────────────────────────────────────
@@ -594,6 +626,10 @@ const realApi = {
     request<{ settings: UserSettings }>("PUT", "/me/settings", patch),
   listAgentTemplates: () =>
     request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
+  getTemplateAllocations: () =>
+    request<{ templates: TemplateAllocation[] }>("GET", "/agent-templates/allocations"),
+  setTemplateAllocations: (input: TemplateAllocationsInput) =>
+    request<{ templates: TemplateAllocation[] }>("PUT", "/agent-templates/allocations", input),
   getAgentTemplate: (id: string) =>
     request<{ template: AgentTemplate }>("GET", `/agent-templates/${id}`),
   createAgentTemplate: (input: AgentTemplateInput) =>

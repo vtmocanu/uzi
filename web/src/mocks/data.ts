@@ -534,19 +534,26 @@ const tmpl = (
   name: string,
   description: string,
   opts: Partial<AgentTemplate> = {},
-): AgentTemplate => ({
-  id,
-  name,
-  description,
-  model: null,
-  tools: null,
-  prompt_body: `You are the ${name} agent.\n\n## Role\n\n${description}\n\n## Working agreement\n\n- Stay inside the repository you were given.\n- Report findings tersely; the orchestrator relays them.\n- Never touch \`main\` — all work lands on a branch and goes out as an MR.`,
-  is_builtin: true,
-  updated_by: null,
-  created_at: daysAgo(40),
-  updated_at: daysAgo(40),
-  ...opts,
-});
+): AgentTemplate => {
+  const is_builtin = opts.is_builtin ?? true;
+  return {
+    id,
+    name,
+    description,
+    model: null,
+    tools: null,
+    prompt_body: `You are the ${name} agent.\n\n## Role\n\n${description}\n\n## Working agreement\n\n- Stay inside the repository you were given.\n- Report findings tersely; the orchestrator relays them.\n- Never touch \`main\` — all work lands on a branch and goes out as an MR.`,
+    is_builtin,
+    // scope tracks is_builtin (Decision 9): a builtin is scope 'builtin', a
+    // non-builtin demo template is a 'global' admin one unless opts say otherwise.
+    scope: opts.scope ?? (is_builtin ? "builtin" : "global"),
+    user_id: opts.user_id ?? null,
+    updated_by: null,
+    created_at: daysAgo(40),
+    updated_at: daysAgo(40),
+    ...opts,
+  };
+};
 
 export const mockTemplates: AgentTemplate[] = [
   tmpl("t-coder", "coder", "Implements features, fixes bugs, refactors code. Runs the project's test/lint commands before reporting done."),
