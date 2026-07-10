@@ -95,6 +95,25 @@ func (p *slackPoster) PostBlocks(ctx context.Context, channelID, threadTS, fallb
 	return ts, err
 }
 
+func (p *slackPoster) UpdateBlocks(ctx context.Context, channelID, ts, fallbackText string, blocks []slack.Block) error {
+	c, err := p.api(ctx)
+	if err != nil {
+		return err
+	}
+	_, _, _, err = c.UpdateMessageContext(ctx, channelID, ts,
+		slack.MsgOptionText(fallbackText, false), slack.MsgOptionBlocks(blocks...))
+	return err
+}
+
+func (p *slackPoster) PostEphemeral(ctx context.Context, channelID, userID, text string) error {
+	c, err := p.api(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = c.PostEphemeralContext(ctx, channelID, userID, slack.MsgOptionText(text, false))
+	return err
+}
+
 func (p *slackPoster) LookupUserByEmail(ctx context.Context, email string) (string, error) {
 	c, err := p.api(ctx)
 	if err != nil {

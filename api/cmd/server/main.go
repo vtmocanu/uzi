@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -144,14 +145,38 @@ func run() error {
 	// it never affects a run or the socket.
 	slackLinker := slacksvc.NewLinker(q, slackPoster, slog.Default())
 
+	// Agent-runtime service (PRD #4): the run queue, worker protocol, and sweeper
+	// DB work. Shares the same secret cipher (sole key holder) as the forge svc.
+	// Constructed here (ahead of the seeds it used to follow) because the Slack
+	// approval-gate handler needs its SubmitInput and the socket manager captures
+	// its inbound handler at construction.
+	wsvc := workersvc.New(q, box, workersvc.Params{
+		RunTimeout:           cfg.RunTimeout,
+		RunIdleTimeout:       cfg.RunIdleTimeout,
+		RunMaxIterations:     cfg.RunMaxIterations,
+		RunMaxRequeues:       cfg.RunMaxRequeues,
+		WorkerHeartbeatStale: cfg.WorkerHeartbeatStale,
+		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
+		SkillMaxBytes:        cfg.SkillMaxBytes,
+		SkillsMaxPerRun:      cfg.SkillsMaxPerRun,
+	})
+
+	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
+	// Reject-without-reason buttons. It rides workersvc's ownership-checked
+	// SubmitInput (via the gateSubmitter adapter, which keeps slacksvc free of a
+	// workersvc import) and reads run status itself for stale-click handling.
+	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
 	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
 	// token/enable change); otherwise it idles as a strict no-op. It never touches
 	// the run lifecycle — Slack is best-effort. Run in the background WaitGroup below.
+	// Inbound Block Kit actions fan out through an InboundMux to the linker (Confirm
+	// / Not-me) and the gatekeeper (gate buttons) — disjoint action-id namespaces.
 	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{
 		HTTPTimeout: cfg.SlackHTTPTimeout,
-		Inbound:     slackLinker,
+		Inbound:     slacksvc.InboundMux{slackLinker, slackGate},
 		OnConnected: slackLinker.AutoMatch,
 	})
 
@@ -181,19 +206,6 @@ func run() error {
 	if err := seed.AnthropicToken(ctx, q, box, cfg); err != nil {
 		return err
 	}
-
-	// Agent-runtime service (PRD #4): the run queue, worker protocol, and sweeper
-	// DB work. Shares the same secret cipher (sole key holder) as the forge svc.
-	wsvc := workersvc.New(q, box, workersvc.Params{
-		RunTimeout:           cfg.RunTimeout,
-		RunIdleTimeout:       cfg.RunIdleTimeout,
-		RunMaxIterations:     cfg.RunMaxIterations,
-		RunMaxRequeues:       cfg.RunMaxRequeues,
-		WorkerHeartbeatStale: cfg.WorkerHeartbeatStale,
-		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
-		SkillMaxBytes:        cfg.SkillMaxBytes,
-		SkillsMaxPerRun:      cfg.SkillsMaxPerRun,
-	})
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and
@@ -342,6 +354,21 @@ func run() error {
 	// race a closing pool.
 	lifecycle.Wait()
 	return runErr
+}
+
+// gateSubmitter adapts *workersvc.Service to slacksvc.PlanGateSubmitter — the
+// slice the Slack approval gatekeeper needs (read a run, submit an approve/reject
+// input). It drops SubmitInput's result (the gatekeeper only cares whether it
+// succeeded) and keeps slacksvc free of a workersvc import.
+type gateSubmitter struct{ svc *workersvc.Service }
+
+func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error) {
+	return g.svc.GetRun(ctx, userID, runID)
+}
+
+func (g gateSubmitter) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) error {
+	_, err := g.svc.SubmitInput(ctx, userID, runID, kind, body)
+	return err
 }
 
 // seedAdmin provisions the configured admin user if seeding is enabled and no

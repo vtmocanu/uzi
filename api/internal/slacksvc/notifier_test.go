@@ -24,6 +24,7 @@ type fakeNotifStore struct {
 	msg         store.SlackRunMessage
 	msgErr      error
 	upserted    []store.UpsertSlackRunMessageParams
+	gateSet     []store.SetSlackRunGateParams
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
@@ -39,6 +40,10 @@ func (f *fakeNotifStore) UpsertSlackRunMessage(_ context.Context, arg store.Upse
 	f.upserted = append(f.upserted, arg)
 	return store.SlackRunMessage{RunID: arg.RunID, ChannelID: arg.ChannelID, RootTs: arg.RootTs}, nil
 }
+func (f *fakeNotifStore) SetSlackRunGate(_ context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error) {
+	f.gateSet = append(f.gateSet, arg)
+	return store.SlackRunMessage{RunID: arg.RunID, GateTs: arg.GateTs, GateState: arg.GateState}, nil
+}
 
 type postCall struct{ channel, thread, text string }
 type updateCall struct{ channel, ts, text string }
@@ -47,19 +52,51 @@ type blockCall struct {
 	sectionText               string
 	actionIDs                 []string
 }
+type updateBlockCall struct {
+	channel, ts, fallback string
+	sectionText           string
+	actionIDs             []string
+}
+type ephemeralCall struct{ channel, user, text string }
 
 type fakePoster struct {
-	dmChannel string
-	posts     []postCall
-	updates   []updateCall
-	blocks    []blockCall
-	openErr   error
-	postErr   error
-	tsSeq     int
+	dmChannel    string
+	posts        []postCall
+	updates      []updateCall
+	blocks       []blockCall
+	updateBlocks []updateBlockCall
+	ephemerals   []ephemeralCall
+	openErr      error
+	postErr      error
+	tsSeq        int
 	// emailToID maps an email to a Slack id for LookupUserByEmail; a miss returns
 	// lookupErr (defaulting to a not-found-style error).
 	emailToID map[string]string
 	lookupErr error
+}
+
+// blockSummary flattens a Block Kit slice to (button action ids, concatenated
+// section text) so tests can assert what a message carries without deep matching.
+func blockSummary(blks []slack.Block) ([]string, string) {
+	ids := []string{}
+	section := ""
+	for _, b := range blks {
+		switch bl := b.(type) {
+		case *slack.ActionBlock:
+			if bl.Elements != nil {
+				for _, el := range bl.Elements.ElementSet {
+					if btn, ok := el.(*slack.ButtonBlockElement); ok {
+						ids = append(ids, btn.ActionID)
+					}
+				}
+			}
+		case *slack.SectionBlock:
+			if bl.Text != nil {
+				section += bl.Text.Text
+			}
+		}
+	}
+	return ids, section
 }
 
 func (p *fakePoster) OpenDM(context.Context, string) (string, error) {
@@ -78,27 +115,19 @@ func (p *fakePoster) Update(_ context.Context, ch, ts, text string) error {
 	return nil
 }
 func (p *fakePoster) PostBlocks(_ context.Context, ch, thread, fallback string, blks []slack.Block) (string, error) {
-	ids := []string{}
-	sectionText := ""
-	for _, b := range blks {
-		switch bl := b.(type) {
-		case *slack.ActionBlock:
-			if bl.Elements != nil {
-				for _, el := range bl.Elements.ElementSet {
-					if btn, ok := el.(*slack.ButtonBlockElement); ok {
-						ids = append(ids, btn.ActionID)
-					}
-				}
-			}
-		case *slack.SectionBlock:
-			if bl.Text != nil {
-				sectionText += bl.Text.Text
-			}
-		}
-	}
+	ids, sectionText := blockSummary(blks)
 	p.blocks = append(p.blocks, blockCall{channel: ch, thread: thread, fallback: fallback, sectionText: sectionText, actionIDs: ids})
 	p.tsSeq++
 	return fmt.Sprintf("ts%d", p.tsSeq), p.postErr
+}
+func (p *fakePoster) UpdateBlocks(_ context.Context, ch, ts, fallback string, blks []slack.Block) error {
+	ids, sectionText := blockSummary(blks)
+	p.updateBlocks = append(p.updateBlocks, updateBlockCall{channel: ch, ts: ts, fallback: fallback, sectionText: sectionText, actionIDs: ids})
+	return p.postErr
+}
+func (p *fakePoster) PostEphemeral(_ context.Context, ch, user, text string) error {
+	p.ephemerals = append(p.ephemerals, ephemeralCall{channel: ch, user: user, text: text})
+	return p.postErr
 }
 func (p *fakePoster) LookupUserByEmail(_ context.Context, email string) (string, error) {
 	if id, ok := p.emailToID[email]; ok {
@@ -251,6 +280,73 @@ func TestNotifierEscapesAndBoundsFailureReason(t *testing.T) {
 	}
 	if !strings.Contains(evt, "…") || strings.Contains(evt, strings.Repeat("x", 501)) {
 		t.Errorf("failure reason was not length-bounded: %q", evt)
+	}
+}
+
+// Entering awaiting_approval posts the gate message (Approve / Reject / Open)
+// in-thread under the root and records gate_ts/gate_state='open' (PRD #25 M4).
+func TestNotifierPostsGateOnAwaitingApproval(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	if len(fp.blocks) != 1 || fp.blocks[0].thread != "ts1" {
+		t.Fatalf("gate must post one Block Kit message in-thread under the root: %+v", fp.blocks)
+	}
+	ids := fp.blocks[0].actionIDs
+	if len(ids) != 3 || ids[0] != ActionGateApprove || ids[1] != ActionGateReject || ids[2] != ActionGateOpen {
+		t.Fatalf("gate buttons = %v, want [approve reject open]", ids)
+	}
+	if len(fs.gateSet) != 1 || fs.gateSet[0].GateState.String != gateStateOpen || !fs.gateSet[0].GateTs.Valid {
+		t.Fatalf("gate anchor not recorded open: %+v", fs.gateSet)
+	}
+}
+
+// A run already carrying an open gate must not get a second gate message.
+func TestNotifierDoesNotDoublePostGate(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1", GateTs: txt("gate-ts"), GateState: txt(gateStateOpen)},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	if len(fp.blocks) != 0 {
+		t.Fatalf("an already-open gate must not be re-posted: %+v", fp.blocks)
+	}
+	if len(fs.gateSet) != 0 {
+		t.Fatalf("no gate write expected when the gate is already open: %+v", fs.gateSet)
+	}
+}
+
+// Cross-surface idempotency: when a run leaves awaiting_approval with a gate still
+// open (resolved from the web UI / a timeout / the sweeper), the notifier closes
+// the Slack gate message and clears the anchor.
+func TestNotifierClosesGateWhenResolvedElsewhere(t *testing.T) {
+	rc := baseRun("running")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1", GateTs: txt("gate-ts"), GateState: txt(gateStateOpen)},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "running"})
+
+	if len(fp.updateBlocks) != 1 || fp.updateBlocks[0].ts != "gate-ts" || len(fp.updateBlocks[0].actionIDs) != 0 {
+		t.Fatalf("gate message must be edited button-free at its gate_ts: %+v", fp.updateBlocks)
+	}
+	if len(fs.gateSet) != 1 || fs.gateSet[0].GateTs.Valid || fs.gateSet[0].GateState.Valid {
+		t.Fatalf("gate anchor must be cleared (both NULL): %+v", fs.gateSet)
 	}
 }
 
