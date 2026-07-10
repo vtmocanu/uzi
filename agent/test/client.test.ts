@@ -205,3 +205,69 @@ describe("isTransient", () => {
     assert.strictEqual(isTransient(new Error("network down")), true);
   });
 });
+
+// Chat agent read surface (PRD #39 M3): the four worker-authenticated endpoints the
+// uzi-tools MCP server calls. Verifies each hits the right path with the right query
+// params, parses the wire shape, and that a foreign run id surfaces as 404.
+describe("chat read surface (PRD #39 M3)", () => {
+  it("listChatRuns hits /worker/chat/runs with ?limit and parses the runs", async () => {
+    api.setChatRuns([
+      {
+        id: "r1", kind: "chat", status: "running", repo_path: null, issue_iid: null,
+        title: "How does the plan gate work?", branch: null, mr_url: null, failure_reason: null,
+        created_at: "2026-07-10T00:00:00Z", updated_at: "2026-07-10T00:00:00Z",
+      },
+    ]);
+    const runs = await newClient().listChatRuns(25);
+    assert.strictEqual(api.chatListLimits.at(-1), "25");
+    assert.strictEqual(runs.length, 1);
+    assert.strictEqual(runs[0]!.title, "How does the plan gate work?");
+    assert.strictEqual(runs[0]!.repo_path, null);
+  });
+
+  it("listChatRuns omits ?limit when unset", async () => {
+    api.setChatRuns([]);
+    await newClient().listChatRuns();
+    assert.strictEqual(api.chatListLimits.at(-1), null);
+  });
+
+  it("getChatRun parses the detail; a foreign/unknown id is 404", async () => {
+    api.setChatRunDetail("r1", {
+      id: "r1", kind: "issue", status: "failed", repo_path: "g/p", issue_iid: 57,
+      title: "Fix login", branch: "agent/issue-57", mr_url: null, failure_reason: "tests failed",
+      created_at: "2026-07-10T00:00:00Z", updated_at: "2026-07-10T00:00:00Z",
+      mr_state: null, stop_kind: null, fix_verdict: null, iteration_count: 3, plan_md: "## Plan",
+    });
+    const d = await newClient().getChatRun("r1");
+    assert.strictEqual(d.failure_reason, "tests failed");
+    assert.strictEqual(d.iteration_count, 3);
+    await assert.rejects(
+      newClient().getChatRun("missing"),
+      (e: unknown) => e instanceof RequestError && e.status === 404,
+    );
+  });
+
+  it("getChatRunMessages passes after + limit and parses the page", async () => {
+    api.setChatMessages("r1", [
+      { seq: 4, kind: "text", agent: "lead", payload: { text: "working" }, created_at: "2026-07-10T00:00:00Z" },
+    ]);
+    const msgs = await newClient().getChatRunMessages("r1", 3, 100);
+    const q = api.chatMessageQueries.at(-1)!;
+    assert.strictEqual(q.runId, "r1");
+    assert.strictEqual(q.after, "3");
+    assert.strictEqual(q.limit, "100");
+    assert.strictEqual(msgs[0]!.seq, 4);
+  });
+
+  it("createProposal POSTs to the run's proposals with repo_path and returns the pending proposal", async () => {
+    const p = await newClient().createProposal("chat-1", {
+      repo_path: "group/project", title: "Add dashboard", description: "please", labels: ["PRD"],
+    });
+    const req = api.proposalRequests.at(-1)!;
+    assert.strictEqual(req.runId, "chat-1");
+    assert.strictEqual(req.body.repo_path, "group/project");
+    assert.strictEqual(p.status, "pending");
+    assert.deepStrictEqual(p.labels, ["PRD"]);
+    assert.strictEqual(p.repo_id, "id-for-group/project"); // server resolved path -> id
+  });
+});

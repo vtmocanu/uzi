@@ -272,6 +272,74 @@ export interface ChatClaimConfig {
   default_model?: string;
 }
 
+// ── Chat agent read surface (PRD #39 M3, Decision 7) ─────────────────────────
+// The worker-authenticated endpoints the chat agent's uzi-tools MCP server calls to
+// investigate its OWNER'S runs. Pinned against api/internal/handler/worker_chat.go.
+// Every text field here is UNTRUSTED (forge/model-derived) and MUST be wrapped in the
+// evidence envelope before it reaches the model (uzi-tools.ts), never fed as prose.
+
+/** One run in the compact worker list (GET /api/worker/chat/runs). repo_path/mr_url
+ *  are null for a chat run; issue_iid/branch null when absent. */
+export interface WorkerRunListItem {
+  id: string;
+  kind: string;
+  status: string;
+  repo_path: string | null;
+  issue_iid: number | null;
+  title: string;
+  branch: string | null;
+  mr_url: string | null;
+  failure_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Single-run detail (GET /api/worker/chat/runs/:id): the list fields plus the
+ *  diagnostics the agent needs to answer "why did run X fail?". */
+export interface WorkerRunDetail extends WorkerRunListItem {
+  mr_state: string | null;
+  stop_kind: string | null;
+  fix_verdict: string | null;
+  iteration_count: number;
+  plan_md: string | null;
+}
+
+/** One run message page item (GET /api/worker/chat/runs/:id/messages). payload is
+ *  arbitrary per kind and UNTRUSTED. */
+export interface WorkerRunMessage {
+  seq: number;
+  kind: string;
+  agent: string | null;
+  payload: Record<string, unknown> | null;
+  created_at: string;
+}
+
+/** A created issue proposal (POST /api/worker/runs/:id/proposals → 201). Pending
+ *  until the user confirms in the browser; the worker never writes the forge. */
+export interface WorkerProposal {
+  id: string;
+  run_id: string;
+  repo_id: string;
+  title: string;
+  description: string;
+  labels: string[];
+  status: string;
+  created_at: string;
+}
+
+/** Request body for POST /api/worker/runs/:id/proposals (Phase-3 wire catalog).
+ *  The agent sends `repo_path` — the exact string the read endpoints expose — which
+ *  the server resolves to the internal id (user-scoped), so UUIDs stay off the
+ *  worker. `repo_id` is accepted for back-compat (repo_path wins server-side). At
+ *  least one must be set. */
+export interface CreateProposalRequest {
+  repo_path?: string;
+  repo_id?: string;
+  title: string;
+  description: string;
+  labels: string[];
+}
+
 /** One appended message; the server is idempotent on (run_id, seq). */
 export interface OutgoingMessage {
   seq: number;
