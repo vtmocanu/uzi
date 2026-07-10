@@ -78,7 +78,9 @@ func (q *Queries) GetAutopilotTrigger(ctx context.Context, arg GetAutopilotTrigg
 const hasActiveRunForIssue = `-- name: HasActiveRunForIssue :one
 SELECT EXISTS (
     SELECT 1 FROM runs
-    WHERE repo_id = $1 AND issue_iid = $2
+    -- ::uuid keeps this a non-null uuid.UUID param after runs.repo_id went nullable
+    -- (PRD #39 chat runs); an autopilot issue run always targets a repo.
+    WHERE repo_id = $1::uuid AND issue_iid = $2
       AND status NOT IN ('completed', 'failed', 'cancelled')
 ) AS active
 `

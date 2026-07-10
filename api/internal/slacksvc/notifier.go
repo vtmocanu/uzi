@@ -127,7 +127,13 @@ func (n *Notifier) Run(ctx context.Context) {
 func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 	rc, err := n.store.GetSlackRunContext(ctx, ev.runID)
 	if err != nil {
-		n.logf("load run context", err)
+		// No row for a chat run (PRD #39): GetSlackRunContext INNER-JOINs repos, and a
+		// chat run has no repo (repo_id NULL), so it returns ErrNoRows here. Chat
+		// transitions have no repo-scoped DM to send — skip silently (as for a run
+		// deleted out from under us), never a noisy error per chat transition.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			n.logf("load run context", err)
+		}
 		return
 	}
 	target, err := n.store.GetSlackDeliveryForUser(ctx, rc.UserID)

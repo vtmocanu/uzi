@@ -117,23 +117,47 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 // WorkerClaim atomically claims the next run for the worker's user. 204 when the
 // queue is idle; otherwise the full claim payload (never logged — it carries
 // decrypted credentials).
+//
+// The optional ?lane= query selects which queue to claim from (PRD #39 Decision 4):
+// the default/absent/"run" lane claims issue+ci_fix runs (back-compat — an older
+// worker sends no lane), and "chat" claims chat runs via the disjoint chat lane and
+// returns the narrower ChatClaimPayload (no forge PAT). The worker runs the two
+// lanes as independent, concurrent claim loops.
 func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	payload, err := h.wsvc.Claim(r.Context(), wkr)
-	if err != nil {
-		slog.Error("worker claim", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
+
+	switch r.URL.Query().Get("lane") {
+	case "chat":
+		payload, err := h.wsvc.ClaimChat(r.Context(), wkr)
+		if err != nil {
+			slog.Error("worker claim (chat lane)", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if payload == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, payload)
+	case "", "run":
+		payload, err := h.wsvc.Claim(r.Context(), wkr)
+		if err != nil {
+			slog.Error("worker claim", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if payload == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, payload)
+	default:
+		httpx.Error(w, http.StatusBadRequest, "lane must be one of run, chat")
 	}
-	if payload == nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, payload)
 }
 
 // WorkerRunMessages appends a batch of seq-numbered messages (idempotent on

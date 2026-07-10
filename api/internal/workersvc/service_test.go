@@ -82,10 +82,10 @@ type fakeStore struct {
 	sweptRequeued []store.RequeueRunsOfStaleWorkersRow
 
 	// Submit input.
-	runByID       store.Run
-	runByIDErr    error
-	workerByID    store.Worker
-	workerByIDErr error
+	runByID            store.Run
+	runByIDErr         error
+	workerByID         store.Worker
+	workerByIDErr      error
 	createdInput       *store.CreateRunInputParams
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	cancelled          *store.CancelRunServerSideParams
@@ -125,6 +125,41 @@ type fakeStore struct {
 	countActiveParams  *store.CountWorkerNonTerminalRunsParams
 	deleteWorkerRows   int64
 	deleteWorkerParams *store.DeleteWorkerForUserParams
+
+	// Chat (PRD #39).
+	chatClaimRun          store.Run
+	chatClaimErr          error
+	chatClaimParams       *store.ClaimChatRunParams
+	resumeSession         pgtype.Text
+	followUpCount         int64
+	sweptIdleChats        []store.SweepIdleChatRunsRow
+	markedProposalDismiss *uuid.UUID
+	markedProposalConfirm *store.MarkProposalConfirmedParams
+	proposalDismissErr    error
+	proposalConfirmErr    error
+}
+
+func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams) (store.Run, error) {
+	f.chatClaimParams = &arg
+	f.callOrder = append(f.callOrder, "claim_chat")
+	return f.chatClaimRun, f.chatClaimErr
+}
+func (f *fakeStore) GetChatRunClaimContext(context.Context, uuid.UUID) (pgtype.Text, error) {
+	return f.resumeSession, nil
+}
+func (f *fakeStore) CountChatFollowUps(context.Context, uuid.UUID) (int64, error) {
+	return f.followUpCount, nil
+}
+func (f *fakeStore) SweepIdleChatRuns(context.Context, pgtype.Timestamptz) ([]store.SweepIdleChatRunsRow, error) {
+	return f.sweptIdleChats, nil
+}
+func (f *fakeStore) MarkProposalConfirmed(_ context.Context, arg store.MarkProposalConfirmedParams) (store.IssueProposal, error) {
+	f.markedProposalConfirm = &arg
+	return store.IssueProposal{}, f.proposalConfirmErr
+}
+func (f *fakeStore) MarkProposalDismissed(_ context.Context, id uuid.UUID) (store.IssueProposal, error) {
+	f.markedProposalDismiss = &id
+	return store.IssueProposal{}, f.proposalDismissErr
 }
 
 func (f *fakeStore) ClaimRun(_ context.Context, arg store.ClaimRunParams) (store.Run, error) {
@@ -308,15 +343,19 @@ func (f *fakeStore) ListToolAllowlist(_ context.Context) ([]store.ToolAllowlist,
 // testParams are sane fixed knobs for the tests.
 func testParams() Params {
 	return Params{
-		RunTimeout:           2 * time.Hour,
-		RunIdleTimeout:       10 * time.Minute,
-		RunMaxIterations:     5,
-		RunMaxRequeues:       1,
-		WorkerHeartbeatStale: 45 * time.Second,
-		WorkerAffinityGrace:  2 * time.Minute,
-		ClaimGrace:           5 * time.Minute,
-		SkillMaxBytes:        65536,
-		SkillsMaxPerRun:      32,
+		RunTimeout:            2 * time.Hour,
+		RunIdleTimeout:        10 * time.Minute,
+		RunMaxIterations:      5,
+		RunMaxRequeues:        1,
+		WorkerHeartbeatStale:  45 * time.Second,
+		WorkerAffinityGrace:   2 * time.Minute,
+		ClaimGrace:            5 * time.Minute,
+		SkillMaxBytes:         65536,
+		SkillsMaxPerRun:       32,
+		ChatIdleTimeout:       70 * time.Minute,
+		ChatMaxTurns:          50,
+		WorkerChatIdleTimeout: 60 * time.Minute,
+		WorkerChatTurnTimeout: 10 * time.Minute,
 	}
 }
 
@@ -545,7 +584,7 @@ func TestResolveToolingResolvesAllowedProfilePackages(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}, {Name: "jq"}},
 	}
 	svc := New(fs, newBox(t), testParams())
-	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
 	if err != nil {
 		t.Fatalf("resolveTooling: %v", err)
 	}
@@ -561,7 +600,7 @@ func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
 		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}}, // terraform removed after the profile was saved
 	}
 	svc := New(fs, newBox(t), testParams())
-	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
 	if !errors.Is(err, errToolPackagesRejected) {
 		t.Fatalf("err = %v, want errToolPackagesRejected", err)
 	}
@@ -573,7 +612,7 @@ func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
 func TestResolveToolingNoProfileMeansNoProvisioning(t *testing.T) {
 	fs := &fakeStore{toolProfileErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: pgUUID(uuid.New())})
 	if err != nil {
 		t.Fatalf("resolveTooling: %v", err)
 	}

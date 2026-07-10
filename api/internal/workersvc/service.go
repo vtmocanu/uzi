@@ -116,6 +116,20 @@ type Store interface {
 	CreateStopVerdictInput(ctx context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
 
+	// Chat runs (PRD #39): a third run kind riding the run machinery. The chat
+	// claim lane (ClaimChatRun) is disjoint from ClaimRun (which now excludes chat);
+	// GetChatRunClaimContext carries only the resume session (no repo/forge join).
+	CreateChatRun(ctx context.Context, arg store.CreateChatRunParams) (store.Run, error)
+	CreateChatContinueRun(ctx context.Context, arg store.CreateChatContinueRunParams) (store.Run, error)
+	ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]store.Run, error)
+	ClaimChatRun(ctx context.Context, arg store.ClaimChatRunParams) (store.Run, error)
+	GetChatRunClaimContext(ctx context.Context, runID uuid.UUID) (pgtype.Text, error)
+	CountChatFollowUps(ctx context.Context, runID uuid.UUID) (int64, error)
+	SweepIdleChatRuns(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepIdleChatRunsRow, error)
+	GetChatProposalForConfirm(ctx context.Context, arg store.GetChatProposalForConfirmParams) (store.GetChatProposalForConfirmRow, error)
+	MarkProposalConfirmed(ctx context.Context, arg store.MarkProposalConfirmedParams) (store.IssueProposal, error)
+	MarkProposalDismissed(ctx context.Context, id uuid.UUID) (store.IssueProposal, error)
+
 	// Cross-cutting reads for run creation + claim.
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
@@ -149,6 +163,17 @@ type Params struct {
 	// the claim so the worker enforces the same limits (no server/worker drift).
 	SkillMaxBytes   int
 	SkillsMaxPerRun int
+
+	// Chat lifecycle knobs (PRD #39 Decision 3). ChatIdleTimeout is the SERVER idle
+	// backstop the sweep applies (complete a chat whose last message is older than
+	// this). ChatMaxTurns is the server-enforced turn cap AND is delivered in the
+	// chat claim so the worker enforces the same value. WorkerChatIdleTimeout /
+	// WorkerChatTurnTimeout ride the chat claim so the worker's own idle + per-turn
+	// wall-clocks match what the server configured.
+	ChatIdleTimeout       time.Duration
+	ChatMaxTurns          int
+	WorkerChatIdleTimeout time.Duration
+	WorkerChatTurnTimeout time.Duration
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -323,40 +348,45 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 
 	payload, err := s.assembleClaim(ctx, run)
 	if err != nil {
-		// Vault lock race: the owner locked between the gate above and the token
-		// open. This is transient, NOT a credential failure — reset the just-claimed
-		// run to queued (never fail it) so it reclaims after the next unlock, and
-		// report idle. Mirrors SweepClaimedNeverStarted; RequeueClaimedRunToQueued
-		// keeps worker_id for affinity and does not bump requeue_count, so a
-		// persistently locked vault can never trip the requeue cap.
-		if errors.Is(err, errVaultLocked) {
-			if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
-				return nil, rerr
-			}
-			return nil, nil // idle; the run is queued again, awaiting unlock
-		}
-		// A missing/undecryptable credential OR a tool package that fell out of the
-		// allowlist is not retryable: fail the run and report idle. Both failure
-		// reasons are safe to store (no secret bytes; package names only).
-		if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) {
-			if _, ferr := s.q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{
-				ID:            run.ID,
-				FailureReason: pgText(err.Error()),
-			}); ferr != nil {
-				return nil, ferr
-			}
-			s.notify(run.ID, "failed") // restore the origin column for the dead run
-			return nil, nil            // idle; the run now shows failed in the UI
-		}
-		// The run vanished between claim and payload assembly (its forge
-		// connection was deleted, cascading repo → run away). Nothing to fail or
-		// hand out; report idle.
-		if errors.Is(err, errRunVanished) {
-			return nil, nil
-		}
-		return nil, err
+		return nil, s.recoverClaimAssembly(ctx, run, err)
 	}
 	return payload, nil
+}
+
+// recoverClaimAssembly turns a failed claim assembly (run OR chat lane) into the
+// right terminal/transient outcome, always reporting idle (nil payload) to the
+// caller so a broken claim never wedges the worker's poll loop:
+//   - a locked vault is transient — reset the just-claimed run to queued (never
+//     fail it), keeping worker_id for affinity and NOT bumping requeue_count, so a
+//     persistently locked vault can't trip the requeue cap (mirrors
+//     SweepClaimedNeverStarted);
+//   - a missing/undecryptable credential (or a rejected tool package) is terminal —
+//     fail the run with the safe (no-secret-bytes) reason and fire the failed notify;
+//   - a vanished run (its forge connection cascade-deleted the repo → run) is dropped.
+//
+// The returned error is nil for every handled case (report idle) and non-nil only
+// for an unexpected error the caller must propagate.
+func (s *Service) recoverClaimAssembly(ctx context.Context, run store.Run, err error) error {
+	switch {
+	case errors.Is(err, errVaultLocked):
+		if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
+			return rerr
+		}
+		return nil // idle; the run is queued again, awaiting unlock
+	case errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected):
+		if _, ferr := s.q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{
+			ID:            run.ID,
+			FailureReason: pgText(err.Error()),
+		}); ferr != nil {
+			return ferr
+		}
+		s.notify(run.ID, "failed") // restore the origin column for the dead run (no-op for chat)
+		return nil                 // idle; the run now shows failed in the UI
+	case errors.Is(err, errRunVanished):
+		return nil
+	default:
+		return err
+	}
 }
 
 // errCredentialUnavailable marks a claim that cannot proceed because a required
@@ -375,6 +405,40 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 // queued to be retried after the next unlock (PRD #32 success criteria 3 & 5).
 var errVaultLocked = errors.New("vault locked during claim")
 
+// openAnthropic opens the owner's decrypted Anthropic token — the one secret both
+// the run lane and the chat lane deliver. With the vault wired (production), route
+// through vault.Open on the row's sealed_with: a 'dek' row needs the owner's vault
+// unlocked, and a lock that landed after the claim gate surfaces as vault.ErrLocked
+// → errVaultLocked (requeue, never fail). A legacy 'master' row opens under the
+// master box without an unlock (the claim gate is what withholds a locked owner's
+// runs; the master box is not DEK-protected). Nil vault (tests) opens under the
+// master box directly. A missing/undecryptable token is errCredentialUnavailable.
+func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID) ([]byte, error) {
+	secret, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
+		UserID: userID,
+		Kind:   store.KindAnthropicToken,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
+		}
+		return nil, fmt.Errorf("anthropic secret lookup: %w", err)
+	}
+	var anthropic []byte
+	if s.vlt != nil {
+		anthropic, err = s.vlt.Open(userID, store.KindAnthropicToken, secret.SealedWith, secret.Ciphertext)
+		if errors.Is(err, vault.ErrLocked) {
+			return nil, errVaultLocked
+		}
+	} else {
+		anthropic, err = s.box.Open(secret.Ciphertext)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
+	}
+	return anthropic, nil
+}
+
 // assembleClaim builds the claim payload for an already-claimed run.
 func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
@@ -391,35 +455,9 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 	}
 
-	secret, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
-		UserID: run.UserID,
-		Kind:   store.KindAnthropicToken,
-	})
+	anthropic, err := s.openAnthropic(ctx, run.UserID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
-		}
-		return nil, fmt.Errorf("anthropic secret lookup: %w", err)
-	}
-	// Open the owner's Anthropic token. With the vault wired (production), route
-	// through vault.Open on the row's sealed_with: a 'dek' row needs the owner's
-	// vault unlocked, and a lock that landed after the claim gate surfaces as
-	// vault.ErrLocked → errVaultLocked (requeue, never fail). A legacy 'master' row
-	// opens under the master box without an unlock (the claim gate above is what
-	// withholds a locked owner's runs; the master box is not DEK-protected). The
-	// bot PAT (above) always stays master-sealed. Nil vault (tests) opens under the
-	// master box directly, unchanged.
-	var anthropic []byte
-	if s.vlt != nil {
-		anthropic, err = s.vlt.Open(run.UserID, store.KindAnthropicToken, secret.SealedWith, secret.Ciphertext)
-		if errors.Is(err, vault.ErrLocked) {
-			return nil, errVaultLocked
-		}
-	} else {
-		anthropic, err = s.box.Open(secret.Ciphertext)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
+		return nil, err
 	}
 
 	// Only the templates allocated to this run's owner ride the claim (PRD #18
@@ -487,7 +525,7 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		PlanMd:           textPtr(run.PlanMd),
 		AutoApprove:      run.AutoApprove,
 		Repo: ClaimRepo{
-			ID:            run.RepoID.String(),
+			ID:            uuid.UUID(run.RepoID.Bytes).String(),
 			URL:           rc.RepoWebUrl,
 			CloneURL:      rc.RepoWebUrl + ".git",
 			DefaultBranch: textPtr(rc.DefaultBranch),
@@ -528,7 +566,9 @@ var errToolPackagesRejected = errors.New("tool packages no longer allowed")
 // flag rides separately (set from the repos row in assembleClaim); the worker does
 // the tier-2 extraction after clone (PRD #18 M5).
 func (s *Service) resolveTooling(ctx context.Context, run store.Run) (toolPackages []string, err error) {
-	profile, err := s.q.GetRepoToolProfile(ctx, store.GetRepoToolProfileParams{UserID: run.UserID, RepoID: run.RepoID})
+	// assembleClaim only reaches resolveTooling for a run-lane (issue/ci_fix) run,
+	// whose repo_id is always non-NULL (runs_kind_shape), so the conversion is safe.
+	profile, err := s.q.GetRepoToolProfile(ctx, store.GetRepoToolProfileParams{UserID: run.UserID, RepoID: uuid.UUID(run.RepoID.Bytes)})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return []string{}, nil // no profile ⇒ no tier-1 provisioning
@@ -1106,11 +1146,12 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 
 // SweepResult reports the row counts touched by one Sweep pass (for logging).
 type SweepResult struct {
-	WorkersOffline int64
-	ClaimedReset   int64
-	RunningTimeout int64
-	StaleFailed    int64
-	StaleRequeued  int64
+	WorkersOffline    int64
+	ClaimedReset      int64
+	RunningTimeout    int64
+	StaleFailed       int64
+	StaleRequeued     int64
+	ChatIdleCompleted int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -1177,6 +1218,20 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.StaleRequeued = int64(len(requeued))
 	for _, r := range requeued {
 		s.publishSwept(r.ID, r.Status)
+	}
+
+	// Chat idle backstop (PRD #39 Decision 3): a chat run whose last message is
+	// older than ChatIdleTimeout is completed even though its worker is alive (so no
+	// stale-worker sweep above fired for it). Disabled when ChatIdleTimeout is 0.
+	if s.p.ChatIdleTimeout > 0 {
+		idleChats, err := s.q.SweepIdleChatRuns(ctx, pgTime(now.Add(-s.p.ChatIdleTimeout)))
+		if err != nil {
+			return res, fmt.Errorf("sweep idle chat runs: %w", err)
+		}
+		res.ChatIdleCompleted = int64(len(idleChats))
+		for _, r := range idleChats {
+			s.publishSwept(r.ID, r.Status)
+		}
 	}
 	return res, nil
 }

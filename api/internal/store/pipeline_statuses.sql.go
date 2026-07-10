@@ -112,7 +112,7 @@ const listRunPipelineStatusesForRepo = `-- name: ListRunPipelineStatusesForRepo 
 WITH latest_run AS (
     SELECT DISTINCT ON (r.issue_iid) r.issue_iid, r.branch
     FROM runs r
-    WHERE r.repo_id = $1 AND r.issue_iid IS NOT NULL
+    WHERE r.repo_id = $1::uuid AND r.issue_iid IS NOT NULL
     ORDER BY r.issue_iid, r.created_at DESC
 )
 SELECT lr.issue_iid, ps.ref, ps.status, ps.web_url, ps.pipeline_id, ps.synced_at
@@ -167,7 +167,7 @@ WITH per_branch AS (
     SELECT DISTINCT ON (r.branch)
            r.branch, r.mr_iid, r.created_at
     FROM runs r
-    WHERE r.repo_id = $2
+    WHERE r.repo_id = $2::uuid
       AND r.branch IS NOT NULL AND r.branch <> ''
       AND (
         r.status NOT IN ('completed', 'failed', 'cancelled')
