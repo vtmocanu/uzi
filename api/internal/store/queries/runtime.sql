@@ -361,8 +361,12 @@ ORDER BY seq ASC;
 -- non-terminal (awaiting_approval/running); the client's terminal-guarded
 -- isStoppedRun ignores it until the run actually reaches failed/cancelled.
 WITH stamped AS (
+    -- The ::text cast is load-bearing: the stop_kind parameter appears only in the
+    -- SET and in this IS NOT NULL guard, and Postgres cannot infer a bare param's
+    -- type from `$n IS NOT NULL` alone (SQLSTATE 42P08 at prepare time). Casting the
+    -- guard occurrence pins it to text for the whole statement.
     UPDATE runs SET stop_kind = sqlc.narg('stop_kind'), updated_at = now()
-    WHERE id = @run_id AND sqlc.narg('stop_kind') IS NOT NULL
+    WHERE id = @run_id AND sqlc.narg('stop_kind')::text IS NOT NULL
     RETURNING id
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
