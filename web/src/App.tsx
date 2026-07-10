@@ -19,6 +19,7 @@ import { Board } from "./pages/Board";
 import { IssueView } from "./pages/IssueView";
 import { RunsList } from "./pages/RunsList";
 import { RunView } from "./pages/RunView";
+import { ChatList, ChatConversation } from "./pages/Chat";
 import { WorkersSettings } from "./pages/WorkersSettings";
 import { Docs } from "./pages/Docs";
 import { DocPage } from "./pages/DocPage";
@@ -101,6 +102,22 @@ export default function App() {
           element={
             <ProtectedRoute>
               <RunView />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/chat"
+          element={
+            <ProtectedRoute>
+              <ChatList />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/chat/:id"
+          element={
+            <ProtectedRoute>
+              <ChatConversation />
             </ProtectedRoute>
           }
         />

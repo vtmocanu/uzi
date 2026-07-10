@@ -4,13 +4,16 @@
 // socket is therefore a live cache over this store, exactly like /api/ws is
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
-import type { Board, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import type { Board, IssueProposal, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
 import {
   mockAdmin,
   mockAwaitingMessages,
   mockBoards,
+  mockChatMessages,
+  mockChatRuns,
   mockDoneMessages,
   mockFailedMessages,
+  mockProposals,
   mockRuns,
 } from "./data";
 
@@ -19,6 +22,10 @@ export interface MockState {
   runs: Map<string, Run>;
   messages: Map<string, RunMessage[]>;
   boards: Map<string, Board>;
+  // Issue proposals from chat (PRD #39): keyed by proposal id, mutated by the
+  // confirm/dismiss mock endpoints. The card in the transcript renders from its
+  // run_message payload; this map is the authoritative status the actions update.
+  proposals: Map<string, IssueProposal>;
   // Vault unlocked state (PRD #32). Starts unlocked so the demo is fully usable;
   // the Lock vault action flips it so the badge, banner, and "waiting for vault
   // unlock" run state are all browsable.
@@ -28,12 +35,17 @@ export interface MockState {
 function seed(): MockState {
   const runs = new Map<string, Run>();
   for (const r of mockRuns) runs.set(r.id, { ...r });
+  // Chat conversations ride the same run + message maps (PRD #39).
+  for (const r of mockChatRuns) runs.set(r.id, { ...r });
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-done", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
   messages.set("run-failed", [...mockFailedMessages]);
   messages.set("run-live", []);
   messages.set("run-cancelled", []);
+  for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
+  const proposals = new Map<string, IssueProposal>();
+  for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();
   for (const [id, b] of Object.entries(mockBoards)) {
     boards.set(id, { ...b, columns: [...b.columns], cards: b.cards.map((c) => ({ ...c })) });
@@ -41,7 +53,7 @@ function seed(): MockState {
   // Auth is instant/fake in mock mode: the session starts signed in as admin so
   // the whole app is browsable with zero steps. Logout still works (and any
   // login/register signs straight back in).
-  return { session: { ...mockAdmin }, runs, messages, boards, vaultUnlocked: true };
+  return { session: { ...mockAdmin }, runs, messages, boards, proposals, vaultUnlocked: true };
 }
 
 export const state: MockState = seed();
@@ -107,4 +119,23 @@ export function getRun(runId: string): Run | undefined {
 let runCounter = 0;
 export function nextRunId(): string {
   return `run-new-${++runCounter}`;
+}
+
+// ── Issue proposals (PRD #39) ────────────────────────────────────────────────
+
+export function getProposal(id: string): IssueProposal | undefined {
+  return state.proposals.get(id);
+}
+
+// putProposal upserts a proposal row (create on scheduleChatReply, mutate on
+// confirm/dismiss). No broadcast — the card is driven by its run_message payload
+// and the action's response, not a state frame.
+export function putProposal(p: IssueProposal): IssueProposal {
+  state.proposals.set(p.id, p);
+  return p;
+}
+
+let proposalCounter = 0;
+export function nextProposalId(): string {
+  return `prop-new-${++proposalCounter}`;
 }

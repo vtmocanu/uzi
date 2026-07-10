@@ -562,6 +562,64 @@ export interface WsEvent {
   status?: string;
 }
 
+// ── Chat (PRD #39) — PROVISIONAL wire shapes ────────────────────────────────
+// Chat rides the run machinery: a conversation IS a run row (runs.kind='chat'),
+// so its LIVE VIEW reuses the existing stream verbatim — pass a Chat.id to
+// getRun / getRunMessages / createRunSocket. Only the conversation-level verbs
+// below (create/list/message/end/continue and the two proposal actions) are new.
+// These types + the seven realApi methods mirror the PRD #39 endpoint contracts
+// but are marked PROVISIONAL: M1 publishes the authoritative wire and Phase 3
+// reconciles this seam against it (kept in one place so that stays a small diff).
+
+// A chat conversation's lifecycle reuses the run state machine
+// (queued → claimed → running → … → completed/failed/cancelled); a terminal chat
+// is an ended conversation (Continue starts a fresh one, Decision 11).
+export type ChatStatus = RunStatus;
+
+export interface Chat {
+  // The chat run id. This is what the streaming machinery keys on.
+  id: string;
+  // First-message-derived conversation title; null until the worker derives one.
+  title: string | null;
+  status: ChatStatus;
+  // Server-counted user turns and the server cap (Decision 3b, counted from
+  // persisted user inputs so a compromised worker can't burn past it). Together
+  // they drive the turn-cap notice + composer hard-stop.
+  turn_count: number;
+  max_turns: number;
+  // Set when this chat continues an ended one (Decision 11); null otherwise.
+  resume_of_run_id: string | null;
+  // Newest message time — drives list ordering + the "last activity" label; null
+  // before the first message lands.
+  last_message_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type ProposalStatus = "pending" | "confirmed" | "dismissed";
+
+// IssueProposal is a chat agent's issue draft (Decision 8). It streams into the
+// conversation as a distinct `proposal`-kind run message and renders as a card.
+// Its title/description/labels are MODEL-authored and untrusted: the card renders
+// them as plain inert text (never Markdown, no clickable model links). The forge
+// write happens only on the human's Create click; created_issue_url is populated
+// then.
+export interface IssueProposal {
+  id: string;
+  run_id: string;
+  repo_id: string;
+  // Display path (server-side join); may be empty when the repo is unresolved.
+  repo_path: string;
+  title: string;
+  description: string;
+  labels: string[];
+  status: ProposalStatus;
+  created_issue_iid: number | null;
+  created_issue_url: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 // runSocketUrl builds the same-origin WebSocket URL for a run. The HttpOnly auth
 // cookie rides along automatically (same origin through nginx); Origin==Host is
 // enforced server-side against cross-site hijacking.
@@ -862,6 +920,24 @@ const realApi = {
     ),
   submitRunInput: (id: string, kind: RunInputKind, body = "") =>
     request<{ server_side: boolean }>("POST", `/runs/${id}/inputs`, { kind, body }),
+
+  // ── Chat (PRD #39) — PROVISIONAL, reconciled with M1's wire in Phase 3 ──────
+  // The live view (messages, WS, replay) reuses getRun/getRunMessages/
+  // createRunSocket with the chat's id — only these conversation verbs are new.
+  listChats: () => request<{ chats: Chat[] }>("GET", "/chats"),
+  createChat: (prompt: string) => request<{ chat: Chat }>("POST", "/chats", { prompt }),
+  // Wraps SubmitInput follow_up; the reply arrives over the run stream, so the
+  // body carries no message payload the caller needs (mirrors submitRunInput).
+  sendChatMessage: (id: string, body: string) =>
+    request<{ server_side: boolean }>("POST", `/chats/${id}/messages`, { body }),
+  endChat: (id: string) => request<{ chat: Chat }>("POST", `/chats/${id}/end`),
+  // Continue creates a NEW chat run carrying resume_of_run_id (Decision 11).
+  continueChat: (id: string) => request<{ chat: Chat }>("POST", `/chats/${id}/continue`),
+  // The ONLY forge-write path from chat: session + CSRF, forge-first (Decision 8).
+  confirmProposal: (chatId: string, proposalId: string) =>
+    request<{ proposal: IssueProposal }>("POST", `/chats/${chatId}/proposals/${proposalId}/confirm`),
+  dismissProposal: (chatId: string, proposalId: string) =>
+    request<{ proposal: IssueProposal }>("POST", `/chats/${chatId}/proposals/${proposalId}/dismiss`),
 
   adminListWorkers: () => request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
   adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),
