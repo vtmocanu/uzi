@@ -67,7 +67,9 @@ func (h *Handler) ListChats(w http.ResponseWriter, r *http.Request) {
 	for _, run := range rows {
 		out = append(out, runToDTO(run))
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"chats": out})
+	// max_turns is the instance-wide cap the UI shows the turn counter against
+	// (an instance constant, not per-chat), so it rides the list envelope.
+	httpx.JSON(w, http.StatusOK, map[string]any{"chats": out, "max_turns": h.cfg.ChatMaxTurns})
 }
 
 // PostChatMessage adds a follow-up turn to a live conversation. A terminal chat is
