@@ -1,26 +1,32 @@
-// The curated model aliases, for the agent package (PRD #37 Decision 2).
+// Model-string validation for the agent package (PRD #37 Decision 2, as ratified
+// 2026-07-10).
 //
-// This is the third copy of one list, and the drift is deliberate rather than
-// accidental: `web/src/components/ModelSelect.tsx` offers them in the template
-// editor, `api/internal/agenttmpl/model.go` bounds the *shape* of a model string
-// (single token, no control chars) without enumerating valid IDs, and the worker
-// needs the enumeration to CLAMP an untrusted repo-declared model. A repo's
-// `.claude/agents/*.md` may name any model; only an alias on this list is
-// honored, anything else (custom IDs, typos) is ignored so the agent inherits the
-// run default. That bounds two abuses at once: a hostile repo pinning the most
-// expensive model onto the user's Anthropic quota, and a bogus id that would
-// self-DoS the run with an SDK error.
+// A repo's `.claude/agents/*.md` may pin a `model`. The user's decision is to
+// HONOR it — not clamp it to a short alias list — so a repo can legitimately pin a
+// full model id like `claude-opus-4-8`, not only `opus`. The only bound is the
+// same shape check the API's `ValidateModel` (api/internal/agenttmpl/model.go)
+// applies to uzi's own templates: a single non-empty token, at most MAX_MODEL_LEN
+// bytes, free of control characters, the Unicode replacement char, and interior
+// whitespace. A value failing that is ignored (the agent inherits the run
+// default) — the API cannot enumerate valid ids without calling Anthropic, so a
+// genuine typo surfaces as a run-time SDK error, not here; this only rejects a
+// string that could never be a model id.
 //
-// A test (test/repoagents.test.ts) pins this list against ModelSelect.tsx so the
-// two never drift apart silently.
+// This intentionally REPLACES the earlier alias-only clamp (and its drift test
+// against web/ ModelSelect.tsx): there is no longer any coupling between the
+// worker and the web picker's alias list.
 
-export const MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
+/** Cap on a model token, in lockstep with the API's MaxModelLen. */
+export const MAX_MODEL_LEN = 100;
 
-export type ModelAlias = (typeof MODEL_ALIASES)[number];
+// A model token must not contain a control character (Cc — newline, CR, ESC), the
+// Unicode replacement char (U+FFFD), or any whitespace (it is a single token).
+// Mirrors the rune loop in the Go ValidateModel.
+const MODEL_INVALID_CHAR_RE = /[\p{Cc}�\s]/u;
 
-/** True when `value` is one of the curated aliases (exact, case-sensitive — the
- *  SDK's own alias matching is). Blank/absent is not an alias: it means inherit. */
-export function isModelAlias(value: string | null | undefined): value is ModelAlias {
-  if (!value) return false;
-  return (MODEL_ALIASES as readonly string[]).includes(value);
+/** True when `value` is a well-formed model token (already trimmed by the caller).
+ *  A blank value is NOT valid here — blank means "inherit", handled before this. */
+export function isValidModel(value: string): boolean {
+  if (value.length === 0 || value.length > MAX_MODEL_LEN) return false;
+  return !MODEL_INVALID_CHAR_RE.test(value);
 }

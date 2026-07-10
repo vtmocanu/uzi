@@ -7,7 +7,12 @@ import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import type { Logger } from "./log.js";
 import type { AgentTemplate, ClaimResponse } from "./protocol.js";
-import { describeRepoAgentNote, detectRepoAgents, repoAgentSummaries } from "./repoagents.js";
+import {
+  describeRepoAgentNote,
+  detectRepoAgents,
+  repoAgentSummaries,
+  type DetectedRepoAgents,
+} from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
 import { SteeringChannel, type PlanVerdict } from "./steering.js";
 import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
@@ -26,6 +31,9 @@ export interface RunnerOptions {
   planApprovalTimeoutMs?: number;
   /** Injected for tests; default opens real GitLab MRs. */
   gitlab?: GitLabClient;
+  /** Injected for tests; default is the real `.claude/agents/` parser (PRD #37).
+   *  A seam so a test can drive the detection-failure path deterministically. */
+  detectRepoAgents?: (worktreePath: string) => Promise<DetectedRepoAgents>;
 }
 
 /**
@@ -44,6 +52,7 @@ export class RunRunner {
   private readonly pollMs: number;
   private readonly planApprovalTimeoutMs: number;
   private readonly gitlab: GitLabClient;
+  private readonly detect: (worktreePath: string) => Promise<DetectedRepoAgents>;
 
   constructor(
     private readonly client: WorkerClient,
@@ -59,6 +68,7 @@ export class RunRunner {
     this.pollMs = opts.pollMs ?? 3_000;
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
+    this.detect = opts.detectRepoAgents ?? detectRepoAgents;
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
@@ -109,8 +119,20 @@ export class RunRunner {
       // rather than the gate so that an autopilot run — which never parks at
       // awaiting_approval — records what was detected just the same. The roster is
       // inert data: nothing is assembled until a selection picks the repo source.
-      const repoAgents = await this.parseRepoAgents(worktree.path, batcher, runLog);
-      await reportState({ status: "running", repo_agents: repoAgentSummaries(repoAgents) });
+      const detection = await this.parseRepoAgents(worktree.path, batcher, runLog);
+      const repoAgents = detection.agents;
+      if (detection.ok) {
+        // Non-fatal, and fire-and-forget (matching the session-id report below): an
+        // INFORMATIONAL roster report must never fail a run. An older API without the
+        // repo_agents field 400s DisallowUnknownFields, which the client treats as
+        // permanent — awaiting the report here would turn a working run into a failed
+        // one over a field the run does not depend on. On a detection FAILURE we send
+        // no roster at all, so the column stays NULL ("not reported") rather than `[]`
+        // ("scanned, found none") — the two must stay distinguishable.
+        void reportState({ status: "running", repo_agents: repoAgentSummaries(repoAgents) }).catch((e) =>
+          runLog.warn("could not report repo agent roster", { error: errMessage(e) }),
+        );
+      }
 
       const ctx: RunContext = {
         runId,
@@ -231,17 +253,31 @@ export class RunRunner {
   /**
    * Parse the clone's `.claude/agents/*.md` (PRD #37), logging every skipped or
    * clamped file to the run stream. Detection is best-effort by construction: a
-   * repo without the directory has no agents, and an unreadable one is reported as
-   * a warning — neither is ever a run failure, because a repo's optional roster
-   * must not be able to stop the run it was detected for.
+   * repo without the directory has no agents (ok: true, agents: []), and an
+   * enumeration FAILURE (e.g. an unreadable dir) is reported as a warning and a run
+   * message with ok: false — neither is ever a run failure, because a repo's
+   * optional roster must not be able to stop the run it was detected for.
+   *
+   * The `ok` flag is what keeps a detection FAILURE distinguishable from a genuinely
+   * empty roster at the API: the caller reports `repo_agents: []` only when ok, so a
+   * failure leaves the column NULL ("not reported") rather than `[]` ("found none").
    */
-  private async parseRepoAgents(worktreePath: string, batcher: MessageBatcher, runLog: Logger): Promise<AgentTemplate[]> {
+  private async parseRepoAgents(
+    worktreePath: string,
+    batcher: MessageBatcher,
+    runLog: Logger,
+  ): Promise<{ agents: AgentTemplate[]; ok: boolean }> {
     let detected;
     try {
-      detected = await detectRepoAgents(worktreePath);
+      detected = await this.detect(worktreePath);
     } catch (err) {
       runLog.warn("repo agent detection failed", { error: errMessage(err) });
-      return [];
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: "could not read the repo's .claude/agents/; continuing with your own agent templates" },
+      });
+      return { agents: [], ok: false };
     }
     for (const note of detected.notes) {
       batcher.emit({ kind: "status", agent: "worker", payload: { text: describeRepoAgentNote(note) } });
@@ -255,7 +291,7 @@ export class RunRunner {
       });
     }
     runLog.info("repo agents detected", { count: detected.agents.length, dropped: detected.notes.length });
-    return detected.agents;
+    return { agents: detected.agents, ok: true };
   }
 
   /**

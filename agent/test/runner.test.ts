@@ -486,7 +486,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     }
   }
 
-  it("reports the parsed roster on a running report, noting every drop and clamp", async () => {
+  it("reports the parsed roster on a running report, noting every drop", async () => {
     const { states, texts } = await runAgainst({
       ".claude/agents/coder.md": "---\nname: coder\ndescription: Implements changes.\nmodel: opus\n---\n\nImplement it.\n",
       ".claude/agents/reviewer.md": "---\nname: reviewer\ndescription: Reviews changes.\ntools: Read, WebFetch\n---\n\nReview it.\n",
@@ -506,7 +506,8 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     assert.ok(!JSON.stringify(report!.repo_agents).includes("Implement it."));
 
     assert.ok(texts.some((t) => t.includes('repo agent "broken" was skipped')), texts.join("\n"));
-    assert.ok(texts.some((t) => t.includes('repo agent "reviewer": removed WebFetch')), texts.join("\n"));
+    // WebFetch is HONORED now — reviewer keeps it, so NO tools_filtered note fires.
+    assert.ok(!texts.some((t) => t.includes("removed WebFetch")), texts.join("\n"));
     assert.ok(texts.some((t) => t.includes("detected 2 agent(s)")), texts.join("\n"));
   });
 
@@ -517,5 +518,48 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     assert.deepStrictEqual(report?.repo_agents, []);
     assert.ok(!texts.some((t) => t.includes("repo agent")), "no notes when there is nothing to detect");
     assert.ok(states.some((s) => s.status === "completed"), "the run still completes");
+  });
+
+  it("keeps a detection FAILURE distinguishable from an empty roster (no repo_agents reported)", async () => {
+    // A detection throw (e.g. an unreadable dir) must NOT be reported as `[]` (which
+    // means "scanned, found none"). The worker sends no repo_agents at all, so the
+    // column stays NULL, and it says so on the feed. The run still completes.
+    const repoFx = makeFixture({});
+    try {
+      const { gitlab } = fakeGitlab();
+      const claim = makeClaim({
+        issue_iid: 32,
+        issue_title: "detection fails",
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+        last_seq: 0,
+        secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+      });
+      const runner = new RunRunner(
+        client,
+        new GitCache(repoFx.dataDir, nullLogger()),
+        new StubExecutor(nullLogger()),
+        nullLogger(),
+        20,
+        undefined,
+        {
+          pollMs: 5,
+          planApprovalTimeoutMs: 0,
+          gitlab,
+          detectRepoAgents: async () => {
+            throw new Error("enumeration failed");
+          },
+        },
+      );
+      await runner.execute(claim);
+
+      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+      // NO report carries repo_agents — not even `[]`. The column stays "not reported".
+      assert.ok(!states.some((s) => s.repo_agents !== undefined), "a detection failure reports no roster");
+      assert.ok(texts.some((t) => t.includes("could not read the repo's .claude/agents/")), texts.join("\n"));
+      assert.ok(states.some((s) => s.status === "completed"), "the run still completes");
+    } finally {
+      repoFx.cleanup();
+    }
   });
 });

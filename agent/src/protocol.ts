@@ -288,40 +288,83 @@ export function encodeAgentSelection(selection: AgentSelection): string {
 }
 
 /**
- * Parse + validate an `approve_plan` body as an AgentSelection.
- *
- * Returns undefined for anything that is not a well-formed selection — absent,
- * blank, non-JSON, unknown source, malformed/over-cap exclusions. The caller
- * then falls back to the run's default source: a malformed body must never fail
- * an approved run, and it must never be read as "approve with no restrictions"
- * beyond that default. Exclusion names are held to AGENT_NAME_RE so a body can
- * carry nothing but identities; membership (⊂ the chosen roster) is the API's
- * check, not this one.
+ * The outcome of parsing an `approve_plan` body — three cases the caller MUST keep
+ * apart (PRD #37, ↳review B2/F5):
+ *   - "absent":  no body was sent (autopilot, Slack today, or an older client).
+ *                The run uses its DEFAULT source, which may be the detected repo
+ *                roster — an absence is not a signal to distrust.
+ *   - "invalid": a body WAS sent but is malformed. It must NEVER resolve toward the
+ *                untrusted repo source; the caller forces `own` and notes it.
+ *   - "ok":      a well-formed selection.
+ * Folding "invalid" into "absent" (as returning `undefined` for both did) would let
+ * `{"source":"own","exclusions":"oops"}` silently fall back to the repo default — the
+ * exact "fall back toward the untrusted source" bug the review flagged.
  */
-export function parseAgentSelection(raw: string | null | undefined): AgentSelection | undefined {
-  if (typeof raw !== "string" || raw.trim() === "") return undefined;
+export type AgentSelectionParse =
+  | { status: "absent" }
+  | { status: "invalid" }
+  | { status: "ok"; selection: AgentSelection };
+
+/**
+ * Parse + validate an `approve_plan` body. Absent/blank → "absent"; anything sent
+ * but not a well-formed selection (non-JSON, unknown source, malformed/over-cap
+ * exclusions) → "invalid". Exclusion names are held to AGENT_NAME_RE so a body can
+ * carry nothing but identities; membership (⊂ the chosen roster) is the API's check
+ * (and M3 re-clamps worker-side), not this one.
+ */
+export function parseAgentSelection(raw: string | null | undefined): AgentSelectionParse {
+  if (typeof raw !== "string" || raw.trim() === "") return { status: "absent" };
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return undefined;
+    return { status: "invalid" };
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { status: "invalid" };
 
   const { source, exclusions } = parsed as { source?: unknown; exclusions?: unknown };
-  if (source !== "repo" && source !== "own") return undefined;
+  if (source !== "repo" && source !== "own") return { status: "invalid" };
 
-  if (exclusions === undefined || exclusions === null) return { source, exclusions: [] };
-  if (!Array.isArray(exclusions) || exclusions.length > AGENT_EXCLUSIONS_MAX) return undefined;
+  if (exclusions === undefined || exclusions === null) return { status: "ok", selection: { source, exclusions: [] } };
+  if (!Array.isArray(exclusions) || exclusions.length > AGENT_EXCLUSIONS_MAX) return { status: "invalid" };
 
   const out: string[] = [];
   for (const e of exclusions) {
-    if (typeof e !== "string") return undefined;
+    if (typeof e !== "string") return { status: "invalid" };
     const name = e.trim();
-    if (name.length > AGENT_NAME_MAX_LEN || !AGENT_NAME_RE.test(name)) return undefined;
+    if (name.length > AGENT_NAME_MAX_LEN || !AGENT_NAME_RE.test(name)) return { status: "invalid" };
     if (!out.includes(name)) out.push(name);
   }
-  return { source, exclusions: out };
+  return { status: "ok", selection: { source, exclusions: out } };
+}
+
+/**
+ * Resolve a parsed `approve_plan` body to the selection the run will use, applying
+ * the fallback policy (PRD #37 ↳review B2/F5). `repoAvailable` is whether the run
+ * detected a non-empty repo roster:
+ *   - ok      → the parsed selection, as sent.
+ *   - invalid → FORCE `own` (never the repo source), plus a note for the feed. A
+ *               malformed selection must not be able to activate attacker-authored
+ *               repo agents.
+ *   - absent  → the run default: the repo roster when one was detected, else `own`.
+ * M3 consumes this at the gate boundary; the note (when present) is emitted to the
+ * run stream so the choice is visible.
+ */
+export function resolveAgentSelection(
+  parse: AgentSelectionParse,
+  repoAvailable: boolean,
+): { selection: AgentSelection; note?: string } {
+  switch (parse.status) {
+    case "ok":
+      return { selection: parse.selection };
+    case "invalid":
+      return {
+        selection: { source: "own", exclusions: [] },
+        note: "the submitted agent selection was malformed; using your own agent templates",
+      };
+    case "absent":
+      return { selection: { source: repoAvailable ? "repo" : "own", exclusions: [] } };
+  }
 }
 
 /** Body of POST /runs/:id/state. Fields are set per target status. */
@@ -363,8 +406,9 @@ export interface UserInput {
   kind: InputKind;
   /** Per kind: `follow_up` carries the user's message, `reject_plan` the reason,
    *  `cancel` nothing — and `approve_plan` carries the JSON-encoded AgentSelection
-   *  (PRD #37; parse it with parseAgentSelection, which yields undefined for a body
-   *  that is absent or malformed so the run falls back to its default source). */
+   *  (PRD #37). Parse it with parseAgentSelection + resolveAgentSelection: an ABSENT
+   *  body uses the run default (repo if detected), but a malformed one resolves to
+   *  `own`, never the untrusted repo source. */
   body?: string | null;
   created_at?: string;
 }
