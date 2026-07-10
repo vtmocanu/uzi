@@ -86,6 +86,36 @@ describe("assembleAgents", () => {
   });
 });
 
+describe("lead pin (PRD #18 Decision 8)", () => {
+  // The server guarantees a claim never carries two lead-matching templates: the
+  // reserved-name check (M6) refuses to create a global/user template whose name
+  // matches LEAD_NAME_RE, so only the seeded builtin lead can exist, and
+  // allocation resolution (M7) delivers at most that one. These worker-side tests
+  // pin the two ends of that contract: the wire goldens never carry two leads, and
+  // assembleAgents deterministically routes exactly one even if it somehow did.
+  const leadCount = (names: string[]) => names.filter((n) => LEAD_NAME_RE.test(n)).length;
+
+  for (const golden of ["claim_skills_wire.json", "claim_ci_fix_wire.json"]) {
+    it(`${golden} carries at most one lead-matching agent`, () => {
+      const p = join(import.meta.dirname, "..", "..", "api", "internal", "workersvc", "testdata", golden);
+      const claim = JSON.parse(readFileSync(p, "utf8")) as { agents?: { name: string }[] };
+      const names = (claim.agents ?? []).map((a) => a.name);
+      assert.ok(leadCount(names) <= 1, `${golden} agents ${JSON.stringify(names)} carry >1 lead`);
+    });
+  }
+
+  it("routes exactly one lead even if two lead-named templates are (wrongly) delivered", () => {
+    // Defense in depth: the server must never send this, but if it did, the first
+    // by array order becomes the lead and the rest are ordinary subagents — never
+    // two leads, never a crash. `orchestrator` also matches LEAD_NAME_RE.
+    const orchestrator: AgentTemplate = { name: "orchestrator", description: "d", prompt_body: "p", tools: null, model: null };
+    const { subagents, leadSystemPrompt } = assembleAgents([lead, orchestrator, coder]);
+    assert.strictEqual(leadSystemPrompt, lead.prompt_body, "the first lead-matching template wins the main thread");
+    assert.ok("orchestrator" in subagents, "the second lead-matching template falls back to a subagent");
+    assert.ok(!("lead" in subagents), "the routed lead is never also a subagent");
+  });
+});
+
 describe("shipped lead builtin", () => {
   // Guard the cross-package contract: the lead template the api ships
   // (api/internal/agenttmpl/builtins/lead.md) must carry a name this worker

@@ -17,6 +17,15 @@ export interface Config {
   workerToken: string;
   dataDir: string;
   workerName: string;
+  /**
+   * The worker template this image was built from (PRD #18), baked in as
+   * ENV UZI_WORKER_TEMPLATE by each agent/templates/<name>/Dockerfile (a hardcoded
+   * literal per template, not the WORKER_TEMPLATE build arg). Reported at register
+   * so the server can badge drift from the declared choice. Defaults to "base"
+   * when the env is unset (the minimal image). Observability only: never a trust
+   * boundary — the server re-validates it and the join token is the sole authn.
+   */
+  workerTemplate: string;
   version: string;
   /** `sdk` = Claude Agent SDK (default, product path); `stub` = M2 no-AI stub. */
   executor: ExecutorKind;
@@ -136,6 +145,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     workerToken: resolveWorkerToken(env),
     dataDir: env.UZI_DATA_DIR?.trim() || "/data",
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),
+    workerTemplate: env.UZI_WORKER_TEMPLATE?.trim() || "base",
     version: env.UZI_AGENT_VERSION?.trim() || "0.1.0-m4",
     executor: parseExecutor(env.UZI_EXECUTOR),
     stubPlanGate: parseBool(env.UZI_STUB_PLAN_GATE),

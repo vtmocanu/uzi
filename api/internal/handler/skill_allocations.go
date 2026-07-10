@@ -64,7 +64,7 @@ func (h *Handler) GetTemplateSkills(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	tid, ok := h.templateIDForSkills(w, r)
+	tid, ok := h.templateIDForSkills(w, r, actor)
 	if !ok {
 		return
 	}
@@ -85,7 +85,7 @@ func (h *Handler) SetTemplateSkills(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	tid, ok := h.templateIDForSkills(w, r)
+	tid, ok := h.templateIDForSkills(w, r, actor)
 	if !ok {
 		return
 	}
@@ -173,15 +173,21 @@ func (h *Handler) SetTemplateSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 // templateIDForSkills parses the {id} path param and verifies the template
-// exists (allocations reference a real template). It writes the error response
-// and returns ok=false on any failure.
-func (h *Handler) templateIDForSkills(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+// exists AND is visible to actor (builtin/global to everyone, a user template
+// only to its owner) so a user cannot set or read an allocation overlay on a
+// template they may not see. Writes the error response and returns ok=false on
+// any failure; an invisible template is 404 (existence hidden).
+func (h *Handler) templateIDForSkills(w http.ResponseWriter, r *http.Request, actor store.User) (uuid.UUID, bool) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid template id")
 		return uuid.UUID{}, false
 	}
-	if _, err := h.q.GetAgentTemplate(r.Context(), id); err != nil {
+	if _, err := h.q.GetAgentTemplateForViewer(r.Context(), store.GetAgentTemplateForViewerParams{
+		ID:       id,
+		IsAdmin:  actor.IsAdmin,
+		ViewerID: pgUUID(actor.ID),
+	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			httpx.Error(w, http.StatusNotFound, "template not found")
 			return uuid.UUID{}, false

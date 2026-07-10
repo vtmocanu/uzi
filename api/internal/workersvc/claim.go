@@ -149,6 +149,15 @@ type ClaimConfig struct {
 	// already applied SkillMaxBytes at save and SkillsMaxPerRun at this assembly.
 	SkillMaxBytes   int `json:"skill_max_bytes"`
 	SkillsMaxPerRun int `json:"skills_max_per_run"`
+	// ToolPackages is the run's resolved tier-1 tool package list (PRD #18 M3),
+	// already validated against the allowlist. The worker synthesizes a devbox.json
+	// from it and provisions in a secret-scrubbed subprocess before the SDK starts.
+	// Empty ⇒ no provisioning (today's behavior). Always sent (possibly empty).
+	ToolPackages []string `json:"tool_packages"`
+	// RepoDevboxOptIn is whether the worker may union the repo's own devbox.json
+	// packages into the provisioned set (PRD #18 M5). Delivered from M3 but always
+	// false until M5 wires the per-repo trust toggle.
+	RepoDevboxOptIn bool `json:"repo_devbox_opt_in"`
 }
 
 // agentsFromTemplates maps stored templates to claim-payload agents, decoding

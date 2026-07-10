@@ -354,6 +354,22 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
   -config "$RUNROOT/certs/openssl.cnf" >/dev/null 2>&1
 chmod 0644 "$RUNROOT/certs/"*.pem
 
+# Stub `devbox` for the PRD #18 tool-provisioning scenario: the isolated stack has
+# no substituter egress, so a real `devbox install` is neither possible nor wanted.
+# This fake satisfies the worker's provision path — `install` is a no-op; `shellenv`
+# prints one allowlisted PATH line filterShellenv keeps — so the provisioning wiring
+# is exercised end to end, fast, with no network. Bind-mounted over the baked-in
+# binary by the overlay; only invoked when a run has tier-1 packages.
+cat > "$RUNROOT/fake-devbox" <<'EOF'
+#!/bin/sh
+case "$1" in
+  install)  exit 0 ;;
+  shellenv) printf 'export PATH="/nix/e2e-tools/bin:${PATH}"\n'; exit 0 ;;
+  *)        exit 0 ;;
+esac
+EOF
+chmod 0755 "$RUNROOT/fake-devbox"
+
 # Local bare repo standing in for GitLab's git server, seeded with a main commit.
 git init --bare -q "$RUNROOT/fakeremote/repo.git"
 git -C "$RUNROOT/fakeremote/repo.git" symbolic-ref HEAD refs/heads/main
@@ -722,6 +738,66 @@ echo "$PS2" | jq -e '(index("ci-cd-norms") != null) and (index("e2e-repo-skill")
 apipost "/api/runs/$RUN_S2/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
 wait_status "$RUN_S2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 pass "flag ON: plugin dir has BOTH ci-cd-norms and e2e-repo-skill ($PS2)"
+
+# =============================================================================
+# PRD #18 — agent template scopes/allocation + tier-1 tool provisioning, end to
+# end. The stub executor reports the claim's delivered template set
+# (payload.agents) and runs the SAME provisioning path as the SDK executor
+# (against the stubbed devbox), so both are observable with no live Anthropic
+# session and no substituter egress.
+say "PRD #18: user-scoped template + allocation → claim delivers only the owner's set"
+
+# delivered_agents RUN — the flattened, deduped agent names the stub reported.
+delivered_agents() { apiget "/api/runs/$1/messages" | jq -c '[.messages[].payload.agents // empty] | flatten | unique'; }
+# run_texts RUN — every status/text line, newline-joined (fixed-string greppable).
+run_texts() { apiget "/api/runs/$1/messages" | jq -r '.messages[].payload.text // empty'; }
+
+# Create a private (scope=user) template as the seed admin, then allocate it to the
+# admin's own runs (my_overrides enabled). A uniquely-named user template rides the
+# owner's claim; another user would never see it (proven at the SQL layer).
+UT_ID="$(apipost /api/agent-templates '{"name":"e2e-mine","description":"a private e2e helper.","prompt_body":"You help with e2e things.\n","model":null,"tools":null,"scope":"user"}' | jq -r '.template.id')"
+{ [ -n "$UT_ID" ] && [ "$UT_ID" != null ]; } || fail "user-scoped template create failed"
+apiput /api/agent-templates/allocations "{\"my_overrides\":[{\"template_id\":\"$UT_ID\",\"enabled\":true}]}" >/dev/null
+pass "created + allocated a user-scoped template (e2e-mine)"
+
+# A reserved lead name is refused for a user template (Decision 8, the no-two-leads pin).
+C="$(fresh_code POST /api/agent-templates '{"name":"orchestrator","description":"x.","prompt_body":"b\n","model":null,"tools":null,"scope":"user"}')"
+[ "$C" = 400 ] || fail "reserved lead name (orchestrator) should be 400, got $C"
+pass "reserved lead name refused for a user template (400)"
+
+RUN_UT="$(skill_run 'E2E user-template delivery')"
+DA="$(delivered_agents "$RUN_UT")"
+echo "$DA" | jq -e 'index("e2e-mine") != null' >/dev/null \
+  || fail "allocated user template absent from the delivered claim: $DA"
+echo "$DA" | jq -e '(index("lead") != null) and (index("coder") != null)' >/dev/null \
+  || fail "builtin lead/coder missing from the delivered claim: $DA"
+apipost "/api/runs/$RUN_UT/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_UT" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "user template e2e-mine delivered to its owner's run alongside the builtins ($DA)"
+
+say "PRD #18: tier-1 tool provisioning → claim carries tool_packages → worker provisions (devbox stubbed)"
+
+# Set an allowlisted package as the repo's tier-1 tool profile (the M4 seed allowlist).
+PKG="$(apiget /api/tool-allowlist | jq -r '.allowlist[0].name // empty')"
+{ [ -n "$PKG" ] && [ "$PKG" != null ]; } || fail "tool allowlist was not seeded"
+apiput "/api/repos/$REPO_ID/tool-profile" "{\"packages\":[\"$PKG\"]}" \
+  | jq -e --arg p "$PKG" '.packages | index($p) != null' >/dev/null \
+  || fail "repo tool profile did not save $PKG"
+pass "set repo tier-1 tool profile: [$PKG]"
+
+RUN_TP="$(skill_run 'E2E tool provisioning')"
+# The claim carried tool_packages=[$PKG]; the worker provisions against the stubbed
+# devbox (install no-op, shellenv one PATH line — no substituter egress).
+TP_TEXTS="$(run_texts "$RUN_TP")"
+echo "$TP_TEXTS" | grep -qF "provisioning 1 tool(s): $PKG" \
+  || fail "claim did not carry tool_packages / provisioning not started for $PKG"
+echo "$TP_TEXTS" | grep -qxF "tools provisioned" \
+  || fail "provisioning path not exercised (no 'tools provisioned' message)"
+apipost "/api/runs/$RUN_TP/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_status "$RUN_TP" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "tier-1 tool [$PKG] provisioned against the stubbed devbox, run completed"
+# Clear the profile so later scenarios' runs aren't perturbed by provisioning.
+apiput "/api/repos/$REPO_ID/tool-profile" '{"packages":[]}' >/dev/null
 
 # =============================================================================
 # PRD #19 — admin settings + autopilot. The poller is already at ~2s (the phase
@@ -1143,4 +1219,4 @@ curl -fsS -b "$JAR2" -X POST "$BASE/api/vault/unlock" -H 'Content-Type: applicat
   || fail "admin migration count should be 0 after the last master row rewrapped"
 pass "lazy rewrap on unlock: user2's row flipped 'master' -> 'dek'; admin count back to 0"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault; executor=%s)\n' "$EXECUTOR"
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault; executor=%s)\n' "$EXECUTOR"

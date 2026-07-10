@@ -24,6 +24,11 @@ vi.mock("../lib/api", async (importActual) => {
       getMySettings: vi.fn(),
       putMySettings: vi.fn(),
       vaultLock: vi.fn(),
+      // The Notifications section (a child of Settings) loads its own state.
+      getMySlack: vi.fn(),
+      setMySlackNotify: vi.fn(),
+      setMySlackOverride: vi.fn(),
+      testMySlackDM: vi.fn(),
     },
   };
 });
@@ -66,6 +71,9 @@ beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
   mockApi.getMySettings.mockResolvedValue({ settings: { default_model: null, theme: null } });
   mockApi.putMySettings.mockResolvedValue({ settings: { default_model: null, theme: "mission" } });
+  mockApi.getMySlack.mockResolvedValue({
+    slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked" },
+  });
   mockAuth(baseUser);
 });
 

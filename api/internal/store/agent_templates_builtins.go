@@ -16,7 +16,14 @@ import (
 // path unit-testable without a live database.
 type builtinReconcilerQueries interface {
 	InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error)
-	GetAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error)
+	// GetSharedAgentTemplateByName reads back the row that kept a seed out, scoped
+	// to the shared namespace so it stays a unique lookup post-00047 (a user's
+	// same-name template must not win it and trigger a false shadow warning).
+	GetSharedAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error)
+	// SeedSharedTemplateAllocationByName seeds a builtin's global-default
+	// allocation row (PRD #18 M7). Called only when the builtin was actually
+	// inserted, so an admin's later removal of the default is never re-added.
+	SeedSharedTemplateAllocationByName(ctx context.Context, name string) error
 }
 
 // ReconcileBuiltinTemplates seeds the Go-embedded builtin agent templates into
@@ -41,6 +48,14 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 		if err != nil {
 			return fmt.Errorf("insert builtin %q: %w", def.Name, err)
 		}
+		if n > 0 {
+			// A newly-inserted builtin becomes a global default (PRD #18 M7). Seed
+			// its shared allocation row here, not on every boot, so a default an
+			// admin later removes stays removed. Idempotent (ON CONFLICT DO NOTHING).
+			if err := q.SeedSharedTemplateAllocationByName(ctx, def.Name); err != nil {
+				return fmt.Errorf("seed default allocation for builtin %q: %w", def.Name, err)
+			}
+		}
 		if n == 0 {
 			// ON CONFLICT (name) DO NOTHING: an existing row of the same name
 			// kept the seed out. That is normal when a prior boot already
@@ -49,7 +64,7 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 			// receive it — the worker still routes it by name, but it is not
 			// resettable to the shipped definition. Warn so an operator can
 			// rename or delete the custom row if they want the builtin.
-			existing, gErr := q.GetAgentTemplateByName(ctx, def.Name)
+			existing, gErr := q.GetSharedAgentTemplateByName(ctx, def.Name)
 			switch {
 			case gErr != nil:
 				// The row exists (n==0) but the read-back to classify it failed;

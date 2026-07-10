@@ -27,6 +27,15 @@ type AgentTemplate struct {
 	UpdatedBy   pgtype.UUID        `json:"updated_by"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	Scope       string             `json:"scope"`
+	UserID      pgtype.UUID        `json:"user_id"`
+}
+
+type AgentTemplateAllocation struct {
+	TemplateID uuid.UUID          `json:"template_id"`
+	UserID     pgtype.UUID        `json:"user_id"`
+	Enabled    bool               `json:"enabled"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
 type AppSetting struct {
@@ -101,6 +110,16 @@ type Repo struct {
 	DefaultBranch     pgtype.Text `json:"default_branch"`
 	Enabled           bool        `json:"enabled"`
 	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
+	RepoDevboxOptIn   bool        `json:"repo_devbox_opt_in"`
+}
+
+type RepoToolProfile struct {
+	ID        uuid.UUID          `json:"id"`
+	UserID    uuid.UUID          `json:"user_id"`
+	RepoID    uuid.UUID          `json:"repo_id"`
+	Packages  []byte             `json:"packages"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Run struct {
@@ -169,19 +188,42 @@ type Skill struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type SlackRunMessage struct {
+	RunID     uuid.UUID          `json:"run_id"`
+	ChannelID string             `json:"channel_id"`
+	RootTs    string             `json:"root_ts"`
+	GateTs    pgtype.Text        `json:"gate_ts"`
+	GateState pgtype.Text        `json:"gate_state"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ToolAllowlist struct {
+	ID            uuid.UUID          `json:"id"`
+	Name          string             `json:"name"`
+	PinnedVersion pgtype.Text        `json:"pinned_version"`
+	Note          pgtype.Text        `json:"note"`
+	UpdatedBy     pgtype.UUID        `json:"updated_by"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
 type User struct {
-	ID               uuid.UUID          `json:"id"`
-	Email            string             `json:"email"`
-	PasswordHash     string             `json:"password_hash"`
-	DisplayName      pgtype.Text        `json:"display_name"`
-	IsAdmin          bool               `json:"is_admin"`
-	IsActive         bool               `json:"is_active"`
-	TokenVersion     int32              `json:"token_version"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	LastLogin        pgtype.Timestamptz `json:"last_login"`
-	DefaultModel     pgtype.Text        `json:"default_model"`
-	AutopilotEnabled bool               `json:"autopilot_enabled"`
-	Theme            pgtype.Text        `json:"theme"`
+	ID                   uuid.UUID          `json:"id"`
+	Email                string             `json:"email"`
+	PasswordHash         string             `json:"password_hash"`
+	DisplayName          pgtype.Text        `json:"display_name"`
+	IsAdmin              bool               `json:"is_admin"`
+	IsActive             bool               `json:"is_active"`
+	TokenVersion         int32              `json:"token_version"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	LastLogin            pgtype.Timestamptz `json:"last_login"`
+	DefaultModel         pgtype.Text        `json:"default_model"`
+	AutopilotEnabled     bool               `json:"autopilot_enabled"`
+	Theme                pgtype.Text        `json:"theme"`
+	SlackMemberID        pgtype.Text        `json:"slack_member_id"`
+	SlackNotify          bool               `json:"slack_notify"`
+	SlackResolvedID      pgtype.Text        `json:"slack_resolved_id"`
+	SlackLinkConfirmedAt pgtype.Timestamptz `json:"slack_link_confirmed_at"`
 }
 
 type UserSecret struct {
@@ -203,13 +245,15 @@ type UserVault struct {
 }
 
 type Worker struct {
-	ID              uuid.UUID          `json:"id"`
-	UserID          uuid.UUID          `json:"user_id"`
-	Name            string             `json:"name"`
-	TokenHash       []byte             `json:"token_hash"`
-	Status          string             `json:"status"`
-	LastHeartbeatAt pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version         pgtype.Text        `json:"version"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	Name             string             `json:"name"`
+	TokenHash        []byte             `json:"token_hash"`
+	Status           string             `json:"status"`
+	LastHeartbeatAt  pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version          pgtype.Text        `json:"version"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared pgtype.Text        `json:"template_declared"`
+	TemplateReported pgtype.Text        `json:"template_reported"`
 }

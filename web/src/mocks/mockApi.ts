@@ -12,11 +12,19 @@ import {
   type AppSettings,
   type PrivilegeReport,
   type Run,
+  type SettingSource,
+  type SettingsResponse,
+  type SlackLink,
+  type UpdateSettingsPayload,
   type RunInputKind,
   type SecretMeta,
   type Skill,
   type SkillCreateInput,
   type SkillUpdateInput,
+  type TemplateAllocation,
+  type TemplateAllocationsInput,
+  type ToolAllowlistEntry,
+  type ToolAllowlistWriteInput,
   type User,
   type UserSettings,
   type UserSettingsPatch,
@@ -31,9 +39,11 @@ import {
   mockConnection,
   mockForgeConfig,
   mockRepos,
+  mockRepoToolProfiles,
   mockSecrets,
   mockSkills,
   mockTemplates,
+  mockToolAllowlist,
   mockUsers,
   mockWorkers,
   runListItem,
@@ -66,6 +76,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   default_theme: "ember",
   prdless_enabled: "true",
   prdless_label: "PRDLESS",
+  slack_enabled: "false",
+  public_base_url: "http://127.0.0.1:8080",
 };
 
 interface PersistedSettings {
@@ -94,7 +106,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.autopilot_label === "string" &&
     typeof a.default_theme === "string" &&
     typeof a.prdless_enabled === "string" &&
-    typeof a.prdless_label === "string";
+    typeof a.prdless_label === "string" &&
+    typeof a.slack_enabled === "string" &&
+    typeof a.public_base_url === "string";
   return okUser && okApp;
 }
 
@@ -142,14 +156,88 @@ let allocations: Record<string, { shared: string[]; mine: string[] }> = Object.f
   Object.entries(mockAllocations).map(([k, v]) => [k, { shared: [...v.shared], mine: [...v.mine] }]),
 );
 let appSettings: AppSettings = loadedSettings.appSettings;
+// Slack secret tokens (PRD #25) are write-only: the demo tracks only whether one
+// is configured, never a value, mirroring the real API's `secrets` map. There is
+// no ENV overlay in the demo, so every key's source is db/default.
+const slackSecrets: Record<string, boolean> = { slack_bot_token: false, slack_app_token: false };
+
+// The current user's Slack linking state (PRD #25 M3). The demo starts unlinked;
+// setting an override moves it to "pending" (a real deployment would then DM the
+// target a Confirm card), and there is no inbound socket here to confirm it.
+let slackLink: Omit<SlackLink, "state"> = { member_id: null, notify: true, resolved_id: null, confirmed: false };
+
+// slackLinkResponse derives the state field the real API returns, so the mock and
+// the server never disagree on how member_id/resolved_id/confirmed map to a state.
+function slackLinkResponse(): { slack: SlackLink } {
+  const state: SlackLink["state"] = !slackLink.resolved_id
+    ? "unlinked"
+    : slackLink.confirmed
+      ? "confirmed"
+      : "pending";
+  return { slack: { ...slackLink, state } };
+}
+
+// settingsResponse builds the admin SettingsResponse from the mock's current
+// state: readable non-secret values, per-secret configured flags, and per-key
+// sources (all db/default — the demo has no ENV overlay).
+function settingsResponse(): SettingsResponse {
+  const sources: Record<string, SettingSource> = {};
+  for (const key of Object.keys(appSettings)) sources[key] = "db";
+  for (const key of Object.keys(slackSecrets)) sources[key] = slackSecrets[key] ? "db" : "default";
+  // The demo has no real socket, so Slack is always "disabled" here.
+  return { settings: { ...appSettings }, secrets: { ...slackSecrets }, sources, slack_status: "disabled" };
+}
 let templateCounter = 0;
 let workerCounter = 0;
 let skillCounter = 0;
+// Tool allowlist + per-repo profiles (PRD #18 M4).
+let toolAllowlist: ToolAllowlistEntry[] = mockToolAllowlist.map((e) => ({ ...e }));
+const repoToolProfiles = new Map<string, string[]>(
+  Object.entries(mockRepoToolProfiles).map(([k, v]) => [k, [...v]]),
+);
+let toolEntryCounter = 0;
+
+// Template allocations (PRD #18 M7). Global defaults are seeded for every
+// builtin/global template (no empty-means-all cliff); the per-user overlay maps
+// a template id to a forced on/off decision.
+const templateGlobalDefaults = new Set<string>(
+  templates.filter((t) => t.scope !== "user").map((t) => t.id),
+);
+const templateOverrides = new Map<string, Map<string, boolean>>();
+
+// The reserved lead names mirror the server's leadNameRe / worker LEAD_NAME_RE.
+const LEAD_NAME_RE = /^(lead|orchestrator)$/i;
 
 // visibleSkills mirrors the real read: admins see every scope, everyone else
 // sees builtin ∪ global ∪ their own user skills.
 function visibleSkills(me: User): Skill[] {
   return skills.filter((s) => me.is_admin || s.scope !== "user" || s.user_id === me.id);
+}
+
+// visibleTemplates mirrors the real read: builtin ∪ global ∪ own user templates
+// (admins see all).
+function visibleTemplates(me: User): AgentTemplate[] {
+  return templates.filter((t) => me.is_admin || t.scope !== "user" || t.user_id === me.id);
+}
+
+// templateAllocationView resolves each visible template's allocation state for
+// me: overlay wins, else the global default.
+function templateAllocationView(me: User): TemplateAllocation[] {
+  const overlay = templateOverrides.get(me.id) ?? new Map<string, boolean>();
+  return visibleTemplates(me).map((t) => {
+    const globalDefault = templateGlobalDefaults.has(t.id);
+    const myOverride = overlay.has(t.id) ? (overlay.get(t.id) as boolean) : null;
+    return {
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      scope: t.scope,
+      is_builtin: t.is_builtin,
+      global_default: globalDefault,
+      my_override: myOverride,
+      effective: myOverride ?? globalDefault,
+    };
+  });
 }
 
 function toAllocated(id: string): AllocatedSkill | null {
@@ -224,23 +312,44 @@ export const mockApi = {
   // ── Admin: instance settings (PRD #19) ───────────────────────────────────────
   // Mirrors the server's Decision 8 validation so the demo surfaces the same
   // rejection messages the real API would.
-  getSettings: async () => delay({ settings: { ...appSettings } }),
+  getSettings: async () => delay(settingsResponse()),
   // Demo is fully DEK-sealed (no legacy rows), so the admin migration notice is
   // hidden; the wiring is still exercised by the AdminSettings unit test.
   vaultMigration: async () => delay({ master_sealed: 0 }),
-  updateSettings: async (updates: Partial<AppSettings>) => {
-    const merged = { ...appSettings, ...updates };
-    for (const [key, value] of Object.entries(updates)) {
+  updateSettings: async (updates: UpdateSettingsPayload) => {
+    // Secret tokens are write-only: validated + recorded as configured, never
+    // merged into the readable settings (mirrors the real structural exclusion).
+    const nonSecret: Partial<AppSettings> = {};
+    for (const [key, raw] of Object.entries(updates)) {
+      const value = raw ?? "";
+      if (key === "slack_bot_token" || key === "slack_app_token") {
+        const prefix = key === "slack_bot_token" ? "xoxb-" : "xapp-";
+        if (!value.startsWith(prefix)) {
+          throw new ApiError(400, `${key}: token must start with ${prefix}`);
+        }
+        slackSecrets[key] = true;
+        continue;
+      }
       // default_theme routes to the theme registry, not the label rules (PRD #21).
       if (key === "default_theme") {
         if (!isTheme(value)) throw new ApiError(400, `default_theme: unknown theme: "${value}"`);
+        nonSecret.default_theme = value;
         continue;
       }
-      // prdless_enabled is a strict bool, not a label (PRD #22 M1).
-      if (key === "prdless_enabled") {
+      // prdless_enabled / slack_enabled are strict bools, not labels.
+      if (key === "prdless_enabled" || key === "slack_enabled") {
         if (value !== "true" && value !== "false") {
-          throw new ApiError(400, `prdless_enabled: must be "true" or "false"`);
+          throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
+        (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      // public_base_url must be http(s) (PRD #25).
+      if (key === "public_base_url") {
+        if (!/^https?:\/\/.+/.test(value)) {
+          throw new ApiError(400, "public_base_url: must use http or https");
+        }
+        nonSecret.public_base_url = value;
         continue;
       }
       if (key !== "prd_label" && key !== "autopilot_label" && key !== "prdless_label") {
@@ -249,7 +358,9 @@ export const mockApi = {
       if (!value || value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
       if (value.length > 64) throw new ApiError(400, `${key}: must be at most 64 characters`);
       if (value.includes(",")) throw new ApiError(400, `${key}: must not contain a comma`);
+      (nonSecret as Record<string, string>)[key] = value;
     }
+    const merged = { ...appSettings, ...nonSecret };
     // The label triple must be pairwise-distinct (Decision 8 + PRD #22 Decision 7).
     if (merged.prd_label === merged.autopilot_label) {
       throw new ApiError(400, "prd_label and autopilot_label must differ");
@@ -262,7 +373,7 @@ export const mockApi = {
     }
     appSettings = merged;
     persistSettings();
-    return delay({ settings: { ...appSettings } });
+    return delay(settingsResponse());
   },
 
   // ── Autopilot opt-in (PRD #19 M3) ────────────────────────────────────────────
@@ -323,6 +434,30 @@ export const mockApi = {
     return delay({ settings: { ...userSettings } });
   },
 
+  // ── Slack linking (PRD #25 M3) ───────────────────────────────────────────────
+  getMySlack: async () => delay(slackLinkResponse()),
+  setMySlackNotify: async (notify: boolean) => {
+    slackLink = { ...slackLink, notify };
+    return delay(slackLinkResponse());
+  },
+  setMySlackOverride: async (memberId: string | null) => {
+    const member = memberId?.trim() ?? "";
+    if (member === "") {
+      // Clear the override: fall back to email auto-match (nothing resolved here).
+      slackLink = { ...slackLink, member_id: null, resolved_id: null, confirmed: false };
+    } else {
+      if (!/^[A-Za-z0-9]{1,64}$/.test(member)) throw new ApiError(400, "invalid Slack member ID");
+      // A set resets confirmation: the target must Confirm before content flows.
+      slackLink = { ...slackLink, member_id: member, resolved_id: member, confirmed: false };
+    }
+    return delay(slackLinkResponse());
+  },
+  testMySlackDM: async () => {
+    if (!slackLink.resolved_id) throw new ApiError(400, "no linked Slack account to send a test DM to");
+    return delay({ status: "sent" });
+  },
+  getSlackStatus: async () => delay({ slack_status: "disabled" }),
+
   // ── Agent templates ─────────────────────────────────────────────────────────
   listAgentTemplates: async () => delay({ templates: templates.map((t) => ({ ...t })) }),
   getAgentTemplate: async (id: string) => {
@@ -331,10 +466,28 @@ export const mockApi = {
     return delay({ template: { ...t } });
   },
   createAgentTemplate: async (input: AgentTemplateInput) => {
+    const me = requireSession();
     if (!input.name || !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(input.name)) {
       throw new ApiError(400, "name must be kebab-case");
     }
-    if (templates.some((t) => t.name === input.name)) {
+    if (LEAD_NAME_RE.test(input.name)) {
+      throw new ApiError(400, "name is reserved for the built-in lead orchestrator");
+    }
+    // Blank scope defaults to global (the pre-M6 admin create).
+    const scope = input.scope ?? "global";
+    if (scope === "global" && !me.is_admin) {
+      throw new ApiError(403, "only admins can create global templates");
+    }
+    if (scope !== "global" && scope !== "user") {
+      throw new ApiError(400, "scope must be 'global' or 'user'");
+    }
+    // Name uniqueness: shared names are unique across builtin+global; a user's
+    // names are unique to that user (they may reuse a builtin/global name).
+    const clash =
+      scope === "user"
+        ? templates.some((t) => t.scope === "user" && t.user_id === me.id && t.name === input.name)
+        : templates.some((t) => t.scope !== "user" && t.name === input.name);
+    if (clash) {
       throw new ApiError(409, "a template with this name already exists");
     }
     const now = new Date().toISOString();
@@ -346,12 +499,44 @@ export const mockApi = {
       tools: input.tools,
       prompt_body: input.prompt_body,
       is_builtin: false,
-      updated_by: requireSession().email,
+      scope,
+      user_id: scope === "user" ? me.id : null,
+      updated_by: me.email,
       created_at: now,
       updated_at: now,
     };
     templates.push(t);
+    // A new global template is a global default from creation (removable).
+    if (scope === "global") templateGlobalDefaults.add(t.id);
     return delay({ template: { ...t } });
+  },
+  getTemplateAllocations: async () => delay({ templates: templateAllocationView(requireSession()) }),
+  setTemplateAllocations: async (input: TemplateAllocationsInput) => {
+    const me = requireSession();
+    if (input.global_default_ids === undefined && input.my_overrides === undefined) {
+      throw new ApiError(400, "provide global_default_ids and/or my_overrides");
+    }
+    const canSee = (id: string) => visibleTemplates(me).some((t) => t.id === id);
+    if (input.global_default_ids !== undefined) {
+      if (!me.is_admin) throw new ApiError(403, "only admins can set global default allocations");
+      for (const id of input.global_default_ids) {
+        const t = templates.find((x) => x.id === id);
+        if (!t || t.scope === "user") {
+          throw new ApiError(400, "only builtin or global templates can be global defaults");
+        }
+      }
+      templateGlobalDefaults.clear();
+      for (const id of input.global_default_ids) templateGlobalDefaults.add(id);
+    }
+    if (input.my_overrides !== undefined) {
+      for (const o of input.my_overrides) {
+        if (!canSee(o.template_id)) throw new ApiError(400, "one or more templates are not allocatable");
+      }
+      const overlay = new Map<string, boolean>();
+      for (const o of input.my_overrides) overlay.set(o.template_id, o.enabled);
+      templateOverrides.set(me.id, overlay);
+    }
+    return delay({ templates: templateAllocationView(me) });
   },
   updateAgentTemplate: async (id: string, input: AgentTemplateInput) => {
     const t = templates.find((x) => x.id === id);
@@ -595,6 +780,59 @@ export const mockApi = {
     r.repo_skills_enabled = enabled;
     return delay({ repo: { ...r } });
   },
+  setRepoDevboxOptIn: async (id: string, enabled: boolean) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.repo_devbox_opt_in = enabled;
+    return delay({ repo: { ...r } });
+  },
+
+  // ── Tool allowlist + repo tool profiles (PRD #18 M4) ─────────────────────────
+  listToolAllowlist: async () => delay({ allowlist: toolAllowlist.map((e) => ({ ...e })) }),
+  createToolAllowlistEntry: async (input: ToolAllowlistWriteInput) => {
+    const name = (input.name ?? "").trim();
+    if (name === "") throw new ApiError(400, "name is required");
+    if (toolAllowlist.some((e) => e.name === name)) throw new ApiError(409, "that package is already on the allowlist");
+    const now = new Date().toISOString();
+    const entry: ToolAllowlistEntry = {
+      id: `tal-${++toolEntryCounter}`,
+      name,
+      pinned_version: input.pinned_version?.trim() || null,
+      note: input.note?.trim() || null,
+      updated_by: requireSession().id,
+      created_at: now,
+      updated_at: now,
+    };
+    toolAllowlist = [...toolAllowlist, entry].sort((a, b) => a.name.localeCompare(b.name));
+    return delay({ entry: { ...entry } });
+  },
+  updateToolAllowlistEntry: async (id: string, input: ToolAllowlistWriteInput) => {
+    const entry = toolAllowlist.find((e) => e.id === id);
+    if (!entry) throw new ApiError(404, "allowlist entry not found");
+    entry.pinned_version = input.pinned_version?.trim() || null;
+    entry.note = input.note?.trim() || null;
+    entry.updated_at = new Date().toISOString();
+    return delay({ entry: { ...entry } });
+  },
+  deleteToolAllowlistEntry: async (id: string) => {
+    toolAllowlist = toolAllowlist.filter((e) => e.id !== id);
+    return delay(null);
+  },
+  getRepoToolProfile: async (repoId: string) => {
+    if (!repos.some((r) => r.id === repoId)) throw new ApiError(404, "repo not found");
+    return delay({ packages: [...(repoToolProfiles.get(repoId) ?? [])] });
+  },
+  setRepoToolProfile: async (repoId: string, packages: string[]) => {
+    if (!repos.some((r) => r.id === repoId)) throw new ApiError(404, "repo not found");
+    // Mirror the server's allowlist validation so the demo rejects the same way.
+    const allowed = new Set<string>();
+    for (const e of toolAllowlist) allowed.add(e.pinned_version ? `${e.name}@${e.pinned_version}` : e.name);
+    const rejected = packages.filter((p) => !allowed.has(p));
+    if (rejected.length > 0) throw new ApiError(400, "these packages are not on the allowlist: " + rejected.join(", "));
+    const cleaned = [...new Set(packages)].sort();
+    repoToolProfiles.set(repoId, cleaned);
+    return delay({ packages: cleaned });
+  },
 
   // ── Board ───────────────────────────────────────────────────────────────────
   getBoard: async (repoId: string) => {
@@ -680,12 +918,15 @@ export const mockApi = {
 
   // ── Workers ─────────────────────────────────────────────────────────────────
   listWorkers: async () => delay({ workers: workers.map((w) => ({ ...w })) }),
-  createWorker: async (name: string) => {
+  createWorker: async (name: string, template?: string) => {
     const w = {
       id: `w-new-${++workerCounter}`,
       name,
       status: "offline",
       busy: false,
+      // Declared at issuance; reported stays null until the worker registers.
+      template_declared: template ?? null,
+      template_reported: null,
       version: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),

@@ -36,6 +36,11 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   assert.equal(claim.config?.skill_max_bytes, 65536);
   assert.equal(claim.config?.skills_max_per_run, 32);
 
+  // Tool provisioning fields (PRD #18 M3): the resolved tier-1 package list and
+  // the repo devbox opt-in flag ride the same config.
+  assert.deepEqual(claim.config?.tool_packages, ["kubectl@1.31", "jq"]);
+  assert.equal(claim.config?.repo_devbox_opt_in, false);
+
   // The per-run skill union: name + description + body per entry.
   assert.ok(Array.isArray(claim.skills));
   assert.deepEqual(

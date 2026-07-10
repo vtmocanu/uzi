@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -31,6 +32,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
@@ -115,6 +117,77 @@ func run() error {
 	// the forge sync/poller (read the configured PRD label every cycle). One
 	// process, so one cache. Built before the forge service, which reads it.
 	settingsCache := settings.New(q, cfg.SettingsCacheTTL)
+	// Wire the secret cipher + ENV-source overlay (PRD #25): the Slack tokens and
+	// public base URL an operator set via environment win over their DB rows, and
+	// the box seals/opens the secret keys. Only keys actually set appear in the
+	// overlay, so an unconfigured Slack instance stays a strict no-op.
+	slackEnv := map[string]string{}
+	if cfg.SlackBotToken != "" {
+		slackEnv[settings.KeySlackBotToken] = cfg.SlackBotToken
+	}
+	if cfg.SlackAppToken != "" {
+		slackEnv[settings.KeySlackAppToken] = cfg.SlackAppToken
+	}
+	if cfg.PublicBaseURL != "" {
+		slackEnv[settings.KeyPublicBaseURL] = cfg.PublicBaseURL
+	}
+	settingsCache.ConfigureSecrets(box, slackEnv)
+
+	// Shared bot-token Slack surface (PRD #25 M3): the run notifier, the account
+	// linker, and the /me/slack test-DM endpoint all post through it. It reads the
+	// CURRENT bot token per call (hot-rotation safe), bounded by the Slack HTTP
+	// timeout.
+	slackPoster := slacksvc.NewPoster(settingsCache.SlackBotToken, &http.Client{Timeout: cfg.SlackHTTPTimeout})
+
+	// Account linker (PRD #25 M3): the email auto-match pass (fired on every socket
+	// connect) plus the link-confirmation DM round-trip (Confirm / Not-me). It is
+	// the Manager's inbound Block Kit handler and its on-connected hook, and it
+	// backs the user-settings override / test-DM endpoints. Best-effort throughout —
+	// it never affects a run or the socket.
+	slackLinker := slacksvc.NewLinker(q, slackPoster, slog.Default())
+
+	// Agent-runtime service (PRD #4): the run queue, worker protocol, and sweeper
+	// DB work. Shares the same secret cipher (sole key holder) as the forge svc.
+	// Constructed here (ahead of the seeds it used to follow) because the Slack
+	// approval-gate handler needs its SubmitInput and the socket manager captures
+	// its inbound handler at construction.
+	wsvc := workersvc.New(q, box, workersvc.Params{
+		RunTimeout:           cfg.RunTimeout,
+		RunIdleTimeout:       cfg.RunIdleTimeout,
+		RunMaxIterations:     cfg.RunMaxIterations,
+		RunMaxRequeues:       cfg.RunMaxRequeues,
+		WorkerHeartbeatStale: cfg.WorkerHeartbeatStale,
+		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
+		SkillMaxBytes:        cfg.SkillMaxBytes,
+		SkillsMaxPerRun:      cfg.SkillsMaxPerRun,
+	})
+
+	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
+	// Reject-without-reason buttons. It rides workersvc's ownership-checked
+	// SubmitInput (via the gateSubmitter adapter, which keeps slacksvc free of a
+	// workersvc import) and reads run status itself for stale-click handling.
+	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+
+	// Reply-from-Slack handler (PRD #25 M5): inbound message.im thread replies →
+	// reasoned reject during a reject-pending gate, follow_up on a live run, a nudge
+	// during an open gate, or a coalesced ephemeral otherwise. Same ownership-checked
+	// submitter as the gatekeeper.
+	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+
+	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
+	// connection: it polls the settings cache and, while Slack is enabled with both
+	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
+	// token/enable change); otherwise it idles as a strict no-op. It never touches
+	// the run lifecycle — Slack is best-effort. Run in the background WaitGroup below.
+	// Inbound Block Kit actions fan out through an InboundMux to the linker (Confirm
+	// / Not-me) and the gatekeeper (gate buttons); message.im thread replies go to
+	// the replier.
+	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{
+		HTTPTimeout: cfg.SlackHTTPTimeout,
+		Inbound:     slacksvc.InboundMux{slackLinker, slackGate},
+		Messages:    slackReplier,
+		OnConnected: slackLinker.AutoMatch,
+	})
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
 
@@ -166,29 +239,30 @@ func run() error {
 		return err
 	}
 
-	// Agent-runtime service (PRD #4): the run queue, worker protocol, and sweeper
-	// DB work. Shares the same secret cipher (sole key holder) as the forge svc.
-	wsvc := workersvc.New(q, box, workersvc.Params{
-		RunTimeout:           cfg.RunTimeout,
-		RunIdleTimeout:       cfg.RunIdleTimeout,
-		RunMaxIterations:     cfg.RunMaxIterations,
-		RunMaxRequeues:       cfg.RunMaxRequeues,
-		WorkerHeartbeatStale: cfg.WorkerHeartbeatStale,
-		WorkerAffinityGrace:  cfg.WorkerAffinityGrace,
-		SkillMaxBytes:        cfg.SkillMaxBytes,
-		SkillsMaxPerRun:      cfg.SkillsMaxPerRun,
-	})
-
 	// Claim gating + claim-time token open share the same vault instance the HTTP
 	// handlers hold (PRD #32 M3): a locked owner's runs stay queued instead of
-	// claiming, and a 'dek'-sealed Anthropic token opens only while unlocked.
+	// claiming, and a 'dek'-sealed Anthropic token opens only while unlocked. wsvc
+	// is built above (ahead of the Slack setup that needs it); vlt just above.
 	wsvc.SetVault(vlt)
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and
 	// stateless — every event is already durable in the DB.
 	liveHub := hub.New()
-	wsvc.SetBroadcaster(liveHub)
+
+	// Slack run-notifier (PRD #25 M3): a Broadcaster that turns run state
+	// transitions into per-owner DMs. It shares the workersvc broadcast seam with
+	// the WS hub via MultiBroadcaster, so a persisted transition fans out to both
+	// the browser and Slack. PublishState never blocks (it enqueues); a Slack
+	// failure is logged redacted and never affects the run. Unconfigured users are
+	// dropped silently, so this is a strict no-op until linking is set up.
+	slackNotifier := slacksvc.NewNotifier(
+		q,
+		slackPoster,
+		settingsCache.PublicBaseURL,
+		slog.Default(),
+	)
+	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier})
 
 	// Board column automation (PRD #12): reacts to run status changes with
 	// forge-first label moves, plus a reconcile loop that retries moves a down
@@ -228,7 +302,7 @@ func run() error {
 	pcheck := privcheck.NewService(q, svc)
 
 	var bgWG sync.WaitGroup
-	bgWG.Add(3)
+	bgWG.Add(5)
 	go func() {
 		defer bgWG.Done()
 		engine.Run(ctx)
@@ -240,6 +314,14 @@ func run() error {
 	go func() {
 		defer bgWG.Done()
 		lifecycle.RunReconciler(ctx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		slackManager.Run(ctx)
+	}()
+	go func() {
+		defer bgWG.Done()
+		slackNotifier.Run(ctx)
 	}()
 	if cfg.PrivilegeCheckInterval > 0 {
 		privSweep := privcheck.NewEngine(pcheck, cfg.PrivilegeCheckInterval)
@@ -260,6 +342,9 @@ func run() error {
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
+	// Dedicated tighter budget for the two Slack-DM-triggering /me/slack endpoints
+	// (PRD #25 M3 fast-follow) — see the wiring in handler.Routes.
+	slackDMLimiter := mw.NewLimiter(cfg.SlackDMRateLimitMax, cfg.SlackDMRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// The settings PUT handler asks the poller to full-sync every repo when a label
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
@@ -269,10 +354,16 @@ func run() error {
 	// save, the /api/vault endpoints, and vault status on /api/me (PRD #32). M3 adds
 	// the same instance to workersvc for claim-time gating + open.
 	h.SetVault(vlt)
+	// Surface the live Slack connection state on the admin settings DTO (PRD #25 M2).
+	h.SetSlackStatus(slackManager.State)
+	// Wire the account linker so the /me/slack override + test-DM endpoints can send
+	// their Slack DMs (PRD #25 M3). Best-effort: a nil linker (never in production)
+	// would make those endpoints report Slack as unavailable.
+	h.SetSlackLinker(slackLinker)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           h.Routes(authLimiter, forgeLimiter),
+		Handler:           h.Routes(authLimiter, forgeLimiter, slackDMLimiter),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -308,6 +399,21 @@ func run() error {
 	// race a closing pool.
 	lifecycle.Wait()
 	return runErr
+}
+
+// gateSubmitter adapts *workersvc.Service to slacksvc.PlanGateSubmitter — the
+// slice the Slack approval gatekeeper needs (read a run, submit an approve/reject
+// input). It drops SubmitInput's result (the gatekeeper only cares whether it
+// succeeded) and keeps slacksvc free of a workersvc import.
+type gateSubmitter struct{ svc *workersvc.Service }
+
+func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error) {
+	return g.svc.GetRun(ctx, userID, runID)
+}
+
+func (g gateSubmitter) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) error {
+	_, err := g.svc.SubmitInput(ctx, userID, runID, kind, body)
+	return err
 }
 
 // seedAdmin provisions the configured admin user if seeding is enabled and no

@@ -23,11 +23,40 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   default_theme: "ember",
   prdless_enabled: "true",
   prdless_label: "PRDLESS",
+  slack_enabled: "false",
+  public_base_url: "http://127.0.0.1:8080",
   ...over,
 });
 
+type Src = "env" | "db" | "default";
+
+// A full SettingsResponse fixture. Secrets default to not-configured and every
+// key to source "default"; tests override just what they exercise.
+const response = (
+  over: Partial<import("../lib/api").AppSettings> = {},
+  secrets: Record<string, boolean> = {},
+  sources: Record<string, Src> = {},
+  slack_status = "disabled",
+) => ({
+  settings: settings(over),
+  secrets: { slack_bot_token: false, slack_app_token: false, ...secrets },
+  sources: {
+    prd_label: "db",
+    autopilot_label: "default",
+    default_theme: "default",
+    prdless_enabled: "default",
+    prdless_label: "default",
+    slack_enabled: "default",
+    public_base_url: "default",
+    slack_bot_token: "default",
+    slack_app_token: "default",
+    ...sources,
+  } as Record<string, Src>,
+  slack_status,
+});
+
 beforeEach(() => {
-  mockApi.getSettings.mockResolvedValue({ settings: settings() });
+  mockApi.getSettings.mockResolvedValue(response());
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
 });
 
@@ -74,7 +103,7 @@ describe("AdminSettings", () => {
   });
 
   it("saves edited labels and shows a success notice", async () => {
-    mockApi.updateSettings.mockResolvedValue({ settings: settings({ prd_label: "Feature" }) });
+    mockApi.updateSettings.mockResolvedValue(response({ prd_label: "Feature" }));
     renderPage();
     await screen.findByLabelText("PRD label");
     fireEvent.change(input("PRD label"), { target: { value: "Feature" } });
@@ -98,7 +127,7 @@ describe("AdminSettings", () => {
   });
 
   it("saves the default theme selection (PRD #21)", async () => {
-    mockApi.updateSettings.mockResolvedValue({ settings: settings({ default_theme: "mission" }) });
+    mockApi.updateSettings.mockResolvedValue(response({ default_theme: "mission" }));
     renderPage();
     await screen.findByLabelText("PRD label");
     const theme = screen.getByLabelText("Default theme") as HTMLSelectElement;
@@ -168,5 +197,57 @@ describe("AdminSettings", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/must differ/i);
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+
+  // ── Slack card (PRD #25 M1) ──────────────────────────────────────────────
+  it("greys out Slack fields fixed by the environment", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response({}, { slack_bot_token: true }, { public_base_url: "env", slack_bot_token: "env" }),
+    );
+    renderPage();
+    const baseUrl = (await screen.findByLabelText("Public base URL")) as HTMLInputElement;
+    expect(baseUrl.disabled).toBe(true);
+    expect((screen.getByLabelText("Bot token") as HTMLInputElement).disabled).toBe(true);
+    // The "set from environment" hint appears for the greyed fields.
+    expect(screen.getAllByText("Set from environment.").length).toBeGreaterThan(0);
+  });
+
+  it("marks a stored token configured without revealing it", async () => {
+    mockApi.getSettings.mockResolvedValue(response({}, { slack_bot_token: true }));
+    renderPage();
+    const bot = (await screen.findByLabelText("Bot token")) as HTMLInputElement;
+    // Write-only: the stored token is never pre-filled, only signalled.
+    expect(bot.value).toBe("");
+    expect(bot.placeholder).toMatch(/configured/i);
+  });
+
+  it("renders the live Slack connection status chip (PRD #25 M2)", async () => {
+    mockApi.getSettings.mockResolvedValue(response({}, {}, {}, "connected"));
+    renderPage();
+    // The chip reflects the DTO's slack_status, not a hardcoded stub.
+    expect(await screen.findByText("connected")).toBeTruthy();
+    expect(screen.queryByText("disabled")).toBeNull();
+  });
+
+  it("saves the Slack card, sending only the entered token", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ slack_enabled: "true" }));
+    renderPage();
+    await screen.findByLabelText("Bot token");
+    fireEvent.click(screen.getByLabelText(/Enable Slack notifications/i));
+    fireEvent.change(screen.getByLabelText("Bot token"), { target: { value: "xoxb-new" } });
+
+    const btn = screen.getByRole("button", { name: /save slack settings/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({
+        slack_enabled: "true",
+        public_base_url: "http://127.0.0.1:8080",
+        slack_bot_token: "xoxb-new",
+      }),
+    );
+    // The app token was left blank, so it is NOT sent.
+    expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("slack_app_token");
   });
 });

@@ -21,6 +21,7 @@ import {
   ChevronRightIcon,
   FactoryIcon,
   GearIcon,
+  PackageIcon,
   GitIcon,
   GitLabIcon,
   HomeIcon,
@@ -257,6 +258,13 @@ function SidebarContent({
         {user?.is_admin && (
           <NavGroup label="Admin" collapsed={collapsed}>
             <NavItem to="/admin/users" icon={<UsersIcon />} label="Users" onNavigate={onNavigate} collapsed={collapsed} />
+            <NavItem
+              to="/admin/tool-allowlist"
+              icon={<PackageIcon />}
+              label="Tool allowlist"
+              onNavigate={onNavigate}
+              collapsed={collapsed}
+            />
             <NavItem
               to="/admin/settings"
               icon={<GearIcon />}

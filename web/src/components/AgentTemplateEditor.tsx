@@ -1,6 +1,6 @@
 import { useMemo, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { AgentTemplateInput } from "../lib/api";
-import { Alert, Button, Field, Input } from "./ui";
+import { Alert, Button, Field, Input, Select } from "./ui";
 import { ModelSelect } from "./ModelSelect";
 import {
   frontmatterFieldWarning,
@@ -20,12 +20,16 @@ export interface EditorInitial {
   prompt_body: string;
 }
 
-// AgentTemplateEditor is the shared admin form for creating and editing a
-// template. name is editable only on create (it is the immutable subagent
-// identity afterwards). It carries a live preview of the exported subagent file.
+// AgentTemplateEditor is the shared form for creating and editing a template.
+// name is editable only on create (the immutable subagent identity afterwards);
+// scope is chosen on create too (PRD #18 M6): any user authors a private "Mine"
+// template, and an admin can additionally publish a "Global" one. It carries a
+// live preview of the exported subagent file.
 export function AgentTemplateEditor({
   initial,
   nameEditable,
+  scopeEditable = false,
+  isAdmin = false,
   submitLabel,
   busy,
   error,
@@ -33,12 +37,16 @@ export function AgentTemplateEditor({
 }: {
   initial: EditorInitial;
   nameEditable: boolean;
+  scopeEditable?: boolean;
+  isAdmin?: boolean;
   submitLabel: string;
   busy: boolean;
   error: string;
   onSubmit: (input: AgentTemplateInput) => void;
 }) {
   const [name, setName] = useState(initial.name);
+  // Create defaults to a personal ("user") template; admins can switch to global.
+  const [scope, setScope] = useState<"global" | "user">("user");
   const [description, setDescription] = useState(initial.description);
   const [model, setModel] = useState(initial.model ?? "");
   const [tools, setTools] = useState<string[]>(initial.tools ?? []);
@@ -91,6 +99,8 @@ export function AgentTemplateEditor({
     e.preventDefault();
     onSubmit({
       ...(nameEditable ? { name: name.trim() } : {}),
+      // A non-admin can only author a user template; scope rides only on create.
+      ...(scopeEditable ? { scope: isAdmin ? scope : "user" } : {}),
       description: description.trim(),
       model: model.trim() || null,
       tools: tools.length ? tools : null,
@@ -119,6 +129,27 @@ export function AgentTemplateEditor({
           <p className="mt-1 font-mono text-sm text-muted">{name}</p>
         </div>
       )}
+
+      {scopeEditable &&
+        (isAdmin ? (
+          <Field label="Scope" htmlFor="template-scope">
+            <Select
+              id="template-scope"
+              value={scope}
+              onChange={(e) => setScope(e.target.value as "global" | "user")}
+            >
+              <option value="user">Mine — private to you</option>
+              <option value="global">Global — visible to everyone</option>
+            </Select>
+          </Field>
+        ) : (
+          <div>
+            <span className="text-sm font-medium text-muted">Scope</span>
+            <p className="mt-1 text-sm text-muted">
+              Personal (Mine) — only your runs will see this agent.
+            </p>
+          </div>
+        ))}
 
       <Field label="Description (single sentence, used for routing)">
         <Input value={description} onChange={(e) => setDescription(e.target.value)} />

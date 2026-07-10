@@ -340,22 +340,29 @@ func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) 
 
 const createWorker = `-- name: CreateWorker :one
 
-INSERT INTO workers (user_id, name, token_hash)
-VALUES ($1, $2, $3)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at
+INSERT INTO workers (user_id, name, token_hash, template_declared)
+VALUES ($1, $2, $3, $4)
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported
 `
 
 type CreateWorkerParams struct {
-	UserID    uuid.UUID `json:"user_id"`
-	Name      string    `json:"name"`
-	TokenHash []byte    `json:"token_hash"`
+	UserID           uuid.UUID   `json:"user_id"`
+	Name             string      `json:"name"`
+	TokenHash        []byte      `json:"token_hash"`
+	TemplateDeclared pgtype.Text `json:"template_declared"`
 }
 
 // Workers -----------------------------------------------------------------
 // Issue a worker: the plaintext join token is shown once by the caller; only its
-// sha256 (token_hash) is stored.
+// sha256 (token_hash) is stored. template_declared is the UI-chosen template
+// (PRD #18), NULL when the caller made no choice.
 func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, createWorker, arg.UserID, arg.Name, arg.TokenHash)
+	row := q.db.QueryRow(ctx, createWorker,
+		arg.UserID,
+		arg.Name,
+		arg.TokenHash,
+		arg.TemplateDeclared,
+	)
 	var i Worker
 	err := row.Scan(
 		&i.ID,
@@ -367,6 +374,8 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
 	)
 	return i, err
 }
@@ -388,13 +397,14 @@ func (q *Queries) DeleteWorkerForUser(ctx context.Context, arg DeleteWorkerForUs
 	return result.RowsAffected(), nil
 }
 
-const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :execrows
+const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :many
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= $2
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < $3
   )
+RETURNING id, user_id, status
 `
 
 type FailRunsOfStaleWorkersOverCapParams struct {
@@ -403,16 +413,34 @@ type FailRunsOfStaleWorkersOverCapParams struct {
 	Cutoff        pgtype.Timestamptz `json:"cutoff"`
 }
 
+type FailRunsOfStaleWorkersOverCapRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
 // A stale worker's non-terminal run that has already used its re-queue budget →
 // failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 // origin column; the sweep itself never touches the forge — worker-loss recovery
 // must not wait on a down forge).
-func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRunsOfStaleWorkersOverCapParams) (int64, error) {
-	result, err := q.db.Exec(ctx, failRunsOfStaleWorkersOverCap, arg.FailureReason, arg.MaxRequeues, arg.Cutoff)
+func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRunsOfStaleWorkersOverCapParams) ([]FailRunsOfStaleWorkersOverCapRow, error) {
+	rows, err := q.db.Query(ctx, failRunsOfStaleWorkersOverCap, arg.FailureReason, arg.MaxRequeues, arg.Cutoff)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []FailRunsOfStaleWorkersOverCapRow{}
+	for rows.Next() {
+		var i FailRunsOfStaleWorkersOverCapRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :execrows
@@ -543,6 +571,7 @@ SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.default_branch,
        rp.repo_skills_enabled,
+       rp.repo_devbox_opt_in,
        c.forge_type,
        c.base_url,
        c.bot_username,
@@ -558,6 +587,7 @@ type GetRunClaimContextRow struct {
 	RepoPath          string      `json:"repo_path"`
 	DefaultBranch     pgtype.Text `json:"default_branch"`
 	RepoSkillsEnabled bool        `json:"repo_skills_enabled"`
+	RepoDevboxOptIn   bool        `json:"repo_devbox_opt_in"`
 	ForgeType         string      `json:"forge_type"`
 	BaseUrl           string      `json:"base_url"`
 	BotUsername       string      `json:"bot_username"`
@@ -575,6 +605,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.RepoPath,
 		&i.DefaultBranch,
 		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.BotUsername,
@@ -696,7 +727,7 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -712,12 +743,14 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -738,12 +771,14 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -760,6 +795,8 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
 	)
 	return i, err
 }
@@ -770,7 +807,7 @@ UPDATE workers SET
     last_heartbeat_at = now(),
     updated_at        = now()
 WHERE id = $1
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported
 `
 
 func (q *Queries) HeartbeatWorker(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -786,6 +823,8 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, id uuid.UUID) (Worker, er
 		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
 	)
 	return i, err
 }
@@ -899,7 +938,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -937,6 +976,8 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.Version,
 			&i.Worker.CreatedAt,
 			&i.Worker.UpdatedAt,
+			&i.Worker.TemplateDeclared,
+			&i.Worker.TemplateReported,
 			&i.Busy,
 			&i.OwnerEmail,
 		); err != nil {
@@ -1173,7 +1214,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -1185,16 +1226,18 @@ ORDER BY w.created_at ASC
 `
 
 type ListWorkersByUserRow struct {
-	ID              uuid.UUID          `json:"id"`
-	UserID          uuid.UUID          `json:"user_id"`
-	Name            string             `json:"name"`
-	TokenHash       []byte             `json:"token_hash"`
-	Status          string             `json:"status"`
-	LastHeartbeatAt pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version         pgtype.Text        `json:"version"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
-	Busy            bool               `json:"busy"`
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	Name             string             `json:"name"`
+	TokenHash        []byte             `json:"token_hash"`
+	Status           string             `json:"status"`
+	LastHeartbeatAt  pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version          pgtype.Text        `json:"version"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared pgtype.Text        `json:"template_declared"`
+	TemplateReported pgtype.Text        `json:"template_reported"`
+	Busy             bool               `json:"busy"`
 }
 
 // Worker list for the owning user. "busy" is derived here (never stored): a
@@ -1218,6 +1261,8 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.Version,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.TemplateDeclared,
+			&i.TemplateReported,
 			&i.Busy,
 		); err != nil {
 			return nil, err
@@ -1296,20 +1341,25 @@ const registerWorker = `-- name: RegisterWorker :one
 UPDATE workers SET
     status            = 'online',
     version           = $1,
+    template_reported = $2,
     last_heartbeat_at = now(),
     updated_at        = now()
-WHERE id = $2
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at
+WHERE id = $3
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported
 `
 
 type RegisterWorkerParams struct {
-	Version pgtype.Text `json:"version"`
-	ID      uuid.UUID   `json:"id"`
+	Version          pgtype.Text `json:"version"`
+	TemplateReported pgtype.Text `json:"template_reported"`
+	ID               uuid.UUID   `json:"id"`
 }
 
-// Worker announces version and comes online; heartbeat is stamped now.
+// Worker announces version + its self-reported template and comes online;
+// heartbeat is stamped now. template_reported is what the image bakes in (PRD
+// #18), NULL when the worker sends none (older image) — stored as-is; drift vs
+// template_declared is surfaced, never rejected.
 func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, registerWorker, arg.Version, arg.ID)
+	row := q.db.QueryRow(ctx, registerWorker, arg.Version, arg.TemplateReported, arg.ID)
 	var i Worker
 	err := row.Scan(
 		&i.ID,
@@ -1321,6 +1371,8 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.Version,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
 	)
 	return i, err
 }
@@ -1357,7 +1409,10 @@ WHERE id = $1 AND status = 'claimed'
 // would violate "a locked owner's run waits, never fails". worker_id is left
 // intact for resume affinity. Guarded on status='claimed' so a run that a
 // concurrent path already advanced is untouched. Mirrors
-// SweepClaimedNeverStarted but targets exactly one run by id.
+// SweepClaimedNeverStarted but targets exactly one run by id. Stays :execrows
+// (not :many like the sweeps): this runs on the claim path, not the sweeper, and
+// deliberately does not broadcast the claimed→queued transition (matching the
+// reviewed PRD #32 M3 behavior — it is a rare lock-race requeue, not a sweep).
 func (q *Queries) RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, requeueClaimedRunToQueued, id)
 	if err != nil {
@@ -1366,13 +1421,14 @@ func (q *Queries) RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (
 	return result.RowsAffected(), nil
 }
 
-const requeueRunsOfStaleWorkers = `-- name: RequeueRunsOfStaleWorkers :execrows
+const requeueRunsOfStaleWorkers = `-- name: RequeueRunsOfStaleWorkers :many
 UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count < $1
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < $2
   )
+RETURNING id, user_id, status
 `
 
 type RequeueRunsOfStaleWorkersParams struct {
@@ -1380,14 +1436,32 @@ type RequeueRunsOfStaleWorkersParams struct {
 	Cutoff      pgtype.Timestamptz `json:"cutoff"`
 }
 
+type RequeueRunsOfStaleWorkersRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
 // A stale worker's non-terminal run within its re-queue budget → back to queued
 // (worker_id kept for affinity, requeue_count incremented).
-func (q *Queries) RequeueRunsOfStaleWorkers(ctx context.Context, arg RequeueRunsOfStaleWorkersParams) (int64, error) {
-	result, err := q.db.Exec(ctx, requeueRunsOfStaleWorkers, arg.MaxRequeues, arg.Cutoff)
+func (q *Queries) RequeueRunsOfStaleWorkers(ctx context.Context, arg RequeueRunsOfStaleWorkersParams) ([]RequeueRunsOfStaleWorkersRow, error) {
+	rows, err := q.db.Query(ctx, requeueRunsOfStaleWorkers, arg.MaxRequeues, arg.Cutoff)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []RequeueRunsOfStaleWorkersRow{}
+	for rows.Next() {
+		var i RequeueRunsOfStaleWorkersRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const requeueWorkerRuns = `-- name: RequeueWorkerRuns :execrows
@@ -1579,26 +1653,48 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 	return result.RowsAffected(), nil
 }
 
-const sweepClaimedNeverStarted = `-- name: SweepClaimedNeverStarted :execrows
+const sweepClaimedNeverStarted = `-- name: SweepClaimedNeverStarted :many
 
 UPDATE runs SET status = 'queued', updated_at = now()
 WHERE status = 'claimed' AND claimed_at < $1
+RETURNING id, user_id, status
 `
+
+type SweepClaimedNeverStartedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
 
 // Sweeper: run-level timeouts and worker-loss recovery -----------------------
 // claimed but never started past the grace window → back to queued (worker_id
-// kept for affinity so the same disk reclaims it).
-func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, sweepClaimedNeverStarted, cutoff)
+// kept for affinity so the same disk reclaims it). RETURNING id, user_id, status
+// so the sweeper can publish each transition through the broadcaster/notifier
+// fan-out (PRD #25 M3: sweeper-driven transitions were previously silent).
+func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]SweepClaimedNeverStartedRow, error) {
+	rows, err := q.db.Query(ctx, sweepClaimedNeverStarted, cutoff)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []SweepClaimedNeverStartedRow{}
+	for rows.Next() {
+		var i SweepClaimedNeverStartedRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
-const sweepRunningTimeout = `-- name: SweepRunningTimeout :execrows
+const sweepRunningTimeout = `-- name: SweepRunningTimeout :many
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE status = 'running' AND started_at < $2
+RETURNING id, user_id, status
 `
 
 type SweepRunningTimeoutParams struct {
@@ -1606,15 +1702,33 @@ type SweepRunningTimeoutParams struct {
 	Cutoff        pgtype.Timestamptz `json:"cutoff"`
 }
 
+type SweepRunningTimeoutRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
 // running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 // Stamps move_pending_since so the (forge-free) sweep leaves the isolated
 // reconcile loop a marker to restore the origin column later.
-func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeoutParams) (int64, error) {
-	result, err := q.db.Exec(ctx, sweepRunningTimeout, arg.FailureReason, arg.Cutoff)
+func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeoutParams) ([]SweepRunningTimeoutRow, error) {
+	rows, err := q.db.Query(ctx, sweepRunningTimeout, arg.FailureReason, arg.Cutoff)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []SweepRunningTimeoutRow{}
+	for rows.Next() {
+		var i SweepRunningTimeoutRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updateRunLastSeq = `-- name: UpdateRunLastSeq :execrows

@@ -2,9 +2,10 @@
 
 -- name: CreateWorker :one
 -- Issue a worker: the plaintext join token is shown once by the caller; only its
--- sha256 (token_hash) is stored.
-INSERT INTO workers (user_id, name, token_hash)
-VALUES (@user_id, @name, @token_hash)
+-- sha256 (token_hash) is stored. template_declared is the UI-chosen template
+-- (PRD #18), NULL when the caller made no choice.
+INSERT INTO workers (user_id, name, token_hash, template_declared)
+VALUES (@user_id, @name, @token_hash, @template_declared)
 RETURNING *;
 
 -- name: GetWorkerByTokenHash :one
@@ -31,10 +32,14 @@ WHERE w.user_id = @user_id
 ORDER BY w.created_at ASC;
 
 -- name: RegisterWorker :one
--- Worker announces version and comes online; heartbeat is stamped now.
+-- Worker announces version + its self-reported template and comes online;
+-- heartbeat is stamped now. template_reported is what the image bakes in (PRD
+-- #18), NULL when the worker sends none (older image) — stored as-is; drift vs
+-- template_declared is surfaced, never rejected.
 UPDATE workers SET
     status            = 'online',
     version           = @version,
+    template_reported = @template_reported,
     last_heartbeat_at = now(),
     updated_at        = now()
 WHERE id = @id
@@ -172,6 +177,7 @@ SELECT rp.web_url             AS repo_web_url,
        rp.path_with_namespace AS repo_path,
        rp.default_branch,
        rp.repo_skills_enabled,
+       rp.repo_devbox_opt_in,
        c.forge_type,
        c.base_url,
        c.bot_username,
@@ -269,11 +275,14 @@ WHERE id = @id;
 
 -- Sweeper: run-level timeouts and worker-loss recovery -----------------------
 
--- name: SweepClaimedNeverStarted :execrows
+-- name: SweepClaimedNeverStarted :many
 -- claimed but never started past the grace window → back to queued (worker_id
--- kept for affinity so the same disk reclaims it).
+-- kept for affinity so the same disk reclaims it). RETURNING id, user_id, status
+-- so the sweeper can publish each transition through the broadcaster/notifier
+-- fan-out (PRD #25 M3: sweeper-driven transitions were previously silent).
 UPDATE runs SET status = 'queued', updated_at = now()
-WHERE status = 'claimed' AND claimed_at < @cutoff;
+WHERE status = 'claimed' AND claimed_at < @cutoff
+RETURNING id, user_id, status;
 
 -- name: RequeueClaimedRunToQueued :execrows
 -- Vault lock race (PRD #32 M3): a run claimed while the owner's vault was
@@ -282,18 +291,22 @@ WHERE status = 'claimed' AND claimed_at < @cutoff;
 -- would violate "a locked owner's run waits, never fails". worker_id is left
 -- intact for resume affinity. Guarded on status='claimed' so a run that a
 -- concurrent path already advanced is untouched. Mirrors
--- SweepClaimedNeverStarted but targets exactly one run by id.
+-- SweepClaimedNeverStarted but targets exactly one run by id. Stays :execrows
+-- (not :many like the sweeps): this runs on the claim path, not the sweeper, and
+-- deliberately does not broadcast the claimed→queued transition (matching the
+-- reviewed PRD #32 M3 behavior — it is a rare lock-race requeue, not a sweep).
 UPDATE runs SET status = 'queued', updated_at = now()
 WHERE id = @id AND status = 'claimed';
 
--- name: SweepRunningTimeout :execrows
+-- name: SweepRunningTimeout :many
 -- running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 -- Stamps move_pending_since so the (forge-free) sweep leaves the isolated
 -- reconcile loop a marker to restore the origin column later.
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
-WHERE status = 'running' AND started_at < @cutoff;
+WHERE status = 'running' AND started_at < @cutoff
+RETURNING id, user_id, status;
 
--- name: FailRunsOfStaleWorkersOverCap :execrows
+-- name: FailRunsOfStaleWorkersOverCap :many
 -- A stale worker's non-terminal run that has already used its re-queue budget →
 -- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
@@ -303,9 +316,10 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
-  );
+  )
+RETURNING id, user_id, status;
 
--- name: RequeueRunsOfStaleWorkers :execrows
+-- name: RequeueRunsOfStaleWorkers :many
 -- A stale worker's non-terminal run within its re-queue budget → back to queued
 -- (worker_id kept for affinity, requeue_count incremented).
 UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
@@ -313,7 +327,8 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count < @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
-  );
+  )
+RETURNING id, user_id, status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
 

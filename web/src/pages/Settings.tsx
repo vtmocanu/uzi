@@ -10,6 +10,7 @@ import { ModelSelect } from "../components/ModelSelect";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
 import { VaultBadge, useVaultLock } from "../components/VaultControls";
+import { SlackNotifications } from "../components/SlackNotifications";
 import { prefs } from "../lib/prefs";
 import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
 
@@ -367,6 +368,8 @@ export function Settings() {
           </Field>
         </div>
       </Card>
+
+      <SlackNotifications />
 
       {user && (
         <Card>

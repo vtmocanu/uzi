@@ -33,7 +33,7 @@ uzi's current MVP is a docker-compose stack of three always-on services (`web`, 
 - **`web`** (`web/Dockerfile`) — a Vite/React SPA built at image build time and served by `nginxinc/nginx-unprivileged`. Its `nginx.conf` does two jobs: serve the built static assets, and reverse-proxy `/api/*` to `api:8080`. The SPA and API therefore share one origin (`http://127.0.0.1:8080`) — no CORS configuration exists anywhere in the stack.
 - **`api`** (`api/Dockerfile`) — a statically linked Go binary (`chi` router) on `gcr.io/distroless/static-debian12`, running as `nonroot`. Serves `/api/auth/*`, `/api/admin/*`, `/api/agent-templates/*`, `/api/me/secrets/*`, `/api/worker/*` (the worker protocol, PRD #4), `/api/ws`, `/api/health`, among others. Runs its own DB migrations and builtin-template reconciliation at startup before it starts accepting traffic (see below).
 - **`db`** — stock `postgres:17`, digest-pinned in `docker-compose.yml`. Data lives in the named volume `pgdata`; it is not a bind mount, so it survives container recreation but is bound to the Docker volume store on this host.
-- **`agent`** (`agent/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 22 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* to `api` and executes runs. See [Agent runtime](#agent-runtime-workers-runs-live-view) below and [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure.
+- **`agent`** (`agent/templates/<name>/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 22 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* and executes runs. The image is built from a curated **template** selected by `WORKER_TEMPLATE` (PRD #18: `base`, or heavy-dep variants like `jvm`). Its outbound reach is `api`, the forge (git clone/fetch/push over HTTPS, the PAT injected as a Basic-auth header, not a session), **plus**, when a run has tier-1 tool packages to provision, the **nix substituters** the devbox engine fetches from (`cache.nixos.org` and any configured extras) — provisioning runs before the SDK in a secret-scrubbed subprocess (PRD #18 M3, [docs/worker-setup.md](docs/worker-setup.md#tool-provisioning)). The substituters are the one NEW egress PRD #18 adds to that set; the nix store lives on its own `agentnix` volume (at `/nix`) so it is a first-run-only fetch. See [Agent runtime](#agent-runtime-workers-runs-live-view) below and [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure.
 
 All images are pulled/built by digest or pinned tag in `docker-compose.yml`, not floating `latest`.
 
@@ -145,11 +145,35 @@ recipe a later release renders into a running one.
   SDK/Anthropic-account default. A subagent's own template `model`, when set,
   always wins for that subagent; unset, it inherits the resolved main-thread
   model. See [docs/worker-model.md](docs/worker-model.md).
-- **Read/write split.** Any authenticated user can list, view, and preview
-  templates (`GET /api/agent-templates*`); only an admin can create, edit,
-  delete, or reset one (`RequireAdmin` in `api/internal/handler/handler.go`).
-  Templates are shared across all users, so this closes the hole where any
-  user could rewrite the prompts everyone else's agents run with.
+- **Scopes + per-user ownership (PRD #18).** Each template has a `scope`
+  (`builtin`/`global`/`user`) and, for user scope, a `user_id`, mirroring the
+  skills model. Builtin and global are visible to everyone and admin-managed; a
+  `user` template is visible to and editable by only its owner. Reads and
+  writes are scope-authorized per row (not a blanket `RequireAdmin`): any user
+  creates/edits/deletes their own templates, builtin/global management stays
+  admin-only, and a non-owner never learns a private template exists (404, not
+  403). `is_builtin` is retained as a compat column a CHECK ties to
+  `scope='builtin'`. Two partial-unique name indexes (shared names unique
+  across builtin+global; per-user names unique) let a user own a name that
+  collides with a shared one; `lead`/`orchestrator` are reserved so no
+  API-created template (global or user) can take a lead name — the invariant
+  behind the worker's "a claim never carries two lead-matching templates" pin.
+  This still closes the hole where any user could rewrite the shared prompts.
+- **Allocation + claim filtering (PRD #18).** `agent_template_allocations`
+  decides which templates ride each run: a global-default layer (admin,
+  `user_id NULL`, always enabled) plus a per-user `enabled` overlay. Seeded
+  with no empty-means-all cliff — every builtin/global gets an explicit default
+  row (at migration, on the reconciler's first insert of a builtin, and on a
+  global's creation), so absence of a row is always a deliberate removal. A
+  claim delivers only the run owner's **resolved** set (`ListClaimAgentTemplates`:
+  the overlay wins, else the global default, else dropped) — builtin∪global
+  defaults ± the owner's overlay + the owner's own allocated user templates,
+  never another user's rows. A user template whose name collides with a
+  builtin/global is dropped from the claim (**shared precedence**), so the
+  worker's name-keyed subagent map never has the curated builtin displaced (a
+  deliberate divergence from skills' body-precedence; surfaced in the UI as a
+  `shadowed` badge). The lead is a normal template in the set — a user may
+  disable it, and the worker degrades to its hardcoded guardrail lead prompt.
 - **Renderer.** `api/internal/agenttmpl/render.go` turns a template into
   Claude Code's subagent Markdown (fixed-order YAML frontmatter, `tools` as an
   inline comma-separated string, `tools`/`model` omitted when they inherit).
@@ -160,24 +184,29 @@ recipe a later release renders into a running one.
   in this release writes it to a filesystem or spawns anything from it (that
   is a later release's job). See
   [docs/agent-templates.md](docs/agent-templates.md).
-- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique,
-  and immutable after creation (it is the subagent's filename and identity;
-  renaming means creating a new template and deleting the old one; builtins
-  are never renamed). `description` and `prompt_body` are required and
+- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique
+  within its scope namespace (the two partial-unique indexes above), not a
+  reserved lead name for an API create, and immutable after creation (it is the
+  subagent's filename and identity; renaming means creating a new template and
+  deleting the old one; builtins are never renamed). `description` and `prompt_body` are required and
   non-empty; `description`, `model`, and each tool name must not contain a
   newline, carriage return, or other control character (they each render on
   a single frontmatter line). A template is rejected if its description or
   prompt body contains what looks like a complete Anthropic token (a
   high-confidence `sk-ant-...` match); the UI separately warns, without
   blocking, on looser patterns so legitimate text stays savable.
-- **API surface.** All endpoints require authentication (session + CSRF); the
-  writes also require admin: `GET /api/agent-templates` (list), `GET
-  /api/agent-templates/:id` (one), `GET .../rendered`, `POST
-  /api/agent-templates` (create), `PUT .../:id` (update; name is ignored,
-  immutable), `DELETE .../:id` (409 on a builtin), `POST .../:id/reset` (400
-  on a non-builtin). Edits are last-write-wins — no optimistic-concurrency
-  check in this release — but every row records `updated_by` and `updated_at`
-  so concurrent edits are at least attributable after the fact.
+- **API surface.** All endpoints require authentication (session + CSRF);
+  writes are scope-authorized per row (PRD #18), not blanket-admin: `GET
+  /api/agent-templates` (list, viewer-scoped), `GET /api/agent-templates/:id`
+  (one, viewer-scoped), `GET .../rendered`, `GET|PUT
+  /api/agent-templates/allocations` (the per-template toggle view + replace-set
+  write: an admin global-default half + the caller's overlay half), `POST
+  /api/agent-templates` (create; `scope` global⇒admin or user⇒owner, blank⇒global
+  for back-compat; a reserved lead name is rejected), `PUT .../:id` (update; name
+  and scope are ignored, immutable), `DELETE .../:id` (409 on a builtin), `POST
+  .../:id/reset` (400 on a non-builtin). Edits are last-write-wins — no
+  optimistic-concurrency check in this release — but every row records
+  `updated_by` and `updated_at` so concurrent edits are at least attributable.
 
 ## Agent skills
 
@@ -460,6 +489,18 @@ that are load-bearing, not incidental: **Origin validation** on the upgrade
 **per-run authorization check on subscribe** — the same owner-or-admin rule
 REST enforces, checked again here since a WS subscription is a second entry
 point into the same data.
+
+## Slack integration (outbound-only)
+
+uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slacksvc`, PRD #25): per-user run DMs, plan-approval buttons, and reply-from-Slack steering. It adds no new service and no new inbound port — the trust posture below is why. Full design rationale lives in the PRD (`prds/25-slack-integration.md`, especially its Security posture and Decision Log); user-facing setup is [docs/slack.md](docs/slack.md).
+
+- **Outbound-only, no inbound surface.** The manager (`slacksvc.Manager`) opens a Socket Mode WebSocket *out* to Slack and polls it live; there is no public URL, no signing-secret HTTP endpoint, and no new port on `api`. This holds the same "only `web` publishes a port" boundary above unchanged — Slack is a second *outbound* relationship, the same shape as the forge integration, not a new inbound one. The honest caveat: enabling Slack does export run *status metadata* off-box to Slack's cloud (see Content minimization, below).
+- **`api` is the sole custodian of both Slack tokens.** The bot (`xoxb-`) and app-level (`xapp-`) tokens are settings values, sealed with the same `secretbox` key as every other secret at rest, and structurally excluded from every value-producing settings read (`settings.SecretKeys`, kept out of `Defaults` so `All()`/`Effective()` cannot emit them by construction — the same "cannot forget to redact" pattern used for the Anthropic token above). They are readable only through slacksvc's own decrypt accessors. A dedicated `slacksvc.Redact` additionally scrubs `xoxb-`/`xapp-` patterns *and* the Socket Mode connection URL's `?ticket=` query — a live-session credential the token-shape redaction alone would miss — from every log line. Neither token, nor the ticket URL, is ever sent to a worker or agent.
+- **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (the manual override, or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key`, `WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user can ever resolve from a given Slack id. Every inbound handler (the Gatekeeper's Approve/Reject, the Replier's thread replies) re-resolves the Slack-authenticated envelope actor through `GetConfirmedUserBySlackID`, which additionally requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true` — an unconfirmed link or a deactivated account resolves to no row and the action is refused with an ephemeral notice, never guessed at. Content flows only after the user completes a link-confirmation DM round-trip; since uzi emails are unverified at registration, that confirmation click — not the email match itself — is what makes the mapping trustworthy against account-squatting. Approve/Reject and follow-up submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second, independent gate.
+- **Content minimization.** Slack messages carry status, repository path, issue number and title, MR link, and failure reason only — plan and diff content never leaves `api`; the plan is one click away behind the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`). Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup. A separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth, on top of the mrkdwn escaping.
+- **Inbound rate limits, at two layers.** The Socket Mode receive loop ACKs every envelope before processing (Slack retries an un-ACKed one in ~3s), and a per-Slack-user flood window bounds thread-reply volume. Separately, the two `/me/slack` endpoints that trigger an outbound DM to a caller-supplied Slack id (`PUT .../override`, `POST .../test-dm`) sit behind a dedicated, tighter per-user `mw.Limiter` (`SLACK_DM_RATE_LIMIT_MAX`/`_WINDOW`, distinct from the forge limiter above) plus a 30-second per-target DM cooldown in `slacksvc.Linker` — together bounding both an arbitrary-member DM-spam primitive and a member-id enumeration oracle.
+- **The primary directive is unaffected.** Slack can only approve, reject, or steer a plan gate — a latency/authorization control, not a `main`-write capability. A wrongful approval can at worst produce a branch + MR, same as an approval from the web UI, and every one of the [four guardrail layers](#guardrail-layers-the-primary-directive) is untouched by this integration: Slack never holds a forge credential, never talks to a worker, and never reaches the agent's own context.
+- **Fails safe when unconfigured.** With Slack disabled (the default) or either token absent, the manager idles and every other surface behaves exactly as before — nothing here is a hard dependency of the run lifecycle.
 
 ## Docs
 

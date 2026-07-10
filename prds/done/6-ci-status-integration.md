@@ -1,7 +1,7 @@
 # PRD #6: CI Status Integration & CI-Fix Agent
 
 **GitLab Issue**: [vtmocanu/uzi#6](https://gitlab.example.com/vtmocanu/uzi/-/issues/6)
-**Status**: Draft
+**Status**: Complete (2026-07-06, MR !29)
 **Priority**: Medium
 **Created**: 2026-07-04
 **Depends on**: PRD #2 (forge integration + poller, done) for the **display half** (M1–M3; it also *reads* the `runs` table from PRD #4 M1, which is already merged — no dependency on PRD #4's pending milestones, so it can run in parallel with PRD #4 M3–M7); PRD #4 **M3 (SDK executor), M4 (plan gate + MR flow), M5 (run view UI)** for the **fix-agent half** (M4–M7 here). The two halves are phased accordingly — see "Phasing & parallel-safety".

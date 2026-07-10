@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +28,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 )
 
@@ -96,13 +99,13 @@ type Store interface {
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
-	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
+	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error)
 	// RequeueClaimedRunToQueued resets one just-claimed run to queued when its
 	// owner's vault locked between the claim gate and the token open (PRD #32 M3).
 	RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error)
-	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) (int64, error)
-	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) (int64, error)
-	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) (int64, error)
+	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
+	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
+	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) (int64, error)
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
 
@@ -118,8 +121,15 @@ type Store interface {
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
-	ListAgentTemplates(ctx context.Context) ([]store.AgentTemplate, error)
+	// ListClaimAgentTemplates resolves template allocations for the run owner
+	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
+	// owner's own allocated user templates ride the claim, not every template.
+	ListClaimAgentTemplates(ctx context.Context, userID pgtype.UUID) ([]store.AgentTemplate, error)
 	ListRunSkillAllocations(ctx context.Context, userID pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error)
+	// Tier-1 tool provisioning (PRD #18 M4): the run owner's per-repo package list
+	// and the admin allowlist it is re-validated against at claim time.
+	GetRepoToolProfile(ctx context.Context, arg store.GetRepoToolProfileParams) (store.RepoToolProfile, error)
+	ListToolAllowlist(ctx context.Context) ([]store.ToolAllowlist, error)
 }
 
 // Params are the runtime knobs the service needs, mirrored from config.
@@ -149,6 +159,24 @@ type Broadcaster interface {
 	PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time)
 	// PublishState signals that a run's status changed.
 	PublishState(runID uuid.UUID, status string)
+}
+
+// MultiBroadcaster fans each event out to several Broadcasters — the WS hub AND
+// the Slack notifier (PRD #25 M3). Each is best-effort and non-blocking by its
+// own contract, so the fan-out is a plain iteration. A nil or empty value is a
+// valid no-op broadcaster.
+type MultiBroadcaster []Broadcaster
+
+func (m MultiBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time) {
+	for _, b := range m {
+		b.PublishMessage(runID, seq, kind, agent, payload, createdAt)
+	}
+}
+
+func (m MultiBroadcaster) PublishState(runID uuid.UUID, status string) {
+	for _, b := range m {
+		b.PublishState(runID, status)
+	}
 }
 
 // RunLifecycle is notified after each run status write so the board's column
@@ -232,7 +260,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // (affinity) to be re-claimed and resumed from the persisted session. This is
 // what makes `docker compose down && up` recover — the out-of-process worker's
 // fresh-start signal, which the server cannot infer from heartbeats alone.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version string) (store.Worker, error) {
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
 	if _, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
@@ -247,7 +275,13 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version string
 	}); err != nil {
 		return store.Worker{}, err
 	}
-	return s.q.RegisterWorker(ctx, store.RegisterWorkerParams{Version: pgText(version), ID: wkr.ID})
+	// template is the worker's self-reported image template (PRD #18); empty →
+	// NULL (older image sends none). Soft signal only; never rejected here.
+	return s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
+		Version:          pgText(version),
+		TemplateReported: pgText(template),
+		ID:               wkr.ID,
+	})
 }
 
 // Heartbeat refreshes liveness and returns the (possibly updated) worker.
@@ -300,9 +334,10 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 			}
 			return nil, nil // idle; the run is queued again, awaiting unlock
 		}
-		// A missing/undecryptable credential is not retryable: fail the run and
-		// report idle. The failure reason never carries secret bytes.
-		if errors.Is(err, errCredentialUnavailable) {
+		// A missing/undecryptable credential OR a tool package that fell out of the
+		// allowlist is not retryable: fail the run and report idle. Both failure
+		// reasons are safe to store (no secret bytes; package names only).
+		if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errToolPackagesRejected) {
 			if _, ferr := s.q.MarkRunFailedByID(ctx, store.MarkRunFailedByIDParams{
 				ID:            run.ID,
 				FailureReason: pgText(err.Error()),
@@ -386,9 +421,13 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
 	}
 
-	templates, err := s.q.ListAgentTemplates(ctx)
+	// Only the templates allocated to this run's owner ride the claim (PRD #18
+	// M7): builtin/global defaults ± the owner's overlay + the owner's own
+	// allocated user templates. The reserved-name check (M6) guarantees at most
+	// one lead-matching template can exist, so the payload can never carry two.
+	templates, err := s.q.ListClaimAgentTemplates(ctx, pgUUID(run.UserID))
 	if err != nil {
-		return nil, fmt.Errorf("list agent templates: %w", err)
+		return nil, fmt.Errorf("list claim agent templates: %w", err)
 	}
 
 	// The run owner's per-user default model overrides the lead template's model
@@ -409,6 +448,15 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("list run skill allocations: %w", err)
 	}
 	skills := assembleRunSkills(skillRows, s.p.SkillsMaxPerRun)
+
+	// Tier-1 tool packages for the worker's provisioning engine (PRD #18 M4): the
+	// owner's per-repo profile, re-validated against the current allowlist. A
+	// rejected package fails the claim (errToolPackagesRejected → the run is failed
+	// in Claim, not delivered). The tier-2 opt-in flag rides from the repos row.
+	toolPackages, err := s.resolveTooling(ctx, run)
+	if err != nil {
+		return nil, err
+	}
 
 	// A ci_fix run carries no issue and instead delivers the failed-pipeline
 	// snapshot; an issue run carries its issue iid and no pipeline (PRD #6).
@@ -459,8 +507,75 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 			DefaultModel:       textPtr(defaultModel),
 			SkillMaxBytes:      s.p.SkillMaxBytes,
 			SkillsMaxPerRun:    s.p.SkillsMaxPerRun,
+			ToolPackages:       toolPackages,
+			RepoDevboxOptIn:    rc.RepoDevboxOptIn,
 		},
 	}, nil
+}
+
+// errToolPackagesRejected marks a claim whose grandfathered tool packages fell out
+// of the (possibly shrunk) allowlist at claim time. Non-retryable: the run is
+// failed with this message (which lists the rejected package names — never secret
+// bytes) so the owner fixes the profile or an admin restores the allowlist entry.
+var errToolPackagesRejected = errors.New("tool packages no longer allowed")
+
+// resolveTooling resolves the run's TIER-1 tool packages for the claim payload
+// (PRD #18 M4). The desired list is the run owner's per-(user,repo)
+// repo_tool_profiles, RE-VALIDATED against the current tool_allowlist (it can
+// shrink after the profile was saved — Technical §3). A rejected package fails the
+// claim (Success Criteria 5), not silently drops. The tier-2 repo_devbox_opt_in
+// flag rides separately (set from the repos row in assembleClaim); the worker does
+// the tier-2 extraction after clone (PRD #18 M5).
+func (s *Service) resolveTooling(ctx context.Context, run store.Run) (toolPackages []string, err error) {
+	profile, err := s.q.GetRepoToolProfile(ctx, store.GetRepoToolProfileParams{UserID: run.UserID, RepoID: run.RepoID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return []string{}, nil // no profile ⇒ no tier-1 provisioning
+		}
+		return nil, fmt.Errorf("get repo tool profile: %w", err)
+	}
+	desired := decodePackageList(profile.Packages)
+	if len(desired) == 0 {
+		return []string{}, nil
+	}
+	rules, err := s.loadToolRules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	allowed, rejected := toolprofile.Resolve(desired, rules)
+	if len(rejected) > 0 {
+		return nil, fmt.Errorf("%w: %s", errToolPackagesRejected, strings.Join(rejected, ", "))
+	}
+	if allowed == nil {
+		allowed = []string{} // always send an array, never null (wire contract)
+	}
+	return allowed, nil
+}
+
+// loadToolRules projects the DB tool_allowlist into the toolprofile.Rules map the
+// pure resolver consumes, via the shared loader (identical to the write-time
+// loader in the handler, so save and claim can never diverge).
+func (s *Service) loadToolRules(ctx context.Context) (toolprofile.Rules, error) {
+	rows, err := s.q.ListToolAllowlist(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list tool allowlist: %w", err)
+	}
+	return toolprofile.RulesFromRows(rows), nil
+}
+
+// decodePackageList decodes a repo_tool_profiles.packages JSONB array into a slice.
+// A NULL/empty/malformed column yields an empty list (never fails the claim on
+// bad data — an out-of-band write can't wedge a run).
+func decodePackageList(raw []byte) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal(raw, &out); err != nil {
+		slog.Error("workersvc: decode repo tool profile packages", "error", err)
+		return nil
+	}
+	return out
 }
 
 // IncomingMessage is one seq-numbered message a worker appends.
@@ -644,12 +759,19 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 
 // CreateWorker issues a worker for the user and returns the plaintext join token
 // exactly once (only its hash is stored).
-func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name string) (store.Worker, string, error) {
+func (s *Service) CreateWorker(ctx context.Context, userID uuid.UUID, name, templateDeclared string) (store.Worker, string, error) {
 	token, hash, err := jointoken.Generate()
 	if err != nil {
 		return store.Worker{}, "", err
 	}
-	wkr, err := s.q.CreateWorker(ctx, store.CreateWorkerParams{UserID: userID, Name: name, TokenHash: hash})
+	// templateDeclared is the UI-chosen worker template (PRD #18), validated
+	// against the registry by the caller; empty → NULL (no choice made).
+	wkr, err := s.q.CreateWorker(ctx, store.CreateWorkerParams{
+		UserID:           userID,
+		Name:             name,
+		TokenHash:        hash,
+		TemplateDeclared: pgText(templateDeclared),
+	})
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -976,31 +1098,69 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	if res.WorkersOffline, err = s.q.MarkStaleWorkersOffline(ctx, staleCutoff); err != nil {
 		return res, fmt.Errorf("mark stale workers offline: %w", err)
 	}
-	if res.ClaimedReset, err = s.q.SweepClaimedNeverStarted(ctx, claimCutoff); err != nil {
+
+	claimed, err := s.q.SweepClaimedNeverStarted(ctx, claimCutoff)
+	if err != nil {
 		return res, fmt.Errorf("sweep claimed-never-started: %w", err)
 	}
-	if res.RunningTimeout, err = s.q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
+	res.ClaimedReset = int64(len(claimed))
+	for _, r := range claimed {
+		s.publishSwept(r.ID, r.Status)
+	}
+
+	timedOut, err := s.q.SweepRunningTimeout(ctx, store.SweepRunningTimeoutParams{
 		FailureReason: pgText("run exceeded RUN_TIMEOUT"),
 		Cutoff:        runCutoff,
-	}); err != nil {
+	})
+	if err != nil {
 		return res, fmt.Errorf("sweep running-timeout: %w", err)
 	}
+	res.RunningTimeout = int64(len(timedOut))
+	for _, r := range timedOut {
+		s.publishSwept(r.ID, r.Status)
+	}
+
 	// Fail-over-cap before re-queue: the two are disjoint on requeue_count, but
 	// failing first keeps a run that just hit the cap from being re-queued.
-	if res.StaleFailed, err = s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
+	failed, err := s.q.FailRunsOfStaleWorkersOverCap(ctx, store.FailRunsOfStaleWorkersOverCapParams{
 		FailureReason: pgText("worker lost; exceeded re-queue budget"),
 		MaxRequeues:   max,
 		Cutoff:        staleCutoff,
-	}); err != nil {
+	})
+	if err != nil {
 		return res, fmt.Errorf("fail stale-worker runs over cap: %w", err)
 	}
-	if res.StaleRequeued, err = s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
+	res.StaleFailed = int64(len(failed))
+	for _, r := range failed {
+		s.publishSwept(r.ID, r.Status)
+	}
+
+	requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
 		MaxRequeues: max,
 		Cutoff:      staleCutoff,
-	}); err != nil {
+	})
+	if err != nil {
 		return res, fmt.Errorf("re-queue stale-worker runs: %w", err)
 	}
+	res.StaleRequeued = int64(len(requeued))
+	for _, r := range requeued {
+		s.publishSwept(r.ID, r.Status)
+	}
 	return res, nil
+}
+
+// publishSwept fans a sweeper-driven run transition out to the same seams a
+// worker-reported transition uses: the live WS hub (PublishState) and, once the
+// Slack notifier is wired behind the fan-out, the per-owner DM. Before PRD #25 M3
+// these bulk transitions returned counts only and never reached the Broadcaster,
+// so timeout/worker-loss failures — exactly the "failed" events a user most wants
+// pushed — were silently missed. Best-effort and non-blocking (the Broadcaster
+// contract), so a slow consumer never delays the sweep.
+func (s *Service) publishSwept(runID uuid.UUID, status string) {
+	if s.bcast != nil {
+		s.bcast.PublishState(runID, status)
+	}
+	s.notify(runID, status)
 }
 
 // -------------------------------------------------------------------------

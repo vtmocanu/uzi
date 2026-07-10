@@ -28,15 +28,45 @@ docker compose --profile agent up
 
 This starts the `agent` service pointed at the compose network's `api`, with its data on the named volume `agentdata`. Once it registers, **Settings → Workers** shows it as **online**.
 
-**Standalone**, for a different host or a remote server:
+**Standalone**, for a different host or a remote server (note the `-f` selecting the template Dockerfile, see [Worker templates](#worker-templates) below):
 
 ```sh
-docker build -t uzi-agent ./agent
+docker build -t uzi-agent -f agent/templates/base/Dockerfile agent
 docker run -d -e UZI_API_URL=https://uzi.example.com -e UZI_WORKER_TOKEN=<the join token> \
   -v uzi-agent-data:/data --cap-drop ALL --security-opt no-new-privileges:true uzi-agent
 ```
 
 Put a TLS-terminating proxy in front of a worker reached over an untrusted network: `api` itself listens plain HTTP.
+
+## Worker templates
+
+A worker image is built from a **template**: a curated, code-reviewed Dockerfile under `agent/templates/<name>/`. Templates exist for heavy or system-level dependencies a per-repo tool provisioner can't supply well (a JDK, system libraries); everyday CLI tools belong to the repo, not the image. Two ship today:
+
+| Template | What it adds | Use it when |
+|---|---|---|
+| `base` (default) | Node 22 + git + bash — the minimal worker | Most repos |
+| `jvm` | `base` plus a JDK (`java`/`javac`) | Repos that build or test Java |
+
+Pick a template at build time with the `WORKER_TEMPLATE` variable, which selects `agent/templates/<name>/Dockerfile`:
+
+```sh
+WORKER_TEMPLATE=jvm docker compose --profile agent build agent
+WORKER_TEMPLATE=jvm docker compose --profile agent up
+```
+
+With `WORKER_TEMPLATE` unset, compose builds `base`. Set it to a **bare template name** only (one of the names above): it is interpolated into the Dockerfile path, so a value with `/`, `..`, or an absolute path is unsupported and would resolve outside `agent/templates/`. Standalone, point `docker build -f` at the template's Dockerfile (e.g. `-f agent/templates/jvm/Dockerfile agent`).
+
+Each template's Dockerfile bakes its own name into the image as `UZI_WORKER_TEMPLATE` (a fixed literal, independent of the `WORKER_TEMPLATE` build variable), and the worker **reports** that at register, so **Settings → Workers** shows each worker's template. Because the reported value is the image's own baked-in identity, it flags a genuine mismatch when you build with one `WORKER_TEMPLATE` but declared another at issuance. This is observability only: the join token is still the sole trust anchor, so a worker's reported template is never used to accept or reject it.
+
+## Tool provisioning
+
+Beyond the image's baked-in tools, a run can install **per-repo CLI tools** (kubectl, terraform, jq, and so on) on demand with [devbox](https://www.jetify.com/devbox) (nix under the hood). Users set a repo's tool profile, opt into a repo's own `devbox.json`, and admins manage the allowlist — all covered in [Per-repo tools](./worker-tools.md). The operator points to know:
+
+- **New outbound egress.** Installing tools reaches **nix substituters** (`https://cache.nixos.org` plus any you configure) — the one *new* egress this feature adds. A worker also reaches the forge directly for git (clone/fetch/push), so its full outbound set is `api` + the forge + the substituters. Allow the substituters through an egress firewall if you run one.
+- **Provisioning is secret-scrubbed.** The install runs in a subprocess stripped of the forge token, the Anthropic token, and the join token, so a package's build hook cannot read your credentials. Only an explicit allowlist of tool environment variables (`PATH` and nix's TLS/locale vars) is passed back to the agent.
+- **Provisioning failure fails the run** with a clear message rather than silently continuing without the tool.
+
+The worker image installs a **pinned** devbox binary and nix at build time (no floating installer, no first-run download). Storage: the nix store is the `agentnix` volume at `/nix`; devbox/nix per-user metadata lands HOME-derived under `/data` (the `agentdata` volume). Both persist across `docker compose down`/`up`, so only a fresh `down -v` re-downloads packages.
 
 ## Online, offline, busy
 

@@ -23,11 +23,14 @@
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
 import fs from "node:fs/promises";
+import path from "node:path";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { Options as SdkOptions, SDKMessage, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
+import { provisionTools } from "./provision.js";
+import { provisionRunTools } from "./provision-run.js";
 import { assembleAgents } from "./agents.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
@@ -75,6 +78,12 @@ export interface SdkExecutorOptions {
   kill?: (pid: number | undefined) => boolean;
   /** Worker-credential file paths (UZI_WORKER_TOKEN_FILE) the Bash guard denies. */
   secretPaths?: readonly string[];
+  /** Root for per-run tool-provisioning dirs (PRD #18 M3), OUTSIDE any clone.
+   *  Default: a `provision/` sibling of homeDir on the data volume. */
+  provisionRoot?: string;
+  /** Devbox provisioning fn (PRD #18 M3). Injected in tests so no real nix egress
+   *  happens; default = provisionTools. */
+  provision?: typeof provisionTools;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -100,6 +109,8 @@ export class SdkExecutor implements Executor {
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
   private readonly secretPaths: readonly string[];
+  private readonly provisionRoot: string;
+  private readonly provision: typeof provisionTools;
   /** Every pid spawned across the current run's turns, for the done-path reap. */
   private readonly spawnedPids = new Set<number>();
 
@@ -116,6 +127,10 @@ export class SdkExecutor implements Executor {
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
     this.secretPaths = opts.secretPaths ?? [];
+    // Per-run provisioning dirs live alongside homeDir on the data volume, OUTSIDE
+    // any clone (Decision 3), so the synthesized devbox.json is never repo-borne.
+    this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.homeDir), "provision");
+    this.provision = opts.provision ?? provisionTools;
   }
 
   /**
@@ -157,7 +172,20 @@ export class SdkExecutor implements Executor {
 
     await fs.mkdir(this.homeDir, { recursive: true });
 
-    const env = buildSdkEnv(oauthToken, this.homeDir);
+    // Tool provisioning (PRD #18 M3): before the SDK starts, install the run's
+    // tier-1 (∪ opted-in tier-2) packages in a secret-scrubbed subprocess and fold
+    // the resulting (allowlisted) tool env into the SDK env. No packages ⇒ exactly
+    // today's behavior. A provision failure FAILS the run — never silent
+    // degradation. Shared with the stub executor (provision-run.ts) so the two
+    // never drift.
+    const { toolEnv, provisionDir } = await provisionRunTools(ctx, {
+      provisionRoot: this.provisionRoot,
+      homeDir: this.homeDir,
+      log: this.log,
+      provision: this.provision,
+    });
+
+    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
 
     // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
@@ -320,6 +348,10 @@ export class SdkExecutor implements Executor {
       // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
       // too, not just the runner's explicit pre-push call.
       this.killAgentTree();
+      // Remove the per-run provisioning dir (the synthesized devbox.json + profile
+      // symlinks). The nix STORE is global (on the data volume), NOT here, so this
+      // never evicts the warm-start cache. Best-effort.
+      if (provisionDir) await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
