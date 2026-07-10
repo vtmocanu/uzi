@@ -6,7 +6,8 @@ import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import type { Logger } from "./log.js";
-import type { AgentTemplate, ClaimResponse } from "./protocol.js";
+import type { AgentSelection, AgentSource, AgentTemplate, ClaimResponse, StateRequest } from "./protocol.js";
+import { resolveAgentSelection } from "./protocol.js";
 import {
   describeRepoAgentNote,
   detectRepoAgents,
@@ -165,7 +166,8 @@ export class RunRunner {
         // verdict the steering channel resolves (bounded so an abandoned plan
         // fails rather than wedging the worker). An autopilot claim short-circuits
         // to an approve verdict (see gatePlan) — the run never parks at the gate.
-        gatePlan: (planMd) => this.gatePlan(runId, planMd, batcher, steering, reportState, runLog, claim.auto_approve ?? false),
+        gatePlan: (planMd) =>
+          this.gatePlan(runId, planMd, batcher, steering, reportState, runLog, claim.auto_approve ?? false, repoAgents),
         pullFollowUp: () => steering.pullFollowUp(),
         reportIteration: (iteration) => {
           void reportState({ status: "running", iteration_count: iteration }).catch((e) =>
@@ -211,7 +213,7 @@ export class RunRunner {
         sourceBranch: result.branch,
         targetBranch,
         title: mrTitle(claim),
-        description: mrDescription(claim, result.branch),
+        description: mrDescription(claim, result.branch, result.agentSelection),
       });
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` } });
 
@@ -315,15 +317,18 @@ export class RunRunner {
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
    *  For an autopilot run, the plan is still recorded but the gate resolves with an
-   *  approve verdict immediately — no awaiting_approval report, no /inputs wait. */
+   *  approve verdict immediately — no awaiting_approval report, no /inputs wait. It
+   *  also resolves + records the run's DEFAULT agent selection (PRD #37 Decision 6),
+   *  since a self-approved run never receives an approve_plan input to carry one. */
   private async gatePlan(
     runId: string,
     planMd: string,
     batcher: MessageBatcher,
     steering: SteeringChannel,
-    reportState: (body: { status: "awaiting_approval"; plan_md: string }) => Promise<void>,
+    reportState: (body: StateRequest) => Promise<void>,
     runLog: Logger,
     autoApprove: boolean,
+    repoAgents: AgentTemplate[],
   ): Promise<PlanVerdict> {
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
     // Get the plan message onto the stream regardless of mode — it is the audit
@@ -334,8 +339,17 @@ export class RunRunner {
       // Auto-approve is a VERDICT SOURCE at the existing gate, not a bypass around
       // it: the plan was recorded above; the run just never enters awaiting_approval
       // (no state flicker, no column-automation churn) and never waits on a human.
-      runLog.info("plan gate: auto-approved (autopilot)", { run_id: runId });
-      return { kind: "approve" };
+      // The default selection (repo agents when detected, else the owner's
+      // templates) is resolved here, persisted via the running report (the only
+      // channel a no-input run has, Decision 6), and stated on the feed. The
+      // executor re-resolves the SAME absent-parse to build the identical roster.
+      const selection = resolveAgentSelection({ status: "absent" }, repoAgents.length > 0).selection;
+      await reportState({ status: "running", agent_selection: selection }).catch((e) =>
+        runLog.warn("could not persist autopilot agent selection", { error: errMessage(e) }),
+      );
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: autopilotSelectionText(selection, repoAgents.length) } });
+      runLog.info("plan gate: auto-approved (autopilot)", { run_id: runId, agent_source: selection.source });
+      return { kind: "approve", selection: { status: "ok", selection } };
     }
 
     await reportState({ status: "awaiting_approval", plan_md: planMd });
@@ -364,14 +378,32 @@ function mrTitle(claim: ClaimResponse): string {
 }
 
 /** MR body: links + closes the issue (issue run) or links the failing pipeline
- *  (ci_fix, PRD #6), and states the primary directive (humans merge). */
-function mrDescription(claim: ClaimResponse, branch: string): string {
+ *  (ci_fix, PRD #6), states the primary directive (humans merge), and — when the
+ *  run used the repo's own agents (PRD #37 Decision 3b) — a marker so the human
+ *  reviewer knows the internal review loop was performed by repo-authored agents,
+ *  not by uzi's built-in reviewer. */
+function mrDescription(
+  claim: ClaimResponse,
+  branch: string,
+  agentSelection?: { source: AgentSource; agents: string[] },
+): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
+  const repoMarker =
+    agentSelection?.source === "repo"
+      ? [
+          "",
+          "> ⚠️ This run used agent definitions from the repository's own " +
+            `\`.claude/agents/\` (${agentSelection.agents.join(", ") || "none"}). The internal ` +
+            "review was performed by those repo-authored agents, not by uzi's built-in " +
+            "reviewer — review this change accordingly.",
+        ]
+      : [];
   if (claim.kind === "ci_fix" && claim.pipeline) {
     return [
       `Fixes the failed CI pipeline for \`${claim.pipeline.ref}\`.`,
       "",
       `Failing pipeline: ${claim.pipeline.web_url}`,
+      ...repoMarker,
       "",
       "---",
       footer,
@@ -381,8 +413,17 @@ function mrDescription(claim: ClaimResponse, branch: string): string {
     `Implements issue #${claim.issue_iid}.`,
     "",
     `Closes #${claim.issue_iid}`,
+    ...repoMarker,
     "",
     "---",
     footer,
   ].join("\n");
+}
+
+/** Feed text for an autopilot run's resolved default selection (PRD #37 Decision
+ *  6). Repo source names the count; own source names the fallback. */
+function autopilotSelectionText(selection: AgentSelection, repoCount: number): string {
+  return selection.source === "repo"
+    ? `autopilot: using the ${repoCount} agent(s) from the repo's .claude/agents/`
+    : "autopilot: using your own agent templates";
 }

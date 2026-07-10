@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { assembleAgents, LEAD_NAME_RE } from "../src/agents.js";
+import { assembleAgents, LEAD_NAME_RE, selectSubagents, subagentsFromTemplates } from "../src/agents.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
 const coder: AgentTemplate = {
@@ -113,6 +113,49 @@ describe("lead pin (PRD #18 Decision 8)", () => {
     assert.strictEqual(leadSystemPrompt, lead.prompt_body, "the first lead-matching template wins the main thread");
     assert.ok("orchestrator" in subagents, "the second lead-matching template falls back to a subagent");
     assert.ok(!("lead" in subagents), "the routed lead is never also a subagent");
+  });
+});
+
+describe("subagentsFromTemplates (PRD #37 repo source)", () => {
+  const repoLead: AgentTemplate = { name: "lead", description: "repo lead", prompt_body: "REPO LEAD BODY" };
+  const repoAuditor: AgentTemplate = { name: "auditor", description: "repo auditor", prompt_body: "audit body" };
+
+  it("maps EVERY template to a subagent, including one named `lead`", () => {
+    const subagents = subagentsFromTemplates([repoLead, repoAuditor], new Set());
+    assert.deepStrictEqual(Object.keys(subagents).sort(), ["auditor", "lead"]);
+    // A repo `lead` is an ordinary subagent — its body is the subagent prompt, NOT
+    // hoisted to a main-thread system prompt (that is assembleAgents' job for own).
+    assert.strictEqual(subagents.lead!.prompt, "REPO LEAD BODY");
+    // Structural denial still applies via toDefinition.
+    assert.ok(subagents.lead!.disallowedTools?.includes("Agent"));
+    assert.ok(subagents.auditor!.disallowedTools?.includes("Agent"));
+  });
+
+  it("drops excluded names", () => {
+    const subagents = subagentsFromTemplates([repoLead, repoAuditor], new Set(["lead"]));
+    assert.deepStrictEqual(Object.keys(subagents), ["auditor"]);
+  });
+});
+
+describe("selectSubagents (PRD #37)", () => {
+  const repoCoder: AgentTemplate = { name: "coder", description: "repo coder", prompt_body: "REPO CODER", tools: ["Read", "WebFetch"] };
+  const repoAuditor: AgentTemplate = { name: "auditor", description: "repo auditor", prompt_body: "audit" };
+
+  it("own source returns the pre-assembled own subagents minus exclusions", () => {
+    const own = assembleAgents([lead, coder, reviewer]).subagents;
+    assert.deepStrictEqual(Object.keys(selectSubagents("own", own, [], [])).sort(), ["coder", "reviewer"]);
+    assert.deepStrictEqual(Object.keys(selectSubagents("own", own, [], ["reviewer"])), ["coder"]);
+  });
+
+  it("repo source returns the repo roster minus exclusions, honoring declared tools", () => {
+    const own = assembleAgents([lead, coder, reviewer]).subagents;
+    const repo = selectSubagents("repo", own, [repoCoder, repoAuditor], []);
+    assert.deepStrictEqual(Object.keys(repo).sort(), ["auditor", "coder"]);
+    // The repo coder's WebFetch survives (policy reversed) and its repo body runs.
+    assert.deepStrictEqual(repo.coder!.tools, ["Read", "WebFetch"]);
+    assert.strictEqual(repo.coder!.prompt, "REPO CODER");
+    // Exclusions apply to the repo roster too.
+    assert.deepStrictEqual(Object.keys(selectSubagents("repo", own, [repoCoder, repoAuditor], ["auditor"])), ["coder"]);
   });
 });
 

@@ -562,4 +562,109 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       repoFx.cleanup();
     }
   });
+
+  it("autopilot resolves + reports the repo-agent default selection with a feed note (PRD #37)", async () => {
+    // A repo shipping agents + an autopilot claim: the self-approve path resolves
+    // the default to the repo source, reports it on a running report (the only
+    // channel a no-input run has), and states it on the feed — never parking at the
+    // gate.
+    const repoFx = makeFixture({
+      ".claude/agents/coder.md": "---\nname: coder\ndescription: c.\n---\n\nbody\n",
+      ".claude/agents/reviewer.md": "---\nname: reviewer\ndescription: r.\n---\n\nbody\n",
+    });
+    try {
+      const { gitlab } = fakeGitlab();
+      const claim = makeClaim({
+        issue_iid: 33,
+        issue_title: "autopilot with repo agents",
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+        last_seq: 0,
+        secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+        auto_approve: true,
+      });
+      const r = new RunRunner(
+        client,
+        new GitCache(repoFx.dataDir, nullLogger()),
+        new StubExecutor(nullLogger(), { planGate: true }),
+        nullLogger(),
+        20,
+        undefined,
+        { pollMs: 5, planApprovalTimeoutMs: 0, gitlab },
+      );
+      await r.execute(claim);
+
+      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+      const selection = states.find((s) => s.agent_selection !== undefined)?.agent_selection;
+      assert.deepStrictEqual(selection, { source: "repo", exclusions: [] }, "autopilot persisted the repo default");
+      assert.ok(
+        texts.some((t) => t.includes("autopilot: using the 2 agent(s) from the repo's .claude/agents/")),
+        texts.join("\n"),
+      );
+      assert.ok(!states.some((s) => s.status === "awaiting_approval"), "autopilot never parks at the gate");
+      assert.ok(states.some((s) => s.status === "completed"), "the run still completes");
+    } finally {
+      repoFx.cleanup();
+    }
+  });
+
+  it("autopilot with no repo agents resolves + reports the OWN default", async () => {
+    const { states, texts } = await (async () => {
+      const repoFx = makeFixture({});
+      try {
+        const { gitlab } = fakeGitlab();
+        const claim = makeClaim({
+          issue_iid: 36,
+          issue_title: "autopilot no repo agents",
+          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+          last_seq: 0,
+          secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+          auto_approve: true,
+        });
+        const r = new RunRunner(
+          client,
+          new GitCache(repoFx.dataDir, nullLogger()),
+          new StubExecutor(nullLogger(), { planGate: true }),
+          nullLogger(),
+          20,
+          undefined,
+          { pollMs: 5, planApprovalTimeoutMs: 0, gitlab },
+        );
+        await r.execute(claim);
+        return {
+          states: api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body),
+          texts: api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text)),
+        };
+      } finally {
+        repoFx.cleanup();
+      }
+    })();
+    assert.deepStrictEqual(states.find((s) => s.agent_selection !== undefined)?.agent_selection, {
+      source: "own",
+      exclusions: [],
+    });
+    assert.ok(texts.some((t) => t.includes("autopilot: using your own agent templates")), texts.join("\n"));
+  });
+
+  it("the MR description carries the repo-agents marker only when the run used repo agents", async () => {
+    // A fake executor that reports which roster the implement phase ran with — the
+    // stub does not, so the marker is driven directly here (the SDK executor sets it).
+    const repoExec: Executor = {
+      run: async (ctx) => ({ branch: ctx.branch, agentSelection: { source: "repo", agents: ["coder", "auditor"] } }),
+    };
+    const ownExec: Executor = {
+      run: async (ctx) => ({ branch: ctx.branch, agentSelection: { source: "own", agents: ["coder"] } }),
+    };
+
+    const repoGl = fakeGitlab();
+    await runner(repoExec, repoGl.gitlab).execute(gitlabClaim(34));
+    const repoBody = JSON.parse(repoGl.calls[0]!.body ?? "{}");
+    assert.match(repoBody.description, /repository's own `\.claude\/agents\/`/, "repo-source MR carries the marker");
+    assert.match(repoBody.description, /coder, auditor/, "the marker names the roster");
+
+    const ownGl = fakeGitlab();
+    await runner(ownExec, ownGl.gitlab).execute(gitlabClaim(35));
+    const ownBody = JSON.parse(ownGl.calls[0]!.body ?? "{}");
+    assert.ok(!/repository's own/.test(ownBody.description), "an own-source MR has no repo marker");
+  });
 });
