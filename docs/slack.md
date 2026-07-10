@@ -24,6 +24,9 @@ display_information:
   name: uzi
   description: Run notifications and plan-approval buttons from uzi
 features:
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   bot_user:
     display_name: uzi
     always_online: true
@@ -49,9 +52,11 @@ settings:
 
 `users:read.email` is what lets uzi match a workspace member to a uzi account
 by email (see the privacy note below); `reactions:write` is only for the ✅
-uzi adds to an accepted thread reply. Nothing here needs a Request URL —
-Socket Mode carries events and interactive actions over the same outbound
-connection.
+uzi adds to an accepted thread reply. The `app_home.messages_tab_enabled`
+pair is what lets you TYPE in the bot's DM — without it Slack shows "Sending
+messages to this app has been turned off" and thread-reply steering can't
+work. Nothing here needs a Request URL — Socket Mode carries events and
+interactive actions over the same outbound connection.
 
 ## 2. Mint the two tokens
 

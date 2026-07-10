@@ -9,7 +9,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pressly/goose/v3 v3.27.2
-	github.com/slack-go/slack v0.26.0
+	github.com/slack-go/slack v0.27.0
 	gitlab.com/gitlab-org/api/client-go/v2 v2.44.0
 	golang.org/x/crypto v0.53.0
 )

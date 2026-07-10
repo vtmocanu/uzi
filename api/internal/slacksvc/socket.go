@@ -3,7 +3,9 @@ package slacksvc
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -11,6 +13,18 @@ import (
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
+
+// actionIDs extracts the pressed buttons' action ids for the receipt log —
+// ids only, never button values (a value may carry payload data).
+func actionIDs(cb slack.InteractionCallback) []string {
+	ids := make([]string, 0, len(cb.ActionCallback.BlockActions))
+	for _, ba := range cb.ActionCallback.BlockActions {
+		if ba != nil {
+			ids = append(ids, ba.ActionID)
+		}
+	}
+	return ids
+}
 
 // newSocketDialer returns the production DialFunc bound to a client whose Timeout
 // caps the Socket Mode HTTP handshake (apps.connections.open). The websocket
@@ -43,8 +57,12 @@ func newSocketDialer(timeout time.Duration, inbound InboundHandler, messages Mes
 // client, not the socket (the socket uses the app token), so it is unused here.
 func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken string, inbound InboundHandler, messages MessageHandler, onConnecting, onConnected func()) error {
 	_ = botToken // the outbound bot-token client is built from this in the poster.
-	api := slack.New("", slack.OptionAppLevelToken(appToken), slack.OptionHTTPClient(client))
-	sm := socketmode.New(api)
+	// SLACK_SOCKET_DEBUG=1 turns on slack-go's own wire logging (every raw ws
+	// frame). DIAGNOSTIC ONLY, off by default: the connect line includes the wss
+	// ?ticket= credential, so never leave it on in a shared deployment.
+	debug := os.Getenv("SLACK_SOCKET_DEBUG") == "1"
+	api := slack.New("", slack.OptionAppLevelToken(appToken), slack.OptionHTTPClient(client), slack.OptionDebug(debug))
+	sm := socketmode.New(api, socketmode.OptionDebug(debug))
 
 	// Each connection runs under its own cancellable context; every exit path
 	// cancels it and waits for the run goroutine to observe the cancellation and
@@ -86,6 +104,18 @@ func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken
 				onConnecting()
 			case socketmode.EventTypeConnected, socketmode.EventTypeHello:
 				onConnected()
+			case socketmode.EventTypeErrorBadMessage:
+				// slack-go could not parse an inbound envelope (e.g. a payload shape
+				// newer than the vendored version understands). There is no Request to
+				// ack, so Slack re-delivers ~3x and then surfaces a ⚠ to the clicker.
+				// Log the cause (redacted) — otherwise this failure mode is fully
+				// silent and looks identical to "no event arrived at all".
+				if bad, ok := evt.Data.(*socketmode.ErrorBadMessage); ok && bad != nil && bad.Cause != nil {
+					slog.Warn("slack: unparseable inbound envelope dropped", "error", Redact(bad.Cause.Error()))
+				} else {
+					slog.Warn("slack: unparseable inbound envelope dropped")
+				}
+				continue
 			case socketmode.EventTypeInvalidAuth:
 				// Surface a clean auth failure the Manager classifies as error:auth,
 				// rather than waiting for the generic run error.
@@ -98,6 +128,10 @@ func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken
 				}
 				if inbound != nil {
 					if cb, ok := evt.Data.(slack.InteractionCallback); ok {
+						// Coarse receipt log (type + action ids only, never values): inbound
+						// interactive events are rare and otherwise fully silent, which makes
+						// a delivery failure indistinguishable from a routing one.
+						slog.Info("slack: inbound interactive", "callback_type", string(cb.Type), "actions", actionIDs(cb))
 						routeInteractive(ctx, inbound, cb)
 					}
 				}
@@ -108,15 +142,24 @@ func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken
 				if evt.Request != nil {
 					_ = sm.Ack(*evt.Request)
 				}
+				slog.Info("slack: inbound events-api envelope")
 				if messages != nil {
 					if e, ok := evt.Data.(slackevents.EventsAPIEvent); ok {
 						routeMessage(ctx, messages, e)
 					}
 				}
 				continue
+			default:
+				// Coarse visibility on anything unrouted (type only, no payload) so an
+				// ignored-but-relevant envelope kind is discoverable from the logs.
+				slog.Info("slack: unhandled envelope type", "type", string(evt.Type))
 			}
-			// Ack any other envelope so Slack does not re-deliver it.
-			if evt.Request != nil {
+			// Ack any other envelope so Slack does not re-deliver it. Only envelopes
+			// with a non-empty id are ackable: hello (and other control frames) carry
+			// an empty EnvelopeID, and acking one sends `{"envelope_id":""}` — protocol
+			// garbage that makes Slack drop the socket ~10s later (found live 2026-07-10:
+			// the connection flapped on a 10s cycle and every inbound click/DM was lost).
+			if evt.Request != nil && evt.Request.EnvelopeID != "" {
 				_ = sm.Ack(*evt.Request)
 			}
 		}

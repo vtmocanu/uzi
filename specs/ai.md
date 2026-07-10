@@ -4406,3 +4406,35 @@ Serves human: the success criteria are demonstrable, not just asserted.
   shell env above `--env-file` (the repo's documented smoke hazard), the harness reads the
   key back out of the running api container via `docker inspect ... .Config.Env` rather than
   trusting the env it thinks it set, then AES-256-GCM-seals the fixture with it.
+
+## 167. Socket Mode inbound was dead-on-arrival: the empty-envelope ack (found live 2026-07-10)
+
+Serves human: PRD #25's Confirm/gate buttons and thread replies — none had ever worked
+against real Slack (unit tests fake the dialer; e2e stubs Slack entirely).
+
+- **Symptom**: outbound DMs fine, every inbound click/DM lost with a ⚠ in Slack; manager
+  chip stuck `connected`; zero error logs. **Cause**: the receive loop's catch-all "ack
+  any other envelope" also acked *hello* (its `Request` is non-nil but `EnvelopeID` is
+  empty), sending `{"envelope_id":""}` — protocol garbage after which Slack never pinged
+  the connection and dropped it ~10s later, forever. Every inbound event raced a dying
+  socket. Fix: only ack envelopes with a non-empty `EnvelopeID` (`socket.go`).
+- **Debugging affordances added** (all INFO, payload-free): inbound interactive receipt
+  (callback type + action ids, never values), events-api receipt, `ErrorBadMessage`
+  cause (redacted), unhandled envelope types, and `SLACK_SOCKET_DEBUG=1` (env-gated
+  slack-go wire logging; leaks the wss `?ticket=` — diagnostic only, never in a shared
+  deployment). The silent-receive design made this bug indistinguishable from "Slack
+  sends nothing": three config-side red herrings (interactivity toggle, app_home
+  messages tab, event subscriptions) were chased first.
+- **Diagnostic ladder that found it** (for the next socket mystery): DB row (click
+  persisted?) → admin chip (in-memory state) → receipt logs (envelope arrived?) → raw
+  Node WebSocket probe on the same xapp token with the api stopped (Slack delivers at
+  all?) → slack-go wire debug (the probe acked only non-empty envelope ids and lived;
+  the api acked hello and died every 10s — a controlled A/B).
+- **slack-go bumped v0.26.0 → v0.27.0** while diagnosing (socketmode identical; kept for
+  the newer payload structs). The manifest in docs/slack.md also gained
+  `features.app_home.messages_tab_enabled: true` + `messages_tab_read_only_enabled:
+  false` — without them the DM shows "Sending messages to this app has been turned off"
+  and M5 thread replies are impossible to type.
+- **Open follow-up**: the manager trusts slack-go's RunContext to notice a dead link; a
+  zombie connection (e.g. after laptop sleep) can leave the chip `connected` with no
+  socket — consider a liveness probe (last-hello age) surfaced on the admin DTO.
