@@ -53,6 +53,41 @@ func (q *Queries) GetUserSecretCiphertext(ctx context.Context, arg GetUserSecret
 	return i, err
 }
 
+const listMasterSealedSecrets = `-- name: ListMasterSealedSecrets :many
+SELECT kind, ciphertext FROM user_secrets
+WHERE user_id = $1 AND sealed_with = 'master'
+`
+
+type ListMasterSealedSecretsRow struct {
+	Kind       string `json:"kind"`
+	Ciphertext []byte `json:"ciphertext"`
+}
+
+// The user's still-legacy secrets, for lazy rewrap on unlock (PRD #32): the vault
+// opens each with the master box, reseals under the DEK, and flips it to 'dek'
+// (RewrapUserSecret). Selects the ciphertext because rewrap must decrypt it; the
+// rows are only ever handed to the vault, never serialized out. Empty once a user
+// has been fully migrated, so the steady-state unlock does no rewrap work.
+func (q *Queries) ListMasterSealedSecrets(ctx context.Context, userID uuid.UUID) ([]ListMasterSealedSecretsRow, error) {
+	rows, err := q.db.Query(ctx, listMasterSealedSecrets, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMasterSealedSecretsRow{}
+	for rows.Next() {
+		var i ListMasterSealedSecretsRow
+		if err := rows.Scan(&i.Kind, &i.Ciphertext); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserSecretsMeta = `-- name: ListUserSecretsMeta :many
 SELECT kind, created_at, updated_at
 FROM user_secrets

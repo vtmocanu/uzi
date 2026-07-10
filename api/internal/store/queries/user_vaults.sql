@@ -4,23 +4,27 @@
 -- in memory. pgx.ErrNoRows ⇒ no vault yet, and the first-ever unlock creates one.
 SELECT * FROM user_vaults WHERE user_id = $1;
 
--- name: UpsertUserVault :one
--- Create the vault on first unlock, or (on a future password change) rewrap the
--- DEK under a fresh KEK salt. Only ever stores the wrapped DEK; kek_salt is the
--- per-user Argon2 salt, distinct from users.password_hash's salt so the DB never
--- contains the KEK.
+-- name: CreateUserVaultIfAbsent :one
+-- First-unlock vault creation, race-safe. Two concurrent first-unlocks for the
+-- same user both run this; ON CONFLICT DO NOTHING lets exactly one insert win and
+-- returns no row (pgx.ErrNoRows) to the loser, who re-reads the winner's row and
+-- unwraps it with the same password — so the cached DEK always equals the
+-- persisted one (fixes the check-then-act race where each request would otherwise
+-- cache a different DEK than the DB holds). Deliberately DO NOTHING, never DO
+-- UPDATE: overwriting a live wrapped_dek would orphan every secret sealed under
+-- the previous DEK. kek_salt is the per-user Argon2 salt, distinct from
+-- users.password_hash's salt so the DB never contains the KEK.
 INSERT INTO user_vaults (user_id, kek_salt, wrapped_dek)
 VALUES ($1, $2, $3)
-ON CONFLICT (user_id) DO UPDATE
-    SET kek_salt = EXCLUDED.kek_salt,
-        wrapped_dek = EXCLUDED.wrapped_dek,
-        updated_at = now()
+ON CONFLICT (user_id) DO NOTHING
 RETURNING *;
 
 -- name: DeleteUserVault :execrows
--- Password reset (PRD #32, Password change / reset): the DEK is unrecoverable by
--- design, so reset must drop the vault together with the user's dek-sealed
--- secrets and force re-entry. Keeping unreadable ciphertext would be a worse bug
--- than the data loss. The ON DELETE CASCADE from users covers account deletion;
--- this is the standalone reset path.
+-- Drops ONLY the vault row (there is no FK cascade user_vaults → user_secrets).
+-- Intended for the future password-reset flow, where the DEK is unrecoverable by
+-- design: that flow MUST also delete this user's sealed_with='dek' user_secrets
+-- rows and force re-entry — keeping unreadable ciphertext would be a worse bug
+-- than the data loss. Reset itself is out of scope (PRD #32); this is the
+-- primitive it will build on. Account deletion is already handled by the
+-- ON DELETE CASCADE from users.
 DELETE FROM user_vaults WHERE user_id = $1;

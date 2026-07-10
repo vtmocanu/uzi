@@ -35,14 +35,20 @@ func (s *fakeSecretStore) UpsertUserSecret(_ context.Context, arg store.UpsertUs
 	return store.UpsertUserSecretRow{Kind: arg.Kind}, nil
 }
 
-// fakeSealer seals with a recognizable prefix so the stored ciphertext can be
-// asserted without a real cipher, and counts calls to prove the no-op paths
-// never seal.
-type fakeSealer struct{ sealed int }
+// fakeSealer stands in for the vault: it DEK-seals with a recognizable prefix so
+// the stored ciphertext can be asserted without a real cipher, records the user +
+// kind it was bound to, and counts calls to prove the no-op paths never seal.
+type fakeSealer struct {
+	sealed     int
+	lastUserID uuid.UUID
+	lastKind   string
+}
 
-func (s *fakeSealer) Seal(plaintext []byte) ([]byte, error) {
+func (s *fakeSealer) Seal(userID uuid.UUID, kind string, plaintext []byte) ([]byte, error) {
 	s.sealed++
-	return append([]byte("sealed:"), plaintext...), nil
+	s.lastUserID = userID
+	s.lastKind = kind
+	return append([]byte("dek:"), plaintext...), nil
 }
 
 func anthropicCfg() config.Config {
@@ -69,13 +75,18 @@ func TestAnthropicTokenSeedsWhenAbsent(t *testing.T) {
 	if st.upserted.Kind != store.KindAnthropicToken {
 		t.Fatalf("token stored under the wrong kind: %q", st.upserted.Kind)
 	}
-	if got := string(st.upserted.Ciphertext); got != "sealed:sk-ant-oat-abc123" {
-		t.Fatalf("token not sealed via Seal: %q", got)
+	if got := string(st.upserted.Ciphertext); got != "dek:sk-ant-oat-abc123" {
+		t.Fatalf("token not DEK-sealed via the vault: %q", got)
 	}
-	// M1 seeds a master-box-sealed token; sealed_with must record that (an empty
-	// value would violate the migration's CHECK at runtime, which the fake hides).
-	if st.upserted.SealedWith != store.SealedWithMaster {
-		t.Fatalf("seeded secret sealed_with = %q, want %q", st.upserted.SealedWith, store.SealedWithMaster)
+	// M2 seeds a DEK-sealed token (the seed admin's vault is boot-unlocked by main);
+	// sealed_with must record 'dek' (an empty value would violate the migration's
+	// CHECK at runtime, which the fake hides), and the seal must be bound to the
+	// seed admin + the anthropic kind.
+	if st.upserted.SealedWith != store.SealedWithDEK {
+		t.Fatalf("seeded secret sealed_with = %q, want %q", st.upserted.SealedWith, store.SealedWithDEK)
+	}
+	if box.lastUserID != userID || box.lastKind != store.KindAnthropicToken {
+		t.Fatalf("seal bound to (%v,%q), want (%v,%q)", box.lastUserID, box.lastKind, userID, store.KindAnthropicToken)
 	}
 }
 

@@ -33,6 +33,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -131,14 +132,37 @@ func run() error {
 	if err := seed.ForgeConnection(ctx, q, svc, cfg); err != nil {
 		return err
 	}
+	// Per-user vault (PRD #32): password-wrapped DEKs sealing each user's personal
+	// secrets. One instance, shared by the HTTP handlers (unlock at login, secret
+	// save) and — from M3 — the worker service (claim-time open), so a login on the
+	// API and a claim by the worker see one DEK cache. Built on the master box
+	// (which now seals only connection PATs + legacy master-sealed rows) and the store.
+	vlt := vault.New(box, q)
+	// Boot-unlock the seed admin so a headless deployment runs overnight autopilot
+	// from the first boot: the DEK cache is empty after every restart, and without
+	// this the seed admin would sit locked until an interactive login (defeating the
+	// bootstrap case). Fatal when seeding is configured — a seed admin whose vault
+	// cannot be unlocked at boot is a broken bootstrap, matching the other seed
+	// steps' loud-on-misconfig stance. First boot creates the vault here; a later
+	// boot re-derives it and lazily rewraps any legacy master-sealed secret to the DEK.
+	if cfg.SeedEmail != "" {
+		seedUser, err := q.GetUserByEmail(ctx, cfg.SeedEmail)
+		if err != nil {
+			return fmt.Errorf("boot-unlock seed admin: look up %q: %w", cfg.SeedEmail, err)
+		}
+		if err := vlt.Unlock(ctx, seedUser.ID, cfg.SeedPassword); err != nil {
+			return fmt.Errorf("boot-unlock seed admin vault: %w", err)
+		}
+		slog.Info("boot-unlocked seed admin vault", "email", cfg.SeedEmail)
+	}
 	// Optional startup Anthropic-token seed for the seed admin (dev convenience:
 	// survives `docker compose down -v` so the token need not be re-pasted). Runs
-	// after the admin seed (whose user it belongs to). Create-only and
-	// format-checked only — it seeds the operator's EXISTING token, never mints a
-	// credential, never does a live/network check, and never logs the value. A DB
-	// error or a malformed configured token aborts boot; an already-present token
-	// is left untouched.
-	if err := seed.AnthropicToken(ctx, q, box, cfg); err != nil {
+	// after the admin seed (whose user it belongs to) and the boot-unlock (so it can
+	// DEK-seal). Create-only and format-checked only — it seeds the operator's
+	// EXISTING token, never mints a credential, never does a live/network check, and
+	// never logs the value. A DB error or a malformed configured token aborts boot;
+	// an already-present token is left untouched.
+	if err := seed.AnthropicToken(ctx, q, vlt, cfg); err != nil {
 		return err
 	}
 
@@ -236,6 +260,10 @@ func run() error {
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
 	// the signal target is the handler.
 	h.SetReconciler(engine)
+	// Share the vault with the HTTP handlers: unlock at login, DEK-seal on secret
+	// save, the /api/vault endpoints, and vault status on /api/me (PRD #32). M3 adds
+	// the same instance to workersvc for claim-time gating + open.
+	h.SetVault(vlt)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

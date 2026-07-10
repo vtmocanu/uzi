@@ -27,6 +27,15 @@ ORDER BY kind;
 -- name: DeleteUserSecret :execrows
 DELETE FROM user_secrets WHERE user_id = $1 AND kind = $2;
 
+-- name: ListMasterSealedSecrets :many
+-- The user's still-legacy secrets, for lazy rewrap on unlock (PRD #32): the vault
+-- opens each with the master box, reseals under the DEK, and flips it to 'dek'
+-- (RewrapUserSecret). Selects the ciphertext because rewrap must decrypt it; the
+-- rows are only ever handed to the vault, never serialized out. Empty once a user
+-- has been fully migrated, so the steady-state unlock does no rewrap work.
+SELECT kind, ciphertext FROM user_secrets
+WHERE user_id = $1 AND sealed_with = 'master';
+
 -- name: RewrapUserSecret :execrows
 -- Lazy migration (PRD #32): re-seal a legacy master-key-sealed secret under the
 -- owner's vault DEK on their first unlock, flipping sealed_with 'master' → 'dek'

@@ -27,6 +27,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/google/uuid"
@@ -58,18 +59,25 @@ var (
 	// user's vault is not unlocked in this process (before first login, after
 	// Lock, or after a restart).
 	ErrLocked = errors.New("vault: locked")
-	// ErrWrongPassword is returned by Unlock when the supplied password does not
-	// unwrap the stored DEK (a GCM authentication failure). It is no more of an
-	// oracle than login already is; the unlock endpoint sits behind the per-user
-	// rate limiter.
+	// ErrWrongPassword is returned by Unlock/UnlockExisting when the supplied
+	// password does not unwrap the stored DEK (a GCM authentication failure). It is
+	// no more of an oracle than login already is; the unlock endpoint sits behind
+	// the per-user rate limiter.
 	ErrWrongPassword = errors.New("vault: wrong password")
+	// ErrNoVault is returned by UnlockExisting when the user has no vault row yet.
+	// The interactive unlock endpoint must NOT create a vault (only login/register,
+	// holding a freshly verified password, may) — otherwise any password would mint
+	// a fresh vault and lock the user out of their real (differently-keyed) secrets.
+	ErrNoVault = errors.New("vault: no vault for user")
 )
 
 // Store is the narrow set of generated queries the vault needs. *store.Queries
 // satisfies it; tests supply an in-memory fake.
 type Store interface {
 	GetUserVault(ctx context.Context, userID uuid.UUID) (store.UserVault, error)
-	UpsertUserVault(ctx context.Context, arg store.UpsertUserVaultParams) (store.UserVault, error)
+	CreateUserVaultIfAbsent(ctx context.Context, arg store.CreateUserVaultIfAbsentParams) (store.UserVault, error)
+	ListMasterSealedSecrets(ctx context.Context, userID uuid.UUID) ([]store.ListMasterSealedSecretsRow, error)
+	RewrapUserSecret(ctx context.Context, arg store.RewrapUserSecretParams) (int64, error)
 }
 
 // Vault owns the per-user DEK cache and the wrap/unwrap crypto. It is safe for
@@ -89,35 +97,68 @@ func New(master *secretbox.Box, q Store) *Vault {
 	return &Vault{master: master, q: q, cache: make(map[uuid.UUID][]byte)}
 }
 
-// Unlock derives the KEK from the login password and unwraps — or, on the
-// first-ever unlock, generates and persists — the user's DEK, caching it for this
-// process. A wrong password surfaces as a GCM auth failure ⇒ ErrWrongPassword.
+// Unlock caches the user's DEK for this process, creating the vault on the
+// first-ever unlock. Use it only on the login/register paths, which hold a
+// freshly verified password. A wrong password surfaces as ErrWrongPassword.
 // Idempotent: unlocking an already-unlocked vault refreshes the cached DEK.
 func (v *Vault) Unlock(ctx context.Context, userID uuid.UUID, password string) error {
+	return v.unlock(ctx, userID, password, true)
+}
+
+// UnlockExisting is Unlock without the create-on-first path: a missing vault row
+// returns ErrNoVault instead of minting one. This is the interactive
+// /api/vault/unlock endpoint's entry point — see ErrNoVault for why unlock must
+// never create.
+func (v *Vault) UnlockExisting(ctx context.Context, userID uuid.UUID, password string) error {
+	return v.unlock(ctx, userID, password, false)
+}
+
+func (v *Vault) unlock(ctx context.Context, userID uuid.UUID, password string, allowCreate bool) error {
 	row, err := v.q.GetUserVault(ctx, userID)
 	switch {
 	case err == nil:
-		kek := deriveKEK(password, row.KekSalt)
-		defer wipe(kek)
-		kekBox, kerr := secretbox.New(kek)
-		if kerr != nil {
-			return fmt.Errorf("vault: kek box: %w", kerr)
+		if uerr := v.cacheFromRow(userID, password, row); uerr != nil {
+			return uerr
 		}
-		dek, oerr := kekBox.OpenWithAAD(row.WrappedDek, wrapAAD(userID))
-		if oerr != nil {
-			return ErrWrongPassword
-		}
-		v.put(userID, dek)
-		return nil
 	case errors.Is(err, pgx.ErrNoRows):
-		return v.create(ctx, userID, password)
+		if !allowCreate {
+			return ErrNoVault
+		}
+		if cerr := v.create(ctx, userID, password); cerr != nil {
+			return cerr
+		}
 	default:
 		return fmt.Errorf("vault: load: %w", err)
 	}
+	// Lazy migration: reseal any still-master-sealed secrets under the now-cached
+	// DEK. Best-effort — a rewrap fault must never fail an otherwise-valid unlock;
+	// the rows stay 'master' and are retried on the next unlock.
+	v.rewrapMasterSecrets(ctx, userID)
+	return nil
+}
+
+// cacheFromRow derives the KEK from the password + the row's salt, unwraps the
+// DEK, and caches it. A GCM auth failure means the password is wrong.
+func (v *Vault) cacheFromRow(userID uuid.UUID, password string, row store.UserVault) error {
+	kek := deriveKEK(password, row.KekSalt)
+	defer wipe(kek)
+	kekBox, err := secretbox.New(kek)
+	if err != nil {
+		return fmt.Errorf("vault: kek box: %w", err)
+	}
+	dek, err := kekBox.OpenWithAAD(row.WrappedDek, wrapAAD(userID))
+	if err != nil {
+		return ErrWrongPassword
+	}
+	v.put(userID, dek)
+	return nil
 }
 
 // create generates a fresh DEK + kek_salt, wraps the DEK under the password KEK,
-// persists the vault row, and caches the DEK.
+// and persists it race-safely: CreateUserVaultIfAbsent lets exactly one of N
+// concurrent first-unlocks win. If we lose (pgx.ErrNoRows), we re-read the
+// winner's row and cache THAT DEK (unwrapped with our identical password) so the
+// cached DEK always matches what is persisted — never our discarded local one.
 func (v *Vault) create(ctx context.Context, userID uuid.UUID, password string) error {
 	dek := make([]byte, dekLen)
 	if _, err := rand.Read(dek); err != nil {
@@ -137,15 +178,62 @@ func (v *Vault) create(ctx context.Context, userID uuid.UUID, password string) e
 	if err != nil {
 		return fmt.Errorf("vault: wrap dek: %w", err)
 	}
-	if _, err := v.q.UpsertUserVault(ctx, store.UpsertUserVaultParams{
+	_, err = v.q.CreateUserVaultIfAbsent(ctx, store.CreateUserVaultIfAbsentParams{
 		UserID:     userID,
 		KekSalt:    salt,
 		WrappedDek: wrapped,
-	}); err != nil {
+	})
+	switch {
+	case err == nil:
+		// We won the insert; the DEK we generated is the persisted one.
+		v.put(userID, dek)
+		return nil
+	case errors.Is(err, pgx.ErrNoRows):
+		// A concurrent first-unlock won. Discard our DEK and adopt the persisted
+		// row's, keyed by our (identical) password, so cache == DB.
+		wipe(dek)
+		row, gerr := v.q.GetUserVault(ctx, userID)
+		if gerr != nil {
+			return fmt.Errorf("vault: reload after conflict: %w", gerr)
+		}
+		return v.cacheFromRow(userID, password, row)
+	default:
 		return fmt.Errorf("vault: persist: %w", err)
 	}
-	v.put(userID, dek)
-	return nil
+}
+
+// rewrapMasterSecrets reseals every still-master-sealed secret of the user under
+// their now-cached DEK, flipping sealed_with 'master' → 'dek'. It runs on every
+// unlock but does nothing once a user is fully migrated. Every step is
+// best-effort and logged (never with secret bytes); a failure leaves the row
+// 'master' for the next unlock to retry. It does NOT un-leak a token that ever
+// existed master-sealed — rotation is the real fix (PRD #32).
+func (v *Vault) rewrapMasterSecrets(ctx context.Context, userID uuid.UUID) {
+	rows, err := v.q.ListMasterSealedSecrets(ctx, userID)
+	if err != nil {
+		slog.Error("vault: list master-sealed for rewrap", "user", userID, "error", err)
+		return
+	}
+	for _, row := range rows {
+		plain, err := v.master.Open(row.Ciphertext)
+		if err != nil {
+			slog.Error("vault: rewrap open (master)", "user", userID, "kind", row.Kind, "error", err)
+			continue
+		}
+		sealed, serr := v.Seal(userID, row.Kind, plain)
+		wipe(plain)
+		if serr != nil {
+			slog.Error("vault: rewrap seal (dek)", "user", userID, "kind", row.Kind, "error", serr)
+			continue
+		}
+		if _, rerr := v.q.RewrapUserSecret(ctx, store.RewrapUserSecretParams{
+			UserID:     userID,
+			Kind:       row.Kind,
+			Ciphertext: sealed,
+		}); rerr != nil {
+			slog.Error("vault: rewrap persist", "user", userID, "kind", row.Kind, "error", rerr)
+		}
+	}
 }
 
 // Lock evicts and best-effort zeroizes the user's cached DEK. Go gives no
