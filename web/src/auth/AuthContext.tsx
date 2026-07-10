@@ -11,6 +11,7 @@ import {
   api,
   ApiError,
   setUnauthorizedHandler,
+  setVaultLockedHandler,
   DEFAULT_PRD_LABEL,
   DEFAULT_AUTOPILOT_LABEL,
   DEFAULT_PRDLESS_LABEL,
@@ -40,6 +41,11 @@ interface AuthState {
   // fields simply hides the toggle rather than showing one the backend 422s.
   prdlessLabel: string;
   prdlessEnabled: boolean;
+  // Vault status (PRD #32): true when the user's secret vault is unlocked in the
+  // server process. Rides the session payload; drives the header badge, the locked
+  // banner, and the "waiting for vault unlock" run state. Defaults to true (a
+  // server that predates the field, or a signed-out visitor, shows no banner).
+  vaultUnlocked: boolean;
   register: (email: string, password: string, displayName: string) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -58,6 +64,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [defaultTheme, setDefaultTheme] = useState<Theme>(DEFAULT_THEME);
   const [prdlessLabel, setPrdlessLabel] = useState(DEFAULT_PRDLESS_LABEL);
   const [prdlessEnabled, setPrdlessEnabled] = useState(false);
+  const [vaultUnlocked, setVaultUnlocked] = useState(true);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
@@ -78,6 +85,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     applyTheme(resolved);
     setPrdlessLabel(session.prdless_label || DEFAULT_PRDLESS_LABEL);
     setPrdlessEnabled(session.prdless_enabled ?? false);
+    // Absent field (older server) reads as unlocked, so no spurious banner.
+    setVaultUnlocked(session.vault?.unlocked ?? true);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -99,6 +108,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUnauthorizedHandler(() => setUser(null));
     return () => setUnauthorizedHandler(null);
   }, []);
+
+  // Any 409 vault_locked (a save that raced a pod restart) refreshes the session
+  // so the SPA learns the vault is locked and shows the unlock banner (PRD #32).
+  useEffect(() => {
+    setVaultLockedHandler(() => {
+      void refresh();
+    });
+    return () => setVaultLockedHandler(null);
+  }, [refresh]);
+
+  // Refresh vault status when the tab regains focus: the DEK cache is per-process,
+  // so a restart while the tab was backgrounded flips the vault to locked without
+  // any request from this tab. There is no global socket to push it (PRD #32); a
+  // focus refresh is the cheap catch-up. Only while signed in.
+  useEffect(() => {
+    if (!user) return;
+    const onFocus = () => {
+      void refresh();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [user, refresh]);
 
   useEffect(() => {
     (async () => {
@@ -140,6 +171,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       defaultTheme,
       prdlessLabel,
       prdlessEnabled,
+      vaultUnlocked,
       register,
       login,
       logout,
@@ -155,6 +187,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       defaultTheme,
       prdlessLabel,
       prdlessEnabled,
+      vaultUnlocked,
       register,
       login,
       logout,

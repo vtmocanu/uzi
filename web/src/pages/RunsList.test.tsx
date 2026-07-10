@@ -55,6 +55,49 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("RunsList — waiting for vault unlock (PRD #32)", () => {
+  it("renders own queued runs as waiting for vault unlock while locked", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: false,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "q", issue_title: "Queued run", status: "queued" })],
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Queued run")).toBeTruthy());
+    expect(screen.getByText(/waiting for vault unlock/)).toBeTruthy();
+    // The bare "queued" pill must not also render for that run.
+    expect(screen.queryByText("queued")).toBeNull();
+  });
+
+  it("renders a plain queued pill when the vault is unlocked", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "q", issue_title: "Queued run", status: "queued" })],
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Queued run")).toBeTruthy());
+    expect(screen.getByText("queued")).toBeTruthy();
+    expect(screen.queryByText(/waiting for vault unlock/)).toBeNull();
+  });
+});
+
 describe("RunsList — autopilot badge", () => {
   it("shows the autopilot badge only for an auto_approve run", async () => {
     mockApi.listRuns.mockResolvedValue({

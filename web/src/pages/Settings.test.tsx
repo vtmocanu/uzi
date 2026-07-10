@@ -23,6 +23,7 @@ vi.mock("../lib/api", async (importActual) => {
       setAutopilotEnabled: vi.fn(),
       getMySettings: vi.fn(),
       putMySettings: vi.fn(),
+      vaultLock: vi.fn(),
     },
   };
 });
@@ -53,6 +54,7 @@ function mockAuth(user: User) {
     defaultTheme: "ember",
     prdlessLabel: "PRDLESS",
     prdlessEnabled: false,
+    vaultUnlocked: true,
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),
@@ -75,6 +77,33 @@ afterEach(() => {
 
 const toggle = () =>
   screen.getByLabelText("Enable autopilot for my account") as HTMLInputElement;
+
+describe("Settings — vault (PRD #32)", () => {
+  it("shows the irrecoverability notice on the token card", () => {
+    const { container } = render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    expect((container.textContent ?? "")).toMatch(/cannot be recovered/i);
+  });
+
+  it("Lock vault calls the API, refreshes, and confirms runs will queue", async () => {
+    mockApi.vaultLock.mockResolvedValue(null);
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /lock vault/i }));
+
+    await waitFor(() => expect(mockApi.vaultLock).toHaveBeenCalled());
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    // The success notice is unique to the lock confirmation (the card description
+    // also mentions "waiting for vault unlock", so match the notice's own text).
+    await waitFor(() => expect(screen.getByText(/Runs already in flight finish/i)).toBeTruthy());
+  });
+});
 
 describe("Settings — autopilot opt-in (PRD #19 M3, Decision 7)", () => {
   it("states plainly what autopilot does", () => {

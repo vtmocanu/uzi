@@ -19,6 +19,10 @@ export interface MockState {
   runs: Map<string, Run>;
   messages: Map<string, RunMessage[]>;
   boards: Map<string, Board>;
+  // Vault unlocked state (PRD #32). Starts unlocked so the demo is fully usable;
+  // the Lock vault action flips it so the badge, banner, and "waiting for vault
+  // unlock" run state are all browsable.
+  vaultUnlocked: boolean;
 }
 
 function seed(): MockState {
@@ -37,7 +41,7 @@ function seed(): MockState {
   // Auth is instant/fake in mock mode: the session starts signed in as admin so
   // the whole app is browsable with zero steps. Logout still works (and any
   // login/register signs straight back in).
-  return { session: { ...mockAdmin }, runs, messages, boards };
+  return { session: { ...mockAdmin }, runs, messages, boards, vaultUnlocked: true };
 }
 
 export const state: MockState = seed();
