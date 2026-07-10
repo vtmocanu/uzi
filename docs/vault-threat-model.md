@@ -14,7 +14,7 @@ had every token in plaintext. The vault removes the token's decryption key from
 everywhere at rest.
 
 Design rationale lives in the PRD
-([../prds/32-user-vault-password-wrapped-secrets.md](../prds/32-user-vault-password-wrapped-secrets.md));
+([../prds/done/32-user-vault-password-wrapped-secrets.md](../prds/done/32-user-vault-password-wrapped-secrets.md));
 this page is the as-built residual-risk list and the operator hardening steps.
 
 ## What the vault protects — and what it does not
