@@ -424,12 +424,27 @@ func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (sto
 	return g.svc.GetRun(ctx, userID, runID)
 }
 
-// SubmitInput adapts the Slack gate to the run service. Slack carries no agent
-// picker, so its approve never names a selection (PRD #37): the run keeps whatever
-// default its worker resolved — repo agents when the clone shipped some, else the
-// owner's templates.
+// SubmitInput adapts the Slack gate's reject path to the run service. Approve goes
+// through SubmitApproval (which carries the agent source); this carries no
+// selection (reject_plan / — never approve_plan from the gate).
 func (g gateSubmitter) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) error {
 	_, err := g.svc.SubmitInput(ctx, userID, runID, kind, body, nil)
+	return err
+}
+
+// SubmitApproval adapts the Slack agent-picker approve (PRD #37 M7): the gatekeeper
+// passes a source string from a closed action-id set; here we build the
+// workersvc.AgentSelection (Slack never sets exclusions — those live in the web UI).
+// The server re-reads the run's roster and validates; ErrInvalidSelection (the
+// source no longer holds) is translated to the slacksvc sentinel so the gatekeeper
+// leaves the gate open. Keeping this translation in main keeps slacksvc free of a
+// workersvc import.
+func (g gateSubmitter) SubmitApproval(ctx context.Context, userID, runID uuid.UUID, source string) error {
+	_, err := g.svc.SubmitInput(ctx, userID, runID, "approve_plan", "",
+		&workersvc.AgentSelection{Source: source, Exclusions: []string{}})
+	if errors.Is(err, workersvc.ErrInvalidSelection) {
+		return slacksvc.ErrSelectionRejected
+	}
 	return err
 }
 

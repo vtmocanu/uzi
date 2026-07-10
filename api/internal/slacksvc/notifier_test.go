@@ -314,6 +314,40 @@ func TestNotifierPostsGateOnAwaitingApproval(t *testing.T) {
 	}
 }
 
+// When the run detected a repo roster, the gate offers TWO approve buttons — repo
+// and own — before Reject/Open (PRD #37 M7). A run with no roster (the test above)
+// keeps the single-approve shape.
+func TestNotifierGateOffersRepoAndOwnWhenRosterDetected(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	rc.RepoAgentNames = []string{"coder", "reviewer", "tester"}
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	if len(fp.blocks) != 1 {
+		t.Fatalf("gate must post one Block Kit message: %+v", fp.blocks)
+	}
+	ids := fp.blocks[0].actionIDs
+	want := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateReject, ActionGateOpen}
+	if len(ids) != len(want) {
+		t.Fatalf("gate buttons = %v, want %v", ids, want)
+	}
+	for i, w := range want {
+		if ids[i] != w {
+			t.Fatalf("gate button %d = %q, want %q (all: %v)", i, ids[i], w, ids)
+		}
+	}
+	// The names ride the body; descriptions never do (there are none in the row).
+	if !strings.Contains(fp.blocks[0].sectionText, "coder") {
+		t.Fatalf("gate body must list the repo agent names: %q", fp.blocks[0].sectionText)
+	}
+}
+
 // A run already carrying an open gate must not get a second gate message.
 func TestNotifierDoesNotDoublePostGate(t *testing.T) {
 	rc := baseRun("awaiting_approval")

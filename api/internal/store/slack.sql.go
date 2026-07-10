@@ -95,7 +95,13 @@ func (q *Queries) GetSlackDeliveryForUser(ctx context.Context, id uuid.UUID) (pg
 const getSlackRunContext = `-- name: GetSlackRunContext :one
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.branch, r.failure_reason, r.kind,
-       rp.path_with_namespace, rp.web_url
+       rp.path_with_namespace, rp.web_url,
+       COALESCE(
+           (SELECT array_agg(elem->>'name' ORDER BY ord)
+            FROM jsonb_array_elements(COALESCE(r.repo_agents, '[]'::jsonb)) WITH ORDINALITY AS names(elem, ord)
+            WHERE elem->>'name' IS NOT NULL),
+           ARRAY[]::text[]
+       )::text[] AS repo_agent_names
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 WHERE r.id = $1
@@ -113,12 +119,21 @@ type GetSlackRunContextRow struct {
 	Kind              string      `json:"kind"`
 	PathWithNamespace string      `json:"path_with_namespace"`
 	WebUrl            string      `json:"web_url"`
+	RepoAgentNames    []string    `json:"repo_agent_names"`
 }
 
 // Everything the notifier renders into a run DM (content-minimized): owner,
 // status, issue identity + title, the outcome (MR iid / branch / failure reason),
 // and the repo path + web url for the deep link and MR link. One join, keyed by
 // run id.
+//
+// repo_agent_names (PRD #37 M7): the detected repo agent NAMES as a text[], for
+// the Slack approval gate's per-source buttons. Computed in SQL so slacksvc never
+// parses the worker's repo_agents jsonb nor duplicates the RepoAgent shape, and
+// descriptions (1024 chars of repo-authored free text) never leave the DB toward
+// Slack. COALESCE collapses BOTH NULL (no worker report) and [] (scanned, found
+// none) to an empty array — Slack renders them identically (single-approve shape).
+// Names ride in roster order (WITH ORDINALITY).
 func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlackRunContextRow, error) {
 	row := q.db.QueryRow(ctx, getSlackRunContext, id)
 	var i GetSlackRunContextRow
@@ -134,6 +149,7 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 		&i.Kind,
 		&i.PathWithNamespace,
 		&i.WebUrl,
+		&i.RepoAgentNames,
 	)
 	return i, err
 }
