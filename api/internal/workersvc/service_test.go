@@ -25,19 +25,28 @@ type fakeStore struct {
 	Store
 
 	// Claim path.
-	claimRun            store.Run
-	claimErr            error
-	claimParams         *store.ClaimRunParams
-	claimCtx            store.GetRunClaimContextRow
-	claimCtxErr         error
-	anthropic           []byte
-	anthropicErr        error
+	claimRun     store.Run
+	claimErr     error
+	claimParams  *store.ClaimRunParams
+	claimCtx     store.GetRunClaimContextRow
+	claimCtxErr  error
+	anthropic    []byte
+	anthropicErr error
+	// anthropicSealedWith is the row's sealed_with (defaults to 'master' when
+	// empty, so existing fixtures are unchanged); set to 'dek' for vault tests.
+	anthropicSealedWith string
+	// onClaimRun, if set, runs inside ClaimRun — used to simulate the vault locking
+	// between the claim gate and the token open (the M3 lock race).
+	onClaimRun          func()
 	defaultModel        pgtype.Text
 	defaultModelErr     error
 	templates           []store.AgentTemplate
 	skillAllocations    []store.ListRunSkillAllocationsRow
 	skillAllocationsErr error
 	markedFailed        *store.MarkRunFailedByIDParams
+	// requeuedRun records the run id reset to queued by the vault lock-race path
+	// (PRD #32 M3); nil unless RequeueClaimedRunToQueued was called.
+	requeuedRun *uuid.UUID
 
 	// Ownership + messages + state.
 	runOwned         store.Run
@@ -107,14 +116,20 @@ type fakeStore struct {
 
 func (f *fakeStore) ClaimRun(_ context.Context, arg store.ClaimRunParams) (store.Run, error) {
 	f.claimParams = &arg
+	if f.onClaimRun != nil {
+		f.onClaimRun()
+	}
 	return f.claimRun, f.claimErr
 }
 func (f *fakeStore) GetRunClaimContext(context.Context, uuid.UUID) (store.GetRunClaimContextRow, error) {
 	return f.claimCtx, f.claimCtxErr
 }
 func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
-	// The test fixtures seal with the master box, so the row reports 'master'.
-	return store.GetUserSecretCiphertextRow{Ciphertext: f.anthropic, SealedWith: store.SealedWithMaster}, f.anthropicErr
+	sealedWith := f.anthropicSealedWith
+	if sealedWith == "" {
+		sealedWith = store.SealedWithMaster // default: fixtures seal with the master box
+	}
+	return store.GetUserSecretCiphertextRow{Ciphertext: f.anthropic, SealedWith: sealedWith}, f.anthropicErr
 }
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultModel, f.defaultModelErr
@@ -194,6 +209,10 @@ func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Ti
 	f.claimCutoff = cutoff
 	f.callOrder = append(f.callOrder, "claimed_never_started")
 	return 0, nil
+}
+func (f *fakeStore) RequeueClaimedRunToQueued(_ context.Context, id uuid.UUID) (int64, error) {
+	f.requeuedRun = &id
+	return 1, nil
 }
 func (f *fakeStore) SweepRunningTimeout(_ context.Context, arg store.SweepRunningTimeoutParams) (int64, error) {
 	f.runCutoff = arg.Cutoff

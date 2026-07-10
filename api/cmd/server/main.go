@@ -179,6 +179,11 @@ func run() error {
 		SkillsMaxPerRun:      cfg.SkillsMaxPerRun,
 	})
 
+	// Claim gating + claim-time token open share the same vault instance the HTTP
+	// handlers hold (PRD #32 M3): a locked owner's runs stay queued instead of
+	// claiming, and a 'dek'-sealed Anthropic token opens only while unlocked.
+	wsvc.SetVault(vlt)
+
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and
 	// stateless — every event is already durable in the DB.
