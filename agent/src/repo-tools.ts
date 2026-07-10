@@ -20,6 +20,10 @@ import path from "node:path";
 const PKG_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+-]*(@[a-zA-Z0-9][a-zA-Z0-9._+-]*)?$/;
 const MAX_PKG_LEN = 128;
 const MAX_REPO_PACKAGES = 64;
+// The length/count caps above only bite AFTER a full readFile, so a hostile
+// multi-GB devbox.json could OOM the worker before they apply. Stat-gate the read
+// on this ceiling; a real manifest is a few KB.
+const MAX_DEVBOX_BYTES = 1024 * 1024;
 
 /** The base package name (before any @version). */
 function baseName(pkg: string): string {
@@ -34,9 +38,14 @@ function baseName(pkg: string): string {
  * opted in.
  */
 export async function extractRepoDevboxPackages(worktreePath: string): Promise<string[]> {
+  const file = path.join(worktreePath, "devbox.json");
   let raw: string;
   try {
-    raw = await fs.readFile(path.join(worktreePath, "devbox.json"), "utf8");
+    // Size guard BEFORE reading the whole file, so an absurdly large hostile
+    // manifest is rejected without ever loading it into memory.
+    const st = await fs.stat(file);
+    if (st.size > MAX_DEVBOX_BYTES) return [];
+    raw = await fs.readFile(file, "utf8");
   } catch {
     return [];
   }
@@ -80,10 +89,16 @@ export async function extractRepoDevboxPackages(worktreePath: string): Promise<s
  * tier-2 entries.
  */
 export function mergeToolPackages(tier1: string[], tier2: string[]): string[] {
-  const tier1Bases = new Set(tier1.map(baseName));
+  const seenBases = new Set(tier1.map(baseName));
   const merged = [...tier1];
   for (const p of tier2) {
-    if (!tier1Bases.has(baseName(p))) merged.push(p);
+    const base = baseName(p);
+    // Skip a base tier-1 already provides AND a base an earlier tier-2 entry
+    // already contributed, so two tier-2 versions of one package never both
+    // survive (first tier-2 wins the intra-tier-2 conflict).
+    if (seenBases.has(base)) continue;
+    seenBases.add(base);
+    merged.push(p);
   }
   return merged;
 }

@@ -59,6 +59,10 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       assert.match(text, /install -m 0755 .*\/usr\/local\/bin\/devbox/, `${name}/Dockerfile must install devbox mode 0755 (non-owner exec)`);
       assert.match(text, /nix-installer/, `${name}/Dockerfile must install nix at build time`);
       assert.doesNotMatch(text, /get\.jetify\.com\/devbox/, `${name}/Dockerfile must NOT use the floating devbox launcher`);
+      // The checksum grep|sha256sum pipe must run under pipefail — BusyBox
+      // sha256sum -c exits 0 on empty stdin, so a no-match grep would else skip
+      // verification silently (audit L2).
+      assert.match(text, /set -o pipefail/, `${name}/Dockerfile must guard the checksum pipe with 'set -o pipefail'`);
     });
   }
 });

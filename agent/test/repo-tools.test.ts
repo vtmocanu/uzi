@@ -62,6 +62,13 @@ describe("extractRepoDevboxPackages (packages-only, hooks never run)", () => {
     assert.strictEqual(pkgs.length, 64);
     assert.strictEqual(new Set(pkgs).size, 64);
   });
+
+  it("returns [] for an oversized devbox.json without loading it (size guard, audit L1)", async () => {
+    // Valid JSON, but larger than the 1 MiB stat ceiling: rejected before readFile.
+    const filler = "x".repeat(1024 * 1024 + 1);
+    await writeDevbox(JSON.stringify({ packages: ["hello"], _pad: filler }));
+    assert.deepStrictEqual(await extractRepoDevboxPackages(dir), []);
+  });
 });
 
 describe("mergeToolPackages (tier-1 wins conflicts)", () => {
@@ -74,5 +81,11 @@ describe("mergeToolPackages (tier-1 wins conflicts)", () => {
   it("returns tier-1 unchanged when tier-2 is empty, and tier-2 when tier-1 is empty", () => {
     assert.deepStrictEqual(mergeToolPackages(["a"], []), ["a"]);
     assert.deepStrictEqual(mergeToolPackages([], ["b@1"]), ["b@1"]);
+  });
+
+  it("dedupes two tier-2 versions of the same base — first wins (audit dedupe nit)", () => {
+    // Both entries share base "node"; only the first survives, so provisioning
+    // never gets two conflicting versions of one package.
+    assert.deepStrictEqual(mergeToolPackages([], ["node@20", "node@22", "jq"]), ["node@20", "jq"]);
   });
 });

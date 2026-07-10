@@ -46,7 +46,10 @@ ENV PATH="/nix/var/nix/profiles/default/bin:${PATH}"
 # devbox pinned binary; tarball saved under its EXACT release name so sha256sum -c
 # (which opens the name in checksums.txt) finds it. See templates/base.
 ARG DEVBOX_VERSION=0.17.5
-RUN cd /tmp \
+# set -o pipefail so a grep that matches no checksum line fails the build rather
+# than feeding empty stdin to `sha256sum -c -` (which exits 0). See templates/base.
+RUN set -o pipefail \
+    && cd /tmp \
     && TARBALL="devbox_${DEVBOX_VERSION}_linux_${TARGETARCH}.tar.gz" \
     && curl -fsSL -o "${TARBALL}" \
       "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/${TARBALL}" \

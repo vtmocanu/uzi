@@ -72,7 +72,11 @@ ENV PATH="/nix/var/nix/profiles/default/bin:${PATH}"
 # The tarball is saved under its EXACT release filename so `sha256sum -c` (which
 # opens the filename named in checksums.txt) finds it.
 ARG DEVBOX_VERSION=0.17.5
-RUN cd /tmp \
+# set -o pipefail: BusyBox `sha256sum -c -` exits 0 on EMPTY stdin, so without it a
+# grep that matches no checksum line would SKIP verification silently. pipefail
+# makes the grep no-match (exit 1) fail the build.
+RUN set -o pipefail \
+    && cd /tmp \
     && TARBALL="devbox_${DEVBOX_VERSION}_linux_${TARGETARCH}.tar.gz" \
     && curl -fsSL -o "${TARBALL}" \
       "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/${TARBALL}" \
