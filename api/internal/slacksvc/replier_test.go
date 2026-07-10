@@ -81,6 +81,49 @@ func TestReplierRejectPendingSubmitsReasonedReject(t *testing.T) {
 	}
 }
 
+// A reply arriving in the reject-pending window AFTER the run already left the
+// gate (resolved from another surface, anchor not yet cleared by the notifier)
+// must NOT submit a stale reject_plan — the run.Status guard makes it fall through
+// to follow_up on a still-live run.
+func TestReplierRejectPendingStaleRunFallsThroughToFollowUp(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, gateStateRejectPending)} // stale reject-pending anchor
+	sub := &fakeSubmitter{run: liveRun(runID, user.ID, "running")}                        // run already moved on
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("late rejection reason"))
+
+	if len(sub.submitted) != 1 || sub.submitted[0].kind != "follow_up" || sub.submitted[0].body != "late rejection reason" {
+		t.Fatalf("a stale reject-pending reply on a running run must fall through to follow_up, not reject_plan: %+v", sub.submitted)
+	}
+	if len(fp.updateBlocks) != 0 || len(fs.gateSet) != 0 {
+		t.Fatalf("a stale reply must not resolve the gate: edits=%v gate=%v", fp.updateBlocks, fs.gateSet)
+	}
+	if len(fp.reactions) != 1 {
+		t.Fatalf("the fallen-through follow_up should still be acked: %+v", fp.reactions)
+	}
+}
+
+// Same race but the run already finished: falls through to the finished ephemeral,
+// still no stale reject_plan.
+func TestReplierRejectPendingStaleTerminalRunIsFinished(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, gateStateRejectPending)}
+	sub := &fakeSubmitter{run: liveRun(runID, user.ID, "completed")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("late rejection reason"))
+
+	if len(sub.submitted) != 0 {
+		t.Fatalf("a stale reject-pending reply on a finished run must not submit: %+v", sub.submitted)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "already finished") {
+		t.Fatalf("stale reject-pending on a terminal run → finished ephemeral: %+v", fp.ephemerals)
+	}
+}
+
 // A reply on a live run with no open gate becomes a follow_up.
 func TestReplierLiveRunSubmitsFollowUp(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}

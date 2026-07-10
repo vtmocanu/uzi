@@ -120,7 +120,9 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	}
 
 	// Resolve the run anchored at this thread (thread_ts == root_ts). No anchor →
-	// the reply isn't under a run DM; ignore silently.
+	// the reply isn't under a run DM; ignore silently. (channel_id, root_ts) is
+	// effectively unique: each run posts its OWN root message, so its ts is distinct
+	// within the DM channel — hence the :one lookup can never straddle two runs.
 	anchor, err := r.store.GetSlackRunMessageByRoot(ctx, store.GetSlackRunMessageByRootParams{
 		ChannelID: m.ChannelID, RootTs: m.ThreadTS,
 	})
@@ -144,9 +146,14 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	text := boundReply(m.Text)
 
 	switch {
-	case anchor.GateState.Valid && anchor.GateState.String == gateStateRejectPending:
-		// Reject-pending: the reply IS the reasoned rejection. Submit it, resolve the
-		// gate, ack. The reason goes only to the worker — never echoed back to Slack.
+	case run.Status == "awaiting_approval" && anchor.GateState.Valid && anchor.GateState.String == gateStateRejectPending:
+		// Reject-pending AND the run is still parked: the reply IS the reasoned
+		// rejection. Submit it, resolve the gate, ack; the reason goes only to the
+		// worker, never echoed back to Slack. The run.Status guard mirrors the
+		// gatekeeper's stale-check: if the gate was resolved from another surface
+		// while reject-pending and the notifier hasn't yet cleared the anchor, this
+		// stale reply must NOT submit reject_plan (which could wrongly fail a run that
+		// already left the gate) — it falls through to the branches below instead.
 		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "reject_plan", text); err != nil {
 			r.logf("submit reasoned reject", err)
 			return
@@ -158,7 +165,8 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		// Open gate (not reject-pending): a bare reply is NOT a plan verdict — the
 		// worker queues a follow_up submitted during a gate rather than consuming it
 		// as feedback (verified in agent/src/steering.ts), so nudge, don't submit.
-		r.ephemeral(ctx, m,
+		// Coalesced like the other notices so a burst is nudged once.
+		r.coalescedEphemeral(ctx, m, "gate-open",
 			"The plan gate takes Approve or Reject. Press Reject to use a reply as the reason, or open the run in uzi.")
 
 	case isTerminalStatus(run.Status):
