@@ -4438,3 +4438,134 @@ against real Slack (unit tests fake the dialer; e2e stubs Slack entirely).
 - **Open follow-up**: the manager trusts slack-go's RunContext to notice a dead link; a
   zombie connection (e.g. after laptop sleep) can leave the chip `connected` with no
   socket — consider a liveness probe (last-hello age) surfaced on the admin DTO.
+
+---
+
+## 168. Activity feed rendering — command fidelity, hierarchy, collapsible agents
+
+Serves human Feature #11 (run-view UX) and the PRD #38 additions (feed redesigned to
+the approved mock, bash as highlighted code, per-agent collapse). Web-only: no API,
+schema, agent, or message-shape change — a pure `web/src` render refactor. Full
+rationale + Decision Log: `prds/38-activity-feed-redesign.md`; the design contract is
+`prds/mockups/38-activity-feed-mock.html`.
+
+- **Full command is the source of truth; truncation is display-only** (`RunEvent.tsx`):
+  `toolSummary` returns the whole (possibly multi-line) Bash command — the earlier
+  `firstLine()` clamp destroyed lines 2+ everywhere. `CommandBlock` renders it on a code
+  surface with a `❯` prompt and clamps to 2 lines with a "Show full command" toggle. The
+  toggle appears from a CONTENT heuristic (command contains `\n` or > 160 chars), not
+  layout measurement — jsdom has no layout (`scrollHeight` is 0), so a measured-overflow
+  toggle would be untestable.
+- **In-house shell highlighter, no library, no `dangerouslySetInnerHTML`** (`highlightShell`
+  in `RunEvent.tsx`): a pure tokenizer returning `ReactNode[]` (command / flag / string /
+  operator / comment / arg spans). Tool commands are untrusted LLM output, so output stays
+  React elements — a command containing `<script>` renders inert. Best-effort accuracy: a
+  mis-classified token is cosmetic; text-content correctness is what tests pin.
+- **Syntax colors are semantic tokens aliasing the palette** (`index.css`,
+  `tailwind.config.js`): `--syn-cmd/-flag/-str/-op/-comment/-arg` + `--tool-rail`, each an
+  alias of an existing token (`--brand`, `--info`, `--ok`, `--brand-hover`, `--faint`,
+  `--fg`, `--edge`) — same pattern as `--queue-*`, so themes recolour automatically, no
+  hardcoded hex. Matching `token()` color entries in `tailwind.config.js` (file is `.js`,
+  not the PRD's draft `.ts`) make `text-syn-cmd` / `border-tool-rail` resolve to utilities.
+  Mission theme diverges only on `--syn-flag` → `--warn` and `--syn-op` → `--muted`
+  (mission's `--info`/`--brand-hover` both alias `--brand`, which would collapse the tones).
+- **Hierarchy is structural**: agent prose renders full-width (primary); consecutive tool
+  events sit in an indented rail (`border-l` + `pl-3`, subordinate). Tool name demotes to
+  11px uppercase `text-muted`; prose stays 14px `text-fg`. Per-tool icon map
+  (Bash/Read/Write/Edit/Grep/Glob/Task/Web*) replaces the shared `TerminalIcon`.
+- **Results are chips; errors are loud** (`ToolResultBody`): collapsed = inline pill
+  (`✗ error` / `✓ ok` for empty output / `✓ N lines`); expanded = bordered `<pre>`,
+  `max-h` scroll, focusable (`tabindex=0` + `role="group"` + `aria-label`). Collapsed
+  bodies stay MOUNTED but `hidden` so result text remains in the DOM for tests and pairing
+  assertions. Behavior change vs before: short results no longer render open by default,
+  so assertions that read result text now expand first. Errors keep auto-expand + danger
+  tint. The `[image omitted]` note renders as the first body line (excluded from the chip's
+  line count).
+- **Durations inline, never fabricated**: rendered `shrink-0` inline after the tool name in
+  a non-wrapping header row (can't float to its own line). Sub-100ms → "instant" — but this
+  substitution lives ONLY in `ToolUseRow`'s tool-duration path; shared `formatDuration`
+  (also used by RunView's header/terminal line) is untouched. Long-running tint `--warn`;
+  running = inline spinner + live elapsed.
+- **Agent collapse keyed by agent NAME, lifted to feed level** (`ActivityFeed.tsx`):
+  `groupByAgent` emits a new block whenever the speaker changes, so `lead→worker→lead`
+  yields two non-contiguous `lead` blocks; collapse is keyed by name so muting `lead` mutes
+  ALL its blocks. Chevron button (≥24px target, `aria-expanded`/`aria-controls`) hides each
+  block's body (prose + tools); collapsed header shows an italic hidden-content summary.
+  Per-run client state, not persisted; a new message from a collapsed agent does NOT
+  auto-expand it but still counts in the new-messages pill. Follow-scroll is preserved
+  across toggles WITHOUT modifying `useFollowScroll` (re-pinned around the height change).
+- **Status/meta has ONE owner** (`MetaLine` in `RunEvent.tsx`): the old feed-level
+  interception was removed; `MetaLine` renders status/meta as a full-width hairline-flanked
+  divider, two-tone key (mono `--fg` key + muted italic remainder) per the mock. Every
+  message kind has a defined home (prose full-width; tool use/result/thinking in the rail;
+  meta divider; error full-width danger, never collapsed; plan one-liner stays). Empty-text
+  messages render null (skipped by hidden-summary and rail grouping).
+- **Prose ⇄ command parity by construction** (`Markdown.tsx`): the `code` override routes
+  fences classed `language-(bash|sh|shell)` through the SAME `CommandBlock`/`highlightShell`
+  as tool commands (react-markdown v10 dropped the `inline` prop, so detection is by
+  `className`, not `inline`). `MarkdownCore` sanitizer policy is untouched — no rehype-raw,
+  no HTML pass-through. A benign `RunEvent` ↔ `Markdown` import cycle is accepted over
+  duplicating the code surface.
+
+## 169. Feed security hardening (untrusted-command render path)
+
+Serves the primary safety posture: tool commands and results are attacker-influenced LLM
+output rendered verbatim, so the render path is bounded against DoS. All in
+`prds/38-activity-feed-redesign.md`.
+
+- **Tokenizer fan-out cap** (`highlightShell`, `RunEvent.tsx`): stops at
+  `HIGHLIGHT_MAX_CHARS` (8 KB) or `HIGHLIGHT_MAX_NODES` (2000) and appends the exact
+  remainder as ONE plain text node — a pathological command can't fan out into unbounded
+  React elements. Correctness preserved (no bytes dropped); only per-node highlighting is
+  capped.
+- **Linear trailing-newline strip** (`stripTrailingNewlines`, `Markdown.tsx`): replaced a
+  `/\n+$/` regex measured at catastrophic backtracking (~O(n²), ~6s at 100 KB) with a
+  linear scan, applied before a fence reaches `CommandBlock`.
+- **Announcement length cap** (`ActivityFeed.tsx`): the sr-only live-region text is
+  truncated to `ANNOUNCE_MAX` (200 chars) so a long agent line can't flood assistive tech
+  with a multi-KB utterance.
+
+## 170. Feed accessibility (WCAG pass)
+
+Serves human Feature #11's usability intent, extended to a11y. See
+`prds/38-activity-feed-redesign.md` (M4).
+
+- **Scoped live region** (`ActivityFeed.tsx`): the scroll container keeps `role="log"` but
+  is forced `aria-live="off"` — `role="log"` carries an implicit `aria-live="polite"`, so
+  merely dropping the attribute would change nothing and screen readers would hear every
+  tool frame. Announcements route EXCLUSIVELY through one `sr-only` `aria-live="polite"`
+  `aria-atomic` region fed only meaningful transitions (agent started/finished/handoff,
+  plan submitted, error, run state change).
+- **Live-region coalescing is accepted as designed**: one announcement per update — the
+  last meaningful message wins (error beats plan by arriving last; terminal "Run finished"
+  beats "agent finished").
+- **`--faint` banned for interactive/essential text**: expander/chip/collapse-summary/
+  duration labels use `--muted` (~6.9:1); `--faint` stays legal only for decorative/
+  redundant text (timestamps with a `title`, icons beside labels). Conscious exception: the
+  "Activity" section heading stays `text-faint` (app-wide idiom, redundant with the log's
+  `aria-label`) — the only in-feed faint essential-ish text.
+- **Reduced-motion guard is UNLAYERED** in `index.css`: a plain `@media
+  (prefers-reduced-motion: reduce)` block neutralizing Tailwind's `animate-spin` /
+  `animate-pulse`. It wins by source order (after `@tailwind utilities`); the PRD's
+  "@layer base" wording was wrong in practice — a `@layer base` placement would lose the
+  cascade. Components use only these built-in animations, so no per-component CSS is touched.
+- Result `<pre>` bodies are keyboard-focusable; expander/chevron hit areas are ≥24px
+  (WCAG 2.5.8); the active/idle chip gains pulsing-dot emphasis with its transition
+  announced through the live region.
+
+## 171. PRD #38 scope boundaries, mock-as-contract & recorded deferrals
+
+See `prds/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
+
+- **The mock is the contract, with named illustrative exceptions** (M6, web-ux browser
+  pass): structure/color/interaction are contractual; literal string formatting follows the
+  code — duration strings follow `formatDuration`'s zero-padded output ("40m 03s"), not the
+  mock's illustrative "40m 3s"; the built-in `animate-pulse` is sanctioned.
+- **Deliberately skipped polish** (recorded, not regressions): non-Bash args wrap with a
+  "more" affordance instead of the mock's ellipsis (Decision 13 beats the mock);
+  image-result chip line count excludes the `[image omitted]` note; the
+  inline-`❯`-when-clamped idea would deviate from the approved mock (post-PRD user call, not
+  implemented).
+- **Out of scope** (unchanged from before): message persistence / protocol / agent /
+  worker; virtualized rendering for very long feeds; multi-language highlighting (bash-only
+  by design); persisting agent-collapse state across reloads; in-feed search/filter.
