@@ -93,7 +93,7 @@ Three tracks sharing one mental model (the PRD #16 scope+allocation pattern):
 - [x] **M5 — Tier 2 repo `devbox.json` packages opt-in**: per-repo trust toggle (default off), packages-only extraction, union-merge with tier-1 precedence, trust warning in UI + docs.
 - [x] **M6 — Agent template scopes migration + user CRUD** *(blocked by PRD #16 schema landing, or explicitly takes over the shared shapes)*: scope/user_id migration, partial uniques, reconciler conflict-target fix, reserved-name validation, user-scoped CRUD.
 - [x] **M7 — Template allocation + claim filtering** *(same blocker as M6)*: allocation table with explicit seeded defaults, overlay resolution, claim payload delivers only allocated templates, Agents page allocation UI.
-- [ ] **M8 — Tests, specs, docs complete**: e2e covering a provisioned-tool run (devbox stubbed in the isolated e2e stack — no substituter egress there; a separate opt-in integration test does a real `devbox install`) and a run using a user-scoped template; `specs/ai.md` + `ARCHITECTURE.md` + user docs updated.
+- [x] **M8 — Tests, specs, docs complete**: e2e covering a provisioned-tool run (devbox stubbed in the isolated e2e stack — no substituter egress there; a separate opt-in integration test does a real `devbox install`) and a run using a user-scoped template; `specs/ai.md` + `ARCHITECTURE.md` + user docs updated.
 
 Phase note: M1–M2 (worker templates) and M3–M5 (tooling) are independent tracks touching disjoint files and can run in parallel; M6–M7 (scopes) is sequenced against PRD #16/#17 per the notes above. M8 spans all.
 
@@ -110,7 +110,17 @@ Work runs on `feature/prd-18-worker-templates` (worktree `../prd-18-worker-templ
 | M4 audit ride-alongs (denylist, caps, shared rules loader) | `a45a9fd` | **NOT yet agent-reviewed** |
 | M5 tier-2 repo opt-in | `a0b7ba9` `ec12c96` | **NOT yet reviewed/audited/tested — first validation wave on resume** |
 
-Resume plan: (1) confirm the coder's final Dockerfile-fix commit + checkpoint (`.claude/agent-team-tasks/prd-18-coder-checkpoint.md`); (2) reviewer+auditor wave over `a45a9fd`+`a0b7ba9`+`ec12c96`+fix, tester on the tier-2 hostile-manifest path + a real build; (3) M6–M7 with a FRESH coder (mirror the landed #16 skills shapes; reconciler conflict-target change per §4); (4) M8. Open question for tomorrow: apply the credential-CLI denylist to tier-2 packages too (belt-and-suspenders; coder shipped PRD-posture = no).
+Day 2 (2026-07-10) completed the run — all milestones landed and validated:
+
+| Scope | Commits | Agent validation |
+|---|---|---|
+| Day-1 validation debt (M4 ride-alongs, M5, Dockerfile fix) | `a45a9fd` `a0b7ba9` `ec12c96` `989755f` | reviewer PASS, auditor PASS; tester: real `docker build` of both templates (native arm64), uid-100 rootless provision smoke, cross-container warm-start, hostile tier-2 manifest inert, e2e 63/63 |
+| main merge (PRD #28 drift) | `173b94b` | reviewer sanity PASS (empty combined diff, reviewed SHAs remain ancestors) |
+| M6 scopes + user CRUD | `2ca62c0` | reviewer PASS; auditor found 1 Blocking (unfiltered claim query leaked private templates cross-user) → closed below |
+| M7 allocations + claim filtering | `5d3d35d` `b3904c9` `f6aa609` `5416176` | reviewer PASS, auditor re-gate: Blocking CLOSED (owner-scoped claim SQL + shared-precedence drop + live-DB regression tests); tester: store-IT live-DB scenarios, e2e, image rebuilds all PASS |
+| M8 e2e/docs/specs + fixes | `cafbcbd` `2d3e131` `da96e6a` `d04c731` `bcfc1bc` `bbb7c48` `31aeb08` | reviewer PASS, auditor SECURITY SIGN-OFF, fact-checker: all claims verified after 1 refuted egress-wording claim fixed in `31aeb08`; `specs/human.md` Feature #18 user-approved verbatim |
+
+Closed during the run: tier-2 deliberately bypasses allowlist AND denylist (audit-probed, accepted — bounded by opt-in + packages-only + scrubbed provisioning env); shared-precedence claim drop for user/shared name collisions (deliberate divergence from skills' body precedence); reserved lead names blocked for global creates too. Known residual: native amd64 `docker build` unverified (arm64-only host; asset names + checksums verified against live releases).
 
 ## Success Criteria
 
