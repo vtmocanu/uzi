@@ -76,6 +76,11 @@ type latestRunDTO struct {
 	// renders merged/closed distinctly and everything else as the plain open chip.
 	// Kept fresh by the watcher only for the board card (the issue's latest run).
 	MrState       *string   `json:"mr_state"`
+	// FailureReason is OWNER-ONLY (PRD #33 Decision 5): it can carry a user's verbatim
+	// typed reject reason or a raw agent error, so a shared board must not expose it
+	// to non-owner viewers — they get null. Owners keep it (the failed-badge tooltip).
+	// The non-sensitive StopKind enum below stays visible to everyone for the
+	// stopped-vs-failed badge, so classification never depends on this field.
 	FailureReason *string   `json:"failure_reason"`
 	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
 	// or "plan_rejected", null otherwise. The board badge reads it (not the
@@ -100,16 +105,21 @@ type latestRunDTO struct {
 // longer even selects the email, so there is nothing to fall back to here.
 func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrState, failureReason, stopKind, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
 	dto := &latestRunDTO{
-		ID:            runID.String(),
-		Status:        status,
-		MrState:       textPtrValue(mrState.Valid, mrState.String),
-		FailureReason: textPtrValue(failureReason.Valid, failureReason.String),
-		StopKind:      textPtrValue(stopKind.Valid, stopKind.String),
-		WorkerName:    textPtrValue(workerName.Valid, workerName.String),
-		IsMine:        ownerID == viewerID,
-		RunCount:      runCount,
-		CreatedAt:     createdAt.Time,
-		UpdatedAt:     updatedAt.Time,
+		ID:         runID.String(),
+		Status:     status,
+		MrState:    textPtrValue(mrState.Valid, mrState.String),
+		StopKind:   textPtrValue(stopKind.Valid, stopKind.String),
+		WorkerName: textPtrValue(workerName.Valid, workerName.String),
+		IsMine:     ownerID == viewerID,
+		RunCount:   runCount,
+		CreatedAt:  createdAt.Time,
+		UpdatedAt:  updatedAt.Time,
+	}
+	// failure_reason is owner-only (Decision 5): it can carry a verbatim reject reason
+	// or a raw agent error, so a non-owner viewer of a shared board gets null. stop_kind
+	// (above, unconditional) already gives everyone the stopped-vs-failed classification.
+	if dto.IsMine {
+		dto.FailureReason = textPtrValue(failureReason.Valid, failureReason.String)
 	}
 	if mrIID.Valid {
 		v := mrIID.Int64

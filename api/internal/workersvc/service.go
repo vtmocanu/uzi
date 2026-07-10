@@ -109,6 +109,7 @@ type Store interface {
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
+	CreateStopVerdictInput(ctx context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
 
 	// Cross-cutting reads for run creation + claim.
@@ -856,26 +857,36 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			s.notify(runID, status) // cancelled → origin restore; failed (reject) → origin restore
 			return SubmitInputResult{ServerSide: true}, nil
 		}
+		// Live poller: the worker will consume this verdict. Enqueue it AND stamp the
+		// deliberate-stop signal in one statement (PRD #33 Decision 3) via the
+		// dedicated CreateStopVerdictInput CTE, so the signal is never lost
+		// independently of the input that requested it. stopKindFor is always non-empty
+		// here (kind is cancel/reject_plan). The stamp lands while the run is still
+		// non-terminal; the client's terminal-guarded isStoppedRun ignores it until the
+		// run reaches failed/cancelled.
+		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
+			RunID: runID, Kind: kind, Body: pgText(body), StopKind: pgText(stopKindFor(kind)),
+		}); err != nil {
+			return SubmitInputResult{}, err
+		}
+		return SubmitInputResult{ServerSide: false}, nil
 	}
 
-	// Live-poller path: the worker will consume this verdict. Stamp the
-	// deliberate-stop signal transactionally with the input insert (PRD #33
-	// Decision 3) — stopKindFor is non-empty only for cancel/reject_plan, so a
-	// follow_up/approve_plan leaves stop_kind NULL and the run row untouched. The
-	// stamp lands while the run is still non-terminal; the client's terminal-guarded
-	// isStoppedRun ignores it until the run reaches failed/cancelled.
+	// A plain steering input (approve_plan / follow_up): enqueue for the worker with
+	// no stop signal and no runs-row touch.
 	if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
-		RunID: runID, Kind: kind, Body: pgText(body), StopKind: pgText(stopKindFor(kind)),
+		RunID: runID, Kind: kind, Body: pgText(body),
 	}); err != nil {
 		return SubmitInputResult{}, err
 	}
 	return SubmitInputResult{ServerSide: false}, nil
 }
 
-// stopKindFor maps a steering-input kind to the deliberate-stop signal stamped on
-// the run (PRD #33): a cancel verdict is 'cancelled', a plan reject is
-// 'plan_rejected', and every other kind stamps nothing (""). The server owns this
-// mapping so the signal never depends on the reason string the worker later reports.
+// stopKindFor maps a deliberate-stop steering kind to the stop signal stamped on the
+// run (PRD #33): a cancel verdict is 'cancelled', a plan reject is 'plan_rejected'.
+// Only cancel/reject_plan reach it (the stop-verdict branch of SubmitInput); the
+// server owns this mapping so the signal never depends on the reason string the
+// worker later reports.
 func stopKindFor(kind string) string {
 	switch kind {
 	case "cancel":

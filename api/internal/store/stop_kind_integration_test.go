@@ -14,11 +14,12 @@ import (
 
 // TestCreateRunInputStopKindLiveDB exercises the PRD #33 deliberate-stop stamp
 // against a REAL Postgres — the exact surface the fake-store unit tests cannot
-// cover, because they never run the SQL. It is the regression guard for the
-// data-modifying-CTE type-inference bug the e2e caught: CreateRunInput's stamp uses
-// `stop_kind IS NOT NULL`, and a bare parameter there fails to prepare with SQLSTATE
-// 42P08 ("could not determine data type of parameter") unless cast to ::text. An
-// approve_plan (NULL stop_kind) went through that exact path and 500'd.
+// cover, because they never run the SQL. It proves the two-query split (Decision 3):
+// the plain CreateRunInput (approve_plan/follow_up) never touches the runs row, while
+// the dedicated CreateStopVerdictInput CTE enqueues the verdict AND stamps stop_kind
+// in one statement. It is also the regression guard for the data-modifying-CTE type
+// hazard the e2e first caught (an earlier single-query design with a `stop_kind IS
+// NOT NULL` guard failed to prepare, SQLSTATE 42P08, and 500'd every approve_plan).
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; the e2e
 // runner (e2e/run-store-it.sh) provides one.
@@ -68,25 +69,25 @@ func TestCreateRunInputStopKindLiveDB(t *testing.T) {
 		return &s
 	}
 
-	// ── approve_plan: NULL stop_kind must NOT error (the 42P08 regression) and must
-	//    leave the run's stop_kind untouched. ──
+	// ── approve_plan: the plain CreateRunInput enqueues without touching the runs
+	//    row, so stop_kind stays NULL. ──
 	rApprove := seedRun(1)
 	if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
 		RunID: rApprove, Kind: "approve_plan", Body: pgtype.Text{String: "", Valid: false},
-		StopKind: pgtype.Text{}, // NULL — the case that 500'd before the ::text cast
 	}); err != nil {
-		t.Fatalf("CreateRunInput(approve_plan, NULL stop_kind) must succeed, got: %v", err)
+		t.Fatalf("CreateRunInput(approve_plan) must succeed, got: %v", err)
 	}
 	if sk := stopKindOf(rApprove); sk != nil {
 		t.Fatalf("approve_plan must leave stop_kind NULL, got %q", *sk)
 	}
 
-	// ── live cancel: stamps stop_kind='cancelled' in the same statement as the input. ──
+	// ── live cancel: the dedicated CreateStopVerdictInput CTE stamps
+	//    stop_kind='cancelled' in the same statement as the input. ──
 	rCancel := seedRun(2)
-	if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
+	if _, err := q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
 		RunID: rCancel, Kind: "cancel", Body: pgtype.Text{}, StopKind: pgtype.Text{String: "cancelled", Valid: true},
 	}); err != nil {
-		t.Fatalf("CreateRunInput(cancel): %v", err)
+		t.Fatalf("CreateStopVerdictInput(cancel): %v", err)
 	}
 	if sk := stopKindOf(rCancel); sk == nil || *sk != "cancelled" {
 		t.Fatalf("live cancel must stamp stop_kind 'cancelled', got %v", sk)
@@ -94,11 +95,11 @@ func TestCreateRunInputStopKindLiveDB(t *testing.T) {
 
 	// ── live reject: stamps stop_kind='plan_rejected'. ──
 	rReject := seedRun(3)
-	if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
+	if _, err := q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
 		RunID: rReject, Kind: "reject_plan", Body: pgtype.Text{String: "wrong", Valid: true},
 		StopKind: pgtype.Text{String: "plan_rejected", Valid: true},
 	}); err != nil {
-		t.Fatalf("CreateRunInput(reject_plan): %v", err)
+		t.Fatalf("CreateStopVerdictInput(reject_plan): %v", err)
 	}
 	if sk := stopKindOf(rReject); sk == nil || *sk != "plan_rejected" {
 		t.Fatalf("live reject must stamp stop_kind 'plan_rejected', got %v", sk)

@@ -316,13 +316,40 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 
 const createRunInput = `-- name: CreateRunInput :one
 
+INSERT INTO run_user_inputs (run_id, kind, body)
+VALUES ($1, $2, $3)
+RETURNING id, run_id, kind, body, consumed_at, created_at
+`
+
+type CreateRunInputParams struct {
+	RunID uuid.UUID   `json:"run_id"`
+	Kind  string      `json:"kind"`
+	Body  pgtype.Text `json:"body"`
+}
+
+// User inputs (steering) ---------------------------------------------------
+// Enqueue a plain steering input (approve_plan / follow_up) for the live worker to
+// consume. This path never touches the runs row — no stop signal, no lock — so a
+// follow-up mid-run is a single cheap insert. Deliberate-stop verdicts go through
+// CreateStopVerdictInput instead (they must stamp runs.stop_kind atomically).
+func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, createRunInput, arg.RunID, arg.Kind, arg.Body)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createStopVerdictInput = `-- name: CreateStopVerdictInput :one
 WITH stamped AS (
-    -- The ::text cast is load-bearing: the stop_kind parameter appears only in the
-    -- SET and in this IS NOT NULL guard, and Postgres cannot infer a bare param's
-    -- type from ` + "`" + `$n IS NOT NULL` + "`" + ` alone (SQLSTATE 42P08 at prepare time). Casting the
-    -- guard occurrence pins it to text for the whole statement.
     UPDATE runs SET stop_kind = $4, updated_at = now()
-    WHERE id = $1 AND $4::text IS NOT NULL
+    WHERE id = $1
     RETURNING id
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
@@ -330,26 +357,25 @@ VALUES ($1, $2, $3)
 RETURNING id, run_id, kind, body, consumed_at, created_at
 `
 
-type CreateRunInputParams struct {
+type CreateStopVerdictInputParams struct {
 	RunID    uuid.UUID   `json:"run_id"`
 	Kind     string      `json:"kind"`
 	Body     pgtype.Text `json:"body"`
 	StopKind pgtype.Text `json:"stop_kind"`
 }
 
-// User inputs (steering) ---------------------------------------------------
-// Enqueue a steering input for the live worker to consume. When the input carries
-// a deliberate-stop verdict (cancel/reject_plan) the caller passes the matching
-// stop_kind, and it is stamped on the run in the SAME statement (PRD #33 Decision
-// 3): a data-modifying CTE runs to completion exactly once, so the stop signal can
-// never be lost independently of the input that requested it — which a second,
-// non-transactional UPDATE would risk, reintroducing the failed-vs-stopped bug.
-// stop_kind is NULL for a non-verdict input (follow_up/approve_plan) and the WHERE
-// guard then leaves the run row untouched. The stamp lands while the run is still
-// non-terminal (awaiting_approval/running); the client's terminal-guarded
+// Enqueue a deliberate-stop verdict (cancel / reject_plan) for the live worker AND
+// stamp runs.stop_kind in the SAME statement (PRD #33 Decision 3): a data-modifying
+// CTE runs to completion exactly once, so the stop signal can never be lost
+// independently of the input that requested it — which a second, non-transactional
+// UPDATE would risk, reintroducing the failed-vs-stopped bug. workersvc.Store exposes
+// no transaction seam, so this single combined statement IS the atomicity. It is used
+// ONLY for the two stop verdicts, so the stamp is unconditional (no IS NOT NULL guard
+// and thus no parameter-type-inference pitfall). The stamp lands while the run is
+// still non-terminal (awaiting_approval/running); the client's terminal-guarded
 // isStoppedRun ignores it until the run actually reaches failed/cancelled.
-func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) (RunUserInput, error) {
-	row := q.db.QueryRow(ctx, createRunInput,
+func (q *Queries) CreateStopVerdictInput(ctx context.Context, arg CreateStopVerdictInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, createStopVerdictInput,
 		arg.RunID,
 		arg.Kind,
 		arg.Body,

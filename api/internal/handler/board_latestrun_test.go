@@ -55,12 +55,15 @@ func TestMapLatestRun(t *testing.T) {
 		}
 	})
 
-	t.Run("another owner's run is not mine; owner_name is empty when display name absent (email NOT used)", func(t *testing.T) {
+	t.Run("another owner's run is not mine: no email, failure_reason gated, stop_kind exposed", func(t *testing.T) {
 		otherOwner := uuid.New()
-		// The query no longer selects the email, so mapLatestRun has only the display
-		// name to work with. A run whose owner has no display name shows an empty
-		// owner_name — never the email (PRD #33 Decision 5, the anti-leak guarantee).
-		dto := mapLatestRun(runID, otherOwner, "running", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(),
+		// A non-owner viewer of a shared board: owner_name is empty when the display
+		// name is absent (never the email — Decision 5, the anti-leak guarantee), and
+		// failure_reason is withheld even though the run has one (it can carry a verbatim
+		// reject reason or a raw agent error). stop_kind (a non-sensitive enum) stays
+		// visible so the badge can still classify the run as stopped.
+		dto := mapLatestRun(runID, otherOwner, "failed", pgtype.Int8{}, nullTxt(),
+			txt("panic: raw agent internals"), txt("plan_rejected"),
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
@@ -74,8 +77,14 @@ func TestMapLatestRun(t *testing.T) {
 		if dto.MrIID != nil {
 			t.Fatalf("null mr_iid should map to nil, got %v", *dto.MrIID)
 		}
-		if dto.FailureReason != nil || dto.WorkerName != nil {
-			t.Fatalf("null failure_reason/worker_name should map to nil: %+v", dto)
+		if dto.FailureReason != nil {
+			t.Fatalf("failure_reason must be withheld from a non-owner viewer, got %q", *dto.FailureReason)
+		}
+		if dto.StopKind == nil || *dto.StopKind != "plan_rejected" {
+			t.Fatalf("stop_kind must stay exposed to a non-owner viewer, got %v", dto.StopKind)
+		}
+		if dto.WorkerName != nil {
+			t.Fatalf("null worker_name should map to nil: %+v", dto)
 		}
 	})
 
@@ -104,7 +113,7 @@ func TestAssembleCards(t *testing.T) {
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
 		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", MrIid: i8(5), MrState: txt("closed"),
-			OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+			FailureReason: txt("raw agent internals"), OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running",
 			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 	}
@@ -148,6 +157,10 @@ func TestAssembleCards(t *testing.T) {
 	}
 	if byIID[20].LatestRun.MrState == nil || *byIID[20].LatestRun.MrState != "closed" {
 		t.Fatalf("issue 20: mr_state should flow through, got %v", byIID[20].LatestRun.MrState)
+	}
+	// Decision 5: another owner's failure_reason is withheld from this viewer.
+	if byIID[20].LatestRun.FailureReason != nil {
+		t.Fatalf("issue 20: failure_reason must be withheld from a non-owner viewer, got %q", *byIID[20].LatestRun.FailureReason)
 	}
 	// (4) run_count keys onto the right issue (drives the "×N" retry hint).
 	if byIID[20].LatestRun.RunCount != 2 {
