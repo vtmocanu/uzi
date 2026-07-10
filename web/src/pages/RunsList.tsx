@@ -188,7 +188,17 @@ export function RunsList() {
             ) : (
               <ul className="space-y-2">
                 {adminRuns.map((r) => (
-                  <RunRow key={r.id} run={r} showOwner />
+                  <RunRow
+                    key={r.id}
+                    run={r}
+                    showOwner
+                    // Only the current admin's OWN queued rows can show the vault state —
+                    // another owner's vault status is unknown here (PRD #32), so theirs
+                    // render as plain "queued".
+                    waitingForVault={
+                      !vaultUnlocked && r.status === "queued" && r.owner_email === user?.email
+                    }
+                  />
                 ))}
               </ul>
             )}

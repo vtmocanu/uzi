@@ -31,6 +31,22 @@ func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"settings": all})
 }
 
+// VaultMigration reports how many stored user secrets still use the legacy
+// master-key sealing (PRD #32): an admin-visible migration-progress signal so the
+// operator can see who has not unlocked since the vault rolled out. New saves are
+// born 'dek' and lazy rewrap flips old rows on unlock, so a healthy instance
+// trends to zero. Admin-only (mounted under the admin group). It never exposes any
+// secret value or per-user identity — only the count.
+func (h *Handler) VaultMigration(w http.ResponseWriter, r *http.Request) {
+	n, err := h.q.CountMasterSealedSecrets(r.Context())
+	if err != nil {
+		slog.Error("count master-sealed secrets", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"master_sealed": n})
+}
+
 // UpdateSettings writes one or more settings (admin only), validating per
 // Decision 8: each value non-empty, ≤ 64 chars, no comma; unknown keys
 // rejected; and the cross-key rule prd_label != autopilot_label checked against

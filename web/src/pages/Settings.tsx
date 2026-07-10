@@ -223,8 +223,8 @@ export function Settings() {
             />
           </Field>
           <p className="text-xs text-faint">
-            Encrypted with your login password (PRD #32). If you forget your password this token
-            cannot be recovered and must be re-entered.
+            Encrypted with your login password. If you forget your password this token cannot be
+            recovered and must be re-entered.
           </p>
           <Button type="submit" disabled={busy || token.trim() === ""}>
             {meta ? "Save new token" : "Save token"}
@@ -255,14 +255,16 @@ export function Settings() {
           <SectionTitle>Vault</SectionTitle>
           <p className="mt-2 text-sm text-muted">
             Your Anthropic token is sealed with a key derived from your login password, so it is
-            readable only while your vault is unlocked in this session (PRD #32). It unlocks
+            readable only while your vault is unlocked in this session. It unlocks
             automatically when you log in and stays unlocked — including overnight — until you lock it
             or the server restarts. While locked, your agents pause: new runs wait as{" "}
             <em>waiting for vault unlock</em> rather than failing.
           </p>
         </div>
 
-        {vaultNotice && <Alert tone="success" message={vaultNotice} />}
+        {/* Info (not success/green): locking flips the badge amber, so a green
+            "success" toast would clash with the color language. */}
+        {vaultNotice && <Alert tone="info" message={vaultNotice} />}
 
         <div className="flex items-center justify-between rounded-lg border border-edge bg-raised/60 px-4 py-3">
           <VaultBadge />

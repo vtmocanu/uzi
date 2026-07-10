@@ -225,6 +225,9 @@ export const mockApi = {
   // Mirrors the server's Decision 8 validation so the demo surfaces the same
   // rejection messages the real API would.
   getSettings: async () => delay({ settings: { ...appSettings } }),
+  // Demo is fully DEK-sealed (no legacy rows), so the admin migration notice is
+  // hidden; the wiring is still exercised by the AdminSettings unit test.
+  vaultMigration: async () => delay({ master_sealed: 0 }),
   updateSettings: async (updates: Partial<AppSettings>) => {
     const merged = { ...appSettings, ...updates };
     for (const [key, value] of Object.entries(updates)) {

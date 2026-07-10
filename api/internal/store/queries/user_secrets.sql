@@ -27,6 +27,14 @@ ORDER BY kind;
 -- name: DeleteUserSecret :execrows
 DELETE FROM user_secrets WHERE user_id = $1 AND kind = $2;
 
+-- name: CountMasterSealedSecrets :one
+-- Admin migration-progress signal (PRD #32): how many stored user secrets still
+-- use the legacy master-key sealing — i.e. owners who have not unlocked since the
+-- vault rolled out. New saves are born 'dek' and lazy rewrap flips old rows on the
+-- owner's next unlock, so this trends to zero; a persistently non-zero count flags
+-- dormant accounts an operator may want to nudge.
+SELECT count(*) FROM user_secrets WHERE sealed_with = 'master';
+
 -- name: ListMasterSealedSecrets :many
 -- The user's still-legacy secrets, for lazy rewrap on unlock (PRD #32): the vault
 -- opens each with the master box, reseals under the DEK, and flips it to 'dek'

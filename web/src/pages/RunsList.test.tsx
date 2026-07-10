@@ -10,7 +10,10 @@ import { useAuth } from "../auth/AuthContext";
 // list renders offline. A non-admin viewer skips the admin fetches.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  return { ...actual, api: { listRuns: vi.fn() } };
+  return {
+    ...actual,
+    api: { listRuns: vi.fn(), adminListRuns: vi.fn(), adminListWorkers: vi.fn() },
+  };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
@@ -75,6 +78,33 @@ describe("RunsList — waiting for vault unlock (PRD #32)", () => {
     expect(screen.getByText(/waiting for vault unlock/)).toBeTruthy();
     // The bare "queued" pill must not also render for that run.
     expect(screen.queryByText("queued")).toBeNull();
+  });
+
+  it("admin all-users list: only the admin's OWN queued row shows waiting-for-unlock", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: false,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "mine", issue_title: "My queued", status: "queued", owner_email: "me@uzi.test" }),
+        aRun({ id: "theirs", issue_title: "Their queued", status: "queued", owner_email: "other@uzi.test" }),
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("My queued")).toBeTruthy());
+    // Exactly one waiting badge — the admin's own row; the other owner's row stays
+    // a plain "queued" pill (their vault state is unknown here).
+    expect(screen.getAllByText(/waiting for vault unlock/)).toHaveLength(1);
+    expect(screen.getByText("queued")).toBeTruthy();
   });
 
   it("renders a plain queued pill when the vault is unlocked", async () => {

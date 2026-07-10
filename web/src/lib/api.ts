@@ -585,6 +585,9 @@ const realApi = {
   getSettings: () => request<{ settings: AppSettings }>("GET", "/admin/settings"),
   updateSettings: (settings: Partial<AppSettings>) =>
     request<{ settings: AppSettings }>("PUT", "/admin/settings", { settings }),
+  // Vault migration progress (PRD #32): count of stored secrets still master-sealed
+  // (owners who have not unlocked since the vault rolled out). Admin-only.
+  vaultMigration: () => request<{ master_sealed: number }>("GET", "/admin/vault-migration"),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),

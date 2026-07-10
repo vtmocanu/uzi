@@ -12,6 +12,22 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countMasterSealedSecrets = `-- name: CountMasterSealedSecrets :one
+SELECT count(*) FROM user_secrets WHERE sealed_with = 'master'
+`
+
+// Admin migration-progress signal (PRD #32): how many stored user secrets still
+// use the legacy master-key sealing — i.e. owners who have not unlocked since the
+// vault rolled out. New saves are born 'dek' and lazy rewrap flips old rows on the
+// owner's next unlock, so this trends to zero; a persistently non-zero count flags
+// dormant accounts an operator may want to nudge.
+func (q *Queries) CountMasterSealedSecrets(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countMasterSealedSecrets)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteUserSecret = `-- name: DeleteUserSecret :execrows
 DELETE FROM user_secrets WHERE user_id = $1 AND kind = $2
 `
