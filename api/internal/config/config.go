@@ -322,19 +322,21 @@ func Load() (Config, error) {
 	cfg.ProposalRateLimitMax = parseInt("PROPOSAL_RATE_LIMIT_MAX", 20)
 	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalConfirmStuckTimeout = parseDuration("PROPOSAL_CONFIRM_STUCK_TIMEOUT", 2*time.Minute)
-	// LOAD-BEARING correctness invariant (auditor Minor) — REFUSE TO START on violation,
-	// matching the placeholder-key/refuse-on-misconfig posture above. The stuck-confirming
-	// sweep must NEVER revert a proposal to pending while its CreateIssue is still in
-	// flight: if it did, the forge call could then succeed while MarkProposalConfirmed
-	// (guarded on status='confirming') finds 'pending' -> 0 rows, leaving a real issue
-	// created but the proposal re-confirmable into a DUPLICATE — exactly what claim-first
-	// removed. The in-flight confirm window is bounded by FORGE_HTTP_TIMEOUT, so the sweep
-	// timeout MUST exceed it by a margin (>= FORGE_HTTP_TIMEOUT + 30s). This is a
-	// correctness ordering, not a tuning knob, so a bad value is a loud boot failure
-	// (not a silent clamp), naming both env vars. Defaults (15s vs 2m) are safe.
-	if minStuck := cfg.ForgeHTTPTimeout + 30*time.Second; cfg.ProposalConfirmStuckTimeout > 0 && cfg.ProposalConfirmStuckTimeout < minStuck {
-		return Config{}, fmt.Errorf("PROPOSAL_CONFIRM_STUCK_TIMEOUT (%s) must exceed FORGE_HTTP_TIMEOUT (%s) by at least 30s (need >= %s): otherwise the stuck-confirming sweep could revert a proposal while its CreateIssue is still in flight, and a later re-confirm would create a duplicate issue",
-			cfg.ProposalConfirmStuckTimeout, cfg.ForgeHTTPTimeout, minStuck)
+	// LOAD-BEARING ordering invariant (reviewer + auditor): the stuck-confirming sweep
+	// must NEVER revert a proposal to pending while a legitimately-slow CreateIssue is
+	// still in flight. If it did, the forge call could then succeed while
+	// MarkProposalConfirmed (guarded on status='confirming') finds 'pending' -> 0 rows,
+	// leaving a real issue created but the proposal re-confirmable into a DUPLICATE —
+	// exactly what claim-first removed. The in-flight confirm window is bounded by
+	// ForgeHTTPTimeout, so the sweep timeout MUST sit safely above it. Clamp up (never
+	// trust a low operator value) with a full ForgeHTTPTimeout of margin, and warn.
+	// 0 means the sweep is disabled, so it is left alone.
+	if floor := 2 * cfg.ForgeHTTPTimeout; cfg.ProposalConfirmStuckTimeout > 0 && cfg.ProposalConfirmStuckTimeout < floor {
+		slog.Warn("PROPOSAL_CONFIRM_STUCK_TIMEOUT is not safely above FORGE_HTTP_TIMEOUT; clamping up to protect the confirm ordering invariant (else a slow forge write could be reverted mid-flight and re-confirmed into a duplicate issue)",
+			"configured", cfg.ProposalConfirmStuckTimeout.String(),
+			"forge_http_timeout", cfg.ForgeHTTPTimeout.String(),
+			"clamped_to", floor.String())
+		cfg.ProposalConfirmStuckTimeout = floor
 	}
 
 	cfg.CIWatchRunWindow = parseDuration("CI_WATCH_RUN_WINDOW", 14*24*time.Hour)

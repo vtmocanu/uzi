@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -232,6 +233,10 @@ func proposalToDTO(p store.IssueProposal) proposalDTO {
 }
 
 type workerProposalRequest struct {
+	// RepoPath (path_with_namespace, e.g. "group/project") is what the agent sends —
+	// the read endpoints expose repo_path, not internal UUIDs (Decision 7). RepoID is
+	// accepted too for back-compat; RepoPath wins when both are present.
+	RepoPath    string   `json:"repo_path"`
 	RepoID      string   `json:"repo_id"`
 	Title       string   `json:"title"`
 	Description string   `json:"description"`
@@ -260,9 +265,30 @@ func (h *Handler) WorkerCreateProposal(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	repoID, err := uuid.Parse(req.RepoID)
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid repo_id")
+	// Resolve the target repo. The agent sends repo_path (it never sees internal
+	// UUIDs); repo_id is accepted for back-compat. Path resolution is user-scoped, so
+	// an unknown/foreign path is 404.
+	var repoID uuid.UUID
+	switch {
+	case strings.TrimSpace(req.RepoPath) != "":
+		repoID, err = h.wsvc.ResolveRepoForWorker(r.Context(), wkr, strings.TrimSpace(req.RepoPath))
+		if err != nil {
+			if errors.Is(err, workersvc.ErrRepoNotFound) {
+				httpx.Error(w, http.StatusNotFound, "repo not found for this worker's user")
+				return
+			}
+			slog.Error("worker create proposal: resolve repo path", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	case req.RepoID != "":
+		repoID, err = uuid.Parse(req.RepoID)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid repo_id")
+			return
+		}
+	default:
+		httpx.Error(w, http.StatusBadRequest, "repo_path is required")
 		return
 	}
 	title := req.Title
