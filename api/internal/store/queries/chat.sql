@@ -127,13 +127,62 @@ FROM issue_proposals p
 JOIN runs r ON r.id = p.run_id
 WHERE p.id = @id AND p.run_id = @run_id AND r.user_id = @user_id AND r.kind = 'chat';
 
--- name: MarkProposalConfirmed :one
--- Confirm a proposal AFTER the forge CreateIssue succeeded, stamping the created
--- issue iid. Guarded on status='pending' so a double-confirm (or a race with a
--- dismiss) touches nothing (0 rows) rather than re-opening a second issue.
-UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = @created_issue_iid, resolved_at = now()
-WHERE id = @id AND status = 'pending'
+-- name: CreateIssueProposal :one
+-- The worker's propose_issue tool creates a PENDING proposal (PRD #39 M3, Decision
+-- 8). It NEVER touches the forge — only the browser's confirm does. The handler has
+-- already verified the target run is the worker's user's chat run and repo_id is a
+-- repo they own, and enforced the per-run pending cap. labels is a JSON array.
+INSERT INTO issue_proposals (run_id, repo_id, title, description, labels)
+VALUES (@run_id, @repo_id, @title, @description, @labels)
 RETURNING *;
+
+-- name: CountPendingProposalsForRun :one
+-- Per-run pending-proposal cap (Decision 7/8): a prompt-injected loop can mass-create
+-- inert proposal rows, so proposal creation is refused once a run already holds this
+-- many pending (unresolved) proposals.
+SELECT count(*) FROM issue_proposals WHERE run_id = @run_id AND status = 'pending';
+
+-- name: ClaimProposalForConfirm :one
+-- Claim-first confirmation, phase 1 (PRD #39 M3, audit Minor #1): atomically move a
+-- PENDING proposal to 'confirming' BEFORE the forge CreateIssue, user-scoped through
+-- the owning chat run. The status='pending' guard + row lock make this the single
+-- serialization point: of two concurrent confirms exactly one flips pending ->
+-- confirming (and reaches the forge); the other matches 0 rows -> 409. Returns the
+-- draft the handler writes to the forge.
+UPDATE issue_proposals p SET status = 'confirming', confirming_since = now()
+FROM runs r
+WHERE p.id = @id AND p.run_id = @run_id AND p.status = 'pending'
+  AND r.id = p.run_id AND r.user_id = @user_id AND r.kind = 'chat'
+RETURNING p.id, p.run_id, p.repo_id, p.title, p.description, p.labels;
+
+-- name: MarkProposalConfirmed :one
+-- Claim-first confirmation, phase 2: stamp the created issue iid AFTER the forge
+-- CreateIssue succeeded. Guarded on status='confirming' (the state ClaimProposalForConfirm
+-- left it in), so it only ever settles a proposal this same flow claimed. Clears the
+-- transient confirming_since marker.
+UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = @created_issue_iid, resolved_at = now(), confirming_since = NULL
+WHERE id = @id AND status = 'confirming'
+RETURNING *;
+
+-- name: RevertProposalToPending :execrows
+-- Claim-first confirmation, failure path: return a claimed proposal to 'pending' when
+-- the forge CreateIssue (or a step after the claim) failed, so the user can retry or
+-- dismiss it. Guarded on status='confirming' so it can only undo an in-flight claim.
+-- Clears confirming_since (no longer in flight).
+UPDATE issue_proposals SET status = 'pending', confirming_since = NULL
+WHERE id = @id AND status = 'confirming';
+
+-- name: SweepStuckConfirmingProposals :many
+-- Recover proposals stranded in 'confirming' by a confirm handler that was killed
+-- after the claim committed but before it settled/reverted (the crash window). Any
+-- 'confirming' row older than the cutoff (now - PROPOSAL_CONFIRM_STUCK_TIMEOUT) goes
+-- back to pending so the user can retry or dismiss it — the not-trusting-the-process
+-- backstop, mirroring SweepClaimedNeverStarted for stale run claims. The cutoff sits
+-- well above the forge HTTP timeout, so a legitimately in-flight confirm is never
+-- reaped. RETURNING id for the sweep's count/log.
+UPDATE issue_proposals SET status = 'pending', confirming_since = NULL
+WHERE status = 'confirming' AND confirming_since IS NOT NULL AND confirming_since < @cutoff
+RETURNING id;
 
 -- name: MarkProposalDismissed :one
 -- Dismiss a proposal. Status-only, never a forge write (Decision 8) — dismissing

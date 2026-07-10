@@ -44,6 +44,28 @@ var (
 	// ErrProposalNotPending is returned when a confirm/dismiss targets a proposal
 	// that was already resolved (idempotency guard against a double click / race).
 	ErrProposalNotPending = errors.New("proposal already resolved")
+	// ErrProposalRunNotChat rejects a propose_issue against a non-chat run (M3):
+	// only a chat conversation proposes issues.
+	ErrProposalRunNotChat = errors.New("proposal target is not a chat run")
+	// ErrProposalCapReached rejects proposal creation once a run already holds
+	// MaxPendingProposalsPerRun unresolved proposals (anti-spam, Decision 7/8).
+	ErrProposalCapReached = errors.New("too many pending proposals for this chat")
+)
+
+// MaxPendingProposalsPerRun caps how many unresolved (pending) proposals a single
+// chat run may hold at once — the per-run half of the proposal anti-spam controls
+// (the per-worker creation rate limiter is the other half). A prompt-injected loop
+// can create at most this many inert rows before it must wait for the human to
+// confirm/dismiss.
+const MaxPendingProposalsPerRun = 10
+
+// Proposal field caps (M3): title mirrors the forge issue-title cap; the label set
+// is bounded in count and each label in length so a runaway tool call can't store an
+// unbounded blob. Description reuses MaxIssueDescriptionBytes.
+const (
+	MaxProposalTitleBytes = 255
+	MaxProposalLabels     = 20
+	MaxProposalLabelBytes = 255
 )
 
 // -------------------------------------------------------------------------
@@ -327,10 +349,41 @@ func (s *Service) GetChatProposal(ctx context.Context, userID, runID, propID uui
 	return row, nil
 }
 
-// ConfirmProposal records a proposal as confirmed with the forge issue iid the
-// handler just created (forge-first — the handler does the CreateIssue, then calls
-// this). The status='pending' guard means a lost race (a concurrent confirm/dismiss
-// won) yields ErrProposalNotPending rather than re-recording.
+// ClaimProposalForConfirm is claim-first confirmation phase 1 (M3, audit Minor #1):
+// it atomically moves a PENDING proposal to 'confirming' BEFORE the handler's forge
+// CreateIssue, user-scoped through the owning chat run, so of two concurrent confirms
+// exactly one wins the claim (the other gets ErrProposalNotPending). It returns the
+// draft the handler writes to the forge. On the 0-row path it does one follow-up read
+// to tell not-found/not-owned (ErrProposalNotFound → 404) from already-resolved-or-
+// in-flight (ErrProposalNotPending → 409).
+func (s *Service) ClaimProposalForConfirm(ctx context.Context, userID, runID, propID uuid.UUID) (store.ClaimProposalForConfirmRow, error) {
+	row, err := s.q.ClaimProposalForConfirm(ctx, store.ClaimProposalForConfirmParams{
+		ID: propID, RunID: runID, UserID: userID,
+	})
+	if err == nil {
+		return row, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.ClaimProposalForConfirmRow{}, err
+	}
+	// The claim matched no pending row: distinguish a genuinely absent/foreign
+	// proposal from one that exists but is no longer pending (resolved or a
+	// concurrent confirm in flight).
+	if _, gerr := s.q.GetChatProposalForConfirm(ctx, store.GetChatProposalForConfirmParams{
+		ID: propID, RunID: runID, UserID: userID,
+	}); gerr != nil {
+		if errors.Is(gerr, pgx.ErrNoRows) {
+			return store.ClaimProposalForConfirmRow{}, ErrProposalNotFound
+		}
+		return store.ClaimProposalForConfirmRow{}, gerr
+	}
+	return store.ClaimProposalForConfirmRow{}, ErrProposalNotPending
+}
+
+// ConfirmProposal is claim-first phase 2: stamp the created issue iid after the forge
+// CreateIssue succeeded. Guarded on status='confirming' (the state
+// ClaimProposalForConfirm left the row in), so it only ever settles a proposal this
+// same flow claimed.
 func (s *Service) ConfirmProposal(ctx context.Context, propID uuid.UUID, issueIID int64) error {
 	if _, err := s.q.MarkProposalConfirmed(ctx, store.MarkProposalConfirmedParams{
 		ID:              propID,
@@ -344,6 +397,15 @@ func (s *Service) ConfirmProposal(ctx context.Context, propID uuid.UUID, issueII
 	return nil
 }
 
+// RevertProposalToPending returns a claimed ('confirming') proposal to 'pending' when
+// a step after the claim failed (repo gone, forge build, forge CreateIssue), so the
+// user can retry or dismiss it. Best-effort: the caller logs a non-nil error but the
+// user still sees the underlying failure.
+func (s *Service) RevertProposalToPending(ctx context.Context, propID uuid.UUID) error {
+	_, err := s.q.RevertProposalToPending(ctx, propID)
+	return err
+}
+
 // DismissProposal flips a proposal to dismissed. Status-only — it NEVER touches the
 // forge (Decision 8: dismissing provably writes nothing).
 func (s *Service) DismissProposal(ctx context.Context, propID uuid.UUID) error {
@@ -354,6 +416,105 @@ func (s *Service) DismissProposal(ctx context.Context, propID uuid.UUID) error {
 		return err
 	}
 	return nil
+}
+
+// CreateProposal creates a PENDING issue proposal from the worker's propose_issue
+// tool (M3, Decision 8). It NEVER touches the forge — only the browser's confirm
+// does. It verifies the target run is the worker's user's chat run and still
+// non-terminal, that repo_id is a repo that user owns, and that the run is under the
+// per-run pending cap. labelsJSON is the already-marshaled JSON array (the handler
+// validated the label bounds).
+func (s *Service) CreateProposal(ctx context.Context, wkr store.Worker, runID, repoID uuid.UUID, title, description string, labelsJSON []byte) (store.IssueProposal, error) {
+	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.IssueProposal{}, ErrRunNotFound
+		}
+		return store.IssueProposal{}, err
+	}
+	if run.Kind != RunKindChat {
+		return store.IssueProposal{}, ErrProposalRunNotChat
+	}
+	if terminalStatuses[run.Status] {
+		return store.IssueProposal{}, ErrRunTerminal
+	}
+	// The target issue repo must belong to the same user (never trust a worker-
+	// supplied repo_id blindly).
+	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: wkr.UserID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.IssueProposal{}, ErrRepoNotFound
+		}
+		return store.IssueProposal{}, err
+	}
+	count, err := s.q.CountPendingProposalsForRun(ctx, runID)
+	if err != nil {
+		return store.IssueProposal{}, err
+	}
+	if count >= MaxPendingProposalsPerRun {
+		return store.IssueProposal{}, ErrProposalCapReached
+	}
+	return s.q.CreateIssueProposal(ctx, store.CreateIssueProposalParams{
+		RunID: runID, RepoID: repoID, Title: title, Description: description, Labels: labelsJSON,
+	})
+}
+
+// ListRunsForWorker returns a bounded, newest-first list of the worker's USER's runs
+// (both kinds — the chat agent investigates issue runs too), Decision 7. limit is
+// clamped to [1, workerRunsMaxLimit].
+func (s *Service) ListRunsForWorker(ctx context.Context, wkr store.Worker, limit int) ([]store.ListRunsForWorkerUserRow, error) {
+	return s.q.ListRunsForWorkerUser(ctx, store.ListRunsForWorkerUserParams{
+		UserID: wkr.UserID,
+		Lim:    int32(clampLimit(limit, workerRunsDefaultLimit, workerRunsMaxLimit)),
+	})
+}
+
+// GetRunForWorker returns one run's detail scoped to the worker's user; a foreign or
+// unknown id is ErrRunNotFound (404), never a bare run_id lookup (Decision 7).
+func (s *Service) GetRunForWorker(ctx context.Context, wkr store.Worker, runID uuid.UUID) (store.GetRunForWorkerUserRow, error) {
+	row, err := s.q.GetRunForWorkerUser(ctx, store.GetRunForWorkerUserParams{ID: runID, UserID: wkr.UserID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.GetRunForWorkerUserRow{}, ErrRunNotFound
+		}
+		return store.GetRunForWorkerUserRow{}, err
+	}
+	return row, nil
+}
+
+// ListRunMessagesForWorker returns a bounded page of a run's messages after a seq.
+// Authorization is enforced first (the run must be the worker's user's — a foreign id
+// is ErrRunNotFound), so this is never a bare run_id message read (Decision 7).
+func (s *Service) ListRunMessagesForWorker(ctx context.Context, wkr store.Worker, runID uuid.UUID, afterSeq int32, limit int) ([]store.RunMessage, error) {
+	if _, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrRunNotFound
+		}
+		return nil, err
+	}
+	return s.q.ListRunMessagesForWorkerPage(ctx, store.ListRunMessagesForWorkerPageParams{
+		RunID:    runID,
+		AfterSeq: afterSeq,
+		Lim:      int32(clampLimit(limit, workerMessagesDefaultLimit, workerMessagesMaxLimit)),
+	})
+}
+
+// Worker read paging bounds (Decision 7: bounded responses).
+const (
+	workerRunsDefaultLimit     = 50
+	workerRunsMaxLimit         = 50
+	workerMessagesDefaultLimit = 200
+	workerMessagesMaxLimit     = 200
+)
+
+// clampLimit returns limit clamped to [1, max], or def when limit <= 0 (unset).
+func clampLimit(limit, def, max int) int {
+	if limit <= 0 {
+		return def
+	}
+	if limit > max {
+		return max
+	}
+	return limit
 }
 
 // -------------------------------------------------------------------------

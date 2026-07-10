@@ -202,6 +202,16 @@ type Config struct {
 	ChatMaxTurns          int
 	ChatRateLimitMax      int
 	ChatRateLimitWindow   time.Duration
+	// ProposalRateLimit* is the per-worker budget on the propose_issue endpoint
+	// (PRD #39 M3): a spam guard complementing the per-run pending-proposal cap, so a
+	// prompt-injected worker cannot mass-create proposals across its user's chats.
+	ProposalRateLimitMax    int
+	ProposalRateLimitWindow time.Duration
+	// ProposalConfirmStuckTimeout is how long a proposal may sit in the transient
+	// 'confirming' state before the sweeper reverts it to pending (PRD #39 M3): the
+	// recovery for a confirm handler killed after the claim but before it settled.
+	// Above the forge HTTP timeout so an in-flight confirm is never reaped. 0 disables it.
+	ProposalConfirmStuckTimeout time.Duration
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -309,6 +319,25 @@ func Load() (Config, error) {
 	cfg.ChatMaxTurns = parseInt("CHAT_MAX_TURNS", 50)
 	cfg.ChatRateLimitMax = parseInt("CHAT_RATE_LIMIT_MAX", 60)
 	cfg.ChatRateLimitWindow = parseDuration("CHAT_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.ProposalRateLimitMax = parseInt("PROPOSAL_RATE_LIMIT_MAX", 20)
+	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.ProposalConfirmStuckTimeout = parseDuration("PROPOSAL_CONFIRM_STUCK_TIMEOUT", 2*time.Minute)
+	// LOAD-BEARING ordering invariant (reviewer + auditor): the stuck-confirming sweep
+	// must NEVER revert a proposal to pending while a legitimately-slow CreateIssue is
+	// still in flight. If it did, the forge call could then succeed while
+	// MarkProposalConfirmed (guarded on status='confirming') finds 'pending' -> 0 rows,
+	// leaving a real issue created but the proposal re-confirmable into a DUPLICATE —
+	// exactly what claim-first removed. The in-flight confirm window is bounded by
+	// ForgeHTTPTimeout, so the sweep timeout MUST sit safely above it. Clamp up (never
+	// trust a low operator value) with a full ForgeHTTPTimeout of margin, and warn.
+	// 0 means the sweep is disabled, so it is left alone.
+	if floor := 2 * cfg.ForgeHTTPTimeout; cfg.ProposalConfirmStuckTimeout > 0 && cfg.ProposalConfirmStuckTimeout < floor {
+		slog.Warn("PROPOSAL_CONFIRM_STUCK_TIMEOUT is not safely above FORGE_HTTP_TIMEOUT; clamping up to protect the confirm ordering invariant (else a slow forge write could be reverted mid-flight and re-confirmed into a duplicate issue)",
+			"configured", cfg.ProposalConfirmStuckTimeout.String(),
+			"forge_http_timeout", cfg.ForgeHTTPTimeout.String(),
+			"clamped_to", floor.String())
+		cfg.ProposalConfirmStuckTimeout = floor
+	}
 
 	cfg.CIWatchRunWindow = parseDuration("CI_WATCH_RUN_WINDOW", 14*24*time.Hour)
 	// parseNonNegInt: 0 is legitimate here — it disables the pipeline sync.

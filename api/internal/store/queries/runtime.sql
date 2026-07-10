@@ -382,6 +382,44 @@ FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
 
+-- Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
+-- The chat agent investigates its OWNER'S runs (both kinds) via the worker. These
+-- queries are USER_ID-scoped (from the authenticated worker), NEVER a bare run_id
+-- lookup — a compromised worker still reads only its own user's runs, and a foreign
+-- run id simply returns no row (404). repo_web_url rides along so the handler can
+-- build the MR URL; a chat run has no repo, so repo fields are NULL (LEFT JOIN).
+
+-- name: ListRunsForWorkerUser :many
+-- Compact list of the worker's user's runs, newest first, bounded by @lim.
+SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
+       r.failure_reason, r.created_at, r.updated_at,
+       rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.user_id = @user_id
+ORDER BY r.created_at DESC
+LIMIT @lim;
+
+-- name: GetRunForWorkerUser :one
+-- One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
+SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r.mr_state,
+       r.failure_reason, r.stop_kind, r.fix_verdict, r.iteration_count, r.plan_md,
+       r.created_at, r.updated_at,
+       rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.id = @id AND r.user_id = @user_id;
+
+-- name: ListRunMessagesForWorkerPage :many
+-- A bounded page of a run's messages after a seq (the worker read tool's paging).
+-- Authorization (the run is the worker's user's) is checked by the caller before
+-- this; here @lim caps the page so a single response can't be unbounded.
+SELECT id, run_id, seq, kind, agent, payload, created_at
+FROM run_messages
+WHERE run_id = @run_id AND seq > @after_seq
+ORDER BY seq ASC
+LIMIT @lim;
+
 -- User inputs (steering) ---------------------------------------------------
 
 -- name: CreateRunInput :one
