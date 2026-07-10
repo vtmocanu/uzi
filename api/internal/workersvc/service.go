@@ -120,7 +120,10 @@ type Store interface {
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) ([]byte, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
-	ListAgentTemplates(ctx context.Context) ([]store.AgentTemplate, error)
+	// ListClaimAgentTemplates resolves template allocations for the run owner
+	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
+	// owner's own allocated user templates ride the claim, not every template.
+	ListClaimAgentTemplates(ctx context.Context, userID pgtype.UUID) ([]store.AgentTemplate, error)
 	ListRunSkillAllocations(ctx context.Context, userID pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error)
 	// Tier-1 tool provisioning (PRD #18 M4): the run owner's per-repo package list
 	// and the admin allowlist it is re-validated against at claim time.
@@ -340,9 +343,13 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
 	}
 
-	templates, err := s.q.ListAgentTemplates(ctx)
+	// Only the templates allocated to this run's owner ride the claim (PRD #18
+	// M7): builtin/global defaults ± the owner's overlay + the owner's own
+	// allocated user templates. The reserved-name check (M6) guarantees at most
+	// one lead-matching template can exist, so the payload can never carry two.
+	templates, err := s.q.ListClaimAgentTemplates(ctx, pgUUID(run.UserID))
 	if err != nil {
-		return nil, fmt.Errorf("list agent templates: %w", err)
+		return nil, fmt.Errorf("list claim agent templates: %w", err)
 	}
 
 	// The run owner's per-user default model overrides the lead template's model

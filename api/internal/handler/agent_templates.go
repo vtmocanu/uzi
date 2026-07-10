@@ -277,7 +277,17 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row, err := h.q.CreateAgentTemplate(r.Context(), store.CreateAgentTemplateParams{
+	ctx := r.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		slog.Error("begin create template tx", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
+	qtx := h.q.WithTx(tx)
+
+	row, err := qtx.CreateAgentTemplate(ctx, store.CreateAgentTemplateParams{
 		Name:        name,
 		Description: fields.description,
 		Model:       fields.model,
@@ -293,6 +303,21 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("create agent template", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// A new global template is a global default from creation (removable via the
+	// allocation UI). No empty-means-all cliff (PRD #18 M7). User templates are
+	// delivered only via the owner's own overlay, so they get no default row.
+	if scope == "global" {
+		if err := qtx.InsertSharedTemplateAllocation(ctx, row.ID); err != nil {
+			slog.Error("seed global template allocation", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("commit create template tx", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}

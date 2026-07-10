@@ -126,6 +126,115 @@ func TestAgentTemplateScopesLiveDB(t *testing.T) {
 	}
 }
 
+// TestTemplateAllocationsLiveDB pins the PRD #18 M7 allocation resolution the
+// claim depends on: a user overlay (enabled) wins over the global default; absent
+// an overlay the global default decides; a user template rides only its owner's
+// claim (and only when the owner allocated it); no empty-means-all cliff.
+func TestTemplateAllocationsLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	suffix := uuid.NewString()[:8]
+	userA, userB := uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{userA, userB} {
+		mustExec(ctx, t, pool,
+			`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			id, fmt.Sprintf("alloc-%s-%s@e2e", suffix, id))
+	}
+
+	// g1: a global default (shared row seeded). g2: a global with its default
+	// removed (no shared row). ua: userA's private template.
+	g1 := mustCreateTemplate(ctx, t, q, "g1-"+suffix, "global", uuid.Nil)
+	g2 := mustCreateTemplate(ctx, t, q, "g2-"+suffix, "global", uuid.Nil)
+	ua := mustCreateTemplate(ctx, t, q, "ua-"+suffix, "user", userA)
+
+	if err := q.InsertSharedTemplateAllocation(ctx, g1.ID); err != nil {
+		t.Fatalf("seed g1 default: %v", err)
+	}
+	// userA overlay: force g1 OFF, force g2 ON, enable own ua.
+	for _, o := range []struct {
+		id      uuid.UUID
+		enabled bool
+	}{{g1.ID, false}, {g2.ID, true}, {ua.ID, true}} {
+		if err := q.InsertUserTemplateAllocation(ctx, store.InsertUserTemplateAllocationParams{
+			TemplateID: o.id, UserID: pgUUID(userA), Enabled: o.enabled,
+		}); err != nil {
+			t.Fatalf("insert userA overlay: %v", err)
+		}
+	}
+
+	claimNames := func(who uuid.UUID) map[string]bool {
+		rows, err := q.ListClaimAgentTemplates(ctx, pgUUID(who))
+		if err != nil {
+			t.Fatalf("list claim templates: %v", err)
+		}
+		out := map[string]bool{}
+		for _, tmpl := range rows {
+			out[tmpl.Name] = true
+		}
+		return out
+	}
+
+	// userA: overlay wins — g2 + ua delivered, g1 suppressed.
+	a := claimNames(userA)
+	if a[g1.Name] {
+		t.Error("userA overlay force-off must suppress the global default g1")
+	}
+	if !a[g2.Name] || !a[ua.Name] {
+		t.Errorf("userA overlay force-on must deliver g2 + own ua; got %v", a)
+	}
+
+	// userB: no overlay — only the global default g1. g2 (no default) absent; ua
+	// (userA's private) never visible.
+	b := claimNames(userB)
+	if !b[g1.Name] {
+		t.Errorf("userB must receive the global default g1; got %v", b)
+	}
+	if b[g2.Name] {
+		t.Error("userB must NOT receive g2 (no global default, no overlay) — the no-cliff guarantee")
+	}
+	if b[ua.Name] {
+		t.Error("userB must NOT receive userA's private template")
+	}
+
+	// Allocation view: userA sees the resolved state; userB never sees ua.
+	viewA := map[string]store.ListTemplateAllocationsForViewerRow{}
+	rowsA, err := q.ListTemplateAllocationsForViewer(ctx, store.ListTemplateAllocationsForViewerParams{IsAdmin: false, ViewerID: pgUUID(userA)})
+	if err != nil {
+		t.Fatalf("alloc view A: %v", err)
+	}
+	for _, r := range rowsA {
+		viewA[r.Name] = r
+	}
+	if !viewA[g1.Name].GlobalDefault || !viewA[g1.Name].MyOverride.Valid || viewA[g1.Name].MyOverride.Bool {
+		t.Errorf("g1 for userA: want global_default=true, my_override=false; got %+v", viewA[g1.Name])
+	}
+	if viewA[g2.Name].GlobalDefault || !viewA[g2.Name].MyOverride.Bool {
+		t.Errorf("g2 for userA: want global_default=false, my_override=true; got %+v", viewA[g2.Name])
+	}
+	rowsB, err := q.ListTemplateAllocationsForViewer(ctx, store.ListTemplateAllocationsForViewerParams{IsAdmin: false, ViewerID: pgUUID(userB)})
+	if err != nil {
+		t.Fatalf("alloc view B: %v", err)
+	}
+	for _, r := range rowsB {
+		if r.Name == ua.Name {
+			t.Error("userB allocation view must NOT include userA's private template")
+		}
+	}
+}
+
 func mustCreateTemplate(ctx context.Context, t *testing.T, q *store.Queries, name, scope string, owner uuid.UUID) store.AgentTemplate {
 	t.Helper()
 	var uid pgtype.UUID

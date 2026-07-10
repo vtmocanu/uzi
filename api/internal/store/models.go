@@ -31,6 +31,13 @@ type AgentTemplate struct {
 	UserID      pgtype.UUID        `json:"user_id"`
 }
 
+type AgentTemplateAllocation struct {
+	TemplateID uuid.UUID          `json:"template_id"`
+	UserID     pgtype.UUID        `json:"user_id"`
+	Enabled    bool               `json:"enabled"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
 type AppSetting struct {
 	Key       string             `json:"key"`
 	Value     string             `json:"value"`

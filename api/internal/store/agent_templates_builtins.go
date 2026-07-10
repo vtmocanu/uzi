@@ -17,6 +17,10 @@ import (
 type builtinReconcilerQueries interface {
 	InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error)
 	GetAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error)
+	// SeedSharedTemplateAllocationByName seeds a builtin's global-default
+	// allocation row (PRD #18 M7). Called only when the builtin was actually
+	// inserted, so an admin's later removal of the default is never re-added.
+	SeedSharedTemplateAllocationByName(ctx context.Context, name string) error
 }
 
 // ReconcileBuiltinTemplates seeds the Go-embedded builtin agent templates into
@@ -40,6 +44,14 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 		})
 		if err != nil {
 			return fmt.Errorf("insert builtin %q: %w", def.Name, err)
+		}
+		if n > 0 {
+			// A newly-inserted builtin becomes a global default (PRD #18 M7). Seed
+			// its shared allocation row here, not on every boot, so a default an
+			// admin later removes stays removed. Idempotent (ON CONFLICT DO NOTHING).
+			if err := q.SeedSharedTemplateAllocationByName(ctx, def.Name); err != nil {
+				return fmt.Errorf("seed default allocation for builtin %q: %w", def.Name, err)
+			}
 		}
 		if n == 0 {
 			// ON CONFLICT (name) DO NOTHING: an existing row of the same name

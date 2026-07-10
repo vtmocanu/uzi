@@ -166,6 +166,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 		r.Route("/agent-templates", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Get("/", h.ListAgentTemplates)
+
+			// Template allocations (PRD #18 M7): which templates ride the caller's
+			// claims. GET is the per-template toggle view; PUT replaces the admin
+			// global-default set and/or the caller's overlay (per-half authz in the
+			// handler). A static path, matched ahead of /{id}.
+			r.Get("/allocations", h.GetTemplateAllocations)
+			r.Put("/allocations", h.SetTemplateAllocations)
+
 			r.Get("/{id}", h.GetAgentTemplate)
 			r.Get("/{id}/rendered", h.GetRenderedAgentTemplate)
 

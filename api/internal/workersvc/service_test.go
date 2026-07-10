@@ -125,7 +125,7 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultModel, f.defaultModelErr
 }
-func (f *fakeStore) ListAgentTemplates(context.Context) ([]store.AgentTemplate, error) {
+func (f *fakeStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return f.templates, nil
 }
 func (f *fakeStore) ListRunSkillAllocations(context.Context, pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error) {
