@@ -9,7 +9,7 @@ import {
 } from "react";
 import type { RunMessage } from "../lib/api";
 import { useFollowScroll, useReconnectingBanner } from "../lib/useFollowScroll";
-import { buildToolIndex, describeError, describeStatus, RunEventRow } from "./RunEvent";
+import { buildToolIndex, describeError, describeStatus, RunEventRow, truncate } from "./RunEvent";
 import { ChevronRightIcon } from "./icons";
 import { Badge, cx } from "./ui";
 
@@ -114,6 +114,11 @@ function useNow(intervalMs: number): number {
 const CAP_TRIGGER = 1000;
 const CAP_VISIBLE = 500;
 
+// The announced string is untrusted and unbounded (agent names, describeStatus/
+// describeError text), and aria-atomic="true" makes AT re-read the whole thing on
+// every change — so cap it (PRD #38 M4 audit).
+const ANNOUNCE_MAX = 200;
+
 export function ActivityFeed({
   messages,
   runningLive,
@@ -217,7 +222,7 @@ export function ActivityFeed({
     if (terminal && !seen.terminal) next = "Run finished";
     seen.terminal = terminal;
 
-    if (next !== null) setAnnouncement(next);
+    if (next !== null) setAnnouncement(truncate(next, ANNOUNCE_MAX));
   }, [messages, activeAgent, terminal]);
 
   return (

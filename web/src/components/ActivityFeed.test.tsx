@@ -300,6 +300,17 @@ describe("ActivityFeed accessibility (M4)", () => {
     expect(region().textContent).toContain("push failed");
   });
 
+  it("bounds a huge untrusted status announcement", () => {
+    const region = () => document.querySelector('[aria-live="polite"]') as HTMLElement;
+    const huge = "x".repeat(5000);
+    render(
+      <ActivityFeed messages={[m(1, "status", { text: huge }, "lead")]} runningLive={true} connected={true} terminal={false} />,
+    );
+    const text = region().textContent ?? "";
+    expect(text.length).toBeLessThanOrEqual(200);
+    expect(text).toContain("xxx"); // the (truncated) status still shows
+  });
+
   it("mutes the scroll container's implicit live region to aria-live=off", () => {
     const { container } = render(
       <ActivityFeed messages={[m(1, "text", { text: "hi" })]} runningLive={true} connected={true} terminal={false} />,
