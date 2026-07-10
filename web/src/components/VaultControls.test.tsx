@@ -76,4 +76,24 @@ describe("VaultLockedBanner", () => {
     await waitFor(() => expect(screen.getByText("Incorrect password.")).toBeTruthy());
     expect(refresh).not.toHaveBeenCalled();
   });
+
+  it("adds a re-login hint after repeated failures (dead-end recovery)", async () => {
+    setAuth({ vaultUnlocked: false });
+    mockApi.vaultUnlock.mockRejectedValue(new ApiError(403, "incorrect password"));
+
+    render(<VaultLockedBanner />);
+    const submit = () => {
+      fireEvent.change(screen.getByLabelText("Vault password"), { target: { value: "believed-correct" } });
+      fireEvent.click(screen.getByRole("button", { name: /unlock/i }));
+    };
+
+    // First failure: plain message, no hint.
+    submit();
+    await waitFor(() => expect(screen.getByText("Incorrect password.")).toBeTruthy());
+    expect(screen.queryByText(/Sign out and back in/i)).toBeNull();
+
+    // Second consecutive failure: the recovery hint appears.
+    submit();
+    await waitFor(() => expect(screen.getByText(/Sign out and back in to re-create your vault/i)).toBeTruthy());
+  });
 });

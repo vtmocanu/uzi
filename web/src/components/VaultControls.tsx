@@ -61,6 +61,13 @@ export function VaultLockedBanner() {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Consecutive failed unlocks. The server answers an identical 403 for a wrong
+  // password AND for a missing vault row (no oracle) — but a user whose vault row
+  // failed to create at register/login has the CORRECT password yet is stuck on
+  // "Incorrect password" forever, since UnlockExisting never creates. After a
+  // couple of failures we surface the one recovery path (a full re-login re-creates
+  // the vault) without weakening the server's indistinguishability.
+  const [failures, setFailures] = useState(0);
 
   if (!user || vaultUnlocked) return null;
 
@@ -71,15 +78,22 @@ export function VaultLockedBanner() {
     try {
       await api.vaultUnlock(password);
       setPassword("");
+      setFailures(0);
       await refresh();
     } catch (err) {
+      const next = failures + 1;
+      setFailures(next);
       // 403 is the deliberate wrong-password / no-vault answer; keep it specific.
-      setError(
+      const base =
         err instanceof ApiError && err.status === 403
           ? "Incorrect password."
           : err instanceof ApiError
             ? err.message
-            : "Failed to unlock the vault.",
+            : "Failed to unlock the vault.";
+      setError(
+        next >= 2
+          ? base + " Still locked with the right password? Sign out and back in to re-create your vault."
+          : base,
       );
     } finally {
       setBusy(false);

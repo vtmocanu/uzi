@@ -12,7 +12,7 @@ package store
 // never changes.
 const KindAnthropicToken = "anthropic_token"
 
-// user_secrets.sealed_with (migration 00044): which key sealed the ciphertext.
+// user_secrets.sealed_with (migration 00051): which key sealed the ciphertext.
 // 'master' = the legacy UZI_SECRET_KEY box; 'dek' = the per-user vault DEK.
 const (
 	SealedWithMaster = "master"

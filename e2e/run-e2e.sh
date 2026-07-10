@@ -1194,7 +1194,10 @@ sealed_of() { db_psql "SELECT s.sealed_with FROM user_secrets s JOIN users u ON 
 vault_status_jar() { curl -fsS -b "$1" "$BASE/api/vault/status" | jq -r '.unlocked'; }
 # master_seal_hex TEXT — AES-256-GCM seal a plaintext under UZI_SECRET_KEY, matching
 # secretbox's nonce||ciphertext||tag layout, so the Go master box can open it. Run in
-# forge-fake (a node image) with the key passed via env, not argv.
+# forge-fake (a node image) with the key passed via env, not argv. The PLAINTEXT
+# rides argv (visible in the container's `ps`) — fine here because it is only ever
+# a dummy fixture; never reuse this helper with a real token. The key correctly
+# goes via env, not argv.
 master_seal_hex() {
   "${COMPOSE[@]}" exec -T -e SK="$SECRET_KEY_B64" forge-fake node -e '
     const crypto = require("crypto");

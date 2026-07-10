@@ -348,7 +348,7 @@ func wrapAAD(userID uuid.UUID) []byte {
 func secretAAD(userID uuid.UUID, kind string) []byte {
 	aad := make([]byte, 0, 16+1+len(kind))
 	aad = append(aad, userID[:]...)
-	aad = append(aad, 0) // separator so (id,"ab")||"" ≠ (id,"a")||"b"
+	aad = append(aad, 0) // fixed delimiter after the 16-byte user_id; the boundary is already unambiguous (user_id is fixed-length), so this is belt-and-suspenders
 	return append(aad, kind...)
 }
 

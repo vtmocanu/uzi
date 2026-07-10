@@ -57,7 +57,10 @@ services:
       # A literal here overrides the base's ${UZI_SECRET_KEY} for THIS container, so the
       # stack no longer depends on the developer's shell (Compose ranks a shell-exported
       # UZI_SECRET_KEY above --env-file — CLAUDE.md), matching how the seed vars below are
-      # pinned. Keeps the whole e2e sealing/opening under one known key.
+      # pinned. Keeps the whole e2e sealing/opening under one known key. This file
+      # is a TEST harness, NOT a deployment template: never copy this literal into a
+      # real stack. (It is a weak but varied key — it only passes secretbox.LoadKey's
+      # low-entropy placeholder check; a real key is `openssl rand -base64 32`.)
       UZI_SECRET_KEY: "ZTJlLWR1bW15LXNlY3JldC1rZXktbm90LXJlYWwhISE=" # gitleaks:allow (fixed dummy)
       # Trust forge-fake's self-signed cert (Go honors SSL_CERT_FILE; the api
       # makes no other outbound TLS call in the E2E).
