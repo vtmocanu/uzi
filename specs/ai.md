@@ -3462,12 +3462,13 @@ Serves human: the behavioral gate must be automated (no browser automation in-re
 Serves human Feature #32 (an operator with the DB + env/Infisical/etcd master key must
 not recover any user's Anthropic token; each user's secrets keyed by their own login
 password; auto-unlock at login with the key in server memory until restart/lock; locked
-runs queue; forgotten password ⇒ unrecoverable). **Status: designed (PRD #32,
+runs queue; forgotten password ⇒ unrecoverable). **Status: built (PRD #32,
 `prds/32-user-vault-password-wrapped-secrets.md` carries the full Decision Log +
-user-vs-AI provenance); not yet realized in code — these sections record the intended
-design.** Builds on PRD #3 (`user_secrets` + `secretbox`, §29–30) and gates PRD #19
-autopilot's claims. Live migration head is `00043`, so the PRD's draft `00044` renumbers
-to the live head at land (goose convention). Extends §17/§29 (secretbox), §40–41 (claim
+user-vs-AI provenance). These sections record the as-built system; where implementation
+diverged from the design, the as-built decision and its reason are called out inline
+("as-built").** Builds on PRD #3 (`user_secrets` + `secretbox`, §29–30) and gates PRD #19
+autopilot's claims. Landed as migration `00044_user_vaults.sql` (the draft number was
+already the next free slot above head `00043`). Extends §17/§29 (secretbox), §40–41 (claim
 path), §24 (seed).
 
 ## 136. Key hierarchy & crypto (Bitwarden model, per-user)
@@ -3494,32 +3495,63 @@ the server stores only the wrapped key".
   wrong KEK, so unwrapping `wrapped_dek` fails GCM authentication cleanly ⇒
   `ErrWrongPassword`. No separate password-verifier is stored, and this is no more of an
   oracle than login already is (endpoint sits behind the auth-class rate limiter, §138).
-- **AAD binding** (`user_id || kind`) on Seal/Open is a cheap defense-in-depth against a
-  DB-*write* operator swapping ciphertext rows between users (outside the passive threat
-  model — a swap fails GCM or hands over the wrong token, not disclosure — but a few lines).
+- **AAD binding (as-built).** `secretbox` grew `SealWithAAD`/`OpenWithAAD`; the plain
+  `Seal`/`Open` now delegate with nil AAD, byte-identical to the legacy construction so
+  master-sealed rows written before the vault still open. Two distinct bindings: a
+  DEK-sealed **secret** is bound to `user_id || 0x00 || kind` (the 0x00 separator keeps
+  `(id,"ab")||"" ≠ (id,"a")||"b"`); the **wrapped DEK** is bound to
+  `"uzi-vault-dek\x00" || user_id`. Both defend against a DB-*write* operator swapping a
+  ciphertext (or a whole `user_vaults` row) between users — a swap fails GCM auth rather
+  than yielding a working key (outside the passive threat model — not disclosure — but a
+  few lines). The `kind` / `sealed_with` string literals are centralized as
+  `store.KindAnthropicToken` and `store.SealedWith{Master,DEK}`
+  (`api/internal/store/enums.go`) so no two seal sites can disagree on the AAD and
+  silently break decryption.
+- **KEK cost is a private copy of the auth Argon2 params, not an import** (the `kek*`
+  consts in `vault.go`; t=2, 19 MiB, p=1). The KEK and the login hash are separate
+  security domains: a vault-protected deployment can raise the KEK cost alone (residual #1)
+  without coupling the two. Kept `>=` the login-hash cost.
 
 ## 137. Storage & lazy rewrap (`user_vaults`, `user_secrets.sealed_with`)
 
 Serves human: server stores only the wrapped key; forgotten password ⇒ unrecoverable by
 design.
 
-- **New `user_vaults`** (migration draft `00044`): `user_id PK → users ON DELETE CASCADE,
-  kek_salt bytea, wrapped_dek bytea, created_at, updated_at` — one row per user,
+- **New `user_vaults`** (migration `00044_user_vaults.sql`): `user_id PK → users ON DELETE
+  CASCADE, kek_salt bytea, wrapped_dek bytea, created_at, updated_at` — one row per user,
   cascade-scoped like every other per-user table.
 - **`user_secrets` gains `sealed_with TEXT NOT NULL DEFAULT 'master' CHECK IN
   ('master','dek')`** so `vault.Open` knows which box to use per ciphertext. New saves
   always seal `'dek'`.
-- **Lazy rewrap on unlock**: pre-existing rows are master-key-sealed and cannot be
-  rewrapped without the user's password. On each successful unlock, that user's still-
-  `'master'` rows are opened with the master box, resealed with the DEK, and flipped to
-  `'dek'` in one transaction. Dormant accounts never rewrap; an admin-visible count of
-  still-`'master'` rows shows migration progress.
+- **Vault-row creation is race-safe and login/register-only (as-built).** The insert is
+  `CreateUserVaultIfAbsent` (`INSERT ... ON CONFLICT (user_id) DO NOTHING RETURNING`):
+  exactly one of N concurrent first-unlocks wins; a loser re-reads the winner's row and
+  caches THAT persisted DEK (unwrapped with its identical password), so the in-memory DEK
+  always matches what is stored. The design's M1 `UpsertUserVault` was **removed** — a
+  `DO UPDATE` would overwrite an existing wrapped DEK and orphan every secret sealed under
+  the old one. Creation happens ONLY on the login/register paths (which hold a
+  freshly verified password), **never** on the interactive unlock endpoint (§138): the
+  endpoint uses a no-create `UnlockExisting`, so a wrong password can never mint a fresh,
+  differently-keyed vault and self-lock the user out of their real secrets.
+- **Lazy rewrap on unlock (as-built): best-effort, never fails the unlock.** Pre-existing
+  rows are master-key-sealed and cannot be rewrapped without the user's password. On each
+  unlock, that user's still-`'master'` rows are opened with the master box, resealed with
+  the DEK, and flipped `'master' → 'dek'` — **one guarded UPDATE per row**
+  (`RewrapUserSecret`, `WHERE ... sealed_with='master'`, so a concurrent flip is a no-op),
+  not one transaction across all rows as first sketched. Every step is logged (never with
+  secret bytes) and a fault leaves the row `'master'` for the next unlock to retry; a
+  rewrap error must never fail an otherwise-valid login/unlock. Dormant accounts never
+  rewrap.
+- **Migration progress is admin-visible**: `GET /api/admin/vault-migration` returns the
+  count of still-`sealed_with='master'` rows (`CountMasterSealedSecrets`), surfaced as a
+  progress notice in AdminSettings (Instance settings).
 - **Rewrap protects going-forward only, never retroactively.** An operator could have
   snapshotted the DB before the rewrap, so any token that ever existed master-sealed is
   potentially already leaked; the real fix is to **rotate the token**, not rewrap it. A
-  one-time post-unlock UI notice says exactly that ("protected from now on"; rotate for
-  full protection), never "protected retroactively". Until rewrap, legacy `'master'` rows
-  are withheld only by the runtime claim gate (§139) — a runtime control, not a
+  one-time, per-browser-dismissible UI notice (Settings → Secrets; localStorage key
+  `uzi.vault.rotateNoticeDismissed`) says exactly that ("protected from now on"; rotate
+  for full protection), never "protected retroactively". Until rewrap, legacy `'master'`
+  rows are withheld only by the runtime claim gate (§139) — a runtime control, not a
   cryptographic one.
 - **Reset (password lost) must DELETE `user_vaults` + all `'dek'` rows** and prompt
   re-entry — silently keeping unreadable ciphertext would be a worse bug than the
@@ -3541,17 +3573,34 @@ lock; lock/unlock/status surface.
   overnight/autopilot runs working while unlocked). `Seal`/`Open` return `ErrLocked` when
   the user isn't cached.
 - **Unlock at login** (`Login`, right after `VerifyPassword`, reusing the same plaintext
-  before it leaves scope; a first-ever unlock creates DEK + wrap) and **at register**
-  (KEK derived *before* the registration `pg_advisory_xact_lock` tx so a second in-lock
-  Argon2id doesn't serialize all registrations — only the cheap row insert is in-tx; a
-  crash between is recovered by Unlock's create-on-first-login path). Login now runs
-  Argon2id twice (verify + KEK) — keep the login rate limiter strict.
+  before it leaves scope; a first-ever unlock creates DEK + wrap; a failure is non-fatal —
+  logged loudly, the session still issues with the vault left locked and the SPA shows the
+  unlock banner). **At register (as-built)** the vault is created+unlocked by a standalone
+  `vault.Unlock` call AFTER the user-create transaction commits — NOT a row insert inside
+  it. Register holds a `pg_advisory_xact_lock`; running the vault's Argon2 KEK derivation
+  inside that lock would serialize all registrations, so it stays outside. Crash-safety
+  comes not from tx atomicity but from Unlock's create-on-first-login: a crash between
+  user-create and vault-create is healed by the next login. Login now runs Argon2id twice
+  on the success path (verify + KEK) — keep the login rate limiter strict.
 - **Endpoints inside `RequireAuth`** (so unlock is not a pre-auth oracle and CSRF
   applies): `POST /api/vault/unlock {password}` → 204/403, `POST /api/vault/lock` → 204,
   `GET /api/vault/status`. Unlock is rate-limited with the **per-user**
   `PerUserMiddleware`, not the per-IP auth limiter — it is authenticated, and a stolen
   JWT would otherwise make it an online password-guessing oracle sharing a NAT bucket
-  with other users' logins.
+  with other users' logins. The endpoint calls `UnlockExisting`; a **wrong password**
+  (`ErrWrongPassword`) and a **no-vault user** (`ErrNoVault`) return an **identical 403** —
+  it never distinguishes the two, and (unlike login/register) never creates a vault.
+- **Constant-cost auth surfaces (as-built), so timing is never an oracle.** Every
+  wrong-credential answer costs exactly one Argon2. *Login*: a known email runs the real
+  `VerifyPassword`; an unknown email burns one Argon2 against a fixed `dummyHash`. The KEK
+  derivation (a second Argon2) runs ONLY after a successful verify — once success has
+  already revealed the email exists — so it needs no counterweight on the failure paths. A
+  design-stage "second dummy burn" on the known-email/wrong-password branch was implemented
+  then **reverted** (commit `1a4cfe5`): it fired the KEK-cost Argon2 only when the email
+  existed, which was itself an email-existence timing oracle. *Unlock endpoint*: both 403
+  paths burn one KEK-cost Argon2 — the wrong-password path against the vault's real
+  `kek_salt`, the no-vault path against a fixed `dummyKEKSalt` using the same `kek*`
+  params, so a future cost bump self-tracks.
 - **Vault status rides `/api/me`** (`sessionPayload`) so the SPA shell learns lock state
   in one round-trip; the web client refreshes it via `AuthContext.refresh()` on window
   focus, on any 409 `vault_locked` response, and after lock/unlock calls (there is no
@@ -3569,19 +3618,27 @@ Serves human: locked-owner runs queue as "waiting for vault unlock" instead of c
 or failing; unlock resumes them within a poll cycle.
 
 - **Single Go gate, no SQL change**: `ClaimRun` is already scoped `r.user_id = @user_id`
-  (from the worker's own identity), so a one-line `if !s.vault.Unlocked(wkr.UserID) {
-  return idle }` before `ClaimRun` keeps a locked owner's runs `queued`. Autopilot and
-  the poller need no special code — this gate is the single enforcement point.
-- **`assembleClaim` opens the Anthropic token via `vault.Open(run.UserID, …)`**; bot-PAT
-  decryption is unchanged (master box, §140).
-- **Lock-race sentinel `errVaultLocked`**: if Lock lands between `ClaimRun` and
-  `assembleClaim`, the run must **NOT** take the terminal `errCredentialUnavailable` path
-  (that fails the run and violates the queue-don't-fail contract). A distinct
-  `errVaultLocked` resets the just-claimed run back to `queued` (new query mirroring
-  `SweepClaimedNeverStarted`) and reports idle.
-- **`SetVault(*vault.Vault)` optional-dependency seam** on `workersvc` (same pattern as
-  `SetBroadcaster`/`SetLifecycle`), called additively from `main.go` — keeps the claim
-  wire-in's files disjoint from the auth/endpoint wire-in.
+  (from the worker's own identity), so a one-line `if s.vlt != nil &&
+  !s.vlt.Unlocked(wkr.UserID) { return idle }` before `ClaimRun` keeps a locked owner's
+  runs `queued`. Autopilot and the poller need no special code — this gate is the single
+  enforcement point.
+- **`assembleClaim` opens the Anthropic token via `vault.Open(run.UserID, kind,
+  sealed_with, …)`**; bot-PAT decryption is unchanged (master box, §140). With no vault
+  wired (nil — tests, or a deployment that opts out), the token opens under the master box:
+  the pre-vault behavior.
+- **Lock-race sentinel `errVaultLocked` (as-built): a bare sentinel, requeue not fail.**
+  If Lock lands between `ClaimRun` and `assembleClaim`, `vault.Open` returns `ErrLocked`,
+  which maps to `errVaultLocked`. This must **NOT** take the terminal
+  `errCredentialUnavailable` path (`MarkRunFailedByID` — reserved for a *genuine* crypto
+  fault, which still fails the run). Instead `RequeueClaimedRunToQueued` resets the
+  just-claimed run `claimed → queued` (`WHERE id=@id AND status='claimed'`), **keeps
+  `worker_id` for resume affinity, and does NOT bump `requeue_count`** — so a persistently
+  locked vault can never trip the requeue cap — then reports idle.
+- **One shared `*vault.Vault`, wired via `SetVault` seams.** The vault is constructed once
+  in `main.go` and injected into BOTH `workersvc` (`SetVault`, same optional-dependency
+  pattern as `SetBroadcaster`/`SetLifecycle`) and the HTTP handlers (`Handler.SetVault`),
+  so a login-time unlock and a claim-time `Unlocked` check see the same DEK cache. The
+  additive seam keeps the claim wire-in's files disjoint from the auth/endpoint wire-in.
 - **Sweeper verified safe** (2026-07-10): no sweep query touches `status='queued'` and
   there is no queued-age timeout, so locked-owner runs sit indefinitely by design; a
   resumed run re-enters the claim gate and waits rather than failing.
@@ -3590,6 +3647,10 @@ or failing; unlock resumes them within a poll cycle.
 
 Serves human: "materially harder, not impossible"; user accepts the residuals.
 
+The as-built residual-risk list and operator hardening steps also ship as an in-app
+operator doc, `docs/vault-threat-model.md` (`audience: operator`), linking back to the PRD
+for rationale.
+
 - **Forge bot PAT stays under `UZI_SECRET_KEY` (master key), outside the vault.** The
   poller must sync issues 24/7 with no user present, so the connection PAT cannot be
   password-wrapped. `UZI_SECRET_KEY` therefore remains, but only for connection-level
@@ -3597,17 +3658,27 @@ Serves human: "materially harder, not impossible"; user accepts the residuals.
   recover the bot PAT (Developer-role, blast radius bounded by PRD #5's least-privilege
   checks), but no user's personal Anthropic token.
 - **Seed admin explicitly exempt.** `UZI_SEED_PASSWORD` / `UZI_SEED_ANTHROPIC_TOKEN` are
-  env vars, so the vault is only as strong as env for that one account. Seeding creates
-  the vault row, seals the token with the DEK, **and unlocks the seed admin at boot**
-  (populates the cache) — otherwise a fresh headless deploy sits locked until the first
-  interactive login, defeating overnight autopilot for exactly the bootstrap case. The
-  `Sealer` interface grows a vault-aware variant. Post-boot hardening documented: change
-  the seed password, rotate the token, remove `UZI_SEED_*` from the deployed env.
+  env vars, so the vault is only as strong as env for that one account. As-built boot
+  order in `main.go`: seed the admin user → **boot-unlock the seed admin's vault**
+  (`vlt.Unlock` with the seeded password; first boot creates the vault here) → seed the
+  Anthropic token, which the seed **DEK-seals** under the now-unlocked vault via a narrow
+  `VaultSealer` interface (the subset of `*vault.Vault` the seed needs — not the earlier
+  "`Sealer` grows a variant" sketch). Boot-unlock is **fatal when seeding is configured** —
+  a seed admin whose vault can't be unlocked at boot is a broken bootstrap, matching the
+  other seed steps' loud-on-misconfig stance — and populating the cache is what lets a
+  fresh headless deploy run overnight autopilot before any interactive login. Post-boot
+  hardening (documented): change the seed password, rotate the token, remove `UZI_SEED_*`
+  from the deployed env. **Caveat once a change-password flow lands**: a stale
+  `UZI_SEED_PASSWORD` left in the env would make the next (fatal) boot-unlock fail, so
+  removing it becomes mandatory rather than merely advisable.
 - **Dominant residual: `users.password_hash` is an offline brute-force oracle.** An
   operator with the DB can crack the login password against the stored Argon2id hash →
   KEK → DEK → tokens. The scheme's real strength is **password entropy + Argon2 cost, not
   the 256-bit DEK** (`MinPasswordLen` is 12). Documented loudly; a higher KEK Argon2 cost
-  and a higher password floor are the noted mitigations for vault-protected deployments.
+  and a higher password floor are the noted mitigations for vault-protected deployments. As
+  shipped the KEK reuses the login-hash cost (t=2, 19 MiB); raising it alone is a one-line
+  change to the `kek*` consts in `vault.go`, and the no-vault unlock timing burn derives
+  with those same params so the parity self-tracks any bump.
 - **Other documented residuals**: live-pod memory dump captures cached DEKs + in-flight
   plaintext (DEK-in-RAM is the *common* state under until-restart caching; an optional
   idle auto-lock is a future off-by-default knob that would break overnight runs);
@@ -3635,3 +3706,26 @@ Serves human: the chosen approach is one of several; record why.
   dot-agent-deck (ambient creds) all store provider credentials plaintext-equivalent;
   none does password-wrapped envelope encryption — this beats them by following
   Bitwarden's master-password key hierarchy.
+
+## 142. As-built validation (tests & e2e)
+
+Serves human: the success criteria are demonstrable, not just asserted.
+
+- **Unit tests** (`api/internal/vault/vault_test.go`) cover wrap/unwrap roundtrip, wrong
+  password ⇒ GCM auth failure ⇒ `ErrWrongPassword`, the master key cannot open a DEK-sealed
+  row, `UnlockExisting` returns `ErrNoVault` (never creates), and the first-unlock race
+  (concurrent creators converge on one persisted DEK). Handler tests assert the identical
+  403 on wrong-password vs no-vault.
+- **e2e** (`e2e/run-e2e.sh`) runs four vault scenarios end to end against the isolated
+  stack: (1) the seeded token is DEK-sealed at boot and `/api/me` reports unlocked; a
+  handler save also writes `sealed_with='dek'`; (2) lock → a new run stays `queued` across
+  several poll cycles (never claimed, never failed) → unlock → it claims and reaches the
+  plan gate; (3) restart the API → the seed admin is boot-unlocked while a normal user is
+  locked (both JWTs survive; only the DEK cache is lost); (4) that user unlocks without
+  re-login → lazy rewrap flips their staged legacy `'master'` row to `'dek'` and the admin
+  migration count returns to 0.
+- **Test seam for the legacy-row fixture**: scenario 4 stages a `sealed_with='master'` row
+  sealed under the API's *actual* `UZI_SECRET_KEY`. Because Compose ranks the developer's
+  shell env above `--env-file` (the repo's documented smoke hazard), the harness reads the
+  key back out of the running api container via `docker inspect ... .Config.Env` rather than
+  trusting the env it thinks it set, then AES-256-GCM-seals the fixture with it.
