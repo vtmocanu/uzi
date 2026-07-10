@@ -225,14 +225,14 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	user, err := h.q.GetUserByEmail(r.Context(), email)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Burn a comparable amount of time, then fail generically. The known-email
-			// path runs Argon2 TWICE (VerifyPassword + the vault KEK derivation inside
-			// Unlock), so equalize with a matching second dummy hash when the vault is
-			// wired — otherwise email existence leaks through response time (PRD #32).
+			// Burn ONE Argon2 so an unknown email is timing-indistinguishable from a
+			// known email with a WRONG password: both fail here having done exactly one
+			// VerifyPassword. The vault KEK derivation (a second Argon2) runs only AFTER
+			// a correct password, on the success path — which a 200 + Set-Cookie already
+			// reveals, so it needs no counterweight here. A second dummy hash on this
+			// path would itself leak email existence (unknown=2 vs known-wrong=1), the
+			// exact oracle this burn exists to close.
 			_, _ = auth.VerifyPassword(req.Password, dummyHash)
-			if h.vault != nil {
-				_, _ = auth.VerifyPassword(req.Password, dummyHash)
-			}
 			httpx.Error(w, http.StatusUnauthorized, "invalid credentials")
 			return
 		}
