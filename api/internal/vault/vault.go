@@ -122,6 +122,11 @@ func (v *Vault) unlock(ctx context.Context, userID uuid.UUID, password string, a
 		}
 	case errors.Is(err, pgx.ErrNoRows):
 		if !allowCreate {
+			// Burn one KEK-cost Argon2 so a no-vault result is not timing-
+			// distinguishable from a wrong password (both cases the endpoint answers
+			// with an identical 403): the wrong-password path derives one KEK in
+			// cacheFromRow, so this path must too. The derived key is discarded.
+			wipe(deriveKEK(password, dummyKEKSalt))
 			return ErrNoVault
 		}
 		if cerr := v.create(ctx, userID, password); cerr != nil {
@@ -321,6 +326,11 @@ func (v *Vault) put(userID uuid.UUID, dek []byte) {
 	}
 	v.cache[userID] = dek
 }
+
+// dummyKEKSalt is a fixed salt used only by the no-vault timing-equalization burn
+// in unlock(); the derived key is discarded, so the salt value is irrelevant — it
+// exists solely to give deriveKEK an argument.
+var dummyKEKSalt = make([]byte, kekSaltLen)
 
 func deriveKEK(password string, salt []byte) []byte {
 	return argon2.IDKey([]byte(password), salt, kekTime, kekMemoryKiB, kekThreads, kekLength)
