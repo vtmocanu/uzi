@@ -112,6 +112,15 @@ type SynClass = keyof typeof SYN_CLASS;
 const SHELL_SPACE = new Set([" ", "\t", "\n", "\r", "\f", "\v"]);
 const SHELL_OP_START = new Set(["&", "|", ";", "<", ">"]);
 
+// Commands are untrusted and have no upstream length cap (PRD threat model), and
+// this emits one DOM node per token — so a multi-MB command would freeze the tab
+// (line-clamp is CSS-only and does not reduce node count). Highlight only the
+// first HIGHLIGHT_MAX_CHARS / HIGHLIGHT_MAX_NODES, then append the exact
+// remainder as ONE plain (unhighlighted) text node: text is preserved verbatim,
+// DOM fan-out is bounded.
+const HIGHLIGHT_MAX_CHARS = 8 * 1024;
+const HIGHLIGHT_MAX_NODES = 2000;
+
 // highlightShell is a pure, best-effort shell tokenizer (PRD #38 Decision 2). It
 // splits a command into command / flag / string / operator / comment / arg spans
 // and returns React elements only — never dangerouslySetInnerHTML — so untrusted
@@ -137,6 +146,12 @@ export function highlightShell(command: string): ReactNode[] {
   let expectCommand = true;
 
   while (i < n) {
+    // Fan-out guard: once the char or node budget is spent, dump the untouched
+    // tail as a single text node and stop tokenizing (bounds DOM for a huge cmd).
+    if (i >= HIGHLIGHT_MAX_CHARS || nodes.length >= HIGHLIGHT_MAX_NODES) {
+      nodes.push(command.slice(i));
+      break;
+    }
     const c = command[i];
 
     // Whitespace run (preserved verbatim as a plain text node so pre-wrap keeps

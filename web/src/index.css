@@ -119,11 +119,15 @@
   --neutral-surface: 30 41 59;
 
   /* Shell syntax highlighting (PRD #38) — mission's palette via the same aliases
-     as the ember block, so the code surfaces recolour with the theme. */
+     as the ember block, EXCEPT --syn-flag/--syn-op: mission's --info and
+     --brand-hover both collapse onto the cyan --brand, which would make command,
+     flag, and operator render as one indistinct cyan. Re-point flags to amber
+     (--warn) and operators to slate (--muted) so the three stay legible. Ember,
+     whose --info/--brand-hover are already distinct hues, keeps the plain aliases. */
   --syn-cmd: var(--brand);
-  --syn-flag: var(--info);
+  --syn-flag: var(--warn);
   --syn-str: var(--ok);
-  --syn-op: var(--brand-hover);
+  --syn-op: var(--muted);
   --syn-comment: var(--faint);
   --syn-arg: var(--fg);
   --tool-rail: var(--edge);

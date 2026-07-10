@@ -262,11 +262,23 @@ describe("highlightShell", () => {
       'echo "a\\"b" || rm -rf /x',
       "env -i HOME=$HOME docker compose -p uzi run --rm api",
       "cat <<'EOF'\nline one\nline two\nEOF",
+      "echo 'unclosed", // unterminated single quote — tail preserved, not dropped
+      'echo "unclosed', // unterminated double quote
     ]) {
       const { getByTestId, unmount } = renderCmd(cmd);
       expect(getByTestId("h").textContent).toBe(cmd);
       unmount();
     }
+  });
+
+  it("caps DOM fan-out for a pathological command while preserving the text", () => {
+    // ~200 KB of "a b a b …": uncapped this is ~100k DOM nodes and freezes the tab.
+    const cmd = "a b ".repeat(50_000);
+    const { getByTestId } = renderCmd(cmd);
+    const host = getByTestId("h");
+    expect(host.textContent).toBe(cmd); // every character still present
+    expect(host.childNodes.length).toBeLessThanOrEqual(2001); // spans + remainder tail
+    expect(host.querySelectorAll("span").length).toBeLessThanOrEqual(2000);
   });
 
   it("classifies command / flag / string / operator / comment tokens", () => {
