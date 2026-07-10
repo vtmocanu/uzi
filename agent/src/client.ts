@@ -1,6 +1,7 @@
 import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
+  type ChatClaimResponse,
   type ClaimResponse,
   type HeartbeatRequest,
   type MessagesRequest,
@@ -72,12 +73,24 @@ export class WorkerClient {
     await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
   }
 
-  /** Claim the oldest queued run for this worker's user. Returns null on 204. */
+  /** Claim the oldest queued run for this worker's user (the RUN lane — no lane
+   *  param, back-compat with older servers). Returns null on 204. */
   async claimRun(): Promise<ClaimResponse | null> {
     const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, {});
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
     return (await res.json()) as ClaimResponse;
+  }
+
+  /** Claim the oldest queued CHAT run for this worker's user (the disjoint chat
+   *  lane, PRD #39 Decision 4). Returns null on 204 (chat queue idle). Runs as an
+   *  independent loop concurrently with claimRun. */
+  async claimChat(): Promise<ChatClaimResponse | null> {
+    const path = `${WORKER_API_PREFIX}/runs/claim?lane=chat`;
+    const res = await this.fetchRaw("POST", path, {});
+    if (res.status === 204) return null;
+    if (res.status >= 400) throw await this.toError("POST", path, res);
+    return (await res.json()) as ChatClaimResponse;
   }
 
   async postMessages(runId: string, messages: OutgoingMessage[]): Promise<void> {

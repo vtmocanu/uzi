@@ -69,6 +69,10 @@ export interface Config {
   chatTurnTimeoutMs: number;
   chatIdleTimeoutMs: number;
   chatPollMs: number;
+  /** How many chat sessions the worker runs CONCURRENTLY with the run slot
+   *  (Decision 4). Default 1 — one live conversation per user-worker; a second chat
+   *  queues until the first ends. The run lane is always a separate concurrent slot. */
+  chatSessions: number;
   logLevel: LogLevel;
 }
 
@@ -184,6 +188,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     chatTurnTimeoutMs: duration(env, "WORKER_CHAT_TURN_TIMEOUT", "10m"),
     chatIdleTimeoutMs: duration(env, "WORKER_CHAT_IDLE_TIMEOUT", "60m"),
     chatPollMs: duration(env, "WORKER_CHAT_POLL_MS", "1000"),
+    chatSessions: positiveInt(env, "WORKER_CHAT_SESSIONS", 1),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }

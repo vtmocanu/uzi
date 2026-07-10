@@ -226,6 +226,52 @@ export interface ClaimResponse {
   auto_approve?: boolean;
 }
 
+/**
+ * Chat claim lane payload (PRD #39, the chat lane's counterpart to ClaimResponse).
+ * Pinned against M1's landed `workersvc.ChatClaimPayload` (chat.go): a narrower,
+ * repo-less shape claimed via `POST /api/worker/runs/claim?lane=chat`. Carries the
+ * Anthropic token ONLY — there is structurally no forge_pat/forge_username key
+ * (Decision 9) and no repo (Decision 12). There is NO prompt field: the first user
+ * message is a seeded `follow_up` run input the worker consumes through the normal
+ * input path, uniform with every later turn. A Continue run (Decision 11) carries
+ * `resume_of_run_id` and no seeded input (it parks awaiting the next message).
+ */
+export interface ChatClaimResponse {
+  run_id: string;
+  kind: "chat";
+  /** Conversation display title (server-derived; may be empty). */
+  title: string;
+  /** Current run status at claim time (e.g. "claimed"). */
+  status: string;
+  /** SDK session to resume: the run's own (requeue/resume) or, for a Continue run,
+   *  the resumed-from run's session (Decision 11). null for a fresh chat. */
+  session_id: string | null;
+  /** Set only for a Continue run, so the worker can say "continuing without prior
+   *  context" honestly when the session is gone. */
+  resume_of_run_id: string | null;
+  /** High-water mark of run_messages.seq; the worker continues numbering here. */
+  last_seq: number;
+  requeue_count: number;
+  secrets: ChatClaimSecrets;
+  config: ChatClaimConfig;
+}
+
+/** A chat claim's secrets — the Anthropic token and NOTHING else (Decision 9). */
+export interface ChatClaimSecrets {
+  anthropic_oauth_token: string;
+}
+
+/** Chat lifecycle caps the server pushes down so the worker's clocks match (no
+ *  drift, Decision 3). Timeouts are in SECONDS, matching the run claim convention
+ *  (converted to ms at the worker use site). */
+export interface ChatClaimConfig {
+  idle_timeout_seconds: number;
+  turn_timeout_seconds: number;
+  max_turns: number;
+  /** The owner's per-user default model (PRD #17); omitted when unset. */
+  default_model?: string;
+}
+
 /** One appended message; the server is idempotent on (run_id, seq). */
 export interface OutgoingMessage {
   seq: number;
