@@ -1,7 +1,8 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RunMessage } from "../lib/api";
 import { useFollowScroll, useReconnectingBanner } from "../lib/useFollowScroll";
-import { buildToolIndex, RunEventRow } from "./RunEvent";
+import { buildToolIndex, describeStatus, RunEventRow } from "./RunEvent";
+import { ChevronRightIcon } from "./icons";
 import { Badge, cx } from "./ui";
 
 // Each agent gets a stable accent so consecutive blocks are scannable — the
@@ -39,6 +40,56 @@ function groupByAgent(messages: RunMessage[]): AgentGroup[] {
   return groups;
 }
 
+// hiddenSummary describes what a collapsed block hides: prose/meta rows counted
+// as "messages", tool calls counted separately. A folded tool_result (its call is
+// visible, so it renders under the call rather than as its own row) is not a row,
+// so it is not counted — the summary reflects what actually disappears.
+function hiddenSummary(group: AgentGroup, visibleToolUseIds: Set<string>): string {
+  let tools = 0;
+  let msgs = 0;
+  for (const m of group.messages) {
+    if (m.kind === "tool_use") {
+      tools++;
+      continue;
+    }
+    if (m.kind === "tool_result") {
+      const useId = (m.payload as { tool_use_id?: string } | null)?.tool_use_id;
+      if (useId && visibleToolUseIds.has(useId)) continue;
+    }
+    msgs++;
+  }
+  const msgPart = `${msgs} ${msgs === 1 ? "message" : "messages"}`;
+  const toolPart = `${tools} tool ${tools === 1 ? "call" : "calls"}`;
+  return `${msgPart}, ${toolPart} hidden`;
+}
+
+// relativeTime renders an ISO instant as a coarse "time ago" for the block header
+// (the absolute value lives in the element's title). Coarse on purpose — the feed
+// reads as a narrative, not a precise log.
+function relativeTime(iso: string, now: number): string {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return "";
+  const s = Math.max(0, Math.floor((now - t) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+// useNow ticks a coarse clock so relative timestamps age without the feed needing
+// a re-render from elsewhere (e.g. a terminal run left open). One interval for the
+// whole feed; settled RunEventRow rows are memoized so a tick is cheap.
+function useNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
+    return () => window.clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
 // Keep the DOM bounded on very long runs: past the trigger, render only the most
 // recent VISIBLE messages behind a "show earlier" expander (cap-and-expand,
 // chosen over a virtualization dependency for this MVP).
@@ -57,8 +108,40 @@ export function ActivityFeed({
   terminal: boolean;
 }) {
   const [showAll, setShowAll] = useState(false);
+  // Agent collapse is keyed by agent NAME, not by block: groupByAgent emits a
+  // fresh block whenever the speaker changes, so lead→worker→lead yields two
+  // lead blocks — collapsing lead must mute BOTH (Decision 7). Per-run client
+  // state, never persisted; a new message from a collapsed agent does not
+  // auto-expand it (this Set is untouched by appends) but still counts in the
+  // follow pill (useFollowScroll sees the full, unfiltered messages.length).
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const follow = useFollowScroll(messages.length);
   const reconnecting = useReconnectingBanner(connected);
+  const now = useNow(30_000);
+
+  // Collapsing/expanding changes scroll height, which can strand a following user
+  // mid-feed or silently flip isNearBottom. Capture "were we following?" at click
+  // time, then re-arm the tail AFTER the height change lands (layout effect, keyed
+  // on the collapse Set) — but only if we were following, so a scrolled-up reader
+  // is left in place (Decision 7).
+  const rearmRef = useRef(false);
+  const toggleAgent = useCallback(
+    (agent: string) => {
+      rearmRef.current = !follow.paused;
+      setCollapsed((prev) => {
+        const next = new Set(prev);
+        if (next.has(agent)) next.delete(agent);
+        else next.add(agent);
+        return next;
+      });
+    },
+    [follow.paused],
+  );
+  useLayoutEffect(() => {
+    if (!rearmRef.current) return;
+    rearmRef.current = false;
+    follow.jumpToBottom();
+  }, [collapsed, follow.jumpToBottom]);
 
   const toolIndex = useMemo(() => buildToolIndex(messages), [messages]);
 
@@ -130,17 +213,37 @@ export function ActivityFeed({
               Show {hiddenCount} earlier messages
             </button>
           )}
-          {groups.map((g, i) => (
-            <AgentBlock
-              key={`${g.agent}-${g.messages[0]?.seq ?? i}`}
-              group={g}
-              live={g.agent === activeAgent}
-              toolIndex={toolIndex}
-              visibleToolUseIds={visibleToolUseIds}
-            />
-          ))}
+          {groups.map((g, i) => {
+            const firstSeq = g.messages[0]?.seq ?? i;
+            return (
+              <AgentBlock
+                key={`${g.agent}-${firstSeq}`}
+                bodyId={`agent-body-${firstSeq}`}
+                group={g}
+                live={g.agent === activeAgent}
+                collapsed={collapsed.has(g.agent)}
+                onToggle={() => toggleAgent(g.agent)}
+                now={now}
+                toolIndex={toolIndex}
+                visibleToolUseIds={visibleToolUseIds}
+              />
+            );
+          })}
         </div>
       )}
+    </div>
+  );
+}
+
+// MetaLine renders a status/meta message as a full-width, hairline-flanked divider
+// (Decision 12). Done here rather than in RunEvent's status branch so M3 stays
+// inside its file scope; RunEvent's branch remains for its own unit tests.
+function MetaLine({ text }: { text: string }) {
+  return (
+    <div className="flex items-center gap-2.5 py-0.5 text-xs italic text-muted">
+      <span aria-hidden="true" className="h-px flex-1 bg-edge" />
+      <span>{text}</span>
+      <span aria-hidden="true" className="h-px flex-1 bg-edge" />
     </div>
   );
 }
@@ -148,28 +251,68 @@ export function ActivityFeed({
 function AgentBlock({
   group,
   live,
+  collapsed,
+  onToggle,
+  now,
+  bodyId,
   toolIndex,
   visibleToolUseIds,
 }: {
   group: AgentGroup;
   live: boolean;
+  collapsed: boolean;
+  onToggle: () => void;
+  now: number;
+  bodyId: string;
   toolIndex: ReturnType<typeof buildToolIndex>;
   visibleToolUseIds: Set<string>;
 }) {
   const accent = agentAccent(group.agent);
   return (
     <div className={cx("rounded-lg border-l-2 bg-surface/60 py-3 pl-3 pr-3", accent)}>
-      <div className="mb-2 flex items-center gap-2">
+      <div className={cx("flex items-center gap-2", !collapsed && "mb-2")}>
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={!collapsed}
+          aria-controls={bodyId}
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${group.agent} activity`}
+          className="-ml-1 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted transition-colors hover:bg-raised/60 hover:text-fg"
+        >
+          <span
+            aria-hidden="true"
+            className={cx("inline-flex transition-transform", !collapsed && "rotate-90")}
+          >
+            <ChevronRightIcon />
+          </span>
+        </button>
         <span className={cx("text-sm font-semibold", accent.split(" ")[0])}>{group.agent}</span>
-        <Badge tone={live ? "warning" : "neutral"} title={live ? "Most recent activity" : "Idle"}>
+        <Badge
+          tone={live ? "warning" : "neutral"}
+          dot
+          pulse={live}
+          title={live ? "Most recent activity" : "Idle"}
+        >
           {live ? "active" : "idle"}
         </Badge>
-        <span className="ml-auto text-[11px] text-faint" title={group.startedAt}>
-          {group.startedAt ? new Date(group.startedAt).toLocaleTimeString() : ""}
+        {collapsed && (
+          <span className="min-w-0 truncate text-xs italic text-muted">
+            {hiddenSummary(group, visibleToolUseIds)}
+          </span>
+        )}
+        <span
+          className="ml-auto shrink-0 text-[11px] tabular-nums text-faint"
+          title={group.startedAt}
+        >
+          {relativeTime(group.startedAt, now)}
         </span>
       </div>
-      <div className="space-y-2">
+      <div id={bodyId} hidden={collapsed} className="space-y-2">
         {group.messages.map((m) => {
+          // Status/meta lines become hairline dividers (Decision 12).
+          if (m.kind === "status") {
+            return <MetaLine key={m.seq} text={describeStatus(m.payload)} />;
+          }
           // Fold a tool_result under its call (matched by id); skip it here — but
           // only when the call is in the visible window, else render it standalone
           // (its call was capped out, so nothing else would show the result).
