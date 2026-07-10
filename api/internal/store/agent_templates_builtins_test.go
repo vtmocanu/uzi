@@ -36,7 +36,7 @@ func (f *reconcilerFake) SeedSharedTemplateAllocationByName(_ context.Context, n
 	return nil
 }
 
-func (f *reconcilerFake) GetAgentTemplateByName(_ context.Context, name string) (AgentTemplate, error) {
+func (f *reconcilerFake) GetSharedAgentTemplateByName(_ context.Context, name string) (AgentTemplate, error) {
 	if err := f.getErr[name]; err != nil {
 		return AgentTemplate{}, err
 	}

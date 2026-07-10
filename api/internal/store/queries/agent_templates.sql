@@ -29,8 +29,12 @@ WHERE id = sqlc.arg(id)
        OR scope IN ('builtin', 'global')
        OR (scope = 'user' AND user_id = sqlc.arg(viewer_id)));
 
--- name: GetAgentTemplateByName :one
-SELECT * FROM agent_templates WHERE name = $1;
+-- name: GetSharedAgentTemplateByName :one
+-- Shared-namespace lookup for the reconciler's shadow-warning classification.
+-- Scoped to scope <> 'user' so it is unique (uq_agent_templates_shared_name):
+-- post-00047 a bare name is NOT unique, and a user's same-name template could
+-- otherwise win the QueryRow and trigger a false "builtin shadowed" warning.
+SELECT * FROM agent_templates WHERE name = $1 AND scope <> 'user';
 
 -- name: CreateAgentTemplate :one
 -- Create a global (admin) or user (owner) template. scope='builtin' is never

@@ -23,11 +23,22 @@ ORDER BY t.scope, t.name;
 -- global default (user_id NULL) decides; absent both, the template is not
 -- delivered. Shared rows are always enabled=true, so COALESCE(g.enabled, false)
 -- reduces to "a global-default row exists". Replaces the all-templates claim read.
+--
+-- SHARED precedence (audit acceptance criterion): a user template whose name
+-- exists in the shared (builtin/global) namespace is dropped from the claim
+-- entirely — the curated shared subagent must never be replaced by a user's
+-- same-named one (the worker keys subagents by name with no scope tiebreak). With
+-- this drop, plus the two partial uniques (shared names unique; per-user names
+-- unique), every delivered name is unique, so the worker never sees a collision.
 SELECT t.* FROM agent_templates t
 LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = sqlc.arg(user_id)
 LEFT JOIN agent_template_allocations g  ON g.template_id = t.id AND g.user_id IS NULL
 WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = sqlc.arg(user_id)))
   AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+  AND NOT (
+    t.scope = 'user'
+    AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name)
+  )
 ORDER BY t.name;
 
 -- name: DeleteSharedTemplateAllocations :exec

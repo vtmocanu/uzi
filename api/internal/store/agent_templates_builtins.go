@@ -16,7 +16,10 @@ import (
 // path unit-testable without a live database.
 type builtinReconcilerQueries interface {
 	InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error)
-	GetAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error)
+	// GetSharedAgentTemplateByName reads back the row that kept a seed out, scoped
+	// to the shared namespace so it stays a unique lookup post-00047 (a user's
+	// same-name template must not win it and trigger a false shadow warning).
+	GetSharedAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error)
 	// SeedSharedTemplateAllocationByName seeds a builtin's global-default
 	// allocation row (PRD #18 M7). Called only when the builtin was actually
 	// inserted, so an admin's later removal of the default is never re-added.
@@ -61,7 +64,7 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 			// receive it — the worker still routes it by name, but it is not
 			// resettable to the shipped definition. Warn so an operator can
 			// rename or delete the custom row if they want the builtin.
-			existing, gErr := q.GetAgentTemplateByName(ctx, def.Name)
+			existing, gErr := q.GetSharedAgentTemplateByName(ctx, def.Name)
 			switch {
 			case gErr != nil:
 				// The row exists (n==0) but the read-back to classify it failed;

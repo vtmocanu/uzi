@@ -235,6 +235,81 @@ func TestTemplateAllocationsLiveDB(t *testing.T) {
 	}
 }
 
+// TestClaimSharedPrecedenceLiveDB pins the audit acceptance criterion: a user
+// template whose name collides with a builtin/global is dropped from the owner's
+// claim (SHARED wins), so the worker — which keys subagents by name with no scope
+// tiebreak — can never have its curated builtin displaced by a user's same-named
+// template. Also pins the reconciler's shadow-warning read-back to the shared row.
+func TestClaimSharedPrecedenceLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	suffix := uuid.NewString()[:8]
+	userA := uuid.New()
+	mustExec(ctx, t, pool,
+		`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		userA, fmt.Sprintf("shadow-%s@e2e", suffix))
+
+	// A builtin "coder-<suffix>" (seeded like the reconciler does: insert + default
+	// allocation), and a user template of the SAME name allocated by userA.
+	name := "coder-" + suffix
+	if _, err := q.InsertBuiltinAgentTemplate(ctx, store.InsertBuiltinAgentTemplateParams{
+		Name: name, Description: "the curated coder.", PromptBody: "builtin body\n",
+	}); err != nil {
+		t.Fatalf("insert builtin: %v", err)
+	}
+	if err := q.SeedSharedTemplateAllocationByName(ctx, name); err != nil {
+		t.Fatalf("seed builtin default: %v", err)
+	}
+	uc := mustCreateTemplate(ctx, t, q, name, "user", userA)
+	if err := q.InsertUserTemplateAllocation(ctx, store.InsertUserTemplateAllocationParams{
+		TemplateID: uc.ID, UserID: pgUUID(userA), Enabled: true,
+	}); err != nil {
+		t.Fatalf("allocate user coder: %v", err)
+	}
+
+	rows, err := q.ListClaimAgentTemplates(ctx, pgUUID(userA))
+	if err != nil {
+		t.Fatalf("list claim templates: %v", err)
+	}
+	var seen []store.AgentTemplate
+	for _, r := range rows {
+		if r.Name == name {
+			seen = append(seen, r)
+		}
+	}
+	if len(seen) != 1 {
+		t.Fatalf("claim must carry exactly one %q (shared wins, user dropped); got %d", name, len(seen))
+	}
+	if seen[0].Scope != "builtin" {
+		t.Errorf("the surviving %q must be the builtin, not the user template; got scope %q", name, seen[0].Scope)
+	}
+	if seen[0].ID == uc.ID {
+		t.Error("the user template must be dropped from the claim, not delivered")
+	}
+
+	// Shadow-warning read-back resolves to the shared row, not the user's same-name.
+	got, err := q.GetSharedAgentTemplateByName(ctx, name)
+	if err != nil {
+		t.Fatalf("shared read-back: %v", err)
+	}
+	if got.Scope != "builtin" || got.ID == uc.ID {
+		t.Errorf("GetSharedAgentTemplateByName must return the builtin, not the user row; got scope %q", got.Scope)
+	}
+}
+
 func mustCreateTemplate(ctx context.Context, t *testing.T, q *store.Queries, name, scope string, owner uuid.UUID) store.AgentTemplate {
 	t.Helper()
 	var uid pgtype.UUID

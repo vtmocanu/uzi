@@ -102,12 +102,23 @@ func (q *Queries) GetAgentTemplate(ctx context.Context, id uuid.UUID) (AgentTemp
 	return i, err
 }
 
-const getAgentTemplateByName = `-- name: GetAgentTemplateByName :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates WHERE name = $1
+const getAgentTemplateForViewer = `-- name: GetAgentTemplateForViewer :one
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates
+WHERE id = $1
+  AND ($2::boolean
+       OR scope IN ('builtin', 'global')
+       OR (scope = 'user' AND user_id = $3))
 `
 
-func (q *Queries) GetAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error) {
-	row := q.db.QueryRow(ctx, getAgentTemplateByName, name)
+type GetAgentTemplateForViewerParams struct {
+	ID       uuid.UUID   `json:"id"`
+	IsAdmin  bool        `json:"is_admin"`
+	ViewerID pgtype.UUID `json:"viewer_id"`
+}
+
+// Single-template read with the same visibility rule as ListAgentTemplatesForViewer.
+func (q *Queries) GetAgentTemplateForViewer(ctx context.Context, arg GetAgentTemplateForViewerParams) (AgentTemplate, error) {
+	row := q.db.QueryRow(ctx, getAgentTemplateForViewer, arg.ID, arg.IsAdmin, arg.ViewerID)
 	var i AgentTemplate
 	err := row.Scan(
 		&i.ID,
@@ -126,23 +137,16 @@ func (q *Queries) GetAgentTemplateByName(ctx context.Context, name string) (Agen
 	return i, err
 }
 
-const getAgentTemplateForViewer = `-- name: GetAgentTemplateForViewer :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates
-WHERE id = $1
-  AND ($2::boolean
-       OR scope IN ('builtin', 'global')
-       OR (scope = 'user' AND user_id = $3))
+const getSharedAgentTemplateByName = `-- name: GetSharedAgentTemplateByName :one
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates WHERE name = $1 AND scope <> 'user'
 `
 
-type GetAgentTemplateForViewerParams struct {
-	ID       uuid.UUID   `json:"id"`
-	IsAdmin  bool        `json:"is_admin"`
-	ViewerID pgtype.UUID `json:"viewer_id"`
-}
-
-// Single-template read with the same visibility rule as ListAgentTemplatesForViewer.
-func (q *Queries) GetAgentTemplateForViewer(ctx context.Context, arg GetAgentTemplateForViewerParams) (AgentTemplate, error) {
-	row := q.db.QueryRow(ctx, getAgentTemplateForViewer, arg.ID, arg.IsAdmin, arg.ViewerID)
+// Shared-namespace lookup for the reconciler's shadow-warning classification.
+// Scoped to scope <> 'user' so it is unique (uq_agent_templates_shared_name):
+// post-00047 a bare name is NOT unique, and a user's same-name template could
+// otherwise win the QueryRow and trigger a false "builtin shadowed" warning.
+func (q *Queries) GetSharedAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error) {
+	row := q.db.QueryRow(ctx, getSharedAgentTemplateByName, name)
 	var i AgentTemplate
 	err := row.Scan(
 		&i.ID,
