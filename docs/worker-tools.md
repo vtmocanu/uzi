@@ -67,8 +67,9 @@ relies on the opt-in and the scrubbed provisioning env instead, as above.)
 
 - **New outbound egress.** Installing tools fetches them from **nix
   substituters** (`https://cache.nixos.org` plus any you add). This is the
-  one place a worker reaches beyond `api`; allow it through an egress
-  firewall if you run one.
+  one *new* egress this feature adds; a worker's full outbound set is `api`,
+  the forge (for git clone/fetch/push), and now the substituters. Allow the
+  substituters through an egress firewall if you run one.
 - **First-run-only.** The nix store lives on its own named volume
   (`agentnix` at `/nix`); the first run downloads, later runs on the same
   worker warm-start from it. It survives `docker compose down`/`up`.

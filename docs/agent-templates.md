@@ -59,7 +59,8 @@ turn it back on.
 
 If you name a **Mine** template the same as a builtin or global one, it is
 **shadowed**: the shared one wins and yours is dropped from your runs (shown
-with a `shadowed` badge). Rename it to use it.
+with a `shadowed` badge). Delete and recreate it under a different name to use it
+(a template's name is fixed once created).
 
 ## Create or edit a template
 

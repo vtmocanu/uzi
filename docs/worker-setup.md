@@ -62,7 +62,7 @@ Each template's Dockerfile bakes its own name into the image as `UZI_WORKER_TEMP
 
 Beyond the image's baked-in tools, a run can install **per-repo CLI tools** (kubectl, terraform, jq, and so on) on demand with [devbox](https://www.jetify.com/devbox) (nix under the hood). Users set a repo's tool profile, opt into a repo's own `devbox.json`, and admins manage the allowlist — all covered in [Per-repo tools](./worker-tools.md). The operator points to know:
 
-- **New outbound egress.** Installing tools reaches **nix substituters** (`https://cache.nixos.org` plus any you configure) — the one place the worker goes beyond `api`. Allow it through an egress firewall if you run one.
+- **New outbound egress.** Installing tools reaches **nix substituters** (`https://cache.nixos.org` plus any you configure) — the one *new* egress this feature adds. A worker also reaches the forge directly for git (clone/fetch/push), so its full outbound set is `api` + the forge + the substituters. Allow the substituters through an egress firewall if you run one.
 - **Provisioning is secret-scrubbed.** The install runs in a subprocess stripped of the forge token, the Anthropic token, and the join token, so a package's build hook cannot read your credentials. Only an explicit allowlist of tool environment variables (`PATH` and nix's TLS/locale vars) is passed back to the agent.
 - **Provisioning failure fails the run** with a clear message rather than silently continuing without the tool.
 
