@@ -4605,3 +4605,20 @@ See `prds/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
 - **Out of scope** (unchanged from before): message persistence / protocol / agent /
   worker; virtualized rendering for very long feeds; multi-language highlighting (bash-only
   by design); persisting agent-collapse state across reloads; in-feed search/filter.
+
+## 173. Worker ↔ run concurrency model — ADR-42 (decided; implementation via PRD #42)
+
+See `adr/0042-worker-run-concurrency.md` (the full ADR: research context, options, residuals)
+and `prds/42-worker-run-concurrency.md` (implementation design + milestones).
+
+- **Decision**: a worker may execute multiple runs concurrently, bounded by a worker-side
+  slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — default behavior unchanged);
+  the cap is advertised at registration for observability but never enforced server-side.
+  The server deliberately does NOT enforce 1:1 worker:run (a DB constraint there would
+  block PRD #39's chat lane and encode scaling policy in the schema).
+- **§878's "one run at a time" becomes "bounded by the cap, default 1"** once PRD #42
+  lands; §669's one-*worker*-per-user invariant is untouched.
+- **Cap>1 is an informed opt-in with two accepted intra-user residuals** (sibling `/proc`
+  PAT exposure during push windows; Bash cross-run worktree writes — details in the ADR);
+  the real fix is the k8s uid-split/container-per-run era (§168), where each
+  operator-spawned pod is a single-slot worker and this design composes unchanged.
