@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -146,6 +147,36 @@ func TestWorkerCreateProposalAuthzAndCaps(t *testing.T) {
 	newWorkerChatHandler(st).WorkerCreateProposal(rec, workerChatReq(http.MethodPost, "/api/worker/runs/x/proposals", wkr, runID, body))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("capped proposal = %d, want 409", rec.Code)
+	}
+}
+
+// TestWorkerCreateProposalIsRateLimited asserts the proposal endpoint rides the
+// per-worker limiter (the creation-rate cap complementing the per-run pending cap):
+// with a 1-request budget the second create is 429, driven through the real chi
+// route + real PerWorkerMiddleware.
+func TestWorkerCreateProposalIsRateLimited(t *testing.T) {
+	uid, runID, repoID := uuid.New(), uuid.New(), uuid.New()
+	wkr := store.Worker{ID: uuid.New(), UserID: uid}
+	st := &workerChatStore{userID: uid, repoID: repoID, chatRun: store.Run{ID: runID, UserID: uid, Kind: workersvc.RunKindChat, Status: "running"}}
+	h := newWorkerChatHandler(st)
+
+	lim := mw.NewLimiter(1, time.Minute, nil)
+	router := chi.NewRouter()
+	router.With(lim.PerWorkerMiddleware).Post("/api/worker/runs/{id}/proposals", h.WorkerCreateProposal)
+
+	body := `{"repo_id":"` + repoID.String() + `","title":"t","description":"d","labels":[]}`
+	do := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/"+runID.String()+"/proposals", strings.NewReader(body))
+		req = req.WithContext(mw.ContextWithWorker(req.Context(), wkr))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := do(); code != http.StatusCreated {
+		t.Fatalf("first proposal = %d, want 201", code)
+	}
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Fatalf("second proposal = %d, want 429 (per-worker limiter must apply)", code)
 	}
 }
 
