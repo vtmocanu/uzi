@@ -38,6 +38,16 @@ export default {
           border: token("neutral-border"),
           surface: token("neutral-surface"),
         },
+        // Shell syntax-highlight tokens (PRD #38) — alias the palette in
+        // index.css; these entries make text-syn-cmd / text-syn-flag / … and
+        // border-tool-rail resolve to real utilities.
+        "syn-cmd": token("syn-cmd"),
+        "syn-flag": token("syn-flag"),
+        "syn-str": token("syn-str"),
+        "syn-op": token("syn-op"),
+        "syn-comment": token("syn-comment"),
+        "syn-arg": token("syn-arg"),
+        "tool-rail": token("tool-rail"),
         ring: token("ring"), // keyboard focus ring (see :focus-visible in index.css)
       },
       // Radii derive from the single --radius token (multica's calc scheme in

@@ -120,6 +120,15 @@ Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
 - No "show raw JSON" toggle in the web UI. [explicit user rejection]
 - Reuse PRD #7's markdown renderer rather than building a parallel one. [user coordination]
 
+## Feature #38 — Activity feed redesign
+
+Tracked as GitLab issue vtmocanu/uzi#38; PRD at `prds/38-activity-feed-redesign.md`.
+
+- The run Activity feed is polished/redesigned per the approved mock.
+- Bash commands render as highlighted code, not plain text; no command content is lost in the UI.
+- Agent output is collapsible per agent (collapse lead/worker output).
+- The approved mock is the design contract; the implemented UI must match it. Mock committed at `prds/mockups/38-activity-feed-mock.html`.
+
 ## Feature #12 — Board–run lifecycle integration
 
 Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/12-board-run-lifecycle.md`.
