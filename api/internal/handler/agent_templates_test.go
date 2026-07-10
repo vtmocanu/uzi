@@ -4,7 +4,71 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
+
+// TestLeadNameReserved pins Decision 8: no API-created template (global or user)
+// may take a lead name, so a claim can never carry two lead-matching templates.
+// Case-insensitive and anchored, matching the worker's LEAD_NAME_RE.
+func TestLeadNameReserved(t *testing.T) {
+	reserved := []string{"lead", "orchestrator", "LEAD", "Orchestrator", "Lead", "ORCHESTRATOR"}
+	for _, s := range reserved {
+		if !leadNameRe.MatchString(s) {
+			t.Errorf("leadNameRe must reserve %q", s)
+		}
+	}
+	// Anchored: only the exact words are reserved, not names that merely contain them.
+	allowed := []string{"coder", "reviewer", "lead-helper", "my-lead", "orchestrators", "leader"}
+	for _, s := range allowed {
+		if leadNameRe.MatchString(s) {
+			t.Errorf("leadNameRe must allow %q", s)
+		}
+	}
+}
+
+// TestAuthorizeTemplateWrite is the core write-authz matrix mirroring skills:
+// builtin/global are admin-only, a user template is owner-only, and a non-owner
+// non-admin sees 404 (existence hidden) while an admin who cannot edit a user
+// template sees 403.
+func TestAuthorizeTemplateWrite(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	other := store.User{ID: uuid.New()}
+	admin := store.User{ID: uuid.New(), IsAdmin: true}
+
+	builtin := store.AgentTemplate{Scope: "builtin", IsBuiltin: true}
+	global := store.AgentTemplate{Scope: "global"}
+	mine := store.AgentTemplate{Scope: "user", UserID: pgUUID(owner.ID)}
+
+	cases := []struct {
+		name       string
+		actor      store.User
+		tmpl       store.AgentTemplate
+		wantOK     bool
+		wantStatus int
+	}{
+		{"admin edits builtin", admin, builtin, true, 0},
+		{"user edits builtin", owner, builtin, false, 403},
+		{"admin edits global", admin, global, true, 0},
+		{"user edits global", owner, global, false, 403},
+		{"owner edits own user template", owner, mine, true, 0},
+		{"admin edits others user template", admin, mine, false, 403},
+		{"other user edits user template", other, mine, false, 404},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, ok := authorizeTemplateWrite(c.actor, c.tmpl)
+			if ok != c.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, c.wantOK)
+			}
+			if !ok && status != c.wantStatus {
+				t.Errorf("status = %d, want %d", status, c.wantStatus)
+			}
+		})
+	}
+}
 
 func TestNameRe(t *testing.T) {
 	valid := []string{"coder", "fact-checker", "a", "a1", "spec-keeper", "x-y-z"}

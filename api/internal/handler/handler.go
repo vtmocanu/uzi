@@ -159,9 +159,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Put("/", h.PutMySettings)
 		})
 
-		// Agent templates: all authenticated users can read and preview; only
-		// admins can create, edit, delete, or reset (closes bottega's hole
-		// where any user rewrites the shared prompts everyone's agents run).
+		// Agent templates (PRD #18 M6): every authenticated user reads the
+		// templates visible to them (builtin + global + own) and manages their own
+		// user templates; global/builtin management stays admin-only (per-row scope
+		// authz). Still closes bottega's hole where any user rewrites shared prompts.
 		r.Route("/agent-templates", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Get("/", h.ListAgentTemplates)
@@ -170,17 +171,18 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 
 			// Skill allocations (PRD #16): the shared half is admin-only and the
 			// mine half is any user's own overlay, so authz is per-half inside the
-			// handler — these stay OUTSIDE the admin subgroup below.
+			// handler (per-half), not a blanket admin gate.
 			r.Get("/{id}/skills", h.GetTemplateSkills)
 			r.Put("/{id}/skills", h.SetTemplateSkills)
 
-			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireAdmin)
-				r.Post("/", h.CreateAgentTemplate)
-				r.Put("/{id}", h.UpdateAgentTemplate)
-				r.Delete("/{id}", h.DeleteAgentTemplate)
-				r.Post("/{id}/reset", h.ResetAgentTemplate)
-			})
+			// Create/update/delete/reset (PRD #18 M6): a user manages their own
+			// scope='user' templates; global/builtin management stays admin-only.
+			// The split is per-row by scope inside the handlers
+			// (authorizeTemplateWrite), not a blanket RequireAdmin gate.
+			r.Post("/", h.CreateAgentTemplate)
+			r.Put("/{id}", h.UpdateAgentTemplate)
+			r.Delete("/{id}", h.DeleteAgentTemplate)
+			r.Post("/{id}/reset", h.ResetAgentTemplate)
 		})
 
 		// Skills (PRD #16): every authenticated user can read the skills visible

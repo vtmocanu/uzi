@@ -27,6 +27,8 @@ type AgentTemplate struct {
 	UpdatedBy   pgtype.UUID        `json:"updated_by"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	Scope       string             `json:"scope"`
+	UserID      pgtype.UUID        `json:"user_id"`
 }
 
 type AppSetting struct {
