@@ -6,7 +6,43 @@ import (
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
+	"github.com/slack-go/slack/socketmode"
 )
+
+// The regression that shipped (specs/ai.md §167): acking hello — whose Request
+// is non-nil but EnvelopeID empty — sends `{"envelope_id":""}`, after which
+// Slack drops the socket ~10s later and every inbound event is lost. ackable is
+// the single predicate every ack site goes through; hello-shaped envelopes must
+// be false, genuine app envelopes true.
+func TestAckable(t *testing.T) {
+	for name, tc := range map[string]struct {
+		evt  socketmode.Event
+		want bool
+	}{
+		"hello: request without envelope id": {
+			evt:  socketmode.Event{Type: socketmode.EventTypeHello, Request: &socketmode.Request{Type: "hello"}},
+			want: false,
+		},
+		"internal event: no request at all": {
+			evt:  socketmode.Event{Type: socketmode.EventTypeConnected},
+			want: false,
+		},
+		"events_api envelope": {
+			evt:  socketmode.Event{Type: socketmode.EventTypeEventsAPI, Request: &socketmode.Request{Type: "events_api", EnvelopeID: "env-1"}},
+			want: true,
+		},
+		"interactive envelope": {
+			evt:  socketmode.Event{Type: socketmode.EventTypeInteractive, Request: &socketmode.Request{Type: "interactive", EnvelopeID: "env-2"}},
+			want: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ackable(tc.evt); got != tc.want {
+				t.Errorf("ackable() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 // recordingInbound captures the BlockActions routeInteractive dispatches.
 type recordingInbound struct{ actions []BlockAction }

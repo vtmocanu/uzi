@@ -26,6 +26,17 @@ func actionIDs(cb slack.InteractionCallback) []string {
 	return ids
 }
 
+// ackable reports whether evt carries an envelope Slack expects an ack for: a
+// non-nil Request with a non-empty EnvelopeID. Hello (and slack-go's internal
+// events) carry an empty id, and acking one sends `{"envelope_id":""}` —
+// protocol garbage after which Slack drops the socket ~10s later (found live
+// 2026-07-10: the connection flapped on a 10s cycle and every inbound click/DM
+// was lost). Every ack in the receive loop goes through this single predicate
+// so the invariant is structural, not a per-branch spelling.
+func ackable(evt socketmode.Event) bool {
+	return evt.Request != nil && evt.Request.EnvelopeID != ""
+}
+
 // newSocketDialer returns the production DialFunc bound to a client whose Timeout
 // caps the Socket Mode HTTP handshake (apps.connections.open). The websocket
 // itself is not bounded by the client timeout — its liveness is the deadman
@@ -123,7 +134,7 @@ func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken
 			case socketmode.EventTypeInteractive:
 				// ACK FIRST, before any processing, so Slack does not re-deliver the
 				// envelope in ~3s. Only then route the (Slack-authenticated) payload.
-				if evt.Request != nil {
+				if ackable(evt) {
 					_ = sm.Ack(*evt.Request)
 				}
 				if inbound != nil {
@@ -139,27 +150,33 @@ func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken
 			case socketmode.EventTypeEventsAPI:
 				// ACK FIRST, then route message.im thread replies (M5). Other inner
 				// events are ACKed and ignored.
-				if evt.Request != nil {
+				if ackable(evt) {
 					_ = sm.Ack(*evt.Request)
 				}
-				slog.Info("slack: inbound events-api envelope")
 				if messages != nil {
 					if e, ok := evt.Data.(slackevents.EventsAPIEvent); ok {
+						// Receipt log with the inner event type (a Slack-defined type name,
+						// never payload content) so a dropped-in-routing event is
+						// distinguishable from one that never arrived.
+						slog.Info("slack: inbound events-api envelope", "inner", e.InnerEvent.Type)
 						routeMessage(ctx, messages, e)
 					}
 				}
 				continue
+			case socketmode.EventTypeConnectionError, socketmode.EventTypeIncomingError, socketmode.EventTypeErrorWriteFailed:
+				// slack-go's internal error events, not Slack envelopes. Type-only at
+				// Warn (a reconnect storm repeats ConnectionError per attempt; the
+				// manager's own backoff warning carries the redacted cause).
+				slog.Warn("slack: socket client error event", "type", string(evt.Type))
 			default:
 				// Coarse visibility on anything unrouted (type only, no payload) so an
 				// ignored-but-relevant envelope kind is discoverable from the logs.
 				slog.Info("slack: unhandled envelope type", "type", string(evt.Type))
 			}
-			// Ack any other envelope so Slack does not re-deliver it. Only envelopes
-			// with a non-empty id are ackable: hello (and other control frames) carry
-			// an empty EnvelopeID, and acking one sends `{"envelope_id":""}` — protocol
-			// garbage that makes Slack drop the socket ~10s later (found live 2026-07-10:
-			// the connection flapped on a 10s cycle and every inbound click/DM was lost).
-			if evt.Request != nil && evt.Request.EnvelopeID != "" {
+			// Ack any other envelope so Slack does not re-deliver it (ackable skips
+			// hello and the internal events above — see its doc for why acking an
+			// empty EnvelopeID kills the connection).
+			if ackable(evt) {
 				_ = sm.Ack(*evt.Request)
 			}
 		}
