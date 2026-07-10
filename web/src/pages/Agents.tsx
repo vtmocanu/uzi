@@ -49,6 +49,15 @@ export function Agents() {
 
   const allocById = useMemo(() => new Map(allocations.map((a) => [a.id, a])), [allocations]);
 
+  // A user template whose name collides with a builtin/global is SHADOWED: the
+  // claim drops it (shared precedence, PRD #18 M7), so it never reaches a run even
+  // when toggled on. Surface it so the toggle isn't silently a no-op — the fix is
+  // to rename. Shared names are always visible, so this set is exact.
+  const sharedNames = useMemo(
+    () => new Set(templates.filter((t) => t.scope !== "user").map((t) => t.name)),
+    [templates],
+  );
+
   // Replace-set writes: the PUT fully replaces the half it carries, so each
   // toggle recomputes the whole set from current state and changes just one entry.
   const setMyOverride = async (id: string, enabled: boolean) => {
@@ -134,6 +143,7 @@ export function Agents() {
                       template={t}
                       alloc={allocById.get(t.id)}
                       isAdmin={isAdmin}
+                      shadowed={t.scope === "user" && sharedNames.has(t.name)}
                       busy={busyId === t.id}
                       onToggleMine={setMyOverride}
                       onToggleGlobal={setGlobalDefault}
@@ -153,6 +163,7 @@ function AgentRow({
   template: t,
   alloc,
   isAdmin,
+  shadowed,
   busy,
   onToggleMine,
   onToggleGlobal,
@@ -160,6 +171,7 @@ function AgentRow({
   template: AgentTemplate;
   alloc: TemplateAllocation | undefined;
   isAdmin: boolean;
+  shadowed: boolean;
   busy: boolean;
   onToggleMine: (id: string, enabled: boolean) => void;
   onToggleGlobal: (id: string, on: boolean) => void;
@@ -176,6 +188,14 @@ function AgentRow({
           {isLeadTemplateName(t.name) && (
             <Badge tone="brand" title="The orchestrator: the main agent thread that plans and delegates.">
               orchestrator
+            </Badge>
+          )}
+          {shadowed && (
+            <Badge
+              tone="warning"
+              title="A builtin or global template shares this name and takes precedence, so this agent is dropped from your runs. Rename it to use it."
+            >
+              shadowed
             </Badge>
           )}
         </span>

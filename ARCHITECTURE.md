@@ -145,11 +145,35 @@ recipe a later release renders into a running one.
   SDK/Anthropic-account default. A subagent's own template `model`, when set,
   always wins for that subagent; unset, it inherits the resolved main-thread
   model. See [docs/worker-model.md](docs/worker-model.md).
-- **Read/write split.** Any authenticated user can list, view, and preview
-  templates (`GET /api/agent-templates*`); only an admin can create, edit,
-  delete, or reset one (`RequireAdmin` in `api/internal/handler/handler.go`).
-  Templates are shared across all users, so this closes the hole where any
-  user could rewrite the prompts everyone else's agents run with.
+- **Scopes + per-user ownership (PRD #18).** Each template has a `scope`
+  (`builtin`/`global`/`user`) and, for user scope, a `user_id`, mirroring the
+  skills model. Builtin and global are visible to everyone and admin-managed; a
+  `user` template is visible to and editable by only its owner. Reads and
+  writes are scope-authorized per row (not a blanket `RequireAdmin`): any user
+  creates/edits/deletes their own templates, builtin/global management stays
+  admin-only, and a non-owner never learns a private template exists (404, not
+  403). `is_builtin` is retained as a compat column a CHECK ties to
+  `scope='builtin'`. Two partial-unique name indexes (shared names unique
+  across builtin+global; per-user names unique) let a user own a name that
+  collides with a shared one; `lead`/`orchestrator` are reserved so no
+  API-created template (global or user) can take a lead name — the invariant
+  behind the worker's "a claim never carries two lead-matching templates" pin.
+  This still closes the hole where any user could rewrite the shared prompts.
+- **Allocation + claim filtering (PRD #18).** `agent_template_allocations`
+  decides which templates ride each run: a global-default layer (admin,
+  `user_id NULL`, always enabled) plus a per-user `enabled` overlay. Seeded
+  with no empty-means-all cliff — every builtin/global gets an explicit default
+  row (at migration, on the reconciler's first insert of a builtin, and on a
+  global's creation), so absence of a row is always a deliberate removal. A
+  claim delivers only the run owner's **resolved** set (`ListClaimAgentTemplates`:
+  the overlay wins, else the global default, else dropped) — builtin∪global
+  defaults ± the owner's overlay + the owner's own allocated user templates,
+  never another user's rows. A user template whose name collides with a
+  builtin/global is dropped from the claim (**shared precedence**), so the
+  worker's name-keyed subagent map never has the curated builtin displaced (a
+  deliberate divergence from skills' body-precedence; surfaced in the UI as a
+  `shadowed` badge). The lead is a normal template in the set — a user may
+  disable it, and the worker degrades to its hardcoded guardrail lead prompt.
 - **Renderer.** `api/internal/agenttmpl/render.go` turns a template into
   Claude Code's subagent Markdown (fixed-order YAML frontmatter, `tools` as an
   inline comma-separated string, `tools`/`model` omitted when they inherit).
@@ -160,24 +184,29 @@ recipe a later release renders into a running one.
   in this release writes it to a filesystem or spawns anything from it (that
   is a later release's job). See
   [docs/agent-templates.md](docs/agent-templates.md).
-- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique,
-  and immutable after creation (it is the subagent's filename and identity;
-  renaming means creating a new template and deleting the old one; builtins
-  are never renamed). `description` and `prompt_body` are required and
+- **Validation.** `name` is kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique
+  within its scope namespace (the two partial-unique indexes above), not a
+  reserved lead name for an API create, and immutable after creation (it is the
+  subagent's filename and identity; renaming means creating a new template and
+  deleting the old one; builtins are never renamed). `description` and `prompt_body` are required and
   non-empty; `description`, `model`, and each tool name must not contain a
   newline, carriage return, or other control character (they each render on
   a single frontmatter line). A template is rejected if its description or
   prompt body contains what looks like a complete Anthropic token (a
   high-confidence `sk-ant-...` match); the UI separately warns, without
   blocking, on looser patterns so legitimate text stays savable.
-- **API surface.** All endpoints require authentication (session + CSRF); the
-  writes also require admin: `GET /api/agent-templates` (list), `GET
-  /api/agent-templates/:id` (one), `GET .../rendered`, `POST
-  /api/agent-templates` (create), `PUT .../:id` (update; name is ignored,
-  immutable), `DELETE .../:id` (409 on a builtin), `POST .../:id/reset` (400
-  on a non-builtin). Edits are last-write-wins — no optimistic-concurrency
-  check in this release — but every row records `updated_by` and `updated_at`
-  so concurrent edits are at least attributable after the fact.
+- **API surface.** All endpoints require authentication (session + CSRF);
+  writes are scope-authorized per row (PRD #18), not blanket-admin: `GET
+  /api/agent-templates` (list, viewer-scoped), `GET /api/agent-templates/:id`
+  (one, viewer-scoped), `GET .../rendered`, `GET|PUT
+  /api/agent-templates/allocations` (the per-template toggle view + replace-set
+  write: an admin global-default half + the caller's overlay half), `POST
+  /api/agent-templates` (create; `scope` global⇒admin or user⇒owner, blank⇒global
+  for back-compat; a reserved lead name is rejected), `PUT .../:id` (update; name
+  and scope are ignored, immutable), `DELETE .../:id` (409 on a builtin), `POST
+  .../:id/reset` (400 on a non-builtin). Edits are last-write-wins — no
+  optimistic-concurrency check in this release — but every row records
+  `updated_by` and `updated_at` so concurrent edits are at least attributable.
 
 ## Agent skills
 
