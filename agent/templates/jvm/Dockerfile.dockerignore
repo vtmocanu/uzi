@@ -6,11 +6,9 @@
 # agent/ docs/ specs/ prds/ e2e/ scripts/ *.md) — only secrets, VCS, submodules,
 # deps, and build artifacts. See templates/base/Dockerfile.dockerignore for detail.
 
-# Secrets — must NEVER enter the build context.
-.env
-.env.*
-**/.env
-**/.env.*
+# Secrets — must NEVER enter the build context (`.env*` also catches `.envrc`).
+.env*
+**/.env*
 
 # VCS + submodule metadata + the large inspiration/ submodules.
 .git

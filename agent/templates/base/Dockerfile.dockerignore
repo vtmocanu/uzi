@@ -11,11 +11,10 @@
 # It only hard-excludes secrets, VCS, submodules, deps, and build artifacts.
 
 # Secrets — must NEVER enter the build context (the baked source is world-readable
-# to the agent). Bare patterns catch the root; **/ globs catch any depth.
-.env
-.env.*
-**/.env
-**/.env.*
+# to the agent). `.env*` (no trailing dot) also catches non-dotted forms like a
+# devbox/direnv `.envrc`; `**/.env*` catches any depth including the root.
+.env*
+**/.env*
 
 # VCS + submodule metadata + the large inspiration/ submodules (prior-art only).
 .git
