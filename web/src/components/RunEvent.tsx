@@ -404,10 +404,25 @@ function Expander({
       type="button"
       aria-expanded={open}
       onClick={onToggle}
-      className="text-[11px] font-medium text-faint hover:text-muted"
+      // Interactive label: --muted (~6.9:1, not the ~3.65:1 --faint) and a ≥24px
+      // hit target with padding (WCAG 1.4.3 + 2.5.8, PRD #38 Decisions 9 + M4).
+      className="inline-flex min-h-[24px] items-center rounded-md px-1.5 py-0.5 text-[11px] font-medium text-muted hover:bg-raised/60 hover:text-fg"
     >
       {label}
     </button>
+  );
+}
+
+// MetaLine renders a status/meta message as a full-width, hairline-flanked divider
+// (PRD #38 Decision 12). Single source of truth for status rendering: the feed no
+// longer intercepts `status` — RunEventRow's status branch delegates here.
+function MetaLine({ text }: { text: string }) {
+  return (
+    <div className="flex items-center gap-2.5 py-0.5 text-xs italic text-muted">
+      <span aria-hidden="true" className="h-px flex-1 bg-edge" />
+      <span>{text}</span>
+      <span aria-hidden="true" className="h-px flex-1 bg-edge" />
+    </div>
   );
 }
 
@@ -579,7 +594,10 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
   const argOverflow = !isBash && full.length > SUMMARY_MAX;
 
   return (
-    <div className="border-l border-tool-rail/70 pl-3 text-sm">
+    // The tool rail (border-l) is drawn once by the feed around a RUN of
+    // consecutive tool/thinking rows (PRD #38 M4 rail consolidation), so the row
+    // itself no longer carries its own border — that produced a segmented rail.
+    <div className="text-sm">
       <div className="flex items-center gap-2">
         <span aria-hidden="true" className="inline-flex shrink-0 text-faint [font-size:14px]">
           {toolIcon(name)}
@@ -605,8 +623,11 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
 
 function ThinkingRow({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
+  // Muted, not faint (Decision 12 + M4 contrast): thinking is de-emphasized but
+  // still conveys meaning, so it must clear 4.5:1. The rail border is drawn by
+  // the feed's rail wrapper, not here.
   return (
-    <div className="border-l border-tool-rail/70 pl-3 text-sm text-faint">
+    <div className="text-sm text-muted">
       <div className="flex items-baseline gap-2">
         <span className="inline-flex items-baseline gap-1.5 italic">
           <span aria-hidden="true" className="self-center">
@@ -617,7 +638,7 @@ function ThinkingRow({ text }: { text: string }) {
         <Expander open={open} onToggle={() => setOpen((o) => !o)} label={open ? "hide" : "show"} />
       </div>
       {open && (
-        <pre className="mt-1 whitespace-pre-wrap break-words text-xs italic text-faint">{text}</pre>
+        <pre className="mt-1 whitespace-pre-wrap break-words text-xs italic text-muted">{text}</pre>
       )}
     </div>
   );
@@ -626,7 +647,7 @@ function ThinkingRow({ text }: { text: string }) {
 function StandaloneResult({ result }: { result: RunMessage }) {
   const id = asString(asRecord(result.payload)?.["tool_use_id"]);
   return (
-    <div className="border-l border-tool-rail/70 pl-3 text-sm">
+    <div className="text-sm">
       <div className="text-[11px] font-semibold uppercase tracking-wider text-muted">
         result{id ? ` for ${truncate(id, 24)}` : ""}
       </div>
@@ -661,7 +682,7 @@ export const RunEventRow = memo(function RunEventRow({
       // Only reached for orphan results; folded ones are skipped by the parent.
       return <StandaloneResult result={msg} />;
     case "status":
-      return <div className="text-xs italic text-faint">{describeStatus(msg.payload)}</div>;
+      return <MetaLine text={describeStatus(msg.payload)} />;
     case "error":
       return (
         <div className="rounded-md border border-danger/40 bg-danger/10 px-2 py-1 text-sm text-danger">
@@ -680,9 +701,9 @@ export const RunEventRow = memo(function RunEventRow({
     default: {
       const extract = asString(rec?.["text"]) ?? asString(rec?.["message"]) ?? "";
       return (
-        <div className="text-xs text-faint">
+        <div className="text-xs text-muted">
           <span className="italic">unrenderable {msg.kind} event</span>
-          {extract && <span className="ml-1 text-muted">— {truncate(extract)}</span>}
+          {extract && <span className="ml-1 text-fg">— {truncate(extract)}</span>}
         </div>
       );
     }

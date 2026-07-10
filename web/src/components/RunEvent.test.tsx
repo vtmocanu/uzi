@@ -443,8 +443,34 @@ describe("tool durations (PRD #38 Decision 6)", () => {
     );
     const more = getByRole("button", { name: "more" });
     expect(more).toBeTruthy();
+    // M4: the interactive label clears contrast (--muted, not --faint) and gets a
+    // ≥24px hit target.
+    expect(more.className).toContain("text-muted");
+    expect(more.className).toContain("min-h-[24px]");
     expect(container.textContent).not.toContain(pattern); // truncated while collapsed
     fireEvent.click(more);
     expect(container.textContent).toContain(pattern); // full arg revealed
+  });
+});
+
+describe("accessibility (PRD #38 M4)", () => {
+  it("renders a status event as a hairline meta divider (single source of truth)", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "status", payload: { event: "init", model: "claude-fable-5" } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("agent started (claude-fable-5)");
+    expect(container.querySelector(".h-px")).not.toBeNull();
+  });
+
+  it("gives the thinking expander a muted ≥24px target", () => {
+    const { getByRole } = render(
+      <RunEventRow msg={msg({ seq: 1, kind: "thinking", payload: { text: "deliberating" } })} live={false} />,
+    );
+    const btn = getByRole("button", { name: "show" });
+    expect(btn.className).toContain("text-muted");
+    expect(btn.className).toContain("min-h-[24px]");
   });
 });

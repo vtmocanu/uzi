@@ -1,7 +1,15 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import type { RunMessage } from "../lib/api";
 import { useFollowScroll, useReconnectingBanner } from "../lib/useFollowScroll";
-import { buildToolIndex, describeStatus, RunEventRow } from "./RunEvent";
+import { buildToolIndex, describeError, describeStatus, RunEventRow } from "./RunEvent";
 import { ChevronRightIcon } from "./icons";
 import { Badge, cx } from "./ui";
 
@@ -40,6 +48,15 @@ function groupByAgent(messages: RunMessage[]): AgentGroup[] {
   return groups;
 }
 
+// isEmptyText marks a text message that renders to nothing (RunEventRow returns
+// null for empty/blank text): it must neither split the tool rail nor count as a
+// hidden "message" in a collapsed block's summary (PRD #38 M4 review).
+function isEmptyText(m: RunMessage): boolean {
+  if (m.kind !== "text") return false;
+  const t = (m.payload as { text?: unknown } | null)?.text;
+  return typeof t !== "string" || t === "";
+}
+
 // hiddenSummary describes what a collapsed block hides: prose/meta rows counted
 // as "messages", tool calls counted separately. A folded tool_result (its call is
 // visible, so it renders under the call rather than as its own row) is not a row,
@@ -48,6 +65,7 @@ function hiddenSummary(group: AgentGroup, visibleToolUseIds: Set<string>): strin
   let tools = 0;
   let msgs = 0;
   for (const m of group.messages) {
+    if (isEmptyText(m)) continue;
     if (m.kind === "tool_use") {
       tools++;
       continue;
@@ -167,8 +185,46 @@ export function ActivityFeed({
     return ids;
   }, [visible]);
 
+  // One polite live region carries only MEANINGFUL narration (Decision 8): an
+  // agent handoff, agent started/finished, a plan submitted, an error, or the run
+  // finishing — never a per-tool frame. The scroll container's own role="log" is
+  // muted to aria-live="off" (below), so a burst of tool_use/tool_result/text/
+  // thinking appends leaves this string untouched and screen readers hear the
+  // story, not every shell command.
+  const [announcement, setAnnouncement] = useState("");
+  const announcedRef = useRef({ agent: undefined as string | undefined, seq: 0, terminal: false });
+  useEffect(() => {
+    const seen = announcedRef.current;
+    let next: string | null = null;
+
+    if (activeAgent && activeAgent !== seen.agent) next = `${activeAgent} is now active`;
+    seen.agent = activeAgent;
+
+    let meaningful: RunMessage | undefined;
+    for (const mm of messages) {
+      if (mm.kind === "status" || mm.kind === "error" || mm.kind === "plan") meaningful = mm;
+    }
+    if (meaningful && meaningful.seq !== seen.seq) {
+      seen.seq = meaningful.seq;
+      next =
+        meaningful.kind === "error"
+          ? `Error: ${describeError(meaningful.payload)}`
+          : meaningful.kind === "plan"
+            ? "Plan submitted, awaiting approval"
+            : describeStatus(meaningful.payload);
+    }
+
+    if (terminal && !seen.terminal) next = "Run finished";
+    seen.terminal = terminal;
+
+    if (next !== null) setAnnouncement(next);
+  }, [messages, activeAgent, terminal]);
+
   return (
     <div className="space-y-2">
+      <div aria-live="polite" aria-atomic="true" className="sr-only">
+        {announcement}
+      </div>
       <div className="flex items-center justify-between">
         <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Activity</h2>
         <div className="flex items-center gap-2">
@@ -176,7 +232,7 @@ export function ActivityFeed({
             <button
               type="button"
               onClick={follow.jumpToBottom}
-              className="rounded-full bg-brand px-2.5 py-0.5 text-xs font-medium text-on-brand hover:bg-brand-hover"
+              className="inline-flex min-h-[24px] items-center rounded-full bg-brand px-2.5 py-0.5 text-xs font-medium text-on-brand hover:bg-brand-hover"
             >
               {follow.newCount} new ↓
             </button>
@@ -200,7 +256,10 @@ export function ActivityFeed({
           ref={follow.ref}
           onScroll={follow.onScroll}
           role="log"
-          aria-live="polite"
+          // role="log" implies aria-live="polite"; force it OFF so tool frames are
+          // not announced. Meaningful transitions route through the sr-only region
+          // above (Decision 8).
+          aria-live="off"
           aria-label="Run activity"
           className="max-h-[65vh] space-y-3 overflow-auto rounded-lg border border-edge bg-ink/60 p-3 [overscroll-behavior:contain]"
         >
@@ -235,19 +294,6 @@ export function ActivityFeed({
   );
 }
 
-// MetaLine renders a status/meta message as a full-width, hairline-flanked divider
-// (Decision 12). Done here rather than in RunEvent's status branch so M3 stays
-// inside its file scope; RunEvent's branch remains for its own unit tests.
-function MetaLine({ text }: { text: string }) {
-  return (
-    <div className="flex items-center gap-2.5 py-0.5 text-xs italic text-muted">
-      <span aria-hidden="true" className="h-px flex-1 bg-edge" />
-      <span>{text}</span>
-      <span aria-hidden="true" className="h-px flex-1 bg-edge" />
-    </div>
-  );
-}
-
 function AgentBlock({
   group,
   live,
@@ -268,6 +314,51 @@ function AgentBlock({
   visibleToolUseIds: Set<string>;
 }) {
   const accent = agentAccent(group.agent);
+
+  // Build the body as a flow of full-width rows (prose, status divider, error,
+  // plan) with any RUN of consecutive rail-kind rows (tool_use, thinking, orphan
+  // tool_result) gathered into ONE bordered rail container — the continuous rail
+  // of the mock, instead of a per-row border segmented by the space-y gaps (M4).
+  const rows: ReactNode[] = [];
+  let rail: ReactNode[] = [];
+  let railSeq = 0;
+  const flushRail = () => {
+    if (rail.length === 0) return;
+    rows.push(
+      <div key={`rail-${railSeq}`} className="space-y-2 border-l border-tool-rail/70 pl-3">
+        {rail}
+      </div>,
+    );
+    rail = [];
+  };
+  for (const m of group.messages) {
+    // Empty text renders nothing — drop it so it neither splits the rail nor
+    // shows up in a collapsed block's summary count.
+    if (isEmptyText(m)) continue;
+    if (m.kind === "tool_result") {
+      const useId = (m.payload as { tool_use_id?: string } | null)?.tool_use_id;
+      // Folded under its visible call (rendered there); skip. Otherwise orphan →
+      // stands alone inside the rail.
+      if (useId && visibleToolUseIds.has(useId)) continue;
+      if (rail.length === 0) railSeq = m.seq;
+      rail.push(<RunEventRow key={m.seq} msg={m} live={live} />);
+      continue;
+    }
+    if (m.kind === "tool_use" || m.kind === "thinking") {
+      const result =
+        m.kind === "tool_use"
+          ? toolIndex.resultByUseId.get((m.payload as { id?: string } | null)?.id ?? "")
+          : undefined;
+      if (rail.length === 0) railSeq = m.seq;
+      rail.push(<RunEventRow key={m.seq} msg={m} result={result} live={live} />);
+      continue;
+    }
+    // Full-width kinds (text, status→divider, error, plan, unknown) break the rail.
+    flushRail();
+    rows.push(<RunEventRow key={m.seq} msg={m} live={live} />);
+  }
+  flushRail();
+
   return (
     <div className={cx("rounded-lg border-l-2 bg-surface/60 py-3 pl-3 pr-3", accent)}>
       <div className={cx("flex items-center gap-2", !collapsed && "mb-2")}>
@@ -308,24 +399,7 @@ function AgentBlock({
         </span>
       </div>
       <div id={bodyId} hidden={collapsed} className="space-y-2">
-        {group.messages.map((m) => {
-          // Status/meta lines become hairline dividers (Decision 12).
-          if (m.kind === "status") {
-            return <MetaLine key={m.seq} text={describeStatus(m.payload)} />;
-          }
-          // Fold a tool_result under its call (matched by id); skip it here — but
-          // only when the call is in the visible window, else render it standalone
-          // (its call was capped out, so nothing else would show the result).
-          if (m.kind === "tool_result") {
-            const useId = (m.payload as { tool_use_id?: string } | null)?.tool_use_id;
-            if (useId && visibleToolUseIds.has(useId)) return null;
-          }
-          const result =
-            m.kind === "tool_use"
-              ? toolIndex.resultByUseId.get((m.payload as { id?: string } | null)?.id ?? "")
-              : undefined;
-          return <RunEventRow key={m.seq} msg={m} result={result} live={live} />;
-        })}
+        {rows}
       </div>
     </div>
   );

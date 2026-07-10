@@ -177,6 +177,19 @@ body {
   }
 }
 
+/* Respect prefers-reduced-motion (PRD #38 M4): neutralize the two Tailwind
+   keyframe utilities the run feed animates — the running-tool spinner
+   (animate-spin) and the active-agent pulsing dot (animate-pulse). Kept
+   UNLAYERED on purpose: Tailwind's `utilities` layer wins over `@layer base`, so
+   a base-layer override would lose to `animate-spin` itself; an unlayered rule
+   outranks any layered utility at equal specificity, so this reliably wins. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin,
+  .animate-pulse {
+    animation: none;
+  }
+}
+
 /* Typography for rendered docs markdown (DocMarkdown). Hand-rolled prose rules
    consistent with the dark theme — the @tailwindcss/typography plugin is not a
    dependency. Interactive/asset elements (a, img, table) are handled in

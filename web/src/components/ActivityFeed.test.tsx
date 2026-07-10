@@ -262,3 +262,72 @@ describe("ActivityFeed header emphasis (M3)", () => {
     expect(container.querySelector(".h-px")).not.toBeNull();
   });
 });
+
+describe("ActivityFeed accessibility (M4)", () => {
+  it("routes only meaningful transitions to the live region, never tool frames", () => {
+    const region = () => document.querySelector('[aria-live="polite"]') as HTMLElement;
+    const base = [
+      m(1, "status", { event: "init", model: "claude-opus-4-8" }, "lead"),
+      m(2, "text", { text: "planning" }, "lead"),
+      m(3, "tool_use", { id: "u1", name: "Read", input: { file_path: "/x" } }, "lead"),
+    ];
+    const { rerender } = render(
+      <ActivityFeed messages={base} runningLive={true} connected={true} terminal={false} />,
+    );
+    const afterMount = region().textContent;
+    expect(afterMount).toContain("agent started (claude-opus-4-8)");
+
+    // Appending only tool frames must NOT change the announced text.
+    const withTools = [
+      ...base,
+      m(4, "tool_result", { tool_use_id: "u1", content: "ok" }, "lead"),
+      m(5, "tool_use", { id: "u2", name: "Bash", input: { command: "ls" } }, "lead"),
+    ];
+    rerender(
+      <ActivityFeed messages={withTools} runningLive={true} connected={true} terminal={false} />,
+    );
+    expect(region().textContent).toBe(afterMount);
+
+    // An error transition DOES update it.
+    rerender(
+      <ActivityFeed
+        messages={[...withTools, m(6, "error", { text: "push failed" }, "lead")]}
+        runningLive={true}
+        connected={true}
+        terminal={false}
+      />,
+    );
+    expect(region().textContent).toContain("push failed");
+  });
+
+  it("mutes the scroll container's implicit live region to aria-live=off", () => {
+    const { container } = render(
+      <ActivityFeed messages={[m(1, "text", { text: "hi" })]} runningLive={true} connected={true} terminal={false} />,
+    );
+    expect(container.querySelector('[role="log"]')?.getAttribute("aria-live")).toBe("off");
+  });
+
+  it("gathers consecutive tool rows into ONE rail, split by interleaved prose", () => {
+    const twoTools = [
+      m(1, "tool_use", { id: "a", name: "Read", input: { file_path: "/x" } }, "lead"),
+      m(2, "tool_use", { id: "b", name: "Grep", input: { pattern: "y" } }, "lead"),
+    ];
+    const { container, unmount } = render(
+      <ActivityFeed messages={twoTools} runningLive={false} connected={true} terminal={true} />,
+    );
+    // A single continuous rail wraps both tools (was one border per row).
+    expect(container.querySelectorAll('[class*="tool-rail"]')).toHaveLength(1);
+    unmount();
+
+    const split = [
+      m(1, "tool_use", { id: "a", name: "Read", input: { file_path: "/x" } }, "lead"),
+      m(2, "text", { text: "note between" }, "lead"),
+      m(3, "tool_use", { id: "b", name: "Grep", input: { pattern: "y" } }, "lead"),
+    ];
+    const { container: c2 } = render(
+      <ActivityFeed messages={split} runningLive={false} connected={true} terminal={true} />,
+    );
+    // Interleaved prose breaks the rail into two.
+    expect(c2.querySelectorAll('[class*="tool-rail"]')).toHaveLength(2);
+  });
+});
