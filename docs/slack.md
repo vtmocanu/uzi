@@ -101,9 +101,9 @@ Open **Settings → Notifications**:
   reason instead — a threaded reply there *is* the rejection.
 - **Steering a live run**: reply in the thread outside a gate and it's
   submitted as a follow-up instruction, with a ✅ reaction as the ack.
-- Only status, issue title, MR link, and failure reason ever appear in a
-  message — never the plan body or a diff; the plan is one click away behind
-  the deep link.
+- Only status, repository path, issue number and title, MR link, and failure
+  reason ever appear in a message — never the plan body or a diff; the plan
+  is one click away behind the deep link.
 - Approving or rejecting from the web UI updates the Slack message too (and
   vice versa), so a stale button press just gets a quiet "already handled".
 
@@ -111,9 +111,9 @@ Open **Settings → Notifications**:
 
 - **Privacy**: the `users:read.email` scope lets uzi resolve workspace
   members' emails to match them to uzi accounts. Turning Slack on also means
-  run status metadata (status, issue titles, MR links, failure reasons) leaves
-  the box for Slack's cloud — nothing sensitive, but it's no longer
-  loopback-only once enabled.
+  run status metadata (status, repository paths, issue numbers and titles, MR
+  links, failure reasons) leaves the box for Slack's cloud — nothing
+  sensitive, but it's no longer loopback-only once enabled.
 - **Rotating a token from Settings**: uzi hot-reloads a changed token within
   one settings poll (about 5 seconds) and tears down the old socket — there's
   a brief window where the previous connection can still be live.
