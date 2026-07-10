@@ -39,6 +39,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXECUTOR="${UZI_E2E_EXECUTOR:-stub}"
 PROJECT="${UZI_E2E_COMPOSE_PROJECT:-uzi-e2e-$$}"
+# Compose project-name guard (PRD #33 Decision 7): reject an invalid RESOLVED
+# project name up front — before any scratch-dir or compose work — so a branch-like
+# UZI_E2E_COMPOSE_PROJECT with a slash (e.g. feature/prd-33) fails with a clear
+# message instead of docker rejecting it mid-run, after setup has begun. We validate,
+# never rewrite: an explicit value is user intent, and silently sanitizing it would
+# hide the mismatch from the logs and teardown hints. The rule is Compose's own
+# (lowercase alphanumerics, '-', '_', starting alphanumeric); the PID-based default
+# uzi-e2e-$$ always passes, so no provenance check is needed — an invalid value is
+# always user-set.
+project_name_re='^[a-z0-9][a-z0-9_-]*$'
+if [[ ! "$PROJECT" =~ $project_name_re ]]; then
+  echo "error: invalid compose project name '$PROJECT'" >&2
+  echo "  UZI_E2E_COMPOSE_PROJECT must match ${project_name_re} (lowercase alphanumerics," >&2
+  echo "  '-' and '_', starting with an alphanumeric). A branch-like name with a '/' is not valid." >&2
+  exit 2
+fi
 # A real SDK agent turn takes minutes (observed ~13m: the seeded template spawns
 # a reviewer subagent), where the stub finishes in seconds.
 [ "$EXECUTOR" = sdk ] && COMPLETE_TIMEOUT_DEFAULT=1800 || COMPLETE_TIMEOUT_DEFAULT=90
@@ -214,6 +230,20 @@ wait_card_column() {
     sleep 2
   done
   fail "timeout: card #$iid never reached column '$want' (last: '${c:-none}')"
+}
+
+# wait_run_mr_state RUN WANT [TIMEOUT] — poll a run until its watcher-maintained
+# mr_state reaches WANT. PRD #33 surfaces runs.mr_state (written by the PRD #24
+# MR-close watcher) in the run payload; this lets the harness assert the chip's
+# underlying state, not just the card move it drives.
+wait_run_mr_state() {
+  local run="$1" want="$2" deadline=$((SECONDS + ${3:-30})) s
+  while [ $SECONDS -lt $deadline ]; do
+    s="$(apiget "/api/runs/$run" | jq -r '.run.mr_state // empty')"
+    [ "$s" = "$want" ] && return 0
+    sleep 2
+  done
+  fail "timeout: run $run mr_state never reached '$want' (last: '${s:-none}')"
 }
 
 # flip_mr IID STATE — drive forge-fake's /_e2e state mutator (the harness stand-in
@@ -632,6 +662,32 @@ ENV_HITS="$("${COMPOSE[@]}" exec -T agent sh -c '
 pass "/proc hardening: join token absent from every process environ; delivery file unlinked"
 
 # =============================================================================
+# PRD #33 — deliberate-stop signal: a live-poller plan reject carrying a VERBATIM
+# reason must surface as a stop (runs.stop_kind='plan_rejected'), not a bare failure
+# the client can't classify (issue #15 item 3). A worker is online, so the reject is
+# poller-consumed (server_side=false); the stub runner reports `failed` with the
+# reason verbatim, and the server stamps stop_kind at verdict enqueue.
+say "PRD #33: live plan reject with a verbatim reason → stop_kind=plan_rejected + verbatim failure_reason"
+IID_R="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E reject","description":"reject me — see prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+RUN_R="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_R}" | jq -r '.run.id')"
+[ -n "$RUN_R" ] && [ "$RUN_R" != null ] || fail "reject-path run was not created"
+wait_status "$RUN_R" awaiting_approval
+# A reason the OLD exact-string heuristic ("run cancelled"/"plan rejected") could
+# never recognise — stop_kind must classify it regardless.
+REJECT_REASON="this plan skips the migration step; redo it against the new schema"
+SS_R="$(apipost "/api/runs/$RUN_R/inputs" \
+  "$(jq -cn --arg r "$REJECT_REASON" '{kind:"reject_plan",body:$r}')" | jq -r '.server_side')"
+[ "$SS_R" = false ] || fail "a reject against a LIVE worker must be poller-consumed, not server-side (got server_side=$SS_R)"
+wait_status "$RUN_R" failed
+REJ="$(apiget "/api/runs/$RUN_R")"
+[ "$(echo "$REJ" | jq -r '.run.stop_kind')" = plan_rejected ] \
+  || fail "rejected run must carry stop_kind=plan_rejected (got '$(echo "$REJ" | jq -r '.run.stop_kind')')"
+[ "$(echo "$REJ" | jq -r '.run.failure_reason')" = "$REJECT_REASON" ] \
+  || fail "rejected run must carry the VERBATIM failure_reason (got '$(echo "$REJ" | jq -r '.run.failure_reason')')"
+pass "live plan reject: status=failed, stop_kind=plan_rejected, failure_reason=verbatim"
+
+# =============================================================================
 # PRD #24 — MR-close watcher: a reviewer closing an agent's MR without merging
 # moves the card from Human Review back to In Progress; reopening restores it; a
 # manual drag is never fought. The happy-path run above left card #$IID in Human
@@ -657,15 +713,20 @@ sleep 6
   || fail "NULL-bootstrap must record MR state without moving the card (Decision 9)"
 pass "NULL-bootstrap recorded MR state without moving the card"
 
-# Close edge: reviewer closes the MR without merging → rework → In Progress.
+# Close edge: reviewer closes the MR without merging → rework → In Progress. The
+# watcher also records the run's mr_state='closed' (PRD #33: what the "MR !N closed"
+# chip renders), so assert both the move and the surfaced state.
 flip_mr "$MR_IID" closed
 wait_card_column "$IID" "In Progress" 40
-pass "MR closed unmerged → card #$IID moved Human Review → In Progress"
+wait_run_mr_state "$RUN" closed 20
+pass "MR closed unmerged → card #$IID moved Human Review → In Progress; run mr_state=closed"
 
-# Reopen edge: reopening the MR restores the card to Human Review, symmetrically.
+# Reopen edge: reopening the MR restores the card to Human Review, symmetrically, and
+# the run's mr_state returns to 'opened' (the plain chip again).
 flip_mr "$MR_IID" opened
 wait_card_column "$IID" "Human Review" 40
-pass "MR reopened → card #$IID returned In Progress → Human Review"
+wait_run_mr_state "$RUN" opened 20
+pass "MR reopened → card #$IID returned In Progress → Human Review; run mr_state=opened"
 
 # Manual-drag pre-emption, exercising the Go source-column guard (not just the SQL
 # prefilter): re-close so the card is In Progress AND still a watch candidate

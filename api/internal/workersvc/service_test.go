@@ -77,9 +77,10 @@ type fakeStore struct {
 	runByIDErr    error
 	workerByID    store.Worker
 	workerByIDErr error
-	createdInput  *store.CreateRunInputParams
-	cancelled     *store.CancelRunServerSideParams
-	rejected      *store.RejectRunServerSideParams
+	createdInput       *store.CreateRunInputParams
+	createdStopVerdict *store.CreateStopVerdictInputParams
+	cancelled          *store.CancelRunServerSideParams
+	rejected           *store.RejectRunServerSideParams
 
 	// Create run.
 	repoErr         error
@@ -228,6 +229,10 @@ func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, err
 }
 func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error) {
 	f.createdInput = &arg
+	return store.RunUserInput{}, nil
+}
+func (f *fakeStore) CreateStopVerdictInput(_ context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
+	f.createdStopVerdict = &arg
 	return store.RunUserInput{}, nil
 }
 func (f *fakeStore) CancelRunServerSide(_ context.Context, arg store.CancelRunServerSideParams) (int64, error) {
@@ -968,11 +973,49 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	if res.ServerSide {
 		t.Fatal("a live worker should consume the cancel; not server-side")
 	}
-	if fs.createdInput == nil || fs.createdInput.Kind != "cancel" {
-		t.Fatalf("input not enqueued for the worker: %+v", fs.createdInput)
+	// A live stop verdict goes through the dedicated CreateStopVerdictInput CTE, which
+	// enqueues the input AND stamps stop_kind transactionally (PRD #33 Decision 3) —
+	// not the plain CreateRunInput path.
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.Kind != "cancel" {
+		t.Fatalf("stop verdict not enqueued for the worker: %+v", fs.createdStopVerdict)
+	}
+	if fs.createdStopVerdict.StopKind.String != "cancelled" || !fs.createdStopVerdict.StopKind.Valid {
+		t.Fatalf("live cancel must stamp stop_kind 'cancelled', got %+v", fs.createdStopVerdict.StopKind)
+	}
+	if fs.createdInput != nil {
+		t.Fatal("a stop verdict must not use the plain CreateRunInput path")
 	}
 	if fs.cancelled != nil {
 		t.Fatal("server-side cancel must not run when a worker is live")
+	}
+}
+
+func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Status: "awaiting_approval", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	// A live reject carrying a VERBATIM reason string still stamps the structured
+	// signal — the exact case the failed-vs-stopped heuristic could not recognise.
+	res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", "this is the wrong approach entirely")
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a live worker should consume the reject; not server-side")
+	}
+	if fs.createdStopVerdict == nil || fs.createdStopVerdict.Kind != "reject_plan" {
+		t.Fatalf("reject verdict not enqueued for the worker: %+v", fs.createdStopVerdict)
+	}
+	if fs.createdStopVerdict.StopKind.String != "plan_rejected" || !fs.createdStopVerdict.StopKind.Valid {
+		t.Fatalf("live reject must stamp stop_kind 'plan_rejected', got %+v", fs.createdStopVerdict.StopKind)
 	}
 }
 
@@ -1015,6 +1058,10 @@ func TestSubmitInputFollowUpAlwaysEnqueues(t *testing.T) {
 	}
 	if fs.createdInput == nil || fs.createdInput.Kind != "follow_up" {
 		t.Fatalf("follow_up not enqueued: %+v", fs.createdInput)
+	}
+	// A non-verdict input uses the plain path and never stamps a stop signal.
+	if fs.createdStopVerdict != nil {
+		t.Fatalf("follow_up must not use the stop-verdict path, got %+v", fs.createdStopVerdict)
 	}
 }
 

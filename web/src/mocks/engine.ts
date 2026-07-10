@@ -216,6 +216,9 @@ export function handleInput(runId: string, kind: RunInputKind, body: string) {
       patchRun(runId, {
         status: run.status === "queued" ? "cancelled" : "failed",
         failure_reason: run.status === "queued" ? null : "run cancelled",
+        // The server stamps the deliberate-stop signal (PRD #33), so a cancel that
+        // lands as `failed` still renders the calm "stopped" badge, not "failed".
+        stop_kind: "cancelled",
         finished_at: new Date().toISOString(),
       });
       return;

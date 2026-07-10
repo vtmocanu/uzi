@@ -24,8 +24,11 @@ func TestMapLatestRun(t *testing.T) {
 	updated := created.Add(5 * time.Minute)
 
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("boom"),
-			txt("Vlad"), txt("vlad@example.com"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
+		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("merged"), txt("boom"), nullTxt(),
+			txt("Vlad"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
+		if dto.MrState == nil || *dto.MrState != "merged" {
+			t.Fatalf("mr_state should be carried, got %v", dto.MrState)
+		}
 		if dto.ID != runID.String() || dto.Status != "completed" {
 			t.Fatalf("id/status wrong: %+v", dto)
 		}
@@ -52,30 +55,44 @@ func TestMapLatestRun(t *testing.T) {
 		}
 	})
 
-	t.Run("another owner's run is not mine, still shows owner name", func(t *testing.T) {
+	t.Run("another owner's run is not mine: no email, failure_reason gated, stop_kind exposed", func(t *testing.T) {
 		otherOwner := uuid.New()
-		dto := mapLatestRun(runID, otherOwner, "running", pgtype.Int8{}, nullTxt(),
-			nullTxt(), txt("someone@example.com"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
+		// A non-owner viewer of a shared board: owner_name is empty when the display
+		// name is absent (never the email — Decision 5, the anti-leak guarantee), and
+		// failure_reason is withheld even though the run has one (it can carry a verbatim
+		// reject reason or a raw agent error). stop_kind (a non-sensitive enum) stays
+		// visible so the badge can still classify the run as stopped.
+		dto := mapLatestRun(runID, otherOwner, "failed", pgtype.Int8{}, nullTxt(),
+			txt("panic: raw agent internals"), txt("plan_rejected"),
+			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
 		}
-		// display name absent → fall back to email so "started by X" is never blank.
-		if dto.OwnerName != "someone@example.com" {
-			t.Fatalf("owner_name should fall back to email, got %q", dto.OwnerName)
+		if dto.MrState != nil {
+			t.Fatalf("null mr_state should map to nil, got %v", *dto.MrState)
+		}
+		if dto.OwnerName != "" {
+			t.Fatalf("owner_name must be empty when display name is absent, never an email; got %q", dto.OwnerName)
 		}
 		if dto.MrIID != nil {
 			t.Fatalf("null mr_iid should map to nil, got %v", *dto.MrIID)
 		}
-		if dto.FailureReason != nil || dto.WorkerName != nil {
-			t.Fatalf("null failure_reason/worker_name should map to nil: %+v", dto)
+		if dto.FailureReason != nil {
+			t.Fatalf("failure_reason must be withheld from a non-owner viewer, got %q", *dto.FailureReason)
+		}
+		if dto.StopKind == nil || *dto.StopKind != "plan_rejected" {
+			t.Fatalf("stop_kind must stay exposed to a non-owner viewer, got %v", dto.StopKind)
+		}
+		if dto.WorkerName != nil {
+			t.Fatalf("null worker_name should map to nil: %+v", dto)
 		}
 	})
 
-	t.Run("blank display name and email leave owner name empty", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(),
-			txt(""), nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
+	t.Run("blank display name leaves owner name empty", func(t *testing.T) {
+		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(),
+			txt(""), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.OwnerName != "" {
-			t.Fatalf("owner_name should be empty when no name/email, got %q", dto.OwnerName)
+			t.Fatalf("owner_name should be empty when the display name is blank, got %q", dto.OwnerName)
 		}
 	})
 }
@@ -95,8 +112,8 @@ func TestAssembleCards(t *testing.T) {
 	// Deliberately NOT in issue order (20 before 10): a correct assembly keys by
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
-		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", MrIid: i8(5),
-			OwnerName: nullTxt(), OwnerEmail: txt("o@example.com"), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", MrIid: i8(5), MrState: txt("closed"),
+			FailureReason: txt("raw agent internals"), OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running",
 			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 	}
@@ -129,11 +146,21 @@ func TestAssembleCards(t *testing.T) {
 	if byIID[20].LatestRun.IsMine {
 		t.Fatal("issue 20: another owner's run must not be is_mine")
 	}
-	if byIID[20].LatestRun.OwnerName != "o@example.com" {
-		t.Fatalf("issue 20: owner_name should fall back to email, got %q", byIID[20].LatestRun.OwnerName)
+	// Decision 5: owner_name is the display name or empty, never the email. This
+	// run's owner has no display name, so a shared board shows an empty owner, not
+	// the leaked email address.
+	if byIID[20].LatestRun.OwnerName != "" {
+		t.Fatalf("issue 20: owner_name must be empty (no display name), never an email; got %q", byIID[20].LatestRun.OwnerName)
 	}
 	if byIID[20].LatestRun.MrIID == nil || *byIID[20].LatestRun.MrIID != 5 {
 		t.Fatalf("issue 20: mr_iid should flow through, got %v", byIID[20].LatestRun.MrIID)
+	}
+	if byIID[20].LatestRun.MrState == nil || *byIID[20].LatestRun.MrState != "closed" {
+		t.Fatalf("issue 20: mr_state should flow through, got %v", byIID[20].LatestRun.MrState)
+	}
+	// Decision 5: another owner's failure_reason is withheld from this viewer.
+	if byIID[20].LatestRun.FailureReason != nil {
+		t.Fatalf("issue 20: failure_reason must be withheld from a non-owner viewer, got %q", *byIID[20].LatestRun.FailureReason)
 	}
 	// (4) run_count keys onto the right issue (drives the "×N" retry hint).
 	if byIID[20].LatestRun.RunCount != 2 {

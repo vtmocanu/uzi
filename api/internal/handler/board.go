@@ -71,7 +71,21 @@ type latestRunDTO struct {
 	ID            string    `json:"id"`
 	Status        string    `json:"status"`
 	MrIID         *int64    `json:"mr_iid"`
+	// MrState is the PRD #24 watcher's last-observed merge-request state, null when
+	// never observed. Display-only (PRD #33 Decision 1): the board card's chip
+	// renders merged/closed distinctly and everything else as the plain open chip.
+	// Kept fresh by the watcher only for the board card (the issue's latest run).
+	MrState       *string   `json:"mr_state"`
+	// FailureReason is OWNER-ONLY (PRD #33 Decision 5): it can carry a user's verbatim
+	// typed reject reason or a raw agent error, so a shared board must not expose it
+	// to non-owner viewers — they get null. Owners keep it (the failed-badge tooltip).
+	// The non-sensitive StopKind enum below stays visible to everyone for the
+	// stopped-vs-failed badge, so classification never depends on this field.
 	FailureReason *string   `json:"failure_reason"`
+	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
+	// or "plan_rejected", null otherwise. The board badge reads it (not the
+	// failure_reason text) to render a deliberate stop as calm "stopped".
+	StopKind      *string   `json:"stop_kind"`
 	OwnerName     string    `json:"owner_name"`
 	WorkerName    *string   `json:"worker_name"`
 	IsMine        bool      `json:"is_mine"`
@@ -85,27 +99,36 @@ type latestRunDTO struct {
 // mapLatestRun builds the card's run summary from the shared run + owner + worker
 // columns the board and single-card queries both return. viewerID is the board
 // viewer; IsMine is set when the run belongs to them (only then does the client
-// render the run-view link). ownerName prefers the display name, falling back to
-// the email, so "started by X" is never blank.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, failureReason, ownerName, ownerEmail, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+// render the run-view link). ownerName is the owner's display name or empty — never
+// the email (PRD #33 Decision 5): a shared board must not leak another user's email
+// on a card, and the web already renders a no-owner badge for empty. The query no
+// longer even selects the email, so there is nothing to fall back to here.
+func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrState, failureReason, stopKind, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
 	dto := &latestRunDTO{
-		ID:            runID.String(),
-		Status:        status,
-		FailureReason: textPtrValue(failureReason.Valid, failureReason.String),
-		WorkerName:    textPtrValue(workerName.Valid, workerName.String),
-		IsMine:        ownerID == viewerID,
-		RunCount:      runCount,
-		CreatedAt:     createdAt.Time,
-		UpdatedAt:     updatedAt.Time,
+		ID:         runID.String(),
+		Status:     status,
+		MrState:    textPtrValue(mrState.Valid, mrState.String),
+		StopKind:   textPtrValue(stopKind.Valid, stopKind.String),
+		WorkerName: textPtrValue(workerName.Valid, workerName.String),
+		IsMine:     ownerID == viewerID,
+		RunCount:   runCount,
+		CreatedAt:  createdAt.Time,
+		UpdatedAt:  updatedAt.Time,
+	}
+	// failure_reason is owner-only (Decision 5): it can carry a verbatim reject reason
+	// or a raw agent error, so a non-owner viewer of a shared board gets null. stop_kind
+	// (above, unconditional) already gives everyone the stopped-vs-failed classification.
+	if dto.IsMine {
+		dto.FailureReason = textPtrValue(failureReason.Valid, failureReason.String)
 	}
 	if mrIID.Valid {
 		v := mrIID.Int64
 		dto.MrIID = &v
 	}
-	if ownerName.Valid && ownerName.String != "" {
+	// Display name or empty — never the email (Decision 5). An empty owner_name is a
+	// legal, rendered no-owner badge on the web.
+	if ownerName.Valid {
 		dto.OwnerName = ownerName.String
-	} else if ownerEmail.Valid {
-		dto.OwnerName = ownerEmail.String
 	}
 	return dto
 }
@@ -360,7 +383,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
-			rr.FailureReason, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
+			rr.MrState, rr.FailureReason, rr.StopKind, rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
 
 	cards := make([]cardDTO, 0, len(issues))
@@ -571,7 +594,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
 	}
@@ -669,7 +692,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	// a toggle never blanks the run badge the board/issue view is showing.
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.FailureReason, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for prdless card", "error", err)
 	}
