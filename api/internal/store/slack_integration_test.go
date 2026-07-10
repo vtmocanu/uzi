@@ -1,9 +1,13 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -11,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -144,6 +150,92 @@ func TestSlackConfirmedLookupSkipsDeactivatedLiveDB(t *testing.T) {
 	}
 	if _, err := q.GetConfirmedUserBySlackID(ctx, txt(slackID)); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("a deactivated (but confirmed) user must resolve to no user, got err=%v", err)
+	}
+}
+
+// TestSlackBotTokenSealedAtRestLiveDB is the auditor's M1 end-to-end at-rest
+// assertion, exercising the REAL seal (secretbox+base64) + REAL Postgres write +
+// raw read. It bypasses only the HTTP hop, because the settings PUT live-validates
+// a bot token against Slack (AuthTest) which cannot run in an offline gate — the
+// seal/store/read path it proves is identical. It pins: (1) the raw app_settings
+// value is base64 that neither equals nor contains the token, and (2) the admin
+// view (the GET's data source) reports configured=true with no token/ciphertext
+// bytes, and the decrypt accessor round-trips.
+func TestSlackBotTokenSealedAtRestLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	// A non-secret 32-byte AES key for the test (New only checks length).
+	box, err := secretbox.New(bytes.Repeat([]byte("ab"), 16))
+	if err != nil {
+		t.Fatalf("secretbox: %v", err)
+	}
+
+	const token = "xoxb-not-a-real-bot-token-value"
+	sealed, err := settings.ValueForStorage(box, settings.KeySlackBotToken, token)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if _, err := q.UpsertAppSetting(ctx, store.UpsertAppSettingParams{
+		Key: settings.KeySlackBotToken, Value: sealed, UpdatedBy: pgtype.UUID{},
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	// (1) Raw DB read: the stored value is base64 and never the token bytes.
+	var raw string
+	if err := pool.QueryRow(ctx, "SELECT value FROM app_settings WHERE key=$1", settings.KeySlackBotToken).Scan(&raw); err != nil {
+		t.Fatalf("raw select: %v", err)
+	}
+	if raw == token || strings.Contains(raw, token) {
+		t.Fatalf("stored value must neither equal nor contain the token: %q", raw)
+	}
+	dec, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		t.Fatalf("stored value must be base64, got %q (%v)", raw, err)
+	}
+	if strings.Contains(string(dec), token) {
+		t.Fatalf("decoded ciphertext must not contain the token plaintext")
+	}
+
+	// (2) Admin view: configured=true, secret key absent from Values, and no token
+	// or ciphertext bytes anywhere in the view.
+	cache := settings.New(q, 0)
+	cache.ConfigureSecrets(box, nil)
+	av, err := cache.AdminView(ctx)
+	if err != nil {
+		t.Fatalf("admin view: %v", err)
+	}
+	if !av.Secrets[settings.KeySlackBotToken] {
+		t.Fatalf("admin view must report %s configured=true", settings.KeySlackBotToken)
+	}
+	if _, present := av.Values[settings.KeySlackBotToken]; present {
+		t.Fatalf("admin view Values must not carry the secret key at all")
+	}
+	if blob := fmt.Sprintf("%+v", av); strings.Contains(blob, token) || strings.Contains(blob, raw) {
+		t.Fatalf("admin view must not contain token or ciphertext bytes: %q", blob)
+	}
+
+	// The decrypt accessor round-trips to the original token (proves reversible
+	// sealing with the key, not merely an opaque blob).
+	got, err := cache.SlackBotToken(ctx)
+	if err != nil {
+		t.Fatalf("decrypt accessor: %v", err)
+	}
+	if got != token {
+		t.Fatalf("decrypt accessor = %q, want the original token", got)
 	}
 }
 
