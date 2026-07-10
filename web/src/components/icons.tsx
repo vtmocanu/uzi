@@ -195,6 +195,13 @@ export const TerminalIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+export const SearchIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m21 21-4.3-4.3" />
+  </Icon>
+);
+
 export const ThoughtIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <circle cx="12" cy="11" r="7" />

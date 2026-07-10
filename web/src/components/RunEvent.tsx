@@ -1,7 +1,16 @@
-import { memo, useEffect, useState, type ReactNode } from "react";
+import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import type { RunMessage } from "../lib/api";
 import { Markdown } from "./Markdown";
-import { FileTextIcon, TerminalIcon, ThoughtIcon } from "./icons";
+import { cx } from "./ui";
+import {
+  BotIcon,
+  CircleIcon,
+  ExternalLinkIcon,
+  FileTextIcon,
+  SearchIcon,
+  TerminalIcon,
+  ThoughtIcon,
+} from "./icons";
 
 // Terse, per-kind rendering of a run's event stream — one readable line per
 // event instead of a JSON dump. Kinds come from agent/src/sdk-messages.ts (the
@@ -387,44 +396,140 @@ function Expander({
   );
 }
 
-const RESULT_INLINE_LINES = 8;
+// ── tool icons + duration ─────────────────────────────────────────────────────
+
+// One type-appropriate icon per tool (PRD #38 Decision, "per-tool icons"); an
+// unknown tool gets a neutral dot rather than masquerading as a shell command.
+function toolIcon(name: string): ReactNode {
+  switch (name) {
+    case "Bash":
+      return <TerminalIcon />;
+    case "Read":
+    case "Write":
+    case "Edit":
+    case "MultiEdit":
+    case "NotebookEdit":
+      return <FileTextIcon />;
+    case "Grep":
+    case "Glob":
+      return <SearchIcon />;
+    case "Task":
+      return <BotIcon />;
+    case "WebFetch":
+    case "WebSearch":
+      return <ExternalLinkIcon />;
+    default:
+      return <CircleIcon />;
+  }
+}
+
+// Tool-duration thresholds. These live ONLY in the tool render path — the shared
+// formatDuration (used by RunView's header/terminal line) is left untouched
+// (PRD #38 Decision 6): sub-100ms collapses to "instant", and a span past a
+// minute tints --warn.
+const INSTANT_MS = 100;
+const SLOW_MS = 60_000;
+
+function ToolDuration({ msg, result, live }: { msg: RunMessage; result?: RunMessage; live: boolean }) {
+  if (result) {
+    const raw = new Date(result.created_at).getTime() - new Date(msg.created_at).getTime();
+    const ms = Number.isFinite(raw) && raw >= 0 ? raw : 0;
+    if (ms < INSTANT_MS) {
+      // Suppress the meaningless "0.0s"; the raw value stays available in the title.
+      return (
+        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted" title={`${Math.round(ms)}ms`}>
+          instant
+        </span>
+      );
+    }
+    return (
+      <span
+        className={cx("ml-auto shrink-0 text-[11px] tabular-nums", ms >= SLOW_MS ? "text-warn" : "text-muted")}
+      >
+        {formatDuration(ms)}
+      </span>
+    );
+  }
+  if (live) {
+    return (
+      <span className="ml-auto shrink-0">
+        <RunningIndicator start={msg.created_at} />
+      </span>
+    );
+  }
+  return <span className="ml-auto shrink-0 text-[11px] italic text-muted">no result</span>;
+}
 
 // ── per-kind rows ───────────────────────────────────────────────────────────
 
+// ToolResultBody renders a result as a collapsed inline chip that expands into a
+// focusable code block (PRD #38 Decision 13). Labels: "✗ error" / "✓ ok"
+// (empty or whitespace-only output) / "✓ N lines". The body stays MOUNTED but
+// hidden while collapsed, so its text is always in the DOM (pairing/test
+// assertions); a dropped non-text block surfaces as a "[image omitted]" first
+// line. Errors auto-expand with a danger tint.
 function ToolResultBody({ result }: { result: RunMessage }) {
   const rec = asRecord(result.payload) ?? {};
   const isError = rec["is_error"] === true;
   const { text, hadNonText } = resultToText(rec["content"]);
-  const lines = text === "" ? 0 : text.split("\n").length;
-  const large = lines > RESULT_INLINE_LINES;
-  // Errors auto-expand — a failed tool is exactly what the user wants to see.
-  const [open, setOpen] = useState(isError || !large);
+  const empty = text.trim() === "";
+  const lineCount = empty ? 0 : text.split("\n").length;
 
-  const mark = isError ? "✗" : "✓";
-  const markClass = isError ? "text-danger" : "text-ok";
-  const body = text || (hadNonText ? "" : "(no output)");
+  const [open, setOpen] = useState(isError);
+  const bodyRef = useRef<HTMLPreElement>(null);
+  const userToggled = useRef(false);
+  // Move keyboard focus into the body only when the USER opens it — never on the
+  // error auto-expand, which would steal focus as the feed renders.
+  useEffect(() => {
+    if (open && userToggled.current) bodyRef.current?.focus();
+  }, [open]);
+
+  const label = isError ? "error" : empty ? "ok" : `${lineCount} line${lineCount === 1 ? "" : "s"}`;
+  const showLabel = isError
+    ? "Show error output"
+    : empty
+      ? "Show output"
+      : `Show ${label} of output`;
+  const ariaLabel = open ? (isError ? "Hide error output" : "Hide output") : showLabel;
+
+  const bodyText = empty ? (hadNonText ? "" : "(no output)") : text;
+  const body = [hadNonText ? "[image omitted]" : "", bodyText].filter(Boolean).join("\n");
 
   return (
-    <div className={`mt-1 rounded-md border px-2 py-1 ${isError ? "border-danger/40 bg-danger/10" : "border-edge bg-raised/50"}`}>
-      <div className="flex items-center gap-2">
-        <span className={`text-xs font-semibold ${markClass}`}>
-          <span aria-hidden="true">{mark}</span>{" "}
-          <span>{isError ? "error" : "result"}</span>
-        </span>
-        {large && (
-          <Expander
-            open={open}
-            onToggle={() => setOpen((o) => !o)}
-            label={open ? "hide" : `show ${lines} lines`}
-          />
+    <div className="mt-1.5">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-label={ariaLabel}
+        onClick={() => {
+          userToggled.current = true;
+          setOpen((o) => !o);
+        }}
+        className={cx(
+          "inline-flex min-h-[24px] items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-medium",
+          isError
+            ? "border-danger/40 bg-danger/10 text-danger"
+            : "border-edge bg-raised/50 text-muted hover:border-edge-strong",
         )}
-      </div>
-      {open && body !== "" && (
-        <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-muted">
-          {body}
-        </pre>
-      )}
-      {hadNonText && <div className="mt-1 text-[11px] italic text-faint">non-text result (e.g. image) omitted</div>}
+      >
+        <span aria-hidden="true" className={cx("font-bold", isError ? "text-danger" : "text-ok")}>
+          {isError ? "✗" : "✓"}
+        </span>
+        {label}
+      </button>
+      <pre
+        ref={bodyRef}
+        hidden={!open}
+        tabIndex={0}
+        role="group"
+        aria-label={isError ? "Tool error output" : "Tool output"}
+        className={cx(
+          "mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border px-2.5 py-2 font-mono text-xs text-muted",
+          isError ? "border-danger/40 bg-danger/[0.08]" : "border-edge bg-ink",
+        )}
+      >
+        {body}
+      </pre>
     </div>
   );
 }
@@ -452,39 +557,30 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
   const full = toolSummary(name, rec["input"]);
   const isBash = name === "Bash";
   const [open, setOpen] = useState(false);
-  // Bash routes its full (possibly multi-line) command through CommandBlock
-  // below the header (PRD #38 M1); non-Bash args keep the inline text plus the
-  // >160-char "more" affordance. The broader row/rail restructure is M2.
-  const truncated = !isBash && full.length > SUMMARY_MAX;
+  // Bash routes its full (possibly multi-line) command through CommandBlock; a
+  // non-Bash arg stays inline and keeps the >160-char "more" affordance so it is
+  // never ellipsis-only (PRD #38 Decision 13). The header does NOT wrap, so the
+  // duration (ml-auto shrink-0) can never float to its own line (Decision 6).
+  const argOverflow = !isBash && full.length > SUMMARY_MAX;
 
   return (
-    <div className="text-sm">
-      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <span className="inline-flex shrink-0 items-baseline gap-1.5 font-medium text-fg">
-          <span aria-hidden="true" className="self-center text-faint">
-            <TerminalIcon />
-          </span>
+    <div className="border-l border-tool-rail/70 pl-3 text-sm">
+      <div className="flex items-center gap-2">
+        <span aria-hidden="true" className="inline-flex shrink-0 text-faint [font-size:14px]">
+          {toolIcon(name)}
+        </span>
+        <span className="shrink-0 text-[11px] font-semibold uppercase tracking-wider text-muted">
           {name}
         </span>
         {!isBash && full && (
-          <span className="min-w-0 break-words font-mono text-xs text-muted">
+          <span className="min-w-0 break-words font-mono text-xs text-fg">
             {open ? full : truncate(full)}
           </span>
         )}
-        {truncated && (
+        {argOverflow && (
           <Expander open={open} onToggle={() => setOpen((o) => !o)} label={open ? "less" : "more"} />
         )}
-        <span className="ml-auto shrink-0">
-          {result ? (
-            <span className="text-xs tabular-nums text-faint">
-              {formatDuration(new Date(result.created_at).getTime() - new Date(msg.created_at).getTime())}
-            </span>
-          ) : live ? (
-            <RunningIndicator start={msg.created_at} />
-          ) : (
-            <span className="text-xs italic text-faint">no result</span>
-          )}
-        </span>
+        <ToolDuration msg={msg} result={result} live={live} />
       </div>
       {isBash && full && <CommandBlock command={full} />}
       {result && <ToolResultBody result={result} />}
@@ -495,7 +591,7 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
 function ThinkingRow({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="text-sm text-faint">
+    <div className="border-l border-tool-rail/70 pl-3 text-sm text-faint">
       <div className="flex items-baseline gap-2">
         <span className="inline-flex items-baseline gap-1.5 italic">
           <span aria-hidden="true" className="self-center">
@@ -515,8 +611,8 @@ function ThinkingRow({ text }: { text: string }) {
 function StandaloneResult({ result }: { result: RunMessage }) {
   const id = asString(asRecord(result.payload)?.["tool_use_id"]);
   return (
-    <div className="text-sm">
-      <div className="text-xs text-faint">
+    <div className="border-l border-tool-rail/70 pl-3 text-sm">
+      <div className="text-[11px] font-semibold uppercase tracking-wider text-muted">
         result{id ? ` for ${truncate(id, 24)}` : ""}
       </div>
       <ToolResultBody result={result} />
