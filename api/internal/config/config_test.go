@@ -134,12 +134,12 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 	}
 }
 
-// TestProposalConfirmStuckTimeoutBootGuard pins the load-bearing ordering invariant:
-// the stuck-confirming sweep timeout must exceed the forge HTTP timeout (by >= 30s),
-// so a slow CreateIssue can never be reverted mid-flight and re-confirmed into a
-// duplicate issue. A too-low value REFUSES TO START (loud boot failure, not a silent
-// clamp); a comfortably-large value boots cleanly.
-func TestProposalConfirmStuckTimeoutBootGuard(t *testing.T) {
+// TestProposalConfirmStuckTimeoutClamped pins the load-bearing ordering invariant:
+// the stuck-confirming sweep timeout must sit safely above the forge HTTP timeout, so
+// a slow CreateIssue can never be reverted mid-flight and re-confirmed into a
+// duplicate issue. A too-low value is clamped up (to 2x the forge timeout); a
+// comfortably-large value is left untouched.
+func TestProposalConfirmStuckTimeoutClamped(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
 	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
 	varied := make([]byte, secretbox.KeySize)
@@ -148,16 +148,20 @@ func TestProposalConfirmStuckTimeoutBootGuard(t *testing.T) {
 	}
 	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
 
-	// A stuck timeout not clearing FORGE_HTTP_TIMEOUT + 30s is a boot failure.
+	// A stuck timeout below 2x the (raised) forge timeout is clamped up.
 	t.Setenv("FORGE_HTTP_TIMEOUT", "90s")
-	t.Setenv("PROPOSAL_CONFIRM_STUCK_TIMEOUT", "100s") // < 90s + 30s
-	if _, err := Load(); err == nil {
-		t.Fatalf("Load() = nil, want a boot failure: stuck timeout must exceed the forge timeout by >= 30s")
+	t.Setenv("PROPOSAL_CONFIRM_STUCK_TIMEOUT", "30s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.ProposalConfirmStuckTimeout != 180*time.Second {
+		t.Errorf("clamped stuck timeout = %v, want 180s (2x the 90s forge timeout)", cfg.ProposalConfirmStuckTimeout)
 	}
 
-	// A value that clears the margin boots and is kept as configured.
+	// A comfortably-large value is left as configured.
 	t.Setenv("PROPOSAL_CONFIRM_STUCK_TIMEOUT", "10m")
-	cfg, err := Load()
+	cfg, err = Load()
 	if err != nil {
 		t.Fatalf("Load(): %v", err)
 	}
