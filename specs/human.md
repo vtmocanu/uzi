@@ -100,6 +100,14 @@ Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/7-docs-section-webui.md`.
 - Include screenshots; screenshots are provided by the user (ask the user for them).
 - Skills howto now in scope and shipped (`docs/skills.md`) — Feature #16 added the skills feature.
 
+## Feature #28 — Docs search
+
+Tracked as GitLab issue vtmocanu/uzi#28; PRD at `prds/28-docs-search.md`.
+
+- A search box for the docs page.
+- Full-text search with snippets (not a title/summary filter).
+- Search box on the `/docs` index only (not on individual doc pages).
+
 ## Feature #11 — Run view UX: markdown plan, boxed activity, terse events
 
 Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
@@ -215,6 +223,17 @@ Tracked as GitLab issue vtmocanu/uzi#25; PRD at `prds/25-slack-integration.md`.
 - User mapping: email auto-match + manual Slack member-ID override. [user 2026-07-06]
 - Per-user notifications toggle, default ON; default-ON initiates a link-confirmation DM, run content flows only after Confirm. [user 2026-07-06, amended by security review]
 - Slack tokens configurable from ENV or the admin webui; sealed at rest, never echoed back; ENV wins.
+
+## Feature #32 — Per-user vault: password-wrapped secrets
+
+Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wrapped-secrets.md`.
+
+- Threat: a k8s operator can read env/Infisical/etcd (master key) plus the DB and decrypt every user's Anthropic token. etcd encryption at rest is not an option. [user-stated threat model]
+- Goal is to make token theft materially harder, not impossible — no decryption key at rest anywhere an operator can read. [user accepts residual risks: memory dump, trojaned image]
+- Each user's secrets are encrypted with a key derived from their own login password (vault); the server stores only the wrapped key.
+- Vault unlocks automatically at login and the key is kept in server memory until pod restart or an explicit "Lock vault" action — no per-session re-entry, so overnight/autopilot runs keep working while unlocked. [user choice over session-TTL caching]
+- UI shows an unlocked/locked vault status; when locked (e.g. after a deploy), runs queue as "waiting for vault unlock" and a password prompt unlocks without full re-login.
+- Forgotten password ⇒ vault contents unrecoverable by design; user re-enters tokens.
 
 ## Startup admin seed
 

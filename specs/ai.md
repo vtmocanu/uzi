@@ -3360,6 +3360,284 @@ PRD working" (user, 2026-07-06).
   job gated on `UZI_CI_DEMO_FAIL=1`** so a red pipeline can be produced on demand to
   exercise the Fix-CI path end to end.
 
+---
+
+# PRD #28 — Docs Search (client-side full-text search on /docs)
+
+Serves human Feature #28 ("a search box for the docs page; full-text with snippets;
+on the `/docs` index only"). **Status: M1–M3 built and merged on `feature/prd-28-docs-search`;
+M4 (this spec sync) closing out.** Adds **zero** new services, API routes, DB tables,
+env vars, or dependencies — a pure web-side extension of PRD #7's bundled-docs corpus.
+Extends §54–60.
+
+## 133. Search core — pure tokenized substring search (`web/src/lib/docsearch.ts`)
+
+Serves human: "full-text search with snippets" (not a title/summary filter).
+Best-practice at this scale (11 short in-memory pages); the pure module keeps a
+library swap contained if the corpus outgrows substring search.
+
+- **Hand-rolled client-side search, zero new deps** — rejected `fuse.js` (bottega's is a
+  declared-but-unused dependency, nothing to copy) and multica's server-route
+  Fumadocs/Orama search (uzi has no docs backend by design; PRD #7 rejected a docs
+  service/framework). The corpus is already fully in the browser as raw strings, so
+  search needs no network at all.
+- **Corpus = `audience: user` pages only** (`listUserDocs()` — exactly what the index
+  lists). Same pure/bound split as §54's docs.ts: `buildIndex` + `searchIndex` are
+  fixture-testable; `searchDocs()` binds them to the real corpus, memoized once (the
+  bundle's corpus is fixed).
+- **Matching**: case-insensitive, multi-token AND — every whitespace token must appear
+  as a substring in title, headings, or body. Matching/counting use **`indexOf` loops,
+  never `new RegExp(token)`** — query tokens are user input full of regex metacharacters
+  by design (`.env`, `--profile`, `c++`); a test pins literal matching.
+- **Short-query + length guards**: whole query under `MIN_QUERY_LENGTH` (2) chars → no
+  search (normal index shown); tokens shorter than 2 chars are dropped after tokenizing
+  (so `"a b"` doesn't match near-every doc); query truncated at `MAX_QUERY_LENGTH` (256)
+  before scanning (defensive; no real query approaches it).
+- **Ranking**: title-hit tier > heading-hit tier > body-only tier; within a tier, more
+  total token occurrences first; slug `localeCompare` as stable tiebreak (same spirit as
+  §55's `sortDocsForIndex`).
+- **Markdown stripping for indexing** (`stripDocBody`, single fence-tracked pass):
+  reduces links/images to their label and drops emphasis/backtick markers (reusing
+  §56's `summarize()` regex approach), but **keeps fenced-code and table-cell text**
+  (users search for commands like `docker compose --profile agent up`) and **preserves
+  intra-word underscores** (`\b_+|_+\b` only strips word-boundary underscores) so
+  identifiers like `UZI_WORKER_TOKEN` stay searchable — a deliberate deviation from
+  `summarize()`'s blanket underscore strip. Fence delimiter and GFM table-alignment
+  rows are dropped; heading markers dropped but heading text retained (and collected
+  separately for the ranking tier). A `#` inside a fence is code, not a heading.
+- **Snippet**: `SearchResult = { doc, snippet, ranges }`. Snippet is a ~160-char window
+  (`SNIPPET_WINDOW`, `SNIPPET_LEAD` 60 chars of pre-match context) centered on the
+  earliest body match, word-boundary trimmed with leading/trailing `…`; a **title/
+  heading-only hit falls back to the doc's existing `summary`**. `ranges` are
+  **snippet-relative, sorted, and merged/non-overlapping** (overlapping tokens like
+  `work` + `worker` collapse into one range) so the UI's split-and-mark is a straight
+  fold with no nested `<mark>`s. A token matching only in title/headings simply
+  contributes no body range (tested via the mixed title-token + body-token case).
+
+## 134. Index UI — search box on `/docs` (`web/src/pages/Docs.tsx`)
+
+Serves human: "search box on the `/docs` index only" (not on `/docs/:slug`, not global
+nav — 2026-07-09). Best-practice a11y + dark-theme consistency.
+
+- The repo's `Input` primitive with `type="search"`, labelled, placeholder "Search
+  docs…" at the top of the index — not a bare `<input>`, so focus/border styling stays
+  consistent. **No debounce** (11 docs, synchronous, instantaneous).
+- **Empty/short query renders the existing ordered card list unchanged**; an active
+  query renders result cards (same `Card` language): title + snippet with matched tokens
+  wrapped in `<mark>`. A no-results state lives inside a `Card`, matching the existing
+  empty state.
+- **`<mark>` highlighting via React elements only** (split text + `<mark>` nodes),
+  **never `dangerouslySetInnerHTML`**. Explicitly styled `bg-warn/25 text-fg` — there is
+  no highlight token in the theme and the UA-default opaque yellow is unusable on the
+  dark theme, so the UA background/color is overridden.
+- **A11y**: `aria-live="polite"` scoped to the **result-count/no-results line only**
+  (not the result list), so screen readers announce "N docs match" per keystroke without
+  re-reading every snippet. Input is labelled.
+- **Keyboard**: `Escape` clears the query; `/` anywhere on the index focuses the box,
+  skipped when focus is already in an input/textarea.
+- No nginx/CSP change (no new asset types, no inline script).
+
+## 135. Test & docs surface
+
+Serves human: the behavioral gate must be automated (no browser automation in-repo).
+
+- **jsdom component tests are the behavioral gate** (`Docs.test.tsx`, existing vitest +
+  testing-library) — a body-only term from a real bundled page is found, snippet marked,
+  clear restores the index. Unit tests (`docsearch.test.ts`) pin stripping edge cases
+  (code fences, tables, links, intra-word underscores), ranking tiers, multi-token AND,
+  snippet windowing, the short-query/length guards, regex-metachar tokens, overlapping-
+  range merging, and the mixed title-token + body-token snippet.
+- **M3 compose smoke rescoped to curl-assertable checks** (the built image serves `/docs`
+  HTML + JS bundle); search itself is client-side JS with no browser automation in-repo,
+  so jsdom (M2) is the automated gate and a manual browser check is a nice-to-have, not a
+  gate.
+- **Adding a future docs page requires no search work** — the corpus derives from the
+  same glob/frontmatter pipeline as the index (§54–55). `docs/README.md`'s add-a-page
+  section notes that `user` pages are automatically searchable (nothing to register).
+
+---
+
+# PRD #32 — Per-user vault: password-wrapped secrets
+
+Serves human Feature #32 (an operator with the DB + env/Infisical/etcd master key must
+not recover any user's Anthropic token; each user's secrets keyed by their own login
+password; auto-unlock at login with the key in server memory until restart/lock; locked
+runs queue; forgotten password ⇒ unrecoverable). **Status: designed (PRD #32,
+`prds/32-user-vault-password-wrapped-secrets.md` carries the full Decision Log +
+user-vs-AI provenance); not yet realized in code — these sections record the intended
+design.** Builds on PRD #3 (`user_secrets` + `secretbox`, §29–30) and gates PRD #19
+autopilot's claims. Live migration head is `00043`, so the PRD's draft `00044` renumbers
+to the live head at land (goose convention). Extends §17/§29 (secretbox), §40–41 (claim
+path), §24 (seed).
+
+## 136. Key hierarchy & crypto (Bitwarden model, per-user)
+
+Serves human: "secrets encrypted with a key derived from the user's own login password;
+the server stores only the wrapped key".
+
+- **Two-tier envelope**, Bitwarden/1Password shape (master password → KEK → DEK → data):
+  - **DEK** = 32 random bytes (`crypto/rand`), one per user, generated on vault creation;
+    seals that user's `user_secrets` rows via `secretbox`.
+  - **KEK** = `Argon2id(login password, kek_salt)`, derived at unlock, used to unwrap the
+    DEK, then discarded. Never persisted.
+  - **`wrapped_dek = secretbox(KEK, DEK)`** is the only at-rest form of the DEK: the DEK
+    is never written unwrapped, the KEK is never written at all.
+- **`kek_salt` is a dedicated random 16-byte salt, independent of the auth-hash salt.**
+  Load-bearing: the login flow *stores* its Argon2 output in `users.password_hash`;
+  reusing the same salt+params would make `password_hash` itself equal the KEK — i.e.
+  leak the KEK at rest. A distinct salt ⇒ distinct derivation ⇒ the KEK result is never
+  persisted anywhere. Cost params reuse `auth/argon2.go` (t=2, 19 MiB); a higher KEK cost
+  is a documented option.
+- **Reuses `secretbox` AES-256-GCM (§29) for BOTH layers** — the wrap (KEK→DEK) and the
+  data seal (DEK→secret) are the same construction with different keys. No new primitive.
+- **GCM auth failure doubles as wrong-password detection**: a wrong password derives a
+  wrong KEK, so unwrapping `wrapped_dek` fails GCM authentication cleanly ⇒
+  `ErrWrongPassword`. No separate password-verifier is stored, and this is no more of an
+  oracle than login already is (endpoint sits behind the auth-class rate limiter, §138).
+- **AAD binding** (`user_id || kind`) on Seal/Open is a cheap defense-in-depth against a
+  DB-*write* operator swapping ciphertext rows between users (outside the passive threat
+  model — a swap fails GCM or hands over the wrong token, not disclosure — but a few lines).
+
+## 137. Storage & lazy rewrap (`user_vaults`, `user_secrets.sealed_with`)
+
+Serves human: server stores only the wrapped key; forgotten password ⇒ unrecoverable by
+design.
+
+- **New `user_vaults`** (migration draft `00044`): `user_id PK → users ON DELETE CASCADE,
+  kek_salt bytea, wrapped_dek bytea, created_at, updated_at` — one row per user,
+  cascade-scoped like every other per-user table.
+- **`user_secrets` gains `sealed_with TEXT NOT NULL DEFAULT 'master' CHECK IN
+  ('master','dek')`** so `vault.Open` knows which box to use per ciphertext. New saves
+  always seal `'dek'`.
+- **Lazy rewrap on unlock**: pre-existing rows are master-key-sealed and cannot be
+  rewrapped without the user's password. On each successful unlock, that user's still-
+  `'master'` rows are opened with the master box, resealed with the DEK, and flipped to
+  `'dek'` in one transaction. Dormant accounts never rewrap; an admin-visible count of
+  still-`'master'` rows shows migration progress.
+- **Rewrap protects going-forward only, never retroactively.** An operator could have
+  snapshotted the DB before the rewrap, so any token that ever existed master-sealed is
+  potentially already leaked; the real fix is to **rotate the token**, not rewrap it. A
+  one-time post-unlock UI notice says exactly that ("protected from now on"; rotate for
+  full protection), never "protected retroactively". Until rewrap, legacy `'master'` rows
+  are withheld only by the runtime claim gate (§139) — a runtime control, not a
+  cryptographic one.
+- **Reset (password lost) must DELETE `user_vaults` + all `'dek'` rows** and prompt
+  re-entry — silently keeping unreadable ciphertext would be a worse bug than the
+  by-design data loss. Change/reset endpoints don't exist yet; constraints recorded for
+  when they land (change: unwrap old-KEK → rewrap new-KEK in the same tx as
+  `password_hash`, transparent to the user).
+
+## 138. `api/internal/vault` package, DEK cache & wire-in
+
+Serves human: auto-unlock at login; key kept in server memory until restart/explicit
+lock; lock/unlock/status surface.
+
+- **New `api/internal/vault`** package: `Unlock` / `Lock` / `Unlocked` / `Seal` / `Open`
+  over a store, a master box (for lazy rewrap), and an in-process DEK cache
+  (`map[uuid.UUID][]byte` + `sync.RWMutex`). DEKs are never logged or serialized and are
+  best-effort zeroized on Lock (Go gives no guarantee — stated in a comment, not oversold).
+- **The DEK cache IS the "unlocked" state**, held in API process memory from unlock until
+  pod restart or explicit Lock (the user's choice over session-TTL caching — keeps
+  overnight/autopilot runs working while unlocked). `Seal`/`Open` return `ErrLocked` when
+  the user isn't cached.
+- **Unlock at login** (`Login`, right after `VerifyPassword`, reusing the same plaintext
+  before it leaves scope; a first-ever unlock creates DEK + wrap) and **at register**
+  (KEK derived *before* the registration `pg_advisory_xact_lock` tx so a second in-lock
+  Argon2id doesn't serialize all registrations — only the cheap row insert is in-tx; a
+  crash between is recovered by Unlock's create-on-first-login path). Login now runs
+  Argon2id twice (verify + KEK) — keep the login rate limiter strict.
+- **Endpoints inside `RequireAuth`** (so unlock is not a pre-auth oracle and CSRF
+  applies): `POST /api/vault/unlock {password}` → 204/403, `POST /api/vault/lock` → 204,
+  `GET /api/vault/status`. Unlock is rate-limited with the **per-user**
+  `PerUserMiddleware`, not the per-IP auth limiter — it is authenticated, and a stolen
+  JWT would otherwise make it an online password-guessing oracle sharing a NAT bucket
+  with other users' logins.
+- **Vault status rides `/api/me`** (`sessionPayload`) so the SPA shell learns lock state
+  in one round-trip; the web client refreshes it via `AuthContext.refresh()` on window
+  focus, on any 409 `vault_locked` response, and after lock/unlock calls (there is no
+  global WS to push it — the only socket is per-run).
+- **Secrets save** (`handler/secrets.go`) seals via `vault.Seal`; returns 409
+  `vault_locked` when locked (only reachable if the pod restarted mid-session).
+- **Web surface**: header badge (🔓/🔒 with tooltip), a locked banner with a password
+  field that unlocks without a full re-login, a Lock action in the settings menu,
+  `queued` own-runs rendered as "waiting for vault unlock", and an irrecoverability
+  notice on the token-save form.
+
+## 139. Claim gating & lock-race handling (`workersvc`)
+
+Serves human: locked-owner runs queue as "waiting for vault unlock" instead of claiming
+or failing; unlock resumes them within a poll cycle.
+
+- **Single Go gate, no SQL change**: `ClaimRun` is already scoped `r.user_id = @user_id`
+  (from the worker's own identity), so a one-line `if !s.vault.Unlocked(wkr.UserID) {
+  return idle }` before `ClaimRun` keeps a locked owner's runs `queued`. Autopilot and
+  the poller need no special code — this gate is the single enforcement point.
+- **`assembleClaim` opens the Anthropic token via `vault.Open(run.UserID, …)`**; bot-PAT
+  decryption is unchanged (master box, §140).
+- **Lock-race sentinel `errVaultLocked`**: if Lock lands between `ClaimRun` and
+  `assembleClaim`, the run must **NOT** take the terminal `errCredentialUnavailable` path
+  (that fails the run and violates the queue-don't-fail contract). A distinct
+  `errVaultLocked` resets the just-claimed run back to `queued` (new query mirroring
+  `SweepClaimedNeverStarted`) and reports idle.
+- **`SetVault(*vault.Vault)` optional-dependency seam** on `workersvc` (same pattern as
+  `SetBroadcaster`/`SetLifecycle`), called additively from `main.go` — keeps the claim
+  wire-in's files disjoint from the auth/endpoint wire-in.
+- **Sweeper verified safe** (2026-07-10): no sweep query touches `status='queued'` and
+  there is no queued-age timeout, so locked-owner runs sit indefinitely by design; a
+  resumed run re-enters the claim gate and waits rather than failing.
+
+## 140. Scope boundary, seed exemption & residual risks
+
+Serves human: "materially harder, not impossible"; user accepts the residuals.
+
+- **Forge bot PAT stays under `UZI_SECRET_KEY` (master key), outside the vault.** The
+  poller must sync issues 24/7 with no user present, so the connection PAT cannot be
+  password-wrapped. `UZI_SECRET_KEY` therefore remains, but only for connection-level
+  secrets (and legacy not-yet-rewrapped rows). Accepted residual: an operator can still
+  recover the bot PAT (Developer-role, blast radius bounded by PRD #5's least-privilege
+  checks), but no user's personal Anthropic token.
+- **Seed admin explicitly exempt.** `UZI_SEED_PASSWORD` / `UZI_SEED_ANTHROPIC_TOKEN` are
+  env vars, so the vault is only as strong as env for that one account. Seeding creates
+  the vault row, seals the token with the DEK, **and unlocks the seed admin at boot**
+  (populates the cache) — otherwise a fresh headless deploy sits locked until the first
+  interactive login, defeating overnight autopilot for exactly the bootstrap case. The
+  `Sealer` interface grows a vault-aware variant. Post-boot hardening documented: change
+  the seed password, rotate the token, remove `UZI_SEED_*` from the deployed env.
+- **Dominant residual: `users.password_hash` is an offline brute-force oracle.** An
+  operator with the DB can crack the login password against the stored Argon2id hash →
+  KEK → DEK → tokens. The scheme's real strength is **password entropy + Argon2 cost, not
+  the 256-bit DEK** (`MinPasswordLen` is 12). Documented loudly; a higher KEK Argon2 cost
+  and a higher password floor are the noted mitigations for vault-protected deployments.
+- **Other documented residuals**: live-pod memory dump captures cached DEKs + in-flight
+  plaintext (DEK-in-RAM is the *common* state under until-restart caching; an optional
+  idle auto-lock is a future off-by-default knob that would break overnight runs);
+  trojaned image; the worker holds the plaintext Anthropic token for the run's duration
+  (per-run short-lived tokens are the future-PRD answer); DEK cache is per-process, so
+  the API stays single-replica (never replicate DEKs across pods); and a one-time rollout
+  stall — on the deploy that ships this, every existing user's runs stop claiming until
+  their next login (call out in release/ops notes).
+
+## 141. Rejected alternatives
+
+Serves human: the chosen approach is one of several; record why.
+
+- **Key as a mounted file / fetched from Infisical at boot** — rejected: the same
+  operators read Infisical and can exec into the pod to read the file.
+- **Vault transit / KMS envelope encryption** — rejected for this deployment: cluster
+  operators also administer Vault/Infisical, so it adds audit, not confidentiality.
+- **Global manual unseal at boot (Vault-style Shamir shards)** — viable, but rejected in
+  favor of per-user unlock: no ops ceremony on every deploy, per-user granularity, and
+  the unlocker owns the secret. Layerable later for the connection PATs if wanted.
+- **Per-run short-lived Anthropic tokens** (worker never holds a long-lived credential) —
+  out of scope: depends on what the Anthropic OAuth flow permits; noted as a future PRD
+  that composes with this one.
+- **Inspiration check**: bottega (host ambient creds), multica (plaintext creds), and
+  dot-agent-deck (ambient creds) all store provider credentials plaintext-equivalent;
+  none does password-wrapped envelope encryption — this beats them by following
+  Bitwarden's master-password key hierarchy.
+
+---
+
 # PRD #25 — Slack Integration
 
 Serves human: "Users only learn that an agent run finished, failed, or is parked at the
@@ -3370,7 +3648,7 @@ pass before build). Realizes `prds/25-slack-integration.md` (its Decision Log ca
 full user-vs-AI provenance); builds on PRD #4 (runs, steering inputs), PRD #19
 (`app_settings`), and `secretbox`. Section numbers continue past PRD #6's #132.
 
-## 133. Socket Mode manager: outbound-only supervisor, settings-driven hot-reload
+## 142. Socket Mode manager: outbound-only supervisor, settings-driven hot-reload
 
 Serves human: "outbound-only... no inbound HTTP, no public URL" (Decision Log,
 user-confirmed 2026-07-06).
@@ -3394,7 +3672,7 @@ user-confirmed 2026-07-06).
   `auth.test` validator and the initial handshake are time-bounded, by `SLACK_HTTP_TIMEOUT`
   (default 15s).
 
-## 134. Settings secret-key class + ENV overlay (net-new registry work)
+## 143. Settings secret-key class + ENV overlay (net-new registry work)
 
 Serves human: "Config from ENV or webui... sealed at rest... ENV wins" (Decision Log,
 user-confirmed).
@@ -3429,7 +3707,7 @@ user-confirmed).
   previously any settings write triggered a repo resync, so a Slack-token or `slack_enabled`
   write would needlessly force one. Only the two label keys now do.
 
-## 135. Persistence: per-user linking columns + `slack_run_messages` anchor
+## 144. Persistence: per-user linking columns + `slack_run_messages` anchor
 
 Serves human: "auto-matches each user by account email... manual Slack member-ID
 override" (Decision Log, user-confirmed).
@@ -3449,7 +3727,7 @@ override" (Decision Log, user-confirmed).
   'open' | 'reject_pending'`) track a live approval gate for M4/M5's cross-surface
   idempotency.
 
-## 136. Identity mapping is the authz primitive
+## 145. Identity mapping is the authz primitive
 
 Serves human: "no inbound Slack action can affect a run whose owner isn't the
 confirmed-linked Slack user... an ambiguous or unconfirmed link refuses rather than
@@ -3480,7 +3758,7 @@ at registration).
   unchanged match never resets `slack_link_confirmed_at`), with a 10-minute cooldown, and
   stops early if Slack rate-limits — so a reconnect storm can't hammer `users.lookupByEmail`.
 
-## 137. Notifier: content-minimized DMs, non-blocking fan-out, sweeper coverage
+## 146. Notifier: content-minimized DMs, non-blocking fan-out, sweeper coverage
 
 Serves human: "state transitions... arrive as Slack DMs... status + issue title + link
 only" (Decision Log; content minimization is a security-review requirement).
@@ -3494,7 +3772,7 @@ only" (Decision Log; content minimization is a security-review requirement).
 - **One root message per run**, edited in place (`chat.update`) as status changes
   (▶ running, ⏸ needs you, ✅ MR link, ❌ failed: reason, 🚫 cancelled); every other event
   threads under it. No plan or diff content ever appears — status, issue title, MR URL,
-  and failure reason only, each individually mrkdwn-escaped before interpolation (§140).
+  and failure reason only, each individually mrkdwn-escaped before interpolation (§149).
 - **AI decision (fact-check finding, built into M3, not a later fix)**: the Broadcaster
   seam alone misses the sweeper's bulk timeout/requeue/stale-worker transitions, which
   run as row-count-only SQL and never touched the Broadcaster before this PRD — exactly
@@ -3509,7 +3787,7 @@ only" (Decision Log; content minimization is a security-review requirement).
   `Broadcaster.PublishMessage` (per-run-message events) is a deliberate **no-op** — only
   *state* transitions notify, reinforcing content minimization.
 
-## 138. Approval gate from Slack
+## 147. Approval gate from Slack
 
 Serves human: "the `awaiting_approval` message carries Approve/Reject buttons... Reject
 prompts for a threaded reason" (Decision Log, user-confirmed, refined after design
@@ -3539,12 +3817,12 @@ review).
   pre-submit `run.Status` read and enqueue an `approve_plan`, but the worker consumes only
   the first as the verdict — the second is a dead input, not a second approval.
 
-## 139. Reply-from-Slack
+## 148. Reply-from-Slack
 
 Serves human: "Threaded replies on a live (non-gate) run become `follow_up` inputs"
 (Decision Log, user-confirmed).
 
-- A thread reply re-resolves the confirmed author (§136) and the run anchored at the
+- A thread reply re-resolves the confirmed author (§145) and the run anchored at the
   thread (`channel_id`+`root_ts` — effectively unique per run, since each run posts its
   own root message), then re-checks **ownership** of that run via the same
   `PlanGateSubmitter.GetRun` the gatekeeper uses — never trusting the thread anchor or
@@ -3571,7 +3849,7 @@ Serves human: "Threaded replies on a live (non-gate) run become `follow_up` inpu
   trimmed → `ScrubSecrets` → **capped at 2000 runes**, worker-bound only, never echoed back
   to Slack.
 
-## 140. mrkdwn injection hardening + outbound secret scrub
+## 149. mrkdwn injection hardening + outbound secret scrub
 
 Serves human: best-practice (audit finding: forge/worker-controlled text must not
 smuggle Slack markup into a trusted message).
@@ -3591,7 +3869,7 @@ smuggle Slack markup into a trusted message).
   Slack surface (the M4 gate messages, the M5 reply acks/ephemerals) is built on the same
   two functions rather than reinventing escaping per call site.
 
-## 141. Web UI + configuration
+## 150. Web UI + configuration
 
 Serves human: "webui field renders greyed out... a 'send test DM' button" (Decision Log,
 user-confirmed).
@@ -3612,11 +3890,11 @@ user-confirmed).
   name), so a settings page load never degrades when Slack itself is down; a
   resolvable display name is deferred as a follow-up.
 - Configuration surface: `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN`/`UZI_PUBLIC_BASE_URL` (ENV
-  overlay, §134), `SLACK_HTTP_TIMEOUT` (default `15s`), `SLACK_DM_RATE_LIMIT_MAX`/
-  `_WINDOW` (default `6`/`1m`, §139) — extends the existing configuration doc/table
+  overlay, §143), `SLACK_HTTP_TIMEOUT` (default `15s`), `SLACK_DM_RATE_LIMIT_MAX`/
+  `_WINDOW` (default `6`/`1m`, §148) — extends the existing configuration doc/table
   pattern (§13/§25/§131), no new mechanism.
 
-## 142. App manifest scopes verified against the implemented code (M7)
+## 151. App manifest scopes verified against the implemented code (M7)
 
 Serves human: best-practice — a paste-ready manifest should grant exactly what the bot
 uses, not what a draft guessed it would need.
@@ -3635,7 +3913,7 @@ uses, not what a draft guessed it would need.
   email verification at registration (would strengthen auto-match, but the confirmation
   round-trip already makes it safe without it).
 
-## 143. Testing (M6)
+## 152. Testing (M6)
 
 Serves human: best-practice — the authz + seal invariants above must hold against a real
 Postgres, and the whole integration must be a strict no-op when unconfigured.
@@ -3651,9 +3929,9 @@ Postgres, and the whole integration must be a strict no-op when unconfigured.
   acceptance criterion: an unconfigured instance must behave exactly as it did before the
   feature.
 
-## 144. Deferred / follow-up candidates (recorded, not implemented)
+## 153. Deferred / follow-up candidates (recorded, not implemented)
 
-- Live Slack **display-name** resolution in `GET /me/slack` (kept pure-DB, §141).
+- Live Slack **display-name** resolution in `GET /me/slack` (kept pure-DB, §150).
 - **Backoff-reset-on-flap gating** (an M2 reviewer nit): a socket that connects then drops
   immediately still resets its backoff.
 - Requeue-swept runs currently render as **"queued"** in DMs (a "↻ requeued" affordance or
@@ -3661,8 +3939,8 @@ Postgres, and the whole integration must be a strict no-op when unconfigured.
 - A **redundant `OpenDM`** on non-first transitions, and a rare **duplicate root message** if
   the `slack_run_messages` anchor upsert fails after the post — both benign.
 - The **webui steering-input body is uncapped/unscrubbed** (pre-existing; the Slack reply path
-  is the stricter one, §139) — out of this PRD's scope.
+  is the stricter one, §148) — out of this PRD's scope.
 - **Worker-side `failure_reason` sanitization at source** (today the notifier bounds it to
-  500 runes and escapes it, §140).
+  500 runes and escapes it, §149).
 - A **tighter dedicated DM budget** (~5/min) for the two `/me/slack` DM routes, below the
-  shared forge limiter — a Low follow-up from the DM-abuse audit (§139).
+  shared forge limiter — a Low follow-up from the DM-abuse audit (§148).

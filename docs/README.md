@@ -33,6 +33,8 @@ This file itself is exempt from the frontmatter contract below and from
 3. Write the content (house style below), run the validator, and link the
    page from wherever a reader would land on it (another doc, `README.md`,
    or `ARCHITECTURE.md`).
+4. `audience: user` pages are automatically searchable from the `/docs`
+   index (PRD #28) — no separate registration needed.
 
 ## Audiences
 
