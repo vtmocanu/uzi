@@ -130,7 +130,7 @@ func ciFixClaimPayload(t *testing.T) ClaimPayload {
 	fs := &fakeStore{
 		claimRun: store.Run{
 			ID:               uuid.MustParse("33333333-3333-3333-3333-333333333333"),
-			RepoID:           uuid.MustParse("22222222-2222-2222-2222-222222222222"),
+			RepoID:           pgUUID(uuid.MustParse("22222222-2222-2222-2222-222222222222")),
 			Kind:             RunKindCIFix,
 			IssueTitle:       "Fix CI: main pipeline #4200",
 			IssueDescription: "Diagnose and fix the failed pipeline for `main`.",

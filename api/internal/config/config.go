@@ -182,6 +182,26 @@ type Config struct {
 	// declared here so M3 can consume it.
 	SkillMaxBytes   int
 	SkillsMaxPerRun int
+
+	// Chat agent (PRD #39). Chat runs get their own lifecycle clocks (Decision 3):
+	// the sweeper skips RUN_TIMEOUT for them and applies these instead.
+	//   - ChatIdleTimeout is the SERVER idle backstop: a chat whose last message is
+	//     older than this is completed by the sweep (the not-trusting-the-worker
+	//     clock, raised above the worker's own idle timer so the worker completes
+	//     first in the normal case).
+	//   - WorkerChatIdleTimeout / WorkerChatTurnTimeout ride the chat claim so the
+	//     worker enforces the same idle + per-turn wall-clock the server configured
+	//     (no drift, the RUN_IDLE_TIMEOUT precedent).
+	//   - ChatMaxTurns is enforced BOTH server-side (the browser message endpoint
+	//     counts persisted follow_ups) and worker-side (delivered in the claim), so a
+	//     compromised worker can't burn spend past the cap.
+	// ChatRateLimit* is a dedicated per-user budget on chat create + message posts.
+	ChatIdleTimeout       time.Duration
+	WorkerChatIdleTimeout time.Duration
+	WorkerChatTurnTimeout time.Duration
+	ChatMaxTurns          int
+	ChatRateLimitMax      int
+	ChatRateLimitWindow   time.Duration
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -279,6 +299,16 @@ func Load() (Config, error) {
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)
+
+	// Chat agent (PRD #39 Decision 3). Idle windows are generous — an idle-death
+	// discards the conversation, so the Continue affordance is the recovery, not a
+	// tight reaper. The server idle backstop sits above the worker's own idle timer.
+	cfg.ChatIdleTimeout = parseDuration("CHAT_IDLE_TIMEOUT", 70*time.Minute)
+	cfg.WorkerChatIdleTimeout = parseDuration("WORKER_CHAT_IDLE_TIMEOUT", 60*time.Minute)
+	cfg.WorkerChatTurnTimeout = parseDuration("WORKER_CHAT_TURN_TIMEOUT", 10*time.Minute)
+	cfg.ChatMaxTurns = parseInt("CHAT_MAX_TURNS", 50)
+	cfg.ChatRateLimitMax = parseInt("CHAT_RATE_LIMIT_MAX", 60)
+	cfg.ChatRateLimitWindow = parseDuration("CHAT_RATE_LIMIT_WINDOW", time.Minute)
 
 	cfg.CIWatchRunWindow = parseDuration("CI_WATCH_RUN_WINDOW", 14*24*time.Hour)
 	// parseNonNegInt: 0 is legitimate here — it disables the pipeline sync.

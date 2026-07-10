@@ -70,13 +70,14 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.RunningTimeout+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
 			"running_timeout", res.RunningTimeout,
 			"stale_failed", res.StaleFailed,
 			"stale_requeued", res.StaleRequeued,
+			"chat_idle_completed", res.ChatIdleCompleted,
 		)
 	}
 }

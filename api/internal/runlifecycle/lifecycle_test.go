@@ -156,7 +156,7 @@ func moveCtx(repoID uuid.UUID, iid int64, status string, origin, boardCol pgtype
 	return store.GetRunMoveContextRow{
 		Status:           status,
 		IssueIid:         pgtype.Int8{Int64: iid, Valid: true},
-		RepoID:           repoID,
+		RepoID:           pgtype.UUID{Bytes: repoID, Valid: true},
 		OriginColumn:     origin,
 		BoardColumn:      boardCol,
 		MovePendingSince: ts(testNow.Add(-time.Minute)), // set + inside the window
@@ -414,7 +414,7 @@ func TestReconcileGiveUpLeavesMarker(t *testing.T) {
 	runID := uuid.New()
 	fs := &fakeStore{
 		gaveUp: []store.ListGaveUpColumnMovesRow{
-			{ID: runID, RepoID: uuid.New(), IssueIid: pgtype.Int8{Int64: 9, Valid: true}, Status: "completed", MovePendingSince: ts(testNow.Add(-40 * time.Minute))},
+			{ID: runID, RepoID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, IssueIid: pgtype.Int8{Int64: 9, Valid: true}, Status: "completed", MovePendingSince: ts(testNow.Add(-40 * time.Minute))},
 		},
 	}
 	fm := &fakeMover{}
