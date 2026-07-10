@@ -25,7 +25,7 @@ func TestMapLatestRun(t *testing.T) {
 
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
 		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("merged"), txt("boom"), nullTxt(),
-			txt("Vlad"), txt("vlad@example.com"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
+			txt("Vlad"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
 		if dto.MrState == nil || *dto.MrState != "merged" {
 			t.Fatalf("mr_state should be carried, got %v", dto.MrState)
 		}
@@ -55,19 +55,21 @@ func TestMapLatestRun(t *testing.T) {
 		}
 	})
 
-	t.Run("another owner's run is not mine, still shows owner name", func(t *testing.T) {
+	t.Run("another owner's run is not mine; owner_name is empty when display name absent (email NOT used)", func(t *testing.T) {
 		otherOwner := uuid.New()
+		// The query no longer selects the email, so mapLatestRun has only the display
+		// name to work with. A run whose owner has no display name shows an empty
+		// owner_name — never the email (PRD #33 Decision 5, the anti-leak guarantee).
 		dto := mapLatestRun(runID, otherOwner, "running", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(),
-			nullTxt(), txt("someone@example.com"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
+			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
 		}
 		if dto.MrState != nil {
 			t.Fatalf("null mr_state should map to nil, got %v", *dto.MrState)
 		}
-		// display name absent → fall back to email so "started by X" is never blank.
-		if dto.OwnerName != "someone@example.com" {
-			t.Fatalf("owner_name should fall back to email, got %q", dto.OwnerName)
+		if dto.OwnerName != "" {
+			t.Fatalf("owner_name must be empty when display name is absent, never an email; got %q", dto.OwnerName)
 		}
 		if dto.MrIID != nil {
 			t.Fatalf("null mr_iid should map to nil, got %v", *dto.MrIID)
@@ -77,11 +79,11 @@ func TestMapLatestRun(t *testing.T) {
 		}
 	})
 
-	t.Run("blank display name and email leave owner name empty", func(t *testing.T) {
+	t.Run("blank display name leaves owner name empty", func(t *testing.T) {
 		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(),
-			txt(""), nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
+			txt(""), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.OwnerName != "" {
-			t.Fatalf("owner_name should be empty when no name/email, got %q", dto.OwnerName)
+			t.Fatalf("owner_name should be empty when the display name is blank, got %q", dto.OwnerName)
 		}
 	})
 }
@@ -102,7 +104,7 @@ func TestAssembleCards(t *testing.T) {
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
 		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", MrIid: i8(5), MrState: txt("closed"),
-			OwnerName: nullTxt(), OwnerEmail: txt("o@example.com"), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+			OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running",
 			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 	}
@@ -135,8 +137,11 @@ func TestAssembleCards(t *testing.T) {
 	if byIID[20].LatestRun.IsMine {
 		t.Fatal("issue 20: another owner's run must not be is_mine")
 	}
-	if byIID[20].LatestRun.OwnerName != "o@example.com" {
-		t.Fatalf("issue 20: owner_name should fall back to email, got %q", byIID[20].LatestRun.OwnerName)
+	// Decision 5: owner_name is the display name or empty, never the email. This
+	// run's owner has no display name, so a shared board shows an empty owner, not
+	// the leaked email address.
+	if byIID[20].LatestRun.OwnerName != "" {
+		t.Fatalf("issue 20: owner_name must be empty (no display name), never an email; got %q", byIID[20].LatestRun.OwnerName)
 	}
 	if byIID[20].LatestRun.MrIID == nil || *byIID[20].LatestRun.MrIID != 5 {
 		t.Fatalf("issue 20: mr_iid should flow through, got %v", byIID[20].LatestRun.MrIID)

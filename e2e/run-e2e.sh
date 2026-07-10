@@ -39,6 +39,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXECUTOR="${UZI_E2E_EXECUTOR:-stub}"
 PROJECT="${UZI_E2E_COMPOSE_PROJECT:-uzi-e2e-$$}"
+# Compose project-name guard (PRD #33 Decision 7): reject an invalid RESOLVED
+# project name up front — before any scratch-dir or compose work — so a branch-like
+# UZI_E2E_COMPOSE_PROJECT with a slash (e.g. feature/prd-33) fails with a clear
+# message instead of docker rejecting it mid-run, after setup has begun. We validate,
+# never rewrite: an explicit value is user intent, and silently sanitizing it would
+# hide the mismatch from the logs and teardown hints. The rule is Compose's own
+# (lowercase alphanumerics, '-', '_', starting alphanumeric); the PID-based default
+# uzi-e2e-$$ always passes, so no provenance check is needed — an invalid value is
+# always user-set.
+project_name_re='^[a-z0-9][a-z0-9_-]*$'
+if [[ ! "$PROJECT" =~ $project_name_re ]]; then
+  echo "error: invalid compose project name '$PROJECT'" >&2
+  echo "  UZI_E2E_COMPOSE_PROJECT must match ${project_name_re} (lowercase alphanumerics," >&2
+  echo "  '-' and '_', starting with an alphanumeric). A branch-like name with a '/' is not valid." >&2
+  exit 2
+fi
 # A real SDK agent turn takes minutes (observed ~13m: the seeded template spawns
 # a reviewer subagent), where the stub finishes in seconds.
 [ "$EXECUTOR" = sdk ] && COMPLETE_TIMEOUT_DEFAULT=1800 || COMPLETE_TIMEOUT_DEFAULT=90

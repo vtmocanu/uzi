@@ -94,9 +94,11 @@ type latestRunDTO struct {
 // mapLatestRun builds the card's run summary from the shared run + owner + worker
 // columns the board and single-card queries both return. viewerID is the board
 // viewer; IsMine is set when the run belongs to them (only then does the client
-// render the run-view link). ownerName prefers the display name, falling back to
-// the email, so "started by X" is never blank.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrState, failureReason, stopKind, ownerName, ownerEmail, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+// render the run-view link). ownerName is the owner's display name or empty — never
+// the email (PRD #33 Decision 5): a shared board must not leak another user's email
+// on a card, and the web already renders a no-owner badge for empty. The query no
+// longer even selects the email, so there is nothing to fall back to here.
+func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrState, failureReason, stopKind, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:            runID.String(),
 		Status:        status,
@@ -113,10 +115,10 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mr
 		v := mrIID.Int64
 		dto.MrIID = &v
 	}
-	if ownerName.Valid && ownerName.String != "" {
+	// Display name or empty — never the email (Decision 5). An empty owner_name is a
+	// legal, rendered no-owner badge on the web.
+	if ownerName.Valid {
 		dto.OwnerName = ownerName.String
-	} else if ownerEmail.Valid {
-		dto.OwnerName = ownerEmail.String
 	}
 	return dto
 }
@@ -371,7 +373,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
-			rr.MrState, rr.FailureReason, rr.StopKind, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
+			rr.MrState, rr.FailureReason, rr.StopKind, rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
 
 	cards := make([]cardDTO, 0, len(issues))
@@ -582,7 +584,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
 	}
@@ -680,7 +682,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	// a toggle never blanks the run badge the board/issue view is showing.
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for prdless card", "error", err)
 	}
