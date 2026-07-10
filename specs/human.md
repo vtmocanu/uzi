@@ -100,6 +100,14 @@ Tracked as GitLab issue vtmocanu/uzi#7; PRD at `prds/7-docs-section-webui.md`.
 - Include screenshots; screenshots are provided by the user (ask the user for them).
 - Skills howto now in scope and shipped (`docs/skills.md`) — Feature #16 added the skills feature.
 
+## Feature #28 — Docs search
+
+Tracked as GitLab issue vtmocanu/uzi#28; PRD at `prds/28-docs-search.md`.
+
+- A search box for the docs page.
+- Full-text search with snippets (not a title/summary filter).
+- Search box on the `/docs` index only (not on individual doc pages).
+
 ## Feature #11 — Run view UX: markdown plan, boxed activity, terse events
 
 Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
