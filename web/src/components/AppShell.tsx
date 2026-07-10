@@ -18,6 +18,7 @@ import {
   BoardIcon,
   BookIcon,
   BotIcon,
+  ChatIcon,
   ChevronRightIcon,
   FactoryIcon,
   GearIcon,
@@ -233,6 +234,7 @@ function SidebarContent({
               />
             ))}
           <NavItem to="/runs" icon={<ActivityIcon />} label="Runs" onNavigate={onNavigate} collapsed={collapsed} />
+          <NavItem to="/chat" icon={<ChatIcon />} label="Chat" onNavigate={onNavigate} collapsed={collapsed} />
         </NavGroup>
 
         <NavGroup label="Factory" collapsed={collapsed}>
