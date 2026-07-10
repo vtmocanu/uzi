@@ -1527,7 +1527,9 @@ Serves human: "the board must show that runs happened / are happening — badges
   client fan-in.
 - **`owner_name` falls back to the owner's email** — harmless today (per-connection
   repos ⇒ every board self-owned) but a tracked multi-user revisit item: switch to a
-  neutral label before boards are ever shared.
+  neutral label before boards are ever shared. **Superseded by §145 (PRD #33):**
+  display-name-or-empty, email dropped from the board queries entirely, and the DTO's
+  `failure_reason` owner-gated.
 
 ## 73. Board badges, attention strip, self-refresh
 
@@ -1551,7 +1553,10 @@ Serves human: "the board must update itself (no manual Refresh)"; card badge/MR-
   `latest_run` (one fewer request, no race).
 - Known limitation (out of scope, documented): no MR-state tracking — a chip can
   advertise an already-merged MR, and Human Review never auto-drains on merge. Named
-  follow-up PRD.
+  follow-up PRD. **Update:** PRD #24 landed the close/reopen watcher (§89–§91), and
+  §142 (PRD #33) now surfaces its `mr_state` on the chip (merged/closed variants);
+  auto-drain on merge is already handled by the agent MR's `Closes #N` + poller sync,
+  not a gap.
 
 ## 74. Deliberate-stop neutral styling (cross-surface)
 
@@ -1571,6 +1576,10 @@ board, Runs list, issue view).
   - **Known residual** (documented in-code): a live-poller *plan reject* carrying the
     user's verbatim free-text reason stays "failed" — no client heuristic can catch
     arbitrary user text.
+  - **Superseded by §143–§144 (PRD #33):** the string heuristic (`STOPPED_FAILURE_REASONS`)
+    is deleted in favor of a server-stamped `runs.stop_kind`; `isStoppedRun` becomes
+    status/stop_kind-based (terminal-guarded), and the verbatim-reason residual above is
+    fixed.
 - **Auto-move toast suppression for manual drags**: a `suppressToastIids` ref silences
   the "#42 → column" toast for a card the user just dragged, released after 11s (> the
   10s poll). Accepted tradeoff: a genuine auto-move of a just-dragged card inside the
@@ -1978,6 +1987,8 @@ Serves human Feature #24; no new surface required.
   optional `closed`/`merged` chip next to the `MR !N` chips is a noted nice-to-have,
   **not built** (Open Question 2); prior art if pursued is multica's derived
   PR-status enum (precompute a display status, don't surface the raw forge string).
+  **Built by §142 (PRD #33):** `mr_state` is now on both run DTOs and rendered as a
+  derived-enum chip (`mrChipState`, the multica pattern) at all five MR-chip surfaces.
 - **Docs**: `docs/board.md` gains the MR-close/reopen automation and the Decision 9
   note (pre-existing stuck cards heal with one manual drag).
 
@@ -3635,3 +3646,148 @@ Serves human: the chosen approach is one of several; record why.
   dot-agent-deck (ambient creds) all store provider credentials plaintext-equivalent;
   none does password-wrapped envelope encryption — this beats them by following
   Bitwarden's master-password key hierarchy.
+
+---
+
+# PRD #33 — Board–Run follow-ups: MR-state surfacing, deliberate-stop signal, multi-user hardening, e2e guard
+
+Serves human Feature #12 (board–run lifecycle: "run badges + MR link on the card") and
+Feature #14 (run-status language unified across all surfaces), plus the best-practice
+bar (multi-user least-disclosure; e2e robustness). **The single user-stated decision
+here (2026-07-10) is to consolidate the four self-contained follow-ups issue #15
+recorded while shipping PRD #12 into ONE PRD / ONE MR** — the four items themselves were
+AI-surfaced, not user-requested, so `specs/human.md` gains no new requirement. Status:
+designed + implemented on `feature/prd-33-board-run-followups`; pre-reviewed by
+design-review + fact-check (blocking findings folded: the transactional stamp §143 and
+the terminal guard §144). Updates §72 (owner_name / run_count), supersedes §74's client
+string heuristic (→ server-stamped `stop_kind`), and realizes §92's noted-but-unbuilt
+`mr_state`-on-the-runs-API chip. Migration draft `00045` (live head `00043`; `00044`
+drafted by PRD #32) renumbers above the live head at land (goose convention).
+
+## 142. MR-state surfacing — display-only, best-effort chip (api handler + web)
+
+Serves human: Feature #12 board card MR signal; Feature #14 unified surfaces. Realizes
+§92's deferred nice-to-have without touching PRD #24's watcher.
+
+- **`runs.mr_state` (PRD #24's watcher column, §89) is *display-only* surfacing — no new
+  polling, no watcher/candidate-set widening.** The watcher maintains `mr_state` only
+  for its watch candidates (the latest completed run while in Human Review or under
+  reopen-watch, §89/§91); widening that set for cosmetic freshness would break PRD #24's
+  cost bound (§91). The chip therefore treats `mr_state` as a *hint*: NULL renders
+  exactly today's plain `MR !N`.
+- **Freshness holds only for the board card** (the issue's latest run, kept watched).
+  Per-run history rows (issue view, runs list, run view, dashboard) render each run's
+  *frozen* `mr_state` "as of last sync": once a rework run supersedes a completed run the
+  watcher never revisits the old run, so a superseded run's chip can read a stale
+  `closed`. Only stale `closed` misleads; `merged` is terminal. The chip `title` says "as
+  of last sync"; docs scope the freshness claim to the board card and do not oversell
+  `merged` (a merge usually closes the issue and drops it from candidates before `merged`
+  is ever observed).
+- **Derived-status enum, never raw forge strings** (multica's PR-status pattern, the
+  prior art §92 named): one pure web helper `mrChipState(mr_state) → open | merged |
+  closed`, where unknown / `opened` / `locked` / NULL all collapse to `open`,
+  unit-tested like the rest of `runBadge.ts`. `merged` → ok-toned "MR !N merged";
+  `closed` → muted/struck "MR !N closed"; `open` → today's chip. Applied at **all five**
+  MR-chip surfaces (board card, issue-view run history, runs list, dashboard, run view)
+  so no surface ever renders a raw forge state string.
+- **Plumbing**: `mr_state` added to the latest-run DTO (`handler/board.go`) and the
+  per-run DTO (`runToDTO`, `handler/workers.go`), sourced from the run-returning queries
+  (sqlc regenerated) and mirrored into the web `LatestRun` / run-row types. Store
+  unchanged — the column already exists (migration `00029`).
+
+## 143. Deliberate-stop signal — server-stamped `runs.stop_kind`, not a new status
+
+Serves human: Feature #14 ("a deliberate human stop is not breakage" — neutral, never
+rose, across all surfaces). Supersedes §74's client string heuristic.
+
+- **New nullable column `runs.stop_kind` (`cancelled` | `plan_rejected`), NOT a new run
+  status.** A new status would touch the state machine, the sweeper, the claim gate,
+  terminal-status checks, and every status switch in api/web/agent for what is purely
+  presentation semantics; the status stays `failed` / `cancelled` exactly as before. The
+  column records the *server's intent*, independent of whatever `failure_reason` string
+  the worker later reports.
+- **Stamped server-side at the moment the server knows the verdict** (all in
+  `workersvc`):
+  - **The live-poller reject/cancel path has no status write** — it enqueues the verdict
+    via the shared `CreateRunInput` insert. The stamp MUST land in the *same statement*
+    as that insert: a dedicated `CreateStopVerdictInput` CTE (unconditional UPDATE +
+    INSERT, one statement) used only by the live cancel/reject branch. **Non-negotiable
+    (blocking review finding): a second, non-transactional statement whose loss would
+    reintroduce the failed-vs-stopped bug is forbidden.** `CreateRunInput` stays a plain
+    INSERT for approve/follow_up (no runs-row lock on the hot path).
+  - **The server-side no-poller reject** stamps `plan_rejected` alongside its existing
+    `FailureReason` write; the **existing server-side cancel path** (status `cancelled`)
+    stamps `cancelled` for uniformity (the client already treats status `cancelled` as
+    stopped).
+  - **Sweeper timeout/requeue failures never stamp it** — a timeout is not a deliberate
+    human stop. Worker-reported `SetRunFailed` never stamps it either; if the run had a
+    pending stop verdict, the verdict site already did.
+- **Agent unchanged**: no worker-protocol change; the worker keeps reporting whatever
+  `failure_reason` it has and the server signal is authoritative.
+
+## 144. Client stopped-vs-failed reclassification, backfill, and the terminal guard
+
+Serves human: the same Feature #14 neutral-stop styling, now server-driven end to end.
+
+- **`isStoppedRun(status, stopKind) = status === 'cancelled' || (status === 'failed' &&
+  stopKind != null)`** replaces §74's `STOPPED_FAILURE_REASONS` string set entirely
+  (deleted, including the `runBadge.ts` known-limitation comment block) — issue #15's
+  stated bar. The previously-uncatchable live-poller plan reject carrying the user's
+  *verbatim* reason now renders a neutral "stopped".
+- **The `failed` guard is load-bearing (blocking review finding), not defensive
+  boilerplate.** On the live path `stop_kind` is stamped at verdict *enqueue* while the
+  run is still `awaiting_approval` / `running`, and a reject-then-approve race (latest
+  verdict wins) can even *complete* a run that carries `stop_kind`. Without the terminal
+  guard those would render "stopped" prematurely or suppress a completed run's MR chip.
+  Two dedicated web tests pin it (stamped-but-still-running renders by status;
+  stamped-but-completed renders the MR chip).
+- **Backfill covers only the two exact literals**: `stop_kind` is set where
+  `failure_reason IN ('run cancelled','plan rejected')` (the only literals a deliberate
+  stop ever persisted). Historical rejects that carried a verbatim reason are
+  indistinguishable from real failures after the fact and **stay "failed" — accepted**;
+  the set is small and shrinking. Server-side cancels write status `cancelled` with no
+  `failure_reason` and are deliberately not backfilled (`isStoppedRun`'s `cancelled`
+  branch already covers them).
+- **Accepted edge (reviewer, non-blocking): `stop_kind` is never cleared on requeue.** A
+  stamped-then-requeued run that later genuinely fails renders "stopped"; accepted as
+  semantically fine — the user did ask to stop it.
+
+## 145. Multi-user board hardening — no email leak, owner-gated failure_reason, issue-scoped run_count
+
+Serves human: best-practice / least-disclosure. Latent today (per-connection repos are
+self-owned) but real once boards are shared. Supersedes §72's email-fallback revisit
+item.
+
+- **`owner_name` never contains an email.** The fallback chain becomes display-name →
+  empty string (the web already renders a no-owner badge for empty). No sanitized email
+  local-part — a handle derived from the email still leaks the identifier it was meant to
+  hide. Email is **dropped from the board queries entirely** (never fetched), not merely
+  omitted from the DTO. `owner_email` stays admin-list-only where it already is
+  (`handler/runs.go`).
+- **`failure_reason` on the board latest-run DTO is owner-gated** (auditor pre-flag,
+  lead-accepted 2026-07-10): it can carry a user's verbatim typed reject reason or a raw
+  agent error, so a non-owner viewer of a shared board gets `null` (owners keep it for
+  the failed-badge tooltip). `stop_kind` — a non-sensitive enum — stays exposed to
+  everyone, so stopped-vs-failed classification never needs the free-text field.
+- **`run_count` stays issue-scoped (counts all users' runs), documented, not
+  per-viewer.** The "×N" hint answers "how many times has this issue been run" — a
+  board-level fact a shared board legitimately shows, exposing only a count and no
+  identity. Per-viewer scoping would make the same card show different histories to
+  different users and complicate the `DISTINCT ON` query for no confidentiality gain.
+  Rationale commented at the window definition (`forge.sql`); revisit only if a real
+  multi-tenant deployment objects.
+
+## 146. e2e compose-project-name guard (`e2e/run-e2e.sh`)
+
+Serves human: best-practice (the harness must fail loudly up front, not mid-run).
+
+- **Validate the resolved `UZI_E2E_COMPOSE_PROJECT` unconditionally against compose's
+  project-name rule** `^[a-z0-9][a-z0-9_-]*$` (lowercase alphanumerics, `-`, `_`, must
+  start alphanumeric; verified against Compose v5.1.2's own error message) and exit 2
+  with the offending value + the rule **before any scratch-dir / compose work**. A
+  slashed explicit value (e.g. a branch-like `feature/prd-33`) otherwise makes docker
+  reject the name mid-run, after setup has begun.
+- **Reject, never rewrite.** An explicit export is user intent; silently sanitizing it
+  would hide the mismatch from logs, teardown hints, and any concurrently running stack
+  that would then reference a name the user never set. No provenance check needed — the
+  PID default `uzi-e2e-$$` always passes the rule.
