@@ -172,12 +172,17 @@ func (q *Queries) CreateChatContinueRun(ctx context.Context, arg CreateChatConti
 
 const createChatRun = `-- name: CreateChatRun :one
 
-INSERT INTO runs (user_id, kind, issue_title, issue_description, title)
-VALUES ($1, 'chat', $2, $3, $4)
+WITH seed AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    VALUES ($1, 'follow_up', $4)
+)
+INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title)
+VALUES ($1, $2, 'chat', $3, $4, $5)
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, title, resume_of_run_id
 `
 
 type CreateChatRunParams struct {
+	RunID            uuid.UUID   `json:"run_id"`
 	UserID           uuid.UUID   `json:"user_id"`
 	IssueTitle       string      `json:"issue_title"`
 	IssueDescription string      `json:"issue_description"`
@@ -185,15 +190,23 @@ type CreateChatRunParams struct {
 }
 
 // Chat runs (PRD #39) --------------------------------------------------------
-// Queue a chat run (Decision 1/2). repo_id/issue_iid/branch stay NULL (kind='chat',
-// enforced by runs_kind_shape). issue_title/issue_description are the NOT NULL
-// columns repurposed: issue_title carries the derived conversation title (so the
-// existing run-view header stays populated) and issue_description carries the raw
-// first message — the initial prompt the worker seeds the SDK session with, exactly
-// as an issue run's description is its task. title is the same derived title in the
-// dedicated column the chat UI reads.
+// Queue a chat run (Decision 1/2) AND seed its first message as a follow_up input in
+// ONE statement. repo_id/issue_iid/branch stay NULL (kind='chat', runs_kind_shape).
+// issue_title carries the derived conversation title (so the run-view header stays
+// populated) and issue_description keeps the raw first message as the run's durable,
+// self-contained copy. The DELIVERY of that first message to the worker is the seeded
+// run_user_inputs follow_up row — NOT a special claim field — so the worker's single
+// input-consumption path handles the initial prompt exactly like every later turn and
+// emits the user_message run_message uniformly (pinned M4 contract). The seed also
+// means CountChatFollowUps counts the initial prompt as turn 1 under CHAT_MAX_TURNS.
+// A data-modifying CTE runs the two inserts atomically (the CreateStopVerdictInput
+// precedent), so a chat can never exist without its first message. The run id is
+// caller-supplied so the runs INSERT stays the OUTER statement (RETURNING * → the
+// Run model, not a synthetic CTE row); the FK from the seeded input to the run holds
+// because both rows land in the same statement (immediate FK checked at statement end).
 func (q *Queries) CreateChatRun(ctx context.Context, arg CreateChatRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createChatRun,
+		arg.RunID,
 		arg.UserID,
 		arg.IssueTitle,
 		arg.IssueDescription,

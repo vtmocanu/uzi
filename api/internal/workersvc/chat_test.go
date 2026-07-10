@@ -45,9 +45,6 @@ func TestClaimChatSucceedsWithoutForgeConnection(t *testing.T) {
 	if payload.Secrets.AnthropicOAuthToken != "anthropic-chat-token-abcdef1234567890" {
 		t.Errorf("chat claim must carry the decrypted Anthropic token")
 	}
-	if payload.Prompt != "how does the plan-approval gate work?" {
-		t.Errorf("Prompt = %q, want the first message", payload.Prompt)
-	}
 	if payload.Config.MaxTurns != 50 {
 		t.Errorf("Config.MaxTurns = %d, want 50 (delivered so the worker enforces the same cap)", payload.Config.MaxTurns)
 	}

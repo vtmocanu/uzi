@@ -63,11 +63,13 @@ type ChatClaimPayload struct {
 	// Kind is always "chat" — the worker's chat lane asserts it, and it keeps the
 	// two lanes' payloads self-describing.
 	Kind string `json:"kind"`
-	// Title is the conversation's display title; Prompt is the user's first message
-	// (the initial prompt the worker seeds the SDK session with). Prompt is empty for
-	// a Continue run (Decision 11) — the worker resumes the prior session and parks.
+	// Title is the conversation's display title. There is deliberately no prompt
+	// field (pinned M4 contract): the user's first message is delivered as a seeded
+	// run_user_inputs follow_up (see CreateChatRun), so the worker consumes it through
+	// the same input path as every later turn — one code path, uniform user_message
+	// emission. A Continue run (Decision 11) carries no seeded input; the worker
+	// resumes the prior session and parks awaiting the next message.
 	Title  string `json:"title"`
-	Prompt string `json:"prompt"`
 	Status string `json:"status"`
 	// SessionID is the SDK session to resume: the run's own session (a
 	// requeued/resumed chat) or, for a Continue run, the resumed-from run's session
@@ -170,7 +172,6 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		RunID:         run.ID.String(),
 		Kind:          run.Kind,
 		Title:         run.Title.String,
-		Prompt:        run.IssueDescription,
 		Status:        run.Status,
 		SessionID:     textPtr(sessionID),
 		ResumeOfRunID: uuidPtr(run.ResumeOfRunID),
@@ -202,6 +203,7 @@ func (s *Service) CreateChatRun(ctx context.Context, userID uuid.UUID, message s
 	}
 	title := deriveChatTitle(message)
 	return s.q.CreateChatRun(ctx, store.CreateChatRunParams{
+		RunID:            uuid.New(),
 		UserID:           userID,
 		IssueTitle:       title,
 		IssueDescription: message,

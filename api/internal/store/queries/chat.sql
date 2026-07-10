@@ -1,15 +1,26 @@
 -- Chat runs (PRD #39) --------------------------------------------------------
 
 -- name: CreateChatRun :one
--- Queue a chat run (Decision 1/2). repo_id/issue_iid/branch stay NULL (kind='chat',
--- enforced by runs_kind_shape). issue_title/issue_description are the NOT NULL
--- columns repurposed: issue_title carries the derived conversation title (so the
--- existing run-view header stays populated) and issue_description carries the raw
--- first message — the initial prompt the worker seeds the SDK session with, exactly
--- as an issue run's description is its task. title is the same derived title in the
--- dedicated column the chat UI reads.
-INSERT INTO runs (user_id, kind, issue_title, issue_description, title)
-VALUES (@user_id, 'chat', @issue_title, @issue_description, @title)
+-- Queue a chat run (Decision 1/2) AND seed its first message as a follow_up input in
+-- ONE statement. repo_id/issue_iid/branch stay NULL (kind='chat', runs_kind_shape).
+-- issue_title carries the derived conversation title (so the run-view header stays
+-- populated) and issue_description keeps the raw first message as the run's durable,
+-- self-contained copy. The DELIVERY of that first message to the worker is the seeded
+-- run_user_inputs follow_up row — NOT a special claim field — so the worker's single
+-- input-consumption path handles the initial prompt exactly like every later turn and
+-- emits the user_message run_message uniformly (pinned M4 contract). The seed also
+-- means CountChatFollowUps counts the initial prompt as turn 1 under CHAT_MAX_TURNS.
+-- A data-modifying CTE runs the two inserts atomically (the CreateStopVerdictInput
+-- precedent), so a chat can never exist without its first message. The run id is
+-- caller-supplied so the runs INSERT stays the OUTER statement (RETURNING * → the
+-- Run model, not a synthetic CTE row); the FK from the seeded input to the run holds
+-- because both rows land in the same statement (immediate FK checked at statement end).
+WITH seed AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    VALUES (@run_id, 'follow_up', @issue_description)
+)
+INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title)
+VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title)
 RETURNING *;
 
 -- name: CreateChatContinueRun :one

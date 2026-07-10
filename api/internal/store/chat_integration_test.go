@@ -53,7 +53,7 @@ func TestChatRunsLiveDB(t *testing.T) {
 
 	// ── shape: a valid chat run has NULL repo_id/issue_iid/branch + kind='chat' ──
 	chat, err := q.CreateChatRun(ctx, store.CreateChatRunParams{
-		UserID: userID, IssueTitle: "How does the plan gate work?",
+		RunID: uuid.New(), UserID: userID, IssueTitle: "How does the plan gate work?",
 		IssueDescription: "how does the plan-approval gate work?",
 		Title:            pgtype.Text{String: "How does the plan gate work?", Valid: true},
 	})
@@ -62,6 +62,11 @@ func TestChatRunsLiveDB(t *testing.T) {
 	}
 	if chat.Kind != "chat" || chat.RepoID.Valid || chat.IssueIid.Valid || chat.Branch.Valid {
 		t.Fatalf("chat run must be kind=chat with NULL repo_id/issue_iid/branch, got %+v", chat)
+	}
+	// The create atomically seeds the first message as a follow_up input (pinned M4
+	// contract) — so a fresh chat already has exactly one persisted turn.
+	if n, err := q.CountChatFollowUps(ctx, chat.ID); err != nil || n != 1 {
+		t.Fatalf("CreateChatRun must seed the first message as a follow_up; CountChatFollowUps = %d, %v; want 1", n, err)
 	}
 
 	// ── CHECK runs_kind_shape: chat with any of repo/issue/branch set → 23514 (use
@@ -141,24 +146,25 @@ func TestChatRunsLiveDB(t *testing.T) {
 		t.Fatalf("Continue claim must carry the prior run's session, got %+v", resumeSession)
 	}
 
-	// ── turn count: CountChatFollowUps counts only follow_up inputs ──
-	freshChat, _ := q.CreateChatRun(ctx, store.CreateChatRunParams{UserID: userID, IssueTitle: "t", IssueDescription: "hi", Title: pgtype.Text{String: "t", Valid: true}})
+	// ── turn count: CountChatFollowUps counts every follow_up input, including the
+	// seeded initial prompt (1) plus 3 later turns → 4 ──
+	freshChat, _ := q.CreateChatRun(ctx, store.CreateChatRunParams{RunID: uuid.New(), UserID: userID, IssueTitle: "t", IssueDescription: "hi", Title: pgtype.Text{String: "t", Valid: true}})
 	for i := 0; i < 3; i++ {
 		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: freshChat.ID, Kind: "follow_up", Body: pgtype.Text{String: "m", Valid: true}}); err != nil {
 			t.Fatalf("CreateRunInput: %v", err)
 		}
 	}
-	if n, err := q.CountChatFollowUps(ctx, freshChat.ID); err != nil || n != 3 {
-		t.Fatalf("CountChatFollowUps = %d, %v; want 3", n, err)
+	if n, err := q.CountChatFollowUps(ctx, freshChat.ID); err != nil || n != 4 {
+		t.Fatalf("CountChatFollowUps = %d, %v; want 4 (seeded initial + 3)", n, err)
 	}
 
 	// ── idle sweep: a claimed chat with an OLD message completes; a recent one and
 	// a message-less queued chat do not ──
-	idleChat, _ := q.CreateChatRun(ctx, store.CreateChatRunParams{UserID: userID, IssueTitle: "idle", IssueDescription: "x", Title: pgtype.Text{String: "idle", Valid: true}})
+	idleChat, _ := q.CreateChatRun(ctx, store.CreateChatRunParams{RunID: uuid.New(), UserID: userID, IssueTitle: "idle", IssueDescription: "x", Title: pgtype.Text{String: "idle", Valid: true}})
 	mustExec(ctx, t, pool, `UPDATE runs SET status = 'running' WHERE id = $1`, idleChat.ID)
 	mustExec(ctx, t, pool, `INSERT INTO run_messages (run_id, seq, kind, payload, created_at) VALUES ($1, 1, 'text', '{}', now() - interval '2 hours')`, idleChat.ID)
 
-	activeChat, _ := q.CreateChatRun(ctx, store.CreateChatRunParams{UserID: userID, IssueTitle: "active", IssueDescription: "x", Title: pgtype.Text{String: "active", Valid: true}})
+	activeChat, _ := q.CreateChatRun(ctx, store.CreateChatRunParams{RunID: uuid.New(), UserID: userID, IssueTitle: "active", IssueDescription: "x", Title: pgtype.Text{String: "active", Valid: true}})
 	mustExec(ctx, t, pool, `UPDATE runs SET status = 'running' WHERE id = $1`, activeChat.ID)
 	mustExec(ctx, t, pool, `INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 1, 'text', '{}')`, activeChat.ID)
 
