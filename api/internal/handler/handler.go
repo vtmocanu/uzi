@@ -431,7 +431,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter 
 				r.Get("/", h.ListChats)
 				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/messages", h.PostChatMessage)
 				r.Post("/{id}/end", h.EndChat)
-				r.Post("/{id}/continue", h.ContinueChat)
+				// Continue mints a NEW queued chat run, so it rides the same per-user chat
+				// limiter as create/messages — a spend guard against minting queued runs
+				// via repeated Continue.
+				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/continue", h.ContinueChat)
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/proposals/{pid}/confirm", h.ConfirmProposal)
 				r.Post("/{id}/proposals/{pid}/dismiss", h.DismissProposal)
 			})

@@ -57,6 +57,9 @@ func (s *chatStore) MarkProposalDismissed(_ context.Context, id uuid.UUID) (stor
 	s.dismissed = &id
 	return store.IssueProposal{}, nil
 }
+func (s *chatStore) CreateChatContinueRun(_ context.Context, arg store.CreateChatContinueRunParams) (store.Run, error) {
+	return store.Run{ID: uuid.New(), UserID: arg.UserID, Kind: workersvc.RunKindChat, Status: "queued"}, nil
+}
 func (s *chatStore) ListChatRunsForUser(_ context.Context, userID uuid.UUID) ([]store.ListChatRunsForUserRow, error) {
 	if userID != s.ownerID {
 		return nil, nil
@@ -189,6 +192,38 @@ func TestPostChatMessageTerminalConflict(t *testing.T) {
 	h.PostChatMessage(rec, chatReq(http.MethodPost, owner, runID, uuid.Nil, `{"message":"hi"}`))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("terminal PostChatMessage = %d, want 409 (client shows Continue)", rec.Code)
+	}
+}
+
+// TestContinueChatIsRateLimited asserts POST /api/chats/:id/continue rides the
+// per-user chat limiter (it mints a new queued chat run, so repeated Continue must
+// not bypass the create/messages spend guard). Drives the real chi route + real
+// PerUserMiddleware with a 1-request budget: the second Continue is 429.
+func TestContinueChatIsRateLimited(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	// A terminal source so ContinueChat proceeds to mint a run (201) rather than 409.
+	st := &chatStore{ownerID: owner.ID, chatRun: store.Run{ID: runID, UserID: owner.ID, Kind: workersvc.RunKindChat, Status: "completed"}}
+	h := newChatHandler(st)
+
+	lim := mw.NewLimiter(1, time.Minute, nil)
+	router := chi.NewRouter()
+	router.Route("/api/chats", func(r chi.Router) {
+		r.With(lim.PerUserMiddleware).Post("/{id}/continue", h.ContinueChat)
+	})
+
+	do := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/api/chats/"+runID.String()+"/continue", nil)
+		req = req.WithContext(mw.ContextWithUser(req.Context(), owner))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := do(); code != http.StatusCreated {
+		t.Fatalf("first continue = %d, want 201", code)
+	}
+	if code := do(); code != http.StatusTooManyRequests {
+		t.Fatalf("second continue = %d, want 429 (chat limiter must apply to /continue)", code)
 	}
 }
 
