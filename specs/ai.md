@@ -3944,3 +3944,174 @@ Postgres, and the whole integration must be a strict no-op when unconfigured.
   500 runes and escapes it, §149).
 - A **tighter dedicated DM budget** (~5/min) for the two `/me/slack` DM routes, below the
   shared forge limiter — a Low follow-up from the DM-abuse audit (§148).
+
+# PRD #18 — Worker templates (git-curated) + devbox tool tiers + agent template scopes
+
+Serves human plan.md lines 44/64/81 (per-user/per-repo toolchains; "command not
+found" surfacing; global/user agent scoping with allocation). Three tracks on one
+mental model (the PRD #16 scope+allocation pattern): curated worker image templates
+in git, per-repo devbox tool tiers, and agent-template scopes+allocation. Section
+numbers continue past PRD #25's #153. Builds on PRD #4 (worker runtime, claim
+payload, guardrails), #16 (skills scope+allocation shapes reused here), and #17
+(claim plumbing, decoupled builtins). Migrations landed `00045`–`00049` (renumbered above main's `00044_slack`; prior live head
+was `00043`). Full rationale in `prds/18-worker-templates-and-agent-scopes.md`;
+user guides in `docs/worker-setup.md` + `docs/worker-tools.md` + `docs/agent-templates.md`.
+
+## 154. Worker image templates in git (agent + compose)
+
+Serves human: "one might need node tools, other might need java tools" (plan.md 81).
+
+- **`agent/templates/<name>/Dockerfile`**, each self-contained (not a shared base
+  stage — the M3 provisioning stack is MIRRORED across every template, kept in
+  lockstep by a test). `base` (node22+git+bash) and `jvm` (base + JDK) ship. Variants
+  exist ONLY for heavy/system deps devbox/nix handles poorly; per-repo CLI tools are
+  Track 2's job (the two tracks never solve the same problem twice).
+- **`WORKER_TEMPLATE` build arg** selects `agent/templates/<name>/Dockerfile` (compose
+  `agent.build.dockerfile`); unset ⇒ `base`. A bare name only (interpolated into the
+  path; `/`/`..`/absolute would escape `agent/templates/`).
+- **Image identity is baked, distinct from the build arg.** Each Dockerfile bakes its
+  own name as a fixed literal `UZI_WORKER_TEMPLATE` (NOT the `WORKER_TEMPLATE` build
+  var), and the worker reports THAT at register. So the reported value is the image's
+  own identity — it flags a real mismatch when you build one template but declared
+  another at token issuance.
+- **`workers.template_declared` (UI, at join-token issuance) + `workers.template_reported`
+  (register)** (migration `00045`). Register payload gains optional `template`
+  (`agent/src/client.ts` / `WorkerRegister`); the decode struct widened BEFORE any
+  worker sends it (DecodeJSON rejects unknown fields). **A malformed/blank reported
+  template drops to NULL** rather than persisting junk.
+- **Soft verification only** (Decision 5): declared-vs-reported drift is surfaced
+  (admin + owner), never rejected — a hostile worker can lie, and legitimate local
+  builds must not break. The join token stays the sole authn boundary.
+
+## 155. Devbox provisioning engine in the worker (M3)
+
+Serves human: per-repo toolchains; "command not found" surfacing (plan.md 44/64).
+
+- **Alpine/musl base KEPT** (nix works on it — tester-verified). **Build-time PINNED
+  installs only**, no floating `curl|bash`, no runtime download: Determinate
+  nix-installer (single-user, `--init none`, `chown -R uzi /nix`, `NIX_REMOTE=""`) +
+  devbox release binary at mode 0755 (the launcher's 0711 root-owned blocked non-owner
+  exec). `/nix` stays at its DEFAULT path (relocating forfeits cache.nixos.org
+  substitution) and is persisted by the `agentnix:/nix` compose volume; devbox/nix
+  per-user metadata lands HOME-derived under `/data` (`agentdata`).
+- **`ARG TARGETARCH`** drives arch (amd64→x86_64, arm64→aarch64). **Devbox verified
+  against the release `checksums.txt`** (tag-pinned artifact, not a hardcoded sha —
+  lead-accepted tradeoff): tarball saved under its EXACT release filename so
+  `sha256sum -c` finds it, and the `grep|sha256sum` pipe runs under **`set -o pipefail`**
+  (BusyBox `sha256sum -c -` exits 0 on empty stdin, so a no-match grep would else skip
+  verification silently — audit L2).
+- **Provisioning at claim time, before the SDK**: resolve manifest by precedence →
+  synthesize `devbox.json` in a per-run dir OUTSIDE the clone → `devbox install` in a
+  **secret-scrubbed subprocess** (no PAT, Anthropic token, or join-token path —
+  Decision 3, mirroring `buildSdkEnv`) → export `devbox shellenv` filtered through an
+  **explicit variable allowlist** (`PATH` prepend + nix TLS/locale vars only, never a
+  blind merge) into the SDK env. **Provision failure FAILS the run** (missing package,
+  allowlist reject) — never silent degradation.
+- **New egress**: nix substituters (cache.nixos.org). ARCHITECTURE.md's "outbound-only
+  to api" worker description amended accordingly.
+
+## 156. Tool profiles + admin allowlist (M4)
+
+Serves human: allowlist-bounded per-repo tools.
+
+- **Tables** (`00046`): `tool_allowlist` (admin CRUD: exact package base name (an
+  allowlist map key matched by lookup, no globs) + optional pinned-version policy;
+  seeded with the M3 default package set) and `repo_tool_profiles`
+  (user_id, repo_id, packages JSONB, unique per pair). **Tier 1 stores a package LIST,
+  not a `devbox.json`** (Decision 2): a raw manifest permits `shell.init_hook`/`scripts`
+  (arbitrary provision-time shell); a declarative allowlist-validated list is safe to
+  offer non-admins.
+- **`api/internal/toolprofile` is the single validation seam**: pure over a `Rules` map;
+  `RulesFromRows` is the ONE loader used at BOTH write time (handler) and claim time
+  (workersvc) — allowlist may have shrunk since save, so both re-validate. Includes a
+  **credential-CLI DENYLIST** (Decision 6: a pre-authenticated `glab`/kubeconfig would
+  bypass "worker holds the PAT, agent doesn't") and a **128-char cap**.
+- **Claim payload** gains `tool_packages []string` (resolved tier-1 list) + `repo_devbox_opt_in bool`.
+- **Web**: repo **Tools** panel (Boards page) = allowlist-backed package picker;
+  **Admin → Tool allowlist** page for the allowlist CRUD.
+
+## 157. Tier-2 repo `devbox.json` opt-in (M5)
+
+Serves human: repo-carried toolchains, safely.
+
+- **`repos.repo_devbox_opt_in BOOLEAN NOT NULL DEFAULT false`** (`00047`); per-repo
+  trust toggle in the Tools panel. **Packages-only extraction** (`agent/src/repo-tools.ts`):
+  only the `packages` field is read, shape-validated (name / name@version); `init_hook`,
+  `scripts`, flake refs, and every other key are ignored and NEVER executed — pure JSON
+  parse, no `devbox` invocation on the repo file. A **1 MiB stat-guard** rejects an
+  oversized manifest before reading it (the length/count caps only bite post-read —
+  audit L1).
+- **Union-merge with tier-1 precedence** (`mergeToolPackages`): tier-1 wins a version
+  conflict on the same base name; two tier-2 versions of one base dedup to the first
+  (audit ride-along).
+- **Tier-2 bypasses BOTH the allowlist AND the credential-CLI denylist** — the PRD
+  posture, **audit-ACCEPTED** (probed, no concrete escalation): bounded by opt-in +
+  packages-only, and the actual security control is Decision 3's secret-scrubbed
+  provisioning env (a freshly nix-installed CLI holds no credentials; toolEnv folds only
+  into the SDK env, never the worker's PAT-bearing process). NOT re-hardened.
+
+## 158. Agent template scopes migration + user CRUD (M6)
+
+Serves human plan.md 44 (global/user agents), extended from skills to the templates.
+
+- **`agent_templates` grows `scope` (builtin|global|user) + `user_id`** (`00048`),
+  mirroring skills §99: backfill `scope='builtin' where is_builtin`; drop the flat
+  `UNIQUE(name)`; add the two partial uniques (`uq_agent_templates_shared_name (name)
+  WHERE scope<>'user'`, `uq_agent_templates_user_name (user_id,name) WHERE scope='user'`).
+- **`is_builtin` KEPT as a compat column** (Decision 9): rather than churn every
+  is_builtin consumer, a CHECK `is_builtin = (scope='builtin')` ties the two so they
+  can never drift; builtin seeding + ResetAgentTemplate behavior unchanged.
+- **Reconciler conflict-target fix in the SAME migration commit**: the builtin seed's
+  `ON CONFLICT (name) DO NOTHING` is INVALID against the partial index — changed to
+  `ON CONFLICT (name) WHERE scope<>'user'` (+ sets `scope='builtin'`), so a user's
+  same-name template can never block a builtin seed at boot. The shadow-warning
+  read-back is likewise scoped (`GetSharedAgentTemplateByName`, `WHERE name=$1 AND
+  scope<>'user'`) so a user row can't win the QueryRow and emit a false "shadowed" warn.
+- **Handlers mirror the skills authz matrix**: viewer-scoped list/get (builtin∪global∪own;
+  admins all), per-row write authz (builtin/global admin-only, user owner-only; a
+  non-owner non-admin gets 404 to hide existence). User CRUD for `scope='user'` templates
+  leaves the blanket `RequireAdmin` group.
+- **Reserved-name check extended to global creates, not just user** (deliberate
+  extension of Decision 8): the binding invariant is the worker-side "a claim never
+  carries two LEAD_NAME_RE matches" pin, which only holds if NO API-created template
+  (global or user) may take a lead name — the seeded builtin `lead` is the sole
+  legitimate one. Enforced at create (name is immutable, so no rename path exists).
+- **Blank scope on create defaults to `global`** (back-compat): the pre-M6 admin create
+  sent no scope field; the "my agents" flow sends `scope='user'` explicitly.
+
+## 159. Template allocation + claim filtering (M7)
+
+Serves human: per-agent allocation (which templates ride which runs).
+
+- **`agent_template_allocations`** (`00049`), same shape as `agent_skill_allocations`
+  but the overlay carries an **`enabled` flag** (a user must be able to both ADD a
+  template and REMOVE a global default from their own runs — skills only ever add).
+  Row identity `uq (template_id, COALESCE(user_id,'0000…'))`; `user_id NULL` = global
+  default (admin, always enabled=true), non-NULL = the user's signed overlay.
+- **No empty-means-all cliff** (review m5): the migration seeds a global-default row
+  for every existing builtin/global; the reconciler seeds a builtin's row the FIRST
+  time it inserts that builtin (gated on the insert, so an admin's later removal is
+  never re-added on the next boot); the global-create handler seeds a new global's row
+  in-tx. Absence of a shared row is thus always a deliberate removal; absence of a user
+  overlay means "follow the global default set".
+- **Claim resolution** (`ListClaimAgentTemplates`, replaces the all-templates read):
+  visible to the run owner AND resolved-as-allocated — a user overlay (enabled) wins,
+  else the global default, else dropped. Delivers builtin∪global defaults ± the owner's
+  overlay + the owner's own allocated user templates; NEVER another user's row (the M6
+  audit's confidentiality criterion).
+- **Shared-precedence claim drop for name collisions** (M7 audit acceptance criterion,
+  deliberate divergence from skills' user>global>builtin BODY precedence): a user
+  template whose name exists in the shared namespace is DROPPED from the claim entirely.
+  The worker keys subagents by name with no scope tiebreak, so the curated shared
+  subagent must survive (lead routing delegates to `coder` etc. by name); SHARED always
+  wins. With this drop + the two partial uniques, every delivered claim name is unique,
+  so the worker never sees a collision. Surfaced in the UI as a `shadowed` badge.
+- **Lead toggle-off is graceful** (Decision, lead-accepted): the lead is a normal
+  template in the allocation set; a user CAN disable it. The worker degrades to the
+  hardcoded `LEAD_GUARDRAIL_APPEND` (guardrails intact, just no custom lead body) —
+  never a broken run, no pin needed.
+- **Endpoints**: `GET/PUT /agent-templates/allocations` — the per-template toggle view;
+  the PUT is a replace-set with an admin global-default half + the caller's overlay
+  half (per-half authz). Worker needs no routing changes (`assembleAgents` consumes what
+  the claim delivers). Claim WIRE shape unchanged (only which templates ride it), so the
+  goldens stand.

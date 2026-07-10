@@ -161,6 +161,14 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/17-lead-template-and-model
 - Precedence: a user's default model wins over the lead template's model (unset = inherit the lead template's model, opus by default).
 - Sequence this PRD before PRD #16 so #16 inherits the decoupled-builtins convention.
 
+## Feature #18 — Worker templates, per-repo tools & agent scopes
+
+Tracked as GitLab issue vtmocanu/uzi#18; PRD at `prds/18-worker-templates-and-agent-scopes.md`.
+
+- Curated worker image templates in git so different workers can carry different heavy toolchains (e.g. node tools vs java tools); the user picks one per worker.
+- Per-repo CLI tools installed on demand (so "command not found" stops being a dead end), from a user tool profile bounded by an admin allowlist, plus an opt-in for a repo's own devbox.json packages.
+- Agent templates gain global and per-user (private) scopes with per-user allocation, so a user can define a private agent and choose which agents ride their runs; admins manage the shared defaults.
+
 ## Feature #19 — Admin settings & autopilot label
 
 Tracked as GitLab issue vtmocanu/uzi#19; PRD at `prds/19-admin-settings-and-autopilot.md`.

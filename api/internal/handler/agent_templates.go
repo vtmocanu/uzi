@@ -34,6 +34,15 @@ var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 // "sk-ant-..." mentioned in prose.
 var fullTokenRe = regexp.MustCompile(`sk-ant-[A-Za-z0-9]+-[A-Za-z0-9_-]{40,}`)
 
+// leadNameRe mirrors the worker's LEAD_NAME_RE (agent/src/agents.ts): a template
+// whose name matches it is routed to the main thread as the lead, not registered
+// as an invokable subagent. The single legitimate lead is the seeded builtin, so
+// the API refuses to create/rename any non-builtin (global or user) template into
+// a lead name (Decision 8). That guarantees a claim payload can carry at most one
+// lead-matching template — the worker-side pin — regardless of allocation. Case-
+// insensitive to match the worker regex, though nameRe already forces lowercase.
+var leadNameRe = regexp.MustCompile(`(?i)^(lead|orchestrator)$`)
+
 // agentTemplateDTO is the safe JSON view of a template row. tools is null when
 // the template inherits all tools (matching the render semantics); model is
 // null when it inherits the model.
@@ -45,9 +54,15 @@ type agentTemplateDTO struct {
 	Tools       []string  `json:"tools"`
 	PromptBody  string    `json:"prompt_body"`
 	IsBuiltin   bool      `json:"is_builtin"`
-	UpdatedBy   *string   `json:"updated_by"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	// Scope is builtin|global|user (PRD #18 M6). IsBuiltin is retained as a compat
+	// flag kept in lockstep with Scope=='builtin' by builtin_scope_ck; the UI reads
+	// Scope for badges and the "my agents" grouping. UserID is set only for
+	// scope='user' rows (the owner).
+	Scope     string    `json:"scope"`
+	UserID    *string   `json:"user_id"`
+	UpdatedBy *string   `json:"updated_by"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func templateDTO(t store.AgentTemplate) agentTemplateDTO {
@@ -58,11 +73,16 @@ func templateDTO(t store.AgentTemplate) agentTemplateDTO {
 		Tools:       decodeTools(t.Tools),
 		PromptBody:  t.PromptBody,
 		IsBuiltin:   t.IsBuiltin,
+		Scope:       t.Scope,
 		CreatedAt:   t.CreatedAt.Time,
 		UpdatedAt:   t.UpdatedAt.Time,
 	}
 	if t.Model.Valid {
 		dto.Model = &t.Model.String
+	}
+	if t.UserID.Valid {
+		u := uuid.UUID(t.UserID.Bytes).String()
+		dto.UserID = &u
 	}
 	if t.UpdatedBy.Valid {
 		s := uuid.UUID(t.UpdatedBy.Bytes).String()
@@ -101,8 +121,8 @@ func templateToDefinition(t store.AgentTemplate) agenttmpl.Definition {
 	return d
 }
 
-// templateWriteRequest is the admin-supplied body for create/update. name is
-// only read on create (immutable afterwards); is_builtin and timestamps are
+// templateWriteRequest is the create/update body. name and scope are only read
+// on create (both immutable afterwards); is_builtin, user_id and timestamps are
 // server-controlled and never accepted from the client.
 type templateWriteRequest struct {
 	Name        string   `json:"name"`
@@ -110,11 +130,57 @@ type templateWriteRequest struct {
 	Model       *string  `json:"model"`
 	Tools       []string `json:"tools"`
 	PromptBody  string   `json:"prompt_body"`
+	Scope       string   `json:"scope"`
 }
 
-// ListAgentTemplates returns every template (any authenticated user).
+// authorizeTemplateWrite decides whether actor may edit/delete t and, if not,
+// which status to return. Mirrors authorizeSkillWrite: builtin and global are
+// admin-only; a user template is owner-only. A user-scope row the actor neither
+// owns nor (as admin) can edit is reported as 404 so a private template's
+// existence never leaks to a non-owner; an admin who can see it but may not edit
+// it gets 403 (honest, not a leak). ok=true carries status 0.
+func authorizeTemplateWrite(actor store.User, t store.AgentTemplate) (int, bool) {
+	switch t.Scope {
+	case "builtin", "global":
+		if actor.IsAdmin {
+			return 0, true
+		}
+		return http.StatusForbidden, false
+	case "user":
+		if t.UserID.Valid && uuid.UUID(t.UserID.Bytes) == actor.ID {
+			return 0, true
+		}
+		if actor.IsAdmin {
+			return http.StatusForbidden, false
+		}
+		return http.StatusNotFound, false
+	default:
+		return http.StatusForbidden, false
+	}
+}
+
+// templateWriteDenyMessage maps an authz status to a user-facing message. 404 is
+// worded as not-found (the existence-hiding case), 403 as a permission denial.
+func templateWriteDenyMessage(status int) string {
+	if status == http.StatusNotFound {
+		return "template not found"
+	}
+	return "you do not have permission to modify this template"
+}
+
+// ListAgentTemplates returns the templates visible to the caller: builtin ∪
+// global ∪ the caller's own user templates (admins see all scopes). Deliberately
+// NOT an all-shared read — that would leak private user templates (PRD #18 M6).
 func (h *Handler) ListAgentTemplates(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.q.ListAgentTemplates(r.Context())
+	actor, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	rows, err := h.q.ListAgentTemplatesForViewer(r.Context(), store.ListAgentTemplatesForViewerParams{
+		IsAdmin:  actor.IsAdmin,
+		ViewerID: pgUUID(actor.ID),
+	})
 	if err != nil {
 		slog.Error("list agent templates", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -127,9 +193,10 @@ func (h *Handler) ListAgentTemplates(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"templates": out})
 }
 
-// GetAgentTemplate returns one template by id (any authenticated user).
+// GetAgentTemplate returns one template by id, subject to the same visibility
+// rule as the list (404 when the caller may not see it).
 func (h *Handler) GetAgentTemplate(w http.ResponseWriter, r *http.Request) {
-	t, ok := h.loadTemplate(w, r)
+	_, t, ok := h.loadTemplateForViewer(w, r)
 	if !ok {
 		return
 	}
@@ -140,7 +207,7 @@ func (h *Handler) GetAgentTemplate(w http.ResponseWriter, r *http.Request) {
 // for a template (any authenticated user). PRD #4 writes this straight into an
 // agent workspace, so it is served as raw Markdown, not a JSON envelope.
 func (h *Handler) GetRenderedAgentTemplate(w http.ResponseWriter, r *http.Request) {
-	t, ok := h.loadTemplate(w, r)
+	_, t, ok := h.loadTemplateForViewer(w, r)
 	if !ok {
 		return
 	}
@@ -154,7 +221,10 @@ func (h *Handler) GetRenderedAgentTemplate(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// CreateAgentTemplate creates a new (non-builtin) template (admin only).
+// CreateAgentTemplate creates a global (admin) or user (owner) template. Builtin
+// scope is never creatable via the API (builtins are seeded); name must be
+// kebab-case, may not be a reserved lead name (Decision 8), and is immutable
+// after creation.
 func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 	actor, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -172,18 +242,59 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "name must be kebab-case (lowercase letters, digits, single hyphens)")
 		return
 	}
+	// The lead is the seeded builtin only: no API-created template (global or
+	// user) may take a lead name, so a claim can never carry two lead-matching
+	// templates (Decision 8; the worker routes the first by array order).
+	if leadNameRe.MatchString(name) {
+		httpx.Error(w, http.StatusBadRequest, "name is reserved for the built-in lead orchestrator")
+		return
+	}
+
+	// Blank scope defaults to 'global' so the pre-M6 admin create (which sent no
+	// scope field) keeps its exact behavior — a global, admin-only template. The
+	// "my agents" flow (M7) sends scope='user' explicitly.
+	scope := req.Scope
+	if scope == "" {
+		scope = "global"
+	}
+	var userID pgtype.UUID
+	switch scope {
+	case "global":
+		if !actor.IsAdmin {
+			httpx.Error(w, http.StatusForbidden, "only admins can create global templates")
+			return
+		}
+	case "user":
+		userID = pgUUID(actor.ID)
+	default:
+		httpx.Error(w, http.StatusBadRequest, "scope must be 'global' or 'user'")
+		return
+	}
+
 	fields, err := validateTemplateFields(req)
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	row, err := h.q.CreateAgentTemplate(r.Context(), store.CreateAgentTemplateParams{
+	ctx := r.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		slog.Error("begin create template tx", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
+	qtx := h.q.WithTx(tx)
+
+	row, err := qtx.CreateAgentTemplate(ctx, store.CreateAgentTemplateParams{
 		Name:        name,
 		Description: fields.description,
 		Model:       fields.model,
 		Tools:       fields.tools,
 		PromptBody:  fields.promptBody,
+		Scope:       scope,
+		UserID:      userID,
 		UpdatedBy:   pgUUID(actor.ID),
 	})
 	if err != nil {
@@ -195,20 +306,34 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// A new global template is a global default from creation (removable via the
+	// allocation UI). No empty-means-all cliff (PRD #18 M7). User templates are
+	// delivered only via the owner's own overlay, so they get no default row.
+	if scope == "global" {
+		if err := qtx.InsertSharedTemplateAllocation(ctx, row.ID); err != nil {
+			slog.Error("seed global template allocation", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("commit create template tx", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"template": templateDTO(row)})
 }
 
-// UpdateAgentTemplate edits a template's mutable fields (admin only). name is
-// immutable and ignored if present in the body.
+// UpdateAgentTemplate edits a template's mutable fields. name and scope are
+// immutable and ignored if present. Authorization is scope-based (see
+// authorizeTemplateWrite): builtin/global admin-only, user owner-only.
 func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
-	actor, ok := mw.UserFromContext(r.Context())
+	actor, t, ok := h.loadTemplateForWrite(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		httpx.Error(w, http.StatusBadRequest, "invalid template id")
+	if status, ok := authorizeTemplateWrite(actor, t); !ok {
+		httpx.Error(w, status, templateWriteDenyMessage(status))
 		return
 	}
 	var req templateWriteRequest
@@ -223,7 +348,7 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	row, err := h.q.UpdateAgentTemplate(r.Context(), store.UpdateAgentTemplateParams{
-		ID:          id,
+		ID:          t.ID,
 		Description: fields.description,
 		Model:       fields.model,
 		Tools:       fields.tools,
@@ -231,10 +356,6 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		UpdatedBy:   pgUUID(actor.ID),
 	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			httpx.Error(w, http.StatusNotFound, "template not found")
-			return
-		}
 		slog.Error("update agent template", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -242,15 +363,19 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"template": templateDTO(row)})
 }
 
-// DeleteAgentTemplate deletes a non-builtin template (admin only). Builtins
+// DeleteAgentTemplate deletes a global (admin) or user (owner) template. Builtins
 // return 409 — they get reset instead, so PRD #4 can rely on them existing.
 func (h *Handler) DeleteAgentTemplate(w http.ResponseWriter, r *http.Request) {
-	t, ok := h.loadTemplate(w, r)
+	actor, t, ok := h.loadTemplateForWrite(w, r)
 	if !ok {
 		return
 	}
 	if t.IsBuiltin {
 		httpx.Error(w, http.StatusConflict, "builtin templates cannot be deleted; reset them instead")
+		return
+	}
+	if status, ok := authorizeTemplateWrite(actor, t); !ok {
+		httpx.Error(w, status, templateWriteDenyMessage(status))
 		return
 	}
 	if _, err := h.q.DeleteAgentTemplate(r.Context(), t.ID); err != nil {
@@ -261,16 +386,19 @@ func (h *Handler) DeleteAgentTemplate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ResetAgentTemplate re-applies a builtin's embedded definition (admin only).
-// Non-builtins have no default to reset to and return 400.
+// ResetAgentTemplate re-applies a builtin's embedded definition. Builtins are
+// admin-only (authorizeTemplateWrite), so this is effectively admin-only for the
+// rows it can act on; non-builtins have no default to reset to and return 400.
 func (h *Handler) ResetAgentTemplate(w http.ResponseWriter, r *http.Request) {
-	actor, ok := mw.UserFromContext(r.Context())
+	actor, t, ok := h.loadTemplateForWrite(w, r)
 	if !ok {
-		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	t, ok := h.loadTemplate(w, r)
-	if !ok {
+	// Authorize BEFORE the builtin-only rule: a template the caller may not see
+	// (another user's private template) must return 404, not a 400 that would
+	// confirm the id exists — an existence oracle. Consistent with Update/Delete.
+	if status, ok := authorizeTemplateWrite(actor, t); !ok {
+		httpx.Error(w, status, templateWriteDenyMessage(status))
 		return
 	}
 	if !t.IsBuiltin {
@@ -306,25 +434,62 @@ func (h *Handler) ResetAgentTemplate(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"template": templateDTO(row)})
 }
 
-// loadTemplate resolves the {id} path param and fetches the row, writing the
-// appropriate error response and returning ok=false on any failure.
-func (h *Handler) loadTemplate(w http.ResponseWriter, r *http.Request) (store.AgentTemplate, bool) {
+// loadTemplateForViewer resolves the {id} path param, requires auth, and fetches
+// the row through the visibility filter (a template the caller may not see is
+// 404). Used by the read handlers. Returns the actor and row.
+func (h *Handler) loadTemplateForViewer(w http.ResponseWriter, r *http.Request) (store.User, store.AgentTemplate, bool) {
+	actor, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return store.User{}, store.AgentTemplate{}, false
+	}
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid template id")
-		return store.AgentTemplate{}, false
+		return store.User{}, store.AgentTemplate{}, false
+	}
+	t, err := h.q.GetAgentTemplateForViewer(r.Context(), store.GetAgentTemplateForViewerParams{
+		ID:       id,
+		IsAdmin:  actor.IsAdmin,
+		ViewerID: pgUUID(actor.ID),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "template not found")
+			return store.User{}, store.AgentTemplate{}, false
+		}
+		slog.Error("get agent template", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return store.User{}, store.AgentTemplate{}, false
+	}
+	return actor, t, true
+}
+
+// loadTemplateForWrite resolves the {id} path param, requires auth, and fetches
+// the row unfiltered (the write handlers apply scope-based authz next). A missing
+// id is 404. Returns the actor and row.
+func (h *Handler) loadTemplateForWrite(w http.ResponseWriter, r *http.Request) (store.User, store.AgentTemplate, bool) {
+	actor, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return store.User{}, store.AgentTemplate{}, false
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid template id")
+		return store.User{}, store.AgentTemplate{}, false
 	}
 	t, err := h.q.GetAgentTemplate(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			httpx.Error(w, http.StatusNotFound, "template not found")
-			return store.AgentTemplate{}, false
+			return store.User{}, store.AgentTemplate{}, false
 		}
 		slog.Error("get agent template", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return store.AgentTemplate{}, false
+		return store.User{}, store.AgentTemplate{}, false
 	}
-	return t, true
+	return actor, t, true
 }
 
 // validatedFields holds the sanitized column values for a write.

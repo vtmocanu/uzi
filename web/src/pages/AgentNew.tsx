@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type AgentTemplateInput } from "../lib/api";
 import { Button, Card } from "../components/ui";
 import { AgentTemplateEditor } from "../components/AgentTemplateEditor";
@@ -14,6 +15,7 @@ const BLANK = {
 
 export function AgentNew() {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -36,6 +38,9 @@ export function AgentNew() {
           <h1 className="text-2xl font-semibold">New agent template</h1>
           <p className="mt-1 text-muted">
             The name becomes the subagent identity and cannot be changed later.
+            {user?.is_admin
+              ? " Publish it globally or keep it private to you."
+              : " Your agent stays private to your runs."}
           </p>
         </div>
         <Button variant="ghost" onClick={() => navigate("/agents")}>
@@ -47,6 +52,8 @@ export function AgentNew() {
         <AgentTemplateEditor
           initial={BLANK}
           nameEditable
+          scopeEditable
+          isAdmin={!!user?.is_admin}
           submitLabel="Create template"
           busy={busy}
           error={error}

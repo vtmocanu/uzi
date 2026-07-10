@@ -103,6 +103,13 @@ type fakeStore struct {
 	createWorkerResult store.Worker
 	createWorkerParams *store.CreateWorkerParams
 
+	// Tool provisioning (PRD #18 M4). Defaults (zero profile, nil error, empty
+	// allowlist) resolve to no provisioning, so claim tests that don't opt in are
+	// unaffected.
+	toolProfile    store.RepoToolProfile
+	toolProfileErr error
+	toolAllowlist  []store.ToolAllowlist
+
 	// Delete worker.
 	countActiveRuns    int64
 	countActiveParams  *store.CountWorkerNonTerminalRunsParams
@@ -123,7 +130,7 @@ func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecret
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultModel, f.defaultModelErr
 }
-func (f *fakeStore) ListAgentTemplates(context.Context) ([]store.AgentTemplate, error) {
+func (f *fakeStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
 	return f.templates, nil
 }
 func (f *fakeStore) ListRunSkillAllocations(context.Context, pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error) {
@@ -265,6 +272,12 @@ func (f *fakeStore) CountWorkerNonTerminalRuns(_ context.Context, arg store.Coun
 func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorkerForUserParams) (int64, error) {
 	f.deleteWorkerParams = &arg
 	return f.deleteWorkerRows, nil
+}
+func (f *fakeStore) GetRepoToolProfile(_ context.Context, _ store.GetRepoToolProfileParams) (store.RepoToolProfile, error) {
+	return f.toolProfile, f.toolProfileErr
+}
+func (f *fakeStore) ListToolAllowlist(_ context.Context) ([]store.ToolAllowlist, error) {
+	return f.toolAllowlist, nil
 }
 
 // testParams are sane fixed knobs for the tests.
@@ -494,6 +507,82 @@ func TestClaimFailsRunWhenAnthropicTokenMissing(t *testing.T) {
 	}
 	if !fs.markedFailed.FailureReason.Valid || !strings.Contains(fs.markedFailed.FailureReason.String, "Anthropic token") {
 		t.Fatalf("failure reason unclear: %+v", fs.markedFailed.FailureReason)
+	}
+}
+
+// -------------------------------------------------------------------------
+// Tool provisioning resolution (PRD #18 M4)
+// -------------------------------------------------------------------------
+
+func TestResolveToolingResolvesAllowedProfilePackages(t *testing.T) {
+	fs := &fakeStore{
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["kubectl@1.31","jq","kubectl@1.31"]`)},
+		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}, {Name: "jq"}},
+	}
+	svc := New(fs, newBox(t), testParams())
+	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	if err != nil {
+		t.Fatalf("resolveTooling: %v", err)
+	}
+	// Deduped + sorted.
+	if strings.Join(pkgs, ",") != "jq,kubectl@1.31" {
+		t.Fatalf("pkgs = %v, want [jq kubectl@1.31]", pkgs)
+	}
+}
+
+func TestResolveToolingRejectsPackageOutsideShrunkAllowlist(t *testing.T) {
+	fs := &fakeStore{
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["kubectl@1.31","terraform"]`)},
+		toolAllowlist: []store.ToolAllowlist{{Name: "kubectl"}}, // terraform removed after the profile was saved
+	}
+	svc := New(fs, newBox(t), testParams())
+	_, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	if !errors.Is(err, errToolPackagesRejected) {
+		t.Fatalf("err = %v, want errToolPackagesRejected", err)
+	}
+	if !strings.Contains(err.Error(), "terraform") {
+		t.Fatalf("error should name the rejected package: %v", err)
+	}
+}
+
+func TestResolveToolingNoProfileMeansNoProvisioning(t *testing.T) {
+	fs := &fakeStore{toolProfileErr: pgx.ErrNoRows}
+	svc := New(fs, newBox(t), testParams())
+	pkgs, err := svc.resolveTooling(context.Background(), store.Run{UserID: uuid.New(), RepoID: uuid.New()})
+	if err != nil {
+		t.Fatalf("resolveTooling: %v", err)
+	}
+	if len(pkgs) != 0 {
+		t.Fatalf("no profile ⇒ no packages, got %v", pkgs)
+	}
+}
+
+func TestClaimFailsRunWhenToolPackagesRejected(t *testing.T) {
+	// A grandfathered package that fell out of the allowlist fails the CLAIM (the
+	// run is failed, no payload handed out) with a message naming the package.
+	box := newBox(t)
+	sealedPAT, _ := box.Seal([]byte("bot-pat-something-long-enough"))
+	sealedTok, _ := box.Seal([]byte("anthropic-oauth-something-long-enough"))
+	fs := &fakeStore{
+		claimRun:      store.Run{ID: uuid.New(), Status: "claimed"},
+		claimCtx:      store.GetRunClaimContextRow{TokenCiphertext: sealedPAT, RepoWebUrl: "https://x/y", BotUsername: "uzi-bot"},
+		anthropic:     sealedTok,
+		toolProfile:   store.RepoToolProfile{Packages: []byte(`["terraform"]`)},
+		toolAllowlist: []store.ToolAllowlist{}, // shrank to nothing
+	}
+	svc := New(fs, box, testParams())
+	payload, err := svc.Claim(context.Background(), worker())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload != nil {
+		t.Fatal("a rejected tool package must not hand out a payload")
+	}
+	if fs.markedFailed == nil {
+		t.Fatal("the run should have been marked failed")
+	}
+	if !strings.Contains(fs.markedFailed.FailureReason.String, "terraform") {
+		t.Fatalf("failure reason should name the rejected package: %+v", fs.markedFailed.FailureReason)
 	}
 }
 
@@ -738,7 +827,7 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3"); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm"); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	want := []string{"fail_over_cap", "requeue_worker", "register"}
@@ -753,6 +842,25 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	}
 	if fs.registerParams == nil || !fs.registerParams.Version.Valid || fs.registerParams.Version.String != "1.2.3" {
 		t.Fatalf("register version wrong: %+v", fs.registerParams)
+	}
+	// The self-reported template rides into template_reported (PRD #18).
+	if !fs.registerParams.TemplateReported.Valid || fs.registerParams.TemplateReported.String != "jvm" {
+		t.Fatalf("register template_reported wrong: %+v", fs.registerParams.TemplateReported)
+	}
+}
+
+func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
+	// An older image reports no template ⇒ template_reported stays NULL, never an
+	// empty string.
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", ""); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {
+		t.Fatalf("empty template must be NULL, got %+v", fs.registerParams.TemplateReported)
 	}
 }
 
@@ -1196,7 +1304,7 @@ func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
 func TestCreateWorkerReturnsTokenOnce(t *testing.T) {
 	fs := &fakeStore{createWorkerResult: store.Worker{ID: uuid.New(), Name: "laptop"}}
 	svc := New(fs, newBox(t), testParams())
-	_, token, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop")
+	_, token, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop", "jvm")
 	if err != nil {
 		t.Fatalf("CreateWorker: %v", err)
 	}
@@ -1206,6 +1314,21 @@ func TestCreateWorkerReturnsTokenOnce(t *testing.T) {
 	// The stored hash must not be the plaintext token.
 	if fs.createWorkerParams == nil || bytes.Contains(fs.createWorkerParams.TokenHash, []byte(token)) {
 		t.Fatal("stored token_hash must not contain the plaintext token")
+	}
+	// The declared template is persisted (PRD #18).
+	if !fs.createWorkerParams.TemplateDeclared.Valid || fs.createWorkerParams.TemplateDeclared.String != "jvm" {
+		t.Fatalf("declared template wrong: %+v", fs.createWorkerParams.TemplateDeclared)
+	}
+}
+
+func TestCreateWorkerEmptyTemplateStoresNull(t *testing.T) {
+	fs := &fakeStore{createWorkerResult: store.Worker{ID: uuid.New(), Name: "laptop"}}
+	svc := New(fs, newBox(t), testParams())
+	if _, _, err := svc.CreateWorker(context.Background(), uuid.New(), "laptop", ""); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+	if fs.createWorkerParams == nil || fs.createWorkerParams.TemplateDeclared.Valid {
+		t.Fatalf("no declared choice must be NULL, got %+v", fs.createWorkerParams.TemplateDeclared)
 	}
 }
 

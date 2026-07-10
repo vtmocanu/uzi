@@ -21,6 +21,10 @@ import {
   type Skill,
   type SkillCreateInput,
   type SkillUpdateInput,
+  type TemplateAllocation,
+  type TemplateAllocationsInput,
+  type ToolAllowlistEntry,
+  type ToolAllowlistWriteInput,
   type User,
   type UserSettings,
   type UserSettingsPatch,
@@ -35,9 +39,11 @@ import {
   mockConnection,
   mockForgeConfig,
   mockRepos,
+  mockRepoToolProfiles,
   mockSecrets,
   mockSkills,
   mockTemplates,
+  mockToolAllowlist,
   mockUsers,
   mockWorkers,
   runListItem,
@@ -184,11 +190,54 @@ function settingsResponse(): SettingsResponse {
 let templateCounter = 0;
 let workerCounter = 0;
 let skillCounter = 0;
+// Tool allowlist + per-repo profiles (PRD #18 M4).
+let toolAllowlist: ToolAllowlistEntry[] = mockToolAllowlist.map((e) => ({ ...e }));
+const repoToolProfiles = new Map<string, string[]>(
+  Object.entries(mockRepoToolProfiles).map(([k, v]) => [k, [...v]]),
+);
+let toolEntryCounter = 0;
+
+// Template allocations (PRD #18 M7). Global defaults are seeded for every
+// builtin/global template (no empty-means-all cliff); the per-user overlay maps
+// a template id to a forced on/off decision.
+const templateGlobalDefaults = new Set<string>(
+  templates.filter((t) => t.scope !== "user").map((t) => t.id),
+);
+const templateOverrides = new Map<string, Map<string, boolean>>();
+
+// The reserved lead names mirror the server's leadNameRe / worker LEAD_NAME_RE.
+const LEAD_NAME_RE = /^(lead|orchestrator)$/i;
 
 // visibleSkills mirrors the real read: admins see every scope, everyone else
 // sees builtin ∪ global ∪ their own user skills.
 function visibleSkills(me: User): Skill[] {
   return skills.filter((s) => me.is_admin || s.scope !== "user" || s.user_id === me.id);
+}
+
+// visibleTemplates mirrors the real read: builtin ∪ global ∪ own user templates
+// (admins see all).
+function visibleTemplates(me: User): AgentTemplate[] {
+  return templates.filter((t) => me.is_admin || t.scope !== "user" || t.user_id === me.id);
+}
+
+// templateAllocationView resolves each visible template's allocation state for
+// me: overlay wins, else the global default.
+function templateAllocationView(me: User): TemplateAllocation[] {
+  const overlay = templateOverrides.get(me.id) ?? new Map<string, boolean>();
+  return visibleTemplates(me).map((t) => {
+    const globalDefault = templateGlobalDefaults.has(t.id);
+    const myOverride = overlay.has(t.id) ? (overlay.get(t.id) as boolean) : null;
+    return {
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      scope: t.scope,
+      is_builtin: t.is_builtin,
+      global_default: globalDefault,
+      my_override: myOverride,
+      effective: myOverride ?? globalDefault,
+    };
+  });
 }
 
 function toAllocated(id: string): AllocatedSkill | null {
@@ -392,10 +441,28 @@ export const mockApi = {
     return delay({ template: { ...t } });
   },
   createAgentTemplate: async (input: AgentTemplateInput) => {
+    const me = requireSession();
     if (!input.name || !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(input.name)) {
       throw new ApiError(400, "name must be kebab-case");
     }
-    if (templates.some((t) => t.name === input.name)) {
+    if (LEAD_NAME_RE.test(input.name)) {
+      throw new ApiError(400, "name is reserved for the built-in lead orchestrator");
+    }
+    // Blank scope defaults to global (the pre-M6 admin create).
+    const scope = input.scope ?? "global";
+    if (scope === "global" && !me.is_admin) {
+      throw new ApiError(403, "only admins can create global templates");
+    }
+    if (scope !== "global" && scope !== "user") {
+      throw new ApiError(400, "scope must be 'global' or 'user'");
+    }
+    // Name uniqueness: shared names are unique across builtin+global; a user's
+    // names are unique to that user (they may reuse a builtin/global name).
+    const clash =
+      scope === "user"
+        ? templates.some((t) => t.scope === "user" && t.user_id === me.id && t.name === input.name)
+        : templates.some((t) => t.scope !== "user" && t.name === input.name);
+    if (clash) {
       throw new ApiError(409, "a template with this name already exists");
     }
     const now = new Date().toISOString();
@@ -407,12 +474,44 @@ export const mockApi = {
       tools: input.tools,
       prompt_body: input.prompt_body,
       is_builtin: false,
-      updated_by: requireSession().email,
+      scope,
+      user_id: scope === "user" ? me.id : null,
+      updated_by: me.email,
       created_at: now,
       updated_at: now,
     };
     templates.push(t);
+    // A new global template is a global default from creation (removable).
+    if (scope === "global") templateGlobalDefaults.add(t.id);
     return delay({ template: { ...t } });
+  },
+  getTemplateAllocations: async () => delay({ templates: templateAllocationView(requireSession()) }),
+  setTemplateAllocations: async (input: TemplateAllocationsInput) => {
+    const me = requireSession();
+    if (input.global_default_ids === undefined && input.my_overrides === undefined) {
+      throw new ApiError(400, "provide global_default_ids and/or my_overrides");
+    }
+    const canSee = (id: string) => visibleTemplates(me).some((t) => t.id === id);
+    if (input.global_default_ids !== undefined) {
+      if (!me.is_admin) throw new ApiError(403, "only admins can set global default allocations");
+      for (const id of input.global_default_ids) {
+        const t = templates.find((x) => x.id === id);
+        if (!t || t.scope === "user") {
+          throw new ApiError(400, "only builtin or global templates can be global defaults");
+        }
+      }
+      templateGlobalDefaults.clear();
+      for (const id of input.global_default_ids) templateGlobalDefaults.add(id);
+    }
+    if (input.my_overrides !== undefined) {
+      for (const o of input.my_overrides) {
+        if (!canSee(o.template_id)) throw new ApiError(400, "one or more templates are not allocatable");
+      }
+      const overlay = new Map<string, boolean>();
+      for (const o of input.my_overrides) overlay.set(o.template_id, o.enabled);
+      templateOverrides.set(me.id, overlay);
+    }
+    return delay({ templates: templateAllocationView(me) });
   },
   updateAgentTemplate: async (id: string, input: AgentTemplateInput) => {
     const t = templates.find((x) => x.id === id);
@@ -656,6 +755,59 @@ export const mockApi = {
     r.repo_skills_enabled = enabled;
     return delay({ repo: { ...r } });
   },
+  setRepoDevboxOptIn: async (id: string, enabled: boolean) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    r.repo_devbox_opt_in = enabled;
+    return delay({ repo: { ...r } });
+  },
+
+  // ── Tool allowlist + repo tool profiles (PRD #18 M4) ─────────────────────────
+  listToolAllowlist: async () => delay({ allowlist: toolAllowlist.map((e) => ({ ...e })) }),
+  createToolAllowlistEntry: async (input: ToolAllowlistWriteInput) => {
+    const name = (input.name ?? "").trim();
+    if (name === "") throw new ApiError(400, "name is required");
+    if (toolAllowlist.some((e) => e.name === name)) throw new ApiError(409, "that package is already on the allowlist");
+    const now = new Date().toISOString();
+    const entry: ToolAllowlistEntry = {
+      id: `tal-${++toolEntryCounter}`,
+      name,
+      pinned_version: input.pinned_version?.trim() || null,
+      note: input.note?.trim() || null,
+      updated_by: requireSession().id,
+      created_at: now,
+      updated_at: now,
+    };
+    toolAllowlist = [...toolAllowlist, entry].sort((a, b) => a.name.localeCompare(b.name));
+    return delay({ entry: { ...entry } });
+  },
+  updateToolAllowlistEntry: async (id: string, input: ToolAllowlistWriteInput) => {
+    const entry = toolAllowlist.find((e) => e.id === id);
+    if (!entry) throw new ApiError(404, "allowlist entry not found");
+    entry.pinned_version = input.pinned_version?.trim() || null;
+    entry.note = input.note?.trim() || null;
+    entry.updated_at = new Date().toISOString();
+    return delay({ entry: { ...entry } });
+  },
+  deleteToolAllowlistEntry: async (id: string) => {
+    toolAllowlist = toolAllowlist.filter((e) => e.id !== id);
+    return delay(null);
+  },
+  getRepoToolProfile: async (repoId: string) => {
+    if (!repos.some((r) => r.id === repoId)) throw new ApiError(404, "repo not found");
+    return delay({ packages: [...(repoToolProfiles.get(repoId) ?? [])] });
+  },
+  setRepoToolProfile: async (repoId: string, packages: string[]) => {
+    if (!repos.some((r) => r.id === repoId)) throw new ApiError(404, "repo not found");
+    // Mirror the server's allowlist validation so the demo rejects the same way.
+    const allowed = new Set<string>();
+    for (const e of toolAllowlist) allowed.add(e.pinned_version ? `${e.name}@${e.pinned_version}` : e.name);
+    const rejected = packages.filter((p) => !allowed.has(p));
+    if (rejected.length > 0) throw new ApiError(400, "these packages are not on the allowlist: " + rejected.join(", "));
+    const cleaned = [...new Set(packages)].sort();
+    repoToolProfiles.set(repoId, cleaned);
+    return delay({ packages: cleaned });
+  },
 
   // ── Board ───────────────────────────────────────────────────────────────────
   getBoard: async (repoId: string) => {
@@ -741,12 +893,15 @@ export const mockApi = {
 
   // ── Workers ─────────────────────────────────────────────────────────────────
   listWorkers: async () => delay({ workers: workers.map((w) => ({ ...w })) }),
-  createWorker: async (name: string) => {
+  createWorker: async (name: string, template?: string) => {
     const w = {
       id: `w-new-${++workerCounter}`,
       name,
       status: "offline",
       busy: false,
+      // Declared at issuance; reported stays null until the worker registers.
+      template_declared: template ?? null,
+      template_reported: null,
       version: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),

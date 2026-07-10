@@ -81,6 +81,10 @@ export function AgentDetail() {
   if (error) return <Alert message={error} />;
   if (!template) return <Alert message="Template not found." />;
 
+  // Write authz mirrors the server (PRD #18 M6): a user template is owner-only,
+  // builtin/global are admin-only.
+  const canEdit = template.scope === "user" ? template.user_id === user?.id : isAdmin;
+
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-4">
@@ -98,7 +102,7 @@ export function AgentDetail() {
 
       {notice && <Alert message={notice} tone="success" />}
 
-      {isAdmin ? (
+      {canEdit ? (
         <>
           <Card className="space-y-5">
             <h2 className="text-sm font-semibold uppercase tracking-wide text-faint">

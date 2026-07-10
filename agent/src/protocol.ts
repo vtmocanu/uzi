@@ -65,6 +65,11 @@ export interface ClaimFailedJob {
 export interface RegisterRequest {
   name: string;
   version: string;
+  /** The template this worker's image was built from (PRD #18), baked in as
+   *  ENV WORKER_TEMPLATE. Optional: omitted by images without it (older workers),
+   *  in which case the server stores NULL for template_reported. Soft signal for
+   *  drift display only — never an authn/authz input. */
+  template?: string;
 }
 
 export interface RegisterResponse {
@@ -161,6 +166,15 @@ export interface ClaimConfig {
    *  delivered ∪ repo union (re-enforced worker-side, M4/M6). */
   skill_max_bytes?: number;
   skills_max_per_run?: number;
+  /** Tier-1 tool packages (PRD #18 M3): the resolved, allowlist-validated devbox
+   *  package list the worker provisions before the SDK starts. Empty/absent ⇒ no
+   *  provisioning (today's behavior). The server resolves this; the worker only
+   *  installs it (in a secret-scrubbed subprocess). */
+  tool_packages?: string[];
+  /** Repo devbox.json packages opt-in (PRD #18 M5): whether the worker may union
+   *  the repo's own devbox.json packages (packages-only) into the provisioned set.
+   *  Delivered from M3 but always false until M5 wires the per-repo toggle. */
+  repo_devbox_opt_in?: boolean;
 }
 
 /**

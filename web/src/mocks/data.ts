@@ -15,6 +15,7 @@ import type {
   RunMessage,
   SecretMeta,
   Skill,
+  ToolAllowlistEntry,
   User,
   Worker,
 } from "../lib/api";
@@ -117,6 +118,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: true,
+    repo_devbox_opt_in: true,
     pipeline: {
       status: "failed",
       web_url: "https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242",
@@ -134,6 +136,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    repo_devbox_opt_in: false,
     pipeline: {
       status: "success",
       web_url: "https://gitlab.example.com/vtmocanu/atlas-api/-/pipelines/3311",
@@ -151,6 +154,7 @@ export const mockRepos: Repo[] = [
     default_branch: "main",
     enabled: false,
     repo_skills_enabled: false,
+    repo_devbox_opt_in: false,
     pipeline: null,
   },
 ];
@@ -473,15 +477,20 @@ export const mockWorkers: Worker[] = [
     name: "laptop",
     status: "online",
     busy: true,
+    template_declared: "base",
+    template_reported: "base",
     version: "0.4.2",
     last_heartbeat_at: minsAgo(0.2),
     created_at: daysAgo(14),
   },
   {
+    // Declared jvm at issuance but the running image is base → drift badge demo.
     id: "w-ci",
     name: "ci-runner-1",
     status: "offline",
     busy: false,
+    template_declared: "jvm",
+    template_reported: "base",
     version: "0.4.1",
     last_heartbeat_at: daysAgo(2),
     created_at: daysAgo(21),
@@ -496,12 +505,27 @@ export const mockAdminWorkers: AdminWorker[] = [
     name: "mira-desktop",
     status: "online",
     busy: false,
+    template_declared: "jvm",
+    template_reported: "jvm",
     version: "0.4.2",
     last_heartbeat_at: minsAgo(0.5),
     created_at: daysAgo(9),
     owner_email: "mira@uzi.local",
   },
 ];
+
+// ── Tool allowlist + repo tool profiles (PRD #18 M4) ─────────────────────────
+
+export const mockToolAllowlist: ToolAllowlistEntry[] = [
+  { id: "tal-kubectl", name: "kubectl", pinned_version: null, note: "For the k8s repos", updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
+  { id: "tal-terraform", name: "terraform", pinned_version: "1.7", note: null, updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
+  { id: "tal-jq", name: "jq", pinned_version: null, note: null, updated_by: mockAdmin.id, created_at: daysAgo(20), updated_at: daysAgo(20) },
+];
+
+// A seed profile so the demo repo shows a couple of selected tools.
+export const mockRepoToolProfiles: Record<string, string[]> = {
+  "repo-uzi": ["jq", "kubectl"],
+};
 
 // ── Agent templates ──────────────────────────────────────────────────────────
 
@@ -510,19 +534,26 @@ const tmpl = (
   name: string,
   description: string,
   opts: Partial<AgentTemplate> = {},
-): AgentTemplate => ({
-  id,
-  name,
-  description,
-  model: null,
-  tools: null,
-  prompt_body: `You are the ${name} agent.\n\n## Role\n\n${description}\n\n## Working agreement\n\n- Stay inside the repository you were given.\n- Report findings tersely; the orchestrator relays them.\n- Never touch \`main\` — all work lands on a branch and goes out as an MR.`,
-  is_builtin: true,
-  updated_by: null,
-  created_at: daysAgo(40),
-  updated_at: daysAgo(40),
-  ...opts,
-});
+): AgentTemplate => {
+  const is_builtin = opts.is_builtin ?? true;
+  return {
+    id,
+    name,
+    description,
+    model: null,
+    tools: null,
+    prompt_body: `You are the ${name} agent.\n\n## Role\n\n${description}\n\n## Working agreement\n\n- Stay inside the repository you were given.\n- Report findings tersely; the orchestrator relays them.\n- Never touch \`main\` — all work lands on a branch and goes out as an MR.`,
+    is_builtin,
+    // scope tracks is_builtin (Decision 9): a builtin is scope 'builtin', a
+    // non-builtin demo template is a 'global' admin one unless opts say otherwise.
+    scope: opts.scope ?? (is_builtin ? "builtin" : "global"),
+    user_id: opts.user_id ?? null,
+    updated_by: null,
+    created_at: daysAgo(40),
+    updated_at: daysAgo(40),
+    ...opts,
+  };
+};
 
 export const mockTemplates: AgentTemplate[] = [
   tmpl("t-coder", "coder", "Implements features, fixes bugs, refactors code. Runs the project's test/lint commands before reporting done."),

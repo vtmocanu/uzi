@@ -50,6 +50,10 @@ export interface UserSettingsPatch {
   theme?: string | null;
 }
 
+// AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
+// global (admin, visible to all), user (self-service, owner-visible).
+export type AgentTemplateScope = "builtin" | "global" | "user";
+
 // SlackLink is the current user's own Slack linking state (PRD #25 M3), for the
 // Settings → Notifications section. state is derived: unlinked (no resolved id) |
 // pending (resolved, awaiting the Confirm DM) | confirmed. member_id is the manual
@@ -64,7 +68,8 @@ export interface SlackLink {
 }
 
 // AgentTemplate is a stored agent definition. tools is null when the template
-// inherits all tools; model is null when it inherits the model.
+// inherits all tools; model is null when it inherits the model. scope/user_id
+// carry the M6 ownership model; is_builtin is retained (== scope 'builtin').
 export interface AgentTemplate {
   id: string;
   name: string;
@@ -73,19 +78,46 @@ export interface AgentTemplate {
   tools: string[] | null;
   prompt_body: string;
   is_builtin: boolean;
+  scope: AgentTemplateScope;
+  user_id: string | null;
   updated_by: string | null;
   created_at: string;
   updated_at: string;
 }
 
-// AgentTemplateInput is the admin-editable shape. name is only sent on create
-// (it is immutable afterwards).
+// AgentTemplateInput is the create/edit shape. name and scope are only sent on
+// create (both immutable afterwards); scope is "global" (admin) or "user"
+// (owner) — "builtin" is never creatable via the API. A blank/absent scope
+// defaults to global server-side (the pre-M6 admin create).
 export interface AgentTemplateInput {
   name?: string;
   description: string;
   model: string | null;
   tools: string[] | null;
   prompt_body: string;
+  scope?: "global" | "user";
+}
+
+// TemplateAllocation is one template in the caller's allocation view (PRD #18
+// M7): whether it is a global default, the caller's own overlay (null = none),
+// and the resolved effective decision (overlay wins, else the global default).
+export interface TemplateAllocation {
+  id: string;
+  name: string;
+  description: string;
+  scope: AgentTemplateScope;
+  is_builtin: boolean;
+  global_default: boolean;
+  my_override: boolean | null;
+  effective: boolean;
+}
+
+// TemplateAllocationsInput is the replace-set write. Each half is optional: an
+// omitted half is left untouched. global_default_ids is admin-only (the shared
+// default set); my_overrides is the caller's own overlay.
+export interface TemplateAllocationsInput {
+  global_default_ids?: string[];
+  my_overrides?: { template_id: string; enabled: boolean }[];
 }
 
 // ── Agent skills (PRD #16) ────────────────────────────────────────────────
@@ -220,6 +252,9 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  // Tier-2 opt-in (PRD #18 M5): when true, a run on this repo also unions the
+  // packages from the repo's own devbox.json (packages-only). Default false.
+  repo_devbox_opt_in: boolean;
   // Default-branch CI status (PRD #6), null when there is no cached default-branch
   // pipeline (no CI, MR-only pipelines, or not yet synced).
   pipeline: PipelineStatus | null;
@@ -228,6 +263,24 @@ export interface Repo {
 export interface BoardColumn {
   label_name: string;
   position: number;
+}
+
+// Tool allowlist entry (PRD #18 M4): an admin-permitted package. pinned_version,
+// when set, requires the profile to request exactly that version.
+export interface ToolAllowlistEntry {
+  id: string;
+  name: string;
+  pinned_version: string | null;
+  note: string | null;
+  updated_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ToolAllowlistWriteInput {
+  name?: string; // create only; ignored on update
+  pinned_version?: string;
+  note?: string;
 }
 
 // LatestRun is the newest run for a card's issue (PRD #12 M2), or null when the
@@ -383,6 +436,11 @@ export interface Worker {
   name: string;
   status: string; // "offline" | "online"
   busy: boolean; // derived: holds a claimed/running/awaiting_approval run
+  // Worker template (PRD #18): the choice recorded at issuance and the value the
+  // worker self-reports at register. Either may be null (no choice / older
+  // image); a mismatch is surfaced as a drift badge, never a rejection.
+  template_declared: string | null;
+  template_reported: string | null;
   version: string | null;
   last_heartbeat_at: string | null;
   created_at: string;
@@ -623,6 +681,10 @@ const realApi = {
   getSlackStatus: () => request<{ slack_status: string }>("GET", "/admin/slack/status"),
   listAgentTemplates: () =>
     request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
+  getTemplateAllocations: () =>
+    request<{ templates: TemplateAllocation[] }>("GET", "/agent-templates/allocations"),
+  setTemplateAllocations: (input: TemplateAllocationsInput) =>
+    request<{ templates: TemplateAllocation[] }>("PUT", "/agent-templates/allocations", input),
   getAgentTemplate: (id: string) =>
     request<{ template: AgentTemplate }>("GET", `/agent-templates/${id}`),
   createAgentTemplate: (input: AgentTemplateInput) =>
@@ -647,6 +709,22 @@ const realApi = {
     request<{ allocations: TemplateSkills }>("GET", `/agent-templates/${id}/skills`),
   setTemplateSkills: (id: string, input: AllocationsInput) =>
     request<{ allocations: TemplateSkills }>("PUT", `/agent-templates/${id}/skills`, input),
+
+  // Tool allowlist + per-repo tool profiles (PRD #18 M4). The allowlist is readable
+  // by any user (the repo picker needs it); writes are admin-only. A repo's profile
+  // is owner-only.
+  listToolAllowlist: () =>
+    request<{ allowlist: ToolAllowlistEntry[] }>("GET", "/tool-allowlist"),
+  createToolAllowlistEntry: (input: ToolAllowlistWriteInput) =>
+    request<{ entry: ToolAllowlistEntry }>("POST", "/tool-allowlist", input),
+  updateToolAllowlistEntry: (id: string, input: ToolAllowlistWriteInput) =>
+    request<{ entry: ToolAllowlistEntry }>("PUT", `/tool-allowlist/${id}`, input),
+  deleteToolAllowlistEntry: (id: string) =>
+    request<null>("DELETE", `/tool-allowlist/${id}`),
+  getRepoToolProfile: (repoId: string) =>
+    request<{ packages: string[] }>("GET", `/repos/${repoId}/tool-profile`),
+  setRepoToolProfile: (repoId: string, packages: string[]) =>
+    request<{ packages: string[] }>("PUT", `/repos/${repoId}/tool-profile`, { packages }),
 
   // Forge integration.
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
@@ -677,6 +755,9 @@ const realApi = {
     request<{ repo: Repo }>("PUT", `/repos/${id}`, { enabled }),
   setRepoSkillsEnabled: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, { repo_skills_enabled: enabled }),
+  // Tier-2 repo devbox.json opt-in (PRD #18 M5). Owner or admin.
+  setRepoDevboxOptIn: (id: string, enabled: boolean) =>
+    request<{ repo: Repo }>("PATCH", `/repos/${id}`, { repo_devbox_opt_in: enabled }),
 
   getBoard: (repoId: string) => request<{ board: Board }>("GET", `/repos/${repoId}/board`),
   configureColumns: (repoId: string, columns: { label_name: string }[]) =>
@@ -696,8 +777,8 @@ const realApi = {
 
   // Agent runtime (PRD #4).
   listWorkers: () => request<{ workers: Worker[] }>("GET", "/workers"),
-  createWorker: (name: string) =>
-    request<{ worker: Worker; token: string }>("POST", "/workers", { name }),
+  createWorker: (name: string, template?: string) =>
+    request<{ worker: Worker; token: string }>("POST", "/workers", { name, template }),
   deleteWorker: (id: string) => request<null>("DELETE", `/workers/${id}`),
 
   createRun: (repoId: string, issueIid: number) =>

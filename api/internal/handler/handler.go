@@ -248,28 +248,38 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) 
 			r.With(slackDMLimiter.PerUserMiddleware).Post("/test-dm", h.PostMySlackTestDM)
 		})
 
-		// Agent templates: all authenticated users can read and preview; only
-		// admins can create, edit, delete, or reset (closes bottega's hole
-		// where any user rewrites the shared prompts everyone's agents run).
+		// Agent templates (PRD #18 M6): every authenticated user reads the
+		// templates visible to them (builtin + global + own) and manages their own
+		// user templates; global/builtin management stays admin-only (per-row scope
+		// authz). Still closes bottega's hole where any user rewrites shared prompts.
 		r.Route("/agent-templates", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Get("/", h.ListAgentTemplates)
+
+			// Template allocations (PRD #18 M7): which templates ride the caller's
+			// claims. GET is the per-template toggle view; PUT replaces the admin
+			// global-default set and/or the caller's overlay (per-half authz in the
+			// handler). A static path, matched ahead of /{id}.
+			r.Get("/allocations", h.GetTemplateAllocations)
+			r.Put("/allocations", h.SetTemplateAllocations)
+
 			r.Get("/{id}", h.GetAgentTemplate)
 			r.Get("/{id}/rendered", h.GetRenderedAgentTemplate)
 
 			// Skill allocations (PRD #16): the shared half is admin-only and the
 			// mine half is any user's own overlay, so authz is per-half inside the
-			// handler — these stay OUTSIDE the admin subgroup below.
+			// handler (per-half), not a blanket admin gate.
 			r.Get("/{id}/skills", h.GetTemplateSkills)
 			r.Put("/{id}/skills", h.SetTemplateSkills)
 
-			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireAdmin)
-				r.Post("/", h.CreateAgentTemplate)
-				r.Put("/{id}", h.UpdateAgentTemplate)
-				r.Delete("/{id}", h.DeleteAgentTemplate)
-				r.Post("/{id}/reset", h.ResetAgentTemplate)
-			})
+			// Create/update/delete/reset (PRD #18 M6): a user manages their own
+			// scope='user' templates; global/builtin management stays admin-only.
+			// The split is per-row by scope inside the handlers
+			// (authorizeTemplateWrite), not a blanket RequireAdmin gate.
+			r.Post("/", h.CreateAgentTemplate)
+			r.Put("/{id}", h.UpdateAgentTemplate)
+			r.Delete("/{id}", h.DeleteAgentTemplate)
+			r.Post("/{id}/reset", h.ResetAgentTemplate)
 		})
 
 		// Skills (PRD #16): every authenticated user can read the skills visible
@@ -285,6 +295,20 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) 
 			r.Put("/{id}", h.UpdateSkill)
 			r.Delete("/{id}", h.DeleteSkill)
 			r.Post("/{id}/reset", h.ResetSkill)
+		})
+
+		// Tool allowlist (PRD #18 M4): any authenticated user can READ it (the repo
+		// package picker needs the selectable set); only admins write. Same
+		// read-all / write-admin split as agent-templates.
+		r.Route("/tool-allowlist", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListToolAllowlist)
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAdmin)
+				r.Post("/", h.CreateToolAllowlistEntry)
+				r.Put("/{id}", h.UpdateToolAllowlistEntry)
+				r.Delete("/{id}", h.DeleteToolAllowlistEntry)
+			})
 		})
 
 		r.Route("/admin", func(r chi.Router) {
@@ -330,6 +354,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) 
 				r.Put("/{id}", h.SetRepoEnabled)
 				// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 				r.Patch("/{id}", h.PatchRepo)
+				// Per-repo tool profile (PRD #18 M4): the owner's tier-1 package list.
+				// Owner-only (a repo belongs to one user's connection).
+				r.Get("/{id}/tool-profile", h.GetRepoToolProfile)
+				r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
 				r.Get("/{id}/board", h.GetBoard)
 				r.Put("/{id}/board/columns", h.ConfigureColumns)
 				// The in-app issue view fetches the issue (with its description) live

@@ -54,7 +54,12 @@
     "max_iterations": 5,
     "default_model": "sonnet",
     "skill_max_bytes": 65536,
-    "skills_max_per_run": 32
+    "skills_max_per_run": 32,
+    "tool_packages": [
+      "kubectl@1.31",
+      "jq"
+    ],
+    "repo_devbox_opt_in": false
   },
   "skills": [
     {

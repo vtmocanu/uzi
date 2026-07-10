@@ -12,6 +12,7 @@ import { Agents } from "./pages/Agents";
 import { AgentNew } from "./pages/AgentNew";
 import { AgentDetail } from "./pages/AgentDetail";
 import { Skills } from "./pages/Skills";
+import { ToolAllowlist } from "./pages/ToolAllowlist";
 import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
@@ -114,9 +115,9 @@ export default function App() {
         <Route
           path="/agents/new"
           element={
-            <AdminRoute>
+            <ProtectedRoute>
               <AgentNew />
-            </AdminRoute>
+            </ProtectedRoute>
           }
         />
         <Route
@@ -172,6 +173,14 @@ export default function App() {
           element={
             <AdminRoute>
               <AdminSettings />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="/admin/tool-allowlist"
+          element={
+            <AdminRoute>
+              <ToolAllowlist />
             </AdminRoute>
           }
         />
