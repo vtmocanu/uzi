@@ -38,7 +38,7 @@ async function main(): Promise<void> {
   const sdkHomeDir = path.join(config.dataDir, "agent-home");
   const executor: Executor =
     config.executor === "stub"
-      ? new StubExecutor(log, { planGate: config.stubPlanGate })
+      ? new StubExecutor(log, { planGate: config.stubPlanGate, homeDir: sdkHomeDir })
       : new SdkExecutor(log, sdkHomeDir, {
           // Deny a Bash `cat` of the join-token file (a read-only secret mount
           // persists it); the built-in /run/secrets/ prefix already covers the

@@ -29,8 +29,8 @@ import type { Options as SdkOptions, SDKMessage, SpawnOptions, SpawnedProcess } 
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
-import { provisionTools, type ProvisionResult } from "./provision.js";
-import { extractRepoDevboxPackages, mergeToolPackages } from "./repo-tools.js";
+import { provisionTools } from "./provision.js";
+import { provisionRunTools } from "./provision-run.js";
 import { assembleAgents } from "./agents.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
@@ -55,11 +55,6 @@ const REASON_CANCELLED = "run cancelled";
 const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
 const REASON_NO_PLAN = "the agent ended the planning turn without submitting a plan";
 const REASON_MAX_ITERATIONS = "run reached the maximum implement/review iterations without completing";
-const REASON_PROVISION_FAILED = "tool provisioning failed before the agent could start";
-
-// A run id is a server-issued UUID; pinned here because it becomes a path segment
-// for the per-run provisioning dir.
-const RUN_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 /**
  * Injectable seam over the SDK's `query`. The return only needs to be async
@@ -178,46 +173,17 @@ export class SdkExecutor implements Executor {
     await fs.mkdir(this.homeDir, { recursive: true });
 
     // Tool provisioning (PRD #18 M3): before the SDK starts, install the run's
-    // tier-1 packages in a secret-scrubbed subprocess and fold the resulting
-    // (allowlisted) tool env into the SDK env. No packages ⇒ exactly today's
-    // behavior. A provision failure FAILS the run — never silent degradation.
-    let toolPackages = ctx.config?.tool_packages ?? [];
-    // Tier-2 (PRD #18 M5): when the repo owner opted in, union the repo's own
-    // devbox.json packages (packages-only, shape-validated, hooks/scripts/flakes
-    // ignored) with tier-1 — tier-1 wins version conflicts. Pure JSON extraction;
-    // nothing from the manifest is executed.
-    if (ctx.config?.repo_devbox_opt_in) {
-      const repoPackages = await extractRepoDevboxPackages(ctx.worktreePath);
-      if (repoPackages.length > 0) {
-        const before = toolPackages.length;
-        toolPackages = mergeToolPackages(toolPackages, repoPackages);
-        const added = toolPackages.length - before;
-        if (added > 0) {
-          ctx.emit({ kind: "status", agent: "worker", payload: { text: `merged ${added} package(s) from this repo's devbox.json` } });
-        }
-      }
-    }
-    let toolEnv: Record<string, string> = {};
-    let provisionDir: string | undefined;
-    if (toolPackages.length > 0) {
-      // Defense-in-depth: ctx.runId is a server-issued UUID, but it becomes a path
-      // segment here — reject anything not UUID-shaped so a malformed id can never
-      // traverse out of provisionRoot.
-      if (!RUN_ID_RE.test(ctx.runId)) throw new Error(`${REASON_PROVISION_FAILED}: invalid run id`);
-      provisionDir = path.join(this.provisionRoot, ctx.runId);
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: `provisioning ${toolPackages.length} tool(s): ${toolPackages.join(", ")}` } });
-      try {
-        const res: ProvisionResult = await this.provision(
-          { packages: toolPackages, runDir: provisionDir, homeDir: this.homeDir },
-          { log: this.log },
-        );
-        toolEnv = res.toolEnv;
-        ctx.emit({ kind: "status", agent: "worker", payload: { text: "tools provisioned" } });
-      } catch (err) {
-        await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
-        throw new Error(`${REASON_PROVISION_FAILED}: ${errMessage(err)}`);
-      }
-    }
+    // tier-1 (∪ opted-in tier-2) packages in a secret-scrubbed subprocess and fold
+    // the resulting (allowlisted) tool env into the SDK env. No packages ⇒ exactly
+    // today's behavior. A provision failure FAILS the run — never silent
+    // degradation. Shared with the stub executor (provision-run.ts) so the two
+    // never drift.
+    const { toolEnv, provisionDir } = await provisionRunTools(ctx, {
+      provisionRoot: this.provisionRoot,
+      homeDir: this.homeDir,
+      log: this.log,
+      provision: this.provision,
+    });
 
     const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);

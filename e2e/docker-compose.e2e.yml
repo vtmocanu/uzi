@@ -112,3 +112,8 @@ services:
       - ${E2E_RUN_DIR}/worker-secret:/worker-secret
       - ${E2E_RUN_DIR}/agent-gitconfig:/e2e-git:ro
       - ${E2E_RUN_DIR}/fakeremote:/fakeremote
+      # Stub `devbox` over the baked-in binary (PRD #18 M8 tool-provisioning
+      # scenario): the isolated stack has NO substituter egress, so a real
+      # `devbox install` is neither possible nor wanted. Only invoked when a run
+      # has tier-1 packages, so every other scenario is unaffected.
+      - ${E2E_RUN_DIR}/fake-devbox:/usr/local/bin/devbox:ro
