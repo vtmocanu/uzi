@@ -6,7 +6,8 @@ import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import type { Logger } from "./log.js";
-import type { ClaimResponse } from "./protocol.js";
+import type { AgentTemplate, ClaimResponse } from "./protocol.js";
+import { describeRepoAgentNote, detectRepoAgents, repoAgentSummaries } from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
 import { SteeringChannel, type PlanVerdict } from "./steering.js";
 import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
@@ -103,6 +104,14 @@ export class RunRunner {
       worktreePath = worktree.path;
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `worktree ready on ${worktree.branch}` } });
 
+      // PRD #37: parse the checked-out repo's own agent roster and report it on
+      // this first post-checkout `running` state report. It rides the STATE report
+      // rather than the gate so that an autopilot run — which never parks at
+      // awaiting_approval — records what was detected just the same. The roster is
+      // inert data: nothing is assembled until a selection picks the repo source.
+      const repoAgents = await this.parseRepoAgents(worktree.path, batcher, runLog);
+      await reportState({ status: "running", repo_agents: repoAgentSummaries(repoAgents) });
+
       const ctx: RunContext = {
         runId,
         kind: claim.kind ?? "issue",
@@ -115,6 +124,7 @@ export class RunRunner {
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
         agents: claim.agents,
+        repoAgents,
         skills: claim.skills,
         skillsDropped: claim.skills_dropped,
         repoSkillsEnabled: claim.repo.skills_enabled ?? false,
@@ -216,6 +226,36 @@ export class RunRunner {
           .catch((e) => runLog.warn("skills plugin cleanup failed", { error: errMessage(e) }));
       }
     }
+  }
+
+  /**
+   * Parse the clone's `.claude/agents/*.md` (PRD #37), logging every skipped or
+   * clamped file to the run stream. Detection is best-effort by construction: a
+   * repo without the directory has no agents, and an unreadable one is reported as
+   * a warning — neither is ever a run failure, because a repo's optional roster
+   * must not be able to stop the run it was detected for.
+   */
+  private async parseRepoAgents(worktreePath: string, batcher: MessageBatcher, runLog: Logger): Promise<AgentTemplate[]> {
+    let detected;
+    try {
+      detected = await detectRepoAgents(worktreePath);
+    } catch (err) {
+      runLog.warn("repo agent detection failed", { error: errMessage(err) });
+      return [];
+    }
+    for (const note of detected.notes) {
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: describeRepoAgentNote(note) } });
+    }
+    if (detected.agents.length > 0) {
+      const names = detected.agents.map((a) => a.name).join(", ");
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `detected ${detected.agents.length} agent(s) in the repo's .claude/agents/: ${names}` },
+      });
+    }
+    runLog.info("repo agents detected", { count: detected.agents.length, dropped: detected.notes.length });
+    return detected.agents;
   }
 
   /**

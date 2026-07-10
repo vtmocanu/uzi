@@ -109,7 +109,9 @@ describe("RunRunner — worker-performed push + MR", () => {
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    assert.deepStrictEqual(statuses, ["running", "completed"]);
+    // Two `running` reports: the claim→running transition, then the post-checkout
+    // one carrying the repo's detected agent roster (PRD #37).
+    assert.deepStrictEqual(statuses, ["running", "running", "completed"]);
     const completed = api.states.find((s) => s.body.status === "completed")!.body;
     assert.strictEqual(completed.branch, "agent/issue-7");
     assert.strictEqual(completed.mr_iid, 42);
@@ -161,7 +163,9 @@ describe("RunRunner — worker-performed push + MR", () => {
     await runner(boom, gitlab).execute(claim);
 
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    assert.deepStrictEqual(statuses, ["running", "failed"]);
+    // The second `running` is the post-checkout roster report; the executor throws
+    // after it.
+    assert.deepStrictEqual(statuses, ["running", "running", "failed"]);
     assert.ok(api.states.find((s) => s.body.status === "failed")?.body.failure_reason?.includes("kaboom"));
     assert.strictEqual(calls.length, 0, "no MR on failure");
     assert.strictEqual(fs.existsSync(worktreeDirFor(9)), false);
@@ -273,7 +277,7 @@ describe("RunRunner — plan gate + steering end to end", () => {
     await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
 
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    assert.deepStrictEqual(statuses, ["running", "awaiting_approval", "running", "completed"]);
+    assert.deepStrictEqual(statuses, ["running", "running", "awaiting_approval", "running", "completed"]);
     const gate = api.states.find((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")!.body;
     assert.match(gate.plan_md ?? "", /Stub plan for issue #24/);
     const completed = api.states.find((s) => s.body.status === "completed")!.body;
@@ -326,7 +330,7 @@ describe("RunRunner — plan gate + steering end to end", () => {
     await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
 
     const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
-    assert.deepStrictEqual(statuses, ["running", "awaiting_approval", "running", "completed"]);
+    assert.deepStrictEqual(statuses, ["running", "running", "awaiting_approval", "running", "completed"]);
   });
 
   it("stub executor with planGate fails verbatim when the plan is rejected", async () => {
@@ -450,5 +454,68 @@ describe("RunRunner — plan gate + steering end to end", () => {
     assert.ok(failed, "cancelled run reports failed");
     assert.match(failed!.body.failure_reason ?? "", /run cancelled/);
     assert.strictEqual(calls.length, 0, "no MR on cancel");
+  });
+});
+
+describe("RunRunner — repo agent detection (PRD #37)", () => {
+  /** Run one claim against an origin carrying `files`, returning the state reports
+   *  and the status messages that reached the stream. */
+  async function runAgainst(files: Record<string, string>) {
+    const repoFx = makeFixture(files);
+    try {
+      const { gitlab } = fakeGitlab();
+      const claim = makeClaim({
+        issue_iid: 31,
+        issue_title: "detect the roster",
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+        last_seq: 0,
+        secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+      });
+      const repoRunner = new RunRunner(client, new GitCache(repoFx.dataDir, nullLogger()), new StubExecutor(nullLogger()), nullLogger(), 20, undefined, {
+        pollMs: 5,
+        planApprovalTimeoutMs: 0,
+        gitlab,
+      });
+      await repoRunner.execute(claim);
+      return {
+        states: api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body),
+        texts: api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text)),
+      };
+    } finally {
+      repoFx.cleanup();
+    }
+  }
+
+  it("reports the parsed roster on a running report, noting every drop and clamp", async () => {
+    const { states, texts } = await runAgainst({
+      ".claude/agents/coder.md": "---\nname: coder\ndescription: Implements changes.\nmodel: opus\n---\n\nImplement it.\n",
+      ".claude/agents/reviewer.md": "---\nname: reviewer\ndescription: Reviews changes.\ntools: Read, WebFetch\n---\n\nReview it.\n",
+      ".claude/agents/broken.md": "not an agent file\n",
+      // Never loaded through this path: only .claude/agents/*.md is read.
+      ".claude/settings.json": '{"permissions":{"allow":["Bash(rm -rf /)"]}}',
+    });
+
+    const report = states.find((s) => s.repo_agents !== undefined);
+    assert.ok(report, "a state report carries the roster");
+    assert.strictEqual(report!.status, "running", "the roster rides a running report, not the gate");
+    assert.deepStrictEqual(report!.repo_agents, [
+      { name: "coder", description: "Implements changes." },
+      { name: "reviewer", description: "Reviews changes." },
+    ]);
+    // Prompt bodies stay worker-side; only names + descriptions travel.
+    assert.ok(!JSON.stringify(report!.repo_agents).includes("Implement it."));
+
+    assert.ok(texts.some((t) => t.includes('repo agent "broken" was skipped')), texts.join("\n"));
+    assert.ok(texts.some((t) => t.includes('repo agent "reviewer": removed WebFetch')), texts.join("\n"));
+    assert.ok(texts.some((t) => t.includes("detected 2 agent(s)")), texts.join("\n"));
+  });
+
+  it("reports an empty roster (not an absent one) for a repo with no .claude/agents", async () => {
+    const { states, texts } = await runAgainst({});
+    const report = states.find((s) => s.repo_agents !== undefined);
+    // `[]` is "detection ran, found none" — distinct from a pre-feature run's NULL.
+    assert.deepStrictEqual(report?.repo_agents, []);
+    assert.ok(!texts.some((t) => t.includes("repo agent")), "no notes when there is nothing to detect");
+    assert.ok(states.some((s) => s.status === "completed"), "the run still completes");
   });
 });

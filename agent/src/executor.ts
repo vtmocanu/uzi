@@ -46,6 +46,12 @@ export interface RunContext {
   oauthToken?: string;
   /** PRD #3 templates (lead + subagents) mapped to SDK AgentDefinitions. */
   agents?: AgentTemplate[];
+  /** PRD #37: the roster the worker parsed out of the clone's `.claude/agents/`,
+   *  with prompt bodies. Detected before the first turn but INERT until a selection
+   *  activates it at the gate (M3); the lead always comes from `agents` above, so a
+   *  repo file named `lead` is only ever a subagent candidate. Empty when the repo
+   *  ships none. */
+  repoAgents?: AgentTemplate[];
   /** M4 (PRD #16): the per-run skill union — materialized into a local plugin dir
    *  and enabled via the SDK `skills` list. */
   skills?: ClaimSkill[];

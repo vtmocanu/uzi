@@ -83,6 +83,14 @@ export interface HeartbeatRequest {
   version: string;
 }
 
+/** Kebab-case agent name. Mirrors the API's template nameRe
+ *  (api/internal/handler/agent_templates.go:28) so a repo-detected agent, a uzi
+ *  template, and an exclusion entry all answer to one identity rule. */
+export const AGENT_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+/** Cap on an agent name. The regex admits arbitrary length; this bounds it. */
+export const AGENT_NAME_MAX_LEN = 64;
+
 /** Structured agent-template fields (PRD #3), consumed programmatically by M3. */
 export interface AgentTemplate {
   name: string;
@@ -239,6 +247,83 @@ export interface MessagesRequest {
   messages: OutgoingMessage[];
 }
 
+/**
+ * One agent detected in the cloned repo's `.claude/agents/` (PRD #37). Names and
+ * descriptions ONLY: the prompt bodies never leave the worker — the API stores a
+ * roster the plan gate can render, not the untrusted prompts themselves.
+ */
+export interface RepoAgentSummary {
+  name: string;
+  description: string;
+}
+
+/** Which roster a run's SUBAGENTS come from (PRD #37 Decision 4: either/or, no
+ *  mixing). The `lead` orchestrator is always uzi's builtin and is never
+ *  selectable, under either source. */
+export type AgentSource = "repo" | "own";
+
+/**
+ * The per-run subagent selection (PRD #37). `exclusions` are names removed from
+ * the chosen source's roster; at least one subagent must survive (enforced by the
+ * UI and re-validated API-side in M2 — the worker treats this as a request, not
+ * as authority).
+ *
+ * It travels on two paths, both landing in the same `runs` columns:
+ *   - human gate: JSON-encoded into the `approve_plan` UserInput `body`;
+ *   - autopilot: on the worker's own `running` state report (Decision 6), since
+ *     a self-approved run never receives a SubmitInput.
+ */
+export interface AgentSelection {
+  source: AgentSource;
+  exclusions: string[];
+}
+
+/** Cap on `exclusions`. Twice the repo-agent file cap, so excluding the whole of
+ *  either roster still fits (the user's own template list is not file-capped). */
+export const AGENT_EXCLUSIONS_MAX = 32;
+
+/** JSON-encode a selection for the `approve_plan` input body. */
+export function encodeAgentSelection(selection: AgentSelection): string {
+  return JSON.stringify({ source: selection.source, exclusions: selection.exclusions });
+}
+
+/**
+ * Parse + validate an `approve_plan` body as an AgentSelection.
+ *
+ * Returns undefined for anything that is not a well-formed selection — absent,
+ * blank, non-JSON, unknown source, malformed/over-cap exclusions. The caller
+ * then falls back to the run's default source: a malformed body must never fail
+ * an approved run, and it must never be read as "approve with no restrictions"
+ * beyond that default. Exclusion names are held to AGENT_NAME_RE so a body can
+ * carry nothing but identities; membership (⊂ the chosen roster) is the API's
+ * check, not this one.
+ */
+export function parseAgentSelection(raw: string | null | undefined): AgentSelection | undefined {
+  if (typeof raw !== "string" || raw.trim() === "") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+
+  const { source, exclusions } = parsed as { source?: unknown; exclusions?: unknown };
+  if (source !== "repo" && source !== "own") return undefined;
+
+  if (exclusions === undefined || exclusions === null) return { source, exclusions: [] };
+  if (!Array.isArray(exclusions) || exclusions.length > AGENT_EXCLUSIONS_MAX) return undefined;
+
+  const out: string[] = [];
+  for (const e of exclusions) {
+    if (typeof e !== "string") return undefined;
+    const name = e.trim();
+    if (name.length > AGENT_NAME_MAX_LEN || !AGENT_NAME_RE.test(name)) return undefined;
+    if (!out.includes(name)) out.push(name);
+  }
+  return { source, exclusions: out };
+}
+
 /** Body of POST /runs/:id/state. Fields are set per target status. */
 export interface StateRequest {
   status: RunState;
@@ -259,11 +344,27 @@ export interface StateRequest {
    *  diagnosis and no MR). verified/fix_failed are stamped server-side by the
    *  pipeline sync, never reported here; an issue run omits this. */
   fix_verdict?: FixVerdict;
+  /** The roster detected in the clone's `.claude/agents/` (PRD #37 Decision 6).
+   *  Sent on the first `running` report AFTER checkout — on the state report, not
+   *  the gate, so an autopilot run (which never reports awaiting_approval) records
+   *  its roster too. Always sent once detection ran, possibly `[]`: an empty array
+   *  means "detected nothing" (the gate's repo card goes inert), while an absent
+   *  field/NULL column means "pre-feature run". */
+  repo_agents?: RepoAgentSummary[];
+  /** The selection an AUTOPILOT run resolved for itself (PRD #37 Decision 6):
+   *  repo agents when detected, else the owner's templates, with no exclusions.
+   *  Human-gated runs persist their selection through the `approve_plan` input
+   *  instead, so this is absent there. */
+  agent_selection?: AgentSelection;
 }
 
 export interface UserInput {
   id: number;
   kind: InputKind;
+  /** Per kind: `follow_up` carries the user's message, `reject_plan` the reason,
+   *  `cancel` nothing — and `approve_plan` carries the JSON-encoded AgentSelection
+   *  (PRD #37; parse it with parseAgentSelection, which yields undefined for a body
+   *  that is absent or malformed so the run falls back to its default source). */
   body?: string | null;
   created_at?: string;
 }
