@@ -1,0 +1,27 @@
+# Per-Dockerfile ignore for the `jvm` worker image (PRD #39 Decision 5). MIRRORED
+# from templates/base/Dockerfile.dockerignore — keep in lockstep. BuildKit picks it
+# up by the "<Dockerfile-name>.dockerignore" naming next to templates/jvm/Dockerfile;
+# its patterns resolve relative to the BUILD CONTEXT ROOT (the repo root), not this
+# directory. It must NOT exclude the source trees the chat agent reads (api/ web/
+# agent/ docs/ specs/ prds/ e2e/ scripts/ *.md) — only secrets, VCS, submodules,
+# deps, and build artifacts. See templates/base/Dockerfile.dockerignore for detail.
+
+# Secrets — must NEVER enter the build context.
+.env
+.env.*
+**/.env
+**/.env.*
+
+# VCS + submodule metadata + the large inspiration/ submodules.
+.git
+.gitignore
+.gitmodules
+inspiration/
+
+# Installed deps + build artifacts (regenerated; not source).
+**/node_modules
+web/node_modules
+agent/node_modules
+**/dist
+web/dist
+agent/dist

@@ -152,9 +152,18 @@ services:
     # this WORKER_TEMPLATE build var), self-reported at register so the server can
     # badge drift from the per-worker declared choice. `docker compose
     # build` with no env set still works (defaults to base).
+    #
+    # Context is the REPO ROOT (PRD #39 Decision 5), not ./agent: the worker image
+    # bakes uzi's own read-only source at /opt/uzi-src for the `chat` run kind, and
+    # the per-Dockerfile ignore (agent/templates/<name>/Dockerfile.dockerignore) keeps
+    # secrets/.git/inspiration/node_modules out while KEEPING api/ web/ agent/ docs/…
+    # UZI_SRC_SHA stamps BUILD_INFO with the deployed commit; export it before build
+    # (e.g. `UZI_SRC_SHA=$(git rev-parse HEAD) docker compose build agent`), empty ok.
     build:
-      context: ./agent
-      dockerfile: templates/${WORKER_TEMPLATE:-base}/Dockerfile
+      context: .
+      dockerfile: agent/templates/${WORKER_TEMPLATE:-base}/Dockerfile
+      args:
+        UZI_SRC_SHA: ${UZI_SRC_SHA:-}
     profiles: ["agent"]
     security_opt:
       - "no-new-privileges:true"

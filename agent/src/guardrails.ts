@@ -597,16 +597,28 @@ function deepestExisting(p: string): { path: string; tail: string[] } | undefine
  * that reads /proc, escapes the run worktree, or touches `.git/`, closing the
  * sibling-tool bypass of the Bash `/proc` deny. Non-path tools and in-worktree
  * paths return no decision (the tool proceeds under `bypassPermissions`).
+ *
+ * `extraSecretPaths` are worker-credential file paths (the configured
+ * UZI_WORKER_TOKEN_FILE) to deny a Read/Grep/Glob of, with an explicit
+ * secret-file reason. For a run these already sit outside the worktree and so are
+ * caught by the containment check; naming them here is load-bearing for a CHAT
+ * session (PRD #39 Decision 6/S2), whose root is the baked source `/opt/uzi-src`
+ * — a compromised chat must never Read the join token and escalate to the worker
+ * protocol whose *run* claims carry the PAT. Checked before containment so the
+ * denial reason is the specific one, symmetric with the Bash hook.
  */
 export function buildPathGuardHook(
   worktreeRoot: string,
   log: Logger,
+  extraSecretPaths: readonly string[] = [],
 ): (input: HookInput) => Promise<HookJSONOutput> {
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse" || !PATH_TOOLS.has(input.tool_name)) return {};
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : worktreeRoot;
     for (const candidate of extractToolPaths(input.tool_input)) {
-      const screen = screenToolPath(candidate, worktreeRoot, cwd);
+      const screen = hitsSecret(candidate, extraSecretPaths)
+        ? deny(REASON_SECRET_FILE)
+        : screenToolPath(candidate, worktreeRoot, cwd);
       if (screen.denied) {
         log.warn("guardrail denied a file-tool path", { tool: input.tool_name, reason: screen.reason });
         return {
