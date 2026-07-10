@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
 
@@ -16,10 +18,10 @@ import (
 // ping — so a healthy long-lived connection is unaffected. inbound (may be nil)
 // is captured once here, NOT per connection: it is static, so a hot token restart
 // re-dials with the same handler.
-func newSocketDialer(timeout time.Duration, inbound InboundHandler) DialFunc {
+func newSocketDialer(timeout time.Duration, inbound InboundHandler, messages MessageHandler) DialFunc {
 	client := &http.Client{Timeout: timeout}
 	return func(ctx context.Context, botToken, appToken string, onConnecting, onConnected func()) error {
-		return dialSocketMode(ctx, client, botToken, appToken, inbound, onConnecting, onConnected)
+		return dialSocketMode(ctx, client, botToken, appToken, inbound, messages, onConnecting, onConnected)
 	}
 }
 
@@ -35,12 +37,11 @@ func newSocketDialer(timeout time.Duration, inbound InboundHandler) DialFunc {
 // the token-pattern redaction would miss, so it must never reach a log.
 //
 // Inbound interactive block_actions are ACKed first (Slack re-delivers an
-// un-ACKed envelope every ~3s) and then routed to inbound (the link Confirm /
-// Not-me handler in M3; M4/M5 add gate + reply kinds). message.im events are
-// still ACKed and discarded until M5. The bot token authenticates the outbound
-// Web API client, not the socket (the socket uses the app token), so it is
-// unused here.
-func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken string, inbound InboundHandler, onConnecting, onConnected func()) error {
+// un-ACKed envelope every ~3s) and then routed to inbound (link Confirm / Not-me
+// + the M4 gate buttons). message.im events (thread replies) are ACKed first and
+// routed to messages (M5). The bot token authenticates the outbound Web API
+// client, not the socket (the socket uses the app token), so it is unused here.
+func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken string, inbound InboundHandler, messages MessageHandler, onConnecting, onConnected func()) error {
 	_ = botToken // the outbound bot-token client is built from this in the poster.
 	api := slack.New("", slack.OptionAppLevelToken(appToken), slack.OptionHTTPClient(client))
 	sm := socketmode.New(api)
@@ -101,6 +102,18 @@ func dialSocketMode(ctx context.Context, client *http.Client, botToken, appToken
 					}
 				}
 				continue
+			case socketmode.EventTypeEventsAPI:
+				// ACK FIRST, then route message.im thread replies (M5). Other inner
+				// events are ACKed and ignored.
+				if evt.Request != nil {
+					_ = sm.Ack(*evt.Request)
+				}
+				if messages != nil {
+					if e, ok := evt.Data.(slackevents.EventsAPIEvent); ok {
+						routeMessage(ctx, messages, e)
+					}
+				}
+				continue
 			}
 			// Ack any other envelope so Slack does not re-deliver it.
 			if evt.Request != nil {
@@ -132,4 +145,36 @@ func routeInteractive(ctx context.Context, inbound InboundHandler, cb slack.Inte
 			MessageTS:   cb.Container.MessageTs,
 		})
 	}
+}
+
+// routeMessage turns a message.im thread reply into a MessageReply for the handler
+// (M5). Only genuine user thread replies in a DM are routed: the bot's own posts
+// (BotID set), non-message subtypes (edits/deletes/joins), non-thread top-level
+// DMs, non-DM channel types, and empty text are dropped. The actor is the
+// authenticated envelope user (ev.User) — never a client-controlled value — which
+// is what makes the downstream confirmed-user/ownership join trustworthy. It is
+// the small pure seam the dial loop delegates to so it stays unit-testable.
+func routeMessage(ctx context.Context, messages MessageHandler, e slackevents.EventsAPIEvent) {
+	if e.Type != slackevents.CallbackEvent {
+		return
+	}
+	ev, ok := e.InnerEvent.Data.(*slackevents.MessageEvent)
+	if !ok {
+		return
+	}
+	// Plain user message in a DM only: no subtype (edits/deletes/joins carry one),
+	// not a bot post, a real author, and a thread reply (thread_ts == the run root).
+	if ev.ChannelType != "im" || ev.SubType != "" || ev.BotID != "" || ev.User == "" {
+		return
+	}
+	if strings.TrimSpace(ev.ThreadTimeStamp) == "" || strings.TrimSpace(ev.Text) == "" {
+		return
+	}
+	messages.HandleMessage(ctx, MessageReply{
+		SlackUserID: ev.User,
+		ChannelID:   ev.Channel,
+		ThreadTS:    ev.ThreadTimeStamp,
+		MessageTS:   ev.TimeStamp,
+		Text:        ev.Text,
+	})
 }

@@ -87,10 +87,13 @@ type Config struct {
 	// does NOT bound the long-lived websocket itself. Ignored when Dial is set.
 	HTTPTimeout time.Duration
 	// Inbound (may be nil) routes inbound Block Kit actions (the link Confirm /
-	// Not-me handler; M4/M5 add gate + reply kinds). It is captured once by the
-	// real dialer — static, not part of the token fingerprint — so a hot restart
-	// keeps the same handler. Ignored when Dial is set.
+	// Not-me handler + the M4 gate buttons). It is captured once by the real dialer
+	// — static, not part of the token fingerprint — so a hot restart keeps the same
+	// handler. Ignored when Dial is set.
 	Inbound InboundHandler
+	// Messages (may be nil) routes inbound message.im thread replies (M5),
+	// captured statically like Inbound. Ignored when Dial is set.
+	Messages MessageHandler
 	// OnConnected (may be nil) fires once each time a session becomes live (the
 	// email auto-match pass), in a goroutine bound to the connection context.
 	OnConnected func(context.Context)
@@ -111,7 +114,7 @@ func NewManager(s SettingsSource, cfg Config) *Manager {
 		state:       StateDisabled,
 	}
 	if m.dial == nil {
-		m.dial = newSocketDialer(orDuration(cfg.HTTPTimeout, 15*time.Second), cfg.Inbound)
+		m.dial = newSocketDialer(orDuration(cfg.HTTPTimeout, 15*time.Second), cfg.Inbound, cfg.Messages)
 	}
 	if m.logger == nil {
 		m.logger = slog.Default()

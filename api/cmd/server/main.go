@@ -167,16 +167,24 @@ func run() error {
 	// workersvc import) and reads run status itself for stale-click handling.
 	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
 
+	// Reply-from-Slack handler (PRD #25 M5): inbound message.im thread replies →
+	// reasoned reject during a reject-pending gate, follow_up on a live run, a nudge
+	// during an open gate, or a coalesced ephemeral otherwise. Same ownership-checked
+	// submitter as the gatekeeper.
+	slackReplier := slacksvc.NewReplier(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
+
 	// Slack Socket Mode manager (PRD #25 M2). Supervises the single outbound
 	// connection: it polls the settings cache and, while Slack is enabled with both
 	// tokens present, keeps a socket up (backoff reconnect, hot-restart on a
 	// token/enable change); otherwise it idles as a strict no-op. It never touches
 	// the run lifecycle — Slack is best-effort. Run in the background WaitGroup below.
 	// Inbound Block Kit actions fan out through an InboundMux to the linker (Confirm
-	// / Not-me) and the gatekeeper (gate buttons) — disjoint action-id namespaces.
+	// / Not-me) and the gatekeeper (gate buttons); message.im thread replies go to
+	// the replier.
 	slackManager := slacksvc.NewManager(settingsCache, slacksvc.Config{
 		HTTPTimeout: cfg.SlackHTTPTimeout,
 		Inbound:     slacksvc.InboundMux{slackLinker, slackGate},
+		Messages:    slackReplier,
 		OnConnected: slackLinker.AutoMatch,
 	})
 

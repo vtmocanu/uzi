@@ -50,11 +50,14 @@ SET slack_resolved_id = NULL, slack_link_confirmed_at = NULL
 WHERE slack_resolved_id = @slack_resolved_id;
 
 -- name: GetConfirmedUserBySlackID :one
--- Inbound authz: resolve a Slack member id to its EXACTLY-ONE confirmed uzi user.
--- The unique partial index guarantees at most one row; the confirmed filter is
--- what makes it an authorization join (an unconfirmed match resolves to nothing).
+-- Inbound authz: resolve a Slack member id to its EXACTLY-ONE confirmed, ACTIVE
+-- uzi user. The unique partial index guarantees at most one row; the confirmed
+-- filter makes it an authorization join (an unconfirmed match resolves to
+-- nothing); the is_active filter means a deactivated account cannot act on a run
+-- from Slack, mirroring the webui's RequireAuth block. This is the single
+-- chokepoint for every inbound Slack action (gate buttons and thread replies).
 SELECT * FROM users
-WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL;
+WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL AND is_active = true;
 
 -- name: ListUsersForSlackLink :many
 -- Override-free, active users for the email auto-match pass: id + email to look
@@ -106,6 +109,12 @@ WHERE r.id = $1;
 -- name: GetSlackRunMessage :one
 -- The DM anchor for a run (threading + edit target). Absent = not yet notified.
 SELECT * FROM slack_run_messages WHERE run_id = $1;
+
+-- name: GetSlackRunMessageByRoot :one
+-- Reverse lookup for an inbound thread reply (PRD #25 M5): a reply's thread_ts is
+-- the run's root message ts, so (channel_id, root_ts) resolves the anchored run.
+-- Scoped by channel too so a ts collision across DM channels can't cross runs.
+SELECT * FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2;
 
 -- name: SetSlackRunGate :one
 -- Set/clear the open-gate anchor (M4 approval flow): gate_ts + gate_state. NULLs

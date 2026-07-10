@@ -52,6 +52,9 @@ type Poster interface {
 	// stale-click or unlinked-user notice), so those transient replies don't persist
 	// in the DM history.
 	PostEphemeral(ctx context.Context, channelID, userID, text string) error
+	// AddReaction adds an emoji reaction to a message — the ✅ ack on an accepted
+	// inbound thread reply (PRD #25 M5). Best-effort.
+	AddReaction(ctx context.Context, channelID, ts, emoji string) error
 	// LookupUserByEmail resolves a workspace member's email to their Slack user id
 	// (users.lookupByEmail), for the email auto-match pass. A not-found or any other
 	// Slack error is returned to the caller, which treats it as "no match".

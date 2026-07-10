@@ -99,6 +99,54 @@ func TestSlackLinkResolutionLiveDB(t *testing.T) {
 	}
 }
 
+// TestSlackConfirmedLookupSkipsDeactivatedLiveDB pins the M5 audit fix: the
+// inbound authz join (GetConfirmedUserBySlackID) — the single chokepoint for every
+// inbound Slack action (gate buttons + thread replies) — must exclude deactivated
+// accounts, mirroring the webui's RequireAuth block. Without it a confirmed-linked
+// user who was later deactivated could still Approve/Reject/reply from Slack.
+func TestSlackConfirmedLookupSkipsDeactivatedLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+	txt := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
+
+	u, err := q.CreateUser(ctx, store.CreateUserParams{Email: "dz-" + uniq(t) + "@example.com", PasswordHash: "x"})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	slackID := "U" + uniq(t)
+	if _, err := q.SetUserSlackOverride(ctx, store.SetUserSlackOverrideParams{
+		SlackMemberID: txt(slackID), SlackResolvedID: txt(slackID), ID: u.ID,
+	}); err != nil {
+		t.Fatalf("set override: %v", err)
+	}
+	if n, err := q.ConfirmUserSlackLink(ctx, txt(slackID)); err != nil || n != 1 {
+		t.Fatalf("confirm: rows=%d err=%v", n, err)
+	}
+	// Active + confirmed → resolves.
+	if _, err := q.GetConfirmedUserBySlackID(ctx, txt(slackID)); err != nil {
+		t.Fatalf("active confirmed user must resolve: %v", err)
+	}
+	// Deactivate → the SAME confirmed link must now resolve to nothing.
+	if _, err := q.SetUserActive(ctx, store.SetUserActiveParams{IsActive: false, ID: u.ID}); err != nil {
+		t.Fatalf("deactivate: %v", err)
+	}
+	if _, err := q.GetConfirmedUserBySlackID(ctx, txt(slackID)); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("a deactivated (but confirmed) user must resolve to no user, got err=%v", err)
+	}
+}
+
 // uniq returns a short unique suffix so re-runs against the same DB never collide
 // on the users.email unique constraint or on a reused Slack id.
 func uniq(t *testing.T) string {

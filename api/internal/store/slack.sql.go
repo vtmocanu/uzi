@@ -44,12 +44,15 @@ func (q *Queries) ConfirmUserSlackLink(ctx context.Context, slackResolvedID pgty
 
 const getConfirmedUserBySlackID = `-- name: GetConfirmedUserBySlackID :one
 SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at FROM users
-WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL
+WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL AND is_active = true
 `
 
-// Inbound authz: resolve a Slack member id to its EXACTLY-ONE confirmed uzi user.
-// The unique partial index guarantees at most one row; the confirmed filter is
-// what makes it an authorization join (an unconfirmed match resolves to nothing).
+// Inbound authz: resolve a Slack member id to its EXACTLY-ONE confirmed, ACTIVE
+// uzi user. The unique partial index guarantees at most one row; the confirmed
+// filter makes it an authorization join (an unconfirmed match resolves to
+// nothing); the is_active filter means a deactivated account cannot act on a run
+// from Slack, mirroring the webui's RequireAuth block. This is the single
+// chokepoint for every inbound Slack action (gate buttons and thread replies).
 func (q *Queries) GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID pgtype.Text) (User, error) {
 	row := q.db.QueryRow(ctx, getConfirmedUserBySlackID, slackResolvedID)
 	var i User
@@ -142,6 +145,32 @@ SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at FROM slack_r
 // The DM anchor for a run (threading + edit target). Absent = not yet notified.
 func (q *Queries) GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (SlackRunMessage, error) {
 	row := q.db.QueryRow(ctx, getSlackRunMessage, runID)
+	var i SlackRunMessage
+	err := row.Scan(
+		&i.RunID,
+		&i.ChannelID,
+		&i.RootTs,
+		&i.GateTs,
+		&i.GateState,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getSlackRunMessageByRoot = `-- name: GetSlackRunMessageByRoot :one
+SELECT run_id, channel_id, root_ts, gate_ts, gate_state, updated_at FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2
+`
+
+type GetSlackRunMessageByRootParams struct {
+	ChannelID string `json:"channel_id"`
+	RootTs    string `json:"root_ts"`
+}
+
+// Reverse lookup for an inbound thread reply (PRD #25 M5): a reply's thread_ts is
+// the run's root message ts, so (channel_id, root_ts) resolves the anchored run.
+// Scoped by channel too so a ts collision across DM channels can't cross runs.
+func (q *Queries) GetSlackRunMessageByRoot(ctx context.Context, arg GetSlackRunMessageByRootParams) (SlackRunMessage, error) {
+	row := q.db.QueryRow(ctx, getSlackRunMessageByRoot, arg.ChannelID, arg.RootTs)
 	var i SlackRunMessage
 	err := row.Scan(
 		&i.RunID,

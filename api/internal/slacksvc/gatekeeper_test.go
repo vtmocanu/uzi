@@ -175,6 +175,28 @@ func TestGatekeeperRunNotOwnedIsEphemeral(t *testing.T) {
 	}
 }
 
+// A deactivated (but previously confirmed) user cannot act on a gate: the guarded
+// GetConfirmedUserBySlackID (AND is_active) returns no row, so the click is refused
+// with an ephemeral and nothing is submitted. (The SQL filter itself is pinned by
+// the live-DB TestSlackConfirmedLookupSkipsDeactivatedLiveDB; this is the handler
+// half of that chokepoint.)
+func TestGatekeeperDeactivatedUserRefused(t *testing.T) {
+	runID := uuid.New()
+	gs := &fakeGateStore{userErr: pgx.ErrNoRows} // deactivated → guarded lookup finds nothing
+	sub := &fakeSubmitter{}
+	fp := &fakePoster{}
+	g := NewGatekeeper(gs, sub, fp, nil)
+
+	g.HandleBlockAction(context.Background(), gateAction(ActionGateApprove, runID))
+
+	if len(sub.submitted) != 0 {
+		t.Fatalf("a deactivated user must never submit: %+v", sub.submitted)
+	}
+	if len(fp.ephemerals) != 1 {
+		t.Fatalf("a deactivated user's click must be refused with an ephemeral: %+v", fp.ephemerals)
+	}
+}
+
 // The gatekeeper owns only slack_gate_* actions: link actions and the Open-in-uzi
 // url button are ignored (they never even resolve a user).
 func TestGatekeeperIgnoresNonGateActions(t *testing.T) {

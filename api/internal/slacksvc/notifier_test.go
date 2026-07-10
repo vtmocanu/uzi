@@ -58,6 +58,7 @@ type updateBlockCall struct {
 	actionIDs             []string
 }
 type ephemeralCall struct{ channel, user, text string }
+type reactionCall struct{ channel, ts, emoji string }
 
 type fakePoster struct {
 	dmChannel    string
@@ -66,6 +67,7 @@ type fakePoster struct {
 	blocks       []blockCall
 	updateBlocks []updateBlockCall
 	ephemerals   []ephemeralCall
+	reactions    []reactionCall
 	openErr      error
 	postErr      error
 	tsSeq        int
@@ -127,6 +129,10 @@ func (p *fakePoster) UpdateBlocks(_ context.Context, ch, ts, fallback string, bl
 }
 func (p *fakePoster) PostEphemeral(_ context.Context, ch, user, text string) error {
 	p.ephemerals = append(p.ephemerals, ephemeralCall{channel: ch, user: user, text: text})
+	return p.postErr
+}
+func (p *fakePoster) AddReaction(_ context.Context, ch, ts, emoji string) error {
+	p.reactions = append(p.reactions, reactionCall{channel: ch, ts: ts, emoji: emoji})
 	return p.postErr
 }
 func (p *fakePoster) LookupUserByEmail(_ context.Context, email string) (string, error) {

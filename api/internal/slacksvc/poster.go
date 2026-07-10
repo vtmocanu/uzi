@@ -114,6 +114,14 @@ func (p *slackPoster) PostEphemeral(ctx context.Context, channelID, userID, text
 	return err
 }
 
+func (p *slackPoster) AddReaction(ctx context.Context, channelID, ts, emoji string) error {
+	c, err := p.api(ctx)
+	if err != nil {
+		return err
+	}
+	return c.AddReactionContext(ctx, emoji, slack.NewRefToMessage(channelID, ts))
+}
+
 func (p *slackPoster) LookupUserByEmail(ctx context.Context, email string) (string, error) {
 	c, err := p.api(ctx)
 	if err != nil {
