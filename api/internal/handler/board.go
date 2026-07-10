@@ -71,6 +71,11 @@ type latestRunDTO struct {
 	ID            string    `json:"id"`
 	Status        string    `json:"status"`
 	MrIID         *int64    `json:"mr_iid"`
+	// MrState is the PRD #24 watcher's last-observed merge-request state, null when
+	// never observed. Display-only (PRD #33 Decision 1): the board card's chip
+	// renders merged/closed distinctly and everything else as the plain open chip.
+	// Kept fresh by the watcher only for the board card (the issue's latest run).
+	MrState       *string   `json:"mr_state"`
 	FailureReason *string   `json:"failure_reason"`
 	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
 	// or "plan_rejected", null otherwise. The board badge reads it (not the
@@ -91,10 +96,11 @@ type latestRunDTO struct {
 // viewer; IsMine is set when the run belongs to them (only then does the client
 // render the run-view link). ownerName prefers the display name, falling back to
 // the email, so "started by X" is never blank.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, failureReason, stopKind, ownerName, ownerEmail, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrState, failureReason, stopKind, ownerName, ownerEmail, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:            runID.String(),
 		Status:        status,
+		MrState:       textPtrValue(mrState.Valid, mrState.String),
 		FailureReason: textPtrValue(failureReason.Valid, failureReason.String),
 		StopKind:      textPtrValue(stopKind.Valid, stopKind.String),
 		WorkerName:    textPtrValue(workerName.Valid, workerName.String),
@@ -365,7 +371,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
-			rr.FailureReason, rr.StopKind, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
+			rr.MrState, rr.FailureReason, rr.StopKind, rr.OwnerName, rr.OwnerEmail, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
 
 	cards := make([]cardDTO, 0, len(issues))
@@ -576,7 +582,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.FailureReason, lr.StopKind, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
 	}
@@ -674,7 +680,7 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	// a toggle never blanks the run badge the board/issue view is showing.
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.FailureReason, lr.StopKind, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.OwnerEmail, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for prdless card", "error", err)
 	}

@@ -6,6 +6,9 @@ import {
   hasActiveRun,
   isAwaitingApproval,
   isStoppedRun,
+  mrChipState,
+  mrChipSuffix,
+  mrChipTitle,
   retryHint,
   runBadge,
   runStatusTone,
@@ -18,6 +21,7 @@ function run(over: Partial<LatestRun> = {}): LatestRun {
     id: "run-1",
     status: "queued",
     mr_iid: null,
+    mr_state: null,
     failure_reason: null,
     stop_kind: null,
     owner_name: "Vlad",
@@ -80,10 +84,19 @@ describe("runBadge taxonomy", () => {
     expect(r).toMatchObject({ kind: "badge", label: "stopped", tone: "neutral" });
   });
 
-  it("completed with an MR → MR chip", () => {
+  it("completed with an MR → MR chip carrying the derived state (open by default)", () => {
     expect(runBadge(run({ status: "completed", mr_iid: 42 }), NOW)).toEqual({
       kind: "mr",
       mrIid: 42,
+      mrState: "open",
+    });
+  });
+
+  it("completed with a merged MR → MR chip carrying mrState 'merged'", () => {
+    expect(runBadge(run({ status: "completed", mr_iid: 42, mr_state: "merged" }), NOW)).toEqual({
+      kind: "mr",
+      mrIid: 42,
+      mrState: "merged",
     });
   });
 
@@ -104,6 +117,7 @@ describe("runBadge taxonomy", () => {
     expect(runBadge(run({ status: "completed", stop_kind: "plan_rejected", mr_iid: 42 }), NOW)).toEqual({
       kind: "mr",
       mrIid: 42,
+      mrState: "open",
     });
   });
 });
@@ -150,6 +164,33 @@ describe("runStatusTone (list-row tone)", () => {
     expect(runStatusTone("claimed", null)).toBe("info");
     expect(runStatusTone("running", null)).toBe("info");
     expect(runStatusTone("queued", null)).toBe("queue");
+  });
+});
+
+describe("mrChipState (derived MR-state variant, PRD #33)", () => {
+  it("maps merged and closed to their own variant", () => {
+    expect(mrChipState("merged")).toBe("merged");
+    expect(mrChipState("closed")).toBe("closed");
+  });
+  it("treats opened / locked / unknown / null / undefined as 'open' (chip unchanged — SC2)", () => {
+    expect(mrChipState("opened")).toBe("open");
+    expect(mrChipState("locked")).toBe("open");
+    expect(mrChipState("something-else")).toBe("open");
+    expect(mrChipState(null)).toBe("open");
+    expect(mrChipState(undefined)).toBe("open");
+  });
+});
+
+describe("mrChipSuffix / mrChipTitle", () => {
+  it("suffix is empty for open, the state word otherwise", () => {
+    expect(mrChipSuffix("open")).toBe("");
+    expect(mrChipSuffix("merged")).toBe(" merged");
+    expect(mrChipSuffix("closed")).toBe(" closed");
+  });
+  it("title scopes merged/closed to 'as of last sync'", () => {
+    expect(mrChipTitle("merged")).toMatch(/merged \(as of last sync\)/);
+    expect(mrChipTitle("closed")).toMatch(/closed unmerged \(as of last sync\)/);
+    expect(mrChipTitle("open")).toBe("Open the merge request on GitLab");
   });
 });
 

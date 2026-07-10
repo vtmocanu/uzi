@@ -186,7 +186,7 @@ SELECT * FROM issues WHERE repo_id = $1 ORDER BY forge_issue_iid ASC;
 -- and drives the board's "×N" retry hint without a per-issue history fan-in. Only
 -- display fields — never session_id, plan_md, or any secret.
 SELECT DISTINCT ON (r.issue_iid)
-       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.failure_reason, r.stop_kind,
+       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop_kind,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
@@ -202,7 +202,7 @@ ORDER BY r.issue_iid, r.created_at DESC;
 -- its run badge on partial updates. run_count mirrors ListLatestRunsForRepo (a
 -- window count over the issue's runs, already scoped to one issue by the WHERE) so
 -- the "×N" retry hint survives a drag. Returns no rows when the issue has never run.
-SELECT r.id, r.user_id, r.status, r.mr_iid, r.failure_reason, r.stop_kind, r.created_at, r.updated_at,
+SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop_kind, r.created_at, r.updated_at,
        ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
 FROM runs r

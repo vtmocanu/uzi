@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type IssueDetail, type RunListItem } from "../lib/api";
 import { startRunGate } from "../lib/runStream";
-import { activeRunInHistory, isStoppedRun, runStatusTone } from "../lib/runBadge";
+import { activeRunInHistory, isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { Markdown } from "../components/Markdown";
 import { formatDuration } from "../components/RunEvent";
@@ -250,6 +250,9 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
   // PRD §3 asks for an MR *link* in the history; link it when we can build an https
   // URL, else fall back to a plain "!N" chip so it is never absent.
   const mrHref = run.mr_iid != null ? mergeRequestUrl(projectWebUrl, run.mr_iid) : null;
+  // MR state (PRD #33): a per-run frozen hint; open renders exactly as before,
+  // merged/closed get a label and closed is muted + struck ("as of last sync").
+  const mrState = mrChipState(run.mr_state);
   // §3 "started": show when the run began; fall back to its queued time for a run
   // that has not started yet (started_at null).
   const stamp = run.started_at ?? run.created_at;
@@ -268,14 +271,24 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
                   href={mrHref}
                   target="_blank"
                   rel="noreferrer"
-                  title="Open the merge request on GitLab"
-                  className="text-brand hover:text-brand-hover"
+                  title={mrChipTitle(mrState)}
+                  className={
+                    mrState === "closed"
+                      ? "text-faint line-through hover:text-muted"
+                      : "text-brand hover:text-brand-hover"
+                  }
                 >
                   !{run.mr_iid}
                 </a>
               ) : (
-                <>!{run.mr_iid}</>
+                <span
+                  title={mrChipTitle(mrState)}
+                  className={mrState === "closed" ? "text-faint line-through" : undefined}
+                >
+                  !{run.mr_iid}
+                </span>
               )}
+              {mrChipSuffix(mrState)}
             </span>
           )}
         </div>

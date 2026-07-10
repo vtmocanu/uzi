@@ -42,6 +42,7 @@ function fakeRun(): Run {
     worker_id: "worker-1",
     branch: null,
     mr_iid: null,
+    mr_state: null,
     failure_reason: null,
     stop_kind: null,
     pipeline_ref: null,

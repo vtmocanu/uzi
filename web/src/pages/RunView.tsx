@@ -9,7 +9,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, isTerminalRun, type Repo, type RunMessage } from "../lib/api";
-import { isStoppedRun } from "../lib/runBadge";
+import { isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
 import { useRunStream } from "../lib/useRunStream";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { formatDuration } from "../components/RunEvent";
@@ -112,6 +112,9 @@ export function RunView() {
   // the header pill and the terminal banner both go neutral so they agree with
   // the board/RunsList treatment (isStoppedRun).
   const stopped = isStoppedRun(run.status, run.stop_kind);
+  // MR state (PRD #33): a per-run frozen hint. It appends "merged"/"closed" to the
+  // MR affordance and (for closed) drops the ok tone; open is unchanged.
+  const mrState = mrChipState(run.mr_state);
   const mrUrl =
     run.mr_iid != null && isHttpsUrl(repoWebUrl)
       ? `${repoWebUrl}/-/merge_requests/${run.mr_iid}`
@@ -227,11 +230,16 @@ export function RunView() {
             {mrUrl ? (
               <a href={mrUrl} target="_blank" rel="noreferrer">
                 <Button>
-                  Open merge request !{run.mr_iid} <ExternalLinkIcon />
+                  Open merge request !{run.mr_iid}{mrChipSuffix(mrState)} <ExternalLinkIcon />
                 </Button>
               </a>
             ) : (
-              run.mr_iid != null && <Badge tone="ok">MR !{run.mr_iid}</Badge>
+              run.mr_iid != null && (
+                <Badge tone={mrState === "closed" ? "neutral" : "ok"} title={mrChipTitle(mrState)}>
+                  MR <span className={mrState === "closed" ? "line-through" : undefined}>!{run.mr_iid}</span>
+                  {mrChipSuffix(mrState)}
+                </Badge>
+              )
             )}
           </div>
         </div>
@@ -261,11 +269,16 @@ export function RunView() {
             {mrUrl ? (
               <a href={mrUrl} target="_blank" rel="noreferrer">
                 <Button variant="secondary">
-                  Open merge request !{run.mr_iid} <ExternalLinkIcon />
+                  Open merge request !{run.mr_iid}{mrChipSuffix(mrState)} <ExternalLinkIcon />
                 </Button>
               </a>
             ) : (
-              run.mr_iid != null && <Badge tone="neutral">MR !{run.mr_iid}</Badge>
+              run.mr_iid != null && (
+                <Badge tone="neutral" title={mrChipTitle(mrState)}>
+                  MR <span className={mrState === "closed" ? "line-through" : undefined}>!{run.mr_iid}</span>
+                  {mrChipSuffix(mrState)}
+                </Badge>
+              )
             )}
           </div>
         </div>

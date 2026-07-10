@@ -53,6 +53,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     worker_id: "w1",
     branch: null,
     mr_iid: null,
+    mr_state: null,
     failure_reason: null,
     stop_kind: null,
     pipeline_ref: null,

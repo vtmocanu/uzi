@@ -10,9 +10,9 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem } from "../lib/api";
-import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
+import { Alert, Badge, Card, cx, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
-import { isStoppedRun } from "../lib/runBadge";
+import { isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -27,6 +27,9 @@ function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
   // that into the pill's status so the shared StatusPill palette renders it calm.
   const pillStatus = isStoppedRun(run.status, run.stop_kind) ? "stopped" : run.status;
+  // MR chip state (PRD #33): open renders exactly as before; merged/closed get a
+  // label and closed is muted + struck. This is a per-run frozen hint.
+  const mrState = mrChipState(run.mr_state);
   return (
     <li>
       <Link
@@ -42,7 +45,15 @@ function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
             {run.worker_name && <span>· {run.worker_name}</span>}
             {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
             <span>· {new Date(run.updated_at).toLocaleString()}</span>
-            {run.mr_iid != null && <span className="font-medium text-ok">· MR !{run.mr_iid}</span>}
+            {run.mr_iid != null && (
+              <span
+                className={cx("font-medium", mrState === "closed" ? "text-faint" : "text-ok")}
+                title={mrChipTitle(mrState)}
+              >
+                · MR <span className={mrState === "closed" ? "line-through" : undefined}>!{run.mr_iid}</span>
+                {mrChipSuffix(mrState)}
+              </span>
+            )}
           </p>
         </div>
         <div className="flex items-center gap-2">

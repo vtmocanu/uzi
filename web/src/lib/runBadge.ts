@@ -11,10 +11,43 @@ import { isTerminalRun, type LatestRun, type StopKind } from "./api";
 export type BadgeTone = "neutral" | "queue" | "warning" | "danger" | "info" | "ok";
 
 // RunBadge is a card's primary status pill. kind "mr" is the completed-with-MR
-// chip (rendered as a link to the merge request); kind "badge" is a plain pill.
+// chip (rendered as a link to the merge request), carrying the derived MR-state
+// variant; kind "badge" is a plain pill.
 export type RunBadge =
-  | { kind: "mr"; mrIid: number }
+  | { kind: "mr"; mrIid: number; mrState: MrChipState }
   | { kind: "badge"; label: string; tone: BadgeTone; pulse: boolean; title?: string };
+
+// MrChipState is the MR chip's display variant (PRD #33 Decision 2, multica's
+// derived-status pattern): the single enum every chip surface renders from, so raw
+// forge state strings never scatter through components.
+export type MrChipState = "open" | "merged" | "closed";
+
+// mrChipState collapses a run's frozen mr_state hint into that variant. Display-only:
+// only merged/closed get distinct rendering; opened / locked / unknown / NULL are
+// "open" — the chip exactly as before this change (success criterion 2). mr_state is
+// frozen per run and can be stale on a superseded run (only a stale "closed"
+// misleads; "merged" is terminal), so callers scope any freshness claim to the board
+// card and every surface's chip title says "as of last sync".
+export function mrChipState(mrState: string | null | undefined): MrChipState {
+  if (mrState === "merged") return "merged";
+  if (mrState === "closed") return "closed";
+  return "open";
+}
+
+// mrChipSuffix is the state word a chip appends after its "!N" — "" for open (so the
+// chip is unchanged, SC2), " merged" / " closed" otherwise. Shared by all five chip
+// surfaces so the wording is defined once.
+export function mrChipSuffix(state: MrChipState): string {
+  return state === "open" ? "" : ` ${state}`;
+}
+
+// mrChipTitle is the chip's hover title. merged/closed scope the claim to "as of
+// last sync" (Decision 1: mr_state is frozen per run and only best-effort fresh).
+export function mrChipTitle(state: MrChipState): string {
+  if (state === "merged") return "Merge request merged (as of last sync)";
+  if (state === "closed") return "Merge request closed unmerged (as of last sync)";
+  return "Open the merge request on GitLab";
+}
 
 // isStoppedRun folds the cancelled nuance (PRD §1): a deliberate human stop is not
 // breakage, so the board and RunsList style it calm/neutral, never rose. It reads
@@ -87,9 +120,10 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
         title: run.failure_reason ?? undefined,
       };
     case "completed":
-      // A completed run with an MR becomes a link chip (ok-accented); without one
-      // it must still be visible, so a plain ok "completed" badge stands in.
-      if (run.mr_iid != null) return { kind: "mr", mrIid: run.mr_iid };
+      // A completed run with an MR becomes a link chip (ok-accented), carrying the
+      // derived MR-state variant so the board card can show merged/closed; without
+      // an MR it must still be visible, so a plain ok "completed" badge stands in.
+      if (run.mr_iid != null) return { kind: "mr", mrIid: run.mr_iid, mrState: mrChipState(run.mr_state) };
       return { kind: "badge", label: "completed", tone: "ok", pulse: false };
     default:
       return { kind: "badge", label: run.status.replace(/_/g, " "), tone: "neutral", pulse: false };

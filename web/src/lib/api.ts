@@ -224,6 +224,11 @@ export interface LatestRun {
   id: string;
   status: RunStatus;
   mr_iid: number | null;
+  // Last merge-request state the PRD #24 watcher observed for mr_iid
+  // (opened|closed|merged|locked), null when never observed. Display-only hint
+  // (PRD #33): mrChipState maps it to the chip variant. Kept fresh only for the
+  // board card (the issue's latest run); a superseded run's value can be stale.
+  mr_state: string | null;
   failure_reason: string | null;
   // Server-stamped deliberate-stop signal (PRD #33); null for every non-stop run.
   // Read by isStoppedRun to render a stop as calm "stopped" instead of rose "failed".
@@ -398,6 +403,10 @@ export interface Run {
   worker_id: string | null;
   branch: string | null;
   mr_iid: number | null;
+  /** Last MR state the PRD #24 watcher observed for mr_iid
+   *  (opened|closed|merged|locked), null when never observed. Display-only hint
+   *  (PRD #33); frozen per run, so a superseded run's value can be stale. */
+  mr_state: string | null;
   failure_reason: string | null;
   /** Server-stamped deliberate-stop signal (PRD #33): "cancelled" or
    *  "plan_rejected", null otherwise. isStoppedRun reads this, not failure_reason. */

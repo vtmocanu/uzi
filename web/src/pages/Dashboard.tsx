@@ -8,6 +8,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type RunListItem } from "../lib/api";
+import { mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
@@ -231,7 +232,9 @@ export function Dashboard() {
           </p>
         ) : (
           <ul className="mt-2 divide-y divide-edge">
-            {recent.map((r) => (
+            {recent.map((r) => {
+              const mrState = mrChipState(r.mr_state);
+              return (
               <li key={r.id}>
                 <Link
                   to={`/runs/${r.id}`}
@@ -241,7 +244,15 @@ export function Dashboard() {
                     <p className="truncate text-sm font-medium text-fg">{r.issue_title}</p>
                     <p className="text-xs text-faint">
                       {r.repo_path} #{r.issue_iid}
-                      {r.mr_iid != null && <span className="ml-2 text-ok">MR !{r.mr_iid}</span>}
+                      {r.mr_iid != null && (
+                        <span
+                          className={cx("ml-2", mrState === "closed" ? "text-faint" : "text-ok")}
+                          title={mrChipTitle(mrState)}
+                        >
+                          MR <span className={mrState === "closed" ? "line-through" : undefined}>!{r.mr_iid}</span>
+                          {mrChipSuffix(mrState)}
+                        </span>
+                      )}
                     </p>
                   </div>
                   {r.iteration_count > 0 && (
@@ -252,7 +263,8 @@ export function Dashboard() {
                   <StatusPill status={r.status} />
                 </Link>
               </li>
-            ))}
+              );
+            })}
           </ul>
         )}
       </Card>
