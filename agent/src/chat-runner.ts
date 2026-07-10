@@ -99,8 +99,14 @@ export class ChatRunner {
     // The uzi tools MCP server (M3): bound to THIS run's client + run id, so
     // propose_issue can only ever propose on this chat run, and the read tools call
     // the worker-authenticated, user-scoped endpoints. Its tool names are added to
-    // the executor's `tools` allowlist so they are actually callable.
-    const uziTools = buildUziToolsServer({ client: this.client, runId, log: runLog });
+    // the executor's `tools` allowlist so they are actually callable. `emit` is the
+    // run's batcher so propose_issue can stream the proposal card (worker owns the seq).
+    const uziTools = buildUziToolsServer({
+      client: this.client,
+      runId,
+      emit: (m) => batcher.emit(m),
+      log: runLog,
+    });
 
     // Resolve this run's clocks: the claim config (server-pushed, no drift) wins over
     // the worker env defaults (Decision 3). Timeouts are delivered in SECONDS.

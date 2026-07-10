@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { makeUziToolHandlers, uziToolNames, wrapEvidence, UZI_TOOLS_SERVER_NAME } from "../src/uzi-tools.js";
 import { RequestError, type WorkerClient } from "../src/client.js";
+import type { EmittedMessage } from "../src/executor.js";
 import type { WorkerRunDetail, WorkerRunListItem, WorkerRunMessage, WorkerProposal } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
@@ -84,7 +85,13 @@ function fakeClient(over: {
   return { client, calls };
 }
 
-const handlers = (client: WorkerClient, runId = "chat-current") => makeUziToolHandlers({ client, runId, log: nullLogger() });
+/** Build handlers with an emit spy (default run id "chat-current"). */
+function handlersWith(client: WorkerClient, runId = "chat-current"): { h: ReturnType<typeof makeUziToolHandlers>; emits: EmittedMessage[] } {
+  const emits: EmittedMessage[] = [];
+  const h = makeUziToolHandlers({ client, runId, emit: (m) => emits.push(m), log: nullLogger() });
+  return { h, emits };
+}
+const handlers = (client: WorkerClient, runId = "chat-current") => handlersWith(client, runId).h;
 const bodyText = (r: { content: { text: string }[] }): string => r.content[0]!.text;
 
 describe("uzi tools — read surface", () => {
@@ -168,25 +175,61 @@ describe("uzi tools — propose_issue (Decision 8/10)", () => {
     assert.match(bodyText(res), /prop-1/);
   });
 
-  it("forwards repo_id only as a back-compat fallback when no path is given", async () => {
-    const { client, calls } = fakeClient();
-    await handlers(client).proposeIssue({ repo_id: "abc-123", title: "T" });
-    assert.strictEqual(calls.createProposal[0]!.body.repo_id, "abc-123");
-    assert.ok(!("repo_path" in calls.createProposal[0]!.body));
+  it("emits a `proposal` run_message card (the full IssueProposal payload, keyed on id) on success", async () => {
+    const { client } = fakeClient({
+      proposal: {
+        id: "prop-7", run_id: "chat-current", repo_id: "id-for-group/project", title: "Add dashboard",
+        description: "please", labels: ["PRD"], status: "pending", created_at: "2026-07-10T00:00:00Z",
+      },
+    });
+    const { h, emits } = handlersWith(client, "chat-current");
+    await h.proposeIssue({ repo_path: "group/project", title: "Add dashboard", description: "please", labels: ["PRD"] });
+
+    assert.strictEqual(emits.length, 1, "exactly one card emitted");
+    const card = emits[0]!;
+    assert.strictEqual(card.kind, "proposal");
+    // The web keys Create/Dismiss on payload.id and needs the full IssueProposal shape.
+    assert.deepStrictEqual(card.payload, {
+      id: "prop-7",
+      run_id: "chat-current",
+      repo_id: "id-for-group/project",
+      title: "Add dashboard",
+      description: "please",
+      labels: ["PRD"],
+      status: "pending",
+      created_at: "2026-07-10T00:00:00Z",
+      repo_path: "group/project", // worker-computed (the path the user saw)
+      created_issue_iid: null, // pending — no issue filed yet
+      created_issue_url: null,
+      resolved_at: null,
+    });
   });
 
-  it("asks for the repo instead of guessing when neither repo_path nor repo_id is given", async () => {
+  it("forwards repo_id only as a back-compat fallback when no path is given (card repo_path empty)", async () => {
     const { client, calls } = fakeClient();
-    const res = await handlers(client).proposeIssue({ title: "T" });
+    const { h, emits } = handlersWith(client);
+    await h.proposeIssue({ repo_id: "abc-123", title: "T" });
+    assert.strictEqual(calls.createProposal[0]!.body.repo_id, "abc-123");
+    assert.ok(!("repo_path" in calls.createProposal[0]!.body));
+    assert.strictEqual((emits[0]!.payload as { repo_path?: string }).repo_path, "", "no path known → empty repo_path (unresolved)");
+  });
+
+  it("asks for the repo instead of guessing when neither repo_path nor repo_id is given (no card)", async () => {
+    const { client, calls } = fakeClient();
+    const { h, emits } = handlersWith(client);
+    const res = await h.proposeIssue({ title: "T" });
     assert.strictEqual(calls.createProposal.length, 0, "no forge-adjacent call without a repo");
+    assert.strictEqual(emits.length, 0, "no card emitted when nothing was proposed");
     assert.strictEqual(res.isError, true);
     assert.match(bodyText(res), /needs the target repo/);
   });
 
-  it("surfaces the per-run proposal cap (409) as guidance", async () => {
+  it("surfaces the per-run proposal cap (409) as guidance and emits NO card", async () => {
     const { client } = fakeClient({ proposalThrows: new RequestError("POST", "/x", 409, "too many pending proposals") });
-    const res = await handlers(client).proposeIssue({ repo_path: "g/p", title: "T" });
+    const { h, emits } = handlersWith(client);
+    const res = await h.proposeIssue({ repo_path: "g/p", title: "T" });
     assert.strictEqual(res.isError, true);
+    assert.strictEqual(emits.length, 0, "a failed create must not leave a phantom card in the feed");
     assert.match(bodyText(res), /too many pending proposals/);
   });
 });

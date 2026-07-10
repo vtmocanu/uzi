@@ -29,6 +29,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { z } from "zod";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
+import type { EmittedMessage } from "./executor.js";
 import type { Logger } from "./log.js";
 import { errMessage } from "./util.js";
 
@@ -96,6 +97,10 @@ export interface UziToolsDeps {
   client: WorkerClient;
   /** The CURRENT chat run id — propose_issue targets ONLY this run (never arbitrary). */
   runId: string;
+  /** Append a run message to the live stream (the worker's batcher — worker owns the
+   *  gapless seq). propose_issue emits the `proposal` CARD through this so the browser
+   *  renders Create/Dismiss; without it the proposal never reaches the UI. */
+  emit(msg: EmittedMessage): void;
   log: Logger;
 }
 
@@ -115,7 +120,7 @@ export interface UziToolHandlers {
 }
 
 export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
-  const { client, runId, log } = deps;
+  const { client, runId, emit, log } = deps;
   return {
     async listRuns(args) {
       try {
@@ -159,6 +164,21 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
           title: args.title,
           description: args.description ?? "",
           labels: args.labels ?? [],
+        });
+        // Emit the proposal CARD to the live stream (worker owns the seq). The browser
+        // renders Create/Dismiss keyed on payload.id; without this emit the proposal
+        // would only reach the model, never the UI (the card contract). The pending
+        // proposal has no created issue yet; repo_path is the human path the user saw
+        // (server-resolved to repo_id on success), empty only if a bare repo_id was used.
+        emit({
+          kind: "proposal",
+          payload: {
+            ...proposal,
+            repo_path: args.repo_path ?? "",
+            created_issue_iid: null,
+            created_issue_url: null,
+            resolved_at: null,
+          },
         });
         return asText(
           `Drafted issue proposal ${proposal.id} (status: ${proposal.status}) titled "${proposal.title}"` +

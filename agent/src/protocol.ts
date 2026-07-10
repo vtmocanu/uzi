@@ -23,7 +23,8 @@ export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
   "failed",
 ]);
 
-/** run_messages.kind (PRD #4 §Schema). */
+/** run_messages.kind (PRD #4 §Schema; PRD #39 adds user_message + proposal — the
+ *  DB column carries no CHECK, so these need no migration, Decision 8/D12). */
 export type MessageKind =
   | "text"
   | "thinking"
@@ -32,7 +33,8 @@ export type MessageKind =
   | "status"
   | "error"
   | "user_message"
-  | "plan";
+  | "plan"
+  | "proposal";
 
 /** run_user_inputs.kind (PRD #4 §Schema). */
 export type InputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
