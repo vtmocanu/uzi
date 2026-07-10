@@ -213,6 +213,66 @@ func TestConfirmProposalRaceIsNotPending(t *testing.T) {
 	}
 }
 
+// TestClaimProposalForConfirmDistinguishesNotFoundVsNotPending: the claim's 0-row
+// path does one follow-up read to tell a genuinely absent/foreign proposal (404)
+// from one that exists but is no longer pending (409).
+func TestClaimProposalForConfirmDistinguishesNotFoundVsNotPending(t *testing.T) {
+	uid, runID, propID := uuid.New(), uuid.New(), uuid.New()
+
+	// Claim wins → returns the row.
+	won := &fakeStore{claimProposalRow: store.ClaimProposalForConfirmRow{ID: propID, Title: "t"}}
+	if _, err := New(won, newBox(t), testParams()).ClaimProposalForConfirm(context.Background(), uid, runID, propID); err != nil {
+		t.Fatalf("winning claim: %v", err)
+	}
+
+	// Claim 0-row + follow-up read finds nothing → ErrProposalNotFound (404).
+	gone := &fakeStore{claimProposalErr: pgx.ErrNoRows, getChatProposalErr: pgx.ErrNoRows}
+	if _, err := New(gone, newBox(t), testParams()).ClaimProposalForConfirm(context.Background(), uid, runID, propID); !errors.Is(err, ErrProposalNotFound) {
+		t.Fatalf("absent proposal err = %v, want ErrProposalNotFound", err)
+	}
+
+	// Claim 0-row + follow-up read finds a (non-pending) row → ErrProposalNotPending (409).
+	resolved := &fakeStore{claimProposalErr: pgx.ErrNoRows, getChatProposalRow: store.GetChatProposalForConfirmRow{ID: propID, Status: "confirmed"}}
+	if _, err := New(resolved, newBox(t), testParams()).ClaimProposalForConfirm(context.Background(), uid, runID, propID); !errors.Is(err, ErrProposalNotPending) {
+		t.Fatalf("resolved proposal err = %v, want ErrProposalNotPending", err)
+	}
+}
+
+// TestCreateProposalGuards: proposal creation rejects a non-chat target, a terminal
+// chat, and a run already at the per-run pending cap.
+func TestCreateProposalGuards(t *testing.T) {
+	uid, runID, repoID := uuid.New(), uuid.New(), uuid.New()
+	wkr := store.Worker{ID: uuid.New(), UserID: uid}
+	labels := []byte(`[]`)
+
+	// Non-chat target → ErrProposalRunNotChat.
+	nonChat := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindIssue, Status: "running"}}
+	if _, err := New(nonChat, newBox(t), testParams()).CreateProposal(context.Background(), wkr, runID, repoID, "t", "d", labels); !errors.Is(err, ErrProposalRunNotChat) {
+		t.Fatalf("non-chat target err = %v, want ErrProposalRunNotChat", err)
+	}
+
+	// Terminal chat → ErrRunTerminal.
+	terminal := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindChat, Status: "completed"}}
+	if _, err := New(terminal, newBox(t), testParams()).CreateProposal(context.Background(), wkr, runID, repoID, "t", "d", labels); !errors.Is(err, ErrRunTerminal) {
+		t.Fatalf("terminal chat err = %v, want ErrRunTerminal", err)
+	}
+
+	// At the per-run pending cap → ErrProposalCapReached.
+	capped := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindChat, Status: "running"}, pendingProposalCount: MaxPendingProposalsPerRun}
+	if _, err := New(capped, newBox(t), testParams()).CreateProposal(context.Background(), wkr, runID, repoID, "t", "d", labels); !errors.Is(err, ErrProposalCapReached) {
+		t.Fatalf("capped err = %v, want ErrProposalCapReached", err)
+	}
+
+	// Happy path → a proposal is created.
+	ok := &fakeStore{runByID: store.Run{ID: runID, UserID: uid, Kind: RunKindChat, Status: "running"}, pendingProposalCount: 2}
+	if _, err := New(ok, newBox(t), testParams()).CreateProposal(context.Background(), wkr, runID, repoID, "t", "d", labels); err != nil {
+		t.Fatalf("valid CreateProposal: %v", err)
+	}
+	if ok.createdProposal == nil || ok.createdProposal.RunID != runID {
+		t.Fatalf("a valid proposal must be created, got %v", ok.createdProposal)
+	}
+}
+
 // TestSweepCompletesIdleChats: the sweep completes chat runs the idle-chat query
 // returns, fanning each transition out (the not-trusting-the-worker backstop).
 func TestSweepCompletesIdleChats(t *testing.T) {

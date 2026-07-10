@@ -364,6 +364,9 @@ func run() error {
 	slackDMLimiter := mw.NewLimiter(cfg.SlackDMRateLimitMax, cfg.SlackDMRateLimitWindow, cfg.TrustedProxies)
 	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
 	chatLimiter := mw.NewLimiter(cfg.ChatRateLimitMax, cfg.ChatRateLimitWindow, cfg.TrustedProxies)
+	// Per-worker budget on the propose_issue endpoint (PRD #39 M3): a proposal-spam
+	// guard complementing the per-run pending cap.
+	proposalLimiter := mw.NewLimiter(cfg.ProposalRateLimitMax, cfg.ProposalRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// The settings PUT handler asks the poller to full-sync every repo when a label
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
@@ -382,7 +385,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter),
+		Handler:           h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

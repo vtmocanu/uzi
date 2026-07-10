@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -195,15 +196,20 @@ func (h *Handler) ConfirmProposal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	prop, err := h.wsvc.GetChatProposal(r.Context(), userID, runID, propID)
+	// Claim-first (M3, audit Minor #1): atomically move the proposal pending ->
+	// confirming BEFORE the forge write, so of two concurrent confirms exactly one
+	// reaches CreateIssue (the other 409s). Every failure after this claim reverts
+	// the row to pending so the user can retry or dismiss.
+	claim, err := h.wsvc.ClaimProposalForConfirm(r.Context(), userID, runID, propID)
 	if err != nil {
 		h.writeProposalLookupError(w, err)
 		return
 	}
 
 	// Load the target repo + its connection PAT (the user must still own it).
-	repo, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: prop.RepoID, UserID: userID})
+	repo, err := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: claim.RepoID, UserID: userID})
 	if err != nil {
+		h.revertProposal(r.Context(), propID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			httpx.Error(w, http.StatusNotFound, "the proposal's target repo is no longer available")
 			return
@@ -215,40 +221,46 @@ func (h *Handler) ConfirmProposal(w http.ResponseWriter, r *http.Request) {
 
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
+		h.revertProposal(r.Context(), propID)
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	var labels []string
-	if len(prop.Labels) > 0 {
-		if err := json.Unmarshal(prop.Labels, &labels); err != nil {
+	if len(claim.Labels) > 0 {
+		if err := json.Unmarshal(claim.Labels, &labels); err != nil {
 			labels = nil
 		}
 	}
 
-	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, prop.Title, prop.Description, labels)
+	created, err := f.CreateIssue(r.Context(), repo.ForgeProjectID, claim.Title, claim.Description, labels)
 	if err != nil {
+		h.revertProposal(r.Context(), propID)
 		// err is already PAT-redacted by the driver.
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
 		return
 	}
 
-	// Record the proposal as confirmed. A lost race (a concurrent confirm/dismiss
-	// won between GetChatProposal and here) is rare behind the human-clicked,
-	// rate-limited confirm; the issue was still created, so surface it rather than
-	// dropping it, and log the race for the owner's audit trail.
+	// Settle confirming -> confirmed with the created iid. This row is ours (we hold
+	// the claim), so a non-nil error here is unexpected; the issue WAS created, so
+	// surface it and log rather than revert (reverting would orphan the real issue).
 	if err := h.wsvc.ConfirmProposal(r.Context(), propID, created.IID); err != nil {
-		if errors.Is(err, workersvc.ErrProposalNotPending) {
-			slog.Warn("confirm proposal: raced after issue creation", "proposal", propID.String(), "issue_iid", created.IID, "issue_url", created.WebURL)
-		} else {
-			slog.Error("confirm proposal: mark confirmed", "error", err)
-		}
+		slog.Error("confirm proposal: mark confirmed after issue creation", "proposal", propID.String(), "issue_iid", created.IID, "error", err)
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"issue": createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
 	})
+}
+
+// revertProposal best-effort returns a claimed proposal to pending after a
+// post-claim failure; a revert error is logged but never changes the response the
+// user already gets for the underlying failure.
+func (h *Handler) revertProposal(ctx context.Context, propID uuid.UUID) {
+	if err := h.wsvc.RevertProposalToPending(ctx, propID); err != nil {
+		slog.Error("confirm proposal: revert to pending", "proposal", propID.String(), "error", err)
+	}
 }
 
 // DismissProposal marks a proposal dismissed. It NEVER touches the forge

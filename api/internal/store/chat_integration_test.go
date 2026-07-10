@@ -200,30 +200,86 @@ func TestChatRunsLiveDB(t *testing.T) {
 		t.Fatalf("chat list must sort by last activity (activeChat first), got first=%v", list[0].ID)
 	}
 
-	// ── proposals: user-scoped lookup + confirm/dismiss idempotency guards ──
-	propID := uuid.New()
-	mustExec(ctx, t, pool,
-		`INSERT INTO issue_proposals (id, run_id, repo_id, title, description) VALUES ($1, $2, $3, 'Add a job', 'desc')`,
-		propID, freshChat.ID, repoID)
+	// ── proposals (M3): creation + per-run count + claim-first confirm + revert ──
+	p1, err := q.CreateIssueProposal(ctx, store.CreateIssueProposalParams{
+		RunID: freshChat.ID, RepoID: repoID, Title: "Add a job", Description: "desc", Labels: []byte(`["enhancement"]`),
+	})
+	if err != nil {
+		t.Fatalf("CreateIssueProposal: %v", err)
+	}
+	if p1.Status != "pending" {
+		t.Fatalf("a new proposal must be pending, got %q", p1.Status)
+	}
+	if n, err := q.CountPendingProposalsForRun(ctx, freshChat.ID); err != nil || n != 1 {
+		t.Fatalf("CountPendingProposalsForRun = %d, %v; want 1", n, err)
+	}
 
-	// Owner sees it; a foreign user does not.
-	if _, err := q.GetChatProposalForConfirm(ctx, store.GetChatProposalForConfirmParams{ID: propID, RunID: freshChat.ID, UserID: userID}); err != nil {
-		t.Fatalf("owner GetChatProposalForConfirm: %v", err)
-	}
-	if _, err := q.GetChatProposalForConfirm(ctx, store.GetChatProposalForConfirmParams{ID: propID, RunID: freshChat.ID, UserID: uuid.New()}); err != pgx.ErrNoRows {
-		t.Fatalf("a foreign user must not read another user's proposal, got %v", err)
+	// A foreign user cannot claim it (user-scoped through the chat run).
+	if _, err := q.ClaimProposalForConfirm(ctx, store.ClaimProposalForConfirmParams{ID: p1.ID, RunID: freshChat.ID, UserID: uuid.New()}); err != pgx.ErrNoRows {
+		t.Fatalf("a foreign user must not claim another user's proposal, got %v", err)
 	}
 
-	// Confirm once stamps the iid; a second confirm touches nothing.
-	if _, err := q.MarkProposalConfirmed(ctx, store.MarkProposalConfirmedParams{ID: propID, CreatedIssueIid: pgtype.Int8{Int64: 99, Valid: true}}); err != nil {
-		t.Fatalf("MarkProposalConfirmed: %v", err)
+	// Claim-first: the FIRST claim wins (pending -> confirming) and returns the draft;
+	// a second (concurrent) claim matches no pending row -> the confirm-side race guard.
+	claim, err := q.ClaimProposalForConfirm(ctx, store.ClaimProposalForConfirmParams{ID: p1.ID, RunID: freshChat.ID, UserID: userID})
+	if err != nil {
+		t.Fatalf("ClaimProposalForConfirm: %v", err)
 	}
-	if _, err := q.MarkProposalConfirmed(ctx, store.MarkProposalConfirmedParams{ID: propID, CreatedIssueIid: pgtype.Int8{Int64: 100, Valid: true}}); err != pgx.ErrNoRows {
-		t.Fatalf("a second confirm must be a no-op (already resolved), got %v", err)
+	if claim.Title != "Add a job" || claim.RepoID != repoID {
+		t.Fatalf("claim must return the draft + repo, got %+v", claim)
 	}
-	// Dismiss on an already-resolved proposal is a no-op.
-	if _, err := q.MarkProposalDismissed(ctx, propID); err != pgx.ErrNoRows {
+	if _, err := q.ClaimProposalForConfirm(ctx, store.ClaimProposalForConfirmParams{ID: p1.ID, RunID: freshChat.ID, UserID: userID}); err != pgx.ErrNoRows {
+		t.Fatalf("a second claim must match no pending row (claim-first race guard), got %v", err)
+	}
+	// A claimed (confirming) proposal no longer counts as pending.
+	if n, _ := q.CountPendingProposalsForRun(ctx, freshChat.ID); n != 0 {
+		t.Fatalf("a claimed (confirming) proposal must not count as pending, got %d", n)
+	}
+	// Settle confirming -> confirmed; then it can't be claimed, reverted, or dismissed.
+	if _, err := q.MarkProposalConfirmed(ctx, store.MarkProposalConfirmedParams{ID: p1.ID, CreatedIssueIid: pgtype.Int8{Int64: 99, Valid: true}}); err != nil {
+		t.Fatalf("MarkProposalConfirmed from confirming: %v", err)
+	}
+	if n, err := q.RevertProposalToPending(ctx, p1.ID); err != nil || n != 0 {
+		t.Fatalf("revert of a confirmed proposal must touch 0 rows, got n=%d err=%v", n, err)
+	}
+	if _, err := q.MarkProposalDismissed(ctx, p1.ID); err != pgx.ErrNoRows {
 		t.Fatalf("dismiss of a confirmed proposal must be a no-op, got %v", err)
+	}
+
+	// Revert path: a claimed proposal reverts to pending and is claimable again (the
+	// forge-failure retry path).
+	p2, _ := q.CreateIssueProposal(ctx, store.CreateIssueProposalParams{RunID: freshChat.ID, RepoID: repoID, Title: "t2", Description: "d2", Labels: []byte(`[]`)})
+	if _, err := q.ClaimProposalForConfirm(ctx, store.ClaimProposalForConfirmParams{ID: p2.ID, RunID: freshChat.ID, UserID: userID}); err != nil {
+		t.Fatalf("claim p2: %v", err)
+	}
+	if n, err := q.RevertProposalToPending(ctx, p2.ID); err != nil || n != 1 {
+		t.Fatalf("revert of a confirming proposal must touch 1 row, got n=%d err=%v", n, err)
+	}
+	if _, err := q.ClaimProposalForConfirm(ctx, store.ClaimProposalForConfirmParams{ID: p2.ID, RunID: freshChat.ID, UserID: userID}); err != nil {
+		t.Fatalf("a reverted proposal must be claimable again: %v", err)
+	}
+
+	// ── worker chat reads (M3): user_id-scoped, foreign id -> no row ──
+	wruns, err := q.ListRunsForWorkerUser(ctx, store.ListRunsForWorkerUserParams{UserID: userID, Lim: 50})
+	if err != nil {
+		t.Fatalf("ListRunsForWorkerUser: %v", err)
+	}
+	if len(wruns) == 0 {
+		t.Fatalf("worker run list must include the user's runs")
+	}
+	if foreign, _ := q.ListRunsForWorkerUser(ctx, store.ListRunsForWorkerUserParams{UserID: uuid.New(), Lim: 50}); len(foreign) != 0 {
+		t.Fatalf("a foreign user's worker run list must be empty, got %d", len(foreign))
+	}
+	if _, err := q.GetRunForWorkerUser(ctx, store.GetRunForWorkerUserParams{ID: issueRun.ID, UserID: userID}); err != nil {
+		t.Fatalf("GetRunForWorkerUser(own issue run): %v", err)
+	}
+	if _, err := q.GetRunForWorkerUser(ctx, store.GetRunForWorkerUserParams{ID: issueRun.ID, UserID: uuid.New()}); err != pgx.ErrNoRows {
+		t.Fatalf("GetRunForWorkerUser for a foreign user must be no row, got %v", err)
+	}
+	// activeChat has one run_message; the bounded page returns it.
+	page, err := q.ListRunMessagesForWorkerPage(ctx, store.ListRunMessagesForWorkerPageParams{RunID: activeChat.ID, AfterSeq: 0, Lim: 200})
+	if err != nil || len(page) != 1 {
+		t.Fatalf("ListRunMessagesForWorkerPage = %d msgs, %v; want 1", len(page), err)
 	}
 }
 

@@ -684,6 +684,67 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 	return i, err
 }
 
+const getRunForWorkerUser = `-- name: GetRunForWorkerUser :one
+SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r.mr_state,
+       r.failure_reason, r.stop_kind, r.fix_verdict, r.iteration_count, r.plan_md,
+       r.created_at, r.updated_at,
+       rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.id = $1 AND r.user_id = $2
+`
+
+type GetRunForWorkerUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type GetRunForWorkerUserRow struct {
+	ID             uuid.UUID          `json:"id"`
+	Kind           string             `json:"kind"`
+	Status         string             `json:"status"`
+	IssueIid       pgtype.Int8        `json:"issue_iid"`
+	IssueTitle     string             `json:"issue_title"`
+	Branch         pgtype.Text        `json:"branch"`
+	MrIid          pgtype.Int8        `json:"mr_iid"`
+	MrState        pgtype.Text        `json:"mr_state"`
+	FailureReason  pgtype.Text        `json:"failure_reason"`
+	StopKind       pgtype.Text        `json:"stop_kind"`
+	FixVerdict     pgtype.Text        `json:"fix_verdict"`
+	IterationCount int32              `json:"iteration_count"`
+	PlanMd         pgtype.Text        `json:"plan_md"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	RepoPath       pgtype.Text        `json:"repo_path"`
+	RepoWebUrl     pgtype.Text        `json:"repo_web_url"`
+}
+
+// One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
+func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUserParams) (GetRunForWorkerUserRow, error) {
+	row := q.db.QueryRow(ctx, getRunForWorkerUser, arg.ID, arg.UserID)
+	var i GetRunForWorkerUserRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Status,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.Branch,
+		&i.MrIid,
+		&i.MrState,
+		&i.FailureReason,
+		&i.StopKind,
+		&i.FixVerdict,
+		&i.IterationCount,
+		&i.PlanMd,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.RepoPath,
+		&i.RepoWebUrl,
+	)
+	return i, err
+}
+
 const getRunMoveContext = `-- name: GetRunMoveContext :one
 
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
@@ -1205,6 +1266,51 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 	return items, nil
 }
 
+const listRunMessagesForWorkerPage = `-- name: ListRunMessagesForWorkerPage :many
+SELECT id, run_id, seq, kind, agent, payload, created_at
+FROM run_messages
+WHERE run_id = $1 AND seq > $2
+ORDER BY seq ASC
+LIMIT $3
+`
+
+type ListRunMessagesForWorkerPageParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	AfterSeq int32     `json:"after_seq"`
+	Lim      int32     `json:"lim"`
+}
+
+// A bounded page of a run's messages after a seq (the worker read tool's paging).
+// Authorization (the run is the worker's user's) is checked by the caller before
+// this; here @lim caps the page so a single response can't be unbounded.
+func (q *Queries) ListRunMessagesForWorkerPage(ctx context.Context, arg ListRunMessagesForWorkerPageParams) ([]RunMessage, error) {
+	rows, err := q.db.Query(ctx, listRunMessagesForWorkerPage, arg.RunID, arg.AfterSeq, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunMessage{}
+	for rows.Next() {
+		var i RunMessage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Seq,
+			&i.Kind,
+			&i.Agent,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.title, r.resume_of_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
@@ -1283,6 +1389,78 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.ResumeOfRunID,
 			&i.RepoPath,
 			&i.WorkerName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunsForWorkerUser = `-- name: ListRunsForWorkerUser :many
+
+SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
+       r.failure_reason, r.created_at, r.updated_at,
+       rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.user_id = $1
+ORDER BY r.created_at DESC
+LIMIT $2
+`
+
+type ListRunsForWorkerUserParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Lim    int32     `json:"lim"`
+}
+
+type ListRunsForWorkerUserRow struct {
+	ID            uuid.UUID          `json:"id"`
+	Kind          string             `json:"kind"`
+	Status        string             `json:"status"`
+	IssueIid      pgtype.Int8        `json:"issue_iid"`
+	IssueTitle    string             `json:"issue_title"`
+	Branch        pgtype.Text        `json:"branch"`
+	MrIid         pgtype.Int8        `json:"mr_iid"`
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	RepoPath      pgtype.Text        `json:"repo_path"`
+	RepoWebUrl    pgtype.Text        `json:"repo_web_url"`
+}
+
+// Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
+// The chat agent investigates its OWNER'S runs (both kinds) via the worker. These
+// queries are USER_ID-scoped (from the authenticated worker), NEVER a bare run_id
+// lookup — a compromised worker still reads only its own user's runs, and a foreign
+// run id simply returns no row (404). repo_web_url rides along so the handler can
+// build the MR URL; a chat run has no repo, so repo fields are NULL (LEFT JOIN).
+// Compact list of the worker's user's runs, newest first, bounded by @lim.
+func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWorkerUserParams) ([]ListRunsForWorkerUserRow, error) {
+	rows, err := q.db.Query(ctx, listRunsForWorkerUser, arg.UserID, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunsForWorkerUserRow{}
+	for rows.Next() {
+		var i ListRunsForWorkerUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Status,
+			&i.IssueIid,
+			&i.IssueTitle,
+			&i.Branch,
+			&i.MrIid,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.RepoPath,
+			&i.RepoWebUrl,
 		); err != nil {
 			return nil, err
 		}

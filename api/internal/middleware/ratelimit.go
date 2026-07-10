@@ -119,6 +119,33 @@ func (l *Limiter) PerUserMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// PerWorkerMiddleware limits by (route pattern, authenticated worker id). It MUST
+// run after RequireWorker (which sets the worker in context). Used on the worker's
+// proposal-creation endpoint so a single (possibly prompt-injected) worker cannot
+// mass-create proposal rows across its user's chat runs, complementing the per-run
+// pending cap. Falls back to the client IP if no worker is in context (should not
+// happen post-auth).
+func (l *Limiter) PerWorkerMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pattern := chi.RouteContext(r.Context()).RoutePattern()
+		if pattern == "" {
+			pattern = r.URL.Path
+		}
+		var who string
+		if wkr, ok := WorkerFromContext(r.Context()); ok {
+			who = wkr.ID.String()
+		} else {
+			who = ClientIP(r, l.trustedProxies)
+		}
+		if !l.allow(pattern + "|" + who) {
+			w.Header().Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
+			httpx.Error(w, http.StatusTooManyRequests, "too many requests")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ClientIP determines the real client IP. It honors X-Forwarded-For ONLY when
 // the direct connection (RemoteAddr) comes from a trusted proxy CIDR — our
 // nginx overwrites XFF with $remote_addr, so behind nginx the trusted hop

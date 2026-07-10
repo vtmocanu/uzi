@@ -137,6 +137,28 @@ type fakeStore struct {
 	markedProposalConfirm *store.MarkProposalConfirmedParams
 	proposalDismissErr    error
 	proposalConfirmErr    error
+
+	// M3 (PRD #39): proposal creation + claim-first confirm.
+	claimProposalRow     store.ClaimProposalForConfirmRow
+	claimProposalErr     error
+	getChatProposalRow   store.GetChatProposalForConfirmRow
+	getChatProposalErr   error
+	pendingProposalCount int64
+	createdProposal      *store.CreateIssueProposalParams
+}
+
+func (f *fakeStore) ClaimProposalForConfirm(context.Context, store.ClaimProposalForConfirmParams) (store.ClaimProposalForConfirmRow, error) {
+	return f.claimProposalRow, f.claimProposalErr
+}
+func (f *fakeStore) GetChatProposalForConfirm(context.Context, store.GetChatProposalForConfirmParams) (store.GetChatProposalForConfirmRow, error) {
+	return f.getChatProposalRow, f.getChatProposalErr
+}
+func (f *fakeStore) CountPendingProposalsForRun(context.Context, uuid.UUID) (int64, error) {
+	return f.pendingProposalCount, nil
+}
+func (f *fakeStore) CreateIssueProposal(_ context.Context, arg store.CreateIssueProposalParams) (store.IssueProposal, error) {
+	f.createdProposal = &arg
+	return store.IssueProposal{ID: uuid.New(), RunID: arg.RunID, RepoID: arg.RepoID, Title: arg.Title, Status: "pending"}, nil
 }
 
 func (f *fakeStore) ClaimChatRun(_ context.Context, arg store.ClaimChatRunParams) (store.Run, error) {

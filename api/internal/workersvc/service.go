@@ -129,6 +129,15 @@ type Store interface {
 	GetChatProposalForConfirm(ctx context.Context, arg store.GetChatProposalForConfirmParams) (store.GetChatProposalForConfirmRow, error)
 	MarkProposalConfirmed(ctx context.Context, arg store.MarkProposalConfirmedParams) (store.IssueProposal, error)
 	MarkProposalDismissed(ctx context.Context, id uuid.UUID) (store.IssueProposal, error)
+	// M3 (PRD #39): proposal creation (worker) + claim-first confirm + the worker's
+	// user_id-scoped chat read surface.
+	CreateIssueProposal(ctx context.Context, arg store.CreateIssueProposalParams) (store.IssueProposal, error)
+	CountPendingProposalsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
+	ClaimProposalForConfirm(ctx context.Context, arg store.ClaimProposalForConfirmParams) (store.ClaimProposalForConfirmRow, error)
+	RevertProposalToPending(ctx context.Context, id uuid.UUID) (int64, error)
+	ListRunsForWorkerUser(ctx context.Context, arg store.ListRunsForWorkerUserParams) ([]store.ListRunsForWorkerUserRow, error)
+	GetRunForWorkerUser(ctx context.Context, arg store.GetRunForWorkerUserParams) (store.GetRunForWorkerUserRow, error)
+	ListRunMessagesForWorkerPage(ctx context.Context, arg store.ListRunMessagesForWorkerPageParams) ([]store.RunMessage, error)
 
 	// Cross-cutting reads for run creation + claim.
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)

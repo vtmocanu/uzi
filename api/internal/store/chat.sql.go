@@ -86,6 +86,49 @@ func (q *Queries) ClaimChatRun(ctx context.Context, arg ClaimChatRunParams) (Run
 	return i, err
 }
 
+const claimProposalForConfirm = `-- name: ClaimProposalForConfirm :one
+UPDATE issue_proposals p SET status = 'confirming'
+FROM runs r
+WHERE p.id = $1 AND p.run_id = $2 AND p.status = 'pending'
+  AND r.id = p.run_id AND r.user_id = $3 AND r.kind = 'chat'
+RETURNING p.id, p.run_id, p.repo_id, p.title, p.description, p.labels
+`
+
+type ClaimProposalForConfirmParams struct {
+	ID     uuid.UUID `json:"id"`
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type ClaimProposalForConfirmRow struct {
+	ID          uuid.UUID `json:"id"`
+	RunID       uuid.UUID `json:"run_id"`
+	RepoID      uuid.UUID `json:"repo_id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Labels      []byte    `json:"labels"`
+}
+
+// Claim-first confirmation, phase 1 (PRD #39 M3, audit Minor #1): atomically move a
+// PENDING proposal to 'confirming' BEFORE the forge CreateIssue, user-scoped through
+// the owning chat run. The status='pending' guard + row lock make this the single
+// serialization point: of two concurrent confirms exactly one flips pending ->
+// confirming (and reaches the forge); the other matches 0 rows -> 409. Returns the
+// draft the handler writes to the forge.
+func (q *Queries) ClaimProposalForConfirm(ctx context.Context, arg ClaimProposalForConfirmParams) (ClaimProposalForConfirmRow, error) {
+	row := q.db.QueryRow(ctx, claimProposalForConfirm, arg.ID, arg.RunID, arg.UserID)
+	var i ClaimProposalForConfirmRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.RepoID,
+		&i.Title,
+		&i.Description,
+		&i.Labels,
+	)
+	return i, err
+}
+
 const countChatFollowUps = `-- name: CountChatFollowUps :one
 SELECT count(*) FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'follow_up'
@@ -97,6 +140,20 @@ WHERE run_id = $1 AND kind = 'follow_up'
 // spend past the cap even if it ignores its own worker-side counter.
 func (q *Queries) CountChatFollowUps(ctx context.Context, runID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countChatFollowUps, runID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countPendingProposalsForRun = `-- name: CountPendingProposalsForRun :one
+SELECT count(*) FROM issue_proposals WHERE run_id = $1 AND status = 'pending'
+`
+
+// Per-run pending-proposal cap (Decision 7/8): a prompt-injected loop can mass-create
+// inert proposal rows, so proposal creation is refused once a run already holds this
+// many pending (unresolved) proposals.
+func (q *Queries) CountPendingProposalsForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countPendingProposalsForRun, runID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -253,6 +310,48 @@ func (q *Queries) CreateChatRun(ctx context.Context, arg CreateChatRunParams) (R
 	return i, err
 }
 
+const createIssueProposal = `-- name: CreateIssueProposal :one
+INSERT INTO issue_proposals (run_id, repo_id, title, description, labels)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, run_id, repo_id, title, description, labels, status, created_issue_iid, created_at, resolved_at
+`
+
+type CreateIssueProposalParams struct {
+	RunID       uuid.UUID `json:"run_id"`
+	RepoID      uuid.UUID `json:"repo_id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Labels      []byte    `json:"labels"`
+}
+
+// The worker's propose_issue tool creates a PENDING proposal (PRD #39 M3, Decision
+// 8). It NEVER touches the forge — only the browser's confirm does. The handler has
+// already verified the target run is the worker's user's chat run and repo_id is a
+// repo they own, and enforced the per-run pending cap. labels is a JSON array.
+func (q *Queries) CreateIssueProposal(ctx context.Context, arg CreateIssueProposalParams) (IssueProposal, error) {
+	row := q.db.QueryRow(ctx, createIssueProposal,
+		arg.RunID,
+		arg.RepoID,
+		arg.Title,
+		arg.Description,
+		arg.Labels,
+	)
+	var i IssueProposal
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.RepoID,
+		&i.Title,
+		&i.Description,
+		&i.Labels,
+		&i.Status,
+		&i.CreatedIssueIid,
+		&i.CreatedAt,
+		&i.ResolvedAt,
+	)
+	return i, err
+}
+
 const getChatProposalForConfirm = `-- name: GetChatProposalForConfirm :one
 
 SELECT p.id, p.run_id, p.repo_id, p.title, p.description, p.labels, p.status, p.created_issue_iid
@@ -379,7 +478,7 @@ func (q *Queries) ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]
 
 const markProposalConfirmed = `-- name: MarkProposalConfirmed :one
 UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = $1, resolved_at = now()
-WHERE id = $2 AND status = 'pending'
+WHERE id = $2 AND status = 'confirming'
 RETURNING id, run_id, repo_id, title, description, labels, status, created_issue_iid, created_at, resolved_at
 `
 
@@ -388,9 +487,9 @@ type MarkProposalConfirmedParams struct {
 	ID              uuid.UUID   `json:"id"`
 }
 
-// Confirm a proposal AFTER the forge CreateIssue succeeded, stamping the created
-// issue iid. Guarded on status='pending' so a double-confirm (or a race with a
-// dismiss) touches nothing (0 rows) rather than re-opening a second issue.
+// Claim-first confirmation, phase 2: stamp the created issue iid AFTER the forge
+// CreateIssue succeeded. Guarded on status='confirming' (the state ClaimProposalForConfirm
+// left it in), so it only ever settles a proposal this same flow claimed.
 func (q *Queries) MarkProposalConfirmed(ctx context.Context, arg MarkProposalConfirmedParams) (IssueProposal, error) {
 	row := q.db.QueryRow(ctx, markProposalConfirmed, arg.CreatedIssueIid, arg.ID)
 	var i IssueProposal
@@ -433,6 +532,22 @@ func (q *Queries) MarkProposalDismissed(ctx context.Context, id uuid.UUID) (Issu
 		&i.ResolvedAt,
 	)
 	return i, err
+}
+
+const revertProposalToPending = `-- name: RevertProposalToPending :execrows
+UPDATE issue_proposals SET status = 'pending'
+WHERE id = $1 AND status = 'confirming'
+`
+
+// Claim-first confirmation, failure path: return a claimed proposal to 'pending' when
+// the forge CreateIssue (or a step after the claim) failed, so the user can retry or
+// dismiss it. Guarded on status='confirming' so it can only undo an in-flight claim.
+func (q *Queries) RevertProposalToPending(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, revertProposalToPending, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const sweepIdleChatRuns = `-- name: SweepIdleChatRuns :many

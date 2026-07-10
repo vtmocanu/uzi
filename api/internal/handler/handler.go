@@ -189,7 +189,7 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot
 // hammer the upstream forge; slackDMLimiter is a tighter per-user budget on the
 // two Slack-DM-triggering /me/slack endpoints.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter *mw.Limiter) http.Handler {
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -456,6 +456,17 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter 
 			r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 			r.Post("/runs/{id}/state", h.WorkerRunState)
 			r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
+
+			// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
+			// investigates its OWNER'S runs. Every query is scoped to the worker's
+			// user_id (a foreign run id is 404), never a bare run_id lookup.
+			r.Get("/chat/runs", h.WorkerChatListRuns)
+			r.Get("/chat/runs/{id}", h.WorkerChatGetRun)
+			r.Get("/chat/runs/{id}/messages", h.WorkerChatRunMessages)
+			// propose_issue (Decision 8): persists a PENDING proposal (never a forge
+			// write). The per-worker proposal limiter caps mass-creation across a
+			// user's chats; the per-run pending cap is the other half.
+			r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/proposals", h.WorkerCreateProposal)
 		})
 	})
 

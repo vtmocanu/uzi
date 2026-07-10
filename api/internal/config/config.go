@@ -202,6 +202,11 @@ type Config struct {
 	ChatMaxTurns          int
 	ChatRateLimitMax      int
 	ChatRateLimitWindow   time.Duration
+	// ProposalRateLimit* is the per-worker budget on the propose_issue endpoint
+	// (PRD #39 M3): a spam guard complementing the per-run pending-proposal cap, so a
+	// prompt-injected worker cannot mass-create proposals across its user's chats.
+	ProposalRateLimitMax    int
+	ProposalRateLimitWindow time.Duration
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -309,6 +314,8 @@ func Load() (Config, error) {
 	cfg.ChatMaxTurns = parseInt("CHAT_MAX_TURNS", 50)
 	cfg.ChatRateLimitMax = parseInt("CHAT_RATE_LIMIT_MAX", 60)
 	cfg.ChatRateLimitWindow = parseDuration("CHAT_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.ProposalRateLimitMax = parseInt("PROPOSAL_RATE_LIMIT_MAX", 20)
+	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
 
 	cfg.CIWatchRunWindow = parseDuration("CI_WATCH_RUN_WINDOW", 14*24*time.Hour)
 	// parseNonNegInt: 0 is legitimate here — it disables the pipeline sync.
