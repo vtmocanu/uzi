@@ -16,6 +16,7 @@ import type { ChatClaimResponse, StateRequest } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
 import { ChatExecutor, type ChatContext, type ChatExecutorResult } from "./chat-executor.js";
 import { ChatSteering, type ChatInputSource } from "./steering.js";
+import { buildUziToolsServer, UZI_TOOLS_SERVER_NAME } from "./uzi-tools.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { errMessage } from "./util.js";
 
@@ -95,6 +96,18 @@ export class ChatRunner {
     }
     const source = this.makeSource(runId, cancel, runLog);
 
+    // The uzi tools MCP server (M3): bound to THIS run's client + run id, so
+    // propose_issue can only ever propose on this chat run, and the read tools call
+    // the worker-authenticated, user-scoped endpoints. Its tool names are added to
+    // the executor's `tools` allowlist so they are actually callable. `emit` is the
+    // run's batcher so propose_issue can stream the proposal card (worker owns the seq).
+    const uziTools = buildUziToolsServer({
+      client: this.client,
+      runId,
+      emit: (m) => batcher.emit(m),
+      log: runLog,
+    });
+
     // Resolve this run's clocks: the claim config (server-pushed, no drift) wins over
     // the worker env defaults (Decision 3). Timeouts are delivered in SECONDS.
     const maxTurns = positiveOr(claim.config.max_turns, this.defaults.maxTurns);
@@ -138,6 +151,8 @@ export class ChatRunner {
         maxTurns,
         turnTimeoutMs,
         model: claim.config.default_model,
+        mcpServers: { [UZI_TOOLS_SERVER_NAME]: uziTools.server },
+        extraTools: uziTools.toolNames,
         // Park on the steering channel; on a delivered message, emit the user_message
         // run message (worker owns the seq) BEFORE the executor streams the model's
         // reply for that turn. `idle`/`ended` → undefined (the loop completes; the

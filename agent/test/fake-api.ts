@@ -6,6 +6,9 @@ import type {
   OutgoingMessage,
   StateRequest,
   UserInput,
+  WorkerRunDetail,
+  WorkerRunListItem,
+  WorkerRunMessage,
 } from "../src/protocol.js";
 
 interface RecordedRegister {
@@ -43,6 +46,14 @@ export class FakeApi {
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
   private readonly messagesByRun = new Map<string, OutgoingMessage[]>();
   private readonly seenSeqByRun = new Map<string, Set<number>>();
+
+  // --- chat read surface (PRD #39 M3) --------------------------------------
+  private chatRunsList: WorkerRunListItem[] = [];
+  private readonly chatRunDetails = new Map<string, WorkerRunDetail>();
+  private readonly chatMessagesByRun = new Map<string, WorkerRunMessage[]>();
+  readonly chatListLimits: (string | null)[] = [];
+  readonly chatMessageQueries: Array<{ runId: string; after: string | null; limit: string | null }> = [];
+  readonly proposalRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
 
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
@@ -90,6 +101,16 @@ export class FakeApi {
     this.inputsByRun.set(runId, inputs);
   }
 
+  setChatRuns(runs: WorkerRunListItem[]): void {
+    this.chatRunsList = runs;
+  }
+  setChatRunDetail(id: string, detail: WorkerRunDetail): void {
+    this.chatRunDetails.set(id, detail);
+  }
+  setChatMessages(id: string, msgs: WorkerRunMessage[]): void {
+    this.chatMessagesByRun.set(id, msgs);
+  }
+
   messages(runId: string): OutgoingMessage[] {
     return this.messagesByRun.get(runId) ?? [];
   }
@@ -121,6 +142,45 @@ export class FakeApi {
       const claim = this.claimQueue.shift();
       if (!claim) return sendEmpty(res, 204);
       return send(res, 200, claim);
+    }
+
+    // Chat read surface (PRD #39 M3), user-scoped server-side. Records query params
+    // and proposal bodies for assertions.
+    if (req.method === "GET" && p === "/api/worker/chat/runs") {
+      this.chatListLimits.push(url.searchParams.get("limit"));
+      return send(res, 200, { runs: this.chatRunsList });
+    }
+    const chatMsgs = /^\/api\/worker\/chat\/runs\/([^/]+)\/messages$/.exec(p);
+    if (req.method === "GET" && chatMsgs) {
+      const id = chatMsgs[1] as string;
+      this.chatMessageQueries.push({ runId: id, after: url.searchParams.get("after"), limit: url.searchParams.get("limit") });
+      return send(res, 200, { messages: this.chatMessagesByRun.get(id) ?? [] });
+    }
+    const chatDetail = /^\/api\/worker\/chat\/runs\/([^/]+)$/.exec(p);
+    if (req.method === "GET" && chatDetail) {
+      const detail = this.chatRunDetails.get(chatDetail[1] as string);
+      if (!detail) return send(res, 404, { error: "run not found" });
+      return send(res, 200, { run: detail });
+    }
+    const propMatch = /^\/api\/worker\/runs\/([^/]+)\/proposals$/.exec(p);
+    if (req.method === "POST" && propMatch) {
+      const runId = propMatch[1] as string;
+      this.proposalRequests.push({ runId, body: json });
+      const labels = Array.isArray(json.labels) ? (json.labels as string[]) : [];
+      // Server resolves repo_path -> internal id (Phase-3 catalog); repo_id back-compat.
+      const resolvedRepoID = json.repo_path ? `id-for-${String(json.repo_path)}` : String(json.repo_id ?? "");
+      return send(res, 201, {
+        proposal: {
+          id: "prop-1",
+          run_id: runId,
+          repo_id: resolvedRepoID,
+          title: String(json.title ?? ""),
+          description: String(json.description ?? ""),
+          labels,
+          status: "pending",
+          created_at: "2026-07-10T00:00:00Z",
+        },
+      });
     }
 
     const runMatch = /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);

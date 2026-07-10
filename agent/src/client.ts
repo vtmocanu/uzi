@@ -3,6 +3,7 @@ import {
   WORKER_API_PREFIX,
   type ChatClaimResponse,
   type ClaimResponse,
+  type CreateProposalRequest,
   type HeartbeatRequest,
   type MessagesRequest,
   type OutgoingMessage,
@@ -11,6 +12,10 @@ import {
   type StateRequest,
   type UserInput,
   type InputsResponse,
+  type WorkerProposal,
+  type WorkerRunDetail,
+  type WorkerRunListItem,
+  type WorkerRunMessage,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -130,6 +135,45 @@ export class WorkerClient {
   async getInputs(runId: string): Promise<UserInput[]> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
     return res.inputs ?? [];
+  }
+
+  // ── Chat agent read surface (PRD #39 M3) ───────────────────────────────────
+  // User-scoped by the worker's join token server-side; a foreign run id is 404.
+  // Returned text is UNTRUSTED — the uzi-tools MCP server wraps it as evidence.
+
+  /** List the worker user's runs, newest first (GET /worker/chat/runs?limit). */
+  async listChatRuns(limit?: number): Promise<WorkerRunListItem[]> {
+    const q = typeof limit === "number" ? `?limit=${encodeURIComponent(String(limit))}` : "";
+    const res = (await this.getJSON(`${WORKER_API_PREFIX}/chat/runs${q}`)) as { runs?: WorkerRunListItem[] };
+    return res.runs ?? [];
+  }
+
+  /** One run's detail (GET /worker/chat/runs/:id). Throws RequestError(404) for a
+   *  run that is not the worker user's. */
+  async getChatRun(runId: string): Promise<WorkerRunDetail> {
+    const res = (await this.getJSON(`${WORKER_API_PREFIX}/chat/runs/${encodeURIComponent(runId)}`)) as { run: WorkerRunDetail };
+    return res.run;
+  }
+
+  /** A bounded page of a run's messages (GET /worker/chat/runs/:id/messages). */
+  async getChatRunMessages(runId: string, after?: number, limit?: number): Promise<WorkerRunMessage[]> {
+    const params = new URLSearchParams();
+    if (typeof after === "number") params.set("after", String(after));
+    if (typeof limit === "number") params.set("limit", String(limit));
+    const q = params.toString() ? `?${params.toString()}` : "";
+    const res = (await this.getJSON(`${WORKER_API_PREFIX}/chat/runs/${encodeURIComponent(runId)}/messages${q}`)) as {
+      messages?: WorkerRunMessage[];
+    };
+    return res.messages ?? [];
+  }
+
+  /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).
+   *  NEVER writes the forge — the browser confirm does. Returns the created proposal. */
+  async createProposal(runId: string, body: CreateProposalRequest): Promise<WorkerProposal> {
+    const res = (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/proposals`, body)) as {
+      proposal: WorkerProposal;
+    };
+    return res.proposal;
   }
 
   /** A 409, or a 4xx body mentioning "terminal", means the server already
