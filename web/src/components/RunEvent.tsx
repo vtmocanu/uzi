@@ -258,11 +258,20 @@ export function CommandBlock({ command }: { command: string }) {
   const clamped = clampable && !expanded;
   return (
     <div className="mt-1.5">
-      <div className="whitespace-pre-wrap break-words rounded-md border border-edge bg-ink px-2.5 py-2 font-mono text-xs leading-relaxed">
-        <span aria-hidden="true" className="mr-2 select-none text-faint">
-          ❯
-        </span>
-        <code className={clamped ? "line-clamp-2" : undefined}>{highlightShell(command)}</code>
+      <div className="rounded-md border border-edge bg-ink px-2.5 py-2 font-mono text-xs leading-relaxed">
+        {/* Clamp on this padding-free inner wrapper via max-height (2 line boxes),
+            NOT line-clamp: line-clamp forces display:-webkit-box on its target,
+            which drops the inline ❯ prompt onto its own line above the text. Here
+            ❯ stays a plain inline sibling of <code>, so it reads inline in BOTH
+            states (user-approved deviation from the mock's line-clamp quirk). The
+            cap is 2 × leading-relaxed(1.625) = 3.25em (em == the inherited
+            text-xs), i.e. exactly two lines regardless of the outer padding. */}
+        <div className={cx("whitespace-pre-wrap break-words", clamped && "max-h-[3.25em] overflow-hidden")}>
+          <span aria-hidden="true" className="mr-2 select-none text-faint">
+            ❯
+          </span>
+          <code>{highlightShell(command)}</code>
+        </div>
       </div>
       {clampable && (
         <button

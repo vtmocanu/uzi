@@ -326,6 +326,23 @@ describe("CommandBlock", () => {
     const { queryByRole } = render(<CommandBlock command="git status --short" />);
     expect(queryByRole("button")).toBeNull();
   });
+
+  it("clamps via max-height with the ❯ prompt inline (not line-clamp), toggled off on expand", () => {
+    const cmd = "echo one\necho two\necho three";
+    const { container, getByRole } = render(<CommandBlock command={cmd} />);
+    // Clamp is a max-height wrapper, never line-clamp (which would push ❯ to its
+    // own line by forcing display:-webkit-box on the code).
+    const clampEl = container.querySelector(".max-h-\\[3\\.25em\\]");
+    expect(clampEl).not.toBeNull();
+    expect(container.querySelector(".line-clamp-2")).toBeNull();
+    // ❯ is an inline sibling INSIDE the clamped wrapper and never pollutes the
+    // code's exact text.
+    expect(clampEl?.querySelector("span[aria-hidden='true']")?.textContent).toBe("❯");
+    expect(container.querySelector("code")?.textContent).toBe(cmd);
+    // Expanding drops the clamp.
+    fireEvent.click(getByRole("button", { name: /show full command/i }));
+    expect(container.querySelector(".max-h-\\[3\\.25em\\]")).toBeNull();
+  });
 });
 
 describe("result chips (PRD #38 Decision 13)", () => {

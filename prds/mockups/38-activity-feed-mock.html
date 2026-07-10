@@ -146,7 +146,12 @@
     white-space: pre-wrap; word-break: break-word;
   }
   .cmd .prompt { color: rgb(var(--faint)); user-select: none; margin-right: 8px; }
-  .cmd.clamp .code { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  /* Clamp via max-height on a padding-free inner wrapper (2 lines at line-height
+     1.5 = 3em), NOT -webkit-line-clamp: line-clamp forces display:-webkit-box on
+     its target, which drops the inline ❯ prompt onto its own line above the text.
+     Keeping the prompt inline in both states is a user-approved deviation from the
+     earlier line-clamp treatment (PRD #38 follow-up). */
+  .cmd.clamp .cmd-code { max-height: 3em; overflow: hidden; }
   .t-cmd { color: rgb(var(--syn-cmd)); }
   .t-flag { color: rgb(var(--syn-flag)); }
   .t-str { color: rgb(var(--syn-str)); }
@@ -375,7 +380,7 @@ api/internal/metrics/registry.go:31</pre>
               <span class="tool-name">Bash</span>
               <span class="dur dur--slow">1m 12s</span>
             </div>
-            <div class="cmd clamp" id="cmd-long"><span class="prompt" aria-hidden="true">&#10095;</span><span class="code"><span class="t-cmd">env</span> <span class="t-arg">-i</span> <span class="t-arg">HOME=$HOME</span> <span class="t-arg">PATH=$PATH</span> <span class="t-cmd">docker</span> <span class="t-arg">compose</span> <span class="t-flag">--env-file</span> <span class="t-arg">.env.dummy</span> <span class="t-flag">-p</span> <span class="t-arg">uzi-pr-142</span> <span class="t-arg">run</span> <span class="t-flag">--rm</span> <span class="t-arg">api</span> <span class="t-cmd">go</span> <span class="t-arg">test</span> <span class="t-arg">./internal/...</span> <span class="t-flag">-run</span> <span class="t-arg">TestForgeSyncColumnMoveSnapBack</span> <span class="t-flag">-count=1</span> <span class="t-flag">-race</span> <span class="t-op">|</span> <span class="t-cmd">tee</span> <span class="t-arg">/tmp/out.log</span> <span class="t-cmt"># full suite</span></span></div>
+            <div class="cmd clamp" id="cmd-long"><div class="cmd-code"><span class="prompt" aria-hidden="true">&#10095;</span><span class="code"><span class="t-cmd">env</span> <span class="t-arg">-i</span> <span class="t-arg">HOME=$HOME</span> <span class="t-arg">PATH=$PATH</span> <span class="t-cmd">docker</span> <span class="t-arg">compose</span> <span class="t-flag">--env-file</span> <span class="t-arg">.env.dummy</span> <span class="t-flag">-p</span> <span class="t-arg">uzi-pr-142</span> <span class="t-arg">run</span> <span class="t-flag">--rm</span> <span class="t-arg">api</span> <span class="t-cmd">go</span> <span class="t-arg">test</span> <span class="t-arg">./internal/...</span> <span class="t-flag">-run</span> <span class="t-arg">TestForgeSyncColumnMoveSnapBack</span> <span class="t-flag">-count=1</span> <span class="t-flag">-race</span> <span class="t-op">|</span> <span class="t-cmd">tee</span> <span class="t-arg">/tmp/out.log</span> <span class="t-cmt"># full suite</span></span></div></div>
             <button class="xbtn showfull" type="button" aria-expanded="false"
                     aria-label="Show full command" data-clamp="cmd-long">
               <span class="chev" aria-hidden="true">&#10095;</span> Show full command
