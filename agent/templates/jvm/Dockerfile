@@ -63,11 +63,26 @@ RUN set -o pipefail \
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.
-COPY package.json package-lock.json ./
+# The build context is the REPO ROOT (PRD #39 Decision 5), so the worker's own
+# files are under agent/ — the per-Dockerfile ignore (Dockerfile.dockerignore next
+# to this file) trims the context to source only. MIRRORED from templates/base.
+COPY agent/package.json agent/package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY tsconfig.json ./
-COPY src ./src
+COPY agent/tsconfig.json ./
+COPY agent/src ./src
+
+# --- PRD #39 M2: bake uzi's own source, read-only, for the `chat` run kind --------
+# Read-only snapshot of uzi's own source for the chat agent, matched to the deployed
+# image — never a clone, no PAT. Root-owned (final USER is non-root uzi), never
+# chowned to uzi below. Context is the repo root; the per-Dockerfile
+# Dockerfile.dockerignore hard-excludes .env*, .git, inspiration/, node_modules and
+# build artifacts (patterns relative to the CONTEXT ROOT). MIRRORED from
+# templates/base — keep in lockstep. See templates/base/Dockerfile for the rationale.
+ARG UZI_SRC_SHA=
+COPY . /opt/uzi-src
+RUN printf 'uzi source baked into the worker image (PRD #39 chat)\ncommit: %s\nbuilt:  %s\n' \
+      "${UZI_SRC_SHA:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /opt/uzi-src/BUILD_INFO
 
 # UZI_DATA_DIR holds the bare-clone cache, worktrees, and the pinned SDK session
 # dir; devbox/nix per-user metadata lands HOME-derived under here too; the big

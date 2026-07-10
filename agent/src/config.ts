@@ -57,6 +57,18 @@ export interface Config {
    * wedges the worker (one run at a time).
    */
   planApprovalTimeoutMs: number;
+  /**
+   * Chat run (PRD #39) lifecycle knobs. Chat rides the run machinery as a third
+   * kind but has its own clocks (Decision 3): a per-conversation turn cap, a
+   * per-turn wall-clock backstop, an idle window that completes a parked chat, and
+   * a faster poll cadence for input pickup (Decision 2, latency floor). The turn
+   * cap default matches the server-side ceiling; a claim's own config may push a
+   * lower per-run value, which the ChatRunner prefers over this worker default.
+   */
+  chatMaxTurns: number;
+  chatTurnTimeoutMs: number;
+  chatIdleTimeoutMs: number;
+  chatPollMs: number;
   logLevel: LogLevel;
 }
 
@@ -87,6 +99,16 @@ function required(env: NodeJS.ProcessEnv, key: string): string {
 
 function duration(env: NodeJS.ProcessEnv, key: string, fallback: string): number {
   return parseDuration(env[key]?.trim() || fallback);
+}
+
+/** Parse a positive-integer env (e.g. CHAT_MAX_TURNS) with a fallback; a blank or
+ *  non-positive value falls back rather than throwing, matching duration()'s lenient
+ *  shape for operator-tunable knobs. */
+function positiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
 function isLogLevel(v: string): v is LogLevel {
@@ -155,6 +177,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     messageBatchMs: duration(env, "WORKER_MESSAGE_BATCH_INTERVAL", "500ms"),
     httpTimeoutMs: duration(env, "WORKER_HTTP_TIMEOUT", "30s"),
     planApprovalTimeoutMs: duration(env, "WORKER_PLAN_APPROVAL_TIMEOUT", "24h"),
+    // Chat lifecycle (PRD #39 Decisions 2/3). Defaults raised from the earlier
+    // 15/20m draft because idle-death discards the conversation; poll is faster
+    // than the run lane so a turn starts within ~1s of a user message.
+    chatMaxTurns: positiveInt(env, "CHAT_MAX_TURNS", 50),
+    chatTurnTimeoutMs: duration(env, "WORKER_CHAT_TURN_TIMEOUT", "10m"),
+    chatIdleTimeoutMs: duration(env, "WORKER_CHAT_IDLE_TIMEOUT", "60m"),
+    chatPollMs: duration(env, "WORKER_CHAT_POLL_MS", "1000"),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }
