@@ -267,11 +267,12 @@ func (r *Replier) logf(what string, err error) {
 	r.logger.Warn("slack replier: "+what+" failed (best-effort)", "error", Redact(err.Error()))
 }
 
-// boundReply trims and length-caps an accepted reply before it becomes a
-// worker-bound reject reason / follow_up. Untrusted free text, so cap defensively;
-// it is never echoed back to Slack.
+// boundReply sanitizes an accepted reply before it becomes a worker-bound reject
+// reason / follow_up: trim, scrub credential patterns (defense in depth — a secret
+// a user pastes into a Slack reply must not propagate into run inputs or agent
+// context), then length-cap. Untrusted free text; it is never echoed back to Slack.
 func boundReply(s string) string {
-	s = strings.TrimSpace(s)
+	s = ScrubSecrets(strings.TrimSpace(s))
 	rn := []rune(s)
 	if len(rn) > maxReplyRunes {
 		return string(rn[:maxReplyRunes])

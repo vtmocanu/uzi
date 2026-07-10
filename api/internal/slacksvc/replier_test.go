@@ -215,6 +215,29 @@ func TestReplierInboundFloodLimit(t *testing.T) {
 	}
 }
 
+// A credential a user pastes into a reply is scrubbed before it becomes
+// worker-bound input (defense in depth — it must not land in run inputs or agent
+// context). The reply never goes back out to Slack.
+func TestReplierScrubsSecretsFromReply(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
+	sub := &fakeSubmitter{run: liveRun(runID, user.ID, "running")}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("token is glpat-x, use it"))
+
+	if len(sub.submitted) != 1 {
+		t.Fatalf("want one submit, got %d", len(sub.submitted))
+	}
+	if strings.Contains(sub.submitted[0].body, "glpat-x") {
+		t.Fatalf("a credential in the reply must be scrubbed before the worker sees it: %q", sub.submitted[0].body)
+	}
+	if !strings.Contains(sub.submitted[0].body, "[redacted]") {
+		t.Fatalf("scrubbed reply should carry the redaction marker: %q", sub.submitted[0].body)
+	}
+}
+
 func TestReplierBoundsReplyLength(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
 	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, "")}
