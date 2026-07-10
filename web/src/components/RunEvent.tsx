@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useState, type ReactNode } from "react";
 import type { RunMessage } from "../lib/api";
 import { Markdown } from "./Markdown";
 import { FileTextIcon, TerminalIcon, ThoughtIcon } from "./icons";
@@ -53,7 +53,10 @@ export function toolSummary(name: string | undefined, input: unknown): string {
   const s = (k: string): string => asString(rec[k]) ?? "";
   switch (name) {
     case "Bash":
-      return firstLine(s("command"));
+      // The full command is the source of truth (PRD #38 Decision 1); the
+      // display layer (CommandBlock) clamps for presentation. firstLine() used
+      // to truncate here, silently losing lines 2+ of any multi-line command.
+      return s("command");
     case "Read":
     case "Write":
     case "Edit":
@@ -81,6 +84,174 @@ export function toolSummary(name: string | undefined, input: unknown): string {
       return pairs.join(", ");
     }
   }
+}
+
+// ── shell highlighting + command block ──────────────────────────────────────
+
+// Tailwind classes for each shell token class. Colours are the --syn-* tokens
+// (index.css), which alias the palette so a theme recolours them for free.
+const SYN_CLASS = {
+  cmd: "text-syn-cmd",
+  flag: "text-syn-flag",
+  str: "text-syn-str",
+  op: "text-syn-op",
+  comment: "italic text-syn-comment",
+  arg: "text-syn-arg",
+} as const;
+type SynClass = keyof typeof SYN_CLASS;
+
+const SHELL_SPACE = new Set([" ", "\t", "\n", "\r", "\f", "\v"]);
+const SHELL_OP_START = new Set(["&", "|", ";", "<", ">"]);
+
+// highlightShell is a pure, best-effort shell tokenizer (PRD #38 Decision 2). It
+// splits a command into command / flag / string / operator / comment / arg spans
+// and returns React elements only — never dangerouslySetInnerHTML — so untrusted
+// LLM command text (e.g. a literal "<script>") renders inert as escaped text.
+// Accuracy is cosmetic: a mis-classified token only mis-colours; the invariant
+// that MATTERS and is tested is that the concatenated text equals the input
+// exactly (no character is ever dropped or added).
+export function highlightShell(command: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  let key = 0;
+  const emit = (cls: SynClass, text: string) => {
+    nodes.push(
+      <span key={key++} className={SYN_CLASS[cls]}>
+        {text}
+      </span>,
+    );
+  };
+
+  const n = command.length;
+  let i = 0;
+  // The next bare word is a command name at the start of the string and after
+  // any control operator (|, &&, ;, newline, …); otherwise it is an argument.
+  let expectCommand = true;
+
+  while (i < n) {
+    const c = command[i];
+
+    // Whitespace run (preserved verbatim as a plain text node so pre-wrap keeps
+    // the original spacing). A newline starts a fresh command context.
+    if (SHELL_SPACE.has(c)) {
+      let j = i + 1;
+      while (j < n && SHELL_SPACE.has(command[j])) j++;
+      const ws = command.slice(i, j);
+      nodes.push(ws);
+      if (ws.includes("\n")) expectCommand = true;
+      i = j;
+      continue;
+    }
+
+    // Comment: '#' only reaches this branch at a token boundary (a mid-word '#'
+    // is consumed by the word scanner), so it runs to end of line.
+    if (c === "#") {
+      let j = i + 1;
+      while (j < n && command[j] !== "\n") j++;
+      emit("comment", command.slice(i, j));
+      i = j;
+      continue;
+    }
+
+    // Control / redirection operators (&& || | ; << < >> > &). Reset to command.
+    if (SHELL_OP_START.has(c)) {
+      const next = command[i + 1];
+      const isDouble =
+        (c === "&" && next === "&") ||
+        (c === "|" && next === "|") ||
+        (c === ">" && next === ">") ||
+        (c === "<" && next === "<") ||
+        (c === ";" && next === ";");
+      const op = isDouble ? c + next : c;
+      emit("op", op);
+      i += op.length;
+      expectCommand = true;
+      continue;
+    }
+
+    // Single-quoted string (no escapes inside).
+    if (c === "'") {
+      let j = i + 1;
+      while (j < n && command[j] !== "'") j++;
+      if (j < n) j++; // include the closing quote
+      emit("str", command.slice(i, j));
+      i = j;
+      expectCommand = false;
+      continue;
+    }
+
+    // Double-quoted string (honours \" escapes).
+    if (c === '"') {
+      let j = i + 1;
+      while (j < n) {
+        if (command[j] === "\\" && j + 1 < n) {
+          j += 2;
+          continue;
+        }
+        if (command[j] === '"') {
+          j++;
+          break;
+        }
+        j++;
+      }
+      emit("str", command.slice(i, j));
+      i = j;
+      expectCommand = false;
+      continue;
+    }
+
+    // A bare word: run until whitespace, an operator start, or a quote (so an
+    // embedded quote becomes its own string token). A '#' inside a word stays.
+    let j = i;
+    while (j < n) {
+      const cj = command[j];
+      if (SHELL_SPACE.has(cj) || SHELL_OP_START.has(cj) || cj === "'" || cj === '"') break;
+      j++;
+    }
+    const word = command.slice(i, j);
+    if (expectCommand) {
+      emit("cmd", word);
+      expectCommand = false;
+    } else if (word.startsWith("-")) {
+      emit("flag", word);
+    } else {
+      emit("arg", word);
+    }
+    i = j;
+  }
+
+  return nodes;
+}
+
+// CommandBlock renders a Bash command on a dark code surface with a ❯ prompt and
+// shell highlighting (PRD #38 Decisions 1–3). Long commands clamp to two lines
+// behind a "Show full command" toggle. Overflow is decided by a CONTENT
+// heuristic (a newline, or > SUMMARY_MAX chars), never layout measurement:
+// jsdom reports no layout (scrollHeight === 0), so a measured toggle would be
+// both untestable and flaky.
+export function CommandBlock({ command }: { command: string }) {
+  const clampable = command.includes("\n") || command.length > SUMMARY_MAX;
+  const [expanded, setExpanded] = useState(false);
+  const clamped = clampable && !expanded;
+  return (
+    <div className="mt-1.5">
+      <div className="whitespace-pre-wrap break-words rounded-md border border-edge bg-ink px-2.5 py-2 font-mono text-xs leading-relaxed">
+        <span aria-hidden="true" className="mr-2 select-none text-faint">
+          ❯
+        </span>
+        <code className={clamped ? "line-clamp-2" : undefined}>{highlightShell(command)}</code>
+      </div>
+      {clampable && (
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((e) => !e)}
+          className="mt-1 inline-flex min-h-[24px] items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-muted hover:bg-raised/60 hover:text-fg"
+        >
+          {expanded ? "Show less" : "Show full command"}
+        </button>
+      )}
+    </div>
+  );
 }
 
 // ── tool results ────────────────────────────────────────────────────────────
@@ -279,8 +450,12 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
   const rec = asRecord(msg.payload) ?? {};
   const name = asString(rec["name"]) ?? "tool";
   const full = toolSummary(name, rec["input"]);
+  const isBash = name === "Bash";
   const [open, setOpen] = useState(false);
-  const truncated = full.length > SUMMARY_MAX;
+  // Bash routes its full (possibly multi-line) command through CommandBlock
+  // below the header (PRD #38 M1); non-Bash args keep the inline text plus the
+  // >160-char "more" affordance. The broader row/rail restructure is M2.
+  const truncated = !isBash && full.length > SUMMARY_MAX;
 
   return (
     <div className="text-sm">
@@ -291,7 +466,7 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
           </span>
           {name}
         </span>
-        {full && (
+        {!isBash && full && (
           <span className="min-w-0 break-words font-mono text-xs text-muted">
             {open ? full : truncate(full)}
           </span>
@@ -311,6 +486,7 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
           )}
         </span>
       </div>
+      {isBash && full && <CommandBlock command={full} />}
       {result && <ToolResultBody result={result} />}
     </div>
   );

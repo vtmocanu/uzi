@@ -52,6 +52,18 @@
   --neutral-border: var(--edge);
   --neutral-surface: var(--raised);
 
+  /* Shell syntax highlighting (PRD #38). Each --syn-* aliases a palette/status
+     token, so a theme recolours the tool-command and prose code surfaces for
+     free — same aliasing approach as the --queue-* tokens above. --tool-rail is
+     the indent border under a run of tool events. */
+  --syn-cmd: var(--brand);
+  --syn-flag: var(--info);
+  --syn-str: var(--ok);
+  --syn-op: var(--brand-hover);
+  --syn-comment: var(--faint);
+  --syn-arg: var(--fg);
+  --tool-rail: var(--edge);
+
   /* Radii: one base value, everything derived (multica's --radius scheme). */
   --radius: 0.625rem;
 
@@ -105,6 +117,16 @@
   --neutral-fg: 203 213 225;
   --neutral-border: 51 65 85;
   --neutral-surface: 30 41 59;
+
+  /* Shell syntax highlighting (PRD #38) — mission's palette via the same aliases
+     as the ember block, so the code surfaces recolour with the theme. */
+  --syn-cmd: var(--brand);
+  --syn-flag: var(--info);
+  --syn-str: var(--ok);
+  --syn-op: var(--brand-hover);
+  --syn-comment: var(--faint);
+  --syn-arg: var(--fg);
+  --tool-rail: var(--edge);
 
   /* Sharper corners (every radius derives from this one value). */
   --radius: 0.25rem;

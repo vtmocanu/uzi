@@ -1,13 +1,15 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { RunMessage } from "../lib/api";
 import {
+  CommandBlock,
   RunEventRow,
   buildToolIndex,
   describeError,
   describeStatus,
   formatDuration,
+  highlightShell,
   resultToText,
   toolSummary,
   truncate,
@@ -20,8 +22,15 @@ function msg(partial: Partial<RunMessage> & { kind: string; seq: number }): RunM
 }
 
 describe("toolSummary", () => {
+  it("keeps the full multi-line command for Bash (no first-line truncation)", () => {
+    // PRD #38 Decision 1: the full command is the source of truth; truncation is
+    // a display concern handled by CommandBlock, never a lossy transform here.
+    const cmd = "cat <<'EOF'\nline one\nline two && echo done\nEOF";
+    expect(toolSummary("Bash", { command: cmd })).toBe(cmd);
+  });
+
   it("summarizes known tools by their salient argument", () => {
-    expect(toolSummary("Bash", { command: "ls -la\nsecond line" })).toBe("ls -la");
+    expect(toolSummary("Bash", { command: "ls -la\nsecond line" })).toBe("ls -la\nsecond line");
     expect(toolSummary("Read", { file_path: "/a/b.ts" })).toBe("/a/b.ts");
     expect(toolSummary("Edit", { file_path: "/a/b.ts", old_string: "x" })).toBe("/a/b.ts");
     expect(toolSummary("Grep", { pattern: "foo", path: "src" })).toBe("foo in src");
@@ -217,5 +226,89 @@ describe("RunEventRow rendering", () => {
     );
     expect(container.textContent).toContain("unrenderable mystery event");
     expect(container.textContent).toContain("some detail");
+  });
+
+  it("renders a full multi-line Bash command through the code surface", () => {
+    const command = "cat <<'EOF'\nfirst line\nsecond line && echo done\nEOF";
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Bash", input: { command } } })}
+        live={false}
+      />,
+    );
+    // No line is lost end-to-end (the bug PRD #38 fixes).
+    expect(container.textContent).toContain("first line");
+    expect(container.textContent).toContain("second line && echo done");
+    expect(container.textContent).toContain("EOF");
+    // Rendered on the code surface (❯ prompt) with the multi-line clamp toggle.
+    expect(container.textContent).toContain("❯");
+    expect(container.querySelector("button[aria-expanded='false']")?.textContent).toMatch(
+      /show full command/i,
+    );
+  });
+});
+
+describe("highlightShell", () => {
+  const renderCmd = (cmd: string) => render(<div data-testid="h">{highlightShell(cmd)}</div>);
+
+  it("preserves the exact command text — no character dropped or added", () => {
+    for (const cmd of [
+      "ls -la",
+      "cd api && go build ./...",
+      "grep -rn 'foo bar' src | tee /tmp/out.log # note",
+      'echo "a\\"b" || rm -rf /x',
+      "env -i HOME=$HOME docker compose -p uzi run --rm api",
+      "cat <<'EOF'\nline one\nline two\nEOF",
+    ]) {
+      const { getByTestId, unmount } = renderCmd(cmd);
+      expect(getByTestId("h").textContent).toBe(cmd);
+      unmount();
+    }
+  });
+
+  it("classifies command / flag / string / operator / comment tokens", () => {
+    const { container } = renderCmd("git commit -m 'wip' && echo ok # done");
+    expect(container.querySelector(".text-syn-cmd")?.textContent).toBe("git");
+    expect(container.querySelector(".text-syn-flag")?.textContent).toBe("-m");
+    expect(container.querySelector(".text-syn-str")?.textContent).toBe("'wip'");
+    expect(container.querySelector(".text-syn-op")?.textContent).toBe("&&");
+    expect(container.querySelector(".text-syn-comment")?.textContent).toBe("# done");
+    // The word after a control operator is treated as a fresh command name.
+    const cmds = Array.from(container.querySelectorAll(".text-syn-cmd")).map((e) => e.textContent);
+    expect(cmds).toContain("echo");
+  });
+
+  it("renders a <script> payload inert as escaped text, not a real element", () => {
+    const cmd = "echo <script>alert(1)</script>";
+    const { container, getByTestId } = renderCmd(cmd);
+    expect(container.querySelector("script")).toBeNull();
+    expect(getByTestId("h").textContent).toBe(cmd);
+  });
+});
+
+describe("CommandBlock", () => {
+  it("renders every line of a multi-line command (full fidelity)", () => {
+    const cmd = "cd web\nnpm run build\nnpm test";
+    const { container } = render(<CommandBlock command={cmd} />);
+    expect(container.textContent).toContain("cd");
+    expect(container.textContent).toContain("npm run build");
+    expect(container.textContent).toContain("npm test");
+  });
+
+  it("offers the clamp toggle for a multi-line OR long command (content heuristic)", () => {
+    for (const cmd of ["echo one\necho two", `echo ${"x".repeat(200)}`]) {
+      const { getByRole, unmount } = render(<CommandBlock command={cmd} />);
+      const btn = getByRole("button", { name: /show full command/i });
+      expect(btn.getAttribute("aria-expanded")).toBe("false");
+      fireEvent.click(btn);
+      expect(btn.getAttribute("aria-expanded")).toBe("true");
+      expect(btn.textContent).toMatch(/show less/i);
+      unmount();
+    }
+  });
+
+  it("shows no clamp toggle for a short single-line command", () => {
+    const { queryByRole } = render(<CommandBlock command="git status --short" />);
+    expect(queryByRole("button")).toBeNull();
   });
 });
