@@ -4438,3 +4438,41 @@ against real Slack (unit tests fake the dialer; e2e stubs Slack entirely).
 - **Open follow-up**: the manager trusts slack-go's RunContext to notice a dead link; a
   zombie connection (e.g. after laptop sleep) can leave the chip `connected` with no
   socket — consider a liveness probe (last-hello age) surfaced on the admin DTO.
+
+---
+
+# PRD-less — On-demand worker spawn: always-on for compose, spawn-on-demand deferred to k8s (design decision, 2026-07-10)
+
+Serves human: discussed while designing a future in-app chat agent (chat rides the
+run machinery, so it needs a live worker to answer; a user chatting in the web UI
+should never have to know a worker exists). No PRD yet — recorded so the k8s phase
+inherits the decision.
+
+## 168. Worker availability: always-on on compose; launcher-spawned pods on k8s
+
+- **Compose (now): the worker runs always-on; nothing spawns containers.** An idle
+  worker is a Node process on a 3s poll — tens of MB RAM, zero Anthropic spend — so
+  demand-spawning buys nothing on a laptop. Features that need a live worker (chat,
+  runs) surface worker liveness (heartbeats already track it) as an explicit
+  "worker offline" state instead of silently queueing forever.
+- **Rejected: `api` spawning workers via `docker.sock`.** The socket is effectively
+  root on the host; mounting it into `api` would wreck its posture (distroless,
+  no shell, sole holder of `UZI_SECRET_KEY`/`JWT_SECRET`). `api` must never hold
+  container-runtime credentials — this constraint carries to every deployment shape.
+- **Rejected for compose: a dedicated launcher sidecar** (a small always-on service
+  holding `docker.sock`, watching for queued work and starting/stopping the agent
+  container). It isolates the privilege correctly but means building an orchestrator
+  (join-token provisioning, template/image selection, lifecycle, crash handling) to
+  avoid ~50MB of idle RAM, and the implementation is throwaway once workers move
+  off compose.
+- **k8s / remote-worker phase (the deferred design): the launcher shape, as an
+  operator.** A dedicated controller with cluster-API access (never `api` itself)
+  spawns per-user worker pods on demand — triggered by queued work (a run or chat
+  session appearing) — and reaps idle ones. This composes with the
+  [docs/proc-hardening.md](../docs/proc-hardening.md) remote-worker design (pod-level
+  uid split worker/agent, TLS-terminated ingress in front of `api` for the join-token
+  hop): the pods the operator spawns are exactly those two-container pods. Join-token
+  issuance for spawned workers becomes the operator's job (machine-issued, not
+  pasted-once-by-a-human), which is new design work to do then.
+- Cross-references: ARCHITECTURE.md "Not yet in scope" (API-spawned workers) and
+  specs/human.md "Deferred" both point here.
