@@ -311,6 +311,23 @@ describe("ActivityFeed accessibility (M4)", () => {
     expect(text).toContain("xxx"); // the (truncated) status still shows
   });
 
+  it("uses muted (not faint) for the empty-state text and the message counter", () => {
+    const empty = render(
+      <ActivityFeed messages={[]} runningLive={false} connected={true} terminal={true} />,
+    );
+    const emptyP = empty.getByText("No messages were recorded for this run.");
+    expect(emptyP.className).toContain("text-muted");
+    expect(emptyP.className).not.toContain("text-faint");
+    empty.unmount();
+
+    const withMsgs = render(
+      <ActivityFeed messages={[m(1, "text", { text: "hi" })]} runningLive={false} connected={true} terminal={true} />,
+    );
+    const counter = withMsgs.getByText("1 messages");
+    expect(counter.className).toContain("text-muted");
+    expect(counter.className).not.toContain("text-faint");
+  });
+
   it("mutes the scroll container's implicit live region to aria-live=off", () => {
     const { container } = render(
       <ActivityFeed messages={[m(1, "text", { text: "hi" })]} runningLive={true} connected={true} terminal={false} />,

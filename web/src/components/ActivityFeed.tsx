@@ -242,7 +242,7 @@ export function ActivityFeed({
               {follow.newCount} new ↓
             </button>
           )}
-          <span className="text-xs text-faint">{messages.length} messages</span>
+          <span className="text-xs text-muted">{messages.length} messages</span>
         </div>
       </div>
 
@@ -253,7 +253,7 @@ export function ActivityFeed({
       )}
 
       {groups.length === 0 ? (
-        <p className="py-6 text-center text-sm text-faint">
+        <p className="py-6 text-center text-sm text-muted">
           {terminal ? "No messages were recorded for this run." : "Waiting for the agent…"}
         </p>
       ) : (
