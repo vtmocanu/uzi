@@ -212,6 +212,17 @@ Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/done/24-mr-close-rework.md
 - When a reviewer closes an agent's MR without merging, move the board card back from Human Review to In Progress (the "rework needed" signal).
 - Target column is In Progress — user's explicit choice, over Open/backlog.
 
+## Feature #32 — Per-user vault: password-wrapped secrets
+
+Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wrapped-secrets.md`.
+
+- Threat: a k8s operator can read env/Infisical/etcd (master key) plus the DB and decrypt every user's Anthropic token. etcd encryption at rest is not an option. [user-stated threat model]
+- Goal is to make token theft materially harder, not impossible — no decryption key at rest anywhere an operator can read. [user accepts residual risks: memory dump, trojaned image]
+- Each user's secrets are encrypted with a key derived from their own login password (vault); the server stores only the wrapped key.
+- Vault unlocks automatically at login and the key is kept in server memory until pod restart or an explicit "Lock vault" action — no per-session re-entry, so overnight/autopilot runs keep working while unlocked. [user choice over session-TTL caching]
+- UI shows an unlocked/locked vault status; when locked (e.g. after a deploy), runs queue as "waiting for vault unlock" and a password prompt unlocks without full re-login.
+- Forgotten password ⇒ vault contents unrecoverable by design; user re-enters tokens.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

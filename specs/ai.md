@@ -3454,3 +3454,184 @@ Serves human: the behavioral gate must be automated (no browser automation in-re
 - **Adding a future docs page requires no search work** — the corpus derives from the
   same glob/frontmatter pipeline as the index (§54–55). `docs/README.md`'s add-a-page
   section notes that `user` pages are automatically searchable (nothing to register).
+
+---
+
+# PRD #32 — Per-user vault: password-wrapped secrets
+
+Serves human Feature #32 (an operator with the DB + env/Infisical/etcd master key must
+not recover any user's Anthropic token; each user's secrets keyed by their own login
+password; auto-unlock at login with the key in server memory until restart/lock; locked
+runs queue; forgotten password ⇒ unrecoverable). **Status: designed (PRD #32,
+`prds/32-user-vault-password-wrapped-secrets.md` carries the full Decision Log +
+user-vs-AI provenance); not yet realized in code — these sections record the intended
+design.** Builds on PRD #3 (`user_secrets` + `secretbox`, §29–30) and gates PRD #19
+autopilot's claims. Live migration head is `00043`, so the PRD's draft `00044` renumbers
+to the live head at land (goose convention). Extends §17/§29 (secretbox), §40–41 (claim
+path), §24 (seed).
+
+## 136. Key hierarchy & crypto (Bitwarden model, per-user)
+
+Serves human: "secrets encrypted with a key derived from the user's own login password;
+the server stores only the wrapped key".
+
+- **Two-tier envelope**, Bitwarden/1Password shape (master password → KEK → DEK → data):
+  - **DEK** = 32 random bytes (`crypto/rand`), one per user, generated on vault creation;
+    seals that user's `user_secrets` rows via `secretbox`.
+  - **KEK** = `Argon2id(login password, kek_salt)`, derived at unlock, used to unwrap the
+    DEK, then discarded. Never persisted.
+  - **`wrapped_dek = secretbox(KEK, DEK)`** is the only at-rest form of the DEK: the DEK
+    is never written unwrapped, the KEK is never written at all.
+- **`kek_salt` is a dedicated random 16-byte salt, independent of the auth-hash salt.**
+  Load-bearing: the login flow *stores* its Argon2 output in `users.password_hash`;
+  reusing the same salt+params would make `password_hash` itself equal the KEK — i.e.
+  leak the KEK at rest. A distinct salt ⇒ distinct derivation ⇒ the KEK result is never
+  persisted anywhere. Cost params reuse `auth/argon2.go` (t=2, 19 MiB); a higher KEK cost
+  is a documented option.
+- **Reuses `secretbox` AES-256-GCM (§29) for BOTH layers** — the wrap (KEK→DEK) and the
+  data seal (DEK→secret) are the same construction with different keys. No new primitive.
+- **GCM auth failure doubles as wrong-password detection**: a wrong password derives a
+  wrong KEK, so unwrapping `wrapped_dek` fails GCM authentication cleanly ⇒
+  `ErrWrongPassword`. No separate password-verifier is stored, and this is no more of an
+  oracle than login already is (endpoint sits behind the auth-class rate limiter, §138).
+- **AAD binding** (`user_id || kind`) on Seal/Open is a cheap defense-in-depth against a
+  DB-*write* operator swapping ciphertext rows between users (outside the passive threat
+  model — a swap fails GCM or hands over the wrong token, not disclosure — but a few lines).
+
+## 137. Storage & lazy rewrap (`user_vaults`, `user_secrets.sealed_with`)
+
+Serves human: server stores only the wrapped key; forgotten password ⇒ unrecoverable by
+design.
+
+- **New `user_vaults`** (migration draft `00044`): `user_id PK → users ON DELETE CASCADE,
+  kek_salt bytea, wrapped_dek bytea, created_at, updated_at` — one row per user,
+  cascade-scoped like every other per-user table.
+- **`user_secrets` gains `sealed_with TEXT NOT NULL DEFAULT 'master' CHECK IN
+  ('master','dek')`** so `vault.Open` knows which box to use per ciphertext. New saves
+  always seal `'dek'`.
+- **Lazy rewrap on unlock**: pre-existing rows are master-key-sealed and cannot be
+  rewrapped without the user's password. On each successful unlock, that user's still-
+  `'master'` rows are opened with the master box, resealed with the DEK, and flipped to
+  `'dek'` in one transaction. Dormant accounts never rewrap; an admin-visible count of
+  still-`'master'` rows shows migration progress.
+- **Rewrap protects going-forward only, never retroactively.** An operator could have
+  snapshotted the DB before the rewrap, so any token that ever existed master-sealed is
+  potentially already leaked; the real fix is to **rotate the token**, not rewrap it. A
+  one-time post-unlock UI notice says exactly that ("protected from now on"; rotate for
+  full protection), never "protected retroactively". Until rewrap, legacy `'master'` rows
+  are withheld only by the runtime claim gate (§139) — a runtime control, not a
+  cryptographic one.
+- **Reset (password lost) must DELETE `user_vaults` + all `'dek'` rows** and prompt
+  re-entry — silently keeping unreadable ciphertext would be a worse bug than the
+  by-design data loss. Change/reset endpoints don't exist yet; constraints recorded for
+  when they land (change: unwrap old-KEK → rewrap new-KEK in the same tx as
+  `password_hash`, transparent to the user).
+
+## 138. `api/internal/vault` package, DEK cache & wire-in
+
+Serves human: auto-unlock at login; key kept in server memory until restart/explicit
+lock; lock/unlock/status surface.
+
+- **New `api/internal/vault`** package: `Unlock` / `Lock` / `Unlocked` / `Seal` / `Open`
+  over a store, a master box (for lazy rewrap), and an in-process DEK cache
+  (`map[uuid.UUID][]byte` + `sync.RWMutex`). DEKs are never logged or serialized and are
+  best-effort zeroized on Lock (Go gives no guarantee — stated in a comment, not oversold).
+- **The DEK cache IS the "unlocked" state**, held in API process memory from unlock until
+  pod restart or explicit Lock (the user's choice over session-TTL caching — keeps
+  overnight/autopilot runs working while unlocked). `Seal`/`Open` return `ErrLocked` when
+  the user isn't cached.
+- **Unlock at login** (`Login`, right after `VerifyPassword`, reusing the same plaintext
+  before it leaves scope; a first-ever unlock creates DEK + wrap) and **at register**
+  (KEK derived *before* the registration `pg_advisory_xact_lock` tx so a second in-lock
+  Argon2id doesn't serialize all registrations — only the cheap row insert is in-tx; a
+  crash between is recovered by Unlock's create-on-first-login path). Login now runs
+  Argon2id twice (verify + KEK) — keep the login rate limiter strict.
+- **Endpoints inside `RequireAuth`** (so unlock is not a pre-auth oracle and CSRF
+  applies): `POST /api/vault/unlock {password}` → 204/403, `POST /api/vault/lock` → 204,
+  `GET /api/vault/status`. Unlock is rate-limited with the **per-user**
+  `PerUserMiddleware`, not the per-IP auth limiter — it is authenticated, and a stolen
+  JWT would otherwise make it an online password-guessing oracle sharing a NAT bucket
+  with other users' logins.
+- **Vault status rides `/api/me`** (`sessionPayload`) so the SPA shell learns lock state
+  in one round-trip; the web client refreshes it via `AuthContext.refresh()` on window
+  focus, on any 409 `vault_locked` response, and after lock/unlock calls (there is no
+  global WS to push it — the only socket is per-run).
+- **Secrets save** (`handler/secrets.go`) seals via `vault.Seal`; returns 409
+  `vault_locked` when locked (only reachable if the pod restarted mid-session).
+- **Web surface**: header badge (🔓/🔒 with tooltip), a locked banner with a password
+  field that unlocks without a full re-login, a Lock action in the settings menu,
+  `queued` own-runs rendered as "waiting for vault unlock", and an irrecoverability
+  notice on the token-save form.
+
+## 139. Claim gating & lock-race handling (`workersvc`)
+
+Serves human: locked-owner runs queue as "waiting for vault unlock" instead of claiming
+or failing; unlock resumes them within a poll cycle.
+
+- **Single Go gate, no SQL change**: `ClaimRun` is already scoped `r.user_id = @user_id`
+  (from the worker's own identity), so a one-line `if !s.vault.Unlocked(wkr.UserID) {
+  return idle }` before `ClaimRun` keeps a locked owner's runs `queued`. Autopilot and
+  the poller need no special code — this gate is the single enforcement point.
+- **`assembleClaim` opens the Anthropic token via `vault.Open(run.UserID, …)`**; bot-PAT
+  decryption is unchanged (master box, §140).
+- **Lock-race sentinel `errVaultLocked`**: if Lock lands between `ClaimRun` and
+  `assembleClaim`, the run must **NOT** take the terminal `errCredentialUnavailable` path
+  (that fails the run and violates the queue-don't-fail contract). A distinct
+  `errVaultLocked` resets the just-claimed run back to `queued` (new query mirroring
+  `SweepClaimedNeverStarted`) and reports idle.
+- **`SetVault(*vault.Vault)` optional-dependency seam** on `workersvc` (same pattern as
+  `SetBroadcaster`/`SetLifecycle`), called additively from `main.go` — keeps the claim
+  wire-in's files disjoint from the auth/endpoint wire-in.
+- **Sweeper verified safe** (2026-07-10): no sweep query touches `status='queued'` and
+  there is no queued-age timeout, so locked-owner runs sit indefinitely by design; a
+  resumed run re-enters the claim gate and waits rather than failing.
+
+## 140. Scope boundary, seed exemption & residual risks
+
+Serves human: "materially harder, not impossible"; user accepts the residuals.
+
+- **Forge bot PAT stays under `UZI_SECRET_KEY` (master key), outside the vault.** The
+  poller must sync issues 24/7 with no user present, so the connection PAT cannot be
+  password-wrapped. `UZI_SECRET_KEY` therefore remains, but only for connection-level
+  secrets (and legacy not-yet-rewrapped rows). Accepted residual: an operator can still
+  recover the bot PAT (Developer-role, blast radius bounded by PRD #5's least-privilege
+  checks), but no user's personal Anthropic token.
+- **Seed admin explicitly exempt.** `UZI_SEED_PASSWORD` / `UZI_SEED_ANTHROPIC_TOKEN` are
+  env vars, so the vault is only as strong as env for that one account. Seeding creates
+  the vault row, seals the token with the DEK, **and unlocks the seed admin at boot**
+  (populates the cache) — otherwise a fresh headless deploy sits locked until the first
+  interactive login, defeating overnight autopilot for exactly the bootstrap case. The
+  `Sealer` interface grows a vault-aware variant. Post-boot hardening documented: change
+  the seed password, rotate the token, remove `UZI_SEED_*` from the deployed env.
+- **Dominant residual: `users.password_hash` is an offline brute-force oracle.** An
+  operator with the DB can crack the login password against the stored Argon2id hash →
+  KEK → DEK → tokens. The scheme's real strength is **password entropy + Argon2 cost, not
+  the 256-bit DEK** (`MinPasswordLen` is 12). Documented loudly; a higher KEK Argon2 cost
+  and a higher password floor are the noted mitigations for vault-protected deployments.
+- **Other documented residuals**: live-pod memory dump captures cached DEKs + in-flight
+  plaintext (DEK-in-RAM is the *common* state under until-restart caching; an optional
+  idle auto-lock is a future off-by-default knob that would break overnight runs);
+  trojaned image; the worker holds the plaintext Anthropic token for the run's duration
+  (per-run short-lived tokens are the future-PRD answer); DEK cache is per-process, so
+  the API stays single-replica (never replicate DEKs across pods); and a one-time rollout
+  stall — on the deploy that ships this, every existing user's runs stop claiming until
+  their next login (call out in release/ops notes).
+
+## 141. Rejected alternatives
+
+Serves human: the chosen approach is one of several; record why.
+
+- **Key as a mounted file / fetched from Infisical at boot** — rejected: the same
+  operators read Infisical and can exec into the pod to read the file.
+- **Vault transit / KMS envelope encryption** — rejected for this deployment: cluster
+  operators also administer Vault/Infisical, so it adds audit, not confidentiality.
+- **Global manual unseal at boot (Vault-style Shamir shards)** — viable, but rejected in
+  favor of per-user unlock: no ops ceremony on every deploy, per-user granularity, and
+  the unlocker owns the secret. Layerable later for the connection PATs if wanted.
+- **Per-run short-lived Anthropic tokens** (worker never holds a long-lived credential) —
+  out of scope: depends on what the Anthropic OAuth flow permits; noted as a future PRD
+  that composes with this one.
+- **Inspiration check**: bottega (host ambient creds), multica (plaintext creds), and
+  dot-agent-deck (ambient creds) all store provider credentials plaintext-equivalent;
+  none does password-wrapped envelope encryption — this beats them by following
+  Bitwarden's master-password key hierarchy.
