@@ -5,6 +5,7 @@
 
 import {
   ApiError,
+  type AgentSelectionInput,
   type AgentTemplate,
   type AgentTemplateInput,
   type AllocatedSkill,
@@ -971,6 +972,9 @@ export const mockApi = {
       pipeline_web_url: null,
       fix_verdict: null,
       plan_md: null,
+      repo_agents: null,
+      agent_source: null,
+      agent_exclusions: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -1009,6 +1013,9 @@ export const mockApi = {
       pipeline_web_url: `https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242`,
       fix_verdict: null,
       plan_md: null,
+      repo_agents: null,
+      agent_source: null,
+      agent_exclusions: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -1037,9 +1044,14 @@ export const mockApi = {
     if (!log) throw new ApiError(404, "run not found");
     return delay({ messages: log.filter((m) => m.seq > afterSeq).map((m) => ({ ...m })) }, 60);
   },
-  submitRunInput: async (id: string, kind: RunInputKind, body = "") => {
+  submitRunInput: async (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
     if (!getRun(id)) throw new ApiError(404, "run not found");
     handleInput(id, kind, body);
+    // PRD #37: mirror the selection onto the run row so the mock's read-only
+    // post-approval view has something to show.
+    if (kind === "approve_plan" && selection) {
+      patchRun(id, { agent_source: selection.source, agent_exclusions: selection.exclusions });
+    }
     return delay({ server_side: false }, 150);
   },
 

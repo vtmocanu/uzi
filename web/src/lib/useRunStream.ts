@@ -4,6 +4,7 @@ import {
   ApiError,
   createRunSocket,
   isTerminalRun,
+  type AgentSelectionInput,
   type Run,
   type RunInputKind,
   type RunMessage,
@@ -139,8 +140,8 @@ export function useRunStream(runId: string) {
   }, [runId, replay, refreshRun, commit]);
 
   const submit = useCallback(
-    async (kind: RunInputKind, body = "") => {
-      await api.submitRunInput(runId, kind, body);
+    async (kind: RunInputKind, body = "", selection?: AgentSelectionInput) => {
+      await api.submitRunInput(runId, kind, body, selection);
       void refreshRun();
     },
     [runId, refreshRun],
