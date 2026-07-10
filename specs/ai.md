@@ -3915,9 +3915,15 @@ uses, not what a draft guessed it would need.
   made (`poster.go`, `linker.go`, `validate.go`): `users:read` is unused (only
   `users.lookupByEmail`, scoped by `users:read.email` alone, is called — no
   `users.info`/`users.list`), while `reactions:write` (`reactions.add`, the M5 ✅ ack) was
-  missing from every scope list in the PRD. `docs/slack.md`'s manifest carries the
-  verified set: `chat:write`, `im:write`, `im:history`, `users:read.email`,
-  `reactions:write`.
+  missing from every scope list in the PRD.
+- **Correction (2026-07-10, found configuring a real workspace)**: dropping `users:read`
+  was wrong at the *manifest* level. Slack rejects a manifest requesting
+  `users:read.email` without `users:read` ("Missing bot extension scopes" —
+  `users:read.email` is an extension scope that must be requested together with
+  `users:read`, per its scope reference page). API-call-level analysis was correct but
+  irrelevant: the constraint is OAuth-install-time, not call-time. `docs/slack.md`'s
+  manifest carries the working set: `chat:write`, `im:write`, `im:history`, `users:read`,
+  `users:read.email`, `reactions:write`.
 - Out of scope (PRD, deliberate): channel/broadcast notifications, an Events API/public-URL
   mode, slash commands, multiple workspaces, non-Slack notification providers (the
   notifier sits behind the `Broadcaster` seam, so one slots in later without rework), and
@@ -4269,3 +4275,36 @@ Serves human: best-practice (the harness must fail loudly up front, not mid-run)
   would hide the mismatch from logs, teardown hints, and any concurrently running stack
   that would then reference a name the user never set. No provenance check needed — the
   PID default `uzi-e2e-$$` always passes the rule.
+
+# PRD-less — Slack settings startup seed (`UZI_SEED_SLACK_*`)
+
+Serves human: user-requested (2026-07-10, while configuring a real workspace): "seed
+the DB from .env like we do for other stuff" — chose the seed option over extending
+the ENV overlay or replacing it.
+
+## 165. Create-only Slack seed alongside (not replacing) the ENV overlay
+
+- **Third config path** for Slack, complementing §143's two: `UZI_SEED_SLACK_BOT_TOKEN`
+  + `UZI_SEED_SLACK_APP_TOKEN` (+ optional `UZI_SEED_PUBLIC_BASE_URL`) write the
+  app_settings rows at boot — tokens sealed via the SAME write-side seam the settings
+  PUT uses (`settings.ValueForStorage`), `slack_enabled` flipped `"true"` in the same
+  pass, `updated_by` NULL (no user performed the write). §143's "ENV wins" overlay is
+  untouched: a seeded value is an ordinary DB row, UI-rotatable, later `.env` edits
+  ignored while the row exists.
+- **Create-only PER KEY** (`seed.SlackSettings`, `api/internal/seed/slack.go`): a row
+  that exists is never overwritten — so an admin's UI rotation survives restarts, and
+  crucially an admin's later `slack_enabled=false` flip is never re-enabled by the seed.
+  Only a fresh `down -v` re-seeds. Runs in main after the Anthropic seed, before the
+  socket-manager goroutine starts; the settings cache is invalidated right after.
+- **Seed × overlay per key is boot-fatal** (config.Load, `loadSeedSlack`): the overlay
+  wins over the DB on every read, so a seeded row under an overlay would be dead weight
+  silently diverging from what runs — loud misconfiguration beats silent shadowing.
+  Also boot-fatal: a half pair (both tokens or neither) and a wrong prefix
+  (`xoxb-`/`xapp-` — cheapest catch for swapped tokens). Error text names variables
+  only, never token bytes.
+- **No live Slack validation at seed time** (mirrors the Anthropic seed's no-network
+  stance, diverges from the settings PUT's `auth.test`/handshake): a network call must
+  not gate boot; a bad seeded token surfaces exactly like a bad UI-saved one — the
+  manager's failed connect on the admin status chip.
+- Unlike the other seeds, requires no `UZI_SEED_EMAIL`: app_settings is instance-wide,
+  not user-owned.
