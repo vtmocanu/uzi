@@ -55,7 +55,8 @@ token.
 ## The allowlist (admins)
 
 **Admin → Tool allowlist** is the set of packages a tier-1 profile may use:
-a name pattern plus an optional pinned-version policy. A small **denylist**
+an exact package name (no wildcards) plus an optional pinned-version policy.
+A small **denylist**
 of credential-bearing CLIs (a pre-authenticated `glab`, a kubeconfig helper)
 gates **tier 1 only**: such a package is refused even if it matches the
 allowlist, so an allowlist-picked tool can never hold push rights the agent

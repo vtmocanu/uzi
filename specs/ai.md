@@ -3524,8 +3524,9 @@ Serves human: per-repo toolchains; "command not found" surfacing (plan.md 44/64)
 
 Serves human: allowlist-bounded per-repo tools.
 
-- **Tables** (`00045`): `tool_allowlist` (admin CRUD: package name pattern + optional
-  pinned-version policy; seeded with the M3 default package set) and `repo_tool_profiles`
+- **Tables** (`00045`): `tool_allowlist` (admin CRUD: exact package base name (an
+  allowlist map key matched by lookup, no globs) + optional pinned-version policy;
+  seeded with the M3 default package set) and `repo_tool_profiles`
   (user_id, repo_id, packages JSONB, unique per pair). **Tier 1 stores a package LIST,
   not a `devbox.json`** (Decision 2): a raw manifest permits `shell.init_hook`/`scripts`
   (arbitrary provision-time shell); a declarative allowlist-validated list is safe to
