@@ -44,8 +44,9 @@ version conflict).
 **What the toggle does and doesn't protect.** Only the `packages` field is
 read: the repo's `shell.init_hook`, `shell.scripts`, flake references, and
 every other key are ignored and **never executed**. It does **not** re-check
-those packages against the admin allowlist — it is bounded by being opt-in
-and packages-only instead. Enable it only for a repo whose review discipline
+those packages against the admin allowlist **or the credential-CLI denylist**
+below — tier 2 is bounded by being opt-in, packages-only, and provisioned in
+the scrubbed env instead. Enable it only for a repo whose review discipline
 you trust, since a package can still run arbitrary build code (as any nix
 package can), just never your credentials: all provisioning runs in a
 subprocess scrubbed of the forge token, the Anthropic token, and the join
@@ -56,8 +57,10 @@ token.
 **Admin → Tool allowlist** is the set of packages a tier-1 profile may use:
 a name pattern plus an optional pinned-version policy. A small **denylist**
 of credential-bearing CLIs (a pre-authenticated `glab`, a kubeconfig helper)
-is refused even if it matches, so a provisioned tool can never hold push
-rights the agent isn't meant to have.
+gates **tier 1 only**: such a package is refused even if it matches the
+allowlist, so an allowlist-picked tool can never hold push rights the agent
+isn't meant to have. (Tier 2 is neither allowlist- nor denylist-checked — it
+relies on the opt-in and the scrubbed provisioning env instead, as above.)
 
 ## Storage and egress
 
