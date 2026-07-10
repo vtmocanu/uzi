@@ -1,7 +1,7 @@
 # PRD #18: Worker Templates (git-curated) + Devbox Tool Tiers + Agent Template Scopes
 
 **GitLab Issue**: [#18](https://gitlab.example.com/vtmocanu/uzi/-/issues/18)
-**Status**: In Progress
+**Status**: Complete (2026-07-10, MR !32)
 **Priority**: Medium
 **Created**: 2026-07-05
 
