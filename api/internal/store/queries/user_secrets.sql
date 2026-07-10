@@ -1,16 +1,21 @@
 -- name: UpsertUserSecret :one
--- Insert or rotate a user's secret of a given kind. Returns metadata only
+-- Insert or rotate a user's secret of a given kind. sealed_with records which key
+-- sealed the ciphertext ('master' for the legacy box, 'dek' for the vault); the
+-- caller sets it to match how it produced @ciphertext. Returns metadata only
 -- (never the ciphertext) so callers cannot accidentally serialize it.
-INSERT INTO user_secrets (user_id, kind, ciphertext)
-VALUES ($1, $2, $3)
+INSERT INTO user_secrets (user_id, kind, ciphertext, sealed_with)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (user_id, kind) DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
+        sealed_with = EXCLUDED.sealed_with,
         updated_at = now()
 RETURNING kind, created_at, updated_at;
 
 -- name: GetUserSecretCiphertext :one
--- Fetch the sealed ciphertext for decryption (used by PRD #4 at agent-run time).
-SELECT ciphertext FROM user_secrets WHERE user_id = $1 AND kind = $2;
+-- Fetch the sealed ciphertext + how it was sealed, for decryption at agent-run
+-- time (PRD #4/#32). sealed_with tells the vault whether to open under the master
+-- box (legacy 'master') or the per-user DEK ('dek').
+SELECT ciphertext, sealed_with FROM user_secrets WHERE user_id = $1 AND kind = $2;
 
 -- name: ListUserSecretsMeta :many
 -- Metadata-only listing for the current user; never selects ciphertext.

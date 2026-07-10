@@ -66,18 +66,23 @@ func TestAnthropicTokenSeedsWhenAbsent(t *testing.T) {
 	if st.upserted.UserID != userID {
 		t.Fatalf("token stored for the wrong user: %v", st.upserted.UserID)
 	}
-	if st.upserted.Kind != anthropicTokenKind {
+	if st.upserted.Kind != store.KindAnthropicToken {
 		t.Fatalf("token stored under the wrong kind: %q", st.upserted.Kind)
 	}
 	if got := string(st.upserted.Ciphertext); got != "sealed:sk-ant-oat-abc123" {
 		t.Fatalf("token not sealed via Seal: %q", got)
+	}
+	// M1 seeds a master-box-sealed token; sealed_with must record that (an empty
+	// value would violate the migration's CHECK at runtime, which the fake hides).
+	if st.upserted.SealedWith != store.SealedWithMaster {
+		t.Fatalf("seeded secret sealed_with = %q, want %q", st.upserted.SealedWith, store.SealedWithMaster)
 	}
 }
 
 func TestAnthropicTokenExistingIsNoOp(t *testing.T) {
 	st := &fakeSecretStore{
 		user:    store.User{ID: uuid.New()},
-		secrets: []store.ListUserSecretsMetaRow{{Kind: anthropicTokenKind}},
+		secrets: []store.ListUserSecretsMetaRow{{Kind: store.KindAnthropicToken}},
 	}
 	box := &fakeSealer{}
 

@@ -55,7 +55,7 @@ func newTestVault(t *testing.T) (*Vault, *secretbox.Box) {
 	return New(master, newFakeVaultStore()), master
 }
 
-const testKind = "anthropic_token"
+const testKind = store.KindAnthropicToken
 
 // TestUnlockSealOpenRoundTrip: create the vault on first unlock, seal a secret,
 // lock, unlock again with the same password, and recover the exact plaintext.
@@ -88,14 +88,14 @@ func TestUnlockSealOpenRoundTrip(t *testing.T) {
 	if _, err := v.Seal(uid, testKind, secret); err != ErrLocked {
 		t.Fatalf("Seal while locked: got %v, want ErrLocked", err)
 	}
-	if _, err := v.Open(uid, testKind, SealedWithDEK, sealed); err != ErrLocked {
+	if _, err := v.Open(uid, testKind, store.SealedWithDEK, sealed); err != ErrLocked {
 		t.Fatalf("Open dek while locked: got %v, want ErrLocked", err)
 	}
 
 	if err := v.Unlock(ctx, uid, pw); err != nil {
 		t.Fatalf("re-Unlock: %v", err)
 	}
-	opened, err := v.Open(uid, testKind, SealedWithDEK, sealed)
+	opened, err := v.Open(uid, testKind, store.SealedWithDEK, sealed)
 	if err != nil {
 		t.Fatalf("Open after re-unlock: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestAADMismatchFails(t *testing.T) {
 		t.Fatalf("Seal: %v", err)
 	}
 
-	if _, err := v.Open(uid, "other_kind", SealedWithDEK, sealed); err == nil {
+	if _, err := v.Open(uid, "other_kind", store.SealedWithDEK, sealed); err == nil {
 		t.Fatal("Open succeeded with a mismatched kind AAD")
 	}
 
@@ -169,7 +169,7 @@ func TestAADMismatchFails(t *testing.T) {
 	if err := v.Unlock(ctx, other, "second-user-pw"); err != nil {
 		t.Fatalf("Unlock other: %v", err)
 	}
-	if _, err := v.Open(other, testKind, SealedWithDEK, sealed); err == nil {
+	if _, err := v.Open(other, testKind, store.SealedWithDEK, sealed); err == nil {
 		t.Fatal("Open succeeded under a different owner's DEK/AAD")
 	}
 }
@@ -188,7 +188,7 @@ func TestOpenMasterRow(t *testing.T) {
 	if v.Unlocked(uid) {
 		t.Fatal("precondition: user should be locked")
 	}
-	opened, err := v.Open(uid, testKind, SealedWithMaster, sealed)
+	opened, err := v.Open(uid, testKind, store.SealedWithMaster, sealed)
 	if err != nil {
 		t.Fatalf("Open master row while locked: %v", err)
 	}

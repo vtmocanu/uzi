@@ -16,10 +16,6 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// anthropicTokenKind is the only secret kind in this PRD. Adding a kind is one
-// ALTER-CHECK migration; the table shape never changes.
-const anthropicTokenKind = "anthropic_token"
-
 // maxTokenBytes bounds a pasted credential. Generous enough for both
 // `claude setup-token` OAuth tokens and console API keys; no format assumption
 // is made beyond length + no control/whitespace.
@@ -91,8 +87,12 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 
 	row, err := h.q.UpsertUserSecret(r.Context(), store.UpsertUserSecretParams{
 		UserID:     user.ID,
-		Kind:       anthropicTokenKind,
+		Kind:       store.KindAnthropicToken,
 		Ciphertext: sealed,
+		// M1 still seals with the master box; M2 switches this to vault.Seal (DEK)
+		// and records SealedWithDEK. The recorded key must match how `sealed` above
+		// was produced.
+		SealedWith: store.SealedWithMaster,
 	})
 	if err != nil {
 		slog.Error("store anthropic token", "error", err)
@@ -112,7 +112,7 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := h.q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
 		UserID: user.ID,
-		Kind:   anthropicTokenKind,
+		Kind:   store.KindAnthropicToken,
 	}); err != nil {
 		slog.Error("delete anthropic token", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

@@ -14,13 +14,6 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// anthropicTokenKind is the secret kind the Anthropic token is stored under. It
-// MUST match handler.anthropicTokenKind ("anthropic_token"); a drift would make
-// the seed's create-only check and its write target a different kind than the UI
-// reads/writes. Duplicated (not imported) to keep this dev-convenience seed off
-// the HTTP handler package.
-const anthropicTokenKind = "anthropic_token"
-
 // maxAnthropicTokenBytes bounds a seeded credential, mirroring
 // handler.maxTokenBytes. Generous enough for both `claude setup-token` OAuth
 // tokens and console API keys.
@@ -80,7 +73,7 @@ func AnthropicToken(ctx context.Context, q SecretStore, box Sealer, cfg config.C
 		return fmt.Errorf("seed anthropic token: list secrets: %w", err)
 	}
 	for _, s := range secrets {
-		if s.Kind == anthropicTokenKind {
+		if s.Kind == store.KindAnthropicToken {
 			slog.Info("seed anthropic token already present, leaving untouched", "email", cfg.SeedEmail)
 			return nil
 		}
@@ -101,8 +94,11 @@ func AnthropicToken(ctx context.Context, q SecretStore, box Sealer, cfg config.C
 
 	if _, err := q.UpsertUserSecret(ctx, store.UpsertUserSecretParams{
 		UserID:     user.ID,
-		Kind:       anthropicTokenKind,
+		Kind:       store.KindAnthropicToken,
 		Ciphertext: sealed,
+		// M1 seeds a master-sealed token; M2 seeds it DEK-sealed and unlocks the
+		// seed admin at boot. The recorded key must match how `sealed` was produced.
+		SealedWith: store.SealedWithMaster,
 	}); err != nil {
 		return fmt.Errorf("seed anthropic token: store: %w", err)
 	}

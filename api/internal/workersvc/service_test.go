@@ -112,8 +112,9 @@ func (f *fakeStore) ClaimRun(_ context.Context, arg store.ClaimRunParams) (store
 func (f *fakeStore) GetRunClaimContext(context.Context, uuid.UUID) (store.GetRunClaimContextRow, error) {
 	return f.claimCtx, f.claimCtxErr
 }
-func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) ([]byte, error) {
-	return f.anthropic, f.anthropicErr
+func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
+	// The test fixtures seal with the master box, so the row reports 'master'.
+	return store.GetUserSecretCiphertextRow{Ciphertext: f.anthropic, SealedWith: store.SealedWithMaster}, f.anthropicErr
 }
 func (f *fakeStore) GetUserDefaultModel(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultModel, f.defaultModelErr

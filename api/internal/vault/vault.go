@@ -53,12 +53,6 @@ const (
 	dekLen       = 32 // 256-bit data key
 )
 
-// SealedWith values recorded on user_secrets.sealed_with.
-const (
-	SealedWithMaster = "master"
-	SealedWithDEK    = "dek"
-)
-
 var (
 	// ErrLocked is returned by Seal and by Open on a dek-sealed secret when the
 	// user's vault is not unlocked in this process (before first login, after
@@ -196,9 +190,9 @@ func (v *Vault) Seal(userID uuid.UUID, kind string, plaintext []byte) ([]byte, e
 // (ErrLocked otherwise) and is bound to user_id||kind.
 func (v *Vault) Open(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error) {
 	switch sealedWith {
-	case SealedWithMaster:
+	case store.SealedWithMaster:
 		return v.master.Open(ciphertext)
-	case SealedWithDEK:
+	case store.SealedWithDEK:
 		box, ok, err := v.dekBox(userID)
 		if err != nil {
 			return nil, err

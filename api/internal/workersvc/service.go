@@ -28,9 +28,6 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// anthropicTokenKind mirrors the secret kind PRD #3's handler stores under.
-const anthropicTokenKind = "anthropic_token"
-
 // MaxIssueDescriptionBytes bounds the snapshotted issue description carried in a
 // run: generous for a PRD-shaped body, a secondary guard under the 1 MiB whole-body
 // cap DecodeJSON already enforces. Enforced once inside createRun so BOTH the
@@ -115,7 +112,7 @@ type Store interface {
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
-	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) ([]byte, error)
+	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	ListAgentTemplates(ctx context.Context) ([]store.AgentTemplate, error)
 	ListRunSkillAllocations(ctx context.Context, userID pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error)
@@ -311,9 +308,9 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 	}
 
-	sealed, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
+	secret, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
 		UserID: run.UserID,
-		Kind:   anthropicTokenKind,
+		Kind:   store.KindAnthropicToken,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -321,7 +318,11 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		}
 		return nil, fmt.Errorf("anthropic secret lookup: %w", err)
 	}
-	anthropic, err := s.box.Open(sealed)
+	// M3 will route this through vault.Open(run.UserID, KindAnthropicToken,
+	// secret.SealedWith, secret.Ciphertext) so a 'dek'-sealed token needs the
+	// owner's vault unlocked. Until then every row is master-sealed, so opening
+	// under the master box is correct and behavior is unchanged.
+	anthropic, err := s.box.Open(secret.Ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
 	}
