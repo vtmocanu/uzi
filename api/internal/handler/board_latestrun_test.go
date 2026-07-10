@@ -24,7 +24,7 @@ func TestMapLatestRun(t *testing.T) {
 	updated := created.Add(5 * time.Minute)
 
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("boom"),
+		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("boom"), nullTxt(),
 			txt("Vlad"), txt("vlad@example.com"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
 		if dto.ID != runID.String() || dto.Status != "completed" {
 			t.Fatalf("id/status wrong: %+v", dto)
@@ -54,7 +54,7 @@ func TestMapLatestRun(t *testing.T) {
 
 	t.Run("another owner's run is not mine, still shows owner name", func(t *testing.T) {
 		otherOwner := uuid.New()
-		dto := mapLatestRun(runID, otherOwner, "running", pgtype.Int8{}, nullTxt(),
+		dto := mapLatestRun(runID, otherOwner, "running", pgtype.Int8{}, nullTxt(), nullTxt(),
 			nullTxt(), txt("someone@example.com"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
@@ -72,7 +72,7 @@ func TestMapLatestRun(t *testing.T) {
 	})
 
 	t.Run("blank display name and email leave owner name empty", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(),
+		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(), nullTxt(),
 			txt(""), nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.OwnerName != "" {
 			t.Fatalf("owner_name should be empty when no name/email, got %q", dto.OwnerName)

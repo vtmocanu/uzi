@@ -245,7 +245,7 @@ export function IssueView() {
 }
 
 function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl: string }) {
-  const stopped = isStoppedRun(run.status, run.failure_reason);
+  const stopped = isStoppedRun(run.status, run.stop_kind);
   const duration = runDuration(run);
   // PRD §3 asks for an MR *link* in the history; link it when we can build an https
   // URL, else fall back to a plain "!N" chip so it is never absent.
@@ -281,7 +281,7 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <Badge tone={runStatusTone(run.status, run.failure_reason)}>
+        <Badge tone={runStatusTone(run.status, run.stop_kind)}>
           {stopped ? "stopped" : run.status.replace("_", " ")}
         </Badge>
         {/* Every run here is the viewer's own (the endpoint is owner-scoped), so

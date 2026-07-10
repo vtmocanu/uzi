@@ -251,14 +251,19 @@ WHERE id = @id
 -- name: CancelRunServerSide :execrows
 -- Server-side cancel for a run with no live poller (still queued, or its worker
 -- went stale): the user input is not stranded waiting for a GET /inputs poll
--- that will never come. cancelled restores the origin column → stamp.
-UPDATE runs SET status = 'cancelled', move_pending_since = now(), finished_at = now(), updated_at = now()
+-- that will never come. cancelled restores the origin column → stamp. stop_kind is
+-- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
+-- status='cancelled' branch already treats this run as a deliberate stop.
+UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: RejectRunServerSide :execrows
--- Server-side plan rejection → failed → origin restore → stamp.
-UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
+-- Server-side plan rejection → failed → origin restore → stamp. stop_kind is
+-- stamped 'plan_rejected' in the same statement as the status/failure_reason write
+-- (PRD #33 Decision 3), so this failed run is recognised as a deliberate stop
+-- regardless of the failure_reason text.
+UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
@@ -345,6 +350,21 @@ ORDER BY seq ASC;
 -- User inputs (steering) ---------------------------------------------------
 
 -- name: CreateRunInput :one
+-- Enqueue a steering input for the live worker to consume. When the input carries
+-- a deliberate-stop verdict (cancel/reject_plan) the caller passes the matching
+-- stop_kind, and it is stamped on the run in the SAME statement (PRD #33 Decision
+-- 3): a data-modifying CTE runs to completion exactly once, so the stop signal can
+-- never be lost independently of the input that requested it — which a second,
+-- non-transactional UPDATE would risk, reintroducing the failed-vs-stopped bug.
+-- stop_kind is NULL for a non-verdict input (follow_up/approve_plan) and the WHERE
+-- guard then leaves the run row untouched. The stamp lands while the run is still
+-- non-terminal (awaiting_approval/running); the client's terminal-guarded
+-- isStoppedRun ignores it until the run actually reaches failed/cancelled.
+WITH stamped AS (
+    UPDATE runs SET stop_kind = sqlc.narg('stop_kind'), updated_at = now()
+    WHERE id = @run_id AND sqlc.narg('stop_kind') IS NOT NULL
+    RETURNING id
+)
 INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES (@run_id, @kind, @body)
 RETURNING *;

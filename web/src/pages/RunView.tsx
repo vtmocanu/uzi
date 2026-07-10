@@ -111,7 +111,7 @@ export function RunView() {
   // A deliberate stop (cancel, or a stop-shaped `failed`) is calm, never rose:
   // the header pill and the terminal banner both go neutral so they agree with
   // the board/RunsList treatment (isStoppedRun).
-  const stopped = isStoppedRun(run.status, run.failure_reason);
+  const stopped = isStoppedRun(run.status, run.stop_kind);
   const mrUrl =
     run.mr_iid != null && isHttpsUrl(repoWebUrl)
       ? `${repoWebUrl}/-/merge_requests/${run.mr_iid}`

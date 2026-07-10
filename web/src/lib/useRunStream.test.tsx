@@ -43,6 +43,7 @@ function fakeRun(): Run {
     branch: null,
     mr_iid: null,
     failure_reason: null,
+    stop_kind: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,

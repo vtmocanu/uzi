@@ -66,7 +66,7 @@ INSERT INTO runs (
     $1, $2, 'ci_fix', $3, $4,
     $5, $6, $7
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind
 `
 
 type CreateCIFixRunParams struct {
@@ -131,12 +131,13 @@ func (q *Queries) CreateCIFixRun(ctx context.Context, arg CreateCIFixRunParams) 
 		&i.PipelineRef,
 		&i.FailureSnapshot,
 		&i.FixVerdict,
+		&i.StopKind,
 	)
 	return i, err
 }
 
 const findCIFixStampTarget = `-- name: FindCIFixStampTarget :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict FROM runs
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind FROM runs
 WHERE kind = 'ci_fix' AND repo_id = $1 AND branch = $2
   AND fix_verdict IS NULL
   AND pipeline_id < $3
@@ -193,6 +194,7 @@ func (q *Queries) FindCIFixStampTarget(ctx context.Context, arg FindCIFixStampTa
 		&i.PipelineRef,
 		&i.FailureSnapshot,
 		&i.FixVerdict,
+		&i.StopKind,
 	)
 	return i, err
 }

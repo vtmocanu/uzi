@@ -3,7 +3,7 @@
 // link gate. Kept out of Board.tsx so the mapping is unit-tested in isolation
 // (see runBadge.test.ts), the same split the run stream uses (runStream.ts).
 
-import { isTerminalRun, type LatestRun } from "./api";
+import { isTerminalRun, type LatestRun, type StopKind } from "./api";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
 // color everywhere: queue (queued), neutral (stopped/idle), info
@@ -16,27 +16,21 @@ export type RunBadge =
   | { kind: "mr"; mrIid: number }
   | { kind: "badge"; label: string; tone: BadgeTone; pulse: boolean; title?: string };
 
-// STOPPED_FAILURE_REASONS are the exact failure_reason strings the SERVER writes
-// for a deliberate stop that surfaces as status `failed`: a live-poller cancel
-// ("run cancelled" — agent/src/executor.ts, sdk-executor.ts) and a server-side
-// plan rejection ("plan rejected" — workersvc SubmitInput reject branch). Matched
-// exactly, not by substring, so an arbitrary agent error that merely contains the
-// word "cancel" is NOT mistaken for a deliberate stop.
-const STOPPED_FAILURE_REASONS = new Set(["run cancelled", "plan rejected"]);
-
 // isStoppedRun folds the cancelled nuance (PRD §1): a deliberate human stop is not
-// breakage, so the board and RunsList style it calm/neutral, never rose. It covers
-// status `cancelled` (server-side no-poller cancel) and status `failed` carrying
-// one of the server's known stop reasons above.
+// breakage, so the board and RunsList style it calm/neutral, never rose. It reads
+// the server-stamped stop_kind (PRD #33), so a live-poller plan reject carrying the
+// user's VERBATIM reason is recognised too — the exact case the old exact-string
+// heuristic could not. It covers status `cancelled` (which the server-side cancel
+// path also stamps stop_kind for) and status `failed` carrying a stop_kind.
 //
-// Known limitation (same class as the PRD's "known soft heuristic" note): a
-// live-poller plan rejection carries the user's VERBATIM reject reason
-// (agent/src/steering.ts), which no client-side match can recognize — it stays
-// rose "failed". Only an empty-reason reject falls back to the literal "plan
-// rejected" and is caught here.
-export function isStoppedRun(status: string, failureReason: string | null | undefined): boolean {
+// The `failed` guard is load-bearing: on the live path stop_kind is stamped at
+// verdict enqueue, while the run is still awaiting_approval/running, and a
+// reject-then-approve race can even COMPLETE a run that carries a stop_kind. So a
+// non-terminal or completed run is never styled "stopped" just because a verdict was
+// once queued — only a `failed`/`cancelled` run is.
+export function isStoppedRun(status: string, stopKind: StopKind | null | undefined): boolean {
   if (status === "cancelled") return true;
-  if (status === "failed" && failureReason != null && STOPPED_FAILURE_REASONS.has(failureReason)) return true;
+  if (status === "failed" && stopKind != null) return true;
   return false;
 }
 
@@ -45,9 +39,9 @@ export function isStoppedRun(status: string, failureReason: string | null | unde
 // and the board badge so one status is one color everywhere: a deliberate stop is
 // calm neutral, awaiting-approval is amber, a genuine failure is rose, completed
 // is green, claimed/running are sky. Shared by the issue-view history rows.
-export function runStatusTone(status: string, failureReason: string | null | undefined): BadgeTone {
+export function runStatusTone(status: string, stopKind: StopKind | null | undefined): BadgeTone {
   if (status === "awaiting_approval") return "warning";
-  if (isStoppedRun(status, failureReason)) return "neutral";
+  if (isStoppedRun(status, stopKind)) return "neutral";
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
   if (status === "claimed" || status === "running") return "info";
@@ -68,9 +62,9 @@ export function formatElapsed(ms: number): string {
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
 export function runBadge(run: LatestRun, nowMs: number): RunBadge {
-  // The stopped heuristic wins over the raw status so a cancel-shaped `failed`
+  // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
-  if (isStoppedRun(run.status, run.failure_reason)) {
+  if (isStoppedRun(run.status, run.stop_kind)) {
     return { kind: "badge", label: "stopped", tone: "neutral", pulse: false };
   }
   switch (run.status) {

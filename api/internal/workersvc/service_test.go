@@ -829,8 +829,42 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	if fs.createdInput == nil || fs.createdInput.Kind != "cancel" {
 		t.Fatalf("input not enqueued for the worker: %+v", fs.createdInput)
 	}
+	// The deliberate-stop signal is stamped transactionally with the enqueue (PRD
+	// #33 Decision 3): a live cancel carries stop_kind 'cancelled'.
+	if fs.createdInput.StopKind.String != "cancelled" || !fs.createdInput.StopKind.Valid {
+		t.Fatalf("live cancel must stamp stop_kind 'cancelled', got %+v", fs.createdInput.StopKind)
+	}
 	if fs.cancelled != nil {
 		t.Fatal("server-side cancel must not run when a worker is live")
+	}
+}
+
+func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	wkrID := uuid.New()
+	fixed := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	fs := &fakeStore{
+		runByID:    store.Run{ID: runID, UserID: user, Status: "awaiting_approval", WorkerID: pgUUID(wkrID)},
+		workerByID: store.Worker{ID: wkrID, LastHeartbeatAt: pgTime(fixed)}, // fresh
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return fixed }
+
+	// A live reject carrying a VERBATIM reason string still stamps the structured
+	// signal — the exact case the failed-vs-stopped heuristic could not recognise.
+	res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", "this is the wrong approach entirely")
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("a live worker should consume the reject; not server-side")
+	}
+	if fs.createdInput == nil || fs.createdInput.Kind != "reject_plan" {
+		t.Fatalf("reject not enqueued for the worker: %+v", fs.createdInput)
+	}
+	if fs.createdInput.StopKind.String != "plan_rejected" || !fs.createdInput.StopKind.Valid {
+		t.Fatalf("live reject must stamp stop_kind 'plan_rejected', got %+v", fs.createdInput.StopKind)
 	}
 }
 
@@ -873,6 +907,10 @@ func TestSubmitInputFollowUpAlwaysEnqueues(t *testing.T) {
 	}
 	if fs.createdInput == nil || fs.createdInput.Kind != "follow_up" {
 		t.Fatalf("follow_up not enqueued: %+v", fs.createdInput)
+	}
+	// A non-verdict input stamps no stop signal (NULL stop_kind → run untouched).
+	if fs.createdInput.StopKind.Valid {
+		t.Fatalf("follow_up must not stamp stop_kind, got %+v", fs.createdInput.StopKind)
 	}
 }
 

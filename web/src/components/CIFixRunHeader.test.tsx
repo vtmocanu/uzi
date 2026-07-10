@@ -22,6 +22,7 @@ function run(over: Partial<Run> = {}): Run {
     branch: "ci-fix/pipeline-4200",
     mr_iid: 7,
     failure_reason: null,
+    stop_kind: null,
     pipeline_ref: "main",
     pipeline_web_url: "https://gitlab.example.com/g/r/-/pipelines/4200",
     fix_verdict: "verified",

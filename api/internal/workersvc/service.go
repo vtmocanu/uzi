@@ -858,12 +858,33 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		}
 	}
 
+	// Live-poller path: the worker will consume this verdict. Stamp the
+	// deliberate-stop signal transactionally with the input insert (PRD #33
+	// Decision 3) — stopKindFor is non-empty only for cancel/reject_plan, so a
+	// follow_up/approve_plan leaves stop_kind NULL and the run row untouched. The
+	// stamp lands while the run is still non-terminal; the client's terminal-guarded
+	// isStoppedRun ignores it until the run reaches failed/cancelled.
 	if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
-		RunID: runID, Kind: kind, Body: pgText(body),
+		RunID: runID, Kind: kind, Body: pgText(body), StopKind: pgText(stopKindFor(kind)),
 	}); err != nil {
 		return SubmitInputResult{}, err
 	}
 	return SubmitInputResult{ServerSide: false}, nil
+}
+
+// stopKindFor maps a steering-input kind to the deliberate-stop signal stamped on
+// the run (PRD #33): a cancel verdict is 'cancelled', a plan reject is
+// 'plan_rejected', and every other kind stamps nothing (""). The server owns this
+// mapping so the signal never depends on the reason string the worker later reports.
+func stopKindFor(kind string) string {
+	switch kind {
+	case "cancel":
+		return "cancelled"
+	case "reject_plan":
+		return "plan_rejected"
+	default:
+		return ""
+	}
 }
 
 // hasLivePoller reports whether a worker is currently polling this run's inputs:

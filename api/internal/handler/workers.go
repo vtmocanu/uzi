@@ -102,6 +102,10 @@ type runDTO struct {
 	Branch           *string    `json:"branch"`
 	MrIID            *int64     `json:"mr_iid"`
 	FailureReason    *string    `json:"failure_reason"`
+	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
+	// or "plan_rejected", null for every other run. It — not the failure_reason
+	// text — is what the client's isStoppedRun reads to style a stop as calm/neutral.
+	StopKind         *string    `json:"stop_kind"`
 	PlanMd           *string    `json:"plan_md"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
@@ -129,6 +133,7 @@ func runToDTO(r store.Run) runDTO {
 		AutoApprove:      r.AutoApprove,
 		Branch:           textPtrValue(r.Branch.Valid, r.Branch.String),
 		FailureReason:    textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
+		StopKind:         textPtrValue(r.StopKind.Valid, r.StopKind.String),
 		PlanMd:           textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
 		PipelineRef:      textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
 		FixVerdict:       textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),

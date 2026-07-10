@@ -225,6 +225,9 @@ export interface LatestRun {
   status: RunStatus;
   mr_iid: number | null;
   failure_reason: string | null;
+  // Server-stamped deliberate-stop signal (PRD #33); null for every non-stop run.
+  // Read by isStoppedRun to render a stop as calm "stopped" instead of rose "failed".
+  stop_kind: StopKind | null;
   owner_name: string;
   worker_name: string | null;
   is_mine: boolean;
@@ -364,6 +367,13 @@ export function isTerminalRun(status: string): boolean {
   return (TERMINAL_RUN_STATUSES as string[]).includes(status);
 }
 
+// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled" or
+// "plan_rejected", null for a run that stopped for any other reason (a genuine
+// failure, a timeout, or is still going). isStoppedRun reads this — never the
+// free-text failure_reason — so a live-poller plan reject carrying the user's
+// verbatim reason is still recognised as a deliberate stop.
+export type StopKind = "cancelled" | "plan_rejected";
+
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
 // problem" verdict; null means the fix is not yet verified.
@@ -389,6 +399,9 @@ export interface Run {
   branch: string | null;
   mr_iid: number | null;
   failure_reason: string | null;
+  /** Server-stamped deliberate-stop signal (PRD #33): "cancelled" or
+   *  "plan_rejected", null otherwise. isStoppedRun reads this, not failure_reason. */
+  stop_kind: StopKind | null;
   /** ci_fix (PRD #6): the failing ref, the failing pipeline's web URL (from the
    *  snapshot), and the fix verdict. All null on an issue run. */
   pipeline_ref: string | null;

@@ -136,6 +136,7 @@ type Run struct {
 	PipelineRef          pgtype.Text        `json:"pipeline_ref"`
 	FailureSnapshot      []byte             `json:"failure_snapshot"`
 	FixVerdict           pgtype.Text        `json:"fix_verdict"`
+	StopKind             pgtype.Text        `json:"stop_kind"`
 }
 
 type RunMessage struct {

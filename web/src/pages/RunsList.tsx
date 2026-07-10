@@ -4,7 +4,7 @@
 // including its sort rule that failed outranks cancelled outranks completed at
 // equal timestamps (PAST_STATUS_RANK there). The row status pill keeps PRD #12's
 // "a deliberate stop is not a failure" nuance: isStoppedRun collapses cancelled /
-// stop-reasoned-failed runs to a calm "stopped" pill instead of a scary "failed".
+// stop_kind-stamped-failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
@@ -23,10 +23,10 @@ function sortPast(a: RunListItem, b: RunListItem): number {
 }
 
 function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
-  // PRD #12: a deliberate human stop (cancelled, or failed carrying a known stop
-  // reason) reads "stopped" / neutral, never "failed" / danger. Fold that into the
-  // pill's status so the shared StatusPill palette renders it calm.
-  const pillStatus = isStoppedRun(run.status, run.failure_reason) ? "stopped" : run.status;
+  // A deliberate human stop (cancelled, or failed carrying a server-stamped
+  // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
+  // that into the pill's status so the shared StatusPill palette renders it calm.
+  const pillStatus = isStoppedRun(run.status, run.stop_kind) ? "stopped" : run.status;
   return (
     <li>
       <Link

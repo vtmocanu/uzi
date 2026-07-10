@@ -128,7 +128,7 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 }
 
 const getLatestRunForIssue = `-- name: GetLatestRunForIssue :one
-SELECT r.id, r.user_id, r.status, r.mr_iid, r.failure_reason, r.created_at, r.updated_at,
+SELECT r.id, r.user_id, r.status, r.mr_iid, r.failure_reason, r.stop_kind, r.created_at, r.updated_at,
        ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
 FROM runs r
@@ -150,6 +150,7 @@ type GetLatestRunForIssueRow struct {
 	Status        string             `json:"status"`
 	MrIid         pgtype.Int8        `json:"mr_iid"`
 	FailureReason pgtype.Text        `json:"failure_reason"`
+	StopKind      pgtype.Text        `json:"stop_kind"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 	OwnerName     pgtype.Text        `json:"owner_name"`
@@ -172,6 +173,7 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.Status,
 		&i.MrIid,
 		&i.FailureReason,
+		&i.StopKind,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.OwnerName,
@@ -529,7 +531,7 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 
 const listLatestRunsForRepo = `-- name: ListLatestRunsForRepo :many
 SELECT DISTINCT ON (r.issue_iid)
-       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.failure_reason,
+       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.failure_reason, r.stop_kind,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
@@ -547,6 +549,7 @@ type ListLatestRunsForRepoRow struct {
 	Status        string             `json:"status"`
 	MrIid         pgtype.Int8        `json:"mr_iid"`
 	FailureReason pgtype.Text        `json:"failure_reason"`
+	StopKind      pgtype.Text        `json:"stop_kind"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 	OwnerName     pgtype.Text        `json:"owner_name"`
@@ -583,6 +586,7 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.Status,
 			&i.MrIid,
 			&i.FailureReason,
+			&i.StopKind,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.OwnerName,
