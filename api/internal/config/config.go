@@ -78,6 +78,15 @@ type Config struct {
 	// upstream forge from a single user's abuse.
 	ForgeRateLimitMax    int
 	ForgeRateLimitWindow time.Duration
+	// SlackDMRateLimitMax/Window bound how often one authenticated user may hit
+	// the two Slack-DM-triggering endpoints (PUT /me/slack/override, POST
+	// /me/slack/test-dm). A dedicated, tighter budget than the forge one (PRD #25
+	// M3 fast-follow): those endpoints DM a user-supplied member id, so the limit
+	// caps arbitrary-member spam and the enumeration-oracle throughput. The
+	// per-target DM cooldown in slacksvc is the finer control; this is the coarse
+	// per-user burst cap.
+	SlackDMRateLimitMax    int
+	SlackDMRateLimitWindow time.Duration
 	// PrivilegeCheckInterval is the cadence of the background PAT least-privilege
 	// re-check sweep (PRD #5). Default 24h; 0 disables the sweep entirely (no boot
 	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
@@ -234,6 +243,11 @@ func Load() (Config, error) {
 	cfg.SettingsCacheTTL = parseDuration("SETTINGS_CACHE_TTL", 5*time.Second)
 	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
 	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
+	// Deliberately tighter than the forge budget: these two routes DM an arbitrary
+	// member id, so a low per-user burst cap plus the per-target cooldown is the
+	// abuse control.
+	cfg.SlackDMRateLimitMax = parseInt("SLACK_DM_RATE_LIMIT_MAX", 6)
+	cfg.SlackDMRateLimitWindow = parseDuration("SLACK_DM_RATE_LIMIT_WINDOW", time.Minute)
 	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)

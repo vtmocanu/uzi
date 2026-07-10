@@ -174,8 +174,9 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // Routes builds the API router. authLimiter is applied per-route to the
 // register and login endpoints; forgeLimiter is a per-user budget on the
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot
-// hammer the upstream forge.
-func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
+// hammer the upstream forge; slackDMLimiter is a tighter per-user budget on the
+// two Slack-DM-triggering /me/slack endpoints.
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -232,12 +233,19 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			// override + test-dm each trigger an outbound Slack DM to a user-supplied
 			// or caller-linked member id, so without a limit an authed user could spam
 			// arbitrary workspace members (override re-sends a Confirm card) or use the
-			// send result as a member-id enumeration oracle. Reuse the per-user forge
-			// limiter as a coarse backstop — PerUserMiddleware keys buckets by route
-			// pattern, so these get their own budget, independent of the forge routes.
-			// The Linker's per-target DM cooldown is the finer-grained dedup.
-			r.With(forgeLimiter.PerUserMiddleware).Put("/override", h.PutMySlackOverride)
-			r.With(forgeLimiter.PerUserMiddleware).Post("/test-dm", h.PostMySlackTestDM)
+			// send result as a member-id enumeration oracle. Two controls: a dedicated,
+			// tighter per-user limiter here (PerUserMiddleware keys buckets by route
+			// pattern, so each gets its own budget) plus the Linker's per-target DM
+			// cooldown, which is the primary dedup.
+			//
+			// Accepted residual (auditor ruling, PRD #25): rate-limiting throttles but
+			// does not close the semantic oracles — test-dm's 200-vs-502 and override's
+			// 409 "already linked". Those responses are deliberate, PRD-specified UX
+			// (a collision must be visible; a failed test DM must be reported), so they
+			// stay as-is; the residual oracle is accepted as consistent with the
+			// trusted-team, single-user-laptop model, bounded by these two controls.
+			r.With(slackDMLimiter.PerUserMiddleware).Put("/override", h.PutMySlackOverride)
+			r.With(slackDMLimiter.PerUserMiddleware).Post("/test-dm", h.PostMySlackTestDM)
 		})
 
 		// Agent templates: all authenticated users can read and preview; only
