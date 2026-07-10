@@ -3635,3 +3635,312 @@ Serves human: the chosen approach is one of several; record why.
   dot-agent-deck (ambient creds) all store provider credentials plaintext-equivalent;
   none does password-wrapped envelope encryption — this beats them by following
   Bitwarden's master-password key hierarchy.
+
+---
+
+# PRD #25 — Slack Integration
+
+Serves human: "Users only learn that an agent run finished, failed, or is parked at the
+plan-approval gate by keeping the webui open... There is no push channel of any kind"
+(PRD #25 Problem statement, no dedicated human.md Feature entry yet — this PRD originated
+directly from GitLab issue vtmocanu/uzi#25, reviewed by a 3-agent design/fact-check/security
+pass before build). Realizes `prds/25-slack-integration.md` (its Decision Log carries the
+full user-vs-AI provenance); builds on PRD #4 (runs, steering inputs), PRD #19
+(`app_settings`), and `secretbox`. Section numbers continue past PRD #6's #132.
+
+## 142. Socket Mode manager: outbound-only supervisor, settings-driven hot-reload
+
+Serves human: "outbound-only... no inbound HTTP, no public URL" (Decision Log,
+user-confirmed 2026-07-06).
+
+- **`slacksvc.Manager`** polls the settings cache (no watch/pubsub exists) and, while
+  `slack_enabled` is true with both tokens present, keeps one `socketmode.Client`
+  connection up with exponential backoff; any token or enable change is diffed against
+  the running connection's pair and hot-restarts the socket — no api reboot. Idle
+  otherwise, so an unconfigured or disabled instance is a strict no-op.
+- **Poll cadence doubles as the hot-reload latency floor** (default 5s): a token rotated
+  in Settings can leave the *previous* socket briefly live for up to one poll before
+  teardown — documented in `docs/slack.md`, not hidden as instant.
+- **Connection state** (`disabled|connecting|connected|error:auth|error:connection`) is
+  exposed through the handler for the admin webui's status chip; the error states carry
+  only a coarse class, never the underlying Slack error text (which could embed a token).
+- Debug logging is left off deliberately: slack-go's default logging would eventually print
+  the Socket Mode connection URL, which carries a `?ticket=` query — a live-session
+  credential the token-shape redaction patterns would miss.
+- Reconnect **backoff resets after a stable connect**, and the long-lived websocket is
+  deliberately **unbounded** (liveness is the Socket Mode ping, not a deadline) — only the
+  `auth.test` validator and the initial handshake are time-bounded, by `SLACK_HTTP_TIMEOUT`
+  (default 15s).
+
+## 143. Settings secret-key class + ENV overlay (net-new registry work)
+
+Serves human: "Config from ENV or webui... sealed at rest... ENV wins" (Decision Log,
+user-confirmed).
+
+- The pre-existing `app_settings` registry was plaintext-only (`Cache.All()` fed the admin
+  GET verbatim; `Validate`'s default branch rejected token-length strings) — verified before
+  building, not assumed reusable. Two structural, net-new additions instead:
+  1. **`settings.SecretKeys`** (`slack_bot_token`, `slack_app_token`): sealed with
+     `secretbox` + base64 before `UpsertAppSetting`, and kept **out of `Defaults`** —
+     since every value-producing read (`All`/`Effective`/the admin DTO) ranges over
+     `Defaults`, a secret key is structurally unable to leak through those paths; the API
+     can only ever report `configured: true|false` for one. Reading the decrypted value is
+     only possible through slacksvc's own accessors.
+  2. **ENV-source overlay**: `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN`/`UZI_PUBLIC_BASE_URL`.
+     `GET /api/admin/settings` reports a per-key `source: "env"|"db"|"default"`; `PUT`
+     returns `409` on a write to an env-sourced key, so the webui's greyed-out fields
+     reflect enforced server policy, not just a UI hint.
+- **AI decision, diverges from the PRD's "thread `config.Config` into the settings
+  handler"**: the ENV overlay and the decrypt accessors instead live on the settings
+  cache itself via a one-shot `ConfigureSecrets(box, env)` call at boot, so
+  env-over-db-over-default precedence has exactly one implementation shared by all three
+  readers (GET source-reporting, decrypt accessors, `slacksvc`'s own token reads) instead
+  of being re-derived at the handler layer. Reviewed and accepted as the better placement.
+- Saving a token **validates live** before it is stored: `auth.test` for the bot token,
+  a Socket Mode handshake (`apps.connections.open`) for the app token — mirroring
+  multica's bring-your-own-app pattern — and a validation failure never echoes the
+  submitted token back.
+- Non-secret keys `slack_enabled` (default `"false"`) and `public_base_url` (default
+  `http://127.0.0.1:8080`, `http(s)`-only) follow the existing PRDLESS-key precedent: no
+  seeded row, synthesized from `Defaults` when absent.
+- **`settings.LabelChanged` was narrowed to a whitelist** (`prd_label`/`autopilot_label`):
+  previously any settings write triggered a repo resync, so a Slack-token or `slack_enabled`
+  write would needlessly force one. Only the two label keys now do.
+
+## 144. Persistence: per-user linking columns + `slack_run_messages` anchor
+
+Serves human: "auto-matches each user by account email... manual Slack member-ID
+override" (Decision Log, user-confirmed).
+
+- Four columns added to `users` (migration `00044_slack.sql`, following the
+  column-on-`users` precedent set by `default_model`/`autopilot_enabled`/`theme` — no
+  `user_settings` table exists): `slack_member_id` (manual override), `slack_notify`
+  (per-user kill switch, default `true`), `slack_resolved_id` (the effective linked id:
+  the override if set, else the cached email-lookup result), `slack_link_confirmed_at`
+  (`NULL` = unconfirmed, no content flows).
+- **`users_slack_resolved_id_key`**, a partial unique index (`WHERE slack_resolved_id IS
+  NOT NULL`): the structural backstop that makes "exactly one uzi user per Slack
+  identity" true regardless of application-layer bugs, and what turns a colliding manual
+  override into a `409` rather than a silent second mapping.
+- **`slack_run_messages`** (`run_id` PK, cascades on run delete): one row per notified
+  run — `channel_id`/`root_ts` anchor the DM thread, `gate_ts`/`gate_state` (`NULL |
+  'open' | 'reject_pending'`) track a live approval gate for M4/M5's cross-surface
+  idempotency.
+
+## 145. Identity mapping is the authz primitive
+
+Serves human: "no inbound Slack action can affect a run whose owner isn't the
+confirmed-linked Slack user... an ambiguous or unconfirmed link refuses rather than
+guesses" (PRD Success Criteria; security-review-driven, since uzi emails are unverified
+at registration).
+
+- Every inbound handler (Gatekeeper, Replier) resolves the actor from the Socket Mode
+  envelope's **authenticated** user id (`callback.User.ID` / `ev.User`) — never a value
+  read out of a forgeable payload blob — through `GetConfirmedUserBySlackID`, which
+  additionally requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true`. An
+  unconfirmed link, a cleared link, or a deactivated account all resolve to zero rows,
+  and the action is refused with an ephemeral notice rather than a best-guess match.
+- **Confirmation round-trip, not the email match itself, is what makes the mapping
+  trustworthy**: an auto-matched or overridden id sends a one-time Confirm/Not-me DM
+  (Block Kit), and no run content flows until the target presses Confirm. Squatting a
+  uzi account's email routes nothing anywhere until the *actual* Slack owner of that
+  address confirms a DM that names the uzi account by label.
+- **AI decision (defect fix in the minimal design)**: a manual override alone would have
+  been a dead end without a paired confirmation DM (`SetUserSlackOverride` resets
+  `slack_link_confirmed_at` unconditionally, and auto-match skips override'd users by
+  design) — so setting an override also (re)sends the Confirm card to the new target.
+- Every action that actually changes a run additionally rides `workersvc.SubmitInput`'s
+  own ownership check (`GetRunByIDForUser`) as a second, independent gate — identity
+  resolution authorizes *which uzi user* is acting; `SubmitInput` authorizes *that user
+  against that specific run*.
+- **Email auto-match runs as the manager's on-connected hook**, not per request: once per
+  socket session it compares each user's email-resolved id and writes only on a change (an
+  unchanged match never resets `slack_link_confirmed_at`), with a 10-minute cooldown, and
+  stops early if Slack rate-limits — so a reconnect storm can't hammer `users.lookupByEmail`.
+
+## 146. Notifier: content-minimized DMs, non-blocking fan-out, sweeper coverage
+
+Serves human: "state transitions... arrive as Slack DMs... status + issue title + link
+only" (Decision Log; content minimization is a security-review requirement).
+
+- **`slacksvc.Notifier` implements `workersvc.Broadcaster`**, wired via
+  `workersvc.MultiBroadcaster{liveHub, slackNotifier}` alongside the existing WS hub —
+  `PublishState` enqueues to an internal channel and returns immediately (never blocks
+  the request path, honoring the Broadcaster contract), with the run/owner load and the
+  actual Slack calls happening on the notifier's own drain goroutine. A Slack failure is
+  logged (redacted) and never affects the run.
+- **One root message per run**, edited in place (`chat.update`) as status changes
+  (▶ running, ⏸ needs you, ✅ MR link, ❌ failed: reason, 🚫 cancelled); every other event
+  threads under it. No plan or diff content ever appears — status, issue title, MR URL,
+  and failure reason only, each individually mrkdwn-escaped before interpolation (§149).
+- **AI decision (fact-check finding, built into M3, not a later fix)**: the Broadcaster
+  seam alone misses the sweeper's bulk timeout/requeue/stale-worker transitions, which
+  run as row-count-only SQL and never touched the Broadcaster before this PRD — exactly
+  the "failed" DMs users most need. The sweep queries were changed to `RETURNING id,
+  status` (owner joined at publish time) and `Sweep` now publishes each transition
+  through the same fan-out, which incidentally also fixed the web UI's board column
+  getting stuck in "In Progress" forever on a sweeper-driven failure — judged a
+  latent-gap bugfix within the PRD's own "publish each transition through the same
+  fan-out" scope, reviewer-flagged as a broadening and lead-accepted.
+- **Back-pressure + fan-out scope**: the enqueue is a non-blocking send to a 256-deep buffer
+  that **drops-and-warns when full** (Slack lag can never stall the run path), and
+  `Broadcaster.PublishMessage` (per-run-message events) is a deliberate **no-op** — only
+  *state* transitions notify, reinforcing content minimization.
+
+## 147. Approval gate from Slack
+
+Serves human: "the `awaiting_approval` message carries Approve/Reject buttons... Reject
+prompts for a threaded reason" (Decision Log, user-confirmed, refined after design
+review).
+
+- **Block Kit gate message**, no plan excerpt: Approve (primary, native confirm dialog),
+  Reject, and an Open-in-uzi link button, each carrying the run id in its button value.
+  The Socket Mode receive loop **ACKs the envelope before any processing** (Slack
+  re-delivers an un-ACKed envelope in ~3s).
+- **`SubmitInput` does not itself verify `awaiting_approval` before an approve**, so
+  `Gatekeeper` reads `run.Status` itself first and answers a stale click with "already
+  handled in {state}" rather than letting a second Approve resubmit.
+- **Reject enters a `reject_pending` state** (recorded on `slack_run_messages`) instead
+  of submitting immediately, since `reject_plan` is terminal and feedback can't follow
+  it: the buttons swap for a "reply in this thread with the reason, or Reject without
+  reason" card (webui parity — the webui's own reject also takes a reason).
+- **Cross-surface idempotency**: resolving the gate from *either* surface (a Slack
+  button, or the webui) edits the Slack message to a button-free terminal state and
+  clears `gate_ts`/`gate_state`, so the other surface's later action on the same gate is
+  a no-op ephemeral, never a double-submit.
+- Inbound dispatch runs through an **`InboundMux` with disjoint action-id namespaces**
+  (`slack_link_*` for link-confirmation vs `slack_gate_*` for approve/reject), so the
+  Gatekeeper and the confirmation handler can never cross-fire on a stray payload.
+  Ephemerals use **`chat.postEphemeral`** (channel+user), not a stored `response_url`, so no
+  per-message reply URL has to be persisted or expired.
+- A double-click on Approve is a **benign micro-race**: both envelopes can pass the
+  pre-submit `run.Status` read and enqueue an `approve_plan`, but the worker consumes only
+  the first as the verdict — the second is a dead input, not a second approval.
+
+## 148. Reply-from-Slack
+
+Serves human: "Threaded replies on a live (non-gate) run become `follow_up` inputs"
+(Decision Log, user-confirmed).
+
+- A thread reply re-resolves the confirmed author (§145) and the run anchored at the
+  thread (`channel_id`+`root_ts` — effectively unique per run, since each run posts its
+  own root message), then re-checks **ownership** of that run via the same
+  `PlanGateSubmitter.GetRun` the gatekeeper uses — never trusting the thread anchor or
+  `gate_state` alone. Routing: a reply while `reject_pending` **is** the reasoned reject;
+  a bare reply during an *open* (not yet reject-pending) gate is nudged, not submitted,
+  since the worker does not consume a `follow_up` mid-gate (verified against
+  `agent/src/steering.ts`, per the PRD's own M4 caveat); otherwise it becomes a
+  `follow_up` on a live run, or a coalesced "already finished" notice on a terminal one.
+- Every accepted reply gets a ✅ (`reactions.add`) ack; unlinked-author and
+  already-finished notices are **coalesced** (at most once per 10 minutes per author+kind)
+  so a burst of replies is answered once, not per event.
+- **Two independent rate limits, not one**: a per-Slack-user flood window
+  (20 events/minute) on the inbound `message.im` stream, plus (a fast-follow promoted out
+  of M5 into an M3 blocking fix after audit) a dedicated per-user `SLACK_DM_RATE_LIMIT_MAX`/
+  `_WINDOW` limiter (default 6/minute) on the two outbound-DM-triggering `/me/slack`
+  endpoints (`override`, `test-dm`), plus a 30-second per-target DM cooldown in
+  `slacksvc.Linker` — bounding both an arbitrary-member spam primitive and the endpoints'
+  accepted-residual member-id enumeration oracle (a 409 or a 200-vs-502 is deliberate,
+  PRD-specified UX, so only the *rate*, not the *existence*, of the oracle is closed).
+- **Stale-reply guard**: the reject-pending branch additionally re-checks
+  `run.Status == 'awaiting_approval'` (never `gate_state` alone) — a reply arriving after the
+  gate already resolved elsewhere falls through to the `follow_up`/finished paths instead of
+  forcing a wrongful `running → failed` via the server-side reject. Inbound reply text is
+  trimmed → `ScrubSecrets` → **capped at 2000 runes**, worker-bound only, never echoed back
+  to Slack.
+
+## 149. mrkdwn injection hardening + outbound secret scrub
+
+Serves human: best-practice (audit finding: forge/worker-controlled text must not
+smuggle Slack markup into a trusted message).
+
+- **AI decision (audit finding, fixed same-milestone, not deferred)**: every dynamic
+  field that could carry forge- or worker-controlled text — issue title, repo path,
+  failure reason, MR URL, the link-confirmation DM's account label — is passed through
+  `EscapeMrkdwn` (Slack's own control-character escaper) **individually**, never applied
+  to the whole rendered string (which would also break the trusted `<url|label>` deep-link
+  markup the notifier constructs itself). `failure_reason` is additionally bounded to 500
+  runes before it reaches a message.
+- **`ScrubSecrets`**, orthogonal to the escaping above, strips `sk-ant-`/`glpat-`/
+  `xoxb-`/`xapp-` patterns from every outbound string as defense-in-depth, on top of a
+  separate `Redact` (used only for logging) that additionally scrubs the Socket Mode
+  `wss://…?ticket=…` connection URL.
+- This scrub discipline is standing policy, not a one-off patch: every later outbound
+  Slack surface (the M4 gate messages, the M5 reply acks/ephemerals) is built on the same
+  two functions rather than reinventing escaping per call site.
+
+## 150. Web UI + configuration
+
+Serves human: "webui field renders greyed out... a 'send test DM' button" (Decision Log,
+user-confirmed).
+
+- **Admin → Instance settings → Slack card**: enable toggle, write-only bot/app token
+  fields (`configured ✓` when a value is already stored, never re-displaying it), public
+  base URL, and a live status chip; any field whose value comes from the environment
+  renders disabled with a "set from environment" hint, matching the server-enforced `409`.
+- **Settings → Notifications** (own-user only, via `mw.UserFromContext` throughout — no
+  user can touch another's mapping): link status (unlinked / pending confirmation /
+  confirmed), the per-user notify toggle, the manual member-ID override field, and a
+  Send-test-DM button.
+- `GetMySlack`/`PutMySlackNotify`/`PutMySlackOverride`/`PostMySlackTestDM` under
+  `/api/me/slack`; `GetAdminSlackStatus` under `/api/admin/slack/status` as a cheap
+  separate poll target so the status chip doesn't have to re-fetch the whole settings
+  blob every few seconds.
+- **AI decision**: `GET /me/slack` stays pure-DB (no live `users.info` call for a display
+  name), so a settings page load never degrades when Slack itself is down; a
+  resolvable display name is deferred as a follow-up.
+- Configuration surface: `SLACK_BOT_TOKEN`/`SLACK_APP_TOKEN`/`UZI_PUBLIC_BASE_URL` (ENV
+  overlay, §143), `SLACK_HTTP_TIMEOUT` (default `15s`), `SLACK_DM_RATE_LIMIT_MAX`/
+  `_WINDOW` (default `6`/`1m`, §148) — extends the existing configuration doc/table
+  pattern (§13/§25/§131), no new mechanism.
+
+## 151. App manifest scopes verified against the implemented code (M7)
+
+Serves human: best-practice — a paste-ready manifest should grant exactly what the bot
+uses, not what a draft guessed it would need.
+
+- The PRD's M7 milestone text listed `chat:write`, `im:write`, `im:history`, `users:read`,
+  `users:read.email` as the bot scopes. Checked against every `slack-go` call actually
+  made (`poster.go`, `linker.go`, `validate.go`): `users:read` is unused (only
+  `users.lookupByEmail`, scoped by `users:read.email` alone, is called — no
+  `users.info`/`users.list`), while `reactions:write` (`reactions.add`, the M5 ✅ ack) was
+  missing from every scope list in the PRD. `docs/slack.md`'s manifest carries the
+  verified set: `chat:write`, `im:write`, `im:history`, `users:read.email`,
+  `reactions:write`.
+- Out of scope (PRD, deliberate): channel/broadcast notifications, an Events API/public-URL
+  mode, slash commands, multiple workspaces, non-Slack notification providers (the
+  notifier sits behind the `Broadcaster` seam, so one slots in later without rework), and
+  email verification at registration (would strengthen auto-match, but the confirmation
+  round-trip already makes it safe without it).
+
+## 152. Testing (M6)
+
+Serves human: best-practice — the authz + seal invariants above must hold against a real
+Postgres, and the whole integration must be a strict no-op when unconfigured.
+
+- The **live-DB store integration tests** (`run-store-it.sh`) carry the authz + seal proofs:
+  exactly-one-user link resolution and its collision refusal, the `is_active` inbound refusal,
+  and a **seal-at-rest raw-`SELECT` byte-check** that `slack_bot_token`'s stored value is
+  ciphertext, never the plaintext token.
+- The byte-check lives in the **store IT, not an HTTP e2e**, because the `PUT` live-validates
+  the token against Slack `auth.test`, which an offline gate can't pass; the complementary
+  "admin GET never returns token bytes" half is asserted at the unit level instead.
+- **e2e stays unchanged-green with Slack disabled** (the default) — the strict-no-op
+  acceptance criterion: an unconfigured instance must behave exactly as it did before the
+  feature.
+
+## 153. Deferred / follow-up candidates (recorded, not implemented)
+
+- Live Slack **display-name** resolution in `GET /me/slack` (kept pure-DB, §150).
+- **Backoff-reset-on-flap gating** (an M2 reviewer nit): a socket that connects then drops
+  immediately still resets its backoff.
+- Requeue-swept runs currently render as **"queued"** in DMs (a "↻ requeued" affordance or
+  suppression is the follow-up).
+- A **redundant `OpenDM`** on non-first transitions, and a rare **duplicate root message** if
+  the `slack_run_messages` anchor upsert fails after the post — both benign.
+- The **webui steering-input body is uncapped/unscrubbed** (pre-existing; the Slack reply path
+  is the stricter one, §148) — out of this PRD's scope.
+- **Worker-side `failure_reason` sanitization at source** (today the notifier bounds it to
+  500 runes and escapes it, §149).
+- A **tighter dedicated DM budget** (~5/min) for the two `/me/slack` DM routes, below the
+  shared forge limiter — a Low follow-up from the DM-abuse audit (§148).

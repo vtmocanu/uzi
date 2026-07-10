@@ -1,0 +1,354 @@
+package slacksvc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/slack-go/slack"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+)
+
+// NotifierStore is the slice of generated queries the notifier reads/writes.
+// *store.Queries satisfies it.
+type NotifierStore interface {
+	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
+	GetSlackDeliveryForUser(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (store.SlackRunMessage, error)
+	UpsertSlackRunMessage(ctx context.Context, arg store.UpsertSlackRunMessageParams) (store.SlackRunMessage, error)
+	// SetSlackRunGate records/clears the open-gate anchor (PRD #25 M4): the notifier
+	// sets it when a run enters awaiting_approval and clears it when the run is
+	// resolved from EITHER surface (cross-surface idempotency).
+	SetSlackRunGate(ctx context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error)
+}
+
+// Poster is the outbound Slack surface the notifier drives: open a DM channel and
+// post / edit messages with the bot token. The production implementation
+// (slackPoster) reads the current bot token from settings per call so a hot
+// token rotation is picked up; tests inject a recording fake.
+type Poster interface {
+	// OpenDM returns the DM channel id for a Slack user id.
+	OpenDM(ctx context.Context, slackUserID string) (string, error)
+	// Post posts text to a channel (threadTS "" = top level) and returns its ts.
+	Post(ctx context.Context, channelID, threadTS, text string) (string, error)
+	// Update edits a message in place.
+	Update(ctx context.Context, channelID, ts, text string) error
+	// PostBlocks posts a Block Kit message (threadTS "" = top level); fallbackText
+	// is the notification/plain-text fallback. Used for the link-confirmation DM
+	// (Confirm / Not me) and the approval gate (Approve / Reject).
+	PostBlocks(ctx context.Context, channelID, threadTS, fallbackText string, blocks []slack.Block) (string, error)
+	// UpdateBlocks edits a message in place to a new Block Kit body (fallbackText is
+	// the plain-text fallback). The gate flow swaps its buttons for a reject-pending
+	// or resolved state, which a text-only Update could not do.
+	UpdateBlocks(ctx context.Context, channelID, ts, fallbackText string, blocks []slack.Block) error
+	// PostEphemeral sends a message only the given user sees in the channel (a
+	// stale-click or unlinked-user notice), so those transient replies don't persist
+	// in the DM history.
+	PostEphemeral(ctx context.Context, channelID, userID, text string) error
+	// AddReaction adds an emoji reaction to a message — the ✅ ack on an accepted
+	// inbound thread reply (PRD #25 M5). Best-effort.
+	AddReaction(ctx context.Context, channelID, ts, emoji string) error
+	// LookupUserByEmail resolves a workspace member's email to their Slack user id
+	// (users.lookupByEmail), for the email auto-match pass. A not-found or any other
+	// Slack error is returned to the caller, which treats it as "no match".
+	LookupUserByEmail(ctx context.Context, email string) (string, error)
+}
+
+// notifierQueue bounds the in-memory event backlog. PublishState drops when full
+// rather than block the request path (Slack is strictly best-effort).
+const notifierQueue = 256
+
+// Notifier turns run state transitions into per-owner Slack DMs (PRD #25 M3). It
+// implements workersvc.Broadcaster: PublishState enqueues and returns
+// immediately (never blocks the run lifecycle), and a drain goroutine does the
+// run/owner loads and the Slack calls. A Slack failure is logged (redacted) and
+// never affects the run. Messages are content-minimized: status + issue title +
+// links only, never plan/diff content, and every outbound string is scrubbed of
+// secrets.
+type Notifier struct {
+	store   NotifierStore
+	poster  Poster
+	baseURL func(context.Context) (string, error)
+	logger  *slog.Logger
+	ch      chan stateEvent
+}
+
+type stateEvent struct {
+	runID  uuid.UUID
+	status string
+}
+
+// NewNotifier builds a Notifier. baseURL supplies the public base URL for deep
+// links (settings.PublicBaseURL). Call Run in a goroutine.
+func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (string, error), logger *slog.Logger) *Notifier {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Notifier{store: s, poster: poster, baseURL: baseURL, logger: logger, ch: make(chan stateEvent, notifierQueue)}
+}
+
+// PublishState implements workersvc.Broadcaster. It MUST NOT block: it enqueues
+// and returns, dropping the event if the queue is full.
+func (n *Notifier) PublishState(runID uuid.UUID, status string) {
+	select {
+	case n.ch <- stateEvent{runID: runID, status: status}:
+	default:
+		n.logger.Warn("slack: notifier queue full, dropping transition", "run", runID.String(), "status", status)
+	}
+}
+
+// PublishMessage is a deliberate no-op: run message CONTENT never goes to Slack
+// (content minimization — only status/title/links do).
+func (n *Notifier) PublishMessage(uuid.UUID, int32, string, string, []byte, time.Time) {}
+
+// Run drains the queue until ctx is cancelled. Wire it into the background
+// WaitGroup alongside the socket manager.
+func (n *Notifier) Run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-n.ch:
+			n.handle(ctx, ev)
+		}
+	}
+}
+
+// handle processes one transition: resolve the owner's delivery target, then
+// post the root DM (first time) or edit it and thread the outcome. Every failure
+// path logs redacted and returns — a run is never affected.
+func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
+	rc, err := n.store.GetSlackRunContext(ctx, ev.runID)
+	if err != nil {
+		n.logf("load run context", err)
+		return
+	}
+	target, err := n.store.GetSlackDeliveryForUser(ctx, rc.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return // unlinked, opted out, or unconfirmed → drop silently
+	}
+	if err != nil {
+		n.logf("resolve delivery target", err)
+		return
+	}
+	if !target.Valid || target.String == "" {
+		return
+	}
+	slackID := target.String
+
+	channel, err := n.poster.OpenDM(ctx, slackID)
+	if err != nil {
+		n.logf("open dm", err)
+		return
+	}
+
+	base, _ := n.baseURL(ctx)
+	root := ScrubSecrets(renderRoot(rc, base))
+
+	existing, err := n.store.GetSlackRunMessage(ctx, ev.runID)
+	var anchor store.SlackRunMessage
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		ts, perr := n.poster.Post(ctx, channel, "", root)
+		if perr != nil {
+			n.logf("post root", perr)
+			return
+		}
+		saved, uerr := n.store.UpsertSlackRunMessage(ctx, store.UpsertSlackRunMessageParams{
+			RunID: rc.ID, ChannelID: channel, RootTs: ts,
+		})
+		if uerr != nil {
+			n.logf("record anchor", uerr)
+			// Fall back to a synthetic anchor so the gate step can still run.
+			saved = store.SlackRunMessage{RunID: rc.ID, ChannelID: channel, RootTs: ts}
+		}
+		anchor = saved
+	case err != nil:
+		n.logf("load anchor", err)
+		return
+	default:
+		anchor = existing
+		if uerr := n.poster.Update(ctx, existing.ChannelID, existing.RootTs, root); uerr != nil {
+			n.logf("update root", uerr)
+		}
+		if evt := renderThread(rc, base); evt != "" {
+			if _, perr := n.poster.Post(ctx, existing.ChannelID, existing.RootTs, ScrubSecrets(evt)); perr != nil {
+				n.logf("post thread event", perr)
+			}
+		}
+	}
+
+	n.handleGate(ctx, rc, anchor, base)
+}
+
+// handleGate manages the approval-gate message's lifecycle on the notifier's
+// (state-transition) side. On entry to awaiting_approval it posts the Approve /
+// Reject gate under the run's root and records gate_ts/gate_state='open' (unless a
+// gate is already open — never double-post). On any transition OUT of
+// awaiting_approval while a gate is still open, the gate was resolved from another
+// surface (the web UI, a timeout, the sweeper) or the Slack handler has not
+// cleared it yet, so it edits the gate message to a closed state and clears the
+// anchor — the cross-surface idempotency hook. All best-effort: a failure is
+// logged (redacted) and never affects the run.
+func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRow, anchor store.SlackRunMessage, base string) {
+	gateOpen := anchor.GateTs.Valid && anchor.GateTs.String != ""
+
+	if rc.Status == "awaiting_approval" {
+		if gateOpen {
+			return // gate already posted for this run
+		}
+		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base))
+		if err != nil {
+			n.logf("post gate", err)
+			return
+		}
+		if _, err := n.store.SetSlackRunGate(ctx, store.SetSlackRunGateParams{
+			RunID: rc.ID, GateTs: pgText(ts), GateState: pgText(gateStateOpen),
+		}); err != nil {
+			n.logf("record gate", err)
+		}
+		return
+	}
+
+	if gateOpen {
+		if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.GateTs.String, "Plan gate closed",
+			gateResolvedBlocks("Plan already handled — this gate is closed.")); err != nil {
+			n.logf("close gate", err)
+		}
+		if _, err := n.store.SetSlackRunGate(ctx, store.SetSlackRunGateParams{RunID: rc.ID}); err != nil {
+			n.logf("clear gate", err)
+		}
+	}
+}
+
+func (n *Notifier) logf(what string, err error) {
+	n.logger.Warn("slack notifier: "+what+" failed (best-effort)", "error", Redact(err.Error()))
+}
+
+// renderRoot builds the content-minimized root line: repo#iid «title» — status,
+// plus an Open-in-uzi deep link. No plan/diff — the plan is one click away. The
+// forge-controlled repo path and issue title are mrkdwn-escaped individually so
+// they cannot inject a spoofed <url|label> link or a <@Uxxx> mention into the DM;
+// the deep-link markup below stays raw (its base is operator-set, its id a uuid).
+func renderRoot(rc store.GetSlackRunContextRow, base string) string {
+	head := fmt.Sprintf("[uzi] run on %s#%d «%s» — %s",
+		EscapeMrkdwn(rc.PathWithNamespace), iid(rc.IssueIid), EscapeMrkdwn(rc.IssueTitle), statusLabel(rc))
+	if link := runLink(base, rc.ID); link != "" {
+		head += "\n" + link
+	}
+	return head
+}
+
+// renderThread returns the threaded outcome event for a terminal transition, or
+// "" for a non-terminal one. Completed carries the MR link; failed the reason. The
+// worker-originated failure reason is length-bounded and mrkdwn-escaped before it
+// goes out (it is untrusted free text with no source-side length bound).
+func renderThread(rc store.GetSlackRunContextRow, base string) string {
+	switch rc.Status {
+	case "completed":
+		if mr := mrLink(rc); mr != "" {
+			return "✅ completed — " + mr
+		}
+		return "✅ completed"
+	case "failed":
+		reason := strings.TrimSpace(rc.FailureReason.String)
+		if reason == "run cancelled" {
+			return "🚫 cancelled"
+		}
+		if reason != "" {
+			return "❌ failed: " + EscapeMrkdwn(boundReason(reason))
+		}
+		return "❌ failed"
+	case "cancelled":
+		return "🚫 cancelled"
+	default:
+		return ""
+	}
+}
+
+// maxFailureReason bounds the worker-originated failure reason before it reaches
+// Slack. Free text with no source-side limit, so cap it defensively (full
+// source-side sanitization is a separate follow-up).
+const maxFailureReason = 500
+
+// boundReason truncates an over-long failure reason on a rune boundary, appending
+// an ellipsis so the DM stays readable and can't be flooded.
+func boundReason(s string) string {
+	r := []rune(s)
+	if len(r) <= maxFailureReason {
+		return s
+	}
+	return string(r[:maxFailureReason]) + "…"
+}
+
+// statusLabel is the compact status shown on the root line.
+func statusLabel(rc store.GetSlackRunContextRow) string {
+	switch rc.Status {
+	case "queued":
+		return "queued"
+	case "claimed", "running":
+		return "▶ running"
+	case "awaiting_approval":
+		return "⏸ needs your approval"
+	case "completed":
+		if rc.MrIid.Valid {
+			return fmt.Sprintf("✅ completed (MR !%d)", rc.MrIid.Int64)
+		}
+		return "✅ completed"
+	case "failed":
+		reason := strings.TrimSpace(rc.FailureReason.String)
+		if reason == "run cancelled" {
+			return "🚫 cancelled"
+		}
+		return "❌ failed"
+	case "cancelled":
+		return "🚫 cancelled"
+	default:
+		return rc.Status
+	}
+}
+
+// runURL is the plain webui deep-link URL to the run view (empty when no base URL
+// resolves). Used raw as a Block Kit button url; runLink wraps it as mrkdwn. The
+// base is operator-set and http(s)-validated server-side and the id is a uuid, so
+// there is nothing hostile to escape.
+func runURL(base string, runID uuid.UUID) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/runs/%s", base, runID.String())
+}
+
+// runLink is the webui deep link to the run view, as a Slack mrkdwn link. Empty
+// when no base URL resolves.
+func runLink(base string, runID uuid.UUID) string {
+	if u := runURL(base, runID); u != "" {
+		return fmt.Sprintf("<%s|Open in uzi>", u)
+	}
+	return ""
+}
+
+// mrLink builds the forge merge-request URL from the repo web url + mr iid. The
+// web url is forge-controlled, so it is mrkdwn-escaped too (a normal URL has no
+// & < >, so this is a no-op for legit links and only neutralizes a hostile one).
+func mrLink(rc store.GetSlackRunContextRow) string {
+	if !rc.MrIid.Valid || rc.WebUrl == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/-/merge_requests/%d", EscapeMrkdwn(strings.TrimRight(rc.WebUrl, "/")), rc.MrIid.Int64)
+}
+
+func iid(v pgtype.Int8) int64 {
+	if v.Valid {
+		return v.Int64
+	}
+	return 0
+}

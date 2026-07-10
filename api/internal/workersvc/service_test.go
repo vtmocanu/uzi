@@ -66,6 +66,11 @@ type fakeStore struct {
 	claimCutoff pgtype.Timestamptz
 	runCutoff   pgtype.Timestamptz
 	sweepMax    int32
+	// Rows the sweep queries return (PRD #25 M3): each drives a published transition.
+	sweptClaimed  []store.SweepClaimedNeverStartedRow
+	sweptTimeout  []store.SweepRunningTimeoutRow
+	sweptFailed   []store.FailRunsOfStaleWorkersOverCapRow
+	sweptRequeued []store.RequeueRunsOfStaleWorkersRow
 
 	// Submit input.
 	runByID       store.Run
@@ -189,24 +194,24 @@ func (f *fakeStore) MarkStaleWorkersOffline(_ context.Context, cutoff pgtype.Tim
 	f.callOrder = append(f.callOrder, "mark_stale")
 	return 0, nil
 }
-func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Timestamptz) (int64, error) {
+func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
 	f.claimCutoff = cutoff
 	f.callOrder = append(f.callOrder, "claimed_never_started")
-	return 0, nil
+	return f.sweptClaimed, nil
 }
-func (f *fakeStore) SweepRunningTimeout(_ context.Context, arg store.SweepRunningTimeoutParams) (int64, error) {
+func (f *fakeStore) SweepRunningTimeout(_ context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error) {
 	f.runCutoff = arg.Cutoff
 	f.callOrder = append(f.callOrder, "running_timeout")
-	return 0, nil
+	return f.sweptTimeout, nil
 }
-func (f *fakeStore) FailRunsOfStaleWorkersOverCap(_ context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) (int64, error) {
+func (f *fakeStore) FailRunsOfStaleWorkersOverCap(_ context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error) {
 	f.sweepMax = arg.MaxRequeues
 	f.callOrder = append(f.callOrder, "stale_fail_over_cap")
-	return 0, nil
+	return f.sweptFailed, nil
 }
-func (f *fakeStore) RequeueRunsOfStaleWorkers(_ context.Context, arg store.RequeueRunsOfStaleWorkersParams) (int64, error) {
+func (f *fakeStore) RequeueRunsOfStaleWorkers(_ context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error) {
 	f.callOrder = append(f.callOrder, "stale_requeue")
-	return 0, nil
+	return f.sweptRequeued, nil
 }
 func (f *fakeStore) GetRunByIDForUser(context.Context, store.GetRunByIDForUserParams) (store.Run, error) {
 	return f.runByID, f.runByIDErr
@@ -779,6 +784,35 @@ func TestSweepComputesCutoffsAndOrder(t *testing.T) {
 	}
 	if fs.sweepMax != 1 {
 		t.Fatalf("max requeues passed = %d, want 1", fs.sweepMax)
+	}
+}
+
+// TestSweepPublishesTransitions is the PRD #25 M3 fix: sweeper-driven transitions
+// (timeouts, worker-loss failures/requeues) must reach the Broadcaster/notifier
+// fan-out — before this they returned counts only and were silently missed.
+func TestSweepPublishesTransitions(t *testing.T) {
+	r1, r2, r3 := uuid.New(), uuid.New(), uuid.New()
+	owner := uuid.New()
+	fs := &fakeStore{
+		sweptTimeout:  []store.SweepRunningTimeoutRow{{ID: r1, UserID: owner, Status: "failed"}},
+		sweptFailed:   []store.FailRunsOfStaleWorkersOverCapRow{{ID: r2, UserID: owner, Status: "failed"}},
+		sweptRequeued: []store.RequeueRunsOfStaleWorkersRow{{ID: r3, UserID: owner, Status: "queued"}},
+	}
+	svc := New(fs, newBox(t), testParams())
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	res, err := svc.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if res.RunningTimeout != 1 || res.StaleFailed != 1 || res.StaleRequeued != 1 {
+		t.Fatalf("counts = %d/%d/%d, want 1/1/1", res.RunningTimeout, res.StaleFailed, res.StaleRequeued)
+	}
+	// Each swept row published its new status through the broadcaster.
+	got := strings.Join(b.statuses, ",")
+	if got != "failed,failed,queued" {
+		t.Fatalf("published statuses = %q, want failed,failed,queued", got)
 	}
 }
 
