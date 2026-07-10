@@ -72,6 +72,13 @@ describe("ChatComposer — disabled gates (terminal / turn-cap)", () => {
     expect(screen.getByText("Turn limit reached (50 turns).")).toBeTruthy();
     expect(screen.queryByLabelText("Message uzi")).toBeNull();
   });
+
+  it("keeps End chat available when disabled by the turn cap", () => {
+    const { onEnd } = renderComposer({ gate: capped });
+    const btn = screen.getByRole("button", { name: "End chat" });
+    fireEvent.click(btn);
+    expect(onEnd).toHaveBeenCalled();
+  });
 });
 
 describe("ChatComposer — the three notices", () => {

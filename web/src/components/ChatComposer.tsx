@@ -94,8 +94,14 @@ export function ChatComposer({
           </div>
         </div>
       ) : (
-        <div className="rounded-xl border border-edge bg-raised/40 px-3 py-3 text-sm text-faint">
-          {gate.reason}
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-edge bg-raised/40 px-3 py-3">
+          <p className="text-sm text-faint">{gate.reason}</p>
+          {/* The composer is only mounted for a non-terminal conversation, so a
+              disabled gate here means the turn cap — End chat must stay reachable
+              (ending it is the way out, alongside starting a new chat). */}
+          <Button variant="ghost" size="sm" disabled={busy} onClick={onEnd}>
+            End chat
+          </Button>
         </div>
       )}
     </div>

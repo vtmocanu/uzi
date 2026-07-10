@@ -164,9 +164,7 @@ function ConversationRow({
   const ended = chatIsEnded(chat);
   const last = chat.last_message_at ?? chat.updated_at;
 
-  const continueChat = async (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
+  const continueChat = async () => {
     setBusy(true);
     try {
       const { chat: next } = await api.continueChat(chat.id);
@@ -177,25 +175,22 @@ function ConversationRow({
     }
   };
 
+  // The Continue button lives OUTSIDE the Link — a button nested inside an anchor
+  // is invalid interactive-in-interactive nesting.
   return (
-    <li>
-      <Link
-        to={`/chat/${chat.id}`}
-        className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70"
-      >
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium text-fg">{conversationTitle(chat)}</p>
-          <p className="mt-0.5 text-xs text-faint">Last activity {new Date(last).toLocaleString()}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <ChatStatusBadge status={chat.status} />
-          {ended && (
-            <Button size="sm" variant="secondary" disabled={busy} onClick={continueChat}>
-              Continue
-            </Button>
-          )}
-        </div>
+    <li className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 transition-colors hover:border-edge-strong hover:bg-raised/70">
+      <Link to={`/chat/${chat.id}`} className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-fg">{conversationTitle(chat)}</p>
+        <p className="mt-0.5 text-xs text-faint">Last activity {new Date(last).toLocaleString()}</p>
       </Link>
+      <div className="flex items-center gap-2">
+        <ChatStatusBadge status={chat.status} />
+        {ended && (
+          <Button size="sm" variant="secondary" disabled={busy} onClick={continueChat}>
+            Continue
+          </Button>
+        )}
+      </div>
     </li>
   );
 }
@@ -280,7 +275,7 @@ export function ChatConversation() {
     );
   }
 
-  const title = conversationTitle(meta ?? ({ title: run?.issue_title ?? null } as ChatDTO));
+  const title = meta ? conversationTitle(meta) : (run?.issue_title?.trim() || "Untitled chat");
 
   return (
     <div className="space-y-4">
