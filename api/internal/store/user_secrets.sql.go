@@ -80,6 +80,33 @@ func (q *Queries) ListUserSecretsMeta(ctx context.Context, userID uuid.UUID) ([]
 	return items, nil
 }
 
+const rewrapUserSecret = `-- name: RewrapUserSecret :execrows
+UPDATE user_secrets
+SET ciphertext = $1, sealed_with = 'dek', updated_at = now()
+WHERE user_id = $2 AND kind = $3 AND sealed_with = 'master'
+`
+
+type RewrapUserSecretParams struct {
+	Ciphertext []byte    `json:"ciphertext"`
+	UserID     uuid.UUID `json:"user_id"`
+	Kind       string    `json:"kind"`
+}
+
+// Lazy migration (PRD #32): re-seal a legacy master-key-sealed secret under the
+// owner's vault DEK on their first unlock, flipping sealed_with 'master' → 'dek'
+// in one statement. Guarded on the current sealed_with so a concurrent unlock
+// cannot double-rewrap (and cannot clobber a DEK-sealed row with stale bytes).
+// This does NOT un-leak a token that ever existed master-sealed — an operator
+// may have snapshotted the DB first; rotation is the real fix. It only improves
+// the at-rest posture going forward.
+func (q *Queries) RewrapUserSecret(ctx context.Context, arg RewrapUserSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rewrapUserSecret, arg.Ciphertext, arg.UserID, arg.Kind)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertUserSecret = `-- name: UpsertUserSecret :one
 INSERT INTO user_secrets (user_id, kind, ciphertext)
 VALUES ($1, $2, $3)

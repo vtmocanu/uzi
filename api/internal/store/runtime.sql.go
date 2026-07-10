@@ -1346,6 +1346,26 @@ func (q *Queries) RejectRunServerSide(ctx context.Context, arg RejectRunServerSi
 	return result.RowsAffected(), nil
 }
 
+const requeueClaimedRunToQueued = `-- name: RequeueClaimedRunToQueued :execrows
+UPDATE runs SET status = 'queued', updated_at = now()
+WHERE id = $1 AND status = 'claimed'
+`
+
+// Vault lock race (PRD #32 M3): a run claimed while the owner's vault was
+// unlocked, then locked before assembleClaim could open the Anthropic token.
+// Reset it to queued — NOT failed, which is terminal (MarkRunFailedByID) and
+// would violate "a locked owner's run waits, never fails". worker_id is left
+// intact for resume affinity. Guarded on status='claimed' so a run that a
+// concurrent path already advanced is untouched. Mirrors
+// SweepClaimedNeverStarted but targets exactly one run by id.
+func (q *Queries) RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueClaimedRunToQueued, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const requeueRunsOfStaleWorkers = `-- name: RequeueRunsOfStaleWorkers :execrows
 UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
