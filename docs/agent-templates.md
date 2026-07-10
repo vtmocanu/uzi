@@ -52,7 +52,10 @@ The **In my runs** toggle on each row decides whether that template is
 delivered to your runs. Builtin and global templates are **on by default**
 (admins set that default set via the **Global default** toggle); your own
 templates are off until you enable them. Absent your own choice, a template
-follows the global default.
+follows the global default. Once you flip a toggle it stays an explicit
+choice for that template (there is no per-row "follow the default again"
+affordance yet); a global template you turned off stays off for you until you
+turn it back on.
 
 If you name a **Mine** template the same as a builtin or global one, it is
 **shadowed**: the shared one wins and yours is dropped from your runs (shown

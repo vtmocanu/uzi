@@ -41,10 +41,12 @@ export async function extractRepoDevboxPackages(worktreePath: string): Promise<s
   const file = path.join(worktreePath, "devbox.json");
   let raw: string;
   try {
-    // Size guard BEFORE reading the whole file, so an absurdly large hostile
-    // manifest is rejected without ever loading it into memory.
+    // Guard BEFORE reading the whole file. stat() follows symlinks, so require a
+    // regular file too: a symlink to a device/FIFO (e.g. /dev/zero) reports size 0
+    // and would otherwise pass the size check and hang readFile on an unbounded
+    // stream. An oversized regular file is rejected without ever loading it.
     const st = await fs.stat(file);
-    if (st.size > MAX_DEVBOX_BYTES) return [];
+    if (!st.isFile() || st.size > MAX_DEVBOX_BYTES) return [];
     raw = await fs.readFile(file, "utf8");
   } catch {
     return [];

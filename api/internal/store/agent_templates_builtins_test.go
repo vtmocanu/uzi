@@ -14,7 +14,7 @@ import (
 // a live database. A name in existing or getErr makes the insert a no-op (0 rows,
 // as ON CONFLICT DO NOTHING would); everything else inserts (1 row).
 type reconcilerFake struct {
-	existing map[string]AgentTemplate // name -> the row GetAgentTemplateByName returns
+	existing map[string]AgentTemplate // name -> the row GetSharedAgentTemplateByName returns
 	getErr   map[string]error         // name -> a read-back error
 	inserted []string
 	seeded   []string // names passed to SeedSharedTemplateAllocationByName

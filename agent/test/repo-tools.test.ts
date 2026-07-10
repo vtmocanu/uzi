@@ -69,6 +69,14 @@ describe("extractRepoDevboxPackages (packages-only, hooks never run)", () => {
     await writeDevbox(JSON.stringify({ packages: ["hello"], _pad: filler }));
     assert.deepStrictEqual(await extractRepoDevboxPackages(dir), []);
   });
+
+  it("returns [] for a symlinked device, never an unbounded read (isFile guard, audit)", async () => {
+    // stat() follows the symlink; a char device (/dev/zero) reports size 0 and
+    // would pass a size-only check, then hang readFile on its endless stream. The
+    // isFile() guard rejects it first. (If /dev/zero is absent, stat throws → [].)
+    await fs.symlink("/dev/zero", path.join(dir, "devbox.json"));
+    assert.deepStrictEqual(await extractRepoDevboxPackages(dir), []);
+  });
 });
 
 describe("mergeToolPackages (tier-1 wins conflicts)", () => {

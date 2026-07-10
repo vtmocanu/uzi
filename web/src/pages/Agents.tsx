@@ -25,7 +25,10 @@ export function Agents() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  // A single global busy flag disables ALL toggles during any in-flight
+  // allocation PUT: each PUT replace-sets the whole half, so two rapid toggles
+  // must not fire from stale state and drop one (reviewer M7 ride-along).
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     setError("");
@@ -61,7 +64,7 @@ export function Agents() {
   // Replace-set writes: the PUT fully replaces the half it carries, so each
   // toggle recomputes the whole set from current state and changes just one entry.
   const setMyOverride = async (id: string, enabled: boolean) => {
-    setBusyId(id);
+    setBusy(true);
     setError("");
     setNotice("");
     try {
@@ -73,12 +76,12 @@ export function Agents() {
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to update allocation");
     } finally {
-      setBusyId(null);
+      setBusy(false);
     }
   };
 
   const setGlobalDefault = async (id: string, on: boolean) => {
-    setBusyId(id);
+    setBusy(true);
     setError("");
     setNotice("");
     try {
@@ -91,7 +94,7 @@ export function Agents() {
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to update global default");
     } finally {
-      setBusyId(null);
+      setBusy(false);
     }
   };
 
@@ -144,7 +147,7 @@ export function Agents() {
                       alloc={allocById.get(t.id)}
                       isAdmin={isAdmin}
                       shadowed={t.scope === "user" && sharedNames.has(t.name)}
-                      busy={busyId === t.id}
+                      busy={busy}
                       onToggleMine={setMyOverride}
                       onToggleGlobal={setGlobalDefault}
                     />
