@@ -79,4 +79,28 @@ describe("Markdown shell-fence parity", () => {
     expect(container.querySelector("script")).toBeNull();
     expect(container.querySelector("code")?.textContent).toBe("echo '<script>alert(1)</script>'");
   });
+
+  it("strips trailing newlines from a pathological fence without a hang", () => {
+    // Many trailing newlines: the strip is now a linear scan (was a
+    // catastrophic-backtracking /\n+$/). Correctness assertion only — the command
+    // survives and every trailing newline is gone. Renders fast; no timing gate.
+    const body = "echo hi" + "\n".repeat(20_000);
+    const { container } = render(<Markdown content={fence("bash", body)} />);
+    expect(container.querySelector("code")?.textContent).toBe("echo hi");
+  });
+
+  it("strips only trailing newlines, preserving interior blank lines", () => {
+    const cmd = "echo a\n\necho b"; // an interior blank line must survive
+    const { container } = render(<Markdown content={fence("bash", cmd + "\n\n\n")} />);
+    expect(container.querySelector("code")?.textContent).toBe(cmd);
+  });
+
+  it("unwraps the <pre> for a shell fence but keeps it for other languages", () => {
+    // A shell fence becomes the block-level CommandBlock (no <pre>); every other
+    // fence keeps its default <pre><code> so .docs-prose styling is untouched.
+    const bash = render(<Markdown content={fence("bash", "npm run build")} />);
+    expect(bash.container.querySelector("pre")).toBeNull();
+    const py = render(<Markdown content={fence("python", "print('hi')")} />);
+    expect(py.container.querySelector("pre")).not.toBeNull();
+  });
 });

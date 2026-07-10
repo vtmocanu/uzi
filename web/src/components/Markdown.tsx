@@ -65,8 +65,26 @@ function preShellLang(node: unknown): string | undefined {
 // is a single text child in practice, but flatten defensively).
 function codeText(children: ReactNode): string {
   if (typeof children === "string") return children;
+  if (typeof children === "number") return String(children);
   if (Array.isArray(children)) return children.map(codeText).join("");
+  // Defensive: a future react-markdown / plugin change could hand the fence text
+  // wrapped in an element instead of a raw string. Recurse into its children so
+  // command text is never silently dropped (which would swallow the code surface).
+  if (children && typeof children === "object" && "props" in children) {
+    return codeText((children as { props?: { children?: ReactNode } }).props?.children);
+  }
   return "";
+}
+
+// stripTrailingNewlines removes trailing "\n" in linear time. It replaces a
+// `/\n+$/` regex that backtracks catastrophically (~O(n²), ~6s at 100 KB) on an
+// attacker fence of many newlines — and this runs synchronously in render, so a
+// hang would freeze the tab (M1's highlightShell node cap is downstream, too late
+// to help).
+function stripTrailingNewlines(s: string): string {
+  let end = s.length;
+  while (end > 0 && s[end - 1] === "\n") end--;
+  return s.slice(0, end);
 }
 
 const components: Components = {
@@ -112,7 +130,7 @@ const components: Components = {
     // CommandBlock). Inline code and every other fence fall through to the
     // default rendering, so their `.docs-prose code` styling is untouched.
     if (shellLang(className)) {
-      return <CommandBlock command={codeText(children).replace(/\n+$/, "")} />;
+      return <CommandBlock command={stripTrailingNewlines(codeText(children))} />;
     }
     return (
       <code className={className} {...props}>
