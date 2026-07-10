@@ -99,7 +99,7 @@ Phase note: M1–M2 (worker templates) and M3–M5 (tooling) are independent tra
 
 ### Progress + agent-validation ledger (2026-07-10, paused for resume)
 
-Work runs on `feature/prd-18-worker-templates` (worktree `../prd-18-worker-templates`), agent-team workflow (coder + reviewer + auditor + tester). PRDs #16/#17 landed before this started, so the M6–M7 blockers are lifted; migrations renumbered `00044+` (live head was `00043`).
+Work runs on `feature/prd-18-worker-templates` (worktree `../prd-18-worker-templates`), agent-team workflow (coder + reviewer + auditor + tester). PRDs #16/#17 landed before this started, so the M6–M7 blockers are lifted; migrations were developed as `00044–00048` (live head was `00043`) and renumbered at landing to **`00045–00049`** after PRD #25 took `00044_slack` on main (per the merge-time renumbering convention); `specs/ai.md` sections likewise landed as §154–159 after #32/#25 took the 130s–140s–150s.
 
 | Scope | Commits | Agent validation |
 |---|---|---|
