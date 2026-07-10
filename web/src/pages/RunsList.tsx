@@ -4,7 +4,7 @@
 // including its sort rule that failed outranks cancelled outranks completed at
 // equal timestamps (PAST_STATUS_RANK there). The row status pill keeps PRD #12's
 // "a deliberate stop is not a failure" nuance: isStoppedRun collapses cancelled /
-// stop-reasoned-failed runs to a calm "stopped" pill instead of a scary "failed".
+// stop_kind-stamped-failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
@@ -12,7 +12,8 @@ import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem } from "../lib/api";
 import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
-import { isStoppedRun } from "../lib/runBadge";
+import { MrChip } from "../components/MrChip";
+import { isStoppedRun, mrChipState } from "../lib/runBadge";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
@@ -35,10 +36,13 @@ function RunRow({
   // amber state instead of a bare "queued" pill.
   waitingForVault?: boolean;
 }) {
-  // PRD #12: a deliberate human stop (cancelled, or failed carrying a known stop
-  // reason) reads "stopped" / neutral, never "failed" / danger. Fold that into the
-  // pill's status so the shared StatusPill palette renders it calm.
-  const pillStatus = isStoppedRun(run.status, run.failure_reason) ? "stopped" : run.status;
+  // A deliberate human stop (cancelled, or failed carrying a server-stamped
+  // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
+  // that into the pill's status so the shared StatusPill palette renders it calm.
+  const pillStatus = isStoppedRun(run.status, run.stop_kind) ? "stopped" : run.status;
+  // MR chip state (PRD #33): open renders exactly as before; merged/closed get a
+  // label and closed is muted + struck. This is a per-run frozen hint.
+  const mrState = mrChipState(run.mr_state);
   return (
     <li>
       <Link
@@ -54,7 +58,9 @@ function RunRow({
             {run.worker_name && <span>· {run.worker_name}</span>}
             {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
             <span>· {new Date(run.updated_at).toLocaleString()}</span>
-            {run.mr_iid != null && <span className="font-medium text-ok">· MR !{run.mr_iid}</span>}
+            {run.mr_iid != null && (
+              <MrChip variant="inline" label="· MR " mrIid={run.mr_iid} mrState={mrState} href={null} className="font-medium" />
+            )}
           </p>
         </div>
         <div className="flex items-center gap-2">

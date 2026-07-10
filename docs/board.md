@@ -76,11 +76,29 @@ Each card shows its latest run at a glance: **queued**/**claimed** while
 waiting for a worker, **running Nm** (pulsing, worker name below), amber
 **awaiting approval** (the loudest treatment — see Attention strip), rose
 **failed** with the reason on hover, and neutral **stopped** for a
-deliberate cancel or plan rejection (never styled as a failure). A completed
-run with a merge request becomes an **`!N`** chip linking to it; without one
-it's still a plain **completed** badge (never invisible). More than one run
-on an issue adds a small **×N** count next to the badge — full history is
-one click away (see Opening an issue).
+deliberate cancel or plan rejection — even one carrying your own free-text
+reason — never styled as a failure. The stopped/failed call is made
+server-side, not guessed from the reason text, so there's no wording that
+can slip a deliberate stop into the rose "failed" treatment.
+
+A completed run with a merge request becomes an **`!N`** chip linking to
+it, colored to match the MR's own state: an open MR renders exactly as
+before, a merged one gets an ok-toned **`!N merged`**, and one closed
+unmerged gets a muted, struck-through **`!N closed`**. Without an MR a
+completed run is still a plain **completed** badge (never invisible). More
+than one run on an issue adds a small **×N** count next to the badge — full
+history is one click away (see Opening an issue).
+
+The merged/closed chip is a best-effort hint, not a live poll, and its
+freshness guarantee applies only to a card's **latest** run — that one
+chip is always accurate as of the board's last sync. Older runs, wherever
+you see their chips (an issue's run history, the run view), are frozen at
+whatever MR state uzi last observed for that specific run: if a later
+rework run supersedes it, its chip stops updating and can go stale — hover
+any chip for "as of last sync". A stale **closed** is the case to watch for
+(that MR may have since been reopened); a stale **merged** is rare in
+practice, since merging an MR closes its issue and the card leaves the
+board before the state would ever go stale.
 
 ## Attention strip
 

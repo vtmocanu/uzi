@@ -192,16 +192,21 @@ SELECT * FROM issues WHERE repo_id = $1 ORDER BY forge_issue_iid ASC;
 -- here genuinely has a run, so id/user_id/status are non-null (a LEFT JOIN LATERAL
 -- onto issues would leave them NULL for issues with no run, which sqlc mistypes as
 -- non-null and would then panic on scan — so the caller maps these onto issues in
--- Go instead, and issues with no run simply render latest_run: null). owner
--- name/email + worker name ride along for the "started by X" treatment; user_id
--- lets the caller flag viewer ownership. run_count is a window count over each
--- issue's runs (evaluated before DISTINCT ON, so it survives the newest-row pick)
--- and drives the board's "×N" retry hint without a per-issue history fan-in. Only
+-- Go instead, and issues with no run simply render latest_run: null). The owner
+-- DISPLAY NAME + worker name ride along for the "started by X" treatment; user_id
+-- lets the caller flag viewer ownership. The email is deliberately NOT selected
+-- (PRD #33 Decision 5): owner_name is display-name-or-empty and must never carry an
+-- identifier, so a shared board can never leak another user's email on a card.
+-- run_count is a window count over each issue's runs (evaluated before DISTINCT ON,
+-- so it survives the newest-row pick) and drives the board's "×N" retry hint without
+-- a per-issue history fan-in. It is ISSUE-SCOPED on purpose (Decision 6): it counts
+-- ALL runs of the issue across every user — a board-level fact a shared board
+-- legitimately shows (only a count, no identity), not a per-viewer number. Only
 -- display fields — never session_id, plan_md, or any secret.
 SELECT DISTINCT ON (r.issue_iid)
-       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.failure_reason,
+       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop_kind,
        r.created_at, r.updated_at,
-       ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
+       ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER (PARTITION BY r.issue_iid) AS run_count
 FROM runs r
 LEFT JOIN users ru ON ru.id = r.user_id
@@ -212,11 +217,13 @@ ORDER BY r.issue_iid, r.created_at DESC;
 -- name: GetLatestRunForIssue :one
 -- One issue's newest run with the same display fields as the board lateral join,
 -- for the single-card responses (e.g. after a manual drag) so a card never loses
--- its run badge on partial updates. run_count mirrors ListLatestRunsForRepo (a
--- window count over the issue's runs, already scoped to one issue by the WHERE) so
--- the "×N" retry hint survives a drag. Returns no rows when the issue has never run.
-SELECT r.id, r.user_id, r.status, r.mr_iid, r.failure_reason, r.created_at, r.updated_at,
-       ru.display_name AS owner_name, ru.email AS owner_email, rw.name AS worker_name,
+-- its run badge on partial updates. Like ListLatestRunsForRepo it selects the owner
+-- DISPLAY NAME only, never the email (Decision 5). run_count mirrors that query (a
+-- window count over the issue's runs, already scoped to one issue by the WHERE, and
+-- issue-scoped across all users by design — Decision 6) so the "×N" retry hint
+-- survives a drag. Returns no rows when the issue has never run.
+SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop_kind, r.created_at, r.updated_at,
+       ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
 FROM runs r
 LEFT JOIN users ru ON ru.id = r.user_id

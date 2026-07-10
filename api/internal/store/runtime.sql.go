@@ -13,7 +13,7 @@ import (
 )
 
 const cancelRunServerSide = `-- name: CancelRunServerSide :execrows
-UPDATE runs SET status = 'cancelled', move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE id = $1 AND user_id = $2
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -25,7 +25,9 @@ type CancelRunServerSideParams struct {
 
 // Server-side cancel for a run with no live poller (still queued, or its worker
 // went stale): the user input is not stranded waiting for a GET /inputs poll
-// that will never come. cancelled restores the origin column → stamp.
+// that will never come. cancelled restores the origin column → stamp. stop_kind is
+// stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
+// status='cancelled' branch already treats this run as a deliberate stop.
 func (q *Queries) CancelRunServerSide(ctx context.Context, arg CancelRunServerSideParams) (int64, error) {
 	result, err := q.db.Exec(ctx, cancelRunServerSide, arg.ID, arg.UserID)
 	if err != nil {
@@ -72,7 +74,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind
 `
 
 type ClaimRunParams struct {
@@ -123,6 +125,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.PipelineRef,
 		&i.FailureSnapshot,
 		&i.FixVerdict,
+		&i.StopKind,
 	)
 	return i, err
 }
@@ -239,7 +242,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
 VALUES ($1, $2, $3, $4, $5, $6, now(), $7)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind
 `
 
 type CreateRunParams struct {
@@ -306,6 +309,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.PipelineRef,
 		&i.FailureSnapshot,
 		&i.FixVerdict,
+		&i.StopKind,
 	)
 	return i, err
 }
@@ -324,8 +328,59 @@ type CreateRunInputParams struct {
 }
 
 // User inputs (steering) ---------------------------------------------------
+// Enqueue a plain steering input (approve_plan / follow_up) for the live worker to
+// consume. This path never touches the runs row — no stop signal, no lock — so a
+// follow-up mid-run is a single cheap insert. Deliberate-stop verdicts go through
+// CreateStopVerdictInput instead (they must stamp runs.stop_kind atomically).
 func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) (RunUserInput, error) {
 	row := q.db.QueryRow(ctx, createRunInput, arg.RunID, arg.Kind, arg.Body)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createStopVerdictInput = `-- name: CreateStopVerdictInput :one
+WITH stamped AS (
+    UPDATE runs SET stop_kind = $4, updated_at = now()
+    WHERE id = $1
+    RETURNING id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+VALUES ($1, $2, $3)
+RETURNING id, run_id, kind, body, consumed_at, created_at
+`
+
+type CreateStopVerdictInputParams struct {
+	RunID    uuid.UUID   `json:"run_id"`
+	Kind     string      `json:"kind"`
+	Body     pgtype.Text `json:"body"`
+	StopKind pgtype.Text `json:"stop_kind"`
+}
+
+// Enqueue a deliberate-stop verdict (cancel / reject_plan) for the live worker AND
+// stamp runs.stop_kind in the SAME statement (PRD #33 Decision 3): a data-modifying
+// CTE runs to completion exactly once, so the stop signal can never be lost
+// independently of the input that requested it — which a second, non-transactional
+// UPDATE would risk, reintroducing the failed-vs-stopped bug. workersvc.Store exposes
+// no transaction seam, so this single combined statement IS the atomicity. It is used
+// ONLY for the two stop verdicts, so the stamp is unconditional (no IS NOT NULL guard
+// and thus no parameter-type-inference pitfall). The stamp lands while the run is
+// still non-terminal (awaiting_approval/running); the client's terminal-guarded
+// isStoppedRun ignores it until the run actually reaches failed/cancelled.
+func (q *Queries) CreateStopVerdictInput(ctx context.Context, arg CreateStopVerdictInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, createStopVerdictInput,
+		arg.RunID,
+		arg.Kind,
+		arg.Body,
+		arg.StopKind,
+	)
 	var i RunUserInput
 	err := row.Scan(
 		&i.ID,
@@ -471,7 +526,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -513,12 +568,13 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.PipelineRef,
 		&i.FailureSnapshot,
 		&i.FixVerdict,
+		&i.StopKind,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -562,6 +618,7 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.PipelineRef,
 		&i.FailureSnapshot,
 		&i.FixVerdict,
+		&i.StopKind,
 	)
 	return i, err
 }
@@ -677,7 +734,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -722,6 +779,7 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.PipelineRef,
 		&i.FailureSnapshot,
 		&i.FixVerdict,
+		&i.StopKind,
 	)
 	return i, err
 }
@@ -862,7 +920,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -923,6 +981,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.PipelineRef,
 			&i.Run.FailureSnapshot,
 			&i.Run.FixVerdict,
+			&i.Run.StopKind,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -1129,7 +1188,7 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, rp.path_with_namespace AS repo_path, w.name AS worker_name
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -1200,6 +1259,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.PipelineRef,
 			&i.Run.FailureSnapshot,
 			&i.Run.FixVerdict,
+			&i.Run.StopKind,
 			&i.RepoPath,
 			&i.WorkerName,
 		); err != nil {
@@ -1378,7 +1438,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 }
 
 const rejectRunServerSide = `-- name: RejectRunServerSide :execrows
-UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE id = $2 AND user_id = $3
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -1389,7 +1449,10 @@ type RejectRunServerSideParams struct {
 	UserID        uuid.UUID   `json:"user_id"`
 }
 
-// Server-side plan rejection → failed → origin restore → stamp.
+// Server-side plan rejection → failed → origin restore → stamp. stop_kind is
+// stamped 'plan_rejected' in the same statement as the status/failure_reason write
+// (PRD #33 Decision 3), so this failed run is recognised as a deliberate stop
+// regardless of the failure_reason text.
 func (q *Queries) RejectRunServerSide(ctx context.Context, arg RejectRunServerSideParams) (int64, error) {
 	result, err := q.db.Exec(ctx, rejectRunServerSide, arg.FailureReason, arg.ID, arg.UserID)
 	if err != nil {

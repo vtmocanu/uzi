@@ -238,6 +238,19 @@ func run() error {
 	if err := seed.AnthropicToken(ctx, q, vlt, cfg); err != nil {
 		return err
 	}
+	// Optional startup Slack-settings seed (UZI_SEED_SLACK_*): create-only
+	// app_settings rows — tokens sealed at rest, slack_enabled flipped on, and
+	// optionally public_base_url — so a fresh `down -v` stack comes up
+	// Slack-configured from .env while the admin UI stays the editable source of
+	// truth afterwards (unlike the SLACK_* overlay, which pins and greys the
+	// fields). No network validation at boot: a bad token surfaces as the socket
+	// manager's failed connect. DB or seal errors abort boot; existing rows are
+	// left untouched. Runs before the manager goroutine starts, and the cache is
+	// invalidated so its first read sees the seeded rows.
+	if err := seed.SlackSettings(ctx, q, box, cfg); err != nil {
+		return err
+	}
+	settingsCache.Invalidate()
 
 	// Claim gating + claim-time token open share the same vault instance the HTTP
 	// handlers hold (PRD #32 M3): a locked owner's runs stay queued instead of

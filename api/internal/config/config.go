@@ -114,6 +114,22 @@ type Config struct {
 	// and is format-checked (never network-verified) at seed time.
 	SeedAnthropicToken string
 
+	// SeedSlackBotToken/SeedSlackAppToken/SeedPublicBaseURL optionally seed the
+	// Slack app_settings rows at startup (UZI_SEED_SLACK_BOT_TOKEN /
+	// UZI_SEED_SLACK_APP_TOKEN / UZI_SEED_PUBLIC_BASE_URL, create-only per key):
+	// the tokens are sealed with the settings secretbox before storage and
+	// slack_enabled is flipped to "true" in the same pass. Unlike the SLACK_* ENV
+	// overlay below — which wins over the DB on every read and greys the webui
+	// fields — a seeded value is an ordinary DB row: rotatable from the admin UI
+	// afterwards, with later .env edits ignored while the row exists. Each seed
+	// var is mutually exclusive with its overlay counterpart (boot-fatal), so a
+	// key can never have two competing env sources. The tokens are prefix-checked
+	// (xoxb-/xapp-) at Load and must be set together; they are settings-level
+	// secrets, never logged.
+	SeedSlackBotToken string
+	SeedSlackAppToken string
+	SeedPublicBaseURL string
+
 	// Agent-runtime (PRD #4) knobs. All have safe defaults; none is a boot guard
 	// (they tune the run queue / worker liveness, not security). RunIdleTimeout
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
@@ -296,6 +312,11 @@ func Load() (Config, error) {
 	if err := loadSeedAnthropic(&cfg); err != nil {
 		return Config{}, err
 	}
+	// Must run after the SLACK_*/UZI_PUBLIC_BASE_URL overlay vars are read above
+	// (it rejects a seed var whose overlay counterpart is also set).
+	if err := loadSeedSlack(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
@@ -377,6 +398,54 @@ func loadSeedAnthropic(cfg *Config) error {
 		return fmt.Errorf("UZI_SEED_ANTHROPIC_TOKEN is set but UZI_SEED_EMAIL is not; the seeded token must belong to the seed admin")
 	}
 	cfg.SeedAnthropicToken = token
+	return nil
+}
+
+// loadSeedSlack reads and validates the optional startup Slack-settings seed
+// (UZI_SEED_SLACK_BOT_TOKEN / UZI_SEED_SLACK_APP_TOKEN / UZI_SEED_PUBLIC_BASE_URL).
+// It is off unless one of them is set; when set, a static misconfiguration is a
+// loud boot failure, consistent with the other seed loaders:
+//   - the two tokens must be set together (a half-configured pair can never
+//     connect) and must carry their well-known prefixes (xoxb-/xapp- — the
+//     cheapest catch for swapped or pasted-wrong values);
+//   - a seed var whose SLACK_*/UZI_PUBLIC_BASE_URL overlay counterpart is also
+//     set is rejected: the overlay wins over the DB on every read, so the seeded
+//     row would be dead weight that silently diverges from what runs.
+//
+// Error messages carry only the variable names, never a token byte. The seeded
+// public base URL passes the same http(s) shape check as its overlay twin.
+func loadSeedSlack(cfg *Config) error {
+	bot := strings.TrimSpace(os.Getenv("UZI_SEED_SLACK_BOT_TOKEN"))
+	app := strings.TrimSpace(os.Getenv("UZI_SEED_SLACK_APP_TOKEN"))
+	pub := strings.TrimSpace(os.Getenv("UZI_SEED_PUBLIC_BASE_URL"))
+	if bot == "" && app == "" && pub == "" {
+		return nil
+	}
+	if (bot == "") != (app == "") {
+		return fmt.Errorf("UZI_SEED_SLACK_BOT_TOKEN and UZI_SEED_SLACK_APP_TOKEN must be set together")
+	}
+	if bot != "" {
+		if cfg.SlackBotToken != "" || cfg.SlackAppToken != "" {
+			return fmt.Errorf("UZI_SEED_SLACK_* and the SLACK_BOT_TOKEN/SLACK_APP_TOKEN overlay are mutually exclusive (the overlay always wins over a DB row); set one or the other")
+		}
+		if !strings.HasPrefix(bot, "xoxb-") {
+			return fmt.Errorf("UZI_SEED_SLACK_BOT_TOKEN must be a bot token (xoxb-…)")
+		}
+		if !strings.HasPrefix(app, "xapp-") {
+			return fmt.Errorf("UZI_SEED_SLACK_APP_TOKEN must be an app-level token (xapp-…)")
+		}
+	}
+	if pub != "" {
+		if cfg.PublicBaseURL != "" {
+			return fmt.Errorf("UZI_SEED_PUBLIC_BASE_URL and UZI_PUBLIC_BASE_URL are mutually exclusive (the overlay always wins over a DB row); set one or the other")
+		}
+		if err := settings.ValidatePublicBaseURL(pub); err != nil {
+			return fmt.Errorf("UZI_SEED_PUBLIC_BASE_URL %s", err)
+		}
+	}
+	cfg.SeedSlackBotToken = bot
+	cfg.SeedSlackAppToken = app
+	cfg.SeedPublicBaseURL = pub
 	return nil
 }
 

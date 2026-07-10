@@ -63,6 +63,9 @@ func (s *runsStore) ListActiveRunsAll(context.Context) ([]store.ListActiveRunsAl
 func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) (store.RunUserInput, error) {
 	return store.RunUserInput{}, nil
 }
+func (s *runsStore) CreateStopVerdictInput(context.Context, store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
+	return store.RunUserInput{}, nil
+}
 
 func newRunsHandler(t *testing.T, st workersvc.Store) *Handler {
 	t.Helper()

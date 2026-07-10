@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +58,74 @@ func TestLoadSlackDefaultsEmpty(t *testing.T) {
 	// and the socket handshake are never unbounded.
 	if cfg.SlackHTTPTimeout != 15*time.Second {
 		t.Errorf("SlackHTTPTimeout default = %v, want 15s", cfg.SlackHTTPTimeout)
+	}
+}
+
+func TestLoadSeedSlack(t *testing.T) {
+	slackBaseEnv(t)
+	t.Setenv("UZI_SEED_SLACK_BOT_TOKEN", "xoxb-seed-bot")
+	t.Setenv("UZI_SEED_SLACK_APP_TOKEN", "xapp-seed-app")
+	t.Setenv("UZI_SEED_PUBLIC_BASE_URL", "https://uzi.example")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.SeedSlackBotToken != "xoxb-seed-bot" {
+		t.Errorf("SeedSlackBotToken = %q", cfg.SeedSlackBotToken)
+	}
+	if cfg.SeedSlackAppToken != "xapp-seed-app" {
+		t.Errorf("SeedSlackAppToken = %q", cfg.SeedSlackAppToken)
+	}
+	if cfg.SeedPublicBaseURL != "https://uzi.example" {
+		t.Errorf("SeedPublicBaseURL = %q", cfg.SeedPublicBaseURL)
+	}
+}
+
+func TestLoadSeedSlackRejectsMisconfiguration(t *testing.T) {
+	// Each is a loud boot failure — a set-but-invalid seed must never be a
+	// silent skip. Error text must name the variable but never carry the token.
+	cases := map[string]map[string]string{
+		"bot token without app token": {
+			"UZI_SEED_SLACK_BOT_TOKEN": "xoxb-alone",
+		},
+		"app token without bot token": {
+			"UZI_SEED_SLACK_APP_TOKEN": "xapp-alone",
+		},
+		"wrong bot prefix": {
+			"UZI_SEED_SLACK_BOT_TOKEN": "xapp-swapped",
+			"UZI_SEED_SLACK_APP_TOKEN": "xapp-seed-app",
+		},
+		"wrong app prefix": {
+			"UZI_SEED_SLACK_BOT_TOKEN": "xoxb-seed-bot",
+			"UZI_SEED_SLACK_APP_TOKEN": "xoxb-swapped",
+		},
+		"seed conflicts with token overlay": {
+			"UZI_SEED_SLACK_BOT_TOKEN": "xoxb-seed-bot",
+			"UZI_SEED_SLACK_APP_TOKEN": "xapp-seed-app",
+			"SLACK_BOT_TOKEN":          "xoxb-env-bot",
+			"SLACK_APP_TOKEN":          "xapp-env-app",
+		},
+		"seed conflicts with base URL overlay": {
+			"UZI_SEED_PUBLIC_BASE_URL": "https://uzi.example",
+			"UZI_PUBLIC_BASE_URL":      "https://uzi.example",
+		},
+		"bad seed base URL": {
+			"UZI_SEED_PUBLIC_BASE_URL": "ftp://uzi.example",
+		},
+	}
+	for name, env := range cases {
+		t.Run(name, func(t *testing.T) {
+			slackBaseEnv(t)
+			for k, v := range env {
+				t.Setenv(k, v)
+			}
+			if _, loadErr := Load(); loadErr == nil {
+				t.Errorf("Load() = nil, want boot failure")
+			} else if strings.Contains(loadErr.Error(), "seed-bot") || strings.Contains(loadErr.Error(), "seed-app") {
+				t.Errorf("error leaks token bytes: %v", loadErr)
+			}
+		})
 	}
 }
 

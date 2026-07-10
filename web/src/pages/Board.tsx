@@ -31,6 +31,7 @@ import { visibleColumns } from "../lib/boardColumns";
 import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
 import { FixCiButton, PipelineBadge } from "../components/PipelineBadge";
+import { MrChip } from "../components/MrChip";
 import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
 
@@ -624,22 +625,7 @@ function IssueCard({
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
         {badge &&
           (badge.kind === "mr" ? (
-            mrHref ? (
-              <a
-                href={mrHref}
-                target="_blank"
-                rel="noreferrer"
-                draggable={false}
-                title="Open the merge request on GitLab"
-                className="inline-flex items-center rounded-md border border-ok/40 bg-ok/10 px-1.5 py-0.5 text-[11px] font-medium text-ok transition-colors hover:bg-ok/20"
-              >
-                !{badge.mrIid}
-              </a>
-            ) : (
-              <span className="inline-flex items-center rounded-md border border-ok/40 bg-ok/10 px-1.5 py-0.5 text-[11px] font-medium text-ok">
-                !{badge.mrIid}
-              </span>
-            )
+            <MrChip mrIid={badge.mrIid} mrState={badge.mrState} href={mrHref} />
           ) : (
             <span className={badge.pulse ? "animate-pulse" : ""}>
               <Badge tone={badge.tone} title={badge.title}>

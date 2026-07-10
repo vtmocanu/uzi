@@ -64,6 +64,21 @@ services:
       # Without this line the boot-seed is inert — config.Load reads it from the
       # api container env, which compose must wire in from .env.
       UZI_SEED_ANTHROPIC_TOKEN: ${UZI_SEED_ANTHROPIC_TOKEN:-}
+      # Slack integration (PRD #25). Without these lines every SLACK_*/seed var in
+      # .env is inert — config.Load reads the api container env, which compose must
+      # wire in from .env. Overlay vars pin + grey the admin UI fields; the
+      # UZI_SEED_SLACK_* vars instead seed the DB create-only on first boot and
+      # leave the UI editable. A seed var and its overlay counterpart together
+      # refuse to boot.
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      UZI_PUBLIC_BASE_URL: ${UZI_PUBLIC_BASE_URL:-}
+      SLACK_HTTP_TIMEOUT: ${SLACK_HTTP_TIMEOUT:-15s}
+      SLACK_DM_RATE_LIMIT_MAX: ${SLACK_DM_RATE_LIMIT_MAX:-6}
+      SLACK_DM_RATE_LIMIT_WINDOW: ${SLACK_DM_RATE_LIMIT_WINDOW:-1m}
+      UZI_SEED_SLACK_BOT_TOKEN: ${UZI_SEED_SLACK_BOT_TOKEN:-}
+      UZI_SEED_SLACK_APP_TOKEN: ${UZI_SEED_SLACK_APP_TOKEN:-}
+      UZI_SEED_PUBLIC_BASE_URL: ${UZI_SEED_PUBLIC_BASE_URL:-}
       # Trust the nginx hop (the compose network is private RFC1918) so the
       # real client IP is read from the XFF nginx sets. A direct hit that
       # bypasses nginx from a non-trusted source has its XFF ignored.

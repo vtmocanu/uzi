@@ -6,6 +6,9 @@ import {
   hasActiveRun,
   isAwaitingApproval,
   isStoppedRun,
+  mrChipState,
+  mrChipSuffix,
+  mrChipTitle,
   retryHint,
   runBadge,
   runStatusTone,
@@ -18,7 +21,9 @@ function run(over: Partial<LatestRun> = {}): LatestRun {
     id: "run-1",
     status: "queued",
     mr_iid: null,
+    mr_state: null,
     failure_reason: null,
+    stop_kind: null,
     owner_name: "Vlad",
     worker_name: null,
     is_mine: true,
@@ -67,17 +72,31 @@ describe("runBadge taxonomy", () => {
     expect(b).toMatchObject({ kind: "badge", label: "stopped", tone: "neutral" });
   });
 
-  it("failed with a known server stop reason → 'stopped', never danger", () => {
-    const b = runBadge(run({ status: "failed", failure_reason: "run cancelled" }), NOW);
+  it("failed with a server-stamped stop_kind → 'stopped', never danger", () => {
+    const b = runBadge(run({ status: "failed", stop_kind: "cancelled" }), NOW);
     expect(b).toMatchObject({ kind: "badge", label: "stopped", tone: "neutral" });
-    const r = runBadge(run({ status: "failed", failure_reason: "plan rejected" }), NOW);
+    // A live-poller plan reject carrying the user's VERBATIM reason: the string
+    // heuristic could never catch this, stop_kind does (PRD #33 success criterion 1).
+    const r = runBadge(
+      run({ status: "failed", stop_kind: "plan_rejected", failure_reason: "this is the wrong approach entirely" }),
+      NOW,
+    );
     expect(r).toMatchObject({ kind: "badge", label: "stopped", tone: "neutral" });
   });
 
-  it("completed with an MR → MR chip", () => {
+  it("completed with an MR → MR chip carrying the derived state (open by default)", () => {
     expect(runBadge(run({ status: "completed", mr_iid: 42 }), NOW)).toEqual({
       kind: "mr",
       mrIid: 42,
+      mrState: "open",
+    });
+  });
+
+  it("completed with a merged MR → MR chip carrying mrState 'merged'", () => {
+    expect(runBadge(run({ status: "completed", mr_iid: 42, mr_state: "merged" }), NOW)).toEqual({
+      kind: "mr",
+      mrIid: 42,
+      mrState: "merged",
     });
   });
 
@@ -85,30 +104,46 @@ describe("runBadge taxonomy", () => {
     const b = runBadge(run({ status: "completed", mr_iid: null }), NOW);
     expect(b).toMatchObject({ kind: "badge", label: "completed", tone: "ok" });
   });
+
+  // Decision 4 guards: a stop_kind stamped at verdict enqueue must not hijack a run
+  // that is still running or that raced to completion.
+  it("stamped stop_kind but still running → renders by status, not 'stopped'", () => {
+    const b = runBadge(run({ status: "running", stop_kind: "cancelled" }), NOW);
+    expect(b).toMatchObject({ kind: "badge", tone: "info", pulse: true });
+    if (b.kind === "badge") expect(b.label).toBe("running 4m");
+  });
+
+  it("stamped stop_kind but completed with an MR → MR chip (reject-then-approve race)", () => {
+    expect(runBadge(run({ status: "completed", stop_kind: "plan_rejected", mr_iid: 42 }), NOW)).toEqual({
+      kind: "mr",
+      mrIid: 42,
+      mrState: "open",
+    });
+  });
 });
 
-describe("isStoppedRun (exact server stop reasons)", () => {
+describe("isStoppedRun (server-stamped stop_kind, terminal-guarded)", () => {
   it("true for cancelled status", () => {
     expect(isStoppedRun("cancelled", null)).toBe(true);
+    expect(isStoppedRun("cancelled", "cancelled")).toBe(true);
   });
-  it("true for failed with an exact server stop reason", () => {
-    expect(isStoppedRun("failed", "run cancelled")).toBe(true);
-    expect(isStoppedRun("failed", "plan rejected")).toBe(true);
+  it("true for failed carrying a stop_kind", () => {
+    expect(isStoppedRun("failed", "cancelled")).toBe(true);
+    expect(isStoppedRun("failed", "plan_rejected")).toBe(true);
   });
-  it("false for a failed reason that merely contains 'cancel' (no false stop)", () => {
-    // An arbitrary agent error containing the word must NOT masquerade as a
-    // deliberate stop — only the exact server literals do.
-    expect(isStoppedRun("failed", "Cancelled by poller")).toBe(false);
-    expect(isStoppedRun("failed", "operation cancel failed")).toBe(false);
-    expect(isStoppedRun("failed", "run cancelled by user")).toBe(false);
-  });
-  it("false for a genuine failure", () => {
-    expect(isStoppedRun("failed", "compile error")).toBe(false);
+  it("false for a genuine failure (no stop_kind)", () => {
     expect(isStoppedRun("failed", null)).toBe(false);
   });
-  it("false for non-terminal / completed", () => {
-    expect(isStoppedRun("completed", null)).toBe(false);
-    expect(isStoppedRun("running", null)).toBe(false);
+  // Decision 4 guard cases: on the live path stop_kind is stamped at verdict
+  // enqueue, before the run is terminal — and a reject-then-approve race can even
+  // complete a stamped run. The `failed`/`cancelled` guard keeps those honest.
+  it("false for a NON-TERMINAL run even when a stop_kind was already stamped", () => {
+    expect(isStoppedRun("awaiting_approval", "plan_rejected")).toBe(false);
+    expect(isStoppedRun("running", "cancelled")).toBe(false);
+  });
+  it("false for a COMPLETED run that carries a stop_kind (reject-then-approve race)", () => {
+    // Must NOT read as stopped — the run finished and should show its MR chip.
+    expect(isStoppedRun("completed", "plan_rejected")).toBe(false);
   });
 });
 
@@ -118,11 +153,10 @@ describe("runStatusTone (list-row tone)", () => {
   });
   it("deliberate stops → neutral, never danger", () => {
     expect(runStatusTone("cancelled", null)).toBe("neutral");
-    expect(runStatusTone("failed", "run cancelled")).toBe("neutral");
-    expect(runStatusTone("failed", "plan rejected")).toBe("neutral");
+    expect(runStatusTone("failed", "cancelled")).toBe("neutral");
+    expect(runStatusTone("failed", "plan_rejected")).toBe("neutral");
   });
-  it("a genuine failure → danger", () => {
-    expect(runStatusTone("failed", "compile error")).toBe("danger");
+  it("a genuine failure (no stop_kind) → danger", () => {
     expect(runStatusTone("failed", null)).toBe("danger");
   });
   it("completed → ok, claimed/running → info, queued → queue (matches StatusPill)", () => {
@@ -130,6 +164,33 @@ describe("runStatusTone (list-row tone)", () => {
     expect(runStatusTone("claimed", null)).toBe("info");
     expect(runStatusTone("running", null)).toBe("info");
     expect(runStatusTone("queued", null)).toBe("queue");
+  });
+});
+
+describe("mrChipState (derived MR-state variant, PRD #33)", () => {
+  it("maps merged and closed to their own variant", () => {
+    expect(mrChipState("merged")).toBe("merged");
+    expect(mrChipState("closed")).toBe("closed");
+  });
+  it("treats opened / locked / unknown / null / undefined as 'open' (chip unchanged — SC2)", () => {
+    expect(mrChipState("opened")).toBe("open");
+    expect(mrChipState("locked")).toBe("open");
+    expect(mrChipState("something-else")).toBe("open");
+    expect(mrChipState(null)).toBe("open");
+    expect(mrChipState(undefined)).toBe("open");
+  });
+});
+
+describe("mrChipSuffix / mrChipTitle", () => {
+  it("suffix is empty for open, the state word otherwise", () => {
+    expect(mrChipSuffix("open")).toBe("");
+    expect(mrChipSuffix("merged")).toBe(" merged");
+    expect(mrChipSuffix("closed")).toBe(" closed");
+  });
+  it("title scopes merged/closed to 'as of last sync'", () => {
+    expect(mrChipTitle("merged")).toMatch(/merged \(as of last sync\)/);
+    expect(mrChipTitle("closed")).toMatch(/closed unmerged \(as of last sync\)/);
+    expect(mrChipTitle("open")).toBe("Open the merge request on GitLab");
   });
 });
 

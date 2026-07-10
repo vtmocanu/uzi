@@ -2,9 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type IssueDetail, type RunListItem } from "../lib/api";
 import { startRunGate } from "../lib/runStream";
-import { activeRunInHistory, isStoppedRun, runStatusTone } from "../lib/runBadge";
+import { activeRunInHistory, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { Markdown } from "../components/Markdown";
+import { MrChip } from "../components/MrChip";
 import { formatDuration } from "../components/RunEvent";
 import { Alert, Badge, Button, Card } from "../components/ui";
 import { useAuth } from "../auth/AuthContext";
@@ -245,11 +246,14 @@ export function IssueView() {
 }
 
 function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl: string }) {
-  const stopped = isStoppedRun(run.status, run.failure_reason);
+  const stopped = isStoppedRun(run.status, run.stop_kind);
   const duration = runDuration(run);
   // PRD §3 asks for an MR *link* in the history; link it when we can build an https
   // URL, else fall back to a plain "!N" chip so it is never absent.
   const mrHref = run.mr_iid != null ? mergeRequestUrl(projectWebUrl, run.mr_iid) : null;
+  // MR state (PRD #33): a per-run frozen hint; open renders exactly as before,
+  // merged/closed get a label and closed is muted + struck ("as of last sync").
+  const mrState = mrChipState(run.mr_state);
   // §3 "started": show when the run began; fall back to its queued time for a run
   // that has not started yet (started_at null).
   const stamp = run.started_at ?? run.created_at;
@@ -262,26 +266,13 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
           {duration && <span>· {duration}</span>}
           {run.mr_iid != null && (
             <span>
-              ·{" "}
-              {mrHref ? (
-                <a
-                  href={mrHref}
-                  target="_blank"
-                  rel="noreferrer"
-                  title="Open the merge request on GitLab"
-                  className="text-brand hover:text-brand-hover"
-                >
-                  !{run.mr_iid}
-                </a>
-              ) : (
-                <>!{run.mr_iid}</>
-              )}
+              · <MrChip variant="inline" openTone="brand" mrIid={run.mr_iid} mrState={mrState} href={mrHref} />
             </span>
           )}
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <Badge tone={runStatusTone(run.status, run.failure_reason)}>
+        <Badge tone={runStatusTone(run.status, run.stop_kind)}>
           {stopped ? "stopped" : run.status.replace("_", " ")}
         </Badge>
         {/* Every run here is the viewer's own (the endpoint is owner-scoped), so

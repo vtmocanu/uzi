@@ -33,6 +33,7 @@ oauth_config:
       - chat:write
       - im:write
       - im:history
+      - users:read
       - users:read.email
       - reactions:write
 settings:
@@ -62,9 +63,19 @@ connection.
 
 ## 3. Configure uzi
 
-Either set env vars on the `api` service — `SLACK_BOT_TOKEN`,
-`SLACK_APP_TOKEN`, and `UZI_PUBLIC_BASE_URL` (the base URL Slack message
-links point at) — or, as an admin, open **Admin → Instance settings → Slack**:
+Three ways, pick one:
+
+- **Env overlay**: set `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and
+  `UZI_PUBLIC_BASE_URL` (the base URL Slack message links point at) on the
+  `api` service. These win over anything saved in the UI and grey out the
+  corresponding fields.
+- **Startup seed**: set `UZI_SEED_SLACK_BOT_TOKEN`, `UZI_SEED_SLACK_APP_TOKEN`
+  (and optionally `UZI_SEED_PUBLIC_BASE_URL`) instead. On first boot they are
+  stored encrypted and Slack is enabled automatically; afterwards the admin UI
+  stays fully editable and later `.env` edits are ignored — see
+  [configuration.md](./configuration.md). Don't combine a seed var with its
+  overlay counterpart (the API refuses to boot).
+- **Admin UI**: as an admin, open **Admin → Instance settings → Slack**:
 
 1. Paste the bot token and app-level token; uzi validates each against Slack
    (`auth.test` for the bot token, a Socket Mode handshake for the app token)
