@@ -78,6 +78,28 @@ func TestValidateRepoAgents(t *testing.T) {
 			agents:  []RepoAgent{{Name: "coder", Description: "bell\x07here"}},
 			wantErr: true,
 		},
+		{
+			// ESC is a control char (Cc) — IsControl already catches the ANSI-escape
+			// spoof — but assert it explicitly since it is the review's example.
+			name:    "ANSI escape in description",
+			agents:  []RepoAgent{{Name: "coder", Description: "\x1b[31mALERT\x1b[0m"}},
+			wantErr: true,
+		},
+		{
+			// U+202E RIGHT-TO-LEFT OVERRIDE is category Cf (format), NOT Cc, so
+			// IsControl misses it: this is the gap the stricter untrusted-repo rule
+			// closes. A bidi override can visually reorder text in the approval panel.
+			name:    "bidirectional override in description",
+			agents:  []RepoAgent{{Name: "coder", Description: "safe‮dnammoc"}},
+			wantErr: true,
+		},
+		{
+			// A zero-width joiner (also Cf) is likewise rejected for these one-line
+			// untrusted fields.
+			name:    "zero-width format character in description",
+			agents:  []RepoAgent{{Name: "coder", Description: "a‍b"}},
+			wantErr: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -129,7 +151,21 @@ func TestValidateSelection(t *testing.T) {
 			roster:  nil,
 			wantErr: true,
 		},
-		{name: "own source with no templates", sel: AgentSelection{Source: "own"}, roster: nil, wantErr: true},
+		{
+			// A user who disabled every subagent (or has only the lead allocated, which
+			// ownSubagentNames strips) approves a lead-only run — legal today, must stay
+			// legal. This is the empty-own-roster regression the review caught.
+			name:   "own source with an empty roster is a lead-only run",
+			sel:    AgentSelection{Source: "own"},
+			roster: nil,
+		},
+		{
+			// …but an exclusion on that empty roster is still a confused request.
+			name:    "own source, empty roster, with an exclusion",
+			sel:     AgentSelection{Source: "own", Exclusions: []string{"coder"}},
+			roster:  nil,
+			wantErr: true,
+		},
 		{
 			name:    "exclusion not in the roster",
 			sel:     AgentSelection{Source: "repo", Exclusions: []string{"auditor"}},
@@ -347,15 +383,20 @@ func TestSetStateAutopilotOwnSelectionUsesTheOwnersTemplates(t *testing.T) {
 	}
 }
 
-// A run whose owner has only the lead allocated has no subagent to run at all.
-func TestSetStateAutopilotOwnSelectionRejectsLeadOnlyRoster(t *testing.T) {
+// A run whose owner has only the lead allocated is a lead-only run — legal today
+// (the lead works alone against its guardrail prompt), so an autopilot `own`
+// default on it must persist, not 400. Regression guard for the empty-own-roster
+// bug the review caught.
+func TestSetStateAutopilotOwnSelectionAcceptsLeadOnlyRoster(t *testing.T) {
 	fs, svc, wkr, runID := runningStateFixture(t)
 	fs.templates = []store.AgentTemplate{{Name: "lead"}}
 	sel := AgentSelection{Source: AgentSourceOwn}
 
-	_, _, err := svc.SetState(context.Background(), wkr, runID, StateRequest{State: "running", AgentSelection: &sel})
-	if !errors.Is(err, ErrInvalidSelection) {
-		t.Fatalf("want ErrInvalidSelection, got %v", err)
+	if _, _, err := svc.SetState(context.Background(), wkr, runID, StateRequest{State: "running", AgentSelection: &sel}); err != nil {
+		t.Fatalf("a lead-only own run must be accepted: %v", err)
+	}
+	if fs.setRunningParams.AgentSource.String != "own" {
+		t.Fatalf("agent_source = %q", fs.setRunningParams.AgentSource.String)
 	}
 }
 

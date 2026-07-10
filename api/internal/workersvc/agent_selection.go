@@ -94,8 +94,8 @@ func validateRepoAgents(agents []RepoAgent) error {
 		if len(a.Description) > MaxAgentDescriptionLen {
 			return fmt.Errorf("%w: repo agent %q description must be at most %d characters", ErrInvalidSelection, a.Name, MaxAgentDescriptionLen)
 		}
-		if hasControlChar(a.Description) {
-			return fmt.Errorf("%w: repo agent %q description must not contain newlines or control characters", ErrInvalidSelection, a.Name)
+		if hasUnsafeChar(a.Description) {
+			return fmt.Errorf("%w: repo agent %q description must not contain newlines, control, or bidirectional/format characters", ErrInvalidSelection, a.Name)
 		}
 	}
 	return nil
@@ -103,9 +103,17 @@ func validateRepoAgents(agents []RepoAgent) error {
 
 // validateSelection checks a selection against the roster it names. `roster` is the
 // chosen source's selectable subagent names (the lead already removed). Exclusions
-// must be well-formed, must all exist in the roster, and must leave at least one
-// subagent standing — a run whose every subagent was excluded is not a run the lead
-// can delegate in, and the UI already refuses to submit one.
+// must be well-formed and must all exist in the roster.
+//
+// An empty roster is NOT rejected for the `own` source: a user may disable every
+// subagent template (or have only the lead allocated, which ownSubagentNames strips),
+// and that is an established, legal configuration — the lead runs alone against its
+// hardcoded guardrail prompt (ARCHITECTURE.md "The lead is a normal template … a
+// user may disable it"; agent/src/prompt.ts renders "No subagents are available; do
+// the work yourself."). Turning that into a 400 would regress a run that approves
+// fine today. Only the `repo` source requires a non-empty roster — that is the real
+// ordering trap: choosing repo agents when none were detected would activate an
+// empty agent map, a broken run rather than a deliberate lead-only one.
 func validateSelection(sel AgentSelection, roster []string) error {
 	if sel.Source != AgentSourceRepo && sel.Source != AgentSourceOwn {
 		return fmt.Errorf("%w: source must be 'repo' or 'own'", ErrInvalidSelection)
@@ -113,13 +121,8 @@ func validateSelection(sel AgentSelection, roster []string) error {
 	if len(sel.Exclusions) > MaxAgentExclusions {
 		return fmt.Errorf("%w: at most %d exclusions", ErrInvalidSelection, MaxAgentExclusions)
 	}
-	if len(roster) == 0 {
-		if sel.Source == AgentSourceRepo {
-			// Guards the ordering trap: choosing the repo source before (or without)
-			// a worker ever reporting a roster would activate an empty agent map.
-			return fmt.Errorf("%w: this run detected no repo agents", ErrInvalidSelection)
-		}
-		return fmt.Errorf("%w: you have no agent templates allocated to this run", ErrInvalidSelection)
+	if len(roster) == 0 && sel.Source == AgentSourceRepo {
+		return fmt.Errorf("%w: this run detected no repo agents", ErrInvalidSelection)
 	}
 
 	known := make(map[string]bool, len(roster))
@@ -131,12 +134,17 @@ func validateSelection(sel AgentSelection, roster []string) error {
 		if !agenttmpl.IsValidName(name) {
 			return fmt.Errorf("%w: exclusion must be kebab-case and at most %d characters", ErrInvalidSelection, agenttmpl.MaxNameLen)
 		}
+		// An exclusion naming an agent the roster does not contain is always an
+		// error, INCLUDING when the roster is empty (an empty `own` roster with an
+		// exclusion is a confused request, not a lead-only run).
 		if !known[name] {
 			return fmt.Errorf("%w: %q is not one of this run's %s agents", ErrInvalidSelection, name, sel.Source)
 		}
 		excluded[name] = true
 	}
-	if len(excluded) >= len(known) {
+	// Gated on a non-empty roster: `0 >= 0` must NOT read as "everything excluded"
+	// for a legitimately subagent-less own run (which reaches here with no exclusions).
+	if len(known) > 0 && len(excluded) >= len(known) {
 		return fmt.Errorf("%w: at least one subagent must remain selected", ErrInvalidSelection)
 	}
 	return nil
@@ -217,12 +225,20 @@ func encodeJSONArray[T any](items []T) ([]byte, error) {
 	return json.Marshal(items)
 }
 
-// hasControlChar reports whether s carries a newline, CR, or any other control
-// character. Mirrors the agent_templates write-path check (handler): these fields
-// render on a single line in the gate panel and in a run message.
-func hasControlChar(s string) bool {
+// hasUnsafeChar reports whether s carries a control character (newline, CR, an
+// ANSI-escape ESC, …) OR a format/bidirectional character (Unicode category Cf:
+// the RLO/LRO overrides U+202A–202E, the isolates U+2066–2069, zero-width joiners,
+// the BOM). uzi holds its OWN templates to the control-char rule via IsControl; a
+// repo agent's description is UNTRUSTED and gets the stricter one, because these
+// fields render straight into the plan-approval panel and a run message: a bidi
+// override can visually reorder "reviewer" into something else in an approval
+// dialog, and IsControl alone (Cc category) never catches U+202E (Cf). No
+// legitimate one-line agent description needs a format character, so rejecting the
+// whole category costs nothing. The worker will scrub these too in a follow-up; the
+// API does not take that on trust.
+func hasUnsafeChar(s string) bool {
 	for _, r := range s {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
 			return true
 		}
 	}
