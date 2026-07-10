@@ -134,6 +134,19 @@ type runDTO struct {
 	FinishedAt     *time.Time `json:"finished_at"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
+	// Per-run agent selection (PRD #37). RepoAgents is the roster the worker
+	// detected in the clone's .claude/agents/: null when no worker ever reported
+	// (a pre-feature run), `[]` when detection ran and found none. The plan gate
+	// distinguishes those two — an inert repo card vs. a live one — so do not
+	// collapse them. AgentSource/AgentExclusions stay null until a selection is
+	// made, at the gate or by an autopilot run's self-resolved default.
+	//
+	// The names and descriptions here are REPO-SUPPLIED text. The gate panel
+	// renders them as plain JSX, never through <Markdown>: an attacker-authored
+	// description must not put a clickable link inside an approval dialog.
+	RepoAgents      []workersvc.RepoAgent `json:"repo_agents"`
+	AgentSource     *string               `json:"agent_source"`
+	AgentExclusions []string              `json:"agent_exclusions"`
 }
 
 func runToDTO(r store.Run) runDTO {
@@ -172,6 +185,20 @@ func runToDTO(r store.Run) runDTO {
 		v := r.MrIid.Int64
 		dto.MrIID = &v
 	}
+	// PRD #37. A decode error should be impossible (the API validates every write
+	// and both columns carry a jsonb_typeof CHECK); it is logged and treated as
+	// "not reported" rather than failing the read of an otherwise-fine run.
+	if agents, err := workersvc.DecodeRepoAgents(r.RepoAgents); err != nil {
+		slog.Error("decode run repo agents", "run_id", r.ID, "error", err)
+	} else {
+		dto.RepoAgents = agents
+	}
+	if excl, err := workersvc.DecodeExclusions(r.AgentExclusions); err != nil {
+		slog.Error("decode run agent exclusions", "run_id", r.ID, "error", err)
+	} else {
+		dto.AgentExclusions = excl
+	}
+	dto.AgentSource = textPtrValue(r.AgentSource.Valid, r.AgentSource.String)
 	// The failing pipeline's URL rides the frozen snapshot, not a column (the
 	// pipeline cache row is transient). Best-effort decode; a ci_fix run always has
 	// one, an issue run has no snapshot.
@@ -478,6 +505,11 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Kind string `json:"kind"`
 		Body string `json:"body"`
+		// Selection is the PRD #37 agent choice, sent STRUCTURED and legal only with
+		// approve_plan. The client never composes the worker-bound input body itself:
+		// the server validates this against the run's real roster and writes its own
+		// canonical JSON encoding into that body.
+		Selection *workersvc.AgentSelection `json:"selection"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -488,13 +520,15 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body)
+	res, err := h.wsvc.SubmitInput(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrInvalidSelection):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		default:
 			slog.Error("submit run input", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

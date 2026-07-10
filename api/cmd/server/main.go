@@ -424,8 +424,12 @@ func (g gateSubmitter) GetRun(ctx context.Context, userID, runID uuid.UUID) (sto
 	return g.svc.GetRun(ctx, userID, runID)
 }
 
+// SubmitInput adapts the Slack gate to the run service. Slack carries no agent
+// picker, so its approve never names a selection (PRD #37): the run keeps whatever
+// default its worker resolved — repo agents when the clone shipped some, else the
+// owner's templates.
 func (g gateSubmitter) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) error {
-	_, err := g.svc.SubmitInput(ctx, userID, runID, kind, body)
+	_, err := g.svc.SubmitInput(ctx, userID, runID, kind, body, nil)
 	return err
 }
 

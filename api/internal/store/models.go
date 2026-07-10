@@ -156,6 +156,9 @@ type Run struct {
 	FailureSnapshot      []byte             `json:"failure_snapshot"`
 	FixVerdict           pgtype.Text        `json:"fix_verdict"`
 	StopKind             pgtype.Text        `json:"stop_kind"`
+	AgentSource          pgtype.Text        `json:"agent_source"`
+	AgentExclusions      []byte             `json:"agent_exclusions"`
+	RepoAgents           []byte             `json:"repo_agents"`
 }
 
 type RunMessage struct {
