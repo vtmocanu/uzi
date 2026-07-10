@@ -26,10 +26,7 @@ function aProposal(over: Partial<IssueProposal> = {}): IssueProposal {
     description: "Plain draft text.",
     labels: ["PRD"],
     status: "pending",
-    created_issue_iid: null,
-    created_issue_url: null,
     created_at: "2026-07-10T00:00:00Z",
-    resolved_at: null,
     ...over,
   };
 }
@@ -67,12 +64,9 @@ describe("ProposalCard — model text is inert (Decision 8)", () => {
 
 describe("ProposalCard — confirm is the only write path", () => {
   it("on Create, calls confirmProposal and shows the returned issue link (app-rendered)", async () => {
+    // Confirm returns the created issue (200 {issue}), NOT an updated proposal.
     mockApi.confirmProposal.mockResolvedValue({
-      proposal: aProposal({
-        status: "confirmed",
-        created_issue_iid: 321,
-        created_issue_url: "https://gitlab.example.com/grp/proj/-/issues/321",
-      }),
+      issue: { iid: 321, web_url: "https://gitlab.example.com/grp/proj/-/issues/321", title: "t" },
     });
 
     const { container } = render(<ProposalCard chatId="chat-1" proposal={aProposal()} />);
@@ -87,9 +81,8 @@ describe("ProposalCard — confirm is the only write path", () => {
   });
 
   it("on Dismiss, writes nothing to the forge and shows the dismissed state", async () => {
-    mockApi.dismissProposal.mockResolvedValue({
-      proposal: aProposal({ status: "dismissed", resolved_at: "2026-07-10T01:00:00Z" }),
-    });
+    // Dismiss is 204 No Content — the client resolves with no body.
+    mockApi.dismissProposal.mockResolvedValue(null);
 
     render(<ProposalCard chatId="chat-1" proposal={aProposal()} />);
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));

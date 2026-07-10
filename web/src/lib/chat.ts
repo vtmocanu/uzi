@@ -3,13 +3,30 @@
 // note, and conversation ordering. Kept out of the components so each rule is
 // unit-tested without a DOM (same split as runStream.ts / useFollowScroll.ts).
 
-import { isTerminalRun, type Chat, type RunMessage, type Worker } from "./api";
+import { isTerminalRun, type Chat, type Run, type RunMessage, type Worker } from "./api";
 
-// CHAT_MAX_TURNS is the server's default per-conversation turn cap
-// (Decision 3b, WORKER default 50). PROVISIONAL: the authoritative value rides
-// the Chat DTO (max_turns) once M1 lands; this is the fallback the conversation
-// view uses when it derives the turn count from the live stream instead.
+// CHAT_MAX_TURNS is the fallback per-conversation turn cap used before the
+// GET /api/chats envelope (max_turns) has loaded. The authoritative value is the
+// instance constant on that envelope (Decision 3b, WORKER default 50).
 export const CHAT_MAX_TURNS = 50;
+
+// chatFromRun maps a runDTO (POST /api/chats and .../continue return one under
+// `run`) into the unified Chat view type the components consume. A chat runDTO
+// carries title + resume_of_run_id; turn_count is not on the runDTO (it is a
+// per-list computation) so a freshly created run starts at 0 until the list or
+// stream refines it, and last_message_at is unknown here (null).
+export function chatFromRun(run: Run): Chat {
+  return {
+    id: run.id,
+    title: run.title,
+    status: run.status,
+    turn_count: 0,
+    resume_of_run_id: run.resume_of_run_id,
+    last_message_at: null,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+  };
+}
 
 // hasOnlineWorker reports whether the user has at least one connected worker —
 // the signal behind the worker-offline banner (Decision 15). Derived from the

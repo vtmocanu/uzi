@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  CHAT_MAX_TURNS,
+  chatFromRun,
   chatIsEnded,
   composerGate,
   conversationTitle,
@@ -10,7 +10,7 @@ import {
   sortConversations,
   turnCapNotice,
 } from "./chat";
-import type { Chat, RunMessage, Worker } from "./api";
+import type { Chat, Run, RunMessage, Worker } from "./api";
 
 function aWorker(over: Partial<Worker> = {}): Worker {
   return {
@@ -33,7 +33,6 @@ function aChat(over: Partial<Chat> = {}): Chat {
     title: "A chat",
     status: "running",
     turn_count: 0,
-    max_turns: CHAT_MAX_TURNS,
     resume_of_run_id: null,
     last_message_at: null,
     created_at: "2026-07-01T00:00:00Z",
@@ -144,5 +143,56 @@ describe("chatIsEnded / conversationTitle / sortConversations", () => {
     const noMsg = aChat({ id: "nomsg", last_message_at: null, updated_at: "2026-07-03T00:00:00Z" });
     const sorted = sortConversations([older, noMsg, newer]);
     expect(sorted.map((c) => c.id)).toEqual(["new", "nomsg", "old"]);
+  });
+});
+
+describe("chatFromRun (create/continue runDTO → unified Chat view)", () => {
+  function aRun(over: Partial<Run> = {}): Run {
+    return {
+      id: "r1",
+      repo_id: null,
+      kind: "chat",
+      issue_iid: null,
+      issue_title: "How does it work?",
+      issue_description: "",
+      title: "How does it work?",
+      resume_of_run_id: null,
+      status: "running",
+      requeue_count: 0,
+      iteration_count: 0,
+      auto_approve: false,
+      worker_id: "w1",
+      branch: null,
+      mr_iid: null,
+      mr_state: null,
+      failure_reason: null,
+      stop_kind: null,
+      pipeline_ref: null,
+      pipeline_web_url: null,
+      fix_verdict: null,
+      plan_md: null,
+      claimed_at: null,
+      started_at: null,
+      finished_at: null,
+      created_at: "2026-07-10T00:00:00Z",
+      updated_at: "2026-07-10T00:00:00Z",
+      ...over,
+    };
+  }
+
+  it("maps a chat runDTO into the Chat view type (title + resume carried, turns start at 0)", () => {
+    const chat = chatFromRun(aRun({ id: "abc", title: "T", resume_of_run_id: "prev" }));
+    expect(chat).toMatchObject({
+      id: "abc",
+      title: "T",
+      status: "running",
+      turn_count: 0,
+      resume_of_run_id: "prev",
+      last_message_at: null,
+    });
+  });
+
+  it("carries a null title through (worker has not derived one yet)", () => {
+    expect(chatFromRun(aRun({ title: null })).title).toBeNull();
   });
 });

@@ -23,7 +23,6 @@ export function ChatMessages({
   messages,
   connected,
   live,
-  onProposalResolved,
 }: {
   chatId: string;
   messages: RunMessage[];
@@ -31,7 +30,6 @@ export function ChatMessages({
   // live: the conversation's run is non-terminal, so a tool call with no result
   // yet shows a running spinner rather than "no result".
   live: boolean;
-  onProposalResolved?: (p: IssueProposal) => void;
 }) {
   const follow = useFollowScroll(messages.length);
   const reconnecting = useReconnectingBanner(connected);
@@ -71,7 +69,6 @@ export function ChatMessages({
                 }
                 live={live}
                 toolUseIds={toolIndex.toolUseIds}
-                onProposalResolved={onProposalResolved}
               />
             ))}
           </div>
@@ -96,14 +93,12 @@ function ChatRow({
   result,
   live,
   toolUseIds,
-  onProposalResolved,
 }: {
   chatId: string;
   msg: RunMessage;
   result?: RunMessage;
   live: boolean;
   toolUseIds: Set<string>;
-  onProposalResolved?: (p: IssueProposal) => void;
 }) {
   // A folded tool_result is skipped here — its call renders it inline (RunEvent).
   if (msg.kind === "tool_result") {
@@ -139,7 +134,7 @@ function ChatRow({
     return (
       <div className="flex justify-start">
         <div className="w-full max-w-[92%]">
-          <ProposalCard chatId={chatId} proposal={proposal} onResolved={onProposalResolved} />
+          <ProposalCard chatId={chatId} proposal={proposal} />
         </div>
       </div>
     );

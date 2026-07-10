@@ -22,13 +22,17 @@ function aChat(over: Partial<Chat> = {}): Chat {
     title: "How does the gate work?",
     status: "running",
     turn_count: 1,
-    max_turns: 50,
     resume_of_run_id: null,
     last_message_at: "2026-07-10T00:00:00Z",
     created_at: "2026-07-10T00:00:00Z",
     updated_at: "2026-07-10T00:00:00Z",
     ...over,
   };
+}
+
+// listChats returns the Chat items plus the max_turns envelope constant.
+function chatList(chats: Chat[]) {
+  return { chats, max_turns: 50 };
 }
 
 function aWorker(over: Partial<Worker> = {}): Worker {
@@ -56,12 +60,12 @@ afterEach(() => {
 
 describe("ChatList — conversation list from fixtures", () => {
   it("renders each conversation's title and status", async () => {
-    mockApi.listChats.mockResolvedValue({
-      chats: [
+    mockApi.listChats.mockResolvedValue(
+      chatList([
         aChat({ id: "a", title: "Active one", status: "running" }),
         aChat({ id: "b", title: "Ended one", status: "completed" }),
-      ],
-    });
+      ]),
+    );
 
     render(
       <MemoryRouter>
@@ -74,7 +78,7 @@ describe("ChatList — conversation list from fixtures", () => {
   });
 
   it("shows an empty state when there are no conversations", async () => {
-    mockApi.listChats.mockResolvedValue({ chats: [] });
+    mockApi.listChats.mockResolvedValue(chatList([]));
     render(
       <MemoryRouter>
         <ChatList />
@@ -86,12 +90,12 @@ describe("ChatList — conversation list from fixtures", () => {
 
 describe("ChatList — ended-conversation Continue affordance (Decision 11)", () => {
   it("shows Continue only for ended conversations", async () => {
-    mockApi.listChats.mockResolvedValue({
-      chats: [
+    mockApi.listChats.mockResolvedValue(
+      chatList([
         aChat({ id: "a", title: "Active one", status: "running" }),
         aChat({ id: "b", title: "Ended one", status: "completed" }),
-      ],
-    });
+      ]),
+    );
 
     render(
       <MemoryRouter>
@@ -107,7 +111,7 @@ describe("ChatList — ended-conversation Continue affordance (Decision 11)", ()
 
 describe("ChatList — worker-offline banner (Decision 15)", () => {
   it("shows the banner when no worker is online", async () => {
-    mockApi.listChats.mockResolvedValue({ chats: [] });
+    mockApi.listChats.mockResolvedValue(chatList([]));
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ status: "offline" })] });
 
     render(
@@ -120,7 +124,7 @@ describe("ChatList — worker-offline banner (Decision 15)", () => {
   });
 
   it("hides the banner when a worker is online", async () => {
-    mockApi.listChats.mockResolvedValue({ chats: [] });
+    mockApi.listChats.mockResolvedValue(chatList([]));
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ status: "online" })] });
 
     render(

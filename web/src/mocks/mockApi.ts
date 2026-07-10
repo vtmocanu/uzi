@@ -11,7 +11,7 @@ import {
   type AllocationsInput,
   type AppSettings,
   type Chat,
-  type IssueProposal,
+  type CreatedIssue,
   type PrivilegeReport,
   type Run,
   type RunMessage,
@@ -960,6 +960,8 @@ export const mockApi = {
       issue_iid: issueIid,
       issue_title: card.title,
       issue_description: "See the linked PRD.",
+      title: null,
+      resume_of_run_id: null,
       status: "queued",
       requeue_count: 0,
       iteration_count: 0,
@@ -998,6 +1000,8 @@ export const mockApi = {
       issue_iid: null,
       issue_title: `Fix CI: ${ref} pipeline`,
       issue_description: `Diagnose and fix the failed pipeline for \`${ref}\`.`,
+      title: null,
+      resume_of_run_id: null,
       status: "queued",
       requeue_count: 0,
       iteration_count: 0,
@@ -1057,20 +1061,23 @@ export const mockApi = {
         .map((r) => runListItem(r, requireSession().email)),
     }),
 
-  // ── Chat (PRD #39) ────────────────────────────────────────────────────────
+  // ── Chat (PRD #39) — real M1 wire ─────────────────────────────────────────
   listChats: async () =>
     delay({
       chats: [...state.runs.values()].filter((r) => r.kind === "chat").map((r) => chatDTO(r)),
+      max_turns: CHAT_MAX_TURNS, // the envelope constant, not per-chat
     }),
-  createChat: async (prompt: string) => {
+  createChat: async (message: string) => {
     const now = new Date().toISOString();
     const run: Run = {
       id: nextRunId(),
-      repo_id: "",
+      repo_id: null,
       kind: "chat",
       issue_iid: null,
-      issue_title: truncateChatTitle(prompt),
+      issue_title: truncateChatTitle(message),
       issue_description: "",
+      title: truncateChatTitle(message),
+      resume_of_run_id: null,
       status: "running",
       requeue_count: 0,
       iteration_count: 0,
@@ -1093,91 +1100,87 @@ export const mockApi = {
     };
     state.runs.set(run.id, run);
     state.messages.set(run.id, []);
-    appendMessage(run.id, "user_message", null, { text: prompt });
-    scheduleChatReply(run.id, prompt);
-    return delay({ chat: chatDTO(run) }, 300);
+    appendMessage(run.id, "user_message", null, { text: message });
+    scheduleChatReply(run.id, message);
+    return delay({ run: { ...run } }, 300);
   },
-  sendChatMessage: async (id: string, body: string) => {
+  sendChatMessage: async (id: string, message: string) => {
     const run = getRun(id);
     if (!run || run.kind !== "chat") throw new ApiError(404, "chat not found");
     if (["completed", "failed", "cancelled"].includes(run.status)) {
       throw new ApiError(409, "this conversation has ended");
     }
-    appendMessage(id, "user_message", null, { text: body });
-    scheduleChatReply(id, body);
+    appendMessage(id, "user_message", null, { text: message });
+    scheduleChatReply(id, message);
     return delay({ server_side: false }, 150);
   },
   endChat: async (id: string) => {
     const run = getRun(id);
     if (!run || run.kind !== "chat") throw new ApiError(404, "chat not found");
-    const next = patchRun(id, { status: "completed", finished_at: new Date().toISOString() })!;
-    return delay({ chat: chatDTO(next) }, 200);
+    patchRun(id, { status: "completed", finished_at: new Date().toISOString() });
+    return delay({ server_side: false }, 200);
   },
   continueChat: async (id: string) => {
     const src = getRun(id);
     if (!src || src.kind !== "chat") throw new ApiError(404, "chat not found");
     const now = new Date().toISOString();
-    const run: Run & { resume_of_run_id?: string } = {
+    const run: Run = {
       ...src,
       id: nextRunId(),
       status: "running",
+      resume_of_run_id: id,
       finished_at: null,
       created_at: now,
       updated_at: now,
-      resume_of_run_id: id,
     };
     state.runs.set(run.id, run);
     state.messages.set(run.id, []);
     appendMessage(run.id, "status", null, { text: "continuing the conversation on your worker" });
-    return delay({ chat: chatDTO(run) }, 250);
+    return delay({ run: { ...run } }, 250);
   },
   confirmProposal: async (chatId: string, proposalId: string) => {
     const p = getProposal(proposalId);
     if (!p || p.run_id !== chatId) throw new ApiError(404, "proposal not found");
     if (p.status !== "pending") throw new ApiError(409, "proposal already resolved");
+    // Mark resolved (a re-confirm 409s); the confirm response is the created issue.
+    putProposal({ ...p, status: "confirmed" });
     const iid = 200 + Math.floor(Math.random() * 800);
-    const resolved: IssueProposal = {
-      ...p,
-      status: "confirmed",
-      created_issue_iid: iid,
-      created_issue_url: `https://gitlab.example.com/${p.repo_path}/-/issues/${iid}`,
-      resolved_at: new Date().toISOString(),
+    const issue: CreatedIssue = {
+      iid,
+      web_url: `https://gitlab.example.com/${p.repo_path ?? "grp/proj"}/-/issues/${iid}`,
+      title: p.title,
     };
-    putProposal(resolved);
     // The created-issue link is appended to the conversation (Decision 8).
-    appendMessage(chatId, "text", "chat", {
-      text: `Created issue #${iid}: ${resolved.created_issue_url}`,
-    });
-    return delay({ proposal: resolved }, 350);
+    appendMessage(chatId, "text", "chat", { text: `Created issue #${iid}: ${issue.web_url}` });
+    return delay({ issue }, 350);
   },
   dismissProposal: async (chatId: string, proposalId: string) => {
     const p = getProposal(proposalId);
     if (!p || p.run_id !== chatId) throw new ApiError(404, "proposal not found");
-    const resolved: IssueProposal = { ...p, status: "dismissed", resolved_at: new Date().toISOString() };
-    putProposal(resolved);
+    putProposal({ ...p, status: "dismissed" });
     appendMessage(chatId, "status", null, { text: "proposal dismissed — nothing written to the forge" });
-    return delay({ proposal: resolved }, 200);
+    return delay(null, 200); // 204 No Content
   },
 };
 
 const CHAT_MAX_TURNS = 50;
 
-// chatDTO derives the Chat conversation shape from a chat run + its message log:
-// the title from the first user turn, the turn count from user_message rows, and
-// last activity from the newest message (PRD #39, PROVISIONAL wire).
+// chatDTO derives the chatListDTO shape from a chat run + its message log: the
+// title (the run's chat title, else derived from the first user turn), the
+// user-turn count, and last activity from the newest message (PRD #39 wire). No
+// max_turns here — that rides the list envelope as an instance constant.
 function chatDTO(run: Run): Chat {
   const msgs: RunMessage[] = state.messages.get(run.id) ?? [];
   const firstUser = msgs.find((m) => m.kind === "user_message");
   const derived = (firstUser?.payload as { text?: string } | null)?.text;
-  const title = derived ? truncateChatTitle(derived) : run.issue_title || null;
+  const title = run.title ?? (derived ? truncateChatTitle(derived) : run.issue_title || null);
   const turnCount = msgs.reduce((n, m) => (m.kind === "user_message" ? n + 1 : n), 0);
   return {
     id: run.id,
     title,
     status: run.status,
     turn_count: turnCount,
-    max_turns: CHAT_MAX_TURNS,
-    resume_of_run_id: (run as Run & { resume_of_run_id?: string }).resume_of_run_id ?? null,
+    resume_of_run_id: run.resume_of_run_id,
     last_message_at: msgs[msgs.length - 1]?.created_at ?? null,
     created_at: run.created_at,
     updated_at: run.updated_at,

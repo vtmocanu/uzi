@@ -73,8 +73,8 @@ export function ChatList() {
   const load = useCallback(async () => {
     setError("");
     try {
-      const [{ chats }, { workers }] = await Promise.all([api.listChats(), api.listWorkers()]);
-      setChats(sortConversations(chats));
+      const [chatRes, { workers }] = await Promise.all([api.listChats(), api.listWorkers()]);
+      setChats(sortConversations(chatRes.chats));
       setWorkers(workers);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load chats");
@@ -93,8 +93,9 @@ export function ChatList() {
     setError("");
     setStarting(true);
     try {
-      const { chat } = await api.createChat(p);
-      navigate(`/chat/${chat.id}`);
+      // create returns a full runDTO under `run`; navigate to the new conversation.
+      const { run } = await api.createChat(p);
+      navigate(`/chat/${run.id}`);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to start the chat");
       setStarting(false);
@@ -167,8 +168,9 @@ function ConversationRow({
   const continueChat = async () => {
     setBusy(true);
     try {
-      const { chat: next } = await api.continueChat(chat.id);
-      onContinued(next.id);
+      // continue returns the NEW chat run under `run`.
+      const { run } = await api.continueChat(chat.id);
+      onContinued(run.id);
     } catch (err) {
       onError(err instanceof ApiError ? err.message : "Failed to continue the chat");
       setBusy(false);
@@ -204,18 +206,21 @@ export function ChatConversation() {
 
   const [meta, setMeta] = useState<ChatDTO | null>(null);
   const [siblings, setSiblings] = useState<ChatDTO[]>([]);
+  const [maxTurns, setMaxTurns] = useState(CHAT_MAX_TURNS);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [busy, setBusy] = useState(false);
   const [actionErr, setActionErr] = useState("");
 
-  // Conversation meta (title, resume-of, the sibling set for the one-live-chat
-  // note) + worker liveness. Refetched on status change so the ended/active
-  // treatment stays honest after End chat.
+  // Conversation meta (title, server turn_count, resume-of, the sibling set for
+  // the one-live-chat note) + the turn-cap envelope constant + worker liveness.
+  // Refetched on status change and after each action so the count/treatment stay
+  // honest.
   const loadMeta = useCallback(async () => {
     try {
-      const [{ chats }, { workers }] = await Promise.all([api.listChats(), api.listWorkers()]);
-      setSiblings(chats);
-      setMeta(chats.find((c) => c.id === id) ?? null);
+      const [chatRes, { workers }] = await Promise.all([api.listChats(), api.listWorkers()]);
+      setSiblings(chatRes.chats);
+      setMeta(chatRes.chats.find((c) => c.id === id) ?? null);
+      setMaxTurns(chatRes.max_turns);
       setWorkers(workers);
     } catch {
       // Non-fatal: the stream still renders the conversation; meta just degrades.
@@ -240,8 +245,10 @@ export function ChatConversation() {
 
   const status = run?.status ?? meta?.status ?? "queued";
   const ended = isTerminalRun(status);
-  const turnCount = useMemo(() => countUserTurns(messages), [messages]);
-  const maxTurns = meta?.max_turns ?? CHAT_MAX_TURNS;
+  // Prefer the server's turn_count (reviewer M4 minor); fall back to the
+  // stream-derived count only until the list meta loads.
+  const streamTurns = useMemo(() => countUserTurns(messages), [messages]);
+  const turnCount = meta?.turn_count ?? streamTurns;
   const gate = composerGate({ status, turnCount, maxTurns });
   const notice = turnCapNotice({ turnCount, maxTurns });
   const queued = meta ? queuedBehindActive(meta, siblings) : false;
@@ -251,19 +258,21 @@ export function ChatConversation() {
     act(async () => {
       await api.sendChatMessage(id, text);
       void refreshRun();
+      // Refresh the server turn_count so the gate/notice track the new turn.
+      void loadMeta();
     });
 
   const end = () =>
     act(async () => {
-      await api.endChat(id);
+      await api.endChat(id); // 202 {server_side}; the run flips terminal server-side.
       void refreshRun();
       void loadMeta();
     });
 
   const continueChat = () =>
     act(async () => {
-      const { chat } = await api.continueChat(id);
-      navigate(`/chat/${chat.id}`);
+      const { run: next } = await api.continueChat(id);
+      navigate(`/chat/${next.id}`);
     });
 
   if (!run && !meta) {
