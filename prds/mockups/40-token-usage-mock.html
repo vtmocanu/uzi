@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uzi Token usage — mock</title>
+<style>
+  /* ── ember design tokens (values copied from web/src/index.css) ───────── */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 100 110 130;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  /* Mock is deliberately single-theme: it reproduces the app's dark "ember" palette. */
+  * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: rgb(var(--edge)) transparent; }
+  body {
+    margin: 0; padding: 32px 16px 64px;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    display: flex; justify-content: center;
+  }
+  .wrap { width: 100%; max-width: 860px; display: flex; flex-direction: column; gap: 40px; }
+  .mock-note { font-size: 12px; color: rgb(var(--faint)); margin: 0; }
+  .mock-note strong { color: rgb(var(--muted)); font-weight: 600; }
+
+  /* Section headers describing which real page each block belongs to */
+  .where {
+    display: flex; align-items: baseline; gap: 10px; margin: 0 0 10px;
+  }
+  .where h2 {
+    margin: 0; font-size: 13px; font-weight: 600; color: rgb(var(--brand));
+    letter-spacing: .02em;
+  }
+  .where span { font-size: 12px; color: rgb(var(--faint)); }
+
+  .card {
+    border: 1px solid rgb(var(--edge));
+    background: rgb(var(--surface));
+    border-radius: calc(var(--radius) + 2px);
+    padding: 20px;
+  }
+  .section-title {
+    font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+    color: rgb(var(--faint)); margin: 0 0 12px;
+  }
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+  /* ── 1. RunView header usage strip ────────────────────────────────────── */
+  .runhead { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+  .runhead h1 { margin: 0; font-size: 17px; font-weight: 600; }
+  .runhead .sub { margin: 4px 0 0; font-size: 12px; color: rgb(var(--faint)); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 500; border-radius: 999px; padding: 2px 10px;
+    border: 1px solid rgb(var(--ok) / .4); background: rgb(var(--ok) / .12); color: rgb(var(--ok));
+  }
+  .usage-strip {
+    margin-top: 16px;
+    display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 1px;
+    background: rgb(var(--edge)); border: 1px solid rgb(var(--edge));
+    border-radius: var(--radius); overflow: hidden;
+  }
+  @media (max-width: 640px) { .usage-strip { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+  .stat { background: rgb(var(--raised) / .75); padding: 10px 14px; }
+  .stat .k { font-size: 10.5px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: rgb(var(--faint)); }
+  .stat .v { margin-top: 3px; font-size: 17px; font-weight: 600; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .stat .d { margin-top: 1px; font-size: 11px; color: rgb(var(--muted)); }
+  .stat .v em { font-style: normal; font-size: 12px; color: rgb(var(--faint)); margin-left: 2px; }
+  .stat.cost .v { color: rgb(var(--brand)); }
+
+  /* cache bar inside the strip */
+  .cachebar { margin-top: 6px; height: 4px; border-radius: 2px; background: rgb(var(--edge)); overflow: hidden; display: flex; }
+  .cachebar i { display: block; height: 100%; }
+  .cachebar .hit { background: rgb(var(--info)); width: 91%; }
+  .cachebar .miss { background: rgb(var(--warn) / .8); width: 9%; }
+
+  /* per-phase table under the strip (collapsible in the real UI) */
+  details.phases { margin-top: 12px; }
+  details.phases summary {
+    cursor: pointer; list-style: none; display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: rgb(var(--muted));
+  }
+  details.phases summary::before { content: "▸"; font-size: 10px; color: rgb(var(--faint)); }
+  details[open].phases summary::before { content: "▾"; }
+  .phases-scroll { overflow-x: auto; margin-top: 8px; }
+  table.phases-t { border-collapse: collapse; width: 100%; font-size: 12px; min-width: 560px; }
+  table.phases-t th {
+    text-align: right; font-weight: 600; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+    color: rgb(var(--faint)); padding: 6px 10px; border-bottom: 1px solid rgb(var(--edge));
+  }
+  table.phases-t th:first-child, table.phases-t td:first-child { text-align: left; }
+  table.phases-t td {
+    padding: 6px 10px; text-align: right; color: rgb(var(--muted));
+    border-bottom: 1px solid rgb(var(--edge) / .5);
+    font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  }
+  table.phases-t td:first-child { font-family: var(--font-sans); color: rgb(var(--fg)); }
+  table.phases-t tr.total td { border-bottom: 0; color: rgb(var(--fg)); font-weight: 600; }
+  table.phases-t tr.total td:first-child { font-weight: 600; }
+
+  /* ── activity-log finish line ─────────────────────────────────────────── */
+  .log {
+    border: 1px solid rgb(var(--edge)); background: rgb(var(--bg) / .6);
+    border-radius: var(--radius); padding: 12px; margin-top: 16px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .meta { display: flex; align-items: center; gap: 10px; font-size: 12px; font-style: italic; color: rgb(var(--muted)); }
+  .meta::before, .meta::after { content: ""; flex: 1; height: 1px; background: rgb(var(--edge)); }
+  .meta .tok { font-style: normal; font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: rgb(var(--faint)); }
+  .meta .cost { font-style: normal; font-family: var(--font-mono); color: rgb(var(--brand)); }
+  .logline { font-size: 12.5px; color: rgb(var(--muted)); padding: 0 4px; }
+  .logline b { color: rgb(var(--fg)); font-weight: 600; }
+
+  /* ── 2. RunsList row ──────────────────────────────────────────────────── */
+  ul.runs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .runrow {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px;
+    border: 1px solid rgb(var(--edge)); background: rgb(var(--raised) / .4);
+    border-radius: calc(var(--radius) - 2px); padding: 10px 12px;
+  }
+  .runrow:hover { border-color: rgb(var(--edge-strong)); background: rgb(var(--raised) / .7); }
+  .runrow .title { margin: 0; font-size: 13.5px; font-weight: 500; }
+  .runrow .sub { margin: 2px 0 0; display: flex; flex-wrap: wrap; gap: 0 8px; font-size: 11.5px; color: rgb(var(--faint)); }
+  .runrow .sub .tok { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .runrow .sub .cost { font-family: var(--font-mono); color: rgb(var(--brand) / .9); }
+  .pill.done { border-color: rgb(var(--ok) / .4); background: rgb(var(--ok) / .12); color: rgb(var(--ok)); }
+  .pill.run  { border-color: rgb(var(--info) / .4); background: rgb(var(--info) / .12); color: rgb(var(--info)); }
+  .pill.fail { border-color: rgb(var(--danger) / .4); background: rgb(var(--danger) / .12); color: rgb(var(--danger)); }
+
+  /* ── 3+4. usage cards ─────────────────────────────────────────────────── */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+  .bignum { font-size: 26px; font-weight: 650; font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .bignum em { font-style: normal; font-size: 14px; color: rgb(var(--faint)); }
+  .subrow { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: 12px; color: rgb(var(--muted)); }
+  .subrow .num { color: rgb(var(--fg)); }
+  .kicker { font-size: 11px; color: rgb(var(--faint)); margin-top: 10px; }
+  .kicker .num { color: rgb(var(--muted)); }
+
+  /* per-user table (admin) */
+  .users-scroll { overflow-x: auto; margin-top: 4px; }
+  table.users { border-collapse: collapse; width: 100%; font-size: 12.5px; min-width: 620px; }
+  table.users th {
+    text-align: right; font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    color: rgb(var(--faint)); padding: 7px 10px; border-bottom: 1px solid rgb(var(--edge));
+  }
+  table.users th:first-child, table.users td:first-child { text-align: left; }
+  table.users td {
+    padding: 7px 10px; text-align: right; border-bottom: 1px solid rgb(var(--edge) / .5);
+    font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: rgb(var(--muted));
+  }
+  table.users td:first-child { font-family: var(--font-sans); color: rgb(var(--fg)); }
+  table.users td .share {
+    display: inline-block; width: 72px; height: 4px; border-radius: 2px;
+    background: rgb(var(--edge)); vertical-align: middle; margin-left: 8px; overflow: hidden;
+  }
+  table.users td .share i { display: block; height: 100%; background: rgb(var(--brand)); }
+  table.users tr.total td { border-bottom: 0; color: rgb(var(--fg)); font-weight: 600; }
+  table.users td.cost { color: rgb(var(--brand)); }
+
+  a.faux { color: rgb(var(--info)); text-decoration: none; }
+  a.faux:hover { text-decoration: underline; }
+  a.faux:focus-visible, details.phases summary:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="mock-note"><strong>Mock — token usage per run / per user / factory-wide.</strong>
+  All figures are realistic fakes. Tokens come from the SDK result frames the worker already streams
+  (<span class="num">usage</span> + <span class="num">modelUsage</span>); totals are upserted into <span class="num">run_usage</span> at persist time.</p>
+
+  <!-- ═════════ 1. RunView ═════════ -->
+  <section>
+    <div class="where"><h2>1 · Run view</h2><span>/runs/:id — usage strip in the header + per-phase breakdown + finish lines in the log</span></div>
+    <div class="card">
+      <div class="runhead">
+        <div>
+          <h1>Add CSV export to the invoices list</h1>
+          <p class="sub">acme/billing #142 · worker vlad-laptop · MR !87</p>
+        </div>
+        <span class="pill done">completed</span>
+      </div>
+
+      <div class="usage-strip" aria-label="Run usage totals">
+        <div class="stat">
+          <div class="k">Tokens in</div>
+          <div class="v">1.28M</div>
+          <div class="d">91% from cache</div>
+          <div class="cachebar" role="img" aria-label="91 percent cache reads"><i class="hit"></i><i class="miss"></i></div>
+        </div>
+        <div class="stat">
+          <div class="k">Tokens out</div>
+          <div class="v">48.2k</div>
+          <div class="d">3 phases · 61 turns</div>
+        </div>
+        <div class="stat">
+          <div class="k">Duration</div>
+          <div class="v">21m 44s</div>
+          <div class="d">claude-sonnet-5</div>
+        </div>
+        <div class="stat cost">
+          <div class="k">Cost</div>
+          <div class="v">$1.87</div>
+          <div class="d">your Anthropic token</div>
+        </div>
+      </div>
+
+      <details class="phases" open>
+        <summary>Per-phase breakdown</summary>
+        <div class="phases-scroll">
+        <table class="phases-t">
+          <thead>
+            <tr><th>Phase</th><th>Turns</th><th>In (fresh)</th><th>In (cached)</th><th>Out</th><th>Cost</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Plan</td><td>9</td><td>21.4k</td><td>188.0k</td><td>6.1k</td><td>$0.24</td></tr>
+            <tr><td>Implement · iteration 1</td><td>34</td><td>58.9k</td><td>612.3k</td><td>28.7k</td><td>$1.02</td></tr>
+            <tr><td>Implement · iteration 2</td><td>18</td><td>34.1k</td><td>371.2k</td><td>13.4k</td><td>$0.61</td></tr>
+            <tr class="total"><td>Run total</td><td>61</td><td>114.4k</td><td>1.17M</td><td>48.2k</td><td>$1.87</td></tr>
+          </tbody>
+        </table>
+        </div>
+      </details>
+
+      <div class="log" aria-label="Activity log excerpt">
+        <div class="logline"><b>lead</b> · All 42 tests pass; the export endpoint streams CSV with the agreed column order. Opening the merge request.</div>
+        <div class="meta"><span>agent finished (8m 12s, 18 turns)</span><span class="tok">34.1k in · 371.2k cached · 13.4k out</span><span class="cost">$0.61</span></div>
+        <div class="logline"><b>uzi</b> · Branch <b>uzi/142-csv-export</b> pushed · MR !87 opened.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═════════ 2. Runs list ═════════ -->
+  <section>
+    <div class="where"><h2>2 · Runs list</h2><span>/runs — tokens + cost join the meta line of every terminal run</span></div>
+    <div class="card">
+      <p class="section-title">Past runs</p>
+      <ul class="runs">
+        <li class="runrow">
+          <div>
+            <p class="title">Add CSV export to the invoices list</p>
+            <p class="sub"><span>acme/billing #142</span><span>· vlad-laptop</span><span>· 09 Jul, 17:42</span><span>· MR !87</span><span class="tok">· 1.33M tok</span><span class="cost">· $1.87</span></p>
+          </div>
+          <span class="pill done">completed</span>
+        </li>
+        <li class="runrow">
+          <div>
+            <p class="title">Rate-limit the public webhook endpoint</p>
+            <p class="sub"><span>acme/gateway #77</span><span>· vlad-laptop</span><span>· 09 Jul, 14:05</span><span>· MR !64</span><span class="tok">· 2.91M tok</span><span class="cost">· $4.12</span></p>
+          </div>
+          <span class="pill done">completed</span>
+        </li>
+        <li class="runrow">
+          <div>
+            <p class="title">Migrate avatars to object storage</p>
+            <p class="sub"><span>acme/billing #150</span><span>· maria-desk</span><span>· 09 Jul, 11:18</span><span class="tok">· 0.64M tok</span><span class="cost">· $0.93</span></p>
+          </div>
+          <span class="pill fail">failed</span>
+        </li>
+        <li class="runrow">
+          <div>
+            <p class="title">Dark-mode audit of the settings pages</p>
+            <p class="sub"><span>acme/web #203</span><span>· vlad-laptop</span><span>· running — usage updates live per phase</span><span class="tok">· 0.42M tok so far</span><span class="cost">· $0.58</span></p>
+          </div>
+          <span class="pill run">running</span>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ═════════ 3 + 4. Dashboard cards ═════════ -->
+  <section>
+    <div class="where"><h2>3 · Your usage &amp; 4 · Factory total</h2><span>Dashboard — everyone gets "Your usage"; the factory-wide card is admin-only</span></div>
+    <div class="grid2">
+
+      <div class="card">
+        <p class="section-title">Your usage</p>
+        <div class="bignum">18.4M <em>tokens</em></div>
+        <div class="subrow">
+          <span>in <span class="num">1.61M</span></span>
+          <span>cached <span class="num">16.1M</span></span>
+          <span>out <span class="num">0.71M</span></span>
+          <span>cost <span class="num" style="color: rgb(var(--brand))">$26.40</span></span>
+        </div>
+        <p class="kicker">Across <span class="num">23</span> runs, all time · <span class="num">3.1M</span> tok / <span class="num">$4.55</span> in the last 7 days · <a class="faux" href="#" onclick="return false">see per-run detail →</a></p>
+      </div>
+
+      <div class="card">
+        <p class="section-title">Factory total · all users · admin</p>
+        <div class="bignum">61.7M <em>tokens</em></div>
+        <div class="subrow">
+          <span>in <span class="num">5.4M</span></span>
+          <span>cached <span class="num">53.9M</span></span>
+          <span>out <span class="num">2.4M</span></span>
+          <span>cost <span class="num" style="color: rgb(var(--brand))">$88.15</span></span>
+        </div>
+        <p class="kicker"><span class="num">79</span> runs by <span class="num">4</span> users since 12 May 2026</p>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <p class="section-title">Per-user breakdown · admin</p>
+      <div class="users-scroll">
+      <table class="users">
+        <thead>
+          <tr><th>User</th><th>Runs</th><th>Tokens</th><th>Out</th><th>Cost</th><th>Share</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>vlad@example.com</td><td>23</td><td>18.4M</td><td>0.71M</td><td class="cost">$26.40</td>
+            <td>30%<span class="share"><i style="width:30%"></i></span></td>
+          </tr>
+          <tr>
+            <td>maria@example.com</td><td>31</td><td>24.9M</td><td>1.02M</td><td class="cost">$37.83</td>
+            <td>40%<span class="share"><i style="width:40%"></i></span></td>
+          </tr>
+          <tr>
+            <td>andrei@example.com</td><td>19</td><td>14.6M</td><td>0.55M</td><td class="cost">$19.71</td>
+            <td>24%<span class="share"><i style="width:24%"></i></span></td>
+          </tr>
+          <tr>
+            <td>dana@example.com</td><td>6</td><td>3.8M</td><td>0.12M</td><td class="cost">$4.21</td>
+            <td>6%<span class="share"><i style="width:6%"></i></span></td>
+          </tr>
+          <tr class="total">
+            <td>uzi total</td><td>79</td><td>61.7M</td><td>2.40M</td><td class="cost">$88.15</td><td></td>
+          </tr>
+        </tbody>
+      </table>
+      </div>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>

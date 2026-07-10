@@ -259,6 +259,13 @@ Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wra
 
 ## Deferred (user, "later stuff")
 
+- On-demand worker spawning: on compose the worker simply runs always-on (idle is
+  cheap); server-provisioned per-user workers are deferred to the k8s/remote-worker
+  phase, where a dedicated operator (never the api, which must never hold
+  container-runtime credentials like `docker.sock`) spawns worker pods when queued
+  work appears — e.g. a future in-app chat agent, whose users chat in the web UI
+  without knowing a worker serves them. [user, 2026-07-10; design detail in
+  specs/ai.md §168]
 - Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
 - Forgejo driver (interface is forge-generic; GitLab implemented first).
 - SSO with Keycloak.
