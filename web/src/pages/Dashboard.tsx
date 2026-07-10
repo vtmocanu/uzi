@@ -8,7 +8,8 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type RunListItem } from "../lib/api";
-import { mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
+import { mrChipState } from "../lib/runBadge";
+import { MrChip } from "../components/MrChip";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
@@ -245,13 +246,7 @@ export function Dashboard() {
                     <p className="text-xs text-faint">
                       {r.repo_path} #{r.issue_iid}
                       {r.mr_iid != null && (
-                        <span
-                          className={cx("ml-2", mrState === "closed" ? "text-faint" : "text-ok")}
-                          title={mrChipTitle(mrState)}
-                        >
-                          MR <span className={mrState === "closed" ? "line-through" : undefined}>!{r.mr_iid}</span>
-                          {mrChipSuffix(mrState)}
-                        </span>
+                        <MrChip variant="inline" label="MR " mrIid={r.mr_iid} mrState={mrState} href={null} className="ml-2" />
                       )}
                     </p>
                   </div>

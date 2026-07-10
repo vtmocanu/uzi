@@ -222,7 +222,8 @@ export function RunView() {
                 {run.branch && (
                   <>
                     Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{run.branch}</code>
-                    {run.mr_iid != null && " — merge request opened."}
+                    {run.mr_iid != null &&
+                      ` — merge request ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
                   </>
                 )}
               </p>

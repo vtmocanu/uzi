@@ -1,36 +1,94 @@
 import { cx } from "./ui";
 import { CheckIcon } from "./icons";
-import { type MrChipState, mrChipTitle } from "../lib/runBadge";
+import { type MrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
 
-// MrChip is the board card's merge-request pill (PRD #12), extended in PRD #33 to
-// show the run's derived MR-state variant (mrChipState):
-//   open   → exactly as before — an ok-toned "!N" pill (success criterion 2);
-//   merged → ok-toned, a check mark and a "merged" label;
-//   closed → muted, the number struck through and a "closed" label.
-// Rendered as a link when href is an https MR URL, else a plain span. The state is a
-// best-effort hint (Decision 1): the title scopes it to "as of last sync".
-export function MrChip({ mrIid, mrState, href }: { mrIid: number; mrState: MrChipState; href: string | null }) {
+type MrChipVariant = "pill" | "inline";
+// openTone is the colour of the OPEN state only: the issue-history link keeps brand,
+// everywhere else open is ok-toned. merged is always ok-toned and closed is always
+// muted, regardless of openTone.
+type OpenTone = "ok" | "brand";
+
+// MrChip renders a run's merge-request chip from its derived MR-state (mrChipState),
+// single-sourcing the tone / suffix / title / strike / accessible-name logic across
+// every surface (PRD #33), so the four call sites can never drift again. Two layouts:
+//   "pill"   — the board card's bordered box (a check-marked "!N merged" etc.).
+//   "inline" — a text chip in a run's meta line (dashboard / runs list / issue history).
+// State tone: merged is ok-toned (green) EVERYWHERE; closed is muted (text-muted, the
+// AA-contrast token) with the number struck through; open keeps the surface's base
+// tone via openTone (brand for the issue-history link, ok elsewhere). The state word
+// ("merged"/"closed") is rendered INSIDE the link/pill, so a screen reader hears
+// "!42 merged", not a bare "!42". href makes the chip a link to the MR; a null href is
+// plain text (e.g. a dashboard row that already links to the run view). label is an
+// optional prefix ("MR ", "· MR ") the meta surfaces put before the number.
+export function MrChip({
+  mrIid,
+  mrState,
+  href,
+  variant = "pill",
+  label = "",
+  openTone = "ok",
+  className,
+}: {
+  mrIid: number;
+  mrState: MrChipState;
+  href: string | null;
+  variant?: MrChipVariant;
+  label?: string;
+  openTone?: OpenTone;
+  className?: string;
+}) {
   const closed = mrState === "closed";
-  const cls = cx(
-    "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-medium",
-    closed ? "border-edge bg-raised/60 text-faint" : "border-ok/40 bg-ok/10 text-ok",
-    href && (closed ? "transition-colors hover:bg-raised" : "transition-colors hover:bg-ok/20"),
-  );
-  const inner = (
+  const merged = mrState === "merged";
+  const title = mrChipTitle(mrState);
+
+  // The accessible unit: prefix + number (struck when closed) + state word, all in one
+  // element so the state is part of the link/chip's accessible name.
+  const body = (
     <>
-      {mrState === "merged" && <CheckIcon className="h-3 w-3" />}
+      {variant === "pill" && merged && <CheckIcon className="h-3 w-3" aria-hidden />}
+      {label}
       <span className={closed ? "line-through" : undefined}>!{mrIid}</span>
-      {mrState !== "open" && <span>{mrState}</span>}
+      {mrState !== "open" && <span>{mrChipSuffix(mrState)}</span>}
     </>
   );
-  const title = mrChipTitle(mrState);
+
+  if (variant === "pill") {
+    const cls = cx(
+      "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-medium",
+      closed ? "border-edge bg-raised/60 text-muted" : "border-ok/40 bg-ok/10 text-ok",
+      href && (closed ? "transition-colors hover:bg-raised" : "transition-colors hover:bg-ok/20"),
+      className,
+    );
+    return href ? (
+      <a href={href} target="_blank" rel="noreferrer" draggable={false} title={title} className={cls}>
+        {body}
+      </a>
+    ) : (
+      <span title={title} className={cls}>
+        {body}
+      </span>
+    );
+  }
+
+  // inline: colour only (no border). merged → ok, closed → muted, open → openTone.
+  const color = closed ? "text-muted" : merged ? "text-ok" : openTone === "brand" ? "text-brand" : "text-ok";
+  const hover = href
+    ? closed
+      ? "hover:text-fg"
+      : merged
+        ? "hover:text-ok"
+        : openTone === "brand"
+          ? "hover:text-brand-hover"
+          : "hover:text-ok"
+    : undefined;
+  const cls = cx(color, hover, className);
   return href ? (
-    <a href={href} target="_blank" rel="noreferrer" draggable={false} title={title} className={cls}>
-      {inner}
+    <a href={href} target="_blank" rel="noreferrer" title={title} className={cls}>
+      {body}
     </a>
   ) : (
     <span title={title} className={cls}>
-      {inner}
+      {body}
     </span>
   );
 }

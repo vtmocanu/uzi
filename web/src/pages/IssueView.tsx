@@ -2,9 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, isHttpsUrl, type IssueDetail, type RunListItem } from "../lib/api";
 import { startRunGate } from "../lib/runStream";
-import { activeRunInHistory, isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle, runStatusTone } from "../lib/runBadge";
+import { activeRunInHistory, isStoppedRun, mrChipState, runStatusTone } from "../lib/runBadge";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { Markdown } from "../components/Markdown";
+import { MrChip } from "../components/MrChip";
 import { formatDuration } from "../components/RunEvent";
 import { Alert, Badge, Button, Card } from "../components/ui";
 import { useAuth } from "../auth/AuthContext";
@@ -265,30 +266,7 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
           {duration && <span>· {duration}</span>}
           {run.mr_iid != null && (
             <span>
-              ·{" "}
-              {mrHref ? (
-                <a
-                  href={mrHref}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={mrChipTitle(mrState)}
-                  className={
-                    mrState === "closed"
-                      ? "text-faint line-through hover:text-muted"
-                      : "text-brand hover:text-brand-hover"
-                  }
-                >
-                  !{run.mr_iid}
-                </a>
-              ) : (
-                <span
-                  title={mrChipTitle(mrState)}
-                  className={mrState === "closed" ? "text-faint line-through" : undefined}
-                >
-                  !{run.mr_iid}
-                </span>
-              )}
-              {mrChipSuffix(mrState)}
+              · <MrChip variant="inline" openTone="brand" mrIid={run.mr_iid} mrState={mrState} href={mrHref} />
             </span>
           )}
         </div>

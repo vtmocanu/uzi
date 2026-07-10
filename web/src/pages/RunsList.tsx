@@ -10,9 +10,10 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem } from "../lib/api";
-import { Alert, Badge, Card, cx, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
+import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
-import { isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
+import { MrChip } from "../components/MrChip";
+import { isStoppedRun, mrChipState } from "../lib/runBadge";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -46,13 +47,7 @@ function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
             {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
             <span>· {new Date(run.updated_at).toLocaleString()}</span>
             {run.mr_iid != null && (
-              <span
-                className={cx("font-medium", mrState === "closed" ? "text-faint" : "text-ok")}
-                title={mrChipTitle(mrState)}
-              >
-                · MR <span className={mrState === "closed" ? "line-through" : undefined}>!{run.mr_iid}</span>
-                {mrChipSuffix(mrState)}
-              </span>
+              <MrChip variant="inline" label="· MR " mrIid={run.mr_iid} mrState={mrState} href={null} className="font-medium" />
             )}
           </p>
         </div>
