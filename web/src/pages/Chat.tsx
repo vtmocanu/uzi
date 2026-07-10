@@ -7,10 +7,11 @@
 // which is mocked in demo mode and real-wired in Phase 3.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, ApiError, isTerminalRun, type Chat as ChatDTO, type Worker } from "../lib/api";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { api, ApiError, isTerminalRun, type Chat as ChatDTO, type Run, type Worker } from "../lib/api";
 import {
   CHAT_MAX_TURNS,
+  chatFromRun,
   chatIsEnded,
   composerGate,
   conversationTitle,
@@ -93,9 +94,10 @@ export function ChatList() {
     setError("");
     setStarting(true);
     try {
-      // create returns a full runDTO under `run`; navigate to the new conversation.
+      // create returns a full runDTO under `run`; navigate to the new conversation,
+      // seeding its meta optimistically so the header renders before the list loads.
       const { run } = await api.createChat(p);
-      navigate(`/chat/${run.id}`);
+      navigate(`/chat/${run.id}`, { state: { seed: chatFromRun(run) } });
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to start the chat");
       setStarting(false);
@@ -143,7 +145,12 @@ export function ChatList() {
           <SectionTitle>Conversations</SectionTitle>
           <ul className="space-y-2">
             {chats.map((c) => (
-              <ConversationRow key={c.id} chat={c} onContinued={(id) => navigate(`/chat/${id}`)} onError={setError} />
+              <ConversationRow
+                key={c.id}
+                chat={c}
+                onContinued={(run) => navigate(`/chat/${run.id}`, { state: { seed: chatFromRun(run) } })}
+                onError={setError}
+              />
             ))}
           </ul>
         </div>
@@ -158,7 +165,7 @@ function ConversationRow({
   onError,
 }: {
   chat: ChatDTO;
-  onContinued: (newId: string) => void;
+  onContinued: (run: Run) => void;
   onError: (msg: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -170,7 +177,7 @@ function ConversationRow({
     try {
       // continue returns the NEW chat run under `run`.
       const { run } = await api.continueChat(chat.id);
-      onContinued(run.id);
+      onContinued(run);
     } catch (err) {
       onError(err instanceof ApiError ? err.message : "Failed to continue the chat");
       setBusy(false);
@@ -202,9 +209,15 @@ function ConversationRow({
 export function ChatConversation() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const { run, messages, connected, error, refreshRun } = useRunStream(id);
 
-  const [meta, setMeta] = useState<ChatDTO | null>(null);
+  // Optimistic seed (Decision 11 UX): create/continue navigate here carrying
+  // chatFromRun(run) in the route state, so the header/title/status/resume-note
+  // render immediately — before the list refetch populates turn_count and
+  // last_message_at. The list + stream then refine it.
+  const seed = (location.state as { seed?: ChatDTO } | null)?.seed;
+  const [meta, setMeta] = useState<ChatDTO | null>(seed ?? null);
   const [siblings, setSiblings] = useState<ChatDTO[]>([]);
   const [maxTurns, setMaxTurns] = useState(CHAT_MAX_TURNS);
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -214,12 +227,13 @@ export function ChatConversation() {
   // Conversation meta (title, server turn_count, resume-of, the sibling set for
   // the one-live-chat note) + the turn-cap envelope constant + worker liveness.
   // Refetched on status change and after each action so the count/treatment stay
-  // honest.
+  // honest. A just-created chat may not be in the list yet — keep the optimistic
+  // seed (or the prior value) rather than clobbering it to null until it appears.
   const loadMeta = useCallback(async () => {
     try {
       const [chatRes, { workers }] = await Promise.all([api.listChats(), api.listWorkers()]);
       setSiblings(chatRes.chats);
-      setMeta(chatRes.chats.find((c) => c.id === id) ?? null);
+      setMeta((prev) => chatRes.chats.find((c) => c.id === id) ?? prev);
       setMaxTurns(chatRes.max_turns);
       setWorkers(workers);
     } catch {
@@ -272,7 +286,7 @@ export function ChatConversation() {
   const continueChat = () =>
     act(async () => {
       const { run: next } = await api.continueChat(id);
-      navigate(`/chat/${next.id}`);
+      navigate(`/chat/${next.id}`, { state: { seed: chatFromRun(next) } });
     });
 
   if (!run && !meta) {

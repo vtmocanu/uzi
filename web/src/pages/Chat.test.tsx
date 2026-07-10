@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { ChatList } from "./Chat";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { ChatConversation, ChatList } from "./Chat";
 import { api, type Chat, type Worker } from "../lib/api";
 
 // Mock only the two network calls the list makes; keep the real helpers.
@@ -13,6 +13,18 @@ vi.mock("../lib/api", async (importOriginal) => {
     api: { listChats: vi.fn(), listWorkers: vi.fn(), createChat: vi.fn(), continueChat: vi.fn() },
   };
 });
+
+// The conversation view reuses the run-view stream; stub it so the seed behaviour
+// is testable without a WebSocket or the run REST fetches.
+vi.mock("../lib/useRunStream", () => ({
+  useRunStream: vi.fn(() => ({
+    run: null,
+    messages: [],
+    connected: false,
+    error: "",
+    refreshRun: vi.fn(),
+  })),
+}));
 
 const mockApi = vi.mocked(api);
 
@@ -135,5 +147,29 @@ describe("ChatList — worker-offline banner (Decision 15)", () => {
 
     await waitFor(() => expect(screen.getByText("No conversations yet")).toBeTruthy());
     expect(screen.queryByText(/No worker connected/)).toBeNull();
+  });
+});
+
+describe("ChatConversation — optimistic seed after create/continue", () => {
+  it("renders the header title from the route-state seed, before the list has it", async () => {
+    // The list does NOT yet contain the just-created chat (eventual consistency).
+    mockApi.listChats.mockResolvedValue(chatList([]));
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ status: "online" })] });
+
+    const seed = aChat({ id: "new-1", title: "My brand new chat", turn_count: 0, last_message_at: null });
+
+    render(
+      <MemoryRouter initialEntries={[{ pathname: "/chat/new-1", state: { seed } }]}>
+        <Routes>
+          <Route path="/chat/:id" element={<ChatConversation />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    // Present on the FIRST paint — sourced from the seed, not the (empty) list.
+    expect(screen.getByText("My brand new chat")).toBeTruthy();
+    // And it survives the list refetch that does not yet include this chat.
+    await waitFor(() => expect(mockApi.listChats).toHaveBeenCalled());
+    expect(screen.getByText("My brand new chat")).toBeTruthy();
   });
 });
