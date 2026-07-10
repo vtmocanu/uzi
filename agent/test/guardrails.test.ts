@@ -218,6 +218,20 @@ describe("screenToolPath", () => {
     assert.strictEqual(screenToolPath("x.ts", WT, "/work/wt/src").denied, false); // relative to subdir cwd
     assert.strictEqual(screenToolPath("./README.md", WT, WT).denied, false);
   });
+
+  // PRD #39 Decision 6: the optional extraSecretPaths denies a configured secret
+  // file EVEN WHEN it resolves INSIDE the root (where containment would allow it),
+  // on the resolved path so a relative reference is caught too. A path outside the
+  // root stays denied by containment with or without the param.
+  it("denies a configured secret path inside the root, and only via the param", () => {
+    const secret = "/work/wt/creds/join-token";
+    assert.strictEqual(screenToolPath(secret, WT, WT).denied, false, "in-root file allowed without the param");
+    assert.strictEqual(screenToolPath(secret, WT, WT, [secret]).denied, true, "denied when listed");
+    assert.strictEqual(screenToolPath("creds/join-token", WT, WT, [secret]).denied, true, "relative reference denied too");
+    // The param never loosens the existing denials.
+    assert.strictEqual(screenToolPath("/proc/1/environ", WT, WT, [secret]).denied, true);
+    assert.strictEqual(screenToolPath("/etc/passwd", WT, WT, []).denied, true);
+  });
 });
 
 // M4 item 6: the lexical jail is bypassable by an in-worktree symlink that

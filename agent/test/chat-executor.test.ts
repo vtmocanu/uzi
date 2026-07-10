@@ -200,34 +200,50 @@ describe("buildChatSdkOptions confinement (PRD #39 Decision 6)", () => {
     assert.deepStrictEqual(matchers, ["Bash", "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep"]);
   });
 
-  it("the path guard denies the join-token file, denies escaping the baked source, and allows inside it", async () => {
+  // The path-guard hook of a built options object, plus a caller + decision reader.
+  const pathHook = (o: SdkOptions) => o.hooks!.PreToolUse![1]!.hooks[0]!;
+  const readPath = (o: SdkOptions, file: string, root: string = UZI_SRC_DIR) =>
+    pathHook(o)(
+      { hook_event_name: "PreToolUse", tool_name: "Read", cwd: root, tool_input: { file_path: file } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+  const decision = (r: unknown) => (r as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision;
+
+  it("denies the join-token file via the outside-root deny — the LOAD-BEARING block, no param needed", async () => {
+    // Root the guard at /opt/uzi-src and DO NOT pass the token in extraSecretPaths:
+    // the token file lives outside the baked source, so the containment check alone
+    // must deny it. This is the protection that survives if the param is ever dropped.
+    assert.strictEqual(decision(await readPath(opts({ secretPaths: [] }), TOKEN_FILE)), "deny");
+  });
+
+  it("keeps the /proc deny intact and denies escaping the baked source", async () => {
     const o = opts();
-    const pathHook = o.hooks!.PreToolUse![1]!.hooks[0]!;
-    const call = (file: string) =>
-      pathHook(
-        { hook_event_name: "PreToolUse", tool_name: "Read", cwd: UZI_SRC_DIR, tool_input: { file_path: file } } as unknown as HookInput,
-        "tu",
-        { signal: new AbortController().signal },
-      );
-    const decision = (r: unknown) => (r as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision;
+    assert.strictEqual(decision(await readPath(o, "/proc/self/environ")), "deny", "/proc read still denied");
+    assert.strictEqual(decision(await readPath(o, "/etc/passwd")), "deny", "outside-source read denied");
+  });
 
-    assert.strictEqual(decision(await call(TOKEN_FILE)), "deny", "join-token file must be denied");
-    assert.strictEqual(decision(await call("/etc/passwd")), "deny", "outside-source read must be denied");
+  it("extraSecretPaths adds defense-in-depth: a secret file INSIDE the root is denied (and allowed without the param)", async () => {
+    // A file inside the root passes the containment check, so the ONLY thing that can
+    // deny it is the param — this proves the new parameter actually does work, on the
+    // resolved path. Use a real temp dir so the guard's realpath resolution resolves.
+    const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-src-"));
+    const insideSecret = path.join(realRoot, "join-token");
+    fs.writeFileSync(insideSecret, "tkn\n");
+    try {
+      assert.strictEqual(decision(await readPath(opts({ cwd: realRoot, secretPaths: [insideSecret] }), insideSecret, realRoot)), "deny", "denied by the param");
+      assert.deepStrictEqual(await readPath(opts({ cwd: realRoot, secretPaths: [] }), insideSecret, realRoot), {}, "without the param the in-root file is allowed");
+    } finally {
+      fs.rmSync(realRoot, { recursive: true, force: true });
+    }
+  });
 
-    // An in-source read is allowed (no decision). Use a real temp dir as the root so
-    // the guard's realpath resolution has something to resolve.
+  it("allows an in-source read (no decision), proving the guard is rooted at the baked source", async () => {
     const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-src-"));
     fs.mkdirSync(path.join(realRoot, "api"));
     fs.writeFileSync(path.join(realRoot, "api", "main.go"), "package main\n");
     try {
-      const o2 = opts({ cwd: realRoot });
-      const hook2 = o2.hooks!.PreToolUse![1]!.hooks[0]!;
-      const allowed = await hook2(
-        { hook_event_name: "PreToolUse", tool_name: "Read", cwd: realRoot, tool_input: { file_path: path.join(realRoot, "api", "main.go") } } as unknown as HookInput,
-        "tu",
-        { signal: new AbortController().signal },
-      );
-      assert.deepStrictEqual(allowed, {}, "an in-source read returns no decision");
+      assert.deepStrictEqual(await readPath(opts({ cwd: realRoot }), path.join(realRoot, "api", "main.go"), realRoot), {});
     } finally {
       fs.rmSync(realRoot, { recursive: true, force: true });
     }

@@ -506,10 +506,15 @@ function extractToolPaths(toolInput: unknown): string[] {
  * ops / userns / hidepid=2 / gVisor) belongs to the remote-worker phase; see the
  * header of docker-compose's agent service.
  */
-export function screenToolPath(candidate: string, worktreeRoot: string, cwd: string): BashScreenResult {
+export function screenToolPath(
+  candidate: string,
+  worktreeRoot: string,
+  cwd: string,
+  secretPaths: readonly string[] = [],
+): BashScreenResult {
   const root = path.resolve(worktreeRoot);
   const lexical = path.resolve(cwd || root, candidate);
-  const lexicalResult = classifyResolvedPath(candidate, lexical, root);
+  const lexicalResult = classifyResolvedPath(candidate, lexical, root, secretPaths);
   if (lexicalResult.denied) return lexicalResult;
   // Resolve symlinks on the existing prefix and re-check, so a symlink that
   // lexically stays in-worktree but points at /proc or outside is caught. Both
@@ -519,12 +524,28 @@ export function screenToolPath(candidate: string, worktreeRoot: string, cwd: str
   // data volume) — a fail-closed asymmetry, not a security hole, but fragile.
   const real = realpathExisting(lexical);
   if (real === lexical) return ALLOW;
-  return classifyResolvedPath(candidate, real, realpathExisting(root));
+  return classifyResolvedPath(candidate, real, realpathExisting(root), secretPaths);
 }
 
-/** Deny a resolved absolute path that reads /proc, escapes the worktree, or hits .git/. */
-function classifyResolvedPath(candidate: string, resolved: string, root: string): BashScreenResult {
+/**
+ * Deny a resolved absolute path that reads /proc, hits a configured secret file,
+ * escapes the worktree, or touches `.git/`. The secret-file check runs on the
+ * RESOLVED path (so a relative or symlinked reference to the secret is caught too)
+ * and BEFORE the containment check, so a secret file that happens to sit inside the
+ * root is still denied — that is what makes `extraSecretPaths` meaningful for a chat
+ * session rooted at /opt/uzi-src (PRD #39 Decision 6). For a run, the worker's join
+ * token lives OUTSIDE the worktree, so the outside-root deny below is already the
+ * load-bearing block; the secret check is additive defense-in-depth. The /proc deny
+ * stays first and unchanged — it is the load-bearing non-Bash egress block.
+ */
+function classifyResolvedPath(
+  candidate: string,
+  resolved: string,
+  root: string,
+  secretPaths: readonly string[] = [],
+): BashScreenResult {
   if (candidate.includes("/proc/") || resolved === "/proc" || resolved.startsWith("/proc/")) return deny(REASON_PROC);
+  if (hitsSecret(resolved, secretPaths)) return deny(REASON_SECRET_FILE);
   const inRoot = resolved === root || resolved.startsWith(root + path.sep);
   if (!inRoot) return deny(REASON_OUTSIDE_WORKTREE);
   const gitDir = path.join(root, ".git");
@@ -599,13 +620,13 @@ function deepestExisting(p: string): { path: string; tail: string[] } | undefine
  * paths return no decision (the tool proceeds under `bypassPermissions`).
  *
  * `extraSecretPaths` are worker-credential file paths (the configured
- * UZI_WORKER_TOKEN_FILE) to deny a Read/Grep/Glob of, with an explicit
- * secret-file reason. For a run these already sit outside the worktree and so are
- * caught by the containment check; naming them here is load-bearing for a CHAT
- * session (PRD #39 Decision 6/S2), whose root is the baked source `/opt/uzi-src`
- * — a compromised chat must never Read the join token and escalate to the worker
- * protocol whose *run* claims carry the PAT. Checked before containment so the
- * denial reason is the specific one, symmetric with the Bash hook.
+ * UZI_WORKER_TOKEN_FILE) to deny a Read/Grep/Glob of, honored inside
+ * classifyResolvedPath (on the resolved path). For a RUN the join token sits
+ * outside the worktree, so the containment check already denies it and this is
+ * additive; for a CHAT session rooted at the baked source `/opt/uzi-src` (PRD #39
+ * Decision 6/S2) it is the same outside-root deny that carries the load, with this
+ * as defense-in-depth — a compromised chat must never Read the join token and
+ * escalate to the worker protocol whose *run* claims carry the PAT.
  */
 export function buildPathGuardHook(
   worktreeRoot: string,
@@ -616,9 +637,7 @@ export function buildPathGuardHook(
     if (input.hook_event_name !== "PreToolUse" || !PATH_TOOLS.has(input.tool_name)) return {};
     const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : worktreeRoot;
     for (const candidate of extractToolPaths(input.tool_input)) {
-      const screen = hitsSecret(candidate, extraSecretPaths)
-        ? deny(REASON_SECRET_FILE)
-        : screenToolPath(candidate, worktreeRoot, cwd);
+      const screen = screenToolPath(candidate, worktreeRoot, cwd, extraSecretPaths);
       if (screen.denied) {
         log.warn("guardrail denied a file-tool path", { tool: input.tool_name, reason: screen.reason });
         return {
