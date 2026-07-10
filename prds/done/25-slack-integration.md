@@ -1,7 +1,7 @@
 # PRD #25: Slack Integration — per-user run notifications, approval buttons, reply-from-Slack
 
 **GitLab Issue**: [vtmocanu/uzi#25](https://gitlab.example.com/vtmocanu/uzi/-/issues/25)
-**Status**: Draft (revised 2026-07-06 after 3-agent review: design, fact-check, security — see Decision Log)
+**Status**: Complete (2026-07-10, MR !31)
 **Priority**: Medium
 **Created**: 2026-07-06
 **Depends on**: nothing pending — rides merged machinery only: the run lifecycle + steering inputs (PRD #4), admin `app_settings` (PRD #19), per-user columns on `users`, `secretbox`. No forge-layer changes.
