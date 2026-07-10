@@ -18,6 +18,7 @@ import (
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workertmpl"
 )
 
 // textPtrValue returns a pointer to s when valid, else nil — the JSON-null vs
@@ -50,36 +51,45 @@ var runInputKinds = map[string]bool{
 // -------------------------------------------------------------------------
 
 type workerDTO struct {
-	ID              string     `json:"id"`
-	Name            string     `json:"name"`
-	Status          string     `json:"status"`
-	Busy            bool       `json:"busy"`
-	Version         *string    `json:"version"`
-	LastHeartbeatAt *time.Time `json:"last_heartbeat_at"`
-	CreatedAt       time.Time  `json:"created_at"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Busy   bool   `json:"busy"`
+	// Worker template (PRD #18): the UI-declared choice and the worker's
+	// self-reported value. Either may be null (no choice / older image); the UI
+	// badges drift when both are set and differ.
+	TemplateDeclared *string    `json:"template_declared"`
+	TemplateReported *string    `json:"template_reported"`
+	Version          *string    `json:"version"`
+	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 func workerDTOFromWorker(w store.Worker, busy bool) workerDTO {
 	return workerDTO{
-		ID:              w.ID.String(),
-		Name:            w.Name,
-		Status:          w.Status,
-		Busy:            busy,
-		Version:         textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt: timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:       w.CreatedAt.Time,
+		ID:               w.ID.String(),
+		Name:             w.Name,
+		Status:           w.Status,
+		Busy:             busy,
+		TemplateDeclared: textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported: textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:          textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:  timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:        w.CreatedAt.Time,
 	}
 }
 
 func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
 	return workerDTO{
-		ID:              w.ID.String(),
-		Name:            w.Name,
-		Status:          w.Status,
-		Busy:            w.Busy,
-		Version:         textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt: timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:       w.CreatedAt.Time,
+		ID:               w.ID.String(),
+		Name:             w.Name,
+		Status:           w.Status,
+		Busy:             w.Busy,
+		TemplateDeclared: textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported: textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:          textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:  timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:        w.CreatedAt.Time,
 	}
 }
 
@@ -220,6 +230,11 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Name string `json:"name"`
+		// Template is the worker template the user picks at issuance (PRD #18).
+		// Optional: empty ⇒ no declared choice (stored NULL). When present it must
+		// be a known curated template — validated against the registry so an
+		// arbitrary string can't land in the declared column.
+		Template string `json:"template"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -230,8 +245,13 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "name must be non-empty and at most 200 characters")
 		return
 	}
+	template := strings.TrimSpace(req.Template)
+	if template != "" && !workertmpl.Valid(template) {
+		httpx.Error(w, http.StatusBadRequest, "unknown worker template")
+		return
+	}
 
-	wkr, token, err := h.wsvc.CreateWorker(r.Context(), user.ID, name)
+	wkr, token, err := h.wsvc.CreateWorker(r.Context(), user.ID, name, template)
 	if err != nil {
 		slog.Error("create worker", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

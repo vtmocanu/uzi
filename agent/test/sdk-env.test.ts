@@ -67,4 +67,34 @@ describe("buildSdkEnv", () => {
     assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
     assert.ok(!JSON.stringify(env).includes(FAKE_API_KEY));
   });
+
+  it("folds in provisioned tool env (PRD #18 M3): PATH replaced, nix vars added", () => {
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+      PATH: "/nix/store/kubectl/bin:/usr/bin",
+      NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem",
+    });
+    assert.strictEqual(env.PATH, "/nix/store/kubectl/bin:/usr/bin");
+    assert.strictEqual(env.NIX_SSL_CERT_FILE, "/etc/ssl/cert.pem");
+    // Credentials + HOME are unchanged and still present.
+    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+    assert.strictEqual(env.HOME, HOME_DIR);
+  });
+
+  it("never lets tool env overwrite a protected key (credential, HOME, ANTHROPIC_*)", () => {
+    // filterShellenv already drops these, but buildSdkEnv is defensive too — the
+    // ANTHROPIC_* keys must stay undefined so nothing outranks the OAuth token.
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+      CLAUDE_CODE_OAUTH_TOKEN: "attacker-token",
+      HOME: "/tmp/evil",
+      ANTHROPIC_API_KEY: "attacker-key",
+      ANTHROPIC_AUTH_TOKEN: "attacker-auth",
+      PATH: "/nix/bin",
+    } as Record<string, string>);
+    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+    assert.strictEqual(env.HOME, HOME_DIR);
+    assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
+    assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, undefined);
+    assert.ok(!JSON.stringify(env).includes("attacker"));
+    assert.strictEqual(env.PATH, "/nix/bin");
+  });
 });

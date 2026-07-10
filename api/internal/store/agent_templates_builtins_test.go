@@ -14,9 +14,10 @@ import (
 // a live database. A name in existing or getErr makes the insert a no-op (0 rows,
 // as ON CONFLICT DO NOTHING would); everything else inserts (1 row).
 type reconcilerFake struct {
-	existing map[string]AgentTemplate // name -> the row GetAgentTemplateByName returns
+	existing map[string]AgentTemplate // name -> the row GetSharedAgentTemplateByName returns
 	getErr   map[string]error         // name -> a read-back error
 	inserted []string
+	seeded   []string // names passed to SeedSharedTemplateAllocationByName
 }
 
 func (f *reconcilerFake) InsertBuiltinAgentTemplate(_ context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error) {
@@ -30,7 +31,12 @@ func (f *reconcilerFake) InsertBuiltinAgentTemplate(_ context.Context, arg Inser
 	return 1, nil
 }
 
-func (f *reconcilerFake) GetAgentTemplateByName(_ context.Context, name string) (AgentTemplate, error) {
+func (f *reconcilerFake) SeedSharedTemplateAllocationByName(_ context.Context, name string) error {
+	f.seeded = append(f.seeded, name)
+	return nil
+}
+
+func (f *reconcilerFake) GetSharedAgentTemplateByName(_ context.Context, name string) (AgentTemplate, error) {
 	if err := f.getErr[name]; err != nil {
 		return AgentTemplate{}, err
 	}
@@ -77,6 +83,12 @@ func TestReconcileWarnsOnCustomRowShadowingBuiltin(t *testing.T) {
 		if name == "lead" {
 			t.Error("lead must not be reported inserted when a custom row shadows it")
 		}
+	}
+	// A global-default allocation is seeded exactly for the builtins that were
+	// actually inserted — never for the shadowed one (PRD #18 M7: no re-adding a
+	// default an admin removed).
+	if strings.Join(fake.seeded, ",") != strings.Join(fake.inserted, ",") {
+		t.Errorf("seeded (%v) must match inserted (%v)", fake.seeded, fake.inserted)
 	}
 }
 

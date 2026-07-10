@@ -1,7 +1,7 @@
 # PRD #18: Worker Templates (git-curated) + Devbox Tool Tiers + Agent Template Scopes
 
 **GitLab Issue**: [#18](https://gitlab.example.com/vtmocanu/uzi/-/issues/18)
-**Status**: Draft
+**Status**: Complete (2026-07-10, MR !32)
 **Priority**: Medium
 **Created**: 2026-07-05
 
@@ -86,16 +86,41 @@ Three tracks sharing one mental model (the PRD #16 scope+allocation pattern):
 
 ## Milestones
 
-- [ ] **M1 — Worker template variants in git**: `agent/templates/` layout with `base` + at least one heavy-dep variant (e.g. `jvm`), compose `WORKER_TEMPLATE` plumbing, register-payload `template` field stored per worker. Docs updated.
-- [ ] **M2 — Template choice in UI + drift surfacing**: per-worker declared template at join-token issuance; workers page shows declared vs reported with mismatch badge.
-- [ ] **M3 — Devbox engine in the worker**: base image ships devbox/nix with store on `agentdata`; worker provisions from a claim-delivered package list in a secret-scrubbed env and exposes tools to the SDK env via the filtered shellenv allowlist; provision failure fails the run cleanly. (Tier 1 end-to-end with a hardcoded allowlist.)
-- [ ] **M4 — Tool profiles + admin allowlist (api + web)**: allowlist CRUD, per-(user,repo) package profiles, claim-time validation, repo settings UI.
-- [ ] **M5 — Tier 2 repo `devbox.json` packages opt-in**: per-repo trust toggle (default off), packages-only extraction, union-merge with tier-1 precedence, trust warning in UI + docs.
-- [ ] **M6 — Agent template scopes migration + user CRUD** *(blocked by PRD #16 schema landing, or explicitly takes over the shared shapes)*: scope/user_id migration, partial uniques, reconciler conflict-target fix, reserved-name validation, user-scoped CRUD.
-- [ ] **M7 — Template allocation + claim filtering** *(same blocker as M6)*: allocation table with explicit seeded defaults, overlay resolution, claim payload delivers only allocated templates, Agents page allocation UI.
-- [ ] **M8 — Tests, specs, docs complete**: e2e covering a provisioned-tool run (devbox stubbed in the isolated e2e stack — no substituter egress there; a separate opt-in integration test does a real `devbox install`) and a run using a user-scoped template; `specs/ai.md` + `ARCHITECTURE.md` + user docs updated.
+- [x] **M1 — Worker template variants in git**: `agent/templates/` layout with `base` + at least one heavy-dep variant (e.g. `jvm`), compose `WORKER_TEMPLATE` plumbing, register-payload `template` field stored per worker. Docs updated.
+- [x] **M2 — Template choice in UI + drift surfacing**: per-worker declared template at join-token issuance; workers page shows declared vs reported with mismatch badge.
+- [x] **M3 — Devbox engine in the worker**: base image ships devbox/nix with store on `agentdata`; worker provisions from a claim-delivered package list in a secret-scrubbed env and exposes tools to the SDK env via the filtered shellenv allowlist; provision failure fails the run cleanly. (Tier 1 end-to-end with a hardcoded allowlist.)
+- [x] **M4 — Tool profiles + admin allowlist (api + web)**: allowlist CRUD, per-(user,repo) package profiles, claim-time validation, repo settings UI.
+- [x] **M5 — Tier 2 repo `devbox.json` packages opt-in**: per-repo trust toggle (default off), packages-only extraction, union-merge with tier-1 precedence, trust warning in UI + docs.
+- [x] **M6 — Agent template scopes migration + user CRUD** *(blocked by PRD #16 schema landing, or explicitly takes over the shared shapes)*: scope/user_id migration, partial uniques, reconciler conflict-target fix, reserved-name validation, user-scoped CRUD.
+- [x] **M7 — Template allocation + claim filtering** *(same blocker as M6)*: allocation table with explicit seeded defaults, overlay resolution, claim payload delivers only allocated templates, Agents page allocation UI.
+- [x] **M8 — Tests, specs, docs complete**: e2e covering a provisioned-tool run (devbox stubbed in the isolated e2e stack — no substituter egress there; a separate opt-in integration test does a real `devbox install`) and a run using a user-scoped template; `specs/ai.md` + `ARCHITECTURE.md` + user docs updated.
 
 Phase note: M1–M2 (worker templates) and M3–M5 (tooling) are independent tracks touching disjoint files and can run in parallel; M6–M7 (scopes) is sequenced against PRD #16/#17 per the notes above. M8 spans all.
+
+### Progress + agent-validation ledger (2026-07-10, paused for resume)
+
+Work runs on `feature/prd-18-worker-templates` (worktree `../prd-18-worker-templates`), agent-team workflow (coder + reviewer + auditor + tester). PRDs #16/#17 landed before this started, so the M6–M7 blockers are lifted; migrations were developed as `00044–00048` (live head was `00043`) and renumbered at landing to **`00045–00049`** after PRD #25 took `00044_slack` on main (per the merge-time renumbering convention); `specs/ai.md` sections likewise landed as §154–159 after #32/#25 took the 130s–140s–150s.
+
+| Scope | Commits | Agent validation |
+|---|---|---|
+| M1+M2 templates + drift UI | `ca93b17` `a1dca44` `7baaece` | reviewer PASS, auditor PASS, tester PASS (images, compose default, e2e w/ 00044) |
+| M3 devbox engine + hardening | `f8779d1` `84fa838` `13591c4` | reviewer PASS, auditor PASS (secret-scrub core confirmed) |
+| M3 image packaging | `ef21dee` `989755f` | tester: LOGIC PASS at `ef21dee` (rootless uzi install, warm-start via `agentnix:/nix`, pinned devbox 0.17.5); the two build blockers it found (checksum-filename verify, hardcoded amd64/no TARGETARCH) are fixed in `989755f`. **`989755f` not yet agent-reviewed; still needs a real `docker build` of both templates (native amd64 ideally)** |
+| M4 tool profiles + allowlist | `c846116` `342520b` | reviewer PASS, auditor PASS |
+| M4 audit ride-alongs (denylist, caps, shared rules loader) | `a45a9fd` | **NOT yet agent-reviewed** |
+| M5 tier-2 repo opt-in | `a0b7ba9` `ec12c96` | **NOT yet reviewed/audited/tested — first validation wave on resume** |
+
+Day 2 (2026-07-10) completed the run — all milestones landed and validated:
+
+| Scope | Commits | Agent validation |
+|---|---|---|
+| Day-1 validation debt (M4 ride-alongs, M5, Dockerfile fix) | `a45a9fd` `a0b7ba9` `ec12c96` `989755f` | reviewer PASS, auditor PASS; tester: real `docker build` of both templates (native arm64), uid-100 rootless provision smoke, cross-container warm-start, hostile tier-2 manifest inert, e2e 63/63 |
+| main merge (PRD #28 drift) | `173b94b` | reviewer sanity PASS (empty combined diff, reviewed SHAs remain ancestors) |
+| M6 scopes + user CRUD | `2ca62c0` | reviewer PASS; auditor found 1 Blocking (unfiltered claim query leaked private templates cross-user) → closed below |
+| M7 allocations + claim filtering | `5d3d35d` `b3904c9` `f6aa609` `5416176` | reviewer PASS, auditor re-gate: Blocking CLOSED (owner-scoped claim SQL + shared-precedence drop + live-DB regression tests); tester: store-IT live-DB scenarios, e2e, image rebuilds all PASS |
+| M8 e2e/docs/specs + fixes | `cafbcbd` `2d3e131` `da96e6a` `d04c731` `bcfc1bc` `bbb7c48` `31aeb08` | reviewer PASS, auditor SECURITY SIGN-OFF, fact-checker: all claims verified after 1 refuted egress-wording claim fixed in `31aeb08`; `specs/human.md` Feature #18 user-approved verbatim |
+
+Closed during the run: tier-2 deliberately bypasses allowlist AND denylist (audit-probed, accepted — bounded by opt-in + packages-only + scrubbed provisioning env); shared-precedence claim drop for user/shared name collisions (deliberate divergence from skills' body precedence); reserved lead names blocked for global creates too. Known residual: native amd64 `docker build` unverified (arm64-only host; asset names + checksums verified against live releases).
 
 ## Success Criteria
 

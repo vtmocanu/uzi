@@ -13,12 +13,16 @@ package settings
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/theme"
 )
@@ -36,6 +40,14 @@ const (
 	// this same table rather than a parallel settings store; its value is a theme
 	// id validated against the canonical theme registry, not a label.
 	KeyDefaultTheme = "default_theme"
+	// Slack integration keys (PRD #25). slack_enabled/public_base_url are plaintext
+	// non-secret settings (in Defaults). slack_bot_token/slack_app_token are SECRET
+	// keys (in SecretKeys, NOT Defaults): sealed with secretbox+base64 at rest and
+	// structurally excluded from every value-producing read — see SecretKeys.
+	KeySlackEnabled  = "slack_enabled"
+	KeyPublicBaseURL = "public_base_url"
+	KeySlackBotToken = "slack_bot_token"
+	KeySlackAppToken = "slack_app_token"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -49,6 +61,11 @@ const (
 	// issues; admins wanting the strict PRD-only regime flip prdless_enabled off.
 	DefaultPrdlessEnabled = "true"
 	DefaultPrdlessLabel   = "PRDLESS"
+	// PRD #25. Slack is off until an admin (or ENV) configures it, so the whole
+	// integration is a strict no-op on a fresh instance. The default deep-link base
+	// only resolves for the laptop's own user; a Tailscale/LAN URL overrides it.
+	DefaultSlackEnabled  = "false"
+	DefaultPublicBaseURL = "http://127.0.0.1:8080"
 )
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
@@ -73,12 +90,39 @@ var Defaults = map[string]string{
 	// migration seed is needed — this fallback plus the stable GET shape follow
 	// automatically from the entry here.
 	KeyDefaultTheme: theme.Default,
+	// PRD #25 Slack non-secret keys. Like the prdless keys, they have NO seeded
+	// row: an absent row synthesizes to these defaults, and no migration adds them.
+	KeySlackEnabled:  DefaultSlackEnabled,
+	KeyPublicBaseURL: DefaultPublicBaseURL,
 }
 
-// Known reports whether key is a setting the API recognizes.
-func Known(key string) bool {
-	_, ok := Defaults[key]
+// SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
+// with secretbox+base64 at rest and NEVER present in any value-producing read.
+// They are deliberately kept OUT of Defaults so All/Effective/AdminView.Values —
+// which range over Defaults — cannot emit them by construction (the handler
+// cannot forget to redact). They are writable (Known reports them) and readable
+// only through the decrypt accessors (SlackBotToken/SlackAppToken) used by
+// slacksvc. A secret key has no compiled-in default; unset reads as empty.
+var SecretKeys = map[string]struct{}{
+	KeySlackBotToken: {},
+	KeySlackAppToken: {},
+}
+
+// IsSecret reports whether key is a secret setting (sealed at rest, never read
+// back through the value-producing paths).
+func IsSecret(key string) bool {
+	_, ok := SecretKeys[key]
 	return ok
+}
+
+// Known reports whether key is a setting the API recognizes: a non-secret key
+// with a compiled-in default, or a declared secret key. A write to any other key
+// is rejected (an admin cannot invent settings the code does not read).
+func Known(key string) bool {
+	if _, ok := Defaults[key]; ok {
+		return true
+	}
+	return IsSecret(key)
 }
 
 // Store is the subset of *store.Queries the cache reads. Declaring it here (not
@@ -98,6 +142,17 @@ type Cache struct {
 	// now is the clock, overridable in tests for deterministic TTL expiry.
 	now func() time.Time
 
+	// box seals/opens the secret keys (PRD #25). nil until ConfigureSecrets runs:
+	// a nil box means the DB-backed secret decrypt path is unavailable (the
+	// env-sourced path never needs it). box and env are set once at boot, before
+	// any read, so they need no lock.
+	box *secretbox.Box
+	// env is the ENV-source overlay (PRD #25): key→plaintext value for the keys an
+	// operator set via environment (SLACK_BOT_TOKEN, SLACK_APP_TOKEN,
+	// UZI_PUBLIC_BASE_URL). ENV wins over the DB per key. Only keys actually set in
+	// the environment appear here.
+	env map[string]string
+
 	mu      sync.RWMutex
 	values  map[string]string // last fetched rows; replaced wholesale, never mutated in place
 	fetched time.Time
@@ -107,6 +162,15 @@ type Cache struct {
 // New builds a cache reading through q, refreshing at most once per ttl.
 func New(q Store, ttl time.Duration) *Cache {
 	return &Cache{q: q, ttl: ttl, now: time.Now}
+}
+
+// ConfigureSecrets wires the secret cipher and the ENV-source overlay (PRD #25).
+// Called once from main after the Box is built and before serving; box seals and
+// opens the secret keys, env carries the operator's environment overrides (only
+// keys actually set). Both are read-only after this call.
+func (c *Cache) ConfigureSecrets(box *secretbox.Box, env map[string]string) {
+	c.box = box
+	c.env = env
 }
 
 // Invalidate drops the cached snapshot so the next read refetches. Called after
@@ -155,19 +219,66 @@ func (c *Cache) snapshot(ctx context.Context) (map[string]string, error) {
 	return m, nil
 }
 
-// get returns the effective value for key: the stored row when present and
-// non-empty, else the compiled-in default. A cold refresh error returns the
-// default alongside the error, so a best-effort caller can ignore err and still
-// get a usable value while a strict caller can surface it.
+// get returns the effective value for a NON-SECRET key: the ENV override when
+// set, else the stored row when present and non-empty, else the compiled-in
+// default (PRD #25 adds the ENV tier; ENV wins over DB). A cold refresh error
+// returns the default alongside the error, so a best-effort caller can ignore
+// err and still get a usable value while a strict caller can surface it.
 func (c *Cache) get(ctx context.Context, key string) (string, error) {
+	if v, ok := c.env[key]; ok && v != "" {
+		return v, nil
+	}
 	m, err := c.snapshot(ctx)
 	if err != nil {
 		return Defaults[key], err
 	}
-	if v, ok := m[key]; ok && v != "" {
-		return v, nil
+	return c.effective(key, m), nil
+}
+
+// effective is get's pure core against an already-fetched snapshot: ENV over DB
+// over the compiled-in default, for a NON-SECRET key. Shared by get and AdminView
+// so both apply identical precedence.
+func (c *Cache) effective(key string, m map[string]string) string {
+	if v, ok := c.env[key]; ok && v != "" {
+		return v
 	}
-	return Defaults[key], nil
+	if v, ok := m[key]; ok && v != "" {
+		return v
+	}
+	return Defaults[key]
+}
+
+// source reports where a key's effective value comes from (PRD #25): "env" when
+// the ENV overlay set it, "db" when a non-empty row exists, else "default". The
+// webui greys an env-sourced field and the PUT rejects a write to it.
+func (c *Cache) source(key string, m map[string]string) string {
+	if v, ok := c.env[key]; ok && v != "" {
+		return "env"
+	}
+	if v, ok := m[key]; ok && v != "" {
+		return "db"
+	}
+	return "default"
+}
+
+// configured reports whether a secret key has a value from any source (PRD #25),
+// without exposing it — the only thing the admin GET ever reveals about a secret.
+func (c *Cache) configured(key string, m map[string]string) bool {
+	if v, ok := c.env[key]; ok && v != "" {
+		return true
+	}
+	if v, ok := m[key]; ok && v != "" {
+		return true
+	}
+	return false
+}
+
+// IsEnvSourced reports whether key's value is fixed by the ENV overlay. The PUT
+// handler rejects writes to such keys (409) so the webui greying reflects an
+// enforced policy, not a hint. Pure (no snapshot) — the overlay is static.
+func (c *Cache) IsEnvSourced(key string) bool {
+	v, ok := c.env[key]
+	return ok && v != ""
 }
 
 // PRDLabel returns the configured PRD label (Decision 1: the first settings
@@ -214,21 +325,148 @@ func (c *Cache) DefaultTheme(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyDefaultTheme)
 }
 
-// All returns every known key with its effective value (row value or default).
-// The shape is stable — always one entry per key in Defaults — so the admin UI
-// never has to reason about missing rows. A cold refresh error is returned so
-// the handler can surface it rather than silently show defaults.
+// SlackEnabled reports whether the Slack integration is enabled instance-wide
+// (PRD #25). Stored as the text "true"/"false"; any other value falls back to the
+// compiled-in default (false) rather than silently reading true — the same
+// junk-tolerance as PrdlessEnabled but defaulting OFF, so a malformed value never
+// silently turns the integration on.
+func (c *Cache) SlackEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeySlackEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultSlackEnabled == "true", err
+	}
+}
+
+// PublicBaseURL returns the base URL used to build webui deep links in Slack
+// messages (PRD #25). ENV (UZI_PUBLIC_BASE_URL) over the DB row over the
+// loopback default.
+func (c *Cache) PublicBaseURL(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyPublicBaseURL)
+}
+
+// SlackBotToken returns the effective Slack bot token in plaintext (PRD #25):
+// the ENV value when set, else the sealed DB row decrypted. Empty string + nil
+// error when neither is configured. Only slacksvc calls this — it is the sole
+// read path for a secret key, keeping token bytes out of every other accessor.
+func (c *Cache) SlackBotToken(ctx context.Context) (string, error) {
+	return c.secret(ctx, KeySlackBotToken)
+}
+
+// SlackAppToken returns the effective Slack app-level token in plaintext (PRD
+// #25), same precedence as SlackBotToken.
+func (c *Cache) SlackAppToken(ctx context.Context) (string, error) {
+	return c.secret(ctx, KeySlackAppToken)
+}
+
+// secret resolves a secret key to plaintext: the ENV overlay value verbatim (it
+// is already plaintext), else the base64-of-sealed DB row opened with the box.
+// A DB-stored secret with no configured box is an error (misconfiguration), not
+// a silent empty. Errors carry no plaintext.
+func (c *Cache) secret(ctx context.Context, key string) (string, error) {
+	if v, ok := c.env[key]; ok && v != "" {
+		return v, nil
+	}
+	m, err := c.snapshot(ctx)
+	if err != nil {
+		return "", err
+	}
+	enc, ok := m[key]
+	if !ok || enc == "" {
+		return "", nil
+	}
+	if c.box == nil {
+		return "", errors.New("settings: secret decrypt requested but no cipher configured")
+	}
+	return DecodeSecret(c.box, enc)
+}
+
+// SealSecret encrypts a secret setting's plaintext for storage: secretbox-seal
+// then base64 (app_settings.value is TEXT). Mirrors multica's base64-of-sealed
+// BYO-token encoding. The handler calls this before UpsertAppSetting.
+func SealSecret(box *secretbox.Box, plaintext string) (string, error) {
+	sealed, err := box.Seal([]byte(plaintext))
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+// DecodeSecret reverses SealSecret: base64-decode then secretbox-open. A tampered
+// or wrong-key row returns an authentication error carrying no plaintext.
+func DecodeSecret(box *secretbox.Box, encoded string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("settings: stored secret is not valid base64: %w", err)
+	}
+	plain, err := box.Open(raw)
+	if err != nil {
+		return "", err
+	}
+	return string(plain), nil
+}
+
+// ValueForStorage prepares a setting value for its app_settings row: a secret key
+// is sealed (secretbox+base64) so the stored bytes are never the token itself;
+// every other key is stored verbatim. This is the single write-side seam — the
+// counterpart to the read-side structural exclusion — so the settings PUT cannot
+// persist a secret in the clear even by omission.
+func ValueForStorage(box *secretbox.Box, key, plaintext string) (string, error) {
+	if IsSecret(key) {
+		return SealSecret(box, plaintext)
+	}
+	return plaintext, nil
+}
+
+// All returns every known NON-SECRET key with its effective value (ENV over row
+// over default). The shape is stable — one entry per key in Defaults, secret keys
+// structurally excluded — so the admin UI never has to reason about missing rows
+// and a secret value can never leak through here. A cold refresh error is
+// returned so the handler can surface it rather than silently show defaults.
 func (c *Cache) All(ctx context.Context) (map[string]string, error) {
 	m, err := c.snapshot(ctx)
 	out := make(map[string]string, len(Defaults))
-	for k, def := range Defaults {
-		if v, ok := m[k]; ok && v != "" {
-			out[k] = v
-		} else {
-			out[k] = def
-		}
+	for k := range Defaults {
+		out[k] = c.effective(k, m)
 	}
 	return out, err
+}
+
+// AdminView is the admin GET /api/admin/settings shape (PRD #25). Values carries
+// the non-secret effective values (secret keys structurally absent); Secrets maps
+// each secret key to whether it is configured (never the value); Sources maps
+// EVERY key to "env"|"db"|"default". Splitting the value map from the secret
+// map is what makes a token leak impossible — nothing here can carry a secret's
+// bytes.
+type AdminView struct {
+	Values  map[string]string
+	Secrets map[string]bool
+	Sources map[string]string
+}
+
+// AdminView assembles the admin settings view. A cold refresh error is returned
+// (the handler 500s on it) but the maps are still filled from defaults/ENV so a
+// caller ignoring err sees a usable shape.
+func (c *Cache) AdminView(ctx context.Context) (AdminView, error) {
+	m, err := c.snapshot(ctx)
+	av := AdminView{
+		Values:  make(map[string]string, len(Defaults)),
+		Secrets: make(map[string]bool, len(SecretKeys)),
+		Sources: make(map[string]string, len(Defaults)+len(SecretKeys)),
+	}
+	for k := range Defaults {
+		av.Values[k] = c.effective(k, m)
+		av.Sources[k] = c.source(k, m)
+	}
+	for k := range SecretKeys {
+		av.Secrets[k] = c.configured(k, m)
+		av.Sources[k] = c.source(k, m)
+	}
+	return av, err
 }
 
 // Effective computes the effective value map for a slice of stored rows: every
@@ -260,13 +498,53 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
-	case KeyPrdlessEnabled:
+	case KeyPrdlessEnabled, KeySlackEnabled:
 		return validateBool(value)
+	case KeyPublicBaseURL:
+		return ValidatePublicBaseURL(value)
+	case KeySlackBotToken:
+		// Format-only (prefix) here; the live AuthTest runs in the handler. The
+		// error must never echo the value (a pasted token), so it names only the
+		// expected shape.
+		return validateSlackToken(value, "xoxb-", "bot")
+	case KeySlackAppToken:
+		return validateSlackToken(value, "xapp-", "app-level")
 	default:
 		// The label keys (prd_label, autopilot_label, prdless_label) all use the
 		// Decision 8 label rules; cross-key distinctness is ValidateMerged's job.
 		return ValidateLabel(value)
 	}
+}
+
+// validateSlackToken is the format gate for a secret Slack token (PRD #25):
+// non-empty and the expected xoxb-/xapp- prefix. It deliberately NEVER includes
+// the value in its error — a token must not appear in a validation message.
+func validateSlackToken(value, prefix, kind string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s token must not be empty", kind)
+	}
+	if !strings.HasPrefix(value, prefix) {
+		return fmt.Errorf("%s token must start with %s", kind, prefix)
+	}
+	return nil
+}
+
+// ValidatePublicBaseURL enforces the deep-link base-URL rule (PRD #25): a
+// parseable URL with an http or https scheme and a host. It becomes a button URL
+// in every DM, so no other scheme is allowed. Reused by config to check the
+// UZI_PUBLIC_BASE_URL env value at boot (single source of the rule).
+func ValidatePublicBaseURL(value string) error {
+	u, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New("must be a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("must use http or https")
+	}
+	if u.Host == "" {
+		return errors.New("must include a host")
+	}
+	return nil
 }
 
 // validateBool is the strict on/off parse for a boolean setting (PRD #22): exactly
@@ -300,15 +578,14 @@ func ValidateLabel(value string) error {
 // LabelChanged reports whether any submitted setting that affects which issues a
 // board shows actually changed value: a board-filtering label (prd_label or
 // autopilot_label) in updates whose value differs from committed. The settings PUT
-// uses it to decide whether to force a full repo resync. Presentation- and
-// gate-only keys never re-filter a board and are excluded: default_theme (PRD #21,
-// presentation-only) and the prdless keys (PRD #22 Decision 9 — they change only
-// whether a run can start without a PRD link, never which issues appear on a
-// board). An idempotent write (same value) returns false, matching the prior "only
-// resync on a real change" behavior.
+// uses it to decide whether to force a full repo resync. Only those two keys
+// re-filter a board, so the check is a whitelist — every other key
+// (default_theme presentation-only, the prdless gate keys, the PRD #25 slack keys)
+// is ignored, and a secret key's plaintext never participates. An idempotent write
+// (same value) returns false, matching the prior "only resync on a real change".
 func LabelChanged(committed, updates map[string]string) bool {
 	for k, v := range updates {
-		if k == KeyDefaultTheme || k == KeyPrdlessEnabled || k == KeyPrdlessLabel {
+		if k != KeyPRDLabel && k != KeyAutopilotLabel {
 			continue
 		}
 		if committed[k] != v {

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, resolveLeadModel, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SdkExecutor, resolveLeadModel, type SdkQueryFn, type SdkExecutorOptions } from "../src/sdk-executor.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill } from "../src/protocol.js";
@@ -680,5 +680,133 @@ describe("SdkExecutor repo skills (PRD #16 M6)", () => {
     assert.deepStrictEqual(o.skills, ["uzi:team-kb"], "repo skill evicted by the cap");
     assert.deepStrictEqual(subagent(o, "coder").skills, [], "evicted repo skill reaches no subagent");
     assert.deepStrictEqual(subagent(o, "reviewer").skills, []);
+  });
+});
+
+describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
+  it("provisions before the SDK and folds the tool env into the SDK env", async () => {
+    const calls: Array<{ packages: string[]; runDir: string; homeDir: string }> = [];
+    const provision: SdkExecutorOptions["provision"] = async (input) => {
+      calls.push(input);
+      return { toolEnv: { PATH: "/nix/kubectl/bin:/usr/bin", NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem" } };
+    };
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [assistantText("impl"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      runId: "11111111-1111-1111-1111-111111111111",
+      agents: [lead, coder],
+      config: { tool_packages: ["kubectl@1.31", "jq"] },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+
+    assert.strictEqual(calls.length, 1);
+    assert.deepStrictEqual(calls[0]!.packages, ["kubectl@1.31", "jq"]);
+    // The provisioned (allowlisted) tool env reached the SDK subprocess env.
+    const env = turns[0]!.options.env as Record<string, string>;
+    assert.strictEqual(env.PATH, "/nix/kubectl/bin:/usr/bin");
+    assert.strictEqual(env.NIX_SSL_CERT_FILE, "/etc/ssl/cert.pem");
+    // The credential is still there and untouched by provisioning.
+    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, OAUTH);
+  });
+
+  it("does not provision when the run has no tool packages (today's behavior)", async () => {
+    let called = false;
+    const provision: SdkExecutorOptions["provision"] = async () => {
+      called = true;
+      return { toolEnv: {} };
+    };
+    const { queryFn } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(makeCtx({ config: null }).ctx);
+    assert.strictEqual(called, false, "provisioning must be skipped when no packages");
+  });
+
+  it("fails the run with a clear message when provisioning throws", async () => {
+    const provision: SdkExecutorOptions["provision"] = async () => {
+      throw new Error("devbox exploded");
+    };
+    const { queryFn } = fakeTurns([[submitPlan("# plan"), resultSuccess()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(
+        makeCtx({ runId: "22222222-2222-2222-2222-222222222222", config: { tool_packages: ["kubectl"] } }).ctx,
+      ),
+      /tool provisioning failed/,
+    );
+  });
+
+  it("tier-2: unions the repo's devbox.json packages when opted in (tier-1 wins conflicts)", async () => {
+    const calls: Array<{ packages: string[] }> = [];
+    const provision: SdkExecutorOptions["provision"] = async (input) => {
+      calls.push(input);
+      return { toolEnv: {} };
+    };
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-wt-"));
+    fs.writeFileSync(
+      path.join(worktree, "devbox.json"),
+      JSON.stringify({ packages: ["jq", "kubectl@9.9"], shell: { init_hook: "echo evil" } }),
+    );
+    try {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({
+        runId: "33333333-3333-3333-3333-333333333333",
+        worktreePath: worktree,
+        config: { tool_packages: ["kubectl@1.31"], repo_devbox_opt_in: true },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+      assert.strictEqual(calls.length, 1);
+      // tier-1 kubectl@1.31 wins the base-name conflict; tier-2 jq is added.
+      assert.deepStrictEqual(calls[0]!.packages, ["kubectl@1.31", "jq"]);
+    } finally {
+      fs.rmSync(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it("does not read the repo devbox.json when opt-in is off", async () => {
+    const calls: Array<{ packages: string[] }> = [];
+    const provision: SdkExecutorOptions["provision"] = async (input) => {
+      calls.push(input);
+      return { toolEnv: {} };
+    };
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-wt-"));
+    fs.writeFileSync(path.join(worktree, "devbox.json"), JSON.stringify({ packages: ["jq"] }));
+    try {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({
+        runId: "44444444-4444-4444-4444-444444444444",
+        worktreePath: worktree,
+        config: { tool_packages: ["kubectl@1.31"], repo_devbox_opt_in: false },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+      // Only tier-1 — the repo's jq is NOT merged (opt-in off).
+      assert.deepStrictEqual(calls[0]!.packages, ["kubectl@1.31"]);
+    } finally {
+      fs.rmSync(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a non-UUID run id before provisioning (path-traversal guard)", async () => {
+    let called = false;
+    const provision: SdkExecutorOptions["provision"] = async () => {
+      called = true;
+      return { toolEnv: {} };
+    };
+    const { queryFn } = fakeTurns([[submitPlan("# plan"), resultSuccess()]]);
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(
+        makeCtx({ runId: "../../etc", config: { tool_packages: ["kubectl"] } }).ctx,
+      ),
+      /invalid run id/,
+    );
+    assert.strictEqual(called, false, "provisioning must not run for a malformed run id");
   });
 });

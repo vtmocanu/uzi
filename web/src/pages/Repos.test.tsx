@@ -14,6 +14,10 @@ vi.mock("../lib/api", async (importOriginal) => {
       listProjects: vi.fn(),
       setRepoEnabled: vi.fn(),
       setRepoSkillsEnabled: vi.fn(),
+      getRepoToolProfile: vi.fn(),
+      listToolAllowlist: vi.fn(),
+      setRepoToolProfile: vi.fn(),
+      setRepoDevboxOptIn: vi.fn(),
     },
   };
 });
@@ -42,6 +46,7 @@ function repo(over: Partial<Repo> & Pick<Repo, "id" | "path_with_namespace">): R
     default_branch: "main",
     enabled: true,
     repo_skills_enabled: false,
+    repo_devbox_opt_in: false,
     pipeline: null,
     ...over,
   };
@@ -62,6 +67,8 @@ function rowFor(name: string): HTMLElement {
 beforeEach(() => {
   mockApi.listConnections.mockResolvedValue({ connections: [CONN] });
   mockApi.listProjects.mockResolvedValue({ repos: REPOS.map((r) => ({ ...r })) });
+  mockApi.getRepoToolProfile.mockResolvedValue({ packages: [] });
+  mockApi.listToolAllowlist.mockResolvedValue({ allowlist: [] });
 });
 
 afterEach(() => {
@@ -144,5 +151,23 @@ describe("Repos — repo-skills opt-in", () => {
     await screen.findByText("vtmocanu/atlas");
     fireEvent.click(within(rowFor("vtmocanu/atlas")).getByRole("button", { name: "Disable repo skills" }));
     await waitFor(() => expect(mockApi.setRepoSkillsEnabled).toHaveBeenCalledWith("repo-atlas", false));
+  });
+});
+
+describe("Repos — tier-2 devbox opt-in (PRD #18 M5)", () => {
+  it("opens the Tools panel and toggles the repo devbox opt-in", async () => {
+    mockApi.setRepoDevboxOptIn.mockResolvedValue({
+      repo: { ...REPOS[0], repo_devbox_opt_in: true },
+    });
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+
+    // Open the per-repo Tools panel.
+    fireEvent.click(within(rowFor("vtmocanu/uzi")).getByRole("button", { name: "Tools" }));
+    // The trust toggle appears (allowlist is empty, so it's the only checkbox).
+    const toggle = await screen.findByRole("checkbox");
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(mockApi.setRepoDevboxOptIn).toHaveBeenCalledWith("repo-uzi", true));
   });
 });

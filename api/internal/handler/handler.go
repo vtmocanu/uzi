@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -46,6 +48,66 @@ type Handler struct {
 	// full-syncs every repo on its next cycle (PRD #19 M2). Optional: nil in tests
 	// that don't exercise the poller; UpdateSettings nil-guards the call.
 	reconciler Reconciler
+	// slackValidator live-validates Slack tokens on save (PRD #25 M1). Optional:
+	// nil falls back to the real slacksvc.Validator (see slackVal); tests inject a
+	// fake so the settings PUT is exercised without a network call to Slack.
+	slackValidator SlackValidator
+	// slackStatus reports the live Slack socket connection state for the admin DTO
+	// (PRD #25 M2). Wired to the slacksvc manager's State in main; nil (tests, or
+	// before wiring) reads as "disabled".
+	slackStatus func() string
+	// slackLinker sends the Slack DMs the /me/slack endpoints need (PRD #25 M3): a
+	// link-confirmation DM after a manual override, and the test DM. Wired to the
+	// slacksvc linker in main; nil (tests, or Slack off) makes those endpoints
+	// report Slack as unavailable rather than panic.
+	slackLinker SlackLinker
+}
+
+// SlackLinker is the slice of the slacksvc linker the /me/slack endpoints drive
+// (PRD #25 M3): re-send the Confirm / Not-me DM to a newly set override target,
+// and send the user-initiated test DM. *slacksvc.Linker satisfies it.
+type SlackLinker interface {
+	SendLinkConfirmation(ctx context.Context, slackID, accountLabel string)
+	SendTestDM(ctx context.Context, slackID string) error
+}
+
+// SetSlackLinker wires the account linker in after construction (built alongside
+// the Slack manager in main). Safe to leave unset — the /me/slack DM-sending
+// endpoints then report Slack as unavailable.
+func (h *Handler) SetSlackLinker(l SlackLinker) { h.slackLinker = l }
+
+// SetSlackStatus wires the Slack manager's connection-state accessor in after
+// construction (the manager is built alongside the handler's other run-lifecycle
+// collaborators). Safe to leave unset — the DTO then reports "disabled".
+func (h *Handler) SetSlackStatus(state func() string) { h.slackStatus = state }
+
+// slackState returns the live connection state, or "disabled" when no manager is
+// wired (Slack off, or a test handler).
+func (h *Handler) slackState() string {
+	if h.slackStatus != nil {
+		return h.slackStatus()
+	}
+	return "disabled"
+}
+
+// SlackValidator live-checks a pasted Slack token against Slack at save time
+// (PRD #25). The settings PUT calls it before sealing a token; slacksvc.Validator
+// is the production implementation, a fake stands in for tests.
+type SlackValidator interface {
+	ValidateBotToken(ctx context.Context, token string) error
+	ValidateAppToken(ctx context.Context, token string) error
+}
+
+// slackVal returns the injected validator, or the real Slack-backed one. The
+// real Validator is stateless, so defaulting here keeps handler.New's signature
+// unchanged while tests still override via the field.
+func (h *Handler) slackVal() SlackValidator {
+	if h.slackValidator != nil {
+		return h.slackValidator
+	}
+	// Bounded by the configured Slack HTTP timeout (Validator defaults it to 15s
+	// when zero), so live token validation can never hang the admin PUT.
+	return slacksvc.Validator{Timeout: h.cfg.SlackHTTPTimeout}
 }
 
 // Reconciler receives the "labels changed, resync everything" signal from the
@@ -112,8 +174,9 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // Routes builds the API router. authLimiter is applied per-route to the
 // register and login endpoints; forgeLimiter is a per-user budget on the
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot
-// hammer the upstream forge.
-func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
+// hammer the upstream forge; slackDMLimiter is a tighter per-user budget on the
+// two Slack-DM-triggering /me/slack endpoints.
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -159,28 +222,64 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Put("/", h.PutMySettings)
 		})
 
-		// Agent templates: all authenticated users can read and preview; only
-		// admins can create, edit, delete, or reset (closes bottega's hole
-		// where any user rewrites the shared prompts everyone's agents run).
+		// Current-user Slack linking (PRD #25 M3): the Notifications settings —
+		// link status, per-user notify toggle, manual member-ID override (409 on
+		// a collision with another user's id), and a self-test DM. All own-user
+		// only via UserFromContext; no user can touch another's mapping.
+		r.Route("/me/slack", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.GetMySlack)
+			r.Put("/notify", h.PutMySlackNotify)
+			// override + test-dm each trigger an outbound Slack DM to a user-supplied
+			// or caller-linked member id, so without a limit an authed user could spam
+			// arbitrary workspace members (override re-sends a Confirm card) or use the
+			// send result as a member-id enumeration oracle. Two controls: a dedicated,
+			// tighter per-user limiter here (PerUserMiddleware keys buckets by route
+			// pattern, so each gets its own budget) plus the Linker's per-target DM
+			// cooldown, which is the primary dedup.
+			//
+			// Accepted residual (auditor ruling, PRD #25): rate-limiting throttles but
+			// does not close the semantic oracles — test-dm's 200-vs-502 and override's
+			// 409 "already linked". Those responses are deliberate, PRD-specified UX
+			// (a collision must be visible; a failed test DM must be reported), so they
+			// stay as-is; the residual oracle is accepted as consistent with the
+			// trusted-team, single-user-laptop model, bounded by these two controls.
+			r.With(slackDMLimiter.PerUserMiddleware).Put("/override", h.PutMySlackOverride)
+			r.With(slackDMLimiter.PerUserMiddleware).Post("/test-dm", h.PostMySlackTestDM)
+		})
+
+		// Agent templates (PRD #18 M6): every authenticated user reads the
+		// templates visible to them (builtin + global + own) and manages their own
+		// user templates; global/builtin management stays admin-only (per-row scope
+		// authz). Still closes bottega's hole where any user rewrites shared prompts.
 		r.Route("/agent-templates", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Get("/", h.ListAgentTemplates)
+
+			// Template allocations (PRD #18 M7): which templates ride the caller's
+			// claims. GET is the per-template toggle view; PUT replaces the admin
+			// global-default set and/or the caller's overlay (per-half authz in the
+			// handler). A static path, matched ahead of /{id}.
+			r.Get("/allocations", h.GetTemplateAllocations)
+			r.Put("/allocations", h.SetTemplateAllocations)
+
 			r.Get("/{id}", h.GetAgentTemplate)
 			r.Get("/{id}/rendered", h.GetRenderedAgentTemplate)
 
 			// Skill allocations (PRD #16): the shared half is admin-only and the
 			// mine half is any user's own overlay, so authz is per-half inside the
-			// handler — these stay OUTSIDE the admin subgroup below.
+			// handler (per-half), not a blanket admin gate.
 			r.Get("/{id}/skills", h.GetTemplateSkills)
 			r.Put("/{id}/skills", h.SetTemplateSkills)
 
-			r.Group(func(r chi.Router) {
-				r.Use(mw.RequireAdmin)
-				r.Post("/", h.CreateAgentTemplate)
-				r.Put("/{id}", h.UpdateAgentTemplate)
-				r.Delete("/{id}", h.DeleteAgentTemplate)
-				r.Post("/{id}/reset", h.ResetAgentTemplate)
-			})
+			// Create/update/delete/reset (PRD #18 M6): a user manages their own
+			// scope='user' templates; global/builtin management stays admin-only.
+			// The split is per-row by scope inside the handlers
+			// (authorizeTemplateWrite), not a blanket RequireAdmin gate.
+			r.Post("/", h.CreateAgentTemplate)
+			r.Put("/{id}", h.UpdateAgentTemplate)
+			r.Delete("/{id}", h.DeleteAgentTemplate)
+			r.Post("/{id}/reset", h.ResetAgentTemplate)
 		})
 
 		// Skills (PRD #16): every authenticated user can read the skills visible
@@ -198,6 +297,20 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Post("/{id}/reset", h.ResetSkill)
 		})
 
+		// Tool allowlist (PRD #18 M4): any authenticated user can READ it (the repo
+		// package picker needs the selectable set); only admins write. Same
+		// read-all / write-admin split as agent-templates.
+		r.Route("/tool-allowlist", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListToolAllowlist)
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAdmin)
+				r.Post("/", h.CreateToolAllowlistEntry)
+				r.Put("/{id}", h.UpdateToolAllowlistEntry)
+				r.Delete("/{id}", h.DeleteToolAllowlistEntry)
+			})
+		})
+
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Use(mw.RequireAdmin)
@@ -206,6 +319,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			// Instance settings (PRD #19): the configurable forge labels today.
 			r.Get("/settings", h.GetSettings)
 			r.Put("/settings", h.UpdateSettings)
+			// Lightweight live Slack connection state for the admin webui chip's poll
+			// (PRD #25 M3), so it need not re-fetch the whole settings blob every 5s.
+			r.Get("/slack/status", h.GetAdminSlackStatus)
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
 			r.Get("/runs", h.AdminListRuns)
@@ -238,6 +354,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 				r.Put("/{id}", h.SetRepoEnabled)
 				// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 				r.Patch("/{id}", h.PatchRepo)
+				// Per-repo tool profile (PRD #18 M4): the owner's tier-1 package list.
+				// Owner-only (a repo belongs to one user's connection).
+				r.Get("/{id}/tool-profile", h.GetRepoToolProfile)
+				r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
 				r.Get("/{id}/board", h.GetBoard)
 				r.Put("/{id}/board/columns", h.ConfigureColumns)
 				// The in-app issue view fetches the issue (with its description) live

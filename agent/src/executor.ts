@@ -6,6 +6,8 @@ import type { Logger } from "./log.js";
 import type { AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MessageKind, RunKind } from "./protocol.js";
 import type { PlanVerdict } from "./steering.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
+import { provisionRunTools } from "./provision-run.js";
+import type { provisionTools } from "./provision.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -139,6 +141,15 @@ export interface StubExecutorOptions {
    * (UZI_STUB_PLAN_GATE) to exercise the full workflow with no live SDK.
    */
   planGate?: boolean;
+  /**
+   * When set, the stub exercises the SAME tool-provisioning path as the SDK
+   * executor (PRD #18 M8): pinned HOME for the install subprocess. Omitted ⇒ no
+   * provisioning (unit tests). The E2E sets it and stubs the `devbox` binary, so a
+   * provisioned-tool run is observable with no live SDK and no substituter egress.
+   */
+  homeDir?: string;
+  /** Injected in tests so no real devbox/nix egress happens; default = provisionTools. */
+  provision?: typeof provisionTools;
 }
 
 /**
@@ -177,6 +188,27 @@ export class StubExecutor implements Executor {
       }
     } catch (err) {
       this.log.warn("stub: skills plugin synthesis failed", { run_id: ctx.runId, error: String(err) });
+    }
+
+    // Delivered agent templates (PRD #18 M7/M8): report the claim's template set so
+    // a user-scoped template's delivery — after the server's allocation +
+    // shared-precedence resolution — is observable in the E2E (the stub runs no lead).
+    const agentNames = (ctx.agents ?? []).map((a) => a.name);
+    ctx.emit({ kind: "status", agent: "worker", payload: { text: `agents: ${agentNames.join(", ") || "(none)"}`, agents: agentNames } });
+
+    // Tool provisioning (PRD #18 M8): exercise the SAME path as the SDK executor
+    // (provision-run.ts), against the E2E's stubbed devbox. No packages ⇒ a no-op;
+    // a provision failure fails the run, matching the SDK executor. The provisioned
+    // env is unused by the stub — the point is to prove the install path end to end.
+    if (this.opts.homeDir) {
+      const provisionRoot = path.join(path.dirname(this.opts.homeDir), "provision");
+      const { provisionDir } = await provisionRunTools(ctx, {
+        provisionRoot,
+        homeDir: this.opts.homeDir,
+        log: this.log,
+        provision: this.opts.provision,
+      });
+      if (provisionDir) await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
     }
 
     const isCIFix = ctx.kind === "ci_fix";

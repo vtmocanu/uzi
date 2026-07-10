@@ -14,6 +14,7 @@ import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle,
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { isStoppedRun, mrChipState } from "../lib/runBadge";
+import { hasTemplateDrift } from "../lib/workerTemplates";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -194,8 +195,21 @@ export function RunsList() {
                     <div>
                       <span className="font-medium text-fg">{w.name}</span>
                       <span className="ml-2 text-xs text-faint">{w.owner_email}</span>
+                      {(w.template_reported || w.template_declared) && (
+                        <span className="ml-2 text-xs text-faint">
+                          template {w.template_reported ?? `${w.template_declared} (declared)`}
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-1.5">
+                      {hasTemplateDrift(w.template_declared, w.template_reported) && (
+                        <Badge
+                          tone="warning"
+                          title={`Declared ${w.template_declared}, worker reports ${w.template_reported}`}
+                        >
+                          template drift
+                        </Badge>
+                      )}
                       <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                         {w.status}
                       </Badge>

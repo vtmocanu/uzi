@@ -13,9 +13,9 @@ import (
 )
 
 const createAgentTemplate = `-- name: CreateAgentTemplate :one
-INSERT INTO agent_templates (name, description, model, tools, prompt_body, updated_by)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at
+INSERT INTO agent_templates (name, description, model, tools, prompt_body, scope, user_id, updated_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id
 `
 
 type CreateAgentTemplateParams struct {
@@ -24,11 +24,14 @@ type CreateAgentTemplateParams struct {
 	Model       pgtype.Text `json:"model"`
 	Tools       []byte      `json:"tools"`
 	PromptBody  string      `json:"prompt_body"`
+	Scope       string      `json:"scope"`
+	UserID      pgtype.UUID `json:"user_id"`
 	UpdatedBy   pgtype.UUID `json:"updated_by"`
 }
 
-// Admin-created template. is_builtin is always false here; builtins are seeded
-// only by the startup reconciler (InsertBuiltinAgentTemplate).
+// Create a global (admin) or user (owner) template. scope='builtin' is never
+// created here (is_builtin stays false, kept in lockstep by the builtin_scope_ck);
+// builtins are seeded only by the startup reconciler (InsertBuiltinAgentTemplate).
 func (q *Queries) CreateAgentTemplate(ctx context.Context, arg CreateAgentTemplateParams) (AgentTemplate, error) {
 	row := q.db.QueryRow(ctx, createAgentTemplate,
 		arg.Name,
@@ -36,6 +39,8 @@ func (q *Queries) CreateAgentTemplate(ctx context.Context, arg CreateAgentTempla
 		arg.Model,
 		arg.Tools,
 		arg.PromptBody,
+		arg.Scope,
+		arg.UserID,
 		arg.UpdatedBy,
 	)
 	var i AgentTemplate
@@ -50,6 +55,8 @@ func (q *Queries) CreateAgentTemplate(ctx context.Context, arg CreateAgentTempla
 		&i.UpdatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scope,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -59,7 +66,7 @@ DELETE FROM agent_templates WHERE id = $1 AND is_builtin = false
 `
 
 // Non-builtins only; the is_builtin guard is belt-and-suspenders (the handler
-// returns 409 before calling this).
+// returns 409 before calling this, and applies scope-based authz first).
 func (q *Queries) DeleteAgentTemplate(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteAgentTemplate, id)
 	if err != nil {
@@ -69,9 +76,12 @@ func (q *Queries) DeleteAgentTemplate(ctx context.Context, id uuid.UUID) (int64,
 }
 
 const getAgentTemplate = `-- name: GetAgentTemplate :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at FROM agent_templates WHERE id = $1
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates WHERE id = $1
 `
 
+// Unfiltered fetch for the write path: the handler loads the row, then applies
+// the scope-based write authz in Go (builtin/global admin-only, user owner-only)
+// and maps an unauthorized user-scope row to 404 so existence never leaks.
 func (q *Queries) GetAgentTemplate(ctx context.Context, id uuid.UUID) (AgentTemplate, error) {
 	row := q.db.QueryRow(ctx, getAgentTemplate, id)
 	var i AgentTemplate
@@ -86,16 +96,29 @@ func (q *Queries) GetAgentTemplate(ctx context.Context, id uuid.UUID) (AgentTemp
 		&i.UpdatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scope,
+		&i.UserID,
 	)
 	return i, err
 }
 
-const getAgentTemplateByName = `-- name: GetAgentTemplateByName :one
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at FROM agent_templates WHERE name = $1
+const getAgentTemplateForViewer = `-- name: GetAgentTemplateForViewer :one
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates
+WHERE id = $1
+  AND ($2::boolean
+       OR scope IN ('builtin', 'global')
+       OR (scope = 'user' AND user_id = $3))
 `
 
-func (q *Queries) GetAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error) {
-	row := q.db.QueryRow(ctx, getAgentTemplateByName, name)
+type GetAgentTemplateForViewerParams struct {
+	ID       uuid.UUID   `json:"id"`
+	IsAdmin  bool        `json:"is_admin"`
+	ViewerID pgtype.UUID `json:"viewer_id"`
+}
+
+// Single-template read with the same visibility rule as ListAgentTemplatesForViewer.
+func (q *Queries) GetAgentTemplateForViewer(ctx context.Context, arg GetAgentTemplateForViewerParams) (AgentTemplate, error) {
+	row := q.db.QueryRow(ctx, getAgentTemplateForViewer, arg.ID, arg.IsAdmin, arg.ViewerID)
 	var i AgentTemplate
 	err := row.Scan(
 		&i.ID,
@@ -108,14 +131,44 @@ func (q *Queries) GetAgentTemplateByName(ctx context.Context, name string) (Agen
 		&i.UpdatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scope,
+		&i.UserID,
+	)
+	return i, err
+}
+
+const getSharedAgentTemplateByName = `-- name: GetSharedAgentTemplateByName :one
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates WHERE name = $1 AND scope <> 'user'
+`
+
+// Shared-namespace lookup for the reconciler's shadow-warning classification.
+// Scoped to scope <> 'user' so it is unique (uq_agent_templates_shared_name):
+// post-00047 a bare name is NOT unique, and a user's same-name template could
+// otherwise win the QueryRow and trigger a false "builtin shadowed" warning.
+func (q *Queries) GetSharedAgentTemplateByName(ctx context.Context, name string) (AgentTemplate, error) {
+	row := q.db.QueryRow(ctx, getSharedAgentTemplateByName, name)
+	var i AgentTemplate
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Description,
+		&i.Model,
+		&i.Tools,
+		&i.PromptBody,
+		&i.IsBuiltin,
+		&i.UpdatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Scope,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const insertBuiltinAgentTemplate = `-- name: InsertBuiltinAgentTemplate :execrows
-INSERT INTO agent_templates (name, description, model, tools, prompt_body, is_builtin)
-VALUES ($1, $2, $3, $4, $5, true)
-ON CONFLICT (name) DO NOTHING
+INSERT INTO agent_templates (name, description, model, tools, prompt_body, is_builtin, scope)
+VALUES ($1, $2, $3, $4, $5, true, 'builtin')
+ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING
 `
 
 type InsertBuiltinAgentTemplateParams struct {
@@ -127,7 +180,10 @@ type InsertBuiltinAgentTemplateParams struct {
 }
 
 // Idempotent seed used by the startup reconciler: insert a missing builtin,
-// never overwrite an existing row (admin edits survive restarts).
+// never overwrite an existing row (admin edits survive restarts). scope='builtin'
+// is set explicitly so it satisfies builtin_scope_ck; the conflict target is the
+// shared-namespace partial unique (uq_agent_templates_shared_name), NOT the bare
+// (name) — a user-scoped template of the same name must never block a builtin seed.
 func (q *Queries) InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertBuiltinAgentTemplate,
 		arg.Name,
@@ -143,9 +199,12 @@ func (q *Queries) InsertBuiltinAgentTemplate(ctx context.Context, arg InsertBuil
 }
 
 const listAgentTemplates = `-- name: ListAgentTemplates :many
-SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at FROM agent_templates ORDER BY name
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates ORDER BY name
 `
 
+// Unfiltered list of every template (all scopes). Claim assembly uses it until
+// M7 replaces it with the allocation-resolving list; the HTTP list handler uses
+// the viewer-scoped query below so a user never sees another user's templates.
 func (q *Queries) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, error) {
 	rows, err := q.db.Query(ctx, listAgentTemplates)
 	if err != nil {
@@ -166,6 +225,58 @@ func (q *Queries) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, erro
 			&i.UpdatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Scope,
+			&i.UserID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAgentTemplatesForViewer = `-- name: ListAgentTemplatesForViewer :many
+SELECT id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id FROM agent_templates
+WHERE $1::boolean
+   OR scope IN ('builtin', 'global')
+   OR (scope = 'user' AND user_id = $2)
+ORDER BY scope, name
+`
+
+type ListAgentTemplatesForViewerParams struct {
+	IsAdmin  bool        `json:"is_admin"`
+	ViewerID pgtype.UUID `json:"viewer_id"`
+}
+
+// Read authz mirror of ListSkillsForViewer: builtin + global are visible to
+// everyone; a user's own templates are visible only to that user; admins see all
+// scopes. Copying the all-shared ListAgentTemplates read verbatim would leak
+// private user templates.
+func (q *Queries) ListAgentTemplatesForViewer(ctx context.Context, arg ListAgentTemplatesForViewerParams) ([]AgentTemplate, error) {
+	rows, err := q.db.Query(ctx, listAgentTemplatesForViewer, arg.IsAdmin, arg.ViewerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentTemplate{}
+	for rows.Next() {
+		var i AgentTemplate
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Description,
+			&i.Model,
+			&i.Tools,
+			&i.PromptBody,
+			&i.IsBuiltin,
+			&i.UpdatedBy,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Scope,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}
@@ -186,7 +297,7 @@ SET description = $1,
     updated_by = $5,
     updated_at = now()
 WHERE id = $6
-RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id
 `
 
 type UpdateAgentTemplateParams struct {
@@ -198,8 +309,9 @@ type UpdateAgentTemplateParams struct {
 	ID          uuid.UUID   `json:"id"`
 }
 
-// Edits the mutable fields. name and is_builtin are immutable and never touched
-// here. Also used by the reset path to re-apply a builtin's embedded definition.
+// Edits the mutable fields. name, scope, user_id and is_builtin are immutable and
+// never touched here. Also used by the reset path to re-apply a builtin's
+// embedded definition.
 func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTemplateParams) (AgentTemplate, error) {
 	row := q.db.QueryRow(ctx, updateAgentTemplate,
 		arg.Description,
@@ -221,6 +333,8 @@ func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTempla
 		&i.UpdatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scope,
+		&i.UserID,
 	)
 	return i, err
 }

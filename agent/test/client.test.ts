@@ -35,6 +35,22 @@ describe("register / heartbeat / claim", () => {
     assert.strictEqual(api.unauthorized, 0);
   });
 
+  it("sends the template when the image declares one (PRD #18)", async () => {
+    await newClient().register("vlad-laptop", "jvm");
+    assert.deepStrictEqual(api.registers, [
+      { name: "vlad-laptop", version: "0.1.0-test", template: "jvm", authorized: true },
+    ]);
+  });
+
+  it("omits the template field when none is set", async () => {
+    await newClient().register("vlad-laptop", undefined);
+    const rec = api.registers[0];
+    assert.ok(rec);
+    // No `template` key at all, so an older image's register wire shape is intact.
+    assert.strictEqual(rec.template, undefined);
+    assert.ok(!("template" in rec));
+  });
+
   it("rejects a wrong token with 401", async () => {
     const bad = new WorkerClient(baseUrl, "nope", "0.1.0-test", nullLogger());
     await assert.rejects(bad.heartbeat(), RequestError);

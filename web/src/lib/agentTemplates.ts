@@ -4,7 +4,27 @@
 // /rendered endpoint) and the hard secret guardrail; these mirror that behavior
 // for live UI feedback only.
 
-import type { AgentTemplate } from "./api";
+import type { AgentTemplate, AgentTemplateScope } from "./api";
+
+// TEMPLATE_SCOPE_LABEL / templateScopeBadgeTone mirror the skills scope helpers
+// (lib/skills.ts) so agent templates and skills badge scope identically (PRD #18
+// M7). "Mine" is the owner-facing label for a user-scope template.
+export const TEMPLATE_SCOPE_LABEL: Record<AgentTemplateScope, string> = {
+  builtin: "Builtin",
+  global: "Global",
+  user: "Mine",
+};
+
+export function templateScopeBadgeTone(scope: AgentTemplateScope): "brand" | "info" | "neutral" {
+  switch (scope) {
+    case "builtin":
+      return "brand";
+    case "global":
+      return "info";
+    default:
+      return "neutral";
+  }
+}
 
 // KNOWN_TOOLS is the set the tag editor recognises. Unknown names are allowed
 // (MCP tool names are legitimate) but flagged so a typo in a core tool is
