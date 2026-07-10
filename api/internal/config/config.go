@@ -16,6 +16,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 )
 
 // Config holds all runtime settings derived from the environment.
@@ -77,6 +78,15 @@ type Config struct {
 	// upstream forge from a single user's abuse.
 	ForgeRateLimitMax    int
 	ForgeRateLimitWindow time.Duration
+	// SlackDMRateLimitMax/Window bound how often one authenticated user may hit
+	// the two Slack-DM-triggering endpoints (PUT /me/slack/override, POST
+	// /me/slack/test-dm). A dedicated, tighter budget than the forge one (PRD #25
+	// M3 fast-follow): those endpoints DM a user-supplied member id, so the limit
+	// caps arbitrary-member spam and the enumeration-oracle throughput. The
+	// per-target DM cooldown in slacksvc is the finer control; this is the coarse
+	// per-user burst cap.
+	SlackDMRateLimitMax    int
+	SlackDMRateLimitWindow time.Duration
 	// PrivilegeCheckInterval is the cadence of the background PAT least-privilege
 	// re-check sweep (PRD #5). Default 24h; 0 disables the sweep entirely (no boot
 	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
@@ -130,6 +140,22 @@ type Config struct {
 	// size (jobs × tail) frozen onto a ci_fix run at queue time.
 	CIFixMaxJobs      int
 	CIFixLogTailBytes int
+
+	// Slack integration ENV overlay (PRD #25). When set, each wins over its DB
+	// app_settings row (enforced in the settings cache) and the webui field renders
+	// greyed with a "set from environment" hint (a PUT to it is rejected 409).
+	// SlackBotToken (SLACK_BOT_TOKEN, xoxb-) and SlackAppToken (SLACK_APP_TOKEN,
+	// xapp-) are secrets held only in api memory; PublicBaseURL (UZI_PUBLIC_BASE_URL)
+	// is the http(s) base for webui deep links in Slack messages. All optional and
+	// empty by default (Slack is off until configured).
+	SlackBotToken string
+	SlackAppToken string
+	PublicBaseURL string
+	// SlackHTTPTimeout bounds every outbound Slack HTTP call (the admin PUT's
+	// live token validation and the manager's Socket Mode handshake), so a slow or
+	// unreachable Slack can never hang a request or wedge the connect path. Mirrors
+	// ForgeHTTPTimeout for the forge layer.
+	SlackHTTPTimeout time.Duration
 
 	// Agent skills (PRD #16). SkillMaxBytes caps a skill body at save (server) and
 	// is re-applied to repo-borne skills worker-side; SkillsMaxPerRun caps the
@@ -217,6 +243,11 @@ func Load() (Config, error) {
 	cfg.SettingsCacheTTL = parseDuration("SETTINGS_CACHE_TTL", 5*time.Second)
 	cfg.ForgeRateLimitMax = parseInt("FORGE_RATE_LIMIT_MAX", 30)
 	cfg.ForgeRateLimitWindow = parseDuration("FORGE_RATE_LIMIT_WINDOW", time.Minute)
+	// Deliberately tighter than the forge budget: these two routes DM an arbitrary
+	// member id, so a low per-user burst cap plus the per-target cooldown is the
+	// abuse control.
+	cfg.SlackDMRateLimitMax = parseInt("SLACK_DM_RATE_LIMIT_MAX", 6)
+	cfg.SlackDMRateLimitWindow = parseDuration("SLACK_DM_RATE_LIMIT_WINDOW", time.Minute)
 	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)
@@ -238,6 +269,20 @@ func Load() (Config, error) {
 	cfg.CIWatchMaxRefs = parseNonNegInt("CI_WATCH_MAX_REFS", 20)
 	cfg.CIFixMaxJobs = parseInt("CI_FIX_MAX_JOBS", 10)
 	cfg.CIFixLogTailBytes = parseInt("CI_FIX_LOG_TAIL_BYTES", 32768)
+
+	// Slack ENV overlay (PRD #25). The tokens are passed through verbatim (their
+	// live validity is surfaced by slacksvc when it connects, not at boot); the
+	// public base URL is scheme-checked here so a bad deep-link base is a loud boot
+	// failure rather than a broken button in every DM.
+	cfg.SlackBotToken = strings.TrimSpace(os.Getenv("SLACK_BOT_TOKEN"))
+	cfg.SlackAppToken = strings.TrimSpace(os.Getenv("SLACK_APP_TOKEN"))
+	cfg.SlackHTTPTimeout = parseDuration("SLACK_HTTP_TIMEOUT", 15*time.Second)
+	if pub := strings.TrimSpace(os.Getenv("UZI_PUBLIC_BASE_URL")); pub != "" {
+		if err := settings.ValidatePublicBaseURL(pub); err != nil {
+			return Config{}, fmt.Errorf("UZI_PUBLIC_BASE_URL %s", err)
+		}
+		cfg.PublicBaseURL = pub
+	}
 
 	if err := loadSeedAdmin(&cfg); err != nil {
 		return Config{}, err

@@ -397,13 +397,14 @@ func (q *Queries) DeleteWorkerForUser(ctx context.Context, arg DeleteWorkerForUs
 	return result.RowsAffected(), nil
 }
 
-const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :execrows
+const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :many
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= $2
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < $3
   )
+RETURNING id, user_id, status
 `
 
 type FailRunsOfStaleWorkersOverCapParams struct {
@@ -412,16 +413,34 @@ type FailRunsOfStaleWorkersOverCapParams struct {
 	Cutoff        pgtype.Timestamptz `json:"cutoff"`
 }
 
+type FailRunsOfStaleWorkersOverCapRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
 // A stale worker's non-terminal run that has already used its re-queue budget →
 // failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 // origin column; the sweep itself never touches the forge — worker-loss recovery
 // must not wait on a down forge).
-func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRunsOfStaleWorkersOverCapParams) (int64, error) {
-	result, err := q.db.Exec(ctx, failRunsOfStaleWorkersOverCap, arg.FailureReason, arg.MaxRequeues, arg.Cutoff)
+func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRunsOfStaleWorkersOverCapParams) ([]FailRunsOfStaleWorkersOverCapRow, error) {
+	rows, err := q.db.Query(ctx, failRunsOfStaleWorkersOverCap, arg.FailureReason, arg.MaxRequeues, arg.Cutoff)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []FailRunsOfStaleWorkersOverCapRow{}
+	for rows.Next() {
+		var i FailRunsOfStaleWorkersOverCapRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :execrows
@@ -1379,13 +1398,14 @@ func (q *Queries) RejectRunServerSide(ctx context.Context, arg RejectRunServerSi
 	return result.RowsAffected(), nil
 }
 
-const requeueRunsOfStaleWorkers = `-- name: RequeueRunsOfStaleWorkers :execrows
+const requeueRunsOfStaleWorkers = `-- name: RequeueRunsOfStaleWorkers :many
 UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count < $1
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < $2
   )
+RETURNING id, user_id, status
 `
 
 type RequeueRunsOfStaleWorkersParams struct {
@@ -1393,14 +1413,32 @@ type RequeueRunsOfStaleWorkersParams struct {
 	Cutoff      pgtype.Timestamptz `json:"cutoff"`
 }
 
+type RequeueRunsOfStaleWorkersRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
 // A stale worker's non-terminal run within its re-queue budget → back to queued
 // (worker_id kept for affinity, requeue_count incremented).
-func (q *Queries) RequeueRunsOfStaleWorkers(ctx context.Context, arg RequeueRunsOfStaleWorkersParams) (int64, error) {
-	result, err := q.db.Exec(ctx, requeueRunsOfStaleWorkers, arg.MaxRequeues, arg.Cutoff)
+func (q *Queries) RequeueRunsOfStaleWorkers(ctx context.Context, arg RequeueRunsOfStaleWorkersParams) ([]RequeueRunsOfStaleWorkersRow, error) {
+	rows, err := q.db.Query(ctx, requeueRunsOfStaleWorkers, arg.MaxRequeues, arg.Cutoff)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []RequeueRunsOfStaleWorkersRow{}
+	for rows.Next() {
+		var i RequeueRunsOfStaleWorkersRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const requeueWorkerRuns = `-- name: RequeueWorkerRuns :execrows
@@ -1592,26 +1630,48 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 	return result.RowsAffected(), nil
 }
 
-const sweepClaimedNeverStarted = `-- name: SweepClaimedNeverStarted :execrows
+const sweepClaimedNeverStarted = `-- name: SweepClaimedNeverStarted :many
 
 UPDATE runs SET status = 'queued', updated_at = now()
 WHERE status = 'claimed' AND claimed_at < $1
+RETURNING id, user_id, status
 `
+
+type SweepClaimedNeverStartedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
 
 // Sweeper: run-level timeouts and worker-loss recovery -----------------------
 // claimed but never started past the grace window → back to queued (worker_id
-// kept for affinity so the same disk reclaims it).
-func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, sweepClaimedNeverStarted, cutoff)
+// kept for affinity so the same disk reclaims it). RETURNING id, user_id, status
+// so the sweeper can publish each transition through the broadcaster/notifier
+// fan-out (PRD #25 M3: sweeper-driven transitions were previously silent).
+func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]SweepClaimedNeverStartedRow, error) {
+	rows, err := q.db.Query(ctx, sweepClaimedNeverStarted, cutoff)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []SweepClaimedNeverStartedRow{}
+	for rows.Next() {
+		var i SweepClaimedNeverStartedRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
-const sweepRunningTimeout = `-- name: SweepRunningTimeout :execrows
+const sweepRunningTimeout = `-- name: SweepRunningTimeout :many
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE status = 'running' AND started_at < $2
+RETURNING id, user_id, status
 `
 
 type SweepRunningTimeoutParams struct {
@@ -1619,15 +1679,33 @@ type SweepRunningTimeoutParams struct {
 	Cutoff        pgtype.Timestamptz `json:"cutoff"`
 }
 
+type SweepRunningTimeoutRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
 // running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 // Stamps move_pending_since so the (forge-free) sweep leaves the isolated
 // reconcile loop a marker to restore the origin column later.
-func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeoutParams) (int64, error) {
-	result, err := q.db.Exec(ctx, sweepRunningTimeout, arg.FailureReason, arg.Cutoff)
+func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeoutParams) ([]SweepRunningTimeoutRow, error) {
+	rows, err := q.db.Query(ctx, sweepRunningTimeout, arg.FailureReason, arg.Cutoff)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []SweepRunningTimeoutRow{}
+	for rows.Next() {
+		var i SweepRunningTimeoutRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updateRunLastSeq = `-- name: UpdateRunLastSeq :execrows

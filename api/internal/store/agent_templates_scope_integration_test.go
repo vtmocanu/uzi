@@ -17,7 +17,7 @@ import (
 // TestAgentTemplateScopesLiveDB pins the PRD #18 M6 SQL guarantees the fake-store
 // unit tests cannot cover: the visibility WHERE clauses in
 // ListAgentTemplatesForViewer / GetAgentTemplateForViewer, and — critically — the
-// reconciler's new partial-unique conflict target. After the 00047 migration the
+// reconciler's new partial-unique conflict target. After the 00048 migration the
 // builtin seed's ON CONFLICT keys on (name) WHERE scope <> 'user'; a user-scoped
 // template of the SAME name must therefore NOT block a builtin seed (boot would
 // otherwise break), while a shared-namespace row of that name is a normal no-op.

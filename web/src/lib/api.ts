@@ -54,6 +54,19 @@ export interface UserSettingsPatch {
 // global (admin, visible to all), user (self-service, owner-visible).
 export type AgentTemplateScope = "builtin" | "global" | "user";
 
+// SlackLink is the current user's own Slack linking state (PRD #25 M3), for the
+// Settings → Notifications section. state is derived: unlinked (no resolved id) |
+// pending (resolved, awaiting the Confirm DM) | confirmed. member_id is the manual
+// override (null = rely on email auto-match); resolved_id is the effective linked
+// Slack id (the override, else the cached email match).
+export interface SlackLink {
+  member_id: string | null;
+  notify: boolean;
+  resolved_id: string | null;
+  confirmed: boolean;
+  state: "unlinked" | "pending" | "confirmed";
+}
+
 // AgentTemplate is a stored agent definition. tools is null when the template
 // inherits all tools; model is null when it inherits the model. scope/user_id
 // carry the M6 ownership model; is_builtin is retained (== scope 'builtin').
@@ -350,7 +363,38 @@ export interface AppSettings {
   // (the API serves every setting as a string); prdless_label is the label name.
   prdless_enabled: string;
   prdless_label: string;
+  // Slack integration non-secret keys (PRD #25). slack_enabled is the text
+  // "true"/"false"; public_base_url is the http(s) base for deep links in Slack
+  // messages. The two Slack TOKENS are secret and never returned here — see
+  // `secrets` on SettingsResponse.
+  slack_enabled: string;
+  public_base_url: string;
 }
+
+// SettingSource reports where a setting's effective value comes from (PRD #25):
+// an env var, the DB app_settings row, or the compiled-in default. An env-sourced
+// key is greyed in the admin UI and a PUT to it is rejected (409).
+export type SettingSource = "env" | "db" | "default";
+
+// SettingsResponse is the admin GET/PUT body (PRD #25). `settings` carries the
+// non-secret effective values; `secrets` reports, per secret key, whether a value
+// is configured (never the value itself); `sources` reports every key's source.
+export interface SettingsResponse {
+  settings: AppSettings;
+  secrets: Record<string, boolean>;
+  sources: Record<string, SettingSource>;
+  // Live Slack socket connection state (PRD #25 M2): "disabled" | "connecting" |
+  // "connected" | "error:<class>". The admin Slack card renders it as a chip.
+  slack_status: string;
+}
+
+// UpdateSettingsPayload extends the non-secret settings with the write-only
+// secret token fields, sent only when the admin enters a new value (an omitted or
+// empty token leaves the stored one unchanged).
+export type UpdateSettingsPayload = Partial<AppSettings> & {
+  slack_bot_token?: string;
+  slack_app_token?: string;
+};
 
 // Compiled-in label defaults, mirroring the API's settings package. The SPA uses
 // them until the session bootstrap resolves the configured values (PRD #19 M2,
@@ -611,9 +655,9 @@ const realApi = {
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
-  getSettings: () => request<{ settings: AppSettings }>("GET", "/admin/settings"),
-  updateSettings: (settings: Partial<AppSettings>) =>
-    request<{ settings: AppSettings }>("PUT", "/admin/settings", { settings }),
+  getSettings: () => request<SettingsResponse>("GET", "/admin/settings"),
+  updateSettings: (settings: UpdateSettingsPayload) =>
+    request<SettingsResponse>("PUT", "/admin/settings", { settings }),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
@@ -624,6 +668,17 @@ const realApi = {
   getMySettings: () => request<{ settings: UserSettings }>("GET", "/me/settings"),
   putMySettings: (patch: UserSettingsPatch) =>
     request<{ settings: UserSettings }>("PUT", "/me/settings", patch),
+  // Slack linking (PRD #25 M3), own-user only. member_id null clears the override
+  // (falls back to email auto-match). A 409 from setMySlackOverride means the id is
+  // already linked to another account.
+  getMySlack: () => request<{ slack: SlackLink }>("GET", "/me/slack"),
+  setMySlackNotify: (notify: boolean) =>
+    request<{ slack: SlackLink }>("PUT", "/me/slack/notify", { notify }),
+  setMySlackOverride: (memberId: string | null) =>
+    request<{ slack: SlackLink }>("PUT", "/me/slack/override", { member_id: memberId }),
+  testMySlackDM: () => request<{ status: string }>("POST", "/me/slack/test-dm"),
+  // Just the live Slack socket state, for the admin chip's poll (PRD #25 M3).
+  getSlackStatus: () => request<{ slack_status: string }>("GET", "/admin/slack/status"),
   listAgentTemplates: () =>
     request<{ templates: AgentTemplate[] }>("GET", "/agent-templates"),
   getTemplateAllocations: () =>

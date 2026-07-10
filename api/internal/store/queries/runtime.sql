@@ -275,20 +275,24 @@ WHERE id = @id;
 
 -- Sweeper: run-level timeouts and worker-loss recovery -----------------------
 
--- name: SweepClaimedNeverStarted :execrows
+-- name: SweepClaimedNeverStarted :many
 -- claimed but never started past the grace window → back to queued (worker_id
--- kept for affinity so the same disk reclaims it).
+-- kept for affinity so the same disk reclaims it). RETURNING id, user_id, status
+-- so the sweeper can publish each transition through the broadcaster/notifier
+-- fan-out (PRD #25 M3: sweeper-driven transitions were previously silent).
 UPDATE runs SET status = 'queued', updated_at = now()
-WHERE status = 'claimed' AND claimed_at < @cutoff;
+WHERE status = 'claimed' AND claimed_at < @cutoff
+RETURNING id, user_id, status;
 
--- name: SweepRunningTimeout :execrows
+-- name: SweepRunningTimeout :many
 -- running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 -- Stamps move_pending_since so the (forge-free) sweep leaves the isolated
 -- reconcile loop a marker to restore the origin column later.
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
-WHERE status = 'running' AND started_at < @cutoff;
+WHERE status = 'running' AND started_at < @cutoff
+RETURNING id, user_id, status;
 
--- name: FailRunsOfStaleWorkersOverCap :execrows
+-- name: FailRunsOfStaleWorkersOverCap :many
 -- A stale worker's non-terminal run that has already used its re-queue budget →
 -- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
@@ -298,9 +302,10 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
-  );
+  )
+RETURNING id, user_id, status;
 
--- name: RequeueRunsOfStaleWorkers :execrows
+-- name: RequeueRunsOfStaleWorkers :many
 -- A stale worker's non-terminal run within its re-queue budget → back to queued
 -- (worker_id kept for affinity, requeue_count incremented).
 UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
@@ -308,7 +313,8 @@ WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count < @max_requeues
   AND worker_id IN (
       SELECT id FROM workers WHERE last_heartbeat_at IS NULL OR last_heartbeat_at < @cutoff
-  );
+  )
+RETURNING id, user_id, status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
 

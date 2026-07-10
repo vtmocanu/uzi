@@ -220,6 +220,18 @@ Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/done/24-mr-close-rework.md
 - When a reviewer closes an agent's MR without merging, move the board card back from Human Review to In Progress (the "rework needed" signal).
 - Target column is In Progress — user's explicit choice, over Open/backlog.
 
+## Feature #25 — Slack integration: run notifications, approve from Slack, reply-from-Slack
+
+Tracked as GitLab issue vtmocanu/uzi#25; PRD at `prds/25-slack-integration.md`.
+
+- Per-user Slack DMs for run state (started, awaiting approval, completed + MR link, failed, cancelled).
+- Approve/reject the plan-approval gate from Slack: buttons + threaded reject reason.
+- Reply from Slack to steer a live run (thread reply becomes a follow-up correction).
+- Socket Mode only — outbound-only; no inbound HTTP, no public URL. [user 2026-07-06]
+- User mapping: email auto-match + manual Slack member-ID override. [user 2026-07-06]
+- Per-user notifications toggle, default ON; default-ON initiates a link-confirmation DM, run content flows only after Confirm. [user 2026-07-06, amended by security review]
+- Slack tokens configurable from ENV or the admin webui; sealed at rest, never echoed back; ENV wins.
+
 ## Feature #32 — Per-user vault: password-wrapped secrets
 
 Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wrapped-secrets.md`.
