@@ -116,14 +116,15 @@ milestones):** (1) review + merge P3-web; (2) M5 security validation pass; (3) M
 Integration branch `feature/prd-39-chat-agent` (worktree `../prd-39-chat-agent`). All merged work
 is reviewed + audited with zero open blocking/major findings. Do these in order:
 
-1. **Finish + merge P3-web (M4 wiring).** Branch `feature/prd-39-p3-web`. At stop it was `99df248`
-   (reviewed merge-ready) plus an **in-flight `chatFromRun` optimistic-meta follow-up** (was
-   uncommitted WIP; coder-m4 was asked to commit it before EOD — check its final reported SHA/state
-   in `.claude/agent-team-tasks/` or the branch). **Needs a quick REVIEW of the `chatFromRun`
-   follow-up commit tomorrow** (reviewer: confirm it seeds conversation meta optimistically from the
-   create/continue `{run}` response without regressing the inert-render/§61 property), then merge into
-   integration and run `cd web && npm run typecheck && npm test`. (If coder-m4 left it as a WIP
-   commit, finish it first.) Reviewer already flagged one inert nit on the merged P3-agent side: the
+1. **Review + merge P3-web (M4 wiring).** Branch `feature/prd-39-p3-web` @ **`7122191`** (final,
+   committed, tree clean, gate GREEN at stop: web typecheck clean + 393/393 vitest). It is `99df248`
+   (M4 wiring, already reviewed merge-ready) **+ `7122191`** (`chatFromRun` optimistic-meta seed on
+   create/continue — the follow-up that was in-flight; now committed). **Only the `7122191` follow-up
+   still needs a REVIEW** (reviewer: confirm it seeds conversation meta optimistically from the
+   create/continue `{run}` response without regressing the inert-render/§61 property; the added test
+   asserts the header title shows right after create). Then merge `7122191` into integration and
+   re-run `cd web && npm run typecheck && npm test`. Reviewer already flagged one inert nit on the
+   merged P3-agent side: the
    emitted `proposal` payload carries three now-unused null fields (`created_issue_iid`/`_url`/
    `resolved_at`) that the reconciled web type dropped — harmless (extra JSON ignored), optional to
    trim.
