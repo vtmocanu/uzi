@@ -8,11 +8,16 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -279,6 +284,52 @@ func TestPostTestDMLinkerErrorIs502(t *testing.T) {
 	h.PostMySlackTestDM(rec, authed(httptest.NewRequest(http.MethodPost, "/api/me/slack/test-dm", nil)))
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 when the Slack send fails", rec.Code)
+	}
+}
+
+// A per-target cooldown from the linker surfaces as 429 with a Retry-After, not
+// the 502 a real send failure gets, so a rapid re-test reads as "slow down".
+func TestPostTestDMCooldownIs429(t *testing.T) {
+	db := &fakeSlackDB{notify: true, resolved: pgtype.Text{String: "U9", Valid: true}}
+	h := &Handler{q: store.New(db), slackLinker: &fakeHandlerLinker{testDMErr: slacksvc.ErrDMCooldown}}
+	rec := httptest.NewRecorder()
+	h.PostMySlackTestDM(rec, authed(httptest.NewRequest(http.MethodPost, "/api/me/slack/test-dm", nil)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 on a per-target DM cooldown; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("429 should carry a Retry-After header")
+	}
+}
+
+// The DM-triggering /me/slack endpoints ride the per-user limiter (the finding was
+// they had none): after the budget is spent the next call is 429 before the
+// handler runs. This exercises the same middleware chain Routes wires onto them.
+func TestMeSlackDMEndpointsRateLimited(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	inject := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(mw.ContextWithUser(r.Context(), user)))
+		})
+	}
+	lim := mw.NewLimiter(2, time.Minute, nil)
+	db := &fakeSlackDB{notify: true, resolved: pgtype.Text{String: "U9", Valid: true}}
+	h := &Handler{q: store.New(db), slackLinker: &fakeHandlerLinker{}}
+
+	r := chi.NewRouter()
+	r.Route("/api/me/slack", func(r chi.Router) {
+		r.Use(inject)
+		r.With(lim.PerUserMiddleware).Post("/test-dm", h.PostMySlackTestDM)
+	})
+
+	var codes []int
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/me/slack/test-dm", nil))
+		codes = append(codes, rec.Code)
+	}
+	if codes[0] != http.StatusOK || codes[1] != http.StatusOK || codes[2] != http.StatusTooManyRequests {
+		t.Fatalf("want [200 200 429] under a budget of 2, got %v", codes)
 	}
 }
 

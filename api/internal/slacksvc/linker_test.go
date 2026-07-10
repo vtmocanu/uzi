@@ -2,6 +2,7 @@ package slacksvc
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -166,6 +167,48 @@ func TestLinkerConfirmDMEscapesAccountLabel(t *testing.T) {
 	}
 	if !strings.Contains(sec, "&lt;@U999&gt;") {
 		t.Errorf("account label was not mrkdwn-escaped: %q", sec)
+	}
+}
+
+// The per-target cooldown suppresses a second Confirm card to the SAME member
+// (override-hammering spam guard) while leaving a distinct target and the normal
+// single-DM flow unaffected.
+func TestLinkerConfirmDMPerTargetCooldown(t *testing.T) {
+	fp := &fakePoster{}
+	l := NewLinker(&fakeLinkerStore{}, fp, nil)
+
+	l.SendLinkConfirmation(context.Background(), "U1", "acct")
+	l.SendLinkConfirmation(context.Background(), "U1", "acct") // within cooldown → suppressed
+	if len(fp.blocks) != 1 {
+		t.Fatalf("a duplicate Confirm card to the same target must be suppressed, got %d DMs", len(fp.blocks))
+	}
+	l.SendLinkConfirmation(context.Background(), "U2", "acct") // distinct target → still sent
+	if len(fp.blocks) != 2 {
+		t.Fatalf("a distinct target must still receive its Confirm card, got %d DMs", len(fp.blocks))
+	}
+}
+
+// The test DM is dedup'd per target too: a rapid re-test to the same id returns
+// ErrDMCooldown (mapped to 429 by the handler) without a second Slack call, while
+// a distinct target still sends.
+func TestLinkerTestDMPerTargetCooldown(t *testing.T) {
+	fp := &fakePoster{}
+	l := NewLinker(&fakeLinkerStore{}, fp, nil)
+
+	if err := l.SendTestDM(context.Background(), "U1"); err != nil {
+		t.Fatalf("first test DM should send: %v", err)
+	}
+	if err := l.SendTestDM(context.Background(), "U1"); !errors.Is(err, ErrDMCooldown) {
+		t.Fatalf("a second test DM within the cooldown should be ErrDMCooldown, got %v", err)
+	}
+	if len(fp.posts) != 1 {
+		t.Fatalf("only the first test DM should reach Slack, got %d posts", len(fp.posts))
+	}
+	if err := l.SendTestDM(context.Background(), "U2"); err != nil {
+		t.Fatalf("a test DM to a distinct target should send: %v", err)
+	}
+	if len(fp.posts) != 2 {
+		t.Fatalf("a distinct-target test DM should reach Slack, got %d posts", len(fp.posts))
 	}
 }
 

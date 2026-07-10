@@ -30,6 +30,20 @@ const (
 // next pass past the cooldown, or a later reconnect).
 const autoMatchCooldown = 10 * time.Minute
 
+// DMTargetCooldown bounds how often a DM is sent to the SAME Slack target across
+// the two user-triggered DM paths (the override-set Confirm card and the test DM).
+// Without it, an authed user could hammer /me/slack/override or /me/slack/test-dm
+// to spam an arbitrary member with Confirm cards, or drive the send result as a
+// member-id enumeration oracle. The per-user rate limiter on those routes is the
+// coarse backstop; this is the finer per-target dedup. Exported so the test-DM
+// handler can advertise a matching Retry-After.
+const DMTargetCooldown = 30 * time.Second
+
+// ErrDMCooldown is returned by SendTestDM when a DM to the same target was sent
+// within DMTargetCooldown. The handler maps it to 429 (not the 502 it uses for a
+// real send failure) so a rapid re-test reads as "slow down", not "Slack is down".
+var ErrDMCooldown = errors.New("slack: per-target DM cooldown")
+
 // BlockAction is one Block Kit button press, resolved from a Socket Mode
 // interactive envelope. SlackUserID is the AUTHENTICATED envelope user
 // (callback.User.ID) — never a value read from a payload blob, which a caller
@@ -71,6 +85,9 @@ type Linker struct {
 
 	mu       sync.Mutex
 	lastPass time.Time
+	// dmSent tracks the last DM time per Slack target for the per-target cooldown.
+	// Guarded by mu; pruned on each check so it stays bounded by the request rate.
+	dmSent map[string]time.Time
 }
 
 // NewLinker builds a Linker. poster is the shared bot-token Slack surface (reads
@@ -79,7 +96,28 @@ func NewLinker(s LinkerStore, poster Poster, logger *slog.Logger) *Linker {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Linker{store: s, poster: poster, logger: logger}
+	return &Linker{store: s, poster: poster, logger: logger, dmSent: make(map[string]time.Time)}
+}
+
+// allowDM reports whether an outbound DM to slackID is outside its per-target
+// cooldown, recording the send when it is. It bounds the two user-triggered DM
+// paths (override Confirm card + test DM) so an authed user cannot turn them into
+// a per-member spam primitive. Expired entries are pruned on each call so the map
+// stays bounded by the request rate. Callers hold no lock; this takes mu itself.
+func (l *Linker) allowDM(slackID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	for id, at := range l.dmSent {
+		if now.Sub(at) >= DMTargetCooldown {
+			delete(l.dmSent, id)
+		}
+	}
+	if at, ok := l.dmSent[slackID]; ok && now.Sub(at) < DMTargetCooldown {
+		return false
+	}
+	l.dmSent[slackID] = now
+	return true
 }
 
 // AutoMatch resolves override-free users by email and (re)sends a link-confirmation
@@ -153,6 +191,11 @@ func (l *Linker) AutoMatch(ctx context.Context) {
 // failure is logged, not returned (the mapping is already stored; a test-DM or a
 // later pass can retry).
 func (l *Linker) SendLinkConfirmation(ctx context.Context, slackID, accountLabel string) {
+	if !l.allowDM(slackID) {
+		// A Confirm card was just sent to this target; suppress the duplicate so
+		// override-hammering can't spam one member. The earlier card still stands.
+		return
+	}
 	channel, err := l.poster.OpenDM(ctx, slackID)
 	if err != nil {
 		l.logf("link confirm: open dm", err)
@@ -168,6 +211,9 @@ func (l *Linker) SendLinkConfirmation(ctx context.Context, slackID, accountLabel
 // Notifications settings "Send test DM" button). Unlike the notifier path it
 // returns the error so the handler can report a failed send to the user.
 func (l *Linker) SendTestDM(ctx context.Context, slackID string) error {
+	if !l.allowDM(slackID) {
+		return ErrDMCooldown
+	}
 	channel, err := l.poster.OpenDM(ctx, slackID)
 	if err != nil {
 		return err

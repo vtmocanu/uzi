@@ -229,8 +229,15 @@ func (h *Handler) Routes(authLimiter, forgeLimiter *mw.Limiter) http.Handler {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Get("/", h.GetMySlack)
 			r.Put("/notify", h.PutMySlackNotify)
-			r.Put("/override", h.PutMySlackOverride)
-			r.Post("/test-dm", h.PostMySlackTestDM)
+			// override + test-dm each trigger an outbound Slack DM to a user-supplied
+			// or caller-linked member id, so without a limit an authed user could spam
+			// arbitrary workspace members (override re-sends a Confirm card) or use the
+			// send result as a member-id enumeration oracle. Reuse the per-user forge
+			// limiter as a coarse backstop — PerUserMiddleware keys buckets by route
+			// pattern, so these get their own budget, independent of the forge routes.
+			// The Linker's per-target DM cooldown is the finer-grained dedup.
+			r.With(forgeLimiter.PerUserMiddleware).Put("/override", h.PutMySlackOverride)
+			r.With(forgeLimiter.PerUserMiddleware).Post("/test-dm", h.PostMySlackTestDM)
 		})
 
 		// Agent templates: all authenticated users can read and preview; only

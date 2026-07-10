@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -186,6 +188,11 @@ func (h *Handler) PostMySlackTestDM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.slackLinker.SendTestDM(r.Context(), link.SlackResolvedID.String); err != nil {
+		if errors.Is(err, slacksvc.ErrDMCooldown) {
+			w.Header().Set("Retry-After", strconv.Itoa(int(slacksvc.DMTargetCooldown.Seconds())))
+			httpx.Error(w, http.StatusTooManyRequests, "a test DM was just sent — please wait a moment before retrying")
+			return
+		}
 		slog.Warn("slack test dm failed", "error", slacksvc.ScrubTokens(err.Error()))
 		httpx.Error(w, http.StatusBadGateway, "couldn't send the test DM — check the Slack connection")
 		return
