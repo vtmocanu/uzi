@@ -125,9 +125,11 @@ interface CtxProbe {
 /**
  * A context whose user messages come from `queue`, consumed one per park:
  *   - a string       → resolves with that message,
- *   - `undefined`    → resolves undefined (no more input → idle-complete),
- *   - `null`         → returns a never-resolving promise (parks on the idle timer),
+ *   - `undefined`    → resolves undefined (source has no more input → idle-complete),
+ *   - `null`         → returns a never-resolving promise (parks until ctx.signal aborts),
  *   - queue empty    → resolves undefined.
+ * Idle is owned by the input source now (steering), so it surfaces here as an
+ * `undefined` resolution, not a timer the executor fires.
  */
 function makeCtx(queue: (string | undefined | null)[], overrides: Partial<ChatContext> = {}): CtxProbe {
   const emits: EmittedMessage[] = [];
@@ -141,7 +143,6 @@ function makeCtx(queue: (string | undefined | null)[], overrides: Partial<ChatCo
     onSessionId: (s) => sessionIds.push(s),
     maxTurns: 50,
     turnTimeoutMs: 5000,
-    idleTimeoutMs: 100000,
     nextUserMessage: () => {
       if (pending.length === 0) return Promise.resolve<string | undefined>(undefined);
       const v = pending.shift();
@@ -315,14 +316,12 @@ describe("ChatExecutor lifecycle clocks (Decision 3)", () => {
     assert.ok(probe.emits.some((m) => m.kind === "status" && /turn limit/.test(String(m.payload["text"]))));
   });
 
-  it("completes a parked chat when the idle timer fires (no user message)", async () => {
+  it("completes with idle when the input source has no more input (source owns the idle clock)", async () => {
+    // Idle is no longer an executor timer (task #8): the source resolves undefined,
+    // and since ctx.signal is NOT aborted the loop completes as idle (not ended).
     const { queryFn } = fakeTurns([[resultSuccess()]]);
-    const sched = new FakeScheduler();
-    const probe = makeCtx([null], { idleTimeoutMs: 100000 }); // null = never resolves → park
-    const run = new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: sched }).run(probe.ctx);
-    await waitForTimer(sched, 100000); // the loop reached awaitNext and armed the idle timer
-    sched.fire(100000); // fire the idle timer
-    const result = await run;
+    const probe = makeCtx([undefined]); // first park → no more input → idle
+    const result = await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler() }).run(probe.ctx);
     assert.strictEqual(result.turns, 0);
     assert.strictEqual(result.endReason, "idle");
   });
@@ -334,7 +333,7 @@ describe("ChatExecutor lifecycle clocks (Decision 3)", () => {
     ]);
     const sched = new FakeScheduler();
     // One message, then no more input so the loop idle-ends after the timed-out turn.
-    const probe = makeCtx(["long question", undefined], { turnTimeoutMs: 5000, idleTimeoutMs: 100000 });
+    const probe = makeCtx(["long question", undefined], { turnTimeoutMs: 5000 });
     const run = new ChatExecutor(nullLogger(), homeDir, {
       queryFn,
       scheduler: sched,

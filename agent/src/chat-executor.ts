@@ -135,19 +135,22 @@ export interface ChatContext {
   onSessionId?(sessionId: string): void;
   /** Aborts the whole chat cleanly (an explicit "End chat" in the UI, or shutdown). */
   signal?: AbortSignal;
-  /** Resolved lifecycle bounds (Decision 3). The ChatRunner resolves these from
-   *  the claim config over the worker env over the hardcoded defaults. */
+  /** Resolved lifecycle bounds the executor owns (Decision 3): the turn cap and the
+   *  per-turn wall-clock. The IDLE window is NOT here — it is owned by the input
+   *  source (steering), so a follow_up racing the idle tick is delivered, never
+   *  dropped (Phase 2, team task #8). The ChatRunner resolves these from the claim
+   *  config over the worker env. */
   maxTurns: number;
   turnTimeoutMs: number;
-  idleTimeoutMs: number;
   /** Per-user default model for the chat main thread (PRD #17); omitted if unset. */
   model?: string;
   /**
-   * Deliver the next user message to answer, or undefined when the caller has no
-   * more input to give (Phase 2: backed by steering's await-next-follow-up, Decision
-   * 2). The executor's own idle timer races this: if idle fires first the loop ends
-   * regardless of what this later resolves. The FIRST user message arrives the same
-   * way (provisional wire assumption; see ChatClaim in chat-runner.ts).
+   * Deliver the next user message to answer, or undefined when the input source has
+   * no more input (idle-completed or ended). Backed by steering's await-next-follow-up
+   * (Decision 2), which owns the idle clock and consumes+delivers a follow_up in the
+   * same poll cycle so an idle tick can never drop a just-arrived message. The FIRST
+   * user message arrives the same way — a seeded follow_up input (M1 CreateChatRun).
+   * `ended` vs `idle` is distinguished by ctx.signal (aborted ⇒ ended).
    */
   nextUserMessage(): Promise<string | undefined>;
 }
@@ -346,11 +349,12 @@ export class ChatExecutor {
   }
 
   /**
-   * Park until the next user message, or until the idle timer fires (complete the
-   * parked chat, Decision 3), or until the whole chat is cancelled. Returns either
-   * a message to answer or the reason the loop should end. The idle timer runs ONLY
-   * while parked — a busy turn re-arming it (sdk-executor.ts:389) is exactly what
-   * the per-turn wall-clock, not idle, backstops.
+   * Park until the next user message, or until the input source signals no more
+   * input (idle-completion) or the whole chat is cancelled. Idle is owned by the
+   * source (steering), not a timer here: `nextUserMessage()` resolves undefined only
+   * after steering has consumed+delivered every buffered follow_up, so a message
+   * racing the idle tick is never dropped (team task #8). `ended` vs `idle` is read
+   * from ctx.signal (an aborted signal is an explicit End chat / shutdown).
    */
   private awaitNext(ctx: ChatContext): Promise<{ message?: string; reason?: ChatEndReason }> {
     if (ctx.signal?.aborted) return Promise.resolve({ reason: "ended" });
@@ -359,15 +363,13 @@ export class ChatExecutor {
       const finish = (r: { message?: string; reason?: ChatEndReason }): void => {
         if (settled) return;
         settled = true;
-        idle.clear();
         ctx.signal?.removeEventListener("abort", onAbort);
         resolve(r);
       };
       const onAbort = (): void => finish({ reason: "ended" });
-      const idle = this.scheduler.set(() => finish({ reason: "idle" }), ctx.idleTimeoutMs);
       ctx.signal?.addEventListener("abort", onAbort, { once: true });
       ctx.nextUserMessage().then(
-        (m) => finish(m === undefined ? { reason: "idle" } : { message: m }),
+        (m) => finish(m === undefined ? { reason: ctx.signal?.aborted ? "ended" : "idle" } : { message: m }),
         (err) => {
           this.log.warn("chat: nextUserMessage rejected", { run_id: ctx.runId, error: errMessage(err) });
           finish({ reason: "idle" });

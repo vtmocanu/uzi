@@ -1,85 +1,44 @@
-// The ChatRunner (PRD #39 M2, Decision 13). A slim sibling of RunRunner for the
+// The ChatRunner (PRD #39 M2/Decision 13). A slim sibling of RunRunner for the
 // `chat` run kind: claim → session loop → complete. It shares the batcher, client,
 // and redaction collaborators with a run, but has NO git collaborator at all — no
 // ensureClone, no worktree, no push, no MR — because a chat holds no PAT and works
 // the baked read-only source, never a clone. That absence is the point: the "no
 // clone attempted by chat" property is structural, not a runtime check.
 //
-// Phase-1 scope: the runner skeleton against a PROVISIONAL ChatClaim shape (below),
-// driving the ChatExecutor with real collaborators. The wire that yields the next
-// user message (steering's await-next-follow-up, Decision 2) is Phase 2 — injected
-// here as `nextUserMessage`, defaulting to "no more input" so a bare claim
-// idle-completes cleanly.
+// Phase 2 wires the real input channel: the ChatSteering channel feeds
+// `nextUserMessage` (Decision 2), and each consumed input — including the seeded
+// first message (M1 CreateChatRun) — is emitted as ONE `user_message` run message
+// (the worker owns the gapless seq) BEFORE the model's response for that turn.
 
 import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
-import type { StateRequest } from "./protocol.js";
+import type { ChatClaimResponse, StateRequest } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
 import { ChatExecutor, type ChatContext, type ChatExecutorResult } from "./chat-executor.js";
+import { ChatSteering, type ChatInputSource } from "./steering.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { errMessage } from "./util.js";
 
 /** Cap on a reported failure_reason (matches RunRunner / the GitLab error cap). */
 const MAX_FAILURE_REASON_LEN = 512;
 
-/**
- * PROVISIONAL chat-claim wire shape (PRD #39 Phase 1). It is DECOUPLED from M1's
- * real claim on purpose and reconciled in Phase 2 (M2 claim-loop split + live wire).
- * Load-bearing assumptions, each a Phase-2 reconciliation point:
- *   - `kind` is `"chat"` and there is no `repo` / `repo_id` — a chat run has no repo
- *     (Decision 12); claim assembly opens only the Anthropic token.
- *   - `secrets` carries the Anthropic token ONLY. There is NO `forge_pat` /
- *     `forge_username` key (Decision 9 — chat claims omit the PAT at the type level).
- *   - the FIRST user message rides the input wire like every subsequent turn
- *     (uniform), so the claim carries no message text; the runner's
- *     `nextUserMessage` source yields it. (If M1 instead delivers the first prompt
- *     as a claim field, this is where it lands.)
- */
-export interface ChatClaim {
-  run_id: string;
-  kind: "chat";
-  /** Conversation title, first-message derived (nullable). */
-  title?: string | null;
-  /** SDK session to resume; null/absent for a fresh chat. */
-  session_id?: string | null;
-  /** Decision 11: the ended chat this one continues. The worker best-effort resumes
-   *  its `session_id` when affinity landed it here; otherwise it says so honestly. */
-  resume_of_run_id?: string | null;
-  /** High-water mark of run_messages.seq; the worker continues numbering from here. */
-  last_seq: number;
-  secrets: ChatClaimSecrets;
-  config?: ChatClaimConfig | null;
-}
-
-/** A chat claim's secrets — the Anthropic token and NOTHING else (Decision 9). */
-export interface ChatClaimSecrets {
-  anthropic_oauth_token?: string;
-}
-
-/** Per-run chat caps the server may push down. */
-export interface ChatClaimConfig {
-  /** Per-run turn ceiling; when present the runner prefers it over the worker default. */
-  chat_max_turns?: number;
-  /** The run owner's per-user default model (PRD #17). */
-  default_model?: string;
-}
-
-/** Worker-config lifecycle defaults the runner resolves each ChatContext from. */
+/** Worker-config lifecycle defaults the runner resolves each ChatContext from; a
+ *  claim's own config wins per-run over these (Decision 3, brief §4). */
 export interface ChatRunnerDefaults {
   maxTurns: number;
   turnTimeoutMs: number;
   idleTimeoutMs: number;
+  /** Chat input poll cadence (WORKER_CHAT_POLL_MS). */
+  pollMs: number;
 }
 
 export interface ChatRunnerOptions {
   /**
-   * Source of the next user message for a claim (Phase 2: steering's await-next-
-   * follow-up over `GET /inputs`, Decision 2). Returns undefined when there is no
-   * further input, which the executor's park loop treats as idle-completion.
-   * Default: always undefined (a fresh claim idle-completes with zero turns) — a
-   * safe skeleton until Phase 2 wires the real input channel.
+   * Build the input source for a claim (Decision 2). Default: a real ChatSteering
+   * over `GET /inputs`. Tests inject a fake that yields scripted ChatInputs so the
+   * user_message emission and the turn/idle/cancel flow are provable without HTTP.
    */
-  nextUserMessage?: (claim: ChatClaim, signal: AbortSignal) => Promise<string | undefined>;
+  makeSource?: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
 }
 
 /**
@@ -88,7 +47,7 @@ export interface ChatRunnerOptions {
  * a chat produces conversation, not a branch.
  */
 export class ChatRunner {
-  private readonly nextUserMessage: (claim: ChatClaim, signal: AbortSignal) => Promise<string | undefined>;
+  private readonly makeSource: (runId: string, cancel: AbortController, log: Logger) => ChatInputSource;
 
   constructor(
     private readonly client: WorkerClient,
@@ -101,10 +60,18 @@ export class ChatRunner {
     private readonly joinToken?: string,
     opts: ChatRunnerOptions = {},
   ) {
-    this.nextUserMessage = opts.nextUserMessage ?? (async () => undefined);
+    this.makeSource =
+      opts.makeSource ??
+      ((runId, cancel, runLog) => new ChatSteering(this.client, runId, this.defaults.pollMs, runLog, cancel));
   }
 
-  async execute(claim: ChatClaim): Promise<void> {
+  /**
+   * @param signal the worker's shutdown signal (optional). When it aborts, the chat's
+   *   own cancel trips, so an in-flight chat stops promptly on SIGTERM rather than
+   *   parking until idle — the chat lane fires sessions concurrently (fire-and-forget),
+   *   so unlike the inline run lane it needs this to drain cleanly at shutdown.
+   */
+  async execute(claim: ChatClaimResponse, signal?: AbortSignal): Promise<void> {
     const runId = claim.run_id;
     // Register the only secret a chat claim carries; never log the claim itself.
     if (claim.secrets.anthropic_oauth_token) this.log.addSecret(claim.secrets.anthropic_oauth_token);
@@ -115,13 +82,28 @@ export class ChatRunner {
     const redactText = makeTextRedactor(secrets);
     const batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact);
 
-    // A cancel (an explicit "End chat", or shutdown) aborts the whole conversation;
-    // the executor's ctx.signal watches it. Phase 2 trips this from the steering
-    // channel; Phase 1 leaves it inert (a bare claim idle-completes).
+    // A `cancel` (End chat) input, or worker shutdown, aborts the whole conversation.
+    // This SAME controller is the steering channel's cancel AND the executor's
+    // ctx.signal, so an End chat aborts a turn in flight, not just a parked wait.
     const cancel = new AbortController();
+    const onShutdown = (): void => {
+      if (!cancel.signal.aborted) cancel.abort();
+    };
+    if (signal) {
+      if (signal.aborted) cancel.abort();
+      else signal.addEventListener("abort", onShutdown, { once: true });
+    }
+    const source = this.makeSource(runId, cancel, runLog);
+
+    // Resolve this run's clocks: the claim config (server-pushed, no drift) wins over
+    // the worker env defaults (Decision 3). Timeouts are delivered in SECONDS.
+    const maxTurns = positiveOr(claim.config.max_turns, this.defaults.maxTurns);
+    const turnTimeoutMs = secondsToMs(claim.config.turn_timeout_seconds) ?? this.defaults.turnTimeoutMs;
+    const idleTimeoutMs = secondsToMs(claim.config.idle_timeout_seconds) ?? this.defaults.idleTimeoutMs;
 
     // Last SDK session id observed, carried on every state report so resume survives
-    // a lost report (§51, same as RunRunner).
+    // a lost report (§51, same as RunRunner). Seeded from the claim so a resumed/
+    // continued chat reports its resume target even before the first turn.
     let observedSessionId = claim.session_id ?? undefined;
     const reportState = (body: StateRequest): Promise<void> =>
       this.client.reportState(runId, observedSessionId ? { ...body, session_id: observedSessionId } : body);
@@ -129,6 +111,7 @@ export class ChatRunner {
     try {
       runLog.info("chat claimed", { resume_of: claim.resume_of_run_id ?? null, session: claim.session_id ?? null });
       await reportState({ status: "running" });
+      source.start();
 
       // Decision 11: a Continue whose prior session is not on this worker's disk
       // resumes without context — say so honestly instead of pretending.
@@ -152,13 +135,19 @@ export class ChatRunner {
           );
         },
         signal: cancel.signal,
-        // Claim config (per-run) wins over the worker default for the turn cap
-        // (Decision 3); the wall-clock + idle windows are worker cadences.
-        maxTurns: claim.config?.chat_max_turns ?? this.defaults.maxTurns,
-        turnTimeoutMs: this.defaults.turnTimeoutMs,
-        idleTimeoutMs: this.defaults.idleTimeoutMs,
-        model: claim.config?.default_model,
-        nextUserMessage: () => this.nextUserMessage(claim, cancel.signal),
+        maxTurns,
+        turnTimeoutMs,
+        model: claim.config.default_model,
+        // Park on the steering channel; on a delivered message, emit the user_message
+        // run message (worker owns the seq) BEFORE the executor streams the model's
+        // reply for that turn. `idle`/`ended` → undefined (the loop completes; the
+        // executor reads ctx.signal to tell an End chat from an idle).
+        nextUserMessage: async () => {
+          const input = await source.awaitFollowUp(idleTimeoutMs);
+          if (input.kind !== "message") return undefined;
+          batcher.emit({ kind: "user_message", payload: { text: input.text } });
+          return input.text;
+        },
       };
 
       const result = await this.executor.run(ctx);
@@ -174,8 +163,21 @@ export class ChatRunner {
       await reportState({ status: "failed", failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN) }).catch((e) =>
         runLog.error("could not report failed chat state", { error: errMessage(e) }),
       );
+    } finally {
+      if (signal) signal.removeEventListener("abort", onShutdown);
+      await source.stop().catch(() => undefined);
     }
   }
+}
+
+/** Convert an optional positive seconds value to ms, else undefined (use fallback). */
+function secondsToMs(seconds: number | undefined): number | undefined {
+  return typeof seconds === "number" && seconds > 0 ? Math.round(seconds * 1000) : undefined;
+}
+
+/** A positive integer override, else the fallback. */
+function positiveOr(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && value > 0 ? Math.floor(value) : fallback;
 }
 
 /** A user-facing completion line for how the conversation ended. */

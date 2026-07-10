@@ -5,7 +5,9 @@ import { WorkerClient } from "./client.js";
 import { GitCache } from "./git.js";
 import { StubExecutor, type Executor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
+import { ChatExecutor } from "./chat-executor.js";
 import { RunRunner } from "./runner.js";
+import { ChatRunner } from "./chat-runner.js";
 import { Worker } from "./worker.js";
 import { errMessage } from "./util.js";
 
@@ -49,7 +51,24 @@ async function main(): Promise<void> {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
   });
-  const worker = new Worker(config, client, runner, log);
+
+  // The chat lane (PRD #39). Its executor gets the SAME join-token secret path as the
+  // run executor (task #9) so the Bash + path-guard hooks deny a read of it, and the
+  // SAME pinned HOME so a chat SDK session survives a restart for Continue/resume. The
+  // ChatRunner resolves each run's clocks from the claim config over these worker
+  // defaults; the chat lane always runs the real ChatExecutor (no stub — chat has no
+  // E2E stub path yet, and an unqueued chat lane just polls 204 harmlessly).
+  const chatExecutor = new ChatExecutor(log, sdkHomeDir, {
+    secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
+  });
+  const chatRunner = new ChatRunner(client, chatExecutor, log, config.messageBatchMs, {
+    maxTurns: config.chatMaxTurns,
+    turnTimeoutMs: config.chatTurnTimeoutMs,
+    idleTimeoutMs: config.chatIdleTimeoutMs,
+    pollMs: config.chatPollMs,
+  }, config.workerToken);
+
+  const worker = new Worker(config, client, runner, chatRunner, log);
 
   const controller = new AbortController();
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
