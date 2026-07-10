@@ -207,6 +207,11 @@ type Config struct {
 	// prompt-injected worker cannot mass-create proposals across its user's chats.
 	ProposalRateLimitMax    int
 	ProposalRateLimitWindow time.Duration
+	// ProposalConfirmStuckTimeout is how long a proposal may sit in the transient
+	// 'confirming' state before the sweeper reverts it to pending (PRD #39 M3): the
+	// recovery for a confirm handler killed after the claim but before it settled.
+	// Above the forge HTTP timeout so an in-flight confirm is never reaped. 0 disables it.
+	ProposalConfirmStuckTimeout time.Duration
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -316,6 +321,9 @@ func Load() (Config, error) {
 	cfg.ChatRateLimitWindow = parseDuration("CHAT_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalRateLimitMax = parseInt("PROPOSAL_RATE_LIMIT_MAX", 20)
 	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
+	// Above ForgeHTTPTimeout (15s default) so a legitimately slow confirm is never
+	// reaped mid-flight.
+	cfg.ProposalConfirmStuckTimeout = parseDuration("PROPOSAL_CONFIRM_STUCK_TIMEOUT", 2*time.Minute)
 
 	cfg.CIWatchRunWindow = parseDuration("CI_WATCH_RUN_WINDOW", 14*24*time.Hour)
 	// parseNonNegInt: 0 is legitimate here — it disables the pipeline sync.

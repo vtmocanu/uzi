@@ -152,18 +152,19 @@ func run() error {
 	// approval-gate handler needs its SubmitInput and the socket manager captures
 	// its inbound handler at construction.
 	wsvc := workersvc.New(q, box, workersvc.Params{
-		RunTimeout:            cfg.RunTimeout,
-		RunIdleTimeout:        cfg.RunIdleTimeout,
-		RunMaxIterations:      cfg.RunMaxIterations,
-		RunMaxRequeues:        cfg.RunMaxRequeues,
-		WorkerHeartbeatStale:  cfg.WorkerHeartbeatStale,
-		WorkerAffinityGrace:   cfg.WorkerAffinityGrace,
-		SkillMaxBytes:         cfg.SkillMaxBytes,
-		SkillsMaxPerRun:       cfg.SkillsMaxPerRun,
-		ChatIdleTimeout:       cfg.ChatIdleTimeout,
-		ChatMaxTurns:          cfg.ChatMaxTurns,
-		WorkerChatIdleTimeout: cfg.WorkerChatIdleTimeout,
-		WorkerChatTurnTimeout: cfg.WorkerChatTurnTimeout,
+		RunTimeout:                  cfg.RunTimeout,
+		RunIdleTimeout:              cfg.RunIdleTimeout,
+		RunMaxIterations:            cfg.RunMaxIterations,
+		RunMaxRequeues:              cfg.RunMaxRequeues,
+		WorkerHeartbeatStale:        cfg.WorkerHeartbeatStale,
+		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
+		SkillMaxBytes:               cfg.SkillMaxBytes,
+		SkillsMaxPerRun:             cfg.SkillsMaxPerRun,
+		ChatIdleTimeout:             cfg.ChatIdleTimeout,
+		ChatMaxTurns:                cfg.ChatMaxTurns,
+		WorkerChatIdleTimeout:       cfg.WorkerChatIdleTimeout,
+		WorkerChatTurnTimeout:       cfg.WorkerChatTurnTimeout,
+		ProposalConfirmStuckTimeout: cfg.ProposalConfirmStuckTimeout,
 	})
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /

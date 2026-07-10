@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -270,6 +271,21 @@ func TestCreateProposalGuards(t *testing.T) {
 	}
 	if ok.createdProposal == nil || ok.createdProposal.RunID != runID {
 		t.Fatalf("a valid proposal must be created, got %v", ok.createdProposal)
+	}
+}
+
+// TestSweepRecoversStuckConfirmingProposals: the sweep reverts proposals stranded
+// in 'confirming' (a confirm handler killed mid-flight) back to pending.
+func TestSweepRecoversStuckConfirmingProposals(t *testing.T) {
+	fs := &fakeStore{sweptStuckProposals: []uuid.UUID{uuid.New(), uuid.New()}}
+	p := testParams()
+	p.ProposalConfirmStuckTimeout = 2 * time.Minute
+	res, err := New(fs, newBox(t), p).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if res.ProposalsRecovered != 2 {
+		t.Fatalf("ProposalsRecovered = %d, want 2", res.ProposalsRecovered)
 	}
 }
 

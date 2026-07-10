@@ -259,6 +259,26 @@ func TestChatRunsLiveDB(t *testing.T) {
 		t.Fatalf("a reverted proposal must be claimable again: %v", err)
 	}
 
+	// ── stuck-confirming recovery: a proposal stranded in 'confirming' past the
+	// cutoff is reverted to pending; a freshly-claimed one (p2, confirming_since=now)
+	// is not. Simulate a handler killed mid-flight by backdating confirming_since. ──
+	p3, _ := q.CreateIssueProposal(ctx, store.CreateIssueProposalParams{RunID: freshChat.ID, RepoID: repoID, Title: "t3", Description: "d3", Labels: []byte(`[]`)})
+	if _, err := q.ClaimProposalForConfirm(ctx, store.ClaimProposalForConfirmParams{ID: p3.ID, RunID: freshChat.ID, UserID: userID}); err != nil {
+		t.Fatalf("claim p3: %v", err)
+	}
+	mustExec(ctx, t, pool, `UPDATE issue_proposals SET confirming_since = now() - interval '10 minutes' WHERE id = $1`, p3.ID)
+	recovered, err := q.SweepStuckConfirmingProposals(ctx, pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true})
+	if err != nil {
+		t.Fatalf("SweepStuckConfirmingProposals: %v", err)
+	}
+	if len(recovered) != 1 || recovered[0] != p3.ID {
+		t.Fatalf("stuck sweep must recover exactly the backdated proposal (not the fresh p2), got %v", recovered)
+	}
+	// The recovered proposal is pending again → claimable.
+	if _, err := q.ClaimProposalForConfirm(ctx, store.ClaimProposalForConfirmParams{ID: p3.ID, RunID: freshChat.ID, UserID: userID}); err != nil {
+		t.Fatalf("a recovered proposal must be claimable again: %v", err)
+	}
+
 	// ── worker chat reads (M3): user_id-scoped, foreign id -> no row ──
 	wruns, err := q.ListRunsForWorkerUser(ctx, store.ListRunsForWorkerUserParams{UserID: userID, Lim: 50})
 	if err != nil {

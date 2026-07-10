@@ -100,6 +100,7 @@ type IssueProposal struct {
 	CreatedIssueIid pgtype.Int8        `json:"created_issue_iid"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	ResolvedAt      pgtype.Timestamptz `json:"resolved_at"`
+	ConfirmingSince pgtype.Timestamptz `json:"confirming_since"`
 }
 
 type PipelineStatus struct {

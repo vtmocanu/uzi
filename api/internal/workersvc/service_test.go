@@ -145,6 +145,11 @@ type fakeStore struct {
 	getChatProposalErr   error
 	pendingProposalCount int64
 	createdProposal      *store.CreateIssueProposalParams
+	sweptStuckProposals  []uuid.UUID
+}
+
+func (f *fakeStore) SweepStuckConfirmingProposals(context.Context, pgtype.Timestamptz) ([]uuid.UUID, error) {
+	return f.sweptStuckProposals, nil
 }
 
 func (f *fakeStore) ClaimProposalForConfirm(context.Context, store.ClaimProposalForConfirmParams) (store.ClaimProposalForConfirmRow, error) {

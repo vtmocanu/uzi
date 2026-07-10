@@ -87,7 +87,7 @@ func (q *Queries) ClaimChatRun(ctx context.Context, arg ClaimChatRunParams) (Run
 }
 
 const claimProposalForConfirm = `-- name: ClaimProposalForConfirm :one
-UPDATE issue_proposals p SET status = 'confirming'
+UPDATE issue_proposals p SET status = 'confirming', confirming_since = now()
 FROM runs r
 WHERE p.id = $1 AND p.run_id = $2 AND p.status = 'pending'
   AND r.id = p.run_id AND r.user_id = $3 AND r.kind = 'chat'
@@ -313,7 +313,7 @@ func (q *Queries) CreateChatRun(ctx context.Context, arg CreateChatRunParams) (R
 const createIssueProposal = `-- name: CreateIssueProposal :one
 INSERT INTO issue_proposals (run_id, repo_id, title, description, labels)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, run_id, repo_id, title, description, labels, status, created_issue_iid, created_at, resolved_at
+RETURNING id, run_id, repo_id, title, description, labels, status, created_issue_iid, created_at, resolved_at, confirming_since
 `
 
 type CreateIssueProposalParams struct {
@@ -348,6 +348,7 @@ func (q *Queries) CreateIssueProposal(ctx context.Context, arg CreateIssuePropos
 		&i.CreatedIssueIid,
 		&i.CreatedAt,
 		&i.ResolvedAt,
+		&i.ConfirmingSince,
 	)
 	return i, err
 }
@@ -477,9 +478,9 @@ func (q *Queries) ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]
 }
 
 const markProposalConfirmed = `-- name: MarkProposalConfirmed :one
-UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = $1, resolved_at = now()
+UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = $1, resolved_at = now(), confirming_since = NULL
 WHERE id = $2 AND status = 'confirming'
-RETURNING id, run_id, repo_id, title, description, labels, status, created_issue_iid, created_at, resolved_at
+RETURNING id, run_id, repo_id, title, description, labels, status, created_issue_iid, created_at, resolved_at, confirming_since
 `
 
 type MarkProposalConfirmedParams struct {
@@ -489,7 +490,8 @@ type MarkProposalConfirmedParams struct {
 
 // Claim-first confirmation, phase 2: stamp the created issue iid AFTER the forge
 // CreateIssue succeeded. Guarded on status='confirming' (the state ClaimProposalForConfirm
-// left it in), so it only ever settles a proposal this same flow claimed.
+// left it in), so it only ever settles a proposal this same flow claimed. Clears the
+// transient confirming_since marker.
 func (q *Queries) MarkProposalConfirmed(ctx context.Context, arg MarkProposalConfirmedParams) (IssueProposal, error) {
 	row := q.db.QueryRow(ctx, markProposalConfirmed, arg.CreatedIssueIid, arg.ID)
 	var i IssueProposal
@@ -504,6 +506,7 @@ func (q *Queries) MarkProposalConfirmed(ctx context.Context, arg MarkProposalCon
 		&i.CreatedIssueIid,
 		&i.CreatedAt,
 		&i.ResolvedAt,
+		&i.ConfirmingSince,
 	)
 	return i, err
 }
@@ -511,7 +514,7 @@ func (q *Queries) MarkProposalConfirmed(ctx context.Context, arg MarkProposalCon
 const markProposalDismissed = `-- name: MarkProposalDismissed :one
 UPDATE issue_proposals SET status = 'dismissed', resolved_at = now()
 WHERE id = $1 AND status = 'pending'
-RETURNING id, run_id, repo_id, title, description, labels, status, created_issue_iid, created_at, resolved_at
+RETURNING id, run_id, repo_id, title, description, labels, status, created_issue_iid, created_at, resolved_at, confirming_since
 `
 
 // Dismiss a proposal. Status-only, never a forge write (Decision 8) — dismissing
@@ -530,18 +533,20 @@ func (q *Queries) MarkProposalDismissed(ctx context.Context, id uuid.UUID) (Issu
 		&i.CreatedIssueIid,
 		&i.CreatedAt,
 		&i.ResolvedAt,
+		&i.ConfirmingSince,
 	)
 	return i, err
 }
 
 const revertProposalToPending = `-- name: RevertProposalToPending :execrows
-UPDATE issue_proposals SET status = 'pending'
+UPDATE issue_proposals SET status = 'pending', confirming_since = NULL
 WHERE id = $1 AND status = 'confirming'
 `
 
 // Claim-first confirmation, failure path: return a claimed proposal to 'pending' when
 // the forge CreateIssue (or a step after the claim) failed, so the user can retry or
 // dismiss it. Guarded on status='confirming' so it can only undo an in-flight claim.
+// Clears confirming_since (no longer in flight).
 func (q *Queries) RevertProposalToPending(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, revertProposalToPending, id)
 	if err != nil {
@@ -591,6 +596,39 @@ func (q *Queries) SweepIdleChatRuns(ctx context.Context, cutoff pgtype.Timestamp
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const sweepStuckConfirmingProposals = `-- name: SweepStuckConfirmingProposals :many
+UPDATE issue_proposals SET status = 'pending', confirming_since = NULL
+WHERE status = 'confirming' AND confirming_since IS NOT NULL AND confirming_since < $1
+RETURNING id
+`
+
+// Recover proposals stranded in 'confirming' by a confirm handler that was killed
+// after the claim committed but before it settled/reverted (the crash window). Any
+// 'confirming' row older than the cutoff (now - PROPOSAL_CONFIRM_STUCK_TIMEOUT) goes
+// back to pending so the user can retry or dismiss it — the not-trusting-the-process
+// backstop, mirroring SweepClaimedNeverStarted for stale run claims. The cutoff sits
+// well above the forge HTTP timeout, so a legitimately in-flight confirm is never
+// reaped. RETURNING id for the sweep's count/log.
+func (q *Queries) SweepStuckConfirmingProposals(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, sweepStuckConfirmingProposals, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

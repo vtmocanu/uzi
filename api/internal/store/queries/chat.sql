@@ -149,7 +149,7 @@ SELECT count(*) FROM issue_proposals WHERE run_id = @run_id AND status = 'pendin
 -- serialization point: of two concurrent confirms exactly one flips pending ->
 -- confirming (and reaches the forge); the other matches 0 rows -> 409. Returns the
 -- draft the handler writes to the forge.
-UPDATE issue_proposals p SET status = 'confirming'
+UPDATE issue_proposals p SET status = 'confirming', confirming_since = now()
 FROM runs r
 WHERE p.id = @id AND p.run_id = @run_id AND p.status = 'pending'
   AND r.id = p.run_id AND r.user_id = @user_id AND r.kind = 'chat'
@@ -158,8 +158,9 @@ RETURNING p.id, p.run_id, p.repo_id, p.title, p.description, p.labels;
 -- name: MarkProposalConfirmed :one
 -- Claim-first confirmation, phase 2: stamp the created issue iid AFTER the forge
 -- CreateIssue succeeded. Guarded on status='confirming' (the state ClaimProposalForConfirm
--- left it in), so it only ever settles a proposal this same flow claimed.
-UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = @created_issue_iid, resolved_at = now()
+-- left it in), so it only ever settles a proposal this same flow claimed. Clears the
+-- transient confirming_since marker.
+UPDATE issue_proposals SET status = 'confirmed', created_issue_iid = @created_issue_iid, resolved_at = now(), confirming_since = NULL
 WHERE id = @id AND status = 'confirming'
 RETURNING *;
 
@@ -167,8 +168,21 @@ RETURNING *;
 -- Claim-first confirmation, failure path: return a claimed proposal to 'pending' when
 -- the forge CreateIssue (or a step after the claim) failed, so the user can retry or
 -- dismiss it. Guarded on status='confirming' so it can only undo an in-flight claim.
-UPDATE issue_proposals SET status = 'pending'
+-- Clears confirming_since (no longer in flight).
+UPDATE issue_proposals SET status = 'pending', confirming_since = NULL
 WHERE id = @id AND status = 'confirming';
+
+-- name: SweepStuckConfirmingProposals :many
+-- Recover proposals stranded in 'confirming' by a confirm handler that was killed
+-- after the claim committed but before it settled/reverted (the crash window). Any
+-- 'confirming' row older than the cutoff (now - PROPOSAL_CONFIRM_STUCK_TIMEOUT) goes
+-- back to pending so the user can retry or dismiss it — the not-trusting-the-process
+-- backstop, mirroring SweepClaimedNeverStarted for stale run claims. The cutoff sits
+-- well above the forge HTTP timeout, so a legitimately in-flight confirm is never
+-- reaped. RETURNING id for the sweep's count/log.
+UPDATE issue_proposals SET status = 'pending', confirming_since = NULL
+WHERE status = 'confirming' AND confirming_since IS NOT NULL AND confirming_since < @cutoff
+RETURNING id;
 
 -- name: MarkProposalDismissed :one
 -- Dismiss a proposal. Status-only, never a forge write (Decision 8) — dismissing

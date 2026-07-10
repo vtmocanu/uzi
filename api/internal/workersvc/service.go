@@ -135,6 +135,7 @@ type Store interface {
 	CountPendingProposalsForRun(ctx context.Context, runID uuid.UUID) (int64, error)
 	ClaimProposalForConfirm(ctx context.Context, arg store.ClaimProposalForConfirmParams) (store.ClaimProposalForConfirmRow, error)
 	RevertProposalToPending(ctx context.Context, id uuid.UUID) (int64, error)
+	SweepStuckConfirmingProposals(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error)
 	ListRunsForWorkerUser(ctx context.Context, arg store.ListRunsForWorkerUserParams) ([]store.ListRunsForWorkerUserRow, error)
 	GetRunForWorkerUser(ctx context.Context, arg store.GetRunForWorkerUserParams) (store.GetRunForWorkerUserRow, error)
 	ListRunMessagesForWorkerPage(ctx context.Context, arg store.ListRunMessagesForWorkerPageParams) ([]store.RunMessage, error)
@@ -183,6 +184,11 @@ type Params struct {
 	ChatMaxTurns          int
 	WorkerChatIdleTimeout time.Duration
 	WorkerChatTurnTimeout time.Duration
+	// ProposalConfirmStuckTimeout bounds how long an issue proposal may sit in the
+	// transient 'confirming' state before the sweep reverts it to pending (M3): the
+	// recovery for a confirm handler killed mid-flight. Must sit above the forge HTTP
+	// timeout so a legitimately in-flight confirm is never reaped. 0 disables the sweep.
+	ProposalConfirmStuckTimeout time.Duration
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -1155,12 +1161,13 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 
 // SweepResult reports the row counts touched by one Sweep pass (for logging).
 type SweepResult struct {
-	WorkersOffline    int64
-	ClaimedReset      int64
-	RunningTimeout    int64
-	StaleFailed       int64
-	StaleRequeued     int64
-	ChatIdleCompleted int64
+	WorkersOffline     int64
+	ClaimedReset       int64
+	RunningTimeout     int64
+	StaleFailed        int64
+	StaleRequeued      int64
+	ChatIdleCompleted  int64
+	ProposalsRecovered int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -1241,6 +1248,18 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		for _, r := range idleChats {
 			s.publishSwept(r.ID, r.Status)
 		}
+	}
+
+	// Recover issue proposals stranded in 'confirming' by a confirm handler killed
+	// mid-flight (M3): revert them to pending so the user retries/dismisses. Disabled
+	// when ProposalConfirmStuckTimeout is 0. No broadcast — proposals have no live
+	// channel; the browser re-reads on its next proposal fetch.
+	if s.p.ProposalConfirmStuckTimeout > 0 {
+		recovered, err := s.q.SweepStuckConfirmingProposals(ctx, pgTime(now.Add(-s.p.ProposalConfirmStuckTimeout)))
+		if err != nil {
+			return res, fmt.Errorf("sweep stuck confirming proposals: %w", err)
+		}
+		res.ProposalsRecovered = int64(len(recovered))
 	}
 	return res, nil
 }
