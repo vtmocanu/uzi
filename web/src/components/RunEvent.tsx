@@ -416,11 +416,23 @@ function Expander({
 // MetaLine renders a status/meta message as a full-width, hairline-flanked divider
 // (PRD #38 Decision 12). Single source of truth for status rendering: the feed no
 // longer intercepts `status` — RunEventRow's status branch delegates here.
+//
+// Two-tone like the mock's `.meta .k`: the event-type key renders mono, text-fg,
+// non-italic; the trailing parenthetical detail (model, finish stats) stays
+// italic text-muted. describeStatus returns a flat "key (detail)" string, so we
+// split on the first "(" — a worker progress line has no parenthetical, so the
+// whole line is the key (still a scannable mono-fg anchor).
 function MetaLine({ text }: { text: string }) {
+  const paren = text.indexOf("(");
+  const key = paren === -1 ? text : text.slice(0, paren).trimEnd();
+  const detail = paren === -1 ? "" : text.slice(paren);
   return (
     <div className="flex items-center gap-2.5 py-0.5 text-xs italic text-muted">
       <span aria-hidden="true" className="h-px flex-1 bg-edge" />
-      <span>{text}</span>
+      <span>
+        <span className="font-mono text-[11px] not-italic text-fg">{key}</span>
+        {detail ? ` ${detail}` : ""}
+      </span>
       <span aria-hidden="true" className="h-px flex-1 bg-edge" />
     </div>
   );
@@ -498,7 +510,7 @@ function ToolDuration({ msg, result, live }: { msg: RunMessage; result?: RunMess
 // hidden while collapsed, so its text is always in the DOM (pairing/test
 // assertions); a dropped non-text block surfaces as a "[image omitted]" first
 // line. Errors auto-expand with a danger tint.
-function ToolResultBody({ result }: { result: RunMessage }) {
+function ToolResultBody({ result, toolName }: { result: RunMessage; toolName?: string }) {
   const rec = asRecord(result.payload) ?? {};
   const isError = rec["is_error"] === true;
   const { text, hadNonText } = resultToText(rec["content"]);
@@ -515,12 +527,20 @@ function ToolResultBody({ result }: { result: RunMessage }) {
   }, [open]);
 
   const label = isError ? "error" : empty ? "ok" : `${lineCount} line${lineCount === 1 ? "" : "s"}`;
+  // Name the tool in the a11y label when the call is known (paired), like the mock
+  // ("Show 3 lines of Bash output"). An orphan result has no call, so it keeps the
+  // tool-agnostic wording (PRD #38 M6 NIT).
+  const of = toolName ? `${toolName} ` : "";
   const showLabel = isError
-    ? "Show error output"
+    ? `Show ${of}error output`
     : empty
-      ? "Show output"
-      : `Show ${label} of output`;
-  const ariaLabel = open ? (isError ? "Hide error output" : "Hide output") : showLabel;
+      ? `Show ${of}output`
+      : `Show ${label} of ${of}output`;
+  const ariaLabel = open
+    ? isError
+      ? `Hide ${of}error output`
+      : `Hide ${of}output`
+    : showLabel;
 
   const bodyText = empty ? (hadNonText ? "" : "(no output)") : text;
   const body = [hadNonText ? "[image omitted]" : "", bodyText].filter(Boolean).join("\n");
@@ -616,7 +636,7 @@ function ToolUseRow({ msg, result, live }: { msg: RunMessage; result?: RunMessag
         <ToolDuration msg={msg} result={result} live={live} />
       </div>
       {isBash && full && <CommandBlock command={full} />}
-      {result && <ToolResultBody result={result} />}
+      {result && <ToolResultBody result={result} toolName={name} />}
     </div>
   );
 }

@@ -206,7 +206,7 @@ describe("RunEventRow rendering", () => {
         live={false}
       />,
     );
-    const chip = getByRole("button", { name: /show 20 lines of output/i });
+    const chip = getByRole("button", { name: /show 20 lines of Read output/i });
     expect(chip.getAttribute("aria-expanded")).toBe("false");
     expect(chip.textContent).toContain("20 lines");
     // The body stays mounted (hidden) so its text is in the DOM while collapsed.
@@ -340,7 +340,7 @@ describe("result chips (PRD #38 Decision 13)", () => {
 
   it("labels an error chip and auto-expands it with a danger body", () => {
     const { getByRole, container } = renderResult({ content: "boom\nstack", is_error: true });
-    const chip = getByRole("button", { name: /hide error output/i });
+    const chip = getByRole("button", { name: /hide Read error output/i });
     expect(chip.textContent).toContain("error");
     expect(chip.getAttribute("aria-expanded")).toBe("true");
     const pre = container.querySelector("pre");
@@ -351,7 +351,7 @@ describe("result chips (PRD #38 Decision 13)", () => {
   it("labels an empty or whitespace-only result 'ok'", () => {
     for (const content of ["", "   \n  \t"]) {
       const { getByRole, unmount } = renderResult({ content });
-      const chip = getByRole("button", { name: /show output/i });
+      const chip = getByRole("button", { name: /show Read output/i });
       expect(chip.textContent).toContain("ok");
       expect(chip.getAttribute("aria-expanded")).toBe("false");
       unmount();
@@ -360,12 +360,12 @@ describe("result chips (PRD #38 Decision 13)", () => {
 
   it("labels a multi-line result 'N lines' and a single-line result '1 line'", () => {
     const three = renderResult({ content: "a\nb\nc" });
-    expect(three.getByRole("button", { name: /show 3 lines of output/i }).textContent).toContain(
+    expect(three.getByRole("button", { name: /show 3 lines of Read output/i }).textContent).toContain(
       "3 lines",
     );
     three.unmount();
     const one = renderResult({ content: "only one line" });
-    expect(one.getByRole("button", { name: /show 1 line of output/i }).textContent).toContain(
+    expect(one.getByRole("button", { name: /show 1 line of Read output/i }).textContent).toContain(
       "1 line",
     );
   });
@@ -472,5 +472,38 @@ describe("accessibility (PRD #38 M4)", () => {
     const btn = getByRole("button", { name: "show" });
     expect(btn.className).toContain("text-muted");
     expect(btn.className).toContain("min-h-[24px]");
+  });
+
+  it("renders the meta divider two-tone: mono text-fg key + muted detail", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "status", payload: { event: "init", model: "claude-fable-5" } })}
+        live={false}
+      />,
+    );
+    // The event-type key is the mono, text-fg anchor…
+    const key = container.querySelector(".font-mono.text-fg");
+    expect(key?.textContent).toBe("agent started");
+    // …and the parenthetical detail stays in the (italic muted) line, not the key.
+    expect(key?.textContent).not.toContain("claude-fable-5");
+    expect(container.textContent).toContain("agent started (claude-fable-5)");
+  });
+
+  it("names the tool in a paired result-chip aria-label, tool-agnostic for orphans", () => {
+    const paired = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Bash", input: { command: "ls" } } })}
+        result={msg({ seq: 2, kind: "tool_result", payload: { tool_use_id: "A", content: "a\nb\nc" } })}
+        live={false}
+      />,
+    );
+    expect(paired.getByRole("button", { name: "Show 3 lines of Bash output" })).toBeTruthy();
+    paired.unmount();
+
+    // An orphan result (no matching call) has no tool name — falls back.
+    const orphan = render(
+      <RunEventRow msg={msg({ seq: 1, kind: "tool_result", payload: { tool_use_id: "Z", content: "a\nb" } })} live={false} />,
+    );
+    expect(orphan.getByRole("button", { name: "Show 2 lines of output" })).toBeTruthy();
   });
 });
