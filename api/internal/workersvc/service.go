@@ -29,10 +29,8 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 )
-
-// anthropicTokenKind mirrors the secret kind PRD #3's handler stores under.
-const anthropicTokenKind = "anthropic_token"
 
 // MaxIssueDescriptionBytes bounds the snapshotted issue description carried in a
 // run: generous for a PRD-shaped body, a secondary guard under the 1 MiB whole-body
@@ -102,6 +100,9 @@ type Store interface {
 
 	// Sweeper + register-time orphan recovery.
 	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error)
+	// RequeueClaimedRunToQueued resets one just-claimed run to queued when its
+	// owner's vault locked between the claim gate and the token open (PRD #32 M3).
+	RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (int64, error)
 	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
@@ -119,7 +120,7 @@ type Store interface {
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
-	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) ([]byte, error)
+	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 	GetUserDefaultModel(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
@@ -205,6 +206,13 @@ type Service struct {
 	// lifecycle reacts to status changes with board column moves. Optional
 	// (nil-safe); set via SetLifecycle for the same reason as bcast.
 	lifecycle RunLifecycle
+	// vlt gates claims on the run owner's vault being unlocked and opens the
+	// owner's Anthropic token at claim time (PRD #32). Optional (nil-safe); set via
+	// SetVault. The SAME *vault.Vault instance backs the HTTP handlers, so a login
+	// on the API and a claim by the worker share one DEK cache. Nil (tests, or a
+	// deployment without the vault) disables the gate and falls back to opening the
+	// token under the master box — the pre-vault behavior.
+	vlt *vault.Vault
 }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
@@ -216,6 +224,12 @@ func (s *Service) SetBroadcaster(b Broadcaster) { s.bcast = b }
 // before serving. A nil lifecycle disables auto-moves; the same-transaction move
 // markers still accumulate and would be applied if one were later attached.
 func (s *Service) SetLifecycle(l RunLifecycle) { s.lifecycle = l }
+
+// SetVault wires the per-user vault (PRD #32 M3). Call once at startup, before
+// serving, with the SAME instance the HTTP handlers hold. A nil vault disables
+// the claim gate and opens the Anthropic token under the master box (pre-vault
+// behavior), which is what the workersvc tests rely on.
+func (s *Service) SetVault(v *vault.Vault) { s.vlt = v }
 
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
@@ -284,6 +298,17 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker) (store.Worker
 // is failed immediately and idle is reported, so a broken run never wedges the
 // worker in a claim loop.
 func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, error) {
+	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
+	// restart, or a manual lock), do not claim any of their runs — report idle so
+	// they stay queued as "waiting for vault unlock" instead of failing. This is a
+	// pure in-memory check on the worker's own user, NOT a SQL filter: ClaimRun is
+	// already scoped to wkr.UserID, and the DEK cache is per-process. A queued run
+	// sits indefinitely by design (no sweep touches status='queued'); the next
+	// unlock lets it claim within one poll cycle.
+	if s.vlt != nil && !s.vlt.Unlocked(wkr.UserID) {
+		return nil, nil // idle: owner locked
+	}
+
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
 		WorkerID:       pgUUID(wkr.ID),
 		UserID:         wkr.UserID,
@@ -298,6 +323,18 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 
 	payload, err := s.assembleClaim(ctx, run)
 	if err != nil {
+		// Vault lock race: the owner locked between the gate above and the token
+		// open. This is transient, NOT a credential failure — reset the just-claimed
+		// run to queued (never fail it) so it reclaims after the next unlock, and
+		// report idle. Mirrors SweepClaimedNeverStarted; RequeueClaimedRunToQueued
+		// keeps worker_id for affinity and does not bump requeue_count, so a
+		// persistently locked vault can never trip the requeue cap.
+		if errors.Is(err, errVaultLocked) {
+			if _, rerr := s.q.RequeueClaimedRunToQueued(ctx, run.ID); rerr != nil {
+				return nil, rerr
+			}
+			return nil, nil // idle; the run is queued again, awaiting unlock
+		}
 		// A missing/undecryptable credential OR a tool package that fell out of the
 		// allowlist is not retryable: fail the run and report idle. Both failure
 		// reasons are safe to store (no secret bytes; package names only).
@@ -331,6 +368,13 @@ var errCredentialUnavailable = errors.New("credential unavailable")
 // assembled (a cascading delete of the forge connection).
 var errRunVanished = errors.New("run vanished before claim assembly")
 
+// errVaultLocked marks a claim that cannot open the owner's DEK-sealed Anthropic
+// token because their vault locked between the claim gate and the open. It must
+// NOT be conflated with errCredentialUnavailable: that path fails the run
+// (terminal), whereas a locked vault is transient and the run must go back to
+// queued to be retried after the next unlock (PRD #32 success criteria 3 & 5).
+var errVaultLocked = errors.New("vault locked during claim")
+
 // assembleClaim builds the claim payload for an already-claimed run.
 func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
@@ -347,9 +391,9 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
 	}
 
-	sealed, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
+	secret, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
 		UserID: run.UserID,
-		Kind:   anthropicTokenKind,
+		Kind:   store.KindAnthropicToken,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -357,7 +401,23 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 		}
 		return nil, fmt.Errorf("anthropic secret lookup: %w", err)
 	}
-	anthropic, err := s.box.Open(sealed)
+	// Open the owner's Anthropic token. With the vault wired (production), route
+	// through vault.Open on the row's sealed_with: a 'dek' row needs the owner's
+	// vault unlocked, and a lock that landed after the claim gate surfaces as
+	// vault.ErrLocked → errVaultLocked (requeue, never fail). A legacy 'master' row
+	// opens under the master box without an unlock (the claim gate above is what
+	// withholds a locked owner's runs; the master box is not DEK-protected). The
+	// bot PAT (above) always stays master-sealed. Nil vault (tests) opens under the
+	// master box directly, unchanged.
+	var anthropic []byte
+	if s.vlt != nil {
+		anthropic, err = s.vlt.Open(run.UserID, store.KindAnthropicToken, secret.SealedWith, secret.Ciphertext)
+		if errors.Is(err, vault.ErrLocked) {
+			return nil, errVaultLocked
+		}
+	} else {
+		anthropic, err = s.box.Open(secret.Ciphertext)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
 	}

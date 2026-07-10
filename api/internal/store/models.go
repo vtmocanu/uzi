@@ -234,6 +234,15 @@ type UserSecret struct {
 	Ciphertext []byte             `json:"ciphertext"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+	SealedWith string             `json:"sealed_with"`
+}
+
+type UserVault struct {
+	UserID     uuid.UUID          `json:"user_id"`
+	KekSalt    []byte             `json:"kek_salt"`
+	WrappedDek []byte             `json:"wrapped_dek"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Worker struct {

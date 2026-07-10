@@ -1,7 +1,7 @@
 # PRD #32: Per-User Vault — Password-Wrapped Secrets
 
 **GitLab Issue**: [vtmocanu/uzi#32](https://gitlab.example.com/vtmocanu/uzi/-/issues/32)
-**Status**: Draft
+**Status**: In Progress
 **Priority**: High
 **Created**: 2026-07-10
 **Depends on**: PRD #3 (user secrets + secretbox, done); PRD #19 (autopilot, done — this PRD gates its claims).

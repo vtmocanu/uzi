@@ -8,6 +8,7 @@ import (
 	"net/mail"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -152,6 +153,19 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Create + unlock the user's vault with the registration password (PRD #32).
+	// Deliberately AFTER the transaction commits: registration holds a
+	// pg_advisory_xact_lock, and the vault's Argon2 KEK derivation inside that lock
+	// would serialize all registrations. The vault row is created in its own
+	// statement here; a crash between user-create and vault-create is self-healing
+	// (the next login's first-unlock creates it). A failure is non-fatal, same as
+	// login — the account exists and the SPA will show the unlock banner.
+	if h.vault != nil {
+		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
+			slog.Error("vault unlock at register", "user", user.ID, "error", err)
+		}
+	}
+
 	if !h.issueSession(w, user) {
 		return
 	}
@@ -211,7 +225,13 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	user, err := h.q.GetUserByEmail(r.Context(), email)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Burn a comparable amount of time, then fail generically.
+			// Burn ONE Argon2 so an unknown email is timing-indistinguishable from a
+			// known email with a WRONG password: both fail here having done exactly one
+			// VerifyPassword. The vault KEK derivation (a second Argon2) runs only AFTER
+			// a correct password, on the success path — which a 200 + Set-Cookie already
+			// reveals, so it needs no counterweight here. A second dummy hash on this
+			// path would itself leak email existence (unknown=2 vs known-wrong=1), the
+			// exact oracle this burn exists to close.
 			_, _ = auth.VerifyPassword(req.Password, dummyHash)
 			httpx.Error(w, http.StatusUnauthorized, "invalid credentials")
 			return
@@ -238,6 +258,18 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.q.SetLastLogin(r.Context(), user.ID); err != nil {
 		slog.Warn("set last login", "error", err)
+	}
+
+	// Unlock the vault with the just-verified password so the user's agents can
+	// work this session — including overnight, since the DEK lives in the API, not
+	// the browser (PRD #32). First-ever unlock creates the vault. A failure here
+	// must NOT block login (the session is valid); it can only be a corrupted row,
+	// so log loudly and return the session with the vault left locked (the SPA then
+	// shows the unlock banner). The error never carries the password or a secret.
+	if h.vault != nil {
+		if err := h.vault.Unlock(r.Context(), user.ID, req.Password); err != nil {
+			slog.Error("vault unlock at login", "user", user.ID, "error", err)
+		}
 	}
 
 	if !h.issueSession(w, user) {
@@ -307,7 +339,19 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		"default_theme":   defaultTheme,
 		"prdless_label":   prdlessLabel,
 		"prdless_enabled": prdlessEnabled,
+		// Vault status (PRD #32): the SPA shows a 🔒 badge + unlock banner and marks
+		// own queued runs "waiting for vault unlock" when locked. Delivered on the
+		// session payload so the shell needs no extra round-trip; the SPA refreshes
+		// it via AuthContext (window focus, after unlock/lock, on any 409 vault_locked).
+		"vault": map[string]any{"unlocked": h.vaultUnlocked(user.ID)},
 	}
+}
+
+// vaultUnlocked reports whether the user's vault DEK is cached. A nil vault (only
+// in tests; main always wires one) means "no gate", reported as unlocked so the
+// SPA shows no banner and legacy behavior is preserved.
+func (h *Handler) vaultUnlocked(userID uuid.UUID) bool {
+	return h.vault == nil || h.vault.Unlocked(userID)
 }
 
 // AuthConfig returns the operator-set registration policy the register page

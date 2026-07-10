@@ -268,6 +268,7 @@ function sessionBody() {
     default_theme: appSettings.default_theme,
     prdless_label: appSettings.prdless_label,
     prdless_enabled: appSettings.prdless_enabled === "true",
+    vault: { unlocked: state.vaultUnlocked },
   };
 }
 
@@ -312,6 +313,9 @@ export const mockApi = {
   // Mirrors the server's Decision 8 validation so the demo surfaces the same
   // rejection messages the real API would.
   getSettings: async () => delay(settingsResponse()),
+  // Demo is fully DEK-sealed (no legacy rows), so the admin migration notice is
+  // hidden; the wiring is still exercised by the AdminSettings unit test.
+  vaultMigration: async () => delay({ master_sealed: 0 }),
   updateSettings: async (updates: UpdateSettingsPayload) => {
     // Secret tokens are write-only: validated + recorded as configured, never
     // merged into the readable settings (mirrors the real structural exclusion).
@@ -382,12 +386,33 @@ export const mockApi = {
   // ── Secrets ─────────────────────────────────────────────────────────────────
   listSecrets: async () => delay({ secrets: secrets.map((s) => ({ ...s })) }),
   putAnthropicToken: async (_token: string) => {
+    // Mirror the real API: a locked vault cannot seal a new token (PRD #32).
+    if (!state.vaultUnlocked) {
+      throw new ApiError(409, "vault is locked; unlock it with your password, then save again", {
+        code: "vault_locked",
+      });
+    }
     const now = new Date().toISOString();
     const existing = secrets.find((s) => s.kind === "anthropic_token");
     if (existing) existing.updated_at = now;
     else secrets.push({ kind: "anthropic_token", created_at: now, updated_at: now });
     return delay({ secret: { ...secrets.find((s) => s.kind === "anthropic_token")! } });
   },
+
+  // ── Vault (PRD #32) ───────────────────────────────────────────────────────────
+  // Any non-empty password unlocks in the demo (there is no real crypto); an empty
+  // password is treated as the "wrong password" 403 so the banner's error path is
+  // browsable.
+  vaultUnlock: async (password: string) => {
+    if (password.trim() === "") throw new ApiError(403, "incorrect password");
+    state.vaultUnlocked = true;
+    return delay(null, 150);
+  },
+  vaultLock: async () => {
+    state.vaultUnlocked = false;
+    return delay(null, 100);
+  },
+  vaultStatus: async () => delay({ unlocked: state.vaultUnlocked }, 40),
   deleteAnthropicToken: async () => {
     secrets = secrets.filter((s) => s.kind !== "anthropic_token");
     return delay(null);

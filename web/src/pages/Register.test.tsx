@@ -41,6 +41,7 @@ beforeEach(() => {
     defaultTheme: "ember",
     prdlessLabel: "PRDLESS",
     prdlessEnabled: false,
+    vaultUnlocked: true,
   });
 });
 

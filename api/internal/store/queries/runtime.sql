@@ -289,6 +289,20 @@ UPDATE runs SET status = 'queued', updated_at = now()
 WHERE status = 'claimed' AND claimed_at < @cutoff
 RETURNING id, user_id, status;
 
+-- name: RequeueClaimedRunToQueued :execrows
+-- Vault lock race (PRD #32 M3): a run claimed while the owner's vault was
+-- unlocked, then locked before assembleClaim could open the Anthropic token.
+-- Reset it to queued — NOT failed, which is terminal (MarkRunFailedByID) and
+-- would violate "a locked owner's run waits, never fails". worker_id is left
+-- intact for resume affinity. Guarded on status='claimed' so a run that a
+-- concurrent path already advanced is untouched. Mirrors
+-- SweepClaimedNeverStarted but targets exactly one run by id. Stays :execrows
+-- (not :many like the sweeps): this runs on the claim path, not the sweeper, and
+-- deliberately does not broadcast the claimed→queued transition (matching the
+-- reviewed PRD #32 M3 behavior — it is a rare lock-race requeue, not a sweep).
+UPDATE runs SET status = 'queued', updated_at = now()
+WHERE id = @id AND status = 'claimed';
+
 -- name: SweepRunningTimeout :many
 -- running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 -- Stamps move_pending_since so the (forge-free) sweep leaves the isolated

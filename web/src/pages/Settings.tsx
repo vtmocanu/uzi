@@ -4,19 +4,35 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, type SecretMeta } from "../lib/api";
+import { api, ApiError, isVaultLocked, type SecretMeta } from "../lib/api";
 import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { ModelSelect } from "../components/ModelSelect";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
+import { VaultBadge, useVaultLock } from "../components/VaultControls";
 import { SlackNotifications } from "../components/SlackNotifications";
+import { prefs } from "../lib/prefs";
 import { applyTheme, resolveTheme, THEMES, THEME_LABELS, isTheme } from "../lib/theme";
+
+// One-time dismissal (per browser) of the rotate-your-legacy-token reminder.
+const ROTATE_NOTICE_KEY = "uzi.vault.rotateNoticeDismissed";
 
 const DOC_URL =
   "https://gitlab.example.com/vtmocanu/uzi/-/blob/main/docs/anthropic-token.md";
 
 export function Settings() {
-  const { user, refresh, themeOverride, defaultTheme } = useAuth();
+  const { user, refresh, themeOverride, defaultTheme, vaultUnlocked } = useAuth();
+  const [vaultNotice, setVaultNotice] = useState("");
+  const { lock, locking } = useVaultLock(() =>
+    setVaultNotice(
+      "Vault locked. Runs already in flight finish; your new runs wait as “waiting for vault unlock” until you unlock again.",
+    ),
+  );
+  const [rotateDismissed, setRotateDismissed] = useState(() => prefs.get(ROTATE_NOTICE_KEY, false));
+  const dismissRotate = () => {
+    prefs.set(ROTATE_NOTICE_KEY, true);
+    setRotateDismissed(true);
+  };
   const [meta, setMeta] = useState<SecretMeta | null>(null);
   const [loading, setLoading] = useState(true);
   const [token, setToken] = useState("");
@@ -72,10 +88,20 @@ export function Settings() {
     try {
       await api.putAnthropicToken(token);
       setToken("");
-      setNotice("Token saved. It is encrypted at rest and validated on the first agent run.");
+      setNotice(
+        "Token saved. It is sealed with your login password and validated on the first agent run.",
+      );
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to save token");
+      // A mid-session pod restart locks the vault; the global handler already
+      // refreshed the session (the unlock banner is now showing), so point there.
+      setError(
+        isVaultLocked(err)
+          ? "Your vault is locked — unlock it with the banner above, then save again."
+          : err instanceof ApiError
+            ? err.message
+            : "Failed to save token",
+      );
     } finally {
       setBusy(false);
     }
@@ -197,10 +223,60 @@ export function Settings() {
               onChange={(e) => setToken(e.target.value)}
             />
           </Field>
+          <p className="text-xs text-faint">
+            Encrypted with your login password. If you forget your password this token cannot be
+            recovered and must be re-entered.
+          </p>
           <Button type="submit" disabled={busy || token.trim() === ""}>
             {meta ? "Save new token" : "Save token"}
           </Button>
         </form>
+
+        {meta && !rotateDismissed && (
+          <div className="rounded-lg border border-info/40 bg-info/10 px-4 py-3 text-sm text-info">
+            <p className="text-fg">
+              <strong className="font-semibold">Protecting an older token?</strong> If you first saved
+              this token before password-protection was enabled, an operator could have read it. The
+              protection applies from the moment you save, not retroactively — for full protection,
+              rotate the token in the Anthropic console and re-save it above.
+            </p>
+            <button
+              type="button"
+              onClick={dismissRotate}
+              className="mt-2 text-xs font-medium text-brand hover:text-brand-hover"
+            >
+              Got it, dismiss
+            </button>
+          </div>
+        )}
+      </Card>
+
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>Vault</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            Your Anthropic token is sealed with a key derived from your login password, so it is
+            readable only while your vault is unlocked in this session. It unlocks
+            automatically when you log in and stays unlocked — including overnight — until you lock it
+            or the server restarts. While locked, your agents pause: new runs wait as{" "}
+            <em>waiting for vault unlock</em> rather than failing.
+          </p>
+        </div>
+
+        {/* Info (not success/green): locking flips the badge amber, so a green
+            "success" toast would clash with the color language. */}
+        {vaultNotice && <Alert tone="info" message={vaultNotice} />}
+
+        <div className="flex items-center justify-between rounded-lg border border-edge bg-raised/60 px-4 py-3">
+          <VaultBadge />
+          {vaultUnlocked ? (
+            <Button variant="secondary" size="sm" disabled={locking} onClick={lock}>
+              {locking ? "Locking…" : "Lock vault"}
+            </Button>
+          ) : (
+            <span className="text-sm text-muted">Locked — unlock from the banner above.</span>
+          )}
+        </div>
       </Card>
 
       <Card className="space-y-4">

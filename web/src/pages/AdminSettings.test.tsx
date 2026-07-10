@@ -9,7 +9,7 @@ import { api, ApiError } from "../lib/api";
 // `instanceof ApiError` checks match what the mocked methods throw.
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
-  return { ...actual, api: { getSettings: vi.fn(), updateSettings: vi.fn() } };
+  return { ...actual, api: { getSettings: vi.fn(), updateSettings: vi.fn(), vaultMigration: vi.fn() } };
 });
 // The page re-resolves the admin's own theme after a save via useAuth().refresh.
 vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ refresh: vi.fn().mockResolvedValue(undefined) }) }));
@@ -57,6 +57,7 @@ const response = (
 
 beforeEach(() => {
   mockApi.getSettings.mockResolvedValue(response());
+  mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
 });
 
 afterEach(() => {
@@ -74,6 +75,22 @@ function renderPage() {
 
 const input = (name: string) => screen.getByLabelText(name) as HTMLInputElement;
 const saveButton = () => screen.getByRole("button", { name: /save settings/i }) as HTMLButtonElement;
+
+describe("AdminSettings — vault migration (PRD #32)", () => {
+  it("hides the migration notice when nothing is master-sealed", async () => {
+    mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
+    renderPage();
+    await screen.findByLabelText("PRD label");
+    expect(screen.queryByText(/pre-vault encryption/i)).toBeNull();
+  });
+
+  it("shows the migration notice with the count when secrets are still master-sealed", async () => {
+    mockApi.vaultMigration.mockResolvedValue({ master_sealed: 3 });
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/pre-vault encryption/i)).toBeTruthy());
+    expect(screen.getByText(/3 stored secrets/i)).toBeTruthy();
+  });
+});
 
 describe("AdminSettings", () => {
   it("loads the current labels into the fields", async () => {

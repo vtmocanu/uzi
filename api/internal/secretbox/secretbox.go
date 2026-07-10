@@ -73,24 +73,41 @@ func New(key []byte) (*Box, error) {
 // it were deterministic (two Seal calls on the same plaintext produce different
 // bytes, which is what stops content-fingerprinting stored secrets).
 func (b *Box) Seal(plaintext []byte) ([]byte, error) {
+	return b.SealWithAAD(plaintext, nil)
+}
+
+// Open reverses Seal. Returns ErrCiphertextTooShort or an authentication error
+// (from GCM) if the input is malformed or tampered.
+func (b *Box) Open(sealed []byte) ([]byte, error) {
+	return b.OpenWithAAD(sealed, nil)
+}
+
+// SealWithAAD is Seal with additional authenticated data: aad is bound into the
+// GCM tag (not encrypted, not stored) so Open only succeeds when supplied the
+// identical aad. Callers pass a domain-separating context — e.g. user_id||kind —
+// so a DB-write operator cannot swap a ciphertext onto a different owner/kind and
+// have it still authenticate. A nil aad is equivalent to plain Seal, keeping the
+// existing at-rest ciphertexts (sealed with no aad) openable.
+func (b *Box) SealWithAAD(plaintext, aad []byte) ([]byte, error) {
 	nonce := make([]byte, b.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("secretbox: read nonce: %w", err)
 	}
 	// aead.Seal appends ciphertext+tag to its first argument; passing `nonce`
 	// yields a single contiguous nonce||ciphertext||tag slice that Open splits.
-	return b.aead.Seal(nonce, nonce, plaintext, nil), nil
+	return b.aead.Seal(nonce, nonce, plaintext, aad), nil
 }
 
-// Open reverses Seal. Returns ErrCiphertextTooShort or an authentication error
-// (from GCM) if the input is malformed or tampered.
-func (b *Box) Open(sealed []byte) ([]byte, error) {
+// OpenWithAAD reverses SealWithAAD. The aad must byte-match the one passed to
+// SealWithAAD or GCM authentication fails (indistinguishable from a wrong key or
+// a tampered ciphertext — all surface as a decrypt error carrying no plaintext).
+func (b *Box) OpenWithAAD(sealed, aad []byte) ([]byte, error) {
 	ns := b.aead.NonceSize()
 	if len(sealed) < ns+b.aead.Overhead() {
 		return nil, ErrCiphertextTooShort
 	}
 	nonce, ciphertext := sealed[:ns], sealed[ns:]
-	return b.aead.Open(nil, nonce, ciphertext, nil)
+	return b.aead.Open(nil, nonce, ciphertext, aad)
 }
 
 // LoadKey reads a base64-encoded 32-byte key from the given env var. Returns a

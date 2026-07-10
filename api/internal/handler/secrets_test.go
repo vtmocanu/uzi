@@ -93,7 +93,7 @@ func TestAnthropicTokenNeverLeaks(t *testing.T) {
 
 	// 3. The metadata DTO carries no secret value.
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	b, _ := json.Marshal(secretMeta(anthropicTokenKind, now, now))
+	b, _ := json.Marshal(secretMeta(store.KindAnthropicToken, now, now))
 	if strings.Contains(string(b), fixture) {
 		t.Fatal("secret metadata response leaked the token")
 	}
@@ -131,7 +131,7 @@ func (fakeUpsertRow) Scan(dest ...any) error {
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	if len(dest) == 3 {
 		if p, ok := dest[0].(*string); ok {
-			*p = anthropicTokenKind
+			*p = store.KindAnthropicToken
 		}
 		if p, ok := dest[1].(*pgtype.Timestamptz); ok {
 			*p = now
@@ -179,7 +179,7 @@ func TestPutAnthropicTokenNeverLeaksEndToEnd(t *testing.T) {
 	if strings.Contains(respBody, fixture) {
 		t.Fatal("response body leaked the token")
 	}
-	if !strings.Contains(respBody, anthropicTokenKind) {
+	if !strings.Contains(respBody, store.KindAnthropicToken) {
 		t.Fatalf("response should carry the kind metadata, got: %s", respBody)
 	}
 

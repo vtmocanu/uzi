@@ -78,6 +78,44 @@ func TestOpenRejectsWrongKey(t *testing.T) {
 	}
 }
 
+func TestAADRoundTrip(t *testing.T) {
+	box := mustNewBox(t)
+	aad := []byte("user-id||kind")
+	sealed, err := box.SealWithAAD([]byte("bound"), aad)
+	if err != nil {
+		t.Fatalf("SealWithAAD: %v", err)
+	}
+	opened, err := box.OpenWithAAD(sealed, aad)
+	if err != nil {
+		t.Fatalf("OpenWithAAD: %v", err)
+	}
+	if !bytes.Equal(opened, []byte("bound")) {
+		t.Fatalf("aad round trip mismatch: got %q", opened)
+	}
+}
+
+func TestOpenWithAADRejectsWrongAAD(t *testing.T) {
+	box := mustNewBox(t)
+	sealed, _ := box.SealWithAAD([]byte("bound"), []byte("owner-a"))
+	if _, err := box.OpenWithAAD(sealed, []byte("owner-b")); err == nil {
+		t.Fatal("expected auth failure opening under different AAD")
+	}
+}
+
+func TestNilAADEqualsPlainSeal(t *testing.T) {
+	// A ciphertext produced by plain Seal must open via OpenWithAAD(nil) and vice
+	// versa — the guarantee that pre-existing (nil-AAD) at-rest rows stay openable.
+	box := mustNewBox(t)
+	sealed, _ := box.Seal([]byte("legacy"))
+	if _, err := box.OpenWithAAD(sealed, nil); err != nil {
+		t.Fatalf("OpenWithAAD(nil) on plain Seal output: %v", err)
+	}
+	sealed2, _ := box.SealWithAAD([]byte("legacy"), nil)
+	if _, err := box.Open(sealed2); err != nil {
+		t.Fatalf("Open on SealWithAAD(nil) output: %v", err)
+	}
+}
+
 func TestNewRejectsBadKey(t *testing.T) {
 	if _, err := New(make([]byte, 16)); err != ErrInvalidKey {
 		t.Fatalf("expected ErrInvalidKey for 16-byte key, got %v", err)

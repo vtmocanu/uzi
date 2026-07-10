@@ -12,6 +12,7 @@ import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { cx } from "./ui";
+import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import {
   ActivityIcon,
   BoardIcon,
@@ -303,6 +304,9 @@ function SidebarContent({
         {user &&
           (collapsed ? (
             <div className="flex flex-col items-center gap-2 px-3 py-3">
+              {/* Vault status glyph (PRD #32); the lock/unlock action lives in
+                  Settings and the app-wide banner. */}
+              <VaultBadge compact />
               <span
                 title={`${user.display_name ?? user.email} · ${user.is_admin ? "Administrator" : "User"}`}
                 className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-raised text-xs font-semibold text-muted"
@@ -319,25 +323,30 @@ function SidebarContent({
               </button>
             </div>
           ) : (
-            <div className="flex items-center gap-2 px-3 py-3">
-              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-raised text-xs font-semibold text-muted">
-                {(user.display_name?.[0] ?? user.email[0] ?? "?").toUpperCase()}
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-xs font-medium text-fg">
-                  {user.display_name ?? user.email}
+            <div className="px-3 py-3">
+              <div className="mb-2">
+                <VaultBadge />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-raised text-xs font-semibold text-muted">
+                  {(user.display_name?.[0] ?? user.email[0] ?? "?").toUpperCase()}
                 </span>
-                <span className="block truncate text-[11px] text-faint">
-                  {user.is_admin ? "Administrator" : "User"}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-xs font-medium text-fg">
+                    {user.display_name ?? user.email}
+                  </span>
+                  <span className="block truncate text-[11px] text-faint">
+                    {user.is_admin ? "Administrator" : "User"}
+                  </span>
                 </span>
-              </span>
-              <button
-                onClick={handleLogout}
-                title="Log out"
-                className="rounded-md p-1.5 text-faint transition-colors hover:bg-raised hover:text-fg"
-              >
-                <LogOutIcon />
-              </button>
+                <button
+                  onClick={handleLogout}
+                  title="Log out"
+                  className="rounded-md p-1.5 text-faint transition-colors hover:bg-raised hover:text-fg"
+                >
+                  <LogOutIcon />
+                </button>
+              </div>
             </div>
           ))}
       </div>
@@ -445,7 +454,12 @@ export function AppShell({ children }: { children: ReactNode }) {
       )}
 
       <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
-        <div className={cx(!fullBleed && "mx-auto w-full max-w-5xl")}>{children}</div>
+        <div className={cx(!fullBleed && "mx-auto w-full max-w-5xl")}>
+          {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
+              any page. Self-gates — renders nothing while unlocked. */}
+          <VaultLockedBanner />
+          {children}
+        </div>
       </main>
     </div>
   );

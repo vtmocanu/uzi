@@ -427,6 +427,10 @@ export interface SessionResponse {
   default_theme: string;
   prdless_label?: string;
   prdless_enabled?: boolean;
+  // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
+  // in the server process. Optional so a server that predates the field reads as
+  // unlocked (no banner, legacy behavior) rather than falsely locked.
+  vault?: { unlocked: boolean };
 }
 
 // AuthConfig is the unauthenticated registration policy the register page reads
@@ -626,6 +630,28 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): voi
   unauthorizedHandler = handler;
 }
 
+// ── Global vault-locked handling (PRD #32) ────────────────────────────────────
+// A save that races a pod restart comes back 409 with body {code:"vault_locked"}.
+// Like the 401 path, one app-registered handler (AuthContext refreshes the
+// session, so the SPA learns the vault is locked and shows the unlock banner)
+// fires inside request() before the error propagates, so even a caller that
+// swallows the 409 still trips the refresh.
+type VaultLockedHandler = () => void;
+let vaultLockedHandler: VaultLockedHandler | null = null;
+export function setVaultLockedHandler(handler: VaultLockedHandler | null): void {
+  vaultLockedHandler = handler;
+}
+
+// isVaultLocked reports whether an error is the 409 vault_locked signal, so a
+// caller (the secrets form) can show a tailored "unlock first" message.
+export function isVaultLocked(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 409 &&
+    (err.body as { code?: string } | null)?.code === "vault_locked"
+  );
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   if (body !== undefined) {
@@ -655,6 +681,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
   if (!res.ok) {
     if (res.status === 401) unauthorizedHandler?.();
+    if (res.status === 409 && (payload as { code?: string } | null)?.code === "vault_locked") {
+      vaultLockedHandler?.();
+    }
     const message =
       (payload as { error?: string } | null)?.error ?? `request failed (${res.status})`;
     throw new ApiError(res.status, message, payload);
@@ -680,6 +709,9 @@ const realApi = {
   getSettings: () => request<SettingsResponse>("GET", "/admin/settings"),
   updateSettings: (settings: UpdateSettingsPayload) =>
     request<SettingsResponse>("PUT", "/admin/settings", { settings }),
+  // Vault migration progress (PRD #32): count of stored secrets still master-sealed
+  // (owners who have not unlocked since the vault rolled out). Admin-only.
+  vaultMigration: () => request<{ master_sealed: number }>("GET", "/admin/vault-migration"),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
@@ -687,6 +719,13 @@ const realApi = {
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
   deleteAnthropicToken: () => request<null>("DELETE", "/me/secrets/anthropic_token"),
+
+  // Vault (PRD #32): unlock re-derives the DEK from the login password (204, or
+  // 403 on a wrong password); lock evicts it; status is a lightweight poll. Unlock
+  // and lock return no body.
+  vaultUnlock: (password: string) => request<null>("POST", "/vault/unlock", { password }),
+  vaultLock: () => request<null>("POST", "/vault/lock"),
+  vaultStatus: () => request<{ unlocked: boolean }>("GET", "/vault/status"),
   getMySettings: () => request<{ settings: UserSettings }>("GET", "/me/settings"),
   putMySettings: (patch: UserSettingsPatch) =>
     request<{ settings: UserSettings }>("PUT", "/me/settings", patch),

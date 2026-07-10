@@ -110,6 +110,7 @@ beforeEach(() => {
     defaultTheme: "ember",
     prdlessLabel: "PRDLESS",
     prdlessEnabled: false,
+    vaultUnlocked: true,
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

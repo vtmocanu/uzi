@@ -93,6 +93,10 @@ export function AdminSettings() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  // Vault migration progress (PRD #32): stored secrets still using pre-vault
+  // (master-key) encryption. Fetched separately so a failure never blocks the
+  // settings form; null = unknown/not-yet-loaded, rendered only when > 0.
+  const [masterSealed, setMasterSealed] = useState<number | null>(null);
 
   // applyResponse fans a GET/PUT response out to the label-form fields and the
   // shared secret/source state, so both the label form and the Slack card read a
@@ -118,6 +122,11 @@ export function AdminSettings() {
     } finally {
       setLoading(false);
     }
+    // Best-effort, independent of the settings load (PRD #32).
+    api
+      .vaultMigration()
+      .then(({ master_sealed }) => setMasterSealed(master_sealed))
+      .catch(() => setMasterSealed(null));
   }, [applyResponse]);
 
   useEffect(() => {
@@ -197,6 +206,22 @@ export function AdminSettings() {
       />
       {error && <Alert message={error} />}
       {notice && <Alert tone="success" message={notice} />}
+
+      {masterSealed !== null && masterSealed > 0 && (
+        <Card className="space-y-2 border-warn/30">
+          <SectionTitle>Vault migration</SectionTitle>
+          <p className="text-sm text-muted">
+            <strong className="text-fg">
+              {masterSealed} stored secret{masterSealed === 1 ? "" : "s"}
+            </strong>{" "}
+            still use pre-vault encryption — their owners haven&rsquo;t logged in since password
+            protection was enabled. Each re-seals under the owner&rsquo;s password automatically the
+            next time they log in (or unlock). For full protection those owners should also rotate
+            the affected token: sealing an existing value protects it from now on, not
+            retroactively.
+          </p>
+        </Card>
+      )}
 
       <Card className="space-y-5">
         <div>

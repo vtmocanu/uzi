@@ -24,7 +24,18 @@ function sortPast(a: RunListItem, b: RunListItem): number {
   return (PAST_STATUS_RANK[a.status] ?? 3) - (PAST_STATUS_RANK[b.status] ?? 3);
 }
 
-function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
+function RunRow({
+  run,
+  showOwner,
+  waitingForVault = false,
+}: {
+  run: RunListItem;
+  showOwner?: boolean;
+  // waitingForVault (PRD #32): this is the current user's own queued run and their
+  // vault is locked, so it will not claim until they unlock — surfaced as a distinct
+  // amber state instead of a bare "queued" pill.
+  waitingForVault?: boolean;
+}) {
   // A deliberate human stop (cancelled, or failed carrying a server-stamped
   // stop_kind — PRD #33) reads "stopped" / neutral, never "failed" / danger. Fold
   // that into the pill's status so the shared StatusPill palette renders it calm.
@@ -58,7 +69,13 @@ function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
               autopilot
             </Badge>
           )}
-          <StatusPill status={pillStatus} />
+          {waitingForVault ? (
+            <Badge tone="warning" title="This run will claim once you unlock your vault.">
+              <span aria-hidden="true">🔒</span> waiting for vault unlock
+            </Badge>
+          ) : (
+            <StatusPill status={pillStatus} />
+          )}
         </div>
       </Link>
     </li>
@@ -66,7 +83,7 @@ function RunRow({ run, showOwner }: { run: RunListItem; showOwner?: boolean }) {
 }
 
 export function RunsList() {
-  const { user } = useAuth();
+  const { user, vaultUnlocked } = useAuth();
   const isAdmin = !!user?.is_admin;
 
   const [runs, setRuns] = useState<RunListItem[]>([]);
@@ -131,7 +148,11 @@ export function RunsList() {
                 ) : (
                   <ul className="space-y-2">
                     {active.map((r) => (
-                      <RunRow key={r.id} run={r} />
+                      <RunRow
+                        key={r.id}
+                        run={r}
+                        waitingForVault={!vaultUnlocked && r.status === "queued"}
+                      />
                     ))}
                   </ul>
                 )}
@@ -174,7 +195,17 @@ export function RunsList() {
             ) : (
               <ul className="space-y-2">
                 {adminRuns.map((r) => (
-                  <RunRow key={r.id} run={r} showOwner />
+                  <RunRow
+                    key={r.id}
+                    run={r}
+                    showOwner
+                    // Only the current admin's OWN queued rows can show the vault state —
+                    // another owner's vault status is unknown here (PRD #32), so theirs
+                    // render as plain "queued".
+                    waitingForVault={
+                      !vaultUnlocked && r.status === "queued" && r.owner_email === user?.email
+                    }
+                  />
                 ))}
               </ul>
             )}

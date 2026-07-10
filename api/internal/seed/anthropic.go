@@ -14,13 +14,6 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
-// anthropicTokenKind is the secret kind the Anthropic token is stored under. It
-// MUST match handler.anthropicTokenKind ("anthropic_token"); a drift would make
-// the seed's create-only check and its write target a different kind than the UI
-// reads/writes. Duplicated (not imported) to keep this dev-convenience seed off
-// the HTTP handler package.
-const anthropicTokenKind = "anthropic_token"
-
 // maxAnthropicTokenBytes bounds a seeded credential, mirroring
 // handler.maxTokenBytes. Generous enough for both `claude setup-token` OAuth
 // tokens and console API keys.
@@ -37,10 +30,13 @@ type SecretStore interface {
 	UpsertUserSecret(ctx context.Context, arg store.UpsertUserSecretParams) (store.UpsertUserSecretRow, error)
 }
 
-// Sealer is the subset of *secretbox.Box the seed needs: it encrypts the token
-// for storage — the same primitive the secrets handler uses.
-type Sealer interface {
-	Seal(plaintext []byte) ([]byte, error)
+// VaultSealer is the subset of *vault.Vault the seed needs: it seals the seeded
+// token under the seed admin's per-user DEK (PRD #32), the same primitive the
+// secrets handler uses. main boot-unlocks the seed admin's vault before this runs,
+// so Seal succeeds; if it did not, Seal returns vault.ErrLocked and the seed fails
+// loud (consistent with the other boot-fatal seed faults).
+type VaultSealer interface {
+	Seal(userID uuid.UUID, kind string, plaintext []byte) ([]byte, error)
 }
 
 // AnthropicToken seeds the seed admin's Anthropic token from
@@ -62,7 +58,7 @@ type Sealer interface {
 // both of which the codebase treats as boot-fatal (see loadSeedAdmin /
 // loadSeedForge). There is no network/outage condition to defer, so — unlike the
 // forge seed — nothing is swallowed.
-func AnthropicToken(ctx context.Context, q SecretStore, box Sealer, cfg config.Config) error {
+func AnthropicToken(ctx context.Context, q SecretStore, sealer VaultSealer, cfg config.Config) error {
 	if cfg.SeedAnthropicToken == "" {
 		return nil
 	}
@@ -80,7 +76,7 @@ func AnthropicToken(ctx context.Context, q SecretStore, box Sealer, cfg config.C
 		return fmt.Errorf("seed anthropic token: list secrets: %w", err)
 	}
 	for _, s := range secrets {
-		if s.Kind == anthropicTokenKind {
+		if s.Kind == store.KindAnthropicToken {
 			slog.Info("seed anthropic token already present, leaving untouched", "email", cfg.SeedEmail)
 			return nil
 		}
@@ -93,16 +89,19 @@ func AnthropicToken(ctx context.Context, q SecretStore, box Sealer, cfg config.C
 		return fmt.Errorf("seed anthropic token: %w", err)
 	}
 
-	sealed, err := box.Seal([]byte(token))
+	// DEK-seal under the seed admin's vault (unlocked at boot by main). The error
+	// carries no plaintext; vault.ErrLocked here means the boot-unlock did not run,
+	// which is a boot-fatal misconfiguration.
+	sealed, err := sealer.Seal(user.ID, store.KindAnthropicToken, []byte(token))
 	if err != nil {
-		// error carries no plaintext
 		return fmt.Errorf("seed anthropic token: seal: %w", err)
 	}
 
 	if _, err := q.UpsertUserSecret(ctx, store.UpsertUserSecretParams{
 		UserID:     user.ID,
-		Kind:       anthropicTokenKind,
+		Kind:       store.KindAnthropicToken,
 		Ciphertext: sealed,
+		SealedWith: store.SealedWithDEK,
 	}); err != nil {
 		return fmt.Errorf("seed anthropic token: store: %w", err)
 	}

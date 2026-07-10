@@ -12,6 +12,22 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countMasterSealedSecrets = `-- name: CountMasterSealedSecrets :one
+SELECT count(*) FROM user_secrets WHERE sealed_with = 'master'
+`
+
+// Admin migration-progress signal (PRD #32): how many stored user secrets still
+// use the legacy master-key sealing — i.e. owners who have not unlocked since the
+// vault rolled out. New saves are born 'dek' and lazy rewrap flips old rows on the
+// owner's next unlock, so this trends to zero; a persistently non-zero count flags
+// dormant accounts an operator may want to nudge.
+func (q *Queries) CountMasterSealedSecrets(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countMasterSealedSecrets)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteUserSecret = `-- name: DeleteUserSecret :execrows
 DELETE FROM user_secrets WHERE user_id = $1 AND kind = $2
 `
@@ -30,7 +46,7 @@ func (q *Queries) DeleteUserSecret(ctx context.Context, arg DeleteUserSecretPara
 }
 
 const getUserSecretCiphertext = `-- name: GetUserSecretCiphertext :one
-SELECT ciphertext FROM user_secrets WHERE user_id = $1 AND kind = $2
+SELECT ciphertext, sealed_with FROM user_secrets WHERE user_id = $1 AND kind = $2
 `
 
 type GetUserSecretCiphertextParams struct {
@@ -38,12 +54,54 @@ type GetUserSecretCiphertextParams struct {
 	Kind   string    `json:"kind"`
 }
 
-// Fetch the sealed ciphertext for decryption (used by PRD #4 at agent-run time).
-func (q *Queries) GetUserSecretCiphertext(ctx context.Context, arg GetUserSecretCiphertextParams) ([]byte, error) {
+type GetUserSecretCiphertextRow struct {
+	Ciphertext []byte `json:"ciphertext"`
+	SealedWith string `json:"sealed_with"`
+}
+
+// Fetch the sealed ciphertext + how it was sealed, for decryption at agent-run
+// time (PRD #4/#32). sealed_with tells the vault whether to open under the master
+// box (legacy 'master') or the per-user DEK ('dek').
+func (q *Queries) GetUserSecretCiphertext(ctx context.Context, arg GetUserSecretCiphertextParams) (GetUserSecretCiphertextRow, error) {
 	row := q.db.QueryRow(ctx, getUserSecretCiphertext, arg.UserID, arg.Kind)
-	var ciphertext []byte
-	err := row.Scan(&ciphertext)
-	return ciphertext, err
+	var i GetUserSecretCiphertextRow
+	err := row.Scan(&i.Ciphertext, &i.SealedWith)
+	return i, err
+}
+
+const listMasterSealedSecrets = `-- name: ListMasterSealedSecrets :many
+SELECT kind, ciphertext FROM user_secrets
+WHERE user_id = $1 AND sealed_with = 'master'
+`
+
+type ListMasterSealedSecretsRow struct {
+	Kind       string `json:"kind"`
+	Ciphertext []byte `json:"ciphertext"`
+}
+
+// The user's still-legacy secrets, for lazy rewrap on unlock (PRD #32): the vault
+// opens each with the master box, reseals under the DEK, and flips it to 'dek'
+// (RewrapUserSecret). Selects the ciphertext because rewrap must decrypt it; the
+// rows are only ever handed to the vault, never serialized out. Empty once a user
+// has been fully migrated, so the steady-state unlock does no rewrap work.
+func (q *Queries) ListMasterSealedSecrets(ctx context.Context, userID uuid.UUID) ([]ListMasterSealedSecretsRow, error) {
+	rows, err := q.db.Query(ctx, listMasterSealedSecrets, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMasterSealedSecretsRow{}
+	for rows.Next() {
+		var i ListMasterSealedSecretsRow
+		if err := rows.Scan(&i.Kind, &i.Ciphertext); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listUserSecretsMeta = `-- name: ListUserSecretsMeta :many
@@ -80,11 +138,39 @@ func (q *Queries) ListUserSecretsMeta(ctx context.Context, userID uuid.UUID) ([]
 	return items, nil
 }
 
+const rewrapUserSecret = `-- name: RewrapUserSecret :execrows
+UPDATE user_secrets
+SET ciphertext = $1, sealed_with = 'dek', updated_at = now()
+WHERE user_id = $2 AND kind = $3 AND sealed_with = 'master'
+`
+
+type RewrapUserSecretParams struct {
+	Ciphertext []byte    `json:"ciphertext"`
+	UserID     uuid.UUID `json:"user_id"`
+	Kind       string    `json:"kind"`
+}
+
+// Lazy migration (PRD #32): re-seal a legacy master-key-sealed secret under the
+// owner's vault DEK on their first unlock, flipping sealed_with 'master' → 'dek'
+// in one statement. Guarded on the current sealed_with so a concurrent unlock
+// cannot double-rewrap (and cannot clobber a DEK-sealed row with stale bytes).
+// This does NOT un-leak a token that ever existed master-sealed — an operator
+// may have snapshotted the DB first; rotation is the real fix. It only improves
+// the at-rest posture going forward.
+func (q *Queries) RewrapUserSecret(ctx context.Context, arg RewrapUserSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rewrapUserSecret, arg.Ciphertext, arg.UserID, arg.Kind)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertUserSecret = `-- name: UpsertUserSecret :one
-INSERT INTO user_secrets (user_id, kind, ciphertext)
-VALUES ($1, $2, $3)
+INSERT INTO user_secrets (user_id, kind, ciphertext, sealed_with)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (user_id, kind) DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
+        sealed_with = EXCLUDED.sealed_with,
         updated_at = now()
 RETURNING kind, created_at, updated_at
 `
@@ -93,6 +179,7 @@ type UpsertUserSecretParams struct {
 	UserID     uuid.UUID `json:"user_id"`
 	Kind       string    `json:"kind"`
 	Ciphertext []byte    `json:"ciphertext"`
+	SealedWith string    `json:"sealed_with"`
 }
 
 type UpsertUserSecretRow struct {
@@ -101,10 +188,17 @@ type UpsertUserSecretRow struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
-// Insert or rotate a user's secret of a given kind. Returns metadata only
+// Insert or rotate a user's secret of a given kind. sealed_with records which key
+// sealed the ciphertext ('master' for the legacy box, 'dek' for the vault); the
+// caller sets it to match how it produced @ciphertext. Returns metadata only
 // (never the ciphertext) so callers cannot accidentally serialize it.
 func (q *Queries) UpsertUserSecret(ctx context.Context, arg UpsertUserSecretParams) (UpsertUserSecretRow, error) {
-	row := q.db.QueryRow(ctx, upsertUserSecret, arg.UserID, arg.Kind, arg.Ciphertext)
+	row := q.db.QueryRow(ctx, upsertUserSecret,
+		arg.UserID,
+		arg.Kind,
+		arg.Ciphertext,
+		arg.SealedWith,
+	)
 	var i UpsertUserSecretRow
 	err := row.Scan(&i.Kind, &i.CreatedAt, &i.UpdatedAt)
 	return i, err

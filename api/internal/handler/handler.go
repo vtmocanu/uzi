@@ -21,6 +21,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -48,6 +49,12 @@ type Handler struct {
 	// full-syncs every repo on its next cycle (PRD #19 M2). Optional: nil in tests
 	// that don't exercise the poller; UpdateSettings nil-guards the call.
 	reconciler Reconciler
+	// vault holds per-user DEKs and does the password-wrapped secret crypto
+	// (PRD #32). Optional (nil-safe) like the other post-construction collaborators:
+	// wired via SetVault in main. When nil, the secret endpoints fall back to the
+	// legacy master-box behavior and the vault endpoints report "no gate", so tests
+	// that don't exercise the vault need no change.
+	vault *vault.Vault
 	// slackValidator live-validates Slack tokens on save (PRD #25 M1). Optional:
 	// nil falls back to the real slacksvc.Validator (see slackVal); tests inject a
 	// fake so the settings PUT is exercised without a network call to Slack.
@@ -128,6 +135,12 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 // is built after the handler's other deps). Safe to leave unset in tests.
 func (h *Handler) SetReconciler(r Reconciler) { h.reconciler = r }
 
+// SetVault wires the per-user vault (PRD #32). Call once at startup, before
+// serving. The same *vault.Vault instance is shared with workersvc so a login on
+// the API and a claim by the worker see one DEK cache. Leaving it unset keeps the
+// legacy master-box secret behavior (used by tests that don't exercise the vault).
+func (h *Handler) SetVault(v *vault.Vault) { h.vault = v }
+
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
 // password hash or token_version.
 type userDTO struct {
@@ -205,6 +218,18 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) 
 			r.Get("/", h.ListMySecrets)
 			r.Put("/anthropic_token", h.PutAnthropicToken)
 			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
+		})
+
+		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped
+		// secret DEK. All authenticated (CSRF applies to the POSTs). Unlock is a
+		// password-guessing surface, so it rides the auth limiter keyed PER USER
+		// (PerUserMiddleware) — not per-IP, so a stolen JWT cannot share a NAT
+		// bucket with other users' logins, and not the login route's key space.
+		r.Route("/vault", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.With(authLimiter.PerUserMiddleware).Post("/unlock", h.VaultUnlock)
+			r.Post("/lock", h.VaultLock)
+			r.Get("/status", h.VaultStatus)
 		})
 
 		// Current-user autopilot opt-in (PRD #19): per-user consent to unattended
@@ -319,6 +344,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) 
 			// Instance settings (PRD #19): the configurable forge labels today.
 			r.Get("/settings", h.GetSettings)
 			r.Put("/settings", h.UpdateSettings)
+			// Vault migration progress (PRD #32): count of still-master-sealed secrets.
+			r.Get("/vault-migration", h.VaultMigration)
 			// Lightweight live Slack connection state for the admin webui chip's poll
 			// (PRD #25 M3), so it need not re-fetch the whole settings blob every 5s.
 			r.Get("/slack/status", h.GetAdminSlackStatus)

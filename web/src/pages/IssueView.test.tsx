@@ -81,6 +81,7 @@ function setAuth(prdlessEnabled: boolean) {
     defaultTheme: "ember",
     prdlessLabel: "PRDLESS",
     prdlessEnabled,
+    vaultUnlocked: true,
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

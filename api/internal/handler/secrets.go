@@ -9,16 +9,28 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 )
 
-// anthropicTokenKind is the only secret kind in this PRD. Adding a kind is one
-// ALTER-CHECK migration; the table shape never changes.
-const anthropicTokenKind = "anthropic_token"
+// sealUserSecret encrypts a user secret for storage, returning the ciphertext and
+// the sealed_with value to record. With a vault wired (production) it seals under
+// the user's DEK (sealed_with='dek') and returns vault.ErrLocked when the vault is
+// locked; without one (tests) it falls back to the legacy master box
+// (sealed_with='master'), preserving pre-vault behavior.
+func (h *Handler) sealUserSecret(userID uuid.UUID, kind string, plaintext []byte) (sealed []byte, sealedWith string, err error) {
+	if h.vault != nil {
+		sealed, err = h.vault.Seal(userID, kind, plaintext)
+		return sealed, store.SealedWithDEK, err
+	}
+	sealed, err = h.box.Seal(plaintext)
+	return sealed, store.SealedWithMaster, err
+}
 
 // maxTokenBytes bounds a pasted credential. Generous enough for both
 // `claude setup-token` OAuth tokens and console API keys; no format assumption
@@ -82,8 +94,21 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sealed, err := h.box.Seal([]byte(token))
+	// Seal under the user's per-user vault DEK (PRD #32) so a DB dump + every env
+	// var + Infisical cannot recover the token. The vault must be unlocked (it is
+	// right after login; a mid-session pod restart is the only way to hit locked
+	// here) → 409 vault_locked, which the SPA turns into an unlock prompt. When no
+	// vault is wired (tests only; main always wires one) fall back to the legacy
+	// master box so existing behavior and tests are unchanged.
+	sealed, sealedWith, err := h.sealUserSecret(user.ID, store.KindAnthropicToken, []byte(token))
 	if err != nil {
+		if errors.Is(err, vault.ErrLocked) {
+			httpx.JSON(w, http.StatusConflict, map[string]string{
+				"error": "vault is locked; unlock it with your password, then save again",
+				"code":  "vault_locked",
+			})
+			return
+		}
 		slog.Error("seal anthropic token", "error", err) // error carries no plaintext
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -91,8 +116,9 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 
 	row, err := h.q.UpsertUserSecret(r.Context(), store.UpsertUserSecretParams{
 		UserID:     user.ID,
-		Kind:       anthropicTokenKind,
+		Kind:       store.KindAnthropicToken,
 		Ciphertext: sealed,
+		SealedWith: sealedWith,
 	})
 	if err != nil {
 		slog.Error("store anthropic token", "error", err)
@@ -112,7 +138,7 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := h.q.DeleteUserSecret(r.Context(), store.DeleteUserSecretParams{
 		UserID: user.ID,
-		Kind:   anthropicTokenKind,
+		Kind:   store.KindAnthropicToken,
 	}); err != nil {
 		slog.Error("delete anthropic token", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
