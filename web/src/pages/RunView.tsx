@@ -331,11 +331,6 @@ export function RunView() {
   );
 }
 
-// LEAD_NAME_RE mirrors the worker/api convention: a template with this name is
-// the main-thread orchestrator, not a selectable subagent, so it never appears in
-// the "My agent templates" chips (the lead is pinned + shown in the summary line).
-const LEAD_NAME_RE = /^(lead|orchestrator)$/i;
-
 // PlanPanel: the run's one human decision point — visually the loudest thing on
 // the page while it is pending. Grows the PRD #37 agent picker: the user chooses
 // the subagent roster (repo agents when detected, else their templates) with the
@@ -353,30 +348,21 @@ export function PlanPanel({
 }) {
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState("");
-  const [ownTemplates, setOwnTemplates] = useState<OwnTemplate[]>([]);
 
   const repoAgents = useMemo(() => run.repo_agents ?? [], [run.repo_agents]);
   const repoDetected = repoAgents.length > 0;
 
-  // The user's templates for the "My agent templates" card — the lead is pinned,
-  // not selectable, so it is filtered out. Fetched once when the gate is shown.
-  useEffect(() => {
-    let live = true;
-    api
-      .listAgentTemplates()
-      .then(({ templates }) => {
-        if (!live) return;
-        setOwnTemplates(
-          templates
-            .filter((t) => !LEAD_NAME_RE.test(t.name))
-            .map((t) => ({ name: t.name, description: t.description, custom: t.scope === "user" })),
-        );
-      })
-      .catch(() => undefined); // a template-load failure must not break approval
-    return () => {
-      live = false;
-    };
-  }, []);
+  // The "My agent templates" card is sourced from the run's own_agents — the
+  // server's allocation-resolved roster (what the worker actually runs for
+  // source="own"), with the lead already stripped. Reading it off the run (instead
+  // of a separate listAgentTemplates fetch of the broader VISIBLE set) is the
+  // M4-fix: a chip can never name a template the approve validator rejects, and the
+  // count is exact for owners with a disabled/shadowed template. own_agents carries
+  // no scope, so the "custom" badge is not shown here.
+  const ownTemplates = useMemo<OwnTemplate[]>(
+    () => (run.own_agents ?? []).map((a) => ({ name: a.name, description: a.description, custom: false })),
+    [run.own_agents],
+  );
 
   // The picker reports the live selection here; the approve button submits it. The
   // default (repo when detected, else own, no exclusions) is what the picker emits
@@ -449,11 +435,10 @@ export function PlanPanel({
 // names/descriptions render as plain JSX text, never <Markdown>.
 export function AgentRosterSummary({ run }: { run: Run }) {
   const excluded = new Set(run.agent_exclusions ?? []);
-  const repoAgents = run.repo_agents ?? [];
-  const included =
-    run.agent_source === "repo"
-      ? repoAgents.filter((a) => !excluded.has(a.name)).map((a) => a.name)
-      : []; // own-source rosters are the user's templates (not carried on the run row)
+  const roster = run.agent_source === "repo" ? (run.repo_agents ?? []) : (run.own_agents ?? []);
+  // own_agents now carries the own-source roster on the detail read, so this lists
+  // the actual agent names for either source (M4-fix) instead of nothing for own.
+  const included = roster.filter((a) => !excluded.has(a.name)).map((a) => a.name);
   return (
     <Card className="space-y-2 p-4">
       <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Agents used</h2>

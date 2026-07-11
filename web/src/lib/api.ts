@@ -533,6 +533,12 @@ export interface Run {
   agent_source: AgentSource | null;
   /** PRD #37: the names excluded from the chosen source. null before a selection. */
   agent_exclusions: string[] | null;
+  /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
+   *  exactly the allocation-resolved templates the worker runs for source="own",
+   *  lead already stripped. The plan gate's "My agent templates" card is built from
+   *  this, so an excludable chip always matches what approve accepts and the count is
+   *  exact. Populated only on the run-detail read (getRun); null on list rows. */
+  own_agents: RepoAgent[] | null;
   claimed_at: string | null;
   started_at: string | null;
   finished_at: string | null;

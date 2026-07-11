@@ -33,6 +33,10 @@ type runsStore struct {
 	lastRunsArg *store.ListRunsForUserParams
 	allWorkers  []store.ListAllWorkersRow
 	activeRuns  []store.ListActiveRunsAllRow
+	// claimTemplates backs GetRun's own-roster resolution (PRD #37 M4-fix): the
+	// owner's allocation-resolved templates, lead included so the handler's strip is
+	// exercised.
+	claimTemplates []store.AgentTemplate
 }
 
 func (s *runsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -49,6 +53,9 @@ func (s *runsStore) GetRunByID(_ context.Context, id uuid.UUID) (store.Run, erro
 }
 func (s *runsStore) ListRunMessagesAfter(context.Context, store.ListRunMessagesAfterParams) ([]store.RunMessage, error) {
 	return s.msgs, nil
+}
+func (s *runsStore) ListClaimAgentTemplates(context.Context, pgtype.UUID) ([]store.AgentTemplate, error) {
+	return s.claimTemplates, nil
 }
 func (s *runsStore) ListRunsForUser(_ context.Context, arg store.ListRunsForUserParams) ([]store.ListRunsForUserRow, error) {
 	s.lastRunsArg = &arg
@@ -125,6 +132,58 @@ func TestGetRunOwnerNonOwnerAdmin(t *testing.T) {
 	h.GetRun(rec, runReq(admin, runID))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin GetRun = %d, want 200 (admin sees all)", rec.Code)
+	}
+}
+
+// TestGetRunPopulatesOwnAgents proves the run-detail DTO carries the owner's
+// allocation-resolved OWN roster (name + description), with the lead stripped: the
+// plan-gate picker's "My agent templates" chips come from exactly what
+// ListClaimAgentTemplates delivers, not the broader visible-template list (PRD #37
+// M4-fix — the allocation gap that could 400 an excluded-but-undelivered chip).
+func TestGetRunPopulatesOwnAgents(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "awaiting_approval"},
+		claimTemplates: []store.AgentTemplate{
+			{Name: "lead", Description: "orchestrates"},
+			{Name: "coder", Description: "implements features"},
+			{Name: "reviewer", Description: "reviews changes"},
+		},
+	}
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.GetRun(rec, runReq(owner, runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GetRun = %d, want 200", rec.Code)
+	}
+	var body struct {
+		Run struct {
+			OwnAgents []struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"own_agents"`
+		} `json:"run"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	got := body.Run.OwnAgents
+	if len(got) != 2 {
+		t.Fatalf("own_agents len = %d, want 2 (lead stripped): %+v", len(got), got)
+	}
+	if got[0].Name != "coder" || got[0].Description != "implements features" {
+		t.Errorf("own_agents[0] = %+v, want {coder, implements features}", got[0])
+	}
+	if got[1].Name != "reviewer" {
+		t.Errorf("own_agents[1].Name = %q, want reviewer", got[1].Name)
+	}
+	for _, a := range got {
+		if a.Name == "lead" {
+			t.Fatalf("lead must be stripped from own_agents, got %+v", got)
+		}
 	}
 }
 

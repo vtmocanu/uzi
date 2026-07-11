@@ -147,6 +147,14 @@ type runDTO struct {
 	RepoAgents      []workersvc.RepoAgent `json:"repo_agents"`
 	AgentSource     *string               `json:"agent_source"`
 	AgentExclusions []string              `json:"agent_exclusions"`
+	// OwnAgents is the OWN-source subagent roster (name + description) the run's
+	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
+	// minus the lead. It is the single source of truth the plan-gate "My agent
+	// templates" picker reads, so an excludable chip always matches what the
+	// approve validator accepts and the count is exact (PRD #37 M4-fix). Populated
+	// only on the run-detail read (GetRun), where the store is in reach; null (a Go
+	// nil slice) on the list/create/worker DTOs, which never drive the picker.
+	OwnAgents []workersvc.RepoAgent `json:"own_agents"`
 }
 
 func runToDTO(r store.Run) runDTO {
@@ -445,7 +453,18 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run)})
+	dto := runToDTO(run)
+	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
+	// so the plan-gate picker sources its "My agent templates" chips from exactly the
+	// roster the approve validator + worker use (allocation-resolved, lead stripped).
+	// Best-effort: a lookup error leaves own_agents null (the picker degrades to no own
+	// chips) rather than failing the read of an otherwise-fine run.
+	if own, err := h.wsvc.OwnAgentRoster(r.Context(), run.UserID); err != nil {
+		slog.Error("resolve own agent roster", "run_id", run.ID, "error", err)
+	} else {
+		dto.OwnAgents = own
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": dto})
 }
 
 // ListRunMessages returns a run's persisted messages after ?after=<seq> (default

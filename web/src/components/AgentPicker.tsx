@@ -195,6 +195,9 @@ function SourceCard({
     <label
       className={cx(
         "relative flex cursor-pointer flex-col gap-2.5 rounded-lg border p-3.5 transition-colors",
+        // Keyboard-focus ring on the card (WCAG 2.4.7): the radio itself is visually
+        // hidden, so the focus indicator has to live on the label wrapping it.
+        "has-[:focus-visible]:outline has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-brand has-[:focus-visible]:outline-offset-2",
         selected ? "border-brand/70 bg-brand/5" : "border-edge bg-surface hover:border-edge-strong",
         disabled && "cursor-not-allowed opacity-55 hover:border-edge",
       )}

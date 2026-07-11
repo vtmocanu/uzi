@@ -63,6 +63,7 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     repo_agents: null,
     agent_source: null,
     agent_exclusions: null,
+    own_agents: null,
     claimed_at: null,
     started_at: null,
     finished_at: null,

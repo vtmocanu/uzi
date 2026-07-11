@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
@@ -819,6 +820,29 @@ func (s *Service) rosterFor(ctx context.Context, run store.Run, source string, r
 		names = append(names, t.Name)
 	}
 	return ownSubagentNames(names), nil
+}
+
+// OwnAgentRoster resolves the OWN-source subagent roster (name + description) for a
+// run's owner: exactly the templates ListClaimAgentTemplates delivers to that
+// owner's claim, minus the lead orchestrator (the main thread, never a selectable
+// subagent). It is the SAME query rosterFor/validateSelection use for source="own",
+// so populating it onto the run-detail DTO lets the plan-gate picker show precisely
+// what the validator accepts and the worker runs — a chip can never name a template
+// that approve_plan would reject, and the picker's "N of your templates" count is
+// exact even when the owner has a disabled or shadowed template (PRD #37 M4-fix).
+func (s *Service) OwnAgentRoster(ctx context.Context, userID uuid.UUID) ([]RepoAgent, error) {
+	templates, err := s.q.ListClaimAgentTemplates(ctx, pgUUID(userID))
+	if err != nil {
+		return nil, fmt.Errorf("list claim agent templates: %w", err)
+	}
+	out := make([]RepoAgent, 0, len(templates))
+	for _, t := range templates {
+		if agenttmpl.IsLeadName(t.Name) {
+			continue
+		}
+		out = append(out, RepoAgent{Name: t.Name, Description: t.Description})
+	}
+	return out, nil
 }
 
 // InputDTO is a consumed steering input handed to the worker. ID is the input's

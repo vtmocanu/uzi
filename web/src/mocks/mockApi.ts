@@ -975,6 +975,7 @@ export const mockApi = {
       repo_agents: null,
       agent_source: null,
       agent_exclusions: null,
+      own_agents: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -1016,6 +1017,7 @@ export const mockApi = {
       repo_agents: null,
       agent_source: null,
       agent_exclusions: null,
+      own_agents: null,
       claimed_at: null,
       started_at: null,
       finished_at: null,
@@ -1037,7 +1039,13 @@ export const mockApi = {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
     if (id === LIVE_RUN_ID) ensureLive(id);
-    return delay({ run: { ...run } }, 60);
+    // Mirror the server's run-detail read (PRD #37 M4-fix): own_agents is resolved
+    // here from the owner's templates (lead stripped), so the plan gate's "My agent
+    // templates" card has chips in mock mode without a separate fetch.
+    const own_agents = templates
+      .filter((t) => !LEAD_NAME_RE.test(t.name))
+      .map((t) => ({ name: t.name, description: t.description }));
+    return delay({ run: { ...run, own_agents } }, 60);
   },
   getRunMessages: async (id: string, afterSeq = 0) => {
     const log = state.messages.get(id);
