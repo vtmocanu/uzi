@@ -547,7 +547,13 @@ rationale.
 Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
 `AskUserQuestion` mid-run steering, WS wakeup for idle workers (a 3s poll is
 the MVP), API-spawned worker containers (pods/VMs the server provisions
-itself), per-user skills-management UI, encrypting secrets with the user's
+itself — decided 2026-07-10, specs/ai.md §168: on compose the worker just runs
+always-on since idling is cheap; on the k8s phase a dedicated operator — never
+`api`, which must never hold container-runtime credentials — spawns per-user
+worker pods on demand when queued work appears; any worker-dependent feature,
+e.g. a future in-app chat agent, targets the deployment-agnostic worker
+claim/poll protocol so it works identically under both shapes), per-user
+skills-management UI, encrypting secrets with the user's
 own password instead of a shared server key, PAT least-privilege
 verification, and a second (e.g. OpenAI) execution provider are all
 deliberately deferred — see [plan.md](plan.md), the PRDs' Risks sections, and

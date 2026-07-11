@@ -52,6 +52,18 @@
   --neutral-border: var(--edge);
   --neutral-surface: var(--raised);
 
+  /* Shell syntax highlighting (PRD #38). Each --syn-* aliases a palette/status
+     token, so a theme recolours the tool-command and prose code surfaces for
+     free — same aliasing approach as the --queue-* tokens above. --tool-rail is
+     the indent border under a run of tool events. */
+  --syn-cmd: var(--brand);
+  --syn-flag: var(--info);
+  --syn-str: var(--ok);
+  --syn-op: var(--brand-hover);
+  --syn-comment: var(--faint);
+  --syn-arg: var(--fg);
+  --tool-rail: var(--edge);
+
   /* Radii: one base value, everything derived (multica's --radius scheme). */
   --radius: 0.625rem;
 
@@ -106,6 +118,20 @@
   --neutral-border: 51 65 85;
   --neutral-surface: 30 41 59;
 
+  /* Shell syntax highlighting (PRD #38) — mission's palette via the same aliases
+     as the ember block, EXCEPT --syn-flag/--syn-op: mission's --info and
+     --brand-hover both collapse onto the cyan --brand, which would make command,
+     flag, and operator render as one indistinct cyan. Re-point flags to amber
+     (--warn) and operators to slate (--muted) so the three stay legible. Ember,
+     whose --info/--brand-hover are already distinct hues, keeps the plain aliases. */
+  --syn-cmd: var(--brand);
+  --syn-flag: var(--warn);
+  --syn-str: var(--ok);
+  --syn-op: var(--muted);
+  --syn-comment: var(--faint);
+  --syn-arg: var(--fg);
+  --tool-rail: var(--edge);
+
   /* Sharper corners (every radius derives from this one value). */
   --radius: 0.25rem;
 
@@ -148,6 +174,21 @@ body {
   textarea:focus-visible,
   [tabindex]:not([tabindex="-1"]):focus-visible {
     @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-ink;
+  }
+}
+
+/* Respect prefers-reduced-motion (PRD #38 M4): neutralize the two Tailwind
+   keyframe utilities the run feed animates — the running-tool spinner
+   (animate-spin) and the active-agent pulsing dot (animate-pulse). This wins by
+   SOURCE ORDER: Tailwind v3 flattens @layer into plain CSS (no native @layer in
+   the compiled output), so at equal specificity the later rule wins. This block
+   is placed after `@tailwind utilities` (where the animate-* utilities are
+   emitted), so it overrides them — and is deliberately kept OUT of `@layer base`,
+   whose contents Tailwind hoists ahead of the utilities (they would lose). */
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin,
+  .animate-pulse {
+    animation: none;
   }
 }
 

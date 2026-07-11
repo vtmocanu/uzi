@@ -1,13 +1,15 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { RunMessage } from "../lib/api";
 import {
+  CommandBlock,
   RunEventRow,
   buildToolIndex,
   describeError,
   describeStatus,
   formatDuration,
+  highlightShell,
   resultToText,
   toolSummary,
   truncate,
@@ -20,8 +22,15 @@ function msg(partial: Partial<RunMessage> & { kind: string; seq: number }): RunM
 }
 
 describe("toolSummary", () => {
+  it("keeps the full multi-line command for Bash (no first-line truncation)", () => {
+    // PRD #38 Decision 1: the full command is the source of truth; truncation is
+    // a display concern handled by CommandBlock, never a lossy transform here.
+    const cmd = "cat <<'EOF'\nline one\nline two && echo done\nEOF";
+    expect(toolSummary("Bash", { command: cmd })).toBe(cmd);
+  });
+
   it("summarizes known tools by their salient argument", () => {
-    expect(toolSummary("Bash", { command: "ls -la\nsecond line" })).toBe("ls -la");
+    expect(toolSummary("Bash", { command: "ls -la\nsecond line" })).toBe("ls -la\nsecond line");
     expect(toolSummary("Read", { file_path: "/a/b.ts" })).toBe("/a/b.ts");
     expect(toolSummary("Edit", { file_path: "/a/b.ts", old_string: "x" })).toBe("/a/b.ts");
     expect(toolSummary("Grep", { pattern: "foo", path: "src" })).toBe("foo in src");
@@ -188,19 +197,22 @@ describe("RunEventRow rendering", () => {
     expect(container.textContent).toContain("✗");
   });
 
-  it("collapses a large non-error result behind a 'show N lines' expander", () => {
+  it("collapses a large non-error result into a chip with a mounted-but-hidden body", () => {
     const body = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n");
-    const { container } = render(
+    const { container, getByRole } = render(
       <RunEventRow
         msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Read", input: { file_path: "/x" } } })}
         result={msg({ seq: 2, kind: "tool_result", payload: { tool_use_id: "A", content: body } })}
         live={false}
       />,
     );
-    expect(container.textContent).toContain("show 20 lines");
-    expect(container.textContent).not.toContain("line 19");
-    const btn = container.querySelector("button[aria-expanded]");
-    expect(btn?.getAttribute("aria-expanded")).toBe("false");
+    const chip = getByRole("button", { name: /show 20 lines of Read output/i });
+    expect(chip.getAttribute("aria-expanded")).toBe("false");
+    expect(chip.textContent).toContain("20 lines");
+    // The body stays mounted (hidden) so its text is in the DOM while collapsed.
+    const pre = container.querySelector("pre");
+    expect(pre?.hasAttribute("hidden")).toBe(true);
+    expect(pre?.textContent).toContain("line 19");
   });
 
   it("renders a plan event as a terse one-liner (never the body)", () => {
@@ -217,5 +229,298 @@ describe("RunEventRow rendering", () => {
     );
     expect(container.textContent).toContain("unrenderable mystery event");
     expect(container.textContent).toContain("some detail");
+  });
+
+  it("renders a full multi-line Bash command through the code surface", () => {
+    const command = "cat <<'EOF'\nfirst line\nsecond line && echo done\nEOF";
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Bash", input: { command } } })}
+        live={false}
+      />,
+    );
+    // No line is lost end-to-end (the bug PRD #38 fixes).
+    expect(container.textContent).toContain("first line");
+    expect(container.textContent).toContain("second line && echo done");
+    expect(container.textContent).toContain("EOF");
+    // Rendered on the code surface (❯ prompt) with the multi-line clamp toggle.
+    expect(container.textContent).toContain("❯");
+    expect(container.querySelector("button[aria-expanded='false']")?.textContent).toMatch(
+      /show full command/i,
+    );
+  });
+});
+
+describe("highlightShell", () => {
+  const renderCmd = (cmd: string) => render(<div data-testid="h">{highlightShell(cmd)}</div>);
+
+  it("preserves the exact command text — no character dropped or added", () => {
+    for (const cmd of [
+      "ls -la",
+      "cd api && go build ./...",
+      "grep -rn 'foo bar' src | tee /tmp/out.log # note",
+      'echo "a\\"b" || rm -rf /x',
+      "env -i HOME=$HOME docker compose -p uzi run --rm api",
+      "cat <<'EOF'\nline one\nline two\nEOF",
+      "echo 'unclosed", // unterminated single quote — tail preserved, not dropped
+      'echo "unclosed', // unterminated double quote
+    ]) {
+      const { getByTestId, unmount } = renderCmd(cmd);
+      expect(getByTestId("h").textContent).toBe(cmd);
+      unmount();
+    }
+  });
+
+  it("caps DOM fan-out for a pathological command while preserving the text", () => {
+    // ~200 KB of "a b a b …": uncapped this is ~100k DOM nodes and freezes the tab.
+    const cmd = "a b ".repeat(50_000);
+    const { getByTestId } = renderCmd(cmd);
+    const host = getByTestId("h");
+    expect(host.textContent).toBe(cmd); // every character still present
+    expect(host.childNodes.length).toBeLessThanOrEqual(2001); // spans + remainder tail
+    expect(host.querySelectorAll("span").length).toBeLessThanOrEqual(2000);
+  });
+
+  it("classifies command / flag / string / operator / comment tokens", () => {
+    const { container } = renderCmd("git commit -m 'wip' && echo ok # done");
+    expect(container.querySelector(".text-syn-cmd")?.textContent).toBe("git");
+    expect(container.querySelector(".text-syn-flag")?.textContent).toBe("-m");
+    expect(container.querySelector(".text-syn-str")?.textContent).toBe("'wip'");
+    expect(container.querySelector(".text-syn-op")?.textContent).toBe("&&");
+    expect(container.querySelector(".text-syn-comment")?.textContent).toBe("# done");
+    // The word after a control operator is treated as a fresh command name.
+    const cmds = Array.from(container.querySelectorAll(".text-syn-cmd")).map((e) => e.textContent);
+    expect(cmds).toContain("echo");
+  });
+
+  it("renders a <script> payload inert as escaped text, not a real element", () => {
+    const cmd = "echo <script>alert(1)</script>";
+    const { container, getByTestId } = renderCmd(cmd);
+    expect(container.querySelector("script")).toBeNull();
+    expect(getByTestId("h").textContent).toBe(cmd);
+  });
+});
+
+describe("CommandBlock", () => {
+  it("renders every line of a multi-line command (full fidelity)", () => {
+    const cmd = "cd web\nnpm run build\nnpm test";
+    const { container } = render(<CommandBlock command={cmd} />);
+    expect(container.textContent).toContain("cd");
+    expect(container.textContent).toContain("npm run build");
+    expect(container.textContent).toContain("npm test");
+  });
+
+  it("offers the clamp toggle for a multi-line OR long command (content heuristic)", () => {
+    for (const cmd of ["echo one\necho two", `echo ${"x".repeat(200)}`]) {
+      const { getByRole, unmount } = render(<CommandBlock command={cmd} />);
+      const btn = getByRole("button", { name: /show full command/i });
+      expect(btn.getAttribute("aria-expanded")).toBe("false");
+      fireEvent.click(btn);
+      expect(btn.getAttribute("aria-expanded")).toBe("true");
+      expect(btn.textContent).toMatch(/show less/i);
+      unmount();
+    }
+  });
+
+  it("shows no clamp toggle for a short single-line command", () => {
+    const { queryByRole } = render(<CommandBlock command="git status --short" />);
+    expect(queryByRole("button")).toBeNull();
+  });
+
+  it("clamps via max-height with the ❯ prompt inline (not line-clamp), toggled off on expand", () => {
+    const cmd = "echo one\necho two\necho three";
+    const { container, getByRole } = render(<CommandBlock command={cmd} />);
+    // Clamp is a max-height wrapper, never line-clamp (which would push ❯ to its
+    // own line by forcing display:-webkit-box on the code).
+    const clampEl = container.querySelector(".max-h-\\[3\\.25em\\]");
+    expect(clampEl).not.toBeNull();
+    expect(container.querySelector(".line-clamp-2")).toBeNull();
+    // ❯ is an inline sibling INSIDE the clamped wrapper and never pollutes the
+    // code's exact text.
+    expect(clampEl?.querySelector("span[aria-hidden='true']")?.textContent).toBe("❯");
+    expect(container.querySelector("code")?.textContent).toBe(cmd);
+    // Expanding drops the clamp.
+    fireEvent.click(getByRole("button", { name: /show full command/i }));
+    expect(container.querySelector(".max-h-\\[3\\.25em\\]")).toBeNull();
+  });
+});
+
+describe("result chips (PRD #38 Decision 13)", () => {
+  const renderResult = (payload: Record<string, unknown>) =>
+    render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Read", input: { file_path: "/x" } } })}
+        result={msg({ seq: 2, kind: "tool_result", payload: { tool_use_id: "A", ...payload } })}
+        live={false}
+      />,
+    );
+
+  it("labels an error chip and auto-expands it with a danger body", () => {
+    const { getByRole, container } = renderResult({ content: "boom\nstack", is_error: true });
+    const chip = getByRole("button", { name: /hide Read error output/i });
+    expect(chip.textContent).toContain("error");
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    const pre = container.querySelector("pre");
+    expect(pre?.hasAttribute("hidden")).toBe(false); // errors start open
+    expect(pre?.getAttribute("aria-label")).toBe("Tool error output");
+  });
+
+  it("labels an empty or whitespace-only result 'ok'", () => {
+    for (const content of ["", "   \n  \t"]) {
+      const { getByRole, unmount } = renderResult({ content });
+      const chip = getByRole("button", { name: /show Read output/i });
+      expect(chip.textContent).toContain("ok");
+      expect(chip.getAttribute("aria-expanded")).toBe("false");
+      unmount();
+    }
+  });
+
+  it("labels a multi-line result 'N lines' and a single-line result '1 line'", () => {
+    const three = renderResult({ content: "a\nb\nc" });
+    expect(three.getByRole("button", { name: /show 3 lines of Read output/i }).textContent).toContain(
+      "3 lines",
+    );
+    three.unmount();
+    const one = renderResult({ content: "only one line" });
+    expect(one.getByRole("button", { name: /show 1 line of Read output/i }).textContent).toContain(
+      "1 line",
+    );
+  });
+
+  it("keeps the collapsed body mounted (hidden), then expands + focuses it", () => {
+    const { container, getByRole } = renderResult({ content: "kept-in-dom" });
+    const pre = container.querySelector("pre");
+    expect(pre?.hasAttribute("hidden")).toBe(true);
+    expect(pre?.textContent).toContain("kept-in-dom"); // still in the DOM
+    fireEvent.click(getByRole("button"));
+    expect(pre?.hasAttribute("hidden")).toBe(false);
+    expect(document.activeElement).toBe(pre); // keyboard focus moves into it
+  });
+
+  it("surfaces a dropped non-text block as an '[image omitted]' first line", () => {
+    const { container, getByRole } = renderResult({
+      content: [
+        { type: "text", text: "after image" },
+        { type: "image", source: {} },
+      ],
+    });
+    fireEvent.click(getByRole("button")); // expand
+    const pre = container.querySelector("pre");
+    expect(pre?.textContent?.startsWith("[image omitted]")).toBe(true);
+    expect(pre?.textContent).toContain("after image");
+  });
+});
+
+describe("tool durations (PRD #38 Decision 6)", () => {
+  const withSpan = (msAt: string, resAt: string) =>
+    render(
+      <RunEventRow
+        msg={msg({
+          seq: 1,
+          kind: "tool_use",
+          created_at: msAt,
+          payload: { id: "A", name: "Bash", input: { command: "x" } },
+        })}
+        result={msg({
+          seq: 2,
+          kind: "tool_result",
+          created_at: resAt,
+          payload: { tool_use_id: "A", content: "ok" },
+        })}
+        live={false}
+      />,
+    );
+
+  it("renders sub-100ms as 'instant' (raw value in the title), never '0.0s'", () => {
+    const { container } = withSpan("2026-07-04T00:00:00.000Z", "2026-07-04T00:00:00.040Z");
+    const dur = Array.from(container.querySelectorAll("span")).find((s) => s.textContent === "instant");
+    expect(dur).toBeTruthy();
+    expect(dur?.getAttribute("title")).toBe("40ms");
+    expect(container.textContent).not.toContain("0.0s");
+  });
+
+  it("renders a normal span via formatDuration and tints a >1m span --warn", () => {
+    const normal = withSpan("2026-07-04T00:00:00.000Z", "2026-07-04T00:00:04.100Z");
+    expect(normal.container.textContent).toContain("4.1s");
+    normal.unmount();
+    const slow = withSpan("2026-07-04T00:00:00.000Z", "2026-07-04T00:01:12.000Z");
+    const dur = Array.from(slow.container.querySelectorAll("span")).find((s) =>
+      /1m 12s/.test(s.textContent ?? ""),
+    );
+    expect(dur?.className).toContain("text-warn");
+  });
+
+  it("keeps the >160-char 'more' affordance for a long non-Bash arg", () => {
+    const pattern = "x".repeat(200);
+    const { getByRole, container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Grep", input: { pattern } } })}
+        live={false}
+      />,
+    );
+    const more = getByRole("button", { name: "more" });
+    expect(more).toBeTruthy();
+    // M4: the interactive label clears contrast (--muted, not --faint) and gets a
+    // ≥24px hit target.
+    expect(more.className).toContain("text-muted");
+    expect(more.className).toContain("min-h-[24px]");
+    expect(container.textContent).not.toContain(pattern); // truncated while collapsed
+    fireEvent.click(more);
+    expect(container.textContent).toContain(pattern); // full arg revealed
+  });
+});
+
+describe("accessibility (PRD #38 M4)", () => {
+  it("renders a status event as a hairline meta divider (single source of truth)", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "status", payload: { event: "init", model: "claude-fable-5" } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("agent started (claude-fable-5)");
+    expect(container.querySelector(".h-px")).not.toBeNull();
+  });
+
+  it("gives the thinking expander a muted ≥24px target", () => {
+    const { getByRole } = render(
+      <RunEventRow msg={msg({ seq: 1, kind: "thinking", payload: { text: "deliberating" } })} live={false} />,
+    );
+    const btn = getByRole("button", { name: "show" });
+    expect(btn.className).toContain("text-muted");
+    expect(btn.className).toContain("min-h-[24px]");
+  });
+
+  it("renders the meta divider two-tone: mono text-fg key + muted detail", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "status", payload: { event: "init", model: "claude-fable-5" } })}
+        live={false}
+      />,
+    );
+    // The event-type key is the mono, text-fg anchor…
+    const key = container.querySelector(".font-mono.text-fg");
+    expect(key?.textContent).toBe("agent started");
+    // …and the parenthetical detail stays in the (italic muted) line, not the key.
+    expect(key?.textContent).not.toContain("claude-fable-5");
+    expect(container.textContent).toContain("agent started (claude-fable-5)");
+  });
+
+  it("names the tool in a paired result-chip aria-label, tool-agnostic for orphans", () => {
+    const paired = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "tool_use", payload: { id: "A", name: "Bash", input: { command: "ls" } } })}
+        result={msg({ seq: 2, kind: "tool_result", payload: { tool_use_id: "A", content: "a\nb\nc" } })}
+        live={false}
+      />,
+    );
+    expect(paired.getByRole("button", { name: "Show 3 lines of Bash output" })).toBeTruthy();
+    paired.unmount();
+
+    // An orphan result (no matching call) has no tool name — falls back.
+    const orphan = render(
+      <RunEventRow msg={msg({ seq: 1, kind: "tool_result", payload: { tool_use_id: "Z", content: "a\nb" } })} live={false} />,
+    );
+    expect(orphan.getByRole("button", { name: "Show 2 lines of output" })).toBeTruthy();
   });
 });

@@ -120,6 +120,15 @@ Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
 - No "show raw JSON" toggle in the web UI. [explicit user rejection]
 - Reuse PRD #7's markdown renderer rather than building a parallel one. [user coordination]
 
+## Feature #38 — Activity feed redesign
+
+Tracked as GitLab issue vtmocanu/uzi#38; PRD at `prds/38-activity-feed-redesign.md`.
+
+- The run Activity feed is polished/redesigned per the approved mock.
+- Bash commands render as highlighted code, not plain text; no command content is lost in the UI.
+- Agent output is collapsible per agent (collapse lead/worker output).
+- The approved mock is the design contract; the implemented UI must match it. Mock committed at `prds/mockups/38-activity-feed-mock.html`.
+
 ## Feature #12 — Board–run lifecycle integration
 
 Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/12-board-run-lifecycle.md`.
@@ -263,6 +272,13 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/37-run-agent-selection.md`
 
 ## Deferred (user, "later stuff")
 
+- On-demand worker spawning: on compose the worker simply runs always-on (idle is
+  cheap); server-provisioned per-user workers are deferred to the k8s/remote-worker
+  phase, where a dedicated operator (never the api, which must never hold
+  container-runtime credentials like `docker.sock`) spawns worker pods when queued
+  work appears — e.g. a future in-app chat agent, whose users chat in the web UI
+  without knowing a worker serves them. [user, 2026-07-10; design detail in
+  specs/ai.md §168]
 - Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
 - Forgejo driver (interface is forge-generic; GitLab implemented first).
 - SSO with Keycloak.

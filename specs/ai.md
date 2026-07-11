@@ -4439,6 +4439,190 @@ against real Slack (unit tests fake the dialer; e2e stubs Slack entirely).
   zombie connection (e.g. after laptop sleep) can leave the chip `connected` with no
   socket — consider a liveness probe (last-hello age) surfaced on the admin DTO.
 
+---
+
+# PRD-less — On-demand worker spawn: always-on for compose, spawn-on-demand deferred to k8s (design decision, 2026-07-10)
+
+Serves human: discussed while designing a future in-app chat agent (chat rides the
+run machinery, so it needs a live worker to answer; a user chatting in the web UI
+should never have to know a worker exists). No PRD yet — recorded so the k8s phase
+inherits the decision.
+
+## 168. Worker availability: always-on on compose; launcher-spawned pods on k8s
+
+- **Compose (now): the worker runs always-on; nothing spawns containers.** An idle
+  worker is a Node process on a 3s poll — tens of MB RAM, zero Anthropic spend — so
+  demand-spawning buys nothing on a laptop. Features that need a live worker (chat,
+  runs) surface worker liveness (heartbeats already track it) as an explicit
+  "worker offline" state instead of silently queueing forever.
+- **Rejected: `api` spawning workers via `docker.sock`.** The socket is effectively
+  root on the host; mounting it into `api` would wreck its posture (distroless,
+  no shell, sole holder of `UZI_SECRET_KEY`/`JWT_SECRET`). `api` must never hold
+  container-runtime credentials — this constraint carries to every deployment shape.
+- **Rejected for compose: a dedicated launcher sidecar** (a small always-on service
+  holding `docker.sock`, watching for queued work and starting/stopping the agent
+  container). It isolates the privilege correctly but means building an orchestrator
+  (join-token provisioning, template/image selection, lifecycle, crash handling) to
+  avoid ~50MB of idle RAM, and the implementation is throwaway once workers move
+  off compose.
+- **k8s / remote-worker phase (the deferred design): the launcher shape, as an
+  operator.** A dedicated controller with cluster-API access (never `api` itself)
+  spawns per-user worker pods on demand — triggered by queued work (a run or chat
+  session appearing) — and reaps idle ones. This composes with the
+  [docs/proc-hardening.md](../docs/proc-hardening.md) remote-worker design (pod-level
+  uid split worker/agent, TLS-terminated ingress in front of `api` for the join-token
+  hop): the pods the operator spawns are exactly those two-container pods. Join-token
+  issuance for spawned workers becomes the operator's job (machine-issued, not
+  pasted-once-by-a-human), which is new design work to do then.
+- Cross-references: ARCHITECTURE.md "Not yet in scope" (API-spawned workers) and
+  specs/human.md "Deferred" both point here.
+
+## 169. Activity feed rendering — command fidelity, hierarchy, collapsible agents
+
+Serves human Feature #11 (run-view UX) and the PRD #38 additions (feed redesigned to
+the approved mock, bash as highlighted code, per-agent collapse). Web-only: no API,
+schema, agent, or message-shape change — a pure `web/src` render refactor. Full
+rationale + Decision Log: `prds/38-activity-feed-redesign.md`; the design contract is
+`prds/mockups/38-activity-feed-mock.html`.
+
+- **Full command is the source of truth; truncation is display-only** (`RunEvent.tsx`):
+  `toolSummary` returns the whole (possibly multi-line) Bash command — the earlier
+  `firstLine()` clamp destroyed lines 2+ everywhere. `CommandBlock` renders it on a code
+  surface with a `❯` prompt and clamps to 2 lines with a "Show full command" toggle. The
+  toggle appears from a CONTENT heuristic (command contains `\n` or > 160 chars), not
+  layout measurement — jsdom has no layout (`scrollHeight` is 0), so a measured-overflow
+  toggle would be untestable.
+- **In-house shell highlighter, no library, no `dangerouslySetInnerHTML`** (`highlightShell`
+  in `RunEvent.tsx`): a pure tokenizer returning `ReactNode[]` (command / flag / string /
+  operator / comment / arg spans). Tool commands are untrusted LLM output, so output stays
+  React elements — a command containing `<script>` renders inert. Best-effort accuracy: a
+  mis-classified token is cosmetic; text-content correctness is what tests pin.
+- **Syntax colors are semantic tokens aliasing the palette** (`index.css`,
+  `tailwind.config.js`): `--syn-cmd/-flag/-str/-op/-comment/-arg` + `--tool-rail`, each an
+  alias of an existing token (`--brand`, `--info`, `--ok`, `--brand-hover`, `--faint`,
+  `--fg`, `--edge`) — same pattern as `--queue-*`, so themes recolour automatically, no
+  hardcoded hex. Matching `token()` color entries in `tailwind.config.js` (file is `.js`,
+  not the PRD's draft `.ts`) make `text-syn-cmd` / `border-tool-rail` resolve to utilities.
+  Mission theme diverges only on `--syn-flag` → `--warn` and `--syn-op` → `--muted`
+  (mission's `--info`/`--brand-hover` both alias `--brand`, which would collapse the tones).
+- **Hierarchy is structural**: agent prose renders full-width (primary); consecutive tool
+  events sit in an indented rail (`border-l` + `pl-3`, subordinate). Tool name demotes to
+  11px uppercase `text-muted`; prose stays 14px `text-fg`. Per-tool icon map
+  (Bash/Read/Write/Edit/Grep/Glob/Task/Web*) replaces the shared `TerminalIcon`.
+- **Results are chips; errors are loud** (`ToolResultBody`): collapsed = inline pill
+  (`✗ error` / `✓ ok` for empty output / `✓ N lines`); expanded = bordered `<pre>`,
+  `max-h` scroll, focusable (`tabindex=0` + `role="group"` + `aria-label`). Collapsed
+  bodies stay MOUNTED but `hidden` so result text remains in the DOM for tests and pairing
+  assertions. Behavior change vs before: short results no longer render open by default,
+  so assertions that read result text now expand first. Errors keep auto-expand + danger
+  tint. The `[image omitted]` note renders as the first body line (excluded from the chip's
+  line count).
+- **Durations inline, never fabricated**: rendered `shrink-0` inline after the tool name in
+  a non-wrapping header row (can't float to its own line). Sub-100ms → "instant" — but this
+  substitution lives ONLY in `ToolUseRow`'s tool-duration path; shared `formatDuration`
+  (also used by RunView's header/terminal line) is untouched. Long-running tint `--warn`;
+  running = inline spinner + live elapsed.
+- **Agent collapse keyed by agent NAME, lifted to feed level** (`ActivityFeed.tsx`):
+  `groupByAgent` emits a new block whenever the speaker changes, so `lead→worker→lead`
+  yields two non-contiguous `lead` blocks; collapse is keyed by name so muting `lead` mutes
+  ALL its blocks. Chevron button (≥24px target, `aria-expanded`/`aria-controls`) hides each
+  block's body (prose + tools); collapsed header shows an italic hidden-content summary.
+  Per-run client state, not persisted; a new message from a collapsed agent does NOT
+  auto-expand it but still counts in the new-messages pill. Follow-scroll is preserved
+  across toggles WITHOUT modifying `useFollowScroll` (re-pinned around the height change).
+- **Status/meta has ONE owner** (`MetaLine` in `RunEvent.tsx`): the old feed-level
+  interception was removed; `MetaLine` renders status/meta as a full-width hairline-flanked
+  divider, two-tone key (mono `--fg` key + muted italic remainder) per the mock. Every
+  message kind has a defined home (prose full-width; tool use/result/thinking in the rail;
+  meta divider; error full-width danger, never collapsed; plan one-liner stays). Empty-text
+  messages render null (skipped by hidden-summary and rail grouping).
+- **Prose ⇄ command parity by construction** (`Markdown.tsx`): the `code` override routes
+  fences classed `language-(bash|sh|shell)` through the SAME `CommandBlock`/`highlightShell`
+  as tool commands (react-markdown v10 dropped the `inline` prop, so detection is by
+  `className`, not `inline`). `MarkdownCore` sanitizer policy is untouched — no rehype-raw,
+  no HTML pass-through. A benign `RunEvent` ↔ `Markdown` import cycle is accepted over
+  duplicating the code surface.
+
+## 170. Feed security hardening (untrusted-command render path)
+
+Serves the primary safety posture: tool commands and results are attacker-influenced LLM
+output rendered verbatim, so the render path is bounded against DoS. All in
+`prds/38-activity-feed-redesign.md`.
+
+- **Tokenizer fan-out cap** (`highlightShell`, `RunEvent.tsx`): stops at
+  `HIGHLIGHT_MAX_CHARS` (8 KB) or `HIGHLIGHT_MAX_NODES` (2000) and appends the exact
+  remainder as ONE plain text node — a pathological command can't fan out into unbounded
+  React elements. Correctness preserved (no bytes dropped); only per-node highlighting is
+  capped.
+- **Linear trailing-newline strip** (`stripTrailingNewlines`, `Markdown.tsx`): replaced a
+  `/\n+$/` regex measured at catastrophic backtracking (~O(n²), ~6s at 100 KB) with a
+  linear scan, applied before a fence reaches `CommandBlock`.
+- **Announcement length cap** (`ActivityFeed.tsx`): the sr-only live-region text is
+  truncated to `ANNOUNCE_MAX` (200 chars) so a long agent line can't flood assistive tech
+  with a multi-KB utterance.
+
+## 171. Feed accessibility (WCAG pass)
+
+Serves human Feature #11's usability intent, extended to a11y. See
+`prds/38-activity-feed-redesign.md` (M4).
+
+- **Scoped live region** (`ActivityFeed.tsx`): the scroll container keeps `role="log"` but
+  is forced `aria-live="off"` — `role="log"` carries an implicit `aria-live="polite"`, so
+  merely dropping the attribute would change nothing and screen readers would hear every
+  tool frame. Announcements route EXCLUSIVELY through one `sr-only` `aria-live="polite"`
+  `aria-atomic` region fed only meaningful transitions (agent started/finished/handoff,
+  plan submitted, error, run state change).
+- **Live-region coalescing is accepted as designed**: one announcement per update — the
+  last meaningful message wins (error beats plan by arriving last; terminal "Run finished"
+  beats "agent finished").
+- **`--faint` banned for interactive/essential text**: expander/chip/collapse-summary/
+  duration labels use `--muted` (~6.9:1); `--faint` stays legal only for decorative/
+  redundant text (timestamps with a `title`, icons beside labels). Conscious exception: the
+  "Activity" section heading stays `text-faint` (app-wide idiom, redundant with the log's
+  `aria-label`) — the only in-feed faint essential-ish text.
+- **Reduced-motion guard is UNLAYERED** in `index.css`: a plain `@media
+  (prefers-reduced-motion: reduce)` block neutralizing Tailwind's `animate-spin` /
+  `animate-pulse`. It wins by source order (after `@tailwind utilities`); the PRD's
+  "@layer base" wording was wrong in practice — a `@layer base` placement would lose the
+  cascade. Components use only these built-in animations, so no per-component CSS is touched.
+- Result `<pre>` bodies are keyboard-focusable; expander/chevron hit areas are ≥24px
+  (WCAG 2.5.8); the active/idle chip gains pulsing-dot emphasis with its transition
+  announced through the live region.
+
+## 172. PRD #38 scope boundaries, mock-as-contract & recorded deferrals
+
+See `prds/38-activity-feed-redesign.md` (Out of Scope, Decisions 11/13).
+
+- **The mock is the contract, with named illustrative exceptions** (M6, web-ux browser
+  pass): structure/color/interaction are contractual; literal string formatting follows the
+  code — duration strings follow `formatDuration`'s zero-padded output ("40m 03s"), not the
+  mock's illustrative "40m 3s"; the built-in `animate-pulse` is sanctioned.
+- **Deliberately skipped polish** (recorded, not regressions): non-Bash args wrap with a
+  "more" affordance instead of the mock's ellipsis (Decision 13 beats the mock);
+  image-result chip line count excludes the `[image omitted]` note; the
+  inline-`❯`-when-clamped idea would deviate from the approved mock (post-PRD user call, not
+  implemented).
+- **Out of scope** (unchanged from before): message persistence / protocol / agent /
+  worker; virtualized rendering for very long feeds; multi-language highlighting (bash-only
+  by design); persisting agent-collapse state across reloads; in-feed search/filter.
+
+## 173. Worker ↔ run concurrency model — ADR-42 (decided; implementation via PRD #42)
+
+See `adr/0042-worker-run-concurrency.md` (the full ADR: research context, options, residuals)
+and `prds/42-worker-run-concurrency.md` (implementation design + milestones).
+
+- **Decision**: a worker may execute multiple runs concurrently, bounded by a worker-side
+  slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — default behavior unchanged);
+  the cap is advertised at registration for observability but never enforced server-side.
+  The server deliberately does NOT enforce 1:1 worker:run (a DB constraint there would
+  block PRD #39's chat lane and encode scaling policy in the schema).
+- **§878's "one run at a time" becomes "bounded by the cap, default 1"** once PRD #42
+  lands; §669's one-*worker*-per-user invariant is untouched.
+- **Cap>1 is an informed opt-in with two accepted intra-user residuals** (sibling `/proc`
+  PAT exposure during push windows; Bash cross-run worktree writes — details in the ADR);
+  the real fix is the k8s uid-split/container-per-run era (§168), where each
+  operator-spawned pod is a single-slot worker and this design composes unchanged.
+
 # PRD #37 — Per-run agent selection (repo `.claude/agents/` at the plan gate)
 
 Serves human: Feature #16 established that a repo may carry `.claude/` content the
@@ -4453,7 +4637,7 @@ fallback; Slack source choice), recorded there pending user ratification. Migrat
 `00052` (nullable `runs.agent_source`/`agent_exclusions`/`repo_agents`; renumber at
 land). PRD `prds/37-run-agent-selection.md` is the full decision log.
 
-## 168. Repo agents are worker-parsed, never SDK-loaded; capped worker-side AND API-validated
+## 174. Repo agents are worker-parsed, never SDK-loaded; capped worker-side AND API-validated
 
 - **`settingSources` stays `[]`; the worker parses `.claude/agents/*.md` itself**
   (`agent/src/repoagents.ts`, mirroring `repo-skills.ts`) and feeds each as an
@@ -4479,7 +4663,7 @@ land). PRD `prds/37-run-agent-selection.md` is the full decision log.
   kebab-case name rule before persisting. Detection has no side effects until a selection
   activates it.
 
-## 169. Repo-declared `tools`/`model` are honored; denial is narrow and structural; residuals named
+## 175. Repo-declared `tools`/`model` are honored; denial is narrow and structural; residuals named
 
 Decision 2 (user, 2026-07-10 — the review-round tightening was reverted after evidence).
 
@@ -4511,7 +4695,7 @@ Decision 2 (user, 2026-07-10 — the review-round tightening was reverted after 
   (worker-held). The structural close — agent container on an `internal` network + egress
   allowlist (`docs/proc-hardening.md`) — is a follow-up PRD, out of scope here.
 
-## 170. Either/or source, gate-boundary re-assembly, structured wire, trusted-source fallback
+## 176. Either/or source, gate-boundary re-assembly, structured wire, trusted-source fallback
 
 - **One source per run, chips exclude within it, ≥1 subagent survives** (Decision 4,
   user): UI-enforced and server-validated (`agent_selection.go` `validateSelection`); no
@@ -4541,7 +4725,7 @@ Decision 2 (user, 2026-07-10 — the review-round tightening was reverted after 
   must never silently escalate to the untrusted roster. Exclusions are re-clamped
   worker-side (the API check is not trusted alone).
 
-## 171. Roster snapshot + selection travel on state reports; persisted on the run; autopilot path
+## 177. Roster snapshot + selection travel on state reports; persisted on the run; autopilot path
 
 - **The detected roster rides the first `running` report** (Decision 6): `repo_agents`
   (names/descriptions only — bodies stay worker-side) is a `*[]RepoAgent` pointer so the
@@ -4559,7 +4743,7 @@ Decision 2 (user, 2026-07-10 — the review-round tightening was reverted after 
   (no already-approved skip), so the selection is re-collected at the re-entered gate and
   the columns are overwritten by the latest approval — no claim-payload re-delivery.
 
-## 172. Web plan gate, the M4-fix own-roster single source of truth, visual parity
+## 178. Web plan gate, the M4-fix own-roster single source of truth, visual parity
 
 - **PlanPanel** (`web/src/pages/RunView.tsx`) grows the "Agents for this run" section per
   the approved mock (`prds/mockups/37-agent-picker-mock.html`): two source radio cards
@@ -4583,7 +4767,7 @@ Decision 2 (user, 2026-07-10 — the review-round tightening was reverted after 
   fetch + lead filter are deleted — so a chip can never name a template approve rejects,
   the count is exact, and `AgentRosterSummary` lists real own names for an own-source run.
 
-## 173. Slack approval surfaces the source choice (Decision 10)
+## 179. Slack approval surfaces the source choice (Decision 10)
 
 - PRD #25's Slack approve button submitted an empty body, which without this would
   resolve to the run default (repo when detected) — running the untrusted roster with no
@@ -4596,9 +4780,9 @@ Decision 2 (user, 2026-07-10 — the review-round tightening was reverted after 
   `submitApproval` both surfaces enter through; legacy pre-deploy single-button messages →
   `own`. Repo agent *names* (not descriptions) now egress to Slack — bounded, validated,
   noted in PRD #25's content-minimization posture. This is a UX opt-in, not the security
-  fix (that is the trusted-source fallback, §170).
+  fix (that is the trusted-source fallback, §176).
 
-## 174. As-built validation — e2e detect→choose→apply + the resume-honors-agents capstone (M6)
+## 180. As-built validation — e2e detect→choose→apply + the resume-honors-agents capstone (M6)
 
 Serves human: the success criteria are demonstrable, not just asserted; and the one claim
 no fake can make is proven empirically.
