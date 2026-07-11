@@ -700,6 +700,8 @@ export const mockRuns: Run[] = [
     issue_title: "Board card badges for MR pipeline status",
     issue_description: "See prds/12-board-run-lifecycle.md.",
     kind: "issue",
+    title: null,
+    resume_of_run_id: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
@@ -727,6 +729,8 @@ export const mockRuns: Run[] = [
     issue_title: "Worker heartbeat metrics endpoint",
     issue_description: "Expose worker heartbeat freshness as a metrics endpoint. See prds/13-worker-metrics.md.",
     kind: "issue",
+    title: null,
+    resume_of_run_id: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
@@ -756,6 +760,8 @@ export const mockRuns: Run[] = [
     issue_title: "Plan-approval notifications via email",
     issue_description: "Notify a run's owner when their plan is parked awaiting approval. See prds/9-approval-notify.md.",
     kind: "issue",
+    title: null,
+    resume_of_run_id: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
@@ -783,6 +789,8 @@ export const mockRuns: Run[] = [
     issue_title: "Run view: fold tool results under their calls",
     issue_description: "See prds/11-run-view-ux.md.",
     kind: "issue",
+    title: null,
+    resume_of_run_id: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
@@ -813,6 +821,8 @@ export const mockRuns: Run[] = [
     issue_title: "Retry the flaky worker heartbeat probe",
     issue_description: "See prds/12-board-run-lifecycle.md.",
     kind: "issue",
+    title: null,
+    resume_of_run_id: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
@@ -840,6 +850,8 @@ export const mockRuns: Run[] = [
     issue_title: "Postgres connection pool tuning",
     issue_description: "See prds/3-pool-tuning.md.",
     kind: "issue",
+    title: null,
+    resume_of_run_id: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
@@ -867,6 +879,8 @@ export const mockRuns: Run[] = [
     issue_title: "Healthcheck should ping the DB pool",
     issue_description: "See prds/2-health.md.",
     kind: "issue",
+    title: null,
+    resume_of_run_id: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
@@ -908,7 +922,7 @@ export function runListItem(r: Run, ownerEmail?: string): RunListItem {
   const worker = mockWorkers.find((w) => w.id === r.worker_id);
   return {
     ...r,
-    repo_path: repo?.path_with_namespace ?? r.repo_id,
+    repo_path: repo?.path_with_namespace ?? r.repo_id ?? "",
     worker_name: worker?.name ?? null,
     ...(ownerEmail ? { owner_email: ownerEmail } : {}),
   };
@@ -1002,11 +1016,13 @@ const CHAT_3 = "chat-uzi-3"; // ended, offers Continue
 function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["status"] }): Run {
   const { title, ...rest } = over;
   return {
-    repo_id: "",
+    repo_id: null, // a chat run has no repo (runDTO repo_id is nullable, PRD #39)
     kind: "chat",
     issue_iid: null,
     issue_title: title, // conversation title fallback (useRunStream reads the run)
     issue_description: "",
+    title, // the runDTO's chat title
+    resume_of_run_id: null,
     requeue_count: 0,
     iteration_count: 0,
     auto_approve: false,
@@ -1065,10 +1081,7 @@ export const mockProposals: IssueProposal[] = [
       "Surface per-worker heartbeat freshness, active-run count, and template drift on one page, reading the existing /api/metrics/workers data. Idea sketched at https://example.com/metrics-notes — worth a quick spike first.",
     labels: ["PRD", "enhancement"],
     status: "pending",
-    created_issue_iid: null,
-    created_issue_url: null,
     created_at: minsAgo(3),
-    resolved_at: null,
   },
 ];
 

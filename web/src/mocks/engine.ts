@@ -240,10 +240,7 @@ export function scheduleChatReply(runId: string, userText: string) {
           description: `Draft from our conversation:\n\n> ${userText}\n\nRefine before creating if needed.`,
           labels: ["PRD"],
           status: "pending",
-          created_issue_iid: null,
-          created_issue_url: null,
           created_at: new Date().toISOString(),
-          resolved_at: null,
         };
         putProposal(proposal);
         appendMessage(runId, "text", "chat", {
