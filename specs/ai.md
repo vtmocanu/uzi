@@ -4438,3 +4438,189 @@ against real Slack (unit tests fake the dialer; e2e stubs Slack entirely).
 - **Open follow-up**: the manager trusts slack-go's RunContext to notice a dead link; a
   zombie connection (e.g. after laptop sleep) can leave the chip `connected` with no
   socket — consider a liveness probe (last-hello age) surfaced on the admin DTO.
+
+# PRD #37 — Per-run agent selection (repo `.claude/agents/` at the plan gate)
+
+Serves human: Feature #16 established that a repo may carry `.claude/` content the
+worker detects (skills, per-repo opt-in); this extends that to agent definitions, so a
+repo's own curated roster can run instead of the user's templates (Feature #3/#17/#18).
+Mostly AI-designed; the load-bearing user decisions (all 2026-07-10) are Decision 2
+(honor repo-declared tools/model, revert the review-round tightening), Decision 4
+(either/or source, no mixing), Decision 5 (malformed selection falls back to `own`,
+lead-only stays approvable), and Decision 10 (Slack two-button source picker) — so
+`specs/human.md` gains one requirement (choose agents at the gate; repo default; own
+fallback; Slack source choice), recorded there pending user ratification. Migration
+`00052` (nullable `runs.agent_source`/`agent_exclusions`/`repo_agents`; renumber at
+land). PRD `prds/37-run-agent-selection.md` is the full decision log.
+
+## 168. Repo agents are worker-parsed, never SDK-loaded; capped worker-side AND API-validated
+
+- **`settingSources` stays `[]`; the worker parses `.claude/agents/*.md` itself**
+  (`agent/src/repoagents.ts`, mirroring `repo-skills.ts`) and feeds each as an
+  `AgentTemplate` through the same programmatic `query({ options: { agents } })` path
+  (`agents.ts`). Repo hooks/settings/commands never load. This keeps the guardrail
+  *mechanism* (§ARCHITECTURE guardrail layer 4) intact while adding a deliberate,
+  user-visible opt-in for agent *definitions* only — Decision 1.
+- **`lead` is pinned and repo subagents are untrusted in its eyes** (Decision 3). The
+  orchestrator always comes from the claim payload (builtins-only, PRD #17); repo agents
+  and exclusions apply to subagents only, and a repo file named `lead` is just another
+  subagent candidate — routed through `subagentsFromTemplates`/`selectSubagents`, never
+  `assembleAgents`'s `LEAD_NAME_RE` branch (which would hoist a repo `lead.md` onto the
+  main thread). Because choosing repo agents replaces *all* subagents — reviewer/auditor
+  included — with attacker-authorable ones: (a) the lead system prompt gains the
+  `REPO_SUBAGENT_UNTRUSTED_APPEND` passage (only when repo source is active) framing
+  repo-subagent output as unverified input, not uzi's review; (b) the run view and the MR
+  description mark the run as repo-agent-sourced so the human reviewer knows.
+- **Detection is capped worker-side AND re-validated API-side** (Decision 7). Worker caps
+  mirror skills: ≤16 files, 64 KiB each, over-cap dropped with a feed note, parse-failed
+  skipped (never a run failure). The API does not trust the worker payload: the state
+  endpoint (`workersvc` `runningStateParams`/`validateRepoAgents`) re-enforces roster
+  length ≤16, per-item name/description caps, control-char + Cf rejection, and the
+  kebab-case name rule before persisting. Detection has no side effects until a selection
+  activates it.
+
+## 169. Repo-declared `tools`/`model` are honored; denial is narrow and structural; residuals named
+
+Decision 2 (user, 2026-07-10 — the review-round tightening was reverted after evidence).
+
+- **Divergence from the repo-skills strip is conscious**: `repo-skills.ts` drops every
+  frontmatter key except name+description ("the security point"); an agent without its
+  tools is not that agent, so repo agents keep `tools`/`model`. Documented as a decision,
+  not an inconsistency.
+- **Denial is structural, not by parser strip**: repo subagents can never get `Agent`
+  (nested spawning) or the async-deferral tools — `agents.ts` sets
+  `disallowedTools:[Agent]` on every subagent regardless of declared tools,
+  `sdk-executor.ts` denies the deferral tools globally, and the CLI applies
+  `disallowedTools` before the allowlist so it wins even when a repo agent omits `tools:`
+  entirely (fact-checker, from the shipped binary). The `repoagents.ts` denylist matches
+  the *canonical* tool name (CLI rewrites `Task → Agent`) and is layer-1 DiD only.
+- **`WebFetch`/`WebSearch` are NOT denied** (the review proposed it; user reverted): a
+  repo agent that declares `Bash` (as coder roles must) exfiltrates the OAuth token via
+  `curl`/`node -e` regardless, so denying first-class network tools stops nothing an
+  attacker would do while breaking honest agents (6 of uzi's own 8 dev agents declare
+  `WebFetch`; `fact-checker` needs `WebSearch`). SDK tool resolution is case-sensitive
+  and fail-closed (`tools:[webfetch]` grants nothing; inherit-all only when omitted/`*`).
+- **`model` is honored** for any value passing `ValidateModel` semantics (single token,
+  no control chars, length-bounded); un-model-like strings inherit the run default with a
+  `model_ignored` note that does not echo the rejected string. The earlier alias-only
+  clamp was dropped with the network denylist.
+- **Named residuals, accepted for this PRD**: the agent subprocess env holds the
+  Anthropic OAuth token (`sdk-env.ts` sets `CLAUDE_CODE_OAUTH_TOKEN`), so a `Bash`-capable
+  repo agent can exfiltrate it (egress residual); an honored expensive `model` is a
+  cost-abuse residual. "The agent never sees credentials" is true only for the forge PAT
+  (worker-held). The structural close — agent container on an `internal` network + egress
+  allowlist (`docs/proc-hardening.md`) — is a follow-up PRD, out of scope here.
+
+## 170. Either/or source, gate-boundary re-assembly, structured wire, trusted-source fallback
+
+- **One source per run, chips exclude within it, ≥1 subagent survives** (Decision 4,
+  user): UI-enforced and server-validated (`agent_selection.go` `validateSelection`); no
+  name-collision rules. An empty `own` roster is legal (lead-only run stays approvable —
+  Decision 5); only `source="repo"` requires a non-empty detected roster.
+- **The selection applies at the gate boundary** (Decision 5). The plan turn runs with
+  the claim (own) subagents; only once the plan is approved does the roster matter. The
+  executor builds `baseOptions` once and every turn reuses it, and the plan+implement
+  turns share one resumed SDK session — so between the gate verdict and the implement loop
+  (`sdk-executor.ts:331-357`) the executor rebuilds the agents map from the chosen source,
+  rebuilds the `PreToolUse` Agent-guard hook (its `allowSet` is frozen at construction),
+  and recomputes the implement-prompt roster names (`buildImplementPrompt`,
+  `buildLeadSystemPrompt` genericized from the old hardcoded "coder and reviewer").
+  Caveat stated in-panel ("Agent choice locks in on approval") + the read-only
+  post-approval view: the human approves a plan whose delegation targets may then swap.
+- **Structured wire, server writes the canonical body** (M2, better than the original
+  PRD): the client sends `selection:{source,exclusions}` alongside `{kind}`; the server
+  validates against the run's real roster and writes its own canonical JSON into the
+  `approve_plan` input body. Never hand unvalidated client text to the process that builds
+  the agent map. `approve_plan` is live-poller-only (a run is only awaiting approval
+  because a live worker put it there); only cancel/reject have a server-side no-poller
+  branch.
+- **Malformed/absent selection resolves toward the *trusted* source** (Decision 5 +
+  auditor): the worker's `parseAgentSelection`/`resolveAgentSelection` is discriminated —
+  absent/blank ⇒ the run default (repo when detected, else own / autopilot's resolved
+  default); present-but-invalid ⇒ forced `own` + a feed note, never `repo`. A garbled body
+  must never silently escalate to the untrusted roster. Exclusions are re-clamped
+  worker-side (the API check is not trusted alone).
+
+## 171. Roster snapshot + selection travel on state reports; persisted on the run; autopilot path
+
+- **The detected roster rides the first `running` report** (Decision 6): `repo_agents`
+  (names/descriptions only — bodies stay worker-side) is a `*[]RepoAgent` pointer so the
+  three states differ — absent = this report says nothing; `[]` = detection ran, found
+  none (repo card inert, distinct from NULL = pre-feature/not-yet-reported, preserved even
+  across a NULL-param heartbeat); non-empty = the roster. Every run records what was
+  detected, gate or no gate.
+- **Autopilot self-approves and reports its resolved default** on that same report
+  (`runner.ts`, `agent_selection` = source + empty exclusions), emits a status
+  run-message, and lands in the same `runs` columns as a human-gated selection (which the
+  `SubmitInput` approve branch persists). Decision 8: the selection is persisted (source,
+  exclusions, roster snapshot) so the run view/board render which agents ran.
+- **Reproducibility is partial, stated**: prompt bodies are NOT persisted (a rerun
+  re-reads the repo, possibly at a different commit); requeue/resume re-enters plan→gate
+  (no already-approved skip), so the selection is re-collected at the re-entered gate and
+  the columns are overwritten by the latest approval — no claim-payload re-delivery.
+
+## 172. Web plan gate, the M4-fix own-roster single source of truth, visual parity
+
+- **PlanPanel** (`web/src/pages/RunView.tsx`) grows the "Agents for this run" section per
+  the approved mock (`prds/mockups/37-agent-picker-mock.html`): two source radio cards
+  (detected/none pills), per-agent exclusion chips, a pinned `lead` summary line, a live
+  approve-button label; States A (repo default) and B (own default, repo card inert).
+  Approve posts the structured `selection`. Repo agent names/descriptions render as plain
+  JSX text — never `<Markdown>` (Decision 9 / F4: an attacker `http://…` in a description
+  must not become a clickable link inside the approval dialog; vitest asserts inert).
+- **Visual parity is a deliverable** (Decision 9): M5 drove a real browser against the
+  mock (States A/B, chips, tokens, pinned lead line, live label) and passed 1:1; one a11y
+  focus-ring should-fix folded into M4-fix.
+- **M4-fix — the own roster is the run's, not a separate fetch** (design-review MAJOR):
+  the picker's "My agent templates" chips originally came from `listAgentTemplates` (the
+  user's *visible* templates), but a `source="own"` run runs
+  `ListClaimAgentTemplates` (visible AND allocation-enabled AND not shadowed — a subset),
+  which `validateSelection` also uses. Excluding a visible-but-undelivered chip 400'd on
+  approve, and the count mislabeled for any owner with a disabled/shadowed template. Fix:
+  the run-detail DTO gains `own_agents` (name+description, lead stripped), resolved
+  server-side on `GetRun` from the SAME `ListClaimAgentTemplates`
+  (`workersvc.Service.OwnAgentRoster`); the picker reads `run.own_agents` and the client
+  fetch + lead filter are deleted — so a chip can never name a template approve rejects,
+  the count is exact, and `AgentRosterSummary` lists real own names for an own-source run.
+
+## 173. Slack approval surfaces the source choice (Decision 10)
+
+- PRD #25's Slack approve button submitted an empty body, which without this would
+  resolve to the run default (repo when detected) — running the untrusted roster with no
+  user-visible opt-in. The Slack gate renders **two Approve buttons** when a roster is
+  detected — `[Approve · repo agents (N)]` and `[Approve · my templates]` — omitting the
+  repo button when none was detected; each carries the existing confirm dialog as the
+  opt-in record. Source-choice-only: per-agent exclusions stay in the web UI ("Open in
+  uzi" is the escape hatch). A closed set of `action_id`s maps to the source server-side
+  (no client-supplied source string trusted); all validation stays in the one
+  `submitApproval` both surfaces enter through; legacy pre-deploy single-button messages →
+  `own`. Repo agent *names* (not descriptions) now egress to Slack — bounded, validated,
+  noted in PRD #25's content-minimization posture. This is a UX opt-in, not the security
+  fix (that is the trusted-source fallback, §170).
+
+## 174. As-built validation — e2e detect→choose→apply + the resume-honors-agents capstone (M6)
+
+Serves human: the success criteria are demonstrable, not just asserted; and the one claim
+no fake can make is proven empirically.
+
+- **e2e** (`e2e/run-e2e.sh`, stub executor): the seeded repo ships a `.claude/agents/`
+  roster, so a run reaching the gate reports `repo_agents` on the run DTO (detection →
+  persistence → exposure, all executor-independent); the harness approves with a
+  structured `selection` (repo source, one agent excluded) and asserts the run persists
+  `agent_source`/`agent_exclusions`. This exercises the detect→choose→apply wire on dummy
+  creds with no live session. A repo *without* `.claude/agents/` is covered by the
+  existing default path (own templates, repo card inert).
+- **The must-verify-live capstone** (`agent/test/sdk-resume-honors-agents.test.ts`): the
+  gate-boundary rebuild hands the IMPLEMENT turn a new agents map + repo-sourced lead
+  prompt, and that turn RESUMES the plan turn's session. No fake-`queryFn` test can prove
+  the *real SDK transmits* the swapped config on resume (the worry being a resume guard
+  that reuses the session's original config). This test drives the REAL SDK `query()` with
+  a shimmed `spawnClaudeCodeProcess` (no `claude` binary, no network): the fake CLI plays
+  the `initialize` control_request, the SDK writes its config back to stdin, and the test
+  asserts that — with `--resume` on the command line — the transmitted initialize still
+  carries exactly the selected repo subagents (excluded one absent) and the
+  untrusted-review passage. Empirical confirmation of the fact-checker's static finding
+  (`systemPrompt`/`agents`/`hooks` re-apply every turn; `resume` is a CLI flag that gates
+  none of them). The optional live capstone (`UZI_E2E_EXECUTOR=sdk` — a repo subagent
+  actually invoked, an excluded one denied) remains user-gated per the
+  testing-credentials policy and is never a required gate.

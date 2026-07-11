@@ -76,5 +76,9 @@ Never paste a credential into a description or prompt: uzi rejects anything
 that looks like a real Anthropic token. Credentials belong in
 [Anthropic token](./anthropic-token.md).
 
+A repo can ship its own agent roster in `.claude/agents/`; you can run those
+instead of your templates, chosen per run at the plan gate — see
+[Repo agents](./repo-agents.md).
+
 See [ARCHITECTURE.md](../ARCHITECTURE.md#agent-templates) for the renderer,
 scope/allocation model, claim filtering, and API surface.

@@ -416,6 +416,15 @@ printf '# repo\n\nSeeded by the uzi M6 E2E harness.\n' > "$seedwc/README.md"
 mkdir -p "$seedwc/.claude/skills/e2e-repo-skill"
 printf -- '---\nname: e2e-repo-skill\ndescription: A repo-borne skill for the M6 opt-in E2E.\nallowed-tools: Bash, Write\n---\n\n# E2E repo skill\n\nProves the repo-skill opt-in path end to end.\n' \
   > "$seedwc/.claude/skills/e2e-repo-skill/SKILL.md"
+# A repo-borne agent roster for the PRD #37 detect→choose→apply path. The worker
+# parses these after clone (settingSources stays []) and reports them on the run;
+# the gate then defaults to the repo source. Two files so the harness can approve
+# with the repo source while EXCLUDING one — proving choose+apply end to end.
+mkdir -p "$seedwc/.claude/agents"
+printf -- '---\nname: repo-coder\ndescription: Repo-defined coder for the M6 E2E.\ntools: Read, Edit, Bash\n---\n\nYou implement changes for this repo.\n' \
+  > "$seedwc/.claude/agents/repo-coder.md"
+printf -- '---\nname: repo-reviewer\ndescription: Repo-defined reviewer for the M6 E2E.\ntools: Read, Grep\n---\n\nYou review changes for this repo.\n' \
+  > "$seedwc/.claude/agents/repo-reviewer.md"
 git -C "$seedwc" add README.md .claude
 git -C "$seedwc" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit"
 git -C "$seedwc" push -q origin main
@@ -572,8 +581,16 @@ RUN="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID}" | jq -r '.run.i
 pass "issue #$IID created; run $RUN queued"
 
 wait_status "$RUN" awaiting_approval
-[ "$(apiget "/api/runs/$RUN" | jq -r '.run.plan_md // empty')" != "" ] || fail "awaiting_approval carried no plan"
+GATE="$(apiget "/api/runs/$RUN")"
+[ "$(echo "$GATE" | jq -r '.run.plan_md // empty')" != "" ] || fail "awaiting_approval carried no plan"
 pass "run reached the plan gate (awaiting_approval) with a plan"
+
+# PRD #37 detect: the worker parsed the repo's .claude/agents/ after clone and
+# reported the roster on the run (settingSources stays []; detection is
+# executor-independent, so the stub path exercises it too).
+echo "$GATE" | jq -e '.run.repo_agents | (type == "array") and (map(.name) | sort == ["repo-coder","repo-reviewer"])' >/dev/null \
+  || fail "run did not report the seeded repo agents (got: $(echo "$GATE" | jq -c '.run.repo_agents'))"
+pass "PRD #37: run detected + reported the repo's .claude/agents/ roster (repo-coder, repo-reviewer)"
 
 say "restart-resilience: down/up (keep volumes) while parked at the gate"
 "${COMPOSE[@]}" down                       # keeps the named volumes (pgdata, agentdata)
@@ -588,8 +605,12 @@ pass "stack restarted; worker back online"
 wait_status "$RUN" awaiting_approval
 pass "orphaned run was re-queued, re-claimed, and is back at the gate"
 
-say "approve the plan and let the run finish"
-apipost "/api/runs/$RUN/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+say "approve the plan with a repo-source selection (choose), excluding repo-reviewer"
+# PRD #37 choose: approve with the repo source and one agent excluded. The server
+# validates the selection against the run's real roster and writes the canonical
+# body the worker reads; a bad selection would 400 here.
+apipost "/api/runs/$RUN/inputs" \
+  '{"kind":"approve_plan","body":"","selection":{"source":"repo","exclusions":["repo-reviewer"]}}' >/dev/null
 wait_status "$RUN" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 pass "run completed"
 
@@ -601,6 +622,14 @@ FINAL="$(apiget "/api/runs/$RUN")"
 MR_IID="$(echo "$FINAL" | jq -r '.run.mr_iid')"
 { [ "$MR_IID" != null ] && [ "$MR_IID" -gt 0 ]; } || fail "run.mr_iid not set (got $MR_IID)"
 pass "run row: completed, branch=agent/issue-$IID, mr_iid=$MR_IID"
+
+# PRD #37 apply: the approved selection is persisted on the run — repo source, with
+# repo-reviewer excluded — so the run view/board render which agents ran.
+[ "$(echo "$FINAL" | jq -r '.run.agent_source')" = repo ] \
+  || fail "run.agent_source is not 'repo' (got $(echo "$FINAL" | jq -c '.run.agent_source'))"
+echo "$FINAL" | jq -e '.run.agent_exclusions == ["repo-reviewer"]' >/dev/null \
+  || fail "run.agent_exclusions did not persist the choice (got: $(echo "$FINAL" | jq -c '.run.agent_exclusions'))"
+pass "PRD #37: run persisted agent_source=repo + agent_exclusions=[repo-reviewer] (detect→choose→apply)"
 
 git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID" \
   || fail "branch agent/issue-$IID was not pushed to the remote"
@@ -911,6 +940,16 @@ apiget "/api/runs/$RUN_AP/messages" \
 MR_AP="$(echo "$AP" | jq -r '.run.mr_iid')"
 { [ "$MR_AP" != null ] && [ "$MR_AP" -gt 0 ]; } || fail "autopilot run opened no MR (got $MR_AP)"
 pass "run completed unattended (never parked at the gate), plan recorded, MR !$MR_AP opened"
+
+# PRD #37 (autopilot variant): an autopilot run resolves its roster with NO human at
+# the gate and RECORDS it (Decision 6 — the resolved selection rides the running
+# state report, not an approve input). The seed repo ships .claude/agents/, so the
+# resolved default is the repo source with no exclusions.
+[ "$(echo "$AP" | jq -r '.run.agent_source')" = repo ] \
+  || fail "autopilot run did not record a resolved agent_source (got $(echo "$AP" | jq -c '.run.agent_source'))"
+echo "$AP" | jq -e '.run.agent_exclusions == []' >/dev/null \
+  || fail "autopilot run's resolved exclusions should be [] (got: $(echo "$AP" | jq -c '.run.agent_exclusions'))"
+pass "PRD #37: autopilot run recorded its resolved roster (agent_source=repo, no exclusions) with no human interaction"
 
 wait_notes "$IID_AP" 1 40
 notes_text "$IID_AP" | grep -qF "opened a merge request" || fail "expected the success comment with the MR link"
