@@ -243,6 +243,19 @@ Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wra
 - UI shows an unlocked/locked vault status; when locked (e.g. after a deploy), runs queue as "waiting for vault unlock" and a password prompt unlocks without full re-login.
 - Forgotten password ⇒ vault contents unrecoverable by design; user re-enters tokens.
 
+## Feature #37 — Per-run agent selection: repo `.claude/agents` detection with plan-gate choice
+
+Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/37-run-agent-selection.md`.
+
+- At the plan-approval gate, the user chooses which agents the run uses: the repo's own agents (detected from `.claude/agents/`) or the user's uzi templates. [user 2026-07-10]
+- Show whether repo agents were detected and which ones. [user 2026-07-10]
+- Default to the detected repo agents; if the user does not want them, they can choose their own templates instead. [user 2026-07-10]
+- Repo agents run with the tools and model their files declare (honored as they would be under Claude Code), still subject to uzi's guardrails. [user 2026-07-10; a review-round proposal to deny WebFetch/WebSearch and clamp the model to aliases was rejected by the user the same day — `Agent`/nested-spawn and the async-deferral tools stay denied]
+- Either/or source with per-agent exclusions; no mixing the two sources in one run. [user 2026-07-10]
+- Autopilot runs apply the default automatically (repo agents if detected, else the user's templates) and record which roster they used, with no human interaction. [user 2026-07-10]
+- The Slack plan-approval gate offers the same source choice (two Approve buttons: repo agents / my templates); excluding individual agents is done in the web UI. [user 2026-07-10]
+- The shipped picker is validated visually against the approved mock (`prds/mockups/37-agent-picker-mock.html`). [user 2026-07-10]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
