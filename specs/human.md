@@ -243,6 +243,21 @@ Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wra
 - UI shows an unlocked/locked vault status; when locked (e.g. after a deploy), runs queue as "waiting for vault unlock" and a password prompt unlocks without full re-login.
 - Forgotten password ⇒ vault contents unrecoverable by design; user re-enters tokens.
 
+## Feature #39 — In-app uzi chat agent
+
+Tracked as GitLab issue vtmocanu/uzi#39; PRD at `prds/39-chat-agent.md`.
+
+- A chat page in the uzi web UI to talk to uzi: ask about its capabilities and
+  implementations, have it investigate/debug your runs, propose improvements.
+- Runs on the user's own Anthropic token, executed on the user's existing worker
+  (the worker is invisible to the user; an honest "no worker connected" state when none is up).
+- The agent knows uzi's own code: baked into the worker image at build time
+  (no git clone), matching the deployed version.
+- Can create GitLab issues on request via the user's bot credentials, but only
+  after the user confirms a proposal card in the UI (the agent drafts; the click files).
+- Must work on docker-compose now and identically on the later k8s worker phase
+  (targets the deployment-agnostic claim/poll protocol). [user, 2026-07-10, approved 2026-07-11]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
