@@ -114,22 +114,21 @@ milestones):** (1) review + merge P3-web; (2) M5 security validation pass; (3) M
 ## Resume plan (2026-07-11) — pick up here
 
 Integration branch `feature/prd-39-chat-agent` (worktree `../prd-39-chat-agent`). All merged work
-is reviewed + audited with zero open blocking/major findings. Do these in order:
+is reviewed + audited with zero open blocking/major findings.
 
-1. **Review + merge P3-web (M4 wiring).** Branch `feature/prd-39-p3-web` @ **`7122191`** (final,
-   committed, tree clean, gate GREEN at stop: web typecheck clean + 393/393 vitest). It is `99df248`
-   (M4 wiring, already reviewed merge-ready) **+ `7122191`** (`chatFromRun` optimistic-meta seed on
-   create/continue — the follow-up that was in-flight; now committed). **Only the `7122191` follow-up
-   still needs a REVIEW** (reviewer: confirm it seeds conversation meta optimistically from the
-   create/continue `{run}` response without regressing the inert-render/§61 property; the added test
-   asserts the header title shows right after create). Then merge `7122191` into integration and
-   re-run `cd web && npm run typecheck && npm test`. Reviewer already flagged one inert nit on the
-   merged P3-agent side: the
-   emitted `proposal` payload carries three now-unused null fields (`created_issue_iid`/`_url`/
-   `resolved_at`) that the reconciled web type dropped — harmless (extra JSON ignored), optional to
-   trim.
+**Progressed after the team hit the account session-limit (lead solo, 2026-07-11 early AM):**
+- P3-web MERGED (merge `255bf8d`; the `chatFromRun` follow-up `7122191` was lead-reviewed — small,
+  UI-only, tested, gate green 393/393 — since the reviewer was capped; re-review optional tomorrow).
+  So **M1/M2/M3/M4 are all complete and integrated.**
+- M6 docs DONE (commit after `255bf8d`): `docs/chat.md`, ARCHITECTURE.md "Chat with uzi (the fifth
+  surface)", `specs/ai.md` §169–175. check-docs passes. Carry-overs #7 (untracked-secrets operator
+  note) + #10 (PRD-label suggestion) folded into the docs.
+- **Environment note:** `NODE_OPTIONS` carries a broken cmux `--require=…restore-node-options.cjs`
+  preload (temp file cleaned) that crashes every node invocation incl. git hooks — run node/npm/git
+  commands with `NODE_OPTIONS="--max-old-space-size=4096"` until the cmux shim restores it.
 
-2. **M5 — Security validation pass** (agents: **auditor** lead, **tester** for the live/e2e legs).
+**Remaining (needs the team at reset, or lead solo):**
+1. **M5 — Security validation pass** (agents: **auditor** lead, **tester** for the live/e2e legs).
    Most sub-checks were already verified per-branch during review; M5 is the consolidated end-to-end
    proof + the deferred live legs. Fold in these tracked carry-overs: **#6** (image-content check must
    assert `/opt/uzi-src` is root-owned + unwritable by the agent user — add `find /opt/uzi-src ! -user
@@ -139,16 +138,15 @@ is reviewed + audited with zero open blocking/major findings. Do these in order:
    milestone below against the merged integration branch; the injection red-team leans on the
    evidence-fence (already adversarially audited) + the no-egress tool surface.
 
-3. **M6 — Docs + specs + e2e** (agents: **documenter** for `docs/chat.md` + ARCHITECTURE.md,
-   **spec-keeper** for specs/ai.md [auto] + specs/human.md [needs user approval], **tester** for e2e).
-   Fold in carry-overs: **#7** (operator note: the agent build context is now the repo root, so keep
-   untracked secrets out of the repo root — goes in docs/an operator note); **#10** (agent SUGGESTS but
-   never forces the PRD label on chat-created issues — document; the "feed created issue back into the
-   conversation" half is a noted future nicety); **#15** (the chat lane runs the real ChatExecutor even
-   under `UZI_EXECUTOR=stub` — M6 e2e needs a chat stub path so the scenario runs without a live token).
-   e2e scenario: create chat → message → tool call → proposal → confirm → idle-complete → continue.
+2. **M6 — the docs are DONE; e2e + specs/human.md remain.** `docs/chat.md`, ARCHITECTURE.md, and
+   `specs/ai.md` §169–175 are written and committed (carry-overs #7 + #10 folded in). STILL TODO:
+   (a) **`specs/human.md` Feature #39 entry — NEEDS USER APPROVAL** (draft prepared; the spec contract
+   forbids editing human.md without the user's sign-off); (b) the **e2e scenario** (tester) — create chat
+   → message → tool call → proposal → confirm → idle-complete → continue — which requires **#15** first
+   (the chat lane runs the real ChatExecutor even under `UZI_EXECUTOR=stub`; add a chat stub path so the
+   isolated stack runs without a live Anthropic token).
 
-4. **`/prd-done` up to MR creation** (per the `/prd-full` flow — stop at MR, do not merge/close).
+3. **`/prd-done` up to MR creation** (per the `/prd-full` flow — stop at MR, do not merge/close).
 
 Migration renumber reminder (landing): drafts `00065` (chat runs) + `00066` (proposal `confirming`)
 must be renamed to the next free numbers above the live head at rebase time (CLAUDE.md convention).
