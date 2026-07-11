@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MessageKind, RunKind } from "./protocol.js";
+import type { AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MessageKind, RunKind } from "./protocol.js";
 import type { PlanVerdict } from "./steering.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { provisionRunTools } from "./provision-run.js";
@@ -46,6 +46,12 @@ export interface RunContext {
   oauthToken?: string;
   /** PRD #3 templates (lead + subagents) mapped to SDK AgentDefinitions. */
   agents?: AgentTemplate[];
+  /** PRD #37: the roster the worker parsed out of the clone's `.claude/agents/`,
+   *  with prompt bodies. Detected before the first turn but INERT until a selection
+   *  activates it at the gate (M3); the lead always comes from `agents` above, so a
+   *  repo file named `lead` is only ever a subagent candidate. Empty when the repo
+   *  ships none. */
+  repoAgents?: AgentTemplate[];
   /** M4 (PRD #16): the per-run skill union — materialized into a local plugin dir
    *  and enabled via the SDK `skills` list. */
   skills?: ClaimSkill[];
@@ -84,6 +90,12 @@ export interface ExecutorResult {
    *  diagnosis and NO push/MR — approving a no-op costs nothing and the diagnosis is
    *  the value. Absent ⇒ a real fix was committed and must be pushed. */
   fixVerdict?: FixVerdict;
+  /** PRD #37: the resolved subagent roster the IMPLEMENT phase actually ran with —
+   *  the source and the surviving agent names. The runner uses it for the MR
+   *  description marker (a `repo`-source run states the internal review was repo-
+   *  authored, Decision 3b). Absent for a stub/ci_fix-not_code run that assembled
+   *  no roster. */
+  agentSelection?: { source: AgentSource; agents: string[] };
 }
 
 /**

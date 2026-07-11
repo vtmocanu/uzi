@@ -26,12 +26,18 @@ type GateStore interface {
 }
 
 // PlanGateSubmitter is the slice of the run service the gatekeeper drives: read a
-// run (ownership-scoped, for the stale-click status check) and submit the
-// approve/reject steering input (ownership-checked). *workersvc.Service satisfies
-// it through a thin adapter in main, keeping slacksvc free of a workersvc import.
+// run (ownership-scoped, for the stale-click status check), submit a reject
+// steering input, and submit an approve carrying the agent SOURCE. *workersvc.Service
+// satisfies it through a thin adapter in main, keeping slacksvc free of a workersvc
+// import — SubmitApproval takes the source as a plain string, and the adapter builds
+// the workersvc.AgentSelection.
 type PlanGateSubmitter interface {
 	GetRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error)
 	SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) error
+	// SubmitApproval enqueues an approve_plan for `source` ("repo"|"own"); the server
+	// validates the source against the run's real roster and rejects with the
+	// ErrSelectionRejected sentinel when it no longer holds.
+	SubmitApproval(ctx context.Context, userID, runID uuid.UUID, source string) error
 }
 
 // Gatekeeper handles the Slack approval-gate buttons (PRD #25 M4): Approve,
@@ -104,13 +110,14 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 	}
 
 	switch a.ActionID {
-	case ActionGateApprove:
-		if err := g.svc.SubmitInput(ctx, user.ID, runID, "approve_plan", ""); err != nil {
-			g.logf("submit approve", err)
-			g.ephemeral(ctx, a, "Couldn't record the approval — try again from uzi.")
-			return
-		}
-		g.resolveGate(ctx, a, runID, "✅ Plan approved — the run is continuing.")
+	// The approve id encodes the agent source (PRD #37 M7), from a CLOSED set — the
+	// server never receives a client-supplied source string. The legacy/no-roster
+	// id maps to "own".
+	case ActionGateApprove, ActionGateApproveOwn:
+		g.approve(ctx, a, user.ID, runID, "own")
+
+	case ActionGateApproveRepo:
+		g.approve(ctx, a, user.ID, runID, "repo")
 
 	case ActionGateReject:
 		// Enter reject-pending: the run stays parked (still awaiting_approval); swap
@@ -134,6 +141,24 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 		}
 		g.resolveGate(ctx, a, runID, "❌ Plan rejected.")
 	}
+}
+
+// approve submits an approve for the chosen agent source (PRD #37 M7) and resolves
+// the gate. A source the server rejects (ErrSelectionRejected — the roster changed
+// under the button, e.g. a requeue re-detected an empty roster) leaves the gate
+// OPEN with an ephemeral, so the presser can retry from a fresh state rather than
+// being stuck on a stale button.
+func (g *Gatekeeper) approve(ctx context.Context, a BlockAction, userID, runID uuid.UUID, source string) {
+	if err := g.svc.SubmitApproval(ctx, userID, runID, source); err != nil {
+		if errors.Is(err, ErrSelectionRejected) {
+			g.ephemeral(ctx, a, "That agent choice is no longer valid for this run (the roster may have changed) — reopen the plan in uzi.")
+			return
+		}
+		g.logf("submit approve", err)
+		g.ephemeral(ctx, a, "Couldn't record the approval — try again from uzi.")
+		return
+	}
+	g.resolveGate(ctx, a, runID, "✅ Plan approved — the run is continuing.")
 }
 
 // resolveGate edits the gate message to a terminal (button-free) state and clears

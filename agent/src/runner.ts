@@ -6,7 +6,14 @@ import type { Executor, RunContext } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import { skillsPluginDir } from "./skills-plugin.js";
 import type { Logger } from "./log.js";
-import type { ClaimResponse } from "./protocol.js";
+import type { AgentSelection, AgentSource, AgentTemplate, ClaimResponse, StateRequest } from "./protocol.js";
+import { resolveAgentSelection } from "./protocol.js";
+import {
+  describeRepoAgentNote,
+  detectRepoAgents,
+  repoAgentSummaries,
+  type DetectedRepoAgents,
+} from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
 import { SteeringChannel, type PlanVerdict } from "./steering.js";
 import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
@@ -25,6 +32,9 @@ export interface RunnerOptions {
   planApprovalTimeoutMs?: number;
   /** Injected for tests; default opens real GitLab MRs. */
   gitlab?: GitLabClient;
+  /** Injected for tests; default is the real `.claude/agents/` parser (PRD #37).
+   *  A seam so a test can drive the detection-failure path deterministically. */
+  detectRepoAgents?: (worktreePath: string) => Promise<DetectedRepoAgents>;
 }
 
 /**
@@ -43,6 +53,7 @@ export class RunRunner {
   private readonly pollMs: number;
   private readonly planApprovalTimeoutMs: number;
   private readonly gitlab: GitLabClient;
+  private readonly detect: (worktreePath: string) => Promise<DetectedRepoAgents>;
 
   constructor(
     private readonly client: WorkerClient,
@@ -58,6 +69,7 @@ export class RunRunner {
     this.pollMs = opts.pollMs ?? 3_000;
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
+    this.detect = opts.detectRepoAgents ?? detectRepoAgents;
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
@@ -103,6 +115,26 @@ export class RunRunner {
       worktreePath = worktree.path;
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `worktree ready on ${worktree.branch}` } });
 
+      // PRD #37: parse the checked-out repo's own agent roster and report it on
+      // this first post-checkout `running` state report. It rides the STATE report
+      // rather than the gate so that an autopilot run — which never parks at
+      // awaiting_approval — records what was detected just the same. The roster is
+      // inert data: nothing is assembled until a selection picks the repo source.
+      const detection = await this.parseRepoAgents(worktree.path, batcher, runLog);
+      const repoAgents = detection.agents;
+      if (detection.ok) {
+        // Non-fatal, and fire-and-forget (matching the session-id report below): an
+        // INFORMATIONAL roster report must never fail a run. An older API without the
+        // repo_agents field 400s DisallowUnknownFields, which the client treats as
+        // permanent — awaiting the report here would turn a working run into a failed
+        // one over a field the run does not depend on. On a detection FAILURE we send
+        // no roster at all, so the column stays NULL ("not reported") rather than `[]`
+        // ("scanned, found none") — the two must stay distinguishable.
+        void reportState({ status: "running", repo_agents: repoAgentSummaries(repoAgents) }).catch((e) =>
+          runLog.warn("could not report repo agent roster", { error: errMessage(e) }),
+        );
+      }
+
       const ctx: RunContext = {
         runId,
         kind: claim.kind ?? "issue",
@@ -115,6 +147,7 @@ export class RunRunner {
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
         agents: claim.agents,
+        repoAgents,
         skills: claim.skills,
         skillsDropped: claim.skills_dropped,
         repoSkillsEnabled: claim.repo.skills_enabled ?? false,
@@ -133,7 +166,8 @@ export class RunRunner {
         // verdict the steering channel resolves (bounded so an abandoned plan
         // fails rather than wedging the worker). An autopilot claim short-circuits
         // to an approve verdict (see gatePlan) — the run never parks at the gate.
-        gatePlan: (planMd) => this.gatePlan(runId, planMd, batcher, steering, reportState, runLog, claim.auto_approve ?? false),
+        gatePlan: (planMd) =>
+          this.gatePlan(runId, planMd, batcher, steering, reportState, runLog, claim.auto_approve ?? false, repoAgents),
         pullFollowUp: () => steering.pullFollowUp(),
         reportIteration: (iteration) => {
           void reportState({ status: "running", iteration_count: iteration }).catch((e) =>
@@ -179,7 +213,7 @@ export class RunRunner {
         sourceBranch: result.branch,
         targetBranch,
         title: mrTitle(claim),
-        description: mrDescription(claim, result.branch),
+        description: mrDescription(claim, result.branch, result.agentSelection),
       });
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` } });
 
@@ -219,6 +253,50 @@ export class RunRunner {
   }
 
   /**
+   * Parse the clone's `.claude/agents/*.md` (PRD #37), logging every skipped or
+   * clamped file to the run stream. Detection is best-effort by construction: a
+   * repo without the directory has no agents (ok: true, agents: []), and an
+   * enumeration FAILURE (e.g. an unreadable dir) is reported as a warning and a run
+   * message with ok: false — neither is ever a run failure, because a repo's
+   * optional roster must not be able to stop the run it was detected for.
+   *
+   * The `ok` flag is what keeps a detection FAILURE distinguishable from a genuinely
+   * empty roster at the API: the caller reports `repo_agents: []` only when ok, so a
+   * failure leaves the column NULL ("not reported") rather than `[]` ("found none").
+   */
+  private async parseRepoAgents(
+    worktreePath: string,
+    batcher: MessageBatcher,
+    runLog: Logger,
+  ): Promise<{ agents: AgentTemplate[]; ok: boolean }> {
+    let detected;
+    try {
+      detected = await this.detect(worktreePath);
+    } catch (err) {
+      runLog.warn("repo agent detection failed", { error: errMessage(err) });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: "could not read the repo's .claude/agents/; continuing with your own agent templates" },
+      });
+      return { agents: [], ok: false };
+    }
+    for (const note of detected.notes) {
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: describeRepoAgentNote(note) } });
+    }
+    if (detected.agents.length > 0) {
+      const names = detected.agents.map((a) => a.name).join(", ");
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `detected ${detected.agents.length} agent(s) in the repo's .claude/agents/: ${names}` },
+      });
+    }
+    runLog.info("repo agents detected", { count: detected.agents.length, dropped: detected.notes.length });
+    return { agents: detected.agents, ok: true };
+  }
+
+  /**
    * Resolve the run's worktree + branch. An issue run works agent/issue-{iid}. A
    * ci_fix run (PRD #6) targets a fresh `ci-fix/pipeline-{id}` branch when fixing
    * the default branch, or the existing agent branch (updating its MR) when fixing
@@ -239,15 +317,18 @@ export class RunRunner {
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
    *  For an autopilot run, the plan is still recorded but the gate resolves with an
-   *  approve verdict immediately — no awaiting_approval report, no /inputs wait. */
+   *  approve verdict immediately — no awaiting_approval report, no /inputs wait. It
+   *  also resolves + records the run's DEFAULT agent selection (PRD #37 Decision 6),
+   *  since a self-approved run never receives an approve_plan input to carry one. */
   private async gatePlan(
     runId: string,
     planMd: string,
     batcher: MessageBatcher,
     steering: SteeringChannel,
-    reportState: (body: { status: "awaiting_approval"; plan_md: string }) => Promise<void>,
+    reportState: (body: StateRequest) => Promise<void>,
     runLog: Logger,
     autoApprove: boolean,
+    repoAgents: AgentTemplate[],
   ): Promise<PlanVerdict> {
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
     // Get the plan message onto the stream regardless of mode — it is the audit
@@ -258,8 +339,17 @@ export class RunRunner {
       // Auto-approve is a VERDICT SOURCE at the existing gate, not a bypass around
       // it: the plan was recorded above; the run just never enters awaiting_approval
       // (no state flicker, no column-automation churn) and never waits on a human.
-      runLog.info("plan gate: auto-approved (autopilot)", { run_id: runId });
-      return { kind: "approve" };
+      // The default selection (repo agents when detected, else the owner's
+      // templates) is resolved here, persisted via the running report (the only
+      // channel a no-input run has, Decision 6), and stated on the feed. The
+      // executor re-resolves the SAME absent-parse to build the identical roster.
+      const selection = resolveAgentSelection({ status: "absent" }, repoAgents.length > 0).selection;
+      await reportState({ status: "running", agent_selection: selection }).catch((e) =>
+        runLog.warn("could not persist autopilot agent selection", { error: errMessage(e) }),
+      );
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: autopilotSelectionText(selection, repoAgents.length) } });
+      runLog.info("plan gate: auto-approved (autopilot)", { run_id: runId, agent_source: selection.source });
+      return { kind: "approve", selection: { status: "ok", selection } };
     }
 
     await reportState({ status: "awaiting_approval", plan_md: planMd });
@@ -288,14 +378,32 @@ function mrTitle(claim: ClaimResponse): string {
 }
 
 /** MR body: links + closes the issue (issue run) or links the failing pipeline
- *  (ci_fix, PRD #6), and states the primary directive (humans merge). */
-function mrDescription(claim: ClaimResponse, branch: string): string {
+ *  (ci_fix, PRD #6), states the primary directive (humans merge), and — when the
+ *  run used the repo's own agents (PRD #37 Decision 3b) — a marker so the human
+ *  reviewer knows the internal review loop was performed by repo-authored agents,
+ *  not by uzi's built-in reviewer. */
+function mrDescription(
+  claim: ClaimResponse,
+  branch: string,
+  agentSelection?: { source: AgentSource; agents: string[] },
+): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
+  const repoMarker =
+    agentSelection?.source === "repo"
+      ? [
+          "",
+          "> ⚠️ This run used agent definitions from the repository's own " +
+            `\`.claude/agents/\` (${agentSelection.agents.join(", ") || "none"}). The internal ` +
+            "review was performed by those repo-authored agents, not by uzi's built-in " +
+            "reviewer — review this change accordingly.",
+        ]
+      : [];
   if (claim.kind === "ci_fix" && claim.pipeline) {
     return [
       `Fixes the failed CI pipeline for \`${claim.pipeline.ref}\`.`,
       "",
       `Failing pipeline: ${claim.pipeline.web_url}`,
+      ...repoMarker,
       "",
       "---",
       footer,
@@ -305,8 +413,17 @@ function mrDescription(claim: ClaimResponse, branch: string): string {
     `Implements issue #${claim.issue_iid}.`,
     "",
     `Closes #${claim.issue_iid}`,
+    ...repoMarker,
     "",
     "---",
     footer,
   ].join("\n");
+}
+
+/** Feed text for an autopilot run's resolved default selection (PRD #37 Decision
+ *  6). Repo source names the count; own source names the fallback. */
+function autopilotSelectionText(selection: AgentSelection, repoCount: number): string {
+  return selection.source === "repo"
+    ? `autopilot: using the ${repoCount} agent(s) from the repo's .claude/agents/`
+    : "autopilot: using your own agent templates";
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
@@ -54,7 +55,11 @@ var (
 	ErrRunTerminal         = errors.New("run has already finished")
 	ErrInvalidState        = errors.New("invalid run state")
 	ErrInvalidMessage      = errors.New("invalid run message")
-	ErrWorkerNotFound      = errors.New("worker not found")
+	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
+	// agent roster that breaks a cap, and a browser-submitted agent selection that
+	// names an agent the run does not have. Both map to 400.
+	ErrInvalidSelection = errors.New("invalid agent selection")
+	ErrWorkerNotFound   = errors.New("worker not found")
 	// ErrWorkerHasActiveRuns rejects deletion of a worker that still owns a
 	// non-terminal run: the FK is ON DELETE SET NULL, so deleting would orphan the
 	// run past every sweep (and the one-active-run index would then block re-runs).
@@ -114,6 +119,9 @@ type Store interface {
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
 	CreateStopVerdictInput(ctx context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error)
+	// CreateApprovePlanInput enqueues an approve_plan AND records the run's agent
+	// selection atomically (PRD #37).
+	CreateApprovePlanInput(ctx context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
 
 	// Cross-cutting reads for run creation + claim.
@@ -661,6 +669,18 @@ type StateRequest struct {
 	// diagnosis and no MR. Only 'not_code' is expected here — verified/fix_failed are
 	// stamped later by the pipeline sync; a completed report on an issue run omits it.
 	FixVerdict *string `json:"fix_verdict"`
+	// RepoAgents is the roster the worker parsed from the clone's .claude/agents/
+	// (PRD #37), reported on the first `running` report after checkout. A POINTER to
+	// a slice, because the three states differ: absent (nil) = this report says
+	// nothing about the roster; `[]` = detection ran and found none; non-empty = the
+	// detected agents. Only `running` carries it; it is re-validated below, never
+	// trusted from the worker.
+	RepoAgents *[]RepoAgent `json:"repo_agents"`
+	// AgentSelection is the default an AUTOPILOT run resolved for itself (Decision 6).
+	// Such a run self-approves the gate and never receives a SubmitInput, so the state
+	// report is its only channel for recording which roster it used. A human-gated run
+	// omits this and persists its selection through the approve_plan input instead.
+	AgentSelection *AgentSelection `json:"agent_selection"`
 }
 
 // SetState applies a worker's state transition and returns the run's resulting
@@ -671,16 +691,28 @@ type StateRequest struct {
 // "already terminal" as success and learns it was cancelled), per the M2 wire
 // contract.
 func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest) (run store.Run, applied bool, err error) {
-	if _, err = s.runOwnedByWorker(ctx, runID, wkr); err != nil {
+	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
 		return store.Run{}, false, err
 	}
 	sessionID := textParam(req.SessionID)
 	var rows int64
 	switch req.State {
 	case "running":
-		rows, err = s.q.SetRunRunning(ctx, store.SetRunRunningParams{
-			IterationCount: req.IterationCount, SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
-		})
+		// PRD #37: the roster and (for autopilot) the resolved selection ride the
+		// `running` report. Both are re-validated here — the worker capped them, but
+		// the API does not take a worker's word for the shape of what it persists and
+		// then renders in an approval panel.
+		var runningParams store.SetRunRunningParams
+		runningParams, err = s.runningStateParams(ctx, owned, req)
+		if err != nil {
+			return store.Run{}, false, err
+		}
+		runningParams.IterationCount = req.IterationCount
+		runningParams.SessionID = sessionID
+		runningParams.ID = runID
+		runningParams.WorkerID = pgUUID(wkr.ID)
+		rows, err = s.q.SetRunRunning(ctx, runningParams)
 	case "awaiting_approval":
 		rows, err = s.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			PlanMd: textParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgUUID(wkr.ID),
@@ -713,6 +745,104 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		s.notify(runID, run.Status)
 	}
 	return run, rows > 0, err
+}
+
+// runningStateParams builds the `running` update's PRD #37 columns from a worker's
+// report, re-validating both payloads. Absent fields leave the columns untouched
+// (the query COALESCEs them against themselves), so the ordinary session-id and
+// iteration heartbeats never disturb a roster a previous report established.
+//
+// The fields are read ONLY from a `running` report. A completed/failed report that
+// carried them would be ignored rather than rejected: a terminal report is the one
+// call a worker must not be able to fail on a technicality, and no worker sends
+// them there.
+func (s *Service) runningStateParams(ctx context.Context, run store.Run, req StateRequest) (store.SetRunRunningParams, error) {
+	var p store.SetRunRunningParams
+
+	if req.RepoAgents != nil {
+		if err := validateRepoAgents(*req.RepoAgents); err != nil {
+			return p, err
+		}
+		encoded, err := encodeJSONArray(*req.RepoAgents)
+		if err != nil {
+			return p, fmt.Errorf("encode repo agents: %w", err)
+		}
+		p.RepoAgents = encoded
+	}
+
+	if req.AgentSelection == nil {
+		return p, nil
+	}
+	// An autopilot run's self-resolved default. Validate it against the roster it
+	// names — for the repo source that is the roster reported in THIS request when
+	// present (the worker sends both together), else whatever a previous report
+	// persisted.
+	sel := *req.AgentSelection
+	roster, err := s.rosterFor(ctx, run, sel.Source, req.RepoAgents)
+	if err != nil {
+		return p, err
+	}
+	if err := validateSelection(sel, roster); err != nil {
+		return p, err
+	}
+	exclusions, err := encodeJSONArray(sel.Exclusions)
+	if err != nil {
+		return p, fmt.Errorf("encode agent exclusions: %w", err)
+	}
+	p.AgentSource = pgText(sel.Source)
+	p.AgentExclusions = exclusions
+	return p, nil
+}
+
+// rosterFor resolves the selectable subagent names of a source for one run:
+//   - "repo": the detected roster — `reported` when this very request carries it,
+//     else the run's persisted repo_agents column. A repo file named `lead` stays
+//     in it (Decision 3).
+//   - "own":  the templates the claim delivers to the run's owner, minus the lead
+//     orchestrator (which is the main thread, not a subagent).
+func (s *Service) rosterFor(ctx context.Context, run store.Run, source string, reported *[]RepoAgent) ([]string, error) {
+	if source == AgentSourceRepo {
+		if reported != nil {
+			names := make([]string, 0, len(*reported))
+			for _, a := range *reported {
+				names = append(names, a.Name)
+			}
+			return names, nil
+		}
+		return repoAgentNames(run.RepoAgents), nil
+	}
+	templates, err := s.q.ListClaimAgentTemplates(ctx, pgUUID(run.UserID))
+	if err != nil {
+		return nil, fmt.Errorf("list claim agent templates: %w", err)
+	}
+	names := make([]string, 0, len(templates))
+	for _, t := range templates {
+		names = append(names, t.Name)
+	}
+	return ownSubagentNames(names), nil
+}
+
+// OwnAgentRoster resolves the OWN-source subagent roster (name + description) for a
+// run's owner: exactly the templates ListClaimAgentTemplates delivers to that
+// owner's claim, minus the lead orchestrator (the main thread, never a selectable
+// subagent). It is the SAME query rosterFor/validateSelection use for source="own",
+// so populating it onto the run-detail DTO lets the plan-gate picker show precisely
+// what the validator accepts and the worker runs — a chip can never name a template
+// that approve_plan would reject, and the picker's "N of your templates" count is
+// exact even when the owner has a disabled or shadowed template (PRD #37 M4-fix).
+func (s *Service) OwnAgentRoster(ctx context.Context, userID uuid.UUID) ([]RepoAgent, error) {
+	templates, err := s.q.ListClaimAgentTemplates(ctx, pgUUID(userID))
+	if err != nil {
+		return nil, fmt.Errorf("list claim agent templates: %w", err)
+	}
+	out := make([]RepoAgent, 0, len(templates))
+	for _, t := range templates {
+		if agenttmpl.IsLeadName(t.Name) {
+			continue
+		}
+		out = append(out, RepoAgent{Name: t.Name, Description: t.Description})
+	}
+	return out, nil
 }
 
 // InputDTO is a consumed steering input handed to the worker. ID is the input's
@@ -1006,13 +1136,30 @@ type SubmitInputResult struct {
 // transition is applied server-side so the input is never stranded waiting for a
 // GET /inputs poll that will never come. Otherwise the input is enqueued for the
 // worker to consume.
-func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) (SubmitInputResult, error) {
+//
+// sel is the PRD #37 agent selection and is legal ONLY on approve_plan (nil
+// everywhere else, including the Slack approve path, which offers no picker — such
+// a run keeps whatever default its worker resolves). It is validated against the
+// run's actual roster, then persisted to the run row and JSON-encoded into the
+// input body in one statement.
+//
+// approve_plan deliberately has no server-side no-poller branch: a run can only be
+// awaiting approval because a live worker put it there, so an approve with no
+// poller is a race the worker's own gate timeout resolves. Only cancel/reject_plan
+// need the branch below.
+func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, sel *AgentSelection) (SubmitInputResult, error) {
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return SubmitInputResult{}, err
 	}
 	if terminalStatuses[run.Status] {
 		return SubmitInputResult{}, ErrRunTerminal
+	}
+	if sel != nil && kind != "approve_plan" {
+		return SubmitInputResult{}, fmt.Errorf("%w: an agent selection is only valid when approving a plan", ErrInvalidSelection)
+	}
+	if kind == "approve_plan" && sel != nil {
+		return s.submitApproval(ctx, run, *sel)
 	}
 
 	if kind == "cancel" || kind == "reject_plan" {
@@ -1062,6 +1209,49 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return SubmitInputResult{}, err
 	}
 	return SubmitInputResult{ServerSide: false}, nil
+}
+
+// submitApproval enqueues an approve_plan carrying an agent selection (PRD #37):
+// validate against the run's real roster, then write the run's agent_source /
+// agent_exclusions and the worker-bound input body in one statement, so the row can
+// never disagree with what the worker was told to use.
+//
+// The body is the SERVER's canonical encoding of the validated selection, never the
+// client's text: the worker parses it back with parseAgentSelection, and a raw
+// pass-through would hand an unvalidated string to the process that builds the
+// agent map.
+func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSelection) (SubmitInputResult, error) {
+	roster, err := s.rosterFor(ctx, run, sel.Source, nil)
+	if err != nil {
+		return SubmitInputResult{}, err
+	}
+	if err := validateSelection(sel, roster); err != nil {
+		return SubmitInputResult{}, err
+	}
+	exclusions, err := encodeJSONArray(sel.Exclusions)
+	if err != nil {
+		return SubmitInputResult{}, fmt.Errorf("encode agent exclusions: %w", err)
+	}
+	body, err := json.Marshal(AgentSelection{Source: sel.Source, Exclusions: orEmpty(sel.Exclusions)})
+	if err != nil {
+		return SubmitInputResult{}, fmt.Errorf("encode agent selection: %w", err)
+	}
+	if _, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
+		RunID: run.ID, Body: pgText(string(body)), AgentSource: pgText(sel.Source), AgentExclusions: exclusions,
+	}); err != nil {
+		return SubmitInputResult{}, err
+	}
+	return SubmitInputResult{ServerSide: false}, nil
+}
+
+// orEmpty makes a nil slice marshal as `[]`, never `null` — the worker's
+// parseAgentSelection accepts both, but the persisted body is also what a human
+// reads in the inputs table.
+func orEmpty(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
 }
 
 // stopKindFor maps a deliberate-stop steering kind to the stop signal stamped on the

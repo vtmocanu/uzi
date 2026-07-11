@@ -459,8 +459,15 @@ Four independent layers, any one of which failing still leaves the others:
    are denied. A deny from this hook blocks the tool call even though the
    permission mode below is allow-by-default.
 4. **`settingSources: []`.** Nothing from the cloned repository's own
-   `.claude/settings.json`, hooks, or `.claude/agents` is loaded — a
-   prompt-injection-via-repo defense none of the inspiration projects has.
+   `.claude/settings.json`, hooks, commands, or `.claude/agents` is loaded *by
+   the SDK* — a prompt-injection-via-repo defense none of the inspiration
+   projects has. The one deliberate, user-gated exception is per-run agent
+   selection (PRD #37): the *worker* parses `.claude/agents/*.md` itself and
+   feeds them through the same programmatic `agents` map, only when the user
+   picks the repo source at the plan gate. `settingSources` stays `[]`; repo
+   hooks/settings/commands never load; and repo subagents are still bound by
+   the `disallowedTools` list and the deny-hook above. See the Repo agents docs
+   page and `specs/ai.md` "PRD #37".
 
 Permission mode is explicitly `bypassPermissions` (allow-by-default) **plus**
 the deny-hook and a `disallowedTools` list — not `default` (which hangs

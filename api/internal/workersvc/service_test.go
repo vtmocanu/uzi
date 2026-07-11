@@ -88,6 +88,7 @@ type fakeStore struct {
 	workerByIDErr error
 	createdInput       *store.CreateRunInputParams
 	createdStopVerdict *store.CreateStopVerdictInputParams
+	createdApproval    *store.CreateApprovePlanInputParams
 	cancelled          *store.CancelRunServerSideParams
 	rejected           *store.RejectRunServerSideParams
 
@@ -253,6 +254,10 @@ func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputPa
 }
 func (f *fakeStore) CreateStopVerdictInput(_ context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
 	f.createdStopVerdict = &arg
+	return store.RunUserInput{}, nil
+}
+func (f *fakeStore) CreateApprovePlanInput(_ context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error) {
+	f.createdApproval = &arg
 	return store.RunUserInput{}, nil
 }
 func (f *fakeStore) CancelRunServerSide(_ context.Context, arg store.CancelRunServerSideParams) (int64, error) {
@@ -959,7 +964,7 @@ func TestSubmitInputCancelServerSideWhenQueued(t *testing.T) {
 	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "queued"}}
 	svc := New(fs, newBox(t), testParams())
 
-	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "")
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil)
 	if err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
@@ -986,7 +991,7 @@ func TestSubmitInputEnqueuesWhenWorkerLive(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
 
-	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "")
+	res, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil)
 	if err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
@@ -1024,7 +1029,7 @@ func TestSubmitInputLiveRejectStampsStopKind(t *testing.T) {
 
 	// A live reject carrying a VERBATIM reason string still stamps the structured
 	// signal — the exact case the failed-vs-stopped heuristic could not recognise.
-	res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", "this is the wrong approach entirely")
+	res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", "this is the wrong approach entirely", nil)
 	if err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
@@ -1051,7 +1056,7 @@ func TestSubmitInputRejectServerSideWhenWorkerStale(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	svc.now = func() time.Time { return fixed }
 
-	res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", "wrong approach")
+	res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", "wrong approach", nil)
 	if err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
@@ -1069,7 +1074,7 @@ func TestSubmitInputFollowUpAlwaysEnqueues(t *testing.T) {
 	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "queued"}}
 	svc := New(fs, newBox(t), testParams())
 
-	res, err := svc.SubmitInput(context.Background(), user, runID, "follow_up", "use pgx")
+	res, err := svc.SubmitInput(context.Background(), user, runID, "follow_up", "use pgx", nil)
 	if err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
@@ -1090,7 +1095,7 @@ func TestSubmitInputRejectsTerminalRun(t *testing.T) {
 	runID := uuid.New()
 	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "completed"}}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.SubmitInput(context.Background(), user, runID, "cancel", ""); err != ErrRunTerminal {
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil); err != ErrRunTerminal {
 		t.Fatalf("err = %v, want ErrRunTerminal", err)
 	}
 }
@@ -1590,7 +1595,7 @@ func TestSubmitInputServerSideCancelNotifiesCancelled(t *testing.T) {
 	lc := &fakeLifecycle{}
 	svc.SetLifecycle(lc)
 
-	if _, err := svc.SubmitInput(context.Background(), user, runID, "cancel", ""); err != nil {
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil); err != nil {
 		t.Fatalf("SubmitInput: %v", err)
 	}
 	if len(lc.notes) != 1 || lc.notes[0].status != "cancelled" || lc.notes[0].runID != runID {

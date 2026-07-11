@@ -74,7 +74,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents
 `
 
 type ClaimRunParams struct {
@@ -126,6 +126,9 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.FailureSnapshot,
 		&i.FixVerdict,
 		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
 	)
 	return i, err
 }
@@ -238,11 +241,62 @@ func (q *Queries) CountWorkerNonTerminalRuns(ctx context.Context, arg CountWorke
 	return count, err
 }
 
+const createApprovePlanInput = `-- name: CreateApprovePlanInput :one
+WITH selected AS (
+    UPDATE runs SET
+        agent_source     = $3,
+        agent_exclusions = $4,
+        updated_at       = now()
+    WHERE id = $1
+    RETURNING id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+VALUES ($1, 'approve_plan', $2)
+RETURNING id, run_id, kind, body, consumed_at, created_at
+`
+
+type CreateApprovePlanInputParams struct {
+	RunID           uuid.UUID   `json:"run_id"`
+	Body            pgtype.Text `json:"body"`
+	AgentSource     pgtype.Text `json:"agent_source"`
+	AgentExclusions []byte      `json:"agent_exclusions"`
+}
+
+// Enqueue an approve_plan verdict for the live worker AND record the agent
+// selection it carries, in ONE statement (PRD #37, mirroring CreateStopVerdictInput
+// and for the same reason: workersvc.Store exposes no transaction seam, so the
+// combined statement IS the atomicity). A second, non-transactional UPDATE could
+// leave a run whose worker was told to use the repo agents but whose row does not
+// say so — the run view and the MR marker would then lie about what ran.
+//
+// The body carries the canonical JSON encoding of the same selection, because the
+// worker reads it from the input, not from the row. Both are written from the
+// server's re-validated value, never from the client's raw text. A resume that
+// re-enters the gate overwrites both columns with the latest approval (Decision 8b).
+func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApprovePlanInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, createApprovePlanInput,
+		arg.RunID,
+		arg.Body,
+		arg.AgentSource,
+		arg.AgentExclusions,
+	)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
 VALUES ($1, $2, $3, $4, $5, $6, now(), $7)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents
 `
 
 type CreateRunParams struct {
@@ -310,6 +364,9 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.FailureSnapshot,
 		&i.FixVerdict,
 		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
 	)
 	return i, err
 }
@@ -526,7 +583,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -569,12 +626,15 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.FailureSnapshot,
 		&i.FixVerdict,
 		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -619,6 +679,9 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.FailureSnapshot,
 		&i.FixVerdict,
 		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
 	)
 	return i, err
 }
@@ -734,7 +797,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -780,6 +843,9 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.FailureSnapshot,
 		&i.FixVerdict,
 		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
 	)
 	return i, err
 }
@@ -920,7 +986,7 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -982,6 +1048,9 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.FailureSnapshot,
 			&i.Run.FixVerdict,
 			&i.Run.StopKind,
+			&i.Run.AgentSource,
+			&i.Run.AgentExclusions,
+			&i.Run.RepoAgents,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -1188,7 +1257,7 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, rp.path_with_namespace AS repo_path, w.name AS worker_name
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
@@ -1260,6 +1329,9 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.FailureSnapshot,
 			&i.Run.FixVerdict,
 			&i.Run.StopKind,
+			&i.Run.AgentSource,
+			&i.Run.AgentExclusions,
+			&i.Run.RepoAgents,
 			&i.RepoPath,
 			&i.WorkerName,
 		); err != nil {
@@ -1684,29 +1756,50 @@ func (q *Queries) SetRunMRState(ctx context.Context, arg SetRunMRStateParams) (i
 
 const setRunRunning = `-- name: SetRunRunning :execrows
 UPDATE runs SET
-    status          = 'running',
-    started_at      = COALESCE(started_at, now()),
-    iteration_count = GREATEST(iteration_count, $1),
-    session_id      = COALESCE($2, session_id),
-    updated_at      = now()
-WHERE id = $3 AND worker_id = $4
+    status           = 'running',
+    started_at       = COALESCE(started_at, now()),
+    iteration_count  = GREATEST(iteration_count, $1),
+    session_id       = COALESCE($2, session_id),
+    repo_agents      = COALESCE($3::jsonb, repo_agents),
+    agent_source     = COALESCE($4, agent_source),
+    agent_exclusions = COALESCE($5::jsonb, agent_exclusions),
+    updated_at       = now()
+WHERE id = $6 AND worker_id = $7
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunRunningParams struct {
-	IterationCount int32       `json:"iteration_count"`
-	SessionID      pgtype.Text `json:"session_id"`
-	ID             uuid.UUID   `json:"id"`
-	WorkerID       pgtype.UUID `json:"worker_id"`
+	IterationCount  int32       `json:"iteration_count"`
+	SessionID       pgtype.Text `json:"session_id"`
+	RepoAgents      []byte      `json:"repo_agents"`
+	AgentSource     pgtype.Text `json:"agent_source"`
+	AgentExclusions []byte      `json:"agent_exclusions"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
 }
 
-// claimed/awaiting_approval → running. started_at is stamped once; iteration_count
-// only advances (GREATEST) so a resume never regresses the loop counter. A
-// terminal run (e.g. cancelled) is left untouched → 0 rows → "already terminal".
+// claimed/awaiting_approval → running, AND running → running: the worker reports
+// this state more than once per run (once on claim, again after checkout with the
+// repo agent roster, again on every session-id/iteration heartbeat), so the
+// statement is idempotent by construction. started_at is stamped once;
+// iteration_count only advances (GREATEST) so a resume never regresses the loop
+// counter. A terminal run (e.g. cancelled) is left untouched → 0 rows → "already
+// terminal".
+//
+// The three PRD #37 columns are COALESCE'd against their own value, so a report
+// that omits them (the common case) preserves what a previous report wrote and no
+// caller has to read-modify-write. repo_agents is set once, by the post-checkout
+// report; agent_source/agent_exclusions only by an AUTOPILOT run's report (a
+// human-gated run persists its selection through CreateApprovePlanInput instead).
+// Consequence, deliberate: a worker can never NULL these back out — an empty
+// roster is reported as '[]', which is a distinct, meaningful value.
 func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunRunning,
 		arg.IterationCount,
 		arg.SessionID,
+		arg.RepoAgents,
+		arg.AgentSource,
+		arg.AgentExclusions,
 		arg.ID,
 		arg.WorkerID,
 	)
