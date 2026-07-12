@@ -1,8 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { buildSelfImprovePlanPrompt } from "../src/prompt.js";
 import {
+  defaultCheckRunner,
   flagGuardPaths,
   runSelfImproveChecks,
   selfImproveMrSection,
@@ -10,6 +14,7 @@ import {
   SELF_IMPROVE_CHECKS,
   type CheckResult,
   type CheckRunner,
+  type SelfImproveCheck,
 } from "../src/self-improve.js";
 
 describe("flagGuardPaths", () => {
@@ -126,6 +131,96 @@ describe("runSelfImproveChecks", () => {
     assert.ok(web.length >= 1, "a throwing check should be recorded as skipped");
     // The other checks still ran.
     assert.ok(results.some((r) => r.status === "passed"));
+  });
+});
+
+// M8: the check runner must never accuse good code of failing. A check that COULD
+// NOT RUN — missing deps, missing binary, a 127, a timeout — is "skipped" with the
+// reason; only a check that actually ran and genuinely failed is "failed".
+describe("defaultCheckRunner status mapping (M8: skipped is never a false failure)", () => {
+  const worktree = mkdtempSync(join(tmpdir(), "si-checks-"));
+  mkdirSync(join(worktree, "web"), { recursive: true });
+  mkdirSync(join(worktree, "api"), { recursive: true });
+
+  const check = (over: Partial<SelfImproveCheck>): SelfImproveCheck => ({
+    name: "probe",
+    cwd: "api",
+    command: "true",
+    args: [],
+    ...over,
+  });
+
+  it("pre-flights a declared prerequisite: no node_modules → skipped, and the command never runs", async () => {
+    // web/ exists but has NO node_modules — exactly a fresh clone. Point the check at
+    // a command that would BLOW UP if it were ever spawned, to prove the pre-flight
+    // short-circuits before spawning.
+    const r = await defaultCheckRunner(5000)(
+      check({ cwd: "web", command: "definitely-not-spawned-xyz", args: [], requires: "node_modules" }),
+      worktree,
+    );
+    assert.equal(r.status, "skipped");
+    assert.equal(r.detail, "dependencies not installed in the worker");
+  });
+
+  it("runs the check once its prerequisite exists", async () => {
+    mkdirSync(join(worktree, "web", "node_modules"), { recursive: true });
+    const r = await defaultCheckRunner(5000)(
+      check({ cwd: "web", command: "true", args: [], requires: "node_modules" }),
+      worktree,
+    );
+    assert.equal(r.status, "passed");
+    assert.equal(r.detail, "exit 0");
+  });
+
+  it("maps exit 127 to skipped, not failed (an npm script whose binary is missing)", async () => {
+    // `sh -c 'exit 127'` is exactly what `npm test` yields when vitest is absent:
+    // npm itself exists (so no ENOENT), but the script's binary does not.
+    const r = await defaultCheckRunner(5000)(check({ command: "sh", args: ["-c", "exit 127"] }), worktree);
+    assert.equal(r.status, "skipped", "a bare 127 is never a real test failure");
+    assert.equal(r.detail, "command/binary not available (exit 127)");
+  });
+
+  it("still reports a GENUINE non-zero exit as failed", async () => {
+    const r = await defaultCheckRunner(5000)(check({ command: "sh", args: ["-c", "exit 1"] }), worktree);
+    assert.equal(r.status, "failed");
+    assert.equal(r.detail, "exit 1");
+  });
+
+  it("maps a missing command (ENOENT) to skipped", async () => {
+    const r = await defaultCheckRunner(5000)(check({ command: "no-such-binary-xyz", args: [] }), worktree);
+    assert.equal(r.status, "skipped");
+    assert.equal(r.detail, "command not available in the worker");
+  });
+
+  it("captures ONLY the exit status — command output never reaches the result", async () => {
+    const secret = "sk-ant-api03-NEVER-IN-THE-MR";
+    const r = await defaultCheckRunner(5000)(
+      check({ command: "sh", args: ["-c", `echo ${secret}; echo ${secret} >&2; exit 3`] }),
+      worktree,
+    );
+    assert.equal(r.status, "failed");
+    assert.equal(r.detail, "exit 3");
+    assert.ok(!JSON.stringify(r).includes(secret), "command output must never reach the CheckResult");
+  });
+});
+
+describe("selfImproveMrSection skip disclosure (M8)", () => {
+  it("states plainly that skipped is not passed when any check was skipped", () => {
+    const checks: CheckResult[] = [
+      { name: "api: go test ./...", status: "skipped", detail: "command not available in the worker" },
+      { name: "web: npm test", status: "skipped", detail: "dependencies not installed in the worker" },
+      { name: "agent: npm test", status: "passed", detail: "exit 0" },
+    ];
+    const body = selfImproveMrSection([], checks);
+    assert.match(body, /2 of 3 checks were SKIPPED/);
+    assert.match(body, /skipped is NOT passed/i);
+    assert.match(body, /carries NO evidence for them/i);
+  });
+
+  it("adds no skip warning when everything actually ran", () => {
+    const checks: CheckResult[] = [{ name: "agent: npm test", status: "passed", detail: "exit 0" }];
+    const body = selfImproveMrSection([], checks);
+    assert.ok(!/SKIPPED/.test(body), "a fully-run suite needs no skip disclaimer");
   });
 });
 

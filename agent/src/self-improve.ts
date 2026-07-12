@@ -6,6 +6,7 @@
 // primary directive is untouched — the bot still never merges to main.
 
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 
 // SELF_IMPROVE_BRANCH is the fixed branch every self_improve cycle pushes to.
 // Reusing one branch is what lets an open self-improvement MR be extended (the
@@ -59,24 +60,32 @@ export function flagGuardPaths(changedFiles: string[]): string[] {
 
 // SelfImproveCheck is one test/build command the runner executes after the agent
 // finishes, so the MR carries its own pass/fail evidence (Decision 10). cwd is
-// relative to the worktree root.
+// relative to the worktree root. `requires` is an optional prerequisite path
+// (relative to cwd) that must exist for the check to be MEANINGFUL — see the
+// pre-flight in defaultCheckRunner.
 export interface SelfImproveCheck {
   name: string;
   cwd: string;
   command: string;
   args: string[];
+  requires?: string;
 }
 
 // SELF_IMPROVE_CHECKS are the uzi repo's own gates (CLAUDE.md): the Go suite, the
-// web + agent suites, and the web build (which runs check-docs + tsc). npm test in
-// web/agent needs installed deps; a check that cannot run is reported "skipped",
-// never "failed", so a bare worktree does not masquerade as a test failure.
+// web + agent suites, and the web build (which runs check-docs + tsc).
+//
+// The npm checks declare `requires: "node_modules"`. A fresh clone has none, and
+// running `npm test` there does NOT fail with ENOENT (npm itself exists) — it exits
+// 127 because vitest/tsc are missing, which is indistinguishable from a real test
+// failure by exit code alone. Pre-flighting the prerequisite is what keeps the
+// contract honest: a check that CANNOT run is reported "skipped" with the reason,
+// never "failed", so a bare worktree never masquerades as a test failure (M8).
 export const SELF_IMPROVE_CHECKS: SelfImproveCheck[] = [
   { name: "api: go test ./...", cwd: "api", command: "go", args: ["test", "./..."] },
-  { name: "web: npm test", cwd: "web", command: "npm", args: ["test"] },
-  { name: "web: npm run build", cwd: "web", command: "npm", args: ["run", "build"] },
-  { name: "agent: npm run typecheck", cwd: "agent", command: "npm", args: ["run", "typecheck"] },
-  { name: "agent: npm test", cwd: "agent", command: "npm", args: ["test"] },
+  { name: "web: npm test", cwd: "web", command: "npm", args: ["test"], requires: "node_modules" },
+  { name: "web: npm run build", cwd: "web", command: "npm", args: ["run", "build"], requires: "node_modules" },
+  { name: "agent: npm run typecheck", cwd: "agent", command: "npm", args: ["run", "typecheck"], requires: "node_modules" },
+  { name: "agent: npm test", cwd: "agent", command: "npm", args: ["test"], requires: "node_modules" },
 ];
 
 export type CheckStatus = "passed" | "failed" | "skipped";
@@ -109,24 +118,51 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
   return results;
 }
 
-// defaultCheckRunner runs a check via execFile with a wall-clock cap, mapping exit
-// 0 → passed, non-zero → failed, and a spawn error (toolchain/deps missing) →
-// skipped. It captures only the exit status, never the (potentially secret-bearing)
-// command output — the run-message redactor does not cover a third-party test's
-// stdout, so none of it reaches the MR.
+// defaultCheckRunner runs a check via execFile with a wall-clock cap. It captures
+// only the exit status, never the (potentially secret-bearing) command output — the
+// run-message redactor does not cover a third-party test's stdout, so none of it
+// reaches the MR.
+//
+// The status mapping is deliberately conservative: a check only reports "failed"
+// when it actually RAN and genuinely failed. Everything that means "this check could
+// not run here" is "skipped", with the reason (M8 — the MR's evidence must never
+// accuse good code of failing):
+//   - prerequisite missing (e.g. no node_modules)  → skipped  [pre-flight, no spawn]
+//   - command not in the worker (ENOENT)           → skipped
+//   - exit 127 (command/binary not found by the    → skipped
+//     shell or the npm script, e.g. vitest/tsc)
+//   - killed by the wall-clock cap                 → skipped
+//   - any other non-zero exit                      → failed   [a real failure]
 export function defaultCheckRunner(timeoutMs = 15 * 60 * 1000): CheckRunner {
-  return (check, worktreePath) =>
-    new Promise<CheckResult>((resolve) => {
+  return (check, worktreePath) => {
+    const cwd = `${worktreePath}/${check.cwd}`;
+    // Pre-flight: a declared prerequisite that is absent means the check cannot
+    // produce a meaningful verdict. Report it honestly instead of running the
+    // command and misreading its 127 as a test failure.
+    if (check.requires && !existsSync(`${cwd}/${check.requires}`)) {
+      return Promise.resolve({
+        name: check.name,
+        status: "skipped" as const,
+        detail:
+          check.requires === "node_modules"
+            ? "dependencies not installed in the worker"
+            : `prerequisite missing: ${check.requires}`,
+      });
+    }
+    return new Promise<CheckResult>((resolve) => {
       execFile(
         check.command,
         check.args,
-        { cwd: `${worktreePath}/${check.cwd}`, timeout: timeoutMs, maxBuffer: 1 << 20 },
+        { cwd, timeout: timeoutMs, maxBuffer: 1 << 20 },
         (error) => {
           if (!error) {
             resolve({ name: check.name, status: "passed", detail: "exit 0" });
             return;
           }
-          const e = error as NodeJS.ErrnoException & { code?: string | number; killed?: boolean };
+          // execFile's error carries `code` as the ENOENT-style string on a spawn
+          // failure, or the numeric exit status when the command ran and exited
+          // non-zero — so it is genuinely `string | number` here.
+          const e = error as Error & { code?: string | number; killed?: boolean };
           if (e.code === "ENOENT") {
             resolve({ name: check.name, status: "skipped", detail: "command not available in the worker" });
             return;
@@ -135,10 +171,17 @@ export function defaultCheckRunner(timeoutMs = 15 * 60 * 1000): CheckRunner {
             resolve({ name: check.name, status: "skipped", detail: "timed out" });
             return;
           }
+          // 127 is "command not found" from the shell or an npm script whose binary is
+          // absent — never a real test failure, so it is a skip, not a failure.
+          if (e.code === 127) {
+            resolve({ name: check.name, status: "skipped", detail: "command/binary not available (exit 127)" });
+            return;
+          }
           resolve({ name: check.name, status: "failed", detail: typeof e.code === "number" ? `exit ${e.code}` : "failed" });
         },
       );
     });
+  };
 }
 
 // selfImproveMrSection composes the MR-description addendum for a self_improve run:
@@ -173,6 +216,19 @@ export function selfImproveMrSection(guardHits: string[] | null, checks: CheckRe
     lines.push("", "**Test evidence** (run by the worker — this repo has no CI):", "");
     for (const c of checks) {
       lines.push(`- ${checkEmoji(c.status)} ${c.name} — ${c.status} (${c.detail})`);
+    }
+    // A skipped check proves NOTHING. Say so plainly, so a reviewer never reads a
+    // wall of "skipped" as a wall of "passed" (M8): the worker image may lack the
+    // toolchain (no Go) or the fresh clone its dependencies (no node_modules).
+    const skipped = checks.filter((c) => c.status === "skipped");
+    if (skipped.length > 0) {
+      lines.push(
+        "",
+        `> ⚠️ **${skipped.length} of ${checks.length} checks were SKIPPED — skipped is NOT passed.**`,
+        "> Those suites did not run here (the worker lacks the toolchain or the freshly cloned",
+        "> worktree has no installed dependencies), so this MR carries NO evidence for them.",
+        "> Run them yourself before merging.",
+      );
     }
   }
 
