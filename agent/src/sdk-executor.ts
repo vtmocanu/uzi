@@ -33,7 +33,7 @@ import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
 import { resolveAgentSelection } from "./protocol.js";
-import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, isNotCodePlan } from "./prompt.js";
+import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
@@ -319,22 +319,36 @@ export class SdkExecutor implements Executor {
       // (untrusted job logs) instead of a forge issue; everything else — the plan
       // gate, the implement⇄review loop, the guardrails — is identical.
       const isCIFix = ctx.kind === "ci_fix" && ctx.pipeline != null;
-      const planPrompt = isCIFix
-        ? buildCIFixPlanPrompt({
-            ref: ctx.pipeline!.ref,
-            branch: ctx.branch,
-            pipelineWebURL: ctx.pipeline!.web_url,
-            failedJobs: ctx.pipeline!.failed_jobs.map((j) => ({ name: j.name, stage: j.stage, logTail: j.log_tail })),
-            subagentNames: ownSubagentNames,
-          })
-        : buildPlanPrompt({
-            issueIid: ctx.issueIid ?? 0,
-            issueTitle: ctx.issueTitle,
-            issueDescription: ctx.issueDescription,
-            branch: ctx.branch,
-            subagentNames: ownSubagentNames,
-          });
-      ctx.emit({ kind: "status", agent: "worker", payload: { text: `starting SDK agent (${isCIFix ? "diagnosing CI failure" : "planning"})` } });
+      const isSelfImprove = ctx.kind === "self_improve";
+      let planPrompt: string;
+      if (isCIFix) {
+        planPrompt = buildCIFixPlanPrompt({
+          ref: ctx.pipeline!.ref,
+          branch: ctx.branch,
+          pipelineWebURL: ctx.pipeline!.web_url,
+          failedJobs: ctx.pipeline!.failed_jobs.map((j) => ({ name: j.name, stage: j.stage, logTail: j.log_tail })),
+          subagentNames: ownSubagentNames,
+        });
+      } else if (isSelfImprove) {
+        // The self_improve run's issue_description carries the untrusted improve_uzi
+        // backlog; the trusted "pick one / guardrails / tests" directive lives in the
+        // prompt builder, outside the untrusted fence (PRD #46 Decision 10, audit C1).
+        planPrompt = buildSelfImprovePlanPrompt({
+          branch: ctx.branch,
+          recommendations: ctx.issueDescription,
+          subagentNames: ownSubagentNames,
+        });
+      } else {
+        planPrompt = buildPlanPrompt({
+          issueIid: ctx.issueIid ?? 0,
+          issueTitle: ctx.issueTitle,
+          issueDescription: ctx.issueDescription,
+          branch: ctx.branch,
+          subagentNames: ownSubagentNames,
+        });
+      }
+      const planningLabel = isCIFix ? "diagnosing CI failure" : isSelfImprove ? "planning self-improvement" : "planning";
+      ctx.emit({ kind: "status", agent: "worker", payload: { text: `starting SDK agent (${planningLabel})` } });
       const plan = await this.driveTurn(ctx, baseOptions, resumeId, planPrompt, state, idleMs);
       resumeId = plan.sessionId ?? resumeId;
       // A planning turn that ends without a plan is an error — never push

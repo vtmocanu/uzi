@@ -134,6 +134,23 @@ export class GitCache {
     });
   }
 
+  /**
+   * Files changed on the worktree's branch since it diverged from the default
+   * branch (three-dot diff against the merge base) — used by a self_improve run to
+   * flag guard-critical paths in its MR (PRD #46). Best-effort: a diff that cannot
+   * be computed returns an empty list (the caller then simply raises no flag) rather
+   * than failing the run.
+   */
+  async changedFiles(barePath: string, worktreePath: string): Promise<string[]> {
+    try {
+      const baseRef = await this.defaultBranchRef(barePath);
+      const out = await this.runGit(worktreePath, ["diff", "--name-only", `${baseRef}...HEAD`]);
+      return out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+    } catch {
+      return [];
+    }
+  }
+
   private async cloneBare(repoUrl: string, dest: string, pat?: string, scope?: string, username?: string): Promise<void> {
     try {
       await this.runGit(undefined, ["clone", "--bare", repoUrl, dest], pat, scope, username);

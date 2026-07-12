@@ -1,0 +1,122 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+
+import { buildSelfImprovePlanPrompt } from "../src/prompt.js";
+import {
+  flagGuardPaths,
+  runSelfImproveChecks,
+  selfImproveMrSection,
+  SELF_IMPROVE_BRANCH,
+  SELF_IMPROVE_CHECKS,
+  type CheckResult,
+  type CheckRunner,
+} from "../src/self-improve.js";
+
+describe("flagGuardPaths", () => {
+  it("flags guard-critical paths and ignores ordinary ones", () => {
+    const changed = [
+      "web/src/pages/Notifications.tsx",
+      "api/internal/guardrails/nope.go", // not a guard path (wrong dir)
+      "agent/src/guardrails.ts",
+      "api/internal/secretbox/box.go",
+      "api/internal/vault/vault.go",
+      "api/internal/middleware/auth.go",
+      "api/internal/workersvc/claim.go",
+      "docker-compose.yml",
+      ".env.example",
+      "README.md",
+    ];
+    const hits = flagGuardPaths(changed);
+    assert.ok(hits.includes("agent/src/guardrails.ts"));
+    assert.ok(hits.includes("api/internal/secretbox/box.go"));
+    assert.ok(hits.includes("api/internal/vault/vault.go"));
+    assert.ok(hits.includes("api/internal/middleware/auth.go"));
+    assert.ok(hits.includes("api/internal/workersvc/claim.go"));
+    assert.ok(hits.includes("docker-compose.yml"));
+    assert.ok(hits.includes(".env.example"));
+    assert.ok(!hits.includes("web/src/pages/Notifications.tsx"));
+    assert.ok(!hits.includes("README.md"));
+    assert.ok(!hits.includes("api/internal/guardrails/nope.go"));
+  });
+
+  it("returns nothing for an all-clear change", () => {
+    assert.deepEqual(flagGuardPaths(["web/src/App.tsx", "api/internal/handler/runs.go"]), []);
+  });
+});
+
+describe("selfImproveMrSection", () => {
+  const checks: CheckResult[] = [
+    { name: "api: go test ./...", status: "passed", detail: "exit 0" },
+    { name: "web: npm test", status: "failed", detail: "exit 1" },
+    { name: "agent: npm test", status: "skipped", detail: "command not available in the worker" },
+  ];
+
+  it("carries the test evidence and the human-merge note", () => {
+    const md = selfImproveMrSection([], checks);
+    assert.ok(md.includes("Test evidence"));
+    assert.ok(md.includes("api: go test ./... — passed"));
+    assert.ok(md.includes("web: npm test — failed"));
+    assert.ok(md.includes("agent: npm test — skipped"));
+    assert.ok(md.includes("The bot cannot merge to `main`"));
+    // No guard flag when nothing guard-critical was touched.
+    assert.ok(!md.includes("Guard-critical paths touched"));
+  });
+
+  it("raises a loud guard-critical flag listing the touched paths", () => {
+    const md = selfImproveMrSection(["agent/src/guardrails.ts", "api/internal/vault/vault.go"], checks);
+    assert.ok(md.includes("Guard-critical paths touched"));
+    assert.ok(md.includes("`agent/src/guardrails.ts`"));
+    assert.ok(md.includes("`api/internal/vault/vault.go`"));
+  });
+});
+
+describe("runSelfImproveChecks", () => {
+  it("runs every configured check in order via the injected runner", async () => {
+    const seen: string[] = [];
+    const runner: CheckRunner = async (check) => {
+      seen.push(check.name);
+      return { name: check.name, status: "passed", detail: "exit 0" };
+    };
+    const results = await runSelfImproveChecks("/tmp/wt", runner);
+    assert.equal(results.length, SELF_IMPROVE_CHECKS.length);
+    assert.deepEqual(seen, SELF_IMPROVE_CHECKS.map((c) => c.name));
+    assert.ok(results.every((r) => r.status === "passed"));
+  });
+
+  it("records a throwing check as skipped rather than failing the run", async () => {
+    const runner: CheckRunner = async (check) => {
+      if (check.cwd === "web") throw new Error("boom");
+      return { name: check.name, status: "passed", detail: "exit 0" };
+    };
+    const results = await runSelfImproveChecks("/tmp/wt", runner);
+    const web = results.filter((r) => r.status === "skipped");
+    assert.ok(web.length >= 1, "a throwing check should be recorded as skipped");
+    // The other checks still ran.
+    assert.ok(results.some((r) => r.status === "passed"));
+  });
+});
+
+describe("buildSelfImprovePlanPrompt", () => {
+  const prompt = buildSelfImprovePlanPrompt({
+    branch: SELF_IMPROVE_BRANCH,
+    recommendations: "1. [worker] install jq\n2. improve the poller",
+    subagentNames: ["reviewer", "auditor"],
+  });
+
+  it("carries the trusted directive: pick ONE, guardrails, tests, guard-path flag", () => {
+    assert.ok(prompt.includes("exactly ONE"));
+    assert.ok(prompt.includes("Never weaken uzi's guardrails"));
+    assert.ok(prompt.includes("go test ./..."));
+    assert.ok(prompt.includes("never merge to `main`"));
+    assert.ok(prompt.includes(SELF_IMPROVE_BRANCH));
+  });
+
+  it("fences the backlog as untrusted data, with the trusted directive OUTSIDE the fence", () => {
+    assert.ok(prompt.includes("<recommendations>"));
+    assert.ok(prompt.includes("install jq"));
+    assert.ok(prompt.includes("UNTRUSTED"));
+    // The "pick ONE" directive must appear before the untrusted fence, so it reads
+    // as uzi's own instruction, not as fenced data.
+    assert.ok(prompt.indexOf("exactly ONE") < prompt.indexOf("<recommendations>"));
+  });
+});
