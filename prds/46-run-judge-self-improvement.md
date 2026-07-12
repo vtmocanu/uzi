@@ -512,3 +512,34 @@ Approved deviations from the design above, found during implementation:
    `execFile` call never receives that `toolEnv`, so provisioned tools are
    invisible to the checks even when provisioning succeeded. User approved
    landing the fix in this PRD as M9 rather than deferring it to a follow-up.
+7. **M9 threading the toolEnv reopened, then closed, a token-exfil residual —
+   and M5 had silently widened it.** Making the checks actually run means the
+   worker executes model-authored code (the change's own test files,
+   `package.json` scripts) as the worker uid, outside the SDK hook system. The
+   M9 audit found `defaultCheckRunner`'s `execFile` had no `env`, so it would
+   inherit the worker's full environment — the join token
+   (`UZI_WORKER_TOKEN[_FILE]`) + `UZI_API_URL` → worker impersonation → claim →
+   forge PAT + Anthropic token. M9 gives the check subprocess a **scrubbed
+   replacement env** (`buildCheckEnv`, the `provision.ts` discipline: those vars
+   absent by construction) and runs `npm ci --ignore-scripts` to drop the
+   lifecycle-script entry path. Residual accepted for the MVP (documented loudly
+   in `self-improve.ts` + `docs/self-improvement.md`): the subprocess still runs
+   as the worker uid and the join-token *file* stays same-uid readable at a fixed
+   path — the SAME residual class `provision.ts` documents for nix build hooks,
+   but M5 widened it from admin-*vetted* packages to *model-authored* code
+   without calling it out. Structural close = the k8s uid-split (agent under a
+   distinct uid), deferred to the remote-worker phase.
+8. **M10 — a pre-existing PAT-exfil vector in the git path, fixed in this
+   branch.** The same audit sweep found `agent/src/git.ts` `gitEnv` built
+   `{...process.env, …}` (full spread, leaking the join token + API URL) AND
+   injected the forge PAT as `GIT_CONFIG_VALUE_n`; because `pushBranch` runs with
+   `cwd=<bare>`, a git hook at the default path (`<bare>/hooks/pre-push`) fires
+   as a worker child — outside the SDK hook system — inheriting both. Affects
+   every run kind, not just self_improve. Fixed here (not caused by this PRD, but
+   folded in per user decision): `gitEnv` → replacement env (worker/API vars
+   absent by construction; `safe.directory` + the credential pairs preserved),
+   `core.hooksPath` pinned to an empty dir on every invocation (structurally
+   neutralizing any planted hook), and `filter.` added to the guardrails
+   git-config-write deny list (a second code-exec route). M9 + M10 together bring
+   every worker subprocess (SDK, provision, checks, git) onto the
+   replacement-env discipline.

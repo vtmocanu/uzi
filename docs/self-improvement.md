@@ -43,9 +43,12 @@ is skipped (with an inbox note) rather than spending nothing silently.
 - Changes land on a **fixed branch** (`uzi/self-improve`). An already-open
   self-improvement MR is extended rather than replaced, so everything from
   every cycle is tested together in one MR.
-- The worker runs the repo's own test suites and includes pass/fail evidence
-  in the MR description (this repo has no CI, so the MR carries its own
-  proof).
+- The worker installs dependencies (best-effort) and runs the repo's own test
+  suites, including their evidence in the MR description — this repo has no CI,
+  so the MR carries its own proof. Evidence is **best-effort**: a suite the
+  worker cannot run (a missing toolchain, or dependencies that did not install)
+  is reported **skipped**, and the MR states plainly that **skipped is not
+  passed**, so a reviewer never mistakes an unrun suite for a green one.
 - If the change touches a guard-critical path (guardrails, auth, secret/vault
   code, worker token handling, compose secret wiring), the MR description
   flags it loudly for extra-careful review.
@@ -57,6 +60,23 @@ Developer-only GitLab role, the protected `main` branch, the SDK's own
 deny-hook, and the disabled `.claude/` settings load — apply here exactly as
 they do to any other run. A self-improvement MR is never auto-merged: a
 human always reviews and merges it, same as any other run's MR.
+
+## A note on the test evidence and trust
+
+To gather the MR's test evidence, the worker runs the self-improvement change's
+**own** test code — the test files the agent just wrote, `package.json`
+scripts, `vite`/`tsc`/`go test`. That code runs in a scrubbed, credential-free
+environment: it cannot read the worker's forge token, its API URL, or the join
+token from its process environment, and `npm ci` runs with `--ignore-scripts`
+to remove the easiest code-execution path in. One residual remains for the MVP:
+the checks run under the same OS user as the worker, and the join-token file is
+readable at a fixed path by that user, so a hostile self-improvement change
+could in principle read it. The blast radius is bounded — that token grants the
+bot's Developer-role GitLab access (which cannot merge protected `main`) plus
+the enabling admin's own Anthropic token (which the run already uses). The
+structural fix — running the agent under a distinct OS user from the worker —
+is planned for the remote-worker phase. Until then, review a self-improvement
+MR the way you would any change from an autonomous author before merging.
 
 ## Inspecting a cycle
 
