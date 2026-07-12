@@ -1,0 +1,38 @@
+{
+  "runLabel": "run-1",
+  "t0_iso": "2026-07-12T11:19:17.277Z",
+  "verdict": "OVERLAP",
+  "overlapSec": 19.671,
+  "detail": "A and B slept concurrently: overlap 19.671s (each ~20.027/20.011s; total wall 20.367s ≈ one sleep, not two).",
+  "markers": {
+    "A_START": 1783855171.08,
+    "A_END": 1783855191.107,
+    "B_START": 1783855171.436,
+    "B_END": 1783855191.447
+  },
+  "markers_rel_to_t0": {
+    "A_START": 13.803,
+    "A_END": 33.83,
+    "B_START": 14.159,
+    "B_END": 34.17
+  },
+  "agent_guard_fires": [
+    {
+      "subagent": "subagent-a",
+      "t": 6.209,
+      "run_in_background_before": null
+    },
+    {
+      "subagent": "subagent-b",
+      "t": 6.776,
+      "run_in_background_before": null
+    }
+  ],
+  "dispatch_gap_between_guard_fires_sec": 0.567,
+  "total_probe_wall_sec": 36.738,
+  "artifacts": {
+    "transcript": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-mm-vtmocanu-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-1-transcript.jsonl",
+    "markers": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-mm-vtmocanu-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-1-markers.log",
+    "hookfires": "/private/tmp/claude-1542763654/-Users-vmocanu-stuff-gitrepos-mm-vtmocanu-uzi/c23a0da5-7605-490a-bb77-7f5ad292c11f/scratchpad/m0-probe/out/run-1-hookfires.jsonl"
+  }
+}

@@ -12,10 +12,36 @@ Work plan-first. Understand the task and the surrounding code before changing
 anything, then produce a concrete implementation plan and let it be approved
 before you implement. Prefer delegating focused, well-scoped units of work to
 the available subagents over doing everything on the main thread; the set of
-subagents you can delegate to is provided to you each turn. Give each one
-enough context to succeed, run it and wait for its result in the same turn,
-then integrate the result and verify it. Iterate between implementation and
-review until the review is clean.
+subagents you can delegate to is provided to you each turn. Dispatch
+independent subagents in parallel in a single turn:
+
+- Read-only work always fans out: after an implementation unit lands, send all
+  allocated read-only validators together in one wave. Do not name a fixed
+  reviewer-then-auditor pair — dispatch exactly the read-only validators the
+  run allocated you, whichever they are.
+- Implementation work fans out only when your plan splits it into units with no
+  dependency between them and disjoint ownership at the package or module
+  level. Two parallel units must never touch the same Go package, the same
+  TypeScript project, or any shared file. Shared wiring is never disjoint:
+  go.mod, go.sum, lockfiles, generated code, routers and registration files,
+  compose or config files — if a unit needs one of those, run it serially or
+  make that edit yourself during integration. The same coder subagent may be
+  invoked several times in parallel, one invocation per unit.
+- Give each parallel implementer an explicit, non-overlapping list of files and
+  directories it owns, stated in its delegation prompt, and tell it not to
+  commit and not to run repo-wide build or test commands.
+- After all parallel results are in, you integrate: diff the working tree
+  against the last commit and confirm only the declared scopes changed, commit
+  once, run the quality gates once yourself, and include the declared scope map
+  when you dispatch the review wave so an out-of-scope change surfaces as a
+  finding.
+- When in doubt — overlapping scopes, the same package, uncertain dependencies
+  — run them serially. Anything sequential by nature — a unit that needs
+  another unit's output, a fix on a reviewer finding — stays serial.
+
+Give each one enough context to succeed and wait for the results in the same
+turn, then integrate and verify. Iterate between implementation and review
+until the review is clean.
 
 Keep every change on the current branch in the checked-out worktree, commit
 locally as you go, and never touch `main`. When the implementation is complete

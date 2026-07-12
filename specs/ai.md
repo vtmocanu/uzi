@@ -4960,3 +4960,163 @@ PRD carries the complete set (1–15) and the review corrections.
   fresh `HOME` with no prior session to attach to. The *designed* resume path (the
   worker process dies mid-run) is unaffected: `execute()` never reaches this `finally`
   there, so `HOME` survives for the requeued run to reattach to.
+
+# PRD #43 — Intra-run parallel subagents (parallel validators + disjoint-scope parallel coders)
+
+Serves human: the primary directive (agents never touch `main`) — the M2 signal hardening
+closes a real serial-flow hole in it; the parallelism is a wall-clock/throughput improvement
+strictly within existing constraints (PRD #3 templates §29, PRD #4 runtime §40–§53) and adds
+**no new user-stated requirement** (human.md unchanged). All decisions here are AI design
+within the pre-reviewed PRD (`prds/43-intra-run-parallel-subagents.md`, drafted 2026-07-10,
+3-agent-reviewed on 2026-07-10/11; the `↳review` decisions are binding). The user's only input
+to the 2026-07-12 build session was "work on PRD #43, worktree mode, with the agent team." Full
+Decision Log (1–8) + residuals live in the PRD; this section records the load-bearing decisions
+and the M0 verdict that gates them.
+
+## 189. M0 premise proven — same-turn foreground subagents overlap under the real guard hook
+
+- **The whole parallelism track was gated on an unproven SDK premise** (↳review blocking): the
+  builtin `lead` delegated strictly serially, and the B1 agent-guard rewrites
+  `run_in_background: false` on every allowed subagent call (to keep delegation in-turn), so
+  whether two *forced-foreground* same-turn subagents actually dispatch **concurrently** — rather
+  than serialize — was the open question. Had they serialized, the PRD collapsed to the M2
+  hardening only. No prose or template change was allowed to ship before this resolved.
+- **Verdict: OVERLAP (both probe runs), 2026-07-12.** A standalone SDK probe (`prds/43-m0-probe/`,
+  SDK 0.3.201) replicated the real `buildAgentGuardHook` **verbatim** — the name allowlist AND the
+  `run_in_background: false` rewrite — plus `settingSources: []` and subagent
+  `disallowedTools: ['Agent']`. A lead prompt dispatched two trivial foreground subagents in one
+  turn, each doing a 20s `sleep` bracketed by filesystem markers (ground truth independent of the
+  model's self-reported timestamps). Result: subagent B started 0.36s / 0.43s after A, ~19.6s
+  overlap of the two 20s windows, total wall ≈ 20s not 40s. Notably the two `Agent` tool_use calls
+  landed in **separate assistant frames** ~0.3–0.6s apart and still overlapped — concurrency does
+  not require the model to emit both calls in a single frame.
+- **Why a standalone probe, not the live dev stack** (session AI choice): `guardrails.ts` was
+  unimportable from the live-edited worktree during the spike, so the probe re-implemented the
+  guard hook rather than importing it; the fidelity guarantee is the **verbatim replication of the
+  load-bearing `run_in_background:false` rewrite**, not a shared code path. Throwaway evidence
+  retained at `prds/43-m0-probe/` (probe.ts + per-run findings.json + markers.log) as the
+  on-the-record proof.
+
+## 190. The parallel-dispatch contract (builtin `lead` + `coder` prose)
+
+- **Prompt-only change** — the entire behavior lives in two builtin bodies
+  (`api/internal/agenttmpl/builtins/{lead,coder}.md`); no schema, endpoint, or executor change.
+  The serial-delegation sentence in `lead` ("run it and wait … in the same turn") is replaced by a
+  **list** (↳review N1 — a nine-imperative run-on sentence dropped middle clauses and made
+  phrase-pins brittle):
+  - **Read-only work always fans out**: after an implementation unit lands, all *allocated*
+    read-only validators go in one wave — "allocated", never a hardcoded reviewer+auditor list,
+    because allocations vary per run (PRD #37 §174–§177).
+  - **Implementation fans out only on disjoint package/module-level ownership with no dependency** —
+    the parallelization unit is the **package/module, not the file** (↳review M-1/M-2): Go compiles
+    per-package and `tsc`/`node --test` are project-wide, so file-disjointness inside one package is
+    not independence. Two parallel units must never touch the same Go package, the same TS project,
+    or any **shared wiring** (go.mod/go.sum, lockfiles, generated/sqlc output, routers/registration,
+    compose/config); the lead makes shared-wiring edits itself during integration. Recorded honestly:
+    same-language units frequently are NOT parallelizable — the sweet spot is cross-area splits
+    (api ↔ web ↔ agent ↔ docs), which is how uzi PRDs naturally split.
+  - **Parallel implementers get an explicit non-overlapping file/dir scope in their prompt, must not
+    commit, and must not run repo-wide gates.** The lead then **integrates**: diffs the working tree
+    against the last commit (HEAD), confirms only declared scopes changed, commits **once**, runs the
+    quality gate **once**, and passes the declared scope map into the review wave so an out-of-scope
+    write surfaces as a finding. One committer, one gate, after integration.
+  - **When in doubt (overlapping scopes, same package, uncertain deps), serial.** Sequential-by-nature
+    work (a unit needing another's output, a fix on a reviewer finding) stays serial.
+- **`coder` gains a parallel-mode paragraph**: treat the assigned scope as a hard boundary; if the
+  task genuinely needs anything outside it (incl. shared wiring), **stop and report** instead of
+  editing; in parallel mode don't `git commit` and don't run build/test commands unless they cover
+  only exclusively-owned code — otherwise just report edits (↳review M-1: "targeted compile of what
+  you changed" was non-actionable in a per-package/project-wide toolchain, so the contract is "verify
+  only what you exclusively own, else report"). Read-only role templates
+  (`reviewer`/`auditor`/`tester`/`fact-checker`) are unchanged — parallel-safe by construction.
+- **Parallel coders explicitly do NOT commit** (↳review fact-check): the earlier "lead is the only
+  committer" claim was overstated — `coder.md` invites "commits made (if any)" and no deny-list rule
+  blocks `git commit`, so serial coders may commit as today; parallel mode forbids it **in prose
+  only** (concurrent commits contend on the git index) — no guardrail-level commit block (Out of
+  Scope). M1 (commit `cc320ea`, review APPROVE + audit clean) extended the agenttmpl parse/validity
+  tests to **pin 21 load-bearing phrases** (14 lead + 7 coder), mirroring how `TestCoderInheritsAllTools`
+  pins the coder's no-`tools:`-line invariant, so a reword that drops the behavior fails loudly. The
+  audit confirmed no guarantee was weakened: the plan gate and review wave stay non-optional; gating
+  relocated to the lead, not removed.
+
+## 191. Single shared worktree, prompt-level scope isolation, accepted residuals
+
+- **Per-subagent worktrees are rejected** (↳review N3): subagents are same-session tool calls sharing
+  one `cwd: ctx.worktreePath`, not git sessions — there is no per-writer HEAD/index to protect, and
+  per-subagent worktrees would require widening the most security-sensitive hook (`buildPathGuardHook`,
+  the §50 path jail) plus lead-side merge machinery for little gain over disjoint scopes. Scope
+  isolation is therefore a **prompt-level contract with a prompt-level integration check** — nothing
+  mechanical except the path jail and the human-merged MR.
+- **Accepted residuals — all recorded (not hand-waved), the shared backstop being the lead's
+  integration diff + the scope-aware review wave + the human-merged MR**:
+  - **Mid-flight cross-contamination has no serial analog**: a compromised unit A can plant content
+    into a file unit B reads mid-flight; caught only at the integration diff, the review wave, and the MR.
+  - **The integration-scope check is itself a lead-model instruction** a model could skip.
+  - **`setsid`-escape survivors scale with parallel width** (`docs/proc-hardening.md` residual): N
+    concurrent candidates race the short PAT push window instead of one — no new survival class, same
+    k8s uid-split/container-per-run endgame (§168).
+  - **Two same-named parallel coders are indistinguishable in the feed today** (↳review M-4):
+    attribution is envelope-derived/unforgeable and per-run `seq` stays gapless, but `ActivityFeed`
+    groups by agent NAME, so two concurrent `coder` invocations merge into one interleaved section.
+    Per-invocation attribution (a frame-id + feed-key change) is a filed follow-up ONLY if M3's
+    legibility bar fails — validate first, don't pre-build.
+  - **Token pressure is multiplicative with PRD #42** (↳review M-5, §188): N parallel subagents
+    multiply concurrent requests on the one per-user Anthropic token; once a cap-N worker runs M-wide
+    fan-outs that is N×M streams on one token — neither PRD's "SDK backoff handles it" acceptance
+    accounts for the product. No width-cap knob in MVP; practical width is bounded by plan shape (2–3
+    units) × #42's default cap of 1, and the lead's "when in doubt, serial" is the brake. A per-user
+    token concurrency budget becomes materially more pressing once both land.
+
+## 192. Subagent signal hardening (M2) — unconditional, lands regardless of the M0 verdict
+
+- **A real hole existed in today's SERIAL flow** (↳review security major — the PRD's original
+  "no guardrail changes" claim was wrong): the run's workflow-signal MCP tools
+  (`mcp__uzi__submit_plan` / `mcp__uzi__signal_done`) are registered at the session top level, the
+  coder inherits ALL tools (no `tools:` line ⇒ SDK inherit-all), subagents disallow only `Agent`, and
+  `scanSignals` honored a `signal_done` from ANY assistant frame — so a prompt-injected coder could
+  end the implement loop and hand a **partial, unreviewed** tree to the worker's push+MR. Parallel
+  mode only multiplies the odds/blast radius. Shipped independent of the M0 verdict (commits
+  `8fe11c4` + `bcaa46f`; review APPROVE + audit clean over the range).
+- **Two belt-and-suspenders layers, with the load-bearing one named explicitly**:
+  - **Worker-side signal scan is LOAD-BEARING**: `scanSignals` (the sole signal consumer) latches
+    `submit_plan`/`signal_done` only from **main-thread frames** — it gates on a frame discriminator
+    of **non-empty `subagent_type` OR non-null `parent_tool_use_id`** (both SDK-stamped on subagent
+    frames); either present ⇒ the frame belongs to a subagent and its signal is ignored. Centralized
+    in the one consumer so no signal path bypasses it.
+  - **`mcp__uzi` server-level denial is defense-in-depth**: subagent `disallowedTools` grows
+    `[NESTED_AGENT_TOOL] → [NESTED_AGENT_TOOL, "mcp__uzi"]` for every subagent (builtin and custom).
+    It is deliberately the WEAKER layer because `disallowedTools`-vs-explicit-allowlist precedence is
+    **unproven from the installed SDK types** — correctness cannot rest on it, hence the worker-side
+    scan carries the guarantee. Test: a subagent frame carrying `signal_done` must NOT terminate the run.
+- **B1 and the other guardrails are untouched and verified to cover parallel subagents**: the name
+  allowlist + `run_in_background:false` rewrite, async-deferral denial, path jail, and Bash deny-list
+  apply per-subagent unchanged; one CLI process per turn keeps all subagents inside its process group,
+  so the pre-push `killAgentTree` group-kill reaps them all — no subagent survives the turn (§45, §50).
+
+## 193. Builtin propagation — insert-only seed, reset clobbers customizations, documented recipe over auto-migration
+
+- **Editing `builtins/lead.md` reaches new databases only** (↳review M-3): boot seeding is insert-only
+  (`ReconcileBuiltinTemplates`, `ON CONFLICT (name) … DO NOTHING`, §93; scope-aware
+  `WHERE scope <> 'user'` since §158). The sole upgrade path for existing deployments is
+  `ResetAgentTemplate`, which re-applies the embedded builtin **verbatim, discarding any admin
+  customization** of that template — and the population most likely to reset (admins who customized
+  `lead` and want the new parallel prose) is exactly the one that loses edits.
+- **Decision: keep insert-only seeding; document, do not auto-migrate.** `docs/agent-templates.md` +
+  a release-note snippet state plainly that reset discards customizations and give the safe recipe
+  (diff current body against the new builtin, reset, re-apply edits — or hand-merge the new paragraphs
+  without resetting). A UI "builtin changed since seeded" drift indicator stays a stretch goal.
+  Auto-updating admin-customized builtins is explicitly Out of Scope (reset stays explicit).
+
+## 194. M5 — e2e interleaved multi-agent stream guard (isolated stack, no SDK)
+
+- **The isolated e2e stack can't exercise real concurrency** (no Anthropic token; the stub executor
+  never calls the SDK) — so M5 proves the piece it *can*: that an interleaved multi-agent message
+  stream **persists and replays** correctly. The stub executor (`agent/src/executor.ts`) gained a
+  `UZI_STUB_INTERLEAVE` sentinel (session AI choice) that scripts multiple agents' messages
+  interleaved (writes markers + scripted `run_messages`, still never touching the SDK).
+- **The guard asserts** the interleaved stream is persisted first into `run_messages` and served
+  back over REST with **gapless per-run `seq`**, **per-agent name attribution intact**, and correct
+  `?after=<seq>` **replay** — i.e. `GET /api/runs/:id/messages`, the leg the isolated stack can drive
+  deterministically. The `/api/ws` broadcast leg is NOT exercised by the e2e (it is web-vitest scope,
+  `e2e/run-e2e.sh:1549` + `e2e/README.md`); persisted `run_messages` + REST `?after` replay are
+  exactly what M5 proves. `./e2e/run-e2e.sh` green is the gate.

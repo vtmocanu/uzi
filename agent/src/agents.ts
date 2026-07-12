@@ -37,7 +37,22 @@
 import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentSource, AgentTemplate } from "./protocol.js";
 import { NESTED_AGENT_TOOL } from "./guardrails.js";
+import { SIGNAL_SERVER_NAME } from "./signals.js";
 import { qualifiedSkillName } from "./skills-plugin.js";
+
+// Server-level MCP denial (PRD #43 M2 / Decision 3). A `mcp__<server>` entry in
+// disallowedTools removes EVERY tool the named in-process MCP server exposes
+// (sdk.d.ts:48), so this denies both workflow-signal tools
+// (mcp__uzi__submit_plan / mcp__uzi__signal_done) to every subagent. The run's
+// plan gate and its done→MR handoff are the lead's alone: a subagent (coder,
+// reviewer, …) — buggy or prompt-injected — must never reach them and end the
+// loop with a partial, unreviewed tree. This is DEFENSE-IN-DEPTH: it should stop
+// the tool_use from ever being made, but whether disallowedTools wins over a
+// custom template's explicit `tools` allowlist is unproven from the SDK types, so
+// the load-bearing guarantee is the main-thread-only signal scan in signals.ts
+// (scanSignals ignores a subagent-borne signal even if the SDK let the call
+// through). Keep both.
+const SIGNAL_SERVER_DENY = `mcp__${SIGNAL_SERVER_NAME}`;
 
 /**
  * A template is the lead orchestrator (routed to the main thread, not registered
@@ -69,8 +84,10 @@ function toDefinition(
     description: t.description,
     prompt: t.prompt_body,
     // No subagent may spawn nested agents (defense-in-depth over the fact that
-    // `agents` + settingSources:[] already limit spawnable agents to these).
-    disallowedTools: [NESTED_AGENT_TOOL],
+    // `agents` + settingSources:[] already limit spawnable agents to these), and
+    // no subagent may reach the run's workflow-signal MCP tools (SIGNAL_SERVER_DENY
+    // above — the plan gate and done→MR handoff are the lead's alone).
+    disallowedTools: [NESTED_AGENT_TOOL, SIGNAL_SERVER_DENY],
   };
   // A non-empty template list is an explicit allowlist honored verbatim (and is
   // what makes reviewer/tester read-only). null/absent/empty ⇒ leave `tools`

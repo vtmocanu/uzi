@@ -46,6 +46,39 @@ by default unless you set a personal override in
 its persona and workflow; the primary-directive guardrails (never touch
 `main`, no `git push`, the plan gate) are enforced by the worker regardless.
 
+## Parallel dispatch
+
+The lead can dispatch more than one subagent in the same turn when their
+work doesn't overlap, instead of always waiting for one to finish before
+starting the next:
+
+- **Read-only validators fan out together.** After an implementation unit
+  lands, the lead sends every allocated read-only subagent (`reviewer`,
+  `auditor`, `tester`, `fact-checker` — whichever the run allocated) in one
+  wave rather than one at a time.
+- **Coders fan out only for genuinely independent units.** The lead
+  parallelizes implementation work only when the plan splits it into pieces
+  that share no Go package, no TypeScript project, and no file (including
+  `go.mod`, lockfiles, generated code, or wiring/registration files) between
+  them. Each parallel coder gets an explicit file scope in its delegation
+  prompt, doesn't commit, and doesn't run repo-wide build or test commands;
+  the lead diffs the working tree against the last commit to confirm only the
+  declared scopes changed, commits once, then runs the quality gate once.
+- **Anything uncertain stays serial** — overlapping scope, a dependency
+  between units, or a fix that depends on a reviewer's finding.
+
+You'll see this on a run's activity feed as multiple subagents active within
+the same turn. Two parallel invocations of the same coder template currently
+render as one merged section with interleaved messages — per-invocation
+attribution is a possible future improvement, not built yet.
+
+There's no separate concurrency cap for subagents within a run; width is
+bounded by how the plan splits, and by the lead defaulting to serial whenever
+it's unsure. It also compounds with
+[worker run concurrency](./worker-setup.md#concurrent-runs): if your worker
+runs more than one run at once, every parallel subagent in every concurrent
+run shares the same per-user Anthropic token.
+
 ## Allocation: which agents ride your runs
 
 The **In my runs** toggle on each row decides whether that template is
@@ -75,6 +108,32 @@ with a `shadowed` badge). Delete and recreate it under a different name to use i
 Never paste a credential into a description or prompt: uzi rejects anything
 that looks like a real Anthropic token. Credentials belong in
 [Anthropic token](./anthropic-token.md).
+
+### Resetting a builtin template
+
+Open a builtin template's detail page (click its name from **Agents**) and
+click **Reset to default**. It re-applies the shipped builtin body
+**verbatim** — it does not merge. If you've customized a builtin's prompt
+(say, `lead` or `coder`) and reset it to pick up a change shipped in a newer
+uzi version, your customization is gone, not folded into the new body.
+
+That's also why a shipped change to a builtin's prompt doesn't reach you
+automatically: it seeds into a fresh database on first boot, but an
+already-seeded row is never silently overwritten (that's what keeps your
+customizations durable across every other upgrade). Reset is the only path
+that pulls in a newer builtin body for an existing deployment, and it's
+all-or-nothing.
+
+To pick up a new builtin body without losing your own edits:
+
+1. Compare your current template body against the new one shipped in this
+   version (its git history is `api/internal/agenttmpl/builtins/` in the uzi
+   repo, or ask whoever deployed the upgrade).
+2. Reset the template.
+3. Re-apply your customization on top of the new body.
+
+Or skip reset entirely and hand-merge the new paragraphs into your
+customized body yourself.
 
 A repo can ship its own agent roster in `.claude/agents/`; you can run those
 instead of your templates, chosen per run at the plan gate — see
