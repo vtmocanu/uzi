@@ -114,6 +114,14 @@
   table.phases-t td:first-child { font-family: var(--font-sans); color: rgb(var(--fg)); }
   table.phases-t tr.total td { border-bottom: 0; color: rgb(var(--fg)); font-weight: 600; }
   table.phases-t tr.total td:first-child { font-weight: 600; }
+  .table-foot { margin: 6px 0 0; font-size: 11px; color: rgb(var(--faint)); }
+  .agent-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .agent-chip::before {
+    content: ""; width: 7px; height: 7px; border-radius: 2px; background: rgb(var(--brand));
+  }
+  .agent-chip.sub::before { background: rgb(var(--info)); }
 
   /* ── activity-log finish line ─────────────────────────────────────────── */
   .log {
@@ -189,7 +197,7 @@
 
   <!-- ═════════ 1. RunView ═════════ -->
   <section>
-    <div class="where"><h2>1 · Run view</h2><span>/runs/:id — usage strip in the header + per-phase breakdown + finish lines in the log</span></div>
+    <div class="where"><h2>1 · Run view</h2><span>/runs/:id — usage strip in the header + per-phase &amp; per-agent breakdowns + finish lines in the log</span></div>
     <div class="card">
       <div class="runhead">
         <div>
@@ -238,6 +246,24 @@
           </tbody>
         </table>
         </div>
+      </details>
+
+      <details class="phases" open>
+        <summary>Per-agent breakdown</summary>
+        <div class="phases-scroll">
+        <table class="phases-t">
+          <thead>
+            <tr><th>Agent</th><th>In (fresh)</th><th>In (cached)</th><th>Out</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="agent-chip">lead</span></td><td>38.2k</td><td>401.5k</td><td>14.8k</td></tr>
+            <tr><td><span class="agent-chip sub">coder</span></td><td>51.6k</td><td>583.9k</td><td>24.1k</td></tr>
+            <tr><td><span class="agent-chip sub">reviewer</span></td><td>18.9k</td><td>149.7k</td><td>7.6k</td></tr>
+            <tr class="total"><td>Attributed total</td><td>108.7k</td><td>1.14M</td><td>46.5k</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p class="table-foot">Attributed from each agent's assistant messages; may not sum to the run total (tokens only — per-agent cost is not available).</p>
       </details>
 
       <div class="log" aria-label="Activity log excerpt">
