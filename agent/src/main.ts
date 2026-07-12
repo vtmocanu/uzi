@@ -5,7 +5,8 @@ import { WorkerClient } from "./client.js";
 import { GitCache } from "./git.js";
 import { StubExecutor, type Executor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
-import { ChatExecutor } from "./chat-executor.js";
+import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
+import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Worker } from "./worker.js";
@@ -52,15 +53,19 @@ async function main(): Promise<void> {
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
   });
 
-  // The chat lane (PRD #39). Its executor gets the SAME join-token secret path as the
-  // run executor (task #9) so the Bash + path-guard hooks deny a read of it, and the
-  // SAME pinned HOME so a chat SDK session survives a restart for Continue/resume. The
-  // ChatRunner resolves each run's clocks from the claim config over these worker
-  // defaults; the chat lane always runs the real ChatExecutor (no stub — chat has no
-  // E2E stub path yet, and an unqueued chat lane just polls 204 harmlessly).
-  const chatExecutor = new ChatExecutor(log, sdkHomeDir, {
-    secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
-  });
+  // The chat lane (PRD #39). Under UZI_EXECUTOR=stub the chat lane runs the
+  // StubChatExecutor (no live Anthropic session) so the M6 chat e2e runs on the
+  // isolated stack with dummy creds (task #15); otherwise the real ChatExecutor, which
+  // gets the SAME join-token secret path as the run executor (task #9) so the Bash +
+  // path-guard hooks deny a read of it, and the SAME pinned HOME so a chat SDK session
+  // survives a restart for Continue/resume. The ChatRunner resolves each run's clocks
+  // from the claim config over these worker defaults.
+  const chatExecutor: ChatExecutorLike =
+    config.executor === "stub"
+      ? new StubChatExecutor(log)
+      : new ChatExecutor(log, sdkHomeDir, {
+          secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
+        });
   const chatRunner = new ChatRunner(client, chatExecutor, log, config.messageBatchMs, {
     maxTurns: config.chatMaxTurns,
     turnTimeoutMs: config.chatTurnTimeoutMs,

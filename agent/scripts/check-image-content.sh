@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Image-content check for the baked uzi source (PRD #39 M2, Decision 5).
 #
-# Asserts, against the worker image's filesystem, the four content invariants the
-# milestone names:
+# Asserts, against the worker image's filesystem, the invariants the milestone names:
 #   1. /opt/uzi-src/api exists  (the API source is baked in)
 #   2. /opt/uzi-src/web exists  (the web source is baked in)
 #   3. NO file matching .env* anywhere under /opt/uzi-src  (no secret leaked in)
 #   4. NO inspiration/ under /opt/uzi-src  (the large submodules are excluded)
+#   5. /opt/uzi-src is entirely ROOT-OWNED (Decision 5 — the non-root agent can't write it)
+#   6. read-only-to-agent: a write as the image's non-root user is DENIED (full mode only)
 # plus /opt/uzi-src/BUILD_INFO is present.
 #
 # Two modes (the four invariants depend only on the bake COPY + the per-Dockerfile
@@ -80,6 +81,32 @@ else
 fi
 
 if have '^opt/uzi-src/inspiration/'; then echo "FAIL inspiration/ leaked into the baked source"; fail=1; else echo "ok   no inspiration/ under the baked source"; fi
+
+# Ownership (Decision 5): /opt/uzi-src must be entirely root-owned so the non-root
+# agent user can never write it. Run `find` as the image's own USER (COPY defaults to
+# root:root and the Dockerfiles never chown /opt/uzi-src, so this holds in both modes).
+NONROOT="$(docker run --rm --entrypoint sh "$IMAGE" -c 'find /opt/uzi-src ! -user root 2>/dev/null' 2>/dev/null || true)"
+if [ -z "$NONROOT" ]; then
+  echo "ok   /opt/uzi-src is entirely root-owned"
+else
+  echo "FAIL non-root-owned paths under /opt/uzi-src:"
+  printf '%s\n' "$NONROOT" | sed 's/^/       /'
+  fail=1
+fi
+
+# Read-only-to-agent: in the REAL image the process runs as the non-root uzi user, so
+# a write into the root-owned baked source MUST be denied. Full mode only — the light
+# busybox image has no uzi user and runs as root; the ownership check above is what
+# pins the invariant that makes this true.
+if [ "$MODE" = "full" ]; then
+  PROBE="$(docker run --rm --entrypoint sh "$IMAGE" -c 'touch /opt/uzi-src/UZI_WRITE_PROBE 2>/dev/null && echo WROTE || echo denied')"
+  if [ "$PROBE" = "denied" ]; then
+    echo "ok   the agent user cannot write /opt/uzi-src (read-only)"
+  else
+    echo "FAIL the agent user was able to write /opt/uzi-src (expected read-only)"
+    fail=1
+  fi
+fi
 
 if [ "$fail" -ne 0 ]; then echo "IMAGE CONTENT CHECK FAILED"; exit 1; fi
 echo "IMAGE CONTENT CHECK PASSED ($MODE, $TEMPLATE)"

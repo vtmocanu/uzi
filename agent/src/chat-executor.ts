@@ -33,6 +33,7 @@ import fs from "node:fs/promises";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import type { Options as SdkOptions, SDKMessage, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { EmittedMessage } from "./executor.js";
+import type { UziToolHandlers } from "./uzi-tools.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { buildPreToolUseHook, buildPathGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
@@ -163,6 +164,10 @@ export interface ChatContext {
   /** Per-run uzi MCP tool names to add to the read-only base tool set (M3), so the
    *  tools are actually callable. Takes precedence over the executor-level default. */
   extraTools?: readonly string[];
+  /** The uzi tool handlers, bound to this run (M3). The real executor exposes them to
+   *  the model as the `uzi` MCP server (mcpServers above); the STUB executor, which
+   *  runs no SDK/MCP, calls them directly to drive a proposal in the e2e (#15). */
+  uziTools?: UziToolHandlers;
   /**
    * Deliver the next user message to answer, or undefined when the input source has
    * no more input (idle-completed or ended). Backed by steering's await-next-follow-up
@@ -182,6 +187,12 @@ export interface ChatExecutorResult {
   endReason: ChatEndReason;
   /** The last SDK session id observed, for resume (also reported live via onSessionId). */
   sessionId?: string;
+}
+
+/** What the ChatRunner drives: the real SDK-backed ChatExecutor in production, or the
+ *  StubChatExecutor under UZI_EXECUTOR=stub (no live Anthropic session, for the e2e). */
+export interface ChatExecutorLike {
+  run(ctx: ChatContext): Promise<ChatExecutorResult>;
 }
 
 export interface ChatExecutorOptions {
