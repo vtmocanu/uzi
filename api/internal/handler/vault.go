@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -71,6 +72,15 @@ func (h *Handler) VaultPassphrase(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "vault not configured")
 		return
 	}
+	// Defense in depth (auditor): this endpoint is scoped to passwordless (OIDC-only)
+	// users. A password account's vault derives from its LOGIN password, so minting a
+	// separate passphrase vault here would create one that its login-unlock can never
+	// open — a self-brick. The SPA only offers this to passwordless users; enforce it
+	// server-side regardless.
+	if user.PasswordHash.Valid {
+		httpx.Error(w, http.StatusConflict, "account has a password; its vault derives from the login password")
+		return
+	}
 
 	var req struct {
 		Passphrase string `json:"passphrase"`
@@ -80,7 +90,7 @@ func (h *Handler) VaultPassphrase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Passphrase) < minPasswordLen {
-		httpx.Error(w, http.StatusBadRequest, "passphrase must be at least 12 characters")
+		httpx.Error(w, http.StatusBadRequest, fmt.Sprintf("passphrase must be at least %d characters", minPasswordLen))
 		return
 	}
 	if len(req.Passphrase) > maxPasswordLen {

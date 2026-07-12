@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
@@ -226,6 +227,27 @@ func TestVaultPassphraseNoVault(t *testing.T) {
 	rec := postPassphrase(h, uuid.New(), "a-strong-vault-passphrase")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("code = %d, want 500 for a nil vault", rec.Code)
+	}
+}
+
+// TestVaultPassphraseRejectsPasswordUser: a password account (PasswordHash valid)
+// is refused server-side (409) and no vault is minted — defense-in-depth against a
+// self-brick, since its vault derives from the login password (Decision 6).
+func TestVaultPassphraseRejectsPasswordUser(t *testing.T) {
+	h := &Handler{vault: testVault(t)}
+	uid := uuid.New()
+	body, _ := json.Marshal(map[string]string{"passphrase": "a-strong-vault-passphrase"})
+	req := httptest.NewRequest(http.MethodPost, "/api/vault/passphrase", bytes.NewReader(body))
+	req = req.WithContext(mw.ContextWithUser(req.Context(),
+		store.User{ID: uid, PasswordHash: pgtype.Text{String: "argon2-hash-placeholder", Valid: true}}))
+	rec := httptest.NewRecorder()
+	h.VaultPassphrase(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code = %d, want 409 for a password account; body=%s", rec.Code, rec.Body.String())
+	}
+	if h.vaultExists(context.Background(), uid) {
+		t.Error("a password user's passphrase attempt must not create a vault")
 	}
 }
 
