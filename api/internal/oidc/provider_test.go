@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,6 +51,56 @@ func discoveryDoc(issuer string) map[string]any {
 		"token_endpoint":                        issuer + "/token",
 		"jwks_uri":                              issuer + "/jwks",
 		"id_token_signing_alg_values_supported": []string{"RS256"},
+	}
+}
+
+// TestDiscoverSingleflightCollapsesConcurrentCalls: N goroutines racing to discover
+// against a down-then-slow IdP must collapse onto a SINGLE discovery request
+// (singleflight), so an outage does not fan out one uzi->IdP call per pending login.
+func TestDiscoverSingleflightCollapsesConcurrentCalls(t *testing.T) {
+	var hits int32
+	var issuer string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		time.Sleep(50 * time.Millisecond) // widen the window so the goroutines pile up in-flight
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(discoveryDoc(issuer))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	issuer = srv.URL
+
+	p := New(Config{
+		IssuerURL: issuer, ClientID: "uzi", ClientSecret: "s",
+		RedirectURL: issuer + "/cb", Scopes: []string{"openid"}, HTTPTimeout: 5 * time.Second,
+	})
+
+	const n = 20
+	start := make(chan struct{})
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = p.Discover(context.Background())
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: discovery failed: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("discovery endpoint hit %d times, want exactly 1 (singleflight must collapse concurrent calls)", got)
+	}
+	if !p.Discovered() {
+		t.Error("Discovered() = false after a successful collapse")
 	}
 }
 

@@ -111,8 +111,10 @@ func TestOIDCIssuerScheme(t *testing.T) {
 		"https ok":              {"https://idp.example.com", false},
 		"http non-loopback bad": {"http://idp.example.com", true},
 		"http localhost ok":     {"http://localhost:8080/realms/uzi", false},
+		"http localhost bare":   {"http://localhost", false}, // no port
 		"http 127.0.0.1 ok":     {"http://127.0.0.1:8080", false},
 		"http ::1 ok":           {"http://[::1]:8080", false},
+		"http ::1 bare":         {"http://[::1]", false}, // no port
 		"ftp bad":               {"ftp://idp.example.com", true},
 		"no host bad":           {"https://", true},
 	}
