@@ -120,6 +120,36 @@ func TestRegisterEmptyAllowlistAllowsAll(t *testing.T) {
 	}
 }
 
+// TestLoginDisabledWhenPasswordLoginOff: with password login off, POST /login is a
+// 403 even with well-formed, plausibly-valid credentials — the gate fires before the
+// body and the DB, so there is no password backdoor in SSO-only mode (fact-check R1).
+func TestLoginDisabledWhenPasswordLoginOff(t *testing.T) {
+	h := &Handler{cfg: config.Config{PasswordLoginEnabled: false}}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login",
+		strings.NewReader(`{"email":"admin@example.com","password":"a-plausible-password"}`))
+	rec := httptest.NewRecorder()
+	h.Login(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 with password login disabled", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "password login is disabled") {
+		t.Errorf("body = %q, want the disabled reason", rec.Body.String())
+	}
+}
+
+// TestLoginNotGatedWhenPasswordLoginOn: with the flag on, the gate does not fire —
+// a malformed body reaches the decode step and 400s (a 403 here would mean the gate
+// wrongly tripped). Proves the normal path is unchanged without needing a DB.
+func TestLoginNotGatedWhenPasswordLoginOn(t *testing.T) {
+	h := &Handler{cfg: config.Config{PasswordLoginEnabled: true}}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader("not json"))
+	rec := httptest.NewRecorder()
+	h.Login(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (gate off, failing on the malformed body)", rec.Code)
+	}
+}
+
 func TestAuthConfigShape(t *testing.T) {
 	t.Run("enabled with domains", func(t *testing.T) {
 		h := &Handler{cfg: config.Config{RegistrationEnabled: true, AllowedEmailDomains: []string{"example.com"}}}

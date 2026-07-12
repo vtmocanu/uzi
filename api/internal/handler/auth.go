@@ -222,6 +222,19 @@ func (h *Handler) createUserFirstAdmin(r *http.Request, email, hash string, disp
 // for both unknown email and wrong password, and equalizes timing by hashing
 // against a dummy hash when the email is unknown.
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+	// SSO-only mode: with password login disabled, refuse before touching the body
+	// or the DB (PRD #45, Decision 8 / fact-check R1). A uniform 403 regardless of
+	// whether the account exists — no enumeration surface, and no Argon2 on this
+	// path. This is the whole point of the kill-switch: an SSO-only shop must not
+	// leave a password backdoor that bypasses the IdP's offboarding. Login is the
+	// only VerifyPassword caller; worker join tokens and the JWT-cookie paths are
+	// separate. Break-glass stays as documented: flip UZI_PASSWORD_LOGIN_ENABLED back
+	// to true and restart (the seed admin keeps its password_hash).
+	if !h.cfg.PasswordLoginEnabled {
+		httpx.Error(w, http.StatusForbidden, "password login is disabled")
+		return
+	}
+
 	var req loginRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
