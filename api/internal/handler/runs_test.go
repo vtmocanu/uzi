@@ -37,6 +37,13 @@ type runsStore struct {
 	// owner's allocation-resolved templates, lead included so the handler's strip is
 	// exercised.
 	claimTemplates []store.AgentTemplate
+	// PRD #40 usage reads. hasRunUsage=false (default) makes GetRunUsageTotal return
+	// pgx.ErrNoRows so a run shows no usage — existing GetRun tests are unaffected.
+	hasRunUsage   bool
+	runUsageTotal store.GetRunUsageTotalRow
+	selfUsage     store.SelfUsageRow
+	adminTotals   store.AdminUsageTotalsRow
+	adminPerUser  []store.AdminUsagePerUserRow
 }
 
 func (s *runsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -72,6 +79,21 @@ func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) 
 }
 func (s *runsStore) CreateStopVerdictInput(context.Context, store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
 	return store.RunUserInput{}, nil
+}
+func (s *runsStore) GetRunUsageTotal(_ context.Context, _ uuid.UUID) (store.GetRunUsageTotalRow, error) {
+	if !s.hasRunUsage {
+		return store.GetRunUsageTotalRow{}, pgx.ErrNoRows
+	}
+	return s.runUsageTotal, nil
+}
+func (s *runsStore) SelfUsage(_ context.Context, _ uuid.UUID) (store.SelfUsageRow, error) {
+	return s.selfUsage, nil
+}
+func (s *runsStore) AdminUsageTotals(context.Context) (store.AdminUsageTotalsRow, error) {
+	return s.adminTotals, nil
+}
+func (s *runsStore) AdminUsagePerUser(context.Context) ([]store.AdminUsagePerUserRow, error) {
+	return s.adminPerUser, nil
 }
 
 func newRunsHandler(t *testing.T, st workersvc.Store) *Handler {

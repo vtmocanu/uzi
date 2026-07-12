@@ -122,6 +122,11 @@ type Store interface {
 	// UpsertRunUsage folds a delivered result frame's per-model usage into
 	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
 	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
+	// Usage read rollups (PRD #40 M3), all over the run_usage_totals view.
+	GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error)
+	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
+	AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error)
+	AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
 	CreateStopVerdictInput(ctx context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error)
 	// CreateApprovePlanInput enqueues an approve_plan AND records the run's agent
@@ -1286,6 +1291,29 @@ func (s *Service) ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow
 // ListActiveRunsAll returns every non-terminal run across all users (admin).
 func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error) {
 	return s.q.ListActiveRunsAll(ctx)
+}
+
+// RunUsageTotal returns one run's rolled-up token/cost totals (PRD #40 M3). Returns
+// pgx.ErrNoRows for a run with no usage — the caller renders that as "no usage".
+func (s *Service) RunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error) {
+	return s.q.GetRunUsageTotal(ctx, runID)
+}
+
+// SelfUsage returns the user's own lifetime + last-7-days usage totals and their
+// usage-bearing run count (PRD #40 M3, GET /api/usage).
+func (s *Service) SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error) {
+	return s.q.SelfUsage(ctx, userID)
+}
+
+// AdminUsageTotals returns factory-wide usage totals across all users (PRD #40 M3).
+func (s *Service) AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error) {
+	return s.q.AdminUsageTotals(ctx)
+}
+
+// AdminUsagePerUser returns the per-user usage breakdown for the admin factory view
+// (PRD #40 M3); the rows sum to the factory total by construction.
+func (s *Service) AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error) {
+	return s.q.AdminUsagePerUser(ctx)
 }
 
 // SubmitInputResult reports how a steering input was handled.
