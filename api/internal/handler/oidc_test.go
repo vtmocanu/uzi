@@ -81,7 +81,7 @@ func (f *handlerFakeIDP) provider() *oidc.Provider {
 // and a wrong/absent/tampered/incomplete cookie is rejected.
 func TestOIDCStateCookieRoundTrip(t *testing.T) {
 	h := oidcTestHandler(t, nil)
-	want := oidcStateData{State: "state-val", Nonce: "nonce-val", Verifier: "verifier-val"}
+	want := oidcStateData{State: "state-val", Nonce: "nonce-val", Verifier: "verifier-val", IssuedAt: time.Now().Unix()}
 
 	rec := httptest.NewRecorder()
 	if err := h.setOIDCStateCookie(rec, want); err != nil {
@@ -135,7 +135,7 @@ func TestOIDCStateCookieRoundTrip(t *testing.T) {
 	})
 	t.Run("missing field", func(t *testing.T) {
 		rec2 := httptest.NewRecorder()
-		if err := h.setOIDCStateCookie(rec2, oidcStateData{State: "s", Nonce: "n"}); err != nil {
+		if err := h.setOIDCStateCookie(rec2, oidcStateData{State: "s", Nonce: "n", IssuedAt: time.Now().Unix()}); err != nil {
 			t.Fatal(err)
 		}
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -144,6 +144,20 @@ func TestOIDCStateCookieRoundTrip(t *testing.T) {
 		}
 		if _, ok := h.readOIDCStateCookie(r); ok {
 			t.Error("ok=true for a cookie missing the verifier")
+		}
+	})
+	t.Run("expired (back-dated issue time)", func(t *testing.T) {
+		rec2 := httptest.NewRecorder()
+		stale := oidcStateData{State: "s", Nonce: "n", Verifier: "v", IssuedAt: time.Now().Add(-oidcStateTTL - time.Minute).Unix()}
+		if err := h.setOIDCStateCookie(rec2, stale); err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		for _, c := range rec2.Result().Cookies() {
+			r.AddCookie(c)
+		}
+		if _, ok := h.readOIDCStateCookie(r); ok {
+			t.Error("ok=true for a cookie older than the server-side TTL (audit Low1)")
 		}
 	})
 }
@@ -221,9 +235,9 @@ func TestOIDCCallbackStateMismatchRejectsBeforeExchange(t *testing.T) {
 	defer f.srv.Close()
 	h := oidcTestHandler(t, f.provider())
 
-	// Seal a cookie with state "correct".
+	// Seal a valid (unexpired) cookie with state "correct".
 	setter := httptest.NewRecorder()
-	if err := h.setOIDCStateCookie(setter, oidcStateData{State: "correct", Nonce: "n", Verifier: "v"}); err != nil {
+	if err := h.setOIDCStateCookie(setter, oidcStateData{State: "correct", Nonce: "n", Verifier: "v", IssuedAt: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/oidc/callback?code=abc&state=wrong", nil)
@@ -236,6 +250,31 @@ func TestOIDCCallbackStateMismatchRejectsBeforeExchange(t *testing.T) {
 	assertOIDCErrorRedirect(t, rec, "oidc_state")
 	if f.tokenCalls != 0 {
 		t.Fatalf("audit M1 violation: token endpoint called %d times on state mismatch", f.tokenCalls)
+	}
+}
+
+// TestOIDCCallbackEmptyCodeIsExchangeError: a valid cookie + matching state but no
+// code is a protocol failure (Nit A) → oidc_exchange, and no token call happens
+// (there is nothing to exchange).
+func TestOIDCCallbackEmptyCodeIsExchangeError(t *testing.T) {
+	f := newHandlerFakeIDP(t)
+	defer f.srv.Close()
+	h := oidcTestHandler(t, f.provider())
+
+	setter := httptest.NewRecorder()
+	if err := h.setOIDCStateCookie(setter, oidcStateData{State: "st", Nonce: "n", Verifier: "v", IssuedAt: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/oidc/callback?state=st", nil) // no code
+	for _, c := range setter.Result().Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.OIDCCallback(rec, req)
+
+	assertOIDCErrorRedirect(t, rec, "oidc_exchange")
+	if f.tokenCalls != 0 {
+		t.Fatalf("token endpoint called %d times for an empty code", f.tokenCalls)
 	}
 }
 

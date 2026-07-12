@@ -399,18 +399,28 @@ func (h *Handler) AuthConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// issueSessionCookies mints the JWT and sets the auth + CSRF cookies. It logs and
+// returns an error WITHOUT writing a response body, so callers choose how to
+// surface failure: a JSON 500 for the password endpoints (issueSession), a
+// redirect for the OIDC callback (review NB3).
+func (h *Handler) issueSessionCookies(w http.ResponseWriter, user store.User) error {
+	token, err := auth.IssueToken(h.cfg.JWTSecret, user.ID.String(), user.TokenVersion, h.cfg.AuthTokenTTL)
+	if err != nil {
+		slog.Error("issue token", "error", err)
+		return err
+	}
+	if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: h.cfg.CookieSecure, TTL: h.cfg.AuthTokenTTL}); err != nil {
+		slog.Error("set auth cookies", "error", err)
+		return err
+	}
+	return nil
+}
+
 // issueSession mints a JWT at the user's current token_version and sets the
 // auth + CSRF cookies. It writes an error response and returns false on
 // failure.
 func (h *Handler) issueSession(w http.ResponseWriter, user store.User) bool {
-	token, err := auth.IssueToken(h.cfg.JWTSecret, user.ID.String(), user.TokenVersion, h.cfg.AuthTokenTTL)
-	if err != nil {
-		slog.Error("issue token", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return false
-	}
-	if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: h.cfg.CookieSecure, TTL: h.cfg.AuthTokenTTL}); err != nil {
-		slog.Error("set auth cookies", "error", err)
+	if err := h.issueSessionCookies(w, user); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}

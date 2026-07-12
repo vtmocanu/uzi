@@ -49,13 +49,16 @@ const (
 )
 
 // oidcStateData is sealed into the state cookie: the CSRF state, the ID-token
-// nonce, and the PKCE verifier. None is a long-lived secret, but sealing with the
-// master box keeps them opaque + tamper-evident and lets the callback treat any
-// decrypt failure as a hard reject.
+// nonce, the PKCE verifier, and the issue time. None is a long-lived secret, but
+// sealing with the master box keeps them opaque + tamper-evident and lets the
+// callback treat any decrypt failure as a hard reject. IssuedAt is enforced
+// server-side against oidcStateTTL so a replayed cookie cannot outlive the window
+// even if the browser ignores the cookie MaxAge (audit Low1).
 type oidcStateData struct {
 	State    string `json:"s"`
 	Nonce    string `json:"n"`
 	Verifier string `json:"v"`
+	IssuedAt int64  `json:"t"` // unix seconds
 }
 
 // OIDCLogin starts the Authorization Code + PKCE (S256) flow: it mints
@@ -86,7 +89,7 @@ func (h *Handler) OIDCLogin(w http.ResponseWriter, r *http.Request) {
 		h.redirectOIDCError(w, r, oidcErrExchange)
 		return
 	}
-	if err := h.setOIDCStateCookie(w, oidcStateData{State: state, Nonce: nonce, Verifier: verifier}); err != nil {
+	if err := h.setOIDCStateCookie(w, oidcStateData{State: state, Nonce: nonce, Verifier: verifier, IssuedAt: time.Now().Unix()}); err != nil {
 		slog.Error("oidc login: seal state cookie", "error", err)
 		h.redirectOIDCError(w, r, oidcErrInternal)
 		return
@@ -130,7 +133,9 @@ func (h *Handler) OIDCCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	code := q.Get("code")
 	if code == "" {
-		h.redirectOIDCError(w, r, oidcErrState)
+		// Cookie + state were valid but the IdP returned neither a code nor an error:
+		// a protocol failure, not a state failure (Nit A).
+		h.redirectOIDCError(w, r, oidcErrExchange)
 		return
 	}
 
@@ -152,9 +157,12 @@ func (h *Handler) OIDCCallback(w http.ResponseWriter, r *http.Request) {
 	// Converge on the existing session chokepoint (Decision 2): same JWT + CSRF
 	// cookies, same token_version. The OIDC callback never touches the vault
 	// (Decision 6 / audit M4) — a passwordless user creates a vault passphrase
-	// later; a linked user's password-derived vault stays locked here.
-	if !h.issueSession(w, user) {
-		return // issueSession already wrote an error response
+	// later; a linked user's password-derived vault stays locked here. On the rare
+	// mint failure, redirect with an error code rather than emit a raw JSON 500 into
+	// a top-level browser navigation (review NB3).
+	if err := h.issueSessionCookies(w, user); err != nil {
+		h.redirectOIDCError(w, r, oidcErrInternal)
+		return
 	}
 	// Fixed server-side relative path — no next/return_to param exists (Decision 3,
 	// closes open-redirect).
@@ -173,6 +181,12 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 		OidcSubject: pgtype.Text{String: identity.Subject, Valid: true},
 	})
 	if err == nil {
+		// Decision 10: warn on IdP email drift, never auto-apply (email is UNIQUE in
+		// uzi; a blind rename can collide). No raw addresses in the log (PII rule) —
+		// user id + subject is enough to correlate.
+		if addr, e := mail.ParseAddress(strings.TrimSpace(strings.ToLower(identity.Email))); e == nil && addr.Address != user.Email {
+			slog.Warn("oidc login: idp email drift detected (not auto-applied)", "user", user.ID, "subject", identity.Subject)
+		}
 		return h.oidcLoginExisting(ctx, user)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -203,6 +217,13 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 		if existing.OidcSubject.Valid {
 			slog.Warn("oidc resolve: email matches an account bound to a different subject; refusing", "user", existing.ID)
 			return store.User{}, oidcErrForbidden
+		}
+		// Reject a deactivated account BEFORE mutating it (review NB2): the deactivated
+		// check is already in hand from GetUserByEmail, so an unauthenticated callback
+		// hit never links (writes to) a disabled row.
+		if !existing.IsActive {
+			slog.Warn("oidc resolve: link target is deactivated; refusing", "user", existing.ID)
+			return store.User{}, oidcErrDeactivated
 		}
 		linked, err := h.q.LinkUserOIDC(ctx, store.LinkUserOIDCParams{
 			ID:          existing.ID,
@@ -244,7 +265,7 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			// Concurrent first-login race on the email or (issuer,subject) unique
 			// constraint: "already exists → re-fetch and log in" (audit L6).
-			return h.oidcRefetchAfterRace(ctx, identity, email)
+			return h.oidcRefetchAfterRace(ctx, identity)
 		}
 		slog.Error("oidc resolve: create user", "error", err)
 		return store.User{}, oidcErrInternal
@@ -304,7 +325,7 @@ func (h *Handler) createOIDCUserFirstAdmin(r *http.Request, email string, displa
 // re-read by (issuer, subject) and logged in. A 23505 that was actually an email
 // collision with a different subject is treated like the "email bound to a
 // different subject" case — rejected, never hijacked.
-func (h *Handler) oidcRefetchAfterRace(ctx context.Context, identity oidc.Identity, email string) (store.User, string) {
+func (h *Handler) oidcRefetchAfterRace(ctx context.Context, identity oidc.Identity) (store.User, string) {
 	user, err := h.q.GetUserByOIDCSubject(ctx, store.GetUserByOIDCSubjectParams{
 		OidcIssuer:  pgtype.Text{String: identity.Issuer, Valid: true},
 		OidcSubject: pgtype.Text{String: identity.Subject, Valid: true},
@@ -316,7 +337,10 @@ func (h *Handler) oidcRefetchAfterRace(ctx context.Context, identity oidc.Identi
 		slog.Error("oidc resolve: refetch by subject after race", "error", err)
 		return store.User{}, oidcErrInternal
 	}
-	slog.Warn("oidc login: create raced with a different account on this email; refusing", "email", email)
+	// The 23505 was an email collision with a different subject; reject, never
+	// hijack. Log the subject, not the raw email (PII rule — only operator SeedEmail
+	// is ever logged).
+	slog.Warn("oidc login: create raced with a different account on this email; refusing", "subject", identity.Subject)
 	return store.User{}, oidcErrForbidden
 }
 
@@ -390,6 +414,11 @@ func (h *Handler) readOIDCStateCookie(r *http.Request) (oidcStateData, bool) {
 		return oidcStateData{}, false
 	}
 	if data.State == "" || data.Nonce == "" || data.Verifier == "" {
+		return oidcStateData{}, false
+	}
+	// Server-side TTL: reject a cookie older than the window even if the browser
+	// kept it past its MaxAge (shares oidcStateTTL with the cookie MaxAge; audit Low1).
+	if data.IssuedAt <= 0 || time.Since(time.Unix(data.IssuedAt, 0)) > oidcStateTTL {
 		return oidcStateData{}, false
 	}
 	return data, true
