@@ -126,6 +126,26 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 	}
 }
 
+// The admin usage endpoint is gated by RequireAdmin (the route lives under that
+// middleware group): a non-admin gets 403, an admin passes through to 200.
+func TestAdminUsageRequiresAdmin(t *testing.T) {
+	h := newRunsHandler(t, &runsStore{})
+	gated := mw.RequireAdmin(http.HandlerFunc(h.AdminUsage))
+
+	nonAdmin := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/usage", nil)
+	gated.ServeHTTP(nonAdmin, req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: uuid.New(), IsAdmin: false})))
+	if nonAdmin.Code != http.StatusForbidden {
+		t.Fatalf("non-admin on /api/admin/usage = %d, want 403", nonAdmin.Code)
+	}
+
+	admin := httptest.NewRecorder()
+	gated.ServeHTTP(admin, req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: uuid.New(), IsAdmin: true})))
+	if admin.Code != http.StatusOK {
+		t.Fatalf("admin on /api/admin/usage = %d, want 200", admin.Code)
+	}
+}
+
 func TestListRunsAttachesUsageOnlyWhenPresent(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	st := &runsStore{userRuns: []store.ListRunsForUserRow{

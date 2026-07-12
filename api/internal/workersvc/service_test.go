@@ -945,6 +945,33 @@ func TestAppendMessagesFoldSkipsChatRuns(t *testing.T) {
 	}
 }
 
+// Out-of-domain fold inputs are clamped into the run_usage columns' domains so the
+// append can never 22003 (a poison loop: the worker's batcher retries a failed batch
+// at head forever). An absurd cost (>= the numeric(12,6) ceiling) clamps to the
+// ceiling and negative token counts clamp to 0 — the append still succeeds.
+func TestAppendMessagesFoldClampsOutOfRangeValues(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("s")}}
+	svc := New(fs, newBox(t), testParams())
+
+	msgs := []IncomingMessage{{Seq: 1, Kind: "status", Payload: json.RawMessage(
+		`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":-5,"outputTokens":-1,"cacheReadInputTokens":-9,"costUSD":1000000000}}}`)}}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("append must not fail on out-of-range usage (poison-loop guard): %v", err)
+	}
+	if len(fs.upsertedUsage) != 1 {
+		t.Fatalf("expected 1 upsert, got %d", len(fs.upsertedUsage))
+	}
+	u := fs.upsertedUsage[0]
+	if u.InputTokens != 0 || u.OutputTokens != 0 || u.CacheReadTokens != 0 {
+		t.Fatalf("negative token counts must clamp to 0, got %+v", u)
+	}
+	// costUSD 1e9 clamps to the numeric(12,6) ceiling: 999999.999999 → 999999999999e-6.
+	if u.CostUsd.Int == nil || u.CostUsd.Int.Int64() != 999999999999 || u.CostUsd.Exp != -6 {
+		t.Fatalf("absurd cost must clamp to the column ceiling, got int=%v exp=%d", u.CostUsd.Int, u.CostUsd.Exp)
+	}
+}
+
 // A DB error on the fold's upsert propagates: the append fails so the worker
 // re-delivers the batch and the fold retries (idempotent), rather than silently
 // dropping the usage.

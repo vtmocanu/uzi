@@ -795,10 +795,10 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 				RunID:               run.ID,
 				SessionID:           sessionID,
 				Model:               model,
-				InputTokens:         mu.InputTokens,
-				CacheReadTokens:     mu.CacheReadInputTokens,
-				CacheCreationTokens: mu.CacheCreationInputTokens,
-				OutputTokens:        mu.OutputTokens,
+				InputTokens:         nonNegTokens(mu.InputTokens),
+				CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
+				CacheCreationTokens: nonNegTokens(mu.CacheCreationInputTokens),
+				OutputTokens:        nonNegTokens(mu.OutputTokens),
 				CostUsd:             numericUSD(mu.CostUSD),
 			}); err != nil {
 				return fmt.Errorf("fold run usage (run %s, model %s): %w", run.ID, model, err)
@@ -808,15 +808,35 @@ func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []Incomi
 	return nil
 }
 
+// maxCostUSD is the numeric(12,6) ceiling ($999,999.999999). A single frame's
+// cost is far below this, but the fold MUST clamp to it: a bogus costUSD >= 1e6
+// would quantize past the column and raise Postgres 22003, failing the append —
+// and the worker's batcher retries a failed batch at head forever (poison loop).
+const maxCostUSD = 999999.999999
+
 // numericUSD builds a numeric(12,6) cost from the SDK's float dollar amount by
 // quantizing to microdollars (Int = round(usd*1e6), Exp = -6) — deterministic and
-// free of the float-string-parse ambiguity of Scan. A negative/NaN/Inf cost
-// (never expected) folds to 0 rather than poisoning a run's total.
+// free of the float-string-parse ambiguity of Scan. Out-of-range costs (never
+// expected) are clamped into the column's domain rather than poisoning the fold:
+// NaN/negative/-Inf → 0, and anything above the ceiling (incl. +Inf) → the ceiling.
 func numericUSD(usd float64) pgtype.Numeric {
-	if math.IsNaN(usd) || math.IsInf(usd, 0) || usd < 0 {
-		return pgtype.Numeric{Int: big.NewInt(0), Exp: -6, Valid: true}
+	switch {
+	case math.IsNaN(usd) || usd < 0:
+		usd = 0
+	case usd > maxCostUSD: // also catches +Inf
+		usd = maxCostUSD
 	}
 	return pgtype.Numeric{Int: big.NewInt(int64(math.Round(usd * 1e6))), Exp: -6, Valid: true}
+}
+
+// nonNegTokens clamps a token count to >= 0 at fold time. GREATEST only protects an
+// existing row; a fresh (run_id, session_id, model) key inserts whatever arrives, so
+// a negative count (buggy/hostile worker) would otherwise land verbatim.
+func nonNegTokens(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // StateRequest is the worker's report of a run's new state. Only the fields
