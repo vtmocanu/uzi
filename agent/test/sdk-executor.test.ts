@@ -362,6 +362,127 @@ describe("SdkExecutor implement/review loop", () => {
   });
 });
 
+describe("SdkExecutor per-frame usage attach (PRD #40 Decision 11)", () => {
+  const USAGE = { input_tokens: 1200, output_tokens: 800, cache_read_input_tokens: 400, cache_creation_input_tokens: 50 };
+
+  /** An assistant frame carrying per-call usage + arbitrary content blocks. */
+  function assistantUsage(
+    blocks: Array<Record<string, unknown>>,
+    usage: Record<string, unknown> = USAGE,
+    subagentType?: string,
+  ): SDKMessage {
+    const msg: Record<string, unknown> = { type: "assistant", session_id: "sess-1", message: { usage, content: blocks } };
+    if (subagentType) msg["subagent_type"] = subagentType;
+    return msg as unknown as SDKMessage;
+  }
+
+  /** Emitted messages that actually carry an attached `usage` payload key. */
+  function withUsage(emits: EmittedMessage[]): EmittedMessage[] {
+    return emits.filter((m) => m.payload["usage"] !== undefined);
+  }
+
+  it("attaches the frame's usage to EXACTLY ONE emitted message (the first surviving block)", async () => {
+    // A multi-block frame explodes into thinking + text; usage must land once, on
+    // the first — never multiplied across both (which would double the run total).
+    const frame = assistantUsage([
+      { type: "thinking", thinking: "weighing options" },
+      { type: "text", text: "the answer" },
+    ]);
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [frame, signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const carriers = withUsage(probe.emits);
+    assert.strictEqual(carriers.length, 1, "usage attaches exactly once per frame");
+    assert.strictEqual(carriers[0]!.kind, "thinking", "on the FIRST surviving block");
+    assert.deepStrictEqual(carriers[0]!.payload["usage"], USAGE);
+  });
+
+  it("signal-first frame: usage skips the filtered signal and lands on the surviving text", async () => {
+    // signal_done is the FIRST block and is dropped by the signal filter; the usage
+    // must survive on the following text rather than being lost with the signal.
+    const frame = assistantUsage([
+      { type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: {} },
+      { type: "text", text: "all done" },
+    ]);
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [frame, resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const carriers = withUsage(probe.emits);
+    assert.strictEqual(carriers.length, 1);
+    assert.strictEqual(carriers[0]!.kind, "text");
+    assert.strictEqual(carriers[0]!.payload["text"], "all done");
+    // The signal tool_use itself is never emitted, so it can't carry the usage.
+    assert.ok(!probe.emits.some((m) => m.kind === "tool_use" && m.payload["name"] === "mcp__uzi__signal_done"));
+  });
+
+  it("signal-only frame: every message is filtered, so the usage is dropped without error", async () => {
+    // A terminating frame whose ONLY block is signal_done maps to a single message
+    // that the filter drops — the frame's usage is lost (accepted, Decision 11a).
+    // The run must still complete cleanly.
+    const frame = assistantUsage([{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: {} }]);
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [frame, resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.strictEqual(withUsage(probe.emits).length, 0, "no message carries the dropped frame's usage");
+  });
+
+  it("subagent frame keeps its subagent_type attribution alongside the attached usage", async () => {
+    // The lead signals done in its own frame; a subagent's text frame carries usage.
+    // Attribution (agent) and usage must both survive on that one message.
+    const subFrame = assistantUsage([{ type: "text", text: "reviewed unit A" }], USAGE, "reviewer");
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [subFrame, signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    const carriers = withUsage(probe.emits);
+    assert.strictEqual(carriers.length, 1);
+    assert.strictEqual(carriers[0]!.agent, "reviewer", "subagent_type attribution intact");
+    assert.deepStrictEqual(carriers[0]!.payload["usage"], USAGE);
+  });
+
+  it("does NOT re-attach on the result frame (result usage travels via mapResult, not this path)", async () => {
+    // A success result carrying usage must not get an executor-side attach — that
+    // usage is already in the status payload from mapResult, and double-emitting
+    // would let the client per-agent sum absorb a cumulative result total.
+    const resultWithUsage = {
+      type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: "sess-1", usage: USAGE,
+    } as unknown as SDKMessage;
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultWithUsage],
+    ]);
+    const probe = makeCtx();
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // The result usage rides the status payload (event: "result"), and NO
+    // assistant-style attach happened (signal_done was the only assistant block).
+    const statusWithUsage = probe.emits.filter(
+      (m) => m.kind === "status" && m.payload["event"] === "result" && m.payload["usage"] !== undefined,
+    );
+    assert.strictEqual(statusWithUsage.length, 1, "result usage is on the status frame");
+    assert.ok(
+      !probe.emits.some((m) => m.kind !== "status" && m.payload["usage"] !== undefined),
+      "no non-status message got an executor-side attach from the result frame",
+    );
+  });
+});
+
 describe("SdkExecutor guardrail options", () => {
   it("wires the signal MCP server, the subagent guard, and the file/bash hooks", async () => {
     const { queryFn, turns } = fakeTurns([
