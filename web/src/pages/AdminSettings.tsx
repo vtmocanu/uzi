@@ -398,11 +398,13 @@ const HEALTH_FIELDS: { key: keyof AppSettings; label: string; hint?: string }[] 
 ];
 
 // validateHealthSeconds mirrors the server's write-time rule (Decision 5) for
-// immediate feedback: 0 (disable) or an integer in [60, 86400]. The server stays
-// the source of truth.
+// immediate feedback: 0 (disable) or an integer in [60, 86400]. The digit-only test
+// keeps parity with the server's strconv.Atoi, which rejects the forms Number()
+// would silently accept ("1e3", "0x10", "5.0"); the server stays the source of truth.
 function validateHealthSeconds(value: string): string | null {
-  const n = Number(value.trim());
-  if (value.trim() === "" || !Number.isInteger(n)) return "Must be a whole number of seconds";
+  const v = value.trim();
+  if (!/^\d+$/.test(v)) return "Must be a whole number of seconds";
+  const n = Number(v);
   if (n === 0) return null;
   if (n < 60 || n > 86400) return "Must be 0 (disabled) or between 60 and 86400 seconds";
   return null;

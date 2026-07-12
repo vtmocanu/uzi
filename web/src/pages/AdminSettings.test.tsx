@@ -284,6 +284,18 @@ describe("AdminSettings", () => {
     expect(btn.disabled).toBe(true);
   });
 
+  it("rejects a non-digit health threshold for server parity (1e3, PRD #47)", async () => {
+    // Number("1e3") === 1000 would pass a naive isInteger check, but the server's
+    // strconv.Atoi rejects it — the digit-only client rule keeps them in lockstep.
+    renderPage();
+    const stall = (await screen.findByLabelText(/Stalled after/i)) as HTMLInputElement;
+    fireEvent.change(stall, { target: { value: "1e3" } });
+
+    expect(screen.getByText(/whole number of seconds/i)).toBeTruthy();
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
   it("accepts 0 to disable a health signal (PRD #47)", async () => {
     mockApi.updateSettings.mockResolvedValue(response({ health_queued_seconds: "0" }));
     renderPage();
