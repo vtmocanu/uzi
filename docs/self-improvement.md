@@ -45,10 +45,15 @@ is skipped (with an inbox note) rather than spending nothing silently.
   every cycle is tested together in one MR.
 - The worker installs dependencies (best-effort) and runs the repo's own test
   suites, including their evidence in the MR description — this repo has no CI,
-  so the MR carries its own proof. Evidence is **best-effort**: a suite the
-  worker cannot run (a missing toolchain, or dependencies that did not install)
-  is reported **skipped**, and the MR states plainly that **skipped is not
-  passed**, so a reviewer never mistakes an unrun suite for a green one.
+  so the MR carries its own proof. Evidence is **best-effort and conditional**:
+  a suite runs (and produces real pass/fail) only when its toolchain is present
+  in the worker, which for the compiled toolchains means **the connected uzi
+  repo's tool profile must provision them**. To get real evidence for every
+  suite, add **`go`** and **`nodejs`** to that repo's tool profile (Repos →
+  the uzi repo → tool profile); a suite whose toolchain is not provisioned, or
+  whose dependencies did not install, is reported **skipped**, and the MR states
+  plainly that **skipped is not passed** so a reviewer never mistakes an unrun
+  suite for a green one.
 - If the change touches a guard-critical path (guardrails, auth, secret/vault
   code, worker token handling, compose secret wiring), the MR description
   flags it loudly for extra-careful review.

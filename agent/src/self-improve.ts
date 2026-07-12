@@ -74,6 +74,14 @@ export interface SelfImproveCheck {
 // SELF_IMPROVE_CHECKS are the uzi repo's own gates (CLAUDE.md): the Go suite, the
 // web + agent suites, and the web build (which runs check-docs + tsc).
 //
+// Evidence is CONDITIONAL, not automatic: a check produces real pass/fail only when
+// its toolchain is present in the worker. `go` (and `nodejs`) reach the worker only
+// if the connected uzi repo's tool profile provisions them (PRD #18 devbox tooling,
+// threaded to the checks via buildCheckEnv's toolEnv). With an empty tool profile the
+// Go check honest-skips (ENOENT) and the npm checks depend on prepareCheckDeps having
+// installed node_modules. M9 makes real evidence POSSIBLE; the honest skip (M8) is the
+// fallback whenever a toolchain/dep is genuinely absent — never a false pass/fail.
+//
 // The npm checks declare `requires: "node_modules"`. A fresh clone has none, and
 // running `npm test` there does NOT fail with ENOENT (npm itself exists) — it exits
 // 127 because vitest/tsc are missing, which is indistinguishable from a real test

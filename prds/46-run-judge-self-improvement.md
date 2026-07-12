@@ -512,6 +512,15 @@ Approved deviations from the design above, found during implementation:
    `execFile` call never receives that `toolEnv`, so provisioned tools are
    invisible to the checks even when provisioning succeeded. User approved
    landing the fix in this PRD as M9 rather than deferring it to a follow-up.
+   **M9's real evidence is CONDITIONAL, not automatic:** `go`/`nodejs` reach the
+   worker only when the connected uzi repo's `repo_tool_profiles` provisions them
+   (they are on the seeded `tool_allowlist`, `00046`, but an empty profile
+   provisions nothing). So a check produces real pass/fail only when its toolchain
+   is provisioned; otherwise it stays honestly *skipped* (M8's fallback), never a
+   false pass or fail. Operator step to get real evidence for every suite: add
+   `go` + `nodejs` to the uzi repo's tool profile. `npm ci` runs `--ignore-scripts`
+   and stays best-effort, so a hardened deploy that firewalls registry egress
+   degrades to honest-skip rather than failing.
 7. **M9 threading the toolEnv reopened, then closed, a token-exfil residual —
    and M5 had silently widened it.** Making the checks actually run means the
    worker executes model-authored code (the change's own test files,
