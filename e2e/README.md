@@ -83,6 +83,20 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
    dragged to another column, reopening the MR does not fight the placement (the
    reopen edge's source-column guard backs off). The candidate-selection SQL is
    covered separately against a real Postgres — see `run-store-it.sh` below.
+9. **Bounded worker concurrency (PRD #42, stub-only, last phase)**: the single
+   worker is reconfigured to `WORKER_MAX_CONCURRENT_RUNS=2` and enables a **second**
+   repo (`group/repo2`, served by the fake only when `FORGE_FAKE_PROJECT2` is set).
+   Two runs on the two **different** repos are then shown to run **genuinely
+   concurrently** — both reach `awaiting_approval` at once, which a cap-1 worker
+   cannot (a slot is held across the gate), on the **same** worker — the API worker
+   listing reports `active_runs=2`/`max_concurrent_runs=2` while both are live, both
+   land MRs on **independent** git bare-caches with no message cross-talk, and a
+   **mid-run `SIGKILL`** of the agent re-queues **both** in-flight runs together (the
+   sweeper's worker-loss recovery at N=2), after which a restarted worker re-claims
+   both by affinity and completes them. **Stated limit**: the stub executor is
+   already concurrency-safe, so this exercises the worker-loop + server + API path,
+   **not** the M1 per-run executor kill/reap isolation fix (guarded by an `agent/`
+   unit test).
 
 ## How the fakes are wired (no real GitLab, no live session)
 
