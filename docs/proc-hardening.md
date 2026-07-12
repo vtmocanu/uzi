@@ -107,6 +107,14 @@ See `agent/src/config.ts` (`resolveWorkerToken`), the `secrets:` block in
 still needs one of the structural closes below and remains the honest residual
 for the remote-worker phase.
 
+Intra-run parallel subagents ([Agent templates](./agent-templates.md#parallel-dispatch))
+widen the field of candidates for this same residual, not the residual itself:
+a run whose implementation phase dispatches several coders concurrently has
+that many concurrent processes racing the push window instead of one. No new
+escape class, and the same group-kill still reaps every ordinary survivor
+regardless of how many subagents ran; only the `setsid`-escaped case is
+affected, and only by count.
+
 ## The full close: remote-worker (k8s/pod) design
 
 On the remote-worker phase the worker runs as a pod, where the uid split and
