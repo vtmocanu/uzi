@@ -108,9 +108,12 @@ function isSubagentFrame(msg: Record<string, unknown>): boolean {
  * run and end the implement loop, so only the lead's main-thread frames may carry
  * them. A subagent frame reaching either signal — prompt-injected, buggy, or via
  * some future tool leak — must NOT latch done or the plan (that would hand a
- * partial, unreviewed tree to the worker's push+MR). Belt-and-suspenders with the
- * server-level `mcp__uzi` denial on every subagent (agents.ts): that stops the
- * tool_use from being made; this ignores it even if one were.
+ * partial, unreviewed tree to the worker's push+MR). This worker-side scan is the
+ * LOAD-BEARING guarantee for that: it holds regardless of the SDK's tool gating.
+ * The server-level `mcp__uzi` denial on every subagent (agents.ts) is an
+ * additional layer that SHOULD stop the tool_use from ever being made, but whether
+ * disallowedTools wins over a custom template's explicit `tools` allowlist is
+ * unproven from the SDK types — so do not treat this scan as redundant to it.
  */
 export function scanSignals(message: unknown): ScannedSignals {
   const msg = asRecord(message);

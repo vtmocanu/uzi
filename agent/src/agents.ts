@@ -46,9 +46,12 @@ import { qualifiedSkillName } from "./skills-plugin.js";
 // (mcp__uzi__submit_plan / mcp__uzi__signal_done) to every subagent. The run's
 // plan gate and its done→MR handoff are the lead's alone: a subagent (coder,
 // reviewer, …) — buggy or prompt-injected — must never reach them and end the
-// loop with a partial, unreviewed tree. Belt-and-suspenders with the
-// main-thread-only signal scan in signals.ts: this stops the tool_use from ever
-// being made; that scan ignores it even if it somehow were.
+// loop with a partial, unreviewed tree. This is DEFENSE-IN-DEPTH: it should stop
+// the tool_use from ever being made, but whether disallowedTools wins over a
+// custom template's explicit `tools` allowlist is unproven from the SDK types, so
+// the load-bearing guarantee is the main-thread-only signal scan in signals.ts
+// (scanSignals ignores a subagent-borne signal even if the SDK let the call
+// through). Keep both.
 const SIGNAL_SERVER_DENY = `mcp__${SIGNAL_SERVER_NAME}`;
 
 /**
