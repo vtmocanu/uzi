@@ -9,12 +9,14 @@ import { errMessage, sleep } from "./util.js";
  * Outbound-only worker loop (multica's daemon model): register once, heartbeat on
  * an interval, and poll for claims. No inbound ports.
  *
- * TWO independent, CONCURRENT claim lanes (PRD #39 Decision 4): the RUN lane runs
- * one issue/ci_fix run at a time to a terminal state (today's behavior, no lane
- * param — back-compat), and the CHAT lane polls the disjoint `?lane=chat` queue at
+ * TWO independent, CONCURRENT claim lanes (PRD #39 Decision 4): the RUN lane
+ * executes up to WORKER_MAX_CONCURRENT_RUNS issue/ci_fix runs at once, bounded by a
+ * slot semaphore (PRD #42 Decision 1 — default cap 1, i.e. the pre-#42 serial
+ * behavior), and the CHAT lane polls the disjoint `?lane=chat` queue at
  * WORKER_CHAT_POLL_MS and runs up to WORKER_CHAT_SESSIONS chat sessions alongside
- * the run slot. This is the first time the worker executes more than one thing at
- * once; the shared collaborators are audited for it (see chatClaimLoop).
+ * the run slots. The two caps are deliberately distinct knobs (run lane vs chat
+ * lane). The shared collaborators are audited for this concurrency (see
+ * chatClaimLoop; the per-run executor/HOME isolation is PRD #42 M1).
  */
 export class Worker {
   constructor(
@@ -36,7 +38,11 @@ export class Worker {
     let attempt = 0;
     while (!signal.aborted) {
       try {
-        const res = await this.client.register(this.config.workerName, this.config.workerTemplate);
+        const res = await this.client.register(
+          this.config.workerName,
+          this.config.workerTemplate,
+          this.config.maxConcurrentRuns,
+        );
         this.log.info("registered", {
           name: this.config.workerName,
           template: this.config.workerTemplate,
@@ -63,21 +69,62 @@ export class Worker {
     }
   }
 
+  /**
+   * The RUN lane, bounded by a slot semaphore (PRD #42 Decision 1). Executes up to
+   * WORKER_MAX_CONCURRENT_RUNS issue/ci_fix runs concurrently as tracked promises;
+   * a slot is released only when its run settles (the promise resolves/rejects),
+   * held the whole time a run is parked at the plan gate inside `runner.execute`
+   * (Decision 2). Slot-before-claim: a fresh claim is taken only when a slot is
+   * free, so the worker never manufactures a claimed-but-waiting run and
+   * `SweepClaimedNeverStarted` semantics are untouched (Decision 8; no new claim
+   * SQL). At the default cap of 1 this is the pre-#42 serial loop at the observable
+   * level. Mirrors chatClaimLoop's tracked-promise pool (the RUN lane has no
+   * per-execution signal — a run drives its own cancel via steering, so shutdown
+   * drains rather than aborts; see below).
+   */
   private async claimLoop(signal: AbortSignal): Promise<void> {
+    const cap = this.config.maxConcurrentRuns;
+    const active = new Set<Promise<void>>();
+    let loggedAtCapacity = false;
     while (!signal.aborted) {
+      if (active.size >= cap) {
+        // At capacity: defer the claim (never claim without a free slot) and wake
+        // when a slot frees or after a poll. Log once per saturation episode so a
+        // saturated worker is observable without spamming while slots stay pinned
+        // (Decision 1 — multica daemon.go "poll: at capacity"). Suppressed at the
+        // default cap of 1, where "busy with the one run" is the steady state, not
+        // saturation — this keeps the default path's output identical to pre-#42.
+        if (cap > 1 && !loggedAtCapacity) {
+          this.log.info("run lane at capacity, deferring claim", { active: active.size, cap });
+          loggedAtCapacity = true;
+        }
+        await Promise.race([...active, sleep(this.config.pollIntervalMs, signal)]);
+        continue;
+      }
+      loggedAtCapacity = false;
       let claimed = false;
       try {
         const claim = await this.client.claimRun();
         if (claim) {
           claimed = true;
-          await this.runner.execute(claim);
+          const run = this.runner
+            .execute(claim)
+            .catch((err) => this.log.warn("claim/execute cycle failed", { error: errMessage(err) }));
+          active.add(run);
+          void run.finally(() => active.delete(run));
         }
       } catch (err) {
         this.log.warn("claim/execute cycle failed", { error: errMessage(err) });
       }
-      // After finishing a run, immediately try for the next; otherwise wait a poll.
+      // A claim yielded a run: immediately loop to fill the next free slot (up to
+      // cap). Otherwise wait a poll before asking again.
       if (!claimed) await sleep(this.config.pollIntervalMs, signal);
     }
+    // On shutdown, drain every in-flight run (mirrors chatClaimLoop's drain). A run
+    // carries no shutdown signal — it runs to its terminal state; the container's
+    // SIGKILL grace is the hard backstop and the sweeper requeues anything the kill
+    // interrupts, so a stuck run can't wedge shutdown past the grace window.
+    await Promise.allSettled([...active]);
   }
 
   /**
