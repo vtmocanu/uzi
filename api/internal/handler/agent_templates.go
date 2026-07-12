@@ -24,8 +24,10 @@ import (
 
 // nameRe is the kebab-case constraint on a template name: the subagent identity
 // (filename and PRD #4 routing key), so it is validated on create and immutable
-// after.
-var nameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+// after. It moved to agenttmpl because PRD #37's roster + selection validation
+// (workersvc) must hold repo-detected agents to the very same rule; a second copy
+// here would let one surface accept an identity the other rejects.
+var nameRe = agenttmpl.NameRe
 
 // fullTokenRe matches a high-confidence, complete Anthropic token. The server
 // rejects only this (a real credential pasted into a template); the UI does the
@@ -41,7 +43,9 @@ var fullTokenRe = regexp.MustCompile(`sk-ant-[A-Za-z0-9]+-[A-Za-z0-9_-]{40,}`)
 // a lead name (Decision 8). That guarantees a claim payload can carry at most one
 // lead-matching template — the worker-side pin — regardless of allocation. Case-
 // insensitive to match the worker regex, though nameRe already forces lowercase.
-var leadNameRe = regexp.MustCompile(`(?i)^(lead|orchestrator)$`)
+// Shared from agenttmpl with PRD #37, which drops the lead from the `own` roster's
+// selectable subagents for exactly this reason.
+var leadNameRe = agenttmpl.LeadNameRe
 
 // agentTemplateDTO is the safe JSON view of a template row. tools is null when
 // the template inherits all tools (matching the render semantics); model is

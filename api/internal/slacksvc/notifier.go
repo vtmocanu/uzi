@@ -210,7 +210,7 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		if gateOpen {
 			return // gate already posted for this run
 		}
-		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base))
+		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames))
 		if err != nil {
 			n.logf("post gate", err)
 			return

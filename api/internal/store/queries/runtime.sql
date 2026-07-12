@@ -195,15 +195,30 @@ JOIN forge_connections c ON c.id = rp.connection_id
 WHERE r.id = @run_id;
 
 -- name: SetRunRunning :execrows
--- claimed/awaiting_approval → running. started_at is stamped once; iteration_count
--- only advances (GREATEST) so a resume never regresses the loop counter. A
--- terminal run (e.g. cancelled) is left untouched → 0 rows → "already terminal".
+-- claimed/awaiting_approval → running, AND running → running: the worker reports
+-- this state more than once per run (once on claim, again after checkout with the
+-- repo agent roster, again on every session-id/iteration heartbeat), so the
+-- statement is idempotent by construction. started_at is stamped once;
+-- iteration_count only advances (GREATEST) so a resume never regresses the loop
+-- counter. A terminal run (e.g. cancelled) is left untouched → 0 rows → "already
+-- terminal".
+--
+-- The three PRD #37 columns are COALESCE'd against their own value, so a report
+-- that omits them (the common case) preserves what a previous report wrote and no
+-- caller has to read-modify-write. repo_agents is set once, by the post-checkout
+-- report; agent_source/agent_exclusions only by an AUTOPILOT run's report (a
+-- human-gated run persists its selection through CreateApprovePlanInput instead).
+-- Consequence, deliberate: a worker can never NULL these back out — an empty
+-- roster is reported as '[]', which is a distinct, meaningful value.
 UPDATE runs SET
-    status          = 'running',
-    started_at      = COALESCE(started_at, now()),
-    iteration_count = GREATEST(iteration_count, @iteration_count),
-    session_id      = COALESCE(sqlc.narg('session_id'), session_id),
-    updated_at      = now()
+    status           = 'running',
+    started_at       = COALESCE(started_at, now()),
+    iteration_count  = GREATEST(iteration_count, @iteration_count),
+    session_id       = COALESCE(sqlc.narg('session_id'), session_id),
+    repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
+    agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
+    agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
+    updated_at       = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
@@ -429,6 +444,30 @@ LIMIT @lim;
 -- CreateStopVerdictInput instead (they must stamp runs.stop_kind atomically).
 INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES (@run_id, @kind, @body)
+RETURNING *;
+
+-- name: CreateApprovePlanInput :one
+-- Enqueue an approve_plan verdict for the live worker AND record the agent
+-- selection it carries, in ONE statement (PRD #37, mirroring CreateStopVerdictInput
+-- and for the same reason: workersvc.Store exposes no transaction seam, so the
+-- combined statement IS the atomicity). A second, non-transactional UPDATE could
+-- leave a run whose worker was told to use the repo agents but whose row does not
+-- say so — the run view and the MR marker would then lie about what ran.
+--
+-- The body carries the canonical JSON encoding of the same selection, because the
+-- worker reads it from the input, not from the row. Both are written from the
+-- server's re-validated value, never from the client's raw text. A resume that
+-- re-enters the gate overwrites both columns with the latest approval (Decision 8b).
+WITH selected AS (
+    UPDATE runs SET
+        agent_source     = @agent_source,
+        agent_exclusions = @agent_exclusions,
+        updated_at       = now()
+    WHERE id = @run_id
+    RETURNING id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+VALUES (@run_id, 'approve_plan', @body)
 RETURNING *;
 
 -- name: CreateStopVerdictInput :one

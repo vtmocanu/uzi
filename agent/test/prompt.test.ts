@@ -8,6 +8,7 @@ import {
   isNotCodePlan,
   LEAD_GUARDRAIL_APPEND,
   NOT_CODE_MARKER,
+  REPO_SUBAGENT_UNTRUSTED_APPEND,
 } from "../src/prompt.js";
 
 // Untrusted-content discipline (both auditors): issue_title/issue_description and
@@ -86,6 +87,20 @@ describe("buildImplementPrompt", () => {
     const closeIdx = p.indexOf("</follow_up>");
     assert.ok(openIdx >= 0 && injIdx > openIdx && injIdx < closeIdx, "follow-up sits inside the tags");
   });
+
+  it("names the resolved roster and hardcodes no role (PRD #37 genericization)", () => {
+    // A repo roster without coder/reviewer must not get a prompt naming agents that
+    // don't exist. The instruction prose is generic; delegatesLine names the actual
+    // roster.
+    const p = buildImplementPrompt({ branch: "b", subagentNames: ["auditor", "web-ux"], first: true, iteration: 1 });
+    assert.ok(!/coder/.test(p) && !/reviewer/.test(p), "no hardcoded coder/reviewer");
+    assert.match(p, /auditor, web-ux/, "the actual roster is named");
+  });
+
+  it("renders the lead-only case when the roster is empty", () => {
+    const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
+    assert.match(p, /No subagents are available; do the work yourself\./);
+  });
 });
 
 describe("buildLeadSystemPrompt", () => {
@@ -104,6 +119,15 @@ describe("buildLeadSystemPrompt", () => {
 
   it("falls back to the reminder only when the body is blank", () => {
     assert.strictEqual(buildLeadSystemPrompt("   ").append, LEAD_GUARDRAIL_APPEND);
+  });
+
+  it("appends the untrusted-review passage ONLY when the run is repo-sourced (PRD #37)", () => {
+    const own = buildLeadSystemPrompt("lead body", { repoSourced: false });
+    assert.ok(!own.append.includes(REPO_SUBAGENT_UNTRUSTED_APPEND), "own source: no untrusted passage");
+
+    const repo = buildLeadSystemPrompt("lead body", { repoSourced: true });
+    assert.ok(repo.append.endsWith(REPO_SUBAGENT_UNTRUSTED_APPEND), "repo source: passage appended last");
+    assert.match(REPO_SUBAGENT_UNTRUSTED_APPEND, /UNVERIFIED/);
   });
 
   it("the guardrail reminder forbids pushing and nested spawning, and teaches the two-phase flow", () => {

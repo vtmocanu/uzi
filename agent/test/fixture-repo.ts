@@ -14,8 +14,11 @@ export interface Fixture {
 /**
  * Build a throwaway git "origin" on disk. A bare clone of a local path needs no
  * network and no auth, so the whole worktree lifecycle is exercisable offline.
+ *
+ * `files` (repo-relative path → contents) are committed alongside the README, so
+ * a test can ship a repo that carries e.g. its own `.claude/agents/`.
  */
-export function makeFixture(): Fixture {
+export function makeFixture(files: Record<string, string> = {}): Fixture {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-agent-test-"));
   const originPath = path.join(base, "origin");
   const dataDir = path.join(base, "data");
@@ -33,6 +36,11 @@ export function makeFixture(): Fixture {
   git(["config", "user.name", "fixture"]);
   git(["config", "commit.gpgsign", "false"]);
   fs.writeFileSync(path.join(originPath, "README.md"), "# fixture\n");
+  for (const [rel, content] of Object.entries(files)) {
+    const target = path.join(originPath, rel);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content);
+  }
   git(["add", "."]);
   git(["commit", "-m", "init"]);
 

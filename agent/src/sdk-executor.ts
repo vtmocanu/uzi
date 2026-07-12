@@ -31,7 +31,8 @@ import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
 import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
-import { assembleAgents } from "./agents.js";
+import { assembleAgents, selectSubagents } from "./agents.js";
+import { resolveAgentSelection } from "./protocol.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
@@ -203,7 +204,21 @@ export class SdkExecutor implements Executor {
     // dir) plus the all-templates repo survivors (PRD §Worker point 3).
     const survivorNames = new Set(runSkills.map((s) => s.name));
     const assembled = assembleAgents(ctx.agents ?? [], survivorNames, prepared.repoSurvivorNames);
-    const subagentNames = Object.keys(assembled.subagents);
+    // The plan turn runs with the OWN subagents (PRD #37 Decision 5): the roster
+    // choice only takes effect after the plan is approved.
+    const ownSubagentNames = Object.keys(assembled.subagents);
+
+    // The Bash + path-guard hooks are roster-independent, so build them once and
+    // reuse; only the Agent-guard hook's allowSet is frozen at construction and so
+    // must be REBUILT when the implement roster differs from the plan roster (PRD
+    // #37 — an excluded or repo-sourced subagent must be denied by the guard).
+    const bashHook = buildPreToolUseHook(this.log, this.secretPaths);
+    const pathHook = buildPathGuardHook(ctx.worktreePath, this.log);
+    const preToolUse = (allowedSubagents: string[]): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [
+      { matcher: "Bash", hooks: [bashHook] },
+      { matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep", hooks: [pathHook] },
+      { matcher: NESTED_AGENT_TOOL, hooks: [buildAgentGuardHook(allowedSubagents, this.log)] },
+    ];
 
     const baseOptions: SdkOptions = {
       cwd: ctx.worktreePath,
@@ -235,16 +250,11 @@ export class SdkExecutor implements Executor {
       disallowedTools: [...ASYNC_DEFERRAL_TOOLS],
       // The load-bearing deny layer: a PreToolUse deny blocks a tool even under
       // bypassPermissions. Bash screening, the file-tool path jail, AND the M4
-      // hard-fail-on-unexpected-subagent guard (item 7) all live here.
+      // hard-fail-on-unexpected-subagent guard (item 7) all live here. The plan
+      // turn allows the OWN subagents; the implement turns rebuild this with the
+      // selected roster (PRD #37).
       hooks: {
-        PreToolUse: [
-          { matcher: "Bash", hooks: [buildPreToolUseHook(this.log, this.secretPaths)] },
-          {
-            matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
-            hooks: [buildPathGuardHook(ctx.worktreePath, this.log)],
-          },
-          { matcher: NESTED_AGENT_TOOL, hooks: [buildAgentGuardHook(subagentNames, this.log)] },
-        ],
+        PreToolUse: preToolUse(ownSubagentNames),
       },
       // Persist discrete blocks only; partial token deltas would flood the seq
       // stream (the live-partial channel is M5, not M3).
@@ -287,14 +297,14 @@ export class SdkExecutor implements Executor {
             branch: ctx.branch,
             pipelineWebURL: ctx.pipeline!.web_url,
             failedJobs: ctx.pipeline!.failed_jobs.map((j) => ({ name: j.name, stage: j.stage, logTail: j.log_tail })),
-            subagentNames,
+            subagentNames: ownSubagentNames,
           })
         : buildPlanPrompt({
             issueIid: ctx.issueIid ?? 0,
             issueTitle: ctx.issueTitle,
             issueDescription: ctx.issueDescription,
             branch: ctx.branch,
-            subagentNames,
+            subagentNames: ownSubagentNames,
           });
       ctx.emit({ kind: "status", agent: "worker", payload: { text: `starting SDK agent (${isCIFix ? "diagnosing CI failure" : "planning"})` } });
       const plan = await this.driveTurn(ctx, baseOptions, resumeId, planPrompt, state, idleMs);
@@ -318,6 +328,44 @@ export class SdkExecutor implements Executor {
         return { branch: ctx.branch, fixVerdict: "not_code" };
       }
 
+      // --- Apply the agent selection at the gate boundary (PRD #37 Decision 5) ---
+      // The plan turn ran with the OWN subagents; the approved selection now decides
+      // the roster for the implement phase. The lead ALWAYS stays uzi's builtin from
+      // the claim, so only the subagents change: rebuild the agents map, the
+      // Agent-guard hook (its allowSet is frozen at construction — an excluded or
+      // repo-sourced subagent must be denied), the lead system prompt (a repo-source
+      // run adds the untrusted-review passage), and the subagent names fed to the
+      // implement prompt. Malformed selection resolves to `own`, never repo.
+      const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
+      const resolved = resolveAgentSelection(verdict.selection, repoAvailable);
+      if (resolved.note) ctx.emit({ kind: "status", agent: "worker", payload: { text: resolved.note } });
+      const selection = resolved.selection;
+      const selectedSubagents = selectSubagents(
+        selection.source,
+        assembled.subagents,
+        ctx.repoAgents ?? [],
+        selection.exclusions,
+        survivorNames,
+        prepared.repoSurvivorNames,
+      );
+      const selectedNames = Object.keys(selectedSubagents);
+      const implementOptions: SdkOptions = {
+        ...baseOptions,
+        agents: selectedSubagents,
+        systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, { repoSourced: selection.source === "repo" }),
+        hooks: { PreToolUse: preToolUse(selectedNames) },
+      };
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text:
+            selection.source === "repo"
+              ? `implementing with the repo's agents (${selectedNames.join(", ") || "none"})`
+              : `implementing with your agent templates (${selectedNames.join(", ") || "none"})`,
+        },
+      });
+
       // --- Phase 2: implement ⇄ review loop --------------------------------
       let iteration = 0;
       let followUp: string | undefined;
@@ -325,9 +373,9 @@ export class SdkExecutor implements Executor {
         iteration++;
         ctx.reportIteration?.(iteration);
         ctx.emit({ kind: "status", agent: "worker", payload: { text: `implement/review iteration ${iteration}` } });
-        const turn = await this.driveTurn(ctx, baseOptions, resumeId, buildImplementPrompt({
+        const turn = await this.driveTurn(ctx, implementOptions, resumeId, buildImplementPrompt({
           branch: ctx.branch,
-          subagentNames,
+          subagentNames: selectedNames,
           first: iteration === 1,
           iteration,
           followUp,
@@ -339,8 +387,8 @@ export class SdkExecutor implements Executor {
         followUp = ctx.pullFollowUp?.();
       }
 
-      this.log.info("SDK run completed", { run_id: ctx.runId, branch: ctx.branch });
-      return { branch: ctx.branch };
+      this.log.info("SDK run completed", { run_id: ctx.runId, branch: ctx.branch, agent_source: selection.source });
+      return { branch: ctx.branch, agentSelection: { source: selection.source, agents: selectedNames } };
     } finally {
       this.disarmWall(state);
       if (ctx.signal) ctx.signal.removeEventListener("abort", onSignal);

@@ -32,13 +32,20 @@ type submittedInput struct {
 	kind, body    string
 }
 
+type submittedApproval struct {
+	userID, runID uuid.UUID
+	source        string
+}
+
 // fakeSubmitter stands in for workersvc: it serves one run (for the stale check)
-// and records the steering inputs the gatekeeper submits.
+// and records the steering inputs + approvals the gatekeeper submits.
 type fakeSubmitter struct {
-	run       store.Run
-	runErr    error
-	submitted []submittedInput
-	submitErr error
+	run        store.Run
+	runErr     error
+	submitted  []submittedInput
+	approvals  []submittedApproval
+	submitErr  error
+	approveErr error
 }
 
 func (f *fakeSubmitter) GetRun(context.Context, uuid.UUID, uuid.UUID) (store.Run, error) {
@@ -47,6 +54,10 @@ func (f *fakeSubmitter) GetRun(context.Context, uuid.UUID, uuid.UUID) (store.Run
 func (f *fakeSubmitter) SubmitInput(_ context.Context, userID, runID uuid.UUID, kind, body string) error {
 	f.submitted = append(f.submitted, submittedInput{userID, runID, kind, body})
 	return f.submitErr
+}
+func (f *fakeSubmitter) SubmitApproval(_ context.Context, userID, runID uuid.UUID, source string) error {
+	f.approvals = append(f.approvals, submittedApproval{userID, runID, source})
+	return f.approveErr
 }
 
 func gateAction(actionID string, runID uuid.UUID) BlockAction {
@@ -57,25 +68,66 @@ func awaitingRun(runID, userID uuid.UUID) store.Run {
 	return store.Run{ID: runID, UserID: userID, Status: "awaiting_approval"}
 }
 
-func TestGatekeeperApproveSubmitsAndResolves(t *testing.T) {
+// The approve id encodes the agent source (PRD #37 M7), from a closed set: repo,
+// own, and the legacy/no-roster id → own. Each resolves the gate on success.
+func TestGatekeeperApproveRoutesSourceAndResolves(t *testing.T) {
+	cases := []struct {
+		name     string
+		actionID string
+		want     string
+	}{
+		{"legacy id maps to own", ActionGateApprove, "own"},
+		{"own picker button", ActionGateApproveOwn, "own"},
+		{"repo picker button", ActionGateApproveRepo, "repo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			gs := &fakeGateStore{user: user}
+			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+			fp := &fakePoster{}
+			g := NewGatekeeper(gs, sub, fp, nil)
+
+			g.HandleBlockAction(context.Background(), gateAction(tc.actionID, runID))
+
+			if len(sub.approvals) != 1 || sub.approvals[0].source != tc.want ||
+				sub.approvals[0].userID != user.ID || sub.approvals[0].runID != runID {
+				t.Fatalf("approve must submit source %q for the resolved user+run: %+v", tc.want, sub.approvals)
+			}
+			if len(sub.submitted) != 0 {
+				t.Fatalf("approve goes through SubmitApproval, not SubmitInput: %+v", sub.submitted)
+			}
+			if len(gs.gateSet) != 1 || gs.gateSet[0].GateTs.Valid || gs.gateSet[0].GateState.Valid {
+				t.Fatalf("approve must clear the gate anchor: %+v", gs.gateSet)
+			}
+			if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 ||
+				!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "approved") {
+				t.Fatalf("gate message must be edited button-free to an approved state: %+v", fp.updateBlocks)
+			}
+		})
+	}
+}
+
+// A source the server rejects (ErrSelectionRejected — the roster changed under the
+// button, e.g. a requeue re-detected an empty roster) leaves the gate OPEN with an
+// ephemeral: no clear, no resolve edit, and the presser can retry from uzi.
+func TestGatekeeperApproveRejectedLeavesGateOpen(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
 	gs := &fakeGateStore{user: user}
-	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), approveErr: ErrSelectionRejected}
 	fp := &fakePoster{}
 	g := NewGatekeeper(gs, sub, fp, nil)
 
-	g.HandleBlockAction(context.Background(), gateAction(ActionGateApprove, runID))
+	g.HandleBlockAction(context.Background(), gateAction(ActionGateApproveRepo, runID))
 
-	if len(sub.submitted) != 1 || sub.submitted[0].kind != "approve_plan" ||
-		sub.submitted[0].userID != user.ID || sub.submitted[0].runID != runID {
-		t.Fatalf("approve must submit approve_plan for the resolved user+run: %+v", sub.submitted)
+	if len(sub.approvals) != 1 || sub.approvals[0].source != "repo" {
+		t.Fatalf("the approve must have been attempted: %+v", sub.approvals)
 	}
-	if len(gs.gateSet) != 1 || gs.gateSet[0].GateTs.Valid || gs.gateSet[0].GateState.Valid {
-		t.Fatalf("approve must clear the gate anchor: %+v", gs.gateSet)
+	if len(gs.gateSet) != 0 || len(fp.updateBlocks) != 0 {
+		t.Fatalf("a rejected selection must leave the gate OPEN (no clear, no resolve): gate=%v edits=%v", gs.gateSet, fp.updateBlocks)
 	}
-	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 ||
-		!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "approved") {
-		t.Fatalf("gate message must be edited button-free to an approved state: %+v", fp.updateBlocks)
+	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "no longer valid") {
+		t.Fatalf("a rejected selection must get a retry ephemeral: %+v", fp.ephemerals)
 	}
 }
 

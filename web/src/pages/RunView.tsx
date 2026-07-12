@@ -6,9 +6,19 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, isTerminalRun, type Repo, type RunMessage } from "../lib/api";
+import {
+  api,
+  ApiError,
+  isHttpsUrl,
+  isTerminalRun,
+  type AgentSelectionInput,
+  type Repo,
+  type Run,
+  type RunMessage,
+} from "../lib/api";
+import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import { isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
 import { useRunStream } from "../lib/useRunStream";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
@@ -287,11 +297,18 @@ export function RunView() {
 
       {run.status === "awaiting_approval" && (
         <PlanPanel
-          plan={run.plan_md ?? ""}
+          run={run}
           busy={busy}
-          onApprove={() => act(() => submit("approve_plan"))}
+          onApprove={(selection) => act(() => submit("approve_plan", "", selection))}
           onReject={(reason) => act(() => submit("reject_plan", reason))}
         />
+      )}
+
+      {/* Read-only record of which agents the run used, once a selection is made
+          (at the gate or by an autopilot default). Shown for a live/terminal run;
+          the picker above owns the awaiting_approval state. PRD #37 Decision 3(b). */}
+      {run.status !== "awaiting_approval" && run.agent_source && (
+        <AgentRosterSummary run={run} />
       )}
 
       <Card className="p-4">
@@ -315,31 +332,63 @@ export function RunView() {
 }
 
 // PlanPanel: the run's one human decision point — visually the loudest thing on
-// the page while it is pending.
-function PlanPanel({
-  plan,
+// the page while it is pending. Grows the PRD #37 agent picker: the user chooses
+// the subagent roster (repo agents when detected, else their templates) with the
+// approve verdict; the choice is submitted as a structured selection on approve.
+export function PlanPanel({
+  run,
   busy,
   onApprove,
   onReject,
 }: {
-  plan: string;
+  run: Run;
   busy: boolean;
-  onApprove: () => void;
+  onApprove: (selection: AgentSelectionInput) => void;
   onReject: (reason: string) => void;
 }) {
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState("");
+
+  const repoAgents = useMemo(() => run.repo_agents ?? [], [run.repo_agents]);
+  const repoDetected = repoAgents.length > 0;
+
+  // The "My agent templates" card is sourced from the run's own_agents — the
+  // server's allocation-resolved roster (what the worker actually runs for
+  // source="own"), with the lead already stripped. Reading it off the run (instead
+  // of a separate listAgentTemplates fetch of the broader VISIBLE set) is the
+  // M4-fix: a chip can never name a template the approve validator rejects, and the
+  // count is exact for owners with a disabled/shadowed template. own_agents carries
+  // no scope, so the "custom" badge is not shown here.
+  const ownTemplates = useMemo<OwnTemplate[]>(
+    () => (run.own_agents ?? []).map((a) => ({ name: a.name, description: a.description, custom: false })),
+    [run.own_agents],
+  );
+
+  // The picker reports the live selection here; the approve button submits it. The
+  // default (repo when detected, else own, no exclusions) is what the picker emits
+  // on mount, so approving without touching anything sends the right thing.
+  const [selection, setSelection] = useState<AgentSelectionInput>({
+    source: repoDetected ? "repo" : "own",
+    exclusions: [],
+  });
+  const onSelectionChange = useCallback((s: AgentSelectionInput) => setSelection(s), []);
+
+  const activeRoster = selection.source === "repo" ? repoAgents.map((a) => a.name) : ownTemplates.map((t) => t.name);
+  const activeCount = activeRoster.length - selection.exclusions.length;
+  const approveLabel =
+    activeRoster.length > 0 ? `Approve plan · ${selectionLabel(selection.source, activeCount)}` : "Approve plan";
+
   return (
     <div className="overflow-hidden rounded-xl border border-warn/50 bg-warn/5">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-warn/30 bg-warn/10 px-4 py-3">
         <div>
           <h2 className="text-sm font-semibold text-warn">Plan awaiting your approval</h2>
-          <p className="text-xs text-muted">The run is parked until you decide.</p>
+          <p className="text-xs text-muted">The run is parked until you decide. Agent choice locks in on approval.</p>
         </div>
         {!rejecting && (
           <div className="flex gap-2">
-            <Button disabled={busy} onClick={onApprove}>
-              Approve plan
+            <Button disabled={busy} onClick={() => onApprove(selection)}>
+              {approveLabel}
             </Button>
             <Button variant="secondary" disabled={busy} onClick={() => setRejecting(true)}>
               Reject with reason
@@ -347,16 +396,18 @@ function PlanPanel({
           </div>
         )}
       </div>
-      <div className="p-4">
-        {plan ? (
+      <div className="space-y-4 p-4">
+        <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
+
+        {run.plan_md ? (
           <div className="max-h-96 overflow-auto rounded-lg border border-edge bg-surface p-3">
-            <Markdown content={plan} />
+            <Markdown content={run.plan_md} />
           </div>
         ) : (
           <p className="text-sm text-faint">The agent has not attached a plan body.</p>
         )}
         {rejecting && (
-          <div className="mt-3 space-y-2">
+          <div className="space-y-2">
             <Textarea
               rows={3}
               placeholder="What should change? (sent back to the agent as the next turn)"
@@ -375,6 +426,45 @@ function PlanPanel({
         )}
       </div>
     </div>
+  );
+}
+
+// AgentRosterSummary: the read-only record of the locked-in selection, shown once
+// a run is past the gate (PRD #37 Decision 3b). For a repo-source run it says so
+// plainly, so a reader knows the internal review loop was repo-authored. Repo
+// names/descriptions render as plain JSX text, never <Markdown>.
+export function AgentRosterSummary({ run }: { run: Run }) {
+  const excluded = new Set(run.agent_exclusions ?? []);
+  const roster = run.agent_source === "repo" ? (run.repo_agents ?? []) : (run.own_agents ?? []);
+  // own_agents now carries the own-source roster on the detail read, so this lists
+  // the actual agent names for either source (M4-fix) instead of nothing for own.
+  const included = roster.filter((a) => !excluded.has(a.name)).map((a) => a.name);
+  return (
+    <Card className="space-y-2 p-4">
+      <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Agents used</h2>
+      {run.agent_source === "repo" ? (
+        <p className="text-sm text-muted">
+          This run used the repository's own agents from{" "}
+          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">.claude/agents/</code> — its
+          internal review was performed by repo-authored agents, not uzi's built-in reviewer.
+        </p>
+      ) : (
+        <p className="text-sm text-muted">This run used your uzi agent templates.</p>
+      )}
+      {included.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {included.map((name) => (
+            <span
+              key={name}
+              className="rounded-full border border-edge-strong bg-raised px-2.5 py-[3px] font-mono text-[11.5px] text-fg"
+            >
+              {name}
+            </span>
+          ))}
+        </div>
+      )}
+      {excluded.size > 0 && <p className="text-xs text-faint">Excluded: {[...excluded].join(", ")}</p>}
+    </Card>
   );
 }
 
