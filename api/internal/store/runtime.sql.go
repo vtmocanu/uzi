@@ -406,7 +406,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared)
 VALUES ($1, $2, $3, $4)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs
 `
 
 type CreateWorkerParams struct {
@@ -440,6 +440,7 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.UpdatedAt,
 		&i.TemplateDeclared,
 		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
 	)
 	return i, err
 }
@@ -861,7 +862,7 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -879,12 +880,13 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.UpdatedAt,
 		&i.TemplateDeclared,
 		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -907,12 +909,13 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.UpdatedAt,
 		&i.TemplateDeclared,
 		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -931,6 +934,7 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.UpdatedAt,
 		&i.TemplateDeclared,
 		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
 	)
 	return i, err
 }
@@ -941,7 +945,7 @@ UPDATE workers SET
     last_heartbeat_at = now(),
     updated_at        = now()
 WHERE id = $1
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs
 `
 
 func (q *Queries) HeartbeatWorker(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -959,6 +963,7 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, id uuid.UUID) (Worker, er
 		&i.UpdatedAt,
 		&i.TemplateDeclared,
 		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
 	)
 	return i, err
 }
@@ -1076,12 +1081,18 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
        ) AS busy,
+       (
+           SELECT count(*) FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.kind <> 'chat'
+       ) AS active_runs,
        u.email AS owner_email
 FROM workers w
 JOIN users u ON u.id = w.user_id
@@ -1091,10 +1102,16 @@ ORDER BY w.created_at DESC
 type ListAllWorkersRow struct {
 	Worker     Worker `json:"worker"`
 	Busy       bool   `json:"busy"`
+	ActiveRuns int64  `json:"active_runs"`
 	OwnerEmail string `json:"owner_email"`
 }
 
-// Admin Agents-status: every worker with derived busy status and owner email.
+// Admin Agents-status: every worker with owner email plus the same two derived
+// signals as ListWorkersByUser (PRD #42 Decision 10): busy is the ANY-kind
+// non-terminal EXISTS, active_runs is the NON-CHAT active count (chat runs are
+// excluded so a live chat never inflates "N/M runs" past the run-lane cap). The
+// embedded worker carries max_concurrent_runs (the advertised cap, NULL when
+// unadvertised).
 func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, error) {
 	rows, err := q.db.Query(ctx, listAllWorkers)
 	if err != nil {
@@ -1116,7 +1133,9 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.UpdatedAt,
 			&i.Worker.TemplateDeclared,
 			&i.Worker.TemplateReported,
+			&i.Worker.MaxConcurrentRuns,
 			&i.Busy,
+			&i.ActiveRuns,
 			&i.OwnerEmail,
 		); err != nil {
 			return nil, err
@@ -1473,34 +1492,51 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
-       ) AS busy
+       ) AS busy,
+       (
+           SELECT count(*) FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.kind <> 'chat'
+       ) AS active_runs
 FROM workers w
 WHERE w.user_id = $1
 ORDER BY w.created_at ASC
 `
 
 type ListWorkersByUserRow struct {
-	ID               uuid.UUID          `json:"id"`
-	UserID           uuid.UUID          `json:"user_id"`
-	Name             string             `json:"name"`
-	TokenHash        []byte             `json:"token_hash"`
-	Status           string             `json:"status"`
-	LastHeartbeatAt  pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version          pgtype.Text        `json:"version"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared pgtype.Text        `json:"template_declared"`
-	TemplateReported pgtype.Text        `json:"template_reported"`
-	Busy             bool               `json:"busy"`
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	Name              string             `json:"name"`
+	TokenHash         []byte             `json:"token_hash"`
+	Status            string             `json:"status"`
+	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version           pgtype.Text        `json:"version"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared  pgtype.Text        `json:"template_declared"`
+	TemplateReported  pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns pgtype.Int4        `json:"max_concurrent_runs"`
+	Busy              bool               `json:"busy"`
+	ActiveRuns        int64              `json:"active_runs"`
 }
 
-// Worker list for the owning user. "busy" is derived here (never stored): a
-// worker is busy when it holds a non-terminal run.
+// Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
+//   - active_runs counts the worker's NON-CHAT active runs (claimed/running/
+//     awaiting_approval) — the RUN lane that max_concurrent_runs bounds. Chat runs
+//     have their own session budget (WORKER_CHAT_SESSIONS) and ClaimRun excludes
+//     them, so counting a live chat here would render a false "3/2 runs" over-cap.
+//   - busy is the ANY-kind non-terminal signal (a lone active chat still shows the
+//     worker as busy), so it is its own EXISTS over every kind — NOT derived from
+//     active_runs, which now omits chat.
+//
+// max_concurrent_runs (the advertised cap, NULL when unadvertised) rides on w.*; it
+// is observability only and never enforced.
 func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]ListWorkersByUserRow, error) {
 	rows, err := q.db.Query(ctx, listWorkersByUser, userID)
 	if err != nil {
@@ -1522,7 +1558,9 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.UpdatedAt,
 			&i.TemplateDeclared,
 			&i.TemplateReported,
+			&i.MaxConcurrentRuns,
 			&i.Busy,
+			&i.ActiveRuns,
 		); err != nil {
 			return nil, err
 		}
@@ -1598,27 +1636,38 @@ func (q *Queries) RecordRunColumnMove(ctx context.Context, arg RecordRunColumnMo
 
 const registerWorker = `-- name: RegisterWorker :one
 UPDATE workers SET
-    status            = 'online',
-    version           = $1,
-    template_reported = $2,
-    last_heartbeat_at = now(),
-    updated_at        = now()
-WHERE id = $3
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported
+    status              = 'online',
+    version             = $1,
+    template_reported   = $2,
+    max_concurrent_runs = $3,
+    last_heartbeat_at   = now(),
+    updated_at          = now()
+WHERE id = $4
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs
 `
 
 type RegisterWorkerParams struct {
-	Version          pgtype.Text `json:"version"`
-	TemplateReported pgtype.Text `json:"template_reported"`
-	ID               uuid.UUID   `json:"id"`
+	Version           pgtype.Text `json:"version"`
+	TemplateReported  pgtype.Text `json:"template_reported"`
+	MaxConcurrentRuns pgtype.Int4 `json:"max_concurrent_runs"`
+	ID                uuid.UUID   `json:"id"`
 }
 
 // Worker announces version + its self-reported template and comes online;
 // heartbeat is stamped now. template_reported is what the image bakes in (PRD
 // #18), NULL when the worker sends none (older image) — stored as-is; drift vs
-// template_declared is surfaced, never rejected.
+// template_declared is surfaced, never rejected. max_concurrent_runs is the worker's
+// advertised slot cap (PRD #42 Decisions 3 & 10), likewise self-reported: NULL when
+// the worker advertises none (an older image, or before the M2 agent sends it), and
+// overwritten to the current report on every register (the fresh-start signal). It is
+// observability only — the server never enforces it.
 func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) (Worker, error) {
-	row := q.db.QueryRow(ctx, registerWorker, arg.Version, arg.TemplateReported, arg.ID)
+	row := q.db.QueryRow(ctx, registerWorker,
+		arg.Version,
+		arg.TemplateReported,
+		arg.MaxConcurrentRuns,
+		arg.ID,
+	)
 	var i Worker
 	err := row.Scan(
 		&i.ID,
@@ -1632,6 +1681,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.UpdatedAt,
 		&i.TemplateDeclared,
 		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
 	)
 	return i, err
 }

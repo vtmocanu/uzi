@@ -302,7 +302,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // (affinity) to be re-claimed and resumed from the persisted session. This is
 // what makes `docker compose down && up` recover — the out-of-process worker's
 // fresh-start signal, which the server cannot infer from heartbeats alone.
-func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string) (store.Worker, error) {
+func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
 	if _, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
@@ -319,10 +319,14 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	}
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
+	// maxConcurrentRuns is the worker's advertised concurrency cap (PRD #42); nil →
+	// NULL (an older image, or M3a before the M2 agent sends it). Observability
+	// only — the server never enforces it, so it is stored exactly as reported.
 	return s.q.RegisterWorker(ctx, store.RegisterWorkerParams{
-		Version:          pgText(version),
-		TemplateReported: pgText(template),
-		ID:               wkr.ID,
+		Version:           pgText(version),
+		TemplateReported:  pgText(template),
+		MaxConcurrentRuns: pgIntPtr(maxConcurrentRuns),
+		ID:                wkr.ID,
 	})
 }
 
@@ -1302,6 +1306,16 @@ func int8Param(v *int64) pgtype.Int8 {
 		return pgtype.Int8{}
 	}
 	return pgtype.Int8{Int64: *v, Valid: true}
+}
+
+// pgIntPtr maps an optional int (a nil pointer = "not reported") onto a nullable
+// int4 column: nil → NULL, else the value. Used for the worker's advertised
+// max_concurrent_runs (PRD #42).
+func pgIntPtr(v *int) pgtype.Int4 {
+	if v == nil {
+		return pgtype.Int4{}
+	}
+	return pgtype.Int4{Int32: int32(*v), Valid: true}
 }
 
 func pgUUID(id uuid.UUID) pgtype.UUID {

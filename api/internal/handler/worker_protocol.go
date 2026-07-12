@@ -22,6 +22,14 @@ import (
 // version string, tight enough to bound abuse.
 const maxSelfReportedBytes = 64
 
+// maxAdvertisedConcurrentRuns is the sanity ceiling for a worker's self-reported
+// concurrency cap (PRD #42). The cap is observability only — the server enforces no
+// cap — so this is a generous absurd-value guard (far above the documented soft
+// ceiling of 8 and multica's daemon cap of 20), NOT a policy limit. A report outside
+// [1, maxAdvertisedConcurrentRuns] is treated as unadvertised (stored NULL), so a
+// hostile/garbled value can never flow into the fleet UI's "N/M runs" math.
+const maxAdvertisedConcurrentRuns = 256
+
 // sanitizeSelfReported bounds an untrusted worker-reported string: trim, drop
 // control characters (so no terminal escapes reach a log or the UI), and truncate
 // to max bytes (the length check runs after each whole rune is written, so it
@@ -64,6 +72,12 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// the server surfaces and badges drift on, never an authn/authz input.
 		// Optional — an older image omits it and the column stays NULL.
 		Template string `json:"template"`
+		// MaxConcurrentRuns is the worker's advertised concurrency cap (PRD #42
+		// Decisions 3 & 10): observability the server records and the UI renders as
+		// "N/M runs", never enforced server-side. Optional — an older image (and
+		// every M3a worker, before the M2 agent starts sending it) omits it and the
+		// column stays NULL. A pointer so absent (NULL) is distinct from a sent 0.
+		MaxConcurrentRuns *int `json:"max_concurrent_runs"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -84,7 +98,20 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// Cap + strip control chars so a hostile worker can't smuggle unbounded text
 	// or terminal escapes there. Sanitize (never reject) — it is observability.
 	version := sanitizeSelfReported(req.Version, maxSelfReportedBytes)
-	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported)
+	// max_concurrent_runs is the sibling self-reported cap (PRD #42). It is pure
+	// observability the server never enforces AND it flows into the fleet UI's
+	// "N/M runs" math, so a nonsensical report must be neither trusted nor allowed
+	// to wedge the register-retry loop: accept it only within a sane
+	// [1, maxAdvertisedConcurrentRuns] band, else drop it to NULL (treat as
+	// unadvertised) with a warn — like a malformed template, never a 400. The worker
+	// validates ≥ 1 and warns above the documented soft ceiling before sending (M2);
+	// this is the server-side backstop against a hostile/garbled report.
+	advertisedCap := req.MaxConcurrentRuns
+	if advertisedCap != nil && (*advertisedCap < 1 || *advertisedCap > maxAdvertisedConcurrentRuns) {
+		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
+		advertisedCap = nil
+	}
+	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -94,7 +121,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id": updated.ID.String(),
-		"worker":    workerDTOFromWorker(updated, false),
+		"worker":    workerDTOFromWorker(updated, 0, false),
 	})
 }
 
@@ -111,7 +138,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, false)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false)})
 }
 
 // WorkerClaim atomically claims the next run for the worker's user. 204 when the
