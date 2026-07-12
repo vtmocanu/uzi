@@ -633,6 +633,11 @@ export function JudgePanel({ run }: { run: Run }) {
         </p>
       ) : (
         <>
+          {/* summary_md and each rationale_md below are UNTRUSTED judge/worker output.
+              They are DELIBERATELY rendered as escaped plain text (React's default +
+              whitespace-pre-wrap), never markdown/HTML. If these are ever switched to a
+              markdown/HTML renderer, add sanitization first: the review-POST ingest scrub
+              (ScrubSecrets + control-strip) does NOT cover markdown/link injection. */}
           {review.summary_md.trim() !== "" && (
             <p className="whitespace-pre-wrap text-sm text-muted">{review.summary_md}</p>
           )}
