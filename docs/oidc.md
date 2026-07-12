@@ -84,6 +84,10 @@ provisioning can't reach outside it — see
 7. Restart uzi so `config.Load` picks up the new env vars, then click
    "Sign in with SSO" from the uzi login page.
 
+No separate PKCE setting to flip here: Keycloak accepts the S256 challenge
+uzi always sends opportunistically, with no extra client configuration —
+confirmed working out of the box.
+
 ## Pocket ID walkthrough
 
 1. In the Pocket ID admin panel, go to **OIDC Clients → Add OIDC Client** (opens
@@ -156,13 +160,21 @@ every login attempt retries discovery on the spot. Check the API logs for a
 loud discovery-failure line if the button is there but every click bounces
 back with `oidc_exchange`.
 
-Callback failures redirect to `/login?error=<code>` with one of a fixed set
-of codes (the raw error never reaches the URL or the browser):
+**A misconfigured redirect URI usually never reaches uzi at all.** Keycloak
+rejects it at its own authorize step with an IdP-branded error page ("We are
+sorry ... / Invalid parameter: redirect_uri") before ever redirecting back —
+uzi's callback is never hit, so no `?error=` code appears. If you land on a
+page like that instead of back on uzi's `/login`, check that the redirect
+URI registered at the IdP is exactly `FRONTEND_ORIGIN + /api/auth/oidc/callback`.
+
+Callback failures that uzi itself does see redirect to `/login?error=<code>`
+with one of a fixed set of codes (the raw error never reaches the URL or the
+browser):
 
 | Code | Meaning |
 |---|---|
 | `oidc_state` | The state cookie was missing, wouldn't decrypt, or didn't match — usually a stale/expired attempt (the cookie lives 10 minutes) or a cookie blocked by the browser. Retry from the login page. |
-| `oidc_exchange` | Discovery, the token exchange, or ID-token verification failed — the IdP was unreachable or misconfigured (redirect URI mismatch, clock skew, etc). Check the API logs. |
+| `oidc_exchange` | Discovery, the token exchange, or ID-token verification failed — e.g. the IdP went unreachable between login and callback, the client secret is wrong, or a clock-skew/nonce mismatch at the token endpoint. Check the API logs. |
 | `oidc_forbidden` | The IdP denied the request, the email claim was missing/unverified, the email's domain isn't in `UZI_ALLOWED_EMAIL_DOMAINS`, registration is disabled and no existing account matched, or the email already belongs to a *different* linked account. See [Enabling email verification](#enabling-email-verification-required) — this is the most common cause. |
 | `oidc_deactivated` | The matched uzi account has been deactivated by an admin. |
 | `oidc_error` | An internal error (DB, cookie sealing) — check the API logs. |
