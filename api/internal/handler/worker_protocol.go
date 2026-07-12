@@ -22,6 +22,14 @@ import (
 // version string, tight enough to bound abuse.
 const maxSelfReportedBytes = 64
 
+// maxAdvertisedConcurrentRuns is the sanity ceiling for a worker's self-reported
+// concurrency cap (PRD #42). The cap is observability only — the server enforces no
+// cap — so this is a generous absurd-value guard (far above the documented soft
+// ceiling of 8 and multica's daemon cap of 20), NOT a policy limit. A report outside
+// [1, maxAdvertisedConcurrentRuns] is treated as unadvertised (stored NULL), so a
+// hostile/garbled value can never flow into the fleet UI's "N/M runs" math.
+const maxAdvertisedConcurrentRuns = 256
+
 // sanitizeSelfReported bounds an untrusted worker-reported string: trim, drop
 // control characters (so no terminal escapes reach a log or the UI), and truncate
 // to max bytes (the length check runs after each whole rune is written, so it
@@ -91,13 +99,16 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// or terminal escapes there. Sanitize (never reject) — it is observability.
 	version := sanitizeSelfReported(req.Version, maxSelfReportedBytes)
 	// max_concurrent_runs is the sibling self-reported cap (PRD #42). It is pure
-	// observability the server never enforces, so a nonsensical value must not
-	// wedge the register-retry loop: drop a present-but-< 1 report to NULL (like a
-	// malformed template) rather than 400. The worker validates ≥ 1 before sending
-	// (M2); this is the server-side backstop against a hostile/garbled report.
+	// observability the server never enforces AND it flows into the fleet UI's
+	// "N/M runs" math, so a nonsensical report must be neither trusted nor allowed
+	// to wedge the register-retry loop: accept it only within a sane
+	// [1, maxAdvertisedConcurrentRuns] band, else drop it to NULL (treat as
+	// unadvertised) with a warn — like a malformed template, never a 400. The worker
+	// validates ≥ 1 and warns above the documented soft ceiling before sending (M2);
+	// this is the server-side backstop against a hostile/garbled report.
 	cap := req.MaxConcurrentRuns
-	if cap != nil && *cap < 1 {
-		slog.Warn("worker reported a non-positive max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *cap)
+	if cap != nil && (*cap < 1 || *cap > maxAdvertisedConcurrentRuns) {
+		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *cap)
 		cap = nil
 	}
 	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, cap)

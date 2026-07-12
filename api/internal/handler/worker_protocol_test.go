@@ -140,18 +140,40 @@ func TestWorkerRegisterOmitsMaxConcurrentRuns(t *testing.T) {
 	}
 }
 
-func TestWorkerRegisterDropsNonPositiveMaxConcurrentRuns(t *testing.T) {
-	// A garbled/hostile worker reports a non-positive cap. Register must still
-	// succeed (a soft observability field never wedges the register-retry loop) but
-	// the nonsensical value must not reach the DB/UI — dropped to null.
+func TestWorkerRegisterDropsOutOfRangeMaxConcurrentRuns(t *testing.T) {
+	// A garbled/hostile worker reports a cap outside the sane [1, 256] band (zero,
+	// negative, or absurdly large). Register must still succeed (a soft observability
+	// field never wedges the register-retry loop) but the nonsensical value must not
+	// reach the DB/UI — dropped to null, so it never flows into the "N/M runs" math.
+	for _, body := range []string{
+		`{"name":"laptop","version":"1.2.3","max_concurrent_runs":0}`,
+		`{"name":"laptop","version":"1.2.3","max_concurrent_runs":-3}`,
+		`{"name":"laptop","version":"1.2.3","max_concurrent_runs":100000}`,
+		`{"name":"laptop","version":"1.2.3","max_concurrent_runs":257}`,
+	} {
+		h := newProtocolHandler(t, &protocolStore{})
+		rec := httptest.NewRecorder()
+		h.WorkerRegister(rec, workerReq(http.MethodPost, body, uuid.Nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (a bad cap must not fail register) for %s, body %q", rec.Code, body, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), `"max_concurrent_runs":null`) {
+			t.Fatalf("out-of-range cap %s must be dropped to null, got %q", body, rec.Body.String())
+		}
+	}
+}
+
+func TestWorkerRegisterAcceptsCeilingMaxConcurrentRuns(t *testing.T) {
+	// The ceiling value itself is in-band and must round-trip (boundary check that
+	// the guard rejects 257 but not 256).
 	h := newProtocolHandler(t, &protocolStore{})
 	rec := httptest.NewRecorder()
-	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3","max_concurrent_runs":0}`, uuid.Nil))
+	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3","max_concurrent_runs":256}`, uuid.Nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (a bad cap must not fail register), body %q", rec.Code, rec.Body.String())
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"max_concurrent_runs":null`) {
-		t.Fatalf("non-positive cap must be dropped to null, got %q", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"max_concurrent_runs":256`) {
+		t.Fatalf("ceiling cap 256 must be accepted, got %q", rec.Body.String())
 	}
 }
 
