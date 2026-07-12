@@ -111,10 +111,11 @@ that looks like a real Anthropic token. Credentials belong in
 
 ### Resetting a builtin template
 
-Reset re-applies the shipped builtin body **verbatim** — it does not merge.
-If you've customized a builtin's prompt (say, `lead` or `coder`) and reset it
-to pick up a change shipped in a newer uzi version, your customization is
-gone, not folded into the new body.
+Open a builtin template's detail page (click its name from **Agents**) and
+click **Reset to default**. It re-applies the shipped builtin body
+**verbatim** — it does not merge. If you've customized a builtin's prompt
+(say, `lead` or `coder`) and reset it to pick up a change shipped in a newer
+uzi version, your customization is gone, not folded into the new body.
 
 That's also why a shipped change to a builtin's prompt doesn't reach you
 automatically: it seeds into a fresh database on first boot, but an
@@ -126,7 +127,8 @@ all-or-nothing.
 To pick up a new builtin body without losing your own edits:
 
 1. Compare your current template body against the new one shipped in this
-   version (ask whoever deployed the upgrade, or check the release notes).
+   version (its git history is `api/internal/agenttmpl/builtins/` in the uzi
+   repo, or ask whoever deployed the upgrade).
 2. Reset the template.
 3. Re-apply your customization on top of the new body.
 
