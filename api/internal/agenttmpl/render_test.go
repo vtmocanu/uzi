@@ -124,6 +124,80 @@ func TestCoderInheritsAllTools(t *testing.T) {
 	}
 }
 
+// flatten collapses every run of whitespace (including the body's hard line
+// wraps) to a single space, so a phrase assertion matches the prose regardless
+// of where a line break happens to fall. Without this, a load-bearing phrase
+// that straddles a wrap point would look "missing" to a naive substring test.
+func flatten(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// TestLeadParallelDispatchPhrases pins the load-bearing behaviors of the lead's
+// parallel-dispatch prose (PRD #43 M1), one assertion per behavior so a future
+// reword that silently drops a behavior fails loudly. These are the contract
+// the run's fan-out depends on, not incidental wording.
+func TestLeadParallelDispatchPhrases(t *testing.T) {
+	lead, ok := BuiltinByName("lead")
+	if !ok {
+		t.Fatal("lead builtin missing")
+	}
+	body := flatten(string(Render(lead)))
+
+	cases := []struct {
+		behavior string
+		phrase   string
+	}{
+		{"parallel dispatch in a single turn", "Dispatch independent subagents in parallel in a single turn"},
+		{"read-only validators fan out in one wave, allocation-agnostic", "send all allocated read-only validators together in one wave"},
+		{"implementation fans out only with no dependency between units", "units with no dependency between them"},
+		{"disjoint ownership at the package or module level", "disjoint ownership at the package or module level"},
+		{"never the same package, project, or shared file", "never touch the same Go package, the same TypeScript project, or any shared file"},
+		{"shared-wiring exclusion list is enumerated", "go.mod, go.sum, lockfiles, generated code, routers and registration files, compose or config files"},
+		{"same coder may be invoked several times in parallel", "The same coder subagent may be invoked several times in parallel"},
+		{"explicit non-overlapping file scope per implementer", "an explicit, non-overlapping list of files and directories it owns"},
+		{"parallel implementers do not commit or run repo-wide gates", "tell it not to commit and not to run repo-wide build or test commands"},
+		{"lead diffs against the last commit and confirms declared scopes", "diff the working tree against the last commit and confirm only the declared scopes changed"},
+		{"lead commits once and runs the gate once itself", "commit once, run the quality gates once yourself"},
+		{"declared scope map goes to the review wave", "include the declared scope map when you dispatch the review wave"},
+		{"when in doubt, run serially", "run them serially"},
+		{"sequential-by-nature work stays serial", "stays serial"},
+	}
+	for _, c := range cases {
+		if !strings.Contains(body, c.phrase) {
+			t.Errorf("lead template lost behavior %q: missing phrase %q", c.behavior, c.phrase)
+		}
+	}
+}
+
+// TestCoderParallelModeContract pins the coder's parallel-mode contract (PRD #43
+// M1): the hard file-scope boundary, stop-and-report on out-of-scope or shared
+// files, no commit in parallel mode, and gate only what it exclusively owns.
+func TestCoderParallelModeContract(t *testing.T) {
+	coder, ok := BuiltinByName("coder")
+	if !ok {
+		t.Fatal("coder builtin missing")
+	}
+	body := flatten(string(Render(coder)))
+
+	cases := []struct {
+		behavior string
+		phrase   string
+	}{
+		{"may run as one of several parallel coders", "dispatched as one of several coders working in parallel"},
+		{"assigned file scope is a hard boundary", "treat it as a hard boundary"},
+		{"stop and report on out-of-scope need", "stop and report that instead of editing it"},
+		{"shared files are called out as out-of-scope", "including shared files like go.mod, lockfiles, generated code, or wiring and registration files"},
+		{"no git commit in parallel mode", "In parallel mode do not run `git commit`"},
+		{"no build/test unless it covers only exclusively-owned code", "do not run build or test commands unless they cover only code you exclusively own"},
+		{"lead integrates, commits, and runs the repo-wide gate", "the lead integrates, commits, and runs the repo-wide gate"},
+	}
+	for _, c := range cases {
+		if !strings.Contains(body, c.phrase) {
+			t.Errorf("coder template lost behavior %q: missing phrase %q", c.behavior, c.phrase)
+		}
+	}
+}
+
 // TestRenderFieldOrderAndOmission pins the fixed field order and the omit-when-
 // empty behaviour for a synthetic definition covering all four fields.
 func TestRenderFieldOrderAndOmission(t *testing.T) {
