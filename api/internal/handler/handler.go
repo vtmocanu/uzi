@@ -214,6 +214,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// Unauthenticated registration policy for the SPA: outside RequireAuth,
 			// behind the auth limiter. Reveals only operator-set, user-visible policy.
 			r.With(authLimiter.Middleware).Get("/config", h.AuthConfig)
+			// OIDC SSO (PRD #45): top-level GET redirects, outside RequireAuth (the
+			// callback is an unauthenticated cross-site navigation from the IdP), behind
+			// the auth limiter like register/login.
+			r.With(authLimiter.Middleware).Get("/oidc/login", h.OIDCLogin)
+			r.With(authLimiter.Middleware).Get("/oidc/callback", h.OIDCCallback)
 
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))

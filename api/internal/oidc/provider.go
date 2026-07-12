@@ -69,6 +69,12 @@ type Provider struct {
 	oauth    *oauth2.Config
 }
 
+// GenerateVerifier returns a fresh high-entropy PKCE code verifier (RFC 7636),
+// suitable to pass to AuthCodeURL (as the S256 challenge source) and later to
+// Exchange (as the plaintext verifier). Thin re-export so callers do not import
+// golang.org/x/oauth2 directly.
+func GenerateVerifier() string { return oauth2.GenerateVerifier() }
+
 // New constructs a Provider. It does no network I/O; discovery is deferred to the
 // first Discover/AuthCodeURL/Exchange call.
 func New(cfg Config) *Provider {

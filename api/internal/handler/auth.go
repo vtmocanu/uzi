@@ -95,6 +95,13 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "registration is disabled")
 		return
 	}
+	// Password login off (SSO-only) disables registration too: a password account
+	// minted here could never log in (PRD #45, Decision 8 / audit M3). SSO users are
+	// provisioned via JIT or linking, never this endpoint.
+	if !h.cfg.PasswordLoginEnabled {
+		httpx.Error(w, http.StatusForbidden, "password login is disabled")
+		return
+	}
 
 	var req registerRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {

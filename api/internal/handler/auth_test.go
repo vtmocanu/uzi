@@ -84,7 +84,7 @@ func TestRegisterDisabledReturns403(t *testing.T) {
 }
 
 func TestRegisterDomainRejectedReturns403(t *testing.T) {
-	cfg := config.Config{RegistrationEnabled: true, AllowedEmailDomains: []string{"example.com"}}
+	cfg := config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true, AllowedEmailDomains: []string{"example.com"}}
 	rec := postRegister(cfg, `{"email":"someone@gmail.com","password":"a-long-enough-password"}`)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
@@ -99,7 +99,7 @@ func TestRegisterDomainRejectedReturns403(t *testing.T) {
 // password check (not 403), so the domain gate must have passed. Case-insensitive
 // matching is covered by the mixed-case address.
 func TestRegisterDomainAllowedPassesPolicy(t *testing.T) {
-	cfg := config.Config{RegistrationEnabled: true, AllowedEmailDomains: []string{"example.com"}}
+	cfg := config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true, AllowedEmailDomains: []string{"example.com"}}
 	rec := postRegister(cfg, `{"email":"Alice@example.com","password":"short"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (past the domain gate, failing on password)", rec.Code)
@@ -110,7 +110,7 @@ func TestRegisterDomainAllowedPassesPolicy(t *testing.T) {
 }
 
 func TestRegisterEmptyAllowlistAllowsAll(t *testing.T) {
-	cfg := config.Config{RegistrationEnabled: true} // nil AllowedEmailDomains
+	cfg := config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true} // nil AllowedEmailDomains
 	rec := postRegister(cfg, `{"email":"anyone@gmail.com","password":"short"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (any domain allowed, failing on password)", rec.Code)
