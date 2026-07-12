@@ -136,6 +136,14 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		}
 		return
 	}
+	// PRD #46 Decision 6: a judge or self_improve run's OWN state transitions are not
+	// user-facing run events — suppress them from the run-state DM path. A judge run is
+	// repo-less and already yields ErrNoRows above; a self_improve run is repo-ful, so
+	// it needs this explicit skip. The judge "review ready" / self-improve "MR opened"
+	// notifications are a SEPARATE notifier event, not this run-state rendering.
+	if rc.Kind == "judge" || rc.Kind == "self_improve" {
+		return
+	}
 	target, err := n.store.GetSlackDeliveryForUser(ctx, rc.UserID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return // unlinked, opted out, or unconfirmed → drop silently

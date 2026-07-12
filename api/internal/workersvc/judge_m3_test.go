@@ -236,6 +236,55 @@ func TestPostReviewPersistsVerdictAndRecs(t *testing.T) {
 	}
 }
 
+// TestSubmitInputRejectServerSideEnqueuesJudge: a server-side plan REJECT commits the
+// run to 'failed' (a judged status), so it must enqueue a judge (Decision 2 — the
+// cancel/reject trigger point).
+func TestSubmitInputRejectServerSideEnqueuesJudge(t *testing.T) {
+	user, runID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		runByID:      store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},         // GetRun + no worker ⇒ no live poller
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "failed", Kind: RunKindIssue}, // post-reject reload
+		userByID:     store.User{JudgeEnabled: true},
+		anthropic:    []byte("sealed"),
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "reject_plan", "", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if !res.ServerSide {
+		t.Fatal("a reject with no live poller must be applied server-side")
+	}
+	if fs.rejected == nil {
+		t.Fatal("RejectRunServerSide not called")
+	}
+	if fs.createdJudgeRun == nil {
+		t.Fatal("a server-side reject → failed run must enqueue a judge")
+	}
+}
+
+// TestSubmitInputCancelServerSideDoesNotEnqueueJudge: a server-side CANCEL commits
+// 'cancelled', which is never judged (Decision 2).
+func TestSubmitInputCancelServerSideDoesNotEnqueueJudge(t *testing.T) {
+	user, runID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		runByID:      store.Run{ID: runID, UserID: user, Status: "queued"},
+		runByIDPlain: store.Run{ID: runID, UserID: user, Status: "cancelled", Kind: RunKindIssue},
+		userByID:     store.User{JudgeEnabled: true},
+		anthropic:    []byte("sealed"),
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil); err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if fs.createdJudgeRun != nil {
+		t.Fatal("a cancelled run must never be judged")
+	}
+}
+
 func TestPostReviewRejectsUnauthorizedWorker(t *testing.T) {
 	fs := &fakeStore{activeJudgeRunErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())

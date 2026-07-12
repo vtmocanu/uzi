@@ -1281,6 +1281,10 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 				s.bcast.PublishState(runID, status)
 			}
 			s.notify(runID, status) // cancelled → origin restore; failed (reject) → origin restore
+			// PRD #46 Decision 2: a server-side plan REJECT commits the run to 'failed',
+			// a judged status — enqueue a judge on it. A server-side CANCEL commits
+			// 'cancelled', which the enqueue gate filters out. Best-effort, gated inside.
+			s.maybeEnqueueJudgeByID(ctx, runID)
 			return SubmitInputResult{ServerSide: true}, nil
 		}
 		// Live poller: the worker will consume this verdict. Enqueue it AND stamp the

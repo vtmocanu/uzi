@@ -211,6 +211,23 @@ func TestNotifierDropsUnlinkedOwner(t *testing.T) {
 	}
 }
 
+// TestNotifierSuppressesSelfImproveRunState: a self_improve run is repo-ful, so
+// GetSlackRunContext returns a row (unlike a repo-less judge run, dropped as
+// ErrNoRows) — its OWN state transition must still be suppressed from the run-state
+// DM path (PRD #46 Decision 6). The owner is linked, so the only reason nothing posts
+// is the kind skip.
+func TestNotifierSuppressesSelfImproveRunState(t *testing.T) {
+	rc := baseRun("completed")
+	rc.Kind = "self_improve"
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U123")}
+	fp := &fakePoster{}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "completed"})
+	if len(fp.posts) != 0 || len(fp.updates) != 0 {
+		t.Fatalf("a self_improve run's own state must not post to the run-state DM path: posts=%v updates=%v", fp.posts, fp.updates)
+	}
+}
+
 func TestNotifierPublishStateNeverBlocks(t *testing.T) {
 	// No drain goroutine: the queue fills and further calls must drop, not block.
 	n := NewNotifier(&fakeNotifStore{}, &fakePoster{}, fixedBase, nil)
