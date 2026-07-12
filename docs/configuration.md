@@ -85,6 +85,24 @@ Registration controls and PAT least-privilege verification. See [auth-design.md]
 | `UZI_ALLOWED_EMAIL_DOMAINS` | — (empty = all) | Comma-separated registration email-domain allowlist, matched case-insensitively, **exact match only** (no subdomain wildcards: `a.example.com` does not match `example.com`). Empty/unset allows every domain (today's open behavior; the compose demo stays zero-config). A rejected domain returns `403` with the allowed list named. The domain is taken from the parsed address, so display-name forms (`Alice <alice@example.com>`) are handled correctly. The seed admin is **exempt** — an allowlist that excludes your own seed email never causes a bootstrap lockout. |
 | `UZI_PRIVILEGE_CHECK_INTERVAL` | `24h` | Cadence of the background PAT least-privilege re-check sweep (Go duration). When enabled (`> 0`), the sweep runs a boot pass shortly after start — back-filling never-checked (grandfathered) connections so an over-privileged token surfaces without waiting a full interval — then re-checks on the interval. `0` **disables the sweep entirely, including that boot pass**: it is the one duration knob where `0` is honored, not treated as "unset". With `0`, a never-checked connection therefore stays `unchecked` until its owner runs the on-demand "Check privileges" button — only the save-time check (which blocks an over-privileged token at connect) still runs regardless. A negative or otherwise malformed value falls back to the default. |
 
+## OIDC single sign-on (PRD #45)
+
+See [oidc.md](oidc.md) for the operator setup guide (Keycloak and Pocket ID walkthroughs, break-glass, troubleshooting) and [auth-design.md](auth-design.md#oidc-single-sign-on) for the design.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_OIDC_ISSUER_URL` | — (unset = OIDC off) | The IdP's issuer URL; `/.well-known/openid-configuration` is fetched relative to it. Must be `https://` — plain `http://` is accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `::1`), for local IdP development. Setting this enables the "Sign in with SSO" button; it stays visible even if discovery fails at boot (see below), since a login attempt retries discovery on its own. |
+| `UZI_OIDC_CLIENT_ID` | — | The confidential client's ID at the IdP. |
+| `UZI_OIDC_CLIENT_SECRET` | — | The confidential client's secret. Env-only: never stored in the DB, same trust level as `JWT_SECRET`. `UZI_OIDC_ISSUER_URL`, `UZI_OIDC_CLIENT_ID`, and `UZI_OIDC_CLIENT_SECRET` are all-or-nothing — setting some but not all of them refuses to start. |
+| `UZI_OIDC_SCOPES` | `openid profile email` | Space-separated requested scopes. `openid` is always force-included even if omitted (an ID token can't be issued without it); duplicates are dropped. |
+| `UZI_OIDC_PROVIDER_NAME` | `SSO` | Label shown on the login button ("Sign in with {name}"). |
+| `UZI_OIDC_HTTP_TIMEOUT` | `15s` | Hard timeout on every outbound call to the IdP (discovery, JWKS, token exchange), mirroring `FORGE_HTTP_TIMEOUT`'s posture. |
+| `UZI_PASSWORD_LOGIN_ENABLED` | `true` | Kill-switch for email+password: `false` hides the password form in the SPA and makes `POST /api/auth/register` return `403` (no point minting a password account that can never log in). Setting this `false` while OIDC is unconfigured **refuses to start** (a total lockout — nobody could ever authenticate); the break-glass is flipping it back to `true` and restarting, since the seed admin (`UZI_SEED_EMAIL`) always keeps a `password_hash`. A malformed (non-boolean) value also refuses to start. |
+
+The redirect URI is not itself a setting: it's derived as `FRONTEND_ORIGIN + /api/auth/oidc/callback`, and must match exactly what's registered at the IdP.
+
+There is no `UZI_OIDC_*` variable to opt into groups/roles-claim → admin mapping, multiple providers, or SAML — out of scope for this iteration (see the PRD).
+
 ## Agent runtime (PRD #4)
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md#agent-runtime-workers-runs-live-view) for how these are used (run lifecycle, sweeper, claim affinity) and [worker-setup.md](worker-setup.md) for the operator procedure. `UZI_SEED_ANTHROPIC_TOKEN` (dev convenience: boot-seeds an existing Anthropic token for the seed admin) is documented above, in the Forge integration seed table, alongside the other startup seeds.
