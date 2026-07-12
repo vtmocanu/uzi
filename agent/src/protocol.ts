@@ -91,6 +91,14 @@ export interface HeartbeatRequest {
   version: string;
 }
 
+/** Kebab-case agent name. Mirrors the API's template nameRe
+ *  (api/internal/handler/agent_templates.go:28) so a repo-detected agent, a uzi
+ *  template, and an exclusion entry all answer to one identity rule. */
+export const AGENT_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+/** Cap on an agent name. The regex admits arbitrary length; this bounds it. */
+export const AGENT_NAME_MAX_LEN = 64;
+
 /** Structured agent-template fields (PRD #3), consumed programmatically by M3. */
 export interface AgentTemplate {
   name: string;
@@ -323,11 +331,11 @@ export interface WorkerRunMessage {
 }
 
 /** A created issue proposal (POST /api/worker/runs/:id/proposals → 201). Pending
- *  until the user confirms in the browser; the worker never writes the forge. */
+ *  until the user confirms in the browser; the worker never writes the forge. No
+ *  repo_id: the worker only handles the human-readable repo_path (Decision 7). */
 export interface WorkerProposal {
   id: string;
   run_id: string;
-  repo_id: string;
   title: string;
   description: string;
   labels: string[];
@@ -361,6 +369,126 @@ export interface MessagesRequest {
   messages: OutgoingMessage[];
 }
 
+/**
+ * One agent detected in the cloned repo's `.claude/agents/` (PRD #37). Names and
+ * descriptions ONLY: the prompt bodies never leave the worker — the API stores a
+ * roster the plan gate can render, not the untrusted prompts themselves.
+ */
+export interface RepoAgentSummary {
+  name: string;
+  description: string;
+}
+
+/** Which roster a run's SUBAGENTS come from (PRD #37 Decision 4: either/or, no
+ *  mixing). The `lead` orchestrator is always uzi's builtin and is never
+ *  selectable, under either source. */
+export type AgentSource = "repo" | "own";
+
+/**
+ * The per-run subagent selection (PRD #37). `exclusions` are names removed from
+ * the chosen source's roster; at least one subagent must survive (enforced by the
+ * UI and re-validated API-side in M2 — the worker treats this as a request, not
+ * as authority).
+ *
+ * It travels on two paths, both landing in the same `runs` columns:
+ *   - human gate: JSON-encoded into the `approve_plan` UserInput `body`;
+ *   - autopilot: on the worker's own `running` state report (Decision 6), since
+ *     a self-approved run never receives a SubmitInput.
+ */
+export interface AgentSelection {
+  source: AgentSource;
+  exclusions: string[];
+}
+
+/** Cap on `exclusions`. Twice the repo-agent file cap, so excluding the whole of
+ *  either roster still fits (the user's own template list is not file-capped). */
+export const AGENT_EXCLUSIONS_MAX = 32;
+
+/** JSON-encode a selection for the `approve_plan` input body. */
+export function encodeAgentSelection(selection: AgentSelection): string {
+  return JSON.stringify({ source: selection.source, exclusions: selection.exclusions });
+}
+
+/**
+ * The outcome of parsing an `approve_plan` body — three cases the caller MUST keep
+ * apart (PRD #37, ↳review B2/F5):
+ *   - "absent":  no body was sent (autopilot, Slack today, or an older client).
+ *                The run uses its DEFAULT source, which may be the detected repo
+ *                roster — an absence is not a signal to distrust.
+ *   - "invalid": a body WAS sent but is malformed. It must NEVER resolve toward the
+ *                untrusted repo source; the caller forces `own` and notes it.
+ *   - "ok":      a well-formed selection.
+ * Folding "invalid" into "absent" (as returning `undefined` for both did) would let
+ * `{"source":"own","exclusions":"oops"}` silently fall back to the repo default — the
+ * exact "fall back toward the untrusted source" bug the review flagged.
+ */
+export type AgentSelectionParse =
+  | { status: "absent" }
+  | { status: "invalid" }
+  | { status: "ok"; selection: AgentSelection };
+
+/**
+ * Parse + validate an `approve_plan` body. Absent/blank → "absent"; anything sent
+ * but not a well-formed selection (non-JSON, unknown source, malformed/over-cap
+ * exclusions) → "invalid". Exclusion names are held to AGENT_NAME_RE so a body can
+ * carry nothing but identities; membership (⊂ the chosen roster) is the API's check
+ * (and M3 re-clamps worker-side), not this one.
+ */
+export function parseAgentSelection(raw: string | null | undefined): AgentSelectionParse {
+  if (typeof raw !== "string" || raw.trim() === "") return { status: "absent" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { status: "invalid" };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { status: "invalid" };
+
+  const { source, exclusions } = parsed as { source?: unknown; exclusions?: unknown };
+  if (source !== "repo" && source !== "own") return { status: "invalid" };
+
+  if (exclusions === undefined || exclusions === null) return { status: "ok", selection: { source, exclusions: [] } };
+  if (!Array.isArray(exclusions) || exclusions.length > AGENT_EXCLUSIONS_MAX) return { status: "invalid" };
+
+  const out: string[] = [];
+  for (const e of exclusions) {
+    if (typeof e !== "string") return { status: "invalid" };
+    const name = e.trim();
+    if (name.length > AGENT_NAME_MAX_LEN || !AGENT_NAME_RE.test(name)) return { status: "invalid" };
+    if (!out.includes(name)) out.push(name);
+  }
+  return { status: "ok", selection: { source, exclusions: out } };
+}
+
+/**
+ * Resolve a parsed `approve_plan` body to the selection the run will use, applying
+ * the fallback policy (PRD #37 ↳review B2/F5). `repoAvailable` is whether the run
+ * detected a non-empty repo roster:
+ *   - ok      → the parsed selection, as sent.
+ *   - invalid → FORCE `own` (never the repo source), plus a note for the feed. A
+ *               malformed selection must not be able to activate attacker-authored
+ *               repo agents.
+ *   - absent  → the run default: the repo roster when one was detected, else `own`.
+ * M3 consumes this at the gate boundary; the note (when present) is emitted to the
+ * run stream so the choice is visible.
+ */
+export function resolveAgentSelection(
+  parse: AgentSelectionParse,
+  repoAvailable: boolean,
+): { selection: AgentSelection; note?: string } {
+  switch (parse.status) {
+    case "ok":
+      return { selection: parse.selection };
+    case "invalid":
+      return {
+        selection: { source: "own", exclusions: [] },
+        note: "the submitted agent selection was malformed; using your own agent templates",
+      };
+    case "absent":
+      return { selection: { source: repoAvailable ? "repo" : "own", exclusions: [] } };
+  }
+}
+
 /** Body of POST /runs/:id/state. Fields are set per target status. */
 export interface StateRequest {
   status: RunState;
@@ -381,11 +509,28 @@ export interface StateRequest {
    *  diagnosis and no MR). verified/fix_failed are stamped server-side by the
    *  pipeline sync, never reported here; an issue run omits this. */
   fix_verdict?: FixVerdict;
+  /** The roster detected in the clone's `.claude/agents/` (PRD #37 Decision 6).
+   *  Sent on the first `running` report AFTER checkout — on the state report, not
+   *  the gate, so an autopilot run (which never reports awaiting_approval) records
+   *  its roster too. Always sent once detection ran, possibly `[]`: an empty array
+   *  means "detected nothing" (the gate's repo card goes inert), while an absent
+   *  field/NULL column means "pre-feature run". */
+  repo_agents?: RepoAgentSummary[];
+  /** The selection an AUTOPILOT run resolved for itself (PRD #37 Decision 6):
+   *  repo agents when detected, else the owner's templates, with no exclusions.
+   *  Human-gated runs persist their selection through the `approve_plan` input
+   *  instead, so this is absent there. */
+  agent_selection?: AgentSelection;
 }
 
 export interface UserInput {
   id: number;
   kind: InputKind;
+  /** Per kind: `follow_up` carries the user's message, `reject_plan` the reason,
+   *  `cancel` nothing — and `approve_plan` carries the JSON-encoded AgentSelection
+   *  (PRD #37). Parse it with parseAgentSelection + resolveAgentSelection: an ABSENT
+   *  body uses the run default (repo if detected), but a malformed one resolves to
+   *  `own`, never the untrusted repo source. */
   body?: string | null;
   created_at?: string;
 }

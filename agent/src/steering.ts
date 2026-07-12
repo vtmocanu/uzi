@@ -18,11 +18,14 @@
 
 import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
+import { parseAgentSelection, type AgentSelectionParse } from "./protocol.js";
 import { errMessage, sleep } from "./util.js";
 
-/** The outcome of the plan-approval gate. */
+/** The outcome of the plan-approval gate. On approve, `selection` is the parsed
+ *  `approve_plan` body (PRD #37): the executor resolves it against the run's
+ *  detected roster (absent → run default; malformed → own, never repo). */
 export type PlanVerdict =
-  | { kind: "approve" }
+  | { kind: "approve"; selection: AgentSelectionParse }
   | { kind: "reject"; reason: string }
   | { kind: "cancel" };
 
@@ -99,7 +102,10 @@ export class SteeringChannel {
   private route(kind: string, body: string | null | undefined): void {
     switch (kind) {
       case "approve_plan":
-        this.deliverVerdict({ kind: "approve" });
+        // The body carries the JSON-encoded agent selection (PRD #37). Parse it
+        // here; the executor resolves it against the detected roster. A malformed
+        // body parses to `invalid`, which the executor sends to `own`, never repo.
+        this.deliverVerdict({ kind: "approve", selection: parseAgentSelection(body) });
         break;
       case "reject_plan":
         this.deliverVerdict({ kind: "reject", reason: body?.trim() || "plan rejected" });

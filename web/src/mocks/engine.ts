@@ -234,7 +234,6 @@ export function scheduleChatReply(runId: string, userText: string) {
         const proposal: IssueProposal = {
           id: nextProposalId(),
           run_id: runId,
-          repo_id: "repo-uzi",
           repo_path: "vtmocanu/uzi",
           title: truncateTitle(userText),
           description: `Draft from our conversation:\n\n> ${userText}\n\nRefine before creating if needed.`,

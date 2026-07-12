@@ -20,7 +20,6 @@ function aProposal(over: Partial<IssueProposal> = {}): IssueProposal {
   return {
     id: "prop-1",
     run_id: "chat-1",
-    repo_id: "repo-1",
     repo_path: "grp/proj",
     title: "Add a metrics dashboard",
     description: "Plain draft text.",

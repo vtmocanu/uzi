@@ -66,6 +66,12 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
    `awaiting_approval` with a plan → approve → the worker pushes
    `agent/issue-N` to the remote and opens an MR → `completed` with `branch` +
    `mr_iid`.
+   - **Repo agents, detect→choose→apply (PRD #37)**: the seeded repo ships a
+     `.claude/agents/` roster (`repo-coder`, `repo-reviewer`), so the parked run
+     reports `repo_agents` at the gate (detection is executor-independent — the
+     stub exercises it). The harness then approves with a structured `selection`
+     (`source: repo`, excluding `repo-reviewer`) and asserts the completed run
+     persisted `agent_source=repo` + `agent_exclusions=[repo-reviewer]`.
 5. **Restart-resilience**: `docker compose down && up` (keeping volumes) while the
    run is parked at the gate; the orphaned run is re-queued, re-claimed, and
    driven to completion, with a **gapless** `run_messages` seq across the

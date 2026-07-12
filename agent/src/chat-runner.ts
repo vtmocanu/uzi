@@ -14,7 +14,7 @@ import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import type { ChatClaimResponse, StateRequest } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
-import { ChatExecutor, type ChatContext, type ChatExecutorResult } from "./chat-executor.js";
+import type { ChatContext, ChatExecutorLike, ChatExecutorResult } from "./chat-executor.js";
 import { ChatSteering, type ChatInputSource } from "./steering.js";
 import { buildUziToolsServer, UZI_TOOLS_SERVER_NAME } from "./uzi-tools.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
@@ -24,14 +24,16 @@ import { errMessage } from "./util.js";
 const MAX_FAILURE_REASON_LEN = 512;
 
 /**
- * Build a per-session `ChatExecutor` (PRD #42 Decision 4, chat lane). Called once
+ * Build a per-session chat executor (PRD #42 Decision 4, chat lane). Called once
  * per `execute`, so each concurrent chat session drives its OWN executor instance
  * and its `spawnedPids`/`killAgentTree` are private to it — two sessions at
- * `WORKER_CHAT_SESSIONS>1` can never reap each other's SDK subprocess. The chat
- * executor KEEPS the shared SDK HOME (a Continue resumes the same session under a
- * new run_id, so per-run HOME would break resume); only the instance is per-session.
+ * `WORKER_CHAT_SESSIONS>1` can never reap each other's SDK subprocess. Returns a
+ * `ChatExecutorLike` so the factory can build the real `ChatExecutor` or the
+ * `StubChatExecutor` (E2E, PRD #39) per session. The real executor KEEPS the shared
+ * SDK HOME (a Continue resumes the same session under a new run_id, so per-run HOME
+ * would break resume); only the instance is per-session.
  */
-export type ChatExecutorFactory = () => ChatExecutor;
+export type ChatExecutorFactory = () => ChatExecutorLike;
 
 /** Worker-config lifecycle defaults the runner resolves each ChatContext from; a
  *  claim's own config wins per-run over these (Decision 3, brief §4). */
@@ -63,7 +65,7 @@ export class ChatRunner {
   constructor(
     private readonly client: WorkerClient,
     /** Per-session executor factory (PRD #42 Decision 4). Called once per `execute`
-     *  so each chat session drives its OWN ChatExecutor instance. */
+     *  so each chat session drives its OWN executor instance (real or stub). */
     private readonly makeExecutor: ChatExecutorFactory,
     private readonly log: Logger,
     private readonly batchMs: number,
@@ -172,6 +174,9 @@ export class ChatRunner {
         model: claim.config.default_model,
         mcpServers: { [UZI_TOOLS_SERVER_NAME]: uziTools.server },
         extraTools: uziTools.toolNames,
+        // The stub executor (e2e) calls these directly; the real executor ignores
+        // them and drives the model through the MCP server above.
+        uziTools: uziTools.handlers,
         // Park on the steering channel; on a delivered message, emit the user_message
         // run message (worker owns the seq) BEFORE the executor streams the model's
         // reply for that turn. `idle`/`ended` → undefined (the loop completes; the

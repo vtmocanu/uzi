@@ -25,6 +25,24 @@ const coder: AgentTemplate = { name: "coder", description: "writes code", prompt
 const reviewer: AgentTemplate = { name: "reviewer", description: "reviews", prompt_body: "You review.", tools: ["Read", "Grep"] };
 const lead: AgentTemplate = { name: "lead", description: "leads", prompt_body: "LEAD SYSTEM PROMPT", model: "fable" };
 
+// Repo-sourced agents (PRD #37): repoCoder declares WebFetch (honored — the policy
+// reversal); repoAuditor declares NO tools (inherit-all, still structurally denied
+// Agent); repoLead is a repo file named `lead` (an ordinary subagent, never the
+// main-thread orchestrator).
+const repoCoder: AgentTemplate = { name: "coder", description: "repo coder", prompt_body: "REPO CODER BODY", tools: ["Read", "Edit", "Bash", "WebFetch"] };
+const repoAuditor: AgentTemplate = { name: "auditor", description: "repo auditor", prompt_body: "REPO AUDITOR BODY" };
+const repoLead: AgentTemplate = { name: "lead", description: "repo lead", prompt_body: "REPO LEAD BODY" };
+
+/** An approve verdict carrying a resolved selection (as the gate delivers it). */
+function approveWith(source: "repo" | "own", exclusions: string[] = []): PlanVerdict {
+  return { kind: "approve", selection: { status: "ok", selection: { source, exclusions } } };
+}
+
+/** The append text of a lead system prompt (the SDK preset shape). */
+function appendOf(systemPrompt: SdkOptions["systemPrompt"]): string {
+  return (systemPrompt as { append?: string })?.append ?? "";
+}
+
 // --- scripted SDK messages ---------------------------------------------------
 
 function assistantText(text: string, sessionId = "sess-1"): SDKMessage {
@@ -100,7 +118,10 @@ interface CtxProbe {
   iterations: number[];
 }
 
-function makeCtx(overrides: Partial<RunContext> = {}, verdict: PlanVerdict = { kind: "approve" }): CtxProbe {
+function makeCtx(
+  overrides: Partial<RunContext> = {},
+  verdict: PlanVerdict = { kind: "approve", selection: { status: "absent" } },
+): CtxProbe {
   const emits: EmittedMessage[] = [];
   const sessionIds: string[] = [];
   const gated: string[] = [];
@@ -153,7 +174,9 @@ describe("SdkExecutor plan gate", () => {
     const probe = makeCtx({ agents: [lead, coder, reviewer] });
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    assert.deepStrictEqual(result, { branch: "agent/issue-5" });
+    // No repo agents + an absent selection → the run default is the OWN roster
+    // (coder, reviewer), reported back for the MR marker (PRD #37).
+    assert.deepStrictEqual(result, { branch: "agent/issue-5", agentSelection: { source: "own", agents: ["coder", "reviewer"] } });
     assert.deepStrictEqual(probe.gated, ["# The Plan\n- step 1"]); // gate saw the plan
     assert.deepStrictEqual(probe.iterations, [1]); // one loop iteration reported
     assert.strictEqual(turns.length, 2); // exactly one planning + one loop turn
@@ -184,6 +207,125 @@ describe("SdkExecutor plan gate", () => {
       /without submitting a plan/,
     );
     assert.deepStrictEqual(probe.gated, []); // gate never reached
+  });
+});
+
+describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
+  /** Run a plan turn + one implement turn under `verdict`, returning the turns. */
+  async function runWith(overrides: Partial<RunContext>, verdict: PlanVerdict) {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer], ...overrides }, verdict);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    return { turns, probe, result };
+  }
+
+  it("repo source: the implement turn runs the repo roster, each with its declared tools", async () => {
+    const { turns, result } = await runWith({ repoAgents: [repoCoder, repoAuditor] }, approveWith("repo"));
+
+    // The PLAN turn ran with the OWN roster (Decision 5)...
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    // ...the IMPLEMENT turn runs the repo roster.
+    const impl = turns[1]!.options;
+    assert.deepStrictEqual(Object.keys(impl.agents ?? {}).sort(), ["auditor", "coder"]);
+    // The repo coder's declared WebFetch is HONORED (Decision 2, policy reversed).
+    assert.ok(impl.agents!.coder!.tools?.includes("WebFetch"), "repo agent keeps its declared WebFetch");
+    assert.deepStrictEqual(impl.agents!.coder!.tools, ["Read", "Edit", "Bash", "WebFetch"]);
+    // The repo body — not the own coder's — is what runs.
+    assert.strictEqual(impl.agents!.coder!.prompt, "REPO CODER BODY");
+    // The resolved roster is returned for the MR marker.
+    assert.deepStrictEqual(result.agentSelection, { source: "repo", agents: ["coder", "auditor"] });
+  });
+
+  it("a repo agent with no tools declared is still denied Agent + the deferral tools (structural)", async () => {
+    const { turns } = await runWith({ repoAgents: [repoAuditor] }, approveWith("repo"));
+    const impl = turns[1]!.options;
+    // No `tools` key → inherit-all, but Agent is denied per-subagent (agents.ts:73)...
+    assert.strictEqual(impl.agents!.auditor!.tools, undefined);
+    assert.ok(impl.agents!.auditor!.disallowedTools?.includes("Agent"), "Agent denied structurally");
+    // ...and the deferral tools stay denied globally on the implement options.
+    for (const t of ["ScheduleWakeup", "CronCreate"]) {
+      assert.ok((impl.disallowedTools ?? []).includes(t), `${t} denied on the implement turn`);
+    }
+  });
+
+  it("an excluded agent is absent from the assembled map AND denied by the Agent guard", async () => {
+    const { turns } = await runWith({ repoAgents: [repoCoder, repoAuditor] }, approveWith("repo", ["auditor"]));
+    const impl = turns[1]!.options;
+    assert.deepStrictEqual(Object.keys(impl.agents ?? {}), ["coder"], "excluded auditor is gone");
+
+    const agentHook = impl.hooks!.PreToolUse![2]!.hooks[0]!;
+    const denied = await agentHook(
+      { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "auditor" } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+    assert.strictEqual(
+      (denied as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
+      "deny",
+      "the excluded agent is denied by the rebuilt Agent guard",
+    );
+    // The surviving agent is still allowed (guard rebuilt with the new allowSet).
+    const allowed = await agentHook(
+      { hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { subagent_type: "coder" } } as unknown as HookInput,
+      "tu",
+      { signal: new AbortController().signal },
+    );
+    assert.strictEqual(
+      (allowed as { hookSpecificOutput?: { updatedInput?: Record<string, unknown> } }).hookSpecificOutput?.updatedInput?.run_in_background,
+      false,
+    );
+  });
+
+  it("a repo file named `lead` is a subagent, never the main-thread system prompt", async () => {
+    const { turns } = await runWith({ repoAgents: [repoCoder, repoLead] }, approveWith("repo"));
+    const impl = turns[1]!.options;
+    // `lead` is an invokable subagent...
+    assert.ok(Object.keys(impl.agents ?? {}).includes("lead"), "repo lead is a subagent");
+    assert.strictEqual(impl.agents!.lead!.prompt, "REPO LEAD BODY");
+    // ...and the MAIN-THREAD prompt is uzi's builtin lead, NOT the repo lead body.
+    const append = appendOf(impl.systemPrompt);
+    assert.ok(append.includes("LEAD SYSTEM PROMPT"), "the own builtin lead prompt runs the main thread");
+    assert.ok(!append.includes("REPO LEAD BODY"), "the repo lead body never reaches the main-thread prompt");
+  });
+
+  it("repo source adds the untrusted-review passage to the lead prompt; own does not", async () => {
+    const { turns: repoTurns } = await runWith({ repoAgents: [repoCoder] }, approveWith("repo"));
+    assert.ok(appendOf(repoTurns[1]!.options.systemPrompt).includes("UNVERIFIED"), "repo source warns the lead");
+
+    const { turns: ownTurns } = await runWith({}, approveWith("own"));
+    assert.ok(!appendOf(ownTurns[1]!.options.systemPrompt).includes("UNVERIFIED"), "own source does not");
+  });
+
+  it("the implement prompt names the resolved roster (and the lead-only case says do it yourself)", async () => {
+    const { turns: repoTurns } = await runWith({ repoAgents: [repoCoder, repoAuditor] }, approveWith("repo"));
+    const prompt = repoTurns[1]!.promptText ?? "";
+    assert.ok(prompt.includes("auditor") && prompt.includes("coder"), "prompt names the repo roster");
+    assert.ok(!prompt.includes("reviewer"), "the own roster's names do not leak into a repo-source prompt");
+
+    // Excluding every own subagent is a legal lead-only run: the prompt says so.
+    const { turns: leadOnly } = await runWith({}, approveWith("own", ["coder", "reviewer"]));
+    assert.deepStrictEqual(Object.keys(leadOnly[1]!.options.agents ?? {}), []);
+    assert.ok((leadOnly[1]!.promptText ?? "").includes("No subagents are available"), "lead-only prompt renders");
+  });
+
+  it("own source reproduces today's roster, minus exclusions", async () => {
+    const { turns: full } = await runWith({}, approveWith("own"));
+    assert.deepStrictEqual(Object.keys(full[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+
+    const { turns: trimmed } = await runWith({}, approveWith("own", ["reviewer"]));
+    assert.deepStrictEqual(Object.keys(trimmed[1]!.options.agents ?? {}), ["coder"]);
+  });
+
+  it("a malformed selection resolves to own, never the repo source", async () => {
+    const verdict: PlanVerdict = { kind: "approve", selection: { status: "invalid" } };
+    const { turns, probe, result } = await runWith({ repoAgents: [repoCoder, repoAuditor] }, verdict);
+    // Even with repo agents present, an invalid selection uses the OWN roster.
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(result.agentSelection!.source, "own");
+    assert.ok(probe.emits.some((m) => String(m.payload.text ?? "").includes("malformed")), "a note explains the fallback");
   });
 });
 

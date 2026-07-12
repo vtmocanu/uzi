@@ -5,7 +5,8 @@ import { WorkerClient } from "./client.js";
 import { GitCache } from "./git.js";
 import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
-import { ChatExecutor } from "./chat-executor.js";
+import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
+import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Worker } from "./worker.js";
@@ -84,29 +85,27 @@ async function main(): Promise<void> {
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
   });
 
-  // The chat lane (PRD #39). Its executor gets the SAME join-token secret path as the
-  // run executor (task #9) so the Bash + path-guard hooks deny a read of it, and the
-  // pinned HOME so a chat SDK session survives a restart for Continue/resume. The
-  // ChatRunner resolves each run's clocks from the claim config over these worker
-  // defaults; the chat lane always runs the real ChatExecutor (no stub — chat has no
-  // E2E stub path yet, and an unqueued chat lane just polls 204 harmlessly).
+  // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
+  // chat session builds its OWN executor so its spawnedPids/reap are private (no
+  // sharing at WORKER_CHAT_SESSIONS>1) — the same isolation the run lane got above.
+  // Under UZI_EXECUTOR=stub each session is a StubChatExecutor (no live Anthropic
+  // session) so the M6 chat e2e runs on the isolated stack with dummy creds (task
+  // #15); otherwise the real ChatExecutor, which gets the SAME join-token secret path
+  // as the run executor (task #9) so the Bash + path-guard hooks deny a read of it.
   //
   // HOME divergence from runs (PRD #42 Decision 5): a RUN gets a per-run HOME
-  // (agent-home/<runId>, above), but chat deliberately keeps the SHARED agent-home.
-  // A chat "Continue" creates a NEW run (new run_id) that resumes the SAME SDK
-  // session by session_id, and that transcript resolves within the HOME it was
-  // written under — a per-run HOME would file it under the new run_id and break
+  // (agent-home/<runId>, above), but every chat session shares the SDK HOME
+  // (sdkHomeRoot). A chat "Continue" creates a NEW run (new run_id) that resumes the
+  // SAME SDK session by session_id, and that transcript resolves within the HOME it
+  // was written under — a per-run HOME would file it under the new run_id and break
   // resume. Chat is read-only (no clone, no PAT, no Bash), so the process-global
   // $HOME/.claude races that per-run HOME closes for runs don't apply the same way.
-  // Per-session executor factory (PRD #42 Decision 4, chat lane): each chat session
-  // gets its OWN ChatExecutor so its spawnedPids/reap are private (no sharing at
-  // WORKER_CHAT_SESSIONS>1). All sessions share the SDK HOME (sdkHomeRoot) — a
-  // Continue resumes the same session under a new run_id, so per-run HOME would
-  // break chat resume.
-  const makeChatExecutor = (): ChatExecutor =>
-    new ChatExecutor(log, sdkHomeRoot, {
-      secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
-    });
+  const makeChatExecutor = (): ChatExecutorLike =>
+    config.executor === "stub"
+      ? new StubChatExecutor(log)
+      : new ChatExecutor(log, sdkHomeRoot, {
+          secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
+        });
   const chatRunner = new ChatRunner(client, makeChatExecutor, log, config.messageBatchMs, {
     maxTurns: config.chatMaxTurns,
     turnTimeoutMs: config.chatTurnTimeoutMs,

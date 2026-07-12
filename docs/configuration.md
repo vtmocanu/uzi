@@ -129,3 +129,30 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `UZI_LOG_LEVEL` | `info` | Worker log verbosity: `debug`/`info`/`warn`/`error`. At `debug` the worker also writes every raw run event (each `tool_use`, `tool_result`, status, etc.) to its stdout as it is emitted, so `docker logs uzi-agent-1` becomes the full-frame debug surface. Secrets are redacted before logging. `info` stays terse (no per-event lines). |
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
+
+## Chat (PRD #39)
+
+The in-app chat agent ([chat.md](chat.md)) rides the run machinery as a `chat` run kind, so it reuses the run knobs above and adds its own. See [ARCHITECTURE.md](../ARCHITECTURE.md#chat-with-uzi-the-fifth-surface) for how they fit together.
+
+**The worker's chat lifecycle windows are delivered by the `api` in the claim, not read from the worker's own env.** Set `WORKER_CHAT_IDLE_TIMEOUT`, `WORKER_CHAT_TURN_TIMEOUT`, and `CHAT_MAX_TURNS` on the **`api`** service — the worker prefers the per-claim value and treats its own same-named env var only as a fallback default when a claim omits one. This mirrors how `RUN_IDLE_TIMEOUT` etc. are shipped in the claim.
+
+### Server (`api`)
+
+| Var | Default | Notes |
+|---|---|---|
+| `CHAT_IDLE_TIMEOUT` | `70m` | Server-side idle sweep: completes a claimed/running chat whose newest message is older than this. A backstop **above** `WORKER_CHAT_IDLE_TIMEOUT` so the worker normally completes an idle chat first; this catches a dead/silent worker. |
+| `WORKER_CHAT_IDLE_TIMEOUT` | `60m` | Worker-side idle window, **shipped in the claim**: the worker completes a parked chat after this with no new user message. |
+| `WORKER_CHAT_TURN_TIMEOUT` | `10m` | Per-turn wall-clock cap, **shipped in the claim** (the idle timer re-arms on every SDK message, so a busy single turn needs its own bound). |
+| `CHAT_MAX_TURNS` | `50` | Per-conversation turn cap. Enforced **server-side** (counted from persisted inputs, so a compromised worker can't exceed it) and also shipped in the claim; the seeded first message counts as turn 1. |
+| `CHAT_RATE_LIMIT_MAX` / `CHAT_RATE_LIMIT_WINDOW` | `60` / `1m` | Per-user fixed-window limiter on chat create + message endpoints. |
+| `PROPOSAL_RATE_LIMIT_MAX` / `PROPOSAL_RATE_LIMIT_WINDOW` | `20` / `1m` | Per-worker limiter on the `propose_issue` worker endpoint (bounds a prompt-injected propose loop; the per-run pending-proposal cap of 10 is a separate, non-env constant). |
+| `PROPOSAL_CONFIRM_STUCK_TIMEOUT` | `2m` | The sweep reverts a proposal stranded in the transient `confirming` state (a crash between the claim-first flip and the forge write) back to `pending` after this. **Boot-clamped up to at least 2× `FORGE_HTTP_TIMEOUT`** so a slow-but-alive confirm is never reaped mid-flight and re-confirmed into a duplicate issue; `0` disables the sweep. |
+
+### Worker container (`agent`)
+
+| Var | Default | Notes |
+|---|---|---|
+| `WORKER_CHAT_POLL_MS` | `1000` | How often the worker polls the chat claim lane (`?lane=chat`) — faster than the run poll so a chat turn starts promptly. |
+| `WORKER_CHAT_SESSIONS` | `1` | How many chat sessions the worker runs **concurrently** with its single run slot. `1` means one live conversation per user-worker; a second chat queues until the first ends. |
+
+`CHAT_MAX_TURNS`, `WORKER_CHAT_TURN_TIMEOUT`, and `WORKER_CHAT_IDLE_TIMEOUT` are also parsed on the worker as fallback defaults, but the value shipped in the claim (from the `api` config above) wins — set them on `api`.

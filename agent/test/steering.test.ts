@@ -26,7 +26,9 @@ describe("SteeringChannel", () => {
     const { ch } = makeChannel([[inp("approve_plan")]]);
     ch.start();
     const v = await ch.awaitVerdict();
-    assert.deepStrictEqual(v, { kind: "approve" } satisfies PlanVerdict);
+    // An approve with no body carries an ABSENT selection parse (PRD #37): the
+    // executor resolves it to the run's default source.
+    assert.deepStrictEqual(v, { kind: "approve", selection: { status: "absent" } } satisfies PlanVerdict);
     await ch.stop();
   });
 
@@ -46,7 +48,7 @@ describe("SteeringChannel", () => {
     const { ch } = makeChannel([[inp("approve_plan")]]);
     ch.start();
     await tick(); // let the poll consume + buffer the verdict first
-    assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve" });
+    assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
     await ch.stop();
   });
 
@@ -79,7 +81,7 @@ describe("SteeringChannel", () => {
     } as unknown as WorkerClient;
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
     ch.start();
-    assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve" });
+    assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
     await ch.stop();
   });
 });

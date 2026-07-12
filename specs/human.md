@@ -120,6 +120,15 @@ Tracked as GitLab issue vtmocanu/uzi#11; PRD at `prds/11-run-view-ux.md`.
 - No "show raw JSON" toggle in the web UI. [explicit user rejection]
 - Reuse PRD #7's markdown renderer rather than building a parallel one. [user coordination]
 
+## Feature #38 — Activity feed redesign
+
+Tracked as GitLab issue vtmocanu/uzi#38; PRD at `prds/38-activity-feed-redesign.md`.
+
+- The run Activity feed is polished/redesigned per the approved mock.
+- Bash commands render as highlighted code, not plain text; no command content is lost in the UI.
+- Agent output is collapsible per agent (collapse lead/worker output).
+- The approved mock is the design contract; the implemented UI must match it. Mock committed at `prds/mockups/38-activity-feed-mock.html`.
+
 ## Feature #12 — Board–run lifecycle integration
 
 Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/12-board-run-lifecycle.md`.
@@ -243,20 +252,59 @@ Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/32-user-vault-password-wra
 - UI shows an unlocked/locked vault status; when locked (e.g. after a deploy), runs queue as "waiting for vault unlock" and a password prompt unlocks without full re-login.
 - Forgotten password ⇒ vault contents unrecoverable by design; user re-enters tokens.
 
-## Feature #39 — In-app uzi chat agent
+## Feature #37 — Per-run agent selection: repo `.claude/agents` detection with plan-gate choice
 
-Tracked as GitLab issue vtmocanu/uzi#39; PRD at `prds/39-chat-agent.md`.
+Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/37-run-agent-selection.md`.
 
-- A chat page in the uzi web UI to talk to uzi: ask about its capabilities and
-  implementations, have it investigate/debug your runs, propose improvements.
-- Runs on the user's own Anthropic token, executed on the user's existing worker
-  (the worker is invisible to the user; an honest "no worker connected" state when none is up).
-- The agent knows uzi's own code: baked into the worker image at build time
-  (no git clone), matching the deployed version.
-- Can create GitLab issues on request via the user's bot credentials, but only
-  after the user confirms a proposal card in the UI (the agent drafts; the click files).
-- Must work on docker-compose now and identically on the later k8s worker phase
-  (targets the deployment-agnostic claim/poll protocol). [user, 2026-07-10, approved 2026-07-11]
+- At the plan-approval gate, the user chooses which agents the run uses: the repo's own agents (detected from `.claude/agents/`) or the user's uzi templates. [user 2026-07-10]
+- Show whether repo agents were detected and which ones. [user 2026-07-10]
+- Default to the detected repo agents; if the user does not want them, they can choose their own templates instead. [user 2026-07-10]
+- Repo agents run with the tools and model their files declare (honored as they would be under Claude Code), still subject to uzi's guardrails. [user 2026-07-10; a review-round proposal to deny WebFetch/WebSearch and clamp the model to aliases was rejected by the user the same day — `Agent`/nested-spawn and the async-deferral tools stay denied]
+- Either/or source with per-agent exclusions; no mixing the two sources in one run. [user 2026-07-10]
+- Autopilot runs apply the default automatically (repo agents if detected, else the user's templates) and record which roster they used, with no human interaction. [user 2026-07-10]
+- The Slack plan-approval gate offers the same source choice (two Approve buttons: repo agents / my templates); excluding individual agents is done in the web UI. [user 2026-07-10]
+- The shipped picker is validated visually against the approved mock (`prds/mockups/37-agent-picker-mock.html`). [user 2026-07-10]
+
+## Feature — Run retrospective (LLM judge) & self-improvement job
+
+Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvement.md`
+(supersedes plan.md:64/69/91).
+
+- **Run retrospective (LLM judge)**: after a run finishes, an LLM reviews the run
+  trace — agents, tools, prompts, plan quality, review cycles, how the run
+  progressed and delivered — and produces a verdict + recommendations. v1 judges
+  finished runs only, automatically when enabled; mid-run judging deferred. Judge
+  model configurable, cheap default. [user 2026-07-12]
+- Verdicts: "all good/ideal", or concrete suggestions — enable an existing
+  tool/skill for an agent, install a missing tool on the worker, adjust an agent
+  template/prompt, improve existing agents (including repo agents living in git)
+  or propose missing agents that should be added to a repo, or change uzi itself
+  (recommendation only, never code). [user 2026-07-12]
+- The judge runs on the run owner's own Anthropic token, never a shared one.
+  [user 2026-07-12]
+- Per-user opt-in/out; admin can toggle the feature globally and force-disable
+  per user (existing admin settings). [user 2026-07-12]
+- Recommendations land in an inbox/notifications surface — users see their own,
+  admins see all; also visible on the run page — and go out via the existing
+  Slack notifications too. [user 2026-07-12]
+- The deterministic "command not found" scan feeds the judge as an input signal.
+  [user 2026-07-12; plan.md:64]
+- **Self-improvement scheduled job (admin-only)**: configurable interval (2-day
+  default), admin-toggled; reviews uzi's own codebase plus accumulated judge
+  recommendations and picks **one top thing** per iteration — bug, feature, or
+  whole refactor — so uzi iterates and self-improves. [user 2026-07-12]
+- The job spins up an agent team that implements the pick and creates an MR
+  (normal guardrails: never main, MR only). It runs autonomously — no approval
+  gate blocks it — but the plan it worked from must be inspectable. If a
+  self-improvement MR is already open, it reuses/extends that MR so everything
+  is tested together. [user 2026-07-12]
+- One PRD covers both, phased: judge first, job second (shared settings/inbox
+  plumbing). [user 2026-07-12]
+- Token for the job: each admin can enable the job using their own token; the
+  design also accommodates a general/instance token for later, when/if one is
+  implemented (plan.md:69). [user 2026-07-12]
+- Judge recommends; only the job acts. Judge never auto-creates MRs.
+  [user 2026-07-12]
 
 ## Startup admin seed
 

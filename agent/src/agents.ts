@@ -35,7 +35,7 @@
 // boundary; do NOT "re-fix" this into a fail-closed default (it breaks coder).
 
 import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentTemplate } from "./protocol.js";
+import type { AgentSource, AgentTemplate } from "./protocol.js";
 import { NESTED_AGENT_TOOL } from "./guardrails.js";
 import { qualifiedSkillName } from "./skills-plugin.js";
 
@@ -118,4 +118,62 @@ export function assembleAgents(
     result.subagents[t.name] = toDefinition(t, availableSkills, repoSkillNames);
   }
   return result;
+}
+
+/**
+ * Map a template list to a name-keyed subagent map WITHOUT the lead partition:
+ * EVERY template becomes an invokable subagent, including one named `lead`. This
+ * is the repo-source path (PRD #37 Decision 3): a repo file named `lead` is just
+ * another subagent candidate, never the main-thread orchestrator — that always
+ * comes from the claim payload. Feeding the repo roster through `assembleAgents`
+ * instead would route a repo-authored `lead.prompt_body` into the lead system
+ * prompt, the exact repo-borne injection `settingSources: []` exists to prevent.
+ * Excluded names are dropped. Skill scoping is identical to assembleAgents.
+ */
+export function subagentsFromTemplates(
+  templates: AgentTemplate[],
+  exclude: ReadonlySet<string>,
+  availableSkills?: ReadonlySet<string>,
+  repoSkillNames: readonly string[] = [],
+): Record<string, AgentDefinition> {
+  const subagents: Record<string, AgentDefinition> = {};
+  for (const t of templates) {
+    if (exclude.has(t.name)) continue;
+    subagents[t.name] = toDefinition(t, availableSkills, repoSkillNames);
+  }
+  return subagents;
+}
+
+/**
+ * The subagent roster to run the IMPLEMENT phase with, given the approved
+ * selection (PRD #37 Decision 5). The `lead` is NOT here — it stays uzi's builtin
+ * from the claim payload under either source, so callers keep using
+ * assembleAgents' leadSystemPrompt/leadModel.
+ *
+ *   - "own":  the owner's already-assembled subagents (lead already partitioned
+ *             out by assembleAgents), minus the excluded names.
+ *   - "repo": the detected repo roster mapped subagents-only (a repo `lead` stays
+ *             a subagent), minus the excluded names.
+ *
+ * Exclusions are re-applied here worker-side; the API validated membership (M2)
+ * but the worker owns what actually reaches the SDK. An exclusion naming an agent
+ * not in the chosen source is a harmless no-op (nothing to remove).
+ */
+export function selectSubagents(
+  source: AgentSource,
+  ownSubagents: Record<string, AgentDefinition>,
+  repoTemplates: AgentTemplate[],
+  exclusions: readonly string[],
+  availableSkills?: ReadonlySet<string>,
+  repoSkillNames: readonly string[] = [],
+): Record<string, AgentDefinition> {
+  const exclude = new Set(exclusions);
+  if (source === "repo") {
+    return subagentsFromTemplates(repoTemplates, exclude, availableSkills, repoSkillNames);
+  }
+  const out: Record<string, AgentDefinition> = {};
+  for (const [name, def] of Object.entries(ownSubagents)) {
+    if (!exclude.has(name)) out[name] = def;
+  }
+  return out;
 }

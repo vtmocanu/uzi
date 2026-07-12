@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { listUserDocs } from "../lib/docs";
 import { searchDocs, MIN_QUERY_LENGTH, type SearchResult } from "../lib/docsearch";
 import { Card, Input } from "../components/ui";
+import { SearchIcon } from "../components/icons";
 
 const SEARCH_INPUT_ID = "docs-search";
 
@@ -77,14 +78,30 @@ export function Docs() {
         </p>
       </div>
 
-      <Input
-        id={SEARCH_INPUT_ID}
-        type="search"
-        aria-label="Search docs"
-        placeholder="Search docs…"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-      />
+      {/* Leading glyph = visible search affordance; the `/` kbd badge surfaces
+          the focus shortcut (hidden while focused or once a query is typed, so
+          it never sits over the text or the native clear control). */}
+      <div className="relative">
+        <SearchIcon className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
+        <Input
+          id={SEARCH_INPUT_ID}
+          type="search"
+          aria-label="Search docs"
+          aria-keyshortcuts="/"
+          placeholder="Search docs…"
+          className="peer pl-9 pr-10"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        {!query && (
+          <kbd
+            aria-hidden="true"
+            className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 rounded border border-edge bg-surface px-1.5 font-mono text-xs text-muted peer-focus:hidden"
+          >
+            /
+          </kbd>
+        )}
+      </div>
 
       {searching ? (
         // aria-live is scoped to the count/no-results line only — announcing the

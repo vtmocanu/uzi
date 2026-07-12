@@ -204,10 +204,13 @@ func (h *Handler) WorkerChatRunMessages(w http.ResponseWriter, r *http.Request) 
 }
 
 // proposalDTO is the created proposal returned to the worker's propose_issue tool.
+// It intentionally omits the internal repo_id UUID: the worker only handles the
+// human-readable repo_path (Decision 7), and the browser reads the proposal solely
+// from the emitted `proposal` run_message (which mirrors this shape), so no consumer
+// needs the UUID here.
 type proposalDTO struct {
 	ID          string    `json:"id"`
 	RunID       string    `json:"run_id"`
-	RepoID      string    `json:"repo_id"`
 	Title       string    `json:"title"`
 	Description string    `json:"description"`
 	Labels      []string  `json:"labels"`
@@ -223,7 +226,6 @@ func proposalToDTO(p store.IssueProposal) proposalDTO {
 	return proposalDTO{
 		ID:          p.ID.String(),
 		RunID:       p.RunID.String(),
-		RepoID:      p.RepoID.String(),
 		Title:       p.Title,
 		Description: p.Description,
 		Labels:      labels,

@@ -103,8 +103,19 @@ describe("Docs index — search", () => {
   it("focuses the search box when '/' is pressed outside a field", () => {
     renderPage();
     const box = searchBox();
+    expect(box.getAttribute("aria-keyshortcuts")).toBe("/");
     expect(document.activeElement).not.toBe(box);
     fireEvent.keyDown(document, { key: "/" });
     expect(document.activeElement).toBe(box);
+  });
+
+  it("shows the '/' shortcut badge until a query is typed", () => {
+    renderPage();
+    const kbd = () => document.querySelector("kbd");
+    expect(kbd()?.textContent).toBe("/");
+    fireEvent.change(searchBox(), { target: { value: BODY_ONLY_TERM } });
+    expect(kbd()).toBeNull();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(kbd()?.textContent).toBe("/");
   });
 });

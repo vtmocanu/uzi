@@ -167,13 +167,10 @@ export class FakeApi {
       const runId = propMatch[1] as string;
       this.proposalRequests.push({ runId, body: json });
       const labels = Array.isArray(json.labels) ? (json.labels as string[]) : [];
-      // Server resolves repo_path -> internal id (Phase-3 catalog); repo_id back-compat.
-      const resolvedRepoID = json.repo_path ? `id-for-${String(json.repo_path)}` : String(json.repo_id ?? "");
       return send(res, 201, {
         proposal: {
           id: "prop-1",
           run_id: runId,
-          repo_id: resolvedRepoID,
           title: String(json.title ?? ""),
           description: String(json.description ?? ""),
           labels,

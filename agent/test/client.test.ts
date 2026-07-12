@@ -268,6 +268,5 @@ describe("chat read surface (PRD #39 M3)", () => {
     assert.strictEqual(req.body.repo_path, "group/project");
     assert.strictEqual(p.status, "pending");
     assert.deepStrictEqual(p.labels, ["PRD"]);
-    assert.strictEqual(p.repo_id, "id-for-group/project"); // server resolved path -> id
   });
 });

@@ -115,6 +115,14 @@ Open **Settings → Notifications**:
   **Open in uzi**. Approve resumes the run immediately. Reject swaps in a
   **Reject without reason** button and asks you to reply in the thread with a
   reason instead — a threaded reply there *is* the rejection.
+- **Choosing agents from Slack**: when the repo ships its own agents in
+  `.claude/agents/`, the gate shows **two** approve buttons — **Approve · repo
+  agents (N)** and **Approve · my templates** — and lists the repo agent names
+  in the message. Each button's confirm dialog states which roster it uses; that
+  confirm is your opt-in record. The repo card is a whole-roster choice only;
+  to exclude individual agents, approve from the web UI instead. A repo with no
+  `.claude/agents/` shows the single **Approve** button (your templates), exactly
+  as before, and so do gate messages posted before this feature shipped.
 - **Steering a live run**: reply in the thread outside a gate and it's
   submitted as a follow-up instruction, with a ✅ reaction as the ack.
 - Only status, repository path, issue number and title, MR link, and failure
@@ -129,7 +137,10 @@ Open **Settings → Notifications**:
   members' emails to match them to uzi accounts. Turning Slack on also means
   run status metadata (status, repository paths, issue numbers and titles, MR
   links, failure reasons) leaves the box for Slack's cloud — nothing
-  sensitive, but it's no longer loopback-only once enabled.
+  sensitive, but it's no longer loopback-only once enabled. When a repo ships
+  `.claude/agents/`, the agent **names** (short kebab-case identifiers, at most
+  16, ≤64 chars each) also appear in the gate DM so you can choose that roster;
+  their **descriptions** are never sent.
 - **Rotating a token from Settings**: uzi hot-reloads a changed token within
   one settings poll (about 5 seconds) and tears down the old socket — there's
   a brief window where the previous connection can still be live.

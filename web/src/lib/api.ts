@@ -535,6 +535,22 @@ export interface Run {
   pipeline_web_url: string | null;
   fix_verdict: FixVerdict | null;
   plan_md: string | null;
+  /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`.
+   *  null = no worker reported (a pre-feature run); `[]` = detection ran and found
+   *  none (the plan gate's repo card is inert, NOT the same as null). Names +
+   *  descriptions only — REPO-SUPPLIED, untrusted text; render as plain JSX. */
+  repo_agents: RepoAgent[] | null;
+  /** PRD #37: which roster the run's subagents came from, once a selection is made
+   *  (at the gate, or an autopilot run's resolved default). null before then. */
+  agent_source: AgentSource | null;
+  /** PRD #37: the names excluded from the chosen source. null before a selection. */
+  agent_exclusions: string[] | null;
+  /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
+   *  exactly the allocation-resolved templates the worker runs for source="own",
+   *  lead already stripped. The plan gate's "My agent templates" card is built from
+   *  this, so an excludable chip always matches what approve accepts and the count is
+   *  exact. Populated only on the run-detail read (getRun); null on list rows. */
+  own_agents: RepoAgent[] | null;
   claimed_at: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -560,6 +576,29 @@ export interface RunMessage {
 }
 
 export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
+
+// AgentSource is which roster a run's subagents come from (PRD #37): the repo's
+// own .claude/agents/, or the user's uzi templates. The lead orchestrator is
+// always uzi's builtin and is never selectable.
+export type AgentSource = "repo" | "own";
+
+// RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/
+// (PRD #37): names + descriptions ONLY (the prompt bodies never leave the worker).
+// These are REPO-SUPPLIED, untrusted text — the plan gate renders them as plain
+// JSX, never through <Markdown>, so an attacker-authored link can't be clickable
+// inside the approval panel.
+export interface RepoAgent {
+  name: string;
+  description: string;
+}
+
+// AgentSelectionInput is the plan-gate agent choice submitted with approve_plan
+// (PRD #37). The server validates it against the run's real roster and writes its
+// own canonical body; the client never composes the worker-bound body itself.
+export interface AgentSelectionInput {
+  source: AgentSource;
+  exclusions: string[];
+}
 
 // WsEvent is a live frame from /api/ws. A "message" carries a persisted message
 // (rendered directly, deduped by seq); a "state" signals a status change (the
@@ -633,12 +672,12 @@ export type ProposalStatus = "pending" | "confirmed" | "dismissed";
 // untrusted, so the card renders them as plain inert text (never Markdown, no
 // clickable model links). The forge write happens only on the human's Create
 // click; the created-issue link comes from the confirm response (CreatedIssue),
-// NOT from this payload. repo_path is computed by the worker at emit time (the
-// issue_proposals row stores only repo_id), so it is optional here.
+// NOT from this payload. The internal repo_id UUID is intentionally absent: the
+// worker only handles the human-readable repo_path (Decision 7), which is what the
+// card shows, and repo_path is worker-computed at emit time, so it is optional here.
 export interface IssueProposal {
   id: string;
   run_id: string;
-  repo_id: string;
   // Worker-computed display path; absent when the worker could not resolve it.
   repo_path?: string;
   title: string;
@@ -946,8 +985,15 @@ const realApi = {
       "GET",
       afterSeq > 0 ? `/runs/${id}/messages?after=${afterSeq}` : `/runs/${id}/messages`,
     ),
-  submitRunInput: (id: string, kind: RunInputKind, body = "") =>
-    request<{ server_side: boolean }>("POST", `/runs/${id}/inputs`, { kind, body }),
+  submitRunInput: (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) =>
+    request<{ server_side: boolean }>("POST", `/runs/${id}/inputs`, {
+      kind,
+      body,
+      // PRD #37: the structured agent selection is legal only on approve_plan; the
+      // server ignores/validates it per kind. Omitted entirely when absent so a
+      // plain follow-up/cancel body is unchanged.
+      ...(selection ? { selection } : {}),
+    }),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/

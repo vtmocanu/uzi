@@ -72,7 +72,6 @@ function fakeClient(over: {
         over.proposal ?? {
           id: "prop-1",
           run_id: runId,
-          repo_id: "id-for-group/project",
           title: String(body.title ?? ""),
           description: String(body.description ?? ""),
           labels: (body.labels as string[]) ?? [],
@@ -178,7 +177,7 @@ describe("uzi tools — propose_issue (Decision 8/10)", () => {
   it("emits a `proposal` run_message card (the full IssueProposal payload, keyed on id) on success", async () => {
     const { client } = fakeClient({
       proposal: {
-        id: "prop-7", run_id: "chat-current", repo_id: "id-for-group/project", title: "Add dashboard",
+        id: "prop-7", run_id: "chat-current", title: "Add dashboard",
         description: "please", labels: ["PRD"], status: "pending", created_at: "2026-07-10T00:00:00Z",
       },
     });
@@ -192,16 +191,12 @@ describe("uzi tools — propose_issue (Decision 8/10)", () => {
     assert.deepStrictEqual(card.payload, {
       id: "prop-7",
       run_id: "chat-current",
-      repo_id: "id-for-group/project",
       title: "Add dashboard",
       description: "please",
       labels: ["PRD"],
       status: "pending",
       created_at: "2026-07-10T00:00:00Z",
       repo_path: "group/project", // worker-computed (the path the user saw)
-      created_issue_iid: null, // pending — no issue filed yet
-      created_issue_url: null,
-      resolved_at: null,
     });
   });
 
