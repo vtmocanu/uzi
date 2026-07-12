@@ -350,23 +350,23 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
 
 ## Milestones
 
-- [ ] **M1 — Schema + settings groundwork**: migrations (nullable
+- [x] **M1 — Schema + settings groundwork**: migrations (nullable
       `repo_id`/`issue_iid` + kind-shape rework + partial unique indexes,
       `run_reviews`, `review_recommendations`, `notifications`,
       `users.judge_enabled`), sqlc + NULL-`repo_id` query/DTO audit, forked
       judge claim assembly (no-PAT wire assertion), settings
       keys/accessors/validation, user + admin toggle endpoints and UI switches.
       Tests for gating logic.
-- [ ] **M2 — Notifications inbox (generic)**: notifications API, bell + inbox
+- [x] **M2 — Notifications inbox (generic)**: notifications API, bell + inbox
       page (user/admin views), Slack notifier event kind. Judge-independent;
       seeded via a test event.
-- [ ] **M3 — Judge end-to-end**: terminal-funnel enqueue with all gates,
+- [x] **M3 — Judge end-to-end**: terminal-funnel enqueue with all gates,
       command-not-found scan, judge claim lane, worker trace fetch + JudgeRunner
       + review post, `run_reviews` persisted. Validated with the stub executor /
       fake trace.
-- [ ] **M4 — Judge surfacing**: run-page verdict + recommendations panel,
+- [x] **M4 — Judge surfacing**: run-page verdict + recommendations panel,
       re-run action, inbox + Slack delivery wired to review completion.
-- [ ] **M5 — Self-improvement engine**: settings (incl. durable
+- [x] **M5 — Self-improvement engine**: settings (incl. durable
       `selfimprove_last_run_at`), privcheck-shaped scheduler with
       skip-if-active / vault-locked / repo-missing tick skips (+ notifications),
       tracking-issue reuse (no trigger labels), dedicated
@@ -434,3 +434,48 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
   the self-improvement planning prompt.
 - Disabling either feature stops all related token spend immediately; the whole
   PRD is dormant when toggles are off (existing tests unaffected).
+
+## Implementation notes (2026-07-12)
+
+Approved deviations from the design above, found during implementation:
+
+1. **The command-not-found scan runs at claim assembly, not at enqueue.**
+   Decision 4 describes it as part of enqueueing the judge run; in practice it
+   runs off that hot request path, at claim assembly (`assembleJudgeClaim` /
+   `judgeSignal`, `api/internal/workersvc/judge.go`) — a separate worker poll,
+   not the transition that creates the judge run. Accepted trade-off: a judge
+   run that is never claimed (e.g. no worker online) yields no deterministic
+   findings, only whatever the LLM call itself produces once it does run.
+2. **Premise correction on migration numbering (Decision 12).** The PRD
+   assumed the live head was `00052` (PRD #37). PRD #39 (chat) actually landed
+   first and, needing the same repo-less run shape, carried the
+   `repo_id`/`issue_iid` DROP NOT NULL and the repo-less `runs_kind_shape`
+   relaxation itself. This PRD's M1 therefore *extended* chat's constraints
+   (judge + self_improve shapes) rather than introducing the relaxation from
+   scratch, and the actual live head at this PRD's landing was `00055`, not
+   `00052`. Migration numbers in a PRD draft are always collision-avoidance
+   placeholders, renumbered to the real live head at landing (per
+   `CLAUDE.md`'s migration-numbering convention) — this is a correction to the
+   draft's stated *premise* (which PRD got there first), not a new instance of
+   the normal renumbering.
+3. **Re-run judge needs no per-user opt-in.** Decision 7's per-user
+   `judge_enabled` opt-in gates the *automatic* judge (Decision 2's
+   terminal-funnel enqueue). The owner-initiated "re-run judge" action
+   (Decision 8) does not additionally require that flag: an explicit,
+   owner-only click is itself the consent to spend that run. It still runs
+   behind its own dedicated per-user rate limiter (`JUDGE_RATE_LIMIT_MAX`/
+   `_WINDOW`), separate from the chat limiter.
+4. **Notification payload contents, made explicit.** The judge "review ready"
+   notification (inbox row + Slack DM) carries the verdict, a scrubbed and
+   280-rune-capped summary preview, and the recommendation count plus
+   category list. Recommendation `target` and `rationale` free text are never
+   copied into the notification — they stay on the run page behind the deep
+   link (`buildReviewNotification`, `api/internal/handler/judge_worker.go`).
+5. **The two Slack suppressions have different mechanisms.** Decision 6 says
+   judge and self_improve runs' own state transitions are suppressed from the
+   run-state Slack path. In the implementation this is structural for judge
+   runs (they're repo-less, so `GetSlackRunContext`'s INNER JOIN on repos
+   returns `ErrNoRows` before any suppression logic runs) but requires an
+   explicit `rc.Kind == "judge" || rc.Kind == "self_improve"` guard for
+   self_improve runs, which *are* repo-ful and would otherwise get a run-state
+   DM (`Notifier.handle`, `api/internal/slacksvc/notifier.go`).
