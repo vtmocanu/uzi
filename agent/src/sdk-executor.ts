@@ -430,7 +430,9 @@ export class SdkExecutor implements Executor {
       }
 
       this.log.info("SDK run completed", { run_id: ctx.runId, branch: ctx.branch, agent_source: selection.source });
-      return { branch: ctx.branch, agentSelection: { source: selection.source, agents: selectedNames } };
+      // toolEnv (PRD #46 M9): the allowlisted provisioned tool env, so the self_improve
+      // check runner can put the run's provisioned toolchains on its subprocess PATH.
+      return { branch: ctx.branch, agentSelection: { source: selection.source, agents: selectedNames }, toolEnv };
     } finally {
       this.disarmWall(state);
       if (ctx.signal) ctx.signal.removeEventListener("abort", onSignal);

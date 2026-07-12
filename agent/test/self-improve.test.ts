@@ -1,13 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildSelfImprovePlanPrompt } from "../src/prompt.js";
 import {
+  buildCheckEnv,
   defaultCheckRunner,
   flagGuardPaths,
+  prepareCheckDeps,
   runSelfImproveChecks,
   selfImproveMrSection,
   SELF_IMPROVE_BRANCH,
@@ -149,12 +151,13 @@ describe("defaultCheckRunner status mapping (M8: skipped is never a false failur
     args: [],
     ...over,
   });
+  const checkEnv = { PATH: process.env.PATH, HOME: worktree };
 
   it("pre-flights a declared prerequisite: no node_modules → skipped, and the command never runs", async () => {
     // web/ exists but has NO node_modules — exactly a fresh clone. Point the check at
     // a command that would BLOW UP if it were ever spawned, to prove the pre-flight
     // short-circuits before spawning.
-    const r = await defaultCheckRunner(5000)(
+    const r = await defaultCheckRunner(checkEnv, 5000)(
       check({ cwd: "web", command: "definitely-not-spawned-xyz", args: [], requires: "node_modules" }),
       worktree,
     );
@@ -164,7 +167,7 @@ describe("defaultCheckRunner status mapping (M8: skipped is never a false failur
 
   it("runs the check once its prerequisite exists", async () => {
     mkdirSync(join(worktree, "web", "node_modules"), { recursive: true });
-    const r = await defaultCheckRunner(5000)(
+    const r = await defaultCheckRunner(checkEnv, 5000)(
       check({ cwd: "web", command: "true", args: [], requires: "node_modules" }),
       worktree,
     );
@@ -175,32 +178,105 @@ describe("defaultCheckRunner status mapping (M8: skipped is never a false failur
   it("maps exit 127 to skipped, not failed (an npm script whose binary is missing)", async () => {
     // `sh -c 'exit 127'` is exactly what `npm test` yields when vitest is absent:
     // npm itself exists (so no ENOENT), but the script's binary does not.
-    const r = await defaultCheckRunner(5000)(check({ command: "sh", args: ["-c", "exit 127"] }), worktree);
+    const r = await defaultCheckRunner(checkEnv, 5000)(check({ command: "sh", args: ["-c", "exit 127"] }), worktree);
     assert.equal(r.status, "skipped", "a bare 127 is never a real test failure");
     assert.equal(r.detail, "command/binary not available (exit 127)");
   });
 
   it("still reports a GENUINE non-zero exit as failed", async () => {
-    const r = await defaultCheckRunner(5000)(check({ command: "sh", args: ["-c", "exit 1"] }), worktree);
+    const r = await defaultCheckRunner(checkEnv, 5000)(check({ command: "sh", args: ["-c", "exit 1"] }), worktree);
     assert.equal(r.status, "failed");
     assert.equal(r.detail, "exit 1");
   });
 
   it("maps a missing command (ENOENT) to skipped", async () => {
-    const r = await defaultCheckRunner(5000)(check({ command: "no-such-binary-xyz", args: [] }), worktree);
+    const r = await defaultCheckRunner(checkEnv, 5000)(check({ command: "no-such-binary-xyz", args: [] }), worktree);
     assert.equal(r.status, "skipped");
     assert.equal(r.detail, "command not available in the worker");
   });
 
   it("captures ONLY the exit status — command output never reaches the result", async () => {
     const secret = "sk-ant-api03-NEVER-IN-THE-MR";
-    const r = await defaultCheckRunner(5000)(
+    const r = await defaultCheckRunner(checkEnv, 5000)(
       check({ command: "sh", args: ["-c", `echo ${secret}; echo ${secret} >&2; exit 3`] }),
       worktree,
     );
     assert.equal(r.status, "failed");
     assert.equal(r.detail, "exit 3");
     assert.ok(!JSON.stringify(r).includes(secret), "command output must never reach the CheckResult");
+  });
+});
+
+// M9 (security load-bearing): the check subprocess runs agent-authored code as the
+// worker uid, so its env must be a scrubbed REPLACEMENT — the worker impersonation
+// vars (join token + API URL) absent BY CONSTRUCTION, so agent code can't read them.
+describe("buildCheckEnv scrubs worker-impersonation vars (M9)", () => {
+  const source: NodeJS.ProcessEnv = {
+    PATH: "/base/bin",
+    HOME: "/home/uzi",
+    UZI_WORKER_TOKEN: "join-token-SECRET",
+    UZI_WORKER_TOKEN_FILE: "/run/secrets/worker_token",
+    UZI_API_URL: "http://api:8080",
+    NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem",
+    ANTHROPIC_API_KEY: "sk-should-not-be-here-either",
+  };
+
+  it("the built env contains NONE of the worker/API/token vars, by construction", () => {
+    const env = buildCheckEnv(source, "/home/checks", { PATH: "/tools/bin:/base/bin", NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem" });
+    for (const k of ["UZI_WORKER_TOKEN", "UZI_WORKER_TOKEN_FILE", "UZI_API_URL", "ANTHROPIC_API_KEY"]) {
+      assert.equal(env[k], undefined, `${k} must be absent from the check env`);
+    }
+    // Provisioned PATH wins (toolchains resolve); HOME is the given check HOME; TLS carried.
+    assert.equal(env.PATH, "/tools/bin:/base/bin");
+    assert.equal(env.HOME, "/home/checks");
+    assert.equal(env.NIX_SSL_CERT_FILE, "/etc/ssl/cert.pem");
+    assert.equal(env.GIT_TERMINAL_PROMPT, "0");
+    // The whole serialized env must not contain any secret value.
+    const blob = JSON.stringify(env);
+    for (const v of ["join-token-SECRET", "/run/secrets/worker_token", "http://api:8080", "sk-should-not-be-here-either"]) {
+      assert.ok(!blob.includes(v), `leaked ${v}`);
+    }
+  });
+
+  it("falls back to the base PATH when nothing was provisioned", () => {
+    const env = buildCheckEnv(source, "/home/checks");
+    assert.equal(env.PATH, "/base/bin");
+    assert.equal(env.UZI_WORKER_TOKEN, undefined);
+  });
+
+  it("a check spawned under the built env cannot see the token vars (end to end)", async () => {
+    const wt = mkdtempSync(join(tmpdir(), "si-env-"));
+    mkdirSync(join(wt, "api"), { recursive: true });
+    // The probe exits 0 ONLY if the worker vars are all empty in its environment.
+    const probe: SelfImproveCheck = {
+      name: "env probe",
+      cwd: "api",
+      command: "sh",
+      args: ["-c", '[ -z "$UZI_WORKER_TOKEN" ] && [ -z "$UZI_WORKER_TOKEN_FILE" ] && [ -z "$UZI_API_URL" ]'],
+    };
+    // A REAL PATH (so `sh` resolves) but WITH the worker vars present in the source —
+    // the built env must still exclude them, so the probe exits 0.
+    const env = buildCheckEnv({ ...source, PATH: process.env.PATH }, wt);
+    const r = await defaultCheckRunner(env, 5000)(probe, wt);
+    assert.equal(r.status, "passed", "the check subprocess must NOT inherit the worker/API/token vars");
+  });
+});
+
+describe("prepareCheckDeps (M9: best-effort npm ci → honest skip on failure)", () => {
+  it("reports per-dir outcomes and never throws when npm ci fails", async () => {
+    const wt = mkdtempSync(join(tmpdir(), "si-deps-"));
+    mkdirSync(join(wt, "web"), { recursive: true });
+    // web/ has a package.json but a broken lockfile-less state → npm ci fails; agent/
+    // has no package.json → reported as such. Neither throws; both leave node_modules
+    // absent so the checks skip honestly.
+    writeFileSync(join(wt, "web", "package.json"), '{"name":"x","version":"1.0.0"}');
+    const notes = await prepareCheckDeps(wt, { PATH: process.env.PATH, HOME: wt }, ["web", "agent"], 30_000);
+    const web = notes.find((n) => n.dir === "web");
+    const agent = notes.find((n) => n.dir === "agent");
+    assert.ok(web && !web.ok, "npm ci without a lockfile must fail, reported honestly");
+    assert.ok(agent && !agent.ok && agent.detail.includes("no package.json"));
+    // The failure left no node_modules → a real check there would pre-flight to skipped.
+    assert.ok(!existsSync(join(wt, "web", "node_modules")));
   });
 });
 

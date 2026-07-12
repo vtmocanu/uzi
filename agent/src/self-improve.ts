@@ -118,10 +118,91 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
   return results;
 }
 
-// defaultCheckRunner runs a check via execFile with a wall-clock cap. It captures
-// only the exit status, never the (potentially secret-bearing) command output — the
-// run-message redactor does not cover a third-party test's stdout, so none of it
-// reaches the MR.
+// ─── Check subprocess environment (M9 + audit, security load-bearing) ─────────
+// The checks below (and prepareCheckDeps' `npm ci`) execute AGENT-AUTHORED code as
+// the WORKER uid — worktree test files, package.json scripts, vite/tsc/go test —
+// ENTIRELY OUTSIDE the SDK hook system (guardrails.ts constrains only the AGENT's
+// Bash, not a worker-spawned execFile child). The worker process holds the decrypted
+// forge PAT + Anthropic token, and its env carries the join token
+// (UZI_WORKER_TOKEN[_FILE]) + UZI_API_URL. So a check subprocess gets a SCRUBBED
+// REPLACEMENT env — the same discipline provision.ts uses for nix build hooks — never
+// a process.env spread: the join-token/API vars are ABSENT BY CONSTRUCTION, so
+// agent-authored code cannot read them to impersonate the worker
+// (join token → /api/worker/runs/claim → bot forge PAT + the user's Anthropic token).
+//
+// RESIDUAL NOT CLOSED (documented loudly, provision.ts house style): the subprocess
+// still runs as the uzi uid, and the join-token FILE at /run/secrets/worker_token is
+// same-uid readable at a hardcoded, documented path (the worker's post-read unlink
+// fails on the read-only secret mount, so the file persists). Agent-authored test
+// code can read that file directly — a surface behind NO PreToolUse hook. `npm ci`
+// runs with --ignore-scripts (prepareCheckDeps) to delete the lifecycle-script
+// (preinstall/install/postinstall) code-exec entry path — a REDUCTION, not a close:
+// the test runners still execute model-written code. Blast radius if exploited: join
+// token → claim → the bot forge PAT (Developer role, structurally cannot merge
+// protected `main`) + the user's own Anthropic token (which the agent already holds).
+// The structural close is the k8s uid-split (agent under a DISTINCT uid from the
+// worker), deferred to the remote-worker phase. This is the SAME residual class
+// provision.ts documents for build hooks — but those are admin-VETTED packages,
+// whereas these checks run code the model just wrote (M5 silently widened that
+// residual; surfaced by the M9 audit and accepted for the MVP).
+
+// buildCheckEnv is the scrubbed replacement env for a check subprocess. PATH comes
+// from the provisioned toolEnv when present (so go/vitest/tsc resolve), else the
+// worker's base PATH; HOME is a writable per-run dir (npm cache/config). Only what the
+// toolchains + npm-over-HTTPS demonstrably need is added — never a worker secret.
+export function buildCheckEnv(
+  source: NodeJS.ProcessEnv,
+  homeDir: string,
+  toolEnv?: Record<string, string>,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    PATH: toolEnv?.PATH ?? source.PATH,
+    HOME: homeDir,
+    // No interactive prompt if a check shells out to git; not a secret.
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  // TLS trust + locale so nix-provided toolchains and `npm ci` over HTTPS work. Prefer
+  // the provisioned value, fall back to the image's; never invent, never carry else.
+  for (const k of ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"] as const) {
+    const v = toolEnv?.[k] ?? source[k];
+    if (v) env[k] = v;
+  }
+  return env;
+}
+
+// prepareCheckDeps installs node deps so the npm checks can actually run (M9),
+// best-effort. `npm ci --ignore-scripts` in each dir under the SCRUBBED env:
+// --ignore-scripts deletes the lifecycle-script code-exec entry path (a reduction,
+// not a close). On any failure (no registry egress, lockfile drift) it leaves
+// node_modules absent, so the check pre-flight reports an honest "skipped" — never a
+// false pass, never a fabricated failure. Returns per-dir notes for logging only.
+export async function prepareCheckDeps(
+  worktreePath: string,
+  env: NodeJS.ProcessEnv,
+  dirs: string[] = ["web", "agent"],
+  timeoutMs = 10 * 60 * 1000,
+): Promise<{ dir: string; ok: boolean; detail: string }[]> {
+  const out: { dir: string; ok: boolean; detail: string }[] = [];
+  for (const dir of dirs) {
+    const cwd = `${worktreePath}/${dir}`;
+    if (!existsSync(`${cwd}/package.json`)) {
+      out.push({ dir, ok: false, detail: "no package.json" });
+      continue;
+    }
+    const ok = await new Promise<boolean>((resolve) => {
+      execFile("npm", ["ci", "--ignore-scripts"], { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 }, (error) =>
+        resolve(!error),
+      );
+    });
+    out.push({ dir, ok, detail: ok ? "npm ci --ignore-scripts ok" : "npm ci failed → checks skip honestly" });
+  }
+  return out;
+}
+
+// defaultCheckRunner runs a check via execFile under the SCRUBBED env (buildCheckEnv)
+// with a wall-clock cap. It captures only the exit status, never the (potentially
+// secret-bearing) command output — the run-message redactor does not cover a
+// third-party test's stdout, so none of it reaches the MR.
 //
 // The status mapping is deliberately conservative: a check only reports "failed"
 // when it actually RAN and genuinely failed. Everything that means "this check could
@@ -133,7 +214,7 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
 //     shell or the npm script, e.g. vitest/tsc)
 //   - killed by the wall-clock cap                 → skipped
 //   - any other non-zero exit                      → failed   [a real failure]
-export function defaultCheckRunner(timeoutMs = 15 * 60 * 1000): CheckRunner {
+export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 * 1000): CheckRunner {
   return (check, worktreePath) => {
     const cwd = `${worktreePath}/${check.cwd}`;
     // Pre-flight: a declared prerequisite that is absent means the check cannot
@@ -153,7 +234,7 @@ export function defaultCheckRunner(timeoutMs = 15 * 60 * 1000): CheckRunner {
       execFile(
         check.command,
         check.args,
-        { cwd, timeout: timeoutMs, maxBuffer: 1 << 20 },
+        { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 },
         (error) => {
           if (!error) {
             resolve({ name: check.name, status: "passed", detail: "exit 0" });

@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import type { WorkerClient } from "./client.js";
 import type { GitCache } from "./git.js";
 import { gitBasicCredential } from "./git.js";
@@ -20,8 +21,10 @@ import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 import {
+  buildCheckEnv,
   defaultCheckRunner,
   flagGuardPaths,
+  prepareCheckDeps,
   runSelfImproveChecks,
   selfImproveMrSection,
   SELF_IMPROVE_BRANCH,
@@ -84,7 +87,9 @@ export class RunRunner {
   private readonly planApprovalTimeoutMs: number;
   private readonly gitlab: GitLabClient;
   private readonly detect: (worktreePath: string) => Promise<DetectedRepoAgents>;
-  private readonly checkRunner: CheckRunner;
+  // Optional test override; production builds it per-run with the scrubbed check env
+  // (buildCheckEnv) once the executor's provisioned toolEnv is known (M9).
+  private readonly checkRunner?: CheckRunner;
 
   constructor(
     private readonly client: WorkerClient,
@@ -103,7 +108,7 @@ export class RunRunner {
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
-    this.checkRunner = opts.checkRunner ?? defaultCheckRunner();
+    this.checkRunner = opts.checkRunner;
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
@@ -257,7 +262,17 @@ export class RunRunner {
         // through so the MR section fails CLOSED (a loud "guard-path check unavailable"
         // note) instead of silently suppressing the flag (M5 audit).
         const changed = await this.git.changedFiles(barePath, worktree.path);
-        const checks = await runSelfImproveChecks(worktree.path, this.checkRunner);
+        // M9: the checks execute agent-authored code as the worker uid, so they run
+        // under a SCRUBBED replacement env (no join token / API URL / PAT / OAuth token
+        // by construction) with the run's provisioned toolchains on PATH. `npm ci
+        // --ignore-scripts` installs deps best-effort so vitest/tsc exist; a failure
+        // just leaves the check honestly skipped.
+        const checkEnv = buildCheckEnv(process.env, runHome ?? os.tmpdir(), result.toolEnv);
+        for (const note of await prepareCheckDeps(worktree.path, checkEnv).catch(() => [])) {
+          runLog.info("self-improve: dependency install", note);
+        }
+        const checkRunner = this.checkRunner ?? defaultCheckRunner(checkEnv);
+        const checks = await runSelfImproveChecks(worktree.path, checkRunner);
         selfImproveSection = selfImproveMrSection(changed === null ? null : flagGuardPaths(changed), checks);
       }
 

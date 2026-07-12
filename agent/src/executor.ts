@@ -96,6 +96,11 @@ export interface ExecutorResult {
    *  authored, Decision 3b). Absent for a stub/ci_fix-not_code run that assembled
    *  no roster. */
   agentSelection?: { source: AgentSource; agents: string[] };
+  /** PRD #46 M9: the allowlisted provisioned tool env (PATH + nix TLS/locale vars)
+   *  the run's tier-1 packages installed, so the self_improve check runner can put
+   *  go/vitest/tsc on its subprocess PATH. Absent (or `{}`) when nothing was
+   *  provisioned; the check env then falls back to the worker's base PATH. */
+  toolEnv?: Record<string, string>;
 }
 
 /**
