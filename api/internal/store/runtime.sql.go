@@ -2156,3 +2156,57 @@ func (q *Queries) UpdateRunLastSeq(ctx context.Context, arg UpdateRunLastSeqPara
 	}
 	return result.RowsAffected(), nil
 }
+
+const upsertRunUsage = `-- name: UpsertRunUsage :exec
+
+INSERT INTO run_usage (
+    run_id, session_id, model,
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
+) VALUES (
+    $1, $2, $3,
+    $4, $5, $6, $7, $8, now()
+)
+ON CONFLICT (run_id, session_id, model) DO UPDATE SET
+    input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
+    cache_read_tokens     = GREATEST(run_usage.cache_read_tokens,     EXCLUDED.cache_read_tokens),
+    cache_creation_tokens = GREATEST(run_usage.cache_creation_tokens, EXCLUDED.cache_creation_tokens),
+    output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
+    cost_usd              = GREATEST(run_usage.cost_usd,              EXCLUDED.cost_usd),
+    updated_at            = now()
+`
+
+type UpsertRunUsageParams struct {
+	RunID               uuid.UUID      `json:"run_id"`
+	SessionID           string         `json:"session_id"`
+	Model               string         `json:"model"`
+	InputTokens         int64          `json:"input_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CostUsd             pgtype.Numeric `json:"cost_usd"`
+}
+
+// Usage accounting (PRD #40) ------------------------------------------------
+// Fold one model's usage from a delivered result frame into the run's accounting
+// (Decision 2). The result frame's totals are CUMULATIVE-across-resume (M1's
+// Decision 3 verdict b), so the token/cost columns are monotonic per (run_id,
+// session_id, model) and the merge is GREATEST — never a plain overwrite: a
+// crash-retry that re-delivers an EARLIER frame after a LATER one must not regress
+// the row (that is exactly what makes "re-delivering the whole batch changes
+// nothing" true under verdict b, where a stable session_id can otherwise see two
+// different cumulative snapshots hit the same key). The API calls this for every
+// delivered result frame incl. seq-deduped replays, so at-least-once delivery +
+// this idempotent monotonic merge = correct totals with no crash window.
+func (q *Queries) UpsertRunUsage(ctx context.Context, arg UpsertRunUsageParams) error {
+	_, err := q.db.Exec(ctx, upsertRunUsage,
+		arg.RunID,
+		arg.SessionID,
+		arg.Model,
+		arg.InputTokens,
+		arg.CacheReadTokens,
+		arg.CacheCreationTokens,
+		arg.OutputTokens,
+		arg.CostUsd,
+	)
+	return err
+}

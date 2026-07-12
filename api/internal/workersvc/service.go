@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/big"
 	"strings"
 	"time"
 
@@ -117,6 +119,9 @@ type Store interface {
 	// Messages + inputs.
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
+	// UpsertRunUsage folds a delivered result frame's per-model usage into
+	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
+	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
 	CreateStopVerdictInput(ctx context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error)
 	// CreateApprovePlanInput enqueues an approve_plan AND records the run's agent
@@ -698,6 +703,17 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			return err
 		}
 	}
+	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
+	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
+	// still re-run the fold, which is exactly what makes at-least-once delivery plus
+	// the idempotent GREATEST merge converge to correct totals with no crash window.
+	// Malformed/absent usage is skipped inside; a DB error propagates so the worker
+	// re-delivers and the fold retries. No terminal-status guard — a result frame
+	// that lands after a mid-flight cancel still folds (pre-cancel spend is real
+	// spend, Decision 4).
+	if err := s.foldRunUsage(ctx, run, msgs); err != nil {
+		return err
+	}
 	// Fan out after the log + high-water mark are durably advanced, so a browser
 	// that reacts by replaying from last_seq sees a consistent state.
 	if s.bcast != nil {
@@ -707,6 +723,83 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		}
 	}
 	return nil
+}
+
+// resultUsagePayload is the subset of a terminal result frame's payload the fold
+// reads. mapResult (agent/src/sdk-messages.ts) emits result frames as kind
+// `status` (success) or `error`, both with `event: "result"` and a `modelUsage`
+// per-model breakdown (Decision 1). Only these keys are parsed; everything else
+// in the payload is ignored, and the fields are camelCase to match the SDK's
+// `ModelUsage` shape as forwarded on the wire.
+type resultUsagePayload struct {
+	Event      string                      `json:"event"`
+	ModelUsage map[string]resultModelUsage `json:"modelUsage"`
+}
+
+type resultModelUsage struct {
+	InputTokens              int64   `json:"inputTokens"`
+	OutputTokens             int64   `json:"outputTokens"`
+	CacheReadInputTokens     int64   `json:"cacheReadInputTokens"`
+	CacheCreationInputTokens int64   `json:"cacheCreationInputTokens"`
+	CostUSD                  float64 `json:"costUSD"`
+}
+
+// foldRunUsage upserts run_usage for every delivered result frame in the batch
+// (PRD #40 Decision 2). It is called with ALL delivered messages, not just the
+// newly-inserted ones, so a seq-deduped re-delivery re-runs the fold — the
+// GREATEST merge in UpsertRunUsage makes that idempotent. session_id is sourced
+// from the run row (the frame payload carries none); it is ” until the run has
+// reported one, which the monotonic merge + latest/MAX-per-model rollup tolerate.
+// Malformed/absent usage is skipped (never fails the append); a DB error
+// propagates so the append fails and the worker re-delivers.
+func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
+	var sessionID string
+	if run.SessionID.Valid {
+		sessionID = run.SessionID.String
+	}
+	for _, m := range msgs {
+		// Result frames are only ever kind status (success) or error; skip the
+		// rest without paying an unmarshal for every text/tool_use message.
+		if m.Kind != "status" && m.Kind != "error" {
+			continue
+		}
+		var p resultUsagePayload
+		if err := json.Unmarshal(m.Payload, &p); err != nil {
+			continue // malformed payload → skip, never fail the append
+		}
+		if p.Event != "result" || len(p.ModelUsage) == 0 {
+			continue // not a result frame, or no per-model usage to fold
+		}
+		for model, mu := range p.ModelUsage {
+			if model == "" {
+				continue
+			}
+			if err := s.q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
+				RunID:               run.ID,
+				SessionID:           sessionID,
+				Model:               model,
+				InputTokens:         mu.InputTokens,
+				CacheReadTokens:     mu.CacheReadInputTokens,
+				CacheCreationTokens: mu.CacheCreationInputTokens,
+				OutputTokens:        mu.OutputTokens,
+				CostUsd:             numericUSD(mu.CostUSD),
+			}); err != nil {
+				return fmt.Errorf("fold run usage (run %s, model %s): %w", run.ID, model, err)
+			}
+		}
+	}
+	return nil
+}
+
+// numericUSD builds a numeric(12,6) cost from the SDK's float dollar amount by
+// quantizing to microdollars (Int = round(usd*1e6), Exp = -6) — deterministic and
+// free of the float-string-parse ambiguity of Scan. A negative/NaN/Inf cost
+// (never expected) folds to 0 rather than poisoning a run's total.
+func numericUSD(usd float64) pgtype.Numeric {
+	if math.IsNaN(usd) || math.IsInf(usd, 0) || usd < 0 {
+		return pgtype.Numeric{Int: big.NewInt(0), Exp: -6, Valid: true}
+	}
+	return pgtype.Numeric{Int: big.NewInt(int64(math.Round(usd * 1e6))), Exp: -6, Valid: true}
 }
 
 // StateRequest is the worker's report of a run's new state. Only the fields

@@ -427,6 +427,34 @@ FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
 
+-- Usage accounting (PRD #40) ------------------------------------------------
+
+-- name: UpsertRunUsage :exec
+-- Fold one model's usage from a delivered result frame into the run's accounting
+-- (Decision 2). The result frame's totals are CUMULATIVE-across-resume (M1's
+-- Decision 3 verdict b), so the token/cost columns are monotonic per (run_id,
+-- session_id, model) and the merge is GREATEST — never a plain overwrite: a
+-- crash-retry that re-delivers an EARLIER frame after a LATER one must not regress
+-- the row (that is exactly what makes "re-delivering the whole batch changes
+-- nothing" true under verdict b, where a stable session_id can otherwise see two
+-- different cumulative snapshots hit the same key). The API calls this for every
+-- delivered result frame incl. seq-deduped replays, so at-least-once delivery +
+-- this idempotent monotonic merge = correct totals with no crash window.
+INSERT INTO run_usage (
+    run_id, session_id, model,
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
+) VALUES (
+    @run_id, @session_id, @model,
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, now()
+)
+ON CONFLICT (run_id, session_id, model) DO UPDATE SET
+    input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
+    cache_read_tokens     = GREATEST(run_usage.cache_read_tokens,     EXCLUDED.cache_read_tokens),
+    cache_creation_tokens = GREATEST(run_usage.cache_creation_tokens, EXCLUDED.cache_creation_tokens),
+    output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
+    cost_usd              = GREATEST(run_usage.cost_usd,              EXCLUDED.cost_usd),
+    updated_at            = now();
+
 -- Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
 -- The chat agent investigates its OWNER'S runs (both kinds) via the worker. These
 -- queries are USER_ID-scoped (from the authenticated worker), NEVER a bare run_id

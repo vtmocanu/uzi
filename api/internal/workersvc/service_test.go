@@ -53,6 +53,10 @@ type fakeStore struct {
 	runOwnedErr      error
 	insertedSeqs     map[int32]bool
 	insertedMessages []store.InsertRunMessageParams
+	// upsertedUsage records every UpsertRunUsage call (PRD #40 fold); usageErr, if
+	// set, makes the fold's upsert fail (to prove a DB error propagates).
+	upsertedUsage    []store.UpsertRunUsageParams
+	usageErr         error
 	lastSeqUpdated   *int32
 	setRunningParams *store.SetRunRunningParams
 	setAwaiting      *store.SetRunAwaitingApprovalParams
@@ -238,6 +242,13 @@ func (f *fakeStore) UpdateRunLastSeq(_ context.Context, arg store.UpdateRunLastS
 	v := arg.Seq
 	f.lastSeqUpdated = &v
 	return 1, nil
+}
+func (f *fakeStore) UpsertRunUsage(_ context.Context, arg store.UpsertRunUsageParams) error {
+	if f.usageErr != nil {
+		return f.usageErr
+	}
+	f.upsertedUsage = append(f.upsertedUsage, arg)
+	return nil
 }
 func (f *fakeStore) SetRunRunning(_ context.Context, arg store.SetRunRunningParams) (int64, error) {
 	f.setRunningParams = &arg
@@ -795,6 +806,135 @@ func TestAppendMessagesRejectsForeignRun(t *testing.T) {
 	}
 	if len(fs.insertedMessages) != 0 {
 		t.Fatal("no messages should be inserted for a run the worker does not own")
+	}
+}
+
+// --- PRD #40 M2: the run_usage fold ----------------------------------------
+
+// A success result frame's modelUsage folds one UpsertRunUsage per model, keyed by
+// the run's session_id, with the SDK's camelCase fields mapped to the columns;
+// non-result messages in the same batch never fold.
+func TestAppendMessagesFoldsResultUsagePerModel(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-1")}}
+	svc := New(fs, newBox(t), testParams())
+
+	result := json.RawMessage(`{
+		"event":"result","subtype":"success",
+		"usage":{"input_tokens":1600,"output_tokens":900},
+		"modelUsage":{
+			"claude-fable-5":{"inputTokens":1200,"outputTokens":800,"cacheReadInputTokens":400,"cacheCreationInputTokens":50,"costUSD":0.0731},
+			"claude-haiku-4-5":{"inputTokens":400,"outputTokens":100,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":0.0009}
+		}}`)
+	msgs := []IncomingMessage{
+		{Seq: 1, Kind: "text", Agent: "lead", Payload: json.RawMessage(`{"text":"working"}`)},
+		{Seq: 2, Kind: "status", Agent: "lead", Payload: result},
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	if len(fs.upsertedUsage) != 2 {
+		t.Fatalf("expected 2 usage upserts (one per model), got %d", len(fs.upsertedUsage))
+	}
+	byModel := map[string]store.UpsertRunUsageParams{}
+	for _, u := range fs.upsertedUsage {
+		byModel[u.Model] = u
+		if u.RunID != fs.runOwned.ID || u.SessionID != "sess-1" {
+			t.Fatalf("usage row must be keyed by (run, session): got run=%v session=%q", u.RunID, u.SessionID)
+		}
+	}
+	fable := byModel["claude-fable-5"]
+	if fable.InputTokens != 1200 || fable.OutputTokens != 800 || fable.CacheReadTokens != 400 || fable.CacheCreationTokens != 50 {
+		t.Fatalf("fable tokens mismatch: %+v", fable)
+	}
+	if fable.CostUsd.Int == nil || fable.CostUsd.Int.Int64() != 73100 || fable.CostUsd.Exp != -6 {
+		t.Fatalf("fable cost should quantize 0.0731 → 73100e-6, got int=%v exp=%d", fable.CostUsd.Int, fable.CostUsd.Exp)
+	}
+}
+
+// The error branch folds too (Decision 4): a failed/cancelled run's pre-death
+// spend must be counted, so an `error`-kind result frame upserts its usage.
+func TestAppendMessagesFoldsErrorResultUsage(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-err")}}
+	svc := New(fs, newBox(t), testParams())
+
+	msgs := []IncomingMessage{{Seq: 1, Kind: "error", Agent: "lead", Payload: json.RawMessage(`{
+		"event":"result","subtype":"error_max_turns","errors":["cap"],
+		"modelUsage":{"claude-fable-5":{"inputTokens":500,"outputTokens":120,"costUSD":0.031}}}`)}}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	if len(fs.upsertedUsage) != 1 || fs.upsertedUsage[0].InputTokens != 500 || fs.upsertedUsage[0].OutputTokens != 120 {
+		t.Fatalf("error-frame usage not folded: %+v", fs.upsertedUsage)
+	}
+}
+
+// Malformed / absent / non-result payloads are skipped and never fail the append:
+// a plain status string, a result frame with no modelUsage, and an empty
+// modelUsage all fold nothing.
+func TestAppendMessagesFoldMalformedIsNoOp(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID)}}
+	svc := New(fs, newBox(t), testParams())
+
+	msgs := []IncomingMessage{
+		{Seq: 1, Kind: "status", Payload: json.RawMessage(`"running"`)},                          // not an object
+		{Seq: 2, Kind: "status", Payload: json.RawMessage(`{"event":"init","model":"x"}`)},       // not a result frame
+		{Seq: 3, Kind: "status", Payload: json.RawMessage(`{"event":"result"}`)},                 // result, no modelUsage
+		{Seq: 4, Kind: "status", Payload: json.RawMessage(`{"event":"result","modelUsage":{}}`)}, // empty modelUsage
+		{Seq: 5, Kind: "error", Payload: json.RawMessage(`{"event":"result","errors":["x"]}`)},   // error, no usage
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("AppendMessages must not fail on malformed usage: %v", err)
+	}
+	if len(fs.upsertedUsage) != 0 {
+		t.Fatalf("malformed/absent usage must fold nothing, got %d upserts", len(fs.upsertedUsage))
+	}
+}
+
+// The fold runs on EVERY delivery, including a seq-deduped re-delivery (crash
+// retry) — NOT only on newly-inserted messages. Re-delivering the same batch
+// re-invokes UpsertRunUsage; the GREATEST merge (proven at the store layer) makes
+// that idempotent, so this is what makes "re-delivery changes nothing" hold.
+func TestAppendMessagesFoldsOnRedeliveredBatch(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("s")}}
+	svc := New(fs, newBox(t), testParams())
+
+	batch := []IncomingMessage{{Seq: 1, Kind: "status", Payload: json.RawMessage(
+		`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":100,"outputTokens":50,"costUSD":0.001}}}`)}}
+
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, batch); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, batch); err != nil {
+		t.Fatalf("re-delivery: %v", err)
+	}
+	// The re-delivered message is a seq-dedup insert (rows == 0), yet the fold ran
+	// both times — proving it iterates delivered messages, not inserted ones.
+	if len(fs.insertedMessages) != 2 {
+		t.Fatalf("expected 2 insert attempts across the two deliveries, got %d", len(fs.insertedMessages))
+	}
+	if len(fs.upsertedUsage) != 2 {
+		t.Fatalf("fold must run on the re-delivered (deduped) batch too: got %d upserts, want 2", len(fs.upsertedUsage))
+	}
+}
+
+// A DB error on the fold's upsert propagates: the append fails so the worker
+// re-delivers the batch and the fold retries (idempotent), rather than silently
+// dropping the usage.
+func TestAppendMessagesFoldDBErrorPropagates(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{
+		runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID)},
+		usageErr: errors.New("boom"),
+	}
+	svc := New(fs, newBox(t), testParams())
+	msgs := []IncomingMessage{{Seq: 1, Kind: "status", Payload: json.RawMessage(
+		`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":1,"outputTokens":1}}}`)}}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err == nil {
+		t.Fatal("a fold DB error must propagate so the worker re-delivers")
 	}
 }
 
