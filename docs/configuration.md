@@ -130,6 +130,8 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
 
+**Proxied deployments and worker egress.** The worker's git operations (`gitEnv`) and the self-improvement check runner (`buildCheckEnv`, PRD #46 M9/M10) run under a scrubbed *replacement* environment — a deliberate security measure that keeps the join token and API URL out of worker-spawned git/test subprocesses. That replacement env does **not** carry `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`. On the default internal-forge / direct-egress deployment this is fine (the e2e is green), but a deployment that reaches the forge (git push over HTTPS) or the npm registry (`npm ci` for the self-improvement job's test evidence) **through a proxy** must allowlist those vars in the two env builders, or the push / `npm ci` will fail (the checks then degrade to an honest "skipped", never a false failure).
+
 ## Chat (PRD #39)
 
 The in-app chat agent ([chat.md](chat.md)) rides the run machinery as a `chat` run kind, so it reuses the run knobs above and adds its own. See [ARCHITECTURE.md](../ARCHITECTURE.md#chat-with-uzi-the-fifth-surface) for how they fit together.
