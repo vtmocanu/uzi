@@ -103,6 +103,17 @@ type IssueProposal struct {
 	ConfirmingSince pgtype.Timestamptz `json:"confirming_since"`
 }
 
+type Notification struct {
+	ID        uuid.UUID          `json:"id"`
+	UserID    uuid.UUID          `json:"user_id"`
+	Kind      string             `json:"kind"`
+	Payload   []byte             `json:"payload"`
+	RunID     pgtype.UUID        `json:"run_id"`
+	ReviewID  pgtype.UUID        `json:"review_id"`
+	ReadAt    pgtype.Timestamptz `json:"read_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type PipelineStatus struct {
 	ID             int64              `json:"id"`
 	RepoID         uuid.UUID          `json:"repo_id"`
@@ -134,6 +145,19 @@ type RepoToolProfile struct {
 	Packages  []byte             `json:"packages"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ReviewRecommendation struct {
+	ID               uuid.UUID          `json:"id"`
+	ReviewID         uuid.UUID          `json:"review_id"`
+	Category         string             `json:"category"`
+	Target           string             `json:"target"`
+	RationaleMd      string             `json:"rationale_md"`
+	Confidence       string             `json:"confidence"`
+	ProducedByRunID  pgtype.UUID        `json:"produced_by_run_id"`
+	ProducedByUserID pgtype.UUID        `json:"produced_by_user_id"`
+	AddressedByRunID pgtype.UUID        `json:"addressed_by_run_id"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
 type Run struct {
@@ -175,6 +199,7 @@ type Run struct {
 	RepoAgents           []byte             `json:"repo_agents"`
 	Title                pgtype.Text        `json:"title"`
 	ResumeOfRunID        pgtype.UUID        `json:"resume_of_run_id"`
+	TargetRunID          pgtype.UUID        `json:"target_run_id"`
 }
 
 type RunMessage struct {
@@ -185,6 +210,19 @@ type RunMessage struct {
 	Agent     pgtype.Text        `json:"agent"`
 	Payload   []byte             `json:"payload"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunReview struct {
+	ID          uuid.UUID          `json:"id"`
+	TargetRunID uuid.UUID          `json:"target_run_id"`
+	JudgeRunID  pgtype.UUID        `json:"judge_run_id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	Verdict     string             `json:"verdict"`
+	SummaryMd   string             `json:"summary_md"`
+	JudgeModel  string             `json:"judge_model"`
+	Status      string             `json:"status"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RunUserInput struct {
@@ -244,6 +282,7 @@ type User struct {
 	SlackNotify          bool               `json:"slack_notify"`
 	SlackResolvedID      pgtype.Text        `json:"slack_resolved_id"`
 	SlackLinkConfirmedAt pgtype.Timestamptz `json:"slack_link_confirmed_at"`
+	JudgeEnabled         bool               `json:"judge_enabled"`
 }
 
 type UserSecret struct {

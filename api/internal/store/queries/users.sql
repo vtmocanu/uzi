@@ -24,6 +24,14 @@ UPDATE users SET last_login = now() WHERE id = $1;
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
 RETURNING *;
 
+-- name: SetUserJudgeEnabled :one
+-- Flip a user's run-retrospective opt-in (PRD #46 Decision 7). Per-user consent to
+-- spend the user's own Anthropic tokens judging every finished run; default false.
+-- The caller passes the target id: the session user for PUT /api/me/judge, or an
+-- admin-chosen id (from the path) for the admin per-user toggle.
+UPDATE users SET judge_enabled = $2 WHERE id = $1
+RETURNING *;
+
 -- name: GetUserDefaultModel :one
 -- The current user's per-user default worker model (PRD #17); NULL = inherit.
 SELECT default_model FROM users WHERE id = $1;
