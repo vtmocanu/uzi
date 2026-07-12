@@ -144,6 +144,35 @@ export const STUB_FAIL_SENTINEL = "UZI_STUB_FAIL";
  */
 export const STUB_NOT_CODE_SENTINEL = "UZI_STUB_NOT_CODE";
 
+/**
+ * Sentinel that makes the stub emit a scripted INTERLEAVED multi-agent message
+ * stream during the implement phase (PRD #43 M5). A real parallel-subagent run
+ * produces messages from several agents woven together; the SDK is the only thing
+ * that emits them, so the isolated E2E stack (stub, no live SDK) needs the stub to
+ * stand in. The scripted stream lets the E2E prove the persistence/replay contract
+ * — gapless per-run seq, strict order, and per-agent attribution surviving REST
+ * `?after=<seq>` replay — with no Anthropic session. Off unless present.
+ */
+export const STUB_INTERLEAVE_SENTINEL = "UZI_STUB_INTERLEAVE";
+
+/**
+ * The scripted stream STUB_INTERLEAVE_SENTINEL emits, in emit order. Each frame
+ * carries a 1-based `step` in its payload so a consumer can pin exact order and
+ * attribution independently of the run's other (worker) messages. The agents
+ * alternate lead → coder → reviewer, and each name recurs NON-ADJACENTLY (a second
+ * `coder`, then `reviewer`, then `lead`): that is exactly the interleaving a
+ * parallel run yields, and it is what makes name-based attribution non-trivial to
+ * preserve across persistence and reconnect replay.
+ */
+export const STUB_INTERLEAVE_STREAM: ReadonlyArray<{ agent: string; text: string }> = [
+  { agent: "lead", text: "parallel dispatch: units A (api) and B (web)" },
+  { agent: "coder", text: "unit A: editing the api scope" },
+  { agent: "reviewer", text: "review wave: auditing unit A" },
+  { agent: "coder", text: "unit B: editing the web scope" },
+  { agent: "reviewer", text: "review wave: auditing unit B" },
+  { agent: "lead", text: "integration: scopes disjoint, committing once" },
+];
+
 /** Options for the stub executor. */
 export interface StubExecutorOptions {
   /**
@@ -259,6 +288,17 @@ export class StubExecutor implements Executor {
     // during "implementation", exercising the worker-terminated failure path.
     if (ctx.issueDescription.includes(STUB_FAIL_SENTINEL) || ctx.issueTitle.includes(STUB_FAIL_SENTINEL)) {
       throw new Error(`stub executor: forced failure (${STUB_FAIL_SENTINEL} sentinel present)`);
+    }
+
+    // PRD #43 M5: emit a scripted interleaved multi-agent stream so the E2E can
+    // assert that persistence + REST replay keep it gapless, ordered, and
+    // per-agent attributed — the piece the live SDK would otherwise produce. Emits
+    // are synchronous and ordered, so the downstream batcher assigns them a gapless
+    // seq run; the trailing "committed" message keeps them mid-stream, not last.
+    if (ctx.issueDescription.includes(STUB_INTERLEAVE_SENTINEL) || ctx.issueTitle.includes(STUB_INTERLEAVE_SENTINEL)) {
+      STUB_INTERLEAVE_STREAM.forEach((frame, i) => {
+        ctx.emit({ kind: "text", agent: frame.agent, payload: { text: frame.text, step: i + 1 } });
+      });
     }
 
     const markerPath = path.join(ctx.worktreePath, "UZI_RUN.md");
