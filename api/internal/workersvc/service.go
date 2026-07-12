@@ -753,10 +753,15 @@ type resultModelUsage struct {
 // Malformed/absent usage is skipped (never fails the append); a DB error
 // propagates so the append fails and the worker re-delivers.
 func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
-	// Chat-run spend is explicitly OUT of scope for PRD #40 ("Counting tokens spent
-	// outside runs (e.g. the PRD #39 chat agent)"). mapResult is shared with the
-	// chat executor, so a chat run's result frames now carry usage too — skip the
-	// whole fold rather than let chat consumption leak into run_usage.
+	// Fold work runs — issue AND ci_fix both spend the user's tokens working a card
+	// or a pipeline end to end — and exclude ONLY chat. Chat-run spend is explicitly
+	// OUT of scope for PRD #40 ("Counting tokens spent outside runs, e.g. the PRD #39
+	// chat agent"), yet mapResult is shared with the chat executor so a chat run's
+	// result frames now carry usage too; skip the whole fold for kind='chat' rather
+	// than let chat consumption leak into run_usage. This is an exclude-list (skip
+	// chat), NOT an allowlist of {issue, ci_fix}, so a future WORK-run kind folds by
+	// default — matching the success criterion "every run started after this shows
+	// tokens" (a new non-work kind would need adding here, the same as chat).
 	if run.Kind == RunKindChat {
 		return nil
 	}

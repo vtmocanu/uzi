@@ -853,10 +853,12 @@ func TestAppendMessagesFoldsResultUsagePerModel(t *testing.T) {
 }
 
 // The error branch folds too (Decision 4): a failed/cancelled run's pre-death
-// spend must be counted, so an `error`-kind result frame upserts its usage.
+// spend must be counted, so an `error`-kind result frame upserts its usage. Uses a
+// ci_fix run to also lock the positive side of the kind guard — ci_fix is a work
+// run and MUST fold (only chat is excluded).
 func TestAppendMessagesFoldsErrorResultUsage(t *testing.T) {
 	w := worker()
-	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), SessionID: pgText("sess-err")}}
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Kind: RunKindCIFix, SessionID: pgText("sess-err")}}
 	svc := New(fs, newBox(t), testParams())
 
 	msgs := []IncomingMessage{{Seq: 1, Kind: "error", Agent: "lead", Payload: json.RawMessage(`{
