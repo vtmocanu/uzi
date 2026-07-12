@@ -265,6 +265,18 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/37-run-agent-selection.md`
 - The Slack plan-approval gate offers the same source choice (two Approve buttons: repo agents / my templates); excluding individual agents is done in the web UI. [user 2026-07-10]
 - The shipped picker is validated visually against the approved mock (`prds/mockups/37-agent-picker-mock.html`). [user 2026-07-10]
 
+## Feature #40 — Token usage & cost reporting (per run / per user / factory-wide)
+
+Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/40-token-usage-reporting.md`.
+
+- Report token usage and cost per run, per user, and factory-wide. [user]
+- Run view shows the run's usage, broken down per phase and per agent ("coder used 800k"). [user 2026-07-12]
+- Every user sees their own "Your usage" (lifetime + last-7-days); the factory total and per-user breakdown are admin-only. [user]
+- Tokens are the headline figure; cost is a secondary estimate — a $0 cost (subscription-auth runs) renders as "—", not "$0.00". [user]
+- Failed and cancelled runs still count their spend. [user]
+- Chat runs are out of scope (not counted). [user]
+- Shipped surfaces validated against the approved mock (+ addendum). [user 2026-07-12]
+
 ## Feature — Run retrospective (LLM judge) & self-improvement job
 
 Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvement.md`
