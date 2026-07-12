@@ -151,9 +151,13 @@ type userDTO struct {
 	IsActive    bool    `json:"is_active"`
 	// AutopilotEnabled is the user's per-user opt-in to unattended autopilot runs
 	// (PRD #19 M3, Decision 4). Default false; toggled from the user's Settings page.
-	AutopilotEnabled bool       `json:"autopilot_enabled"`
-	CreatedAt        time.Time  `json:"created_at"`
-	LastLogin        *time.Time `json:"last_login"`
+	AutopilotEnabled bool `json:"autopilot_enabled"`
+	// JudgeEnabled is the user's per-user opt-in to run retrospectives (PRD #46
+	// Decision 7). Default false; the user toggles their own from Settings, and an
+	// admin can force-toggle any user's from the admin users surface.
+	JudgeEnabled bool       `json:"judge_enabled"`
+	CreatedAt    time.Time  `json:"created_at"`
+	LastLogin    *time.Time `json:"last_login"`
 }
 
 func toDTO(u store.User) userDTO {
@@ -163,6 +167,7 @@ func toDTO(u store.User) userDTO {
 		IsAdmin:          u.IsAdmin,
 		IsActive:         u.IsActive,
 		AutopilotEnabled: u.AutopilotEnabled,
+		JudgeEnabled:     u.JudgeEnabled,
 		CreatedAt:        u.CreatedAt.Time,
 	}
 	if u.DisplayName.Valid {
@@ -237,6 +242,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Put("/me/autopilot", h.SetAutopilotEnabled)
+			// Current-user run-judge opt-in (PRD #46): per-user consent to spend the
+			// caller's own tokens judging their finished runs. Session-scoped identity
+			// (never the body), like autopilot.
+			r.Put("/me/judge", h.SetJudgeEnabled)
 		})
 
 		// Current-user settings (non-secret, own-user only): the per-user default
@@ -341,6 +350,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Use(mw.RequireAdmin)
 			r.Get("/users", h.ListUsers)
 			r.Patch("/users/{id}", h.PatchUser)
+			// Admin per-user run-judge toggle (PRD #46 Decision 7): actor authorized by
+			// RequireAdmin, target from the path, never the body (audit H3).
+			r.Put("/users/{id}/judge", h.SetUserJudgeEnabled)
 			// Instance settings (PRD #19): the configurable forge labels today.
 			r.Get("/settings", h.GetSettings)
 			r.Put("/settings", h.UpdateSettings)
