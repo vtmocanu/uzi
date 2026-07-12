@@ -18,14 +18,26 @@ export const SELF_IMPROVE_BRANCH = "uzi/self-improve";
 // loudly. A self_improve run cannot weaken its own guardrails at runtime (it runs
 // its compiled guardrails.ts with settingSources:[]; the checked-out copy never
 // loads) — the risk is the MERGED, later-deployed artifact, so the fence is at the
-// human merge, and this flag draws the reviewer's eye there.
+// human merge, and this flag draws the reviewer's eye there. The set is deliberately
+// broad on token custody (M5 audit): an injected change could otherwise be steered
+// into an UNFLAGGED token-handling file precisely to dodge the reviewer alert.
 export const GUARD_CRITICAL_PATTERNS: RegExp[] = [
+  // Agent-side guardrails + worker token custody: the SDK executor/env that fence
+  // the agent subprocess, and git.ts which injects the PAT via env-scoped git config.
   /agent\/src\/guardrails\.ts/,
+  /agent\/src\/sdk-executor\.ts/,
+  /agent\/src\/sdk-env\.ts/,
+  /agent\/src\/git\.ts/,
+  // API auth + secret/vault crypto.
   /api\/internal\/middleware\/auth/,
   /api\/internal\/secretbox\//,
   /api\/internal\/vault\//,
-  // workersvc claim + token assembly (the paths that open the forge PAT / Anthropic token).
-  /api\/internal\/workersvc\/(claim|service)\.go/,
+  // workersvc token custody: claim/token assembly (service.go = assembleClaim +
+  // token open, judge.go = assembleJudgeClaim, claim.go = ClaimSecrets) PLUS any
+  // future token/secret/claim-named file in the package, so a token change can't
+  // land in an unflagged sibling.
+  /api\/internal\/workersvc\/(claim|service|judge)\.go/,
+  /api\/internal\/workersvc\/[^/]*(token|secret|claim)[^/]*\.go/,
   // compose secret wiring.
   /docker-compose[^/]*\.ya?ml$/,
   /(^|\/)\.env(\.|$)/,
@@ -131,12 +143,22 @@ export function defaultCheckRunner(timeoutMs = 15 * 60 * 1000): CheckRunner {
 
 // selfImproveMrSection composes the MR-description addendum for a self_improve run:
 // the guard-critical flag (when any path was touched) and the test-suite evidence.
-// Returns "" only when there is nothing to add (no checks, no hits) — the caller
-// always has at least the checks, so in practice it is non-empty.
-export function selfImproveMrSection(guardHits: string[], checks: CheckResult[]): string {
+// guardHits is null when the changed-file diff could NOT be computed — that surfaces
+// loudly (fail-closed) so a diff failure never silently suppresses the flag on a
+// guard-touching MR (M5 audit). Returns "" only when there is nothing to add (no
+// checks, no hits) — the caller always has at least the checks, so it is non-empty.
+export function selfImproveMrSection(guardHits: string[] | null, checks: CheckResult[]): string {
   const lines: string[] = ["", "---", "### Self-improvement run"];
 
-  if (guardHits.length > 0) {
+  if (guardHits === null) {
+    lines.push(
+      "",
+      "> ⚠️ **Guard-path check: UNAVAILABLE (diff failed).** The worker could not compute the",
+      "> changed-file list, so it could not check for guard-critical paths. Review this change",
+      "> for any touch of guardrails, auth, secret/vault, worker token assembly, or compose",
+      "> secret wiring MANUALLY before merging.",
+    );
+  } else if (guardHits.length > 0) {
     lines.push(
       "",
       "> ⚠️ **Guard-critical paths touched — review with extra care.** This change modifies",

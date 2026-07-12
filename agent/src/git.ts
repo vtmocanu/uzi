@@ -137,17 +137,19 @@ export class GitCache {
   /**
    * Files changed on the worktree's branch since it diverged from the default
    * branch (three-dot diff against the merge base) — used by a self_improve run to
-   * flag guard-critical paths in its MR (PRD #46). Best-effort: a diff that cannot
-   * be computed returns an empty list (the caller then simply raises no flag) rather
-   * than failing the run.
+   * flag guard-critical paths in its MR (PRD #46). Returns null (NOT []) when the
+   * diff cannot be computed, so the caller fails CLOSED — surfacing a loud
+   * "guard-path check unavailable" note rather than silently raising no flag on a
+   * possibly guard-touching MR (M5 audit). An empty list means "computed, nothing
+   * changed".
    */
-  async changedFiles(barePath: string, worktreePath: string): Promise<string[]> {
+  async changedFiles(barePath: string, worktreePath: string): Promise<string[] | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
       const out = await this.runGit(worktreePath, ["diff", "--name-only", `${baseRef}...HEAD`]);
       return out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
     } catch {
-      return [];
+      return null;
     }
   }
 

@@ -18,25 +18,48 @@ describe("flagGuardPaths", () => {
       "web/src/pages/Notifications.tsx",
       "api/internal/guardrails/nope.go", // not a guard path (wrong dir)
       "agent/src/guardrails.ts",
+      "agent/src/sdk-executor.ts",
+      "agent/src/sdk-env.ts",
+      "agent/src/git.ts",
       "api/internal/secretbox/box.go",
       "api/internal/vault/vault.go",
       "api/internal/middleware/auth.go",
       "api/internal/workersvc/claim.go",
+      "api/internal/workersvc/service.go",
+      "api/internal/workersvc/judge.go",
+      "api/internal/workersvc/tokens.go", // hypothetical future token file
       "docker-compose.yml",
       ".env.example",
       "README.md",
     ];
     const hits = flagGuardPaths(changed);
-    assert.ok(hits.includes("agent/src/guardrails.ts"));
-    assert.ok(hits.includes("api/internal/secretbox/box.go"));
-    assert.ok(hits.includes("api/internal/vault/vault.go"));
-    assert.ok(hits.includes("api/internal/middleware/auth.go"));
-    assert.ok(hits.includes("api/internal/workersvc/claim.go"));
-    assert.ok(hits.includes("docker-compose.yml"));
-    assert.ok(hits.includes(".env.example"));
+    // Agent-side guardrails + token custody.
+    for (const f of ["agent/src/guardrails.ts", "agent/src/sdk-executor.ts", "agent/src/sdk-env.ts", "agent/src/git.ts"]) {
+      assert.ok(hits.includes(f), `expected ${f} flagged`);
+    }
+    // API auth/secret/vault + workersvc token custody (incl. a future token-named file).
+    for (const f of [
+      "api/internal/secretbox/box.go",
+      "api/internal/vault/vault.go",
+      "api/internal/middleware/auth.go",
+      "api/internal/workersvc/claim.go",
+      "api/internal/workersvc/service.go",
+      "api/internal/workersvc/judge.go",
+      "api/internal/workersvc/tokens.go",
+      "docker-compose.yml",
+      ".env.example",
+    ]) {
+      assert.ok(hits.includes(f), `expected ${f} flagged`);
+    }
     assert.ok(!hits.includes("web/src/pages/Notifications.tsx"));
     assert.ok(!hits.includes("README.md"));
     assert.ok(!hits.includes("api/internal/guardrails/nope.go"));
+  });
+
+  it("does not over-flag ordinary workersvc files", () => {
+    // A non-token workersvc file (e.g. the self_improve run creator itself) is not
+    // guard-critical, so the flag stays a signal, not noise.
+    assert.deepEqual(flagGuardPaths(["api/internal/workersvc/ci_fix.go", "api/internal/workersvc/chat.go"]), []);
   });
 
   it("returns nothing for an all-clear change", () => {
@@ -67,6 +90,16 @@ describe("selfImproveMrSection", () => {
     assert.ok(md.includes("Guard-critical paths touched"));
     assert.ok(md.includes("`agent/src/guardrails.ts`"));
     assert.ok(md.includes("`api/internal/vault/vault.go`"));
+  });
+
+  it("fails CLOSED when the diff is unavailable (null), not silently clean", () => {
+    // null guardHits means the changed-file diff could not be computed — the section
+    // must surface that loudly, NOT read as "no guard paths touched" (M5 audit).
+    const md = selfImproveMrSection(null, checks);
+    assert.ok(md.includes("Guard-path check: UNAVAILABLE"));
+    assert.ok(md.includes("MANUALLY"));
+    // Test evidence still renders.
+    assert.ok(md.includes("Test evidence"));
   });
 });
 
@@ -127,6 +160,9 @@ describe("buildSelfImprovePlanPrompt", () => {
 
   it("a nonce'd fence resists a </recommendations> breakout embedded in a rationale", () => {
     // A hostile improve_uzi rationale tries to close the fence and inject instructions.
+    // The backlog (ListOpenImproveUziRecommendations) is GLOBAL — any judge-enabled
+    // user's forged rationale reaches the ADMIN's autonomous prompt (M5 audit
+    // cross-user angle) — so this content is untrusted regardless of who authored it.
     // The sanitizer keeps angle brackets/newlines, so this reaches the prompt verbatim;
     // the real fence carries an unpredictable nonce the attacker cannot know.
     const p = buildSelfImprovePlanPrompt({

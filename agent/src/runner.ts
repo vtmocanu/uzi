@@ -253,9 +253,12 @@ export class RunRunner {
       let selfImproveSection: string | undefined;
       if (claim.kind === "self_improve") {
         batcher.emit({ kind: "status", agent: "worker", payload: { text: "self-improvement: running the test suites for MR evidence" } });
+        // changedFiles returns null when the diff could not be computed → pass null
+        // through so the MR section fails CLOSED (a loud "guard-path check unavailable"
+        // note) instead of silently suppressing the flag (M5 audit).
         const changed = await this.git.changedFiles(barePath, worktree.path);
         const checks = await runSelfImproveChecks(worktree.path, this.checkRunner);
-        selfImproveSection = selfImproveMrSection(flagGuardPaths(changed), checks);
+        selfImproveSection = selfImproveMrSection(changed === null ? null : flagGuardPaths(changed), checks);
       }
 
       // The agent signalled done. The WORKER now performs the authenticated push
