@@ -22,6 +22,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/theme"
@@ -48,6 +49,23 @@ const (
 	KeyPublicBaseURL = "public_base_url"
 	KeySlackBotToken = "slack_bot_token"
 	KeySlackAppToken = "slack_app_token"
+	// Run-judge keys (PRD #46 Decision 7). judge_enabled is the global kill-switch
+	// (text "true"/"false"); judge_model is the cheap model the judge runs on
+	// (a model alias, validated with the PRD #17 rules). Both are admin-writable and
+	// carry compiled-in defaults.
+	KeyJudgeEnabled = "judge_enabled"
+	KeyJudgeModel   = "judge_model"
+	// Self-improvement keys (PRD #46 Decision 9). selfimprove_enabled/interval are
+	// admin-configurable (with defaults). selfimprove_repo/user_id/last_run_at are
+	// ENGINE-MANAGED state, NOT admin-writable through the generic settings PUT: they
+	// are deliberately absent from Defaults so Known() rejects a body write (audit H3
+	// keeps selfimprove_user_id off the request path), and the M5 engine sets them via
+	// UpsertAppSetting directly. Their typed accessors read straight from the store.
+	KeySelfimproveEnabled   = "selfimprove_enabled"
+	KeySelfimproveInterval  = "selfimprove_interval"
+	KeySelfimproveRepo      = "selfimprove_repo"
+	KeySelfimproveUserID    = "selfimprove_user_id"
+	KeySelfimproveLastRunAt = "selfimprove_last_run_at"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -66,6 +84,16 @@ const (
 	// only resolves for the laptop's own user; a Tailscale/LAN URL overrides it.
 	DefaultSlackEnabled  = "false"
 	DefaultPublicBaseURL = "http://127.0.0.1:8080"
+	// PRD #46. The judge is OFF until an admin enables it (it spends user tokens), so
+	// the whole feature is a strict no-op on a fresh instance. The default model is
+	// the cheap haiku alias — a retrospective is a single compacted-trace round-trip,
+	// so the cheapest capable model is the right default (Decision 7).
+	DefaultJudgeEnabled = "false"
+	DefaultJudgeModel   = "haiku"
+	// PRD #46 Decision 9. Self-improvement is OFF by default; when an admin enables
+	// it, the engine reviews uzi's own repo on the configured interval (2 days).
+	DefaultSelfimproveEnabled  = "false"
+	DefaultSelfimproveInterval = "48h"
 )
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
@@ -94,6 +122,14 @@ var Defaults = map[string]string{
 	// row: an absent row synthesizes to these defaults, and no migration adds them.
 	KeySlackEnabled:  DefaultSlackEnabled,
 	KeyPublicBaseURL: DefaultPublicBaseURL,
+	// PRD #46 admin-writable keys. No seeded row (an absent row synthesizes to these
+	// defaults). The three engine-managed selfimprove keys (repo/user_id/last_run_at)
+	// are deliberately NOT here — see their KeySelfimprove* doc — so a body PUT to
+	// them is rejected as unknown and only the M5 engine writes them.
+	KeyJudgeEnabled:         DefaultJudgeEnabled,
+	KeyJudgeModel:           DefaultJudgeModel,
+	KeySelfimproveEnabled:   DefaultSelfimproveEnabled,
+	KeySelfimproveInterval:  DefaultSelfimproveInterval,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -349,6 +385,88 @@ func (c *Cache) PublicBaseURL(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyPublicBaseURL)
 }
 
+// JudgeEnabled reports whether the run-judge feature is enabled instance-wide
+// (PRD #46 Decision 7): the global kill-switch. Stored as the text "true"/"false";
+// any other value falls back to the compiled-in default (false) — the same strict
+// junk-tolerance as SlackEnabled, so a malformed value never silently turns token
+// spend on.
+func (c *Cache) JudgeEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyJudgeEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultJudgeEnabled == "true", err
+	}
+}
+
+// JudgeModel returns the model alias the judge runs on (PRD #46 Decision 7). Falls
+// back to the cheap DefaultJudgeModel ("haiku").
+func (c *Cache) JudgeModel(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyJudgeModel)
+}
+
+// SelfimproveEnabled reports whether the self-improvement scheduler is enabled
+// (PRD #46 Decision 9). Strict "true"/"false" with a false fallback, like
+// JudgeEnabled — a malformed value never silently starts autonomous runs.
+func (c *Cache) SelfimproveEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeySelfimproveEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultSelfimproveEnabled == "true", err
+	}
+}
+
+// SelfimproveInterval returns the scheduler tick interval (PRD #46 Decision 9).
+// Stored as a Go duration string ("48h"); a missing or unparseable value falls
+// back to the compiled-in default so a bad row never yields a zero interval that
+// would tick every cycle.
+func (c *Cache) SelfimproveInterval(ctx context.Context) (time.Duration, error) {
+	v, err := c.get(ctx, KeySelfimproveInterval)
+	d, perr := time.ParseDuration(v)
+	if perr != nil || d <= 0 {
+		d, _ = time.ParseDuration(DefaultSelfimproveInterval)
+	}
+	return d, err
+}
+
+// SelfimproveRepo returns the connected uzi repo id the self-improvement job runs
+// against (PRD #46 Decision 9), or "" when unset. Engine-managed state; not
+// admin-writable through the settings PUT.
+func (c *Cache) SelfimproveRepo(ctx context.Context) (string, error) {
+	return c.get(ctx, KeySelfimproveRepo)
+}
+
+// SelfimproveUserID returns the enabling admin's user id — the run owner whose
+// token the self-improvement job spends (PRD #46 Decision 9), or "" when unset.
+// Engine-managed and set ONLY to the authenticated session admin (audit H3), never
+// from a request body; not admin-writable through the settings PUT.
+func (c *Cache) SelfimproveUserID(ctx context.Context) (string, error) {
+	return c.get(ctx, KeySelfimproveUserID)
+}
+
+// SelfimproveLastRunAt returns the durable timestamp of the last self-improvement
+// run creation (PRD #46 Decision 9) and whether one is recorded. Persisted (not an
+// in-memory ticker) so "due" survives an API restart. Engine-managed state; an
+// absent or unparseable value reports (zero, false).
+func (c *Cache) SelfimproveLastRunAt(ctx context.Context) (time.Time, bool, error) {
+	v, err := c.get(ctx, KeySelfimproveLastRunAt)
+	if strings.TrimSpace(v) == "" {
+		return time.Time{}, false, err
+	}
+	t, perr := time.Parse(time.RFC3339, v)
+	if perr != nil {
+		return time.Time{}, false, err
+	}
+	return t, true, err
+}
+
 // SlackBotToken returns the effective Slack bot token in plaintext (PRD #25):
 // the ENV value when set, else the sealed DB row decrypted. Empty string + nil
 // error when neither is configured. Only slacksvc calls this — it is the sole
@@ -498,8 +616,12 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
-	case KeyPrdlessEnabled, KeySlackEnabled:
+	case KeyPrdlessEnabled, KeySlackEnabled, KeyJudgeEnabled, KeySelfimproveEnabled:
 		return validateBool(value)
+	case KeyJudgeModel:
+		return validateModelAlias(value)
+	case KeySelfimproveInterval:
+		return validateDuration(value)
 	case KeyPublicBaseURL:
 		return ValidatePublicBaseURL(value)
 	case KeySlackBotToken:
@@ -525,6 +647,32 @@ func validateSlackToken(value, prefix, kind string) error {
 	}
 	if !strings.HasPrefix(value, prefix) {
 		return fmt.Errorf("%s token must start with %s", kind, prefix)
+	}
+	return nil
+}
+
+// validateModelAlias is the format gate for the judge model setting (PRD #46): a
+// non-empty model alias / id, checked with the shared PRD #17 rules (single token,
+// no control chars, length-capped). Blank is rejected here (unlike the per-user
+// inherit case) — the judge always needs a concrete model.
+func validateModelAlias(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("must not be empty")
+	}
+	_, err := agenttmpl.ValidateModel(value)
+	return err
+}
+
+// validateDuration is the format gate for a duration setting (PRD #46
+// selfimprove_interval): a Go duration string ("48h", "30m") that parses to a
+// strictly positive value, so the scheduler never gets a zero/negative interval.
+func validateDuration(value string) error {
+	d, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New(`must be a duration like "48h"`)
+	}
+	if d <= 0 {
+		return errors.New("must be a positive duration")
 	}
 	return nil
 }
