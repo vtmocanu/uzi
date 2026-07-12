@@ -63,6 +63,7 @@ export const SELF_IMPROVE_CHECKS: SelfImproveCheck[] = [
   { name: "api: go test ./...", cwd: "api", command: "go", args: ["test", "./..."] },
   { name: "web: npm test", cwd: "web", command: "npm", args: ["test"] },
   { name: "web: npm run build", cwd: "web", command: "npm", args: ["run", "build"] },
+  { name: "agent: npm run typecheck", cwd: "agent", command: "npm", args: ["run", "typecheck"] },
   { name: "agent: npm test", cwd: "agent", command: "npm", args: ["test"] },
 ];
 
