@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
@@ -66,7 +68,14 @@ func (h *Handler) SetUserJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 		JudgeEnabled: req.Enabled,
 	})
 	if err != nil {
-		httpx.Error(w, http.StatusNotFound, "user not found")
+		// A no-op UPDATE (unknown id) returns no row → 404; anything else is a real
+		// DB failure → 500 (don't mask it as "user not found").
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "user not found")
+			return
+		}
+		slog.Error("admin set judge enabled", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"user": toDTO(updated)})

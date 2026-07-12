@@ -60,7 +60,8 @@ const (
 	// ENGINE-MANAGED state, NOT admin-writable through the generic settings PUT: they
 	// are deliberately absent from Defaults so Known() rejects a body write (audit H3
 	// keeps selfimprove_user_id off the request path), and the M5 engine sets them via
-	// UpsertAppSetting directly. Their typed accessors read straight from the store.
+	// UpsertAppSetting directly (calling Cache.Invalidate() after, so the next read is
+	// fresh). Their typed accessors read through this same TTL cache, not the store.
 	KeySelfimproveEnabled   = "selfimprove_enabled"
 	KeySelfimproveInterval  = "selfimprove_interval"
 	KeySelfimproveRepo      = "selfimprove_repo"

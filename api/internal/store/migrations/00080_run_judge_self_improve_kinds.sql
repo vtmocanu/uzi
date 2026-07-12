@@ -28,7 +28,7 @@ ALTER TABLE runs DROP CONSTRAINT runs_kind_check;
 ALTER TABLE runs ADD CONSTRAINT runs_kind_check
     CHECK (kind IN ('issue', 'ci_fix', 'chat', 'judge', 'self_improve'));
 
--- Rework the per-kind shape. The four existing clauses are carried verbatim from
+-- Rework the per-kind shape. The three existing clauses are carried verbatim from
 -- 00053; judge and self_improve are added. judge is repo/issue/branch-less and MUST
 -- carry a target_run_id; self_improve is issue-shaped like an issue run.
 ALTER TABLE runs DROP CONSTRAINT runs_kind_shape;
@@ -36,7 +36,7 @@ ALTER TABLE runs ADD CONSTRAINT runs_kind_shape CHECK (
     (kind = 'issue'        AND repo_id IS NOT NULL AND issue_iid IS NOT NULL)
  OR (kind = 'ci_fix'       AND repo_id IS NOT NULL AND pipeline_id IS NOT NULL AND pipeline_ref IS NOT NULL)
  OR (kind = 'chat'         AND repo_id IS NULL AND issue_iid IS NULL AND branch IS NULL)
- OR (kind = 'judge'        AND repo_id IS NULL AND issue_iid IS NULL AND target_run_id IS NOT NULL)
+ OR (kind = 'judge'        AND repo_id IS NULL AND issue_iid IS NULL AND branch IS NULL AND target_run_id IS NOT NULL)
  OR (kind = 'self_improve' AND repo_id IS NOT NULL AND issue_iid IS NOT NULL));
 
 -- One non-terminal judge per reviewed run (Decision 8): enforced AT ENQUEUE, so a
