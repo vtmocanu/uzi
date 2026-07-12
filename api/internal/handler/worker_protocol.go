@@ -106,12 +106,12 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// unadvertised) with a warn — like a malformed template, never a 400. The worker
 	// validates ≥ 1 and warns above the documented soft ceiling before sending (M2);
 	// this is the server-side backstop against a hostile/garbled report.
-	cap := req.MaxConcurrentRuns
-	if cap != nil && (*cap < 1 || *cap > maxAdvertisedConcurrentRuns) {
-		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *cap)
-		cap = nil
+	advertisedCap := req.MaxConcurrentRuns
+	if advertisedCap != nil && (*advertisedCap < 1 || *advertisedCap > maxAdvertisedConcurrentRuns) {
+		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
+		advertisedCap = nil
 	}
-	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, cap)
+	updated, err := h.wsvc.Register(r.Context(), wkr, version, reported, advertisedCap)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -121,7 +121,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id": updated.ID.String(),
-		"worker":    workerDTOFromWorker(updated, 0),
+		"worker":    workerDTOFromWorker(updated, 0, false),
 	})
 }
 
@@ -138,7 +138,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false)})
 }
 
 // WorkerClaim atomically claims the next run for the worker's user. 204 when the

@@ -66,12 +66,14 @@ type workerDTO struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Status string `json:"status"`
-	// Busy stays for back-compat (PRD #42 Decision 10): it is now derived as
-	// active_runs > 0, so a consumer that only reads busy is unchanged.
+	// Busy is the any-kind non-terminal signal (PRD #42 Decision 10): true whenever
+	// the worker holds ANY active run, chat included — so a lone active chat still
+	// reads as busy even though active_runs (run-lane only) is 0.
 	Busy bool `json:"busy"`
-	// ActiveRuns is the worker's live count of non-terminal runs; MaxConcurrentRuns
-	// is its advertised slot cap (null when unadvertised). Together they drive the
-	// "N/M runs" saturation badge (PRD #42).
+	// ActiveRuns is the worker's live count of active RUN-lane runs (chat excluded —
+	// chat has its own session budget); MaxConcurrentRuns is its advertised slot cap
+	// (null when unadvertised). Together they drive the "N/M runs" saturation badge
+	// (PRD #42).
 	ActiveRuns        int  `json:"active_runs"`
 	MaxConcurrentRuns *int `json:"max_concurrent_runs"`
 	// Worker template (PRD #18): the UI-declared choice and the worker's
@@ -84,15 +86,17 @@ type workerDTO struct {
 	CreatedAt        time.Time  `json:"created_at"`
 }
 
-// workerDTOFromWorker builds the DTO from a bare worker row plus its active-run
-// count (busy is derived from the count). The register/heartbeat/create paths do
-// not compute the count and pass 0, exactly as they previously passed busy=false.
-func workerDTOFromWorker(w store.Worker, activeRuns int) workerDTO {
+// workerDTOFromWorker builds the DTO from a bare worker row plus its active (non-chat)
+// run count and its any-kind busy flag — both computed by the list queries, never
+// derivable from a bare Worker row. The register/heartbeat/create paths hold neither
+// (a just-registered worker has requeued its orphans and holds nothing), so they pass
+// 0/false, exactly as they previously passed busy=false.
+func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) workerDTO {
 	return workerDTO{
 		ID:                w.ID.String(),
 		Name:              w.Name,
 		Status:            w.Status,
-		Busy:              activeRuns > 0,
+		Busy:              busy,
 		ActiveRuns:        activeRuns,
 		MaxConcurrentRuns: intPtrValue(w.MaxConcurrentRuns),
 		TemplateDeclared:  textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
@@ -108,7 +112,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
 		ID:                w.ID.String(),
 		Name:              w.Name,
 		Status:            w.Status,
-		Busy:              w.ActiveRuns > 0,
+		Busy:              w.Busy,
 		ActiveRuns:        int(w.ActiveRuns),
 		MaxConcurrentRuns: intPtrValue(w.MaxConcurrentRuns),
 		TemplateDeclared:  textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
@@ -299,7 +303,7 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0),
+		"worker": workerDTOFromWorker(wkr, 0, false),
 		"token":  token,
 	})
 }

@@ -1082,10 +1082,16 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 
 const listAllWorkers = `-- name: ListAllWorkers :many
 SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs,
+       EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+       ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.kind <> 'chat'
        ) AS active_runs,
        u.email AS owner_email
 FROM workers w
@@ -1095,13 +1101,17 @@ ORDER BY w.created_at DESC
 
 type ListAllWorkersRow struct {
 	Worker     Worker `json:"worker"`
+	Busy       bool   `json:"busy"`
 	ActiveRuns int64  `json:"active_runs"`
 	OwnerEmail string `json:"owner_email"`
 }
 
-// Admin Agents-status: every worker with its live active-run count (PRD #42
-// Decision 10; busy is derivable as active_runs > 0) and owner email. The embedded
-// worker carries max_concurrent_runs (the advertised cap, NULL when unadvertised).
+// Admin Agents-status: every worker with owner email plus the same two derived
+// signals as ListWorkersByUser (PRD #42 Decision 10): busy is the ANY-kind
+// non-terminal EXISTS, active_runs is the NON-CHAT active count (chat runs are
+// excluded so a live chat never inflates "N/M runs" past the run-lane cap). The
+// embedded worker carries max_concurrent_runs (the advertised cap, NULL when
+// unadvertised).
 func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, error) {
 	rows, err := q.db.Query(ctx, listAllWorkers)
 	if err != nil {
@@ -1124,6 +1134,7 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.TemplateDeclared,
 			&i.Worker.TemplateReported,
 			&i.Worker.MaxConcurrentRuns,
+			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
 		); err != nil {
@@ -1482,10 +1493,16 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
 SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs,
+       EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+       ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.kind <> 'chat'
        ) AS active_runs
 FROM workers w
 WHERE w.user_id = $1
@@ -1505,15 +1522,21 @@ type ListWorkersByUserRow struct {
 	TemplateDeclared  pgtype.Text        `json:"template_declared"`
 	TemplateReported  pgtype.Text        `json:"template_reported"`
 	MaxConcurrentRuns pgtype.Int4        `json:"max_concurrent_runs"`
+	Busy              bool               `json:"busy"`
 	ActiveRuns        int64              `json:"active_runs"`
 }
 
-// Worker list for the owning user. active_runs is the live count of the worker's
-// non-terminal runs (PRD #42 Decision 10: the count replaced the old EXISTS-derived
-// boolean so the UI can show "N/M runs"); "busy" stays derivable as active_runs > 0,
-// so consumers that only cared about busy are unchanged. max_concurrent_runs is the
-// worker's advertised slot cap, carried by w.* (NULL when unadvertised); it is
-// observability only and never enforced.
+// Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
+//   - active_runs counts the worker's NON-CHAT active runs (claimed/running/
+//     awaiting_approval) — the RUN lane that max_concurrent_runs bounds. Chat runs
+//     have their own session budget (WORKER_CHAT_SESSIONS) and ClaimRun excludes
+//     them, so counting a live chat here would render a false "3/2 runs" over-cap.
+//   - busy is the ANY-kind non-terminal signal (a lone active chat still shows the
+//     worker as busy), so it is its own EXISTS over every kind — NOT derived from
+//     active_runs, which now omits chat.
+//
+// max_concurrent_runs (the advertised cap, NULL when unadvertised) rides on w.*; it
+// is observability only and never enforced.
 func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]ListWorkersByUserRow, error) {
 	rows, err := q.db.Query(ctx, listWorkersByUser, userID)
 	if err != nil {
@@ -1536,6 +1559,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.TemplateDeclared,
 			&i.TemplateReported,
 			&i.MaxConcurrentRuns,
+			&i.Busy,
 			&i.ActiveRuns,
 		); err != nil {
 			return nil, err

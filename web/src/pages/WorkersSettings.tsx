@@ -7,7 +7,7 @@ import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Sel
 import { SettingsShell } from "../components/SettingsShell";
 import { ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
-import { workerRunBadge } from "../lib/workerRuns";
+import { WorkerRunBadge } from "../components/WorkerRunBadge";
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -193,16 +193,7 @@ export function WorkersSettings() {
                   <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                     {w.status}
                   </Badge>
-                  {(() => {
-                    const runBadge = workerRunBadge(w);
-                    return (
-                      runBadge && (
-                        <Badge tone={runBadge.tone} title={runBadge.title}>
-                          {runBadge.label}
-                        </Badge>
-                      )
-                    );
-                  })()}
+                  <WorkerRunBadge worker={w} />
                   <Button variant="danger" size="sm" onClick={() => remove(w.id)}>
                     Delete
                   </Button>

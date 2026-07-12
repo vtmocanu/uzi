@@ -107,52 +107,91 @@ func TestWorkerConcurrencyLiveDB(t *testing.T) {
 	seedRun(21, "completed", &wkr.ID)   // and excludes terminal
 	seedRun(22, "running", nil)         // a run held by no worker must not inflate the count
 
+	// seedChatRun inserts an ACTIVE chat run (kind='chat' ⇒ repo_id/issue_iid/branch
+	// all NULL per runs_kind_shape) held by holder. A chat is active for busy but is
+	// EXCLUDED from active_runs (it does not consume a run-lane slot; PRD #42).
+	seedChatRun := func(status string, holder uuid.UUID) {
+		id := uuid.New()
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, worker_id)
+			 VALUES ($1, $2, 'chat', 't', 'd', $3, $4)`, id, userID, status, holder)
+	}
+	// wkr also holds a live chat: it must NOT bump active_runs past the 3 run-lane runs.
+	seedChatRun("running", wkr.ID)
+
+	// A SECOND worker holds ONLY an active chat: busy=true, active_runs=0 (the exact
+	// case the naive "busy = active_runs > 0" derivation would get wrong).
+	wkr2, err := q.CreateWorker(ctx, store.CreateWorkerParams{
+		UserID: userID, Name: "chat-only", TokenHash: []byte{0xcc, 0xdd},
+	})
+	if err != nil {
+		t.Fatalf("CreateWorker(wkr2): %v", err)
+	}
+	seedChatRun("running", wkr2.ID)
+
 	const wantActive = 3
 
-	// ── ListWorkersByUser: active_runs = 3, busy derivable, cap = 3. ──
+	// ── ListWorkersByUser: wkr = active_runs 3 / busy true / cap 3; the chat-only
+	//    worker = active_runs 0 but busy true. ──
 	byUser, err := q.ListWorkersByUser(ctx, userID)
 	if err != nil {
 		t.Fatalf("ListWorkersByUser: %v", err)
 	}
-	var found bool
+	var sawWkr, sawChatOnly bool
 	for _, row := range byUser {
-		if row.ID != wkr.ID {
-			continue
-		}
-		found = true
-		if row.ActiveRuns != wantActive {
-			t.Fatalf("ListWorkersByUser active_runs = %d, want %d", row.ActiveRuns, wantActive)
-		}
-		if !(row.ActiveRuns > 0) {
-			t.Fatalf("busy must be derivable (active_runs > 0), got active_runs = %d", row.ActiveRuns)
-		}
-		if !row.MaxConcurrentRuns.Valid || row.MaxConcurrentRuns.Int32 != 3 {
-			t.Fatalf("ListWorkersByUser cap = %+v, want 3", row.MaxConcurrentRuns)
+		switch row.ID {
+		case wkr.ID:
+			sawWkr = true
+			if row.ActiveRuns != wantActive {
+				t.Fatalf("ListWorkersByUser active_runs = %d, want %d (chat must not count)", row.ActiveRuns, wantActive)
+			}
+			if !row.Busy {
+				t.Fatalf("ListWorkersByUser busy = false, want true")
+			}
+			if !row.MaxConcurrentRuns.Valid || row.MaxConcurrentRuns.Int32 != 3 {
+				t.Fatalf("ListWorkersByUser cap = %+v, want 3", row.MaxConcurrentRuns)
+			}
+		case wkr2.ID:
+			sawChatOnly = true
+			if row.ActiveRuns != 0 {
+				t.Fatalf("chat-only worker active_runs = %d, want 0 (chat excluded)", row.ActiveRuns)
+			}
+			if !row.Busy {
+				t.Fatalf("chat-only worker busy = false, want true (a live chat is still busy)")
+			}
 		}
 	}
-	if !found {
-		t.Fatalf("worker %s missing from ListWorkersByUser", wkr.ID)
+	if !sawWkr || !sawChatOnly {
+		t.Fatalf("ListWorkersByUser missing a worker: sawWkr=%v sawChatOnly=%v", sawWkr, sawChatOnly)
 	}
 
-	// ── ListAllWorkers (admin): same count on the embedded worker row. ──
+	// ── ListAllWorkers (admin): same busy/active_runs split on the embedded rows. ──
 	all, err := q.ListAllWorkers(ctx)
 	if err != nil {
 		t.Fatalf("ListAllWorkers: %v", err)
 	}
-	found = false
+	sawWkr, sawChatOnly = false, false
 	for _, row := range all {
-		if row.Worker.ID != wkr.ID {
-			continue
-		}
-		found = true
-		if row.ActiveRuns != wantActive {
-			t.Fatalf("ListAllWorkers active_runs = %d, want %d", row.ActiveRuns, wantActive)
-		}
-		if !row.Worker.MaxConcurrentRuns.Valid || row.Worker.MaxConcurrentRuns.Int32 != 3 {
-			t.Fatalf("ListAllWorkers cap = %+v, want 3", row.Worker.MaxConcurrentRuns)
+		switch row.Worker.ID {
+		case wkr.ID:
+			sawWkr = true
+			if row.ActiveRuns != wantActive {
+				t.Fatalf("ListAllWorkers active_runs = %d, want %d", row.ActiveRuns, wantActive)
+			}
+			if !row.Busy {
+				t.Fatalf("ListAllWorkers busy = false, want true")
+			}
+			if !row.Worker.MaxConcurrentRuns.Valid || row.Worker.MaxConcurrentRuns.Int32 != 3 {
+				t.Fatalf("ListAllWorkers cap = %+v, want 3", row.Worker.MaxConcurrentRuns)
+			}
+		case wkr2.ID:
+			sawChatOnly = true
+			if row.ActiveRuns != 0 || !row.Busy {
+				t.Fatalf("ListAllWorkers chat-only worker = active_runs %d busy %v, want 0/true", row.ActiveRuns, row.Busy)
+			}
 		}
 	}
-	if !found {
-		t.Fatalf("worker %s missing from ListAllWorkers", wkr.ID)
+	if !sawWkr || !sawChatOnly {
+		t.Fatalf("ListAllWorkers missing a worker: sawWkr=%v sawChatOnly=%v", sawWkr, sawChatOnly)
 	}
 }

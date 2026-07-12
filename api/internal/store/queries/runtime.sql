@@ -19,17 +19,27 @@ SELECT * FROM workers WHERE id = @id;
 SELECT * FROM workers WHERE id = @id AND user_id = @user_id;
 
 -- name: ListWorkersByUser :many
--- Worker list for the owning user. active_runs is the live count of the worker's
--- non-terminal runs (PRD #42 Decision 10: the count replaced the old EXISTS-derived
--- boolean so the UI can show "N/M runs"); "busy" stays derivable as active_runs > 0,
--- so consumers that only cared about busy are unchanged. max_concurrent_runs is the
--- worker's advertised slot cap, carried by w.* (NULL when unadvertised); it is
--- observability only and never enforced.
+-- Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
+--   * active_runs counts the worker's NON-CHAT active runs (claimed/running/
+--     awaiting_approval) — the RUN lane that max_concurrent_runs bounds. Chat runs
+--     have their own session budget (WORKER_CHAT_SESSIONS) and ClaimRun excludes
+--     them, so counting a live chat here would render a false "3/2 runs" over-cap.
+--   * busy is the ANY-kind non-terminal signal (a lone active chat still shows the
+--     worker as busy), so it is its own EXISTS over every kind — NOT derived from
+--     active_runs, which now omits chat.
+-- max_concurrent_runs (the advertised cap, NULL when unadvertised) rides on w.*; it
+-- is observability only and never enforced.
 SELECT w.*,
+       EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+       ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.kind <> 'chat'
        ) AS active_runs
 FROM workers w
 WHERE w.user_id = @user_id
@@ -141,14 +151,23 @@ ORDER BY r.created_at DESC
 LIMIT 500;
 
 -- name: ListAllWorkers :many
--- Admin Agents-status: every worker with its live active-run count (PRD #42
--- Decision 10; busy is derivable as active_runs > 0) and owner email. The embedded
--- worker carries max_concurrent_runs (the advertised cap, NULL when unadvertised).
+-- Admin Agents-status: every worker with owner email plus the same two derived
+-- signals as ListWorkersByUser (PRD #42 Decision 10): busy is the ANY-kind
+-- non-terminal EXISTS, active_runs is the NON-CHAT active count (chat runs are
+-- excluded so a live chat never inflates "N/M runs" past the run-lane cap). The
+-- embedded worker carries max_concurrent_runs (the advertised cap, NULL when
+-- unadvertised).
 SELECT sqlc.embed(w),
+       EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+       ) AS busy,
        (
            SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.kind <> 'chat'
        ) AS active_runs,
        u.email AS owner_email
 FROM workers w
