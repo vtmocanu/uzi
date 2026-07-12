@@ -5114,7 +5114,9 @@ and the M0 verdict that gates them.
   stream **persists and replays** correctly. The stub executor (`agent/src/executor.ts`) gained a
   `UZI_STUB_INTERLEAVE` sentinel (session AI choice) that scripts multiple agents' messages
   interleaved (writes markers + scripted `run_messages`, still never touching the SDK).
-- **The guard asserts** the interleaved stream survives the persisted-first `run_messages` → `/api/ws`
-  path with **gapless per-run `seq`**, **per-agent name attribution intact**, and correct REST
-  `?after=<seq>` **replay** on reconnect — the properties a real parallel run depends on, validated
-  deterministically without a live model. `./e2e/run-e2e.sh` green is the gate.
+- **The guard asserts** the interleaved stream is persisted first into `run_messages` and served
+  back over REST with **gapless per-run `seq`**, **per-agent name attribution intact**, and correct
+  `?after=<seq>` **replay** — i.e. `GET /api/runs/:id/messages`, the leg the isolated stack can drive
+  deterministically. The `/api/ws` broadcast leg is NOT exercised by the e2e (it is web-vitest scope,
+  `e2e/run-e2e.sh:1549` + `e2e/README.md`); persisted `run_messages` + REST `?after` replay are
+  exactly what M5 proves. `./e2e/run-e2e.sh` green is the gate.
