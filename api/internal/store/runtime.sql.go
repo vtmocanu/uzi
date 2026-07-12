@@ -1078,7 +1078,9 @@ JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
-  AND r.kind <> 'chat'
+  -- Exclude chat AND judge (PRD #46): repo-less meta-runs the admin overview omits.
+  -- self_improve has a real repo and stays visible (same rationale as ListRunsForUser).
+  AND r.kind NOT IN ('chat', 'judge')
 ORDER BY r.created_at DESC
 LIMIT 500
 `
@@ -1411,7 +1413,11 @@ FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 WHERE r.user_id = $1
-  AND r.kind <> 'chat'
+  -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
+  -- list never shows. self_improve has a real repo and stays visible. The repos
+  -- INNER JOIN already drops the repo-less kinds; this predicate is the explicit,
+  -- refactor-proof guard (a future LEFT JOIN must not leak judge runs here).
+  AND r.kind NOT IN ('chat', 'judge')
   AND ($2::uuid IS NULL OR r.repo_id = $2)
   AND ($3::bigint IS NULL OR r.issue_iid = $3)
 ORDER BY r.created_at DESC
