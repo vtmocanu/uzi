@@ -78,7 +78,9 @@ function fakeSource(script: ChatInput[]): ChatInputSource {
 const msg = (text: string): ChatInput => ({ kind: "message", text });
 
 function runner(client: WorkerClient, executor: ChatExecutor, source: ChatInputSource, defaults = DEFAULTS): ChatRunner {
-  return new ChatRunner(client, executor, nullLogger(), 5, defaults, JOIN, { makeSource: () => source });
+  // Wrap the single executor as a per-session factory (PRD #42): each execute()
+  // gets it back. Every test here drives a single session, so one instance is fine.
+  return new ChatRunner(client, () => executor, nullLogger(), 5, defaults, JOIN, { makeSource: () => source });
 }
 
 function baseClaim(overrides: Partial<ChatClaimResponse> = {}): ChatClaimResponse {
@@ -181,5 +183,27 @@ describe("ChatRunner — claim → session loop → complete (no clone, no MR)",
     const failed = states.find((s) => s.status === "failed");
     assert.ok(failed, "a failed state was reported");
     assert.match(String(failed!.failure_reason), /no Anthropic OAuth token/);
+  });
+});
+
+describe("ChatRunner — per-session executor isolation (PRD #42 Decision 4)", () => {
+  it("builds a NEW ChatExecutor per session (its spawnedPids are not shared)", async () => {
+    const { client } = fakeClient();
+    const built: ChatExecutor[] = [];
+    // A per-session factory (what main.ts wires) — one fresh executor per execute().
+    const factory = (): ChatExecutor => {
+      const { queryFn } = fakeQuery();
+      const e = new ChatExecutor(nullLogger(), homeDir, { queryFn });
+      built.push(e);
+      return e;
+    };
+    const rnr = new ChatRunner(client, factory, nullLogger(), 5, DEFAULTS, JOIN, {
+      makeSource: () => fakeSource([msg("hi"), { kind: "idle" }]),
+    });
+    await rnr.execute(baseClaim({ run_id: "chat-a" }));
+    await rnr.execute(baseClaim({ run_id: "chat-b" }));
+
+    assert.strictEqual(built.length, 2, "one ChatExecutor built per session");
+    assert.notStrictEqual(built[0], built[1], "each session gets its OWN instance (private spawnedPids)");
   });
 });

@@ -11,15 +11,15 @@ import type { Logger } from "./log.js";
 import type { RunContext } from "./executor.js";
 import { provisionTools } from "./provision.js";
 import { extractRepoDevboxPackages, mergeToolPackages } from "./repo-tools.js";
-import { errMessage } from "./util.js";
+import { errMessage, RUN_ID_RE } from "./util.js";
 
 /** Reason prefix for a provisioning failure (the run fails, never degrades). */
 export const REASON_PROVISION_FAILED = "tool provisioning failed before the agent could start";
 
-// ctx.runId becomes a path segment under provisionRoot; reject anything not
-// UUID-shaped so a malformed id can never traverse out (defense in depth — the id
-// is a server-issued UUID).
-const RUN_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+// ctx.runId becomes a path segment under provisionRoot; RUN_ID_RE (util.ts) rejects
+// anything not UUID-shaped so a malformed id can never traverse out (defense in
+// depth — the id is a server-issued UUID). Same guard the runner applies to the
+// per-run HOME.
 
 export interface ProvisionRunDeps {
   /** Root for per-run provisioning dirs, OUTSIDE any clone (Decision 3). */
