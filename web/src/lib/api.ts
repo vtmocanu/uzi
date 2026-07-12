@@ -394,6 +394,11 @@ export interface SettingsResponse {
   // Live Slack socket connection state (PRD #25 M2): "disabled" | "connecting" |
   // "connected" | "error:<class>". The admin Slack card renders it as a chip.
   slack_status: string;
+  // OIDC SSO health (PRD #45, Nit6): "disabled" | "ok" | "degraded" (configured but
+  // discovery is failing). oidc_provider_name is the button label. Optional so an
+  // older server omits them.
+  oidc_status?: string;
+  oidc_provider_name?: string;
 }
 
 // UpdateSettingsPayload extends the non-secret settings with the write-only
@@ -444,6 +449,14 @@ export interface SessionResponse {
 export interface AuthConfig {
   registration_enabled: boolean;
   allowed_email_domains: string[];
+  // OIDC SSO (PRD #45). oidc_enabled reflects whether SSO is CONFIGURED (not whether
+  // discovery has succeeded — the button stays visible so the lazy discovery-retry is
+  // reachable when the IdP was down at boot). password_login_enabled hides the
+  // password form + register when an operator goes SSO-only. All optional: an older
+  // server omits them and reads as OIDC-off / password-on.
+  oidc_enabled?: boolean;
+  oidc_provider_name?: string;
+  password_login_enabled?: boolean;
 }
 
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────

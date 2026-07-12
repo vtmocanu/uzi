@@ -98,6 +98,16 @@ func (p *Provider) Discover(ctx context.Context) error {
 	return p.ensure(ctx)
 }
 
+// Discovered reports whether provider discovery has succeeded and is cached. It is
+// non-blocking (never networks), so the admin settings status line can distinguish
+// "ok" from "configured-but-degraded" without hanging on a down IdP (review Nit6).
+// A false result clears itself on the next successful login-triggered discovery.
+func (p *Provider) Discovered() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.provider != nil
+}
+
 // ensure runs discovery at most once on success and caches the derived verifier +
 // oauth2 config. Concurrent callers collapse onto one in-flight discovery via
 // singleflight, so a slow/unreachable IdP does not serialize every pending login

@@ -189,7 +189,14 @@ function settingsResponse(): SettingsResponse {
   for (const key of Object.keys(appSettings)) sources[key] = "db";
   for (const key of Object.keys(slackSecrets)) sources[key] = slackSecrets[key] ? "db" : "default";
   // The demo has no real socket, so Slack is always "disabled" here.
-  return { settings: { ...appSettings }, secrets: { ...slackSecrets }, sources, slack_status: "disabled" };
+  return {
+    settings: { ...appSettings },
+    secrets: { ...slackSecrets },
+    sources,
+    slack_status: "disabled",
+    oidc_status: "disabled", // no real IdP in the demo (PRD #45)
+    oidc_provider_name: "SSO",
+  };
 }
 let templateCounter = 0;
 let workerCounter = 0;
@@ -295,7 +302,15 @@ export const mockApi = {
     return delay(sessionBody());
   },
   // Demo mode has registration open and unrestricted.
-  authConfig: async () => delay({ registration_enabled: true, allowed_email_domains: [] }),
+  authConfig: async () =>
+    delay({
+      registration_enabled: true,
+      allowed_email_domains: [],
+      // OIDC is off in the demo (no real IdP); password login stays on (PRD #45 N6).
+      oidc_enabled: false,
+      oidc_provider_name: "SSO",
+      password_login_enabled: true,
+    }),
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });
