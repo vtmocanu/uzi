@@ -400,6 +400,17 @@ queued → claimed → running → awaiting_approval → running → completed
 - The full message history (`run_messages`, gapless per-run `seq`) and any
   captured plan/session id survive every transition above, so a resumed run
   continues exactly where it left off — see Live message stream, below.
+- **Bounded worker concurrency** (PRD #42, `adr/0042-worker-run-concurrency.md`): a
+  worker may drive more than one of these state machines at once, capped by a
+  worker-side slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — the serial
+  behavior above, unchanged) that the worker advertises at registration but the
+  server never enforces. A run parked at `awaiting_approval` holds its slot the
+  whole time, same as any other non-terminal run. Cap>1 is an informed opt-in with
+  two accepted intra-user residuals (a same-uid sibling briefly reading a
+  push-window credential; Bash writes reaching outside a run's own worktree),
+  documented at the knob in [docs/worker-setup.md](docs/worker-setup.md#concurrent-runs);
+  the real fix — container-per-run — belongs to the future k8s-operator deployment
+  (see Not yet in scope, below).
 
 ### Secrets: who holds what
 

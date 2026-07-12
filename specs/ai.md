@@ -874,8 +874,11 @@ M2 builds the container + protocol + git around a stub executor).
   rewrite.
 - **Outbound loop** (`worker.ts`): register-with-retry once, then a heartbeat loop
   and a claim loop run concurrently until abort. Claim → execute a run to a terminal
-  state → immediately try the next; otherwise wait `WORKER_POLL_INTERVAL` (3s). **One
-  run at a time** in M2.
+  state → immediately try the next slot; otherwise wait `WORKER_POLL_INTERVAL` (3s).
+  **Bounded by the cap, default 1** (PRD #42 / ADR-42, landed after M2): a
+  worker-side slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`) claims a run only when a
+  slot is free, so at the default cap this is observably identical to the original
+  one-run-at-a-time M2 loop.
 - **Config** (`config.ts`, from env): `UZI_API_URL`, `UZI_WORKER_TOKEN`, `UZI_DATA_DIR`
   (default `/data`), `UZI_WORKER_NAME` (default hostname), plus interval knobs that
   accept **either a Go-style duration** (`15s`, `500ms`, `2h`) or a bare integer as
@@ -4601,3 +4604,27 @@ PRD carries the complete set (1–15) and the review corrections.
   SUGGESTS but never forces the `PRD` label on a chat-created issue (labels stay model/user-supplied +
   human-confirmed). Admin human-visibility of chat runs is retained (admins can read the DB anyway); a per-kind
   admin exemption is a recorded revisit candidate.
+
+## 176. Worker ↔ run concurrency model — ADR-42 (PRD #42, landed)
+
+- **Decision**: a worker may execute multiple runs concurrently, bounded by a worker-side
+  slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`, default 1 — default behavior unchanged);
+  the cap is advertised at registration for observability but never enforced server-side.
+  The server deliberately does NOT enforce 1:1 worker:run (a DB constraint there would
+  have blocked PRD #39's chat lane and encoded scaling policy in the schema).
+- **§877-878's "one run at a time" prose is now "bounded by the cap, default 1"**; §669's
+  one-*worker*-per-user invariant is untouched — a different guarantee this PRD does not
+  touch.
+- **Cap>1 is an informed opt-in with two accepted intra-user residuals** (sibling `/proc`
+  PAT exposure during push windows; Bash cross-run worktree writes — documented at the
+  knob in `docs/worker-setup.md`); the real fix is the k8s uid-split/container-per-run
+  era (§168), where each operator-spawned pod is a single-slot worker and this design
+  composes unchanged. Full research, options, and rationale: `adr/0042-worker-run-concurrency.md`;
+  implementation design and milestones: `prds/42-worker-run-concurrency.md`.
+- **Per-run `HOME` cleanup residual**: cleanup runs whenever `execute()` reaches a local
+  terminal outcome, even if the terminal `/state` report itself failed to reach the
+  server (`runner.ts`'s `finally`, logged not thrown) — so a run stuck `running`
+  server-side after a failed report, later requeued by the sweeper, resumes into a
+  fresh `HOME` with no prior session to attach to. The *designed* resume path (the
+  worker process dies mid-run) is unaffected: `execute()` never reaches this `finally`
+  there, so `HOME` survives for the requeued run to reattach to.
