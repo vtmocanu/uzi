@@ -72,7 +72,49 @@ The worker image installs a **pinned** devbox binary and nix at build time (no f
 
 - **online**: a recent heartbeat arrived within the server's staleness window.
 - **offline**: no heartbeat in time; the server re-queues any run the worker was holding.
-- **busy**: the worker currently holds a non-terminal run (it claims at most one at a time).
+- **busy**: the worker holds one or more non-terminal runs — by default just one at a
+  time; see [Concurrent runs](#concurrent-runs) to raise that.
+
+## Concurrent runs
+
+By default a worker executes one run at a time. Set `WORKER_MAX_CONCURRENT_RUNS`
+above 1 (see [configuration.md](./configuration.md)) to let it run several runs
+concurrently, each in its own slot. A slot is roughly one SDK CLI process, its git
+operations, and any devbox tool provisioning it triggers — size the cap to what the
+host can actually run at once; the worker still honors a value above the soft
+ceiling of 8, but warns at boot that it probably shouldn't. The cap is worker-side
+only: it's reported at registration so **Settings → Workers** can show `active/cap`,
+but the server never enforces it.
+
+A run parked at the plan-approval gate holds its slot for the whole wait, up to
+`WORKER_PLAN_APPROVAL_TIMEOUT` (default 24h) — approve your plans, since an
+unapproved one pins a slot until it times out. At the default cap of 1 that's
+already today's behavior.
+
+Raising the cap is an informed trade-off, not a free speedup:
+
+- **A live sibling run can briefly read a push in progress.** Runs share the same
+  container user, so a concurrent run's agent can read another run's git-push
+  child's environment (and its credential) during that run's short push window.
+  `main` stays protected by GitLab's branch protection either way; this narrows a
+  defense-in-depth layer, not the primary one.
+- **Bash isn't jailed to its own worktree.** The guardrail denies push and
+  credential-reading commands but not writes outside a run's own worktree, so a
+  prompt-injected run could shell-write into a sibling's worktree or the shared
+  bare-repo cache.
+- **One container, one memory budget.** A runaway run can OOM the whole container,
+  requeuing every in-flight run together; raise `RUN_MAX_REQUEUES` (default 1)
+  alongside any cap above 1 so an innocent sibling isn't failed outright by another
+  run's crash.
+- **One Anthropic token, N runs.** Every slot shares your Anthropic token, so a
+  higher cap multiplies 429 pressure on it — the SDK's own retry/backoff is the
+  only mitigation today.
+- **Same-repo runs still serialize.** Two concurrent runs against the same repo
+  queue behind each other at the git layer — correct, just not actually parallel.
+
+These are same-uid, single-container specifics; the design behind this feature
+(`adr/0042-worker-run-concurrency.md`) has the full research and the
+container-per-run model that eventually closes them.
 
 ## Multiple workers, removing a worker
 

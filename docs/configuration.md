@@ -124,7 +124,8 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `WORKER_POLL_INTERVAL` | `3s` | How often an idle worker asks the server for a run to claim. |
 | `WORKER_MESSAGE_BATCH_INTERVAL` | `500ms` | How long the worker accumulates SDK output before a batched `POST .../messages` call. |
 | `WORKER_HTTP_TIMEOUT` | `30s` | Per-request timeout on the worker's own control-plane HTTP calls to `api`. |
-| `WORKER_PLAN_APPROVAL_TIMEOUT` | `24h` | How long a run may sit at `awaiting_approval` before the worker fails it: generous so a human has time, finite so an abandoned plan never wedges the (single-run-at-a-time) worker. |
+| `WORKER_PLAN_APPROVAL_TIMEOUT` | `24h` | How long a run may sit at `awaiting_approval` before the worker fails it: generous so a human has time, finite so an abandoned plan never pins its slot indefinitely — at the default cap of 1 (`WORKER_MAX_CONCURRENT_RUNS`) that means the whole worker. |
+| `WORKER_MAX_CONCURRENT_RUNS` | `1` | How many runs this worker executes concurrently, each in its own slot; advertised at registration for the `active/cap` badge in Settings → Workers but never enforced server-side. Honored above a soft ceiling of 8 but warned at boot. See [worker-setup.md](worker-setup.md#concurrent-runs) for sizing guidance and the residuals of raising it. |
 | `UZI_LOG_LEVEL` | `info` | Worker log verbosity: `debug`/`info`/`warn`/`error`. At `debug` the worker also writes every raw run event (each `tool_use`, `tool_result`, status, etc.) to its stdout as it is emitted, so `docker logs uzi-agent-1` becomes the full-frame debug surface. Secrets are redacted before logging. `info` stays terse (no per-event lines). |
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
