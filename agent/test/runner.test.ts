@@ -667,4 +667,22 @@ describe("RunRunner — per-run executor isolation (PRD #42 Decision 4)", () => 
       assert.ok(removed.includes(s), `failed run's secret ${JSON.stringify(s)} must still be evicted`);
     }
   });
+
+  it("rejects a run whose id is not a UUID BEFORE it becomes a path (defense in depth)", async () => {
+    const { gitlab } = fakeGitlab();
+    let factoryReached = false;
+    const factory: ExecutorFactory = () => {
+      factoryReached = true;
+      return { executor: new StubExecutor(nullLogger()) };
+    };
+    // Empty (would collapse the per-run HOME to the shared root), path separators,
+    // and traversal (would escape it) — all must be refused before makeExecutor.
+    for (const badId of ["", "../../etc", "a/b", "not-a-uuid"]) {
+      await assert.rejects(
+        runnerWith(factory, gitlab).execute(gitlabClaim(70, { run_id: badId })),
+        /invalid run id/,
+      );
+    }
+    assert.strictEqual(factoryReached, false, "the executor factory must not be reached for an invalid run id");
+  });
 });

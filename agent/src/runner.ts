@@ -11,7 +11,7 @@ import { MessageBatcher } from "./batcher.js";
 import { SteeringChannel, type PlanVerdict } from "./steering.js";
 import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
-import { errMessage } from "./util.js";
+import { errMessage, RUN_ID_RE } from "./util.js";
 
 /** Cap on a reported failure_reason, matching the GitLab error-body cap
  *  (gitlab.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -83,6 +83,14 @@ export class RunRunner {
 
   async execute(claim: ClaimResponse): Promise<void> {
     const runId = claim.run_id;
+    // Defense in depth (PRD #42): runId becomes a path segment in the per-run HOME
+    // (agent-home/<runId>) which the runner fs.rm's on terminal. It is a
+    // server-issued UUID, but reject anything not UUID-shaped BEFORE it reaches a
+    // path — an empty id would resolve the per-run HOME back to the SHARED root
+    // (removing chat's HOME + every run's HOME on terminal) and a separator/`..`
+    // would escape it. Same guard provision-run.ts applies to the provisioning dir.
+    // Content-free message: never echo the (rejected) id into a log/failure_reason.
+    if (!RUN_ID_RE.test(runId)) throw new Error("refusing to execute a run with an invalid run id");
     // This run's OWN executor + private HOME (PRD #42 Decisions 4/5), built fresh
     // per execution so nothing subprocess-scoped is shared with a concurrent run.
     const { executor, homeDir: runHome } = this.makeExecutor(runId);
