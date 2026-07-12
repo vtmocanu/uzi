@@ -5,7 +5,9 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -85,6 +87,7 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 	st := &runsStore{
 		adminTotals: store.AdminUsageTotalsRow{
 			LifetimeInputTokens: 900, LifetimeOutputTokens: 300, LifetimeCostUsd: numericFor(0.30), RunCount: 4,
+			EarliestRun: pgtype.Timestamptz{Time: time.Date(2026, time.May, 12, 9, 0, 0, 0, time.UTC), Valid: true},
 		},
 		adminPerUser: []store.AdminUsagePerUserRow{
 			{UserID: uuid.New(), Email: "heavy@x", InputTokens: 600, OutputTokens: 200, CostUsd: numericFor(0.20), RunCount: 3},
@@ -107,12 +110,17 @@ func TestAdminUsageShapesFactoryAndUsers(t *testing.T) {
 			Usage    usageBody `json:"usage"`
 			RunCount int64     `json:"run_count"`
 		} `json:"users"`
+		EarliestRun *string `json:"earliest_run"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if body.Factory.Lifetime.InputTokens != 900 || body.Factory.Lifetime.OutputTokens != 300 {
 		t.Fatalf("factory totals wrong: %+v", body.Factory.Lifetime)
+	}
+	// The factory's earliest-run timestamp flows through for the "since <date>" line.
+	if body.EarliestRun == nil || !strings.Contains(*body.EarliestRun, "2026-05-12") {
+		t.Fatalf("earliest_run did not pass through, got %v", body.EarliestRun)
 	}
 	if len(body.Users) != 2 {
 		t.Fatalf("want 2 per-user rows, got %d", len(body.Users))
