@@ -94,6 +94,14 @@ type Store interface {
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
 	ClaimRun(ctx context.Context, arg store.ClaimRunParams) (store.Run, error)
 	GetRunClaimContext(ctx context.Context, runID uuid.UUID) (store.GetRunClaimContextRow, error)
+	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
+	// authz, the command-not-found scan input, and the review upsert.
+	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
+	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
+	GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error)
+	ListToolResultPayloadsForRun(ctx context.Context, arg store.ListToolResultPayloadsForRunParams) ([][]byte, error)
+	ListRunInputsForRun(ctx context.Context, arg store.ListRunInputsForRunParams) ([]store.RunUserInput, error)
+	UpsertRunReviewWithRecommendations(ctx context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
@@ -240,6 +248,16 @@ type RunLifecycle interface {
 	Notify(runID uuid.UUID, status string)
 }
 
+// SettingsReader is the narrow slice of the instance settings the judge machinery
+// reads (PRD #46): the global kill-switch gates the terminal-funnel enqueue, the
+// model rides the judge claim. *settings.Cache satisfies it. Optional (nil-safe);
+// a nil reader means the judge feature is off (no enqueue, no model) — the default
+// in tests and any deployment that never wired it.
+type SettingsReader interface {
+	JudgeEnabled(ctx context.Context) (bool, error)
+	JudgeModel(ctx context.Context) (string, error)
+}
+
 // Service holds the store, the secret cipher, and the runtime params.
 type Service struct {
 	q   Store
@@ -262,7 +280,15 @@ type Service struct {
 	// deployment without the vault) disables the gate and falls back to opening the
 	// token under the master box — the pre-vault behavior.
 	vlt *vault.Vault
+	// settings reads the instance judge toggles/model (PRD #46). Optional (nil-safe);
+	// set via SetSettings. Nil disables the judge terminal-funnel enqueue entirely.
+	settings SettingsReader
 }
+
+// SetSettings wires the instance settings reader (PRD #46). Call once at startup,
+// before serving. A nil reader (tests, or a deployment that never enabled the judge)
+// disables the terminal-funnel enqueue and leaves the judge model unset in claims.
+func (s *Service) SetSettings(sr SettingsReader) { s.settings = sr }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
 // startup, before serving. A nil broadcaster disables live fan-out; the persisted
@@ -811,6 +837,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// Only a genuinely-applied transition drives the column automation; a
 		// no-op onto an already-terminal run (rows == 0) must not.
 		s.notify(runID, run.Status)
+		// PRD #46 Decision 2: enqueue a judge on the COMMITTED terminal transition
+		// (rows>0), not the lossy notify seam. Best-effort — never fails the report.
+		s.maybeEnqueueJudge(ctx, run)
 	}
 	return run, rows > 0, err
 }
@@ -1410,6 +1439,9 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.RunningTimeout = int64(len(timedOut))
 	for _, r := range timedOut {
 		s.publishSwept(r.ID, r.Status)
+		// PRD #46 Decision 2: a swept-to-failed run (timed out) is committed-terminal
+		// and worth judging. Best-effort, gated (kind/toggles/token) inside.
+		s.maybeEnqueueJudgeByID(ctx, r.ID)
 	}
 
 	// Fail-over-cap before re-queue: the two are disjoint on requeue_count, but
@@ -1425,6 +1457,9 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.StaleFailed = int64(len(failed))
 	for _, r := range failed {
 		s.publishSwept(r.ID, r.Status)
+		// PRD #46 Decision 2: a swept-to-failed run (worker lost, over re-queue budget)
+		// is committed-terminal and worth judging. Best-effort, gated inside.
+		s.maybeEnqueueJudgeByID(ctx, r.ID)
 	}
 
 	requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{

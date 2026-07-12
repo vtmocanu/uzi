@@ -49,6 +49,14 @@ type ClaimPayload struct {
 	// the Bearer worker trace endpoint (M3); the claim itself stays small and carries
 	// no forge PAT and no repo — a judge never does git.
 	TargetRunID *string `json:"target_run_id,omitempty"`
+	// JudgeModel is the model alias a JUDGE run runs on (PRD #46 Decision 7), resolved
+	// from the judge_model setting at claim assembly. Present only for kind=judge.
+	JudgeModel *string `json:"judge_model,omitempty"`
+	// JudgeSignal is the API-side deterministic command-not-found pre-scan of the
+	// reviewed run's tool output (PRD #46 Decision 4). Present only for kind=judge (and
+	// omitted when the scan found nothing). The judge interprets it; if the model call
+	// fails it is the deterministic fallback recommendation. The regex only flags.
+	JudgeSignal *JudgeSignal `json:"judge_signal,omitempty"`
 
 	// Pipeline is the failed-pipeline snapshot for a ci_fix run (PRD #6): the
 	// pipeline the agent diagnoses + fixes, with its failed jobs and log tails.

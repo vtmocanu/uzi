@@ -25,16 +25,16 @@ type fakeStore struct {
 	Store
 
 	// Claim path.
-	claimRun     store.Run
-	claimErr     error
-	claimParams  *store.ClaimRunParams
-	claimCtx     store.GetRunClaimContextRow
-	claimCtxErr  error
+	claimRun    store.Run
+	claimErr    error
+	claimParams *store.ClaimRunParams
+	claimCtx    store.GetRunClaimContextRow
+	claimCtxErr error
 	// claimCtxCalled records whether the repo/forge claim-context join was queried;
 	// the judge lane (PRD #46) must never touch it.
 	claimCtxCalled bool
 	anthropic      []byte
-	anthropicErr error
+	anthropicErr   error
 	// anthropicSealedWith is the row's sealed_with (defaults to 'master' when
 	// empty, so existing fixtures are unchanged); set to 'dek' for vault tests.
 	anthropicSealedWith string
@@ -83,6 +83,23 @@ type fakeStore struct {
 	sweptTimeout  []store.SweepRunningTimeoutRow
 	sweptFailed   []store.FailRunsOfStaleWorkersOverCapRow
 	sweptRequeued []store.RequeueRunsOfStaleWorkersRow
+
+	// PRD #46 judge: enqueue funnel + trace/review authz + review upsert.
+	runByIDPlain          store.Run // GetRunByID (non-user-scoped): swept-run reload + trace target
+	runByIDPlainErr       error
+	userByID              store.User
+	userByIDErr           error
+	createdJudgeRun       *store.CreateJudgeRunParams
+	createJudgeRunErr     error
+	activeJudgeRun        store.Run
+	activeJudgeRunErr     error
+	toolResultPayloads    [][]byte
+	toolResultPayloadsErr error
+	runInputs             []store.RunUserInput
+	workerPageMessages    []store.RunMessage
+	workerPageErr         error
+	upsertedReview        *store.UpsertRunReviewWithRecommendationsParams
+	upsertReviewErr       error
 
 	// Submit input.
 	runByID            store.Run
@@ -310,6 +327,40 @@ func (f *fakeStore) RequeueRunsOfStaleWorkers(_ context.Context, arg store.Reque
 }
 func (f *fakeStore) GetRunByIDForUser(context.Context, store.GetRunByIDForUserParams) (store.Run, error) {
 	return f.runByID, f.runByIDErr
+}
+
+// PRD #46 judge: enqueue funnel + trace/review.
+func (f *fakeStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	return f.runByIDPlain, f.runByIDPlainErr
+}
+func (f *fakeStore) GetUserByID(context.Context, uuid.UUID) (store.User, error) {
+	return f.userByID, f.userByIDErr
+}
+func (f *fakeStore) CreateJudgeRun(_ context.Context, arg store.CreateJudgeRunParams) (store.Run, error) {
+	f.createdJudgeRun = &arg
+	if f.createJudgeRunErr != nil {
+		return store.Run{}, f.createJudgeRunErr
+	}
+	return store.Run{ID: uuid.New(), Kind: RunKindJudge, UserID: arg.UserID, TargetRunID: arg.TargetRunID}, nil
+}
+func (f *fakeStore) GetActiveJudgeRunForWorkerTarget(context.Context, store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error) {
+	return f.activeJudgeRun, f.activeJudgeRunErr
+}
+func (f *fakeStore) ListToolResultPayloadsForRun(context.Context, store.ListToolResultPayloadsForRunParams) ([][]byte, error) {
+	return f.toolResultPayloads, f.toolResultPayloadsErr
+}
+func (f *fakeStore) ListRunInputsForRun(context.Context, store.ListRunInputsForRunParams) ([]store.RunUserInput, error) {
+	return f.runInputs, nil
+}
+func (f *fakeStore) ListRunMessagesForWorkerPage(context.Context, store.ListRunMessagesForWorkerPageParams) ([]store.RunMessage, error) {
+	return f.workerPageMessages, f.workerPageErr
+}
+func (f *fakeStore) UpsertRunReviewWithRecommendations(_ context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error) {
+	f.upsertedReview = &arg
+	if f.upsertReviewErr != nil {
+		return uuid.UUID{}, f.upsertReviewErr
+	}
+	return uuid.New(), nil
 }
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr

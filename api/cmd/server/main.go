@@ -263,6 +263,10 @@ func run() error {
 	// is built above (ahead of the Slack setup that needs it); vlt just above.
 	wsvc.SetVault(vlt)
 
+	// Instance settings (PRD #46): gate the judge terminal-funnel enqueue on the
+	// global judge_enabled kill-switch and ride the judge model into the claim.
+	wsvc.SetSettings(settingsCache)
+
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and
 	// stateless — every event is already durable in the DB.
