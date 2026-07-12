@@ -386,6 +386,17 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
       (isolated env per compose rules), one self-improvement tick against a
       scratch repo (not live uzi) to verify issue/MR reuse; findings folded
       back.
+- [ ] **M9 — Real test evidence in self-improvement MRs**: thread the PRD #18
+      provisioned tool env (`provision.ts` → `provision-run.ts` `toolEnv`,
+      already exported into the SDK env) into `defaultCheckRunner`'s
+      `execFile` (today it passes no env at all, so provisioned tools are
+      invisible to the checks); `npm ci` pre-step in `web/` and `agent/` so
+      `vitest`/`tsc` exist; honest-skip fallback retained for genuinely
+      unavailable toolchains (missing prerequisite or exit 127 → `skipped`
+      with a reason, never a false `failed`). Gating unknowns: whether `go`
+      is provisionable via the run's tool packages, and whether the worker
+      has npm-registry egress — whatever cannot be made real stays honestly
+      skipped and is stated as such in the MR.
 
 ## Milestone dependency / parallelization
 
@@ -397,6 +408,7 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
 | 4 | M5 | M1 (M2 for its notifications) | selfimprove engine, runner delta |
 | 5 | M6, M7 | M3–M5 | tests · docs |
 | 6 | M8 | all | live stack |
+| 7 | M9 | M8 | agent/src/{self-improve,runner}.ts, provision plumbing |
 
 ## Out of Scope
 
@@ -480,3 +492,23 @@ Approved deviations from the design above, found during implementation:
    explicit `rc.Kind == "judge" || rc.Kind == "self_improve"` guard for
    self_improve runs, which *are* repo-ful and would otherwise get a run-state
    DM (`Notifier.handle`, `api/internal/slacksvc/notifier.go`).
+6. **M8 found the self-improvement MR's test evidence is false, not just
+   missing (M9 added to fix it).** Decision 10's "the runner runs the test
+   suites and surfaces pass/fail in the MR description" assumed the checks
+   would either pass or genuinely fail. Live validation found a third case:
+   the worker image has no Go toolchain, and a fresh clone has no
+   `node_modules`, so `npm test` in `web`/`agent` exits 127
+   ("vitest: command not found") — which `defaultCheckRunner` maps to
+   `failed`, not `skipped`. A real self-improvement MR would therefore carry
+   four false "failed" checks on perfectly good code, directly contradicting
+   both `self-improve.ts`'s own contract ("a check that cannot run is
+   reported skipped, never failed") and this PRD's success criterion that
+   "each MR carries its own test-suite pass/fail evidence" — the only signal
+   a human reviewer gets, since this repo has no CI. The fix is not a
+   worker-image change: PRD #18's devbox tool provisioning
+   (`provision.ts`/`provision-run.ts`) already runs per-claim and its
+   `toolEnv` is already merged into the agent's own SDK env
+   (`sdk-env.ts`/`sdk-executor.ts`); the gap is that `defaultCheckRunner`'s
+   `execFile` call never receives that `toolEnv`, so provisioned tools are
+   invisible to the checks even when provisioning succeeded. User approved
+   landing the fix in this PRD as M9 rather than deferring it to a follow-up.
