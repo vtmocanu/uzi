@@ -253,6 +253,23 @@ func (v *Vault) Lock(userID uuid.UUID) {
 	}
 }
 
+// Exists reports whether the user has a vault row yet (independent of whether it
+// is currently unlocked in this process). It backs the create-only passphrase
+// endpoint (refuse when present) and the session payload's `exists` bit (review
+// N1), so the SPA can deterministically choose the create-passphrase dialog vs the
+// unlock banner without probing for a 409.
+func (v *Vault) Exists(ctx context.Context, userID uuid.UUID) (bool, error) {
+	_, err := v.q.GetUserVault(ctx, userID)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	default:
+		return false, fmt.Errorf("vault: exists: %w", err)
+	}
+}
+
 // Unlocked reports whether the user's DEK is cached — the gate the claim path
 // checks before ClaimRun.
 func (v *Vault) Unlocked(userID uuid.UUID) bool {

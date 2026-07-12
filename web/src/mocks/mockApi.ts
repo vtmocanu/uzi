@@ -182,6 +182,45 @@ function slackLinkResponse(): { slack: SlackLink } {
 }
 
 // settingsResponse builds the admin SettingsResponse from the mock's current
+// mockScenario reads a demo scenario from ?mock= (or the uzi_mock_scenario
+// localStorage key) so MOCK_MODE demo builds and manual QA can reach the PRD #45
+// OIDC UX, which is otherwise hidden (OIDC off / password on). Unknown/absent keeps
+// the original behavior. Wrapped in try/catch for any non-browser context.
+function mockScenario(): string {
+  try {
+    const q = new URLSearchParams(window.location.search).get("mock");
+    if (q) return q;
+    return window.localStorage.getItem("uzi_mock_scenario") ?? "";
+  } catch {
+    return "";
+  }
+}
+
+interface OidcDemo {
+  oidcEnabled: boolean;
+  providerName: string;
+  passwordLoginEnabled: boolean;
+  oidcStatus: string;
+  passwordless: boolean; // has_password === false → the passphrase-create banner shows
+}
+
+// oidcDemo maps the scenario to the OIDC fields the auth-config, session, and
+// settings responses expose. Scenarios: "oidc" (SSO alongside password),
+// "oidc-degraded" (admin status degraded), "sso-only" (SSO only, password form
+// hidden). Default: OIDC off, password on — the original demo behavior.
+function oidcDemo(): OidcDemo {
+  switch (mockScenario()) {
+    case "oidc":
+      return { oidcEnabled: true, providerName: "Keycloak", passwordLoginEnabled: true, oidcStatus: "ok", passwordless: true };
+    case "oidc-degraded":
+      return { oidcEnabled: true, providerName: "Keycloak", passwordLoginEnabled: true, oidcStatus: "degraded", passwordless: true };
+    case "sso-only":
+      return { oidcEnabled: true, providerName: "Keycloak", passwordLoginEnabled: false, oidcStatus: "ok", passwordless: true };
+    default:
+      return { oidcEnabled: false, providerName: "SSO", passwordLoginEnabled: true, oidcStatus: "disabled", passwordless: false };
+  }
+}
+
 // state: readable non-secret values, per-secret configured flags, and per-key
 // sources (all db/default — the demo has no ENV overlay).
 function settingsResponse(): SettingsResponse {
@@ -189,7 +228,14 @@ function settingsResponse(): SettingsResponse {
   for (const key of Object.keys(appSettings)) sources[key] = "db";
   for (const key of Object.keys(slackSecrets)) sources[key] = slackSecrets[key] ? "db" : "default";
   // The demo has no real socket, so Slack is always "disabled" here.
-  return { settings: { ...appSettings }, secrets: { ...slackSecrets }, sources, slack_status: "disabled" };
+  return {
+    settings: { ...appSettings },
+    secrets: { ...slackSecrets },
+    sources,
+    slack_status: "disabled",
+    oidc_status: oidcDemo().oidcStatus,
+    oidc_provider_name: oidcDemo().providerName,
+  };
 }
 let templateCounter = 0;
 let workerCounter = 0;
@@ -272,7 +318,12 @@ function sessionBody() {
     default_theme: appSettings.default_theme,
     prdless_label: appSettings.prdless_label,
     prdless_enabled: appSettings.prdless_enabled === "true",
-    vault: { unlocked: state.vaultUnlocked },
+    // A passwordless (OIDC) demo user has no vault yet, so the SPA shows the
+    // passphrase-create banner; a password demo user keeps the existing behavior.
+    vault: oidcDemo().passwordless
+      ? { unlocked: false, exists: false }
+      : { unlocked: state.vaultUnlocked, exists: true },
+    has_password: !oidcDemo().passwordless,
   };
 }
 
@@ -293,8 +344,18 @@ export const mockApi = {
     state.session = persona ? { ...persona } : { ...mockAdmin, email: email || mockAdmin.email };
     return delay(sessionBody());
   },
-  // Demo mode has registration open and unrestricted.
-  authConfig: async () => delay({ registration_enabled: true, allowed_email_domains: [] }),
+  // Demo mode has registration open and unrestricted. The OIDC fields follow the
+  // scenario toggle (default off; ?mock=oidc / sso-only enable SSO) — PRD #45 N6.
+  authConfig: async () => {
+    const d = oidcDemo();
+    return delay({
+      registration_enabled: true,
+      allowed_email_domains: [],
+      oidc_enabled: d.oidcEnabled,
+      oidc_provider_name: d.providerName,
+      password_login_enabled: d.passwordLoginEnabled,
+    });
+  },
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });
@@ -409,6 +470,12 @@ export const mockApi = {
   // browsable.
   vaultUnlock: async (password: string) => {
     if (password.trim() === "") throw new ApiError(403, "incorrect password");
+    state.vaultUnlocked = true;
+    return delay(null, 150);
+  },
+  // Passphrase-create (PRD #45): min length 12, then the demo vault is unlocked.
+  vaultCreatePassphrase: async (passphrase: string) => {
+    if (passphrase.length < 12) throw new ApiError(400, "passphrase must be at least 12 characters");
     state.vaultUnlocked = true;
     return delay(null, 150);
   },

@@ -82,6 +82,28 @@ export function Register() {
     );
   }
 
+  // SSO-only mode: no password accounts can be created here (the server 403s), so
+  // point people at single sign-on instead (PRD #45). Checked before the generic
+  // registration-disabled notice because it is the more specific reason.
+  if (config.password_login_enabled === false) {
+    return (
+      <div className="mx-auto max-w-md">
+        <Card>
+          <h1 className="text-2xl font-semibold">Sign-up is via single sign-on</h1>
+          <p className="mt-4 text-sm text-muted">
+            This instance uses single sign-on — your account is created automatically the first
+            time you sign in with your identity provider. There is no password to set here.
+          </p>
+          <p className="mt-4 text-sm text-muted">
+            <Link to="/login" className="text-brand hover:underline">
+              Go to log in
+            </Link>
+          </p>
+        </Card>
+      </div>
+    );
+  }
+
   if (!config.registration_enabled) {
     return (
       <div className="mx-auto max-w-md">

@@ -5120,3 +5120,139 @@ and the M0 verdict that gates them.
   deterministically. The `/api/ws` broadcast leg is NOT exercised by the e2e (it is web-vitest scope,
   `e2e/run-e2e.sh:1549` + `e2e/README.md`); persisted `run_messages` + REST `?after` replay are
   exactly what M5 proves. `./e2e/run-e2e.sh` green is the gate.
+
+# PRD #45 — OIDC SSO login (Keycloak / Pocket ID)
+
+Serves human: Feature #45 — SSO login against a single env-configured OIDC provider
+(Keycloak at work, Pocket ID in homelabs), coexisting with password login behind a
+`UZI_PASSWORD_LOGIN_ENABLED` kill-switch; JIT provisioning with email-link to existing
+accounts; admin stays uzi-managed (no groups mapping); operator docs with step-by-step
+Keycloak AND Pocket ID walkthroughs (all user decisions 2026-07-12). Supersedes the
+"No SSO/OAuth for this MVP" punt in `docs/auth-design.md` (OIDC only; SAML/LDAP stay out).
+Full decision log + security-audit/fact-check trail: `prds/45-oidc-sso-login.md`; operator
+guide: `docs/oidc.md`. Migration landed as `00056_oidc.sql`. This section records the
+load-bearing AI decisions; the PRD carries the complete set (1–10) with the audit H/M/L
+and fact-check findings.
+
+## 195. Authorization Code + PKCE, converging on the existing session path
+
+- **Auth Code + PKCE (S256), confidential client, no implicit/hybrid**, via
+  `github.com/coreos/go-oidc/v3` (new direct dep, pinned) + `golang.org/x/oauth2`. go-oidc
+  pulls in `go-jose` (CVE history, no CI dep-scanner here → manual version gate); bumped to
+  `v4.1.4` for GO-2026-4945 during review. Client secret is env-only (`UZI_OIDC_*`), never
+  in the DB — same trust level as `JWT_SECRET`, so `secretbox` is not involved.
+- **Callback converges on `issueSession`** — same HS256 cookie, CSRF cookie, `token_version`
+  revocation, rolling refresh as password login. uzi keeps NO IdP tokens (no refresh-token
+  storage, no IdP-session tracking, no RP-initiated logout); session lifetime is uzi's
+  `AUTH_TOKEN_TTL`, decoupled from the IdP session. Mirroring IdP session lifetime was
+  rejected (complexity, no threat-model gain for a loopback deploy).
+- `api/internal/oidc` wraps go-oidc: lazy singleflight-collapsed discovery (cached), auth-URL
+  builder, code exchange + ID-token verification. go-oidc verifies issuer/aud/sig (JWKS);
+  `nonce` and `email_verified` are compared explicitly by the wrapper (go-oidc only exposes
+  `IDToken.Nonce`). All outbound calls use an `http.Client` with an explicit timeout
+  (`UZI_OIDC_HTTP_TIMEOUT`, default 15s), mirroring the forge/Slack posture.
+
+## 196. Flow-CSRF via one sealed cookie; validate-before-exchange; no open-redirect
+
+- The callback is a top-level cross-site GET redirect from the IdP, so the `X-CSRF-Token`
+  header scheme can't apply. `/api/auth/oidc/login` generates `{state, nonce, pkce_verifier}`
+  and seals all three in ONE `uzi_oidc_state` cookie (master `secretbox`, HttpOnly, `Secure`
+  per `CookieSecure`, `SameSite=Lax` — Strict is dropped on cross-site nav), with a
+  server-side issued-at TTL (10 min).
+- **Cookie is validated BEFORE the token exchange** (audit M1): absent / won't-decrypt /
+  `state` ≠ query `state` → generic `oidc_state` error with NO token-endpoint call. A missing
+  cookie is a hard reject, never a skip — exchanging first would let cookieless hits drive a
+  uzi→IdP amplification. Only then is the code exchanged and the ID-token `nonce` compared.
+  Cookie is deleted on every callback outcome.
+- **No open-redirect**: the success redirect is a fixed server-side relative `/`; no
+  `next`/`return_to` param exists. Both endpoints sit behind `authLimiter`, wired outside
+  `RequireAuth`. Replay posture is stateless-RP: single-use of the auth `code` is delegated
+  to the IdP (RFC 6749); uzi stores no code/nonce server-side.
+
+## 197. Identity as (issuer, subject) columns; nullable password_hash; constant-time 401
+
+- Identity key `(issuer, subject)` stored as `oidc_issuer`/`oidc_subject` columns on `users`
+  with a partial unique index; `password_hash` relaxed to nullable (migration `00056`). A
+  separate `user_identities` table was rejected — one provider only, it buys nothing until
+  multi-provider is real. `email` stays the human key; `sub` is the join key (IdP emails can
+  be reassigned, subjects cannot).
+- **`password_hash = NULL` ⇒ password login always fails, constant-time** (audit H2). The
+  nullable hash regenerates the sqlc field to `pgtype.Text`; `Login` branches on
+  `!PasswordHash.Valid` FIRST, runs the dummy-hash burn, and returns the identical 401 — no
+  500-vs-401 oracle that would out OIDC-only accounts. The `pgtype.Text` change ripples to
+  every `PasswordHash` site (Register, `seedAdmin`, `UpdatePasswordParams`, store tests).
+  Change-password needs the current password, so OIDC-only users can't set one (deferred;
+  they have SSO).
+
+## 198. Callback resolution: verified-email link, JIT, first-admin, and the race/rejection edges
+
+- **Link and JIT both require `email_verified` === boolean `true`** (string `"true"` / absent /
+  anything-else rejects; audit L2) — matching on an unverified email is an account-takeover
+  vector. No override env var (secure default). Both IdPs default email-verified to false, so
+  both doc walkthroughs MUST cover enabling it or logins die at `oidc_forbidden` out of the box.
+- Login order: (1) `(issuer,subject)` match → login; (2) else verified-email match → link
+  **only when `oidc_subject IS NULL`** (`LinkUserOIDC` carries the `WHERE`, assert one row);
+  an email match on a row already bound to a *different* subject is rejected + logged, never
+  overwritten (audit H1 — a recycled IdP email must not take over an account); no auto-relink
+  on subject change. (3) else JIT-create if `UZI_REGISTRATION_ENABLED` and domain-allowed
+  (`emailDomainAllowed` reused) — first-ever user becomes admin via a passwordless
+  generalization of the advisory-locked first-admin path (`CreateUserOIDC`, NULL hash,
+  `pg_advisory_xact_lock` preserved). Concurrent-first-login `23505` on email or
+  `(issuer,subject)` ⇒ re-fetch and login (audit L6). (4) else `/login?error=oidc_forbidden`.
+- Email is canonicalized exactly like Register (`mail.ParseAddress(lower(trim))`) before the
+  allowlist / link / storage. `UZI_REGISTRATION_ENABLED=false` blocks JIT but not linking
+  (SSO-only shops pre-create users or leave registration on). Deactivated users are rejected
+  at step 1/2 (the callback replicates Login's `!IsActive` check, which `issueSession` skips) →
+  `/login?error=oidc_deactivated`. Fresh-instance footgun (audit M2): docs tell operators to
+  pre-seed the admin (`UZI_SEED_EMAIL`) and/or set the domain allowlist before enabling OIDC.
+
+## 199. Passwordless users get a vault passphrase, not a downgraded vault
+
+- PRD #32's KEK is `Argon2id(login password)`; OIDC-only users have no password. Sealing their
+  secrets under the master key was rejected (silent downgrade of exactly the users SSO
+  attracts). New `POST /api/vault/passphrase` (create-only, refuses when a vault row exists)
+  creates the vault from a user-chosen passphrase, min length = `auth.MinPasswordLen` (12, so a
+  weak passphrase can't undercut the KEK; audit L1). The existing unlock banner and
+  `/api/vault/unlock` work unchanged.
+- The OIDC callback **never** calls `vault.Unlock` — first-unlock *creates* a vault keyed by
+  whatever string it is handed, so an accidental unlock would mint a wrong vault and
+  permanently block the create-only endpoint (audit M4; verified: JIT login leaves no
+  `user_vaults` row). The session payload's vault object gains an `exists` bit beside
+  `unlocked`, and `Me`/session gains `has_password`, so the SPA deterministically picks the
+  create-passphrase dialog vs the unlock banner without probing a 409. Linked (password+OIDC)
+  users keep their password-derived vault; OIDC login does NOT unlock it. Passphrase
+  change/recovery is deferred (delete+recreate loses sealed secrets — acceptable, tokens are
+  re-enterable; documented).
+
+## 200. Boot validation, lockout guard, and the password-login gate
+
+- `UZI_OIDC_*` is all-or-nothing (issuer + client-id + client-secret together, else refuse to
+  start — matches the placeholder-secret refusal). Issuer must be `https://` except loopback
+  (dev), mirroring `FORGE_ALLOWED_BASE_URLS`; the issuer host is implicitly trusted (its
+  discovery doc dictates where the client secret is sent — documented posture, audit L3).
+- **Discovery failure at boot logs loudly and leaves OIDC configured-but-degraded** (login
+  retries discovery; `oidc_enabled` stays true so the button doesn't vanish on an IdP blip)
+  rather than crash-looping. `UZI_PASSWORD_LOGIN_ENABLED=false` with OIDC unconfigured refuses
+  to boot (total lockout); it also disables `POST /api/auth/register` (audit M3). Break-glass
+  when password-login is off and the IdP is down: flip `UZI_PASSWORD_LOGIN_ENABLED=true` and
+  restart (the seed admin keeps a `password_hash`) — documented in `docs/oidc.md`.
+- **`POST /api/auth/login` is itself gated on `PasswordLoginEnabled`** (fact-check 2026-07-12):
+  the PRD assumed it, but an ungated login endpoint is an SSO-only backdoor around IdP
+  offboarding. Decision: gate in code, not soften the docs.
+
+## 201. SPA integration, enumerated error codes, minimal claims
+
+- `AuthConfig` (`/api/auth/config`) grows `oidc_enabled`, `oidc_provider_name`,
+  `password_login_enabled`. The Login page renders a "Sign in with {name}" full-page
+  navigation to `/api/auth/oidc/login` (no fetch); the SSO button is gated on *configured*,
+  not on discovery having succeeded, so the lazy retry stays reachable when the IdP was down at
+  boot. The password form is hidden entirely when password login is off; the degraded state is
+  also surfaced on admin settings. `mockApi.authConfig` returns the new fields so MOCK_MODE
+  keeps rendering.
+- **Callback errors surface only as enumerated `/login?error=<code>`** — the SPA switches on
+  known codes and never renders the raw value; details go to the server log through the
+  existing scrubbing (subject / user-id only; no PII or tokens in URLs or logs).
+- Claims mapping is minimal: `email` (required, canonicalized), `name` → `display_name` (JIT
+  only, length-capped, never refreshed — uzi lets users edit their own display name and won't
+  fight the IdP), `sub`/`iss` → identity. Post-link email drift at the IdP is logged as a
+  warning, not auto-applied (email is UNIQUE; auto-rename can collide — deferred).

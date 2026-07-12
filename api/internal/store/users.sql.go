@@ -38,12 +38,12 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name, is_admin)
 VALUES ($1, $2, $3, $4)
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject
 `
 
 type CreateUserParams struct {
 	Email        string      `json:"email"`
-	PasswordHash string      `json:"password_hash"`
+	PasswordHash pgtype.Text `json:"password_hash"`
 	DisplayName  pgtype.Text `json:"display_name"`
 	IsAdmin      bool        `json:"is_admin"`
 }
@@ -73,12 +73,63 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.SlackNotify,
 		&i.SlackResolvedID,
 		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
+	)
+	return i, err
+}
+
+const createUserOIDC = `-- name: CreateUserOIDC :one
+INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject)
+VALUES ($1, NULL, $2, $3, $4, $5)
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject
+`
+
+type CreateUserOIDCParams struct {
+	Email       string      `json:"email"`
+	DisplayName pgtype.Text `json:"display_name"`
+	IsAdmin     bool        `json:"is_admin"`
+	OidcIssuer  pgtype.Text `json:"oidc_issuer"`
+	OidcSubject pgtype.Text `json:"oidc_subject"`
+}
+
+// JIT-provision a passwordless OIDC user (PRD #45, Decision 7): password_hash is
+// NULL so password login always fails constant-time. is_admin follows the
+// first-user rule, decided by the caller under the advisory lock.
+func (q *Queries) CreateUserOIDC(ctx context.Context, arg CreateUserOIDCParams) (User, error) {
+	row := q.db.QueryRow(ctx, createUserOIDC,
+		arg.Email,
+		arg.DisplayName,
+		arg.IsAdmin,
+		arg.OidcIssuer,
+		arg.OidcSubject,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.IsAdmin,
+		&i.IsActive,
+		&i.TokenVersion,
+		&i.CreatedAt,
+		&i.LastLogin,
+		&i.DefaultModel,
+		&i.AutopilotEnabled,
+		&i.Theme,
+		&i.SlackMemberID,
+		&i.SlackNotify,
+		&i.SlackResolvedID,
+		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at FROM users WHERE email = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -101,12 +152,14 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.SlackNotify,
 		&i.SlackResolvedID,
 		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at FROM users WHERE id = $1
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -129,6 +182,44 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.SlackNotify,
 		&i.SlackResolvedID,
 		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
+	)
+	return i, err
+}
+
+const getUserByOIDCSubject = `-- name: GetUserByOIDCSubject :one
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2
+`
+
+type GetUserByOIDCSubjectParams struct {
+	OidcIssuer  pgtype.Text `json:"oidc_issuer"`
+	OidcSubject pgtype.Text `json:"oidc_subject"`
+}
+
+// Primary OIDC login lookup (PRD #45): match the stable (issuer, subject) identity.
+func (q *Queries) GetUserByOIDCSubject(ctx context.Context, arg GetUserByOIDCSubjectParams) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByOIDCSubject, arg.OidcIssuer, arg.OidcSubject)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.IsAdmin,
+		&i.IsActive,
+		&i.TokenVersion,
+		&i.CreatedAt,
+		&i.LastLogin,
+		&i.DefaultModel,
+		&i.AutopilotEnabled,
+		&i.Theme,
+		&i.SlackMemberID,
+		&i.SlackNotify,
+		&i.SlackResolvedID,
+		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
 	)
 	return i, err
 }
@@ -164,8 +255,51 @@ func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSet
 	return i, err
 }
 
+const linkUserOIDC = `-- name: LinkUserOIDC :one
+UPDATE users SET oidc_issuer = $2, oidc_subject = $3
+WHERE id = $1 AND oidc_subject IS NULL
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject
+`
+
+type LinkUserOIDCParams struct {
+	ID          uuid.UUID   `json:"id"`
+	OidcIssuer  pgtype.Text `json:"oidc_issuer"`
+	OidcSubject pgtype.Text `json:"oidc_subject"`
+}
+
+// Attach an IdP identity to an existing (verified-email-matched) account, but ONLY
+// if the row is not already bound to a subject (audit H1): the WHERE oidc_subject IS
+// NULL guard makes a re-link a no-op that returns no row, so the caller can reject an
+// email match against a row already bound to a DIFFERENT subject instead of
+// overwriting it. The caller asserts exactly one row was returned.
+func (q *Queries) LinkUserOIDC(ctx context.Context, arg LinkUserOIDCParams) (User, error) {
+	row := q.db.QueryRow(ctx, linkUserOIDC, arg.ID, arg.OidcIssuer, arg.OidcSubject)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.IsAdmin,
+		&i.IsActive,
+		&i.TokenVersion,
+		&i.CreatedAt,
+		&i.LastLogin,
+		&i.DefaultModel,
+		&i.AutopilotEnabled,
+		&i.Theme,
+		&i.SlackMemberID,
+		&i.SlackNotify,
+		&i.SlackResolvedID,
+		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
+	)
+	return i, err
+}
+
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at FROM users ORDER BY created_at ASC
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject FROM users ORDER BY created_at ASC
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -194,6 +328,8 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.SlackNotify,
 			&i.SlackResolvedID,
 			&i.SlackLinkConfirmedAt,
+			&i.OidcIssuer,
+			&i.OidcSubject,
 		); err != nil {
 			return nil, err
 		}
@@ -221,7 +357,7 @@ SET is_active = $1,
     -- reactivation leaves it untouched.
     token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END
 WHERE id = $2
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject
 `
 
 type SetUserActiveParams struct {
@@ -249,13 +385,15 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 		&i.SlackNotify,
 		&i.SlackResolvedID,
 		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
 	)
 	return i, err
 }
 
 const setUserAutopilotEnabled = `-- name: SetUserAutopilotEnabled :one
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
-RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject
 `
 
 type SetUserAutopilotEnabledParams struct {
@@ -285,6 +423,8 @@ func (q *Queries) SetUserAutopilotEnabled(ctx context.Context, arg SetUserAutopi
 		&i.SlackNotify,
 		&i.SlackResolvedID,
 		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
 	)
 	return i, err
 }
@@ -334,8 +474,8 @@ WHERE id = $1
 `
 
 type UpdatePasswordParams struct {
-	ID           uuid.UUID `json:"id"`
-	PasswordHash string    `json:"password_hash"`
+	ID           uuid.UUID   `json:"id"`
+	PasswordHash pgtype.Text `json:"password_hash"`
 }
 
 func (q *Queries) UpdatePassword(ctx context.Context, arg UpdatePasswordParams) error {

@@ -95,6 +95,13 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusForbidden, "registration is disabled")
 		return
 	}
+	// Password login off (SSO-only) disables registration too: a password account
+	// minted here could never log in (PRD #45, Decision 8 / audit M3). SSO users are
+	// provisioned via JIT or linking, never this endpoint.
+	if !h.cfg.PasswordLoginEnabled {
+		httpx.Error(w, http.StatusForbidden, "password login is disabled")
+		return
+	}
 
 	var req registerRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
@@ -197,7 +204,7 @@ func (h *Handler) createUserFirstAdmin(r *http.Request, email, hash string, disp
 
 	user, err := qtx.CreateUser(ctx, store.CreateUserParams{
 		Email:        email,
-		PasswordHash: hash,
+		PasswordHash: pgtype.Text{String: hash, Valid: true},
 		DisplayName:  displayName,
 		IsAdmin:      count == 0,
 	})
@@ -215,6 +222,19 @@ func (h *Handler) createUserFirstAdmin(r *http.Request, email, hash string, disp
 // for both unknown email and wrong password, and equalizes timing by hashing
 // against a dummy hash when the email is unknown.
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+	// SSO-only mode: with password login disabled, refuse before touching the body
+	// or the DB (PRD #45, Decision 8 / fact-check R1). A uniform 403 regardless of
+	// whether the account exists — no enumeration surface, and no Argon2 on this
+	// path. This is the whole point of the kill-switch: an SSO-only shop must not
+	// leave a password backdoor that bypasses the IdP's offboarding. Login is the
+	// only VerifyPassword caller; worker join tokens and the JWT-cookie paths are
+	// separate. Break-glass stays as documented: flip UZI_PASSWORD_LOGIN_ENABLED back
+	// to true and restart (the seed admin keeps its password_hash).
+	if !h.cfg.PasswordLoginEnabled {
+		httpx.Error(w, http.StatusForbidden, "password login is disabled")
+		return
+	}
+
 	var req loginRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -241,7 +261,19 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, err := auth.VerifyPassword(req.Password, user.PasswordHash)
+	// OIDC-only accounts have no password_hash (PRD #45, Decision 7). Branch on that
+	// FIRST and treat it exactly like a wrong password: burn one Argon2 against the
+	// dummy hash to hold timing, then return the same generic 401. Never let a
+	// NULL/invalid hash reach VerifyPassword and surface its ErrInvalidHash as a 500 —
+	// that 500-vs-401 difference is an oracle distinguishing OIDC-only accounts from
+	// wrong passwords (audit H2).
+	if !user.PasswordHash.Valid {
+		_, _ = auth.VerifyPassword(req.Password, dummyHash)
+		httpx.Error(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+
+	ok, err := auth.VerifyPassword(req.Password, user.PasswordHash.String)
 	if err != nil {
 		slog.Error("verify password", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -343,7 +375,16 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 		// own queued runs "waiting for vault unlock" when locked. Delivered on the
 		// session payload so the shell needs no extra round-trip; the SPA refreshes
 		// it via AuthContext (window focus, after unlock/lock, on any 409 vault_locked).
-		"vault": map[string]any{"unlocked": h.vaultUnlocked(user.ID)},
+		// `exists` (PRD #45, review N1) lets a passwordless user's SPA pick the
+		// create-passphrase dialog (exists=false) vs the unlock banner (exists=true)
+		// deterministically, without probing for a 409.
+		"vault": map[string]any{
+			"unlocked": h.vaultUnlocked(user.ID),
+			"exists":   h.vaultExists(ctx, user.ID),
+		},
+		// has_password is false for OIDC-only users (NULL password_hash); the SPA uses
+		// it with vault.exists to choose passphrase-create vs unlock wording (PRD #45).
+		"has_password": user.PasswordHash.Valid,
 	}
 }
 
@@ -352,6 +393,24 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) map[strin
 // SPA shows no banner and legacy behavior is preserved.
 func (h *Handler) vaultUnlocked(userID uuid.UUID) bool {
 	return h.vault == nil || h.vault.Unlocked(userID)
+}
+
+// vaultExists reports whether the user has a vault row, for the session payload's
+// `exists` bit (PRD #45). A nil vault (tests) reports true ("no gate", consistent
+// with vaultUnlocked) so the SPA offers no create dialog. A DB error is treated as
+// "exists" (conservative: never invite a passphrase-create over a vault we could
+// not confirm is absent — the user can retry, and /api/vault/passphrase is itself
+// create-only as the real backstop).
+func (h *Handler) vaultExists(ctx context.Context, userID uuid.UUID) bool {
+	if h.vault == nil {
+		return true
+	}
+	exists, err := h.vault.Exists(ctx, userID)
+	if err != nil {
+		slog.Error("vault exists for session payload", "user", userID, "error", err)
+		return true
+	}
+	return exists
 }
 
 // AuthConfig returns the operator-set registration policy the register page
@@ -369,21 +428,39 @@ func (h *Handler) AuthConfig(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"registration_enabled":  h.cfg.RegistrationEnabled,
 		"allowed_email_domains": domains,
+		// OIDC SSO surface (PRD #45, Decision 9). oidc_enabled is gated on the feature
+		// being CONFIGURED, not on discovery having succeeded, so the SSO button stays
+		// visible (and the lazy discovery-retry reachable) even if the IdP was down at
+		// boot. password_login_enabled lets the SPA hide the password form for SSO-only
+		// deployments.
+		"oidc_enabled":           h.cfg.OIDCEnabled(),
+		"oidc_provider_name":     h.cfg.OIDCProviderName,
+		"password_login_enabled": h.cfg.PasswordLoginEnabled,
 	})
+}
+
+// issueSessionCookies mints the JWT and sets the auth + CSRF cookies. It logs and
+// returns an error WITHOUT writing a response body, so callers choose how to
+// surface failure: a JSON 500 for the password endpoints (issueSession), a
+// redirect for the OIDC callback (review NB3).
+func (h *Handler) issueSessionCookies(w http.ResponseWriter, user store.User) error {
+	token, err := auth.IssueToken(h.cfg.JWTSecret, user.ID.String(), user.TokenVersion, h.cfg.AuthTokenTTL)
+	if err != nil {
+		slog.Error("issue token", "error", err)
+		return err
+	}
+	if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: h.cfg.CookieSecure, TTL: h.cfg.AuthTokenTTL}); err != nil {
+		slog.Error("set auth cookies", "error", err)
+		return err
+	}
+	return nil
 }
 
 // issueSession mints a JWT at the user's current token_version and sets the
 // auth + CSRF cookies. It writes an error response and returns false on
 // failure.
 func (h *Handler) issueSession(w http.ResponseWriter, user store.User) bool {
-	token, err := auth.IssueToken(h.cfg.JWTSecret, user.ID.String(), user.TokenVersion, h.cfg.AuthTokenTTL)
-	if err != nil {
-		slog.Error("issue token", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return false
-	}
-	if err := auth.SetAuthCookies(w, token, auth.CookieOptions{Secure: h.cfg.CookieSecure, TTL: h.cfg.AuthTokenTTL}); err != nil {
-		slog.Error("set auth cookies", "error", err)
+	if err := h.issueSessionCookies(w, user); err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}

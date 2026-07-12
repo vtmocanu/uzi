@@ -394,6 +394,11 @@ export interface SettingsResponse {
   // Live Slack socket connection state (PRD #25 M2): "disabled" | "connecting" |
   // "connected" | "error:<class>". The admin Slack card renders it as a chip.
   slack_status: string;
+  // OIDC SSO health (PRD #45, Nit6): "disabled" | "ok" | "degraded" (configured but
+  // discovery is failing). oidc_provider_name is the button label. Optional so an
+  // older server omits them.
+  oidc_status?: string;
+  oidc_provider_name?: string;
 }
 
 // UpdateSettingsPayload extends the non-secret settings with the write-only
@@ -429,8 +434,13 @@ export interface SessionResponse {
   prdless_enabled?: boolean;
   // Vault status (PRD #32): whether the user's per-user secret vault is unlocked
   // in the server process. Optional so a server that predates the field reads as
-  // unlocked (no banner, legacy behavior) rather than falsely locked.
-  vault?: { unlocked: boolean };
+  // unlocked (no banner, legacy behavior) rather than falsely locked. `exists`
+  // (PRD #45) is whether a vault row exists at all; with has_password it lets a
+  // passwordless user's SPA pick the passphrase-create dialog vs the unlock banner.
+  vault?: { unlocked: boolean; exists?: boolean };
+  // has_password is false for OIDC-only users (NULL password_hash; PRD #45). Absent
+  // (older server, or a password user) reads as true — no passphrase-create dialog.
+  has_password?: boolean;
 }
 
 // AuthConfig is the unauthenticated registration policy the register page reads
@@ -439,6 +449,14 @@ export interface SessionResponse {
 export interface AuthConfig {
   registration_enabled: boolean;
   allowed_email_domains: string[];
+  // OIDC SSO (PRD #45). oidc_enabled reflects whether SSO is CONFIGURED (not whether
+  // discovery has succeeded — the button stays visible so the lazy discovery-retry is
+  // reachable when the IdP was down at boot). password_login_enabled hides the
+  // password form + register when an operator goes SSO-only. All optional: an older
+  // server omits them and reads as OIDC-off / password-on.
+  oidc_enabled?: boolean;
+  oidc_provider_name?: string;
+  password_login_enabled?: boolean;
 }
 
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
@@ -849,6 +867,10 @@ const realApi = {
   // 403 on a wrong password); lock evicts it; status is a lightweight poll. Unlock
   // and lock return no body.
   vaultUnlock: (password: string) => request<null>("POST", "/vault/unlock", { password }),
+  // Create a passwordless (OIDC) user's vault from a chosen passphrase (PRD #45).
+  // Create-only: 409 if a vault already exists; 204 on success (vault then unlocked).
+  vaultCreatePassphrase: (passphrase: string) =>
+    request<null>("POST", "/vault/passphrase", { passphrase }),
   vaultLock: () => request<null>("POST", "/vault/lock"),
   vaultStatus: () => request<{ unlocked: boolean }>("GET", "/vault/status"),
   getMySettings: () => request<{ settings: UserSettings }>("GET", "/me/settings"),

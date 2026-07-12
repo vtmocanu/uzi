@@ -46,6 +46,12 @@ interface AuthState {
   // banner, and the "waiting for vault unlock" run state. Defaults to true (a
   // server that predates the field, or a signed-out visitor, shows no banner).
   vaultUnlocked: boolean;
+  // vaultExists is whether the user has a vault row at all; hasPassword is false for
+  // OIDC-only users (PRD #45). Together they let the locked banner choose between the
+  // passphrase-create dialog (passwordless + no vault yet) and the unlock banner.
+  // Both default true so password users and older servers keep the existing flow.
+  vaultExists: boolean;
+  hasPassword: boolean;
   register: (email: string, password: string, displayName: string) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -65,6 +71,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [prdlessLabel, setPrdlessLabel] = useState(DEFAULT_PRDLESS_LABEL);
   const [prdlessEnabled, setPrdlessEnabled] = useState(false);
   const [vaultUnlocked, setVaultUnlocked] = useState(true);
+  const [vaultExists, setVaultExists] = useState(true);
+  const [hasPassword, setHasPassword] = useState(true);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
@@ -87,6 +95,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setPrdlessEnabled(session.prdless_enabled ?? false);
     // Absent field (older server) reads as unlocked, so no spurious banner.
     setVaultUnlocked(session.vault?.unlocked ?? true);
+    // Absent → true so a password user / older server never sees the create dialog.
+    setVaultExists(session.vault?.exists ?? true);
+    setHasPassword(session.has_password ?? true);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -172,6 +183,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       prdlessLabel,
       prdlessEnabled,
       vaultUnlocked,
+      vaultExists,
+      hasPassword,
       register,
       login,
       logout,
@@ -188,6 +201,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       prdlessLabel,
       prdlessEnabled,
       vaultUnlocked,
+      vaultExists,
+      hasPassword,
       register,
       login,
       logout,
