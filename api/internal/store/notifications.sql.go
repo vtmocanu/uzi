@@ -235,10 +235,12 @@ const pruneNotificationsForUser = `-- name: PruneNotificationsForUser :execrows
 DELETE FROM notifications AS n
 WHERE n.user_id = $1
   AND n.created_at < (
-      SELECT keep_row.created_at FROM notifications AS keep_row
-      WHERE keep_row.user_id = $1
-      ORDER BY keep_row.created_at DESC
-      OFFSET $2 LIMIT 1
+      SELECT min(keep_row.created_at) FROM (
+          SELECT created_at FROM notifications
+          WHERE user_id = $1
+          ORDER BY created_at DESC, id DESC
+          LIMIT $2
+      ) AS keep_row
   )
 `
 
@@ -248,12 +250,18 @@ type PruneNotificationsForUserParams struct {
 }
 
 // Per-user retention cap (PRD #46 Decision 6: pruning ships with the table). Keeps
-// the newest @keep rows for a user and deletes the rest. The subquery finds the
-// created_at of the @keep-th newest row via idx_notifications_user_created (an
-// index probe skipping @keep entries — bounded, not a scan); when the user has
-// @keep or fewer rows it yields no row, so `created_at < NULL` deletes nothing.
-// Called best-effort by notifysvc after each insert, so an active writer's inbox
-// can never grow without bound while an idle one is never touched.
+// the newest @keep rows for a user and deletes the rest. The inner subquery takes
+// the newest @keep rows in the list query's total order (created_at DESC, id DESC)
+// via idx_notifications_user_created — a bounded index read of @keep rows, not a
+// scan — and `min(created_at)` over them is the boundary: the created_at of the
+// @keep-th newest (the oldest row still kept). The DELETE removes everything
+// strictly older than that boundary. When the user has @keep or fewer rows the
+// boundary is the oldest existing row, so `created_at <` it deletes nothing (at
+// exactly @keep ⇒ no deletion). The comparison is created_at-only, so rows tied at
+// the boundary's created_at are all kept — a small keep-slightly-more residual
+// accepted for v1 (M6 pins exact semantics). Called best-effort by notifysvc after
+// each insert, so an active writer's inbox can never grow without bound while an
+// idle one is never touched.
 func (q *Queries) PruneNotificationsForUser(ctx context.Context, arg PruneNotificationsForUserParams) (int64, error) {
 	result, err := q.db.Exec(ctx, pruneNotificationsForUser, arg.UserID, arg.Keep)
 	if err != nil {
