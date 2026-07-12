@@ -19,6 +19,12 @@ services:
       # forge-fake 401s the clone/push. Dormant in the default (local-remote) run.
       FORGE_FAKE_EXPECT_USER: uzi-bot
       FORGE_FAKE_EXPECT_PAT: e2e-dummy-forge-pat-000000
+      # A SECOND served project for the PRD #42 M5 bounded-concurrency scenario:
+      # two issues on two DIFFERENT repos so a cap-2 worker's two runs get
+      # independent git bare-caches. Every other phase uses only group/repo (the
+      # first project), and the seed enables only group/repo (UZI_SEED_FORGE_REPOS),
+      # so repo2 stays a disabled, invisible row until that scenario enables it.
+      FORGE_FAKE_PROJECT2: group/repo2
       # Persist recorded state to a bind mount so it survives the restart-resilience
       # down/up. The fake is otherwise in-memory; a real forge does not forget its
       # issues/MRs when uzi restarts, and the MR-close phase reconciles against it.
@@ -69,6 +75,12 @@ services:
       FRONTEND_ORIGIN: http://127.0.0.1:${E2E_WEB_PORT}
       # Give the restart-resilience step head-room to re-queue the orphaned run.
       RUN_MAX_REQUEUES: "3"
+      # Heartbeat-stale window: no heartbeat past this ⇒ the worker goes offline and
+      # its non-terminal runs re-queue (the sweeper's worker-loss recovery). Default
+      # matches the base config (45s); the PRD #42 M5 mid-run-kill step tightens it
+      # (E2E_WORKER_HEARTBEAT_STALE=15s + api recreate) so the sweeper-driven requeue
+      # of two in-flight runs is bounded, still well above the 5s heartbeat interval.
+      WORKER_HEARTBEAT_STALE: ${E2E_WORKER_HEARTBEAT_STALE:-45s}
       # Point the SSRF allowlist + the boot seed at the fake forge.
       FORGE_ALLOWED_BASE_URLS: https://forge-fake.e2e
       # Poll rarely by DEFAULT: the harness drives issues/runs directly, and a long
@@ -116,6 +128,11 @@ services:
       GIT_CONFIG_GLOBAL: /e2e-git/gitconfig
       WORKER_HEARTBEAT_INTERVAL: 5s
       WORKER_POLL_INTERVAL: 2s
+      # RUN-lane concurrency cap (PRD #42). Default 1 = the pre-#42 serial loop, so
+      # every phase except the M5 bounded-concurrency scenario runs the worker
+      # exactly as before; that scenario sets UZI_E2E_MAX_CONCURRENT_RUNS=2 and
+      # recreates the agent to prove two runs execute concurrently.
+      WORKER_MAX_CONCURRENT_RUNS: ${UZI_E2E_MAX_CONCURRENT_RUNS:-1}
     volumes:
       - ${E2E_RUN_DIR}/certs:/certs:ro
       - ${E2E_RUN_DIR}/worker-secret:/worker-secret
