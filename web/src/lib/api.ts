@@ -601,6 +601,31 @@ export interface RunListItem extends Run {
   owner_email?: string;
 }
 
+// SelfUsage is the caller's own consumption (GET /api/usage, PRD #40): lifetime and
+// last-7-days totals plus the count of their usage-bearing runs. run_count === 0
+// means "nothing yet" — the card renders that state, not fabricated zeros.
+export interface SelfUsage {
+  lifetime: RunUsage;
+  last_7_days: RunUsage;
+  run_count: number;
+}
+
+// AdminUsageUser is one user's lifetime row in the admin factory breakdown.
+export interface AdminUsageUser {
+  user_id: string;
+  email: string;
+  usage: RunUsage;
+  run_count: number;
+}
+
+// AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the
+// factory totals plus the per-user breakdown. The per-user rows sum to factory
+// lifetime by construction (the server rollup guarantees it).
+export interface AdminUsage {
+  factory: SelfUsage;
+  users: AdminUsageUser[];
+}
+
 // RunMessage is one persisted, seq-numbered event in a run's stream.
 export interface RunMessage {
   seq: number;
@@ -1019,6 +1044,10 @@ const realApi = {
     return request<{ runs: RunListItem[] }>("GET", qs ? `/runs?${qs}` : "/runs");
   },
   getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),
+  /** The caller's own token/cost usage (PRD #40): lifetime + last-7-days + run count. */
+  getUsage: () => request<SelfUsage>("GET", "/usage"),
+  /** Factory-wide usage + per-user breakdown (PRD #40). Admin-only — a non-admin 403s. */
+  getAdminUsage: () => request<AdminUsage>("GET", "/admin/usage"),
   getRunMessages: (id: string, afterSeq = 0) =>
     request<{ messages: RunMessage[] }>(
       "GET",

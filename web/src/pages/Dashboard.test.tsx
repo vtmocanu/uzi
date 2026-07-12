@@ -20,6 +20,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       listAgentTemplates: vi.fn(),
       listSecrets: vi.fn(),
       listConnections: vi.fn(),
+      getUsage: vi.fn(),
+      getAdminUsage: vi.fn(),
     },
   };
 });
@@ -129,7 +131,15 @@ beforeEach(() => {
   mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
   mockApi.listConnections.mockResolvedValue({ connections: [] });
+  // Default: no usage yet (the run_count===0 "nothing yet" state).
+  mockApi.getUsage.mockResolvedValue(emptySelf());
+  mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [] });
 });
+
+const zeros = () => ({ input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0 });
+function emptySelf() {
+  return { lifetime: zeros(), last_7_days: zeros(), run_count: 0 };
+}
 
 afterEach(() => {
   cleanup();
@@ -170,5 +180,78 @@ describe("Dashboard first-load / re-poll error split", () => {
     expect(mockApi.listRuns).toHaveBeenCalledTimes(2); // first load + one poll
     expect(screen.getByText("Active runs")).toBeTruthy(); // still showing the tiles
     expect(screen.getByText("Live run row")).toBeTruthy(); // last-good data intact
+  });
+});
+
+describe("Dashboard usage cards (PRD #40)", () => {
+  const bundle = (inp: number, cr: number, out: number, cost: number) => ({
+    input_tokens: inp,
+    cache_read_tokens: cr,
+    cache_creation_tokens: 0,
+    output_tokens: out,
+    cost_usd: cost,
+  });
+  const selfWithUsage = {
+    lifetime: bundle(1_610_000, 16_100_000, 710_000, 26.4),
+    last_7_days: bundle(200_000, 2_800_000, 100_000, 4.55),
+    run_count: 23,
+  };
+  const adminUsage = {
+    factory: { lifetime: bundle(5_400_000, 53_900_000, 2_400_000, 88.15), last_7_days: zeros(), run_count: 79 },
+    users: [
+      { user_id: "a", email: "vlad@example.com", usage: bundle(1_610_000, 16_100_000, 710_000, 26.4), run_count: 23 },
+      { user_id: "b", email: "maria@example.com", usage: bundle(2_490_000, 21_400_000, 1_020_000, 37.83), run_count: 31 },
+    ],
+  };
+
+  const settle = async () => {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  };
+
+  it("shows the Your usage card for any user (lifetime total + last-7-days kicker)", async () => {
+    mockApi.getUsage.mockResolvedValue(selfWithUsage);
+    const { container } = renderDashboard();
+    await settle();
+    expect(screen.getByText("Your usage")).toBeTruthy();
+    // lifetime total = 1.61M + 16.1M + 0.71M = 18.42M tokens.
+    expect(container.textContent).toContain("18.42M");
+    expect(screen.getByText(/Across/)).toBeTruthy();
+    expect(screen.getByText(/in the last 7 days/)).toBeTruthy();
+  });
+
+  it("renders the empty 'nothing yet' state when the user has no usage", async () => {
+    // Default getUsage mock returns run_count 0.
+    renderDashboard();
+    await settle();
+    expect(screen.getByText("Your usage")).toBeTruthy();
+    expect(screen.getByText(/No usage recorded yet/)).toBeTruthy();
+  });
+
+  it("an admin sees the Factory total card + per-user breakdown", async () => {
+    vi.mocked(useAuth).mockReturnValue({ user: { ...user, is_admin: true } } as unknown as ReturnType<typeof useAuth>);
+    mockApi.getUsage.mockResolvedValue(selfWithUsage);
+    mockApi.getAdminUsage.mockResolvedValue(adminUsage);
+    renderDashboard();
+    await settle();
+
+    expect(screen.getByText(/Factory total/)).toBeTruthy();
+    expect(screen.getByText(/Per-user breakdown/)).toBeTruthy();
+    expect(screen.getByText("vlad@example.com")).toBeTruthy();
+    expect(screen.getByText("maria@example.com")).toBeTruthy();
+    expect(screen.getByText("uzi total")).toBeTruthy();
+  });
+
+  it("a NON-admin never sees factory data and never calls the admin endpoint", async () => {
+    // Default user has is_admin false.
+    mockApi.getUsage.mockResolvedValue(selfWithUsage);
+    renderDashboard();
+    await settle();
+
+    expect(screen.getByText("Your usage")).toBeTruthy();
+    expect(screen.queryByText(/Factory total/)).toBeNull();
+    expect(screen.queryByText(/Per-user breakdown/)).toBeNull();
+    expect(mockApi.getAdminUsage).not.toHaveBeenCalled();
   });
 });

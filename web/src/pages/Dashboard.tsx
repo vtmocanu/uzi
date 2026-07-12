@@ -7,9 +7,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, isTerminalRun, type RunListItem } from "../lib/api";
+import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage } from "../lib/api";
 import { mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
+import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
@@ -22,6 +23,11 @@ interface Overview {
   templates: number;
   hasToken: boolean;
   hasForge: boolean;
+  // PRD #40: the caller's own usage (everyone) + the factory view (admins only).
+  // Best-effort: a usage fetch failure leaves these null and simply hides the cards,
+  // never blocking the rest of the dashboard.
+  selfUsage: SelfUsage | null;
+  adminUsage: AdminUsage | null;
 }
 
 function Step({
@@ -78,7 +84,7 @@ export function Dashboard() {
     let cancelled = false;
     (async () => {
       try {
-        const [{ runs }, { workers }, { repos }, { templates }, { secrets }, { connections }] =
+        const [{ runs }, { workers }, { repos }, { templates }, { secrets }, { connections }, selfUsage, adminUsage] =
           await Promise.all([
             api.listRuns(),
             api.listWorkers(),
@@ -86,6 +92,11 @@ export function Dashboard() {
             api.listAgentTemplates(),
             api.listSecrets(),
             api.listConnections(),
+            // Usage is best-effort (.catch → null) so it can never fail the core load,
+            // and the admin view is fetched ONLY for an admin — a non-admin never hits
+            // the admin-gated endpoint.
+            api.getUsage().catch(() => null),
+            user?.is_admin ? api.getAdminUsage().catch(() => null) : Promise.resolve(null),
           ]);
         if (cancelled) return;
         setData({
@@ -96,6 +107,8 @@ export function Dashboard() {
           templates: templates.length,
           hasToken: secrets.some((s) => s.kind === "anthropic_token"),
           hasForge: connections.length > 0,
+          selfUsage,
+          adminUsage,
         });
       } catch {
         if (!cancelled) setData(null);
@@ -214,6 +227,20 @@ export function Dashboard() {
           </ol>
         </Card>
       )}
+
+      {/* PRD #40 §3–4: "Your usage" for everyone; the factory total + per-user
+          breakdown only when an admin view was fetched (data.adminUsage non-null).
+          A non-admin never receives factory data, so it can never render. */}
+      {data?.selfUsage &&
+        (data.adminUsage ? (
+          <div className="grid gap-4 lg:grid-cols-2">
+            <YourUsageCard usage={data.selfUsage} />
+            <FactoryTotalCard admin={data.adminUsage} />
+          </div>
+        ) : (
+          <YourUsageCard usage={data.selfUsage} />
+        ))}
+      {data?.adminUsage && <PerUserUsageTable admin={data.adminUsage} />}
 
       <Card>
         <div className="flex items-center justify-between">
