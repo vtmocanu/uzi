@@ -325,11 +325,11 @@ export interface WorkerRunMessage {
 }
 
 /** A created issue proposal (POST /api/worker/runs/:id/proposals → 201). Pending
- *  until the user confirms in the browser; the worker never writes the forge. */
+ *  until the user confirms in the browser; the worker never writes the forge. No
+ *  repo_id: the worker only handles the human-readable repo_path (Decision 7). */
 export interface WorkerProposal {
   id: string;
   run_id: string;
-  repo_id: string;
   title: string;
   description: string;
   labels: string[];

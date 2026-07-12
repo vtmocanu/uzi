@@ -665,12 +665,12 @@ export type ProposalStatus = "pending" | "confirmed" | "dismissed";
 // untrusted, so the card renders them as plain inert text (never Markdown, no
 // clickable model links). The forge write happens only on the human's Create
 // click; the created-issue link comes from the confirm response (CreatedIssue),
-// NOT from this payload. repo_path is computed by the worker at emit time (the
-// issue_proposals row stores only repo_id), so it is optional here.
+// NOT from this payload. The internal repo_id UUID is intentionally absent: the
+// worker only handles the human-readable repo_path (Decision 7), which is what the
+// card shows, and repo_path is worker-computed at emit time, so it is optional here.
 export interface IssueProposal {
   id: string;
   run_id: string;
-  repo_id: string;
   // Worker-computed display path; absent when the worker could not resolve it.
   repo_path?: string;
   title: string;
