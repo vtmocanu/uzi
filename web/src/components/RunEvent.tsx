@@ -1,5 +1,7 @@
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import type { RunMessage } from "../lib/api";
+import type { PhaseUsage } from "../lib/runUsage";
+import { formatTokens, formatCost } from "../lib/formatTokens";
 import { Markdown } from "./Markdown";
 import { cx } from "./ui";
 import {
@@ -343,11 +345,12 @@ export function describeStatus(payload: unknown): string {
   if (event === "result") {
     const subtype = asString(rec["subtype"]) ?? "unknown";
     if (subtype === "success") {
+      // Duration + turns only — the per-phase token/cost figures ride the finish
+      // line separately (PhaseUsage), because the frame's own total_cost_usd is
+      // CUMULATIVE-across-resume (PRD #40 verdict b) and would over-read per phase.
       const bits: string[] = [];
       if (typeof rec["duration_ms"] === "number") bits.push(formatDuration(rec["duration_ms"]));
       if (typeof rec["num_turns"] === "number") bits.push(`${rec["num_turns"]} turns`);
-      if (typeof rec["total_cost_usd"] === "number")
-        bits.push(`$${(rec["total_cost_usd"] as number).toFixed(2)}`);
       return bits.length ? `agent finished (${bits.join(", ")})` : "agent finished";
     }
     return `status: result/${subtype}`;
@@ -431,7 +434,7 @@ function Expander({
 // italic text-muted. describeStatus returns a flat "key (detail)" string, so we
 // split on the first "(" — a worker progress line has no parenthetical, so the
 // whole line is the key (still a scannable mono-fg anchor).
-function MetaLine({ text }: { text: string }) {
+function MetaLine({ text, usage }: { text: string; usage?: PhaseUsage }) {
   const paren = text.indexOf("(");
   const key = paren === -1 ? text : text.slice(0, paren).trimEnd();
   const detail = paren === -1 ? "" : text.slice(paren);
@@ -441,9 +444,28 @@ function MetaLine({ text }: { text: string }) {
       <span>
         <span className="font-mono text-[11px] not-italic text-fg">{key}</span>
         {detail ? ` ${detail}` : ""}
+        {usage && (
+          <>
+            {" · "}
+            <FinishTokens usage={usage} />
+          </>
+        )}
       </span>
       <span aria-hidden="true" className="h-px flex-1 bg-edge" />
     </div>
+  );
+}
+
+// FinishTokens renders a result frame's PER-PHASE token/cost figures on its finish
+// line (PRD #40 §1). Tokens are the delta this phase spent (fresh in · cached · out,
+// derived in lib/runUsage.ts); cost too. A $0 cost (subscription auth) is dropped
+// rather than shown as "$0.00". Mono + tabular so figures line up down the log.
+function FinishTokens({ usage }: { usage: PhaseUsage }) {
+  return (
+    <span className="font-mono not-italic tabular-nums text-faint">
+      {formatTokens(usage.fresh)} in · {formatTokens(usage.cached)} cached · {formatTokens(usage.out)} out
+      {usage.costUsd > 0 && <span className="text-brand"> · {formatCost(usage.costUsd)}</span>}
+    </span>
   );
 }
 
@@ -692,10 +714,14 @@ export const RunEventRow = memo(function RunEventRow({
   msg,
   result,
   live,
+  phaseUsage,
 }: {
   msg: RunMessage;
   result?: RunMessage;
   live: boolean;
+  // PRD #40: the per-phase token/cost delta for a result frame (status/error),
+  // looked up by seq upstream. undefined for every non-result row.
+  phaseUsage?: PhaseUsage;
 }) {
   const rec = asRecord(msg.payload);
   switch (msg.kind) {
@@ -711,11 +737,16 @@ export const RunEventRow = memo(function RunEventRow({
       // Only reached for orphan results; folded ones are skipped by the parent.
       return <StandaloneResult result={msg} />;
     case "status":
-      return <MetaLine text={describeStatus(msg.payload)} />;
+      return <MetaLine text={describeStatus(msg.payload)} usage={phaseUsage} />;
     case "error":
       return (
         <div className="rounded-md border border-danger/40 bg-danger/10 px-2 py-1 text-sm text-danger">
           <span aria-hidden="true">✗</span> {describeError(msg.payload)}
+          {phaseUsage && (
+            <span className="ml-2 text-xs">
+              <FinishTokens usage={phaseUsage} />
+            </span>
+          )}
         </div>
       );
     case "plan":

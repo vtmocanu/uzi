@@ -96,16 +96,18 @@ describe("describeStatus", () => {
       "agent started (claude-fable-5)",
     );
   });
-  it("renders a success result from the forwarded fields", () => {
+  it("renders a success result from duration + turns (cost moved to the per-phase finish line, PRD #40)", () => {
     expect(
       describeStatus({
         event: "result",
         subtype: "success",
         duration_ms: 12400,
         num_turns: 3,
+        // total_cost_usd is cumulative-across-resume (verdict b), so it is no longer
+        // shown here — the per-phase delta cost rides the finish line's FinishTokens.
         total_cost_usd: 0.0731,
       }),
-    ).toBe("agent finished (12.4s, 3 turns, $0.07)");
+    ).toBe("agent finished (12.4s, 3 turns)");
   });
   it("discriminates a non-success result by subtype (not event)", () => {
     expect(describeStatus({ event: "result", subtype: "error_max_turns" })).toBe(
@@ -522,5 +524,62 @@ describe("accessibility (PRD #38 M4)", () => {
       <RunEventRow msg={msg({ seq: 1, kind: "tool_result", payload: { tool_use_id: "Z", content: "a\nb" } })} live={false} />,
     );
     expect(orphan.getByRole("button", { name: "Show 2 lines of output" })).toBeTruthy();
+  });
+});
+
+describe("RunEventRow finish-line usage (PRD #40)", () => {
+  const phaseUsage = {
+    seq: 5,
+    label: "Implement · iteration 2",
+    turns: 18,
+    durationMs: 492_000,
+    fresh: 34_100,
+    cached: 371_200,
+    out: 13_400,
+    costUsd: 0.61,
+    isError: false,
+  };
+
+  it("appends the phase's delta tokens + cost to a success result finish line", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({
+          seq: 5,
+          kind: "status",
+          payload: { event: "result", subtype: "success", duration_ms: 492_000, num_turns: 18, total_cost_usd: 1.87 },
+        })}
+        live={false}
+        phaseUsage={phaseUsage}
+      />,
+    );
+    // describeStatus keeps duration + turns; the cumulative $1.87 is NOT shown here.
+    expect(container.textContent).toContain("agent finished (8m 12s, 18 turns)");
+    expect(container.textContent).not.toContain("$1.87");
+    // FinishTokens shows the per-phase delta + per-phase cost.
+    expect(container.textContent).toContain("34.1k in · 371.2k cached · 13.4k out");
+    expect(container.textContent).toContain("$0.61");
+  });
+
+  it("shows tokens on an error result finish line too (success AND error)", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 6, kind: "error", payload: { event: "result", subtype: "error_max_turns", errors: ["cap"] } })}
+        live={false}
+        phaseUsage={{ ...phaseUsage, isError: true, fresh: 500, cached: 0, out: 120, costUsd: 0.03 }}
+      />,
+    );
+    expect(container.textContent).toContain("500 in · 0 cached · 120 out");
+    expect(container.textContent).toContain("$0.03");
+  });
+
+  it("renders the plain finish line when no phase usage is supplied (pre-feature)", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 7, kind: "status", payload: { event: "result", subtype: "success", num_turns: 3 } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("agent finished");
+    expect(container.textContent).not.toContain(" in · ");
   });
 });

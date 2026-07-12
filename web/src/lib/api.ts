@@ -574,6 +574,23 @@ export interface Run {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  /** PRD #40: the run's rolled-up token/cost totals (greatest-wins per model,
+   *  summed across models — the server's run_usage_totals view). Present only when
+   *  the run has usage rows; absent/null for a pre-feature run, so the UI shows
+   *  nothing rather than a fabricated 0. On both the list rows and the detail read. */
+  usage?: RunUsage | null;
+}
+
+// RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
+// derives its own richer per-phase/per-agent breakdown from the message stream
+// (lib/runUsage.ts); this bundle is the cheap total the list row and detail strip
+// read directly.
+export interface RunUsage {
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
 }
 
 // RunListItem is a run row for the index + admin overview: the run plus display

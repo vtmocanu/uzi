@@ -21,8 +21,10 @@ import {
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
 import { isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
 import { useRunStream } from "../lib/useRunStream";
+import { deriveRunUsage } from "../lib/runUsage";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { formatDuration } from "../components/RunEvent";
+import { RunUsagePanel } from "../components/RunUsage";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { Markdown } from "../components/Markdown";
 import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, Textarea, cx } from "../components/ui";
@@ -107,6 +109,11 @@ export function RunView() {
     () => (run?.status === "running" ? stageForMessages(messages) : null),
     [run?.status, messages],
   );
+
+  // PRD #40: usage derived client-side from the stream (Decision 5) — a pure
+  // reduction re-run as messages grow, so it folds in live (Decision 9) with no
+  // accumulator. Feeds the usage panel + the per-phase finish lines in the feed.
+  const usage = useMemo(() => deriveRunUsage(messages), [messages]);
 
   if (!run) {
     return (
@@ -311,12 +318,19 @@ export function RunView() {
         <AgentRosterSummary run={run} />
       )}
 
+      {usage.hasUsage && (
+        <Card className="p-4">
+          <RunUsagePanel usage={usage} />
+        </Card>
+      )}
+
       <Card className="p-4">
         <ActivityFeed
           messages={messages}
           runningLive={run.status === "running"}
           connected={connected}
           terminal={terminal}
+          phaseUsageBySeq={usage.phaseUsageBySeq}
         />
       </Card>
 
