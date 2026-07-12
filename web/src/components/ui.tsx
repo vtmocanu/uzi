@@ -115,8 +115,8 @@ export function Field({
 const INPUT_CLASS =
   "w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-fg placeholder:text-faint outline-none focus:border-brand/70";
 
-export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
-  return <input className={INPUT_CLASS} {...props} />;
+export function Input({ className = "", ...props }: InputHTMLAttributes<HTMLInputElement>) {
+  return <input className={cx(INPUT_CLASS, className)} {...props} />;
 }
 
 export function Select(props: SelectHTMLAttributes<HTMLSelectElement>) {
