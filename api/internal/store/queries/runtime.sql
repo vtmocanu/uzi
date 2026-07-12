@@ -544,7 +544,7 @@ JOIN runs r ON r.id = t.run_id
 JOIN users u ON u.id = r.user_id
 WHERE r.kind <> 'chat'
 GROUP BY u.id, u.email
-ORDER BY cost_usd DESC, output_tokens DESC;
+ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 
 -- Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
 -- The chat agent investigates its OWNER'S runs (both kinds) via the worker. These
