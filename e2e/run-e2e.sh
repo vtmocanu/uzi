@@ -692,6 +692,28 @@ echo "$MSGS" | jq -e '.messages | (length > 0) and ([.[].seq] == [range(1; lengt
   || fail "run_messages seq is not a gapless 1..N sequence (across the restart)"
 pass "run_messages seq is gapless 1..$(echo "$MSGS" | jq '.messages | length') across the restart"
 
+# PRD #40: the stub emits a synthetic terminal result frame (fixed usage) + a
+# per-agent coder message, standing in for the live SDK. Assert the API folded that
+# usage onto the run, aggregated it into /api/usage, and kept the per-agent row in
+# the stream (the three surfaces M4 renders from).
+RUNUSAGE="$(apiget "/api/runs/$RUN")"
+[ "$(echo "$RUNUSAGE" | jq -r '.run.usage.input_tokens // empty')" = 21400 ] \
+  || fail "run.usage.input_tokens is not 21400 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
+[ "$(echo "$RUNUSAGE" | jq -r '.run.usage.output_tokens // empty')" = 6100 ] \
+  || fail "run.usage.output_tokens is not 6100 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
+pass "PRD #40: run.usage folded the result frame (21400 in / 6100 out) via run_usage"
+
+SELF_USAGE="$(apiget /api/usage)"
+[ "$(echo "$SELF_USAGE" | jq -r '.lifetime.input_tokens')" -ge 21400 ] \
+  || fail "/api/usage lifetime.input_tokens < 21400 (got: $(echo "$SELF_USAGE" | jq -c '.lifetime'))"
+[ "$(echo "$SELF_USAGE" | jq -r '.run_count')" -ge 1 ] \
+  || fail "/api/usage run_count < 1 (got: $(echo "$SELF_USAGE" | jq -c '.run_count'))"
+pass "PRD #40: /api/usage aggregates the run (lifetime in >= 21400, run_count >= 1)"
+
+echo "$MSGS" | jq -e '[.messages[] | select(.agent == "coder" and (.payload.usage.input_tokens? == 12000))] | length >= 1' >/dev/null \
+  || fail "no per-agent (coder) usage-bearing message in the run-view data"
+pass "PRD #40: per-agent coder usage message present in the run stream (12000 in)"
+
 say "secret-hygiene assertions"
 LOGS="$("${COMPOSE[@]}" logs --no-color 2>&1 || true)"
 for sec in "$WTOKEN" "$DUMMY_FORGE_PAT" "$DUMMY_ANTHROPIC"; do

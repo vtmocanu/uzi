@@ -5256,3 +5256,69 @@ and fact-check findings.
   only, length-capped, never refreshed — uzi lets users edit their own display name and won't
   fight the IdP), `sub`/`iss` → identity. Post-link email drift at the IdP is logged as a
   warning, not auto-applied (email is UNIQUE; auto-rename can collide — deferred).
+# PRD #40 — Token usage & cost reporting (per run / per user / factory-wide)
+
+Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisions:
+
+## 195. Result-frame usage is CUMULATIVE-across-resume (M1 verdict b)
+
+- **Decision (PROVISIONAL, no live run available; evidence decompiled from the exact shipping CLI
+  the SDK spawns).** Each phase is its own `query()` invocation resuming the prior session; the
+  terminal `result` frame's `usage`/`modelUsage`/`total_cost_usd` are read from a process-global
+  accumulator that the CLI SEEDS with the prior session's persisted totals on resume (same-process
+  AND cross-process/requeue) before adding this invocation. So each frame reports the session's
+  running totals, not a per-invocation delta. `duration_ms`/`num_turns` stay per-invocation (they
+  read different CLI state). The worker forwards raw SDK numbers — no delta normalization.
+- **Consequences:** the server rollup and the client per-phase view apply DIFFERENT rules to the
+  same cumulative frames, so both are pinned by this verdict (below). A live two-phase run crossing a
+  requeue boundary is the deferred firm-up (M6 residual).
+
+## 196. run_usage snapshot table + greatest-wins rollup centralized in a VIEW
+
+- **Storage** (`00056_run_usage.sql`): `run_usage(run_id FK ON DELETE CASCADE, session_id, model,
+  input/cache_read/cache_creation/output bigint, cost_usd numeric(12,6), updated_at, PK(run_id,
+  session_id, model))`, multica's `task_usage` prior art. The fold is server-side in
+  `workersvc.AppendMessages` on EVERY delivered result frame (incl. seq-deduped replays), so
+  at-least-once delivery + an idempotent write = correct totals with no crash window (the `Store`
+  exposes no transaction seam). Malformed/absent usage skips; out-of-range inputs clamp
+  (cost→numeric(12,6) ceiling, negative tokens→0) so a bogus frame can't 22003 the append into a
+  worker-batcher poison loop. Chat runs (`kind='chat'`, PRD #39) are excluded — issue + ci_fix fold.
+- **The merge is GREATEST per column, not plain EXCLUDED** — under verdict b a stable session_id can
+  see two cumulative snapshots hit one key, so overwrite would let a crash-retry regress the row.
+- **Every rollup reads a `run_usage_totals` VIEW** (`00057`) that computes `MAX` per `(run_id, model)`
+  then `SUM` across models — the verdict-b rule in ONE place so run list/detail totals, `/api/usage`
+  (self, session-authed), and `/api/admin/usage` (RequireAdmin, factory + per-user) can't drift to a
+  plain SUM (which would multiply the snapshots when session_id evolves). Pre-feature runs have no
+  rows → usage is absent, never a fabricated 0.
+
+## 197. Per-agent attribution is client-derived per-call usage — a different data path
+
+- The worker attaches each assistant frame's PER-CALL `message.usage` (BetaUsage, nullable cache
+  fields) to exactly one emitted message that survives the executor's signal filter (Decision 11) —
+  never in `mapAssistant`, which can't see that drop. `run_usage` folds ONLY result-frame usage; the
+  per-agent table is a PURE reduction over the seq-deduped message list grouped by `agent`, so it can
+  double-count refusal-fallback `supersedes` pairs — footnoted "attributed; may not sum to the run
+  total", tokens only.
+
+## 198. Client surfaces derive from the stream; one shared formatter; strip vs list-row can diverge
+
+- The run view derives its usage strip, per-phase table (DELTAS between consecutive cumulative
+  frames, clamped ≥0), per-agent table, and finish-line tokens from the replayed message stream
+  (`web/src/lib/runUsage.ts`, a pure reduction re-run as messages grow → live fold-in, no
+  accumulator). `formatTokens`/`formatCost` (Decision 10) are the single shared formatters — adaptive
+  (k under 1M, M above); a sub-1M list total showing "640.0k" (not "0.64M") is correct, not drift.
+  Cost is secondary and a $0 cost renders "—" (Decision 8). The dashboard's "Your usage" is for
+  everyone; the factory total + per-user table (share bars by total tokens) render only when the
+  admin view was fetched — a non-admin never calls the admin endpoint. **Caveat:** the run-view strip
+  (client top-level delta-sum) and the list-row/detail total (server MAX-then-SUM) agree only in the
+  monotonic case; a requeue reset can make them legitimately differ (client keeps both legs clamped,
+  server greatest-wins takes the higher).
+
+## 199. M6 — the isolated e2e stub stands in for the SDK's usage frames
+
+- The stub executor (`agent/src/executor.ts`) emits a synthetic per-agent `coder` message with
+  per-call usage + a terminal `result` frame with fixed cumulative usage/modelUsage on every run (no
+  sentinel), since the isolated stack has no SDK. `./e2e/run-e2e.sh` asserts the usage folds onto the
+  run (`run.usage`), aggregates into `/api/usage`, and keeps the per-agent coder row in the stream —
+  the three surfaces M4 renders. Live-credential firm-up (verdict b + strip==list-row across a
+  requeue boundary) is the recorded residual.
