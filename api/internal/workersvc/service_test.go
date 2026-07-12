@@ -101,6 +101,10 @@ type fakeStore struct {
 	workerPageErr         error
 	upsertedReview        *store.UpsertRunReviewWithRecommendationsParams
 	upsertReviewErr       error
+	reviewByTarget        store.RunReview
+	reviewByTargetErr     error
+	recsByReview          []store.ReviewRecommendation
+	recsByReviewErr       error
 
 	// Submit input.
 	runByID            store.Run
@@ -362,6 +366,12 @@ func (f *fakeStore) UpsertRunReviewWithRecommendations(_ context.Context, arg st
 		return uuid.UUID{}, f.upsertReviewErr
 	}
 	return uuid.New(), nil
+}
+func (f *fakeStore) GetRunReviewForTarget(context.Context, uuid.UUID) (store.RunReview, error) {
+	return f.reviewByTarget, f.reviewByTargetErr
+}
+func (f *fakeStore) ListRecommendationsForReview(context.Context, uuid.UUID) ([]store.ReviewRecommendation, error) {
+	return f.recsByReview, f.recsByReviewErr
 }
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr

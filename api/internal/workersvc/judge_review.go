@@ -58,6 +58,16 @@ type ReviewRecommendation struct {
 	Confidence  string `json:"confidence"`
 }
 
+// ReviewResult identifies the persisted review after a PostReview — the reviewed
+// run's owner and the review row id. The handler uses it to fire the "review ready"
+// notification AFTER the review is durably persisted (M4, persist-first): the deep
+// link is built from the target run id, the inbox row is anchored to both ids, and
+// the notification is delivered only to the run's own owner (never cross-user).
+type ReviewResult struct {
+	OwnerID  uuid.UUID
+	ReviewID uuid.UUID
+}
+
 // PostReview persists a judge's review of a target run (PRD #46 Decision 5) — the
 // worker's write-back at judge-run completion. Authorization is judge-run-scoped
 // (authorizeJudgeTrace): the caller's worker must own the active judge run reviewing
@@ -65,10 +75,12 @@ type ReviewRecommendation struct {
 // recommendations are written in ONE atomic statement with UPSERT (replace) semantics,
 // so a re-judge overwrites the prior review rather than 23505-ing (Decision 8).
 // Provenance — the producing judge run + owner — is stamped on every recommendation.
-func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission) error {
+// Returns the owner + review id so the caller can notify persist-first (the review is
+// the durable source of truth; the notification is a best-effort surface layered on).
+func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission) (ReviewResult, error) {
 	judge, target, err := s.authorizeJudgeTrace(ctx, wkr, targetID)
 	if err != nil {
-		return err
+		return ReviewResult{}, err
 	}
 	recs := sub.Recommendations
 	if recs == nil {
@@ -76,9 +88,9 @@ func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uui
 	}
 	recsJSON, err := json.Marshal(recs)
 	if err != nil {
-		return fmt.Errorf("marshal recommendations: %w", err)
+		return ReviewResult{}, fmt.Errorf("marshal recommendations: %w", err)
 	}
-	_, err = s.q.UpsertRunReviewWithRecommendations(ctx, store.UpsertRunReviewWithRecommendationsParams{
+	reviewID, err := s.q.UpsertRunReviewWithRecommendations(ctx, store.UpsertRunReviewWithRecommendationsParams{
 		TargetRunID:      target.ID,
 		JudgeRunID:       pgUUID(judge.ID),
 		UserID:           target.UserID,
@@ -90,5 +102,8 @@ func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uui
 		ProducedByUserID: pgUUID(target.UserID),
 		Recommendations:  recsJSON,
 	})
-	return err
+	if err != nil {
+		return ReviewResult{}, err
+	}
+	return ReviewResult{OwnerID: target.UserID, ReviewID: reviewID}, nil
 }

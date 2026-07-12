@@ -10,7 +10,10 @@ import type {
   ForgeConnection,
   IssueProposal,
   LatestRun,
+  RecommendationCategory,
   Repo,
+  ReviewStatus,
+  ReviewVerdict,
   Run,
   RunListItem,
   RunMessage,
@@ -143,6 +146,64 @@ export const mockNotifications: MockNotification[] = [
     created_at: minsAgo(120),
     owner_email: "mira@uzi.local",
     owner_display_name: "Mira Ionescu",
+  },
+];
+
+// ── Run judge reviews (PRD #46 M4) ───────────────────────────────────────────
+// Seeded verdicts for the run-page review panel, keyed by target run id. run-done
+// carries a full "issues" verdict with recommendations so the panel + preview mode
+// have something to show; other terminal runs (e.g. run-failed) have no review, so
+// their panel renders the "not judged yet" state with a Run-judge button.
+export interface MockReview {
+  id: string;
+  target_run_id: string;
+  verdict: ReviewVerdict;
+  summary_md: string;
+  judge_model: string;
+  status: ReviewStatus;
+  created_at: string;
+  updated_at: string;
+  recommendations: {
+    id: string;
+    category: RecommendationCategory;
+    target: string;
+    rationale_md: string;
+    confidence: "" | "low" | "medium" | "high";
+    created_at: string;
+  }[];
+}
+
+export const mockReviews: MockReview[] = [
+  {
+    id: "rev-done",
+    target_run_id: "run-done",
+    verdict: "issues",
+    summary_md:
+      "The run delivered the feature and opened an MR, but the agent lost time to a missing worker tool and re-ran the same search three times before finding the handler.",
+    judge_model: "haiku",
+    status: "complete",
+    created_at: minsAgo(6),
+    updated_at: minsAgo(6),
+    recommendations: [
+      {
+        id: "rec-1",
+        category: "install_worker_tool",
+        target: "shellcheck",
+        rationale_md:
+          "The agent tried `shellcheck` twice and hit `command not found`; installing it in the worker image would save the fallback.",
+        confidence: "high",
+        created_at: minsAgo(6),
+      },
+      {
+        id: "rec-2",
+        category: "improve_agent",
+        target: "reviewer",
+        rationale_md:
+          "The repo reviewer agent approved on the first pass without checking the migration ordering; tightening its checklist would catch this class of issue.",
+        confidence: "medium",
+        created_at: minsAgo(6),
+      },
+    ],
   },
 ];
 

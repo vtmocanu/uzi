@@ -47,6 +47,8 @@ import {
   mockNotifications,
   type MockNotification,
   mockRepos,
+  mockReviews,
+  type MockReview,
   mockRepoToolProfiles,
   mockSecrets,
   mockSkills,
@@ -159,6 +161,7 @@ const loadedSettings = loadSettings();
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let notifications: MockNotification[] = mockNotifications.map((n) => ({ ...n }));
+const reviews: MockReview[] = mockReviews.map((r) => ({ ...r, recommendations: r.recommendations.map((x) => ({ ...x })) }));
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
 let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
@@ -1138,6 +1141,30 @@ export const mockApi = {
       .filter((t) => !LEAD_NAME_RE.test(t.name))
       .map((t) => ({ name: t.name, description: t.description }));
     return delay({ run: { ...run, own_agents } }, 60);
+  },
+  // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
+  getRunReview: async (id: string) => {
+    if (!getRun(id)) throw new ApiError(404, "run not found");
+    const review = reviews.find((r) => r.target_run_id === id);
+    return delay(
+      { review: review ? { ...review, recommendations: review.recommendations.map((x) => ({ ...x })) } : null },
+      60,
+    );
+  },
+  rerunJudge: async (id: string) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.status !== "completed" && run.status !== "failed") {
+      throw new ApiError(422, "this run cannot be judged");
+    }
+    if (run.kind !== "issue" && run.kind !== "ci_fix") {
+      throw new ApiError(422, "this run cannot be judged");
+    }
+    // A mock judge run: no worker executes it, so the seeded review is unchanged —
+    // the panel just shows the "re-queued" note. Cloning the target run yields a
+    // valid Run shape for the envelope.
+    const judge: Run = { ...run, id: nextRunId(), kind: "judge", status: "queued" };
+    return delay({ run: judge }, 120);
   },
   getRunMessages: async (id: string, afterSeq = 0) => {
     const log = state.messages.get(id);

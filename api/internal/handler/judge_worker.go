@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -179,7 +181,8 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.wsvc.PostReview(r.Context(), wkr, targetID, sub); err != nil {
+	res, err := h.wsvc.PostReview(r.Context(), wkr, targetID, sub)
+	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
 			return
@@ -188,7 +191,91 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// The review is now durably persisted (persist-first). Surface it best-effort as a
+	// "review ready" notification to the run's OWNER (never cross-user): an inbox row
+	// plus an optional Slack DM. A notify failure never fails the worker POST — the
+	// review is the source of truth and re-running is cheap.
+	h.notifyReviewReady(r.Context(), targetID, res, sub)
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+// judgeReviewNotificationKind is the inbox notification kind the judge produces at
+// review completion (PRD #46 M4). The inbox + Slack renderers key on the { title,
+// body } payload convention; this kind lets a reader recognize a judge review row.
+const judgeReviewNotificationKind = "judge_review"
+
+// notifyReviewReady fires the "review ready" notification for a just-persisted review
+// (PRD #46 M4). Best-effort and nil-safe: no notifier wired ⇒ no-op; a delivery error
+// is logged, never returned (the worker POST already succeeded). The deep link's base
+// is the operator-set public base URL (server-side, never LLM text); a lookup failure
+// simply drops the link.
+func (h *Handler) notifyReviewReady(ctx context.Context, targetID uuid.UUID, res workersvc.ReviewResult, sub workersvc.ReviewSubmission) {
+	if h.notifier == nil {
+		return
+	}
+	base := ""
+	if h.settings != nil {
+		if b, err := h.settings.PublicBaseURL(ctx); err == nil {
+			base = b
+		}
+	}
+	if _, err := h.notifier.Notify(ctx, buildReviewNotification(base, targetID, res, sub)); err != nil {
+		slog.Error("notify judge review ready", "error", err)
+	}
+}
+
+// buildReviewNotification assembles the "review ready" notification (PRD #46 M4). It
+// is PURE (no I/O) so the security-critical shape is unit-testable: the inbox payload
+// and the Slack body carry ONLY structured fields — the verdict enum and the
+// recommendation COUNT — never the judge's free-text summary/rationale, so nothing
+// unscrubbed ever reaches the verbatim payload path (M2 audit headline). The full
+// scrubbed summary + recommendations live on the run page behind the deep link. The
+// link is server-built from the operator-set base URL + the target run UUID (never
+// any LLM-supplied text); an empty/unset base yields no link. The notification goes
+// only to the reviewed run's owner (res.OwnerID), anchored to both the run and review.
+func buildReviewNotification(baseURL string, targetID uuid.UUID, res workersvc.ReviewResult, sub workersvc.ReviewSubmission) notifysvc.Notification {
+	body := reviewNotificationBody(sub.Verdict, len(sub.Recommendations))
+	runID, reviewID := targetID, res.ReviewID
+	return notifysvc.Notification{
+		UserID: res.OwnerID,
+		Kind:   judgeReviewNotificationKind,
+		Payload: map[string]any{
+			"title":                "Run review ready",
+			"body":                 body,
+			"verdict":              sub.Verdict,
+			"status":               sub.Status,
+			"recommendation_count": len(sub.Recommendations),
+		},
+		RunID:    &runID,
+		ReviewID: &reviewID,
+		Slack: &notifysvc.SlackRender{
+			Title: "Run review ready",
+			Body:  body,
+			Link:  reviewDeepLink(baseURL, targetID),
+		},
+	}
+}
+
+// reviewNotificationBody renders the structured one-line summary shown in the inbox
+// and the Slack DM: the verdict and how many recommendations came with it. All
+// structured — no untrusted free text.
+func reviewNotificationBody(verdict string, recCount int) string {
+	if recCount == 1 {
+		return "verdict: " + verdict + " — 1 recommendation"
+	}
+	return fmt.Sprintf("verdict: %s — %d recommendations", verdict, recCount)
+}
+
+// reviewDeepLink builds the run-page deep link from the operator-set public base URL
+// and the target run UUID. Both are server-controlled; no LLM text is ever
+// interpolated. An empty base (unset, or the settings lookup failed) yields "" so the
+// notification simply carries no link.
+func reviewDeepLink(baseURL string, targetID uuid.UUID) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return ""
+	}
+	return baseURL + "/runs/" + targetID.String()
 }
 
 // validateAndScrubReview is the review ingest gate (Decision 5, audit C1/L4): reject a

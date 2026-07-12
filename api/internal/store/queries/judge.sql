@@ -74,3 +74,19 @@ inserted AS (
         AS x(category text, target text, rationale_md text, confidence text)
 )
 SELECT id FROM upserted;
+
+-- name: GetRunReviewForTarget :one
+-- The judge's verdict for a target run, for the run-page review panel (Decision 5,
+-- M4). Read-side counterpart to the write above; UNIQUE(target_run_id) makes it at
+-- most one row. Owner-or-admin visibility is enforced by the caller (GetRunForViewer
+-- on the target run) BEFORE this read, not here — this is a plain by-target lookup.
+SELECT * FROM run_reviews WHERE target_run_id = @target_run_id;
+
+-- name: ListRecommendationsForReview :many
+-- The structured recommendations of a review, oldest-first, for the run-page panel
+-- (Decision 5, M4). Served by idx_review_recommendations_review. Every free-text
+-- field was scrubbed + capped at the review POST (M3), so the panel renders them as
+-- escaped text; this read adds no trust.
+SELECT * FROM review_recommendations
+WHERE review_id = @review_id
+ORDER BY created_at ASC, id ASC;

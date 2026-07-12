@@ -152,6 +152,73 @@ func (q *Queries) GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg GetA
 	return i, err
 }
 
+const getRunReviewForTarget = `-- name: GetRunReviewForTarget :one
+SELECT id, target_run_id, judge_run_id, user_id, verdict, summary_md, judge_model, status, created_at, updated_at FROM run_reviews WHERE target_run_id = $1
+`
+
+// The judge's verdict for a target run, for the run-page review panel (Decision 5,
+// M4). Read-side counterpart to the write above; UNIQUE(target_run_id) makes it at
+// most one row. Owner-or-admin visibility is enforced by the caller (GetRunForViewer
+// on the target run) BEFORE this read, not here — this is a plain by-target lookup.
+func (q *Queries) GetRunReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (RunReview, error) {
+	row := q.db.QueryRow(ctx, getRunReviewForTarget, targetRunID)
+	var i RunReview
+	err := row.Scan(
+		&i.ID,
+		&i.TargetRunID,
+		&i.JudgeRunID,
+		&i.UserID,
+		&i.Verdict,
+		&i.SummaryMd,
+		&i.JudgeModel,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const listRecommendationsForReview = `-- name: ListRecommendationsForReview :many
+SELECT id, review_id, category, target, rationale_md, confidence, produced_by_run_id, produced_by_user_id, addressed_by_run_id, created_at FROM review_recommendations
+WHERE review_id = $1
+ORDER BY created_at ASC, id ASC
+`
+
+// The structured recommendations of a review, oldest-first, for the run-page panel
+// (Decision 5, M4). Served by idx_review_recommendations_review. Every free-text
+// field was scrubbed + capped at the review POST (M3), so the panel renders them as
+// escaped text; this read adds no trust.
+func (q *Queries) ListRecommendationsForReview(ctx context.Context, reviewID uuid.UUID) ([]ReviewRecommendation, error) {
+	rows, err := q.db.Query(ctx, listRecommendationsForReview, reviewID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ReviewRecommendation{}
+	for rows.Next() {
+		var i ReviewRecommendation
+		if err := rows.Scan(
+			&i.ID,
+			&i.ReviewID,
+			&i.Category,
+			&i.Target,
+			&i.RationaleMd,
+			&i.Confidence,
+			&i.ProducedByRunID,
+			&i.ProducedByUserID,
+			&i.AddressedByRunID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunInputsForRun = `-- name: ListRunInputsForRun :many
 SELECT id, run_id, kind, body, consumed_at, created_at FROM run_user_inputs
 WHERE run_id = $1

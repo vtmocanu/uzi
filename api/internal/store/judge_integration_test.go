@@ -134,6 +134,22 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT verdict FROM run_reviews WHERE id = $1`, reviewID).Scan(&verdict); err != nil || verdict != "ok" {
 		t.Fatalf("re-judge did not update the verdict: %q, %v", verdict, err)
 	}
+
+	// ── read side (M4): GetRunReviewForTarget + ListRecommendationsForReview ──
+	review, err := q.GetRunReviewForTarget(ctx, targetID)
+	if err != nil {
+		t.Fatalf("GetRunReviewForTarget: %v", err)
+	}
+	if review.ID != reviewID || review.Verdict != "ok" || review.TargetRunID != targetID {
+		t.Fatalf("read-back review wrong: %+v", review)
+	}
+	readRecs, err := q.ListRecommendationsForReview(ctx, reviewID)
+	if err != nil {
+		t.Fatalf("ListRecommendationsForReview: %v", err)
+	}
+	if len(readRecs) != 1 || readRecs[0].Category != "improve_agent" || readRecs[0].Target != "coder" {
+		t.Fatalf("read-back recommendations wrong (want the single post-re-judge rec): %+v", readRecs)
+	}
 }
 
 func countRecs(ctx context.Context, t *testing.T, pool *pgxpool.Pool, reviewID uuid.UUID) int {

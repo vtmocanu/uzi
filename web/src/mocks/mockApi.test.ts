@@ -115,3 +115,32 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     expect(runs.length).toBeGreaterThan(0);
   });
 });
+
+describe("mockApi run judge review (PRD #46 M4)", () => {
+  it("returns the seeded review for a judged run, null for an unjudged one, 404 for unknown", async () => {
+    installStorage();
+    const api = await reload();
+
+    const { review } = await api.getRunReview("run-done");
+    expect(review).not.toBeNull();
+    expect(review!.verdict).toBe("issues");
+    expect(review!.recommendations.length).toBeGreaterThan(0);
+
+    // A terminal run with no seeded review reads as null (not judged yet).
+    expect((await api.getRunReview("run-failed")).review).toBeNull();
+
+    await expect(api.getRunReview("does-not-exist")).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("rerunJudge enqueues a judge run for a terminal issue run and rejects a non-terminal one", async () => {
+    installStorage();
+    const api = await reload();
+
+    const { run } = await api.rerunJudge("run-done");
+    expect(run.kind).toBe("judge");
+    expect(run.status).toBe("queued");
+
+    // A still-queued run is not terminal, so it cannot be judged.
+    await expect(api.rerunJudge("run-queued")).rejects.toMatchObject({ status: 422 });
+  });
+});

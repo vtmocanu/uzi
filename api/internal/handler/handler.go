@@ -452,6 +452,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}", h.GetRun)
 				r.Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
+				// Judge surfacing (PRD #46 M4): the run-page verdict + recommendations
+				// panel reads the review (owner-or-admin, GetRunForViewer-scoped).
+				r.Get("/{id}/review", h.GetRunReview)
+				// Re-run judge (Decision 8): enqueue a fresh judge for a terminal run.
+				// Owner-only spend (enforced in the service, audit H3); behind the
+				// per-user chat spend limiter since it mints a token-spending run, like
+				// chat create/continue.
+				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
 			})
 
 			// In-app chat agent (PRD #39): conversations ride runs.kind='chat'. The

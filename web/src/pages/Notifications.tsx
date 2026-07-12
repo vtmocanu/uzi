@@ -17,6 +17,9 @@ import {
   notificationTitle,
 } from "../lib/notifications";
 
+// PAGE_SIZE matches the API's default page; Load-more fetches the next page.
+const PAGE_SIZE = 30;
+
 function NotificationRow({
   n,
   canMarkRead,
@@ -82,26 +85,58 @@ export function Notifications() {
   const [scope, setScope] = useState<"mine" | "all">("mine");
   const [items, setItems] = useState<Notification[]>([]);
   const [unread, setUnread] = useState(0);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
+
+  // The API paginates (offset/limit); the page walks it with a Load-more button
+  // rather than pulling the whole 200-row cap at once. total (from the envelope)
+  // tells us when there is more to fetch. offset paging is stable here because
+  // mark-read flips read_at in place (it never removes a row).
+  const fetchPage = useCallback(
+    (offset: number) =>
+      api.listNotifications({
+        ...(scope === "all" ? { all: true } : {}),
+        limit: PAGE_SIZE,
+        offset,
+      }),
+    [scope],
+  );
 
   const load = useCallback(async () => {
     setError("");
     try {
-      const res = await api.listNotifications(scope === "all" ? { all: true } : undefined);
+      const res = await fetchPage(0);
       setItems(res.notifications);
       setUnread(res.unread);
+      setTotal(res.total);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load notifications");
     } finally {
       setLoading(false);
     }
-  }, [scope]);
+  }, [fetchPage]);
 
   useEffect(() => {
     setLoading(true);
     load();
   }, [load]);
+
+  const loadMore = async () => {
+    setLoadingMore(true);
+    setError("");
+    try {
+      const res = await fetchPage(items.length);
+      setItems((prev) => [...prev, ...res.notifications]);
+      setUnread(res.unread);
+      setTotal(res.total);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to load more");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   const markRead = async (id: string) => {
     try {
@@ -168,11 +203,20 @@ export function Notifications() {
               description="Run reviews and other updates land here. Nothing to show right now."
             />
           ) : (
-            <ul className="space-y-2">
-              {items.map((n) => (
-                <NotificationRow key={n.id} n={n} canMarkRead={canMark(n)} onMarkRead={markRead} />
-              ))}
-            </ul>
+            <>
+              <ul className="space-y-2">
+                {items.map((n) => (
+                  <NotificationRow key={n.id} n={n} canMarkRead={canMark(n)} onMarkRead={markRead} />
+                ))}
+              </ul>
+              {items.length < total && (
+                <div className="flex justify-center pt-1">
+                  <Button variant="secondary" size="sm" disabled={loadingMore} onClick={loadMore}>
+                    {loadingMore ? "Loading…" : `Load more (${items.length} of ${total})`}
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </>
       )}

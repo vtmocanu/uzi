@@ -54,8 +54,8 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     expect(screen.getByText("verdict: issues")).toBeTruthy();
     const link = screen.getByText("· Open run").closest("a");
     expect(link?.getAttribute("href")).toBe("/runs/run-done");
-    // Own view was requested (no all-scope).
-    expect(mockApi.listNotifications).toHaveBeenCalledWith(undefined);
+    // Own view was requested (no all-scope), paged from the first offset.
+    expect(mockApi.listNotifications).toHaveBeenCalledWith({ limit: 30, offset: 0 });
   });
 
   it("falls back to a humanized kind when the payload has no title", async () => {
@@ -124,8 +124,33 @@ describe("Notifications inbox (PRD #46 M2)", () => {
     fireEvent.click(screen.getByText("All users"));
 
     await waitFor(() => expect(screen.getByText("Mira Ionescu")).toBeTruthy());
-    expect(mockApi.listNotifications).toHaveBeenLastCalledWith({ all: true });
+    expect(mockApi.listNotifications).toHaveBeenLastCalledWith({ all: true, limit: 30, offset: 0 });
     // Another user's row offers no mark-read control (own-row only).
     expect(screen.queryByText("Mark read")).toBeNull();
+  });
+
+  it("pages the inbox with Load more (offset paging), then hides the button", async () => {
+    const page1 = Array.from({ length: 30 }, (_, i) =>
+      aNotif({ id: `p1-${i}`, payload: { title: `row ${i}`, body: "" } }),
+    );
+    const page2 = [aNotif({ id: "p2-0", payload: { title: "second page row", body: "" } })];
+    mockApi.listNotifications
+      .mockResolvedValueOnce({ notifications: page1, unread: 0, total: 31 })
+      .mockResolvedValueOnce({ notifications: page2, unread: 0, total: 31 });
+
+    render(
+      <MemoryRouter>
+        <Notifications />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("row 0")).toBeTruthy());
+    fireEvent.click(screen.getByText(/Load more/));
+
+    await waitFor(() => expect(screen.getByText("second page row")).toBeTruthy());
+    // The next page was fetched at offset = the count already shown.
+    expect(mockApi.listNotifications).toHaveBeenLastCalledWith({ limit: 30, offset: 30 });
+    // All 31 rows are now loaded, so the button is gone.
+    expect(screen.queryByText(/Load more/)).toBeNull();
   });
 });

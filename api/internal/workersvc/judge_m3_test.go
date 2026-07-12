@@ -261,12 +261,15 @@ func TestPostReviewPersistsVerdictAndRecs(t *testing.T) {
 		runByIDPlain:   store.Run{ID: target, UserID: owner, Kind: RunKindIssue, Status: "completed"},
 	}
 	svc := New(fs, newBox(t), testParams())
-	err := svc.PostReview(context.Background(), worker(), target, ReviewSubmission{
+	res, err := svc.PostReview(context.Background(), worker(), target, ReviewSubmission{
 		Verdict: "issues", SummaryMd: "needs a tool", JudgeModel: "haiku", Status: "complete",
 		Recommendations: []ReviewRecommendation{{Category: "install_worker_tool", Target: "shellcheck", RationaleMd: "missing", Confidence: "high"}},
 	})
 	if err != nil {
 		t.Fatalf("PostReview: %v", err)
+	}
+	if res.OwnerID != owner {
+		t.Errorf("review result owner = %v, want %v", res.OwnerID, owner)
 	}
 	if fs.upsertedReview == nil {
 		t.Fatal("expected a review upsert")
@@ -338,7 +341,7 @@ func TestSubmitInputCancelServerSideDoesNotEnqueueJudge(t *testing.T) {
 func TestPostReviewRejectsUnauthorizedWorker(t *testing.T) {
 	fs := &fakeStore{activeJudgeRunErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	err := svc.PostReview(context.Background(), worker(), uuid.New(), ReviewSubmission{Verdict: "ok", Status: "complete"})
+	_, err := svc.PostReview(context.Background(), worker(), uuid.New(), ReviewSubmission{Verdict: "ok", Status: "complete"})
 	if err != ErrRunNotFound {
 		t.Fatalf("err = %v, want ErrRunNotFound (no active judge run for this worker/target)", err)
 	}

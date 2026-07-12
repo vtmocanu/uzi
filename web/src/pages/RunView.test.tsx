@@ -1,15 +1,18 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { PlanPanel, AgentRosterSummary } from "./RunView";
-import { api, type RepoAgent, type Run } from "../lib/api";
+import { PlanPanel, AgentRosterSummary, JudgePanel } from "./RunView";
+import { api, type RepoAgent, type Run, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
 // run's own_agents instead). listAgentTemplates is mocked only so a test can assert
-// it is NEVER called.
+// it is NEVER called. getRunReview/rerunJudge back the PRD #46 M4 judge panel.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  return { ...actual, api: { listAgentTemplates: vi.fn() } };
+  return {
+    ...actual,
+    api: { listAgentTemplates: vi.fn(), getRunReview: vi.fn(), rerunJudge: vi.fn() },
+  };
 });
 const mockApi = vi.mocked(api);
 
@@ -186,5 +189,87 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
     expect(screen.getByText("coder")).toBeTruthy();
     expect(screen.getByText("tester")).toBeTruthy();
     expect(screen.getByText(/Excluded: reviewer/)).toBeTruthy();
+  });
+});
+
+describe("JudgePanel (PRD #46 M4)", () => {
+  function review(over: Partial<RunReview> = {}): RunReview {
+    return {
+      id: "rev1",
+      target_run_id: "r1",
+      verdict: "issues",
+      summary_md: "Lost time to a missing tool.",
+      judge_model: "haiku",
+      status: "complete",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      recommendations: [
+        {
+          id: "rc1",
+          category: "install_worker_tool",
+          target: "shellcheck",
+          rationale_md: "hit command not found twice",
+          confidence: "high",
+          created_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+      ...over,
+    };
+  }
+
+  it("renders the verdict chip + recommendations for a judged run", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    expect(await screen.findByText("Issues found")).toBeTruthy();
+    expect(screen.getByText("Lost time to a missing tool.")).toBeTruthy();
+    expect(screen.getByText("Install a worker tool")).toBeTruthy();
+    expect(screen.getByText("shellcheck")).toBeTruthy();
+    expect(screen.getByText("hit command not found twice")).toBeTruthy();
+    expect(mockApi.getRunReview).toHaveBeenCalledWith("r1");
+  });
+
+  it("renders review free text as escaped text, never HTML", async () => {
+    // A rationale containing markup must appear as literal characters (React escapes
+    // it) — proving no dangerouslySetInnerHTML / markdown parsing on judge output.
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        summary_md: "<img src=x onerror=alert(1)> **not bold**",
+        recommendations: [],
+      }),
+    });
+    const { container } = render(<JudgePanel run={run({ status: "completed" })} />);
+
+    expect(await screen.findByText(/<img src=x onerror=alert\(1\)> \*\*not bold\*\*/)).toBeTruthy();
+    // The markup did not become a real element.
+    expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("offers Run judge for an unjudged run and enqueues a re-run", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: null });
+    mockApi.rerunJudge.mockResolvedValue({ run: run({ id: "judge1", kind: "judge", status: "queued" }) });
+    render(<JudgePanel run={run({ status: "failed" })} />);
+
+    const btn = await screen.findByText("Run judge");
+    expect(screen.getByText(/hasn't been judged yet/i)).toBeTruthy();
+    fireEvent.click(btn);
+    expect(mockApi.rerunJudge).toHaveBeenCalledWith("r1");
+    expect(await screen.findByText(/re-queued/i)).toBeTruthy();
+  });
+
+  it("surfaces a re-run error", async () => {
+    const { ApiError } = await import("../lib/api");
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.rerunJudge.mockRejectedValue(new ApiError(409, "a judge run is already in progress for this run"));
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("Re-run judge"));
+    expect(await screen.findByText(/already in progress/i)).toBeTruthy();
+  });
+
+  it("renders nothing for an ineligible kind (chat) and never fetches a review", async () => {
+    const { container } = render(<JudgePanel run={run({ kind: "chat", status: "completed" })} />);
+    expect(container.textContent).toBe("");
+    expect(mockApi.getRunReview).not.toHaveBeenCalled();
   });
 });

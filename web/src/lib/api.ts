@@ -605,6 +605,43 @@ export interface NotificationList {
   total: number;
 }
 
+// ── Run judge review (PRD #46 M4) ────────────────────────────────────────────
+// The judge's retrospective of a finished run: a verdict + structured
+// recommendations. Every free-text field (summary_md, each rationale_md, target)
+// was validated + capped + secret-scrubbed at the review POST and is UNTRUSTED
+// judge/worker output — the run page renders it as escaped text (never markdown/
+// HTML). verdict/category/confidence are closed enums.
+export type ReviewVerdict = "ideal" | "ok" | "issues";
+export type ReviewStatus = "complete" | "failed";
+export type RecommendationCategory =
+  | "enable_tool"
+  | "install_worker_tool"
+  | "adjust_template"
+  | "improve_agent"
+  | "add_agent"
+  | "improve_uzi";
+
+export interface ReviewRecommendation {
+  id: string;
+  category: RecommendationCategory;
+  target: string;
+  rationale_md: string;
+  confidence: "" | "low" | "medium" | "high";
+  created_at: string;
+}
+
+export interface RunReview {
+  id: string;
+  target_run_id: string;
+  verdict: ReviewVerdict;
+  summary_md: string;
+  judge_model: string;
+  status: ReviewStatus;
+  created_at: string;
+  updated_at: string;
+  recommendations: ReviewRecommendation[];
+}
+
 // RunMessage is one persisted, seq-numbered event in a run's stream.
 export interface RunMessage {
   seq: number;
@@ -1041,6 +1078,15 @@ const realApi = {
       // plain follow-up/cancel body is unchanged.
       ...(selection ? { selection } : {}),
     }),
+
+  // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
+  // getRunReview reads the verdict + recommendations for the run page (owner-or-
+  // admin scoped server-side); review is null for a visible-but-unjudged run.
+  // rerunJudge enqueues a fresh judge for a terminal run (owner-only spend), behind
+  // the per-user spend limiter; the new verdict arrives asynchronously once the
+  // judge run finishes, so callers re-fetch getRunReview.
+  getRunReview: (id: string) => request<{ review: RunReview | null }>("GET", `/runs/${id}/review`),
+  rerunJudge: (id: string) => request<{ run: Run }>("POST", `/runs/${id}/rejudge`),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/
