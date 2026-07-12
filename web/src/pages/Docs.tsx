@@ -96,7 +96,7 @@ export function Docs() {
         {!query && (
           <kbd
             aria-hidden="true"
-            className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 rounded border border-edge bg-surface px-1.5 font-mono text-xs text-faint peer-focus:hidden"
+            className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 rounded border border-edge bg-surface px-1.5 font-mono text-xs text-muted peer-focus:hidden"
           >
             /
           </kbd>
