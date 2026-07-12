@@ -469,6 +469,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Post("/runs/{id}/state", h.WorkerRunState)
 			r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 
+			// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
+			// verdict. Both are judge-run-scoped (the worker must own the active judge
+			// run reviewing {id}); {id} is the TARGET run, not the judge run.
+			r.Get("/runs/{id}/trace", h.WorkerRunTrace)
+			r.Post("/runs/{id}/review", h.WorkerRunReview)
+
 			// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 			// investigates its OWNER'S runs. Every query is scoped to the worker's
 			// user_id (a foreign run id is 404), never a bare run_id lookup.
