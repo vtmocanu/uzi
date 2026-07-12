@@ -4808,3 +4808,128 @@ no fake can make is proven empirically.
   none of them). The optional live capstone (`UZI_E2E_EXECUTOR=sdk` — a repo subagent
   actually invoked, an excluded one denied) remains user-gated per the
   testing-credentials policy and is never a required gate.
+
+---
+
+# PRD #39 — In-app uzi chat agent (chat about uzi, investigate runs, propose issues)
+
+Serves human: user-requested (2026-07-10) — a conversational surface where a user chats
+with uzi in the web UI (on their own Anthropic token, worker invisible to them), the agent
+knows uzi's own code, can investigate the user's runs, and can create GitLab issues on
+request via the user's bot credentials. Full rationale + Decision Log: `prds/39-chat-agent.md`
+(3-agent-reviewed; the `↳review` decisions are binding). Architecture map: ARCHITECTURE.md
+"Chat with uzi (the fifth surface)". This section records the load-bearing AI decisions; the
+PRD carries the complete set (1–15) and the review corrections.
+
+## 181. Chat is a third run kind, not a new service
+
+- `runs.kind='chat'` — the `ci_fix` second-kind precedent extended (migration `00065`, draft;
+  renumber at landing). `runs.repo_id` relaxed to nullable with `runs_kind_shape` enforcing
+  `chat ⇒ repo_id/issue_iid/branch all NULL` AND `every other kind ⇒ repo_id NOT NULL` (the
+  pre-existing invariant preserved). Added `runs.title`, `runs.resume_of_run_id`. A chat is one
+  run; turns are ordinary `run_user_inputs` (`follow_up`) rows; the first message is atomically
+  seeded by `CreateChatRun` (a CTE, so a chat can't exist without its first message) — the claim
+  carries NO prompt text. Everything reuses the existing persisted-first `run_messages`→`/api/ws`
+  stream, vault claim-gating (§139), sweeper, and per-user rate-limit middleware with no change.
+- Chat runs are excluded from `GET /api/runs`, the admin runs list, and every board query
+  (structurally — NULL repo_id/issue_iid); an individual chat opens owner-or-admin via
+  `GET /api/runs/:id`. `GET /api/chats` returns `{chats:[chatListDTO], max_turns}` where
+  `chatListDTO` carries `turn_count` (lateral count of follow_ups) + `last_message_at` (lateral
+  MAX run_message time) so the conversation list orders by last activity without loading streams.
+- A dedicated worker-launched `user_message` run_message is emitted per consumed input (payload
+  key `text`, no agent → renders as a user bubble); the server never writes run_messages (worker
+  owns the gapless seq). This is the delivery of the pinned "first message rides the input wire
+  uniformly" contract.
+
+## 182. Narrowest-credential claim: a separate PAT-less ChatClaimPayload + a second claim lane
+
+- The chat claim is a SEPARATE `ChatClaimPayload`/`ChatClaimSecrets` — the `ForgePAT`/`ForgeUsername`
+  fields DO NOT EXIST on it (structurally stronger than `omitempty`; the run-lane wire is byte-identical,
+  golden unchanged). A dedicated `assembleChatClaim` never joins `repos`/`forge_connections`, never
+  decrypts the bot PAT, opens only the Anthropic token — so a user with an Anthropic token and NO forge
+  connection can still chat. A raw-JSON key-absence test guards the no-PAT wire.
+- Claim lane split: `POST /api/worker/runs/claim?lane=chat` selects only chat; the run lane excludes
+  chat and stays lane-less (back-compat with existing workers). The worker runs a second, independent
+  chat claim loop concurrently with its single run slot (up to `WORKER_CHAT_SESSIONS`, default 1). Node's
+  single thread + per-run-scoped collaborators (each `ChatRunner` builds its own batcher/redactor/steering/
+  executor) make the shared `Logger`/`WorkerClient` safe under a concurrent run+chat; redaction is
+  global-and-monotonic (a chat's registered secret only widens scrubbing).
+
+## 183. ChatRunner + confined ChatExecutor (deny-by-default tool surface)
+
+- A slim `ChatRunner` (claim → session loop → complete) with NO git/clone/push/MR spine — distinct from
+  `RunRunner` (the `Executor` seam only isolates the SDK turn). The `ChatExecutor` sets the SDK **`tools`**
+  option to `[Read,Grep,Glob, +uzi MCP tools]` — the real base-set restriction, NOT `allowedTools` (which
+  does not confine under `bypassPermissions`, per the installed SDK's own docs) — plus `disallowedTools`,
+  `settingSources:[]`, the Bash deny-hook, and `buildPathGuardHook` rooted at `/opt/uzi-src`. The path guard
+  gained an optional `extraSecretPaths` (the join-token path) evaluated inside `classifyResolvedPath` on the
+  RESOLVED path (after the `/proc` deny, before containment) — additive, run call sites unchanged. Load-bearing
+  token protection is the outside-root deny (the token file lives outside `/opt/uzi-src`); `extraSecretPaths`
+  is defense-in-depth; the `/proc` deny closes `Read /proc/self/environ`, the one non-Bash egress for
+  `CLAUDE_CODE_OAUTH_TOKEN`. No Bash, Write/Edit, WebFetch/WebSearch, or subagents.
+- Lifecycle: idle-bounded (worker `WORKER_CHAT_IDLE_TIMEOUT` 60m; server idle sweep `CHAT_IDLE_TIMEOUT` 70m
+  above it so the worker completes first; `RUN_TIMEOUT` skipped for chat) + per-turn wall-clock
+  (`WORKER_CHAT_TURN_TIMEOUT` 10m — the idle timer re-arms on every SDK message so a busy turn never idles) +
+  turn cap (`CHAT_MAX_TURNS` 50, enforced SERVER-side from persisted follow_ups, not worker-trusted; the seeded
+  first message counts as turn 1). The steering idle-race is closed structurally: idle is owned inside the poll
+  loop (route-then-serviceWaiter), so a follow_up consumed on the same cycle idle elapses is never dropped; the
+  executor's own idle timer was removed. SIGTERM aborts an in-flight chat (safe — no clone/PAT; session persisted
+  for resume), a deliberate divergence from runs blocking shutdown. `Continue` = a new chat run with
+  `resume_of_run_id`, resuming the persisted SDK session when the worker's disk still has it.
+
+## 184. Baked source, never a clone
+
+- uzi's own source is `COPY`'d into the worker image at build time to `/opt/uzi-src` (root-owned, never chowned
+  to the agent user = read-only) with a `BUILD_INFO` (git SHA + date) stamp, so answers match the DEPLOYED
+  version and need no PAT/network — the §54 bundle-at-build discipline. The agent image's build context moved
+  from `./agent` to the repo root, with a per-Dockerfile BuildKit ignore (`Dockerfile.dockerignore`, patterns
+  context-root-relative) that hard-excludes `.env*`/`**/.env*`, `.git`, `inspiration/`, `**/node_modules`,
+  `**/dist`. `.git` excluded ⇒ no committed-history secret is ever baked. An image-content check (light mode:
+  same context+ignore on busybox) asserts `/opt/uzi-src/{api,web}` present, no `.env*`, no `inspiration/`.
+  Residual (M6): an UNTRACKED non-`.env` secret at the repo root would be baked into agent-readable source —
+  operator note "keep untracked secrets out of the repo root" (the web image already carries this risk class).
+
+## 185. uzi tools MCP server + unforgeable untrusted-evidence fence
+
+- `agent/src/uzi-tools.ts` (`createSdkMcpServer`, the `signals.ts` precedent), wired per-run into the chat
+  executor's `mcpServers`+`extraTools`. `list_runs`/`get_run`/`get_run_messages` read the worker's OWN user's
+  runs via new user-scoped worker endpoints (`GET /api/worker/chat/runs*`, filtered by the authenticated
+  worker's `user_id` at the QUERY level — a foreign run id is a 404, never a bare-id lookup; the read DTOs carry
+  `repo_path` only, no internal repo UUID). `propose_issue` targets the CURRENT run via closure (no run-id
+  parameter — the model cannot name another run) and NEVER writes the forge.
+- Every read-tool output (the whole JSON blob — titles, failure reasons, messages, plans) is wrapped in an
+  `<uzi_evidence_NONCE>` fence where NONCE is a per-call 64-bit `crypto.randomBytes` value included in the
+  CLOSING sentinel, so attacker-authored evidence cannot predict the delimiter to forge a break-out close tag.
+  The fence provably keeps evidence as DATA; the residual (model *persuaded* by in-fence prose) is bounded
+  STRUCTURALLY by the no-egress + human-gated-write tool surface — the worst case is a misleading proposal card
+  the user must click Create on. `propose_issue`'s own success text is deliberately unfenced (it reflects the
+  model's own just-sent draft, not third-party evidence).
+
+## 186. Issue creation is structurally human-gated + claim-first confirm
+
+- `propose_issue` persists a `pending` `issue_proposals` row (via `POST /api/worker/runs/:id/proposals`,
+  server-enforced: run owned by the worker's user + `kind='chat'` + non-terminal + repo owned by the user +
+  per-run pending cap 10 + per-worker rate limit) and emits a `proposal`-kind run_message (payload = the
+  proposalDTO incl. `id` + `repo_path`) the browser renders as a Create/Dismiss card. The agent sends
+  `repo_path` (the human path the read tools expose), resolved server-side user-scoped to the internal id, so
+  internal UUIDs stay off the worker (Decision-7). ONLY the browser's session+CSRF confirm executes
+  `Forge.CreateIssue` (forge-first, PAT-redacted, per-user forge-rate-limited); dismiss is status-only and never
+  touches the forge. The write path does not exist without the human click — genuinely structural, since the
+  chat agent holds no PAT (§182).
+- Confirm is **claim-first** (`issue_proposals.status` gains transient `confirming`): atomic `pending→confirming`
+  before `CreateIssue`, revert on any post-claim failure, so two concurrent confirms create exactly one issue
+  (the loser 409s). A `SweepStuckConfirmingProposals` reverts a crash-stranded `confirming` row (older than
+  `PROPOSAL_CONFIRM_STUCK_TIMEOUT`, default 2m) back to `pending`. `config.Load` CLAMPS that timeout up to
+  ≥2× `FORGE_HTTP_TIMEOUT` (a tuning-knob normalization with a safe floor, chosen over refuse-to-start which
+  uzi reserves for security invariants with no safe fallback), so the sweep can never revert a still-in-flight
+  confirm and reintroduce the duplicate-issue window. `confirming_since` is server-stamped, worker-unspoofable.
+
+## 187. Worker availability surfaced honestly; skills/templates out of chat
+
+- Chat needs a live worker (heartbeats already track it): the Chat page shows an explicit "no worker connected"
+  banner rather than silently queueing forever (UX, not a gate — a queued chat still claims later). Skills and
+  agent templates do not ride chat claims in this MVP (the chat system prompt is worker-built: uzi purpose,
+  baked-source location + BUILD_INFO, tool descriptions, honesty + untrusted-evidence framing). The agent
+  SUGGESTS but never forces the `PRD` label on a chat-created issue (labels stay model/user-supplied +
+  human-confirmed). Admin human-visibility of chat runs is retained (admins can read the DB anyway); a per-kind
+  admin exemption is a recorded revisit candidate.

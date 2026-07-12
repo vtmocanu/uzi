@@ -1,0 +1,32 @@
+# Per-Dockerfile ignore for the `base` worker image (PRD #39 Decision 5). BuildKit
+# picks this up because it is named "<Dockerfile-name>.dockerignore" and sits next
+# to templates/base/Dockerfile; its patterns are resolved relative to the BUILD
+# CONTEXT ROOT (the repo root, per docker-compose agent.build.context: .), NOT this
+# directory. Verified: a named-Dockerfile ignore IS honored and IS context-root
+# relative (a root .dockerignore would apply only as a fallback if this were absent).
+#
+# The agent image bakes uzi's own source read-only at /opt/uzi-src (COPY . ...), so
+# unlike the web image's root .dockerignore this must NOT exclude api/ web/ agent/
+# docs/ specs/ prds/ e2e/ scripts/ *.md — those ARE the source the chat agent reads.
+# It only hard-excludes secrets, VCS, submodules, deps, and build artifacts.
+
+# Secrets — must NEVER enter the build context (the baked source is world-readable
+# to the agent). `.env*` (no trailing dot) also catches non-dotted forms like a
+# devbox/direnv `.envrc`; `**/.env*` catches any depth including the root.
+.env*
+**/.env*
+
+# VCS + submodule metadata + the large inspiration/ submodules (prior-art only).
+.git
+.gitignore
+.gitmodules
+inspiration/
+
+# Installed deps + build artifacts (regenerated; not source). node_modules is huge
+# and platform-specific; web/agent both list explicit paths for clarity.
+**/node_modules
+web/node_modules
+agent/node_modules
+**/dist
+web/dist
+agent/dist

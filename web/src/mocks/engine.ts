@@ -4,9 +4,9 @@
 // parks the run in awaiting_approval; handleInput() resumes/rejects/cancels it,
 // mirroring the real worker protocol's semantics.
 
-import type { RunInputKind } from "../lib/api";
+import type { IssueProposal, RunInputKind } from "../lib/api";
 import { SAMPLE_PLAN } from "./data";
-import { appendMessage, getRun, patchRun } from "./store";
+import { appendMessage, getRun, nextProposalId, patchRun, putProposal } from "./store";
 
 type Step = () => void;
 interface Timed {
@@ -172,6 +172,9 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
 export function ensureLive(runId: string) {
   const run = getRun(runId);
   if (!run || started.has(runId)) return;
+  // Chat conversations (PRD #39) are driven by scheduleChatReply, not the
+  // issue-run planning script — subscribing to one must never inject a plan flow.
+  if (run.kind === "chat") return;
   if (run.status !== "running" && run.status !== "queued" && run.status !== "claimed") return;
   started.add(runId);
   schedule(runId, planningScript(runId));
@@ -191,6 +194,68 @@ export function startNewRun(runId: string) {
       },
     },
   ]);
+}
+
+// ── Chat reply engine (PRD #39) ──────────────────────────────────────────────
+
+// A crude keyword lift so the scripted Grep looks like it searched for something
+// relevant to the user's question.
+function searchTerm(userText: string): string {
+  const m = userText.match(/\b([a-z][a-z_]{4,})\b/i);
+  return m ? m[1].toLowerCase() : "run";
+}
+
+// scheduleChatReply simulates the chat agent answering a turn: a brief prose
+// reply, one read-only tool call against the baked source (/opt/uzi-src), then a
+// file-citing answer. When the user asks to file/propose something, it appends a
+// human-gated issue proposal (registered so confirm/dismiss can resolve it).
+export function scheduleChatReply(runId: string, userText: string) {
+  const wantsIssue = /\b(issue|bug|feature|propose|file (an?|the)|open (an?|the)|create (an?|the))\b/i.test(userText);
+  const term = searchTerm(userText);
+  const steps: Timed[] = [
+    ...say(runId, "chat", "Looking into that against uzi's baked source…"),
+    ...tool(
+      runId,
+      "chat",
+      "Grep",
+      { pattern: term, path: "/opt/uzi-src/api" },
+      "api/internal/workersvc/service.go:388\napi/internal/store/queries/runtime.sql:154",
+    ),
+    ...say(
+      runId,
+      "chat",
+      `Here's what I found: the relevant path is \`api/internal/workersvc/service.go\`. Ask me to go deeper on any part.`,
+    ),
+  ];
+  if (wantsIssue) {
+    steps.push({
+      delay: 900,
+      step: () => {
+        const proposal: IssueProposal = {
+          id: nextProposalId(),
+          run_id: runId,
+          repo_id: "repo-uzi",
+          repo_path: "vtmocanu/uzi",
+          title: truncateTitle(userText),
+          description: `Draft from our conversation:\n\n> ${userText}\n\nRefine before creating if needed.`,
+          labels: ["PRD"],
+          status: "pending",
+          created_at: new Date().toISOString(),
+        };
+        putProposal(proposal);
+        appendMessage(runId, "text", "chat", {
+          text: "Here is a draft — review it and click **Create issue** if it looks right.",
+        });
+        appendMessage(runId, "proposal", "chat", proposal);
+      },
+    });
+  }
+  schedule(runId, steps);
+}
+
+function truncateTitle(s: string): string {
+  const t = s.trim().replace(/\s+/g, " ");
+  return t.length > 72 ? `${t.slice(0, 71)}…` : t;
 }
 
 // handleInput mirrors POST /api/runs/:id/inputs.

@@ -85,8 +85,10 @@ WHERE status = 'online'
 -- Progress), and the same-statement stamp closes the crash window before the
 -- forge move. auto_approve is true only for autopilot-created runs (PRD #19 M4):
 -- the worker reads it to resolve the plan gate without a human.
+-- repo_id is nullable since PRD #39 (chat runs carry none); the ::uuid cast keeps
+-- this INSERT param a non-null uuid.UUID — an issue run always targets a repo.
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
-VALUES (@user_id, @repo_id, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve)
+VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('origin_column'), now(), @auto_approve)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -110,6 +112,7 @@ FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 WHERE r.user_id = @user_id
+  AND r.kind <> 'chat'
   AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id'))
   AND (sqlc.narg('issue_iid')::bigint IS NULL OR r.issue_iid = sqlc.narg('issue_iid'))
 ORDER BY r.created_at DESC
@@ -124,6 +127,7 @@ JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
+  AND r.kind <> 'chat'
 ORDER BY r.created_at DESC
 LIMIT 500;
 
@@ -145,12 +149,14 @@ ORDER BY w.created_at DESC;
 SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
 
 -- name: ClaimRun :one
--- Atomic claim of the oldest claimable queued run for the worker's user. A
--- re-queued run prefers its prior worker (own runs sort first, and are the only
--- claimant until the affinity grace lapses — @affinity_cutoff is now minus
--- WORKER_AFFINITY_GRACE); after that any of the user's workers may claim it.
+-- The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
+-- for the worker's user, EXCLUDING chat runs (which the chat lane claims via
+-- ClaimChatRun). A re-queued run prefers its prior worker (own runs sort first, and
+-- are the only claimant until the affinity grace lapses — @affinity_cutoff is now
+-- minus WORKER_AFFINITY_GRACE); after that any of the user's workers may claim it.
 -- FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
--- blocking (multica's queue semantics).
+-- blocking (multica's queue semantics). The kind<>'chat' predicate is what keeps
+-- the run lane and the concurrent chat lane from stealing each other's work.
 UPDATE runs SET
     status     = 'claimed',
     worker_id  = @worker_id,
@@ -159,6 +165,7 @@ UPDATE runs SET
 WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = @user_id
+      AND r.kind <> 'chat'
       AND r.status = 'queued'
       AND (r.worker_id IS NULL
            OR r.worker_id = @worker_id
@@ -321,9 +328,11 @@ WHERE id = @id AND status = 'claimed';
 -- name: SweepRunningTimeout :many
 -- running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 -- Stamps move_pending_since so the (forge-free) sweep leaves the isolated
--- reconcile loop a marker to restore the origin column later.
+-- reconcile loop a marker to restore the origin column later. Chat runs are exempt
+-- (Decision 3): a chat legitimately parks for a long time between turns, so its own
+-- idle/turn clocks (SweepIdleChatRuns + the worker-side timers) bound it instead.
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
-WHERE status = 'running' AND started_at < @cutoff
+WHERE status = 'running' AND started_at < @cutoff AND kind <> 'chat'
 RETURNING id, user_id, status;
 
 -- name: FailRunsOfStaleWorkersOverCap :many
@@ -387,6 +396,44 @@ SELECT id, run_id, seq, kind, agent, payload, created_at
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
+
+-- Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
+-- The chat agent investigates its OWNER'S runs (both kinds) via the worker. These
+-- queries are USER_ID-scoped (from the authenticated worker), NEVER a bare run_id
+-- lookup — a compromised worker still reads only its own user's runs, and a foreign
+-- run id simply returns no row (404). repo_web_url rides along so the handler can
+-- build the MR URL; a chat run has no repo, so repo fields are NULL (LEFT JOIN).
+
+-- name: ListRunsForWorkerUser :many
+-- Compact list of the worker's user's runs, newest first, bounded by @lim.
+SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
+       r.failure_reason, r.created_at, r.updated_at,
+       rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.user_id = @user_id
+ORDER BY r.created_at DESC
+LIMIT @lim;
+
+-- name: GetRunForWorkerUser :one
+-- One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
+SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r.mr_state,
+       r.failure_reason, r.stop_kind, r.fix_verdict, r.iteration_count, r.plan_md,
+       r.created_at, r.updated_at,
+       rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.id = @id AND r.user_id = @user_id;
+
+-- name: ListRunMessagesForWorkerPage :many
+-- A bounded page of a run's messages after a seq (the worker read tool's paging).
+-- Authorization (the run is the worker's user's) is checked by the caller before
+-- this; here @lim caps the page so a single response can't be unbounded.
+SELECT id, run_id, seq, kind, agent, payload, created_at
+FROM run_messages
+WHERE run_id = @run_id AND seq > @after_seq
+ORDER BY seq ASC
+LIMIT @lim;
 
 -- User inputs (steering) ---------------------------------------------------
 
@@ -538,7 +585,7 @@ WHERE id = @id;
 -- A manual drag heals it: clear the pending marker for every run of this issue so
 -- the reconcile loop stops trying to move a card a human just placed.
 UPDATE runs SET move_pending_since = NULL, updated_at = now()
-WHERE repo_id = @repo_id AND issue_iid = @issue_iid AND move_pending_since IS NOT NULL;
+WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid AND move_pending_since IS NOT NULL;
 
 -- MR-close watcher (PRD #24) --------------------------------------------------
 

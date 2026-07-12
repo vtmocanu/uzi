@@ -66,6 +66,7 @@ UPDATE runs SET
 WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = $2
+      AND r.kind <> 'chat'
       AND r.status = 'queued'
       AND (r.worker_id IS NULL
            OR r.worker_id = $1
@@ -74,7 +75,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id
 `
 
 type ClaimRunParams struct {
@@ -83,12 +84,14 @@ type ClaimRunParams struct {
 	AffinityCutoff pgtype.Timestamptz `json:"affinity_cutoff"`
 }
 
-// Atomic claim of the oldest claimable queued run for the worker's user. A
-// re-queued run prefers its prior worker (own runs sort first, and are the only
-// claimant until the affinity grace lapses — @affinity_cutoff is now minus
-// WORKER_AFFINITY_GRACE); after that any of the user's workers may claim it.
+// The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
+// for the worker's user, EXCLUDING chat runs (which the chat lane claims via
+// ClaimChatRun). A re-queued run prefers its prior worker (own runs sort first, and
+// are the only claimant until the affinity grace lapses — @affinity_cutoff is now
+// minus WORKER_AFFINITY_GRACE); after that any of the user's workers may claim it.
 // FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
-// blocking (multica's queue semantics).
+// blocking (multica's queue semantics). The kind<>'chat' predicate is what keeps
+// the run lane and the concurrent chat lane from stealing each other's work.
 func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, claimRun, arg.WorkerID, arg.UserID, arg.AffinityCutoff)
 	var i Run
@@ -129,13 +132,15 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.AgentSource,
 		&i.AgentExclusions,
 		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
 	)
 	return i, err
 }
 
 const clearIssueRunsMovePending = `-- name: ClearIssueRunsMovePending :execrows
 UPDATE runs SET move_pending_since = NULL, updated_at = now()
-WHERE repo_id = $1 AND issue_iid = $2 AND move_pending_since IS NOT NULL
+WHERE repo_id = $1::uuid AND issue_iid = $2 AND move_pending_since IS NOT NULL
 `
 
 type ClearIssueRunsMovePendingParams struct {
@@ -295,8 +300,8 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
-VALUES ($1, $2, $3, $4, $5, $6, now(), $7)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents
+VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7)
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id
 `
 
 type CreateRunParams struct {
@@ -319,6 +324,8 @@ type CreateRunParams struct {
 // Progress), and the same-statement stamp closes the crash window before the
 // forge move. auto_approve is true only for autopilot-created runs (PRD #19 M4):
 // the worker reads it to resolve the plan gate without a human.
+// repo_id is nullable since PRD #39 (chat runs carry none); the ::uuid cast keeps
+// this INSERT param a non-null uuid.UUID — an issue run always targets a repo.
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createRun,
 		arg.UserID,
@@ -367,6 +374,8 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.AgentSource,
 		&i.AgentExclusions,
 		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
 	)
 	return i, err
 }
@@ -583,7 +592,7 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -629,12 +638,14 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.AgentSource,
 		&i.AgentExclusions,
 		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -682,6 +693,8 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.AgentSource,
 		&i.AgentExclusions,
 		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
 	)
 	return i, err
 }
@@ -734,6 +747,67 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 	return i, err
 }
 
+const getRunForWorkerUser = `-- name: GetRunForWorkerUser :one
+SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r.mr_state,
+       r.failure_reason, r.stop_kind, r.fix_verdict, r.iteration_count, r.plan_md,
+       r.created_at, r.updated_at,
+       rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.id = $1 AND r.user_id = $2
+`
+
+type GetRunForWorkerUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type GetRunForWorkerUserRow struct {
+	ID             uuid.UUID          `json:"id"`
+	Kind           string             `json:"kind"`
+	Status         string             `json:"status"`
+	IssueIid       pgtype.Int8        `json:"issue_iid"`
+	IssueTitle     string             `json:"issue_title"`
+	Branch         pgtype.Text        `json:"branch"`
+	MrIid          pgtype.Int8        `json:"mr_iid"`
+	MrState        pgtype.Text        `json:"mr_state"`
+	FailureReason  pgtype.Text        `json:"failure_reason"`
+	StopKind       pgtype.Text        `json:"stop_kind"`
+	FixVerdict     pgtype.Text        `json:"fix_verdict"`
+	IterationCount int32              `json:"iteration_count"`
+	PlanMd         pgtype.Text        `json:"plan_md"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	RepoPath       pgtype.Text        `json:"repo_path"`
+	RepoWebUrl     pgtype.Text        `json:"repo_web_url"`
+}
+
+// One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
+func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUserParams) (GetRunForWorkerUserRow, error) {
+	row := q.db.QueryRow(ctx, getRunForWorkerUser, arg.ID, arg.UserID)
+	var i GetRunForWorkerUserRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Status,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.Branch,
+		&i.MrIid,
+		&i.MrState,
+		&i.FailureReason,
+		&i.StopKind,
+		&i.FixVerdict,
+		&i.IterationCount,
+		&i.PlanMd,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.RepoPath,
+		&i.RepoWebUrl,
+	)
+	return i, err
+}
+
 const getRunMoveContext = `-- name: GetRunMoveContext :one
 
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
@@ -749,7 +823,7 @@ WHERE r.id = $1
 type GetRunMoveContextRow struct {
 	Status           string             `json:"status"`
 	IssueIid         pgtype.Int8        `json:"issue_iid"`
-	RepoID           uuid.UUID          `json:"repo_id"`
+	RepoID           pgtype.UUID        `json:"repo_id"`
 	OriginColumn     pgtype.Text        `json:"origin_column"`
 	BoardColumn      pgtype.Text        `json:"board_column"`
 	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
@@ -797,7 +871,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -846,6 +920,8 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.AgentSource,
 		&i.AgentExclusions,
 		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
 	)
 	return i, err
 }
@@ -986,12 +1062,13 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
+  AND r.kind <> 'chat'
 ORDER BY r.created_at DESC
 LIMIT 500
 `
@@ -1051,6 +1128,8 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.AgentSource,
 			&i.Run.AgentExclusions,
 			&i.Run.RepoAgents,
+			&i.Run.Title,
+			&i.Run.ResumeOfRunID,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
@@ -1136,7 +1215,7 @@ type ListGaveUpColumnMovesParams struct {
 
 type ListGaveUpColumnMovesRow struct {
 	ID               uuid.UUID          `json:"id"`
-	RepoID           uuid.UUID          `json:"repo_id"`
+	RepoID           pgtype.UUID        `json:"repo_id"`
 	IssueIid         pgtype.Int8        `json:"issue_iid"`
 	Status           string             `json:"status"`
 	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
@@ -1256,12 +1335,58 @@ func (q *Queries) ListRunMessagesAfter(ctx context.Context, arg ListRunMessagesA
 	return items, nil
 }
 
+const listRunMessagesForWorkerPage = `-- name: ListRunMessagesForWorkerPage :many
+SELECT id, run_id, seq, kind, agent, payload, created_at
+FROM run_messages
+WHERE run_id = $1 AND seq > $2
+ORDER BY seq ASC
+LIMIT $3
+`
+
+type ListRunMessagesForWorkerPageParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	AfterSeq int32     `json:"after_seq"`
+	Lim      int32     `json:"lim"`
+}
+
+// A bounded page of a run's messages after a seq (the worker read tool's paging).
+// Authorization (the run is the worker's user's) is checked by the caller before
+// this; here @lim caps the page so a single response can't be unbounded.
+func (q *Queries) ListRunMessagesForWorkerPage(ctx context.Context, arg ListRunMessagesForWorkerPageParams) ([]RunMessage, error) {
+	rows, err := q.db.Query(ctx, listRunMessagesForWorkerPage, arg.RunID, arg.AfterSeq, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunMessage{}
+	for rows.Next() {
+		var i RunMessage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Seq,
+			&i.Kind,
+			&i.Agent,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, rp.path_with_namespace AS repo_path, w.name AS worker_name
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 WHERE r.user_id = $1
+  AND r.kind <> 'chat'
   AND ($2::uuid IS NULL OR r.repo_id = $2)
   AND ($3::bigint IS NULL OR r.issue_iid = $3)
 ORDER BY r.created_at DESC
@@ -1332,8 +1457,82 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.AgentSource,
 			&i.Run.AgentExclusions,
 			&i.Run.RepoAgents,
+			&i.Run.Title,
+			&i.Run.ResumeOfRunID,
 			&i.RepoPath,
 			&i.WorkerName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRunsForWorkerUser = `-- name: ListRunsForWorkerUser :many
+
+SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
+       r.failure_reason, r.created_at, r.updated_at,
+       rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
+FROM runs r
+LEFT JOIN repos rp ON rp.id = r.repo_id
+WHERE r.user_id = $1
+ORDER BY r.created_at DESC
+LIMIT $2
+`
+
+type ListRunsForWorkerUserParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Lim    int32     `json:"lim"`
+}
+
+type ListRunsForWorkerUserRow struct {
+	ID            uuid.UUID          `json:"id"`
+	Kind          string             `json:"kind"`
+	Status        string             `json:"status"`
+	IssueIid      pgtype.Int8        `json:"issue_iid"`
+	IssueTitle    string             `json:"issue_title"`
+	Branch        pgtype.Text        `json:"branch"`
+	MrIid         pgtype.Int8        `json:"mr_iid"`
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	RepoPath      pgtype.Text        `json:"repo_path"`
+	RepoWebUrl    pgtype.Text        `json:"repo_web_url"`
+}
+
+// Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
+// The chat agent investigates its OWNER'S runs (both kinds) via the worker. These
+// queries are USER_ID-scoped (from the authenticated worker), NEVER a bare run_id
+// lookup — a compromised worker still reads only its own user's runs, and a foreign
+// run id simply returns no row (404). repo_web_url rides along so the handler can
+// build the MR URL; a chat run has no repo, so repo fields are NULL (LEFT JOIN).
+// Compact list of the worker's user's runs, newest first, bounded by @lim.
+func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWorkerUserParams) ([]ListRunsForWorkerUserRow, error) {
+	rows, err := q.db.Query(ctx, listRunsForWorkerUser, arg.UserID, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunsForWorkerUserRow{}
+	for rows.Next() {
+		var i ListRunsForWorkerUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Status,
+			&i.IssueIid,
+			&i.IssueTitle,
+			&i.Branch,
+			&i.MrIid,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.RepoPath,
+			&i.RepoWebUrl,
 		); err != nil {
 			return nil, err
 		}
@@ -1849,7 +2048,7 @@ func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Ti
 
 const sweepRunningTimeout = `-- name: SweepRunningTimeout :many
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
-WHERE status = 'running' AND started_at < $2
+WHERE status = 'running' AND started_at < $2 AND kind <> 'chat'
 RETURNING id, user_id, status
 `
 
@@ -1866,7 +2065,9 @@ type SweepRunningTimeoutRow struct {
 
 // running past RUN_TIMEOUT → failed (a hung agent is failed without a human).
 // Stamps move_pending_since so the (forge-free) sweep leaves the isolated
-// reconcile loop a marker to restore the origin column later.
+// reconcile loop a marker to restore the origin column later. Chat runs are exempt
+// (Decision 3): a chat legitimately parks for a long time between turns, so its own
+// idle/turn clocks (SweepIdleChatRuns + the worker-side timers) bound it instead.
 func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeoutParams) ([]SweepRunningTimeoutRow, error) {
 	rows, err := q.db.Query(ctx, sweepRunningTimeout, arg.FailureReason, arg.Cutoff)
 	if err != nil {

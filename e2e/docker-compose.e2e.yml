@@ -77,6 +77,16 @@ services:
       # and recreates the api, so the MR-state watcher actually ticks. Overlay-only;
       # the production default (config.go) is untouched.
       FORGE_POLL_INTERVAL: ${E2E_FORGE_POLL_INTERVAL:-24h}
+      # Chat idle backstop (PRD #39): the server-side not-trusting-the-worker sweep,
+      # set ABOVE the worker's own idle window (WORKER_CHAT_IDLE_TIMEOUT, agent below) so
+      # the WORKER completes an idle chat first and the backstop only fires if it never
+      # does. Seconds here (vs the 70m/60m prod defaults) so the e2e observes idle-completion
+      # without a minutes-long wait. The worker's idle window ITSELF is delivered in the
+      # claim config from the api's WORKER_CHAT_IDLE_TIMEOUT (chat.go -> ClaimConfig, which
+      # the ChatRunner prefers over the agent env), so it MUST be set here, short, for the
+      # worker to idle-complete before this server backstop.
+      WORKER_CHAT_IDLE_TIMEOUT: 20s
+      CHAT_IDLE_TIMEOUT: 90s
       # Deterministic bootstrap (no registration race): seed the admin, the
       # Anthropic token (dummy), and the forge connection + repo at boot. All
       # dummy per the testing-credentials policy.
@@ -116,6 +126,11 @@ services:
       GIT_CONFIG_GLOBAL: /e2e-git/gitconfig
       WORKER_HEARTBEAT_INTERVAL: 5s
       WORKER_POLL_INTERVAL: 2s
+      # Chat lane (PRD #39): fast turn pickup + a SHORT worker-driven idle window so the
+      # e2e sees idle-completion in seconds instead of the 60m default. 30s (not 8-10s)
+      # leaves headroom so the chat can't idle out during a mid-scenario issue-run step.
+      WORKER_CHAT_POLL_MS: "500"
+      WORKER_CHAT_IDLE_TIMEOUT: 20s
     volumes:
       - ${E2E_RUN_DIR}/certs:/certs:ro
       - ${E2E_RUN_DIR}/worker-secret:/worker-secret

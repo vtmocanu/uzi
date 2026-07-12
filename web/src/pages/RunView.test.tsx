@@ -30,6 +30,8 @@ function run(over: Partial<Run>): Run {
     issue_iid: 87,
     issue_title: "Add rate limiting",
     issue_description: "d",
+    title: null,
+    resume_of_run_id: null,
     status: "awaiting_approval",
     requeue_count: 0,
     iteration_count: 0,

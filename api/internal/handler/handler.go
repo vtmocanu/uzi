@@ -189,7 +189,7 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot
 // hammer the upstream forge; slackDMLimiter is a tighter per-user budget on the
 // two Slack-DM-triggering /me/slack endpoints.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) http.Handler {
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -420,6 +420,25 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) 
 				r.Post("/{id}/inputs", h.CreateRunInput)
 			})
 
+			// In-app chat agent (PRD #39): conversations ride runs.kind='chat'. The
+			// live view reuses /api/ws + the /api/runs/{id}/messages replay (a chat run
+			// is a run), so only the create/steer/lifecycle verbs live here. Owner-scoped
+			// (each chat belongs to the caller). Create + message posts ride a dedicated
+			// per-user chat limiter (spend guard); a proposal confirm is a forge write, so
+			// it rides the per-user forge limiter like the other forge-proxying routes.
+			r.Route("/chats", func(r chi.Router) {
+				r.With(chatLimiter.PerUserMiddleware).Post("/", h.CreateChat)
+				r.Get("/", h.ListChats)
+				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/messages", h.PostChatMessage)
+				r.Post("/{id}/end", h.EndChat)
+				// Continue mints a NEW queued chat run, so it rides the same per-user chat
+				// limiter as create/messages — a spend guard against minting queued runs
+				// via repeated Continue.
+				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/continue", h.ContinueChat)
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/proposals/{pid}/confirm", h.ConfirmProposal)
+				r.Post("/{id}/proposals/{pid}/dismiss", h.DismissProposal)
+			})
+
 			// Browser live channel (M5): a WebSocket subscribed to one run's
 			// events. Session-cookie authN via RequireAuth above (a GET upgrade, so
 			// no CSRF step); Origin validation + per-run authz enforced in ServeWS.
@@ -437,6 +456,17 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter *mw.Limiter) 
 			r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 			r.Post("/runs/{id}/state", h.WorkerRunState)
 			r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
+
+			// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
+			// investigates its OWNER'S runs. Every query is scoped to the worker's
+			// user_id (a foreign run id is 404), never a bare run_id lookup.
+			r.Get("/chat/runs", h.WorkerChatListRuns)
+			r.Get("/chat/runs/{id}", h.WorkerChatGetRun)
+			r.Get("/chat/runs/{id}/messages", h.WorkerChatRunMessages)
+			// propose_issue (Decision 8): persists a PENDING proposal (never a forge
+			// write). The per-worker proposal limiter caps mass-creation across a
+			// user's chats; the per-run pending cap is the other half.
+			r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/proposals", h.WorkerCreateProposal)
 		})
 	})
 

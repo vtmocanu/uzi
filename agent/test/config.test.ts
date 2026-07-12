@@ -25,3 +25,38 @@ describe("loadConfig workerTemplate (PRD #18)", () => {
     assert.strictEqual(loadConfig(baseEnv({ UZI_WORKER_TEMPLATE: "  " })).workerTemplate, "base");
   });
 });
+
+describe("loadConfig chat lifecycle knobs (PRD #39)", () => {
+  it("applies the documented defaults when unset", () => {
+    const c = loadConfig(baseEnv());
+    assert.strictEqual(c.chatMaxTurns, 50);
+    assert.strictEqual(c.chatTurnTimeoutMs, 10 * 60_000);
+    assert.strictEqual(c.chatIdleTimeoutMs, 60 * 60_000);
+    assert.strictEqual(c.chatPollMs, 1000);
+    assert.strictEqual(c.chatSessions, 1);
+  });
+
+  it("parses overrides (durations + integer knobs)", () => {
+    const c = loadConfig(
+      baseEnv({
+        CHAT_MAX_TURNS: "12",
+        WORKER_CHAT_TURN_TIMEOUT: "90s",
+        WORKER_CHAT_IDLE_TIMEOUT: "30m",
+        WORKER_CHAT_POLL_MS: "250",
+        WORKER_CHAT_SESSIONS: "3",
+      }),
+    );
+    assert.strictEqual(c.chatMaxTurns, 12);
+    assert.strictEqual(c.chatTurnTimeoutMs, 90_000);
+    assert.strictEqual(c.chatIdleTimeoutMs, 30 * 60_000);
+    assert.strictEqual(c.chatPollMs, 250);
+    assert.strictEqual(c.chatSessions, 3);
+  });
+
+  it("falls back to the default on a non-positive or non-integer turn cap", () => {
+    assert.strictEqual(loadConfig(baseEnv({ CHAT_MAX_TURNS: "0" })).chatMaxTurns, 50);
+    assert.strictEqual(loadConfig(baseEnv({ CHAT_MAX_TURNS: "-3" })).chatMaxTurns, 50);
+    assert.strictEqual(loadConfig(baseEnv({ CHAT_MAX_TURNS: "1.5" })).chatMaxTurns, 50);
+    assert.strictEqual(loadConfig(baseEnv({ CHAT_MAX_TURNS: "  " })).chatMaxTurns, 50);
+  });
+});

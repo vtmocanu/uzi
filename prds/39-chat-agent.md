@@ -78,12 +78,92 @@ A **Chat** page in the web UI where the user converses with an agent that:
 
 ## Milestones
 
-- [ ] **M1 — API: chat run kind, nullable repo_id, forked claim path**: migration (draft `00065`, incl. `repo_id` DROP NOT NULL + kind-shape rework + `resume_of_run_id`), NULL-repo_id audit across runs queries/DTOs, claim kind-split + chat assembly branch (no repo/connection required, PAT type-level omitted), chat CRUD/message/continue endpoints, sweeper idle handling + server turn ceiling, chat rate limiter; Go tests (kind-shape matrix, claim-lane isolation, chat claim with no forge connection succeeds, **no `forge_pat` key on the chat claim wire**, idle sweep, server turn cap). Validation: a chat run created, claimed by a stub worker, messaged, idle-completed, continued.
-- [ ] **M2 — Worker: baked source + ChatRunner/executor + concurrency**: build-context switch + per-Dockerfile ignores + bake stage + BUILD_INFO (image-content test: `/opt/uzi-src/api` exists, no `.env*` anywhere in the image), `chat-runner.ts`/`chat-executor.ts` (session, turns, per-turn wall-clock, idle timer, resume-of), second claim loop + shared-collaborator thread-safety audit/tests, `steering.ts` await-follow-up; agent tests (no clone attempted, turn caps, idle completion, concurrent run+chat session). Validation: live chat answers a question about uzi's source citing a real file while an issue run is executing on the same worker.
-- [ ] **M3 — uzi tools + issue proposals**: `uzi-tools.ts` MCP server, user_id-scoped worker read endpoints, untrusted-evidence framing (messages + titles + failure reasons), `issue_proposals` flow end to end (propose → card → confirm → `Forge.CreateIssue` → link back into chat), per-worker proposal cap; tests both sides (a worker can never read another user's runs; confirm is the only forge write path; dismissed proposal never writes; proposal spam capped). Validation: "why did run X fail?" answered from real messages; a confirmed proposal opens a real GitLab issue (`vtmocanu/uzi-e2e-scratch`).
-- [ ] **M4 — Web chat UI**: Chat page, streaming view, composer, worker-offline banner, proposal cards (inert-link vitest), End chat/Continue, turn-cap notice; typecheck green.
-- [ ] **M5 — Security validation pass**: guardrail regression checks — `tools` base-set restriction actually rejects a Bash `tool_use` in a chat session; path guard denies reads outside `/opt/uzi-src`, of the join-token path, and of `/proc/self/environ`; `settingSources` still `[]`; no PAT on the chat claim wire; proposal confirm requires session+CSRF; injection attempt via a poisoned run message / issue title does not yield tool misuse (scripted red-team scenario in e2e with the stub executor where feasible, manual live check otherwise).
-- [ ] **M6 — Docs + specs + e2e**: `docs/chat.md` (frontmatter per `docs/README.md`), specs/ai.md + human.md (user-approved) + ARCHITECTURE.md updates, e2e scenario (create chat → message → tool call → proposal → confirm → idle-complete → continue) on the isolated stack.
+Progress log (team run, `feature/prd-39-chat-agent`; 3 coders in parallel worktrees, per-branch
+review + security audit, all blocking/major findings resolved before merge):
+
+**2026-07-10 — Phases 1, 2, 3-agent COMPLETE and merged into the integration branch:**
+- Phase 1: M1 api (chat run kind, nullable `repo_id`, forked no-PAT claim) ✅; M2 agent phase-1 slice
+  (baked `/opt/uzi-src` + confined chat executor) ✅; M4 web shell vs mocked API ✅.
+- Phase 2: worker claim-lane split + chat steering (structural idle-race fix) + `user_message`
+  emission (merge `bd5693c`) ✅; M3-api worker chat read endpoints + proposal creation + claim-first
+  confirm + stuck-confirming sweep + boot-clamped timeout invariant + `repo_path` resolution
+  (merges `22a3af6` … final api tip `e01fc74`) ✅.
+- Phase 3-agent: `uzi-tools.ts` MCP (list_runs/get_run/get_run_messages/propose_issue) + per-call
+  CSPRNG-nonce untrusted-evidence framing + the proposal-card run_message emission (merge `325ec3a`,
+  tip `040b9e3`) ✅.
+
+**Landed design deviations (all reviewed, better-than-spec):** chat claim is a SEPARATE
+`ChatClaimPayload` with no PAT field at all (stronger than omit-empty); initial prompt travels as an
+atomically-seeded `run_user_inputs` follow_up row (claim carries no prompt text); chat runs excluded
+from runs/board/admin lists; `GET /api/chats` returns `{chats:[chatListDTO], max_turns}`;
+`propose_issue` sends `repo_path` (server resolves user-scoped; internal UUIDs stay off the worker);
+the proposal-card is a worker-emitted `proposal`-kind run_message keyed on `id`. Authoritative
+Phase-3 wire catalog: `.claude/agent-team-tasks/prd39-phase3-wire-catalog.md`.
+
+**STOPPED 2026-07-10 EOD. To resume tomorrow — do these in order (see "Resume plan" below the
+milestones):** (1) review + merge P3-web; (2) M5 security validation pass; (3) M6 docs/specs/e2e;
+(4) `/prd-done` up to MR creation.
+
+- [x] **M1 — API: chat run kind, nullable repo_id, forked claim path**: migration (draft `00065`, incl. `repo_id` DROP NOT NULL + kind-shape rework + `resume_of_run_id`), NULL-repo_id audit across runs queries/DTOs, claim kind-split + chat assembly branch (no repo/connection required, PAT type-level omitted), chat CRUD/message/continue endpoints, sweeper idle handling + server turn ceiling, chat rate limiter; Go tests (kind-shape matrix, claim-lane isolation, chat claim with no forge connection succeeds, **no `forge_pat` key on the chat claim wire**, idle sweep, server turn cap). Validation: a chat run created, claimed by a stub worker, messaged, idle-completed, continued.
+- [x] **M2 — Worker: baked source + ChatRunner/executor + concurrency** *(DONE — phase-1 slice `bd5693c`-merged + Phase-2 worker wiring `18019d3`-merged; reviewed + audited)*: build-context switch + per-Dockerfile ignores + bake stage + BUILD_INFO (image-content test: `/opt/uzi-src/api` exists, no `.env*` anywhere in the image), `chat-runner.ts`/`chat-executor.ts` (session, turns, per-turn wall-clock, idle timer, resume-of), second claim loop + shared-collaborator thread-safety audit/tests, `steering.ts` await-follow-up; agent tests (no clone attempted, turn caps, idle completion, concurrent run+chat session). Validation: live chat answers a question about uzi's source citing a real file while an issue run is executing on the same worker — live leg deferred to M6 e2e.
+- [x] **M3 — uzi tools + issue proposals** *(DONE — api half `e01fc74` + agent half `040b9e3`, both merged; validated review + audit incl. adversarial evidence-fence attack)*: `uzi-tools.ts` MCP server, user_id-scoped worker read endpoints, untrusted-evidence framing (messages + titles + failure reasons), `issue_proposals` flow end to end (propose → card → confirm → `Forge.CreateIssue` → link back into chat), per-worker proposal cap; tests both sides (a worker can never read another user's runs; confirm is the only forge write path; dismissed proposal never writes; proposal spam capped). Validation: "why did run X fail?" answered from real messages; a confirmed proposal opens a real GitLab issue (`vtmocanu/uzi-e2e-scratch`) — end-to-end live validation deferred to M6 e2e.
+- [x] **M4 — Web chat UI** *(DONE — phase-1 shell `6b6f0cd` + Phase-3 real-endpoint wiring `99df248` + `chatFromRun` optimistic-meta `7122191`, all merged; reviewed)*: Chat page, streaming view, composer, worker-offline banner, proposal cards (inert-link vitest), End chat/Continue, turn-cap notice; typecheck green.
+- [x] **M5 — Security validation pass** *(DONE — auditor consolidated pass 2026-07-12, PASS, no regression; the live red-team leg landed in the M6 e2e)*: guardrail regression checks — `tools` base-set restriction actually rejects a Bash `tool_use` in a chat session; path guard denies reads outside `/opt/uzi-src`, of the join-token path, and of `/proc/self/environ`; `settingSources` still `[]`; no PAT on the chat claim wire; proposal confirm requires session+CSRF; injection attempt via a poisoned run message / issue title does not yield tool misuse (scripted red-team scenario in e2e with the stub executor where feasible, manual live check otherwise).
+- [x] **M6 — Docs + specs + e2e** *(DONE — docs/specs `0f6fe52`/`07a4ee3`, config knobs `db191cb`; chat stub-executor `984e6db` + image-check full-mode fix `da1fcb0`; e2e `7dbcec6`)*: `docs/chat.md` (frontmatter per `docs/README.md`), specs/ai.md + human.md (user-approved) + ARCHITECTURE.md updates, e2e scenario (create chat → message → tool call → proposal → confirm → idle-complete → continue) on the isolated stack. **e2e ran GREEN: 17 chat legs incl. the live injection red-team (poison quoted in the nonce fence, no tool action), lane coexistence, propose→confirm→real issue, dismiss→no-write, idle-complete + gapless seq, continue.**
+
+## Status: COMPLETE (2026-07-12) — ready for MR review
+
+All six milestones done, merged, reviewed + security-audited on `feature/prd-39-chat-agent`; M5 security
+PASS; M6 e2e PASS. Remaining is landing-only:
+- **Migration renumber at landing** (CLAUDE.md convention): drafts `00065` (chat runs) + `00066` (proposal
+  `confirming`) must be renamed to the next free numbers above the live head on `main` at merge time.
+- **Optional cleanup deferred** (non-blocking, tracked): #18 drop `repo_id` from the worker-facing
+  proposal-create DTO (Decision-7 purity; non-exploitable — the worker's own repo id); the three inert
+  `created_issue_*`/`resolved_at` null fields on the emitted proposal payload (harmless extra JSON).
+
+## Resume plan (2026-07-11, now HISTORICAL — see Status above) — pick up here
+
+Integration branch `feature/prd-39-chat-agent` (worktree `../prd-39-chat-agent`). All merged work
+is reviewed + audited with zero open blocking/major findings.
+
+**Progressed after the team hit the account session-limit (lead solo, 2026-07-11 early AM):**
+- P3-web MERGED (merge `255bf8d`; the `chatFromRun` follow-up `7122191` was lead-reviewed — small,
+  UI-only, tested, gate green 393/393 — since the reviewer was capped; re-review optional tomorrow).
+  So **M1/M2/M3/M4 are all complete and integrated.**
+- M6 docs DONE (commit after `255bf8d`): `docs/chat.md`, ARCHITECTURE.md "Chat with uzi (the fifth
+  surface)", `specs/ai.md` §169–175. check-docs passes. Carry-overs #7 (untracked-secrets operator
+  note) + #10 (PRD-label suggestion) folded into the docs.
+- **Environment note:** `NODE_OPTIONS` carries a broken cmux `--require=…restore-node-options.cjs`
+  preload (temp file cleaned) that crashes every node invocation incl. git hooks — run node/npm/git
+  commands with `NODE_OPTIONS="--max-old-space-size=4096"` until the cmux shim restores it.
+
+**Remaining (needs the team at reset, or lead solo):**
+1. **M5 — Security validation pass** (agents: **auditor** lead, **tester** for the live/e2e legs).
+   Most sub-checks were already verified per-branch during review; M5 is the consolidated end-to-end
+   proof + the deferred live legs. Fold in these tracked carry-overs: **#6** (image-content check must
+   assert `/opt/uzi-src` is root-owned + unwritable by the agent user — add `find /opt/uzi-src ! -user
+   root` / write-as-uzi to the check); **#9** already done (verify in the live pass that the real
+   worker constructs `ChatExecutor` with `secretPaths=[workerTokenFile]`); **#18** (optional Decision-7
+   purity — drop `repo_id` from the worker-facing proposal-create DTO). Run the M5 checklist in the
+   milestone below against the merged integration branch; the injection red-team leans on the
+   evidence-fence (already adversarially audited) + the no-egress tool surface.
+
+2. **M6 — the docs are DONE; e2e + specs/human.md remain.** `docs/chat.md`, ARCHITECTURE.md, and
+   `specs/ai.md` §169–175 are written and committed (carry-overs #7 + #10 folded in). STILL TODO:
+   (a) **`specs/human.md` Feature #39 entry — NEEDS USER APPROVAL** (draft prepared; the spec contract
+   forbids editing human.md without the user's sign-off); (b) the **e2e scenario** (tester) — create chat
+   → message → tool call → proposal → confirm → idle-complete → continue — which requires **#15** first
+   (the chat lane runs the real ChatExecutor even under `UZI_EXECUTOR=stub`; add a chat stub path so the
+   isolated stack runs without a live Anthropic token).
+
+3. **`/prd-done` up to MR creation** (per the `/prd-full` flow — stop at MR, do not merge/close).
+
+Migration renumber reminder (landing): drafts `00065` (chat runs) + `00066` (proposal `confirming`)
+must be renamed to the next free numbers above the live head at rebase time (CLAUDE.md convention).
+
+Team roster to re-spawn tomorrow (all opus except documenter=sonnet): coder-m1 (api), coder-m2
+(agent), coder-m4 (web), reviewer, auditor — plus tester + documenter + spec-keeper for M5/M6.
+Full team task list persisted in the session; briefs live in `.claude/agent-team-tasks/`.
 
 ## Milestone dependency / parallelization
 

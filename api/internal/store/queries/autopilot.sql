@@ -57,6 +57,8 @@ SET last_event_id = EXCLUDED.last_event_id, handled_at = now();
 -- comment during an active run.
 SELECT EXISTS (
     SELECT 1 FROM runs
-    WHERE repo_id = @repo_id AND issue_iid = @issue_iid
+    -- ::uuid keeps this a non-null uuid.UUID param after runs.repo_id went nullable
+    -- (PRD #39 chat runs); an autopilot issue run always targets a repo.
+    WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid
       AND status NOT IN ('completed', 'failed', 'cancelled')
 ) AS active;

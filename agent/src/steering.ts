@@ -135,3 +135,141 @@ export class SteeringChannel {
     }
   }
 }
+
+/** What the chat park loop should do next: answer a message, idle-complete, or end
+ *  (an explicit End chat, or worker shutdown). */
+export type ChatInput =
+  | { kind: "message"; text: string }
+  | { kind: "idle" }
+  | { kind: "ended" };
+
+/** The input source a ChatRunner parks on between turns (PRD #39 Decision 2). The
+ *  real one is ChatSteering; tests inject a fake that yields scripted ChatInputs. */
+export interface ChatInputSource {
+  start(): void;
+  stop(): Promise<void>;
+  awaitFollowUp(idleMs: number): Promise<ChatInput>;
+}
+
+export interface ChatSteeringOptions {
+  /** Injectable sleep so tests drive the poll loop deterministically. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Injectable clock so the idle window is provable without real time. */
+  now?: () => number;
+}
+
+/**
+ * The chat steering channel (PRD #39 Decision 2). Like SteeringChannel it is the
+ * SOLE poller of the consume-on-read `GET /inputs`, but a chat only ever sees two
+ * input kinds: `follow_up` (a user turn — including the seeded first message) and
+ * `cancel` (End chat). It also OWNS the idle clock, and that ownership is the
+ * load-bearing fix for the drop-on-idle race (team task #8):
+ *
+ *   The poll loop consumes inputs, buffers any follow_up, and THEN — in the SAME
+ *   iteration, after routing — services the parked waiter, delivering a buffered
+ *   message before it ever tests idle. There is no separate idle timer that could
+ *   fire in the window between the server consuming a follow_up (consume-on-read
+ *   removes it server-side) and the worker buffering it. So a message that races the
+ *   idle tick is delivered, never lost — the only correct design under consume-on-read.
+ *
+ * A `cancel` aborts the shared controller (which is the executor's ctx.signal), so
+ * End chat also aborts a turn in flight, not just a parked wait.
+ */
+export class ChatSteering implements ChatInputSource {
+  private stopped = false;
+  private loop: Promise<void> | undefined;
+  private readonly followUps: string[] = [];
+  private waiter: { resolve: (i: ChatInput) => void; idleMs: number; parkedAt: number } | undefined;
+  private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly now: () => number;
+
+  constructor(
+    private readonly client: WorkerClient,
+    private readonly runId: string,
+    private readonly pollMs: number,
+    private readonly log: Logger,
+    /** Aborted when a `cancel` (End chat) input arrives; this IS the executor's
+     *  ctx.signal, so a cancel also aborts a turn in flight. */
+    private readonly cancel: AbortController,
+    opts: ChatSteeringOptions = {},
+  ) {
+    this.sleepFn = opts.sleep ?? sleep;
+    this.now = opts.now ?? Date.now;
+  }
+
+  start(): void {
+    if (this.loop) return;
+    this.loop = this.pollLoop();
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.settle({ kind: "ended" });
+    if (this.loop) await this.loop;
+  }
+
+  /**
+   * Park until the next user message, or idle after `idleMs` with no message, or end
+   * (cancel/stop). A follow_up already buffered (consumed during the previous turn)
+   * is returned immediately. Only one park is outstanding at a time — the executor
+   * parks exactly once per turn.
+   */
+  awaitFollowUp(idleMs: number): Promise<ChatInput> {
+    if (this.followUps.length) return Promise.resolve<ChatInput>({ kind: "message", text: this.followUps.shift()! });
+    if (this.cancel.signal.aborted || this.stopped) return Promise.resolve<ChatInput>({ kind: "ended" });
+    return new Promise<ChatInput>((resolve) => {
+      this.waiter = { resolve, idleMs, parkedAt: this.now() };
+    });
+  }
+
+  private settle(i: ChatInput): void {
+    const w = this.waiter;
+    if (!w) return;
+    this.waiter = undefined;
+    w.resolve(i);
+  }
+
+  private route(kind: string, body: string | null | undefined): void {
+    switch (kind) {
+      case "follow_up":
+        if (body && body.trim()) this.followUps.push(body.trim());
+        break;
+      case "cancel":
+        if (!this.cancel.signal.aborted) this.cancel.abort();
+        break;
+      default:
+        // approve_plan / reject_plan never occur for a chat (no plan gate).
+        this.log.warn("chat steering: ignoring unexpected input kind", { kind });
+    }
+  }
+
+  /** After each poll+route, decide what a parked waiter gets: cancel/stop wins, then
+   *  a buffered message, then idle — so a just-consumed follow_up is always delivered
+   *  before idle can complete the chat. */
+  private serviceWaiter(): void {
+    if (!this.waiter) return;
+    if (this.cancel.signal.aborted || this.stopped) return this.settle({ kind: "ended" });
+    if (this.followUps.length) return this.settle({ kind: "message", text: this.followUps.shift()! });
+    if (this.now() - this.waiter.parkedAt >= this.waiter.idleMs) this.settle({ kind: "idle" });
+  }
+
+  private async pollLoop(): Promise<void> {
+    while (!this.stopped) {
+      try {
+        const inputs = await this.client.getInputs(this.runId);
+        for (const inp of inputs) this.route(inp.kind, inp.body ?? undefined);
+      } catch (err) {
+        this.log.warn("chat steering: input poll failed", { run_id: this.runId, error: errMessage(err) });
+      }
+      // Route THEN service: a follow_up consumed this cycle is buffered above and
+      // delivered here, before idle is tested (task #8).
+      this.serviceWaiter();
+      // Once cancelled (End chat / shutdown), stop polling — serviceWaiter already
+      // delivered `ended` to any waiter; continuing would busy-spin on the aborted
+      // sleep and hammer /inputs until stop() lands.
+      if (this.stopped || this.cancel.signal.aborted) break;
+      await this.sleepFn(this.pollMs, this.cancel.signal);
+    }
+    this.settle({ kind: "ended" });
+  }
+}

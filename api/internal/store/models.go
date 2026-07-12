@@ -89,6 +89,20 @@ type Issue struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 }
 
+type IssueProposal struct {
+	ID              uuid.UUID          `json:"id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	RepoID          uuid.UUID          `json:"repo_id"`
+	Title           string             `json:"title"`
+	Description     string             `json:"description"`
+	Labels          []byte             `json:"labels"`
+	Status          string             `json:"status"`
+	CreatedIssueIid pgtype.Int8        `json:"created_issue_iid"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	ResolvedAt      pgtype.Timestamptz `json:"resolved_at"`
+	ConfirmingSince pgtype.Timestamptz `json:"confirming_since"`
+}
+
 type PipelineStatus struct {
 	ID             int64              `json:"id"`
 	RepoID         uuid.UUID          `json:"repo_id"`
@@ -125,7 +139,7 @@ type RepoToolProfile struct {
 type Run struct {
 	ID                   uuid.UUID          `json:"id"`
 	UserID               uuid.UUID          `json:"user_id"`
-	RepoID               uuid.UUID          `json:"repo_id"`
+	RepoID               pgtype.UUID        `json:"repo_id"`
 	IssueIid             pgtype.Int8        `json:"issue_iid"`
 	IssueTitle           string             `json:"issue_title"`
 	IssueDescription     string             `json:"issue_description"`
@@ -159,6 +173,8 @@ type Run struct {
 	AgentSource          pgtype.Text        `json:"agent_source"`
 	AgentExclusions      []byte             `json:"agent_exclusions"`
 	RepoAgents           []byte             `json:"repo_agents"`
+	Title                pgtype.Text        `json:"title"`
+	ResumeOfRunID        pgtype.UUID        `json:"resume_of_run_id"`
 }
 
 type RunMessage struct {

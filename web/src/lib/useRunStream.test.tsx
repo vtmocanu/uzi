@@ -35,6 +35,8 @@ function fakeRun(): Run {
     issue_iid: 7,
     issue_title: "Wire the runtime",
     issue_description: "",
+    title: null,
+    resume_of_run_id: null,
     status: "running",
     requeue_count: 0,
     iteration_count: 0,

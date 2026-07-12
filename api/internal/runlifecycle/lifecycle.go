@@ -236,7 +236,9 @@ func (l *Lifecycle) notifyOnce(ctx context.Context, runID uuid.UUID, status stri
 
 func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 	return moveContext{
-		repoID:          mc.RepoID,
+		// GetRunMoveContext INNER-JOINs repos, so a row is returned only for a run
+		// with a non-NULL repo_id (a chat run yields ErrNoRows and never reaches here).
+		repoID:          uuid.UUID(mc.RepoID.Bytes),
 		issueIID:        mc.IssueIid.Int64, // valid: notifyOnce skips ci_fix runs (NULL issue_iid)
 		forgeProjectID:  mc.ForgeProjectID,
 		forgeType:       mc.ForgeType,

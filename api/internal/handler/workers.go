@@ -96,33 +96,40 @@ func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
 // runDTO is the web view of a run. session_id and last_seq are intentionally
 // omitted — they are worker-internal (resume plumbing), not browser state.
 type runDTO struct {
-	ID   string `json:"id"`
-	RepoID string `json:"repo_id"`
-	// Kind is issue|ci_fix (PRD #6). IssueIID is null for a ci_fix run (no issue);
-	// the ci_fix fields below carry its pipeline context instead.
-	Kind             string     `json:"kind"`
-	IssueIID         *int64     `json:"issue_iid"`
-	IssueTitle       string     `json:"issue_title"`
-	IssueDescription string     `json:"issue_description"`
-	Status           string     `json:"status"`
-	RequeueCount     int32      `json:"requeue_count"`
-	IterationCount   int32      `json:"iteration_count"`
-	AutoApprove      bool       `json:"auto_approve"`
-	WorkerID         *string    `json:"worker_id"`
-	Branch           *string    `json:"branch"`
-	MrIID            *int64     `json:"mr_iid"`
+	ID string `json:"id"`
+	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
+	// issue/ci_fix runs.
+	RepoID *string `json:"repo_id"`
+	// Kind is issue|ci_fix|chat. IssueIID is null for ci_fix (no issue) and chat
+	// runs; the ci_fix fields below carry pipeline context, chat carries Title.
+	Kind             string `json:"kind"`
+	IssueIID         *int64 `json:"issue_iid"`
+	IssueTitle       string `json:"issue_title"`
+	IssueDescription string `json:"issue_description"`
+	// Title is the chat conversation's display title (PRD #39), null for
+	// issue/ci_fix runs. ResumeOfRunID points a Continue chat at the ended chat it
+	// resumes (Decision 11), null otherwise.
+	Title          *string `json:"title"`
+	ResumeOfRunID  *string `json:"resume_of_run_id"`
+	Status         string  `json:"status"`
+	RequeueCount   int32   `json:"requeue_count"`
+	IterationCount int32   `json:"iteration_count"`
+	AutoApprove    bool    `json:"auto_approve"`
+	WorkerID       *string `json:"worker_id"`
+	Branch         *string `json:"branch"`
+	MrIID          *int64  `json:"mr_iid"`
 	// MrState is the last merge-request state the PRD #24 watcher observed for
 	// mr_iid (opened|closed|merged|locked), null when never observed. Display-only
 	// and best-effort (PRD #33 Decision 1): the chip treats merged/closed distinctly
 	// and everything else as the plain open chip. Frozen per run — a superseded
 	// run's value can be stale, so freshness is scoped to the board card in the UI.
-	MrState          *string    `json:"mr_state"`
-	FailureReason    *string    `json:"failure_reason"`
+	MrState       *string `json:"mr_state"`
+	FailureReason *string `json:"failure_reason"`
 	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
 	// or "plan_rejected", null for every other run. It — not the failure_reason
 	// text — is what the client's isStoppedRun reads to style a stop as calm/neutral.
-	StopKind         *string    `json:"stop_kind"`
-	PlanMd           *string    `json:"plan_md"`
+	StopKind *string `json:"stop_kind"`
+	PlanMd   *string `json:"plan_md"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).
@@ -160,10 +167,10 @@ type runDTO struct {
 func runToDTO(r store.Run) runDTO {
 	dto := runDTO{
 		ID:               r.ID.String(),
-		RepoID:           r.RepoID.String(),
 		Kind:             r.Kind,
 		IssueTitle:       r.IssueTitle,
 		IssueDescription: r.IssueDescription,
+		Title:            textPtrValue(r.Title.Valid, r.Title.String),
 		Status:           r.Status,
 		RequeueCount:     r.RequeueCount,
 		IterationCount:   r.IterationCount,
@@ -180,6 +187,14 @@ func runToDTO(r store.Run) runDTO {
 		FinishedAt:       timePtr(r.FinishedAt.Valid, r.FinishedAt.Time),
 		CreatedAt:        r.CreatedAt.Time,
 		UpdatedAt:        r.UpdatedAt.Time,
+	}
+	if r.RepoID.Valid {
+		s := uuid.UUID(r.RepoID.Bytes).String()
+		dto.RepoID = &s
+	}
+	if r.ResumeOfRunID.Valid {
+		s := uuid.UUID(r.ResumeOfRunID.Bytes).String()
+		dto.ResumeOfRunID = &s
 	}
 	if r.IssueIid.Valid {
 		v := r.IssueIid.Int64

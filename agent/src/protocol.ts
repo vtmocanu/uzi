@@ -23,7 +23,8 @@ export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
   "failed",
 ]);
 
-/** run_messages.kind (PRD #4 §Schema). */
+/** run_messages.kind (PRD #4 §Schema; PRD #39 adds user_message + proposal — the
+ *  DB column carries no CHECK, so these need no migration, Decision 8/D12). */
 export type MessageKind =
   | "text"
   | "thinking"
@@ -32,7 +33,8 @@ export type MessageKind =
   | "status"
   | "error"
   | "user_message"
-  | "plan";
+  | "plan"
+  | "proposal";
 
 /** run_user_inputs.kind (PRD #4 §Schema). */
 export type InputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
@@ -232,6 +234,120 @@ export interface ClaimResponse {
    *  fact. Re-delivered on every resume/requeue of the same run (the server reads
    *  it from the row), so an unattended resume never hangs at the gate. */
   auto_approve?: boolean;
+}
+
+/**
+ * Chat claim lane payload (PRD #39, the chat lane's counterpart to ClaimResponse).
+ * Pinned against M1's landed `workersvc.ChatClaimPayload` (chat.go): a narrower,
+ * repo-less shape claimed via `POST /api/worker/runs/claim?lane=chat`. Carries the
+ * Anthropic token ONLY — there is structurally no forge_pat/forge_username key
+ * (Decision 9) and no repo (Decision 12). There is NO prompt field: the first user
+ * message is a seeded `follow_up` run input the worker consumes through the normal
+ * input path, uniform with every later turn. A Continue run (Decision 11) carries
+ * `resume_of_run_id` and no seeded input (it parks awaiting the next message).
+ */
+export interface ChatClaimResponse {
+  run_id: string;
+  kind: "chat";
+  /** Conversation display title (server-derived; may be empty). */
+  title: string;
+  /** Current run status at claim time (e.g. "claimed"). */
+  status: string;
+  /** SDK session to resume: the run's own (requeue/resume) or, for a Continue run,
+   *  the resumed-from run's session (Decision 11). null for a fresh chat. */
+  session_id: string | null;
+  /** Set only for a Continue run, so the worker can say "continuing without prior
+   *  context" honestly when the session is gone. */
+  resume_of_run_id: string | null;
+  /** High-water mark of run_messages.seq; the worker continues numbering here. */
+  last_seq: number;
+  requeue_count: number;
+  secrets: ChatClaimSecrets;
+  config: ChatClaimConfig;
+}
+
+/** A chat claim's secrets — the Anthropic token and NOTHING else (Decision 9). */
+export interface ChatClaimSecrets {
+  anthropic_oauth_token: string;
+}
+
+/** Chat lifecycle caps the server pushes down so the worker's clocks match (no
+ *  drift, Decision 3). Timeouts are in SECONDS, matching the run claim convention
+ *  (converted to ms at the worker use site). */
+export interface ChatClaimConfig {
+  idle_timeout_seconds: number;
+  turn_timeout_seconds: number;
+  max_turns: number;
+  /** The owner's per-user default model (PRD #17); omitted when unset. */
+  default_model?: string;
+}
+
+// ── Chat agent read surface (PRD #39 M3, Decision 7) ─────────────────────────
+// The worker-authenticated endpoints the chat agent's uzi-tools MCP server calls to
+// investigate its OWNER'S runs. Pinned against api/internal/handler/worker_chat.go.
+// Every text field here is UNTRUSTED (forge/model-derived) and MUST be wrapped in the
+// evidence envelope before it reaches the model (uzi-tools.ts), never fed as prose.
+
+/** One run in the compact worker list (GET /api/worker/chat/runs). repo_path/mr_url
+ *  are null for a chat run; issue_iid/branch null when absent. */
+export interface WorkerRunListItem {
+  id: string;
+  kind: string;
+  status: string;
+  repo_path: string | null;
+  issue_iid: number | null;
+  title: string;
+  branch: string | null;
+  mr_url: string | null;
+  failure_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Single-run detail (GET /api/worker/chat/runs/:id): the list fields plus the
+ *  diagnostics the agent needs to answer "why did run X fail?". */
+export interface WorkerRunDetail extends WorkerRunListItem {
+  mr_state: string | null;
+  stop_kind: string | null;
+  fix_verdict: string | null;
+  iteration_count: number;
+  plan_md: string | null;
+}
+
+/** One run message page item (GET /api/worker/chat/runs/:id/messages). payload is
+ *  arbitrary per kind and UNTRUSTED. */
+export interface WorkerRunMessage {
+  seq: number;
+  kind: string;
+  agent: string | null;
+  payload: Record<string, unknown> | null;
+  created_at: string;
+}
+
+/** A created issue proposal (POST /api/worker/runs/:id/proposals → 201). Pending
+ *  until the user confirms in the browser; the worker never writes the forge. */
+export interface WorkerProposal {
+  id: string;
+  run_id: string;
+  repo_id: string;
+  title: string;
+  description: string;
+  labels: string[];
+  status: string;
+  created_at: string;
+}
+
+/** Request body for POST /api/worker/runs/:id/proposals (Phase-3 wire catalog).
+ *  The agent sends `repo_path` — the exact string the read endpoints expose — which
+ *  the server resolves to the internal id (user-scoped), so UUIDs stay off the
+ *  worker. `repo_id` is accepted for back-compat (repo_path wins server-side). At
+ *  least one must be set. */
+export interface CreateProposalRequest {
+  repo_path?: string;
+  repo_id?: string;
+  title: string;
+  description: string;
+  labels: string[];
 }
 
 /** One appended message; the server is idempotent on (run_id, seq). */

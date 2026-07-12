@@ -12,7 +12,9 @@ INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_id, pipeline_ref, failure_snapshot
 ) VALUES (
-    @user_id, @repo_id, 'ci_fix', @issue_title, @issue_description,
+    -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
+    -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
+    @user_id, @repo_id::uuid, 'ci_fix', @issue_title, @issue_description,
     @pipeline_id, @pipeline_ref, @failure_snapshot
 )
 RETURNING *;
@@ -24,7 +26,7 @@ RETURNING *;
 -- until the worker creates the worktree, so this catches the already-progressed
 -- case; git's "branch already checked out" backstops the race window.
 SELECT count(*) FROM runs
-WHERE repo_id = @repo_id AND branch = @branch
+WHERE repo_id = @repo_id::uuid AND branch = @branch
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: CountActiveCIFixForRef :one
@@ -33,7 +35,7 @@ WHERE repo_id = @repo_id AND branch = @branch
 -- (agent/issue-N). Refuses starting an issue run onto a branch an active ci_fix is
 -- fixing.
 SELECT count(*) FROM runs
-WHERE repo_id = @repo_id AND kind = 'ci_fix' AND pipeline_ref = @pipeline_ref
+WHERE repo_id = @repo_id::uuid AND kind = 'ci_fix' AND pipeline_ref = @pipeline_ref
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: FindCIFixStampTarget :one
@@ -45,7 +47,7 @@ WHERE repo_id = @repo_id AND kind = 'ci_fix' AND pipeline_ref = @pipeline_ref
 -- from the original failing one). Newest first when a branch hosted several
 -- sequential fix runs over time.
 SELECT * FROM runs
-WHERE kind = 'ci_fix' AND repo_id = @repo_id AND branch = @branch
+WHERE kind = 'ci_fix' AND repo_id = @repo_id::uuid AND branch = @branch
   AND fix_verdict IS NULL
   AND pipeline_id < @observed_pipeline_id
 ORDER BY created_at DESC

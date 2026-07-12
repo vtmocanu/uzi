@@ -492,14 +492,19 @@ export type FixVerdict = "verified" | "fix_failed" | "not_code";
 
 export interface Run {
   id: string;
-  repo_id: string;
+  /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
+  repo_id: string | null;
   /** Run kind (PRD #6): "issue" works issue_iid's card; "ci_fix" fixes a failed
-   *  pipeline (pipeline_ref/pipeline_web_url/fix_verdict below). */
+   *  pipeline (pipeline_ref/pipeline_web_url/fix_verdict below); "chat" (PRD #39). */
   kind: string;
-  /** The worked issue for an issue run; null for a ci_fix run (no issue). */
+  /** The worked issue for an issue run; null for a ci_fix or chat run (no issue). */
   issue_iid: number | null;
   issue_title: string;
   issue_description: string;
+  /** Chat conversation title (PRD #39), first-message derived; null for other kinds
+   *  and until derived. resume_of_run_id points a continued chat at the ended one. */
+  title: string | null;
+  resume_of_run_id: string | null;
   status: RunStatus;
   requeue_count: number;
   iteration_count: number;
@@ -599,6 +604,80 @@ export interface WsEvent {
   payload?: unknown;
   created_at?: string;
   status?: string;
+}
+
+// ── Chat (PRD #39) — PROVISIONAL wire shapes ────────────────────────────────
+// Chat rides the run machinery: a conversation IS a run row (runs.kind='chat'),
+// so its LIVE VIEW reuses the existing stream verbatim — pass a Chat.id to
+// getRun / getRunMessages / createRunSocket. Only the conversation-level verbs
+// below (create/list/message/end/continue and the two proposal actions) are new.
+// These types + the seven realApi methods mirror the PRD #39 endpoint contracts
+// reconciled to M1's landed wire (Phase 3, per the wire catalog).
+
+// A chat conversation's lifecycle reuses the run state machine
+// (queued → claimed → running → … → completed/failed/cancelled); a terminal chat
+// is an ended conversation (Continue starts a fresh one, Decision 11).
+export type ChatStatus = RunStatus;
+
+// Chat is the unified CLIENT VIEW of a conversation the page components consume.
+// The API returns two shapes: GET /api/chats returns this shape per item (plus a
+// max_turns envelope constant); POST /api/chats and .../continue return a full
+// runDTO under `run`. `chatFromRun` (lib/chat.ts) maps a runDTO into this view, so
+// the components never branch on which endpoint produced it. Note: max_turns is
+// NOT here — it is an instance constant carried on the list envelope.
+export interface Chat {
+  // The chat run id. This is what the streaming machinery keys on.
+  id: string;
+  // First-message-derived conversation title; null until the worker derives one.
+  title: string | null;
+  status: ChatStatus;
+  // Server-counted user turns (persisted follow_ups incl. the seeded first
+  // message) — preferred over the stream-derived count for the turn-cap gate.
+  turn_count: number;
+  // Set when this chat continues an ended one (Decision 11); null otherwise.
+  resume_of_run_id: string | null;
+  // Newest message time — drives list ordering + the "last activity" label; null
+  // before the worker emits one.
+  last_message_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// ChatListResponse is the GET /api/chats envelope: the conversations plus the
+// instance-wide turn cap (a constant, not per-chat).
+export interface ChatListResponse {
+  chats: Chat[];
+  max_turns: number;
+}
+
+// CreatedIssue is the confirm response (200 {issue}): the real forge issue the
+// human's Create click produced. The card renders its link (https-guarded).
+export interface CreatedIssue {
+  iid: number;
+  web_url: string;
+  title: string;
+}
+
+export type ProposalStatus = "pending" | "confirmed" | "dismissed";
+
+// IssueProposal is the payload of a `proposal`-kind run message (Decision 8): the
+// chat agent's issue draft. Its title/description/labels are MODEL-authored and
+// untrusted, so the card renders them as plain inert text (never Markdown, no
+// clickable model links). The forge write happens only on the human's Create
+// click; the created-issue link comes from the confirm response (CreatedIssue),
+// NOT from this payload. repo_path is computed by the worker at emit time (the
+// issue_proposals row stores only repo_id), so it is optional here.
+export interface IssueProposal {
+  id: string;
+  run_id: string;
+  repo_id: string;
+  // Worker-computed display path; absent when the worker could not resolve it.
+  repo_path?: string;
+  title: string;
+  description: string;
+  labels: string[];
+  status: ProposalStatus;
+  created_at: string;
 }
 
 // runSocketUrl builds the same-origin WebSocket URL for a run. The HttpOnly auth
@@ -908,6 +987,27 @@ const realApi = {
       // plain follow-up/cancel body is unchanged.
       ...(selection ? { selection } : {}),
     }),
+
+  // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
+  // The live view (messages, WS, replay) reuses getRun/getRunMessages/
+  // createRunSocket with the chat's id — only these conversation verbs are new.
+  // create/continue return a full runDTO under `run`; the list returns the Chat
+  // view shape per item plus the max_turns envelope constant.
+  listChats: () => request<ChatListResponse>("GET", "/chats"),
+  createChat: (message: string) => request<{ run: Run }>("POST", "/chats", { message }),
+  // 202 {server_side}; the reply arrives over the run stream (mirrors submitRunInput).
+  sendChatMessage: (id: string, message: string) =>
+    request<{ server_side: boolean }>("POST", `/chats/${id}/messages`, { message }),
+  endChat: (id: string) => request<{ server_side: boolean }>("POST", `/chats/${id}/end`),
+  // Continue creates a NEW chat run carrying resume_of_run_id (Decision 11).
+  continueChat: (id: string) => request<{ run: Run }>("POST", `/chats/${id}/continue`),
+  // The ONLY forge-write path from chat: session + CSRF, forge-first (Decision 8).
+  // 200 {issue}: the real created issue (the card renders its link).
+  confirmProposal: (chatId: string, proposalId: string) =>
+    request<{ issue: CreatedIssue }>("POST", `/chats/${chatId}/proposals/${proposalId}/confirm`),
+  // 204 No Content: the card updates its state locally.
+  dismissProposal: (chatId: string, proposalId: string) =>
+    request<null>("POST", `/chats/${chatId}/proposals/${proposalId}/dismiss`),
 
   adminListWorkers: () => request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
   adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),

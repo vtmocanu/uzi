@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { SteeringChannel, type PlanVerdict } from "../src/steering.js";
+import { SteeringChannel, ChatSteering, type PlanVerdict } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -83,5 +83,77 @@ describe("SteeringChannel", () => {
     ch.start();
     assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
     await ch.stop();
+  });
+});
+
+// ChatSteering (PRD #39 Decision 2): the chat lane's blocking await-next-follow-up.
+// It owns the idle clock inside the poll loop, so a follow_up consumed on the same
+// poll where idle would elapse is delivered, never dropped (team task #8).
+describe("ChatSteering", () => {
+  it("delivers a follow_up as a message", async () => {
+    const ch = new ChatSteering(fakeClient([[inp("follow_up", "how does X work?")]]), "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "how does X work?" });
+    await ch.stop();
+  });
+
+  it("delivers a follow_up buffered during a turn (no waiter registered yet)", async () => {
+    const ch = new ChatSteering(fakeClient([[inp("follow_up", "buffered")]]), "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    await tick(); // the poll consumes + buffers it while nobody is parked
+    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "buffered" });
+    await ch.stop();
+  });
+
+  it("idle-completes after idleMs of no input (source owns the idle clock)", async () => {
+    let clock = 0;
+    const ch = new ChatSteering(fakeClient([[]]), "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });
+    ch.start();
+    const p = ch.awaitFollowUp(50); // parked at clock=0
+    await tick(); // several polls, clock still 0 → not idle
+    clock = 500; // advance past idleMs
+    assert.deepStrictEqual(await p, { kind: "idle" });
+    await ch.stop();
+  });
+
+  it("does NOT drop a follow_up that races the idle tick (team task #8)", async () => {
+    // The poll that returns the follow_up ALSO advances the clock past idleMs — idle
+    // and a message are both "due" in the same poll. Because the poll loop routes then
+    // services the waiter (message checked before idle), the message wins. There is no
+    // separate idle timer that could have fired first, so the consumed input is never lost.
+    let clock = 0;
+    let calls = 0;
+    const client = {
+      getInputs: async () => {
+        calls++;
+        if (calls >= 3) {
+          clock = 10_000; // idle window (50) long elapsed...
+          return [inp("follow_up", "raced-in")]; // ...but a follow_up arrives THIS poll
+        }
+        return [];
+      },
+    } as unknown as WorkerClient;
+    const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });
+    ch.start();
+    assert.deepStrictEqual(await ch.awaitFollowUp(50), { kind: "message", text: "raced-in" });
+    await ch.stop();
+  });
+
+  it("ends (and aborts the shared controller) on a cancel input — End chat", async () => {
+    const cancel = new AbortController();
+    const ch = new ChatSteering(fakeClient([[inp("cancel")]]), "chat-1", 1, nullLogger(), cancel);
+    ch.start();
+    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "ended" });
+    assert.strictEqual(cancel.signal.aborted, true, "cancel aborts the controller so a turn in flight also stops");
+    await ch.stop();
+  });
+
+  it("settles a parked waiter with ended on stop() (worker shutdown)", async () => {
+    const ch = new ChatSteering(fakeClient([[]]), "chat-1", 1, nullLogger(), new AbortController());
+    ch.start();
+    const p = ch.awaitFollowUp(100000); // parks (no input, huge idle)
+    await tick();
+    await ch.stop();
+    assert.deepStrictEqual(await p, { kind: "ended" });
   });
 });

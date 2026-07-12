@@ -134,7 +134,7 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop
 FROM runs r
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
-WHERE r.repo_id = $1 AND r.issue_iid = $2
+WHERE r.repo_id = $1::uuid AND r.issue_iid = $2
 ORDER BY r.created_at DESC
 LIMIT 1
 `
@@ -542,7 +542,7 @@ SELECT DISTINCT ON (r.issue_iid)
 FROM runs r
 LEFT JOIN users ru ON ru.id = r.user_id
 LEFT JOIN workers rw ON rw.id = r.worker_id
-WHERE r.repo_id = $1 AND r.issue_iid IS NOT NULL   -- issue runs only; ci_fix runs (PRD #6) have no card
+WHERE r.repo_id = $1::uuid AND r.issue_iid IS NOT NULL   -- issue runs only; ci_fix runs (PRD #6) have no card; ::uuid keeps the param non-null after PRD #39
 ORDER BY r.issue_iid, r.created_at DESC
 `
 
