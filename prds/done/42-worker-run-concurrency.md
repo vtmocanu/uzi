@@ -1,7 +1,7 @@
 # PRD #42: Worker run concurrency — bounded multi-run workers
 
 **GitLab Issue**: [vtmocanu/uzi#42](https://gitlab.example.com/vtmocanu/uzi/-/issues/42)
-**Status**: Draft — reviewed 2026-07-10 by 3 agents (design, security, fact-check); no blocking findings; all major/medium findings folded in below (marked ↳review where the design changed). Implemented on feature/prd-42-worker-run-concurrency (MR pending).
+**Status**: Draft — reviewed 2026-07-10 by 3 agents (design, security, fact-check); no blocking findings; all major/medium findings folded in below (marked ↳review where the design changed). Done — merged to main via MR !42 (2026-07-12); all six milestones implemented, reviewed, and audited.
 **Priority**: Medium
 **Created**: 2026-07-10
 **Depends on**: PRD #4 (worker runtime + run machinery, done). **Coupled to**: PRD #39 (chat agent) — its Decision 4 requires exactly the concurrency substrate this PRD builds; M1/M2 here are prerequisites of #39's chat lane and must not be duplicated there.
