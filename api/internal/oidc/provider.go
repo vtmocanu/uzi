@@ -20,6 +20,7 @@ import (
 
 	gooidc "github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 // Config is the relying-party configuration. Every field is required; the caller
@@ -63,7 +64,12 @@ type Provider struct {
 	cfg    Config
 	client *http.Client
 
-	mu       sync.Mutex
+	// sf collapses concurrent first-time discovery attempts onto a single in-flight
+	// call, so an IdP outage does not serialize every pending login behind the mutex
+	// (auditor low). The RWMutex guards the cached results below.
+	sf singleflight.Group
+
+	mu       sync.RWMutex
 	provider *gooidc.Provider
 	verifier *gooidc.IDTokenVerifier
 	oauth    *oauth2.Config
@@ -89,32 +95,50 @@ func New(cfg Config) *Provider {
 // call repeatedly: the boot warm-up calls it once to surface a misconfigured or
 // unreachable IdP loudly, and a failure is not cached, so a later login retries.
 func (p *Provider) Discover(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.ensureLocked(ctx)
+	return p.ensure(ctx)
 }
 
-// ensureLocked runs discovery once and caches the derived verifier + oauth2
-// config. Callers must hold p.mu.
-func (p *Provider) ensureLocked(ctx context.Context) error {
-	if p.provider != nil {
+// ensure runs discovery at most once on success and caches the derived verifier +
+// oauth2 config. Concurrent callers collapse onto one in-flight discovery via
+// singleflight, so a slow/unreachable IdP does not serialize every pending login
+// behind the mutex. A failure is not cached, so a later call retries.
+func (p *Provider) ensure(ctx context.Context) error {
+	p.mu.RLock()
+	ready := p.provider != nil
+	p.mu.RUnlock()
+	if ready {
 		return nil
 	}
-	ctx = gooidc.ClientContext(ctx, p.client)
-	provider, err := gooidc.NewProvider(ctx, p.cfg.IssuerURL)
-	if err != nil {
-		return fmt.Errorf("oidc discovery for %q: %w", p.cfg.IssuerURL, err)
-	}
-	p.provider = provider
-	p.verifier = provider.Verifier(&gooidc.Config{ClientID: p.cfg.ClientID})
-	p.oauth = &oauth2.Config{
-		ClientID:     p.cfg.ClientID,
-		ClientSecret: p.cfg.ClientSecret,
-		Endpoint:     provider.Endpoint(),
-		RedirectURL:  p.cfg.RedirectURL,
-		Scopes:       p.cfg.Scopes,
-	}
-	return nil
+	_, err, _ := p.sf.Do("discover", func() (any, error) {
+		// A concurrent leader may have finished while we waited for the group.
+		p.mu.RLock()
+		done := p.provider != nil
+		p.mu.RUnlock()
+		if done {
+			return nil, nil
+		}
+		// Detach from any single caller's request lifecycle — this is a shared cached
+		// resource, and the sharers of this singleflight call may outlive the leader's
+		// request. The http.Client timeout bounds the discovery HTTP call.
+		dctx := gooidc.ClientContext(context.WithoutCancel(ctx), p.client)
+		provider, err := gooidc.NewProvider(dctx, p.cfg.IssuerURL)
+		if err != nil {
+			return nil, fmt.Errorf("oidc discovery for %q: %w", p.cfg.IssuerURL, err)
+		}
+		p.mu.Lock()
+		p.provider = provider
+		p.verifier = provider.Verifier(&gooidc.Config{ClientID: p.cfg.ClientID})
+		p.oauth = &oauth2.Config{
+			ClientID:     p.cfg.ClientID,
+			ClientSecret: p.cfg.ClientSecret,
+			Endpoint:     provider.Endpoint(),
+			RedirectURL:  p.cfg.RedirectURL,
+			Scopes:       p.cfg.Scopes,
+		}
+		p.mu.Unlock()
+		return nil, nil
+	})
+	return err
 }
 
 // AuthCodeURL builds the IdP authorization URL for the Authorization Code + PKCE
@@ -123,13 +147,12 @@ func (p *Provider) ensureLocked(ctx context.Context) error {
 // whose plaintext is sent at exchange. Triggers lazy discovery, so a degraded
 // provider surfaces its error to the caller (which redirects with an error code).
 func (p *Provider) AuthCodeURL(ctx context.Context, state, nonce, pkceVerifier string) (string, error) {
-	p.mu.Lock()
-	err := p.ensureLocked(ctx)
-	oauth := p.oauth
-	p.mu.Unlock()
-	if err != nil {
+	if err := p.ensure(ctx); err != nil {
 		return "", err
 	}
+	p.mu.RLock()
+	oauth := p.oauth
+	p.mu.RUnlock()
 	return oauth.AuthCodeURL(state,
 		gooidc.Nonce(nonce),
 		oauth2.S256ChallengeOption(pkceVerifier),
@@ -143,13 +166,12 @@ func (p *Provider) AuthCodeURL(ctx context.Context, state, nonce, pkceVerifier s
 // lazily but its one-time network cost is paid under the lock; the per-login token
 // exchange runs outside it so concurrent logins do not serialize.
 func (p *Provider) Exchange(ctx context.Context, code, pkceVerifier, expectedNonce string) (Identity, error) {
-	p.mu.Lock()
-	err := p.ensureLocked(ctx)
-	verifier, oauth := p.verifier, p.oauth
-	p.mu.Unlock()
-	if err != nil {
+	if err := p.ensure(ctx); err != nil {
 		return Identity{}, err
 	}
+	p.mu.RLock()
+	verifier, oauth := p.verifier, p.oauth
+	p.mu.RUnlock()
 
 	ctx = gooidc.ClientContext(ctx, p.client)
 	tok, err := oauth.Exchange(ctx, code, oauth2.VerifierOption(pkceVerifier))
