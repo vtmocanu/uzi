@@ -61,12 +61,21 @@ describe("FactoryTotalCard + PerUserUsageTable", () => {
       { user_id: "a", email: "big@x", usage: bundle(2_490_000, 22_400_000, 1_020_000, 37.83), run_count: 31 },
       { user_id: "b", email: "small@x", usage: bundle(1_610_000, 15_100_000, 710_000, 26.4), run_count: 23 },
     ],
+    earliest_run: "2026-05-12T09:00:00Z",
   };
 
-  it("factory card shows the total tokens + user count", () => {
+  it("factory card shows the total tokens + user count + since date", () => {
     const { getByText, container } = wrap(<FactoryTotalCard admin={admin} />);
     expect(getByText(/Factory total/)).toBeTruthy();
     expect(container.textContent).toContain("2 users");
+    // "since <date>" from earliest_run (locale-formatted; assert the stable bits).
+    expect(container.textContent).toContain("since");
+    expect(container.textContent).toContain("2026");
+  });
+
+  it("omits the 'since' clause when earliest_run is null", () => {
+    const { container } = wrap(<FactoryTotalCard admin={{ ...admin, earliest_run: null }} />);
+    expect(container.textContent).not.toContain("since");
   });
 
   it("per-user table renders a row per user, a total row, and share bars by tokens", () => {

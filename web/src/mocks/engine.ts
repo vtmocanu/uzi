@@ -93,6 +93,17 @@ function planningScript(runId: string): Timed[] {
       delay: 1600,
       step: () => {
         appendMessage(runId, "plan", "lead", { text: SAMPLE_PLAN() });
+        // PRD #40: the plan TURN ends with its own result frame (cumulative usage so
+        // far), so the per-phase table shows a "Plan" phase distinct from implement.
+        appendMessage(runId, "status", null, {
+          event: "result",
+          subtype: "success",
+          duration_ms: 5 * 60_000,
+          num_turns: 9,
+          total_cost_usd: 0.24,
+          usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
+          modelUsage: { "claude-sonnet-5": { inputTokens: 21_400, outputTokens: 6_100, cacheReadInputTokens: 188_000, cacheCreationInputTokens: 0, costUSD: 0.24 } },
+        });
         appendMessage(runId, "status", null, { text: "plan submitted — awaiting approval" });
         patchRun(runId, { status: "awaiting_approval", plan_md: SAMPLE_PLAN() });
       },

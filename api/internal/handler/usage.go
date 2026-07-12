@@ -3,6 +3,7 @@ package handler
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -49,6 +50,9 @@ type adminUserUsageDTO struct {
 type adminUsageDTO struct {
 	Factory selfUsageDTO        `json:"factory"`
 	Users   []adminUserUsageDTO `json:"users"`
+	// EarliestRun is the factory's first usage-bearing run's timestamp, for the
+	// card's "since <date>" line; null when the factory has no usage yet (PRD #40).
+	EarliestRun *time.Time `json:"earliest_run"`
 }
 
 // numericToFloat renders a pgtype.Numeric (a summed cost_usd) as a JSON number.
@@ -148,7 +152,8 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			},
 			RunCount: totals.RunCount,
 		},
-		Users: users,
+		Users:       users,
+		EarliestRun: timePtr(totals.EarliestRun.Valid, totals.EarliestRun.Time),
 	})
 }
 

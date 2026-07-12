@@ -1013,6 +1013,16 @@ export const mockDoneMessages: RunMessage[] = [
   dm("tool_use", "lead", { id: "tu-2", name: "Grep", input: { pattern: "tool_result", path: "web/src" } }, 217),
   dm("tool_result", "lead", { tool_use_id: "tu-2", content: "web/src/components/RunEvent.tsx:12\nweb/src/components/ActivityFeed.tsx:44" }, 217),
   dm("plan", "lead", { text: SAMPLE_PLAN() }, 216),
+  // PRD #40: the plan turn's own result frame → a distinct "Plan" per-phase row.
+  dm("status", null, {
+    event: "result",
+    subtype: "success",
+    duration_ms: 5 * 60_000,
+    num_turns: 9,
+    total_cost_usd: 0.24,
+    usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
+    modelUsage: { "claude-sonnet-5": { inputTokens: 21_400, outputTokens: 6_100, cacheReadInputTokens: 188_000, cacheCreationInputTokens: 0, costUSD: 0.24 } },
+  }, 216),
   dm("status", null, { text: "plan submitted — awaiting approval" }, 216),
   dm("status", null, { text: "plan approved by vlad@uzi.local" }, 205),
   dm("text", "coder", { text: "Implementing the id-based pairing index and the fold-under-call rendering.", usage: { input_tokens: 51_600, cache_read_input_tokens: 583_900, cache_creation_input_tokens: 0, output_tokens: 24_100 } }, 204),
@@ -1070,10 +1080,22 @@ const fm = (kind: string, agent: string | null, payload: unknown): RunMessage =>
 
 export const mockFailedMessages: RunMessage[] = [
   fm("status", null, { event: "init", model: "claude-sonnet-4-6" }),
-  fm("text", "lead", { text: "Benchmarking the pool under load before proposing settings." }),
+  fm("text", "lead", { text: "Benchmarking the pool under load before proposing settings.", usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 } }),
   fm("tool_use", "lead", { id: "f-1", name: "Bash", input: { command: "go test -bench=Pool ./internal/store/..." } }),
   fm("tool_result", "lead", { tool_use_id: "f-1", content: "benchmark hung — no output after 40m", is_error: true }),
   fm("error", null, { text: "run timed out after 2h0m0s (RUN_TIMEOUT)" }),
+  // PRD #40 (Decision 4): a failed run still spent tokens — a usage-bearing error
+  // result frame, so the run view shows its pre-death usage.
+  fm("error", null, {
+    event: "result",
+    subtype: "error_during_execution",
+    errors: ["run timed out after 2h0m0s (RUN_TIMEOUT)"],
+    num_turns: 4,
+    duration_ms: 2 * 60 * 60_000,
+    total_cost_usd: 0.11,
+    usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 },
+    modelUsage: { "claude-sonnet-5": { inputTokens: 8_200, outputTokens: 1_900, cacheReadInputTokens: 42_000, cacheCreationInputTokens: 0, costUSD: 0.11 } },
+  }),
 ];
 
 // ── Chat conversations (PRD #39 M4) ──────────────────────────────────────────

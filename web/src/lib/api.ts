@@ -624,6 +624,9 @@ export interface AdminUsageUser {
 export interface AdminUsage {
   factory: SelfUsage;
   users: AdminUsageUser[];
+  /** ISO timestamp of the factory's earliest usage-bearing run (for the "since
+   *  <date>" line); null when the factory has no usage yet (PRD #40). */
+  earliest_run: string | null;
 }
 
 // RunMessage is one persisted, seq-numbered event in a run's stream.

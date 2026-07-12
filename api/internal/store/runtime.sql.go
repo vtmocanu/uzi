@@ -91,22 +91,26 @@ SELECT
     COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
     COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
-    count(*)::bigint AS run_count
+    count(*)::bigint AS run_count,
+    -- The earliest usage-bearing run's creation time, for the factory card's "since
+    -- <date>" (PRD #40 M6). NULL when the factory has no usage yet.
+    MIN(created_at)::timestamptz AS earliest_run
 FROM scoped
 `
 
 type AdminUsageTotalsRow struct {
-	LifetimeInputTokens         int64          `json:"lifetime_input_tokens"`
-	LifetimeCacheReadTokens     int64          `json:"lifetime_cache_read_tokens"`
-	LifetimeCacheCreationTokens int64          `json:"lifetime_cache_creation_tokens"`
-	LifetimeOutputTokens        int64          `json:"lifetime_output_tokens"`
-	LifetimeCostUsd             pgtype.Numeric `json:"lifetime_cost_usd"`
-	Last7InputTokens            int64          `json:"last7_input_tokens"`
-	Last7CacheReadTokens        int64          `json:"last7_cache_read_tokens"`
-	Last7CacheCreationTokens    int64          `json:"last7_cache_creation_tokens"`
-	Last7OutputTokens           int64          `json:"last7_output_tokens"`
-	Last7CostUsd                pgtype.Numeric `json:"last7_cost_usd"`
-	RunCount                    int64          `json:"run_count"`
+	LifetimeInputTokens         int64              `json:"lifetime_input_tokens"`
+	LifetimeCacheReadTokens     int64              `json:"lifetime_cache_read_tokens"`
+	LifetimeCacheCreationTokens int64              `json:"lifetime_cache_creation_tokens"`
+	LifetimeOutputTokens        int64              `json:"lifetime_output_tokens"`
+	LifetimeCostUsd             pgtype.Numeric     `json:"lifetime_cost_usd"`
+	Last7InputTokens            int64              `json:"last7_input_tokens"`
+	Last7CacheReadTokens        int64              `json:"last7_cache_read_tokens"`
+	Last7CacheCreationTokens    int64              `json:"last7_cache_creation_tokens"`
+	Last7OutputTokens           int64              `json:"last7_output_tokens"`
+	Last7CostUsd                pgtype.Numeric     `json:"last7_cost_usd"`
+	RunCount                    int64              `json:"run_count"`
+	EarliestRun                 pgtype.Timestamptz `json:"earliest_run"`
 }
 
 // Factory-wide totals across ALL users' runs (PRD #40 M3, GET /api/admin/usage).
@@ -128,6 +132,7 @@ func (q *Queries) AdminUsageTotals(ctx context.Context) (AdminUsageTotalsRow, er
 		&i.Last7OutputTokens,
 		&i.Last7CostUsd,
 		&i.RunCount,
+		&i.EarliestRun,
 	)
 	return i, err
 }

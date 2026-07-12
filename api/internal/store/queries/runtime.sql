@@ -524,7 +524,10 @@ SELECT
     COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
     COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
     COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
-    count(*)::bigint AS run_count
+    count(*)::bigint AS run_count,
+    -- The earliest usage-bearing run's creation time, for the factory card's "since
+    -- <date>" (PRD #40 M6). NULL when the factory has no usage yet.
+    MIN(created_at)::timestamptz AS earliest_run
 FROM scoped;
 
 -- name: AdminUsagePerUser :many

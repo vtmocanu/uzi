@@ -133,7 +133,7 @@ beforeEach(() => {
   mockApi.listConnections.mockResolvedValue({ connections: [] });
   // Default: no usage yet (the run_count===0 "nothing yet" state).
   mockApi.getUsage.mockResolvedValue(emptySelf());
-  mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [] });
+  mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
 });
 
 const zeros = () => ({ input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0 });
@@ -202,6 +202,7 @@ describe("Dashboard usage cards (PRD #40)", () => {
       { user_id: "a", email: "vlad@example.com", usage: bundle(1_610_000, 16_100_000, 710_000, 26.4), run_count: 23 },
       { user_id: "b", email: "maria@example.com", usage: bundle(2_490_000, 21_400_000, 1_020_000, 37.83), run_count: 31 },
     ],
+    earliest_run: "2026-05-12T09:00:00Z",
   };
 
   const settle = async () => {

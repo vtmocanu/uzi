@@ -1135,6 +1135,7 @@ export const mockApi = {
         { user_id: "u-andrei", email: "andrei@example.com", usage: { input_tokens: 1_010_000, cache_read_tokens: 13_600_000, cache_creation_tokens: 210_000, output_tokens: 550_000, cost_usd: 19.71 }, run_count: 19 },
         { user_id: "u-dana", email: "dana@example.com", usage: { input_tokens: 290_000, cache_read_tokens: 3_500_000, cache_creation_tokens: 50_000, output_tokens: 120_000, cost_usd: 4.21 }, run_count: 6 },
       ],
+      earliest_run: "2026-05-12T09:00:00Z",
     }),
   getRun: async (id: string) => {
     const run = getRun(id);

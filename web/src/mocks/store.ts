@@ -39,6 +39,9 @@ function seed(): MockState {
   for (const r of mockChatRuns) runs.set(r.id, { ...r });
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-done", [...mockDoneMessages]);
+  // run-closed is a completed run (its MR was later closed unmerged); reuse the
+  // done stream so it also shows the run-view usage surfaces (PRD #40 web-ux).
+  messages.set("run-closed", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
   messages.set("run-failed", [...mockFailedMessages]);
   messages.set("run-live", []);

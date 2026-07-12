@@ -21,6 +21,15 @@ function breakdown(u: RunUsage): { fresh: number; cached: number; out: number; t
 // misleading "$0.00".
 const money = (usd: number): string => (usd > 0 ? formatCost(usd) : "—");
 
+// formatSince renders the factory's earliest-run ISO timestamp as "12 May 2026" for
+// the "since <date>" line; "" (falsy → the clause is dropped) when absent/unparseable.
+function formatSince(iso: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
 function BigNum({ tokens }: { tokens: number }) {
   return (
     <div className="mt-1 font-mono text-[26px] font-semibold tabular-nums tracking-tight">
@@ -81,6 +90,7 @@ export function FactoryTotalCard({ admin }: { admin: AdminUsage }) {
           <p className="mt-2.5 text-[11px] text-faint">
             <span className="tabular-nums text-muted">{admin.factory.run_count}</span> runs by{" "}
             <span className="tabular-nums text-muted">{admin.users.length}</span> user{admin.users.length === 1 ? "" : "s"}
+            {formatSince(admin.earliest_run) && <> since {formatSince(admin.earliest_run)}</>}
           </p>
         </>
       )}
