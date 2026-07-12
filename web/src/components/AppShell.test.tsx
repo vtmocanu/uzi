@@ -13,7 +13,7 @@ import { useAuth } from "../auth/AuthContext";
 // offline.
 vi.mock("../lib/api", () => ({
   MOCK_MODE: false,
-  api: { listRepos: vi.fn(), listConnections: vi.fn() },
+  api: { listRepos: vi.fn(), listConnections: vi.fn(), unreadNotificationCount: vi.fn() },
 }));
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
@@ -119,6 +119,7 @@ beforeEach(() => {
   });
   mockApi.listRepos.mockResolvedValue({ repos });
   mockApi.listConnections.mockResolvedValue({ connections: [gitlabConnection] });
+  mockApi.unreadNotificationCount.mockResolvedValue({ unread: 0 });
 });
 
 afterEach(() => {

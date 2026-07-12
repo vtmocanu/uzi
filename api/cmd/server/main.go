@@ -26,6 +26,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
@@ -286,6 +287,14 @@ func run() error {
 	)
 	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier})
 
+	// Notifications write seam (PRD #46 M2): the one place that creates inbox rows.
+	// It persists the row first, then delivers best-effort through slackNotifier
+	// (reusing its per-user opt-in gating + drain goroutine via a separate queue).
+	// M3+ tenants (the judge) call notifier.Notify; the M2 REST read endpoints go
+	// straight to the store, so the handler only needs the seam wired for future
+	// producers.
+	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
+
 	// Board column automation (PRD #12): reacts to run status changes with
 	// forge-first label moves, plus a reconcile loop that retries moves a down
 	// forge dropped. Wired into workersvc as the status-change hook and run as its
@@ -387,6 +396,9 @@ func run() error {
 	// their Slack DMs (PRD #25 M3). Best-effort: a nil linker (never in production)
 	// would make those endpoints report Slack as unavailable.
 	h.SetSlackLinker(slackLinker)
+	// Wire the notifications write seam (PRD #46 M2) for future producers (the judge,
+	// M4). The M2 read endpoints don't need it; this makes the seam available.
+	h.SetNotifier(notifier)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

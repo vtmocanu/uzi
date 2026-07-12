@@ -16,6 +16,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
@@ -68,7 +69,17 @@ type Handler struct {
 	// slacksvc linker in main; nil (tests, or Slack off) makes those endpoints
 	// report Slack as unavailable rather than panic.
 	slackLinker SlackLinker
+	// notifier is the shared notifications write seam (PRD #46 M2): persist-first,
+	// then best-effort Slack. The M2 REST endpoints (list/unread/mark-read) read
+	// through h.q directly; this field is the seam future notification producers
+	// (the judge, M4) call to create rows. Wired via SetNotifier; nil-safe.
+	notifier *notifysvc.Service
 }
+
+// SetNotifier wires the notifications write seam in after construction (built in
+// main alongside the Slack notifier it delivers through). Safe to leave unset in
+// tests that don't create notifications.
+func (h *Handler) SetNotifier(n *notifysvc.Service) { h.notifier = n }
 
 // SlackLinker is the slice of the slacksvc linker the /me/slack endpoints drive
 // (PRD #25 M3): re-send the Confirm / Not-me DM to a newly set override target,
@@ -246,6 +257,17 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// caller's own tokens judging their finished runs. Session-scoped identity
 			// (never the body), like autopilot.
 			r.Put("/me/judge", h.SetJudgeEnabled)
+		})
+
+		// Notifications inbox (PRD #46 M2). Session-authenticated: list + unread
+		// count are the caller's own; ?all=1 on the list requires admin and is gated
+		// inside the handler (the same endpoint serves both scopes); mark-read
+		// verifies row ownership in the query. The mark-read POST carries CSRF.
+		r.Route("/notifications", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListNotifications)
+			r.Get("/unread_count", h.UnreadNotificationCount)
+			r.Post("/{id}/read", h.MarkNotificationRead)
 		})
 
 		// Current-user settings (non-secret, own-user only): the per-user default

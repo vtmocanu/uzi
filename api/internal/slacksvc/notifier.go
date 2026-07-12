@@ -78,11 +78,27 @@ type Notifier struct {
 	baseURL func(context.Context) (string, error)
 	logger  *slog.Logger
 	ch      chan stateEvent
+	// notifyCh carries generic inbox notifications (PRD #46 M2) — judge reviews,
+	// self-improvement MRs, anything the notifysvc seam publishes. It is a SEPARATE
+	// queue from ch on purpose: these events do NOT go through GetSlackRunContext
+	// (they are not run-state transitions and a judge run is repo-less), so they
+	// share none of the state path's run/repo rendering.
+	notifyCh chan notifyEvent
 }
 
 type stateEvent struct {
 	runID  uuid.UUID
 	status string
+}
+
+// notifyEvent is a generic inbox notification bound for a user's DM (PRD #46 M2).
+// title is a caller-set fixed label; body is dynamic, potentially untrusted free
+// text; link is an in-app deep-link URL. All three are escaped/scrubbed at render.
+type notifyEvent struct {
+	userID uuid.UUID
+	title  string
+	body   string
+	link   string
 }
 
 // NewNotifier builds a Notifier. baseURL supplies the public base URL for deep
@@ -91,7 +107,26 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Notifier{store: s, poster: poster, baseURL: baseURL, logger: logger, ch: make(chan stateEvent, notifierQueue)}
+	return &Notifier{
+		store:    s,
+		poster:   poster,
+		baseURL:  baseURL,
+		logger:   logger,
+		ch:       make(chan stateEvent, notifierQueue),
+		notifyCh: make(chan notifyEvent, notifierQueue),
+	}
+}
+
+// PublishNotification enqueues a generic inbox notification for delivery to the
+// user's Slack DM (PRD #46 M2). It implements notifysvc.Slacker. Like PublishState
+// it MUST NOT block: it enqueues and returns, dropping the event if the queue is
+// full (Slack is strictly best-effort — the inbox row is already durable).
+func (n *Notifier) PublishNotification(userID uuid.UUID, title, body, link string) {
+	select {
+	case n.notifyCh <- notifyEvent{userID: userID, title: title, body: body, link: link}:
+	default:
+		n.logger.Warn("slack: notifier queue full, dropping notification", "user", userID.String())
+	}
 }
 
 // PublishState implements workersvc.Broadcaster. It MUST NOT block: it enqueues
@@ -117,8 +152,69 @@ func (n *Notifier) Run(ctx context.Context) {
 			return
 		case ev := <-n.ch:
 			n.handle(ctx, ev)
+		case ev := <-n.notifyCh:
+			n.handleNotify(ctx, ev)
 		}
 	}
+}
+
+// handleNotify delivers one generic inbox notification to the user's DM (PRD #46
+// M2). It reuses the run-state path's delivery resolution + per-user opt-in gating
+// (GetSlackDeliveryForUser) but NOT its rendering: there is no run/repo context, so
+// it never calls GetSlackRunContext. Unlinked / opted-out / unconfirmed users drop
+// silently; every failure logs redacted and returns (a Slack problem never affects
+// the caller — the inbox row is already persisted).
+func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
+	target, err := n.store.GetSlackDeliveryForUser(ctx, ev.userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return // unlinked, opted out, or unconfirmed → drop silently
+	}
+	if err != nil {
+		n.logf("resolve delivery target", err)
+		return
+	}
+	if !target.Valid || target.String == "" {
+		return
+	}
+
+	channel, err := n.poster.OpenDM(ctx, target.String)
+	if err != nil {
+		n.logf("open dm", err)
+		return
+	}
+
+	if _, err := n.poster.Post(ctx, channel, "", renderNotification(ev)); err != nil {
+		n.logf("post notification", err)
+	}
+}
+
+// renderNotification builds the content-minimized DM for a generic notification.
+// The title is a fixed caller-set label and the body is dynamic, potentially
+// untrusted free text (a judge verdict summary, a repo/agent name), so BOTH are
+// mrkdwn-escaped individually — exactly like renderRoot escapes the issue title —
+// before they sit beside the trusted deep-link markup. The link is an in-app URL
+// whose base is operator-set and http(s)-validated, rendered raw as <url|label>
+// like runLink. The whole line is then ScrubSecrets'd as a last line of defense.
+func renderNotification(ev notifyEvent) string {
+	head := "[uzi] " + EscapeMrkdwn(strings.TrimSpace(ev.title))
+	if body := strings.TrimSpace(ev.body); body != "" {
+		head += " — " + EscapeMrkdwn(boundReason(body))
+	}
+	if link := notifyLink(ev.link); link != "" {
+		head += "\n" + link
+	}
+	return ScrubSecrets(head)
+}
+
+// notifyLink wraps a caller-supplied in-app deep-link URL as a Slack mrkdwn link,
+// or returns "" when no link is set. The URL is trimmed; an empty value yields no
+// markup so the DM is just the title + body.
+func notifyLink(url string) string {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return ""
+	}
+	return fmt.Sprintf("<%s|Open in uzi>", url)
 }
 
 // handle processes one transition: resolve the owner's delivery target, then

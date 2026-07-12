@@ -76,6 +76,76 @@ export const mockUsers: User[] = [
   },
 ];
 
+// ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
+// The mock keeps the full row (incl. user_id + owner) so listNotifications can
+// filter to the caller (own view) or show everyone (admin all-view), exactly like
+// the API. payload follows the { title, body } convention the inbox renders; the
+// judge is the seeded tenant. A couple of rows belong to another user so the admin
+// all-view has cross-owner content to show.
+export interface MockNotification {
+  id: string;
+  user_id: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  run_id: string | null;
+  review_id: string | null;
+  read_at: string | null;
+  created_at: string;
+  owner_email: string;
+  owner_display_name: string | null;
+}
+
+export const mockNotifications: MockNotification[] = [
+  {
+    id: "ntf-1",
+    user_id: mockAdmin.id,
+    kind: "judge_review",
+    payload: { title: "Run review ready", body: "verdict: issues — 2 recommendations, incl. a missing worker tool" },
+    run_id: "run-done",
+    review_id: null,
+    read_at: null,
+    created_at: minsAgo(6),
+    owner_email: mockAdmin.email,
+    owner_display_name: mockAdmin.display_name,
+  },
+  {
+    id: "ntf-2",
+    user_id: mockAdmin.id,
+    kind: "judge_review",
+    payload: { title: "Run review ready", body: "verdict: ideal — nothing to change" },
+    run_id: "run-live",
+    review_id: null,
+    read_at: null,
+    created_at: minsAgo(58),
+    owner_email: mockAdmin.email,
+    owner_display_name: mockAdmin.display_name,
+  },
+  {
+    id: "ntf-3",
+    user_id: mockAdmin.id,
+    kind: "judge_review",
+    payload: { title: "Run review ready", body: "verdict: ok — one template tweak suggested" },
+    run_id: null,
+    review_id: null,
+    read_at: daysAgo(1),
+    created_at: daysAgo(1),
+    owner_email: mockAdmin.email,
+    owner_display_name: mockAdmin.display_name,
+  },
+  {
+    id: "ntf-4",
+    user_id: "u-mira",
+    kind: "judge_review",
+    payload: { title: "Run review ready", body: "verdict: issues — worker missing `jq`" },
+    run_id: null,
+    review_id: null,
+    read_at: null,
+    created_at: minsAgo(120),
+    owner_email: "mira@uzi.local",
+    owner_display_name: "Mira Ionescu",
+  },
+];
+
 // ── Secrets ──────────────────────────────────────────────────────────────────
 
 export const mockSecrets: SecretMeta[] = [

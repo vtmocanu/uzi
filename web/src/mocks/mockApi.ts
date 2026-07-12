@@ -13,6 +13,8 @@ import {
   type AppSettings,
   type Chat,
   type CreatedIssue,
+  type Notification,
+  type NotificationList,
   type PrivilegeReport,
   type Run,
   type RunMessage,
@@ -42,6 +44,8 @@ import {
   mockAllocations,
   mockConnection,
   mockForgeConfig,
+  mockNotifications,
+  type MockNotification,
   mockRepos,
   mockRepoToolProfiles,
   mockSecrets,
@@ -154,6 +158,7 @@ const loadedSettings = loadSettings();
 // Mutable copies of seed collections (CRUD operates on these).
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
+let notifications: MockNotification[] = mockNotifications.map((n) => ({ ...n }));
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
 let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
@@ -261,6 +266,24 @@ function allocationView(templateId: string): { shared: AllocatedSkill[]; mine: A
 
 function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+// notifDTO maps an internal mock notification row to the API shape, attaching the
+// owner block only for the admin all-view (own-scope rows carry no owner), exactly
+// like the server's two query paths.
+function notifDTO(n: MockNotification, includeOwner: boolean): Notification {
+  return {
+    id: n.id,
+    kind: n.kind,
+    payload: n.payload,
+    run_id: n.run_id,
+    review_id: n.review_id,
+    read_at: n.read_at,
+    created_at: n.created_at,
+    ...(includeOwner
+      ? { owner: { id: n.user_id, email: n.owner_email, display_name: n.owner_display_name } }
+      : {}),
+  };
 }
 
 // sessionBody is the auth/session bootstrap payload: the signed-in user, the
@@ -412,6 +435,36 @@ export const mockApi = {
     if (!u) throw new ApiError(404, "user not found");
     u.judge_enabled = enabled;
     return delay({ user: { ...u } });
+  },
+
+  // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
+  // Own view filters to the session user; { all: true } shows everyone but only
+  // for an admin (else 403, like the server). `unread` is always the caller's own
+  // count. Rows come back newest-first, paginated.
+  listNotifications: async (params?: { all?: boolean; limit?: number; offset?: number }): Promise<NotificationList> => {
+    const me = requireSession();
+    const all = params?.all ?? false;
+    if (all && !me.is_admin) throw new ApiError(403, "admin only");
+    const limit = Math.min(Math.max(params?.limit ?? 30, 1), 100);
+    const offset = Math.max(params?.offset ?? 0, 0);
+    const scope = all ? notifications : notifications.filter((n) => n.user_id === me.id);
+    const sorted = [...scope].sort((a, b) => b.created_at.localeCompare(a.created_at));
+    const page = sorted.slice(offset, offset + limit).map((n) => notifDTO(n, all));
+    const unread = notifications.filter((n) => n.user_id === me.id && !n.read_at).length;
+    return delay({ notifications: page, unread, total: scope.length });
+  },
+  unreadNotificationCount: async () => {
+    const me = requireSession();
+    return delay({ unread: notifications.filter((n) => n.user_id === me.id && !n.read_at).length }, 40);
+  },
+  markNotificationRead: async (id: string) => {
+    const me = requireSession();
+    // Ownership is the (id, user_id) match — a foreign or unknown id is a 404,
+    // exactly like the server's query.
+    const n = notifications.find((x) => x.id === id && x.user_id === me.id);
+    if (!n) throw new ApiError(404, "notification not found");
+    if (!n.read_at) n.read_at = new Date().toISOString();
+    return delay({ notification: notifDTO(n, false) });
   },
 
   // ── Secrets ─────────────────────────────────────────────────────────────────
