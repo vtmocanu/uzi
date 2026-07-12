@@ -583,3 +583,18 @@ describe("RunEventRow finish-line usage (PRD #40)", () => {
     expect(container.textContent).not.toContain(" in · ");
   });
 });
+
+describe("FinishTokens $0 cost (Decision 8)", () => {
+  it("shows tokens but DROPS a $0 cost on the finish line (subscription auth)", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 8, kind: "status", payload: { event: "result", subtype: "success", duration_ms: 1000, num_turns: 2 } })}
+        live={false}
+        phaseUsage={{ seq: 8, label: "Plan", turns: 2, durationMs: 1000, fresh: 1000, cached: 0, out: 200, costUsd: 0, isError: false }}
+      />,
+    );
+    expect(container.textContent).toContain("1.0k in · 0 cached · 200 out");
+    // Nonzero tokens, zero cost → no "$" figure at all, never "$0.00".
+    expect(container.textContent).not.toContain("$");
+  });
+});

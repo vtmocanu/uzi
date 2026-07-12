@@ -56,3 +56,22 @@ describe("RunUsagePanel", () => {
     expect(container.firstChild).toBeNull();
   });
 });
+
+describe("RunUsagePanel $0 cost (Decision 8)", () => {
+  it("renders a $0 cost as '—' in the strip and per-phase total, never '$0.00'", () => {
+    seq = 0;
+    const messages = [
+      m("status", "lead", {
+        event: "result",
+        subtype: "success",
+        num_turns: 3,
+        duration_ms: 5000,
+        total_cost_usd: 0,
+        usage: { input_tokens: 1000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 200 },
+      }),
+    ];
+    const { container } = render(<RunUsagePanel usage={deriveRunUsage(messages)} />);
+    expect(container.textContent).toContain("—");
+    expect(container.textContent).not.toContain("$0.00");
+  });
+});
