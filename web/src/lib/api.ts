@@ -605,6 +605,29 @@ export interface NotificationList {
   total: number;
 }
 
+// ── Self-improvement config (PRD #46 M5) ─────────────────────────────────────
+// The admin-facing view of the autonomous self-improvement job. repo_path /
+// user_email are display-only resolutions of the ids; last_run_at is the durable
+// cadence gate; active reports whether a cycle is currently in flight.
+export interface SelfimproveConfig {
+  enabled: boolean;
+  interval: string;
+  repo_id: string | null;
+  repo_path: string | null;
+  user_id: string | null;
+  user_email: string | null;
+  last_run_at: string | null;
+  active: boolean;
+}
+
+// SelfimproveUpdate enables/disables and configures the job. The enabling admin
+// becomes the run owner server-side (from the session, never sent here — audit H3).
+export interface SelfimproveUpdate {
+  enabled: boolean;
+  interval?: string;
+  repo_id?: string | null;
+}
+
 // RunMessage is one persisted, seq-numbered event in a run's stream.
 export interface RunMessage {
   seq: number;
@@ -880,6 +903,11 @@ const realApi = {
   // Vault migration progress (PRD #32): count of stored secrets still master-sealed
   // (owners who have not unlocked since the vault rolled out). Admin-only.
   vaultMigration: () => request<{ master_sealed: number }>("GET", "/admin/vault-migration"),
+  // Self-improvement config (PRD #46 M5). Admin-only. update sets the enabling admin
+  // as the run owner from the session (never the body).
+  getSelfimprove: () => request<{ selfimprove: SelfimproveConfig }>("GET", "/admin/selfimprove"),
+  updateSelfimprove: (input: SelfimproveUpdate) =>
+    request<{ selfimprove: SelfimproveConfig }>("PUT", "/admin/selfimprove", input),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
