@@ -175,6 +175,11 @@ type Run struct {
 	RepoAgents           []byte             `json:"repo_agents"`
 	Title                pgtype.Text        `json:"title"`
 	ResumeOfRunID        pgtype.UUID        `json:"resume_of_run_id"`
+	LastActivityAt       pgtype.Timestamptz `json:"last_activity_at"`
+	Health               string             `json:"health"`
+	HealthReason         pgtype.Text        `json:"health_reason"`
+	HealthSince          pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt     pgtype.Timestamptz `json:"health_notified_at"`
 }
 
 type RunMessage struct {

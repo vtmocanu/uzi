@@ -264,6 +264,12 @@ func run() error {
 	// is built above (ahead of the Slack setup that needs it); vlt just above.
 	wsvc.SetVault(vlt)
 
+	// Run-health detector settings (PRD #47): the sweeper reads the runtime-tunable
+	// health thresholds from the same settings cache the HTTP handlers hold, so an
+	// admin change takes effect within the cache TTL. Nil would disable detection;
+	// wiring it here turns it on with the compiled-in defaults.
+	wsvc.SetSettings(settingsCache)
+
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and
 	// stateless — every event is already durable in the DB.

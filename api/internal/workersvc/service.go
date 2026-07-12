@@ -114,6 +114,14 @@ type Store interface {
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) (int64, error)
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
 
+	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
+	// tool window (loop + in-flight), the single health writer, and the queued-run
+	// worker-online count.
+	ListActiveRunsForHealth(ctx context.Context) ([]store.ListActiveRunsForHealthRow, error)
+	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
+	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
+	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+
 	// Messages + inputs.
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
@@ -262,6 +270,11 @@ type Service struct {
 	// deployment without the vault) disables the gate and falls back to opening the
 	// token under the master box — the pre-vault behavior.
 	vlt *vault.Vault
+	// settings reads the runtime-tunable run-health thresholds (PRD #47). Optional
+	// (nil-safe); set via SetSettings. A nil settings disables the whole health
+	// detector, so tests that do not exercise it — and any deployment without a
+	// settings cache — behave exactly as before.
+	settings Settings
 }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
@@ -279,6 +292,11 @@ func (s *Service) SetLifecycle(l RunLifecycle) { s.lifecycle = l }
 // the claim gate and opens the Anthropic token under the master box (pre-vault
 // behavior), which is what the workersvc tests rely on.
 func (s *Service) SetVault(v *vault.Vault) { s.vlt = v }
+
+// SetSettings wires the run-health settings reader (PRD #47). Call once at startup,
+// before the sweeper runs, with the same settings cache the HTTP handlers hold. A
+// nil settings (the default) disables the health detector entirely.
+func (s *Service) SetSettings(cfg Settings) { s.settings = cfg }
 
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
@@ -1363,6 +1381,9 @@ type SweepResult struct {
 	StaleRequeued      int64
 	ChatIdleCompleted  int64
 	ProposalsRecovered int64
+	// HealthChanged is the number of runs whose health flag the detector wrote this
+	// pass (PRD #47) — raised, changed, or self-cleared. Observability only.
+	HealthChanged int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -1456,6 +1477,12 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 		res.ProposalsRecovered = int64(len(recovered))
 	}
+
+	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
+	// and approval-idle runs from telemetry already in Postgres. Best-effort and
+	// non-terminal — it never kills a run and never fails the sweep (it logs and
+	// returns a count); a nil settings (tests) disables it entirely.
+	res.HealthChanged = s.detectRunHealth(ctx, now)
 	return res, nil
 }
 
