@@ -11,6 +11,8 @@ package workersvc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"time"
@@ -59,8 +61,18 @@ const (
 	reasonWaitingWorker = "waiting for a worker to pick up this run"
 )
 
+// Loop-detection window (Decision 4), code constants (not settings): flag when any
+// tool call recurs at least loopThreshold times among the newest loopWindow
+// tool_use. loopThreshold=4 means an A/B-alternating loop still trips once the
+// window has filled (4 A's and 4 B's), while a healthy edit→test cycle whose
+// distinct edits keep any single call under 4 does not.
+const (
+	loopWindow    = 12
+	loopThreshold = 4
+)
+
 // toolWindowFetch bounds the per-run tool-window fetch (Decisions 4 & 9). It sits
-// well above the 12-wide loop window so the newest 12 tool_use rows plus their
+// well above the loop window so the newest loopWindow tool_use rows plus their
 // interleaved tool_results all fit (each tool_use has at most one result).
 const toolWindowFetch = 40
 
@@ -150,10 +162,17 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 }
 
 // runningTarget computes the flag for a running run, priority looping > stalled >
-// slow (Decision 3). M1 implements stalled (with in-flight suppression) and slow;
-// looping is added in M2.
+// slow (Decision 3): looping is the strongest evidence of pathology, and slow is a
+// wall-clock backstop that must not mask a more specific signal.
 func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
 	stats := s.toolWindow(ctx, r.ID)
+
+	// looping: the same tool call recurred past the threshold in the window. Not
+	// settings-gated (the window/threshold are code constants) and not suppressed by
+	// in-flight — a run repeating the same call is pathological even mid-call.
+	if stats.looping {
+		return healthLooping, reasonLooping
+	}
 
 	// stalled: silence past the threshold, suppressed while a tool call is in flight
 	// (Decision 9). A long build/test-suite emits one tool_use then nothing until its
@@ -177,6 +196,9 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 type toolWindowStats struct {
 	// inFlight is true when the newest tool_use has no matching tool_result yet.
 	inFlight bool
+	// looping is true when some tool call recurs at least loopThreshold times among
+	// the newest loopWindow tool_use.
+	looping bool
 }
 
 // toolWindow fetches and analyzes a running run's recent tool activity. A fetch
@@ -195,16 +217,23 @@ func (s *Service) toolWindow(ctx context.Context, runID uuid.UUID) toolWindowSta
 }
 
 // analyzeToolWindow computes the tool-window signals from rows ordered newest-first.
-// M1 computes only in-flight; M2 adds the loop hash.
 //
 // In-flight (Decision 9): the newest tool_use has no matching tool_result. Because
 // rows are seq-desc and a completed call's result has a higher seq than its
 // tool_use, that result is seen before the tool_use here, so a lookup in the
 // collected result-id set answers the question with no extra query.
+//
+// Looping (Decision 4): hash each of the newest loopWindow tool_use as
+// sha256(name + canonical-JSON(input)) and flag when any hash count reaches
+// loopThreshold. The in-flight (possibly newest) call is included in the window.
+// The hash is compared transiently and NEVER surfaced — not in health_reason, logs,
+// or Slack.
 func analyzeToolWindow(rows []store.ListRunToolWindowRow) toolWindowStats {
 	resultIDs := make(map[string]bool)
+	counts := make(map[string]int)
 	var newestUseID string
 	var haveUse bool
+	var hashed int
 	for _, row := range rows {
 		switch row.Kind {
 		case "tool_result":
@@ -216,11 +245,62 @@ func analyzeToolWindow(rows []store.ListRunToolWindowRow) toolWindowStats {
 				newestUseID = toolUseID(row.Payload)
 				haveUse = true
 			}
+			if hashed < loopWindow {
+				counts[toolCallHash(row.Payload)]++
+				hashed++
+			}
+		}
+	}
+	maxRepeat := 0
+	for _, c := range counts {
+		if c > maxRepeat {
+			maxRepeat = c
 		}
 	}
 	return toolWindowStats{
 		inFlight: haveUse && newestUseID != "" && !resultIDs[newestUseID],
+		looping:  maxRepeat >= loopThreshold,
 	}
+}
+
+// toolCallHash is the loop-detection fingerprint of a tool_use payload:
+// sha256(name + NUL + canonical-JSON(input)). Two calls with the same tool and
+// semantically-equal input hash alike; a malformed payload hashes its raw bytes so
+// it participates deterministically without grouping with a well-formed call. The
+// digest is only ever compared for equality — never logged or stored.
+func toolCallHash(payload []byte) string {
+	var p struct {
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		sum := sha256.Sum256(payload)
+		return hex.EncodeToString(sum[:])
+	}
+	h := sha256.New()
+	h.Write([]byte(p.Name))
+	h.Write([]byte{0})
+	h.Write(canonicalJSON(p.Input))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// canonicalJSON re-encodes a JSON value so equal values compare equal regardless of
+// object-key order (Go's json.Marshal sorts map keys). Array order is preserved (it
+// is semantic). An absent or unparseable input degrades to a stable literal / the
+// raw bytes so the hash stays deterministic.
+func canonicalJSON(raw json.RawMessage) []byte {
+	if len(raw) == 0 {
+		return []byte("null")
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return raw
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // stallBaseline is GREATEST(last_activity_at, started_at): the later of the last
