@@ -350,23 +350,23 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
 
 ## Milestones
 
-- [ ] **M1 — Schema + settings groundwork**: migrations (nullable
+- [x] **M1 — Schema + settings groundwork**: migrations (nullable
       `repo_id`/`issue_iid` + kind-shape rework + partial unique indexes,
       `run_reviews`, `review_recommendations`, `notifications`,
       `users.judge_enabled`), sqlc + NULL-`repo_id` query/DTO audit, forked
       judge claim assembly (no-PAT wire assertion), settings
       keys/accessors/validation, user + admin toggle endpoints and UI switches.
       Tests for gating logic.
-- [ ] **M2 — Notifications inbox (generic)**: notifications API, bell + inbox
+- [x] **M2 — Notifications inbox (generic)**: notifications API, bell + inbox
       page (user/admin views), Slack notifier event kind. Judge-independent;
       seeded via a test event.
-- [ ] **M3 — Judge end-to-end**: terminal-funnel enqueue with all gates,
+- [x] **M3 — Judge end-to-end**: terminal-funnel enqueue with all gates,
       command-not-found scan, judge claim lane, worker trace fetch + JudgeRunner
       + review post, `run_reviews` persisted. Validated with the stub executor /
       fake trace.
-- [ ] **M4 — Judge surfacing**: run-page verdict + recommendations panel,
+- [x] **M4 — Judge surfacing**: run-page verdict + recommendations panel,
       re-run action, inbox + Slack delivery wired to review completion.
-- [ ] **M5 — Self-improvement engine**: settings (incl. durable
+- [x] **M5 — Self-improvement engine**: settings (incl. durable
       `selfimprove_last_run_at`), privcheck-shaped scheduler with
       skip-if-active / vault-locked / repo-missing tick skips (+ notifications),
       tracking-issue reuse (no trigger labels), dedicated
@@ -386,6 +386,17 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
       (isolated env per compose rules), one self-improvement tick against a
       scratch repo (not live uzi) to verify issue/MR reuse; findings folded
       back.
+- [ ] **M9 — Real test evidence in self-improvement MRs**: thread the PRD #18
+      provisioned tool env (`provision.ts` → `provision-run.ts` `toolEnv`,
+      already exported into the SDK env) into `defaultCheckRunner`'s
+      `execFile` (today it passes no env at all, so provisioned tools are
+      invisible to the checks); `npm ci` pre-step in `web/` and `agent/` so
+      `vitest`/`tsc` exist; honest-skip fallback retained for genuinely
+      unavailable toolchains (missing prerequisite or exit 127 → `skipped`
+      with a reason, never a false `failed`). Gating unknowns: whether `go`
+      is provisionable via the run's tool packages, and whether the worker
+      has npm-registry egress — whatever cannot be made real stays honestly
+      skipped and is stated as such in the MR.
 
 ## Milestone dependency / parallelization
 
@@ -397,6 +408,7 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
 | 4 | M5 | M1 (M2 for its notifications) | selfimprove engine, runner delta |
 | 5 | M6, M7 | M3–M5 | tests · docs |
 | 6 | M8 | all | live stack |
+| 7 | M9 | M8 | agent/src/{self-improve,runner}.ts, provision plumbing |
 
 ## Out of Scope
 
@@ -434,3 +446,69 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
   the self-improvement planning prompt.
 - Disabling either feature stops all related token spend immediately; the whole
   PRD is dormant when toggles are off (existing tests unaffected).
+
+## Implementation notes (2026-07-12)
+
+Approved deviations from the design above, found during implementation:
+
+1. **The command-not-found scan runs at claim assembly, not at enqueue.**
+   Decision 4 describes it as part of enqueueing the judge run; in practice it
+   runs off that hot request path, at claim assembly (`assembleJudgeClaim` /
+   `judgeSignal`, `api/internal/workersvc/judge.go`) — a separate worker poll,
+   not the transition that creates the judge run. Accepted trade-off: a judge
+   run that is never claimed (e.g. no worker online) yields no deterministic
+   findings, only whatever the LLM call itself produces once it does run.
+2. **Premise correction on migration numbering (Decision 12).** The PRD
+   assumed the live head was `00052` (PRD #37). By the time this PRD landed,
+   `issue_iid` was already nullable (`00043`, PRD #6's `ci_fix` runs) and
+   `repo_id` was already nullable (`00053`, PRD #39's chat runs, which needed
+   a repo-less run shape first). This PRD's M1 therefore *extended* those two
+   already-relaxed columns into the repo-less `judge` shape and the `judge`/
+   `self_improve` `runs_kind_shape` branches (`00080`), rather than dropping
+   either NOT NULL itself — and the actual live head at this PRD's landing was
+   `00055`, not `00052`. Migration numbers in a PRD draft are always
+   collision-avoidance placeholders, renumbered to the real live head at
+   landing (per `CLAUDE.md`'s migration-numbering convention) — this is a
+   correction to the draft's stated *premise* (which prior PRDs already did
+   the relaxing), not a new instance of the normal renumbering.
+3. **Re-run judge needs no per-user opt-in.** Decision 7's per-user
+   `judge_enabled` opt-in gates the *automatic* judge (Decision 2's
+   terminal-funnel enqueue). The owner-initiated "re-run judge" action
+   (Decision 8) does not additionally require that flag: an explicit,
+   owner-only click is itself the consent to spend that run. It still runs
+   behind its own dedicated per-user rate limiter (`JUDGE_RATE_LIMIT_MAX`/
+   `_WINDOW`), separate from the chat limiter.
+4. **Notification payload contents, made explicit.** The judge "review ready"
+   notification (inbox row + Slack DM) carries the verdict, a scrubbed and
+   280-rune-capped summary preview, and the recommendation count plus
+   category list. Recommendation `target` and `rationale` free text are never
+   copied into the notification — they stay on the run page behind the deep
+   link (`buildReviewNotification`, `api/internal/handler/judge_worker.go`).
+5. **The two Slack suppressions have different mechanisms.** Decision 6 says
+   judge and self_improve runs' own state transitions are suppressed from the
+   run-state Slack path. In the implementation this is structural for judge
+   runs (they're repo-less, so `GetSlackRunContext`'s INNER JOIN on repos
+   returns `ErrNoRows` before any suppression logic runs) but requires an
+   explicit `rc.Kind == "judge" || rc.Kind == "self_improve"` guard for
+   self_improve runs, which *are* repo-ful and would otherwise get a run-state
+   DM (`Notifier.handle`, `api/internal/slacksvc/notifier.go`).
+6. **M8 found the self-improvement MR's test evidence is false, not just
+   missing (M9 added to fix it).** Decision 10's "the runner runs the test
+   suites and surfaces pass/fail in the MR description" assumed the checks
+   would either pass or genuinely fail. Live validation found a third case:
+   the worker image has no Go toolchain, and a fresh clone has no
+   `node_modules`, so `npm test` in `web`/`agent` exits 127
+   ("vitest: command not found") — which `defaultCheckRunner` maps to
+   `failed`, not `skipped`. A real self-improvement MR would therefore carry
+   four false "failed" checks on perfectly good code, directly contradicting
+   both `self-improve.ts`'s own contract ("a check that cannot run is
+   reported skipped, never failed") and this PRD's success criterion that
+   "each MR carries its own test-suite pass/fail evidence" — the only signal
+   a human reviewer gets, since this repo has no CI. The fix is not a
+   worker-image change: PRD #18's devbox tool provisioning
+   (`provision.ts`/`provision-run.ts`) already runs per-claim and its
+   `toolEnv` is already merged into the agent's own SDK env
+   (`sdk-env.ts`/`sdk-executor.ts`); the gap is that `defaultCheckRunner`'s
+   `execFile` call never receives that `toolEnv`, so provisioned tools are
+   invisible to the checks even when provisioning succeeded. User approved
+   landing the fix in this PRD as M9 rather than deferring it to a follow-up.

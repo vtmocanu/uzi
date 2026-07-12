@@ -43,3 +43,6 @@ model.
   spaces or control characters, at most 100 characters. Blank means inherit.
 - **Yours alone.** This setting only changes runs you own; it never affects
   other users or the shared `lead` template.
+- **Separate from the judge model.** The [run judge](./judge.md) runs on its
+  own model, set instance-wide by an admin (a cheap alias by default) — your
+  Worker model setting here has no effect on it.

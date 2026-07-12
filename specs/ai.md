@@ -5120,3 +5120,181 @@ and the M0 verdict that gates them.
   deterministically. The `/api/ws` broadcast leg is NOT exercised by the e2e (it is web-vitest scope,
   `e2e/run-e2e.sh:1549` + `e2e/README.md`); persisted `run_messages` + REST `?after` replay are
   exactly what M5 proves. `./e2e/run-e2e.sh` green is the gate.
+
+## 195. Judge is a worker run kind, built as a delta on PRD #39's landed repo-less machinery (PRD #46 M1)
+
+- **The judge must spend the run owner's token, and only workers spend user tokens** (human.md: judge
+  runs on the owner's own Anthropic token) — `api/` has no Anthropic HTTP client, the token leaves the
+  vault only inside a claim. So the judge is a new `runs.kind = 'judge'`, a slim repo-less run (no clone,
+  no worktree, no push, no MR): the `JudgeRunner` fetches the trace, makes one model call, and posts
+  structured output. An API-side Anthropic client was rejected — new credential path, new egress, breaks
+  the "only workers spend user tokens" custody line.
+- **The repo-less-run relaxation was already landed by PRD #39 (chat), not introduced here** (correction
+  to PRD Decision 12's premise, implementation note 2): chat landed first at live head `00055` and, needing
+  the same shape, carried `runs.repo_id`/`issue_iid` DROP NOT NULL and the repo-less `runs_kind_shape`.
+  This PRD's M1 **extended** those constraints rather than introducing them: the `kind` CHECK grows
+  `judge`/`self_improve`; `runs_kind_shape` gains a judge arm (repo/issue NULL + `target_run_id` NOT NULL,
+  FK `ON DELETE CASCADE`, branch IS NULL) and a self_improve arm (issue-shaped, repo-ful). Migrations sit
+  at draft numbers `00080`–`00083` on this branch (`00080` kinds+shape+indexes, `00081` `run_reviews` +
+  `review_recommendations`, `00082` `notifications`, `00083` `users.judge_enabled`); they renumber to the
+  live head (`00056+`) at landing per the migration-numbering convention.
+- **Two partial unique indexes enforce cost/serialization at the DB, not just the app**
+  (`00080_run_judge_self_improve_kinds.sql:46,54`): `uq_runs_one_active_judge_per_target` (one non-terminal
+  judge per `target_run_id`) and `uq_runs_one_active_self_improve` (one non-terminal self_improve overall).
+  The `run_reviews` UNIQUE(target_run_id) alone would fire only *after* a duplicate judge had already spent
+  tokens (↳review N3); the partial index blocks the duplicate at enqueue. "Non-terminal" excludes
+  `completed`/`failed`/`cancelled`, so a re-judge is a deliberate action taken once the prior judge run is terminal.
+
+## 196. Command-not-found scan runs at claim assembly, not enqueue (PRD #46, implementation note 1)
+
+- **PRD Decision 4 placed the deterministic `command not found` scan at judge-run enqueue; it actually runs
+  at claim assembly** (`assembleJudgeClaim` → `judgeSignal` → `scanCommandNotFound`,
+  `api/internal/workersvc/judge.go:81,138,196`) — off the hot terminal-transition request path, on the worker
+  poll that assembles the claim. The signal rides the claim as a structured `JudgeSignal` (which tool, which
+  agent frame), and doubles as the deterministic fallback content when the LLM call fails, so the two
+  consumers (claim input + fallback) share one code path.
+- **Accepted trade-off** (session decision): a judge run that is never claimed (no worker online) yields no
+  deterministic findings — the scan only runs when a worker picks the run up, not when the run is created. The
+  scan reads the target's `tool_result` payloads, caps the bytes inspected, and the regex never decides
+  anything alone — it is an input signal the judge interprets. Serves human.md's "deterministic command-not-found
+  scan feeds the judge as an input signal."
+
+## 197. Judge claim lane forks before the repo join + PAT open — Anthropic-token-only, wire-asserted (PRD #46 M1/M3)
+
+- **`assembleClaim`'s unconditional bot-PAT open (`service.go`) is the wrong shape for a repo-less judge run.**
+  The judge lane forks in claim assembly **before** the runs→repos→forge_connections join and before the PAT
+  open: `assembleJudgeClaim` carries **only** the Anthropic token + `target_run_id` + judge model + the
+  command-not-found `JudgeSignal`. No `ForgePAT`, no forge-connection dependency. This honors least privilege
+  (a judge does no git) and keeps a judge from spuriously failing when the target's forge connection is gone
+  (audit H2). A wire assertion confirms no `forge_pat` is present on the judge claim.
+- **Trace fetch is a separate Bearer worker endpoint, not carried in the claim.** A trace can be megabytes
+  (`run_messages` + `plan_md` + steering log + roster snapshot), so the claim stays small and the worker pulls
+  the trace paginated through `GET /api/worker/runs/{id}/trace` (existing `ListRunMessagesAfter` replay shape).
+  The `JudgeRunner` compacts/samples the trace to a budget before the single structured-output model call
+  rather than shipping pathological 100k-message traces verbatim.
+
+## 198. Trace-endpoint authz is judge-run-scoped; review POST validates hard at ingest with atomic replace-on-re-judge (PRD #46 M3)
+
+- **The `GetRunOwnedByWorker` user-scoping pattern does not fit the trace endpoint** (audit H1): the worker owns
+  the *judge* run, but `{id}` is the *target*. Plain user-scoping was rejected — it would let any of a user's
+  workers stream any of their traces at will. `GET /api/worker/runs/{id}/trace` instead derives the target
+  server-side: the caller's worker must own a **non-terminal `kind='judge'`** run whose `target_run_id == {id}`,
+  and `target.user_id == judge.user_id` is re-asserted independently (the enqueue invariant is necessary but not
+  sufficient). Uniform 404s on any mismatch; the page/size budget is enforced server-side so a pathological run
+  can't be replayed wholesale (audit L2).
+- **The review POST (`POST /api/worker/runs/{id}/review`) treats worker input as attacker-suppliable** (the worker
+  is a user-controlled container): hard validation at ingest — category against the enum
+  (`enable_tool | install_worker_tool | adjust_template | improve_agent | add_agent | improve_uzi`), length caps +
+  control-char strip on target/rationale/summary (the `sanitizeSelfReported` pattern), and `ScrubSecrets` over free
+  text before persistence. Provenance (producing run + user) is stamped server-side, never from the body. Persist
+  is an **atomic CTE UPSERT** keyed on `run_reviews` UNIQUE(target_run_id) — replace-on-re-judge semantics, so a
+  second review does not 23505 against the unique row (↳review N3, audit M3). Persist-first-then-notify, same
+  ordering discipline as `run_messages`.
+
+## 199. Per-prompt CSPRNG nonce fences everywhere attacker-authorable text enters a prompt (PRD #46 M3/M5)
+
+- **Static untrusted-data fences are forgeable and were rejected** for this PRD's two attacker-authorable inputs:
+  a trace embedding a literal `</untrusted_trace>` (or a recommendation embedding `</untrusted_recommendations>`)
+  could close the fence and inject instructions. Both fences carry a **per-prompt nonce minted from a CSPRNG
+  *after* the untrusted content was captured** (`fenceNonce()`, `agent/src/prompt.ts:286`), so the closing
+  delimiter the attacker would need to emit is unpredictable at content-authoring time — the same pattern as the
+  ci_fix job-log fence.
+  - **Judge trace fence**: `<untrusted_trace_${nonce}>…</…>` around the compacted trace in the judge prompt
+    (`agent/src/judge-runner.ts:271`).
+  - **Self-improvement recommendations fence**: `<untrusted_recommendations_${nonce}>…</…>` around the
+    accumulated `improve_uzi` rows folded into the planning prompt (`agent/src/prompt.ts:224`; nonced in M5 review
+    fixup `d29f472`). The trusted directive ("pick one top thing") sits **outside** the fence; the recommendations
+    are data inside it, never instructions.
+
+## 200. Judge/self_improve run visibility + the two different Slack-suppression mechanisms (PRD #46 M4/M5)
+
+- **Judge runs are hidden from general run lists AND from the chat agent's run-read surface** via explicit kind
+  guards (refactor-proof rather than relying on the repo-less join failing) — a judge run is internal plumbing,
+  not user-facing run history (`a0c1147`). Self_improve runs stay **visible** (they are repo-ful, real runs on
+  the uzi repo with an inspectable plan).
+- **Both kinds' own state transitions are suppressed from the run-state Slack path, by two different mechanisms**
+  (implementation note 5): judge runs are structurally suppressed — `GetSlackRunContext`'s INNER JOIN on repos
+  returns `ErrNoRows` for a repo-less judge run before any suppression logic runs; self_improve runs are repo-ful
+  and would otherwise get a "run completed" DM, so they need an **explicit** `rc.Kind == "judge" || rc.Kind ==
+  "self_improve"` guard in `Notifier.handle` (`api/internal/slacksvc/notifier.go`). Judge/self_improve
+  notifications instead ride the new generic notifications inbox + a new notifier event variant (§201), not the
+  run-state DM path.
+
+## 201. Notifications inbox is generic (tenant #1 = judge); persist-first, bounded prune, scrub-at-producer (PRD #46 M2)
+
+- **No in-app notification store existed** (the WS hub is per-run; the activity feed is a per-run rendering of
+  `run_messages`). New `notifications` table (user_id, kind, payload jsonb, run/review refs, read_at) + REST
+  list/mark-read + a bell + inbox page. The inbox is **generic** — judge is tenant #1; self_improve reuses it.
+  Owner-or-admin scoping reuses the `GetRunForViewer` pattern: list is session-user-scoped, `?all=1` requires
+  admin (and includes the owner in each row), mark-read verifies row ownership even in the admin all-view
+  (audit M2).
+- **A persist-first notify seam**, and **pruning/cap ship with the table, not later** — every finished run of every
+  opted-in user writes here (audit M5): per-user cap `DefaultUserCap = 200` (`api/internal/notifysvc/service.go:30`)
+  enforced by an inline bounded prune on each insert (`PruneNotificationsForUser`, a bounded index read of the
+  newest `@keep` rows, not a full scan).
+- **Payload is verbatim-by-design with a scrub-at-producer contract**: the notifications layer stores the payload as
+  given; the *producer* is responsible for scrubbing. The judge producer (`buildReviewNotification`,
+  `api/internal/handler/judge_worker.go`) ships the verdict + a re-scrubbed 280-rune-capped summary preview + the
+  recommendation count and category list — recommendation `target`/`rationale` free text is **never** copied into the
+  notification; it stays on the run page behind the deep link (implementation note 4). Slack delivery of the same
+  payload is a **real notifier extension**, not a new string: the notifier was structurally run-state-only
+  (`stateEvent{runID,status}` → `GetSlackRunContext` → "run on repo#iid"), so a new event variant + render path was
+  required (↳review N6). Every judge free-text field passes `EscapeMrkdwn` + `ScrubSecrets` on the Slack leg too;
+  inbox + Slack both carry it, per the user decision.
+
+## 202. Re-run judge is owner-only, needs no per-user opt-in, behind a dedicated rate limiter (PRD #46 M4, implementation note 3)
+
+- **The per-user `users.judge_enabled` opt-in gates only the *automatic* judge** (the terminal-funnel enqueue,
+  §204). The owner-initiated "re-run judge" action does **not** additionally require that flag: an explicit,
+  owner-only click is itself the consent to spend that run's token. Still gated by the global kill-switch
+  (`judge_enabled` in `app_settings`), the owner having an Anthropic token, the target being terminal, and the
+  target kind being eligible.
+- **Re-run is owner-only, not viewer-or-admin**: an admin who can *view* another user's run gets **403** on re-run —
+  they cannot spend another user's token (audit H3). `PUT /api/me/judge` (the per-user opt-in toggle) flips only the
+  session user's flag — identity from the session, never the body. Re-run runs behind a **dedicated per-user rate
+  limiter** separate from the chat limiter: `JUDGE_RATE_LIMIT_MAX` (default 60) / `JUDGE_RATE_LIMIT_WINDOW`
+  (default 1m) (`api/internal/config/config.go:216,336`; `bec1c1b`).
+
+## 203. Self-improvement engine — privcheck-shaped ticker with durable due-tracking, fixed-branch MR reuse, fail-closed guard-path flagging (PRD #46 M5)
+
+- **A `selfimprove.Engine` cloned from the privilege-check sweep pattern** (`api/internal/selfimprove/engine.go`,
+  Boot + interval ticker, `0` disables, wired in `main.go`): on tick, if enabled and due, it creates the improvement
+  run. Unlike privcheck's idempotent sweep, a tick is NOT idempotent, so "due" is **durable** — a persisted
+  `selfimprove_last_run_at` setting, not an in-memory ticker that resets on API restart (↳review B3). The engine
+  Invalidates the settings cache after it writes. Settings live in `app_settings`: `selfimprove_enabled`,
+  `selfimprove_interval` (default 48h), `selfimprove_repo`, `selfimprove_last_run_at`, `selfimprove_user_id`. The
+  enabling admin is always the **authenticated session admin** (`selfimprove_user_id` never from the body, audit H3);
+  a narrow token accessor lets a general/instance token slot in later. A tick **skips with an inbox notification** (no
+  silent stall) when a self_improve run is still active (also DB-enforced, §195), the admin's vault is locked, or the
+  repo is disconnected / not owned by the enabling admin (↳review N5).
+- **The improvement run is a normal autonomous run against the uzi repo, guardrails intact.** Creation goes through a
+  **dedicated `CreateSelfImproveRun`** (shaped like `CreateCIFixRun`), not `createRun` — the normal path needs the
+  issue already in the poller cache carrying a PRD link, which a just-filed tracking issue lacks (↳review B2). The
+  tracking issue is filed/reused with a **non-trigger marker label** (never the PRD/autopilot trigger labels — else
+  the poller would enqueue a second `kind='issue'` autopilot run the kind-scoped index would not dedupe, ↳review N1).
+  Auto-approved (no plan gate), but `plan_md` is stored so the plan is inspectable and linked from the notification.
+  MR reuse is free: a fixed branch `uzi/self-improve` + the worker's idempotent `createMergeRequest` (never force-push)
+  extends an open self-improvement MR so every cycle is tested together.
+- **Merge/self-modification fences (audit C1) gate the merge and fence the input, preserving the autonomous run**:
+  recommendations enter the planning prompt only inside the nonce fence (§199) with the trusted directive outside; the
+  bot **structurally cannot merge** (Developer-only role + protected `main`, verified by the privilege-check sweep for
+  the self-improve connection); MRs touching **guard-critical paths** are flagged loudly for extra human review, with
+  the guard-path set **broadened to worker-side token-custody files** and **fail-CLOSED diff handling** (a diff that
+  can't be classified is treated as guard-touching, `5bbaeb6`); the MR carries **exit-status-only** test evidence
+  (`go test`/`npm test`/`npm run build` pass/fail, never stdout — with no CI, an autonomous MR must carry its own
+  proof).
+
+## 204. Enqueue eligibility is an allowlist; judged statuses are completed+failed only; enqueue fires at every committed terminal transition (PRD #46 M3)
+
+- **Judge enqueue is triggered on the *committed* terminal transition, not the best-effort notify goroutine**
+  (`runlifecycle` notify may drop events — fine for comments, not for deciding token spend, ↳review N2). Enqueue fires
+  at **every** committed terminal transition: worker-reported `SetState` (rows>0), the sweeper's terminal sweeps
+  (deliberately including timed-out / worker-lost runs — exactly the runs worth judging), server-side reject, and
+  register-time orphan-fail. When such a transition lands and (global toggle on + owner opted in + owner has an
+  Anthropic token), the API enqueues a `judge` run owned by the **same user** as the judged run — never cross-user.
+- **Eligibility is an explicit allowlist `{issue, ci_fix}`, never a denylist** — a future kind must opt in
+  deliberately, and `judge`/`self_improve` stay outside it (no recursion, no self-feeding loop; audit M4). Judged
+  statuses are **completed and failed only** — user-`cancelled` runs are never judged (the user aborted; don't spend,
+  ↳review N4). **Vault-locked is deliberately NOT an enqueue gate**: token *presence* is the gate, so a locked vault
+  holds the enqueued judge run `queued` (existing "waiting for vault unlock" semantics) rather than dropping it — it
+  runs once the vault unlocks.

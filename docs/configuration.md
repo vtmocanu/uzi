@@ -156,3 +156,12 @@ The in-app chat agent ([chat.md](chat.md)) rides the run machinery as a `chat` r
 | `WORKER_CHAT_SESSIONS` | `1` | How many chat sessions the worker runs **concurrently** with its single run slot. `1` means one live conversation per user-worker; a second chat queues until the first ends. |
 
 `CHAT_MAX_TURNS`, `WORKER_CHAT_TURN_TIMEOUT`, and `WORKER_CHAT_IDLE_TIMEOUT` are also parsed on the worker as fallback defaults, but the value shipped in the claim (from the `api` config above) wins — set them on `api`.
+
+## Run judge and self-improvement (PRD #46)
+
+See [judge.md](judge.md) and [self-improvement.md](self-improvement.md) for what these features do; both are also gated by settings in **Admin → Instance settings** (global on/off, judge model, self-improvement repo/interval), not env vars.
+
+| Var | Default | Notes |
+|---|---|---|
+| `JUDGE_RATE_LIMIT_MAX` / `JUDGE_RATE_LIMIT_WINDOW` | `60` / `1m` | Per-user limiter on the "re-run judge" action. Dedicated budget, separate from `CHAT_RATE_LIMIT_MAX`/`_WINDOW` — re-running the judge and chatting don't share an allowance. |
+| `UZI_SELFIMPROVE_CHECK_INTERVAL` | `1h` | How often the self-improvement engine **wakes** to check whether a cycle is due — the wake cadence, not the improvement interval itself (that's the `selfimprove_interval` admin setting, default `48h`). A boot pass runs immediately when enabled, so a cycle that came due while the API was down fires promptly rather than waiting a full interval. `0` disables the engine entirely (no boot pass, no loop). |
