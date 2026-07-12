@@ -108,6 +108,15 @@ func (n *Notifier) PublishState(runID uuid.UUID, status string) {
 // (content minimization — only status/title/links do).
 func (n *Notifier) PublishMessage(uuid.UUID, int32, string, string, []byte, time.Time) {}
 
+// PublishHealth implements workersvc.Broadcaster for the run-health flag (PRD #47).
+// M3 SEAM ONLY: the notifier accepts the event but does not yet act on it. M4 wires
+// the root-label flip + cooldown-gated threaded nudge here, re-resolving delivery
+// per event through GetSlackDeliveryForUser and passing every string through
+// EscapeMrkdwn + ScrubSecrets (Decision 7). Kept a no-op for now so the shared
+// Broadcaster fan-out compiles and the live-hub WS path (the M3 deliverable) works
+// end to end. reason is the fixed server-controlled template (empty when clearing).
+func (n *Notifier) PublishHealth(runID uuid.UUID, health, reason string) {}
+
 // Run drains the queue until ctx is cancelled. Wire it into the background
 // WaitGroup alongside the socket manager.
 func (n *Notifier) Run(ctx context.Context) {

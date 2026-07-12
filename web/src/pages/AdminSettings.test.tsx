@@ -25,6 +25,12 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   prdless_label: "PRDLESS",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
+  health_enabled: "true",
+  health_stall_seconds: "300",
+  health_slow_seconds: "2700",
+  health_queued_seconds: "600",
+  health_approval_seconds: "3600",
+  health_nudge_cooldown_seconds: "1800",
   ...over,
 });
 
@@ -249,5 +255,46 @@ describe("AdminSettings", () => {
     );
     // The app token was left blank, so it is NOT sent.
     expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("slack_app_token");
+  });
+
+  it("saves the Run health card, sending only changed fields (PRD #47)", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ health_stall_seconds: "120" }));
+    renderPage();
+    const stall = (await screen.findByLabelText(/Stalled after/i)) as HTMLInputElement;
+    fireEvent.change(stall, { target: { value: "120" } });
+
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_stall_seconds: "120" }),
+    );
+    // Untouched thresholds are not sent.
+    expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("health_slow_seconds");
+  });
+
+  it("rejects an out-of-range health threshold client-side and disables save (PRD #47)", async () => {
+    renderPage();
+    const stall = (await screen.findByLabelText(/Stalled after/i)) as HTMLInputElement;
+    fireEvent.change(stall, { target: { value: "30" } }); // 1–59 is rejected
+
+    expect(screen.getByText(/between 60 and 86400/i)).toBeTruthy();
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("accepts 0 to disable a health signal (PRD #47)", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ health_queued_seconds: "0" }));
+    renderPage();
+    const queued = (await screen.findByLabelText(/Stuck queued after/i)) as HTMLInputElement;
+    fireEvent.change(queued, { target: { value: "0" } });
+
+    const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_queued_seconds: "0" }),
+    );
   });
 });

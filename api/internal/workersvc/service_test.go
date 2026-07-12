@@ -1497,6 +1497,7 @@ func TestCreateWorkerEmptyTemplateStoresNull(t *testing.T) {
 type fakeBroadcaster struct {
 	msgSeqs  []int32
 	statuses []string
+	healths  []string
 }
 
 func (b *fakeBroadcaster) PublishMessage(_ uuid.UUID, seq int32, _, _ string, _ []byte, _ time.Time) {
@@ -1504,6 +1505,9 @@ func (b *fakeBroadcaster) PublishMessage(_ uuid.UUID, seq int32, _, _ string, _ 
 }
 func (b *fakeBroadcaster) PublishState(_ uuid.UUID, status string) {
 	b.statuses = append(b.statuses, status)
+}
+func (b *fakeBroadcaster) PublishHealth(_ uuid.UUID, health, _ string) {
+	b.healths = append(b.healths, health)
 }
 
 func TestAppendMessagesBroadcastsOnlyNewlyInserted(t *testing.T) {

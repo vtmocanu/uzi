@@ -217,6 +217,13 @@ type Broadcaster interface {
 	PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time)
 	// PublishState signals that a run's status changed.
 	PublishState(runID uuid.UUID, status string)
+	// PublishHealth signals that a run's health flag changed (PRD #47) — raised,
+	// changed, or self-cleared (health=="ok"). health is the flag enum and reason is
+	// the fixed server-controlled template (empty when clearing). The live hub maps
+	// it to a WS run-update (browsers re-read the run, picking up the owner-gated
+	// reason over REST); the Slack notifier (M4) re-renders its root and, when the
+	// event is nudge-worthy, threads a nudge. Best-effort, never blocks the sweep.
+	PublishHealth(runID uuid.UUID, health, reason string)
 }
 
 // MultiBroadcaster fans each event out to several Broadcasters — the WS hub AND
@@ -234,6 +241,12 @@ func (m MultiBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, agent
 func (m MultiBroadcaster) PublishState(runID uuid.UUID, status string) {
 	for _, b := range m {
 		b.PublishState(runID, status)
+	}
+}
+
+func (m MultiBroadcaster) PublishHealth(runID uuid.UUID, health, reason string) {
+	for _, b := range m {
+		b.PublishHealth(runID, health, reason)
 	}
 }
 

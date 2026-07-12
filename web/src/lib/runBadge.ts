@@ -3,7 +3,7 @@
 // link gate. Kept out of Board.tsx so the mapping is unit-tested in isolation
 // (see runBadge.test.ts), the same split the run stream uses (runStream.ts).
 
-import { isTerminalRun, type LatestRun, type StopKind } from "./api";
+import { isTerminalRun, type LatestRun, type RunHealth, type StopKind } from "./api";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
 // color everywhere: queue (queued), neutral (stopped/idle), info
@@ -92,6 +92,57 @@ export function formatElapsed(ms: number): string {
   return `${h}h ${m % 60}m`;
 }
 
+// HEALTH_FLAG_LABELS is the short word each run-health flag shows (PRD #47 Decision
+// 10). "ok" is absent — a healthy run keeps its normal status badge.
+const HEALTH_FLAG_LABELS: Record<Exclude<RunHealth, "ok">, string> = {
+  stalled: "stalled",
+  looping: "looping",
+  slow: "slow",
+  waiting_worker: "waiting for worker",
+  approval_idle: "needs approval",
+};
+
+// HEALTH_FLAGGABLE_STATUSES mirrors the server's flaggable set: a health flag is
+// only ever rendered while a run is in one of these (belt-and-braces with the
+// server exit contract, Decision 3 — a terminal run must never show a stale ⚠).
+const HEALTH_FLAGGABLE_STATUSES = new Set<string>(["queued", "running", "awaiting_approval"]);
+
+// healthFlagLabel is the short word for a flag, or null for "ok". Shared by the
+// board badge and the run-view header so the wording is defined once.
+export function healthFlagLabel(health: RunHealth): string | null {
+  return health === "ok" ? null : HEALTH_FLAG_LABELS[health];
+}
+
+// isHealthFlaggableStatus reports whether a status can carry a rendered health flag.
+export function isHealthFlaggableStatus(status: string): boolean {
+  return HEALTH_FLAGGABLE_STATUSES.has(status);
+}
+
+// shouldShowHealthFlag is the single gate both surfaces use: a non-ok flag on a
+// flaggable status.
+export function shouldShowHealthFlag(health: RunHealth, status: string): boolean {
+  return health !== "ok" && isHealthFlaggableStatus(status);
+}
+
+// healthBadge is the warn-variant pill for a flagged run (PRD #47): `⚠ <label> ·
+// <elapsed-since-flagged>` in the warn tone, keeping the pulse so it still reads as
+// live. Returns null when the run is healthy or not in a flaggable status, so the
+// caller falls through to the normal status badge. The elapsed counts from
+// health_since ("stuck for Xm"), not created_at. title carries the owner-only
+// reason when present (a non-owner's health_reason is null → no tooltip).
+export function healthBadge(run: LatestRun, nowMs: number): RunBadge | null {
+  if (!shouldShowHealthFlag(run.health, run.status)) return null;
+  const label = healthFlagLabel(run.health);
+  const elapsed = run.health_since ? ` · ${formatElapsed(nowMs - Date.parse(run.health_since))}` : "";
+  return {
+    kind: "badge",
+    label: `⚠ ${label}${elapsed}`,
+    tone: "warning",
+    pulse: true,
+    title: run.health_reason ?? undefined,
+  };
+}
+
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
 export function runBadge(run: LatestRun, nowMs: number): RunBadge {
@@ -100,6 +151,10 @@ export function runBadge(run: LatestRun, nowMs: number): RunBadge {
   if (isStoppedRun(run.status, run.stop_kind)) {
     return { kind: "badge", label: "stopped", tone: "neutral", pulse: false };
   }
+  // A health flag overrides the normal status label while the run is alive but looks
+  // slow/stuck/looping (PRD #47). Only ever fires for a flaggable status.
+  const flagged = healthBadge(run, nowMs);
+  if (flagged) return flagged;
   switch (run.status) {
     case "queued":
       return { kind: "badge", label: "queued", tone: "queue", pulse: false };

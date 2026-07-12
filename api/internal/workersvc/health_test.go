@@ -339,6 +339,50 @@ func TestHealthSkipsUnchanged(t *testing.T) {
 	}
 }
 
+func TestHealthBroadcastsOnChangeNotOnNoop(t *testing.T) {
+	r := runRow("running")
+	r.StartedAt = ago(20 * time.Minute)
+	r.LastActivityAt = ago(10 * time.Minute) // stalled
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc := healthSvc(fs, defaultHealthSettings())
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	// First pass flags stalled → one broadcast carrying the flag.
+	svc.detectRunHealth(context.Background(), t0)
+	if len(b.healths) != 1 || b.healths[0] != healthStalled {
+		t.Fatalf("healths = %v, want [stalled]", b.healths)
+	}
+
+	// Second pass with the run already reading stalled → no write, no broadcast.
+	b.healths = nil
+	r.Health = healthStalled
+	r.HealthReason = pgText(reasonStalled)
+	fs.active = []store.ListActiveRunsForHealthRow{r}
+	svc.detectRunHealth(context.Background(), t0)
+	if len(b.healths) != 0 {
+		t.Fatalf("healths = %v, want none on an unchanged flag", b.healths)
+	}
+}
+
+func TestHealthExitRaceDoesNotBroadcast(t *testing.T) {
+	r := runRow("running")
+	r.StartedAt = ago(20 * time.Minute)
+	r.LastActivityAt = ago(10 * time.Minute)
+	fs := &healthFakeStore{
+		active:     []store.ListActiveRunsForHealthRow{r},
+		leftStatus: map[uuid.UUID]bool{r.ID: true}, // write no-ops
+	}
+	svc := healthSvc(fs, defaultHealthSettings())
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+
+	svc.detectRunHealth(context.Background(), t0)
+	if len(b.healths) != 0 {
+		t.Fatalf("healths = %v, want none when the status-scoped write lost the exit race", b.healths)
+	}
+}
+
 func TestHealthQueuedReasonChangeRewrites(t *testing.T) {
 	// Same waiting_worker enum, different reason (a worker came online): the detector
 	// must re-write so the reason updates even though the flag value is unchanged.

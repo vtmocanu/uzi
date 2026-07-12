@@ -128,7 +128,16 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 			slog.Error("health: write run health", "run_id", r.ID, "error", err)
 			continue
 		}
+		if n == 0 {
+			continue // status-scoped write hit the exit race — no change landed, don't broadcast
+		}
 		changed += n
+		// Fan the change out AFTER it is durable (PRD #47 M3): the live hub prompts a
+		// browser re-read within a tick, the Slack notifier (M4) re-renders/nudges.
+		// Best-effort and non-blocking by the Broadcaster contract.
+		if s.bcast != nil {
+			s.bcast.PublishHealth(r.ID, target, reason)
+		}
 	}
 	return changed
 }
