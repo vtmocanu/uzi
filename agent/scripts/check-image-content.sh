@@ -98,26 +98,33 @@ EOF
     return 1
   fi
 
-  # Enumerate the image filesystem (all paths, incl. dotfiles at any depth).
-  local CID LISTING
-  CID="$(docker create "$IMAGE")"
-  LISTING="$(docker export "$CID" | tar -tf -)"
-  docker rm -f "$CID" >/dev/null 2>&1 || true
+  # Enumerate the baked source from the RUNNING container. `docker export "$CID" | tar`
+  # returns an EMPTY stream for a BuildKit image carrying a provenance/attestation
+  # manifest on this host (Docker 29) — so every presence check below would silently
+  # misread as "missing" and full mode false-FAILs. Reading the live filesystem with
+  # `find` is immune (busybox + alpine both ship find + sh). Paths are absolute
+  # (/opt/uzi-src/…), and scoping the listing to /opt/uzi-src keeps the .env probe from
+  # false-positiving on an OS/nix dotfile elsewhere in the real image.
+  local LISTING
+  LISTING="$(docker run --rm --entrypoint sh "$IMAGE" -c 'find /opt/uzi-src' 2>/dev/null || true)"
 
   local fail=0
-  if have '^opt/uzi-src/api/';       then echo "ok   /opt/uzi-src/api present"; else echo "FAIL /opt/uzi-src/api missing"; fail=1; fi
-  if have '^opt/uzi-src/web/';       then echo "ok   /opt/uzi-src/web present"; else echo "FAIL /opt/uzi-src/web missing"; fail=1; fi
-  if have '^opt/uzi-src/BUILD_INFO'; then echo "ok   /opt/uzi-src/BUILD_INFO present"; else echo "FAIL BUILD_INFO missing"; fail=1; fi
+  # find has no trailing slash on dirs, so match "<path>" or "<path>/…" via (/|$).
+  if have '^/opt/uzi-src/api(/|$)';    then echo "ok   /opt/uzi-src/api present"; else echo "FAIL /opt/uzi-src/api missing"; fail=1; fi
+  if have '^/opt/uzi-src/web(/|$)';    then echo "ok   /opt/uzi-src/web present"; else echo "FAIL /opt/uzi-src/web missing"; fail=1; fi
+  if have '^/opt/uzi-src/BUILD_INFO$'; then echo "ok   /opt/uzi-src/BUILD_INFO present"; else echo "FAIL BUILD_INFO missing"; fail=1; fi
 
-  if have '(^|/)\.env'; then
+  # A .env* path component anywhere under /opt/uzi-src (the subtree scope is implicit —
+  # the listing is only that subtree).
+  if have '/\.env'; then
     echo "FAIL a .env* file leaked into the baked source:"
-    printf '%s\n' "$LISTING" | grep -E '(^|/)\.env' | sed 's/^/       /'
+    printf '%s\n' "$LISTING" | grep -E '/\.env' | sed 's/^/       /'
     fail=1
   else
     echo "ok   no .env* anywhere under the baked source"
   fi
 
-  if have '^opt/uzi-src/inspiration/'; then echo "FAIL inspiration/ leaked into the baked source"; fail=1; else echo "ok   no inspiration/ under the baked source"; fi
+  if have '^/opt/uzi-src/inspiration(/|$)'; then echo "FAIL inspiration/ leaked into the baked source"; fail=1; else echo "ok   no inspiration/ under the baked source"; fi
 
   # Ownership + read-only-to-agent (Decision 5) — FULL MODE ONLY, and per template. The
   # light check builds its OWN busybox Dockerfile.check with no USER switch (runs as
