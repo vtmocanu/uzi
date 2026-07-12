@@ -7,7 +7,7 @@ import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  return { ...actual, api: { vaultUnlock: vi.fn(), vaultLock: vi.fn() } };
+  return { ...actual, api: { vaultUnlock: vi.fn(), vaultLock: vi.fn(), vaultCreatePassphrase: vi.fn() } };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
@@ -95,5 +95,67 @@ describe("VaultLockedBanner", () => {
     // Second consecutive failure: the recovery hint appears.
     submit();
     await waitFor(() => expect(screen.getByText(/Sign out and back in to re-create your vault/i)).toBeTruthy());
+  });
+});
+
+// PRD #45 (Decision 6): the locked banner dispatches on has_password + vault.exists.
+describe("VaultLockedBanner passwordless (SSO) dispatch", () => {
+  it("shows the passphrase-create dialog for a passwordless user with no vault", () => {
+    setAuth({ vaultUnlocked: false, hasPassword: false, vaultExists: false });
+    render(<VaultLockedBanner />);
+    expect(screen.getByText(/Set a vault passphrase/)).toBeTruthy();
+    expect(screen.getByLabelText("Vault passphrase")).toBeTruthy();
+    expect(screen.getByLabelText("Confirm vault passphrase")).toBeTruthy();
+    expect(screen.queryByLabelText("Vault password")).toBeNull();
+  });
+
+  it("shows the unlock banner with passphrase wording for a passwordless user WITH a vault", () => {
+    setAuth({ vaultUnlocked: false, hasPassword: false, vaultExists: true });
+    render(<VaultLockedBanner />);
+    expect(screen.getByLabelText("Vault passphrase")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /unlock/i })).toBeTruthy();
+    expect(screen.queryByText(/Set a vault passphrase/)).toBeNull();
+  });
+
+  it("keeps the password unlock banner for a password user", () => {
+    setAuth({ vaultUnlocked: false, hasPassword: true, vaultExists: true });
+    render(<VaultLockedBanner />);
+    expect(screen.getByLabelText("Vault password")).toBeTruthy();
+    expect(screen.queryByText(/Set a vault passphrase/)).toBeNull();
+  });
+
+  it("creates the vault from a valid passphrase and refreshes the session", async () => {
+    setAuth({ vaultUnlocked: false, hasPassword: false, vaultExists: false });
+    mockApi.vaultCreatePassphrase.mockResolvedValue(null);
+
+    render(<VaultLockedBanner />);
+    fireEvent.change(screen.getByLabelText("Vault passphrase"), { target: { value: "a-strong-passphrase" } });
+    fireEvent.change(screen.getByLabelText("Confirm vault passphrase"), { target: { value: "a-strong-passphrase" } });
+    fireEvent.click(screen.getByRole("button", { name: /set passphrase/i }));
+
+    await waitFor(() => expect(mockApi.vaultCreatePassphrase).toHaveBeenCalledWith("a-strong-passphrase"));
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it("blocks submit on a short passphrase and on a mismatch", () => {
+    setAuth({ vaultUnlocked: false, hasPassword: false, vaultExists: false });
+    render(<VaultLockedBanner />);
+    const button = () => screen.getByRole("button", { name: /set passphrase/i }) as HTMLButtonElement;
+
+    // Too short.
+    fireEvent.change(screen.getByLabelText("Vault passphrase"), { target: { value: "short" } });
+    fireEvent.change(screen.getByLabelText("Confirm vault passphrase"), { target: { value: "short" } });
+    expect(button().disabled).toBe(true);
+
+    // Long enough but mismatched.
+    fireEvent.change(screen.getByLabelText("Vault passphrase"), { target: { value: "a-strong-passphrase" } });
+    fireEvent.change(screen.getByLabelText("Confirm vault passphrase"), { target: { value: "different-passphrase" } });
+    expect(button().disabled).toBe(true);
+    expect(screen.getByText(/do not match/i)).toBeTruthy();
+
+    // Matching + long enough → enabled, and nothing was submitted along the way.
+    fireEvent.change(screen.getByLabelText("Confirm vault passphrase"), { target: { value: "a-strong-passphrase" } });
+    expect(button().disabled).toBe(false);
+    expect(mockApi.vaultCreatePassphrase).not.toHaveBeenCalled();
   });
 });

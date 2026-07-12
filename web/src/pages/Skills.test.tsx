@@ -66,6 +66,8 @@ function setAuth(u: User) {
     prdlessLabel: "PRDLESS",
     prdlessEnabled: false,
     vaultUnlocked: true,
+    vaultExists: true,
+    hasPassword: true,
     register: vi.fn(),
     login: vi.fn(),
     logout: vi.fn(),

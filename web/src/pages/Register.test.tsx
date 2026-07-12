@@ -42,6 +42,8 @@ beforeEach(() => {
     prdlessLabel: "PRDLESS",
     prdlessEnabled: false,
     vaultUnlocked: true,
+    vaultExists: true,
+    hasPassword: true,
   });
 });
 

@@ -272,7 +272,8 @@ function sessionBody() {
     default_theme: appSettings.default_theme,
     prdless_label: appSettings.prdless_label,
     prdless_enabled: appSettings.prdless_enabled === "true",
-    vault: { unlocked: state.vaultUnlocked },
+    vault: { unlocked: state.vaultUnlocked, exists: true },
+    has_password: true, // the demo user is a password account (PRD #45)
   };
 }
 
@@ -409,6 +410,12 @@ export const mockApi = {
   // browsable.
   vaultUnlock: async (password: string) => {
     if (password.trim() === "") throw new ApiError(403, "incorrect password");
+    state.vaultUnlocked = true;
+    return delay(null, 150);
+  },
+  // Passphrase-create (PRD #45): min length 12, then the demo vault is unlocked.
+  vaultCreatePassphrase: async (passphrase: string) => {
+    if (passphrase.length < 12) throw new ApiError(400, "passphrase must be at least 12 characters");
     state.vaultUnlocked = true;
     return delay(null, 150);
   },

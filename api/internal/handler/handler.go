@@ -244,6 +244,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Route("/vault", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.With(authLimiter.PerUserMiddleware).Post("/unlock", h.VaultUnlock)
+			// Create-only passphrase for passwordless (OIDC) users (PRD #45). Behind the
+			// per-user limiter like unlock; refuses when a vault already exists.
+			r.With(authLimiter.PerUserMiddleware).Post("/passphrase", h.VaultPassphrase)
 			r.Post("/lock", h.VaultLock)
 			r.Get("/status", h.VaultStatus)
 		})
