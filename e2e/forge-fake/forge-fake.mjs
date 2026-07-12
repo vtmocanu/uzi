@@ -26,15 +26,37 @@ const KEY = process.env.FORGE_FAKE_KEY || "/certs/key.pem";
 const STATE_FILE = process.env.FORGE_FAKE_STATE || "/tmp/forge-fake-state.json";
 const BASE = process.env.FORGE_FAKE_BASE_URL || "https://forge-fake.e2e";
 
-// The single project this fake serves. path_with_namespace + web_url must match
-// what the harness seeds (UZI_SEED_FORGE_REPOS) and what the worker derives the
-// MR/clone URLs from.
-const PROJECT = {
-  id: 1,
-  path_with_namespace: process.env.FORGE_FAKE_PROJECT || "group/repo",
-  default_branch: "main",
-};
-PROJECT.web_url = `${BASE}/${PROJECT.path_with_namespace}`;
+// The projects this fake serves. The first (group/repo) is always present; a
+// SECOND (FORGE_FAKE_PROJECT2, e.g. group/repo2) is added only when that env is
+// set. path_with_namespace + web_url must match what the harness seeds
+// (UZI_SEED_FORGE_REPOS) and what the worker derives the MR/clone URLs from.
+//
+// The second project exists solely for the PRD #42 M5 bounded-concurrency
+// scenario, which runs two issues on two DIFFERENT repos so a cap-2 worker's two
+// runs get independent git bare-caches (no per-repo GitCache serialization). Every
+// OTHER harness phase touches only the first project, and resolveProject() falls
+// back to it, so single-project behavior is byte-identical when the env is unset.
+function makeProject(id, pathWithNamespace) {
+  return {
+    id,
+    path_with_namespace: pathWithNamespace,
+    default_branch: "main",
+    web_url: `${BASE}/${pathWithNamespace}`,
+  };
+}
+const PROJECTS = [makeProject(1, process.env.FORGE_FAKE_PROJECT || "group/repo")];
+if (process.env.FORGE_FAKE_PROJECT2) PROJECTS.push(makeProject(2, process.env.FORGE_FAKE_PROJECT2));
+const PROJECT = PROJECTS[0]; // back-compat alias for the single-project references
+
+// resolveProject maps a GitLab `:id` path param — a numeric project id (uzi's
+// client-go) OR a url-encoded path_with_namespace (the worker addresses MRs by
+// encoded path) — to one of PROJECTS. Falls back to the first project, so a
+// single-project run is identical to the pre-multi-project behavior where `:id`
+// was ignored entirely.
+function resolveProject(idParam) {
+  const raw = decodeURIComponent(String(idParam || ""));
+  return PROJECTS.find((p) => String(p.id) === raw || p.path_with_namespace === raw) || PROJECTS[0];
+}
 
 // --- git smart-HTTP (optional; the E2E_GIT_SMART_HTTP variant) ----------------
 // Serves the single bare repo under GIT_ROOT via `git http-backend`, gated on an
@@ -126,16 +148,17 @@ function log(...args) {
   console.log(new Date().toISOString(), "[forge-fake]", ...args);
 }
 
-function makeIssue({ iid, title, description, labels, author }) {
+function makeIssue({ iid, title, description, labels, author, project }) {
+  const proj = project || PROJECT;
   return {
     id: 1000 + iid,
     iid,
-    project_id: PROJECT.id,
+    project_id: proj.id,
     title,
     description: description ?? "",
     state: "opened",
     labels: labels && labels.length ? labels : ["PRD"],
-    web_url: `${PROJECT.web_url}/-/issues/${iid}`,
+    web_url: `${proj.web_url}/-/issues/${iid}`,
     // author drives autopilot attribution (the fallback when the label adder is
     // unmapped); default to the bot so the uzi-created issues are unchanged.
     author: { id: author ? 2 : 1, username: author || "uzi-bot" },
@@ -282,6 +305,7 @@ const server = https.createServer(
         notes: state.notes,
         labelEvents: state.labelEvents,
         project: PROJECT,
+        projects: PROJECTS,
       });
     }
     if (method === "GET" && (path === "/_e2e/health" || path === "/")) {
@@ -410,17 +434,21 @@ const server = https.createServer(
       return send(res, 200, { id: 1, name: "uzi-bot", revoked: false, active: true, scopes, expires_at: null });
     }
 
-    // Project listing (api seed / repo discovery).
+    // Project listing (api seed / repo discovery). Returns every served project so
+    // the seed upserts a repo row per project (only the requested ones are enabled).
     if (method === "GET" && path === "/api/v4/projects") {
-      return send(res, 200, [PROJECT]);
+      return send(res, 200, PROJECTS);
     }
 
-    // Everything below is scoped to a project: /api/v4/projects/:id/<rest>. :id
-    // is numeric (api client-go) or a url-encoded path (worker MR); one project,
-    // so the id value is ignored.
-    const proj = path.match(/^\/api\/v4\/projects\/[^/]+(\/.*)?$/);
+    // Everything below is scoped to a project: /api/v4/projects/:id/<rest>. :id is
+    // numeric (api client-go) or a url-encoded path (worker MR). resolveProject()
+    // maps it to a served project (falling back to the first), so issue/MR
+    // attribution is per-project when a second project is served and identical to
+    // the single-project behavior otherwise.
+    const proj = path.match(/^\/api\/v4\/projects\/([^/]+)(\/.*)?$/);
     if (proj) {
-      const rest = proj[1] || "";
+      const project = resolveProject(proj[1]);
+      const rest = proj[2] || "";
 
       // Issues.
       const issueGet = rest.match(/^\/issues\/(\d+)$/);
@@ -474,10 +502,10 @@ const server = https.createServer(
         const body = await readBody(req);
         const iid = state.nextIssueIid++;
         const labels = normLabels(body.labels);
-        const issue = makeIssue({ iid, title: body.title || `issue ${iid}`, description: body.description, labels });
+        const issue = makeIssue({ iid, title: body.title || `issue ${iid}`, description: body.description, labels, project });
         state.issues[iid] = issue;
         persist();
-        log("issue created", iid, JSON.stringify(issue.title));
+        log("issue created", iid, JSON.stringify(issue.title), "in", project.path_with_namespace);
         return send(res, 201, issue);
       }
 
@@ -562,17 +590,17 @@ const server = https.createServer(
         const mr = {
           id: 5000 + iid,
           iid,
-          project_id: PROJECT.id,
+          project_id: project.id,
           source_branch: body.source_branch,
           target_branch: body.target_branch,
           title: body.title,
           description: body.description,
           state: "opened",
-          web_url: `${PROJECT.web_url}/-/merge_requests/${iid}`,
+          web_url: `${project.web_url}/-/merge_requests/${iid}`,
         };
         state.mrs.push(mr);
         persist();
-        log("MR created", iid, mr.source_branch, "->", mr.target_branch);
+        log("MR created", iid, mr.source_branch, "->", mr.target_branch, "in", project.path_with_namespace);
         return send(res, 201, mr);
       }
       if (method === "GET" && rest === "/merge_requests") {
@@ -589,4 +617,6 @@ const server = https.createServer(
 
 load();
 persist();
-server.listen(PORT, () => log(`listening on :${PORT} (base ${BASE}, project ${PROJECT.path_with_namespace})`));
+server.listen(PORT, () =>
+  log(`listening on :${PORT} (base ${BASE}, projects ${PROJECTS.map((p) => p.path_with_namespace).join(", ")})`),
+);

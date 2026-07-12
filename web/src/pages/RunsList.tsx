@@ -15,6 +15,7 @@ import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/i
 import { MrChip } from "../components/MrChip";
 import { isStoppedRun, mrChipState } from "../lib/runBadge";
 import { hasTemplateDrift } from "../lib/workerTemplates";
+import { WorkerRunBadge } from "../components/WorkerRunBadge";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -244,7 +245,7 @@ export function RunsList() {
                       <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                         {w.status}
                       </Badge>
-                      {w.busy && <Badge tone="warning">busy</Badge>}
+                      <WorkerRunBadge worker={w} />
                     </div>
                   </li>
                 ))}

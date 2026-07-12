@@ -19,14 +19,28 @@ SELECT * FROM workers WHERE id = @id;
 SELECT * FROM workers WHERE id = @id AND user_id = @user_id;
 
 -- name: ListWorkersByUser :many
--- Worker list for the owning user. "busy" is derived here (never stored): a
--- worker is busy when it holds a non-terminal run.
+-- Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
+--   * active_runs counts the worker's NON-CHAT active runs (claimed/running/
+--     awaiting_approval) — the RUN lane that max_concurrent_runs bounds. Chat runs
+--     have their own session budget (WORKER_CHAT_SESSIONS) and ClaimRun excludes
+--     them, so counting a live chat here would render a false "3/2 runs" over-cap.
+--   * busy is the ANY-kind non-terminal signal (a lone active chat still shows the
+--     worker as busy), so it is its own EXISTS over every kind — NOT derived from
+--     active_runs, which now omits chat.
+-- max_concurrent_runs (the advertised cap, NULL when unadvertised) rides on w.*; it
+-- is observability only and never enforced.
 SELECT w.*,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
-       ) AS busy
+       ) AS busy,
+       (
+           SELECT count(*) FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.kind <> 'chat'
+       ) AS active_runs
 FROM workers w
 WHERE w.user_id = @user_id
 ORDER BY w.created_at ASC;
@@ -35,13 +49,18 @@ ORDER BY w.created_at ASC;
 -- Worker announces version + its self-reported template and comes online;
 -- heartbeat is stamped now. template_reported is what the image bakes in (PRD
 -- #18), NULL when the worker sends none (older image) — stored as-is; drift vs
--- template_declared is surfaced, never rejected.
+-- template_declared is surfaced, never rejected. max_concurrent_runs is the worker's
+-- advertised slot cap (PRD #42 Decisions 3 & 10), likewise self-reported: NULL when
+-- the worker advertises none (an older image, or before the M2 agent sends it), and
+-- overwritten to the current report on every register (the fresh-start signal). It is
+-- observability only — the server never enforces it.
 UPDATE workers SET
-    status            = 'online',
-    version           = @version,
-    template_reported = @template_reported,
-    last_heartbeat_at = now(),
-    updated_at        = now()
+    status              = 'online',
+    version             = @version,
+    template_reported   = @template_reported,
+    max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
+    last_heartbeat_at   = now(),
+    updated_at          = now()
 WHERE id = @id
 RETURNING *;
 
@@ -132,13 +151,24 @@ ORDER BY r.created_at DESC
 LIMIT 500;
 
 -- name: ListAllWorkers :many
--- Admin Agents-status: every worker with derived busy status and owner email.
+-- Admin Agents-status: every worker with owner email plus the same two derived
+-- signals as ListWorkersByUser (PRD #42 Decision 10): busy is the ANY-kind
+-- non-terminal EXISTS, active_runs is the NON-CHAT active count (chat runs are
+-- excluded so a live chat never inflates "N/M runs" past the run-lane cap). The
+-- embedded worker carries max_concurrent_runs (the advertised cap, NULL when
+-- unadvertised).
 SELECT sqlc.embed(w),
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
        ) AS busy,
+       (
+           SELECT count(*) FROM runs r
+           WHERE r.worker_id = w.id
+             AND r.status IN ('claimed', 'running', 'awaiting_approval')
+             AND r.kind <> 'chat'
+       ) AS active_runs,
        u.email AS owner_email
 FROM workers w
 JOIN users u ON u.id = w.user_id

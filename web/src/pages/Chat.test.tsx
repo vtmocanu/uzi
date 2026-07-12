@@ -53,6 +53,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     name: "laptop",
     status: "online",
     busy: false,
+    active_runs: 0,
+    max_concurrent_runs: null,
     template_declared: null,
     template_reported: null,
     version: null,

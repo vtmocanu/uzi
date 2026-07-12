@@ -14,10 +14,19 @@
 # is re-queued, re-claimed, and driven to completion with a gapless seq) and the
 # server-side cancel path.
 #
-# Finally, the PRD #24 MR-close watcher: with the poller sped to ~2s, closing the
+# Then the PRD #24 MR-close watcher: with the poller sped to ~2s, closing the
 # completed run's MR (without merging, via forge-fake's /_e2e mutator) moves the
 # card Human Review → In Progress; reopening restores it; and a manual drag is
 # never fought (the reopen edge's source-column guard backs off).
+#
+# Finally (PRD #42, stub-only), the single worker is reconfigured to
+# WORKER_MAX_CONCURRENT_RUNS=2 and shown to execute two runs on two DIFFERENT repos
+# genuinely concurrently (both parked at the gate at once — a cap-1 worker cannot),
+# reporting active_runs=2/cap=2 while live, landing both MRs on independent git
+# bare-caches, and re-queuing BOTH in-flight runs together (sweeper at N=2) after a
+# mid-run SIGKILL, with a restarted worker completing them. Stated limit: the stub
+# is already concurrency-safe, so this covers the loop/server/API path, NOT the M1
+# executor kill/reap fix (guarded by an agent/ unit test).
 #
 # Observable assertions: DB run-state transitions (via the API), gapless
 # run_messages seq, branch pushed to the remote, MR recorded by the fake GitLab,
@@ -429,6 +438,25 @@ git -C "$seedwc" add README.md .claude
 git -C "$seedwc" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit"
 git -C "$seedwc" push -q origin main
 rm -rf "$seedwc"
+
+# A SECOND bare repo (group/repo2) for the PRD #42 M5 bounded-concurrency
+# scenario: two runs on two DIFFERENT repos must clone into independent
+# bare-caches so the per-repo GitCache lock (agent/src/git.ts) never serializes
+# them. Seeded minimally with a main commit — repo2 only ever carries a stub run's
+# marker branch. Dormant for every other phase (the seed enables only group/repo,
+# and no phase clones repo2 until M5 enables the repo).
+git init --bare -q "$RUNROOT/fakeremote/repo2.git"
+git -C "$RUNROOT/fakeremote/repo2.git" symbolic-ref HEAD refs/heads/main
+git -C "$RUNROOT/fakeremote/repo2.git" config http.receivepack true
+seedwc2="$RUNROOT/.seedwc2"
+git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/repo2.git" .seedwc2
+git -C "$seedwc2" checkout -q -b main
+printf '# repo2\n\nSecond repo, seeded by the uzi E2E harness for the PRD #42 M5 concurrency scenario.\n' > "$seedwc2/README.md"
+git -C "$seedwc2" add README.md
+git -C "$seedwc2" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit (repo2)"
+git -C "$seedwc2" push -q origin main
+rm -rf "$seedwc2"
+
 chmod -R a+rwX "$RUNROOT/fakeremote"
 
 if [ -n "${E2E_GIT_SMART_HTTP:-}" ]; then
@@ -443,6 +471,8 @@ else
   cat > "$RUNROOT/agent-gitconfig/gitconfig" <<'EOF'
 [url "/fakeremote/repo.git"]
 	insteadOf = https://forge-fake.e2e/group/repo.git
+[url "/fakeremote/repo2.git"]
+	insteadOf = https://forge-fake.e2e/group/repo2.git
 EOF
   GIT_MODE="local bare remote via insteadOf"
 fi
@@ -1542,4 +1572,196 @@ apipost "/api/chats/$CONT/end" '' | jq -e 'has("server_side")' >/dev/null || fai
 wait_status "$CONT" completed 30
 pass "continued chat ended via End chat -> completed"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat; executor=%s)\n' "$EXECUTOR"
+# =============================================================================
+# PRD #42 — bounded worker concurrency (cap 2). ADDITIVE + LAST: the entire suite
+# above ran the single worker at the DEFAULT cap (1 — the pre-#42 serial loop),
+# unchanged. This final phase reconfigures that ONE worker to
+# WORKER_MAX_CONCURRENT_RUNS=2 and proves, on the stub path, that it:
+#   (b) executes two runs on two DIFFERENT repos GENUINELY concurrently — both are
+#       simultaneously parked at the plan gate (awaiting_approval), which a cap-1
+#       worker can NEVER do: a slot is held across the gate (PRD #42 Decision 2),
+#       so at cap 1 the second run would stay `queued`. Same single worker, both
+#       past `claimed`, both non-terminal at once = real overlap, deterministically
+#       (no reliance on racing the fast stub);
+#   (c) reports active_runs=2 / max_concurrent_runs=2 on the API worker listing
+#       while both are live (the "N/M runs" saturation badge's data, PRD #42 M3a);
+#   (d) lands BOTH MRs, each on its own repo's independent git bare-cache, with no
+#       message cross-talk between the two concurrent run streams;
+#   (e) on a mid-run SIGKILL of the agent (two in-flight runs), re-queues BOTH
+#       together via the SWEEPER at N=2 (worker-loss recovery, now exercised with
+#       two runs), and a restarted worker re-claims both by affinity and completes
+#       them.
+#
+# STATED LIMIT (PRD #42 M5 / review — do not overclaim): the stub executor is
+# already concurrency-safe (zero instance-level run state), so this exercises the
+# worker loop + server + API-listing path, NOT the M1 per-run executor kill/reap
+# isolation fix (per-instance SdkExecutor / runId-scoped killAgentTree). M1's unit
+# test (agent/test/) is the guard for that; the stub cannot exercise it.
+if [ "$EXECUTOR" != stub ]; then
+  say "PRD #42 bounded-concurrency scenario: SKIPPED (stub-only; executor=$EXECUTOR)"
+else
+  say "PRD #42: reconfigure the worker to WORKER_MAX_CONCURRENT_RUNS=2 and enable a second repo"
+  login   # fresh admin session (also re-unlocks the admin vault so claims proceed)
+
+  # Enable group/repo2 (served by forge-fake only when FORGE_FAKE_PROJECT2 is set;
+  # the seed enabled just group/repo, so repo2 has been a disabled, invisible row).
+  CONN_ID="$(apiget /api/forge/connections | jq -r '.connections[0].id // empty')"
+  [ -n "$CONN_ID" ] || fail "no forge connection to enable repo2 against"
+  REPO2_ID="$(apiget "/api/forge/connections/$CONN_ID/projects" \
+    | jq -r '.repos[] | select(.path_with_namespace=="group/repo2") | .id')"
+  [ -n "$REPO2_ID" ] && [ "$REPO2_ID" != null ] \
+    || fail "forge-fake did not advertise group/repo2 (is FORGE_FAKE_PROJECT2 set in the overlay?)"
+  apiput "/api/repos/$REPO2_ID" '{"enabled":true}' | jq -e '.repo.enabled == true' >/dev/null \
+    || fail "could not enable group/repo2"
+  pass "second repo group/repo2 enabled (id $REPO2_ID)"
+
+  # Recreate the one worker at cap 2. The token file was unlinked at its first
+  # start (/proc hardening), so restore it before the fresh container reads it.
+  printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
+  write_token
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
+  # Wait for the NEW worker's registration to actually LAND its advertised cap —
+  # not merely for `online`. The recreated container reuses the join token (same
+  # worker id), and the old cap-1 row can still read `online` for a beat before the
+  # fresh register overwrites max_concurrent_runs, so gating on status alone races.
+  cap_deadline=$((SECONDS + 40)); CAP=""
+  while [ $SECONDS -lt $cap_deadline ]; do
+    W0="$(apiget /api/workers | jq -c '.workers[0]')"
+    CAP="$(echo "$W0" | jq -r '.max_concurrent_runs')"
+    { [ "$(echo "$W0" | jq -r '.status')" = online ] && [ "$CAP" = 2 ]; } && break
+    sleep 2
+  done
+  [ "$CAP" = 2 ] || fail "worker did not advertise max_concurrent_runs=2 after recreate (got ${CAP:-none})"
+  pass "worker back online advertising cap 2"
+
+  # --- (b) two runs on two DIFFERENT repos, genuinely concurrent ---------------
+  say "PRD #42: two runs on two different repos → both reach the gate concurrently (cap-1 could not)"
+  IID_A="$(apipost "/api/repos/$REPO_ID/issues" \
+    '{"title":"E2E cap2 A (repo)","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+  IID_B="$(apipost "/api/repos/$REPO2_ID/issues" \
+    '{"title":"E2E cap2 B (repo2)","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+  { [ -n "$IID_A" ] && [ "$IID_A" != null ] && [ -n "$IID_B" ] && [ "$IID_B" != null ]; } \
+    || fail "could not create the two concurrency issues"
+  RUN_A="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_A}" | jq -r '.run.id')"
+  RUN_B="$(apipost "/api/repos/$REPO2_ID/runs" "{\"issue_iid\":$IID_B}" | jq -r '.run.id')"
+  { [ -n "$RUN_A" ] && [ "$RUN_A" != null ] && [ -n "$RUN_B" ] && [ "$RUN_B" != null ]; } \
+    || fail "the two runs were not created"
+  # Both park at the gate and HOLD their slot there (Decision 2), so once both
+  # arrive they stay — a single combined snapshot then shows both non-terminal at
+  # once. At cap 1 the second run would still be `queued` here.
+  wait_status "$RUN_A" awaiting_approval
+  wait_status "$RUN_B" awaiting_approval
+  SA="$(apiget "/api/runs/$RUN_A")"; SB="$(apiget "/api/runs/$RUN_B")"
+  { [ "$(echo "$SA" | jq -r '.run.status')" = awaiting_approval ] \
+    && [ "$(echo "$SB" | jq -r '.run.status')" = awaiting_approval ]; } \
+    || fail "the two runs are not both at the gate simultaneously (no genuine overlap)"
+  WID_A="$(echo "$SA" | jq -r '.run.worker_id')"; WID_B="$(echo "$SB" | jq -r '.run.worker_id')"
+  { [ -n "$WID_A" ] && [ "$WID_A" != null ] && [ "$WID_A" = "$WID_B" ]; } \
+    || fail "the two concurrent runs were not both claimed by the SAME single worker ($WID_A vs $WID_B)"
+  { [ "$(echo "$SA" | jq -r '.run.claimed_at')" != null ] \
+    && [ "$(echo "$SB" | jq -r '.run.claimed_at')" != null ]; } \
+    || fail "a concurrent run has no claimed_at (never got past claimed)"
+  pass "both runs simultaneously past claimed + at the gate, on the one worker $WID_A — genuine concurrency"
+
+  # No cross-talk between the two concurrent runs: each plan references its OWN
+  # issue and never the sibling's (the stub writes `issue #<iid>` into plan_md, set
+  # at the gate). The [^0-9]/end-of-line guard keeps #1 from matching #12, etc.
+  PLAN_A="$(echo "$SA" | jq -r '.run.plan_md')"; PLAN_B="$(echo "$SB" | jq -r '.run.plan_md')"
+  echo "$PLAN_A" | grep -qE "issue #$IID_A([^0-9]|\$)" || fail "run A's plan does not reference its own issue #$IID_A"
+  echo "$PLAN_A" | grep -qE "issue #$IID_B([^0-9]|\$)" && fail "run A's plan references run B's issue #$IID_B (cross-talk)"
+  echo "$PLAN_B" | grep -qE "issue #$IID_B([^0-9]|\$)" || fail "run B's plan does not reference its own issue #$IID_B"
+  echo "$PLAN_B" | grep -qE "issue #$IID_A([^0-9]|\$)" && fail "run B's plan references run A's issue #$IID_A (cross-talk)"
+  pass "no cross-talk: each concurrent run's plan references only its own issue"
+
+  # --- (c) API worker listing: active_runs=2 / cap=2 while both are live -------
+  WL="$(apiget /api/workers | jq '.workers[0]')"
+  [ "$(echo "$WL" | jq -r '.active_runs')" = 2 ] \
+    || fail "worker listing active_runs != 2 while two runs are live (got $(echo "$WL" | jq -r '.active_runs'))"
+  [ "$(echo "$WL" | jq -r '.max_concurrent_runs')" = 2 ] || fail "worker listing cap != 2"
+  [ "$(echo "$WL" | jq -r '.busy')" = true ] || fail "worker not marked busy with two live runs"
+  pass "worker listing shows active_runs=2 / cap=2 (busy) while both runs are live"
+
+  # --- (d) approve both → both land MRs, on independent bare-caches, no cross-talk
+  apipost "/api/runs/$RUN_A/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  apipost "/api/runs/$RUN_B/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  wait_status "$RUN_A" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+  wait_status "$RUN_B" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+  FA="$(apiget "/api/runs/$RUN_A")"; FB="$(apiget "/api/runs/$RUN_B")"
+  [ "$(echo "$FA" | jq -r '.run.branch')" = "agent/issue-$IID_A" ] || fail "run A branch mismatch"
+  [ "$(echo "$FB" | jq -r '.run.branch')" = "agent/issue-$IID_B" ] || fail "run B branch mismatch"
+  MRA="$(echo "$FA" | jq -r '.run.mr_iid')"; MRB="$(echo "$FB" | jq -r '.run.mr_iid')"
+  { [ "$MRA" != null ] && [ "$MRA" -gt 0 ] && [ "$MRB" != null ] && [ "$MRB" -gt 0 ]; } \
+    || fail "both concurrent runs must open an MR (got A=$MRA B=$MRB)"
+  # Each branch landed on its OWN repo's bare — proving the two runs used
+  # independent git caches (repo2's branch is NOT in repo1's bare, and vice versa).
+  git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
+    || fail "run A branch not on the repo1 bare"
+  git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+    || fail "run B branch not on the repo2 bare (independent bare-cache check)"
+  git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+    && fail "run B's branch leaked into the repo1 bare (caches not independent)"
+  FS="$(fake_state)"
+  [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_A" '[.mrs[]|select(.source_branch==$b)]|length')" -ge 1 ] \
+    || fail "fake recorded no MR for run A's branch"
+  # The repo2 MR is attributed to project 2 (the multi-project fake resolves :id).
+  [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_B" '[.mrs[]|select(.source_branch==$b)][-1].project_id')" = 2 ] \
+    || fail "run B's MR not attributed to forge project 2 (group/repo2)"
+  pass "both runs completed: MRs !$MRA (repo) + !$MRB (repo2, project 2), each on its own independent bare"
+
+  # --- (e) mid-run SIGKILL → sweeper re-queues BOTH (N=2) → restart completes ---
+  say "PRD #42: mid-run SIGKILL of the agent with two in-flight runs → sweeper re-queues BOTH → restart completes"
+  # Tighten the heartbeat-stale window so the sweeper's worker-loss recovery is
+  # bounded (15s, still 3× the 5s heartbeat, so a LIVE worker is never spuriously
+  # swept). Recreate the api to pick it up; the worker (cap 2) keeps heartbeating.
+  printf 'E2E_WORKER_HEARTBEAT_STALE=15s\n' >> "$ENVFILE"
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
+  wait_http
+  login
+  wait_worker_online
+
+  IID_KA="$(apipost "/api/repos/$REPO_ID/issues" \
+    '{"title":"E2E cap2 kill A","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+  IID_KB="$(apipost "/api/repos/$REPO2_ID/issues" \
+    '{"title":"E2E cap2 kill B","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+  RUN_KA="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_KA}" | jq -r '.run.id')"
+  RUN_KB="$(apipost "/api/repos/$REPO2_ID/runs" "{\"issue_iid\":$IID_KB}" | jq -r '.run.id')"
+  { [ -n "$RUN_KA" ] && [ "$RUN_KA" != null ] && [ -n "$RUN_KB" ] && [ "$RUN_KB" != null ]; } \
+    || fail "the two kill-scenario runs were not created"
+  wait_status "$RUN_KA" awaiting_approval
+  wait_status "$RUN_KB" awaiting_approval
+  pass "two fresh runs in-flight (both parked at the gate, each holding a slot)"
+
+  # Hard-kill the agent: no graceful drain, no re-register — only the server-side
+  # sweeper can recover the two orphaned runs. Do NOT restart the worker yet, so
+  # the SWEEPER (not the restart's register-time requeue) is what re-queues them.
+  "${COMPOSE[@]}" kill -s KILL agent >/dev/null
+  pass "SIGKILL delivered to the agent container (two runs left in-flight)"
+
+  # Both orphaned runs go back to `queued` together — the sweeper's N=2 recovery.
+  wait_status "$RUN_KA" queued 60
+  wait_status "$RUN_KB" queued 60
+  pass "sweeper marked the dead worker offline and re-queued BOTH runs (N=2)"
+
+  # Restart the worker (same join token ⇒ same worker id): it re-claims both by
+  # affinity and drives them to completion.
+  write_token
+  "${COMPOSE[@]}" up -d --wait agent >/dev/null
+  wait_worker_online
+  wait_status "$RUN_KA" awaiting_approval 60
+  wait_status "$RUN_KB" awaiting_approval 60
+  pass "restarted worker re-claimed both re-queued runs (affinity) — both back at the gate"
+
+  apipost "/api/runs/$RUN_KA/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  apipost "/api/runs/$RUN_KB/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  wait_status "$RUN_KA" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+  wait_status "$RUN_KB" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+  FKA="$(apiget "/api/runs/$RUN_KA")"; FKB="$(apiget "/api/runs/$RUN_KB")"
+  [ "$(echo "$FKA" | jq -r '.run.requeue_count')" -ge 1 ] || fail "run KA was never re-queued (requeue_count=0)"
+  [ "$(echo "$FKB" | jq -r '.run.requeue_count')" -ge 1 ] || fail "run KB was never re-queued (requeue_count=0)"
+  MRKA="$(echo "$FKA" | jq -r '.run.mr_iid')"; MRKB="$(echo "$FKB" | jq -r '.run.mr_iid')"
+  { [ "$MRKA" != null ] && [ "$MRKA" -gt 0 ] && [ "$MRKB" != null ] && [ "$MRKB" -gt 0 ]; } \
+    || fail "re-queued runs must still land their MRs after the restart (got A=$MRKA B=$MRKB)"
+  pass "both re-queued runs completed after restart (requeue_count>=1), MRs !$MRKA + !$MRKB"
+fi
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency; executor=%s)\n' "$EXECUTOR"

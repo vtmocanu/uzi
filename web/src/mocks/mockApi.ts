@@ -928,6 +928,9 @@ export const mockApi = {
       name,
       status: "offline",
       busy: false,
+      // No runs and no advertised cap until the worker registers (PRD #42).
+      active_runs: 0,
+      max_concurrent_runs: null,
       // Declared at issuance; reported stays null until the worker registers.
       template_declared: template ?? null,
       template_reported: null,

@@ -447,7 +447,14 @@ export interface Worker {
   id: string;
   name: string;
   status: string; // "offline" | "online"
-  busy: boolean; // derived: holds a claimed/running/awaiting_approval run
+  busy: boolean; // derived: holds a claimed/running/awaiting_approval run (== active_runs > 0)
+  // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
+  // worker's claimed/running/awaiting_approval runs (busy is derived from it);
+  // max_concurrent_runs is the worker's advertised slot cap, null when it advertises
+  // none (an older image, or before the M2 agent sends it). Together they drive the
+  // "N/M runs" saturation badge (workerRunBadge in lib/workerRuns.ts).
+  active_runs: number;
+  max_concurrent_runs: number | null;
   // Worker template (PRD #18): the choice recorded at issuance and the value the
   // worker self-reports at register. Either may be null (no choice / older
   // image); a mismatch is surfaced as a drift badge, never a rejection.

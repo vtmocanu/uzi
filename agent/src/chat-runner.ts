@@ -23,6 +23,18 @@ import { errMessage } from "./util.js";
 /** Cap on a reported failure_reason (matches RunRunner / the GitLab error cap). */
 const MAX_FAILURE_REASON_LEN = 512;
 
+/**
+ * Build a per-session chat executor (PRD #42 Decision 4, chat lane). Called once
+ * per `execute`, so each concurrent chat session drives its OWN executor instance
+ * and its `spawnedPids`/`killAgentTree` are private to it — two sessions at
+ * `WORKER_CHAT_SESSIONS>1` can never reap each other's SDK subprocess. Returns a
+ * `ChatExecutorLike` so the factory can build the real `ChatExecutor` or the
+ * `StubChatExecutor` (E2E, PRD #39) per session. The real executor KEEPS the shared
+ * SDK HOME (a Continue resumes the same session under a new run_id, so per-run HOME
+ * would break resume); only the instance is per-session.
+ */
+export type ChatExecutorFactory = () => ChatExecutorLike;
+
 /** Worker-config lifecycle defaults the runner resolves each ChatContext from; a
  *  claim's own config wins per-run over these (Decision 3, brief §4). */
 export interface ChatRunnerDefaults {
@@ -52,7 +64,9 @@ export class ChatRunner {
 
   constructor(
     private readonly client: WorkerClient,
-    private readonly executor: ChatExecutorLike,
+    /** Per-session executor factory (PRD #42 Decision 4). Called once per `execute`
+     *  so each chat session drives its OWN executor instance (real or stub). */
+    private readonly makeExecutor: ChatExecutorFactory,
     private readonly log: Logger,
     private readonly batchMs: number,
     private readonly defaults: ChatRunnerDefaults,
@@ -74,8 +88,15 @@ export class ChatRunner {
    */
   async execute(claim: ChatClaimResponse, signal?: AbortSignal): Promise<void> {
     const runId = claim.run_id;
+    // This session's OWN executor (PRD #42 Decision 4), so its spawnedPids/reap are
+    // private to it — no sharing with a concurrent chat session.
+    const executor = this.makeExecutor();
     // Register the only secret a chat claim carries; never log the claim itself.
-    if (claim.secrets.anthropic_oauth_token) this.log.addSecret(claim.secrets.anthropic_oauth_token);
+    // Evicted on terminal (PRD #42 Decision 7) like a run's secrets — the registry
+    // is reference-counted, so an issue run of the same user still holding this
+    // token keeps it scrubbed.
+    const oauthToken = claim.secrets.anthropic_oauth_token;
+    if (oauthToken) this.log.addSecret(oauthToken);
 
     const runLog = this.log.child({ run_id: runId, kind: "chat" });
     const secrets = [claim.secrets.anthropic_oauth_token, this.joinToken];
@@ -168,7 +189,7 @@ export class ChatRunner {
         },
       };
 
-      const result = await this.executor.run(ctx);
+      const result = await executor.run(ctx);
       batcher.emit({ kind: "status", agent: "worker", payload: { text: chatEndText(result) } });
       await batcher.close();
       await reportState({ status: "completed" });
@@ -184,6 +205,8 @@ export class ChatRunner {
     } finally {
       if (signal) signal.removeEventListener("abort", onShutdown);
       await source.stop().catch(() => undefined);
+      // Evict this chat's token now the run is terminal (Decision 7).
+      if (oauthToken) this.log.removeSecret(oauthToken);
     }
   }
 }

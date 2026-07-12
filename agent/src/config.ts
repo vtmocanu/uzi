@@ -54,7 +54,10 @@ export interface Config {
    * Bound on how long a run may sit at the plan-approval gate before it is failed
    * (M4 resolution of the PRD's open "awaiting_approval wall-clock cap"). Generous
    * by default so a human has ample time, but finite so an abandoned plan never
-   * wedges the worker (one run at a time).
+   * pins its slot indefinitely: a gated run holds its slot the whole time it is
+   * parked (PRD #42 Decision 2), so at the default cap of 1 an abandoned plan
+   * wedges the whole run lane until this fires, and at a higher cap it pins one of
+   * N slots. This timeout is the self-heal either way.
    */
   planApprovalTimeoutMs: number;
   /**
@@ -73,8 +76,23 @@ export interface Config {
    *  (Decision 4). Default 1 — one live conversation per user-worker; a second chat
    *  queues until the first ends. The run lane is always a separate concurrent slot. */
   chatSessions: number;
+  /**
+   * How many issue/ci_fix RUNS the worker executes CONCURRENTLY (PRD #42 Decision
+   * 3), bounded by the slot semaphore in worker.ts. Default 1 — the pre-#42 serial
+   * behavior (one run at a time), identical at the observable level. Validated ≥ 1;
+   * a value above MAX_CONCURRENT_RUNS_SOFT_CEILING is honored but warned at boot (a
+   * fat-fingered cap should shout before the OOM killer does). This is the RUN lane
+   * only — the chat lane has its own, distinct ceiling (chatSessions above).
+   */
+  maxConcurrentRuns: number;
   logLevel: LogLevel;
 }
+
+/** Documented soft ceiling for WORKER_MAX_CONCURRENT_RUNS (PRD #42 Decision 3):
+ *  above this the worker still honors the value but warns at boot — multica caps
+ *  its whole daemon at 20, so a fat-fingered per-worker cap should be flagged
+ *  before it OOMs the shared container. Advisory only, never enforced. */
+export const MAX_CONCURRENT_RUNS_SOFT_CEILING = 8;
 
 const DURATION_RE = /^(\d+)\s*(ms|s|m|h)?$/;
 
@@ -189,6 +207,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     chatIdleTimeoutMs: duration(env, "WORKER_CHAT_IDLE_TIMEOUT", "60m"),
     chatPollMs: duration(env, "WORKER_CHAT_POLL_MS", "1000"),
     chatSessions: positiveInt(env, "WORKER_CHAT_SESSIONS", 1),
+    // RUN-lane concurrency cap (PRD #42 Decision 3). positiveInt already enforces
+    // integer ≥ 1 with fallback to 1, so a blank/zero/negative/fractional value is
+    // the safe default. The soft-ceiling warn lives in main.ts (needs the logger,
+    // built after this parse) — see MAX_CONCURRENT_RUNS_SOFT_CEILING.
+    maxConcurrentRuns: positiveInt(env, "WORKER_MAX_CONCURRENT_RUNS", 1),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }

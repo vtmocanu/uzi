@@ -853,6 +853,38 @@ describe("SdkExecutor tool provisioning (PRD #18 M3)", () => {
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, OAUTH);
   });
 
+  it("provisions under the SHARED HOME while the SDK $HOME is per-run (PRD #42 Decision 5)", async () => {
+    const perRunHome = path.join(homeDir, "run-abc"); // stands in for agent-home/<runId>
+    const sharedProvisionHome = path.join(homeDir, "shared");
+    let provisionHome: string | undefined;
+    let provisionRunDir: string | undefined;
+    const provision: SdkExecutorOptions["provision"] = async (input) => {
+      provisionHome = input.homeDir;
+      provisionRunDir = input.runDir;
+      return { toolEnv: {} };
+    };
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ runId: "55555555-5555-5555-5555-555555555555", config: { tool_packages: ["jq"] } });
+    await new SdkExecutor(nullLogger(), perRunHome, { queryFn, provision, provisionHomeDir: sharedProvisionHome }).run(probe.ctx);
+
+    // The nix/devbox install ran under the SHARED provisioning HOME (warm-start),
+    // NOT the per-run SDK HOME — a per-run provisioning HOME would fragment the nix
+    // profile/devbox state every run.
+    assert.strictEqual(provisionHome, sharedProvisionHome);
+    assert.notStrictEqual(provisionHome, perRunHome);
+    // provisionRoot derives from the SHARED HOME; the per-run provision dir sits under it.
+    assert.strictEqual(
+      provisionRunDir,
+      path.join(path.dirname(sharedProvisionHome), "provision", "55555555-5555-5555-5555-555555555555"),
+    );
+    // The SDK subprocess itself got the PER-RUN HOME (its $HOME/.claude state).
+    const env = turns[0]!.options.env as Record<string, string>;
+    assert.strictEqual(env.HOME, perRunHome);
+  });
+
   it("does not provision when the run has no tool packages (today's behavior)", async () => {
     let called = false;
     const provision: SdkExecutorOptions["provision"] = async () => {

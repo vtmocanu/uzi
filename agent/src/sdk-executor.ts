@@ -80,8 +80,19 @@ export interface SdkExecutorOptions {
   /** Worker-credential file paths (UZI_WORKER_TOKEN_FILE) the Bash guard denies. */
   secretPaths?: readonly string[];
   /** Root for per-run tool-provisioning dirs (PRD #18 M3), OUTSIDE any clone.
-   *  Default: a `provision/` sibling of homeDir on the data volume. */
+   *  Default: a `provision/` sibling of the provisioning HOME on the data volume. */
   provisionRoot?: string;
+  /**
+   * SHARED (worker-lifetime) HOME for the tool-provisioning subprocess — the nix
+   * single-user profile + devbox state that warm-start relies on (PRD #18; PRD #42
+   * Decision 5). Deliberately distinct from the per-run SDK `homeDir`: a per-run
+   * provisioning HOME would give every run a cold nix profile and fragment
+   * warm-start state, while buying nothing (the per-run provision DIR under
+   * `provisionRoot/<runId>` already isolates the synthesized devbox.json, and the
+   * nix store is global). Defaults to `homeDir` for callers (tests) that pass one
+   * HOME and don't provision; main.ts passes the shared root explicitly.
+   */
+  provisionHomeDir?: string;
   /** Devbox provisioning fn (PRD #18 M3). Injected in tests so no real nix egress
    *  happens; default = provisionTools. */
   provision?: typeof provisionTools;
@@ -111,13 +122,19 @@ export class SdkExecutor implements Executor {
   private readonly kill: (pid: number | undefined) => boolean;
   private readonly secretPaths: readonly string[];
   private readonly provisionRoot: string;
+  private readonly provisionHomeDir: string;
   private readonly provision: typeof provisionTools;
-  /** Every pid spawned across the current run's turns, for the done-path reap. */
+  /** Every pid spawned across the current run's turns, for the done-path reap.
+   *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
+   *  4), so two concurrent runs can never wipe/kill each other's set. */
   private readonly spawnedPids = new Set<number>();
 
   /**
-   * @param homeDir pinned HOME (a dir on $UZI_DATA_DIR) so SDK session
-   *   transcripts under $HOME/.claude/projects survive a container restart.
+   * @param homeDir per-run SDK HOME (`agent-home/<runId>` on $UZI_DATA_DIR, PRD #42
+   *   Decision 5) so the SDK's process-global $HOME/.claude state (session
+   *   transcripts, history, todos, shell snapshots) can't race or leak between
+   *   concurrent runs and survives a container restart for resume. The nix/devbox
+   *   provisioning HOME is SEPARATE and shared (opts.provisionHomeDir).
    */
   constructor(
     private readonly log: Logger,
@@ -128,9 +145,13 @@ export class SdkExecutor implements Executor {
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
     this.secretPaths = opts.secretPaths ?? [];
-    // Per-run provisioning dirs live alongside homeDir on the data volume, OUTSIDE
-    // any clone (Decision 3), so the synthesized devbox.json is never repo-borne.
-    this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.homeDir), "provision");
+    // Provisioning HOME + root are SHARED worker-lifetime paths (Decision 5): they
+    // must NOT be derived from the per-run SDK homeDir, or the nix profile/devbox
+    // warm-start state would fragment per run. Per-run provisioning dirs live under
+    // provisionRoot/<runId>, OUTSIDE any clone (Decision 3), so the synthesized
+    // devbox.json is never repo-borne.
+    this.provisionHomeDir = opts.provisionHomeDir ?? this.homeDir;
+    this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.provisionHomeDir), "provision");
     this.provision = opts.provision ?? provisionTools;
   }
 
@@ -172,16 +193,23 @@ export class SdkExecutor implements Executor {
     }
 
     await fs.mkdir(this.homeDir, { recursive: true });
+    // The shared provisioning HOME lives elsewhere on the data volume; ensure it
+    // exists before the install subprocess sets HOME to it (a no-op when it equals
+    // the per-run homeDir, e.g. tests that don't split them).
+    if (this.provisionHomeDir !== this.homeDir) {
+      await fs.mkdir(this.provisionHomeDir, { recursive: true });
+    }
 
     // Tool provisioning (PRD #18 M3): before the SDK starts, install the run's
     // tier-1 (∪ opted-in tier-2) packages in a secret-scrubbed subprocess and fold
     // the resulting (allowlisted) tool env into the SDK env. No packages ⇒ exactly
     // today's behavior. A provision failure FAILS the run — never silent
     // degradation. Shared with the stub executor (provision-run.ts) so the two
-    // never drift.
+    // never drift. HOME here is the SHARED provisioning HOME (warm-start), NOT the
+    // per-run SDK homeDir (Decision 5).
     const { toolEnv, provisionDir } = await provisionRunTools(ctx, {
       provisionRoot: this.provisionRoot,
-      homeDir: this.homeDir,
+      homeDir: this.provisionHomeDir,
       log: this.log,
       provision: this.provision,
     });

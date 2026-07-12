@@ -10,6 +10,7 @@ export function nullLogger(): Logger {
     warn() {},
     error() {},
     addSecret() {},
+    removeSecret() {},
     child() {
       return self;
     },
@@ -30,6 +31,7 @@ export function recordingLogger(): { logger: Logger; lines: unknown[] } {
       warn: (m, f) => record("warn", m, f),
       error: (m, f) => record("error", m, f),
       addSecret() {},
+      removeSecret() {},
       child: (fields) => make({ ...base, ...fields }),
     };
     return self;

@@ -923,7 +923,7 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm"); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "jvm", intp(2)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	want := []string{"fail_over_cap", "requeue_worker", "register"}
@@ -943,6 +943,25 @@ func TestRegisterRecoversOrphansThenComesOnline(t *testing.T) {
 	if !fs.registerParams.TemplateReported.Valid || fs.registerParams.TemplateReported.String != "jvm" {
 		t.Fatalf("register template_reported wrong: %+v", fs.registerParams.TemplateReported)
 	}
+	// The advertised concurrency cap rides into max_concurrent_runs (PRD #42).
+	if !fs.registerParams.MaxConcurrentRuns.Valid || fs.registerParams.MaxConcurrentRuns.Int32 != 2 {
+		t.Fatalf("register max_concurrent_runs wrong: %+v", fs.registerParams.MaxConcurrentRuns)
+	}
+}
+
+func TestRegisterNilCapStoresNull(t *testing.T) {
+	// A worker that advertises no cap (an older image, or M3a before the M2 agent
+	// sends it) ⇒ max_concurrent_runs stays NULL, never 0.
+	w := worker()
+	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if fs.registerParams == nil || fs.registerParams.MaxConcurrentRuns.Valid {
+		t.Fatalf("nil cap must be NULL, got %+v", fs.registerParams.MaxConcurrentRuns)
+	}
 }
 
 func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
@@ -952,13 +971,16 @@ func TestRegisterEmptyTemplateStoresNull(t *testing.T) {
 	fs := &fakeStore{registerResult: store.Worker{ID: w.ID, Status: "online"}}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.Register(context.Background(), w, "1.2.3", ""); err != nil {
+	if _, err := svc.Register(context.Background(), w, "1.2.3", "", nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if fs.registerParams == nil || fs.registerParams.TemplateReported.Valid {
 		t.Fatalf("empty template must be NULL, got %+v", fs.registerParams.TemplateReported)
 	}
 }
+
+// intp returns a pointer to v, for the optional *int register cap param (PRD #42).
+func intp(v int) *int { return &v }
 
 // -------------------------------------------------------------------------
 // Sweeper
