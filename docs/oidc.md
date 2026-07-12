@@ -116,6 +116,27 @@ login from that user to `/login?error=oidc_forbidden`. There is no override.
   complete Pocket ID's own email-verification flow. Either way flips the
   per-user flag that uzi checks.
 
+## Development setups
+
+Running `api` in a container while the IdP listens on the **host's**
+loopback (`127.0.0.1`) does not work: inside the container, `127.0.0.1` is
+the container itself, not the host, so the discovery dial refuses (observed:
+`oidc discovery failed at boot; SSO is configured but degraded` followed by
+`dial tcp 127.0.0.1:8081: connection refused` in the API logs, and every
+login attempt bouncing to `oidc_exchange`). Pointing `UZI_OIDC_ISSUER_URL` at
+a container-reachable host alias instead (e.g. `http://host.docker.internal:8081`)
+doesn't work either — by design the issuer must be `https://` except for a
+loopback host, and `host.docker.internal` isn't loopback. Two topologies
+actually work for local development: run **both** `api` and the IdP on the
+host's own loopback with no container boundary between them, or give the dev
+IdP a real `https://` endpoint. Production is unaffected by any of this — the
+issuer there is always `https://`.
+
+**TLS**: uzi verifies the IdP's certificate against the container's system
+trust store; there is no custom-CA configuration knob. A self-signed dev
+certificate will not verify unless that CA is added to the `api`
+image/container's own trust store.
+
 ## IdP outage: break-glass
 
 If `UZI_PASSWORD_LOGIN_ENABLED=false` (SSO-only) and the IdP is unreachable,
