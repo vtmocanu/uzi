@@ -47,6 +47,7 @@ services:
       UZI_OIDC_CLIENT_SECRET: ${UZI_OIDC_CLIENT_SECRET:-}
       UZI_OIDC_SCOPES: ${UZI_OIDC_SCOPES:-openid profile email}
       UZI_OIDC_PROVIDER_NAME: ${UZI_OIDC_PROVIDER_NAME:-SSO}
+      UZI_OIDC_HTTP_TIMEOUT: ${UZI_OIDC_HTTP_TIMEOUT:-15s}
       # Forge integration (PRD #2). Base URLs are an SSRF allowlist; the sync
       # engine polls each enabled repo on FORGE_POLL_INTERVAL.
       FORGE_ALLOWED_BASE_URLS: ${FORGE_ALLOWED_BASE_URLS:-https://gitlab.example.com}
