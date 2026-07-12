@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -149,6 +150,17 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 	}
 	if len(readRecs) != 1 || readRecs[0].Category != "improve_agent" || readRecs[0].Target != "coder" {
 		t.Fatalf("read-back recommendations wrong (want the single post-re-judge rec): %+v", readRecs)
+	}
+
+	// ── trace/review authz: a TERMINAL judge run is no longer "active" ──
+	// GetActiveJudgeRunForWorkerTarget filters status NOT IN (completed,failed,
+	// cancelled), so once the judge run finishes the worker can no longer stream the
+	// target's trace or post another review under it (M6 matrix: "terminal judge run").
+	mustExec(ctx, t, pool, `UPDATE runs SET status = 'completed' WHERE id = $1`, judge.ID)
+	if _, err := q.GetActiveJudgeRunForWorkerTarget(ctx, store.GetActiveJudgeRunForWorkerTargetParams{
+		WorkerID: pgtype.UUID{Bytes: workerID, Valid: true}, TargetRunID: pgtype.UUID{Bytes: targetID, Valid: true},
+	}); err != pgx.ErrNoRows {
+		t.Fatalf("a terminal judge run must not resolve as active (want ErrNoRows), got %v", err)
 	}
 }
 
