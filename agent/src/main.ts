@@ -3,7 +3,7 @@ import { loadConfig } from "./config.js";
 import { createLogger, type Logger } from "./log.js";
 import { WorkerClient } from "./client.js";
 import { GitCache } from "./git.js";
-import { StubExecutor, type Executor } from "./executor.js";
+import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
 import { ChatExecutor } from "./chat-executor.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
@@ -46,16 +46,25 @@ async function main(): Promise<void> {
   // The runId keeps it stable across resume (a requeue keeps the run_id) and the
   // runner removes it on terminal.
   const makeExecutor: ExecutorFactory = (runId) => {
+    // The stub has no SDK $HOME (no session transcript to isolate); its only homeDir
+    // use is the provisioning subprocess HOME, which stays SHARED (warm-start) like
+    // the SDK executor's. So the stub keeps the shared root and there is nothing
+    // per-run to clean (homeDir omitted from the RunExecution).
+    if (config.executor === "stub") {
+      return { executor: new StubExecutor(log, { planGate: config.stubPlanGate, homeDir: sdkHomeRoot }) };
+    }
     const runHome = path.join(sdkHomeRoot, runId);
-    const executor: Executor =
-      config.executor === "stub"
-        ? new StubExecutor(log, { planGate: config.stubPlanGate, homeDir: runHome })
-        : new SdkExecutor(log, runHome, {
-            // Deny a Bash `cat` of the join-token file (a read-only secret mount
-            // persists it); the built-in /run/secrets/ prefix already covers the
-            // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path.
-            secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
-          });
+    const executor = new SdkExecutor(log, runHome, {
+      // Deny a Bash `cat` of the join-token file (a read-only secret mount
+      // persists it); the built-in /run/secrets/ prefix already covers the
+      // shipping default, this adds a non-default UZI_WORKER_TOKEN_FILE path.
+      secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
+      // The nix/devbox provisioning HOME + root stay SHARED worker-lifetime paths
+      // (Decision 5): only the SDK $HOME (runHome) is per-run, so warm-start state
+      // doesn't fragment per run. The per-run provision DIR still isolates the
+      // synthesized devbox.json.
+      provisionHomeDir: sdkHomeRoot,
+    });
     return { executor, homeDir: runHome };
   };
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
@@ -77,10 +86,16 @@ async function main(): Promise<void> {
   // written under — a per-run HOME would file it under the new run_id and break
   // resume. Chat is read-only (no clone, no PAT, no Bash), so the process-global
   // $HOME/.claude races that per-run HOME closes for runs don't apply the same way.
-  const chatExecutor = new ChatExecutor(log, sdkHomeRoot, {
-    secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
-  });
-  const chatRunner = new ChatRunner(client, chatExecutor, log, config.messageBatchMs, {
+  // Per-session executor factory (PRD #42 Decision 4, chat lane): each chat session
+  // gets its OWN ChatExecutor so its spawnedPids/reap are private (no sharing at
+  // WORKER_CHAT_SESSIONS>1). All sessions share the SDK HOME (sdkHomeRoot) — a
+  // Continue resumes the same session under a new run_id, so per-run HOME would
+  // break chat resume.
+  const makeChatExecutor = (): ChatExecutor =>
+    new ChatExecutor(log, sdkHomeRoot, {
+      secretPaths: config.workerTokenFile ? [config.workerTokenFile] : [],
+    });
+  const chatRunner = new ChatRunner(client, makeChatExecutor, log, config.messageBatchMs, {
     maxTurns: config.chatMaxTurns,
     turnTimeoutMs: config.chatTurnTimeoutMs,
     idleTimeoutMs: config.chatIdleTimeoutMs,
