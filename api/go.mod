@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/coder/websocket v1.8.14
+	github.com/coreos/go-oidc/v3 v3.14.1
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
@@ -12,9 +13,11 @@ require (
 	github.com/slack-go/slack v0.27.0
 	gitlab.com/gitlab-org/api/client-go/v2 v2.44.0
 	golang.org/x/crypto v0.53.0
+	golang.org/x/oauth2 v0.36.0
 )
 
 require (
+	github.com/go-jose/go-jose/v4 v4.0.5 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
@@ -25,7 +28,6 @@ require (
 	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect

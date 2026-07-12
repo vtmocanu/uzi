@@ -16,6 +16,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/oidc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
@@ -55,6 +56,11 @@ type Handler struct {
 	// legacy master-box behavior and the vault endpoints report "no gate", so tests
 	// that don't exercise the vault need no change.
 	vault *vault.Vault
+	// oidc is the OIDC relying party (PRD #45). Optional (nil when UZI_OIDC_* is
+	// unset): the login/callback handlers use it and AuthConfig reports whether it is
+	// configured. Discovery is lazy + cached inside the provider, so a boot-time IdP
+	// blip leaves it degraded (login retries) rather than crashing the API.
+	oidc *oidc.Provider
 	// slackValidator live-validates Slack tokens on save (PRD #25 M1). Optional:
 	// nil falls back to the real slacksvc.Validator (see slackVal); tests inject a
 	// fake so the settings PUT is exercised without a network call to Slack.
@@ -140,6 +146,11 @@ func (h *Handler) SetReconciler(r Reconciler) { h.reconciler = r }
 // the API and a claim by the worker see one DEK cache. Leaving it unset keeps the
 // legacy master-box secret behavior (used by tests that don't exercise the vault).
 func (h *Handler) SetVault(v *vault.Vault) { h.vault = v }
+
+// SetOIDC wires the OIDC relying party (PRD #45). Call once at startup when
+// UZI_OIDC_* is configured; leaving it nil keeps OIDC dormant (the login/callback
+// endpoints report the feature as unconfigured and AuthConfig sets oidc_enabled=false).
+func (h *Handler) SetOIDC(p *oidc.Provider) { h.oidc = p }
 
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
 // password hash or token_version.

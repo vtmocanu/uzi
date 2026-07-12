@@ -36,6 +36,17 @@ services:
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://127.0.0.1:8080}
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
       RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-1m}
+      # OIDC single sign-on (PRD #45). Without these lines every UZI_OIDC_*/
+      # UZI_PASSWORD_LOGIN_ENABLED var in .env is inert — config.Load reads the api
+      # container env, which compose must wire in from .env. Setting the issuer (plus
+      # client id/secret, all-or-nothing) enables "Sign in with SSO"; the redirect URI
+      # is FRONTEND_ORIGIN + /api/auth/oidc/callback. See docs/oidc.md.
+      UZI_PASSWORD_LOGIN_ENABLED: ${UZI_PASSWORD_LOGIN_ENABLED:-true}
+      UZI_OIDC_ISSUER_URL: ${UZI_OIDC_ISSUER_URL:-}
+      UZI_OIDC_CLIENT_ID: ${UZI_OIDC_CLIENT_ID:-}
+      UZI_OIDC_CLIENT_SECRET: ${UZI_OIDC_CLIENT_SECRET:-}
+      UZI_OIDC_SCOPES: ${UZI_OIDC_SCOPES:-openid profile email}
+      UZI_OIDC_PROVIDER_NAME: ${UZI_OIDC_PROVIDER_NAME:-SSO}
       # Forge integration (PRD #2). Base URLs are an SSRF allowlist; the sync
       # engine polls each enabled repo on FORGE_POLL_INTERVAL.
       FORGE_ALLOWED_BASE_URLS: ${FORGE_ALLOWED_BASE_URLS:-https://gitlab.example.com}
