@@ -36,6 +36,13 @@ services:
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://127.0.0.1:8080}
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
       RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-1m}
+      # Registration policy. Without these lines both vars are inert — config.Load
+      # reads the api container env, so the .env allowlist that fences OIDC JIT
+      # provisioning (audit M2) would silently do nothing. Empty allowlist = no domain
+      # restriction (config.parseEmailDomains -> nil, emailDomainAllowed allows all);
+      # registration defaults on. Defaults match config.go.
+      UZI_ALLOWED_EMAIL_DOMAINS: ${UZI_ALLOWED_EMAIL_DOMAINS:-}
+      UZI_REGISTRATION_ENABLED: ${UZI_REGISTRATION_ENABLED:-true}
       # OIDC single sign-on (PRD #45). Without these lines every UZI_OIDC_*/
       # UZI_PASSWORD_LOGIN_ENABLED var in .env is inert — config.Load reads the api
       # container env, which compose must wire in from .env. Setting the issuer (plus
