@@ -306,6 +306,18 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvem
 - Judge recommends; only the job acts. Judge never auto-creates MRs.
   [user 2026-07-12]
 
+## Feature #45 — OIDC SSO login (Keycloak / Pocket ID)
+
+Tracked as GitLab issue vtmocanu/uzi#45; PRD at `prds/45-oidc-sso-login.md`.
+
+- SSO login against a single external OIDC provider — Keycloak (work) and Pocket ID (homelab) are the two supported targets. [user 2026-07-12]
+- One provider, env-configured (not multi-provider, no in-app provider config). [user 2026-07-12]
+- Coexists with email+password login; a `UZI_PASSWORD_LOGIN_ENABLED` kill-switch lets operators go SSO-only. [user 2026-07-12]
+- JIT provisioning: first SSO login auto-creates the user; an existing account is linked by verified email. [user 2026-07-12]
+- Admin stays uzi-managed (existing first-user-is-admin rule); no groups/roles-claim mapping this iteration. [user 2026-07-12]
+- Operator docs include step-by-step walkthroughs for BOTH Keycloak and Pocket ID. [user 2026-07-12]
+- Supersedes the earlier "SSO with Keycloak" deferral in the Deferred list. [user 2026-07-12]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
@@ -322,5 +334,4 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvem
   specs/ai.md §168]
 - Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
 - Forgejo driver (interface is forge-generic; GitLab implemented first).
-- SSO with Keycloak.
 - Agent runtime/execution (spawn, file writes, Anthropic API calls) — PRD #4.
