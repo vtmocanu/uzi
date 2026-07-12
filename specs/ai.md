@@ -877,7 +877,7 @@ M2 builds the container + protocol + git around a stub executor).
   state → immediately try the next slot; otherwise wait `WORKER_POLL_INTERVAL` (3s).
   **Bounded by the cap, default 1** (PRD #42 / ADR-42, landed after M2): a
   worker-side slot semaphore (`WORKER_MAX_CONCURRENT_RUNS`) claims a run only when a
-  slot is free, so at the default cap this is byte-identical to the original
+  slot is free, so at the default cap this is observably identical to the original
   one-run-at-a-time M2 loop.
 - **Config** (`config.ts`, from env): `UZI_API_URL`, `UZI_WORKER_TOKEN`, `UZI_DATA_DIR`
   (default `/data`), `UZI_WORKER_NAME` (default hostname), plus interval knobs that
