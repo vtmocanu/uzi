@@ -11,14 +11,26 @@
 
 import type { Logger } from "./log.js";
 import type { ChatContext, ChatEndReason, ChatExecutorLike, ChatExecutorResult } from "./chat-executor.js";
+import type { ToolTextResult, UziToolHandlers } from "./uzi-tools.js";
 
-/**
- * Sentinel in a user message that makes the stub DRAFT an issue via the real
- * propose_issue handler (create the pending proposal + emit the card), so the e2e
- * can drive propose → card → confirm with no live model:
- *
- *   "UZI_STUB_PROPOSE <repo_path> [title words...]"
- */
+// Deterministic sentinels the e2e puts in a chat message to drive the stub through
+// the REAL uzi tools with no live model. Documented for the tester (task #22):
+//
+//   "UZI_STUB_READ [<run_id>]"
+//     → the stub calls the real list_runs handler (a genuine tool result lands in the
+//       feed) and, when a run_id is given, get_run_messages(run_id) too. Both outputs
+//       are the evidence-fenced text the tools produce, emitted as tool_result run
+//       messages — so the M5 red-team leg can seed a poisoned run message/title and
+//       assert it comes back QUOTED inside the nonce fence, never as a bare instruction.
+//
+//   "UZI_STUB_PROPOSE <repo_path> [title words...]"
+//     → the stub calls the real propose_issue handler (createProposal → issue_proposals
+//       row + the `proposal` card emit), so the e2e can drive propose → card → confirm.
+//       repo_path comes from the message (the tester passes a repo the seed user owns);
+//       omit it and the tool returns its "needs the target repo" guidance (no card).
+//
+// A non-sentinel message just gets a canned "stub chat reply to: <msg>".
+export const STUB_CHAT_READ = "UZI_STUB_READ";
 export const STUB_CHAT_PROPOSE = "UZI_STUB_PROPOSE";
 
 export class StubChatExecutor implements ChatExecutorLike {
@@ -60,28 +72,64 @@ export class StubChatExecutor implements ChatExecutorLike {
     return { turns, endReason, sessionId };
   }
 
-  /** Answer one turn: a canned reply, or — on the propose sentinel — the real
-   *  propose_issue handler (pending proposal + card). */
+  /** Answer one turn: on a sentinel, invoke the REAL uzi tools (read and/or propose);
+   *  otherwise a canned reply. A message may carry both sentinels; each is handled
+   *  independently. Always closes with a result frame (a feed turn boundary). */
   private async answer(ctx: ChatContext, message: string): Promise<void> {
-    const at = message.indexOf(STUB_CHAT_PROPOSE);
-    if (at >= 0 && ctx.uziTools) {
-      const rest = message.slice(at + STUB_CHAT_PROPOSE.length).trim().split(/\s+/).filter(Boolean);
-      const repoPath = rest[0];
-      const title = rest.slice(1).join(" ") || "stub proposed issue";
-      const res = await ctx.uziTools.proposeIssue({
-        repo_path: repoPath,
-        title,
-        description: "Proposed by the stub chat executor for the e2e.",
-        labels: [],
-      });
-      const text = res.isError
-        ? String(res.content[0]?.text ?? "could not draft the issue")
-        : "I drafted an issue proposal for you — click Create on the card to open it.";
-      ctx.emit({ kind: "text", agent: "lead", payload: { text } });
-    } else {
+    let handled = false;
+    if (ctx.uziTools && message.includes(STUB_CHAT_READ)) {
+      await this.doRead(ctx, ctx.uziTools, tailAfter(message, STUB_CHAT_READ));
+      handled = true;
+    }
+    if (ctx.uziTools && message.includes(STUB_CHAT_PROPOSE)) {
+      await this.doPropose(ctx, ctx.uziTools, tailAfter(message, STUB_CHAT_PROPOSE));
+      handled = true;
+    }
+    if (!handled) {
       ctx.emit({ kind: "text", agent: "lead", payload: { text: `stub chat reply to: ${message}` } });
     }
-    // Mirror the real executor's terminal result frame so the feed shows a turn boundary.
     ctx.emit({ kind: "status", agent: "lead", payload: { event: "result", subtype: "success" } });
   }
+
+  /** Call the real read tools; emit their (evidence-fenced) output as tool_result run
+   *  messages, so a genuine tool result — and any poisoned run content, still quoted
+   *  inside the nonce fence — lands in the feed. */
+  private async doRead(ctx: ChatContext, tools: UziToolHandlers, args: string[]): Promise<void> {
+    const list = await tools.listRuns({});
+    ctx.emit({ kind: "tool_result", agent: "lead", payload: { tool_use_id: "stub-list_runs", content: resultText(list) } });
+    const runId = args[0];
+    if (runId) {
+      const msgs = await tools.getRunMessages({ run_id: runId });
+      ctx.emit({ kind: "tool_result", agent: "lead", payload: { tool_use_id: "stub-get_run_messages", content: resultText(msgs) } });
+    }
+    ctx.emit({ kind: "text", agent: "lead", payload: { text: "I looked at your runs (stub)." } });
+  }
+
+  /** Call the real propose_issue handler (pending proposal + card). */
+  private async doPropose(ctx: ChatContext, tools: UziToolHandlers, args: string[]): Promise<void> {
+    const repoPath = args[0];
+    const title = args.slice(1).join(" ") || "stub proposed issue";
+    const res = await tools.proposeIssue({
+      repo_path: repoPath,
+      title,
+      description: "Proposed by the stub chat executor for the e2e.",
+      labels: [],
+    });
+    const text = res.isError
+      ? resultText(res)
+      : "I drafted an issue proposal for you — click Create on the card to open it.";
+    ctx.emit({ kind: "text", agent: "lead", payload: { text } });
+  }
+}
+
+/** Tokens after a sentinel occurrence in a message (whitespace-split, empties dropped). */
+function tailAfter(message: string, sentinel: string): string[] {
+  const i = message.indexOf(sentinel);
+  if (i < 0) return [];
+  return message.slice(i + sentinel.length).trim().split(/\s+/).filter(Boolean);
+}
+
+/** The text a tool handler returned (the evidence-fenced payload for a read tool). */
+function resultText(r: ToolTextResult): string {
+  return String(r.content[0]?.text ?? "");
 }
