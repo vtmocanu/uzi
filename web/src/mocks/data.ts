@@ -1117,7 +1117,6 @@ export const mockProposals: IssueProposal[] = [
   {
     id: "prop-metrics-1",
     run_id: CHAT_2,
-    repo_id: "repo-uzi",
     repo_path: "vtmocanu/uzi",
     title: "Add a worker metrics dashboard",
     description:

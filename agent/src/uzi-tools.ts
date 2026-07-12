@@ -167,17 +167,16 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
         });
         // Emit the proposal CARD to the live stream (worker owns the seq). The browser
         // renders Create/Dismiss keyed on payload.id; without this emit the proposal
-        // would only reach the model, never the UI (the card contract). The pending
-        // proposal has no created issue yet; repo_path is the human path the user saw
+        // would only reach the model, never the UI (the card contract). The payload is
+        // exactly the web IssueProposal shape: a pending proposal carries no
+        // created-issue/resolved fields (the browser fills those from the confirm
+        // response, not this payload). repo_path is the human path the user saw
         // (server-resolved to repo_id on success), empty only if a bare repo_id was used.
         emit({
           kind: "proposal",
           payload: {
             ...proposal,
             repo_path: args.repo_path ?? "",
-            created_issue_iid: null,
-            created_issue_url: null,
-            resolved_at: null,
           },
         });
         return asText(
