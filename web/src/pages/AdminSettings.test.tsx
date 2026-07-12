@@ -25,6 +25,8 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   prdless_label: "PRDLESS",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
+  judge_enabled: "false",
+  judge_model: "haiku",
   ...over,
 });
 
@@ -249,5 +251,40 @@ describe("AdminSettings", () => {
     );
     // The app token was left blank, so it is NOT sent.
     expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("slack_app_token");
+  });
+});
+
+describe("AdminSettings — run judge (PRD #46)", () => {
+  it("loads the current global toggle and judge model", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "sonnet" }));
+    renderPage();
+    const toggle = (await screen.findByLabelText(/Enable the run judge for this instance/i)) as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+    expect((screen.getByLabelText("Judge model") as HTMLInputElement).value).toBe("sonnet");
+  });
+
+  it("saves the global toggle and judge model together", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ judge_enabled: "true", judge_model: "opus" }));
+    renderPage();
+    await screen.findByLabelText(/Enable the run judge for this instance/i);
+    fireEvent.click(screen.getByLabelText(/Enable the run judge for this instance/i));
+    fireEvent.change(screen.getByLabelText("Judge model"), { target: { value: "opus" } });
+
+    const btn = screen.getByRole("button", { name: /save run judge settings/i }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ judge_enabled: "true", judge_model: "opus" }),
+    );
+  });
+
+  it("blocks an empty judge model client-side without calling the API", async () => {
+    renderPage();
+    await screen.findByLabelText("Judge model");
+    fireEvent.change(screen.getByLabelText("Judge model"), { target: { value: "  " } });
+    fireEvent.click(screen.getByRole("button", { name: /save run judge settings/i }));
+    expect(await screen.findByText(/judge model must not be empty/i)).toBeTruthy();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 });

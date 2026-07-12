@@ -56,6 +56,22 @@ export function Settings() {
     }
   };
 
+  const [judgeBusy, setJudgeBusy] = useState(false);
+  const [judgeError, setJudgeError] = useState("");
+
+  const toggleJudge = async (enabled: boolean) => {
+    setJudgeError("");
+    setJudgeBusy(true);
+    try {
+      await api.setJudgeEnabled(enabled);
+      await refresh();
+    } catch (err) {
+      setJudgeError(err instanceof ApiError ? err.message : "Failed to update run judge");
+    } finally {
+      setJudgeBusy(false);
+    }
+  };
+
   // Worker model: "" = inherit. savedModel is the persisted value, so Save is
   // only offered when the picker differs from what is stored.
   const [defaultModel, setDefaultModel] = useState("");
@@ -305,6 +321,32 @@ export function Settings() {
             onChange={(e) => toggleAutopilot(e.target.checked)}
           />
           <span className="text-fg">Enable autopilot for my account</span>
+        </label>
+      </Card>
+
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>Run judge</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            With the run judge on, each of your <strong className="text-fg">finished</strong> runs is
+            reviewed by an LLM on <strong className="text-fg">your own Anthropic tokens</strong>. It reads
+            the run trace and produces a verdict plus recommendations (a missing worker tool, an agent or
+            template to improve, and so on) in your inbox — it only recommends, and never changes code. Your
+            instance admin also has to enable the feature globally for anything to run. Off by default.
+          </p>
+        </div>
+
+        {judgeError && <Alert message={judgeError} />}
+
+        <label className="flex items-center gap-3 text-sm">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={user?.judge_enabled ?? false}
+            disabled={judgeBusy}
+            onChange={(e) => toggleJudge(e.target.checked)}
+          />
+          <span className="text-fg">Judge my finished runs</span>
         </label>
       </Card>
 

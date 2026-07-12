@@ -82,6 +82,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   prdless_label: "PRDLESS",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
+  judge_enabled: "false",
+  judge_model: "haiku",
 };
 
 interface PersistedSettings {
@@ -112,7 +114,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.prdless_enabled === "string" &&
     typeof a.prdless_label === "string" &&
     typeof a.slack_enabled === "string" &&
-    typeof a.public_base_url === "string";
+    typeof a.public_base_url === "string" &&
+    typeof a.judge_enabled === "string" &&
+    typeof a.judge_model === "string";
   return okUser && okApp;
 }
 
@@ -340,12 +344,20 @@ export const mockApi = {
         nonSecret.default_theme = value;
         continue;
       }
-      // prdless_enabled / slack_enabled are strict bools, not labels.
-      if (key === "prdless_enabled" || key === "slack_enabled") {
+      // prdless_enabled / slack_enabled / judge_enabled are strict bools, not labels.
+      if (key === "prdless_enabled" || key === "slack_enabled" || key === "judge_enabled") {
         if (value !== "true" && value !== "false") {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
         (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      // judge_model is a model alias (PRD #46): non-empty single token, mirroring the
+      // server's PRD #17 ValidateModel rules.
+      if (key === "judge_model") {
+        if (value.trim() === "") throw new ApiError(400, "judge_model: must not be empty");
+        if (/\s/.test(value)) throw new ApiError(400, "judge_model: must be a single token with no spaces");
+        nonSecret.judge_model = value;
         continue;
       }
       // public_base_url must be http(s) (PRD #25).
@@ -385,6 +397,21 @@ export const mockApi = {
     const u = requireSession();
     u.autopilot_enabled = enabled;
     return delay({ user: { ...u } }, 200);
+  },
+
+  // ── Run-judge opt-in (PRD #46) ───────────────────────────────────────────────
+  // Own-user (session identity, never a body id, mirroring the server's audit H3).
+  setJudgeEnabled: async (enabled: boolean) => {
+    const u = requireSession();
+    u.judge_enabled = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+  // Admin per-user toggle: target from the id argument (the path on the server).
+  setUserJudgeEnabled: async (id: string, enabled: boolean) => {
+    const u = users.find((x) => x.id === id);
+    if (!u) throw new ApiError(404, "user not found");
+    u.judge_enabled = enabled;
+    return delay({ user: { ...u } });
   },
 
   // ── Secrets ─────────────────────────────────────────────────────────────────

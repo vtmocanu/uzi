@@ -322,6 +322,8 @@ export function AdminSettings() {
         )}
       </Card>
 
+      {!loading && saved && <JudgeSettingsCard settings={saved} onSaved={applyResponse} />}
+
       {!loading && saved && (
         <SlackSettingsCard
           settings={saved}
@@ -332,6 +334,101 @@ export function AdminSettings() {
         />
       )}
     </div>
+  );
+}
+
+// JudgeSettingsCard is the admin surface for the run judge (PRD #46): the global
+// on/off kill-switch plus the cheap model the judge runs on. It saves independently
+// of the label form (like the Slack card). A user still has to opt IN under their
+// own Settings, and the judge always spends that user's tokens — this card only
+// arms the feature instance-wide. The self-improvement settings land in M5.
+function JudgeSettingsCard({
+  settings,
+  onSaved,
+}: {
+  settings: AppSettings;
+  onSaved: (resp: SettingsResponse) => void;
+}) {
+  const [enabled, setEnabled] = useState(settings.judge_enabled === "true");
+  const [model, setModel] = useState(settings.judge_model);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const dirty = (enabled ? "true" : "false") !== settings.judge_enabled || model !== settings.judge_model;
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    if (model.trim() === "") {
+      setError("The judge model must not be empty.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const resp = await api.updateSettings({
+        judge_enabled: enabled ? "true" : "false",
+        judge_model: model,
+      });
+      onSaved(resp);
+      setEnabled(resp.settings.judge_enabled === "true");
+      setModel(resp.settings.judge_model);
+      setNotice("Run judge settings saved.");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save run judge settings");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card className="space-y-5">
+      <div>
+        <SectionTitle>Run judge</SectionTitle>
+        <p className="mt-2 text-sm text-muted">
+          When on, every finished run of an opted-in user is reviewed by an LLM on{" "}
+          <strong className="text-fg">that user&rsquo;s own Anthropic tokens</strong>, producing a verdict
+          and recommendations in their inbox. This switch arms the feature instance-wide; each user still
+          opts in under their own Settings. Off by default.
+        </p>
+      </div>
+
+      {error && <Alert message={error} />}
+      {notice && <Alert tone="success" message={notice} />}
+
+      <form onSubmit={save} className="space-y-4">
+        <label className="flex cursor-pointer select-none items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="h-4 w-4 rounded border-edge accent-brand"
+          />
+          Enable the run judge for this instance
+        </label>
+
+        <div className="space-y-1.5">
+          <Field label="Judge model">
+            <Input
+              value={model}
+              maxLength={100}
+              autoComplete="off"
+              placeholder="haiku"
+              onChange={(e) => setModel(e.target.value)}
+            />
+          </Field>
+          <p className="text-xs text-faint">
+            The Claude model the judge runs on. A retrospective is a single trace round-trip, so the cheap
+            default (<code className="rounded bg-raised px-1 py-0.5 text-fg">haiku</code>) is usually right.
+          </p>
+        </div>
+
+        <Button type="submit" disabled={busy || !dirty}>
+          {busy ? "Saving…" : "Save run judge settings"}
+        </Button>
+      </form>
+    </Card>
   );
 }
 

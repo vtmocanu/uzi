@@ -21,6 +21,9 @@ export interface User {
   // autopilot_enabled is the per-user opt-in to unattended autopilot runs (PRD #19
   // M3). Default false; toggled from the user's own Settings page.
   autopilot_enabled: boolean;
+  // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
+  // false; the user toggles their own from Settings, an admin can force any user's.
+  judge_enabled: boolean;
   created_at: string;
   last_login: string | null;
 }
@@ -377,6 +380,11 @@ export interface AppSettings {
   // `secrets` on SettingsResponse.
   slack_enabled: string;
   public_base_url: string;
+  // Run-judge keys (PRD #46). judge_enabled is the global kill-switch (text
+  // "true"/"false"); judge_model is the cheap model alias the judge runs on. The
+  // self-improvement keys are engine-managed and NOT surfaced here.
+  judge_enabled: string;
+  judge_model: string;
 }
 
 // SettingSource reports where a setting's effective value comes from (PRD #25):
@@ -831,6 +839,10 @@ const realApi = {
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
+  // Admin per-user run-judge toggle (PRD #46): force any user's opt-in. Actor is
+  // admin (route-gated); target is the path id, never the body. Returns the user.
+  setUserJudgeEnabled: (id: string, enabled: boolean) =>
+    request<{ user: User }>("PUT", `/admin/users/${id}/judge`, { enabled }),
   getSettings: () => request<SettingsResponse>("GET", "/admin/settings"),
   updateSettings: (settings: UpdateSettingsPayload) =>
     request<SettingsResponse>("PUT", "/admin/settings", { settings }),
@@ -840,6 +852,10 @@ const realApi = {
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  // Flip the current user's run-judge opt-in (PRD #46). Session identity only —
+  // the body carries no user id. Returns the updated user.
+  setJudgeEnabled: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/judge", { enabled }),
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),

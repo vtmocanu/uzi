@@ -50,6 +50,8 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           prdless_label: "NOSPEC",
           slack_enabled: "true",
           public_base_url: "https://uzi.example",
+          judge_enabled: "false",
+          judge_model: "haiku",
         },
       }),
     });
