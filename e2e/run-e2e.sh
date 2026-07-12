@@ -1353,6 +1353,90 @@ curl -fsS -b "$JAR2" -X POST "$BASE/api/vault/unlock" -H 'Content-Type: applicat
 pass "lazy rewrap on unlock: user2's row flipped 'master' -> 'dek'; admin count back to 0"
 
 # =============================================================================
+# PRD #46 — run judge + notifications inbox, end to end. UZI_E2E_EXECUTOR=stub
+# selects the STUB judge queryFn (judge-runner-stub.ts): the judge model call makes
+# NO network request and returns an error result, so JudgeRunner deterministically
+# posts its command-not-found FALLBACK — a real review with a dummy token and ZERO
+# Anthropic spend. Two phases:
+#   A. funnel: enable the judge (global kill-switch + admin opt-in), finish an issue
+#      run → the committed-terminal funnel enqueues a `judge` run → the worker claims
+#      it (repo-less, Anthropic-only claim: no forge PAT) → fetches the trace via the
+#      judge-scoped endpoint → posts a review → a PERSIST-FIRST inbox notification
+#      lands for the reviewed run.
+#   B. deterministic tool naming + re-run UPSERT: plant a `jq: command not found`
+#      tool_result in the target's trace, fire the M4 re-run-judge action, and assert
+#      the replacement review UPSERTs the SAME single row to name install_worker_tool
+#      'jq' — the "names the missing tool even if the LLM call fails" success
+#      criterion, proven with no model. Judge is turned OFF again at the end so the
+#      later concurrency section's capacity math is unaffected.
+# =============================================================================
+say "PRD #46: run judge (stub) — funnel enqueue -> review -> notification -> re-run names the missing tool"
+
+login   # fresh admin session; login also unlocks the admin's vault (the dummy token is DEK-sealed)
+[ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = true ] \
+  || fail "PRD #46: the admin vault must be unlocked so the worker can open the token at judge claim"
+apiput /api/admin/settings '{"settings":{"judge_enabled":"true","judge_model":"haiku"}}' >/dev/null
+[ "$(apiput /api/me/judge '{"enabled":true}' | jq -r '.user.judge_enabled')" = true ] \
+  || fail "PRD #46: PUT /api/me/judge did not enable the per-user opt-in"
+pass "judge enabled (global kill-switch + admin opt-in); dummy token present; vault unlocked"
+
+# --- Phase A: a finished run is auto-judged; a review + notification land ---
+J_IID="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E judge target","description":"judge e2e — implements prds/46-run-judge-self-improvement.md"}' \
+  | jq -r '.card.iid')"
+J_RUN="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$J_IID}" | jq -r '.run.id')"
+wait_status "$J_RUN" awaiting_approval 90
+apipost "/api/runs/$J_RUN/inputs" '{"kind":"approve_plan","body":"","selection":{"source":"repo","exclusions":[]}}' >/dev/null
+wait_status "$J_RUN" completed 120
+pass "target issue run $J_RUN completed (the run the judge reviews)"
+
+# wait_review RUN [TIMEOUT] — poll the M4 owner-scoped review endpoint until a review lands.
+wait_review() {
+  local run="$1" deadline=$((SECONDS + ${2:-120}))
+  while [ $SECONDS -lt $deadline ]; do
+    [ -n "$(apiget "/api/runs/$run/review" | jq -r '.review.id // empty')" ] && return 0
+    sleep 2
+  done
+  fail "PRD #46: no judge review ever landed for run $run"
+}
+wait_review "$J_RUN" 120
+[ "$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.status')" = failed ] \
+  || fail "PRD #46: the stub judge must post a fallback review (status=failed)"
+pass "funnel: the finished run was auto-judged; a review landed on the run-page endpoint (stub fallback, status=failed)"
+
+# The judge run is repo-less — the observable proxy for its Anthropic-only/no-PAT claim
+# (the wire-level no-PAT assertion is TestClaimJudgeWireCarriesNoPATValue).
+J_JUDGE="$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$J_RUN' ORDER BY created_at DESC LIMIT 1")"
+[ -n "$J_JUDGE" ] || fail "PRD #46: no judge run row for target $J_RUN"
+[ "$(db_psql "SELECT repo_id IS NULL FROM runs WHERE id='$J_JUDGE'")" = t ] \
+  || fail "PRD #46: the judge run must be repo-less (no repo join, no forge PAT in its claim)"
+pass "judge run $J_JUDGE is repo-less (Anthropic-only claim; no forge PAT)"
+
+# Persist-first: the review POST created an inbox notification anchored to the reviewed run.
+[ "$(apiget /api/notifications | jq --arg r "$J_RUN" '[.notifications[] | select(.run_id==$r and .kind=="judge_review")] | length')" -ge 1 ] \
+  || fail "PRD #46: no judge_review inbox notification for the reviewed run (persist-first delivery)"
+pass "persist-first: a judge_review inbox notification landed for the reviewed run"
+
+# --- Phase B: plant a missing-tool signal, re-run the judge, assert it names the tool ---
+J_SEQ="$(db_psql "SELECT COALESCE(MAX(seq),0)+1 FROM run_messages WHERE run_id='$J_RUN'")"
+db_psql "INSERT INTO run_messages (run_id, seq, kind, agent, payload) VALUES ('$J_RUN', $J_SEQ, 'tool_result', 'coder', '{\"content\":\"bash: jq: command not found\"}'::jsonb)" >/dev/null
+J_REJUDGE="$(apipost "/api/runs/$J_RUN/rejudge" '' | jq -r '.run.id')"
+{ [ -n "$J_REJUDGE" ] && [ "$J_REJUDGE" != null ]; } || fail "PRD #46: re-run judge did not create a judge run"
+wait_status "$J_REJUDGE" completed 90
+apiget "/api/runs/$J_RUN/review" \
+  | jq -e '.review.recommendations[] | select(.category=="install_worker_tool" and .target=="jq")' >/dev/null \
+  || fail "PRD #46: the re-run judge review must name install_worker_tool 'jq' from the planted command-not-found"
+[ "$(db_psql "SELECT count(*) FROM run_reviews WHERE target_run_id='$J_RUN'")" = 1 ] \
+  || fail "PRD #46: re-judge must UPSERT a single review row, not stack a second"
+pass "deterministic fallback: re-run judge named install_worker_tool 'jq'; the review UPSERTed to one row"
+
+# Restore the default (judge OFF) so later sections' runs are not auto-judged and the
+# PRD #42 concurrency capacity math (judge runs count toward worker capacity) is clean.
+apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null
+apiput /api/me/judge '{"enabled":false}' >/dev/null
+pass "judge disabled again (global + opt-in) — later sections run unjudged"
+
+# =============================================================================
 # PRD #39 — in-app uzi chat agent, end to end on the STUB chat executor.
 # UZI_EXECUTOR=stub selects StubChatExecutor (chat-executor-stub.ts): it drives the
 # REAL ChatContext park/turn loop with canned replies and NO live Anthropic session,
