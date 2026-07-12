@@ -202,6 +202,12 @@ type Config struct {
 	ChatMaxTurns          int
 	ChatRateLimitMax      int
 	ChatRateLimitWindow   time.Duration
+	// JudgeRateLimit* is a dedicated per-user budget on the re-run-judge action (PRD
+	// #46 Decision 8): it mints a token-spending judge run, so it gets its OWN budget
+	// (same shape/defaults as chat) rather than sharing the chat limiter — neither
+	// action should consume the other's allowance.
+	JudgeRateLimitMax    int
+	JudgeRateLimitWindow time.Duration
 	// ProposalRateLimit* is the per-worker budget on the propose_issue endpoint
 	// (PRD #39 M3): a spam guard complementing the per-run pending-proposal cap, so a
 	// prompt-injected worker cannot mass-create proposals across its user's chats.
@@ -319,6 +325,8 @@ func Load() (Config, error) {
 	cfg.ChatMaxTurns = parseInt("CHAT_MAX_TURNS", 50)
 	cfg.ChatRateLimitMax = parseInt("CHAT_RATE_LIMIT_MAX", 60)
 	cfg.ChatRateLimitWindow = parseDuration("CHAT_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.JudgeRateLimitMax = parseInt("JUDGE_RATE_LIMIT_MAX", 60)
+	cfg.JudgeRateLimitWindow = parseDuration("JUDGE_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalRateLimitMax = parseInt("PROPOSAL_RATE_LIMIT_MAX", 20)
 	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalConfirmStuckTimeout = parseDuration("PROPOSAL_CONFIRM_STUCK_TIMEOUT", 2*time.Minute)

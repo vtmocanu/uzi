@@ -10,20 +10,20 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// TestBuildReviewNotificationStructuredOnly is the M2-audit-headline guard for the
-// judge producer (PRD #46 M4): the notification the judge fires must copy NO judge
-// free text into the verbatim payload path. The summary + each rationale are given
-// deliberately-distinctive sentinels; neither may appear anywhere in the marshaled
-// notification (payload OR Slack render) — only the verdict enum + recommendation
-// count do. The deep link is server-built from the base URL + target UUID.
-func TestBuildReviewNotificationStructuredOnly(t *testing.T) {
+// TestBuildReviewNotificationSummaryAndScrub covers the amended producer shape (PRD
+// #46 M4): the notification carries the verdict, the SCRUBBED summary, and the
+// recommendation count + category enums — but NEVER the recommendation target/rationale
+// free text (those stay on the run page). A secret embedded in the summary is re-scrubbed
+// at the producer (belt-and-suspenders over the ingest scrub), since the payload path is
+// stored/served verbatim (audit M2 headline). The deep link is server-built.
+func TestBuildReviewNotificationSummaryAndScrub(t *testing.T) {
 	owner, target, reviewID := uuid.New(), uuid.New(), uuid.New()
-	const summarySentinel = "SUMMARY-SENTINEL-should-not-leak"
 	const rationaleSentinel = "RATIONALE-SENTINEL-should-not-leak"
 	const targetSentinel = "TARGET-SENTINEL-should-not-leak"
+	const secret = "sk-ant-api03-DEADBEEFsecretkeyvalue" // an Anthropic-family token ScrubSecrets redacts
 	sub := workersvc.ReviewSubmission{
 		Verdict:   "issues",
-		SummaryMd: summarySentinel,
+		SummaryMd: "Missing a tool and leaked " + secret + " into a log line",
 		Status:    "complete",
 		Recommendations: []workersvc.ReviewRecommendation{
 			{Category: "install_worker_tool", Target: targetSentinel, RationaleMd: rationaleSentinel, Confidence: "high"},
@@ -53,18 +53,21 @@ func TestBuildReviewNotificationStructuredOnly(t *testing.T) {
 		t.Errorf("slack link = %v, want %q", n.Slack, wantLink)
 	}
 
-	// The whole notification, marshaled, must not contain any judge free text.
 	blob, err := json.Marshal(n)
 	if err != nil {
 		t.Fatalf("marshal notification: %v", err)
 	}
-	for _, sentinel := range []string{summarySentinel, rationaleSentinel, targetSentinel} {
+	// The secret is scrubbed everywhere in the payload path (belt and suspenders).
+	if strings.Contains(string(blob), secret) {
+		t.Errorf("notification leaked a secret into the payload path: %s", blob)
+	}
+	// Recommendation target/rationale free text is never copied into the notification.
+	for _, sentinel := range []string{rationaleSentinel, targetSentinel} {
 		if strings.Contains(string(blob), sentinel) {
-			t.Errorf("notification leaked judge free text %q into the payload path: %s", sentinel, blob)
+			t.Errorf("notification leaked recommendation free text %q: %s", sentinel, blob)
 		}
 	}
 
-	// The structured body carries the verdict enum + the recommendation count.
 	payload, ok := n.Payload.(map[string]any)
 	if !ok {
 		t.Fatalf("payload type = %T, want map", n.Payload)
@@ -75,9 +78,19 @@ func TestBuildReviewNotificationStructuredOnly(t *testing.T) {
 	if payload["recommendation_count"] != 2 {
 		t.Errorf("payload recommendation_count = %v, want 2", payload["recommendation_count"])
 	}
+	// The (scrubbed) summary is carried and surfaced in the body.
+	summary, _ := payload["summary"].(string)
+	if !strings.Contains(summary, "Missing a tool") || strings.Contains(summary, secret) {
+		t.Errorf("payload summary = %q, want the scrubbed summary text", summary)
+	}
 	body, _ := payload["body"].(string)
-	if !strings.Contains(body, "issues") || !strings.Contains(body, "2 recommendations") {
-		t.Errorf("body = %q, want the verdict + count", body)
+	if !strings.Contains(body, "issues") || !strings.Contains(body, "2 recommendations") || !strings.Contains(body, "Missing a tool") {
+		t.Errorf("body = %q, want verdict + count + summary", body)
+	}
+	// The recommendation category enums are carried (closed set, safe raw).
+	cats, _ := payload["recommendation_categories"].([]string)
+	if len(cats) != 2 || cats[0] != "install_worker_tool" || cats[1] != "improve_uzi" {
+		t.Errorf("recommendation_categories = %v, want the two enums", cats)
 	}
 }
 
@@ -90,7 +103,7 @@ func TestBuildReviewNotificationNoBaseURL(t *testing.T) {
 		t.Errorf("slack link = %v, want empty (no base URL)", n.Slack)
 	}
 	// One-recommendation singular vs plural wording.
-	single := reviewNotificationBody("ok", 1)
+	single := reviewNotificationBody("ok", 1, "")
 	if !strings.Contains(single, "1 recommendation") || strings.Contains(single, "recommendations") {
 		t.Errorf("singular body = %q, want '1 recommendation'", single)
 	}

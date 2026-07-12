@@ -224,27 +224,33 @@ func (h *Handler) notifyReviewReady(ctx context.Context, targetID uuid.UUID, res
 	}
 }
 
-// buildReviewNotification assembles the "review ready" notification (PRD #46 M4). It
-// is PURE (no I/O) so the security-critical shape is unit-testable: the inbox payload
-// and the Slack body carry ONLY structured fields — the verdict enum and the
-// recommendation COUNT — never the judge's free-text summary/rationale, so nothing
-// unscrubbed ever reaches the verbatim payload path (M2 audit headline). The full
-// scrubbed summary + recommendations live on the run page behind the deep link. The
-// link is server-built from the operator-set base URL + the target run UUID (never
-// any LLM-supplied text); an empty/unset base yields no link. The notification goes
-// only to the reviewed run's owner (res.OwnerID), anchored to both the run and review.
+// buildReviewNotification assembles the "review ready" notification (PRD #46 M4,
+// Decision 6). It is PURE (no I/O) so the security-critical shape is unit-testable.
+// The inbox payload and the Slack body carry the verdict, the SCRUBBED summary, and
+// the recommendation count + categories (the full recommendation detail lives on the
+// run page behind the deep link). The summary is untrusted judge/worker text: it was
+// already validated + capped + secret-scrubbed at the review POST, and the producer
+// re-scrubs + length-caps it here (belt and suspenders — the notifysvc payload path
+// is stored/served VERBATIM, incl. the admin all-view). Recommendation TARGET and
+// RATIONALE free text are NOT copied here — only the closed category enum is. The deep
+// link is server-built from the operator-set base URL + the target run UUID (never any
+// LLM-supplied text); an empty/unset base yields no link. The notification goes only
+// to the reviewed run's owner (res.OwnerID), anchored to both the run and review.
 func buildReviewNotification(baseURL string, targetID uuid.UUID, res workersvc.ReviewResult, sub workersvc.ReviewSubmission) notifysvc.Notification {
-	body := reviewNotificationBody(sub.Verdict, len(sub.Recommendations))
+	summary := reviewSummaryPreview(sub.SummaryMd)
+	body := reviewNotificationBody(sub.Verdict, len(sub.Recommendations), summary)
 	runID, reviewID := targetID, res.ReviewID
 	return notifysvc.Notification{
 		UserID: res.OwnerID,
 		Kind:   judgeReviewNotificationKind,
 		Payload: map[string]any{
-			"title":                "Run review ready",
-			"body":                 body,
-			"verdict":              sub.Verdict,
-			"status":               sub.Status,
-			"recommendation_count": len(sub.Recommendations),
+			"title":                     "Run review ready",
+			"body":                      body,
+			"verdict":                   sub.Verdict,
+			"status":                    sub.Status,
+			"summary":                   summary,
+			"recommendation_count":      len(sub.Recommendations),
+			"recommendation_categories": recommendationCategories(sub.Recommendations),
 		},
 		RunID:    &runID,
 		ReviewID: &reviewID,
@@ -256,14 +262,52 @@ func buildReviewNotification(baseURL string, targetID uuid.UUID, res workersvc.R
 	}
 }
 
-// reviewNotificationBody renders the structured one-line summary shown in the inbox
-// and the Slack DM: the verdict and how many recommendations came with it. All
-// structured — no untrusted free text.
-func reviewNotificationBody(verdict string, recCount int) string {
+// reviewNotificationBody renders the one-line summary shown in the inbox row and the
+// Slack DM: the verdict, how many recommendations came with it, and (when present) the
+// scrubbed summary preview.
+func reviewNotificationBody(verdict string, recCount int, summary string) string {
+	line := "verdict: " + verdict
 	if recCount == 1 {
-		return "verdict: " + verdict + " — 1 recommendation"
+		line += " — 1 recommendation"
+	} else {
+		line += fmt.Sprintf(" — %d recommendations", recCount)
 	}
-	return fmt.Sprintf("verdict: %s — %d recommendations", verdict, recCount)
+	if summary != "" {
+		line += ": " + summary
+	}
+	return line
+}
+
+// reviewSummaryPreviewMaxRunes caps the summary preview carried in the notification —
+// tight for a one-line inbox/DM row; the run page holds the full text.
+const reviewSummaryPreviewMaxRunes = 280
+
+// reviewSummaryPreview renders the judge's summary for the notification: whitespace
+// (incl. newlines) collapsed to a single space, secret-scrubbed (belt and suspenders —
+// it is already scrubbed at ingest, but the producer contract re-scrubs every free
+// field copied onto the verbatim payload path), then rune-capped. Scrub before the cap
+// so a redaction marker can't be split.
+func reviewSummaryPreview(summaryMd string) string {
+	oneLine := slacksvc.ScrubSecrets(strings.Join(strings.Fields(summaryMd), " "))
+	if oneLine == "" {
+		return ""
+	}
+	runes := []rune(oneLine)
+	if len(runes) > reviewSummaryPreviewMaxRunes {
+		return string(runes[:reviewSummaryPreviewMaxRunes]) + "…"
+	}
+	return oneLine
+}
+
+// recommendationCategories is the list of recommendation category enums (closed set,
+// safe to surface raw) carried in the notification payload — count + categories, not
+// the free-text target/rationale (those stay on the run page).
+func recommendationCategories(recs []workersvc.ReviewRecommendation) []string {
+	cats := make([]string, 0, len(recs))
+	for _, r := range recs {
+		cats = append(cats, r.Category)
+	}
+	return cats
 }
 
 // reviewDeepLink builds the run-page deep link from the operator-set public base URL

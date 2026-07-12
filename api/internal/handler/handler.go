@@ -204,8 +204,9 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // register and login endpoints; forgeLimiter is a per-user budget on the
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot
 // hammer the upstream forge; slackDMLimiter is a tighter per-user budget on the
-// two Slack-DM-triggering /me/slack endpoints.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter *mw.Limiter) http.Handler {
+// two Slack-DM-triggering /me/slack endpoints; judgeLimiter is a per-user budget
+// on the re-run-judge action (PRD #46), separate from chat's.
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -456,10 +457,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// panel reads the review (owner-or-admin, GetRunForViewer-scoped).
 				r.Get("/{id}/review", h.GetRunReview)
 				// Re-run judge (Decision 8): enqueue a fresh judge for a terminal run.
-				// Owner-only spend (enforced in the service, audit H3); behind the
-				// per-user chat spend limiter since it mints a token-spending run, like
-				// chat create/continue.
-				r.With(chatLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
+				// Owner-only spend (enforced in the service, audit H3); behind a
+				// DEDICATED per-user judge spend limiter (separate budget from chat)
+				// since it mints a token-spending run.
+				r.With(judgeLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
 			})
 
 			// In-app chat agent (PRD #39): conversations ride runs.kind='chat'. The
