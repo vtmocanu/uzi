@@ -9,6 +9,7 @@ import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
+import { JudgeRunner } from "./judge-runner.js";
 import { Worker } from "./worker.js";
 import { errMessage } from "./util.js";
 
@@ -113,7 +114,12 @@ async function main(): Promise<void> {
     pollMs: config.chatPollMs,
   }, config.workerToken);
 
-  const worker = new Worker(config, client, runner, chatRunner, log);
+  // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
+  // HOME root but needs no executor/clone — it fetches the trace, calls the model
+  // once, and posts a verdict.
+  const judgeRunner = new JudgeRunner(client, log, { homeRoot: sdkHomeRoot });
+
+  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, log);
 
   const controller = new AbortController();
   for (const sig of ["SIGINT", "SIGTERM"] as const) {
