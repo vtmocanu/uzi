@@ -5260,7 +5260,7 @@ and fact-check findings.
 
 Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisions:
 
-## 195. Result-frame usage is CUMULATIVE-across-resume (M1 verdict b)
+## 202. Result-frame usage is CUMULATIVE-across-resume (M1 verdict b)
 
 - **Decision (PROVISIONAL, no live run available; evidence decompiled from the exact shipping CLI
   the SDK spawns).** Each phase is its own `query()` invocation resuming the prior session; the
@@ -5273,7 +5273,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   same cumulative frames, so both are pinned by this verdict (below). A live two-phase run crossing a
   requeue boundary is the deferred firm-up (M6 residual).
 
-## 196. run_usage snapshot table + greatest-wins rollup centralized in a VIEW
+## 203. run_usage snapshot table + greatest-wins rollup centralized in a VIEW
 
 - **Storage** (`00056_run_usage.sql`): `run_usage(run_id FK ON DELETE CASCADE, session_id, model,
   input/cache_read/cache_creation/output bigint, cost_usd numeric(12,6), updated_at, PK(run_id,
@@ -5282,7 +5282,9 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   at-least-once delivery + an idempotent write = correct totals with no crash window (the `Store`
   exposes no transaction seam). Malformed/absent usage skips; out-of-range inputs clamp
   (cost→numeric(12,6) ceiling, negative tokens→0) so a bogus frame can't 22003 the append into a
-  worker-batcher poison loop. Chat runs (`kind='chat'`, PRD #39) are excluded — issue + ci_fix fold.
+  worker-batcher poison loop. The kind guard is an **exclude-list, not an allowlist**: only chat runs
+  (`kind='chat'`, PRD #39) are skipped — issue + ci_fix fold, and a future work-run kind folds by
+  default (every work run spends the user's tokens, so "every run shows tokens" is the default).
 - **The merge is GREATEST per column, not plain EXCLUDED** — under verdict b a stable session_id can
   see two cumulative snapshots hit one key, so overwrite would let a crash-retry regress the row.
 - **Every rollup reads a `run_usage_totals` VIEW** (`00057`) that computes `MAX` per `(run_id, model)`
@@ -5291,7 +5293,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   plain SUM (which would multiply the snapshots when session_id evolves). Pre-feature runs have no
   rows → usage is absent, never a fabricated 0.
 
-## 197. Per-agent attribution is client-derived per-call usage — a different data path
+## 204. Per-agent attribution is client-derived per-call usage — a different data path
 
 - The worker attaches each assistant frame's PER-CALL `message.usage` (BetaUsage, nullable cache
   fields) to exactly one emitted message that survives the executor's signal filter (Decision 11) —
@@ -5300,7 +5302,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   double-count refusal-fallback `supersedes` pairs — footnoted "attributed; may not sum to the run
   total", tokens only.
 
-## 198. Client surfaces derive from the stream; one shared formatter; strip vs list-row can diverge
+## 205. Client surfaces derive from the stream; one shared formatter; strip vs list-row can diverge
 
 - The run view derives its usage strip, per-phase table (DELTAS between consecutive cumulative
   frames, clamped ≥0), per-agent table, and finish-line tokens from the replayed message stream
@@ -5314,7 +5316,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   monotonic case; a requeue reset can make them legitimately differ (client keeps both legs clamped,
   server greatest-wins takes the higher).
 
-## 199. M6 — the isolated e2e stub stands in for the SDK's usage frames
+## 206. M6 — the isolated e2e stub stands in for the SDK's usage frames
 
 - The stub executor (`agent/src/executor.ts`) emits a synthetic per-agent `coder` message with
   per-call usage + a terminal `result` frame with fixed cumulative usage/modelUsage on every run (no
@@ -5322,3 +5324,26 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   run (`run.usage`), aggregates into `/api/usage`, and keeps the per-agent coder row in the stream —
   the three surfaces M4 renders. Live-credential firm-up (verdict b + strip==list-row across a
   requeue boundary) is the recorded residual.
+
+## 207. M3 read-API shape — window, counts, placement, and the self-reported-trust caveat
+
+- **7-day window keys on `runs.created_at`, not a per-message timestamp** — at laptop scale a run's
+  creation time is close enough to when it spent, and `run_usage` has only `updated_at` (last fold),
+  which would drift on re-delivery. `SelfUsage`/`AdminUsageTotals` compute lifetime + last-7-days in
+  one pass via `FILTER (WHERE created_at >= now() - interval '7 days')`.
+- **`run_count` counts usage-bearing runs only** — the aggregates scope through the `run_usage_totals`
+  view (a run with no usage rows is absent), so the count is "runs that spent", not all runs. The
+  client reads `run_count == 0` as the "nothing yet" empty state (never a fabricated zero).
+- **The admin per-user table omits zero-usage users** — `AdminUsagePerUser` INNER-joins the view, so a
+  user who has never spent produces no row; each user's share is computed client-side against the
+  factory total. Rows are ordered heaviest-cost-first (output-tokens then user-id tiebreak, so the
+  order is deterministic).
+- **Usage rides the user runs index only, not the admin active-runs list** — `ListRunsForUser`
+  LEFT-joins the view (usage columns present, NULL → absent); `ListActiveRunsAll` (admin
+  Agents-status) deliberately carries NO usage, because it is a live-status overview, not an
+  accounting surface. Non-terminal runs are still accumulating; their spend surfaces on the run view
+  and the dashboard rollups, not the live grid.
+- **Every figure is worker-self-reported — a reporting surface, not an authorization one.** The fold
+  trusts the frame's `modelUsage`, so the run/self/factory/per-user rollups (incl. the admin endpoint)
+  inherit that trust: a compromised worker can misreport its own runs' spend. This is accounting, not
+  authz — not a basis for billing or enforcement (§205/Decision 8 already frame cost as an estimate).
