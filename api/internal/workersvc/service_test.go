@@ -921,6 +921,28 @@ func TestAppendMessagesFoldsOnRedeliveredBatch(t *testing.T) {
 	}
 }
 
+// Chat runs (PRD #39) are OUT of scope for usage accounting (PRD #40), but
+// mapResult is shared with the chat executor so their result frames now carry
+// usage — the fold must skip them entirely, keeping chat spend out of run_usage.
+func TestAppendMessagesFoldSkipsChatRuns(t *testing.T) {
+	w := worker()
+	fs := &fakeStore{runOwned: store.Run{ID: uuid.New(), WorkerID: pgUUID(w.ID), Kind: RunKindChat, SessionID: pgText("sess-chat")}}
+	svc := New(fs, newBox(t), testParams())
+
+	msgs := []IncomingMessage{{Seq: 1, Kind: "status", Agent: "lead", Payload: json.RawMessage(
+		`{"event":"result","modelUsage":{"claude-fable-5":{"inputTokens":9000,"outputTokens":4000,"costUSD":0.5}}}`)}}
+	if err := svc.AppendMessages(context.Background(), w, fs.runOwned.ID, msgs); err != nil {
+		t.Fatalf("AppendMessages: %v", err)
+	}
+	// The message still persists (chat runs stream normally); only the fold is skipped.
+	if len(fs.insertedMessages) != 1 {
+		t.Fatalf("chat message should still persist, got %d inserts", len(fs.insertedMessages))
+	}
+	if len(fs.upsertedUsage) != 0 {
+		t.Fatalf("chat-run usage must NOT fold into run_usage, got %d upserts", len(fs.upsertedUsage))
+	}
+}
+
 // A DB error on the fold's upsert propagates: the append fails so the worker
 // re-delivers the batch and the fold retries (idempotent), rather than silently
 // dropping the usage.

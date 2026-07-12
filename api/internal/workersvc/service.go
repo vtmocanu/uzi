@@ -753,6 +753,13 @@ type resultModelUsage struct {
 // Malformed/absent usage is skipped (never fails the append); a DB error
 // propagates so the append fails and the worker re-delivers.
 func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
+	// Chat-run spend is explicitly OUT of scope for PRD #40 ("Counting tokens spent
+	// outside runs (e.g. the PRD #39 chat agent)"). mapResult is shared with the
+	// chat executor, so a chat run's result frames now carry usage too — skip the
+	// whole fold rather than let chat consumption leak into run_usage.
+	if run.Kind == RunKindChat {
+		return nil
+	}
 	var sessionID string
 	if run.SessionID.Valid {
 		sessionID = run.SessionID.String
