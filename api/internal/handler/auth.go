@@ -197,7 +197,7 @@ func (h *Handler) createUserFirstAdmin(r *http.Request, email, hash string, disp
 
 	user, err := qtx.CreateUser(ctx, store.CreateUserParams{
 		Email:        email,
-		PasswordHash: hash,
+		PasswordHash: pgtype.Text{String: hash, Valid: true},
 		DisplayName:  displayName,
 		IsAdmin:      count == 0,
 	})
@@ -241,7 +241,19 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, err := auth.VerifyPassword(req.Password, user.PasswordHash)
+	// OIDC-only accounts have no password_hash (PRD #45, Decision 7). Branch on that
+	// FIRST and treat it exactly like a wrong password: burn one Argon2 against the
+	// dummy hash to hold timing, then return the same generic 401. Never let a
+	// NULL/invalid hash reach VerifyPassword and surface its ErrInvalidHash as a 500 —
+	// that 500-vs-401 difference is an oracle distinguishing OIDC-only accounts from
+	// wrong passwords (audit H2).
+	if !user.PasswordHash.Valid {
+		_, _ = auth.VerifyPassword(req.Password, dummyHash)
+		httpx.Error(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+
+	ok, err := auth.VerifyPassword(req.Password, user.PasswordHash.String)
 	if err != nil {
 		slog.Error("verify password", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -369,6 +381,14 @@ func (h *Handler) AuthConfig(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"registration_enabled":  h.cfg.RegistrationEnabled,
 		"allowed_email_domains": domains,
+		// OIDC SSO surface (PRD #45, Decision 9). oidc_enabled is gated on the feature
+		// being CONFIGURED, not on discovery having succeeded, so the SSO button stays
+		// visible (and the lazy discovery-retry reachable) even if the IdP was down at
+		// boot. password_login_enabled lets the SPA hide the password form for SSO-only
+		// deployments.
+		"oidc_enabled":           h.cfg.OIDCEnabled(),
+		"oidc_provider_name":     h.cfg.OIDCProviderName,
+		"password_login_enabled": h.cfg.PasswordLoginEnabled,
 	})
 }
 

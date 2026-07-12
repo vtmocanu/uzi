@@ -46,7 +46,7 @@ func TestSlackLinkResolutionLiveDB(t *testing.T) {
 	q := store.New(pool)
 
 	mk := func(email string) store.User {
-		u, err := q.CreateUser(ctx, store.CreateUserParams{Email: email, PasswordHash: "x"})
+		u, err := q.CreateUser(ctx, store.CreateUserParams{Email: email, PasswordHash: pgtype.Text{String: "x", Valid: true}})
 		if err != nil {
 			t.Fatalf("create user %s: %v", email, err)
 		}
@@ -127,7 +127,7 @@ func TestSlackConfirmedLookupSkipsDeactivatedLiveDB(t *testing.T) {
 	q := store.New(pool)
 	txt := func(s string) pgtype.Text { return pgtype.Text{String: s, Valid: true} }
 
-	u, err := q.CreateUser(ctx, store.CreateUserParams{Email: "dz-" + uniq(t) + "@example.com", PasswordHash: "x"})
+	u, err := q.CreateUser(ctx, store.CreateUserParams{Email: "dz-" + uniq(t) + "@example.com", PasswordHash: pgtype.Text{String: "x", Valid: true}})
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}

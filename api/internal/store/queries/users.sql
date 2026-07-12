@@ -9,6 +9,28 @@ RETURNING *;
 -- name: GetUserByEmail :one
 SELECT * FROM users WHERE email = $1;
 
+-- name: GetUserByOIDCSubject :one
+-- Primary OIDC login lookup (PRD #45): match the stable (issuer, subject) identity.
+SELECT * FROM users WHERE oidc_issuer = $1 AND oidc_subject = $2;
+
+-- name: LinkUserOIDC :one
+-- Attach an IdP identity to an existing (verified-email-matched) account, but ONLY
+-- if the row is not already bound to a subject (audit H1): the WHERE oidc_subject IS
+-- NULL guard makes a re-link a no-op that returns no row, so the caller can reject an
+-- email match against a row already bound to a DIFFERENT subject instead of
+-- overwriting it. The caller asserts exactly one row was returned.
+UPDATE users SET oidc_issuer = $2, oidc_subject = $3
+WHERE id = $1 AND oidc_subject IS NULL
+RETURNING *;
+
+-- name: CreateUserOIDC :one
+-- JIT-provision a passwordless OIDC user (PRD #45, Decision 7): password_hash is
+-- NULL so password login always fails constant-time. is_admin follows the
+-- first-user rule, decided by the caller under the advisory lock.
+INSERT INTO users (email, password_hash, display_name, is_admin, oidc_issuer, oidc_subject)
+VALUES ($1, NULL, $2, $3, $4, $5)
+RETURNING *;
+
 -- name: GetUserByID :one
 SELECT * FROM users WHERE id = $1;
 

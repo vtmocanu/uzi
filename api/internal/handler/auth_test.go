@@ -155,4 +155,53 @@ func TestAuthConfigShape(t *testing.T) {
 			t.Errorf("body = %q, want an empty array (not null) for the domains", body)
 		}
 	})
+
+	// PRD #45, Decision 9: the OIDC surface fields. Default (no OIDC) is dormant with
+	// password login on; a configured OIDC-only deployment flips all three.
+	t.Run("oidc dormant by default", func(t *testing.T) {
+		h := &Handler{cfg: config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true}}
+		rec := httptest.NewRecorder()
+		h.AuthConfig(rec, httptest.NewRequest(http.MethodGet, "/api/auth/config", nil))
+		var got struct {
+			OIDCEnabled          bool   `json:"oidc_enabled"`
+			OIDCProviderName     string `json:"oidc_provider_name"`
+			PasswordLoginEnabled bool   `json:"password_login_enabled"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode: %v (body %q)", err, rec.Body.String())
+		}
+		if got.OIDCEnabled {
+			t.Error("oidc_enabled should be false when unconfigured")
+		}
+		if !got.PasswordLoginEnabled {
+			t.Error("password_login_enabled should default true")
+		}
+	})
+
+	t.Run("oidc configured, password login off", func(t *testing.T) {
+		h := &Handler{cfg: config.Config{
+			OIDCIssuerURL:        "https://idp.example.com",
+			OIDCProviderName:     "Keycloak",
+			PasswordLoginEnabled: false,
+		}}
+		rec := httptest.NewRecorder()
+		h.AuthConfig(rec, httptest.NewRequest(http.MethodGet, "/api/auth/config", nil))
+		var got struct {
+			OIDCEnabled          bool   `json:"oidc_enabled"`
+			OIDCProviderName     string `json:"oidc_provider_name"`
+			PasswordLoginEnabled bool   `json:"password_login_enabled"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode: %v (body %q)", err, rec.Body.String())
+		}
+		if !got.OIDCEnabled {
+			t.Error("oidc_enabled should be true when the issuer is set")
+		}
+		if got.OIDCProviderName != "Keycloak" {
+			t.Errorf("oidc_provider_name = %q, want Keycloak", got.OIDCProviderName)
+		}
+		if got.PasswordLoginEnabled {
+			t.Error("password_login_enabled should be false")
+		}
+	})
 }
