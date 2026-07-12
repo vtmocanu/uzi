@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
-import { GitCache, bareDirName } from "../src/git.js";
+import { GitCache, bareDirName, gitEnv } from "../src/git.js";
 
 let fx: Fixture;
 let git: GitCache;
@@ -92,5 +92,52 @@ describe("worktree lifecycle", () => {
     assert.strictEqual(fs.existsSync(wt.path), false);
     assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true);
     assert.match(gitIn(bare, ["rev-parse", "--verify", "refs/heads/agent/issue-5"]), /^[0-9a-f]{40}$/);
+  });
+});
+
+describe("gitEnv (M10: scrubbed replacement env + hook neutralization)", () => {
+  const WORKER_VARS = ["UZI_WORKER_TOKEN", "UZI_WORKER_TOKEN_FILE", "UZI_API_URL"];
+  beforeEach(() => {
+    process.env.UZI_WORKER_TOKEN = "join-token-SECRET";
+    process.env.UZI_WORKER_TOKEN_FILE = "/run/secrets/worker_token";
+    process.env.UZI_API_URL = "http://api:8080";
+  });
+  afterEach(() => {
+    for (const k of WORKER_VARS) delete process.env[k];
+  });
+
+  // Collect the inline GIT_CONFIG_* pairs into a key→value map.
+  function configPairs(env: NodeJS.ProcessEnv): Record<string, string> {
+    const out: Record<string, string> = {};
+    const n = Number(env.GIT_CONFIG_COUNT ?? "0");
+    for (let i = 0; i < n; i++) out[env[`GIT_CONFIG_KEY_${i}`]!] = env[`GIT_CONFIG_VALUE_${i}`]!;
+    return out;
+  }
+
+  it("excludes the worker/API vars by construction, keeps PATH + GIT_TERMINAL_PROMPT", () => {
+    const env = gitEnv();
+    for (const k of WORKER_VARS) assert.equal(env[k], undefined, `${k} must be absent from the git env`);
+    assert.equal(env.PATH, process.env.PATH);
+    assert.equal(env.GIT_TERMINAL_PROMPT, "0");
+    assert.ok(!JSON.stringify(env).includes("join-token-SECRET"), "no worker secret in the git env");
+  });
+
+  it("neutralizes hooks: core.hooksPath points at an existing EMPTY dir", () => {
+    const cfg = configPairs(gitEnv());
+    assert.equal(cfg["safe.directory"], "*");
+    const hooks = cfg["core.hooksPath"];
+    assert.ok(hooks && fs.existsSync(hooks), "core.hooksPath must be a real dir");
+    assert.deepEqual(fs.readdirSync(hooks), [], "the hooks dir must be empty so no hook can fire");
+  });
+
+  it("carries the scoped credential pair when a PAT is passed (and hooks stay neutralized)", () => {
+    const cfg = configPairs(gitEnv("secret-pat", "https://gitlab.example.com/", "bot"));
+    assert.match(cfg["http.https://gitlab.example.com/.extraHeader"] ?? "", /^Authorization: Basic /);
+    assert.equal(cfg["http.https://gitlab.example.com/.followRedirects"], "false");
+    assert.ok(cfg["core.hooksPath"], "core.hooksPath is still set alongside the credential");
+    // The PAT rides GIT_CONFIG_VALUE_n (base64 in the header) — never a plain env var.
+    for (const [k, v] of Object.entries(gitEnv("secret-pat"))) {
+      if (!k.startsWith("GIT_CONFIG_VALUE_")) assert.ok(!String(v).includes("secret-pat"), `PAT leaked into ${k}`);
+    }
   });
 });

@@ -248,7 +248,10 @@ function analyzeGitConfig(rest: string[]): BashScreenResult {
   // arbitrary command OUTSIDE the Bash screener the next time any `git <x>` runs,
   // so a write to the alias namespace is denied too (M4 audit item 8). Deny even
   // though the read flags didn't match.
-  if (key && /^(remote|core|http|url|credential|include|includeif|alias)\./i.test(key)) return deny(REASON_CONFIG_WRITE);
+  // `filter.<x>.clean/smudge` bodies run as a shell command on checkout/add via a
+  // matching .gitattributes — a second code-exec route, so deny writes to it too
+  // (M10 audit, defense in depth alongside the worker's core.hooksPath neutralization).
+  if (key && /^(remote|core|http|url|credential|include|includeif|alias|filter)\./i.test(key)) return deny(REASON_CONFIG_WRITE);
   return ALLOW;
 }
 
