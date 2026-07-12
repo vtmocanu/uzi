@@ -103,6 +103,7 @@ describe("Docs index — search", () => {
   it("focuses the search box when '/' is pressed outside a field", () => {
     renderPage();
     const box = searchBox();
+    expect(box.getAttribute("aria-keyshortcuts")).toBe("/");
     expect(document.activeElement).not.toBe(box);
     fireEvent.keyDown(document, { key: "/" });
     expect(document.activeElement).toBe(box);
