@@ -702,7 +702,7 @@ WHERE id = @id;
 -- reason flips no-worker → waiting must not reset the UI's "stuck for Xm").
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
-       health, health_reason, health_since
+       health, health_reason, health_since, health_notified_at
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';
@@ -727,12 +727,18 @@ LIMIT @lim;
 -- race (the worker's status write already cleared health via the exit contract; this
 -- write then matches zero rows). It deliberately does NOT touch updated_at: the
 -- queued and approval-idle age clocks read updated_at, so bumping it here would reset
--- the very signal being flagged. health_notified_at is owned by the Slack path, not
--- written here.
+-- the very signal being flagged.
+--
+-- health_notified_at is the rolling last-nudge stamp (PRD #47 Decision 7): the
+-- sweeper passes it non-NULL ONLY when it emits a nudge-worthy event, so the
+-- COALESCE advances it then and preserves it otherwise. It is never cleared here
+-- (nor by the exit contract), so it damps DM flapping across episodes and API
+-- restarts. The detector remains the single writer of every health column.
 UPDATE runs SET
-    health        = @health,
-    health_reason = sqlc.narg('health_reason'),
-    health_since  = sqlc.narg('health_since')
+    health             = @health,
+    health_reason      = sqlc.narg('health_reason'),
+    health_since       = sqlc.narg('health_since'),
+    health_notified_at = COALESCE(sqlc.narg('health_notified_at'), health_notified_at)
 WHERE id = @id AND status = @status;
 
 -- name: CountOnlineWorkersForUser :one

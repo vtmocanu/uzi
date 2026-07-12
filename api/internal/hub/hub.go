@@ -112,10 +112,10 @@ func (h *Hub) PublishState(runID uuid.UUID, status string) {
 // PublishHealth signals a run-health flag change (PRD #47) to its subscribers. Like
 // a "state" frame it carries NO authoritative data — the browser re-reads the run
 // over REST, which applies the owner-gating on health_reason, so the flag reason
-// never rides the socket. The health/reason args are part of the shared Broadcaster
-// contract (the Slack notifier consumes them); the hub needs only to prompt the
-// repaint.
-func (h *Hub) PublishHealth(runID uuid.UUID, health, reason string) {
+// never rides the socket. The health/reason/nudge args are part of the shared
+// Broadcaster contract (the Slack notifier consumes them); the hub needs only to
+// prompt the repaint, so it ignores them.
+func (h *Hub) PublishHealth(runID uuid.UUID, health, reason string, nudge bool) {
 	h.broadcast(runID, Event{Type: "health"})
 }
 

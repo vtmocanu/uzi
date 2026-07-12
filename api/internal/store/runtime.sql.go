@@ -1209,23 +1209,24 @@ const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
 
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
-       health, health_reason, health_since
+       health, health_reason, health_since, health_notified_at
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
 `
 
 type ListActiveRunsForHealthRow struct {
-	ID             uuid.UUID          `json:"id"`
-	UserID         uuid.UUID          `json:"user_id"`
-	Status         string             `json:"status"`
-	AutoApprove    bool               `json:"auto_approve"`
-	StartedAt      pgtype.Timestamptz `json:"started_at"`
-	LastActivityAt pgtype.Timestamptz `json:"last_activity_at"`
-	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	Health         string             `json:"health"`
-	HealthReason   pgtype.Text        `json:"health_reason"`
-	HealthSince    pgtype.Timestamptz `json:"health_since"`
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	Status           string             `json:"status"`
+	AutoApprove      bool               `json:"auto_approve"`
+	StartedAt        pgtype.Timestamptz `json:"started_at"`
+	LastActivityAt   pgtype.Timestamptz `json:"last_activity_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	Health           string             `json:"health"`
+	HealthReason     pgtype.Text        `json:"health_reason"`
+	HealthSince      pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt pgtype.Timestamptz `json:"health_notified_at"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -1258,6 +1259,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.Health,
 			&i.HealthReason,
 			&i.HealthSince,
+			&i.HealthNotifiedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -2176,18 +2178,20 @@ func (q *Queries) SetRunFailed(ctx context.Context, arg SetRunFailedParams) (int
 
 const setRunHealth = `-- name: SetRunHealth :execrows
 UPDATE runs SET
-    health        = $1,
-    health_reason = $2,
-    health_since  = $3
-WHERE id = $4 AND status = $5
+    health             = $1,
+    health_reason      = $2,
+    health_since       = $3,
+    health_notified_at = COALESCE($4, health_notified_at)
+WHERE id = $5 AND status = $6
 `
 
 type SetRunHealthParams struct {
-	Health       string             `json:"health"`
-	HealthReason pgtype.Text        `json:"health_reason"`
-	HealthSince  pgtype.Timestamptz `json:"health_since"`
-	ID           uuid.UUID          `json:"id"`
-	Status       string             `json:"status"`
+	Health           string             `json:"health"`
+	HealthReason     pgtype.Text        `json:"health_reason"`
+	HealthSince      pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt pgtype.Timestamptz `json:"health_notified_at"`
+	ID               uuid.UUID          `json:"id"`
+	Status           string             `json:"status"`
 }
 
 // The detector's single writer of the health columns (Decision 3). Status-scoped
@@ -2196,13 +2200,19 @@ type SetRunHealthParams struct {
 // race (the worker's status write already cleared health via the exit contract; this
 // write then matches zero rows). It deliberately does NOT touch updated_at: the
 // queued and approval-idle age clocks read updated_at, so bumping it here would reset
-// the very signal being flagged. health_notified_at is owned by the Slack path, not
-// written here.
+// the very signal being flagged.
+//
+// health_notified_at is the rolling last-nudge stamp (PRD #47 Decision 7): the
+// sweeper passes it non-NULL ONLY when it emits a nudge-worthy event, so the
+// COALESCE advances it then and preserves it otherwise. It is never cleared here
+// (nor by the exit contract), so it damps DM flapping across episodes and API
+// restarts. The detector remains the single writer of every health column.
 func (q *Queries) SetRunHealth(ctx context.Context, arg SetRunHealthParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunHealth,
 		arg.Health,
 		arg.HealthReason,
 		arg.HealthSince,
+		arg.HealthNotifiedAt,
 		arg.ID,
 		arg.Status,
 	)

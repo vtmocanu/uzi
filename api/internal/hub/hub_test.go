@@ -73,7 +73,7 @@ func TestPublishHealthEmitsHealthFrameWithoutReason(t *testing.T) {
 
 	// The reason is passed for the shared Broadcaster contract but must NOT ride the
 	// socket — the browser re-reads the run (owner-gated) instead.
-	h.PublishHealth(run, "stalled", "the agent stopped sending updates")
+	h.PublishHealth(run, "stalled", "the agent stopped sending updates", true)
 	ev := readFrame(t, sub)
 	if ev.Type != "health" {
 		t.Fatalf("type = %q, want health", ev.Type)

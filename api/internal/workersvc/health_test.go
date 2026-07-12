@@ -49,8 +49,8 @@ func (f *healthFakeStore) SetRunHealth(_ context.Context, arg store.SetRunHealth
 // fakeSettings is a static health-settings source. All accessors are error-free;
 // the zero value has the detector disabled, so tests opt in explicitly.
 type fakeSettings struct {
-	enabled                       bool
-	stall, slow, queued, approval int
+	enabled                                 bool
+	stall, slow, queued, approval, cooldown int
 }
 
 func (s fakeSettings) HealthEnabled(context.Context) (bool, error)        { return s.enabled, nil }
@@ -58,10 +58,13 @@ func (s fakeSettings) HealthStallSeconds(context.Context) (int, error)    { retu
 func (s fakeSettings) HealthSlowSeconds(context.Context) (int, error)     { return s.slow, nil }
 func (s fakeSettings) HealthQueuedSeconds(context.Context) (int, error)   { return s.queued, nil }
 func (s fakeSettings) HealthApprovalSeconds(context.Context) (int, error) { return s.approval, nil }
+func (s fakeSettings) HealthNudgeCooldownSeconds(context.Context) (int, error) {
+	return s.cooldown, nil
+}
 
-// defaultHealthSettings mirrors the compiled-in defaults (5m / 45m / 10m / 1h).
+// defaultHealthSettings mirrors the compiled-in defaults (5m / 45m / 10m / 1h / 30m).
 func defaultHealthSettings() fakeSettings {
-	return fakeSettings{enabled: true, stall: 300, slow: 2700, queued: 600, approval: 3600}
+	return fakeSettings{enabled: true, stall: 300, slow: 2700, queued: 600, approval: 3600, cooldown: 1800}
 }
 
 func healthSvc(fs Store, st Settings) *Service {
@@ -433,6 +436,137 @@ func TestHealthSlowClampWarnsOncePerValue(t *testing.T) {
 	}
 	if svc.lastSlowClampWarn != 0 {
 		t.Fatalf("lastSlowClampWarn = %v, want reset to 0 once configured below the timeout", svc.lastSlowClampWarn)
+	}
+}
+
+// stalledRunRow is a running run that will flag stalled (silent 10m, under the 45m
+// slow cap so slow never masks it).
+func stalledRunRow() store.ListActiveRunsForHealthRow {
+	r := runRow("running")
+	r.StartedAt = ago(20 * time.Minute)
+	r.LastActivityAt = ago(10 * time.Minute)
+	return r
+}
+
+func nudgeSvc(t *testing.T, r store.ListActiveRunsForHealthRow, st fakeSettings) (*healthFakeStore, *Service, *fakeBroadcaster) {
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc := healthSvc(fs, st)
+	b := &fakeBroadcaster{}
+	svc.SetBroadcaster(b)
+	return fs, svc, b
+}
+
+func TestHealthNudgeOnFirstFlag(t *testing.T) {
+	// ok→flagged with no prior nudge: the sweeper marks it nudge-worthy AND stamps
+	// health_notified_at in the same write.
+	fs, svc, b := nudgeSvc(t, stalledRunRow(), defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+
+	if len(b.healthNudges) != 1 || !b.healthNudges[0] {
+		t.Fatalf("healthNudges = %v, want [true] on the first flag", b.healthNudges)
+	}
+	if w := fs.writes[0]; !w.HealthNotifiedAt.Valid || !w.HealthNotifiedAt.Time.Equal(t0) {
+		t.Fatalf("health_notified_at = %v, want now stamped on a nudge", w.HealthNotifiedAt)
+	}
+}
+
+func TestHealthNoNudgeWithinCooldown(t *testing.T) {
+	// ok→flagged but the last nudge was 10m ago (< 30m cooldown): the flag is still
+	// written, but no nudge and no re-stamp (COALESCE(NULL, …) preserves the stamp).
+	r := stalledRunRow()
+	r.HealthNotifiedAt = ago(10 * time.Minute)
+	fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+
+	if len(b.healths) != 1 || b.healths[0] != healthStalled {
+		t.Fatalf("healths = %v, want [stalled] (flag still written)", b.healths)
+	}
+	if b.healthNudges[0] {
+		t.Fatal("nudge = true within the cooldown, want false")
+	}
+	if w := fs.writes[0]; w.HealthNotifiedAt.Valid {
+		t.Fatalf("health_notified_at = %v, want NULL param within cooldown (preserve the old stamp)", w.HealthNotifiedAt)
+	}
+}
+
+func TestHealthNudgeAfterCooldown(t *testing.T) {
+	r := stalledRunRow()
+	r.HealthNotifiedAt = ago(40 * time.Minute) // > 30m cooldown
+	fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+
+	if !b.healthNudges[0] {
+		t.Fatal("nudge = false after the cooldown elapsed, want true")
+	}
+	if w := fs.writes[0]; !w.HealthNotifiedAt.Valid {
+		t.Fatal("health_notified_at not re-stamped after the cooldown")
+	}
+}
+
+func TestHealthNoNudgeOnFlagChange(t *testing.T) {
+	// A run already flagged slow that becomes stalled: same episode continuing, not an
+	// ok→flagged transition, so no fresh nudge.
+	r := stalledRunRow()
+	r.Health = healthSlow
+	r.HealthReason = pgText(reasonSlow)
+	_, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+
+	if b.healths[0] != healthStalled {
+		t.Fatalf("health = %q, want stalled", b.healths[0])
+	}
+	if b.healthNudges[0] {
+		t.Fatal("nudge = true on a flag→flag change, want false")
+	}
+}
+
+func TestHealthNoNudgeOnClear(t *testing.T) {
+	r := runRow("running")
+	r.StartedAt = ago(20 * time.Minute)
+	r.LastActivityAt = ago(30 * time.Second) // fresh → ok
+	r.Health = healthStalled
+	r.HealthReason = pgText(reasonStalled)
+	r.HealthSince = ago(10 * time.Minute)
+	_, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+
+	if b.healths[0] != healthOK {
+		t.Fatalf("health = %q, want ok (cleared)", b.healths[0])
+	}
+	if b.healthNudges[0] {
+		t.Fatal("nudge = true on a clear, want false")
+	}
+}
+
+func TestHealthCooldownZeroAlwaysNudges(t *testing.T) {
+	// cooldown 0 disables the damping: an ok→flagged transition nudges even if the
+	// last nudge was seconds ago.
+	r := stalledRunRow()
+	r.HealthNotifiedAt = ago(1 * time.Minute)
+	_, svc, b := nudgeSvc(t, r, fakeSettings{enabled: true, stall: 300, cooldown: 0})
+	svc.detectRunHealth(context.Background(), t0)
+
+	if !b.healthNudges[0] {
+		t.Fatal("nudge = false with cooldown 0, want true (no damping)")
+	}
+}
+
+func TestHealthRestartNoDupeNudge(t *testing.T) {
+	// After an API restart the detector re-evaluates a still-stalled run: it reads the
+	// persisted health=stalled, computes stalled again → unchanged → no write, no
+	// broadcast, no nudge. The persisted health_notified_at is untouched.
+	r := stalledRunRow()
+	r.Health = healthStalled
+	r.HealthReason = pgText(reasonStalled)
+	r.HealthNotifiedAt = ago(1 * time.Minute)
+	fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+
+	if len(b.healthNudges) != 0 {
+		t.Fatalf("re-nudged an already-flagged run after restart: %v", b.healthNudges)
+	}
+	if len(fs.writes) != 0 {
+		t.Fatalf("re-wrote an unchanged flag after restart: %d writes", len(fs.writes))
 	}
 }
 

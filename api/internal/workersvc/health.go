@@ -33,6 +33,9 @@ type Settings interface {
 	HealthSlowSeconds(ctx context.Context) (int, error)
 	HealthQueuedSeconds(ctx context.Context) (int, error)
 	HealthApprovalSeconds(ctx context.Context) (int, error)
+	// HealthNudgeCooldownSeconds bounds how often a single run may DM its owner
+	// (PRD #47 M4). 0 means no cooldown (nudge on every ok→flagged transition).
+	HealthNudgeCooldownSeconds(ctx context.Context) (int, error)
 }
 
 // Health flag values. These mirror the CHECK constraint on runs.health; keep them
@@ -110,6 +113,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		return 0
 	}
 	th := s.healthThresholds(ctx)
+	cooldown := healthDur(s.settings.HealthNudgeCooldownSeconds(ctx))
 
 	var changed int64
 	for _, r := range runs {
@@ -117,12 +121,23 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if r.Health == target && textEq(r.HealthReason, reason) {
 			continue // nothing changed — skip the write (and, later, its broadcast)
 		}
+		// Nudge-worthiness (Decision 7): only the ok→flagged transition (a new
+		// episode) DMs the owner, and only if the cooldown has elapsed since the last
+		// nudge. The sweeper is the single writer of health_notified_at, so it stamps
+		// it here — in the same SetRunHealth write — exactly when it emits a nudge.
+		nudge := target != healthOK && r.Health == healthOK &&
+			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
+		notifiedAt := pgtype.Timestamptz{}
+		if nudge {
+			notifiedAt = pgTime(now)
+		}
 		n, err := s.q.SetRunHealth(ctx, store.SetRunHealthParams{
-			Health:       target,
-			HealthReason: pgText(reason), // "" → NULL
-			HealthSince:  healthSince(now, target, r),
-			ID:           r.ID,
-			Status:       r.Status, // exit-race scope: no-ops if the run left this status
+			Health:           target,
+			HealthReason:     pgText(reason), // "" → NULL
+			HealthSince:      healthSince(now, target, r),
+			HealthNotifiedAt: notifiedAt, // NULL → COALESCE preserves the existing stamp
+			ID:               r.ID,
+			Status:           r.Status, // exit-race scope: no-ops if the run left this status
 		})
 		if err != nil {
 			slog.Error("health: write run health", "run_id", r.ID, "error", err)
@@ -136,7 +151,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// browser re-read within a tick, the Slack notifier (M4) re-renders/nudges.
 		// Best-effort and non-blocking by the Broadcaster contract.
 		if s.bcast != nil {
-			s.bcast.PublishHealth(r.ID, target, reason)
+			s.bcast.PublishHealth(r.ID, target, reason, nudge)
 		}
 	}
 	return changed

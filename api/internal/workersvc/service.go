@@ -219,11 +219,13 @@ type Broadcaster interface {
 	PublishState(runID uuid.UUID, status string)
 	// PublishHealth signals that a run's health flag changed (PRD #47) — raised,
 	// changed, or self-cleared (health=="ok"). health is the flag enum and reason is
-	// the fixed server-controlled template (empty when clearing). The live hub maps
-	// it to a WS run-update (browsers re-read the run, picking up the owner-gated
-	// reason over REST); the Slack notifier (M4) re-renders its root and, when the
-	// event is nudge-worthy, threads a nudge. Best-effort, never blocks the sweep.
-	PublishHealth(runID uuid.UUID, health, reason string)
+	// the fixed server-controlled template (empty when clearing). nudge is set ONLY
+	// when the sweeper judged this event nudge-worthy (an ok→flagged transition past
+	// the cooldown) and has already stamped health_notified_at — the notifier then
+	// threads one DM; otherwise it only re-renders the root. The live hub maps the
+	// event to a WS run-update (browsers re-read the run, picking up the owner-gated
+	// reason over REST) and ignores nudge. Best-effort, never blocks the sweep.
+	PublishHealth(runID uuid.UUID, health, reason string, nudge bool)
 }
 
 // MultiBroadcaster fans each event out to several Broadcasters — the WS hub AND
@@ -244,9 +246,9 @@ func (m MultiBroadcaster) PublishState(runID uuid.UUID, status string) {
 	}
 }
 
-func (m MultiBroadcaster) PublishHealth(runID uuid.UUID, health, reason string) {
+func (m MultiBroadcaster) PublishHealth(runID uuid.UUID, health, reason string, nudge bool) {
 	for _, b := range m {
-		b.PublishHealth(runID, health, reason)
+		b.PublishHealth(runID, health, reason, nudge)
 	}
 }
 
