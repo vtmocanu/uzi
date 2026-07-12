@@ -86,7 +86,8 @@ provisioning can't reach outside it — see
 
 ## Pocket ID walkthrough
 
-1. In the Pocket ID admin panel, go to **OIDC Clients → New Client**.
+1. In the Pocket ID admin panel, go to **OIDC Clients → Add OIDC Client** (opens
+   the "Create OIDC Client" form).
 2. Name the client and set its **Callback URL** to
    `<FRONTEND_ORIGIN>/api/auth/oidc/callback`.
 3. Pocket ID generates a **Client ID** and **Client Secret** for you — copy
@@ -110,10 +111,10 @@ login from that user to `/login?error=oidc_forbidden`. There is no override.
 
 - **Keycloak**: Users → select the user → Details tab → toggle **Email
   verified** ON, Save.
-- **Pocket ID** (v2.2.0+): either flip the app-level **auto-verify emails**
-  setting so new accounts start verified, or have the user complete Pocket
-  ID's own email-verification flow. Either way flips the per-user flag that
-  uzi checks.
+- **Pocket ID**: either flip the **Emails Verified** setting under
+  Application Configuration so new accounts start verified, or have the user
+  complete Pocket ID's own email-verification flow. Either way flips the
+  per-user flag that uzi checks.
 
 ## IdP outage: break-glass
 
