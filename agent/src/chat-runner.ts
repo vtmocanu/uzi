@@ -75,7 +75,11 @@ export class ChatRunner {
   async execute(claim: ChatClaimResponse, signal?: AbortSignal): Promise<void> {
     const runId = claim.run_id;
     // Register the only secret a chat claim carries; never log the claim itself.
-    if (claim.secrets.anthropic_oauth_token) this.log.addSecret(claim.secrets.anthropic_oauth_token);
+    // Evicted on terminal (PRD #42 Decision 7) like a run's secrets — the registry
+    // is reference-counted, so an issue run of the same user still holding this
+    // token keeps it scrubbed.
+    const oauthToken = claim.secrets.anthropic_oauth_token;
+    if (oauthToken) this.log.addSecret(oauthToken);
 
     const runLog = this.log.child({ run_id: runId, kind: "chat" });
     const secrets = [claim.secrets.anthropic_oauth_token, this.joinToken];
@@ -181,6 +185,8 @@ export class ChatRunner {
     } finally {
       if (signal) signal.removeEventListener("abort", onShutdown);
       await source.stop().catch(() => undefined);
+      // Evict this chat's token now the run is terminal (Decision 7).
+      if (oauthToken) this.log.removeSecret(oauthToken);
     }
   }
 }

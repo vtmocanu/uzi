@@ -17,6 +17,25 @@ import { errMessage } from "./util.js";
  *  (gitlab.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
 
+/**
+ * What the per-run executor factory yields for one execution (PRD #42 Decisions
+ * 4/5): a freshly-constructed executor plus the per-run HOME to clean on terminal.
+ *  - `executor`: built anew for THIS run, so `SdkExecutor.spawnedPids` and
+ *    `killAgentTree` are private to it — two concurrent runs can never wipe or kill
+ *    each other's subprocess tree (the B1 pre-push reap). Serial runs shared one
+ *    instance before; that latent hazard is closed by construction here.
+ *  - `homeDir`: the run's private HOME (`agent-home/<runId>`), removed by the runner
+ *    when the run reaches a terminal state. Optional so a test/stub factory that owns
+ *    its HOME (or needs none) yields undefined and the runner skips the cleanup.
+ */
+export interface RunExecution {
+  executor: Executor;
+  homeDir?: string;
+}
+
+/** Build a per-execution executor for a run id (called once per `execute`). */
+export type ExecutorFactory = (runId: string) => RunExecution;
+
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
   /** How often the steering channel polls /inputs (default 3s). */
@@ -47,7 +66,9 @@ export class RunRunner {
   constructor(
     private readonly client: WorkerClient,
     private readonly git: GitCache,
-    private readonly executor: Executor,
+    /** Per-execution executor factory (PRD #42 Decision 4). Called once per
+     *  `execute` so each run drives its OWN executor instance. */
+    private readonly makeExecutor: ExecutorFactory,
     private readonly log: Logger,
     private readonly batchMs: number,
     /** The worker's join token — redacted from message payloads (it lives in
@@ -62,15 +83,21 @@ export class RunRunner {
 
   async execute(claim: ClaimResponse): Promise<void> {
     const runId = claim.run_id;
+    // This run's OWN executor + private HOME (PRD #42 Decisions 4/5), built fresh
+    // per execution so nothing subprocess-scoped is shared with a concurrent run.
+    const { executor, homeDir: runHome } = this.makeExecutor(runId);
     // Register per-run secrets with the logger so they are scrubbed from any
-    // output, then never log the claim payload itself.
-    this.log.addSecret(claim.secrets.forge_pat);
-    if (claim.secrets.anthropic_oauth_token) this.log.addSecret(claim.secrets.anthropic_oauth_token);
-    // Defense in depth: the git-over-HTTPS Basic credential (base64(user:pat))
-    // only ever lives in a GIT_CONFIG_VALUE (never argv/logs), but register it too
-    // so a future leak through the git env would still be scrubbed.
+    // output, then never log the claim payload itself. Tracked in runScopedSecrets
+    // and evicted on terminal (Decision 7) so a completed run's PAT/token does not
+    // linger in the process-lifetime scrub set; the registry is reference-counted,
+    // so evicting these never un-scrubs a still-active sibling run that shares them.
     const gitBasic = gitBasicCredential(claim.secrets.forge_pat, claim.secrets.forge_username);
-    this.log.addSecret(gitBasic);
+    // Defense in depth for gitBasic: the git-over-HTTPS Basic credential
+    // (base64(user:pat)) only ever lives in a GIT_CONFIG_VALUE (never argv/logs),
+    // but register it too so a future leak through the git env would still be scrubbed.
+    const runScopedSecrets = [claim.secrets.forge_pat, gitBasic];
+    if (claim.secrets.anthropic_oauth_token) runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
+    for (const s of runScopedSecrets) this.log.addSecret(s);
 
     const runLog = this.log.child({ run_id: runId, issue_iid: claim.issue_iid });
     // Same secret set for both redactors: the batcher scrubs run_message payloads;
@@ -142,19 +169,20 @@ export class RunRunner {
         },
       };
 
-      const result = await this.executor.run(ctx);
+      const result = await executor.run(ctx);
 
       // Reap any agent-backgrounded subprocess BEFORE the PAT touches a git child
       // env — otherwise a survivor could read the PAT from that child's
-      // /proc/environ during the push (M4 audit B1). The SDK executor also
-      // self-reaps in its run() finally; this is the explicit, load-bearing call
-      // at the security boundary.
-      this.executor.killAgentTree?.();
+      // /proc/environ during the push (M4 audit B1). This run's executor reaps only
+      // this run's subprocess tree (per-run instance, Decision 4); a concurrent
+      // sibling's tree is untouched. The SDK executor also self-reaps in its run()
+      // finally; this is the explicit, load-bearing call at the security boundary.
+      executor.killAgentTree?.();
 
       // A ci_fix run that judged the failure not a code problem (PRD #6) completes
       // with the diagnosis and NO push/MR — there is nothing to land.
       if (result.fixVerdict === "not_code") {
-        this.executor.killAgentTree?.();
+        executor.killAgentTree?.();
         batcher.emit({ kind: "status", agent: "worker", payload: { text: "not a code problem: completing with the diagnosis, no merge request" } });
         await batcher.close();
         await reportState({ status: "completed", fix_verdict: "not_code" });
@@ -202,6 +230,11 @@ export class RunRunner {
       );
     } finally {
       await steering.stop().catch(() => undefined);
+      // Evict this run's secrets from the logger now the run is terminal (Decision
+      // 7). Reaching this finally means execute() ran to a terminal report; a
+      // requeue (worker death) never returns here, so the evict/HOME-cleanup below
+      // only ever fire for a run that will not resume.
+      for (const s of runScopedSecrets) this.log.removeSecret(s);
       if (barePath && worktreePath) {
         await this.git
           .removeWorktree(barePath, worktreePath)
@@ -214,6 +247,14 @@ export class RunRunner {
         await fs
           .rm(skillsPluginDir(worktreePath), { recursive: true, force: true })
           .catch((e) => runLog.warn("skills plugin cleanup failed", { error: errMessage(e) }));
+      }
+      // Remove this run's private HOME (agent-home/<runId>, Decision 5). The SDK
+      // session transcript under it is only needed to resume, and a terminal run
+      // never resumes. A concurrent sibling's HOME is a distinct dir, untouched.
+      if (runHome) {
+        await fs
+          .rm(runHome, { recursive: true, force: true })
+          .catch((e) => runLog.warn("run HOME cleanup failed", { error: errMessage(e) }));
       }
     }
   }
