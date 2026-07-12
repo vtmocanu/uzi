@@ -315,6 +315,7 @@ Tracked as GitLab issue vtmocanu/uzi#45; PRD at `prds/45-oidc-sso-login.md`.
 - Coexists with email+password login; a `UZI_PASSWORD_LOGIN_ENABLED` kill-switch lets operators go SSO-only. [user 2026-07-12]
 - JIT provisioning: first SSO login auto-creates the user; an existing account is linked by verified email. [user 2026-07-12]
 - Admin stays uzi-managed (existing first-user-is-admin rule); no groups/roles-claim mapping this iteration. [user 2026-07-12]
+- OIDC-created users have no password, so they set a dedicated vault passphrase for the PRD #32 vault. [user 2026-07-12]
 - Operator docs include step-by-step walkthroughs for BOTH Keycloak and Pocket ID. [user 2026-07-12]
 - Supersedes the earlier "SSO with Keycloak" deferral in the Deferred list. [user 2026-07-12]
 

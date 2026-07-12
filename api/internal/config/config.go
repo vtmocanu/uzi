@@ -42,7 +42,8 @@ type Config struct {
 	// AllowedEmailDomains is the registration email-domain allowlist
 	// (UZI_ALLOWED_EMAIL_DOMAINS), lowercased, exact-match, no subdomain
 	// wildcards. Empty means every domain is allowed (today's behavior; the
-	// compose demo stays zero-config). Enforced only in the register handler.
+	// compose demo stays zero-config). Enforced in the register handler and the
+	// OIDC JIT-provisioning path (PRD #45).
 	AllowedEmailDomains []string
 	// PasswordLoginEnabled is the password-auth kill-switch (UZI_PASSWORD_LOGIN_ENABLED,
 	// default true; PRD #45 Decision 8). When false the SPA hides the password form

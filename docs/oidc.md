@@ -113,6 +113,10 @@ sloppy IdP letting anyone register `victim@yourcompany.com` unverified would
 otherwise be an account-takeover vector — so an unflipped flag sends every
 login from that user to `/login?error=oidc_forbidden`. There is no override.
 
+uzi also requires the claim to be a real JSON boolean: an IdP that emits
+`email_verified` as the *string* `"true"` is treated as unverified. Keycloak
+and Pocket ID both emit a proper boolean; only other IdPs need checking.
+
 - **Keycloak**: Users → select the user → Details tab → toggle **Email
   verified** ON, Save.
 - **Pocket ID**: either flip the **Emails Verified** setting under

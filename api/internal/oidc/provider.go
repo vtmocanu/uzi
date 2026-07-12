@@ -215,8 +215,8 @@ func (p *Provider) Exchange(ctx context.Context, code, pkceVerifier, expectedNon
 
 // rawClaims is the subset of ID-token claims uzi maps. email_verified is kept as
 // raw JSON so a strict boolean-true check can reject the string "true", a missing
-// value, or any non-boolean — matching sloppy IdPs that emit it as a string
-// (audit L2).
+// value, or any non-boolean — sloppy IdPs that emit it as a string are treated
+// as unverified (audit L2).
 type rawClaims struct {
 	Email         string          `json:"email"`
 	EmailVerified json.RawMessage `json:"email_verified"`
