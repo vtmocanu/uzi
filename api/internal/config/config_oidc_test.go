@@ -85,6 +85,7 @@ func TestOIDCAllOrNothing(t *testing.T) {
 		"client id only":     {"UZI_OIDC_CLIENT_ID": "c"},
 		"client secret only": {"UZI_OIDC_CLIENT_SECRET": "s"},
 		"issuer + id":        {"UZI_OIDC_ISSUER_URL": "https://idp.example.com", "UZI_OIDC_CLIENT_ID": "c"},
+		"issuer + secret":    {"UZI_OIDC_ISSUER_URL": "https://idp.example.com", "UZI_OIDC_CLIENT_SECRET": "s"},
 		"id + secret":        {"UZI_OIDC_CLIENT_ID": "c", "UZI_OIDC_CLIENT_SECRET": "s"},
 	}
 	for name, env := range partials {
@@ -111,6 +112,7 @@ func TestOIDCIssuerScheme(t *testing.T) {
 		"http non-loopback bad": {"http://idp.example.com", true},
 		"http localhost ok":     {"http://localhost:8080/realms/uzi", false},
 		"http 127.0.0.1 ok":     {"http://127.0.0.1:8080", false},
+		"http ::1 ok":           {"http://[::1]:8080", false},
 		"ftp bad":               {"ftp://idp.example.com", true},
 		"no host bad":           {"https://", true},
 	}
