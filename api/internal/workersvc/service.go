@@ -469,6 +469,14 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID) ([]byte, 
 
 // assembleClaim builds the claim payload for an already-claimed run.
 func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
+	// Judge lane (PRD #46 Decision 1): a judge run has no repo and no forge
+	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
+	// repos → forge_connections and would treat a repo-less judge run as vanished)
+	// and before the bot-PAT open. Its claim carries only the Anthropic token.
+	if run.Kind == RunKindJudge {
+		return s.assembleJudgeClaim(ctx, run)
+	}
+
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -30,7 +30,10 @@ type fakeStore struct {
 	claimParams  *store.ClaimRunParams
 	claimCtx     store.GetRunClaimContextRow
 	claimCtxErr  error
-	anthropic    []byte
+	// claimCtxCalled records whether the repo/forge claim-context join was queried;
+	// the judge lane (PRD #46) must never touch it.
+	claimCtxCalled bool
+	anthropic      []byte
 	anthropicErr error
 	// anthropicSealedWith is the row's sealed_with (defaults to 'master' when
 	// empty, so existing fixtures are unchanged); set to 'dek' for vault tests.
@@ -198,6 +201,7 @@ func (f *fakeStore) ClaimRun(_ context.Context, arg store.ClaimRunParams) (store
 	return f.claimRun, f.claimErr
 }
 func (f *fakeStore) GetRunClaimContext(context.Context, uuid.UUID) (store.GetRunClaimContextRow, error) {
+	f.claimCtxCalled = true
 	return f.claimCtx, f.claimCtxErr
 }
 func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {

@@ -44,6 +44,12 @@ type ClaimPayload struct {
 	// unchanged; without that an unattended resume would hang at the gate forever.
 	AutoApprove bool `json:"auto_approve"`
 
+	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
+	// for kind=judge (omitted otherwise). The judge fetches that run's trace through
+	// the Bearer worker trace endpoint (M3); the claim itself stays small and carries
+	// no forge PAT and no repo — a judge never does git.
+	TargetRunID *string `json:"target_run_id,omitempty"`
+
 	// Pipeline is the failed-pipeline snapshot for a ci_fix run (PRD #6): the
 	// pipeline the agent diagnoses + fixes, with its failed jobs and log tails.
 	// Present only for kind=ci_fix (omitted for issue runs). Log tails are untrusted
