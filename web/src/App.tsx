@@ -19,6 +19,7 @@ import { Board } from "./pages/Board";
 import { IssueView } from "./pages/IssueView";
 import { RunsList } from "./pages/RunsList";
 import { RunView } from "./pages/RunView";
+import { Notifications } from "./pages/Notifications";
 import { ChatList, ChatConversation } from "./pages/Chat";
 import { WorkersSettings } from "./pages/WorkersSettings";
 import { Docs } from "./pages/Docs";
@@ -102,6 +103,14 @@ export default function App() {
           element={
             <ProtectedRoute>
               <RunView />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/notifications"
+          element={
+            <ProtectedRoute>
+              <Notifications />
             </ProtectedRoute>
           }
         />

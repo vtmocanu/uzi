@@ -574,6 +574,37 @@ export interface RunListItem extends Run {
   owner_email?: string;
 }
 
+// ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
+// A generic in-app notification. kind + payload let any feature enqueue one; the
+// judge is tenant #1. payload is the render blob — by convention a `title` and
+// optional `body` the inbox shows, but readers must tolerate any shape. run_id /
+// review_id are optional deep-link anchors. owner is present ONLY on the admin
+// all-view so the admin sees whose inbox a row belongs to.
+export interface NotificationOwner {
+  id: string;
+  email: string;
+  display_name: string | null;
+}
+
+export interface Notification {
+  id: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  run_id: string | null;
+  review_id: string | null;
+  read_at: string | null;
+  created_at: string;
+  owner?: NotificationOwner;
+}
+
+// NotificationList is the inbox envelope: one page of rows, the caller's own
+// unread count (the bell badge), and the scope total for paging.
+export interface NotificationList {
+  notifications: Notification[];
+  unread: number;
+  total: number;
+}
+
 // RunMessage is one persisted, seq-numbered event in a run's stream.
 export interface RunMessage {
   seq: number;
@@ -1034,6 +1065,22 @@ const realApi = {
 
   adminListWorkers: () => request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
   adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),
+
+  // Notifications inbox (PRD #46 M2). listNotifications is the caller's own inbox;
+  // { all: true } asks for every user's (admin only — a non-admin gets 403). The
+  // envelope's `unread` is always the caller's own count (the bell badge).
+  // unreadNotificationCount is the bell's lightweight poll (no rows).
+  listNotifications: (params?: { all?: boolean; limit?: number; offset?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.all) q.set("all", "1");
+    if (params?.limit != null) q.set("limit", String(params.limit));
+    if (params?.offset != null) q.set("offset", String(params.offset));
+    const qs = q.toString();
+    return request<NotificationList>("GET", qs ? `/notifications?${qs}` : "/notifications");
+  },
+  unreadNotificationCount: () => request<{ unread: number }>("GET", "/notifications/unread_count"),
+  markNotificationRead: (id: string) =>
+    request<{ notification: Notification }>("POST", `/notifications/${id}/read`),
 };
 
 // The one client the app talks to. `mockApi` implements the identical surface

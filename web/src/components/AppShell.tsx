@@ -13,8 +13,10 @@ import { api, MOCK_MODE, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
+import { onNotificationsChanged } from "../lib/notifications";
 import {
   ActivityIcon,
+  BellIcon,
   BoardIcon,
   BookIcon,
   BotIcon,
@@ -58,6 +60,7 @@ function NavItem({
   indent = false,
   onNavigate,
   collapsed = false,
+  badge = 0,
 }: {
   to: string;
   icon?: ReactNode;
@@ -72,10 +75,15 @@ function NavItem({
   // When collapsed the item is an icon-only rail button; the label moves to a
   // native title tooltip so the destination is still identifiable on hover.
   collapsed?: boolean;
+  // badge is an unread count (PRD #46 M2): expanded, a count pill trails the label;
+  // collapsed, a dot overlaps the icon since a rail has no room for a number. 0
+  // renders nothing.
+  badge?: number;
 }) {
   const { pathname } = useLocation();
   let active = exactOnly ? pathname === to : isNavActive(pathname, to);
   if (active && excludeSubpath && isNavActive(pathname, excludeSubpath)) active = false;
+  const hasBadge = badge > 0;
   return (
     <Link
       to={to}
@@ -90,11 +98,25 @@ function NavItem({
       )}
     >
       {icon && (
-        <span className={cx("text-base", active ? "text-brand" : "text-faint group-hover:text-muted")}>
+        <span className={cx("relative text-base", active ? "text-brand" : "text-faint group-hover:text-muted")}>
           {icon}
+          {collapsed && hasBadge && (
+            <span
+              aria-hidden="true"
+              className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-brand ring-2 ring-surface"
+            />
+          )}
         </span>
       )}
       {!collapsed && <span className="truncate">{label}</span>}
+      {!collapsed && hasBadge && (
+        <span
+          aria-label={`${badge} unread`}
+          className="ml-auto min-w-[1.25rem] rounded-full bg-brand px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none text-on-brand"
+        >
+          {badge > 99 ? "99+" : badge}
+        </span>
+      )}
     </Link>
   );
 }
@@ -142,6 +164,8 @@ function SidebarContent({
   // glyph (the Repo DTO has no forge_type). Kept separate from repos so a failed
   // connections call degrades to the Git fallback rather than blanking the boards.
   const [forgeTypeById, setForgeTypeById] = useState<Record<string, string>>({});
+  // Notifications unread badge (PRD #46 M2).
+  const [unread, setUnread] = useState(0);
 
   // Boards in the nav mirror the user's enabled repos; refetched on navigation
   // so enabling/disabling a repo shows up without a reload.
@@ -154,6 +178,30 @@ function SidebarContent({
       .listRepos()
       .then(({ repos }) => setRepos(repos))
       .catch(() => setRepos([]));
+  }, [user, location.pathname]);
+
+  // Unread badge: poll on navigation (no WS — PRD #46 M2) and refresh on the
+  // in-app change event (e.g. after marking one read on the inbox page). A failed
+  // fetch is non-fatal: keep the last known count rather than blanking the badge.
+  useEffect(() => {
+    if (!user) {
+      setUnread(0);
+      return;
+    }
+    let alive = true;
+    const load = () =>
+      api
+        .unreadNotificationCount()
+        .then(({ unread }) => {
+          if (alive) setUnread(unread);
+        })
+        .catch(() => {});
+    load();
+    const off = onNotificationsChanged(load);
+    return () => {
+      alive = false;
+      off();
+    };
   }, [user, location.pathname]);
 
   // Connections change rarely, so this join is fetched once per session, not per
@@ -215,6 +263,14 @@ function SidebarContent({
       <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4">
         <div className="space-y-0.5 pt-3">
           <NavItem to="/dashboard" icon={<HomeIcon />} label="Overview" onNavigate={onNavigate} collapsed={collapsed} />
+          <NavItem
+            to="/notifications"
+            icon={<BellIcon />}
+            label="Notifications"
+            badge={unread}
+            onNavigate={onNavigate}
+            collapsed={collapsed}
+          />
         </div>
 
         <NavGroup label="Work" collapsed={collapsed}>
