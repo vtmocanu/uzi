@@ -308,7 +308,7 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvem
 
 ## Feature #45 — OIDC SSO login (Keycloak / Pocket ID)
 
-Tracked as GitLab issue vtmocanu/uzi#45; PRD at `prds/45-oidc-sso-login.md`.
+Tracked as GitLab issue vtmocanu/uzi#45; PRD at `prds/done/45-oidc-sso-login.md`.
 
 - SSO login against a single external OIDC provider — Keycloak (work) and Pocket ID (homelab) are the two supported targets. [user 2026-07-12]
 - One provider, env-configured (not multi-provider, no in-app provider config). [user 2026-07-12]

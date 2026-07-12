@@ -63,7 +63,7 @@ A new unauthenticated endpoint **`GET /api/auth/config`** returns `{registration
 
 ## OIDC single sign-on
 
-uzi can also authenticate against a single external OIDC provider (Keycloak or Pocket ID) instead of, or alongside, its own password accounts — see [oidc.md](oidc.md) for the operator setup guide and `prds/45-oidc-sso-login.md` for the full decision log. Highlights relevant to this page:
+uzi can also authenticate against a single external OIDC provider (Keycloak or Pocket ID) instead of, or alongside, its own password accounts — see [oidc.md](oidc.md) for the operator setup guide and `prds/done/45-oidc-sso-login.md` for the full decision log. Highlights relevant to this page:
 
 - The callback converges on the same `issueSession` chokepoint as password login: identical JWT cookie, identical CSRF cookie, identical `token_version` revocation, identical rolling refresh. uzi keeps no IdP tokens (no refresh tokens, no IdP session tracking, no RP-initiated logout), so the uzi session's lifetime (`AUTH_TOKEN_TTL`) is fully decoupled from the IdP's own session — logging out of uzi does not end the IdP session, and a live IdP session logs the user straight back in on the next click.
 - Identity is keyed on `(issuer, subject)`, stored directly on `users`; email stays the human key and the join key for linking an existing password account or JIT-provisioning a new one, both gated on the IdP's `email_verified` claim being boolean `true` — an unverified email is an account-takeover vector, so there is no override.

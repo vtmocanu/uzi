@@ -5129,7 +5129,7 @@ Serves human: Feature #45 — SSO login against a single env-configured OIDC pro
 accounts; admin stays uzi-managed (no groups mapping); operator docs with step-by-step
 Keycloak AND Pocket ID walkthroughs (all user decisions 2026-07-12). Supersedes the
 "No SSO/OAuth for this MVP" punt in `docs/auth-design.md` (OIDC only; SAML/LDAP stay out).
-Full decision log + security-audit/fact-check trail: `prds/45-oidc-sso-login.md`; operator
+Full decision log + security-audit/fact-check trail: `prds/done/45-oidc-sso-login.md`; operator
 guide: `docs/oidc.md`. Migration landed as `00056_oidc.sql`. This section records the
 load-bearing AI decisions; the PRD carries the complete set (1–10) with the audit H/M/L
 and fact-check findings.
