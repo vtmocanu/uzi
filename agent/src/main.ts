@@ -1,5 +1,5 @@
 import path from "node:path";
-import { loadConfig } from "./config.js";
+import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING } from "./config.js";
 import { createLogger, type Logger } from "./log.js";
 import { WorkerClient } from "./client.js";
 import { GitCache } from "./git.js";
@@ -28,7 +28,19 @@ async function main(): Promise<void> {
     data_dir: config.dataDir,
     worker_name: config.workerName,
     executor: config.executor,
+    max_concurrent_runs: config.maxConcurrentRuns,
   });
+  // Soft-ceiling warn (PRD #42 Decision 3): the cap is honored as configured, but a
+  // value above the documented ceiling is almost certainly a fat-finger — each slot
+  // is ~one SDK CLI + git ops + optional devbox provisioning, and they share one
+  // container cgroup, so shout before the OOM killer does. Warn here (not in
+  // loadConfig) because the logger is only built after the config parse.
+  if (config.maxConcurrentRuns > MAX_CONCURRENT_RUNS_SOFT_CEILING) {
+    log.warn("WORKER_MAX_CONCURRENT_RUNS above the soft ceiling; size the container for that many concurrent runs", {
+      max_concurrent_runs: config.maxConcurrentRuns,
+      soft_ceiling: MAX_CONCURRENT_RUNS_SOFT_CEILING,
+    });
+  }
 
   const client = new WorkerClient(config.apiUrl, config.workerToken, config.version, log, {
     httpTimeoutMs: config.httpTimeoutMs,

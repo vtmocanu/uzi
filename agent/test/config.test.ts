@@ -60,3 +60,24 @@ describe("loadConfig chat lifecycle knobs (PRD #39)", () => {
     assert.strictEqual(loadConfig(baseEnv({ CHAT_MAX_TURNS: "  " })).chatMaxTurns, 50);
   });
 });
+
+describe("loadConfig WORKER_MAX_CONCURRENT_RUNS (PRD #42 Decision 3)", () => {
+  it("defaults to 1 (the pre-#42 serial run lane) when unset", () => {
+    assert.strictEqual(loadConfig(baseEnv()).maxConcurrentRuns, 1);
+  });
+
+  it("parses a valid integer cap", () => {
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_MAX_CONCURRENT_RUNS: "4" })).maxConcurrentRuns, 4);
+  });
+
+  it("honors a value above the soft ceiling (warn, not clamp — the warn lives in main.ts)", () => {
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_MAX_CONCURRENT_RUNS: "20" })).maxConcurrentRuns, 20);
+  });
+
+  it("falls back to 1 on a blank, zero, negative, or fractional value", () => {
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_MAX_CONCURRENT_RUNS: "  " })).maxConcurrentRuns, 1);
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_MAX_CONCURRENT_RUNS: "0" })).maxConcurrentRuns, 1);
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_MAX_CONCURRENT_RUNS: "-2" })).maxConcurrentRuns, 1);
+    assert.strictEqual(loadConfig(baseEnv({ WORKER_MAX_CONCURRENT_RUNS: "2.5" })).maxConcurrentRuns, 1);
+  });
+});

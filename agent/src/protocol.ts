@@ -72,6 +72,12 @@ export interface RegisterRequest {
    *  in which case the server stores NULL for template_reported. Soft signal for
    *  drift display only — never an authn/authz input. */
   template?: string;
+  /** The worker's advertised RUN-lane concurrency cap (PRD #42 Decision 3,
+   *  WORKER_MAX_CONCURRENT_RUNS). Observability the server records (clamped server-
+   *  side to [1,256]) and the fleet UI renders as "N/M runs"; never enforced. A
+   *  pre-#42 worker omits it and the column stays NULL. Distinct from the chat
+   *  lane's own concurrency (WORKER_CHAT_SESSIONS). */
+  max_concurrent_runs?: number;
 }
 
 export interface RegisterResponse {

@@ -64,12 +64,18 @@ export class WorkerClient {
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
   }
 
-  async register(name: string, template?: string): Promise<RegisterResponse> {
+  async register(name: string, template?: string, maxConcurrentRuns?: number): Promise<RegisterResponse> {
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
     // no template, and the server stores NULL (PRD #18). The server's decoder
     // rejects unknown fields but accepts an absent optional one.
     if (template) body.template = template;
+    // Advertise the RUN-lane concurrency cap (PRD #42 Decision 3): observability the
+    // server records (and clamps to [1,256]) and renders as "N/M runs", never
+    // enforced. Sent whenever the caller knows it (the worker always does — default
+    // 1); M3a's register handler accepts it and a pre-#42 server ignores it. Distinct
+    // from the chat lane's WORKER_CHAT_SESSIONS — this bounds issue/ci_fix runs only.
+    if (typeof maxConcurrentRuns === "number") body.max_concurrent_runs = maxConcurrentRuns;
     return (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
   }
 
