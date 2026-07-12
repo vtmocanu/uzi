@@ -547,8 +547,12 @@ Approved deviations from the design above, found during implementation:
    every run kind, not just self_improve. Fixed here (not caused by this PRD, but
    folded in per user decision): `gitEnv` → replacement env (worker/API vars
    absent by construction; `safe.directory` + the credential pairs preserved),
-   `core.hooksPath` pinned to an empty dir on every invocation (structurally
-   neutralizing any planted hook), and `filter.` added to the guardrails
+   `core.hooksPath` pinned on every invocation to a **root-owned `0555` empty
+   dir baked into the worker image** (`agent/templates/base/Dockerfile`) — NOT a
+   runtime-created dir, which would sit under the shared uzi uid and be
+   agent-writable (that relocates the vector; audit follow-up). The uzi uid
+   cannot create a hook inside a root-owned `0555` dir, so no planted hook can
+   fire. `filter.` added to the guardrails
    git-config-write deny list (a second code-exec route). M9 + M10 together bring
    every worker subprocess (SDK, provision, checks, git) onto the
    replacement-env discipline.

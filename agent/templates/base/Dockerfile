@@ -129,6 +129,12 @@ ENV UZI_DATA_DIR=/data
 # join token stays the trust anchor.
 ENV UZI_WORKER_TEMPLATE=base
 RUN mkdir -p /data && chown -R uzi:uzi /app /data
+# A ROOT-owned, non-writable (0555) empty dir the worker points git's core.hooksPath at
+# on every invocation (agent/src/git.ts, M10 audit). The uzi user cannot create a child
+# inside a root-owned 0555 dir, so a self_improve agent — which shares the worker uid
+# until the k8s uid-split — cannot plant a pre-push (or any) hook there. MUST be created
+# as root, BEFORE the USER line below; the jvm template FROMs base and inherits it.
+RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
 USER uzi:uzi
 # /data persists the clone cache + devbox/nix per-user metadata; /nix persists the
 # nix store (warm-start). Compose backs these with the agentdata + agentnix volumes.

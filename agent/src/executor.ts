@@ -338,10 +338,14 @@ export class StubExecutor implements Executor {
   }
 
   private async git(cwd: string, args: string[]): Promise<void> {
-    await execFileAsync("git", ["-C", cwd, ...args], {
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-      timeout: 60_000,
-    });
+    // Replacement env, not a process.env spread (M10 discipline): even the stub's
+    // local add/commit is a worker-spawned git child, so keep it off the worker's
+    // secrets by construction. Stub/e2e-only with dummy creds, but consistent with
+    // gitEnv. Commit identity rides -c flags (see the caller), so only PATH/HOME are
+    // needed; GIT_CONFIG_GLOBAL is carried if the e2e set it (a config-file path).
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: process.env.HOME, GIT_TERMINAL_PROMPT: "0" };
+    if (process.env.GIT_CONFIG_GLOBAL) env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL;
+    await execFileAsync("git", ["-C", cwd, ...args], { env, timeout: 60_000 });
   }
 }
 

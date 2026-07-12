@@ -1,21 +1,24 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { mkdirSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type { Logger } from "./log.js";
 
 const execFileAsync = promisify(execFile);
 
-// A guaranteed-EMPTY hooks dir. Every worker git invocation sets core.hooksPath here
-// (via gitEnv's own GIT_CONFIG pairs, which override any config file), so a hook the
-// agent planted at the DEFAULT path (e.g. <bare>/hooks/pre-push — agent-writable,
-// outside the worktree, a worker-spawned child with NO SDK PreToolUse reach) can never
-// fire (M10 audit). The worker may set core.* even though the agent's guardrail denies
-// it. Created once at module load; an empty dir means git finds no hooks.
-const EMPTY_GIT_HOOKS_DIR = path.join(os.tmpdir(), "uzi-empty-git-hooks");
-mkdirSync(EMPTY_GIT_HOOKS_DIR, { recursive: true });
+// A ROOT-OWNED, non-writable (0555) empty dir BAKED into the worker image (see
+// agent/templates/base/Dockerfile, created as root before `USER uzi:uzi`). Every
+// worker git invocation sets core.hooksPath here (via gitEnv's own GIT_CONFIG pairs,
+// which override any config file), so a hook the agent tries to plant CANNOT be
+// created: the agent shares the worker uid (the k8s uid-split is deferred), but a
+// non-root process cannot create a child inside a root-owned 0555 dir — so no
+// pre-push (or any) hook can fire (M10 audit).
+//
+// It is NOT created at runtime: a runtime mkdir would land under the SHARED uid and
+// be agent-writable — exactly the vector this closes (relocating, not fixing). A
+// nonexistent path is harmless (git simply runs no hooks), so this is safe on a
+// host/image without the baked dir (e.g. a unit test), where no hooks run anyway.
+const EMPTY_GIT_HOOKS_DIR = "/usr/share/uzi-git-nohooks";
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
 

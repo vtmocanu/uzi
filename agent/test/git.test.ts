@@ -122,12 +122,20 @@ describe("gitEnv (M10: scrubbed replacement env + hook neutralization)", () => {
     assert.ok(!JSON.stringify(env).includes("join-token-SECRET"), "no worker secret in the git env");
   });
 
-  it("neutralizes hooks: core.hooksPath points at an existing EMPTY dir", () => {
+  it("neutralizes hooks: core.hooksPath is the baked root-owned path, NOT a runtime dir", () => {
     const cfg = configPairs(gitEnv());
     assert.equal(cfg["safe.directory"], "*");
-    const hooks = cfg["core.hooksPath"];
-    assert.ok(hooks && fs.existsSync(hooks), "core.hooksPath must be a real dir");
-    assert.deepEqual(fs.readdirSync(hooks), [], "the hooks dir must be empty so no hook can fire");
+    // The empty hooks dir is BAKED into the image as root-owned 0555
+    // (agent/templates/base/Dockerfile) — the uzi uid (which the agent shares) cannot
+    // create a hook inside it. A runtime-created dir would be under the shared uid and
+    // agent-writable, which is the vector this closes. The filesystem perms can't be
+    // unit-tested portably (that's the Dockerfile stanza's job); here we pin that
+    // git.ts uses the constant baked path and does NOT create it at runtime.
+    assert.equal(cfg["core.hooksPath"], "/usr/share/uzi-git-nohooks", "must be the baked constant path");
+    assert.ok(
+      !fs.existsSync("/usr/share/uzi-git-nohooks"),
+      "git.ts must NOT mkdir the hooks dir at runtime (it exists only in the image)",
+    );
   });
 
   it("carries the scoped credential pair when a PAT is passed (and hooks stay neutralized)", () => {
