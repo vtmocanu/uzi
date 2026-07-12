@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
@@ -38,6 +39,17 @@ func timePtr(valid bool, t time.Time) *time.Time {
 	return &t
 }
 
+// intPtrValue returns a pointer to the int value of a nullable int4 column when
+// valid, else nil — the JSON-null vs value convention for the worker's advertised
+// max_concurrent_runs (PRD #42).
+func intPtrValue(i pgtype.Int4) *int {
+	if !i.Valid {
+		return nil
+	}
+	v := int(i.Int32)
+	return &v
+}
+
 // maxWorkerNameBytes bounds a worker's human label.
 const maxWorkerNameBytes = 200
 
@@ -54,7 +66,14 @@ type workerDTO struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Status string `json:"status"`
-	Busy   bool   `json:"busy"`
+	// Busy stays for back-compat (PRD #42 Decision 10): it is now derived as
+	// active_runs > 0, so a consumer that only reads busy is unchanged.
+	Busy bool `json:"busy"`
+	// ActiveRuns is the worker's live count of non-terminal runs; MaxConcurrentRuns
+	// is its advertised slot cap (null when unadvertised). Together they drive the
+	// "N/M runs" saturation badge (PRD #42).
+	ActiveRuns        int  `json:"active_runs"`
+	MaxConcurrentRuns *int `json:"max_concurrent_runs"`
 	// Worker template (PRD #18): the UI-declared choice and the worker's
 	// self-reported value. Either may be null (no choice / older image); the UI
 	// badges drift when both are set and differ.
@@ -65,31 +84,38 @@ type workerDTO struct {
 	CreatedAt        time.Time  `json:"created_at"`
 }
 
-func workerDTOFromWorker(w store.Worker, busy bool) workerDTO {
+// workerDTOFromWorker builds the DTO from a bare worker row plus its active-run
+// count (busy is derived from the count). The register/heartbeat/create paths do
+// not compute the count and pass 0, exactly as they previously passed busy=false.
+func workerDTOFromWorker(w store.Worker, activeRuns int) workerDTO {
 	return workerDTO{
-		ID:               w.ID.String(),
-		Name:             w.Name,
-		Status:           w.Status,
-		Busy:             busy,
-		TemplateDeclared: textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
-		TemplateReported: textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
-		Version:          textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt:  timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:        w.CreatedAt.Time,
+		ID:                w.ID.String(),
+		Name:              w.Name,
+		Status:            w.Status,
+		Busy:              activeRuns > 0,
+		ActiveRuns:        activeRuns,
+		MaxConcurrentRuns: intPtrValue(w.MaxConcurrentRuns),
+		TemplateDeclared:  textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported:  textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:           textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:   timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:         w.CreatedAt.Time,
 	}
 }
 
 func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
 	return workerDTO{
-		ID:               w.ID.String(),
-		Name:             w.Name,
-		Status:           w.Status,
-		Busy:             w.Busy,
-		TemplateDeclared: textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
-		TemplateReported: textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
-		Version:          textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt:  timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:        w.CreatedAt.Time,
+		ID:                w.ID.String(),
+		Name:              w.Name,
+		Status:            w.Status,
+		Busy:              w.ActiveRuns > 0,
+		ActiveRuns:        int(w.ActiveRuns),
+		MaxConcurrentRuns: intPtrValue(w.MaxConcurrentRuns),
+		TemplateDeclared:  textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported:  textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:           textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:   timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:         w.CreatedAt.Time,
 	}
 }
 
@@ -273,7 +299,7 @@ func (h *Handler) CreateWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, false),
+		"worker": workerDTOFromWorker(wkr, 0),
 		"token":  token,
 	})
 }

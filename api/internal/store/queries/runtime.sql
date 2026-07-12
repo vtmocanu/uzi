@@ -19,14 +19,18 @@ SELECT * FROM workers WHERE id = @id;
 SELECT * FROM workers WHERE id = @id AND user_id = @user_id;
 
 -- name: ListWorkersByUser :many
--- Worker list for the owning user. "busy" is derived here (never stored): a
--- worker is busy when it holds a non-terminal run.
+-- Worker list for the owning user. active_runs is the live count of the worker's
+-- non-terminal runs (PRD #42 Decision 10: the count replaced the old EXISTS-derived
+-- boolean so the UI can show "N/M runs"); "busy" stays derivable as active_runs > 0,
+-- so consumers that only cared about busy are unchanged. max_concurrent_runs is the
+-- worker's advertised slot cap, carried by w.* (NULL when unadvertised); it is
+-- observability only and never enforced.
 SELECT w.*,
-       EXISTS (
-           SELECT 1 FROM runs r
+       (
+           SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
-       ) AS busy
+       ) AS active_runs
 FROM workers w
 WHERE w.user_id = @user_id
 ORDER BY w.created_at ASC;
@@ -35,13 +39,18 @@ ORDER BY w.created_at ASC;
 -- Worker announces version + its self-reported template and comes online;
 -- heartbeat is stamped now. template_reported is what the image bakes in (PRD
 -- #18), NULL when the worker sends none (older image) — stored as-is; drift vs
--- template_declared is surfaced, never rejected.
+-- template_declared is surfaced, never rejected. max_concurrent_runs is the worker's
+-- advertised slot cap (PRD #42 Decisions 3 & 10), likewise self-reported: NULL when
+-- the worker advertises none (an older image, or before the M2 agent sends it), and
+-- overwritten to the current report on every register (the fresh-start signal). It is
+-- observability only — the server never enforces it.
 UPDATE workers SET
-    status            = 'online',
-    version           = @version,
-    template_reported = @template_reported,
-    last_heartbeat_at = now(),
-    updated_at        = now()
+    status              = 'online',
+    version             = @version,
+    template_reported   = @template_reported,
+    max_concurrent_runs = sqlc.narg('max_concurrent_runs'),
+    last_heartbeat_at   = now(),
+    updated_at          = now()
 WHERE id = @id
 RETURNING *;
 
@@ -132,13 +141,15 @@ ORDER BY r.created_at DESC
 LIMIT 500;
 
 -- name: ListAllWorkers :many
--- Admin Agents-status: every worker with derived busy status and owner email.
+-- Admin Agents-status: every worker with its live active-run count (PRD #42
+-- Decision 10; busy is derivable as active_runs > 0) and owner email. The embedded
+-- worker carries max_concurrent_runs (the advertised cap, NULL when unadvertised).
 SELECT sqlc.embed(w),
-       EXISTS (
-           SELECT 1 FROM runs r
+       (
+           SELECT count(*) FROM runs r
            WHERE r.worker_id = w.id
              AND r.status IN ('claimed', 'running', 'awaiting_approval')
-       ) AS busy,
+       ) AS active_runs,
        u.email AS owner_email
 FROM workers w
 JOIN users u ON u.id = w.user_id

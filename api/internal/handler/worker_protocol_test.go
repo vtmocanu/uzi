@@ -47,7 +47,7 @@ func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRu
 	return 0, nil
 }
 func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.Worker, error) {
-	return store.Worker{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported}, nil
+	return store.Worker{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns}, nil
 }
 
 func newProtocolHandler(t *testing.T, st workersvc.Store) *Handler {
@@ -108,6 +108,50 @@ func TestWorkerRegisterReadsTemplate(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"template_reported":"jvm"`) {
 		t.Fatalf("expected template_reported=jvm in DTO, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerRegisterReadsMaxConcurrentRuns(t *testing.T) {
+	// PRD #42: the worker advertises its concurrency cap. Register must accept it
+	// (no 400 from the unknown-field-rejecting decoder) and round-trip it into the
+	// DTO as max_concurrent_runs so the fleet UI can render "N/M runs".
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3","max_concurrent_runs":2}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"max_concurrent_runs":2`) {
+		t.Fatalf("expected max_concurrent_runs=2 in DTO, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerRegisterOmitsMaxConcurrentRuns(t *testing.T) {
+	// An older image (and every M3a worker) sends no cap ⇒ max_concurrent_runs is
+	// null in the DTO, never 0.
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3"}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"max_concurrent_runs":null`) {
+		t.Fatalf("absent cap must be null, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerRegisterDropsNonPositiveMaxConcurrentRuns(t *testing.T) {
+	// A garbled/hostile worker reports a non-positive cap. Register must still
+	// succeed (a soft observability field never wedges the register-retry loop) but
+	// the nonsensical value must not reach the DB/UI — dropped to null.
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerRegister(rec, workerReq(http.MethodPost, `{"name":"laptop","version":"1.2.3","max_concurrent_runs":0}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a bad cap must not fail register), body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"max_concurrent_runs":null`) {
+		t.Fatalf("non-positive cap must be dropped to null, got %q", rec.Body.String())
 	}
 }
 

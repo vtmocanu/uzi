@@ -255,7 +255,7 @@ func TestListRunsRejectsMalformedFilters(t *testing.T) {
 func TestAdminListWorkersAndRuns(t *testing.T) {
 	st := &runsStore{
 		allWorkers: []store.ListAllWorkersRow{
-			{Worker: store.Worker{ID: uuid.New(), Name: "w1", Status: "online"}, Busy: true, OwnerEmail: "u@example.com"},
+			{Worker: store.Worker{ID: uuid.New(), Name: "w1", Status: "online"}, ActiveRuns: 1, OwnerEmail: "u@example.com"},
 		},
 		activeRuns: []store.ListActiveRunsAllRow{
 			{Run: store.Run{ID: uuid.New(), Status: "running"}, RepoPath: "grp/repo", OwnerEmail: "u@example.com"},

@@ -190,6 +190,8 @@ describe("IssueView Start gate honors the PRDLESS bypass (PRD #22 B1)", () => {
     name: "laptop",
     status: "online",
     busy: false,
+    active_runs: 0,
+    max_concurrent_runs: null,
     template_declared: null,
     template_reported: null,
     version: null,
