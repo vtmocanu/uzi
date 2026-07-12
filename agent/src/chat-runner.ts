@@ -14,7 +14,7 @@ import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import type { ChatClaimResponse, StateRequest } from "./protocol.js";
 import { MessageBatcher } from "./batcher.js";
-import { ChatExecutor, type ChatContext, type ChatExecutorResult } from "./chat-executor.js";
+import type { ChatContext, ChatExecutorLike, ChatExecutorResult } from "./chat-executor.js";
 import { ChatSteering, type ChatInputSource } from "./steering.js";
 import { buildUziToolsServer, UZI_TOOLS_SERVER_NAME } from "./uzi-tools.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
@@ -52,7 +52,7 @@ export class ChatRunner {
 
   constructor(
     private readonly client: WorkerClient,
-    private readonly executor: ChatExecutor,
+    private readonly executor: ChatExecutorLike,
     private readonly log: Logger,
     private readonly batchMs: number,
     private readonly defaults: ChatRunnerDefaults,
@@ -153,6 +153,9 @@ export class ChatRunner {
         model: claim.config.default_model,
         mcpServers: { [UZI_TOOLS_SERVER_NAME]: uziTools.server },
         extraTools: uziTools.toolNames,
+        // The stub executor (e2e) calls these directly; the real executor ignores
+        // them and drives the model through the MCP server above.
+        uziTools: uziTools.handlers,
         // Park on the steering channel; on a delivered message, emit the user_message
         // run message (worker owns the seq) BEFORE the executor streams the model's
         // reply for that turn. `idle`/`ended` → undefined (the loop completes; the

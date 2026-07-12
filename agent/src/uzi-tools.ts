@@ -195,12 +195,15 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
 
 /**
  * Build the uzi tools MCP server for one chat run. Returns the server config (for
- * `options.mcpServers.uzi`) and the qualified tool names (for `options.tools`). The
- * handlers close over `deps`, so propose_issue can only ever propose on THIS run.
+ * `options.mcpServers.uzi`), the qualified tool names (for `options.tools`), and the
+ * raw handlers (the stub chat executor calls proposeIssue directly, since it runs no
+ * SDK/MCP). All three close over `deps`, so propose_issue can only ever propose on
+ * THIS run.
  */
 export function buildUziToolsServer(deps: UziToolsDeps): {
   server: McpSdkServerConfigWithInstance;
   toolNames: string[];
+  handlers: UziToolHandlers;
 } {
   const h = makeUziToolHandlers(deps);
   const server = createSdkMcpServer({
@@ -255,5 +258,5 @@ export function buildUziToolsServer(deps: UziToolsDeps): {
       ),
     ],
   });
-  return { server, toolNames: uziToolNames() };
+  return { server, toolNames: uziToolNames(), handlers: h };
 }

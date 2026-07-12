@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Image-content check for the baked uzi source (PRD #39 M2, Decision 5).
 #
-# Asserts, against the worker image's filesystem, the four content invariants the
-# milestone names:
+# Asserts, against the worker image's filesystem, the invariants the milestone names:
 #   1. /opt/uzi-src/api exists  (the API source is baked in)
 #   2. /opt/uzi-src/web exists  (the web source is baked in)
 #   3. NO file matching .env* anywhere under /opt/uzi-src  (no secret leaked in)
 #   4. NO inspiration/ under /opt/uzi-src  (the large submodules are excluded)
+#   5. /opt/uzi-src is entirely ROOT-OWNED (Decision 5 — the non-root agent can't write it)
+#   6. read-only-to-agent: a write as the image's non-root user is DENIED
 # plus /opt/uzi-src/BUILD_INFO is present.
+# Invariants 5 + 6 are FULL-mode only (they need the real image's `uzi` user + USER
+# switch; the light busybox reproduction runs as root and would false-pass).
 #
 # Two modes (the four invariants depend only on the bake COPY + the per-Dockerfile
 # ignore, NOT on the heavy nix/devbox layers):
@@ -80,6 +83,35 @@ else
 fi
 
 if have '^opt/uzi-src/inspiration/'; then echo "FAIL inspiration/ leaked into the baked source"; fail=1; else echo "ok   no inspiration/ under the baked source"; fi
+
+# Ownership + read-only-to-agent (Decision 5) — FULL MODE ONLY. This is a meaningful
+# runtime assertion only against the REAL template image, which adds the `uzi` user and
+# switches to `USER uzi`. The light check builds its OWN busybox Dockerfile.check with
+# NO user switch (runs as root, no uzi user), so `find ! -user root` there is a
+# false-pass and a write would succeed — it would assert nothing. So gate both probes
+# on full mode; light stays content-only.
+if [ "$MODE" = "full" ]; then
+  # /opt/uzi-src must be entirely root-owned so the non-root agent can never write it.
+  NONROOT="$(docker run --rm --entrypoint sh "$IMAGE" -c 'find /opt/uzi-src ! -user root 2>/dev/null' 2>/dev/null || true)"
+  if [ -z "$NONROOT" ]; then
+    echo "ok   /opt/uzi-src is entirely root-owned"
+  else
+    echo "FAIL non-root-owned paths under /opt/uzi-src:"
+    printf '%s\n' "$NONROOT" | sed 's/^/       /'
+    fail=1
+  fi
+  # And a write as the image's non-root uzi user MUST be denied (read-only by ownership).
+  PROBE="$(docker run --rm --entrypoint sh "$IMAGE" -c 'touch /opt/uzi-src/UZI_WRITE_PROBE 2>/dev/null && echo WROTE || echo denied')"
+  if [ "$PROBE" = "denied" ]; then
+    echo "ok   the agent user cannot write /opt/uzi-src (read-only)"
+  else
+    echo "FAIL the agent user was able to write /opt/uzi-src (expected read-only)"
+    fail=1
+  fi
+else
+  echo "note ownership/read-only assertion is full-mode only (light image has no non-root user);"
+  echo "     run UZI_CHECK_MODE=full to verify /opt/uzi-src is root-owned + unwritable by uzi"
+fi
 
 if [ "$fail" -ne 0 ]; then echo "IMAGE CONTENT CHECK FAILED"; exit 1; fi
 echo "IMAGE CONTENT CHECK PASSED ($MODE, $TEMPLATE)"
