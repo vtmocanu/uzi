@@ -199,9 +199,6 @@ describe("uzi tools — propose_issue (Decision 8/10)", () => {
       status: "pending",
       created_at: "2026-07-10T00:00:00Z",
       repo_path: "group/project", // worker-computed (the path the user saw)
-      created_issue_iid: null, // pending — no issue filed yet
-      created_issue_url: null,
-      resolved_at: null,
     });
   });
 
