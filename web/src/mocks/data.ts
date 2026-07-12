@@ -1075,6 +1075,10 @@ function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["
     pipeline_web_url: null,
     fix_verdict: null,
     plan_md: null,
+    repo_agents: null, // a chat run carries no agent roster (PRD #37 fields)
+    agent_source: null,
+    agent_exclusions: null,
+    own_agents: null,
     claimed_at: minsAgo(6),
     started_at: minsAgo(6),
     finished_at: null,

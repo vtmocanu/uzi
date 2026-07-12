@@ -297,7 +297,9 @@ func (s *Service) EndChat(ctx context.Context, userID, runID uuid.UUID) (SubmitI
 	if _, err := s.GetChatRun(ctx, userID, runID); err != nil {
 		return SubmitInputResult{}, err
 	}
-	return s.SubmitInput(ctx, userID, runID, "cancel", "")
+	// nil agent selection: chat has no plan gate / agent roster (PRD #37's selection
+	// applies only to approve_plan on issue runs).
+	return s.SubmitInput(ctx, userID, runID, "cancel", "", nil)
 }
 
 // ContinueChat resumes an ENDED conversation (Decision 11): a NEW queued chat run
