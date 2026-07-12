@@ -17,6 +17,8 @@ import {
   type NotificationList,
   type PrivilegeReport,
   type Run,
+  type SelfimproveConfig,
+  type SelfimproveUpdate,
   type RunMessage,
   type SettingSource,
   type SettingsResponse,
@@ -162,6 +164,16 @@ let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let notifications: MockNotification[] = mockNotifications.map((n) => ({ ...n }));
 const reviews: MockReview[] = mockReviews.map((r) => ({ ...r, recommendations: r.recommendations.map((x) => ({ ...x })) }));
+let selfimprove: SelfimproveConfig = {
+  enabled: false,
+  interval: "48h",
+  repo_id: null,
+  repo_path: null,
+  user_id: null,
+  user_email: null,
+  last_run_at: null,
+  active: false,
+};
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
 let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
@@ -350,6 +362,24 @@ export const mockApi = {
   // Demo is fully DEK-sealed (no legacy rows), so the admin migration notice is
   // hidden; the wiring is still exercised by the AdminSettings unit test.
   vaultMigration: async () => delay({ master_sealed: 0 }),
+
+  // ── Self-improvement config (PRD #46 M5) ─────────────────────────────────────
+  getSelfimprove: async () => delay({ selfimprove: { ...selfimprove } }),
+  updateSelfimprove: async (input: SelfimproveUpdate) => {
+    const me = requireSession();
+    selfimprove = { ...selfimprove, enabled: input.enabled };
+    if (input.interval != null) selfimprove.interval = input.interval;
+    if (input.enabled) {
+      // The enabling admin becomes the owner (session identity, mirroring the server).
+      selfimprove.user_id = me.id;
+      selfimprove.user_email = me.email;
+      if (input.repo_id != null) {
+        selfimprove.repo_id = input.repo_id;
+        selfimprove.repo_path = repos.find((r) => r.id === input.repo_id)?.path_with_namespace ?? null;
+      }
+    }
+    return delay({ selfimprove: { ...selfimprove } });
+  },
   updateSettings: async (updates: UpdateSettingsPayload) => {
     // Secret tokens are write-only: validated + recorded as configured, never
     // merged into the readable settings (mirrors the real structural exclusion).

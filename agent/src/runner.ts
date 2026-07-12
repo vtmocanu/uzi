@@ -19,6 +19,14 @@ import { SteeringChannel, type PlanVerdict } from "./steering.js";
 import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
+import {
+  defaultCheckRunner,
+  flagGuardPaths,
+  runSelfImproveChecks,
+  selfImproveMrSection,
+  SELF_IMPROVE_BRANCH,
+  type CheckRunner,
+} from "./self-improve.js";
 
 /** Cap on a reported failure_reason, matching the GitLab error-body cap
  *  (gitlab.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -54,6 +62,9 @@ export interface RunnerOptions {
   /** Injected for tests; default is the real `.claude/agents/` parser (PRD #37).
    *  A seam so a test can drive the detection-failure path deterministically. */
   detectRepoAgents?: (worktreePath: string) => Promise<DetectedRepoAgents>;
+  /** Injected for tests; default runs the uzi test suites as real subprocesses. A
+   *  self_improve run's MR carries these results as its own evidence (PRD #46). */
+  checkRunner?: CheckRunner;
 }
 
 /**
@@ -73,6 +84,7 @@ export class RunRunner {
   private readonly planApprovalTimeoutMs: number;
   private readonly gitlab: GitLabClient;
   private readonly detect: (worktreePath: string) => Promise<DetectedRepoAgents>;
+  private readonly checkRunner: CheckRunner;
 
   constructor(
     private readonly client: WorkerClient,
@@ -91,6 +103,7 @@ export class RunRunner {
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
+    this.checkRunner = opts.checkRunner ?? defaultCheckRunner();
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
@@ -232,6 +245,22 @@ export class RunRunner {
         return;
       }
 
+      // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
+      // repo, the worker itself runs the test suites and flags any guard-critical
+      // path the change touched, folding both into the MR description. Best-effort —
+      // gathered before the push so the MR opens with its evidence, and a suite that
+      // can't run is reported "skipped", never failing the run.
+      let selfImproveSection: string | undefined;
+      if (claim.kind === "self_improve") {
+        batcher.emit({ kind: "status", agent: "worker", payload: { text: "self-improvement: running the test suites for MR evidence" } });
+        // changedFiles returns null when the diff could not be computed → pass null
+        // through so the MR section fails CLOSED (a loud "guard-path check unavailable"
+        // note) instead of silently suppressing the flag (M5 audit).
+        const changed = await this.git.changedFiles(barePath, worktree.path);
+        const checks = await runSelfImproveChecks(worktree.path, this.checkRunner);
+        selfImproveSection = selfImproveMrSection(changed === null ? null : flagGuardPaths(changed), checks);
+      }
+
       // The agent signalled done. The WORKER now performs the authenticated push
       // + MR with the PAT — the agent never had a credential.
       batcher.emit({ kind: "status", agent: "worker", payload: { text: "work complete; pushing branch and opening merge request" } });
@@ -249,7 +278,7 @@ export class RunRunner {
         sourceBranch: result.branch,
         targetBranch,
         title: mrTitle(claim),
-        description: mrDescription(claim, result.branch, result.agentSelection),
+        description: mrDescription(claim, result.branch, result.agentSelection, selfImproveSection),
       });
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` } });
 
@@ -360,6 +389,12 @@ export class RunRunner {
           : claim.pipeline.ref;
       return this.git.worktreeForBranch(barePath, fixBranch, fixBranch.replace(/\//g, "-"));
     }
+    if (claim.kind === "self_improve") {
+      // The FIXED branch (PRD #46 Decision 10): reused every cycle so the worker's
+      // idempotent createMergeRequest extends one open MR rather than opening a new
+      // one, and successive cycles are tested together.
+      return this.git.worktreeForBranch(barePath, SELF_IMPROVE_BRANCH, SELF_IMPROVE_BRANCH.replace(/\//g, "-"));
+    }
     if (claim.issue_iid == null) throw new Error("issue run claim is missing issue_iid");
     return this.git.createOrAttachWorktree(barePath, claim.issue_iid);
   }
@@ -435,6 +470,7 @@ function mrDescription(
   claim: ClaimResponse,
   branch: string,
   agentSelection?: { source: AgentSource; agents: string[] },
+  selfImproveSection?: string,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   const repoMarker =
@@ -447,6 +483,19 @@ function mrDescription(
             "reviewer — review this change accordingly.",
         ]
       : [];
+  if (claim.kind === "self_improve") {
+    // A self_improve MR references its tracking issue but does NOT `Closes` it — the
+    // issue is a stable container reused across cycles (PRD #46 Decision 10). The
+    // self-improvement section carries the guard-critical flag, the test evidence,
+    // and its own human-merge note.
+    return [
+      "Autonomous self-improvement change (PRD #46). Picks one top improvement per cycle.",
+      "",
+      `Tracking issue: #${claim.issue_iid}`,
+      ...repoMarker,
+      selfImproveSection ?? "",
+    ].join("\n");
+  }
   if (claim.kind === "ci_fix" && claim.pipeline) {
     return [
       `Fixes the failed CI pipeline for \`${claim.pipeline.ref}\`.`,

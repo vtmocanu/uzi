@@ -9,6 +9,8 @@ import {
   api,
   ApiError,
   type AppSettings,
+  type Repo,
+  type SelfimproveConfig,
   type SettingSource,
   type SettingsResponse,
   type UpdateSettingsPayload,
@@ -324,6 +326,8 @@ export function AdminSettings() {
 
       {!loading && saved && <JudgeSettingsCard settings={saved} onSaved={applyResponse} />}
 
+      {!loading && <SelfImproveSettingsCard />}
+
       {!loading && saved && (
         <SlackSettingsCard
           settings={saved}
@@ -426,6 +430,138 @@ function JudgeSettingsCard({
 
         <Button type="submit" disabled={busy || !dirty}>
           {busy ? "Saving…" : "Save run judge settings"}
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+// SelfImproveSettingsCard is the admin surface for the autonomous self-improvement
+// job (PRD #46 M5). It self-loads its config (a dedicated endpoint, not the label
+// form) and the admin's connected repos for the target picker. The consent copy is
+// deliberately explicit: the job spends the ENABLING ADMIN'S OWN Anthropic token,
+// on a standing basis (any logged-in window, not a one-time spend), producing
+// autonomous MRs — the bot never merges to main.
+function SelfImproveSettingsCard() {
+  const [config, setConfig] = useState<SelfimproveConfig | null>(null);
+  const [repos, setRepos] = useState<Repo[]>([]);
+  const [enabled, setEnabled] = useState(false);
+  const [interval, setIntervalValue] = useState("48h");
+  const [repoId, setRepoId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const apply = useCallback((c: SelfimproveConfig) => {
+    setConfig(c);
+    setEnabled(c.enabled);
+    setIntervalValue(c.interval);
+    setRepoId(c.repo_id ?? "");
+  }, []);
+
+  useEffect(() => {
+    api
+      .getSelfimprove()
+      .then(({ selfimprove }) => apply(selfimprove))
+      .catch(() => {});
+    api
+      .listRepos()
+      .then(({ repos }) => setRepos(repos))
+      .catch(() => setRepos([]));
+  }, [apply]);
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    if (enabled && repoId === "") {
+      setError("Choose a repository for the self-improvement job to run against.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const { selfimprove } = await api.updateSelfimprove({
+        enabled,
+        interval,
+        // repo_id is only meaningful when enabling; the server records the session
+        // admin as the owner (never sent here).
+        ...(enabled ? { repo_id: repoId } : {}),
+      });
+      apply(selfimprove);
+      setNotice("Self-improvement settings saved.");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save self-improvement settings");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card className="space-y-5">
+      <div>
+        <SectionTitle>Self-improvement</SectionTitle>
+        <p className="mt-2 text-sm text-muted">
+          When on, uzi periodically reviews its own codebase and the accumulated{" "}
+          <code className="rounded bg-raised px-1 py-0.5 text-fg">improve_uzi</code> recommendations, then
+          autonomously opens (or extends) one merge request on the chosen repo &mdash; picking a single top
+          improvement each cycle.
+        </p>
+        <p className="mt-2 text-sm text-warn">
+          It runs on <strong className="text-fg">your own Anthropic token</strong>, on a standing basis: while
+          you are logged in, the job runs unattended on its schedule and produces autonomous code changes
+          &mdash; not a one-time spend. A human still reviews and merges; the bot never merges to{" "}
+          <code className="rounded bg-raised px-1 py-0.5 text-fg">main</code>.
+        </p>
+      </div>
+
+      {error && <Alert message={error} />}
+      {notice && <Alert tone="success" message={notice} />}
+
+      {config?.active && <Alert tone="info" message="A self-improvement run is currently in progress." />}
+      {config?.last_run_at && (
+        <p className="text-xs text-faint">Last cycle: {new Date(config.last_run_at).toLocaleString()}</p>
+      )}
+
+      <form onSubmit={save} className="space-y-4">
+        <label className="flex cursor-pointer select-none items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="h-4 w-4 rounded border-edge accent-brand"
+          />
+          Enable the self-improvement job (uses your token)
+        </label>
+
+        <Field label="Repository">
+          <Select value={repoId} onChange={(e) => setRepoId(e.target.value)}>
+            <option value="">Select a connected repo…</option>
+            {repos.map((r) => (
+              <option key={r.id} value={r.id}>
+                {r.path_with_namespace}
+              </option>
+            ))}
+          </Select>
+        </Field>
+
+        <div className="space-y-1.5">
+          <Field label="Interval">
+            <Input
+              value={interval}
+              maxLength={32}
+              autoComplete="off"
+              placeholder="48h"
+              onChange={(e) => setIntervalValue(e.target.value)}
+            />
+          </Field>
+          <p className="text-xs text-faint">
+            How often a cycle becomes due, as a Go duration (e.g.{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">48h</code>). The default is every two days.
+          </p>
+        </div>
+
+        <Button type="submit" disabled={busy}>
+          {busy ? "Saving…" : "Save self-improvement settings"}
         </Button>
       </form>
     </Card>

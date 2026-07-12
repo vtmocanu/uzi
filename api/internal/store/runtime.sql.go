@@ -774,7 +774,7 @@ SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.id = $1 AND r.user_id = $2
+WHERE r.id = $1 AND r.user_id = $2 AND r.kind <> 'judge'
 `
 
 type GetRunForWorkerUserParams struct {
@@ -803,6 +803,9 @@ type GetRunForWorkerUserRow struct {
 }
 
 // One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
+// judge runs are excluded here too (see ListRunsForWorkerUser): a chat agent asking
+// for a judge run's detail gets a 404, exactly like an unknown id. self_improve is
+// visible.
 func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUserParams) (GetRunForWorkerUserRow, error) {
 	row := q.db.QueryRow(ctx, getRunForWorkerUser, arg.ID, arg.UserID)
 	var i GetRunForWorkerUserRow
@@ -1526,7 +1529,7 @@ SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.user_id = $1
+WHERE r.user_id = $1 AND r.kind <> 'judge'
 ORDER BY r.created_at DESC
 LIMIT $2
 `
@@ -1557,7 +1560,13 @@ type ListRunsForWorkerUserRow struct {
 // lookup — a compromised worker still reads only its own user's runs, and a foreign
 // run id simply returns no row (404). repo_web_url rides along so the handler can
 // build the MR URL; a chat run has no repo, so repo fields are NULL (LEFT JOIN).
-// Compact list of the worker's user's runs, newest first, bounded by @lim.
+// Compact list of the worker's user's runs, newest first, bounded by @lim. The
+// chat agent's investigation surface (PRD #39 Decision 7). judge runs are hidden
+// (PRD #46, M1-review carry-forward): a judge is a repo-less internal retrospective
+// with no investigable task, same rationale as excluding it from the general run
+// lists (f55b37e). self_improve stays visible — it is real work with a repo + MR.
+// The judge WORKER reads its own run through the M3 judge-scoped trace path, not
+// this chat surface, so hiding judge here does not affect judging.
 func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWorkerUserParams) ([]ListRunsForWorkerUserRow, error) {
 	rows, err := q.db.Query(ctx, listRunsForWorkerUser, arg.UserID, arg.Lim)
 	if err != nil {

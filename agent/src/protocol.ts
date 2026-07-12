@@ -39,8 +39,10 @@ export type MessageKind =
 /** run_user_inputs.kind (PRD #4 §Schema). */
 export type InputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
 
-/** runs.kind (PRD #6; PRD #46 adds "judge"). */
-export type RunKind = "issue" | "ci_fix" | "judge";
+/** runs.kind (PRD #6; PRD #46 adds "judge" and "self_improve"). self_improve is
+ *  issue-shaped and runs the ordinary run lane (RunRunner), with a fixed branch and
+ *  its own MR evidence (Decision 10). */
+export type RunKind = "issue" | "ci_fix" | "judge" | "self_improve";
 
 /** A ci_fix run's outbound verdict (PRD #6). Only "not_code" travels the wire;
  *  verified/fix_failed are stamped server-side from the post-fix pipeline. */

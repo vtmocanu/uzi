@@ -387,6 +387,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
 			r.Get("/runs", h.AdminListRuns)
+			// Self-improvement config (PRD #46 M5): read/enable the autonomous
+			// improvement job. PUT sets the enabling admin (session, never the body)
+			// as the run owner and requires a repo the admin owns.
+			r.Get("/selfimprove", h.GetSelfimproveConfig)
+			r.Put("/selfimprove", h.PutSelfimproveConfig)
 		})
 
 		// Forge integration: connections, repo discovery, and the label-synced

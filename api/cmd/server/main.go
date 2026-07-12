@@ -32,6 +32,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/selfimprove"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -369,6 +370,26 @@ func run() error {
 		}()
 	} else {
 		slog.Info("privilege sweeper disabled (UZI_PRIVILEGE_CHECK_INTERVAL=0)")
+	}
+
+	// Self-improvement engine (PRD #46 M5): a privcheck-shaped scheduler that, on a
+	// due cycle, files/reuses a tracking issue on the connected uzi repo and creates
+	// an auto-approved self_improve run folding the accumulated improve_uzi backlog.
+	// Shares the same collaborators the rest of the run machinery uses: workersvc
+	// creates the run, forgesvc builds the driver from the stored connection, the
+	// vault gates on the enabling admin being unlocked, and notifysvc delivers the
+	// tick-skip / run-started notifications. 0 disables it entirely; the Boot pass
+	// runs inside the goroutine (poller precedent) so a slow forge can't delay serve.
+	if cfg.SelfimproveCheckInterval > 0 {
+		siEngine := selfimprove.New(q, settingsCache, wsvc, svc, vlt, notifier, cfg.SelfimproveCheckInterval, slog.Default())
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			siEngine.Boot(ctx)
+			siEngine.Run(ctx)
+		}()
+	} else {
+		slog.Info("self-improvement engine disabled (UZI_SELFIMPROVE_CHECK_INTERVAL=0)")
 	}
 
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)

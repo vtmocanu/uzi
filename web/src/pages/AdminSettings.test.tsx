@@ -9,7 +9,17 @@ import { api, ApiError } from "../lib/api";
 // `instanceof ApiError` checks match what the mocked methods throw.
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
-  return { ...actual, api: { getSettings: vi.fn(), updateSettings: vi.fn(), vaultMigration: vi.fn() } };
+  return {
+    ...actual,
+    api: {
+      getSettings: vi.fn(),
+      updateSettings: vi.fn(),
+      vaultMigration: vi.fn(),
+      getSelfimprove: vi.fn(),
+      updateSelfimprove: vi.fn(),
+      listRepos: vi.fn(),
+    },
+  };
 });
 // The page re-resolves the admin's own theme after a save via useAuth().refresh.
 vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ refresh: vi.fn().mockResolvedValue(undefined) }) }));
@@ -57,9 +67,26 @@ const response = (
   slack_status,
 });
 
+const selfimproveConfig = (over: Partial<import("../lib/api").SelfimproveConfig> = {}) => ({
+  enabled: false,
+  interval: "48h",
+  repo_id: null,
+  repo_path: null,
+  user_id: null,
+  user_email: null,
+  last_run_at: null,
+  active: false,
+  ...over,
+});
+
 beforeEach(() => {
   mockApi.getSettings.mockResolvedValue(response());
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
+  mockApi.getSelfimprove.mockResolvedValue({ selfimprove: selfimproveConfig() });
+  mockApi.updateSelfimprove.mockResolvedValue({ selfimprove: selfimproveConfig() });
+  mockApi.listRepos.mockResolvedValue({
+    repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as import("../lib/api").Repo[],
+  });
 });
 
 afterEach(() => {
@@ -286,5 +313,46 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     fireEvent.click(screen.getByRole("button", { name: /save run judge settings/i }));
     expect(await screen.findByText(/judge model must not be empty/i)).toBeTruthy();
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+});
+
+describe("AdminSettings — self-improvement (PRD #46 M5)", () => {
+  it("shows the token-consent copy and the connected repo in the picker", async () => {
+    renderPage();
+    await screen.findByText("Self-improvement");
+    // The standing token-consent warning must be present.
+    expect(screen.getByText(/your own Anthropic token/i)).toBeTruthy();
+    expect(screen.getByText(/never merges to/i)).toBeTruthy();
+    // The connected repo is offered in the picker.
+    await waitFor(() => expect(screen.getByRole("option", { name: "vtmocanu/uzi" })).toBeTruthy());
+  });
+
+  it("enables with a chosen repo and interval; the body carries no user id (audit H3)", async () => {
+    mockApi.updateSelfimprove.mockResolvedValue({
+      selfimprove: selfimproveConfig({ enabled: true, repo_id: "repo-uzi", repo_path: "vtmocanu/uzi", user_email: "vlad@uzi.local" }),
+    });
+    renderPage();
+    await screen.findByText("Self-improvement");
+
+    fireEvent.click(screen.getByLabelText(/Enable the self-improvement job/i));
+    fireEvent.change(screen.getByLabelText("Repository"), { target: { value: "repo-uzi" } });
+    fireEvent.change(screen.getByLabelText("Interval"), { target: { value: "24h" } });
+    fireEvent.click(screen.getByRole("button", { name: /save self-improvement settings/i }));
+
+    await waitFor(() =>
+      expect(mockApi.updateSelfimprove).toHaveBeenCalledWith({ enabled: true, interval: "24h", repo_id: "repo-uzi" }),
+    );
+    // Structurally impossible to send a user id — the update payload has no such field.
+    const arg = mockApi.updateSelfimprove.mock.calls[0][0] as unknown as Record<string, unknown>;
+    expect(arg).not.toHaveProperty("user_id");
+  });
+
+  it("blocks enabling without a repo, client-side, without calling the API", async () => {
+    renderPage();
+    await screen.findByText("Self-improvement");
+    fireEvent.click(screen.getByLabelText(/Enable the self-improvement job/i));
+    fireEvent.click(screen.getByRole("button", { name: /save self-improvement settings/i }));
+    expect(await screen.findByText(/Choose a repository/i)).toBeTruthy();
+    expect(mockApi.updateSelfimprove).not.toHaveBeenCalled();
   });
 });
