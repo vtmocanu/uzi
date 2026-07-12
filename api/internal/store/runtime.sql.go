@@ -1209,7 +1209,7 @@ const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
 
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
-       health, health_reason
+       health, health_reason, health_since
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat'
@@ -1225,6 +1225,7 @@ type ListActiveRunsForHealthRow struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	Health         string             `json:"health"`
 	HealthReason   pgtype.Text        `json:"health_reason"`
+	HealthSince    pgtype.Timestamptz `json:"health_since"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -1234,7 +1235,9 @@ type ListActiveRunsForHealthRow struct {
 // tighter than any flag). Chat runs are excluded — they legitimately park between
 // turns and have their own idle machinery, so a health flag would be a false alarm.
 // The detector reads current health + reason to skip a no-op write (and its later
-// broadcast) when nothing changed.
+// broadcast) when nothing changed, and health_since so it can PRESERVE the original
+// flag time when only the reason changes within the same enum (a queued run whose
+// reason flips no-worker → waiting must not reset the UI's "stuck for Xm").
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth)
 	if err != nil {
@@ -1254,6 +1257,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 			&i.UpdatedAt,
 			&i.Health,
 			&i.HealthReason,
+			&i.HealthSince,
 		); err != nil {
 			return nil, err
 		}

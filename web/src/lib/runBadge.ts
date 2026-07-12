@@ -124,13 +124,23 @@ export function shouldShowHealthFlag(health: RunHealth, status: string): boolean
   return health !== "ok" && isHealthFlaggableStatus(status);
 }
 
+// HealthFlaggable is the minimal run shape the health badge reads — satisfied by
+// the board's LatestRun AND the owner-scoped Run / RunListItem, so one taxonomy
+// drives every surface (board card, run view, dashboard, runs list).
+export type HealthFlaggable = {
+  health: RunHealth;
+  health_since: string | null;
+  health_reason: string | null;
+  status: string;
+};
+
 // healthBadge is the warn-variant pill for a flagged run (PRD #47): `⚠ <label> ·
 // <elapsed-since-flagged>` in the warn tone, keeping the pulse so it still reads as
 // live. Returns null when the run is healthy or not in a flaggable status, so the
 // caller falls through to the normal status badge. The elapsed counts from
 // health_since ("stuck for Xm"), not created_at. title carries the owner-only
 // reason when present (a non-owner's health_reason is null → no tooltip).
-export function healthBadge(run: LatestRun, nowMs: number): RunBadge | null {
+export function healthBadge(run: HealthFlaggable, nowMs: number): RunBadge | null {
   if (!shouldShowHealthFlag(run.health, run.status)) return null;
   const label = healthFlagLabel(run.health);
   const elapsed = run.health_since ? ` · ${formatElapsed(nowMs - Date.parse(run.health_since))}` : "";

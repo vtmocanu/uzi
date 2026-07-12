@@ -385,18 +385,76 @@ func TestHealthExitRaceDoesNotBroadcast(t *testing.T) {
 
 func TestHealthQueuedReasonChangeRewrites(t *testing.T) {
 	// Same waiting_worker enum, different reason (a worker came online): the detector
-	// must re-write so the reason updates even though the flag value is unchanged.
+	// re-writes so the reason updates, but health_since must be PRESERVED — the run
+	// has been stuck since the original flag, so the UI's "stuck for Xm" must not reset.
+	original := ago(15 * time.Minute)
 	r := runRow("queued")
 	r.UpdatedAt = ago(15 * time.Minute)
 	r.Health = healthWaitingWorker
 	r.HealthReason = pgText(reasonNoWorker)
+	r.HealthSince = original
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, onlineWorkers: 1}
 	svc := healthSvc(fs, defaultHealthSettings())
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
 		t.Fatalf("changed = %d, want 1 (reason changed)", n)
 	}
-	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonWaitingWorker {
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != reasonWaitingWorker {
 		t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonWaitingWorker)
+	}
+	if !w.HealthSince.Valid || !w.HealthSince.Time.Equal(original.Time) {
+		t.Fatalf("health_since = %v, want the preserved original %v (a reason-only change must not reset it)", w.HealthSince, original)
+	}
+}
+
+func TestHealthSlowClampWarnsOncePerValue(t *testing.T) {
+	fs := &healthFakeStore{}
+	// testParams RunTimeout is 2h; a 3h slow threshold forces the read-time clamp.
+	svc := healthSvc(fs, fakeSettings{enabled: true, slow: 3 * 60 * 60})
+	ctx := context.Background()
+
+	if d := svc.slowThreshold(ctx); d != testParams().RunTimeout-time.Minute {
+		t.Fatalf("clamped = %v, want RunTimeout-1m", d)
+	}
+	if svc.lastSlowClampWarn != 3*time.Hour {
+		t.Fatalf("lastSlowClampWarn = %v, want 3h recorded after the first clamp warn", svc.lastSlowClampWarn)
+	}
+	// A repeat pass at the same misconfigured value keeps the tracker stable — the
+	// warn is not re-armed, so it logs once per distinct value, not every tick.
+	svc.slowThreshold(ctx)
+	if svc.lastSlowClampWarn != 3*time.Hour {
+		t.Fatalf("lastSlowClampWarn = %v after a repeat pass, want a stable 3h", svc.lastSlowClampWarn)
+	}
+	// Reconfiguring below the timeout clears the tracker so a later re-break warns again.
+	svc.settings = fakeSettings{enabled: true, slow: 300}
+	if d := svc.slowThreshold(ctx); d != 5*time.Minute {
+		t.Fatalf("slow = %v, want 5m (no clamp)", d)
+	}
+	if svc.lastSlowClampWarn != 0 {
+		t.Fatalf("lastSlowClampWarn = %v, want reset to 0 once configured below the timeout", svc.lastSlowClampWarn)
+	}
+}
+
+func TestHealthEnumChangeResetsSince(t *testing.T) {
+	// A run flagged slow that becomes stalled is a NEW episode: health_since resets to
+	// now, not the old slow timestamp.
+	oldSince := ago(30 * time.Minute)
+	r := runRow("running")
+	r.StartedAt = ago(20 * time.Minute)
+	r.LastActivityAt = ago(10 * time.Minute) // stalled; not slow (20m < 45m)
+	r.Health = healthSlow
+	r.HealthReason = pgText(reasonSlow)
+	r.HealthSince = oldSince
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc := healthSvc(fs, defaultHealthSettings())
+
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthStalled {
+		t.Fatalf("health = %q, want stalled", w.Health)
+	}
+	if !w.HealthSince.Valid || !w.HealthSince.Time.Equal(t0) {
+		t.Fatalf("health_since = %v, want now (%v) on an enum change", w.HealthSince, t0)
 	}
 }

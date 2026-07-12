@@ -697,10 +697,12 @@ WHERE id = @id;
 -- tighter than any flag). Chat runs are excluded — they legitimately park between
 -- turns and have their own idle machinery, so a health flag would be a false alarm.
 -- The detector reads current health + reason to skip a no-op write (and its later
--- broadcast) when nothing changed.
+-- broadcast) when nothing changed, and health_since so it can PRESERVE the original
+-- flag time when only the reason changes within the same enum (a queued run whose
+-- reason flips no-worker → waiting must not reset the UI's "stuck for Xm").
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at,
-       health, health_reason
+       health, health_reason, health_since
 FROM runs
 WHERE status IN ('queued', 'running', 'awaiting_approval')
   AND kind <> 'chat';

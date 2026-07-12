@@ -288,6 +288,11 @@ type Service struct {
 	// detector, so tests that do not exercise it — and any deployment without a
 	// settings cache — behave exactly as before.
 	settings Settings
+	// lastSlowClampWarn is the last health_slow_seconds value the read-time clamp
+	// warned about (PRD #47), so the warning logs once per distinct misconfigured
+	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
+	// (slowThreshold, reached via detectRunHealth ← Sweep), so it needs no lock.
+	lastSlowClampWarn time.Duration
 }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at

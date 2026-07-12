@@ -120,7 +120,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		n, err := s.q.SetRunHealth(ctx, store.SetRunHealthParams{
 			Health:       target,
 			HealthReason: pgText(reason), // "" → NULL
-			HealthSince:  sinceParam(now, target),
+			HealthSince:  healthSince(now, target, r),
 			ID:           r.ID,
 			Status:       r.Status, // exit-race scope: no-ops if the run left this status
 		})
@@ -375,6 +375,7 @@ func healthDur(secs int, _ error) time.Duration {
 func (s *Service) slowThreshold(ctx context.Context) time.Duration {
 	slow := healthDur(s.settings.HealthSlowSeconds(ctx))
 	if slow == 0 {
+		s.lastSlowClampWarn = 0 // reset so a later re-break warns again
 		return 0
 	}
 	if s.p.RunTimeout > 0 && slow >= s.p.RunTimeout {
@@ -382,10 +383,17 @@ func (s *Service) slowThreshold(ctx context.Context) time.Duration {
 		if clamped <= 0 {
 			clamped = s.p.RunTimeout / 2
 		}
-		slog.Warn("health: health_slow_seconds >= RUN_TIMEOUT; clamping so the slow flag can fire before the run is timed out",
-			"configured", slow.String(), "clamped", clamped.String(), "run_timeout", s.p.RunTimeout.String())
-		slow = clamped
+		// Log once per distinct misconfigured value, not on every 15s sweep: the
+		// clamp is re-evaluated each pass, so an unconditional Warn would spam the log
+		// for as long as the misconfiguration stands.
+		if s.lastSlowClampWarn != slow {
+			slog.Warn("health: health_slow_seconds >= RUN_TIMEOUT; clamping so the slow flag can fire before the run is timed out",
+				"configured", slow.String(), "clamped", clamped.String(), "run_timeout", s.p.RunTimeout.String())
+			s.lastSlowClampWarn = slow
+		}
+		return clamped
 	}
+	s.lastSlowClampWarn = 0 // configured below the timeout now; a later re-break warns again
 	return slow
 }
 
@@ -398,12 +406,20 @@ func olderThan(now time.Time, ts pgtype.Timestamptz, d time.Duration) bool {
 	return ts.Valid && now.Sub(ts.Time) >= d
 }
 
-// sinceParam stamps health_since with now for a flag, or NULL when clearing to ok.
-func sinceParam(now time.Time, target string) pgtype.Timestamptz {
-	if target == healthOK {
+// healthSince decides the health_since to write. It stamps now when a flag is raised
+// or its enum CHANGES (a genuinely new episode), PRESERVES the existing timestamp
+// when only the reason changes within the same enum (so a queued run flipping
+// no-worker → waiting keeps the UI's "stuck for Xm" counting from the original flag),
+// and clears it when the run returns to ok.
+func healthSince(now time.Time, target string, r store.ListActiveRunsForHealthRow) pgtype.Timestamptz {
+	switch {
+	case target == healthOK:
 		return pgtype.Timestamptz{}
+	case r.Health == target:
+		return r.HealthSince
+	default:
+		return pgTime(now)
 	}
-	return pgTime(now)
 }
 
 // textEq compares a nullable text column against a want string, where "" means the
