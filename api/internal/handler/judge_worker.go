@@ -213,7 +213,7 @@ func validateAndScrubReview(req workerReviewRequest) (workersvc.ReviewSubmission
 		Verdict:    req.Verdict,
 		Status:     status,
 		SummaryMd:  slacksvc.ScrubSecrets(sanitizeReviewText(req.Summary, workersvc.ReviewSummaryMaxBytes)),
-		JudgeModel: sanitizeSelfReported(req.Model, workersvc.ReviewModelMaxBytes),
+		JudgeModel: slacksvc.ScrubSecrets(sanitizeSelfReported(req.Model, workersvc.ReviewModelMaxBytes)),
 	}
 	for _, rec := range req.Recommendations {
 		if !workersvc.RecommendationCategories[rec.Category] {

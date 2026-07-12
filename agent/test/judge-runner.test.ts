@@ -100,6 +100,28 @@ describe("JudgeRunner", () => {
     assert.equal(calls.state?.body.status, "completed");
   });
 
+  it("posts the deterministic fallback when the trace fetch fails (findings still land)", async () => {
+    const { calls } = fakeClient(emptyTrace);
+    // A client whose getTrace throws, but postReview/reportState still work.
+    const client = {
+      getTrace: async () => {
+        throw new Error("trace endpoint 500");
+      },
+      postReview: async (id: string, review: ReviewRequest) => {
+        calls.review = { id, review };
+      },
+      reportState: async (id: string, body: StateRequest) => {
+        calls.state = { id, body };
+      },
+    } as unknown as WorkerClient;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn("{}") });
+    await runner.execute(judgeClaim());
+
+    assert.equal(calls.review?.review.status, "failed", "a trace-fetch failure still posts the deterministic fallback");
+    assert.equal(calls.review?.review.recommendations[0]?.target, "jq", "the command-not-found signal from the claim lands");
+    assert.equal(calls.state?.body.status, "completed", "the judge run completes with the fallback, not fails with no review");
+  });
+
   it("falls back when the claim carries no Anthropic token (never calls the model)", async () => {
     const { client, calls } = fakeClient(emptyTrace);
     let queried = false;
@@ -166,10 +188,21 @@ describe("fallbackReview", () => {
 });
 
 describe("buildJudgePrompt", () => {
-  it("fences the trace as untrusted and includes the command-not-found signal", () => {
+  it("fences the trace with an unforgeable per-prompt nonce and includes the signal", () => {
     const prompt = buildJudgePrompt(emptyTrace, { missing_tools: [{ command: "jq", evidence: "jq: not found" }] });
-    assert.match(prompt, /UNTRUSTED_TRACE/);
+    assert.match(prompt, /UNTRUSTED DATA/);
     assert.match(prompt, /command-not-found/i);
     assert.match(prompt, /jq/);
+    // The fence tag carries a random 16-hex nonce, and the same nonce closes it — so
+    // an attacker in the trace can't forge the closing tag.
+    const open = prompt.match(/<untrusted_trace_([0-9a-f]{16})>/);
+    assert.ok(open, "expected a nonced open tag");
+    assert.match(prompt, new RegExp(`</untrusted_trace_${open![1]}>`), "close tag must reuse the same nonce");
+  });
+
+  it("mints a different nonce on each build (CSPRNG, not a static sentinel)", () => {
+    const a = buildJudgePrompt(emptyTrace, null).match(/<untrusted_trace_([0-9a-f]{16})>/)?.[1];
+    const b = buildJudgePrompt(emptyTrace, null).match(/<untrusted_trace_([0-9a-f]{16})>/)?.[1];
+    assert.ok(a && b && a !== b, "each prompt must mint a fresh nonce");
   });
 });

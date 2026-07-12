@@ -210,7 +210,7 @@ function sanitizeJobField(s: string): string {
 // fence delimiter and so cannot forge a closing tag to break out — this defeats the
 // WHOLE class of </job_log>-variant injections (whitespace/case/spacing), not just
 // an exact string a static defang would miss.
-function fenceNonce(): string {
+export function fenceNonce(): string {
   return randomBytes(8).toString("hex");
 }
 

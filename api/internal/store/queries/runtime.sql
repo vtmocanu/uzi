@@ -397,15 +397,18 @@ RETURNING id, user_id, status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
 
--- name: FailWorkerRunsOverCap :execrows
+-- name: FailWorkerRunsOverCap :many
 -- On register a worker declares a fresh start, so any run it still holds is
 -- orphaned (its execution is gone). Over its re-queue budget → failed. failed →
 -- origin restore, applied by the reconcile loop (register does no forge I/O), so
--- it stamps move_pending_since.
+-- it stamps move_pending_since. RETURNING id so the caller can funnel these
+-- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
+-- as the sweeper's FailRunsOfStaleWorkersOverCap does.
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval')
-  AND requeue_count >= @max_requeues;
+  AND requeue_count >= @max_requeues
+RETURNING id;
 
 -- name: RequeueWorkerRuns :execrows
 -- Within budget → re-queued to this same worker (affinity), which then re-claims

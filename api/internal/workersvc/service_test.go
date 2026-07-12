@@ -66,7 +66,8 @@ type fakeStore struct {
 	consumeRows      []store.ConsumeRunInputsRow
 
 	// Register + heartbeat.
-	failOverCap    *store.FailWorkerRunsOverCapParams
+	failOverCap      *store.FailWorkerRunsOverCapParams
+	orphanFailedRuns []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
 	requeueWorker  *store.RequeueWorkerRunsParams
 	registerParams *store.RegisterWorkerParams
 	registerResult store.Worker
@@ -279,10 +280,10 @@ func (f *fakeStore) SetRunFailed(_ context.Context, arg store.SetRunFailedParams
 func (f *fakeStore) ConsumeRunInputs(context.Context, uuid.UUID) ([]store.ConsumeRunInputsRow, error) {
 	return f.consumeRows, nil
 }
-func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorkerRunsOverCapParams) (int64, error) {
+func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
 	f.failOverCap = &arg
 	f.callOrder = append(f.callOrder, "fail_over_cap")
-	return 0, nil
+	return f.orphanFailedRuns, nil
 }
 func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorkerRunsParams) (int64, error) {
 	f.requeueWorker = &arg

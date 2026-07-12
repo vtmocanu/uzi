@@ -59,6 +59,56 @@ func TestScanCommandNotFoundEmptyWhenClean(t *testing.T) {
 	}
 }
 
+// TestScanCommandNotFoundFiltersNoise: the low-confidence "X: not found" form drops
+// HTTP/line numbers and shared-object/header files but keeps a real missing tool.
+func TestScanCommandNotFoundFiltersNoise(t *testing.T) {
+	payloads := [][]byte{
+		[]byte(`{"text":"/bin/sh: 1: 404: not found"}`),        // numeric → dropped
+		[]byte(`{"text":"ld: libssl.so.1: not found"}`),        // shared lib → dropped
+		[]byte(`{"text":"link error: foo.o: not found"}`),      // object file → dropped
+		[]byte(`{"text":"/bin/sh: 1: shellcheck: not found"}`), // real tool → kept
+	}
+	got := scanCommandNotFound(payloads)
+	cmds := map[string]bool{}
+	for _, m := range got {
+		cmds[m.Command] = true
+	}
+	if !cmds["shellcheck"] {
+		t.Errorf("a real missing tool must survive the noise filter; got %v", cmds)
+	}
+	for _, noise := range []string{"404", "libssl.so.1", "foo.o"} {
+		if cmds[noise] {
+			t.Errorf("noise token %q should be filtered from the sh 'not found' form", noise)
+		}
+	}
+}
+
+// TestRegisterEnqueuesJudgeForOrphanFailedRuns: a run failed at register time (worker
+// restart, over the re-queue cap) is a worker-lost run Decision 2 wants judged — the
+// same as the sweeper's over-cap fail. Register funnels it.
+func TestRegisterEnqueuesJudgeForOrphanFailedRuns(t *testing.T) {
+	orphan := uuid.New()
+	fs := &fakeStore{
+		orphanFailedRuns: []uuid.UUID{orphan},
+		runByIDPlain:     store.Run{ID: orphan, UserID: uuid.New(), Kind: RunKindIssue, Status: "failed"},
+		userByID:         store.User{JudgeEnabled: true},
+		anthropic:        []byte("sealed"),
+		registerResult:   store.Worker{ID: uuid.New(), Status: "online"},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
+
+	if _, err := svc.Register(context.Background(), worker(), "v1", "", nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if fs.createdJudgeRun == nil {
+		t.Fatal("a register-time orphan-failed run must enqueue a judge (Decision 2)")
+	}
+	if !fs.createdJudgeRun.TargetRunID.Valid || uuid.UUID(fs.createdJudgeRun.TargetRunID.Bytes) != orphan {
+		t.Errorf("judge targets %v, want the orphaned run %v", fs.createdJudgeRun.TargetRunID, orphan)
+	}
+}
+
 // -------------------------------------------------------------------------
 // terminal-funnel enqueue gating matrix (Decision 2)
 // -------------------------------------------------------------------------

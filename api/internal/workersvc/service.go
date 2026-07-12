@@ -119,7 +119,7 @@ type Store interface {
 	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
-	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) (int64, error)
+	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
 
 	// Messages + inputs.
@@ -338,12 +338,20 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // fresh-start signal, which the server cannot infer from heartbeats alone.
 func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
-	if _, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
+	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
 		WorkerID:      pgUUID(wkr.ID),
 		MaxRequeues:   max,
-	}); err != nil {
+	})
+	if err != nil {
 		return store.Worker{}, err
+	}
+	// PRD #46 Decision 2: these orphaned-over-cap runs just committed to 'failed'
+	// (worker lost) — the same worker-lost runs the sweeper's identical
+	// FailRunsOfStaleWorkersOverCap funnels into the judge. Funnel them here too.
+	// Best-effort, gated inside; never fails the register.
+	for _, id := range orphanFailed {
+		s.maybeEnqueueJudgeByID(ctx, id)
 	}
 	if _, err := s.q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
 		WorkerID:    pgUUID(wkr.ID),

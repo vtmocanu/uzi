@@ -65,6 +65,15 @@ var shellNames = map[string]bool{
 	"fish": true, "/bin/sh": true, "/bin/bash": true, "/usr/bin/env": true, "env": true,
 }
 
+// noisyShToken matches tokens the low-confidence `X: not found` (sh/busybox) form
+// commonly mis-flags but that are never a missing WORKER TOOL: HTTP status / line
+// numbers (404, 1) and shared-object / archive / header files (libssl.so.1, foo.o,
+// bar.h). Applied ONLY to reShNotFound; the explicit "command not found" forms are
+// high-confidence and unfiltered. A generic English word ("key: not found") can still
+// slip through — distinguishing it needs context this flag-only scan lacks, so the
+// judge interprets it.
+var noisyShToken = regexp.MustCompile(`(?i)^\d+$|\.(so|a|o|h|dll|dylib|la|lo)(\.\d+)*$`)
+
 // scanCommandNotFound flags missing-executable evidence in a run's tool_result
 // payloads (PRD #46 Decision 4). It bounds the bytes inspected (judgeScanByteBudget),
 // dedupes by command keeping the first evidence line, and caps the distinct count.
@@ -110,6 +119,9 @@ func scanCommandNotFound(payloads [][]byte) []ToolMiss {
 			add(m[1], m[0])
 		}
 		for _, m := range reShNotFound.FindAllStringSubmatch(text, -1) {
+			if noisyShToken.MatchString(m[1]) {
+				continue
+			}
 			add(m[1], m[0])
 		}
 	}

@@ -567,12 +567,13 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 	return items, nil
 }
 
-const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :execrows
+const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :many
 
 UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
 WHERE worker_id = $2
   AND status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= $3
+RETURNING id
 `
 
 type FailWorkerRunsOverCapParams struct {
@@ -585,13 +586,27 @@ type FailWorkerRunsOverCapParams struct {
 // On register a worker declares a fresh start, so any run it still holds is
 // orphaned (its execution is gone). Over its re-queue budget → failed. failed →
 // origin restore, applied by the reconcile loop (register does no forge I/O), so
-// it stamps move_pending_since.
-func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) (int64, error) {
-	result, err := q.db.Exec(ctx, failWorkerRunsOverCap, arg.FailureReason, arg.WorkerID, arg.MaxRequeues)
+// it stamps move_pending_since. RETURNING id so the caller can funnel these
+// committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
+// as the sweeper's FailRunsOfStaleWorkersOverCap does.
+func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, failWorkerRunsOverCap, arg.FailureReason, arg.WorkerID, arg.MaxRequeues)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getRunByID = `-- name: GetRunByID :one
