@@ -38,6 +38,13 @@ const defaultQueryFn: SdkQueryFn = (params) => sdkQuery({ prompt: params.prompt 
 const TRACE_PAGE = 500;
 const MAX_TRACE_PAGES = 20; // ≤ 10k messages fetched
 const PROMPT_CHAR_BUDGET = 120_000;
+
+// Wall-clock cap on the single judge model turn (M8/B). Without it a judge run whose
+// model call hangs or retries indefinitely only ends when the API sweeper reaps it
+// minutes later — and a stalled worker posts no fallback. On the cap we abort the SDK
+// query AND hard-reject the race, so runModel always settles within the budget and
+// judge() falls back to the deterministic review.
+const JUDGE_MODEL_TIMEOUT_MS = 5 * 60 * 1000;
 const MSG_SNIPPET_CHARS = 800;
 const HEAD_MESSAGES = 40;
 const TAIL_MESSAGES = 60;
@@ -81,11 +88,15 @@ export interface JudgeRunnerOptions {
   queryFn?: SdkQueryFn;
   /** Root under which per-run SDK HOME dirs are created; default os.tmpdir(). */
   homeRoot?: string;
+  /** Wall-clock cap on the model turn; default JUDGE_MODEL_TIMEOUT_MS. Injectable so
+   *  a test can drive the timeout path deterministically. */
+  modelTimeoutMs?: number;
 }
 
 export class JudgeRunner {
   private readonly queryFn: SdkQueryFn;
   private readonly homeRoot: string;
+  private readonly modelTimeoutMs: number;
 
   constructor(
     private readonly client: WorkerClient,
@@ -94,6 +105,7 @@ export class JudgeRunner {
   ) {
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.homeRoot = opts.homeRoot ?? os.tmpdir();
+    this.modelTimeoutMs = opts.modelTimeoutMs ?? JUDGE_MODEL_TIMEOUT_MS;
   }
 
   /** Run one judge claim end to end. Never throws — a failure reports the judge run
@@ -177,39 +189,62 @@ export class JudgeRunner {
 
   private async runModel(token: string, model: string, prompt: string): Promise<string> {
     const homeDir = await fs.mkdtemp(path.join(this.homeRoot, "uzi-judge-"));
+    // Wall-clock cap: abort the SDK query (native cancellation) AND hard-reject the
+    // race, so a hung/retrying model call can never wedge the judge run — runModel
+    // settles within JUDGE_MODEL_TIMEOUT_MS and judge() falls back.
+    const abort = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        abort.abort();
+        reject(new Error(`judge model call exceeded ${this.modelTimeoutMs}ms`));
+      }, this.modelTimeoutMs);
+    });
     try {
-      const env = buildSdkEnv(token, homeDir);
-      const options: SdkOptions = {
-        env: env as unknown as Record<string, string | undefined>,
-        // No repo settings, and a deny-all tool hook: the judge reasons from text only.
-        settingSources: [],
-        systemPrompt: JUDGE_SYSTEM_PROMPT,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        includePartialMessages: false,
-        hooks: {
-          PreToolUse: [{ hooks: [denyAllTools] }],
-        },
-      };
-      if (model) options.model = model;
-
-      let text = "";
-      for await (const msg of this.queryFn({ prompt: promptStream(prompt), options })) {
-        for (const em of mapSdkMessage(msg)) {
-          if (em.kind === "text") {
-            const t = (em.payload as { text?: string }).text;
-            if (t) text += t;
-          }
-        }
-        if (isResult(msg)) {
-          if (isErrorResult(msg)) throw new Error("judge model call returned an error result");
-          break;
-        }
-      }
-      return text;
+      return await Promise.race([this.consumeModel(token, model, prompt, homeDir, abort), timeout]);
     } finally {
+      if (timer) clearTimeout(timer);
       await fs.rm(homeDir, { recursive: true, force: true }).catch(() => {});
     }
+  }
+
+  private async consumeModel(
+    token: string,
+    model: string,
+    prompt: string,
+    homeDir: string,
+    abort: AbortController,
+  ): Promise<string> {
+    const env = buildSdkEnv(token, homeDir);
+    const options: SdkOptions = {
+      env: env as unknown as Record<string, string | undefined>,
+      abortController: abort,
+      // No repo settings, and a deny-all tool hook: the judge reasons from text only.
+      settingSources: [],
+      systemPrompt: JUDGE_SYSTEM_PROMPT,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      includePartialMessages: false,
+      hooks: {
+        PreToolUse: [{ hooks: [denyAllTools] }],
+      },
+    };
+    if (model) options.model = model;
+
+    let text = "";
+    for await (const msg of this.queryFn({ prompt: promptStream(prompt), options })) {
+      for (const em of mapSdkMessage(msg)) {
+        if (em.kind === "text") {
+          const t = (em.payload as { text?: string }).text;
+          if (t) text += t;
+        }
+      }
+      if (isResult(msg)) {
+        if (isErrorResult(msg)) throw new Error("judge model call returned an error result");
+        break;
+      }
+    }
+    return text;
   }
 
   private async safeReportFailed(runId: string, reason: string): Promise<void> {

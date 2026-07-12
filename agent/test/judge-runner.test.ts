@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview } from "../src/judge-runner.js";
+import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { WorkerClient } from "../src/client.js";
 import type { ClaimResponse, JudgeTraceResponse, ReviewRequest, StateRequest } from "../src/protocol.js";
@@ -142,6 +143,35 @@ describe("JudgeRunner", () => {
     await runner.execute(judgeClaim({ target_run_id: null }));
     assert.equal(calls.review, undefined, "no review without a target");
     assert.equal(calls.state?.body.status, "failed");
+  });
+
+  it("the UZI_E2E_EXECUTOR=stub judge queryFn drives the deterministic fallback (M8/B)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: stubJudgeQueryFn });
+    await runner.execute(judgeClaim());
+    // The stub yields an error result → JudgeRunner falls back to the claim's
+    // command-not-found signal, so the e2e sees a real review naming jq, no spend.
+    assert.equal(calls.review?.review.status, "failed");
+    assert.equal(calls.review?.review.recommendations[0]?.category, "install_worker_tool");
+    assert.equal(calls.review?.review.recommendations[0]?.target, "jq");
+    assert.equal(calls.state?.body.status, "completed");
+  });
+
+  it("caps the model call by wall clock: a hung query still lands the fallback (M8/B)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    // A queryFn that never yields a terminal result — without the cap, runModel would
+    // hang forever. modelTimeoutMs is injected tiny so the test is fast.
+    const hung: SdkQueryFn = (() =>
+      (async function* () {
+        await new Promise((r) => setTimeout(r, 60_000)); // longer than the injected cap
+      })()) as unknown as SdkQueryFn;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: hung, modelTimeoutMs: 20 });
+    const started = Date.now();
+    await runner.execute(judgeClaim());
+    assert.ok(Date.now() - started < 5_000, "the wall-clock cap must abort the hung model call promptly");
+    assert.equal(calls.review?.review.status, "failed", "a timed-out model call still posts the deterministic fallback");
+    assert.equal(calls.review?.review.recommendations[0]?.target, "jq");
+    assert.equal(calls.state?.body.status, "completed");
   });
 });
 
