@@ -447,17 +447,18 @@ Approved deviations from the design above, found during implementation:
    run that is never claimed (e.g. no worker online) yields no deterministic
    findings, only whatever the LLM call itself produces once it does run.
 2. **Premise correction on migration numbering (Decision 12).** The PRD
-   assumed the live head was `00052` (PRD #37). PRD #39 (chat) actually landed
-   first and, needing the same repo-less run shape, carried the
-   `repo_id`/`issue_iid` DROP NOT NULL and the repo-less `runs_kind_shape`
-   relaxation itself. This PRD's M1 therefore *extended* chat's constraints
-   (judge + self_improve shapes) rather than introducing the relaxation from
-   scratch, and the actual live head at this PRD's landing was `00055`, not
-   `00052`. Migration numbers in a PRD draft are always collision-avoidance
-   placeholders, renumbered to the real live head at landing (per
-   `CLAUDE.md`'s migration-numbering convention) — this is a correction to the
-   draft's stated *premise* (which PRD got there first), not a new instance of
-   the normal renumbering.
+   assumed the live head was `00052` (PRD #37). By the time this PRD landed,
+   `issue_iid` was already nullable (`00043`, PRD #6's `ci_fix` runs) and
+   `repo_id` was already nullable (`00053`, PRD #39's chat runs, which needed
+   a repo-less run shape first). This PRD's M1 therefore *extended* those two
+   already-relaxed columns into the repo-less `judge` shape and the `judge`/
+   `self_improve` `runs_kind_shape` branches (`00080`), rather than dropping
+   either NOT NULL itself — and the actual live head at this PRD's landing was
+   `00055`, not `00052`. Migration numbers in a PRD draft are always
+   collision-avoidance placeholders, renumbered to the real live head at
+   landing (per `CLAUDE.md`'s migration-numbering convention) — this is a
+   correction to the draft's stated *premise* (which prior PRDs already did
+   the relaxing), not a new instance of the normal renumbering.
 3. **Re-run judge needs no per-user opt-in.** Decision 7's per-user
    `judge_enabled` opt-in gates the *automatic* judge (Decision 2's
    terminal-funnel enqueue). The owner-initiated "re-run judge" action

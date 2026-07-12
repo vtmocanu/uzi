@@ -40,11 +40,12 @@ agent for the repo, or improve uzi itself. That last category feeds the
 ## The deterministic fallback
 
 Separately from the LLM call, uzi scans the run's own tool output for
-`command not found` / missing-executable errors and always turns any hit into
-an "install a worker tool" recommendation naming the tool — even if the judge
-model call itself fails. When that happens the run page shows a "judge
-incomplete" badge next to the verdict, but the deterministic findings still
-land.
+`command not found` / missing-executable errors. Normally this is just a hint
+handed to the judge model, which weighs it alongside everything else in the
+trace. But **if the judge model call itself fails**, every hit is turned into
+an "install a worker tool" recommendation naming the tool, guaranteed — so a
+finding still lands even when the LLM doesn't run. When that happens the run
+page shows a "judge incomplete" badge next to the verdict.
 
 ## Re-running the judge
 
