@@ -39,6 +39,10 @@ services:
       default:
         aliases:
           - forge-fake.e2e
+    # Publish the fake on a per-run loopback port so the harness drives the /_e2e
+    # mutators/introspection with plain curl (no `compose exec` per call).
+    ports:
+      - "127.0.0.1:${E2E_FAKE_PORT}:443"
     healthcheck:
       test:
         - CMD
@@ -137,7 +141,11 @@ services:
       # standing in for GitLab's git server (a real remote the worker pushes to).
       GIT_CONFIG_GLOBAL: /e2e-git/gitconfig
       WORKER_HEARTBEAT_INTERVAL: 5s
-      WORKER_POLL_INTERVAL: 2s
+      # Fast claim pickup for the stub path (prod default 3s). This same interval
+      # drives the parked run's input poll (runner pollMs), so approve_plan pickup
+      # at the gate is also ~500ms instead of seconds — the suite runs ~19 full
+      # gate->approve->complete cycles, so this compounds.
+      WORKER_POLL_INTERVAL: 500ms
       # RUN-lane concurrency cap (PRD #42). Default 1 = the pre-#42 serial loop, so
       # every phase except the M5 bounded-concurrency scenario runs the worker
       # exactly as before; that scenario sets UZI_E2E_MAX_CONCURRENT_RUNS=2 and
