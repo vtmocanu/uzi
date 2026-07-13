@@ -81,6 +81,10 @@ DUMMY_ANTHROPIC="sk-ant-e2e-dummy-do-not-use-000000"
 
 WEB_PORT="$(( 20000 + (RANDOM % 20000) ))"
 BASE="http://127.0.0.1:${WEB_PORT}"
+# forge-fake's /_e2e surface, published on the next loopback port (see the
+# fake_post/fake_state helpers below).
+FAKE_PORT="$(( WEB_PORT + 1 ))"
+FAKE_BASE="https://127.0.0.1:${FAKE_PORT}"
 
 COMPOSE=(docker compose -p "$PROJECT" --project-directory "$ROOT" --env-file "$ENVFILE"
   -f "$ROOT/docker-compose.yml" -f "$ROOT/e2e/docker-compose.e2e.yml" --profile agent)
@@ -153,20 +157,47 @@ wait_http() {
   local deadline=$((SECONDS + 90))
   while [ $SECONDS -lt $deadline ]; do
     curl -fsS "$BASE/api/health" >/dev/null 2>&1 && return 0
-    sleep 1
+    sleep 0.3
   done
   fail "api health never came up at $BASE"
 }
 
-wait_worker_online() {
-  local deadline=$((SECONDS + 40)) s
+# wait_eq WANT TIMEOUT DESC GETTER [ARGS...] — the generic "reaches state X" wait:
+# poll GETTER until its output equals WANT. Every simple equality wait shares this
+# skeleton; only the waits with extra early-fail conditions (wait_status,
+# wait_autopilot_done, wait_notes) keep bespoke loops.
+wait_eq() {
+  local want="$1" timeout="$2" desc="$3"; shift 3
+  local deadline=$((SECONDS + timeout)) got
   while [ $SECONDS -lt $deadline ]; do
-    s="$(apiget /api/workers | jq -r '.workers[0].status // empty')"
-    [ "$s" = online ] && return 0
-    sleep 2
+    got="$("$@")"
+    [ "$got" = "$want" ] && return 0
+    sleep 0.3
   done
-  fail "worker never reached online (last status: ${s:-none})"
+  fail "timeout: $desc never reached '$want' (last: '${got:-none}')"
 }
+
+# One-shot getters for wait_eq (and for direct point-in-time assertions).
+worker_status()         { apiget /api/workers | jq -r '.workers[0].status // empty'; }
+board_pipeline_status() { apiget "/api/repos/$REPO_ID/board" | jq -r '.board.pipeline.status // empty'; }
+card_pipeline_status()  { apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" '.board.cards[] | select(.iid==$iid) | .pipeline.status // empty'; }
+run_verdict()           { apiget "/api/runs/$1" | jq -r '.run.fix_verdict // empty'; }
+run_mr_state()          { apiget "/api/runs/$1" | jq -r '.run.mr_state // empty'; }
+run_health()            { apiget "/api/runs/$1" | jq -r '.run.health'; }
+# card_column IID — the board's resolved column for one issue (empty = Open).
+card_column()           { apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" '.board.cards[] | select(.iid==$iid) | .column'; }
+
+wait_worker_online()  { wait_eq online 40 "worker status" worker_status; }
+# Poller-driven waits: PRD #6 CI badges + verification stamp, PRD #24 card moves
+# and the watcher-maintained runs.mr_state (PRD #33 surfaces it on the run).
+wait_board_pipeline() { wait_eq "$1" "${2:-30}" "board pipeline" board_pipeline_status; }
+wait_card_pipeline()  { wait_eq "$2" "${3:-30}" "card #$1 pipeline" card_pipeline_status "$1"; }
+wait_verdict()        { wait_eq "$2" "${3:-30}" "run $1 fix_verdict" run_verdict "$1"; }
+wait_card_column()    { wait_eq "$2" "${3:-40}" "card #$1 column" card_column "$1"; }
+wait_run_mr_state()   { wait_eq "$2" "${3:-30}" "run $1 mr_state" run_mr_state "$1"; }
+# wait_health: a run's health flag (PRD #47) rides the run DTO. Generous default
+# (a stall needs ~75s of quiet plus a sweep tick).
+wait_health()         { wait_eq "$2" "${3:-120}" "run $1 health" run_health "$1"; }
 
 # wait_status RUN WANT [TIMEOUT] — poll a run until it reaches WANT; abort early
 # if it lands in an unexpected terminal state.
@@ -182,133 +213,31 @@ wait_status() {
         reason="$(apiget "/api/runs/$run" | jq -r '.run.failure_reason // empty')"
         fail "run $run entered '$s' (${reason:-no reason}) while waiting for '$want'";;
     esac
-    sleep 2
+    sleep 0.3
   done
   fail "timeout: run $run never reached '$want' (last: ${s:-none})"
 }
 
-# wait_board_pipeline STATUS [TIMEOUT] — wait until the board header's default-branch
-# CI badge reaches STATUS (the pipeline sync is poller-driven, PRD #6).
-wait_board_pipeline() {
-  local want="$1" deadline=$((SECONDS + ${2:-30})) s
-  while [ $SECONDS -lt $deadline ]; do
-    s="$(apiget "/api/repos/$REPO_ID/board" | jq -r '.board.pipeline.status // empty')"
-    [ "$s" = "$want" ] && return 0
-    sleep 2
-  done
-  fail "timeout: board pipeline never reached '$want' (last: ${s:-none})"
-}
+# --- forge-fake /_e2e helpers --------------------------------------------------
+# The overlay publishes forge-fake's 443 on a per-run loopback port so the
+# harness reaches the /_e2e mutators/introspection with plain curl (no
+# `compose exec node -e` round-trip per call — wait_notes polls one of these
+# every 300ms). -k because the self-signed cert names forge-fake.e2e, not
+# 127.0.0.1; TLS fidelity toward uzi is exercised by the api/worker paths, the
+# harness's own probes assert application state only.
 
-# wait_card_pipeline IID STATUS [TIMEOUT] — wait until the board CARD for issue IID
-# shows STATUS on its per-card CI badge (the card's most-recent run branch, PRD #6).
-wait_card_pipeline() {
-  local iid="$1" want="$2" deadline=$((SECONDS + ${3:-30})) s
-  while [ $SECONDS -lt $deadline ]; do
-    s="$(apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$iid" '.board.cards[] | select(.iid==$iid) | .pipeline.status // empty')"
-    [ "$s" = "$want" ] && return 0
-    sleep 2
-  done
-  fail "timeout: card #$iid pipeline never reached '$want' (last: ${s:-none})"
-}
-
-# wait_verdict RUN WANT [TIMEOUT] — wait for a ci_fix run's fix_verdict (the
-# verification stamp is poller-driven, PRD #6).
-wait_verdict() {
-  local run="$1" want="$2" deadline=$((SECONDS + ${3:-30})) v
-  while [ $SECONDS -lt $deadline ]; do
-    v="$(apiget "/api/runs/$run" | jq -r '.run.fix_verdict // empty')"
-    [ "$v" = "$want" ] && return 0
-    sleep 2
-  done
-  fail "timeout: run $run fix_verdict never reached '$want' (last: ${v:-none})"
-}
-
-# wait_health RUN WANT [TIMEOUT] — poll a run's health flag (PRD #47) until it
-# reaches WANT. Health rides the run DTO. Generous default (a stall needs ~75s of
-# quiet plus a sweep tick).
-wait_health() {
-  local run="$1" want="$2" deadline=$((SECONDS + ${3:-120})) h
-  while [ $SECONDS -lt $deadline ]; do
-    h="$(apiget "/api/runs/$run" | jq -r '.run.health')"
-    [ "$h" = "$want" ] && return 0
-    sleep 3
-  done
-  fail "timeout: run $run health never reached '$want' (last: ${h:-none})"
-}
-
-# card_column IID — the board's resolved column for one issue (empty = Open).
-card_column() {
-  apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" \
-    '.board.cards[] | select(.iid==$iid) | .column'
-}
-
-# wait_card_column IID WANT [TIMEOUT] — poll the board until a card resolves to
-# WANT (used for the MR-close watcher's async, poller-driven moves).
-wait_card_column() {
-  local iid="$1" want="$2" deadline=$((SECONDS + ${3:-40})) c
-  while [ $SECONDS -lt $deadline ]; do
-    c="$(card_column "$iid")"
-    [ "$c" = "$want" ] && return 0
-    sleep 2
-  done
-  fail "timeout: card #$iid never reached column '$want' (last: '${c:-none}')"
-}
-
-# wait_run_mr_state RUN WANT [TIMEOUT] — poll a run until its watcher-maintained
-# mr_state reaches WANT. PRD #33 surfaces runs.mr_state (written by the PRD #24
-# MR-close watcher) in the run payload; this lets the harness assert the chip's
-# underlying state, not just the card move it drives.
-wait_run_mr_state() {
-  local run="$1" want="$2" deadline=$((SECONDS + ${3:-30})) s
-  while [ $SECONDS -lt $deadline ]; do
-    s="$(apiget "/api/runs/$run" | jq -r '.run.mr_state // empty')"
-    [ "$s" = "$want" ] && return 0
-    sleep 2
-  done
-  fail "timeout: run $run mr_state never reached '$want' (last: '${s:-none}')"
-}
-
-# flip_mr IID STATE — drive forge-fake's /_e2e state mutator (the harness stand-in
-# for a reviewer closing/reopening/merging an MR). Run from inside the agent, which
-# resolves forge-fake.e2e and trusts its self-signed cert (NODE_EXTRA_CA_CERTS).
-flip_mr() {
-  local iid="$1" state="$2"
-  "${COMPOSE[@]}" exec -T agent node -e '
-    const https=require("https");
-    const data=JSON.stringify({state:process.argv[2]});
-    const req=https.request({hostname:"forge-fake.e2e",port:443,method:"POST",
-      path:`/_e2e/mrs/${process.argv[1]}/state`,
-      headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(data)}},
-      r=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>{
-        if(r.statusCode!==200){console.error("flip failed",r.statusCode,b);process.exit(1)}});});
-    req.on("error",e=>{console.error(e.message);process.exit(2)});
-    req.write(data);req.end();
-  ' "$iid" "$state" >/dev/null
-}
-
-# --- autopilot (PRD #19) helpers ---------------------------------------------
-# fake_post PATH JSON — POST to a forge-fake /_e2e mutator from inside the agent
-# (which resolves forge-fake.e2e and trusts its cert), echoing the response body.
-# Mirrors flip_mr; used to stage PRD/autopilot-labelled issues and label events
-# the way a human filing/labelling an issue would, which uzi's own CreateIssue
+# fake_post PATH JSON — POST to a forge-fake /_e2e mutator, echoing the response
+# body. Used to stage PRD/autopilot-labelled issues and label events the way a
+# human filing/labelling an issue would, which uzi's own CreateIssue
 # (PRD-label-only) cannot.
-fake_post() {
-  "${COMPOSE[@]}" exec -T agent node -e '
-    const https=require("https");
-    const data=process.argv[2];
-    const req=https.request({hostname:"forge-fake.e2e",port:443,method:"POST",
-      path:process.argv[1],
-      headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(data)}},
-      r=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>{
-        process.stdout.write(b);
-        if(r.statusCode>=300){console.error("fake_post",r.statusCode,b);process.exit(1)}});});
-    req.on("error",e=>{console.error(e.message);process.exit(2)});
-    req.write(data);req.end();
-  ' "$1" "$2"
-}
+fake_post() { curl -fsSk -X POST "$FAKE_BASE$1" -H 'Content-Type: application/json' -d "$2"; }
 
-# fake_state — the fake's persisted record (issues, MRs, notes, label events).
-fake_state() { "${COMPOSE[@]}" exec -T forge-fake cat /state/state.json; }
+# flip_mr IID STATE — the harness stand-in for a reviewer closing/reopening/
+# merging an MR (PRD #24).
+flip_mr() { fake_post "/_e2e/mrs/$1/state" "$(jq -nc --arg s "$2" '{state:$s}')" >/dev/null; }
+
+# fake_state — the fake's recorded state (issues, MRs, notes, label events).
+fake_state() { curl -fsSk "$FAKE_BASE/_e2e/state"; }
 
 # note_count IID / notes_text IID — issue-comment introspection.
 note_count() { fake_state | jq --argjson iid "$1" '[.notes[]? | select(.issue_iid==$iid)] | length'; }
@@ -341,7 +270,7 @@ wait_run_for_issue() {
   while [ $SECONDS -lt $deadline ]; do
     rid="$(apiget "/api/runs?issue_iid=$iid" | jq -r '.runs[0].id // empty')"
     [ -n "$rid" ] && { printf '%s' "$rid"; return 0; }
-    sleep 1
+    sleep 0.3
   done
   fail "timeout: no autopilot run appeared for issue #$iid"
 }
@@ -349,7 +278,7 @@ wait_run_for_issue() {
 # assert_no_run_for_issue IID [SETTLE] — let a few detector ticks pass, then prove
 # the issue only drew a comment, never a run.
 assert_no_run_for_issue() {
-  sleep "${2:-8}"
+  sleep "${2:-6}"
   local rid; rid="$(apiget "/api/runs?issue_iid=$1" | jq -r '.runs[0].id // empty')"
   [ -z "$rid" ] || fail "issue #$1 unexpectedly spawned run $rid (autopilot should have only commented)"
 }
@@ -366,7 +295,7 @@ wait_autopilot_done() {
     case "$s" in
       failed|cancelled) [ "$s" = "$want" ] || fail "autopilot run $run entered '$s' while waiting for '$want'";;
     esac
-    sleep 1
+    sleep 0.3
   done
   fail "timeout: autopilot run $run never reached '$want' (last: ${s:-none})"
 }
@@ -379,7 +308,7 @@ wait_notes() {
     n="$(note_count "$iid")"
     [ "$n" = "$want" ] && return 0
     { [ -n "$n" ] && [ "$n" -gt "$want" ] 2>/dev/null; } && fail "issue #$iid has $n comments, expected $want (over-commented)"
-    sleep 1
+    sleep 0.3
   done
   fail "timeout: issue #$iid never reached $want comment(s) (last: ${n:-none})"
 }
@@ -422,53 +351,46 @@ esac
 EOF
 chmod 0755 "$RUNROOT/fake-devbox"
 
-# Local bare repo standing in for GitLab's git server, seeded with a main commit.
-git init --bare -q "$RUNROOT/fakeremote/repo.git"
-git -C "$RUNROOT/fakeremote/repo.git" symbolic-ref HEAD refs/heads/main
-# Allow pushes over git smart-HTTP (the E2E_GIT_SMART_HTTP variant); a no-op for
-# the default local-path remote.
-git -C "$RUNROOT/fakeremote/repo.git" config http.receivepack true
-seedwc="$RUNROOT/.seedwc"
-git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/repo.git" .seedwc
-git -C "$seedwc" checkout -q -b main
-printf '# repo\n\nSeeded by the uzi M6 E2E harness.\n' > "$seedwc/README.md"
-# A repo-borne skill for the PRD #16 M6 opt-in path. Carries a capability key
-# (allowed-tools) that MUST be stripped when the flag is on; the worker loads only
-# name+description. It stays invisible unless the repo owner enables repo skills.
-mkdir -p "$seedwc/.claude/skills/e2e-repo-skill"
-printf -- '---\nname: e2e-repo-skill\ndescription: A repo-borne skill for the M6 opt-in E2E.\nallowed-tools: Bash, Write\n---\n\n# E2E repo skill\n\nProves the repo-skill opt-in path end to end.\n' \
-  > "$seedwc/.claude/skills/e2e-repo-skill/SKILL.md"
-# A repo-borne agent roster for the PRD #37 detect→choose→apply path. The worker
-# parses these after clone (settingSources stays []) and reports them on the run;
-# the gate then defaults to the repo source. Two files so the harness can approve
-# with the repo source while EXCLUDING one — proving choose+apply end to end.
-mkdir -p "$seedwc/.claude/agents"
-printf -- '---\nname: repo-coder\ndescription: Repo-defined coder for the M6 E2E.\ntools: Read, Edit, Bash\n---\n\nYou implement changes for this repo.\n' \
-  > "$seedwc/.claude/agents/repo-coder.md"
-printf -- '---\nname: repo-reviewer\ndescription: Repo-defined reviewer for the M6 E2E.\ntools: Read, Grep\n---\n\nYou review changes for this repo.\n' \
-  > "$seedwc/.claude/agents/repo-reviewer.md"
-git -C "$seedwc" add README.md .claude
-git -C "$seedwc" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit"
-git -C "$seedwc" push -q origin main
-rm -rf "$seedwc"
-
-# A SECOND bare repo (group/repo2) for the PRD #42 M5 bounded-concurrency
-# scenario: two runs on two DIFFERENT repos must clone into independent
-# bare-caches so the per-repo GitCache lock (agent/src/git.ts) never serializes
-# them. Seeded minimally with a main commit — repo2 only ever carries a stub run's
-# marker branch. Dormant for every other phase (the seed enables only group/repo,
-# and no phase clones repo2 until M5 enables the repo).
-git init --bare -q "$RUNROOT/fakeremote/repo2.git"
-git -C "$RUNROOT/fakeremote/repo2.git" symbolic-ref HEAD refs/heads/main
-git -C "$RUNROOT/fakeremote/repo2.git" config http.receivepack true
-seedwc2="$RUNROOT/.seedwc2"
-git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/repo2.git" .seedwc2
-git -C "$seedwc2" checkout -q -b main
-printf '# repo2\n\nSecond repo, seeded by the uzi E2E harness for the PRD #42 M5 concurrency scenario.\n' > "$seedwc2/README.md"
-git -C "$seedwc2" add README.md
-git -C "$seedwc2" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit (repo2)"
-git -C "$seedwc2" push -q origin main
-rm -rf "$seedwc2"
+# Local bare repos standing in for GitLab's git server, each seeded with a main
+# commit. repo2 exists only for the PRD #42 M5 bounded-concurrency scenario: two
+# runs on two DIFFERENT repos must clone into independent bare-caches so the
+# per-repo GitCache lock (agent/src/git.ts) never serializes them. It stays
+# dormant for every other phase (the seed enables only group/repo, and no phase
+# clones repo2 until M5 enables the repo).
+for r in repo repo2; do
+  git init --bare -q "$RUNROOT/fakeremote/$r.git"
+  git -C "$RUNROOT/fakeremote/$r.git" symbolic-ref HEAD refs/heads/main
+  # Allow pushes over git smart-HTTP (the E2E_GIT_SMART_HTTP variant); a no-op for
+  # the default local-path remote.
+  git -C "$RUNROOT/fakeremote/$r.git" config http.receivepack true
+  seedwc="$RUNROOT/.seedwc-$r"
+  git -C "$RUNROOT" clone -q "$RUNROOT/fakeremote/$r.git" ".seedwc-$r"
+  git -C "$seedwc" checkout -q -b main
+  printf '# %s\n\nSeeded by the uzi E2E harness.\n' "$r" > "$seedwc/README.md"
+  if [ "$r" = repo ]; then
+    # A repo-borne skill for the PRD #16 M6 opt-in path. Carries a capability key
+    # (allowed-tools) that MUST be stripped when the flag is on; the worker loads only
+    # name+description. It stays invisible unless the repo owner enables repo skills.
+    mkdir -p "$seedwc/.claude/skills/e2e-repo-skill"
+    printf -- '---\nname: e2e-repo-skill\ndescription: A repo-borne skill for the M6 opt-in E2E.\nallowed-tools: Bash, Write\n---\n\n# E2E repo skill\n\nProves the repo-skill opt-in path end to end.\n' \
+      > "$seedwc/.claude/skills/e2e-repo-skill/SKILL.md"
+    # A repo-borne agent roster for the PRD #37 detect→choose→apply path. The worker
+    # parses these after clone (settingSources stays []) and reports them on the run;
+    # the gate then defaults to the repo source. Two files so the harness can approve
+    # with the repo source while EXCLUDING one — proving choose+apply end to end.
+    mkdir -p "$seedwc/.claude/agents"
+    printf -- '---\nname: repo-coder\ndescription: Repo-defined coder for the M6 E2E.\ntools: Read, Edit, Bash\n---\n\nYou implement changes for this repo.\n' \
+      > "$seedwc/.claude/agents/repo-coder.md"
+    printf -- '---\nname: repo-reviewer\ndescription: Repo-defined reviewer for the M6 E2E.\ntools: Read, Grep\n---\n\nYou review changes for this repo.\n' \
+      > "$seedwc/.claude/agents/repo-reviewer.md"
+    git -C "$seedwc" add README.md .claude
+  else
+    git -C "$seedwc" add README.md
+  fi
+  git -C "$seedwc" -c user.name=seed -c user.email=seed@uzi.e2e -c commit.gpgsign=false commit -q -m "seed: initial commit ($r)"
+  git -C "$seedwc" push -q origin main
+  rm -rf "$seedwc"
+done
 
 chmod -R a+rwX "$RUNROOT/fakeremote"
 
@@ -497,6 +419,7 @@ say "git remote mode: $GIT_MODE"
 cat > "$ENVFILE" <<EOF
 E2E_RUN_DIR=$RUNROOT
 E2E_WEB_PORT=$WEB_PORT
+E2E_FAKE_PORT=$FAKE_PORT
 UZI_E2E_EXECUTOR=$EXECUTOR
 POSTGRES_USER=uzi
 POSTGRES_DB=uzi
@@ -678,7 +601,7 @@ git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/hea
   || fail "branch agent/issue-$IID was not pushed to the remote"
 pass "branch agent/issue-$IID present on the git remote"
 
-STATE_JSON="$("${COMPOSE[@]}" exec -T forge-fake cat /state/state.json)"
+STATE_JSON="$(fake_state)"
 [ "$(echo "$STATE_JSON" | jq '.mrs | length')" -ge 1 ] || fail "fake GitLab recorded no merge request"
 [ "$(echo "$STATE_JSON" | jq -r '.mrs[-1].source_branch')" = "agent/issue-$IID" ] \
   || fail "recorded MR source_branch mismatch"
@@ -767,8 +690,16 @@ pass "live plan reject: status=failed, stop_kind=plan_rejected, failure_reason=v
 say "PRD #24: MR-close watcher (Human Review ⇄ In Progress on MR close/reopen)"
 
 # The watcher only ticks inside the poller; the overlay default is 24h. Switch to
-# ~2s and recreate the api so the MR-state watcher actually runs.
-printf 'E2E_FORGE_POLL_INTERVAL=2s\n' >> "$ENVFILE"
+# ~2s and recreate the api so the MR-state watcher actually runs. NOT faster than
+# 2s: the poll interval doubles as the whole-tick deadline (poller.go tickCtx),
+# and at 1s a slow tick gets cancelled mid-pass — observed losing an autopilot
+# record-then-comment (the comment is never retried by design). The reconcile
+# cadence (FORGE_RECONCILE_EVERY, the PRD #19 FullSync-eviction dedup's bounded
+# wait) is set in the SAME recreate: a full reconcile only mirrors the forge the
+# watcher already wrote forge-first (FullSync writes the issue cache, never moves
+# cards or touches runs.mr_state), so tightening it here changes nothing this or
+# the intervening PRD #16/#18 phases assert — and saves a second api recreate.
+printf 'E2E_FORGE_POLL_INTERVAL=2s\nFORGE_RECONCILE_EVERY=2\n' >> "$ENVFILE"
 "${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
 wait_http
 login
@@ -779,7 +710,7 @@ pass "poller sped to ~2s; card #$IID in Human Review with open MR !$MR_IID"
 
 # NULL-bootstrap (Decision 9): the first tick records the MR's CURRENT state
 # ('opened') WITHOUT moving, so a pre-existing state never triggers a spurious
-# move. Give it a few ticks; the card must stay put.
+# move. Give it a few ticks (2s each); the card must stay put.
 sleep 6
 [ "$(card_column "$IID")" = "Human Review" ] \
   || fail "NULL-bootstrap must record MR state without moving the card (Decision 9)"
@@ -810,9 +741,9 @@ wait_card_column "$IID" "In Progress" 40
 apipost "/api/repos/$REPO_ID/issues/$IID/move" '{"to_column":"Later"}' >/dev/null
 wait_card_column "$IID" "Later" 10   # the move is forge-first; let any in-flight reconcile settle
 flip_mr "$MR_IID" opened
-# Several ticks must pass with the card LEFT in Later (a fight would yank it to
-# Human Review within one tick).
-sleep 10
+# Several ticks (2s each) must pass with the card LEFT in Later (a fight would
+# yank it to Human Review within one tick).
+sleep 6
 [ "$(card_column "$IID")" = "Later" ] \
   || fail "watcher fought a manual drag: card #$IID left Later after the MR reopened"
 pass "manual drag wins: card #$IID stayed in Later despite the MR reopening"
@@ -933,17 +864,12 @@ pass "tier-1 tool [$PKG] provisioned against the stubbed devbox, run completed"
 apiput "/api/repos/$REPO_ID/tool-profile" '{"packages":[]}' >/dev/null
 
 # =============================================================================
-# PRD #19 — admin settings + autopilot. The poller is already at ~2s (the phase
-# above); make the reconcile cadence tight too so the FullSync-eviction dedup
-# assertion has a bounded wait (a full reconcile every 2 ticks). Then map the
+# PRD #19 — admin settings + autopilot. The poller is already at ~1s and the
+# reconcile cadence at every-2-ticks (both set with the MR-close phase's api
+# recreate), so the FullSync-eviction dedup assertion has a bounded wait. Map the
 # repo owner's forge username and opt them into autopilot: the two consent gates
 # an unattended run requires (Decision 4).
-say "PRD #19 autopilot: tighten reconcile cadence, map + opt-in the repo owner"
-printf 'FORGE_RECONCILE_EVERY=2\n' >> "$ENVFILE"
-"${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
-wait_http
-login
-wait_worker_online
+say "PRD #19 autopilot: map + opt-in the repo owner"
 
 CONN_ID="$(apiget /api/forge/connections | jq -r '.connections[0].id // empty')"
 [ -n "$CONN_ID" ] || fail "no seeded forge connection to map"
@@ -1017,9 +943,10 @@ wait_notes "$IID_NC" 2 40
 pass "label remove+re-add (new event id) → re-evaluated once → second comment"
 
 # A FullSync (eviction + resync of the issue cache) must NOT re-comment: the dedup
-# marker lives in autopilot_triggers, not the evictable issue cache. Several ticks
-# (>= one reconcile at FORGE_RECONCILE_EVERY=2) with no new label event → still 2.
-sleep 10
+# marker lives in autopilot_triggers, not the evictable issue cache. Several 2s
+# ticks (>= one reconcile at FORGE_RECONCILE_EVERY=2) with no new label event →
+# still 2.
+sleep 6
 [ "$(note_count "$IID_NC")" = 2 ] || fail "a FullSync eviction re-commented (trigger dedup must survive eviction)"
 assert_no_run_for_issue "$IID_NC" 0
 pass "no re-comment (and still no run) across a FullSync eviction"
@@ -1033,7 +960,7 @@ wait_status "$RUN_FL" failed 120
 wait_notes "$IID_FL" 1 40
 notes_text "$IID_FL" | grep -qF "could not complete" || fail "expected the failure comment"
 notes_text "$IID_FL" | grep -qF "/runs/$RUN_FL" || fail "failure comment is missing the run link"
-sleep 6   # a duplicate would appear within a couple of ticks
+sleep 5   # a duplicate would appear within a couple of (2s) ticks
 [ "$(note_count "$IID_FL")" = 1 ] || fail "failure path posted more than one comment"
 pass "exactly one failure comment (fixed template + run link), no failure_reason echoed"
 
@@ -1307,7 +1234,7 @@ apipost /api/vault/lock '' >/dev/null
 IID_V="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E vault gated","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
 RUN_V="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_V}" | jq -r '.run.id')"
-sleep 8   # several worker poll cycles (2s each) must pass with the run LEFT queued
+sleep 3   # several worker poll cycles (500ms each) must pass with the run LEFT queued
 [ "$(apiget "/api/runs/$RUN_V" | jq -r '.run.status')" = queued ] \
   || fail "a locked owner's run must stay queued (never claimed, never failed)"
 pass "vault locked: run $RUN_V stayed queued across several poll cycles"
@@ -1408,7 +1335,7 @@ wait_review() {
   local run="$1" deadline=$((SECONDS + ${2:-120}))
   while [ $SECONDS -lt $deadline ]; do
     [ -n "$(apiget "/api/runs/$run/review" | jq -r '.review.id // empty')" ] && return 0
-    sleep 2
+    sleep 0.3
   done
   fail "PRD #46: no judge review ever landed for run $run"
 }
@@ -1474,7 +1401,7 @@ wait_msg_kind() {
   while [ $SECONDS -lt $deadline ]; do
     apiget "/api/runs/$run/messages" \
       | jq -e --arg k "$kind" '[.messages[] | select(.kind==$k)] | length >= 1' >/dev/null 2>&1 && return 0
-    sleep 1
+    sleep 0.3
   done
   fail "timeout: run $run never emitted a '$2' message"
 }
@@ -1484,7 +1411,7 @@ wait_msg_text() {
   while [ $SECONDS -lt $deadline ]; do
     apiget "/api/runs/$run/messages" \
       | jq -e --arg s "$sub" '[.messages[] | select((.payload.text // "") | contains($s))] | length >= 1' >/dev/null 2>&1 && return 0
-    sleep 1
+    sleep 0.3
   done
   fail "timeout: run $run never emitted a message containing '$2'"
 }
@@ -1494,7 +1421,7 @@ wait_tool_result() {
   while [ $SECONDS -lt $deadline ]; do
     apiget "/api/runs/$run/messages" \
       | jq -e --arg t "$tuid" '[.messages[] | select(.kind=="tool_result" and .payload.tool_use_id==$t)] | length >= 1' >/dev/null 2>&1 && return 0
-    sleep 1
+    sleep 0.3
   done
   fail "timeout: run $run never emitted a tool_result '$2'"
 }
@@ -1555,7 +1482,7 @@ IID_PZ="$(apipost "/api/repos/$REPO_ID/issues" \
   "$(jq -cn --arg t "$INJECT" '{title:$t,description:"implements prds/4-agent-runtime-workers.md"}')" | jq -r '.card.iid')"
 RUN_PZ="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_PZ}" | jq -r '.run.id')"
 { [ -n "$RUN_PZ" ] && [ "$RUN_PZ" != null ]; } || fail "poisoned run was not created"
-sleep 2   # let the run persist so list_runs (newest-first) surfaces it
+sleep 1   # let the run persist so list_runs (newest-first) surfaces it
 ISSUES_PRE_READ="$(fake_state | jq '.issues | length')"
 PROPS_PRE_READ="$(proposal_count "$CHAT")"
 apipost "/api/chats/$CHAT/messages" \
@@ -1617,13 +1544,13 @@ apipost "/api/chats/$CHAT/messages" \
   "$(jq -cn '{message:"UZI_STUB_PROPOSE group/repo Dismiss me please"}')" \
   | jq -e 'has("server_side")' >/dev/null || fail "second propose message was not accepted"
 deadline=$((SECONDS + 20))
-while [ $SECONDS -lt $deadline ]; do [ "$(proposal_count "$CHAT")" -ge 2 ] && break; sleep 1; done
+while [ $SECONDS -lt $deadline ]; do [ "$(proposal_count "$CHAT")" -ge 2 ] && break; sleep 0.3; done
 PID2="$(newest_proposal_id "$CHAT")"
 { [ -n "$PID2" ] && [ "$PID2" != "$PID" ] && [ "$PID2" != null ]; } || fail "second proposal card did not appear (got '$PID2')"
 ISSUES_BEFORE="$(fake_state | jq '.issues | length')"
 DIS_CODE="$(apipost_code "/api/chats/$CHAT/proposals/$PID2/dismiss" '')"
 [ "$DIS_CODE" = 204 ] || fail "dismiss should be 204 No Content, got $DIS_CODE"
-sleep 2
+sleep 1
 [ "$(fake_state | jq '.issues | length')" = "$ISSUES_BEFORE" ] || fail "dismiss wrote an issue to the forge"
 pass "dismiss (204) wrote nothing to the forge (issue count unchanged at $ISSUES_BEFORE)"
 
@@ -1800,7 +1727,7 @@ else
     W0="$(apiget /api/workers | jq -c '.workers[0]')"
     CAP="$(echo "$W0" | jq -r '.max_concurrent_runs')"
     { [ "$(echo "$W0" | jq -r '.status')" = online ] && [ "$CAP" = 2 ]; } && break
-    sleep 2
+    sleep 0.3
   done
   [ "$CAP" = 2 ] || fail "worker did not advertise max_concurrent_runs=2 after recreate (got ${CAP:-none})"
   pass "worker back online advertising cap 2"
