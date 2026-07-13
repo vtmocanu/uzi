@@ -32,7 +32,7 @@ type CreateJudgeRunParams struct {
 // judge-run-scoped endpoint, and posts back a verdict + recommendations.
 // Enqueue a judge run for a finished target run (Decision 2). Owned by the SAME user
 // as the target (never cross-user). issue_title/description are synthesized — a judge
-// has no issue. The one-active-judge-per-target partial unique index (00080) makes a
+// has no issue. The one-active-judge-per-target partial unique index (00057) makes a
 // duplicate raise 23505, which the caller treats as "already being judged" (a no-op).
 func (q *Queries) CreateJudgeRun(ctx context.Context, arg CreateJudgeRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createJudgeRun,

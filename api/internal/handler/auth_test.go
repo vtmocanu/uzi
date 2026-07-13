@@ -84,7 +84,7 @@ func TestRegisterDisabledReturns403(t *testing.T) {
 }
 
 func TestRegisterDomainRejectedReturns403(t *testing.T) {
-	cfg := config.Config{RegistrationEnabled: true, AllowedEmailDomains: []string{"example.com"}}
+	cfg := config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true, AllowedEmailDomains: []string{"example.com"}}
 	rec := postRegister(cfg, `{"email":"someone@gmail.com","password":"a-long-enough-password"}`)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
@@ -99,7 +99,7 @@ func TestRegisterDomainRejectedReturns403(t *testing.T) {
 // password check (not 403), so the domain gate must have passed. Case-insensitive
 // matching is covered by the mixed-case address.
 func TestRegisterDomainAllowedPassesPolicy(t *testing.T) {
-	cfg := config.Config{RegistrationEnabled: true, AllowedEmailDomains: []string{"example.com"}}
+	cfg := config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true, AllowedEmailDomains: []string{"example.com"}}
 	rec := postRegister(cfg, `{"email":"Alice@example.com","password":"short"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (past the domain gate, failing on password)", rec.Code)
@@ -110,13 +110,43 @@ func TestRegisterDomainAllowedPassesPolicy(t *testing.T) {
 }
 
 func TestRegisterEmptyAllowlistAllowsAll(t *testing.T) {
-	cfg := config.Config{RegistrationEnabled: true} // nil AllowedEmailDomains
+	cfg := config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true} // nil AllowedEmailDomains
 	rec := postRegister(cfg, `{"email":"anyone@gmail.com","password":"short"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (any domain allowed, failing on password)", rec.Code)
 	}
 	if strings.Contains(rec.Body.String(), "restricted") {
 		t.Fatalf("body = %q, an empty allowlist must allow every domain", rec.Body.String())
+	}
+}
+
+// TestLoginDisabledWhenPasswordLoginOff: with password login off, POST /login is a
+// 403 even with well-formed, plausibly-valid credentials — the gate fires before the
+// body and the DB, so there is no password backdoor in SSO-only mode (fact-check R1).
+func TestLoginDisabledWhenPasswordLoginOff(t *testing.T) {
+	h := &Handler{cfg: config.Config{PasswordLoginEnabled: false}}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login",
+		strings.NewReader(`{"email":"admin@example.com","password":"a-plausible-password"}`))
+	rec := httptest.NewRecorder()
+	h.Login(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 with password login disabled", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "password login is disabled") {
+		t.Errorf("body = %q, want the disabled reason", rec.Body.String())
+	}
+}
+
+// TestLoginNotGatedWhenPasswordLoginOn: with the flag on, the gate does not fire —
+// a malformed body reaches the decode step and 400s (a 403 here would mean the gate
+// wrongly tripped). Proves the normal path is unchanged without needing a DB.
+func TestLoginNotGatedWhenPasswordLoginOn(t *testing.T) {
+	h := &Handler{cfg: config.Config{PasswordLoginEnabled: true}}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader("not json"))
+	rec := httptest.NewRecorder()
+	h.Login(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (gate off, failing on the malformed body)", rec.Code)
 	}
 }
 
@@ -153,6 +183,55 @@ func TestAuthConfigShape(t *testing.T) {
 		}
 		if !strings.Contains(body, `"allowed_email_domains":[]`) {
 			t.Errorf("body = %q, want an empty array (not null) for the domains", body)
+		}
+	})
+
+	// PRD #45, Decision 9: the OIDC surface fields. Default (no OIDC) is dormant with
+	// password login on; a configured OIDC-only deployment flips all three.
+	t.Run("oidc dormant by default", func(t *testing.T) {
+		h := &Handler{cfg: config.Config{RegistrationEnabled: true, PasswordLoginEnabled: true}}
+		rec := httptest.NewRecorder()
+		h.AuthConfig(rec, httptest.NewRequest(http.MethodGet, "/api/auth/config", nil))
+		var got struct {
+			OIDCEnabled          bool   `json:"oidc_enabled"`
+			OIDCProviderName     string `json:"oidc_provider_name"`
+			PasswordLoginEnabled bool   `json:"password_login_enabled"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode: %v (body %q)", err, rec.Body.String())
+		}
+		if got.OIDCEnabled {
+			t.Error("oidc_enabled should be false when unconfigured")
+		}
+		if !got.PasswordLoginEnabled {
+			t.Error("password_login_enabled should default true")
+		}
+	})
+
+	t.Run("oidc configured, password login off", func(t *testing.T) {
+		h := &Handler{cfg: config.Config{
+			OIDCIssuerURL:        "https://idp.example.com",
+			OIDCProviderName:     "Keycloak",
+			PasswordLoginEnabled: false,
+		}}
+		rec := httptest.NewRecorder()
+		h.AuthConfig(rec, httptest.NewRequest(http.MethodGet, "/api/auth/config", nil))
+		var got struct {
+			OIDCEnabled          bool   `json:"oidc_enabled"`
+			OIDCProviderName     string `json:"oidc_provider_name"`
+			PasswordLoginEnabled bool   `json:"password_login_enabled"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode: %v (body %q)", err, rec.Body.String())
+		}
+		if !got.OIDCEnabled {
+			t.Error("oidc_enabled should be true when the issuer is set")
+		}
+		if got.OIDCProviderName != "Keycloak" {
+			t.Errorf("oidc_provider_name = %q, want Keycloak", got.OIDCProviderName)
+		}
+		if got.PasswordLoginEnabled {
+			t.Error("password_login_enabled should be false")
 		}
 	})
 }

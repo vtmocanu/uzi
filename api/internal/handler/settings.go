@@ -35,6 +35,12 @@ type settingsResponse struct {
 	// "disabled" | "connecting" | "connected" | "error:<class>". The webui chip
 	// renders it.
 	SlackStatus string `json:"slack_status"`
+	// OIDCStatus is the OIDC SSO health for the admin status line (PRD #45, Nit6):
+	// "disabled" (unconfigured), "ok" (discovery succeeded), or "degraded"
+	// (configured but discovery has not yet succeeded — the IdP was down at boot; a
+	// login retry clears it). OIDCProviderName is the operator-set button label.
+	OIDCStatus       string `json:"oidc_status"`
+	OIDCProviderName string `json:"oidc_provider_name"`
 }
 
 func newSettingsResponse(v settings.AdminView, slackStatus string) settingsResponse {
@@ -52,7 +58,25 @@ func (h *Handler) GetSettings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, newSettingsResponse(view, h.slackState()))
+	resp := newSettingsResponse(view, h.slackState())
+	resp.OIDCStatus = h.oidcStatus()
+	resp.OIDCProviderName = h.cfg.OIDCProviderName
+	httpx.JSON(w, http.StatusOK, resp)
+}
+
+// oidcStatus reports OIDC SSO health for the admin settings line (PRD #45, Nit6),
+// non-blocking: "disabled" when unconfigured, "ok" once discovery has succeeded,
+// "degraded" when configured but discovery has not yet succeeded (IdP down at boot;
+// a login retry clears it). Never networks on the admin page load.
+func (h *Handler) oidcStatus() string {
+	switch {
+	case h.oidc == nil:
+		return "disabled"
+	case h.oidc.Discovered():
+		return "ok"
+	default:
+		return "degraded"
+	}
 }
 
 // VaultMigration reports how many stored user secrets still use the legacy

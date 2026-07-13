@@ -42,6 +42,8 @@ beforeEach(() => {
     prdlessLabel: "PRDLESS",
     prdlessEnabled: false,
     vaultUnlocked: true,
+    vaultExists: true,
+    hasPassword: true,
   });
 });
 
@@ -102,5 +104,13 @@ describe("Register policy gating", () => {
     renderRegister();
     await screen.findByText("Create your account");
     expect(screen.queryByText("Registration is disabled")).toBeNull();
+  });
+
+  it("shows an SSO-only notice (not the form) when password login is disabled", async () => {
+    mockApi.authConfig.mockResolvedValue(cfg({ password_login_enabled: false }));
+    const { container } = renderRegister();
+    await screen.findByText("Sign-up is via single sign-on");
+    expect(screen.queryByText("Create your account")).toBeNull();
+    expect(container.querySelector('input[type="email"]')).toBeNull();
   });
 });

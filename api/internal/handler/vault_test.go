@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
@@ -130,6 +131,123 @@ func TestVaultUnlockLockStatusLifecycle(t *testing.T) {
 	}
 	if !statusUnlocked(t, h, uid) {
 		t.Fatal("status should be unlocked after VaultUnlock")
+	}
+}
+
+func postPassphrase(h *Handler, uid uuid.UUID, passphrase string) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(map[string]string{"passphrase": passphrase})
+	rec := httptest.NewRecorder()
+	h.VaultPassphrase(rec, authedAs(http.MethodPost, "/api/vault/passphrase", body, uid))
+	return rec
+}
+
+// TestVaultPassphraseCreateOnly (PRD #45, Decision 6): the first passphrase create
+// mints + unlocks the vault (204); a second create is refused (409) because
+// overwriting a live wrapped_dek would orphan every DEK-sealed secret.
+func TestVaultPassphraseCreateOnly(t *testing.T) {
+	h := &Handler{vault: testVault(t)}
+	uid := uuid.New()
+
+	if h.vaultExists(context.Background(), uid) {
+		t.Fatal("vault should not exist before create")
+	}
+	rec := postPassphrase(h, uid, "a-strong-vault-passphrase")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("first create code = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if !statusUnlocked(t, h, uid) {
+		t.Error("vault should be unlocked immediately after passphrase create")
+	}
+	if !h.vaultExists(context.Background(), uid) {
+		t.Error("vaultExists should be true after create")
+	}
+
+	// Create-only: a second attempt (even with a different passphrase) is a 409.
+	rec2 := postPassphrase(h, uid, "a-different-strong-passphrase")
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("second create code = %d, want 409", rec2.Code)
+	}
+}
+
+// TestVaultPassphraseMinLength: a passphrase below MinPasswordLen (12) is rejected
+// and no vault is created (audit L1 — a weak passphrase must not undercut the KEK).
+func TestVaultPassphraseMinLength(t *testing.T) {
+	h := &Handler{vault: testVault(t)}
+	uid := uuid.New()
+
+	rec := postPassphrase(h, uid, "short") // 5 chars
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", rec.Code)
+	}
+	if h.vaultExists(context.Background(), uid) {
+		t.Error("a rejected short passphrase must not create a vault")
+	}
+}
+
+// TestVaultPassphraseCreatedVaultUnlockable: a vault created via the passphrase
+// endpoint is a normal vault — the existing /api/vault/unlock accepts the same
+// passphrase and rejects a wrong one, proving the passphrase actually keys the DEK.
+func TestVaultPassphraseCreatedVaultUnlockable(t *testing.T) {
+	h := &Handler{vault: testVault(t)}
+	uid := uuid.New()
+	const pass = "correct-horse-battery-staple"
+
+	if rec := postPassphrase(h, uid, pass); rec.Code != http.StatusNoContent {
+		t.Fatalf("create code = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	h.VaultLock(httptest.NewRecorder(), authedAs(http.MethodPost, "/api/vault/lock", nil, uid))
+	if statusUnlocked(t, h, uid) {
+		t.Fatal("vault should be locked after VaultLock")
+	}
+
+	// Correct passphrase unlocks.
+	body, _ := json.Marshal(map[string]string{"password": pass})
+	rec := httptest.NewRecorder()
+	h.VaultUnlock(rec, authedAs(http.MethodPost, "/api/vault/unlock", body, uid))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("unlock code = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if !statusUnlocked(t, h, uid) {
+		t.Error("vault should be unlocked after the correct-passphrase unlock")
+	}
+
+	// Wrong passphrase is refused (403).
+	wrong, _ := json.Marshal(map[string]string{"password": "not-the-passphrase-at-all"})
+	rec2 := httptest.NewRecorder()
+	h.VaultUnlock(rec2, authedAs(http.MethodPost, "/api/vault/unlock", wrong, uid))
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("wrong-passphrase unlock code = %d, want 403", rec2.Code)
+	}
+}
+
+// TestVaultPassphraseNoVault: with no vault wired the endpoint reports misconfig
+// rather than panicking (mirrors VaultUnlock).
+func TestVaultPassphraseNoVault(t *testing.T) {
+	h := &Handler{} // nil vault
+	rec := postPassphrase(h, uuid.New(), "a-strong-vault-passphrase")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500 for a nil vault", rec.Code)
+	}
+}
+
+// TestVaultPassphraseRejectsPasswordUser: a password account (PasswordHash valid)
+// is refused server-side (409) and no vault is minted — defense-in-depth against a
+// self-brick, since its vault derives from the login password (Decision 6).
+func TestVaultPassphraseRejectsPasswordUser(t *testing.T) {
+	h := &Handler{vault: testVault(t)}
+	uid := uuid.New()
+	body, _ := json.Marshal(map[string]string{"passphrase": "a-strong-vault-passphrase"})
+	req := httptest.NewRequest(http.MethodPost, "/api/vault/passphrase", bytes.NewReader(body))
+	req = req.WithContext(mw.ContextWithUser(req.Context(),
+		store.User{ID: uid, PasswordHash: pgtype.Text{String: "argon2-hash-placeholder", Valid: true}}))
+	rec := httptest.NewRecorder()
+	h.VaultPassphrase(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code = %d, want 409 for a password account; body=%s", rec.Code, rec.Body.String())
+	}
+	if h.vaultExists(context.Background(), uid) {
+		t.Error("a password user's passphrase attempt must not create a vault")
 	}
 }
 

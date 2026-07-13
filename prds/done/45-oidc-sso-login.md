@@ -1,7 +1,7 @@
 # PRD #45: OIDC SSO login — Keycloak / Pocket ID
 
 **GitLab Issue**: [#45](https://gitlab.example.com/vtmocanu/uzi/-/issues/45)
-**Status**: Reviewed (design review + security audit + fact-check, 2026-07-12), ready to start
+**Status**: Complete (2026-07-12, MR !44 merged). Keycloak verified against a real instance; Pocket ID walkthrough verification remains a manual user step (passkey bootstrap).
 **Priority**: Medium
 **Created**: 2026-07-12
 **Depends on**: PRD #1 (auth), PRD #32 (user vault) — both done
@@ -74,7 +74,7 @@ This PRD supersedes that punt for OIDC (SAML stays out of scope).
    `authLimiter`.
 
 4. **Identity key is `(issuer, subject)`, stored as columns on `users`.** Migration
-   (draft `00053`, renumbered at merge per convention) adds `oidc_issuer TEXT`,
+   (landed as `00056`; renumber-at-merge convention still applies if main moves) adds `oidc_issuer TEXT`,
    `oidc_subject TEXT`, a partial unique index on `(oidc_issuer, oidc_subject)`, and
    relaxes `password_hash` to nullable. A separate `user_identities` table was
    rejected: uzi supports exactly one provider, and the table buys nothing until
@@ -220,7 +220,7 @@ This PRD supersedes that punt for OIDC (SAML stays out of scope).
   the wrapper does it explicitly (go-oidc only exposes `IDToken.Nonce`).
 - `api/internal/handler/oidc.go`: the two handlers + state-cookie seal/open;
   wired in `handler.go:200-211` outside `RequireAuth`, behind `authLimiter`.
-- Migration draft `00053_oidc.sql` + sqlc queries: `GetUserByOIDCSubject`,
+- Migration `00056_oidc.sql` (landed number) + sqlc queries: `GetUserByOIDCSubject`,
   `LinkUserOIDC`, `CreateUserOIDC` (NULL password_hash); regenerate sqlc.
 - `POST /api/vault/passphrase` (create-only, RequireAuth) per decision 6.
 - `Login` handles NULL `password_hash` per decision 7; `AuthConfig` per decision 9.
@@ -255,38 +255,41 @@ This PRD supersedes that punt for OIDC (SAML stays out of scope).
 
 ## Milestones
 
-- [ ] **M1 — Config + provider bootstrap**: `UZI_OIDC_*`/`UZI_PASSWORD_LOGIN_ENABLED`
+- [x] **M1 — Config + provider bootstrap**: `UZI_OIDC_*`/`UZI_PASSWORD_LOGIN_ENABLED`
       parsing, boot validation + lockout guard, `go get` of pinned
       `go-oidc/v3` (+ transitive `go-jose` review), `api/internal/oidc` package
       with discovery, env plumbing (`.env.example`, `docker-compose.yml`).
       `go build`, config unit tests.
-- [ ] **M2a — Schema + passwordless groundwork**: migration + sqlc regen, nullable
+- [x] **M2a — Schema + passwordless groundwork**: migration + sqlc regen, nullable
       `password_hash` ripple (all sites from decision 7), NULL-hash Login 401
       path, `AuthConfig` fields. This wide, risky change lands and is tested
       before any flow work (review N3).
-- [ ] **M2b — OIDC login flow (backend)**: the two handlers, state/nonce/PKCE
+- [x] **M2b — OIDC login flow (backend)**: the two handlers, state/nonce/PKCE
       cookie, verify → link/JIT → `issueSession`, register gating when password
       login is off. Validated with a `httptest` fake IdP.
-- [ ] **M3 — Vault passphrase for passwordless users**: `POST /api/vault/passphrase`
+- [x] **M3 — Vault passphrase for passwordless users**: `POST /api/vault/passphrase`
       (min length 12), `has_password` + `vault.exists` in session payload, SPA
       passphrase-create dialog + banner wording. Vault tests extended.
-- [ ] **M4 — Web login UX**: SSO button, error-code banner, password-form gating
+- [x] **M4 — Web login UX**: SSO button, error-code banner, password-form gating
       on Login/Register, `mockApi.authConfig` fields, admin-settings OIDC status
       line. `npm run typecheck` + vitest. (M3 and M4 both touch
       `web/src/lib/api.ts` — serialize those two edits despite being Phase 3;
       review Nit4.)
-- [ ] **M5 — Tests green**: Go tests covering the callback matrix (missing state
+- [x] **M5 — Tests green**: Go tests covering the callback matrix (missing state
       cookie, state mismatch, bad nonce, unverified / non-boolean `email_verified`,
       domain rejected, JIT-first-admin, link, email-matches-different-subject
       rejection, concurrent-JIT 23505, deactivated, registration-disabled), the
       NULL-hash 401 oracle test, OIDC-login-leaves-no-vault-row, web tests for the
       gated login page. Full `go test ./...`, `npm test`.
-- [ ] **M6 — Docs + specs**: `docs/oidc.md` with Keycloak + Pocket ID walkthroughs,
+- [x] **M6 — Docs + specs**: `docs/oidc.md` with Keycloak + Pocket ID walkthroughs,
       `configuration.md`, `auth-design.md`, specs updates; `npm run build`
       (check-docs) green.
-- [ ] **M7 — Live validation**: manual end-to-end against a real Pocket ID (or
+- [x] **M7 — Live validation**: manual end-to-end against a real Pocket ID (or
       Keycloak dev realm) via docker compose with dummy-env isolation; findings
-      folded back.
+      folded back. (Done vs real Keycloak 26.0 — all success-criteria scenarios,
+      incl. real `email_verified=false` refusal; dev-topology finding folded into
+      `docs/oidc.md`. Pocket ID walkthrough verification remains a manual user
+      step: its admin bootstrap needs a passkey, not headless-scriptable.)
 
 ## Milestone dependency / parallelization
 
@@ -296,6 +299,37 @@ This PRD supersedes that punt for OIDC (SAML stays out of scope).
 | 2 | M2b | M1, M2a | handlers, cookie, handler.go |
 | 3 (parallel) | M3, M4, M6 | M2b | vault/handlers+SPA · web pages · docs (M3/M4 share `web/src/lib/api.ts` — serialize) |
 | 4 | M5, M7 | M2b–M4 | tests, live stack |
+
+## Implementation notes (2026-07-12, folded back from review/audit/fact-check/live waves)
+
+- **Login endpoint gated on `UZI_PASSWORD_LOGIN_ENABLED`** (`5f70685`): the PRD's
+  Decision 8 wording assumed it ("accounts that can never log in", the lockout
+  trade-off), but only Register was specified. Fact-check caught the gap: an
+  ungated `POST /api/auth/login` in SSO-only mode bypasses IdP offboarding.
+  Uniform 403 before body/DB; break-glass semantics unchanged.
+- **Singleflight discovery** (`83a28e0`): concurrent logins during an IdP outage
+  collapse onto one in-flight discovery instead of serializing on the provider
+  mutex (auditor wave-1/2 note; reviewed + race-stress-tested, collapse test
+  committed in M5).
+- **M2b review batch** (`af6fc61`): server-side issued-at TTL inside the sealed
+  state cookie; race-path log PII removed (subject only); deactivated check
+  hoisted above `LinkUserOIDC` (reject-before-mutate); `issueSession` failure on
+  the callback redirects `oidc_error` instead of raw JSON 500; empty `code` maps
+  to `oidc_exchange`; Decision-10 email-drift Warn implemented (user id +
+  subject, no addresses).
+- **Vault passphrase guard** (`c1b6a0c`): endpoint also 409s accounts that HAVE
+  a password (defense-in-depth vs self-brick; SPA never offers it to them).
+- **go-jose bumped to v4.1.4** (`a7abfc5`) for GO-2026-4945 (the L7 manual gate
+  working as intended, twice).
+- **Mock scenario toggle** (`b35fd62`): `?mock=oidc|oidc-degraded|sso-only`
+  makes the M3/M4 surfaces reachable in MOCK_MODE demo/QA builds (web-ux
+  finding; N6 extension).
+- **Dev-topology constraint** (M7, `ac900c1`): containerized api cannot reach a
+  host-loopback IdP, and non-loopback `http` issuers are rejected by design —
+  documented in `docs/oidc.md` with the two working dev topologies + a
+  system-trust-store TLS note.
+- **Replay posture** documented in `docs/auth-design.md`: stateless RP, safety
+  rests on IdP single-use codes (RFC 6749); Keycloak + Pocket ID both enforce.
 
 ## Out of Scope
 

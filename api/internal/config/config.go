@@ -42,8 +42,39 @@ type Config struct {
 	// AllowedEmailDomains is the registration email-domain allowlist
 	// (UZI_ALLOWED_EMAIL_DOMAINS), lowercased, exact-match, no subdomain
 	// wildcards. Empty means every domain is allowed (today's behavior; the
-	// compose demo stays zero-config). Enforced only in the register handler.
+	// compose demo stays zero-config). Enforced in the register handler and the
+	// OIDC JIT-provisioning path (PRD #45).
 	AllowedEmailDomains []string
+	// PasswordLoginEnabled is the password-auth kill-switch (UZI_PASSWORD_LOGIN_ENABLED,
+	// default true; PRD #45 Decision 8). When false the SPA hides the password form
+	// and POST /api/auth/register is refused (no point minting password accounts that
+	// can never log in). Boot refuses when this is false AND OIDC is unconfigured
+	// (total lockout guard): the seed admin keeps a password_hash, so the break-glass
+	// is flipping this back to true and restarting.
+	PasswordLoginEnabled bool
+	// OIDC single-sign-on (PRD #45). All-or-nothing (Decision 8): issuer, client id,
+	// and client secret must be set together to enable the feature, else boot fails.
+	// An empty issuer means OIDC is off (fully dormant). The client secret is env-only
+	// and never stored in the DB — same trust level as JWTSecret, so secretbox is not
+	// involved.
+	OIDCIssuerURL    string
+	OIDCClientID     string
+	OIDCClientSecret string
+	// OIDCScopes is the requested scope set (UZI_OIDC_SCOPES, space-separated,
+	// default "openid profile email"). "openid" is always force-included — an OIDC
+	// ID token is not issued without it.
+	OIDCScopes []string
+	// OIDCProviderName is the label the "Sign in with …" button shows
+	// (UZI_OIDC_PROVIDER_NAME, default "SSO").
+	OIDCProviderName string
+	// OIDCRedirectURL is derived as FrontendOrigin + /api/auth/oidc/callback — the
+	// exact callback URI the IdP client must allow-list. Derived (not env-set) so an
+	// operator configures the origin in one place.
+	OIDCRedirectURL string
+	// OIDCHTTPTimeout bounds every outbound OIDC call (discovery, JWKS, token
+	// exchange), mirroring ForgeHTTPTimeout/SlackHTTPTimeout so a slow or unreachable
+	// IdP can never hang a request (audit L3).
+	OIDCHTTPTimeout time.Duration
 	// RateLimitMax is the request budget per window for auth endpoints.
 	RateLimitMax int
 	// RateLimitWindow is the fixed window for the rate limiter.
@@ -392,10 +423,128 @@ func Load() (Config, error) {
 	if err := loadSeedSlack(&cfg); err != nil {
 		return Config{}, err
 	}
+	// Must run after FrontendOrigin is set (the redirect URL is derived from it).
+	if err := loadOIDC(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
 	return cfg, nil
+}
+
+// OIDCEnabled reports whether the OIDC SSO login flow is configured. Boot
+// validation guarantees the issuer, client id, and client secret are all set
+// together, so the issuer alone is a sufficient signal. This is deliberately
+// decoupled from discovery success: OIDC can be enabled but degraded (the IdP was
+// down at boot), in which case login attempts retry discovery and the SSO button
+// must stay visible (PRD #45, Decision 8/9).
+func (c Config) OIDCEnabled() bool { return c.OIDCIssuerURL != "" }
+
+// loadOIDC reads and validates the OIDC SSO config and the password-login
+// kill-switch (PRD #45, Decision 8). UZI_OIDC_ISSUER_URL enables the feature;
+// issuer/client-id/client-secret are all-or-nothing (any-set-but-not-all is a loud
+// boot failure, matching the other static boot guards). The issuer must be https,
+// except loopback hosts for local development — mirroring the FORGE_ALLOWED_BASE_URLS
+// posture: the issuer host is implicitly trusted because its discovery document
+// dictates the token endpoint the client secret is POSTed to. The redirect URL is
+// derived from FrontendOrigin. With UZI_PASSWORD_LOGIN_ENABLED=false and OIDC
+// unconfigured, boot refuses (total lockout guard).
+func loadOIDC(cfg *Config) error {
+	pwEnabled, err := parseBool("UZI_PASSWORD_LOGIN_ENABLED", true)
+	if err != nil {
+		return err
+	}
+	cfg.PasswordLoginEnabled = pwEnabled
+
+	issuer := strings.TrimSpace(os.Getenv("UZI_OIDC_ISSUER_URL"))
+	clientID := strings.TrimSpace(os.Getenv("UZI_OIDC_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("UZI_OIDC_CLIENT_SECRET"))
+
+	if issuer == "" && clientID == "" && clientSecret == "" {
+		// OIDC fully unconfigured. The only remaining guard is the total-lockout
+		// check: with password login off too, nobody could ever authenticate.
+		if !pwEnabled {
+			return fmt.Errorf("UZI_PASSWORD_LOGIN_ENABLED=false requires OIDC to be configured (set UZI_OIDC_ISSUER_URL/UZI_OIDC_CLIENT_ID/UZI_OIDC_CLIENT_SECRET), else no one can log in")
+		}
+		return nil
+	}
+	if issuer == "" || clientID == "" || clientSecret == "" {
+		return fmt.Errorf("UZI_OIDC_ISSUER_URL, UZI_OIDC_CLIENT_ID, and UZI_OIDC_CLIENT_SECRET must be set together to enable OIDC")
+	}
+	if err := validateOIDCIssuerURL(issuer); err != nil {
+		return err
+	}
+
+	cfg.OIDCIssuerURL = issuer
+	cfg.OIDCClientID = clientID
+	cfg.OIDCClientSecret = clientSecret
+	cfg.OIDCScopes = parseScopes(os.Getenv("UZI_OIDC_SCOPES"))
+	cfg.OIDCProviderName = getenv("UZI_OIDC_PROVIDER_NAME", "SSO")
+	cfg.OIDCRedirectURL = strings.TrimRight(cfg.FrontendOrigin, "/") + "/api/auth/oidc/callback"
+	cfg.OIDCHTTPTimeout = parseDuration("UZI_OIDC_HTTP_TIMEOUT", 15*time.Second)
+	return nil
+}
+
+// validateOIDCIssuerURL enforces the issuer scheme guard: https everywhere except
+// loopback hosts, where http is allowed for local IdP development. The issuer is
+// stored verbatim (only surrounding whitespace trimmed) so go-oidc can enforce the
+// exact issuer/discovery-document match itself.
+func validateOIDCIssuerURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("UZI_OIDC_ISSUER_URL is not a valid URL: %w", err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("UZI_OIDC_ISSUER_URL %q has no host", raw)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("UZI_OIDC_ISSUER_URL %q must use https (http is allowed only for loopback hosts)", raw)
+	default:
+		return fmt.Errorf("UZI_OIDC_ISSUER_URL %q must use https", raw)
+	}
+}
+
+// isLoopbackHost reports whether host is a loopback name or IP (localhost,
+// 127.0.0.0/8, ::1). Used to permit plain-http OIDC issuers only for local dev.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// parseScopes parses the space-separated OIDC scope list. Empty/unset yields the
+// default "openid profile email". "openid" is always force-included (the OIDC spec
+// requires it for an ID token to be issued); entries are de-duplicated, first-seen
+// order preserved.
+func parseScopes(raw string) []string {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return []string{"openid", "profile", "email"}
+	}
+	out := make([]string, 0, len(fields)+1)
+	seen := map[string]struct{}{}
+	for _, f := range fields {
+		if _, dup := seen[f]; dup {
+			continue
+		}
+		seen[f] = struct{}{}
+		out = append(out, f)
+	}
+	if _, ok := seen["openid"]; !ok {
+		out = append([]string{"openid"}, out...)
+	}
+	return out
 }
 
 // loadSeedAdmin reads and validates the optional startup-admin seed. Seeding is

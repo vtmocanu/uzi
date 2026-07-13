@@ -55,6 +55,23 @@ function slackStatusChip(status: string) {
   );
 }
 
+// oidcStatusChip renders OIDC SSO health (PRD #45, Nit6) as a tone-coded Badge:
+// ok (green), degraded (warning — configured but discovery is failing), disabled
+// (neutral). Env-configured, so this is read-only status, not a form.
+function oidcStatusChip(status: string) {
+  const map: Record<string, { tone: BadgeTone; pulse?: boolean }> = {
+    ok: { tone: "ok" },
+    degraded: { tone: "warning", pulse: true },
+    disabled: { tone: "neutral" },
+  };
+  const cfg = map[status] ?? { tone: "neutral" as BadgeTone };
+  return (
+    <Badge tone={cfg.tone} dot pulse={cfg.pulse} title={`OIDC SSO: ${status}`}>
+      {status}
+    </Badge>
+  );
+}
+
 // clientValidate reproduces the server's per-value + cross-key rules so an
 // obviously-bad edit is caught before the round-trip. Returns an error message
 // or null. The server re-checks regardless. The label triple must be
@@ -86,6 +103,10 @@ export function AdminSettings() {
   // Live Slack socket state for the status chip (PRD #25 M2), polled separately
   // so it updates without clobbering in-progress form edits.
   const [slackStatus, setSlackStatus] = useState("disabled");
+  // OIDC SSO health for the read-only status line (PRD #45, Nit6). Env-configured,
+  // so there is no form — just a chip that surfaces a degraded (discovery-failing) IdP.
+  const [oidcStatus, setOidcStatus] = useState("disabled");
+  const [oidcProviderName, setOidcProviderName] = useState("SSO");
   const [prdLabel, setPrdLabel] = useState("");
   const [autopilotLabel, setAutopilotLabel] = useState("");
   const [defaultTheme, setDefaultTheme] = useState("");
@@ -109,6 +130,8 @@ export function AdminSettings() {
     setSecrets(sec ?? {});
     setSources(src ?? {});
     setSlackStatus(resp.slack_status ?? "disabled");
+    setOidcStatus(resp.oidc_status ?? "disabled");
+    setOidcProviderName(resp.oidc_provider_name || "SSO");
     setPrdLabel(settings.prd_label);
     setAutopilotLabel(settings.autopilot_label);
     setDefaultTheme(settings.default_theme);
@@ -327,6 +350,23 @@ export function AdminSettings() {
       {!loading && saved && <JudgeSettingsCard settings={saved} onSaved={applyResponse} />}
 
       {!loading && <SelfImproveSettingsCard />}
+
+      {!loading && oidcStatus !== "disabled" && (
+        <Card className="space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <SectionTitle>Single sign-on ({oidcProviderName})</SectionTitle>
+              <p className="mt-2 text-sm text-muted">
+                OIDC is configured via environment variables (restart to change). A{" "}
+                <span className="font-medium text-warn">degraded</span> status means the provider is
+                enabled but uzi could not reach its discovery document — the button still works and
+                a sign-in attempt retries discovery.
+              </p>
+            </div>
+            {oidcStatusChip(oidcStatus)}
+          </div>
+        </Card>
+      )}
 
       {!loading && saved && (
         <SlackSettingsCard

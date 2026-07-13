@@ -52,46 +52,59 @@ export function useVaultLock(onLocked?: () => void) {
   return { lock, locking };
 }
 
-// VaultLockedBanner shows only when authenticated-but-locked: a password field
-// that re-derives the DEK (a full re-login also unlocks, but this is the cheaper
-// path — the JWT cookie survives a restart, the DEK cache does not). Renders
-// nothing while unlocked or signed out.
+// VaultLockedBanner is the authenticated-but-locked surface. It dispatches on the
+// PRD #45 session bits: a passwordless (SSO) user who has not set a vault passphrase
+// yet gets the create dialog; everyone else gets the unlock banner, whose wording
+// switches to "passphrase" for passwordless users. Renders nothing while unlocked or
+// signed out. The `=== false` checks are deliberate: an undefined bit (older server
+// or a partial mock) never falls into the passwordless branch.
 export function VaultLockedBanner() {
-  const { user, vaultUnlocked, refresh } = useAuth();
-  const [password, setPassword] = useState("");
+  const { user, vaultUnlocked, hasPassword, vaultExists } = useAuth();
+  if (!user || vaultUnlocked) return null;
+  if (hasPassword === false && vaultExists === false) return <VaultPassphraseCreate />;
+  return <VaultUnlockBanner credential={hasPassword === false ? "passphrase" : "password"} />;
+}
+
+// VaultUnlockBanner re-derives the DEK from the user's password or passphrase (a
+// full re-login also unlocks a password user, but this is the cheaper path — the JWT
+// cookie survives a restart, the DEK cache does not).
+function VaultUnlockBanner({ credential }: { credential: "password" | "passphrase" }) {
+  const { refresh } = useAuth();
+  const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   // Consecutive failed unlocks. The server answers an identical 403 for a wrong
-  // password AND for a missing vault row (no oracle) — but a user whose vault row
-  // failed to create at register/login has the CORRECT password yet is stuck on
-  // "Incorrect password" forever, since UnlockExisting never creates. After a
-  // couple of failures we surface the one recovery path (a full re-login re-creates
-  // the vault) without weakening the server's indistinguishability.
+  // secret AND for a missing vault row (no oracle) — but a PASSWORD user whose vault
+  // row failed to create at register/login has the CORRECT password yet is stuck on
+  // "Incorrect password" forever, since UnlockExisting never creates. After a couple
+  // of failures we surface the one recovery path (a full re-login re-creates the
+  // vault) without weakening the server's indistinguishability. That recovery does
+  // NOT apply to a passphrase user (SSO login never touches the vault; passphrase
+  // recovery is a documented limitation), so the hint is password-only.
   const [failures, setFailures] = useState(0);
-
-  if (!user || vaultUnlocked) return null;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
     setBusy(true);
     try {
-      await api.vaultUnlock(password);
-      setPassword("");
+      await api.vaultUnlock(secret);
+      setSecret("");
       setFailures(0);
       await refresh();
     } catch (err) {
       const next = failures + 1;
       setFailures(next);
-      // 403 is the deliberate wrong-password / no-vault answer; keep it specific.
       const base =
         err instanceof ApiError && err.status === 403
-          ? "Incorrect password."
+          ? credential === "password"
+            ? "Incorrect password."
+            : "Incorrect passphrase."
           : err instanceof ApiError
             ? err.message
             : "Failed to unlock the vault.";
       setError(
-        next >= 2
+        next >= 2 && credential === "password"
           ? base + " Still locked with the right password? Sign out and back in to re-create your vault."
           : base,
       );
@@ -114,7 +127,7 @@ export function VaultLockedBanner() {
             <span aria-hidden="true">🔒</span> Vault locked
           </p>
           <p className="mt-0.5 text-sm text-muted">
-            Enter your password to resume your agents. While locked, your new runs wait as
+            Enter your {credential} to resume your agents. While locked, your new runs wait as
             &ldquo;waiting for vault unlock&rdquo; instead of failing — the merge-request review stays
             your gate.
           </p>
@@ -124,15 +137,115 @@ export function VaultLockedBanner() {
             <Input
               type="password"
               autoComplete="current-password"
-              aria-label="Vault password"
-              placeholder="Your password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              aria-label={`Vault ${credential}`}
+              placeholder={`Your ${credential}`}
+              value={secret}
+              onChange={(e) => setSecret(e.target.value)}
             />
             {error && <p className="mt-1 text-xs text-danger">{error}</p>}
           </div>
-          <Button type="submit" disabled={busy || password.trim() === ""}>
+          <Button type="submit" disabled={busy || secret.trim() === ""}>
             {busy ? "Unlocking…" : "Unlock"}
+          </Button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// VAULT_PASSPHRASE_MIN mirrors the server floor (auth.MinPasswordLen); the server
+// re-enforces it, this is pre-submit feedback only.
+const VAULT_PASSPHRASE_MIN = 12;
+
+// VaultPassphraseCreate is shown to a passwordless (SSO) user who has no vault yet
+// (PRD #45, Decision 6): they have no login password for the KEK to derive from, so
+// they choose a dedicated vault passphrase. Create-only server-side; on success the
+// vault is created and unlocked, and the session refresh clears this banner.
+function VaultPassphraseCreate() {
+  const { refresh } = useAuth();
+  const [passphrase, setPassphrase] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const tooShort = passphrase.length > 0 && passphrase.length < VAULT_PASSPHRASE_MIN;
+  const mismatch = confirm.length > 0 && confirm !== passphrase;
+  const canSubmit = passphrase.length >= VAULT_PASSPHRASE_MIN && confirm === passphrase && !busy;
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    if (passphrase.length < VAULT_PASSPHRASE_MIN) {
+      setError(`Passphrase must be at least ${VAULT_PASSPHRASE_MIN} characters.`);
+      return;
+    }
+    if (confirm !== passphrase) {
+      setError("Passphrases do not match.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.vaultCreatePassphrase(passphrase);
+      setPassphrase("");
+      setConfirm("");
+      await refresh();
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Failed to set your vault passphrase.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      role="alert"
+      className={cx(
+        "mb-6 rounded-lg border px-4 py-3",
+        "border-warn/40 bg-warn/10 text-warn",
+      )}
+    >
+      <div className="flex flex-col gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-fg">
+            <span aria-hidden="true">🔑</span> Set a vault passphrase
+          </p>
+          <p className="mt-0.5 text-sm text-muted">
+            You sign in with SSO, so there is no login password to protect your stored secrets
+            (like your Anthropic token). Choose a vault passphrase — at least {VAULT_PASSPHRASE_MIN}{" "}
+            characters — to encrypt them. You will enter it to unlock your vault after a restart. It
+            cannot be recovered if lost, so store it somewhere safe.
+          </p>
+        </div>
+        <form onSubmit={submit} className="flex flex-col gap-2 sm:flex-row sm:items-start">
+          <div className="w-56">
+            <Input
+              type="password"
+              autoComplete="new-password"
+              aria-label="Vault passphrase"
+              placeholder={`New passphrase (min ${VAULT_PASSPHRASE_MIN})`}
+              value={passphrase}
+              onChange={(e) => setPassphrase(e.target.value)}
+            />
+            {tooShort && (
+              <p className="mt-1 text-xs text-danger">At least {VAULT_PASSPHRASE_MIN} characters.</p>
+            )}
+          </div>
+          <div className="w-56">
+            <Input
+              type="password"
+              autoComplete="new-password"
+              aria-label="Confirm vault passphrase"
+              placeholder="Confirm passphrase"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+            {mismatch && <p className="mt-1 text-xs text-danger">Passphrases do not match.</p>}
+            {error && <p className="mt-1 text-xs text-danger">{error}</p>}
+          </div>
+          <Button type="submit" disabled={!canSubmit}>
+            {busy ? "Saving…" : "Set passphrase"}
           </Button>
         </form>
       </div>

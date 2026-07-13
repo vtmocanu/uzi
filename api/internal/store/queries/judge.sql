@@ -6,7 +6,7 @@
 -- name: CreateJudgeRun :one
 -- Enqueue a judge run for a finished target run (Decision 2). Owned by the SAME user
 -- as the target (never cross-user). issue_title/description are synthesized — a judge
--- has no issue. The one-active-judge-per-target partial unique index (00080) makes a
+-- has no issue. The one-active-judge-per-target partial unique index (00057) makes a
 -- duplicate raise 23505, which the caller treats as "already being judged" (a no-op).
 INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status)
 VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued')

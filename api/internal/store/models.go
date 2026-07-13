@@ -268,7 +268,7 @@ type ToolAllowlist struct {
 type User struct {
 	ID                   uuid.UUID          `json:"id"`
 	Email                string             `json:"email"`
-	PasswordHash         string             `json:"password_hash"`
+	PasswordHash         pgtype.Text        `json:"password_hash"`
 	DisplayName          pgtype.Text        `json:"display_name"`
 	IsAdmin              bool               `json:"is_admin"`
 	IsActive             bool               `json:"is_active"`
@@ -282,6 +282,8 @@ type User struct {
 	SlackNotify          bool               `json:"slack_notify"`
 	SlackResolvedID      pgtype.Text        `json:"slack_resolved_id"`
 	SlackLinkConfirmedAt pgtype.Timestamptz `json:"slack_link_confirmed_at"`
+	OidcIssuer           pgtype.Text        `json:"oidc_issuer"`
+	OidcSubject          pgtype.Text        `json:"oidc_subject"`
 	JudgeEnabled         bool               `json:"judge_enabled"`
 }
 

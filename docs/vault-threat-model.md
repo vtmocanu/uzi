@@ -32,6 +32,21 @@ this page is the as-built residual-risk list and the operator hardening steps.
   only. An operator can still recover the bot PAT; its blast radius is bounded by
   PRD #5's least-privilege checks (a Developer-role bot on protected repos).
 
+## OIDC-only users: the vault passphrase (PRD #45)
+
+An OIDC-only user (JIT-provisioned or linked via SSO with no password ever
+set) has no login password for the KEK above to derive from. Such a user
+instead sets a dedicated **vault passphrase** through a create-only endpoint,
+running the exact same Argon2id derivation path (`api/internal/vault/vault.go`)
+and enforcing the same 12-character floor as a login password — the KEK's
+real strength (residual risk 1, below) is unchanged by which secret feeds it.
+The DEK hierarchy underneath is identical; the vault has no notion of whether
+the string it was handed at creation was a password or a passphrase. Changing
+or recovering a lost passphrase is deferred (deleting and re-creating the
+vault would lose already-sealed secrets) — a documented limitation, not an
+oversight. See [auth-design.md](auth-design.md#oidc-single-sign-on) for how
+this fits into the OIDC login flow.
+
 ## Residual risks (accepted)
 
 1. **`users.password_hash` is an offline brute-force oracle — the dominant

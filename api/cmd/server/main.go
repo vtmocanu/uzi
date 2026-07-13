@@ -27,6 +27,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/oidc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
@@ -423,6 +424,29 @@ func run() error {
 	// Wire the notifications write seam (PRD #46 M2) for future producers (the judge,
 	// M4). The M2 read endpoints don't need it; this makes the seam available.
 	h.SetNotifier(notifier)
+	// Wire the OIDC relying party when configured (PRD #45). Discovery is warmed once
+	// here so a misconfigured or unreachable IdP is surfaced loudly at boot; a failure
+	// leaves the provider configured-but-degraded (login attempts retry discovery)
+	// rather than crash-looping the API (Decision 8).
+	if cfg.OIDCEnabled() {
+		oidcProvider := oidc.New(oidc.Config{
+			IssuerURL:    cfg.OIDCIssuerURL,
+			ClientID:     cfg.OIDCClientID,
+			ClientSecret: cfg.OIDCClientSecret,
+			RedirectURL:  cfg.OIDCRedirectURL,
+			Scopes:       cfg.OIDCScopes,
+			HTTPTimeout:  cfg.OIDCHTTPTimeout,
+		})
+		warmCtx, cancelWarm := context.WithTimeout(ctx, cfg.OIDCHTTPTimeout)
+		if err := oidcProvider.Discover(warmCtx); err != nil {
+			slog.Error("oidc discovery failed at boot; SSO is configured but degraded (login attempts will retry discovery)",
+				"issuer", cfg.OIDCIssuerURL, "error", err)
+		} else {
+			slog.Info("oidc provider discovered", "issuer", cfg.OIDCIssuerURL, "provider_name", cfg.OIDCProviderName)
+		}
+		cancelWarm()
+		h.SetOIDC(oidcProvider)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -523,7 +547,7 @@ func seedAdmin(ctx context.Context, q *store.Queries, cfg config.Config) error {
 	}
 	if _, err := q.CreateUser(ctx, store.CreateUserParams{
 		Email:        cfg.SeedEmail,
-		PasswordHash: hash,
+		PasswordHash: pgtype.Text{String: hash, Valid: true},
 		DisplayName:  name,
 		IsAdmin:      true,
 	}); err != nil {

@@ -17,6 +17,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/oidc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
@@ -56,6 +57,11 @@ type Handler struct {
 	// legacy master-box behavior and the vault endpoints report "no gate", so tests
 	// that don't exercise the vault need no change.
 	vault *vault.Vault
+	// oidc is the OIDC relying party (PRD #45). Optional (nil when UZI_OIDC_* is
+	// unset): the login/callback handlers use it and AuthConfig reports whether it is
+	// configured. Discovery is lazy + cached inside the provider, so a boot-time IdP
+	// blip leaves it degraded (login retries) rather than crashing the API.
+	oidc *oidc.Provider
 	// slackValidator live-validates Slack tokens on save (PRD #25 M1). Optional:
 	// nil falls back to the real slacksvc.Validator (see slackVal); tests inject a
 	// fake so the settings PUT is exercised without a network call to Slack.
@@ -152,6 +158,11 @@ func (h *Handler) SetReconciler(r Reconciler) { h.reconciler = r }
 // legacy master-box secret behavior (used by tests that don't exercise the vault).
 func (h *Handler) SetVault(v *vault.Vault) { h.vault = v }
 
+// SetOIDC wires the OIDC relying party (PRD #45). Call once at startup when
+// UZI_OIDC_* is configured; leaving it nil keeps OIDC dormant (the login/callback
+// endpoints report the feature as unconfigured and AuthConfig sets oidc_enabled=false).
+func (h *Handler) SetOIDC(p *oidc.Provider) { h.oidc = p }
+
 // userDTO is the safe, JSON-serializable view of a user. It never exposes the
 // password hash or token_version.
 type userDTO struct {
@@ -220,6 +231,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// Unauthenticated registration policy for the SPA: outside RequireAuth,
 			// behind the auth limiter. Reveals only operator-set, user-visible policy.
 			r.With(authLimiter.Middleware).Get("/config", h.AuthConfig)
+			// OIDC SSO (PRD #45): top-level GET redirects, outside RequireAuth (the
+			// callback is an unauthenticated cross-site navigation from the IdP), behind
+			// the auth limiter like register/login.
+			r.With(authLimiter.Middleware).Get("/oidc/login", h.OIDCLogin)
+			r.With(authLimiter.Middleware).Get("/oidc/callback", h.OIDCCallback)
 
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -245,6 +261,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Route("/vault", func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.With(authLimiter.PerUserMiddleware).Post("/unlock", h.VaultUnlock)
+			// Create-only passphrase for passwordless (OIDC) users (PRD #45). Behind the
+			// per-user limiter like unlock; refuses when a vault already exists.
+			r.With(authLimiter.PerUserMiddleware).Post("/passphrase", h.VaultPassphrase)
 			r.Post("/lock", h.VaultLock)
 			r.Get("/status", h.VaultStatus)
 		})

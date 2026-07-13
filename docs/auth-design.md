@@ -5,7 +5,7 @@ audience: design
 
 # Auth design
 
-uzi's auth is a hand-rolled email+password flow, deliberately compared against the two inspiration projects (`inspiration/bottega`, `inspiration/multica`) and designed to beat both. No SSO/OAuth, no OTP, no email verification for this MVP (see [plan.md](../plan.md) "later stuff" and the PRD's "Out of scope").
+uzi's auth is a hand-rolled email+password flow, deliberately compared against the two inspiration projects (`inspiration/bottega`, `inspiration/multica`) and designed to beat both. No OTP, no email verification for password accounts, for this MVP (see [plan.md](../plan.md) "later stuff" and the PRD's "Out of scope"). SSO is covered separately below (PRD #45).
 
 ## Comparison with the inspirations
 
@@ -60,6 +60,15 @@ Two operator-set knobs (PRD #5) gate who may register, enforced server-side in t
 Both policy rejections use **403** (the request is well-formed, the policy forbids it); `400` remains for malformed input and `409` for a duplicate email. Enforcement lives **only** in `Register` — never in a shared helper — so the operator-provisioned admin seed (`seedAdmin()` in `api/cmd/server/main.go`, a direct `CreateUser`) is exempt by construction: the operator sets both the seed email and the allowlist, so gating one on the other would only create bootstrap deadlocks.
 
 A new unauthenticated endpoint **`GET /api/auth/config`** returns `{registration_enabled, allowed_email_domains}` — uzi's first unauthenticated JSON surface besides `/health`. It sits *outside* `RequireAuth`, behind the same auth rate limiter as register/login, and exposes only operator-set, user-visible policy (never user data or secrets — this endpoint's shape is a security boundary). The register page consumes it to disable itself or hint the allowed domains, with client-side pre-validation; the server stays authoritative.
+
+## OIDC single sign-on
+
+uzi can also authenticate against a single external OIDC provider (Keycloak or Pocket ID) instead of, or alongside, its own password accounts — see [oidc.md](oidc.md) for the operator setup guide and `prds/done/45-oidc-sso-login.md` for the full decision log. Highlights relevant to this page:
+
+- The callback converges on the same `issueSession` chokepoint as password login: identical JWT cookie, identical CSRF cookie, identical `token_version` revocation, identical rolling refresh. uzi keeps no IdP tokens (no refresh tokens, no IdP session tracking, no RP-initiated logout), so the uzi session's lifetime (`AUTH_TOKEN_TTL`) is fully decoupled from the IdP's own session — logging out of uzi does not end the IdP session, and a live IdP session logs the user straight back in on the next click.
+- Identity is keyed on `(issuer, subject)`, stored directly on `users`; email stays the human key and the join key for linking an existing password account or JIT-provisioning a new one, both gated on the IdP's `email_verified` claim being boolean `true` — an unverified email is an account-takeover vector, so there is no override.
+- **Replay posture**: the callback keeps no server-side record of which authorization codes or `state` values it has already consumed, by design. Replay safety rests entirely on the IdP enforcing single-use authorization codes, as RFC 6749 requires — both Keycloak and Pocket ID do.
+- **Vault**: an OIDC-only user has no password, so the PRD #32 vault KEK (`Argon2id(login password)`, see [vault-threat-model.md](vault-threat-model.md)) has nothing to derive from. Such a user instead sets a dedicated **vault passphrase** (same 12-character floor as a password) through a create-only endpoint; the DEK hierarchy underneath is unchanged, and a linked user (password + OIDC) keeps using their password-derived vault as before, unaffected by an OIDC login. Changing or recovering a lost vault passphrase is deferred — deleting and re-creating the vault would lose any already-sealed secrets — so this is a documented limitation, not an oversight.
 
 ## Rate limiting and the X-Forwarded-For trust model
 

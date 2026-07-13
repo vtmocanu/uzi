@@ -283,21 +283,22 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
     code review). The judge recommends; only the job acts (user decision,
     2026-07-12).
 
-12. **Migrations draft-numbered `00080+`** to stay clear of ranges other open
-    PRDs hold (#45 drafts 00053, #39 00065, #41 00070, #42 00075; live head is
-    `00052` — PRD #37, landed); renumbered to the live head at landing per
-    convention.
+12. **Migrations were draft-numbered `00080+`** during design to stay clear of
+    ranges other open PRDs held (#45 drafts 00053, #39 00065, #41 00070, #42
+    00075; live head was `00052` — PRD #37 — at draft time). At landing they were
+    renumbered to the live head per convention: contiguous above PRD #45's OIDC
+    head `00056`, as `00057`–`00060`.
 
 ## Technical Design
 
 ### API (api/)
 
-- Migration drafts: `00080` `runs.repo_id`/`issue_iid` DROP NOT NULL + extend
+- Migrations (landed `00057`–`00060`, contiguous above the OIDC head `00056`): `00057` `runs.repo_id`/`issue_iid` DROP NOT NULL + extend
   `runs.kind` CHECK + rework `runs_kind_shape` (`judge` ⇒ repo/issue NULL,
   `target_run_id` NOT NULL FK ON DELETE CASCADE; `self_improve` ⇒ issue-shaped)
   + partial unique indexes (one non-terminal judge per target; one non-terminal
-  self_improve); `00081` `run_reviews` + `review_recommendations` (provenance
-  cols); `00082` `notifications`; `00083` `users.judge_enabled`. sqlc regen +
+  self_improve); `00058` `run_reviews` + `review_recommendations` (provenance
+  cols); `00059` `notifications`; `00060` `users.judge_enabled`. sqlc regen +
   NULL-`repo_id` audit of every runs query/DTO.
 - `workersvc`: enqueue-judge at committed terminal transitions (SetState,
   sweeper, server-side cancel paths); forked claim-assembly branch for `judge`
@@ -483,7 +484,7 @@ Approved deviations from the design above, found during implementation:
    `repo_id` was already nullable (`00053`, PRD #39's chat runs, which needed
    a repo-less run shape first). This PRD's M1 therefore *extended* those two
    already-relaxed columns into the repo-less `judge` shape and the `judge`/
-   `self_improve` `runs_kind_shape` branches (`00080`), rather than dropping
+   `self_improve` `runs_kind_shape` branches (`00057`), rather than dropping
    either NOT NULL itself — and the actual live head at this PRD's landing was
    `00055`, not `00052`. Migration numbers in a PRD draft are always
    collision-avoidance placeholders, renumbered to the real live head at
