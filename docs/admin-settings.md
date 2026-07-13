@@ -34,6 +34,21 @@ every other un-overridden user picks up the change on their next `me`
 refresh (in practice, their next login or reload — there's no push). See
 [Theming](./theming.md) for how themes work and how to add one.
 
+## Run health
+
+uzi can flag a run that looks slow, stuck, or looping — see
+[Run health](./run-health.md) for what each flag means. Tune it, or turn a
+signal off, from **Admin → Instance settings → Run health**:
+
+| Setting | Default | Controls |
+|---|---|---|
+| Enable run-health detection | on | Turns the whole detector on or off. |
+| Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. |
+| Slow after | 2700s (45m) | Wall-clock seconds since start before a running run is flagged slow. |
+| Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. |
+| Awaiting approval after | 3600s (1h) | Seconds a run may sit awaiting approval before it's flagged; skipped for autopilot runs. |
+| Slack nudge cooldown | 1800s (30m) | Minimum time between Slack DMs about the same run's flag — see [Slack notifications](./slack.md). |
+
 ## Validation
 
 - A label value (PRD, autopilot, or PRDLESS) may not be empty, longer than 64
@@ -45,6 +60,13 @@ refresh (in practice, their next login or reload — there's no push). See
   even while its toggle is off, so re-enabling it later is always safe.
 - The PRDLESS on/off switch stores a strict `true` or `false` — nothing else
   is accepted.
+- Each run-health threshold above accepts `0` (disables that one signal) or a
+  whole number of seconds from 60 to 86400 (one day); anything else —
+  negative, non-integer, or 1–59 — is rejected, so a fat-fingered value can't
+  silently disable a signal for a day or more. The slow threshold is further
+  clamped, at read time, to stay below `RUN_TIMEOUT`
+  ([Configuration](./configuration.md)) — a value at or past the timeout
+  would never fire, since the run fails first.
 - An invalid save is rejected before anything is written. The same rules run
   client-side first for immediate feedback, but the server is the source of
   truth.
