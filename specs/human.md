@@ -319,6 +319,16 @@ Tracked as GitLab issue vtmocanu/uzi#45; PRD at `prds/done/45-oidc-sso-login.md`
 - Operator docs include step-by-step walkthroughs for BOTH Keycloak and Pocket ID. [user 2026-07-12]
 - Supersedes the earlier "SSO with Keycloak" deferral in the Deferred list. [user 2026-07-12]
 
+## Feature #47 — Loop/hang detection
+
+Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/47-loop-hang-detection.md`.
+
+- Detect runs that are taking too long or seem stuck, and flag them. (plan.md line 68)
+- Flags surface in the web UI and on Slack.
+- Flags are non-terminal and self-clearing: a flag never kills, requeues, or times out a
+  run — early-warning only; existing watchdogs keep the kill job.
+  [AI-proposed surface, user-ratified via PRD approval 2026-07-12]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
