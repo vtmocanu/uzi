@@ -93,10 +93,10 @@ type healthThresholds struct {
 // failure is logged and skipped, never returned — a health hiccup must not fail the
 // sweep. A nil settings disables the detector entirely.
 func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
-	if s.settings == nil {
+	if s.healthSettings == nil {
 		return 0
 	}
-	enabled, err := s.settings.HealthEnabled(ctx)
+	enabled, err := s.healthSettings.HealthEnabled(ctx)
 	if err != nil {
 		slog.Error("health: read health_enabled", "error", err)
 		return 0
@@ -113,7 +113,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		return 0
 	}
 	th := s.healthThresholds(ctx)
-	cooldown := healthDur(s.settings.HealthNudgeCooldownSeconds(ctx))
+	cooldown := healthDur(s.healthSettings.HealthNudgeCooldownSeconds(ctx))
 
 	var changed int64
 	for _, r := range runs {
@@ -364,10 +364,10 @@ func (s *Service) queuedReason(ctx context.Context, userID uuid.UUID) string {
 // on a read error; healthDur maps a non-positive value to a disabled (zero) signal.
 func (s *Service) healthThresholds(ctx context.Context) healthThresholds {
 	return healthThresholds{
-		stall:    healthDur(s.settings.HealthStallSeconds(ctx)),
+		stall:    healthDur(s.healthSettings.HealthStallSeconds(ctx)),
 		slow:     s.slowThreshold(ctx),
-		queued:   healthDur(s.settings.HealthQueuedSeconds(ctx)),
-		approval: healthDur(s.settings.HealthApprovalSeconds(ctx)),
+		queued:   healthDur(s.healthSettings.HealthQueuedSeconds(ctx)),
+		approval: healthDur(s.healthSettings.HealthApprovalSeconds(ctx)),
 	}
 }
 
@@ -388,7 +388,7 @@ func healthDur(secs int, _ error) time.Duration {
 // RUN_TIMEOUT is an env value that can change across restarts, which is why this
 // lives here and not in the pure settings.Validate().
 func (s *Service) slowThreshold(ctx context.Context) time.Duration {
-	slow := healthDur(s.settings.HealthSlowSeconds(ctx))
+	slow := healthDur(s.healthSettings.HealthSlowSeconds(ctx))
 	if slow == 0 {
 		s.lastSlowClampWarn = 0 // reset so a later re-break warns again
 		return 0

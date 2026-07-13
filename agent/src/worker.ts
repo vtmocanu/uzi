@@ -1,6 +1,7 @@
 import type { WorkerClient } from "./client.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
+import type { JudgeRunner } from "./judge-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
 import { errMessage, sleep } from "./util.js";
@@ -24,6 +25,7 @@ export class Worker {
     private readonly client: WorkerClient,
     private readonly runner: RunRunner,
     private readonly chatRunner: ChatRunner,
+    private readonly judgeRunner: JudgeRunner,
     private readonly log: Logger,
   ) {}
 
@@ -107,9 +109,14 @@ export class Worker {
         const claim = await this.client.claimRun();
         if (claim) {
           claimed = true;
-          const run = this.runner
-            .execute(claim)
-            .catch((err) => this.log.warn("claim/execute cycle failed", { error: errMessage(err) }));
+          // PRD #46: a judge claim rides the same run lane (it counts toward worker
+          // capacity, Decision 8) but is executed by the slim JudgeRunner — no
+          // clone/worktree/git, just fetch the trace, call the model, post the review.
+          const exec =
+            claim.kind === "judge" ? this.judgeRunner.execute(claim) : this.runner.execute(claim);
+          const run = exec.catch((err) =>
+            this.log.warn("claim/execute cycle failed", { error: errMessage(err) }),
+          );
           active.add(run);
           void run.finally(() => active.delete(run));
         }

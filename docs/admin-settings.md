@@ -7,8 +7,8 @@ audience: user
 # Admin settings
 
 uzi keeps a small set of instance-wide settings in the database, editable by
-an admin from **Admin → Instance settings**. Today: three forge labels and a
-default theme.
+an admin from **Admin → Instance settings**. Today: three forge labels, a
+default theme, the run judge, and the self-improvement job.
 
 ## The three labels
 
@@ -33,6 +33,22 @@ always wins over this setting. Saving restyles the admin's own session live;
 every other un-overridden user picks up the change on their next `me`
 refresh (in practice, their next login or reload — there's no push). See
 [Theming](./theming.md) for how themes work and how to add one.
+
+## Run judge
+
+A global kill-switch for the [run judge](./judge.md), plus the model it runs
+on (**Judge model**, a cheap alias like `haiku` by default — a retrospective
+is a single trace round-trip, so a cheap model is usually right). This switch
+only arms the feature instance-wide; each user still opts in under their own
+Settings, and the judge always spends that user's own Anthropic token, never
+the admin's.
+
+## Self-improvement
+
+The [self-improvement job](./self-improvement.md)'s settings: enable/disable,
+the connected repo it targets, and its interval (default `48h`). Unlike the
+run judge, enabling this spends **the enabling admin's own token** on a
+standing basis — see the linked doc for what that means before turning it on.
 
 ## Run health
 

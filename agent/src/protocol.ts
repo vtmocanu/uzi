@@ -39,8 +39,10 @@ export type MessageKind =
 /** run_user_inputs.kind (PRD #4 §Schema). */
 export type InputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
 
-/** runs.kind (PRD #6). */
-export type RunKind = "issue" | "ci_fix";
+/** runs.kind (PRD #6; PRD #46 adds "judge" and "self_improve"). self_improve is
+ *  issue-shaped and runs the ordinary run lane (RunRunner), with a fixed branch and
+ *  its own MR evidence (Decision 10). */
+export type RunKind = "issue" | "ci_fix" | "judge" | "self_improve";
 
 /** A ci_fix run's outbound verdict (PRD #6). Only "not_code" travels the wire;
  *  verified/fix_failed are stamped server-side from the post-fix pipeline. */
@@ -240,6 +242,82 @@ export interface ClaimResponse {
    *  fact. Re-delivered on every resume/requeue of the same run (the server reads
    *  it from the row), so an unattended resume never hangs at the gate. */
   auto_approve?: boolean;
+  /** The run this JUDGE run reviews (PRD #46). Present only for kind="judge"; the
+   *  worker fetches that run's trace via GET /worker/runs/{target_run_id}/trace. */
+  target_run_id?: string | null;
+  /** The model a judge run runs on (PRD #46), resolved from the judge_model setting.
+   *  Present only for kind="judge". */
+  judge_model?: string | null;
+  /** The API's deterministic command-not-found pre-scan of the reviewed run's tool
+   *  output (PRD #46 Decision 4). Present only for kind="judge" (omitted when empty).
+   *  The judge interprets it; if the model call fails it is the fallback. */
+  judge_signal?: JudgeSignal | null;
+}
+
+/** One deterministic missing-executable hit (PRD #46 Decision 4). */
+export interface JudgeToolMiss {
+  command: string;
+  evidence: string;
+}
+
+/** The command-not-found pre-scan carried in a judge claim. */
+export interface JudgeSignal {
+  missing_tools: JudgeToolMiss[];
+}
+
+/** The reviewed run's metadata (GET /worker/runs/{id}/trace → `target`). */
+export interface JudgeTraceTarget {
+  id: string;
+  kind: string;
+  status: string;
+  issue_title: string;
+  issue_description: string;
+  branch: string | null;
+  mr_iid: number | null;
+  failure_reason: string | null;
+  fix_verdict: string | null;
+  plan_md: string | null;
+  iteration_count: number;
+  repo_agents: unknown;
+}
+
+/** One steering-log entry in the trace. */
+export interface JudgeTraceInput {
+  kind: string;
+  body: string | null;
+  created_at: string;
+}
+
+/** A page of the reviewed run's trace (GET /worker/runs/{id}/trace). Messages are
+ *  UNTRUSTED (arbitrary tool output); the judge frames them as evidence. */
+export interface JudgeTraceResponse {
+  target: JudgeTraceTarget;
+  messages: WorkerRunMessage[];
+  inputs: JudgeTraceInput[];
+}
+
+/** One structured recommendation the judge posts back (PRD #46 Decision 5). */
+export interface ReviewRecommendation {
+  category:
+    | "enable_tool"
+    | "install_worker_tool"
+    | "adjust_template"
+    | "improve_agent"
+    | "add_agent"
+    | "improve_uzi";
+  target: string;
+  rationale: string;
+  confidence?: "" | "low" | "medium" | "high";
+}
+
+/** The judge's review POST body (POST /worker/runs/{id}/review). */
+export interface ReviewRequest {
+  verdict: "ideal" | "ok" | "issues";
+  summary: string;
+  model: string;
+  /** "complete" = a real LLM verdict; "failed" = the deterministic fallback. */
+  status: "complete" | "failed";
+  recommendations: ReviewRecommendation[];
 }
 
 /**

@@ -130,6 +130,15 @@ Open **Settings → Notifications**:
   is one click away behind the deep link.
 - Approving or rejecting from the web UI updates the Slack message too (and
   vice versa), so a stale button press just gets a quiet "already handled".
+- **Run judge and self-improvement**: if you've opted into the [run
+  judge](./judge.md), a finished review's verdict and summary arrive as a DM,
+  same content as the inbox row. If your admin has enabled
+  [self-improvement](./self-improvement.md), you get a DM when a cycle starts
+  and when one is skipped (vault locked, repo disconnected, a cycle already
+  running). A judge or self-improvement run's *own* state changes (queued,
+  running, completed) are never DM'd on their own — only the review-ready /
+  cycle-started / cycle-skipped messages above, so you don't get noise like
+  "judge run completed" for a run you never see on the board.
 - **Run health nudges**: if a run you own gets flagged (stalled, looping,
   slow, waiting for a worker, or stuck too long awaiting approval — see
   [Run health](./run-health.md)), its root status label picks up a `· ⚠

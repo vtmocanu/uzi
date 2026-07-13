@@ -16,6 +16,8 @@ import {
   type WorkerRunDetail,
   type WorkerRunListItem,
   type WorkerRunMessage,
+  type JudgeTraceResponse,
+  type ReviewRequest,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -171,6 +173,25 @@ export class WorkerClient {
       messages?: WorkerRunMessage[];
     };
     return res.messages ?? [];
+  }
+
+  /** A page of the reviewed run's trace for a JUDGE run (GET /worker/runs/:id/trace).
+   *  `targetRunId` is the reviewed run; authz is judge-run-scoped server-side (PRD
+   *  #46 Decision 3). Messages are UNTRUSTED tool output. */
+  async getTrace(targetRunId: string, after?: number, limit?: number): Promise<JudgeTraceResponse> {
+    const params = new URLSearchParams();
+    if (typeof after === "number") params.set("after", String(after));
+    if (typeof limit === "number") params.set("limit", String(limit));
+    const q = params.toString() ? `?${params.toString()}` : "";
+    return (await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/trace${q}`,
+    )) as JudgeTraceResponse;
+  }
+
+  /** Post the judge's verdict + recommendations (POST /worker/runs/:id/review). The
+   *  server validates + scrubs; a bad enum is a 400. `targetRunId` is the reviewed run. */
+  async postReview(targetRunId: string, review: ReviewRequest): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/review`, review);
   }
 
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).

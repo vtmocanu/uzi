@@ -283,21 +283,22 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
     code review). The judge recommends; only the job acts (user decision,
     2026-07-12).
 
-12. **Migrations draft-numbered `00080+`** to stay clear of ranges other open
-    PRDs hold (#45 drafts 00053, #39 00065, #41 00070, #42 00075; live head is
-    `00052` — PRD #37, landed); renumbered to the live head at landing per
-    convention.
+12. **Migrations were draft-numbered `00080+`** during design to stay clear of
+    ranges other open PRDs held (#45 drafts 00053, #39 00065, #41 00070, #42
+    00075; live head was `00052` — PRD #37 — at draft time). At landing they were
+    renumbered to the live head per convention: contiguous above PRD #45's OIDC
+    head `00056`, as `00057`–`00060`.
 
 ## Technical Design
 
 ### API (api/)
 
-- Migration drafts: `00080` `runs.repo_id`/`issue_iid` DROP NOT NULL + extend
+- Migrations (landed `00057`–`00060`, contiguous above the OIDC head `00056`): `00057` `runs.repo_id`/`issue_iid` DROP NOT NULL + extend
   `runs.kind` CHECK + rework `runs_kind_shape` (`judge` ⇒ repo/issue NULL,
   `target_run_id` NOT NULL FK ON DELETE CASCADE; `self_improve` ⇒ issue-shaped)
   + partial unique indexes (one non-terminal judge per target; one non-terminal
-  self_improve); `00081` `run_reviews` + `review_recommendations` (provenance
-  cols); `00082` `notifications`; `00083` `users.judge_enabled`. sqlc regen +
+  self_improve); `00058` `run_reviews` + `review_recommendations` (provenance
+  cols); `00059` `notifications`; `00060` `users.judge_enabled`. sqlc regen +
   NULL-`repo_id` audit of every runs query/DTO.
 - `workersvc`: enqueue-judge at committed terminal transitions (SetState,
   sweeper, server-side cancel paths); forked claim-assembly branch for `judge`
@@ -350,42 +351,72 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
 
 ## Milestones
 
-- [ ] **M1 — Schema + settings groundwork**: migrations (nullable
+- [x] **M1 — Schema + settings groundwork**: migrations (nullable
       `repo_id`/`issue_iid` + kind-shape rework + partial unique indexes,
       `run_reviews`, `review_recommendations`, `notifications`,
       `users.judge_enabled`), sqlc + NULL-`repo_id` query/DTO audit, forked
       judge claim assembly (no-PAT wire assertion), settings
       keys/accessors/validation, user + admin toggle endpoints and UI switches.
       Tests for gating logic.
-- [ ] **M2 — Notifications inbox (generic)**: notifications API, bell + inbox
+- [x] **M2 — Notifications inbox (generic)**: notifications API, bell + inbox
       page (user/admin views), Slack notifier event kind. Judge-independent;
       seeded via a test event.
-- [ ] **M3 — Judge end-to-end**: terminal-funnel enqueue with all gates,
+- [x] **M3 — Judge end-to-end**: terminal-funnel enqueue with all gates,
       command-not-found scan, judge claim lane, worker trace fetch + JudgeRunner
       + review post, `run_reviews` persisted. Validated with the stub executor /
       fake trace.
-- [ ] **M4 — Judge surfacing**: run-page verdict + recommendations panel,
+- [x] **M4 — Judge surfacing**: run-page verdict + recommendations panel,
       re-run action, inbox + Slack delivery wired to review completion.
-- [ ] **M5 — Self-improvement engine**: settings (incl. durable
+- [x] **M5 — Self-improvement engine**: settings (incl. durable
       `selfimprove_last_run_at`), privcheck-shaped scheduler with
       skip-if-active / vault-locked / repo-missing tick skips (+ notifications),
       tracking-issue reuse (no trigger labels), dedicated
       `CreateSelfImproveRun`, fixed-branch MR reuse, untrusted-framed
       `improve_uzi` recommendations folded into the planning prompt and marked
       addressed, guard-path flagging + test evidence in the MR.
-- [ ] **M6 — Tests green**: Go + web + agent suites covering the gating matrix
+- [x] **M6 — Tests green**: Go + web + agent suites covering the gating matrix
       (global off / user off / no token / vault locked / non-eligible kind / no
       recursion), trace-endpoint authz (wrong worker, terminal judge run,
       target/judge owner mismatch), review-POST validation (bad enum, oversize,
       control chars, secret-family scrub), toggle authz (body-supplied ids
       ignored), inbox visibility (user vs admin, cross-user mark-read), engine
       tick logic, MR-reuse path. `go test ./...`, `npm test` (web + agent).
-- [ ] **M7 — Docs + specs**: `docs/judge.md`, `docs/self-improvement.md`,
+- [x] **M7 — Docs + specs**: `docs/judge.md`, `docs/self-improvement.md`,
       updated pages, `specs/ai.md`; `npm run build` (check-docs) green.
-- [ ] **M8 — Live validation**: judge a real run end-to-end on a dev stack
-      (isolated env per compose rules), one self-improvement tick against a
-      scratch repo (not live uzi) to verify issue/MR reuse; findings folded
-      back.
+      (fact-checked clean; `specs/ai.md` §195-204 added, `specs/human.md`
+      verified complete.)
+- [ ] **M8 — Live validation** (stub-validated GREEN; live capstone
+      DEFERRED-TO-OPERATOR): judge path end-to-end passed on the isolated
+      stub stack (`run-e2e.sh` PRD #46 section: funnel enqueue →
+      repo-less/no-PAT claim → trace → review → persist-first notification →
+      re-run-judge → `install_worker_tool jq` via the deterministic fallback,
+      UPSERT to one row) — `./e2e/run-e2e.sh` 119/0 GREEN on the rebuilt image
+      (incl. the baked hooksPath dir); MR-reuse + no-force-push proven against
+      the forge-fake; bot=Developer / `main` Maintainers-only verified on the
+      LIVE forge; nonce fence held 20/20. **Remaining, operator-only** (needs a
+      real Anthropic token + scratch repo — must NOT be sourced by the team):
+      a genuinely live LLM judge verdict, and one live self-improvement tick on
+      a scratch repo.
+- [x] **M9 — Real test evidence in self-improvement MRs**: thread the PRD #18
+      provisioned tool env (`provision.ts` → `provision-run.ts` `toolEnv`,
+      already exported into the SDK env) into `defaultCheckRunner`'s
+      `execFile` (today it passes no env at all, so provisioned tools are
+      invisible to the checks); `npm ci` pre-step in `web/` and `agent/` so
+      `vitest`/`tsc` exist; honest-skip fallback retained for genuinely
+      unavailable toolchains (missing prerequisite or exit 127 → `skipped`
+      with a reason, never a false `failed`). Gating unknowns: whether `go`
+      is provisionable via the run's tool packages, and whether the worker
+      has npm-registry egress — whatever cannot be made real stays honestly
+      skipped and is stated as such in the MR.
+- [x] **M10 — Harden worker git env (pre-existing PAT-exfil vector)**: surfaced by the M9
+      audit sweep, PoC-confirmed. `gitEnv` → scrubbed replacement env (worker
+      join-token / API vars absent by construction; credential pairs
+      preserved); `core.hooksPath` pinned to a ROOT-OWNED mode-0555 dir baked
+      at image build (base template) so a non-root uid cannot plant a hook —
+      PoC-confirmed ("Permission denied") + e2e-green; `filter.` added to the
+      guardrail config-write deny. Auditor cleared (blocking finding resolved),
+      reviewer APPROVE. Both worker templates (base + jvm) bake the stanza
+      explicitly (jvm does NOT `FROM base`); reviewer confirmed af267db clean.
 
 ## Milestone dependency / parallelization
 
@@ -397,6 +428,7 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
 | 4 | M5 | M1 (M2 for its notifications) | selfimprove engine, runner delta |
 | 5 | M6, M7 | M3–M5 | tests · docs |
 | 6 | M8 | all | live stack |
+| 7 | M9 | M8 | agent/src/{self-improve,runner}.ts, provision plumbing |
 
 ## Out of Scope
 
@@ -434,3 +466,113 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
   the self-improvement planning prompt.
 - Disabling either feature stops all related token spend immediately; the whole
   PRD is dormant when toggles are off (existing tests unaffected).
+
+## Implementation notes (2026-07-12)
+
+Approved deviations from the design above, found during implementation:
+
+1. **The command-not-found scan runs at claim assembly, not at enqueue.**
+   Decision 4 describes it as part of enqueueing the judge run; in practice it
+   runs off that hot request path, at claim assembly (`assembleJudgeClaim` /
+   `judgeSignal`, `api/internal/workersvc/judge.go`) — a separate worker poll,
+   not the transition that creates the judge run. Accepted trade-off: a judge
+   run that is never claimed (e.g. no worker online) yields no deterministic
+   findings, only whatever the LLM call itself produces once it does run.
+2. **Premise correction on migration numbering (Decision 12).** The PRD
+   assumed the live head was `00052` (PRD #37). By the time this PRD landed,
+   `issue_iid` was already nullable (`00043`, PRD #6's `ci_fix` runs) and
+   `repo_id` was already nullable (`00053`, PRD #39's chat runs, which needed
+   a repo-less run shape first). This PRD's M1 therefore *extended* those two
+   already-relaxed columns into the repo-less `judge` shape and the `judge`/
+   `self_improve` `runs_kind_shape` branches (`00057`), rather than dropping
+   either NOT NULL itself — and the actual live head at this PRD's landing was
+   `00055`, not `00052`. Migration numbers in a PRD draft are always
+   collision-avoidance placeholders, renumbered to the real live head at
+   landing (per `CLAUDE.md`'s migration-numbering convention) — this is a
+   correction to the draft's stated *premise* (which prior PRDs already did
+   the relaxing), not a new instance of the normal renumbering.
+3. **Re-run judge needs no per-user opt-in.** Decision 7's per-user
+   `judge_enabled` opt-in gates the *automatic* judge (Decision 2's
+   terminal-funnel enqueue). The owner-initiated "re-run judge" action
+   (Decision 8) does not additionally require that flag: an explicit,
+   owner-only click is itself the consent to spend that run. It still runs
+   behind its own dedicated per-user rate limiter (`JUDGE_RATE_LIMIT_MAX`/
+   `_WINDOW`), separate from the chat limiter.
+4. **Notification payload contents, made explicit.** The judge "review ready"
+   notification (inbox row + Slack DM) carries the verdict, a scrubbed and
+   280-rune-capped summary preview, and the recommendation count plus
+   category list. Recommendation `target` and `rationale` free text are never
+   copied into the notification — they stay on the run page behind the deep
+   link (`buildReviewNotification`, `api/internal/handler/judge_worker.go`).
+5. **The two Slack suppressions have different mechanisms.** Decision 6 says
+   judge and self_improve runs' own state transitions are suppressed from the
+   run-state Slack path. In the implementation this is structural for judge
+   runs (they're repo-less, so `GetSlackRunContext`'s INNER JOIN on repos
+   returns `ErrNoRows` before any suppression logic runs) but requires an
+   explicit `rc.Kind == "judge" || rc.Kind == "self_improve"` guard for
+   self_improve runs, which *are* repo-ful and would otherwise get a run-state
+   DM (`Notifier.handle`, `api/internal/slacksvc/notifier.go`).
+6. **M8 found the self-improvement MR's test evidence is false, not just
+   missing (M9 added to fix it).** Decision 10's "the runner runs the test
+   suites and surfaces pass/fail in the MR description" assumed the checks
+   would either pass or genuinely fail. Live validation found a third case:
+   the worker image has no Go toolchain, and a fresh clone has no
+   `node_modules`, so `npm test` in `web`/`agent` exits 127
+   ("vitest: command not found") — which `defaultCheckRunner` maps to
+   `failed`, not `skipped`. A real self-improvement MR would therefore carry
+   four false "failed" checks on perfectly good code, directly contradicting
+   both `self-improve.ts`'s own contract ("a check that cannot run is
+   reported skipped, never failed") and this PRD's success criterion that
+   "each MR carries its own test-suite pass/fail evidence" — the only signal
+   a human reviewer gets, since this repo has no CI. The fix is not a
+   worker-image change: PRD #18's devbox tool provisioning
+   (`provision.ts`/`provision-run.ts`) already runs per-claim and its
+   `toolEnv` is already merged into the agent's own SDK env
+   (`sdk-env.ts`/`sdk-executor.ts`); the gap is that `defaultCheckRunner`'s
+   `execFile` call never receives that `toolEnv`, so provisioned tools are
+   invisible to the checks even when provisioning succeeded. User approved
+   landing the fix in this PRD as M9 rather than deferring it to a follow-up.
+   **M9's real evidence is CONDITIONAL, not automatic:** `go`/`nodejs` reach the
+   worker only when the connected uzi repo's `repo_tool_profiles` provisions them
+   (they are on the seeded `tool_allowlist`, `00046`, but an empty profile
+   provisions nothing). So a check produces real pass/fail only when its toolchain
+   is provisioned; otherwise it stays honestly *skipped* (M8's fallback), never a
+   false pass or fail. Operator step to get real evidence for every suite: add
+   `go` + `nodejs` to the uzi repo's tool profile. `npm ci` runs `--ignore-scripts`
+   and stays best-effort, so a hardened deploy that firewalls registry egress
+   degrades to honest-skip rather than failing.
+7. **M9 threading the toolEnv reopened, then closed, a token-exfil residual —
+   and M5 had silently widened it.** Making the checks actually run means the
+   worker executes model-authored code (the change's own test files,
+   `package.json` scripts) as the worker uid, outside the SDK hook system. The
+   M9 audit found `defaultCheckRunner`'s `execFile` had no `env`, so it would
+   inherit the worker's full environment — the join token
+   (`UZI_WORKER_TOKEN[_FILE]`) + `UZI_API_URL` → worker impersonation → claim →
+   forge PAT + Anthropic token. M9 gives the check subprocess a **scrubbed
+   replacement env** (`buildCheckEnv`, the `provision.ts` discipline: those vars
+   absent by construction) and runs `npm ci --ignore-scripts` to drop the
+   lifecycle-script entry path. Residual accepted for the MVP (documented loudly
+   in `self-improve.ts` + `docs/self-improvement.md`): the subprocess still runs
+   as the worker uid and the join-token *file* stays same-uid readable at a fixed
+   path — the SAME residual class `provision.ts` documents for nix build hooks,
+   but M5 widened it from admin-*vetted* packages to *model-authored* code
+   without calling it out. Structural close = the k8s uid-split (agent under a
+   distinct uid), deferred to the remote-worker phase.
+8. **M10 — a pre-existing PAT-exfil vector in the git path, fixed in this
+   branch.** The same audit sweep found `agent/src/git.ts` `gitEnv` built
+   `{...process.env, …}` (full spread, leaking the join token + API URL) AND
+   injected the forge PAT as `GIT_CONFIG_VALUE_n`; because `pushBranch` runs with
+   `cwd=<bare>`, a git hook at the default path (`<bare>/hooks/pre-push`) fires
+   as a worker child — outside the SDK hook system — inheriting both. Affects
+   every run kind, not just self_improve. Fixed here (not caused by this PRD, but
+   folded in per user decision): `gitEnv` → replacement env (worker/API vars
+   absent by construction; `safe.directory` + the credential pairs preserved),
+   `core.hooksPath` pinned on every invocation to a **root-owned `0555` empty
+   dir baked into the worker image** (`agent/templates/base/Dockerfile`) — NOT a
+   runtime-created dir, which would sit under the shared uzi uid and be
+   agent-writable (that relocates the vector; audit follow-up). The uzi uid
+   cannot create a hook inside a root-owned `0555` dir, so no planted hook can
+   fire. `filter.` added to the guardrails
+   git-config-write deny list (a second code-exec route). M9 + M10 together bring
+   every worker subprocess (SDK, provision, checks, git) onto the
+   replacement-env discipline.

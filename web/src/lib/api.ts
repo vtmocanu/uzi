@@ -21,6 +21,9 @@ export interface User {
   // autopilot_enabled is the per-user opt-in to unattended autopilot runs (PRD #19
   // M3). Default false; toggled from the user's own Settings page.
   autopilot_enabled: boolean;
+  // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
+  // false; the user toggles their own from Settings, an admin can force any user's.
+  judge_enabled: boolean;
   created_at: string;
   last_login: string | null;
 }
@@ -384,6 +387,11 @@ export interface AppSettings {
   // `secrets` on SettingsResponse.
   slack_enabled: string;
   public_base_url: string;
+  // Run-judge keys (PRD #46). judge_enabled is the global kill-switch (text
+  // "true"/"false"); judge_model is the cheap model alias the judge runs on. The
+  // self-improvement keys are engine-managed and NOT surfaced here.
+  judge_enabled: string;
+  judge_model: string;
   // Run-health detector keys (PRD #47). health_enabled is the text "true"/"false";
   // the rest are integer seconds as strings (the API serves every setting as a
   // string). 0 disables that one signal.
@@ -617,6 +625,97 @@ export interface RunListItem extends Run {
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;
+}
+
+// ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
+// A generic in-app notification. kind + payload let any feature enqueue one; the
+// judge is tenant #1. payload is the render blob — by convention a `title` and
+// optional `body` the inbox shows, but readers must tolerate any shape. run_id /
+// review_id are optional deep-link anchors. owner is present ONLY on the admin
+// all-view so the admin sees whose inbox a row belongs to.
+export interface NotificationOwner {
+  id: string;
+  email: string;
+  display_name: string | null;
+}
+
+export interface Notification {
+  id: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  run_id: string | null;
+  review_id: string | null;
+  read_at: string | null;
+  created_at: string;
+  owner?: NotificationOwner;
+}
+
+// NotificationList is the inbox envelope: one page of rows, the caller's own
+// unread count (the bell badge), and the scope total for paging.
+export interface NotificationList {
+  notifications: Notification[];
+  unread: number;
+  total: number;
+}
+
+// ── Run judge review (PRD #46 M4) ────────────────────────────────────────────
+// The judge's retrospective of a finished run: a verdict + structured
+// recommendations. Every free-text field (summary_md, each rationale_md, target)
+// was validated + capped + secret-scrubbed at the review POST and is UNTRUSTED
+// judge/worker output — the run page renders it as escaped text (never markdown/
+// HTML). verdict/category/confidence are closed enums.
+export type ReviewVerdict = "ideal" | "ok" | "issues";
+export type ReviewStatus = "complete" | "failed";
+export type RecommendationCategory =
+  | "enable_tool"
+  | "install_worker_tool"
+  | "adjust_template"
+  | "improve_agent"
+  | "add_agent"
+  | "improve_uzi";
+
+export interface ReviewRecommendation {
+  id: string;
+  category: RecommendationCategory;
+  target: string;
+  rationale_md: string;
+  confidence: "" | "low" | "medium" | "high";
+  created_at: string;
+}
+
+export interface RunReview {
+  id: string;
+  target_run_id: string;
+  verdict: ReviewVerdict;
+  summary_md: string;
+  judge_model: string;
+  status: ReviewStatus;
+  created_at: string;
+  updated_at: string;
+  recommendations: ReviewRecommendation[];
+}
+
+// ── Self-improvement config (PRD #46 M5) ─────────────────────────────────────
+// The admin-facing view of the autonomous self-improvement job. repo_path /
+// user_email are display-only resolutions of the ids; last_run_at is the durable
+// cadence gate; active reports whether a cycle is currently in flight.
+export interface SelfimproveConfig {
+  enabled: boolean;
+  interval: string;
+  repo_id: string | null;
+  repo_path: string | null;
+  user_id: string | null;
+  user_email: string | null;
+  last_run_at: string | null;
+  active: boolean;
+}
+
+// SelfimproveUpdate enables/disables and configures the job. The enabling admin
+// becomes the run owner server-side (from the session, never sent here — audit H3).
+export interface SelfimproveUpdate {
+  enabled: boolean;
+  interval?: string;
+  repo_id?: string | null;
 }
 
 // RunMessage is one persisted, seq-numbered event in a run's stream.
@@ -886,15 +985,28 @@ const realApi = {
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, { is_active: isActive }),
+  // Admin per-user run-judge toggle (PRD #46): force any user's opt-in. Actor is
+  // admin (route-gated); target is the path id, never the body. Returns the user.
+  setUserJudgeEnabled: (id: string, enabled: boolean) =>
+    request<{ user: User }>("PUT", `/admin/users/${id}/judge`, { enabled }),
   getSettings: () => request<SettingsResponse>("GET", "/admin/settings"),
   updateSettings: (settings: UpdateSettingsPayload) =>
     request<SettingsResponse>("PUT", "/admin/settings", { settings }),
   // Vault migration progress (PRD #32): count of stored secrets still master-sealed
   // (owners who have not unlocked since the vault rolled out). Admin-only.
   vaultMigration: () => request<{ master_sealed: number }>("GET", "/admin/vault-migration"),
+  // Self-improvement config (PRD #46 M5). Admin-only. update sets the enabling admin
+  // as the run owner from the session (never the body).
+  getSelfimprove: () => request<{ selfimprove: SelfimproveConfig }>("GET", "/admin/selfimprove"),
+  updateSelfimprove: (input: SelfimproveUpdate) =>
+    request<{ selfimprove: SelfimproveConfig }>("PUT", "/admin/selfimprove", input),
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  // Flip the current user's run-judge opt-in (PRD #46). Session identity only —
+  // the body carries no user id. Returns the updated user.
+  setJudgeEnabled: (enabled: boolean) =>
+    request<{ user: User }>("PUT", "/me/judge", { enabled }),
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
   putAnthropicToken: (token: string) =>
     request<{ secret: SecretMeta }>("PUT", "/me/secrets/anthropic_token", { token }),
@@ -1054,6 +1166,15 @@ const realApi = {
       ...(selection ? { selection } : {}),
     }),
 
+  // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
+  // getRunReview reads the verdict + recommendations for the run page (owner-or-
+  // admin scoped server-side); review is null for a visible-but-unjudged run.
+  // rerunJudge enqueues a fresh judge for a terminal run (owner-only spend), behind
+  // the per-user spend limiter; the new verdict arrives asynchronously once the
+  // judge run finishes, so callers re-fetch getRunReview.
+  getRunReview: (id: string) => request<{ review: RunReview | null }>("GET", `/runs/${id}/review`),
+  rerunJudge: (id: string) => request<{ run: Run }>("POST", `/runs/${id}/rejudge`),
+
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/
   // createRunSocket with the chat's id — only these conversation verbs are new.
@@ -1077,6 +1198,22 @@ const realApi = {
 
   adminListWorkers: () => request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
   adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),
+
+  // Notifications inbox (PRD #46 M2). listNotifications is the caller's own inbox;
+  // { all: true } asks for every user's (admin only — a non-admin gets 403). The
+  // envelope's `unread` is always the caller's own count (the bell badge).
+  // unreadNotificationCount is the bell's lightweight poll (no rows).
+  listNotifications: (params?: { all?: boolean; limit?: number; offset?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.all) q.set("all", "1");
+    if (params?.limit != null) q.set("limit", String(params.limit));
+    if (params?.offset != null) q.set("offset", String(params.offset));
+    const qs = q.toString();
+    return request<NotificationList>("GET", qs ? `/notifications?${qs}` : "/notifications");
+  },
+  unreadNotificationCount: () => request<{ unread: number }>("GET", "/notifications/unread_count"),
+  markNotificationRead: (id: string) =>
+    request<{ notification: Notification }>("POST", `/notifications/${id}/read`),
 };
 
 // The one client the app talks to. `mockApi` implements the identical surface

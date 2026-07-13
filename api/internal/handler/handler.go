@@ -16,6 +16,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/oidc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
@@ -74,7 +75,17 @@ type Handler struct {
 	// slacksvc linker in main; nil (tests, or Slack off) makes those endpoints
 	// report Slack as unavailable rather than panic.
 	slackLinker SlackLinker
+	// notifier is the shared notifications write seam (PRD #46 M2): persist-first,
+	// then best-effort Slack. The M2 REST endpoints (list/unread/mark-read) read
+	// through h.q directly; this field is the seam future notification producers
+	// (the judge, M4) call to create rows. Wired via SetNotifier; nil-safe.
+	notifier *notifysvc.Service
 }
+
+// SetNotifier wires the notifications write seam in after construction (built in
+// main alongside the Slack notifier it delivers through). Safe to leave unset in
+// tests that don't create notifications.
+func (h *Handler) SetNotifier(n *notifysvc.Service) { h.notifier = n }
 
 // SlackLinker is the slice of the slacksvc linker the /me/slack endpoints drive
 // (PRD #25 M3): re-send the Confirm / Not-me DM to a newly set override target,
@@ -162,9 +173,13 @@ type userDTO struct {
 	IsActive    bool    `json:"is_active"`
 	// AutopilotEnabled is the user's per-user opt-in to unattended autopilot runs
 	// (PRD #19 M3, Decision 4). Default false; toggled from the user's Settings page.
-	AutopilotEnabled bool       `json:"autopilot_enabled"`
-	CreatedAt        time.Time  `json:"created_at"`
-	LastLogin        *time.Time `json:"last_login"`
+	AutopilotEnabled bool `json:"autopilot_enabled"`
+	// JudgeEnabled is the user's per-user opt-in to run retrospectives (PRD #46
+	// Decision 7). Default false; the user toggles their own from Settings, and an
+	// admin can force-toggle any user's from the admin users surface.
+	JudgeEnabled bool       `json:"judge_enabled"`
+	CreatedAt    time.Time  `json:"created_at"`
+	LastLogin    *time.Time `json:"last_login"`
 }
 
 func toDTO(u store.User) userDTO {
@@ -174,6 +189,7 @@ func toDTO(u store.User) userDTO {
 		IsAdmin:          u.IsAdmin,
 		IsActive:         u.IsActive,
 		AutopilotEnabled: u.AutopilotEnabled,
+		JudgeEnabled:     u.JudgeEnabled,
 		CreatedAt:        u.CreatedAt.Time,
 	}
 	if u.DisplayName.Valid {
@@ -199,8 +215,9 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // register and login endpoints; forgeLimiter is a per-user budget on the
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot
 // hammer the upstream forge; slackDMLimiter is a tighter per-user budget on the
-// two Slack-DM-triggering /me/slack endpoints.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter *mw.Limiter) http.Handler {
+// two Slack-DM-triggering /me/slack endpoints; judgeLimiter is a per-user budget
+// on the re-run-judge action (PRD #46), separate from chat's.
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -256,6 +273,21 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Put("/me/autopilot", h.SetAutopilotEnabled)
+			// Current-user run-judge opt-in (PRD #46): per-user consent to spend the
+			// caller's own tokens judging their finished runs. Session-scoped identity
+			// (never the body), like autopilot.
+			r.Put("/me/judge", h.SetJudgeEnabled)
+		})
+
+		// Notifications inbox (PRD #46 M2). Session-authenticated: list + unread
+		// count are the caller's own; ?all=1 on the list requires admin and is gated
+		// inside the handler (the same endpoint serves both scopes); mark-read
+		// verifies row ownership in the query. The mark-read POST carries CSRF.
+		r.Route("/notifications", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListNotifications)
+			r.Get("/unread_count", h.UnreadNotificationCount)
+			r.Post("/{id}/read", h.MarkNotificationRead)
 		})
 
 		// Current-user settings (non-secret, own-user only): the per-user default
@@ -360,6 +392,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Use(mw.RequireAdmin)
 			r.Get("/users", h.ListUsers)
 			r.Patch("/users/{id}", h.PatchUser)
+			// Admin per-user run-judge toggle (PRD #46 Decision 7): actor authorized by
+			// RequireAdmin, target from the path, never the body (audit H3).
+			r.Put("/users/{id}/judge", h.SetUserJudgeEnabled)
 			// Instance settings (PRD #19): the configurable forge labels today.
 			r.Get("/settings", h.GetSettings)
 			r.Put("/settings", h.UpdateSettings)
@@ -371,6 +406,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
 			r.Get("/runs", h.AdminListRuns)
+			// Self-improvement config (PRD #46 M5): read/enable the autonomous
+			// improvement job. PUT sets the enabling admin (session, never the body)
+			// as the run owner and requires a repo the admin owns.
+			r.Get("/selfimprove", h.GetSelfimproveConfig)
+			r.Put("/selfimprove", h.PutSelfimproveConfig)
 		})
 
 		// Forge integration: connections, repo discovery, and the label-synced
@@ -437,6 +477,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}", h.GetRun)
 				r.Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
+				// Judge surfacing (PRD #46 M4): the run-page verdict + recommendations
+				// panel reads the review (owner-or-admin, GetRunForViewer-scoped).
+				r.Get("/{id}/review", h.GetRunReview)
+				// Re-run judge (Decision 8): enqueue a fresh judge for a terminal run.
+				// Owner-only spend (enforced in the service, audit H3); behind a
+				// DEDICATED per-user judge spend limiter (separate budget from chat)
+				// since it mints a token-spending run.
+				r.With(judgeLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
 			})
 
 			// In-app chat agent (PRD #39): conversations ride runs.kind='chat'. The
@@ -475,6 +523,12 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 			r.Post("/runs/{id}/state", h.WorkerRunState)
 			r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
+
+			// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
+			// verdict. Both are judge-run-scoped (the worker must own the active judge
+			// run reviewing {id}); {id} is the TARGET run, not the judge run.
+			r.Get("/runs/{id}/trace", h.WorkerRunTrace)
+			r.Post("/runs/{id}/review", h.WorkerRunReview)
 
 			// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 			// investigates its OWNER'S runs. Every query is scoped to the worker's

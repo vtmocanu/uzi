@@ -131,7 +131,11 @@ FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 WHERE r.user_id = @user_id
-  AND r.kind <> 'chat'
+  -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
+  -- list never shows. self_improve has a real repo and stays visible. The repos
+  -- INNER JOIN already drops the repo-less kinds; this predicate is the explicit,
+  -- refactor-proof guard (a future LEFT JOIN must not leak judge runs here).
+  AND r.kind NOT IN ('chat', 'judge')
   AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id'))
   AND (sqlc.narg('issue_iid')::bigint IS NULL OR r.issue_iid = sqlc.narg('issue_iid'))
 ORDER BY r.created_at DESC
@@ -146,7 +150,9 @@ JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
-  AND r.kind <> 'chat'
+  -- Exclude chat AND judge (PRD #46): repo-less meta-runs the admin overview omits.
+  -- self_improve has a real repo and stays visible (same rationale as ListRunsForUser).
+  AND r.kind NOT IN ('chat', 'judge')
 ORDER BY r.created_at DESC
 LIMIT 500;
 
@@ -444,18 +450,21 @@ RETURNING id, user_id, status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
 
--- name: FailWorkerRunsOverCap :execrows
+-- name: FailWorkerRunsOverCap :many
 -- On register a worker declares a fresh start, so any run it still holds is
 -- orphaned (its execution is gone). Over its re-queue budget → failed. failed →
 -- origin restore, applied by the reconcile loop (register does no forge I/O), so
--- it stamps move_pending_since.
+-- it stamps move_pending_since. RETURNING id so the caller can funnel these
+-- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
+-- as the sweeper's FailRunsOfStaleWorkersOverCap does.
 UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval')
-  AND requeue_count >= @max_requeues;
+  AND requeue_count >= @max_requeues
+RETURNING id;
 
 -- name: RequeueWorkerRuns :execrows
 -- Within budget → re-queued to this same worker (affinity), which then re-claims
@@ -495,25 +504,34 @@ ORDER BY seq ASC;
 -- build the MR URL; a chat run has no repo, so repo fields are NULL (LEFT JOIN).
 
 -- name: ListRunsForWorkerUser :many
--- Compact list of the worker's user's runs, newest first, bounded by @lim.
+-- Compact list of the worker's user's runs, newest first, bounded by @lim. The
+-- chat agent's investigation surface (PRD #39 Decision 7). judge runs are hidden
+-- (PRD #46, M1-review carry-forward): a judge is a repo-less internal retrospective
+-- with no investigable task, same rationale as excluding it from the general run
+-- lists (f55b37e). self_improve stays visible — it is real work with a repo + MR.
+-- The judge WORKER reads its own run through the M3 judge-scoped trace path, not
+-- this chat surface, so hiding judge here does not affect judging.
 SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
        r.failure_reason, r.created_at, r.updated_at,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.user_id = @user_id
+WHERE r.user_id = @user_id AND r.kind <> 'judge'
 ORDER BY r.created_at DESC
 LIMIT @lim;
 
 -- name: GetRunForWorkerUser :one
 -- One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
+-- judge runs are excluded here too (see ListRunsForWorkerUser): a chat agent asking
+-- for a judge run's detail gets a 404, exactly like an unknown id. self_improve is
+-- visible.
 SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r.mr_state,
        r.failure_reason, r.stop_kind, r.fix_verdict, r.iteration_count, r.plan_md,
        r.created_at, r.updated_at,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.id = @id AND r.user_id = @user_id;
+WHERE r.id = @id AND r.user_id = @user_id AND r.kind <> 'judge';
 
 -- name: ListRunMessagesForWorkerPage :many
 -- A bounded page of a run's messages after a seq (the worker read tool's paging).

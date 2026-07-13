@@ -46,30 +46,32 @@ func (f *healthFakeStore) SetRunHealth(_ context.Context, arg store.SetRunHealth
 	return 1, nil
 }
 
-// fakeSettings is a static health-settings source. All accessors are error-free;
+// fakeHealthSettings is a static health-settings source. All accessors are error-free;
 // the zero value has the detector disabled, so tests opt in explicitly.
-type fakeSettings struct {
+type fakeHealthSettings struct {
 	enabled                                 bool
 	stall, slow, queued, approval, cooldown int
 }
 
-func (s fakeSettings) HealthEnabled(context.Context) (bool, error)        { return s.enabled, nil }
-func (s fakeSettings) HealthStallSeconds(context.Context) (int, error)    { return s.stall, nil }
-func (s fakeSettings) HealthSlowSeconds(context.Context) (int, error)     { return s.slow, nil }
-func (s fakeSettings) HealthQueuedSeconds(context.Context) (int, error)   { return s.queued, nil }
-func (s fakeSettings) HealthApprovalSeconds(context.Context) (int, error) { return s.approval, nil }
-func (s fakeSettings) HealthNudgeCooldownSeconds(context.Context) (int, error) {
+func (s fakeHealthSettings) HealthEnabled(context.Context) (bool, error)      { return s.enabled, nil }
+func (s fakeHealthSettings) HealthStallSeconds(context.Context) (int, error)  { return s.stall, nil }
+func (s fakeHealthSettings) HealthSlowSeconds(context.Context) (int, error)   { return s.slow, nil }
+func (s fakeHealthSettings) HealthQueuedSeconds(context.Context) (int, error) { return s.queued, nil }
+func (s fakeHealthSettings) HealthApprovalSeconds(context.Context) (int, error) {
+	return s.approval, nil
+}
+func (s fakeHealthSettings) HealthNudgeCooldownSeconds(context.Context) (int, error) {
 	return s.cooldown, nil
 }
 
 // defaultHealthSettings mirrors the compiled-in defaults (5m / 45m / 10m / 1h / 30m).
-func defaultHealthSettings() fakeSettings {
-	return fakeSettings{enabled: true, stall: 300, slow: 2700, queued: 600, approval: 3600, cooldown: 1800}
+func defaultHealthSettings() fakeHealthSettings {
+	return fakeHealthSettings{enabled: true, stall: 300, slow: 2700, queued: 600, approval: 3600, cooldown: 1800}
 }
 
 func healthSvc(fs Store, st Settings) *Service {
 	svc := New(fs, nil, testParams())
-	svc.settings = st
+	svc.healthSettings = st
 	return svc
 }
 
@@ -114,7 +116,7 @@ func TestHealthDisabledIsNoop(t *testing.T) {
 	r.StartedAt = ago(2 * time.Hour)
 	r.LastActivityAt = ago(time.Hour)
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
-	svc := healthSvc(fs, fakeSettings{enabled: false, stall: 300})
+	svc := healthSvc(fs, fakeHealthSettings{enabled: false, stall: 300})
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
 		t.Fatalf("changed = %d, want 0 when disabled", n)
@@ -177,7 +179,7 @@ func TestHealthStalledSuppressedWhileToolInFlight(t *testing.T) {
 			r.ID: {useMsg(t, 10, "call_A", "Bash", map[string]any{"command": "go build ./..."})},
 		},
 	}
-	svc := healthSvc(fs, fakeSettings{enabled: true, stall: 300}) // slow disabled
+	svc := healthSvc(fs, fakeHealthSettings{enabled: true, stall: 300}) // slow disabled
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
 		t.Fatalf("changed = %d, want 0 (stalled suppressed while a tool is in flight)", n)
@@ -231,7 +233,7 @@ func TestHealthThresholdDisablePerSignal(t *testing.T) {
 	r.LastActivityAt = ago(time.Hour) // very silent
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	// stall disabled (0), slow disabled (0) → healthy despite the long silence.
-	svc := healthSvc(fs, fakeSettings{enabled: true, stall: 0, slow: 0, queued: 600, approval: 3600})
+	svc := healthSvc(fs, fakeHealthSettings{enabled: true, stall: 0, slow: 0, queued: 600, approval: 3600})
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
 		t.Fatalf("changed = %d, want 0 with both running signals disabled", n)
@@ -414,7 +416,7 @@ func TestHealthQueuedReasonChangeRewrites(t *testing.T) {
 func TestHealthSlowClampWarnsOncePerValue(t *testing.T) {
 	fs := &healthFakeStore{}
 	// testParams RunTimeout is 2h; a 3h slow threshold forces the read-time clamp.
-	svc := healthSvc(fs, fakeSettings{enabled: true, slow: 3 * 60 * 60})
+	svc := healthSvc(fs, fakeHealthSettings{enabled: true, slow: 3 * 60 * 60})
 	ctx := context.Background()
 
 	if d := svc.slowThreshold(ctx); d != testParams().RunTimeout-time.Minute {
@@ -430,7 +432,7 @@ func TestHealthSlowClampWarnsOncePerValue(t *testing.T) {
 		t.Fatalf("lastSlowClampWarn = %v after a repeat pass, want a stable 3h", svc.lastSlowClampWarn)
 	}
 	// Reconfiguring below the timeout clears the tracker so a later re-break warns again.
-	svc.settings = fakeSettings{enabled: true, slow: 300}
+	svc.healthSettings = fakeHealthSettings{enabled: true, slow: 300}
 	if d := svc.slowThreshold(ctx); d != 5*time.Minute {
 		t.Fatalf("slow = %v, want 5m (no clamp)", d)
 	}
@@ -448,7 +450,7 @@ func stalledRunRow() store.ListActiveRunsForHealthRow {
 	return r
 }
 
-func nudgeSvc(t *testing.T, r store.ListActiveRunsForHealthRow, st fakeSettings) (*healthFakeStore, *Service, *fakeBroadcaster) {
+func nudgeSvc(t *testing.T, r store.ListActiveRunsForHealthRow, st fakeHealthSettings) (*healthFakeStore, *Service, *fakeBroadcaster) {
 	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 	svc := healthSvc(fs, st)
 	b := &fakeBroadcaster{}
@@ -543,7 +545,7 @@ func TestHealthCooldownZeroAlwaysNudges(t *testing.T) {
 	// last nudge was seconds ago.
 	r := stalledRunRow()
 	r.HealthNotifiedAt = ago(1 * time.Minute)
-	_, svc, b := nudgeSvc(t, r, fakeSettings{enabled: true, stall: 300, cooldown: 0})
+	_, svc, b := nudgeSvc(t, r, fakeHealthSettings{enabled: true, stall: 300, cooldown: 0})
 	svc.detectRunHealth(context.Background(), t0)
 
 	if !b.healthNudges[0] {

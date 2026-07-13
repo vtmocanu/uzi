@@ -21,6 +21,7 @@ vi.mock("../lib/api", async (importActual) => {
       putAnthropicToken: vi.fn(),
       deleteAnthropicToken: vi.fn(),
       setAutopilotEnabled: vi.fn(),
+      setJudgeEnabled: vi.fn(),
       getMySettings: vi.fn(),
       putMySettings: vi.fn(),
       vaultLock: vi.fn(),
@@ -44,6 +45,7 @@ const baseUser: User = {
   is_admin: true,
   is_active: true,
   autopilot_enabled: false,
+  judge_enabled: false,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -178,6 +180,57 @@ describe("Settings — autopilot opt-in (PRD #19 M3, Decision 7)", () => {
 
     expect(await screen.findByText("internal error")).toBeTruthy();
     expect(toggle().disabled).toBe(false);
+  });
+});
+
+describe("Settings — run judge opt-in (PRD #46, Decision 7)", () => {
+  const judgeToggle = () =>
+    screen.getByLabelText("Judge my finished runs") as HTMLInputElement;
+
+  it("states plainly what the judge does and that it spends the user's tokens", () => {
+    const { container } = render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const text = container.textContent ?? "";
+    expect(text).toMatch(/finished/i);
+    expect(text).toMatch(/your own Anthropic tokens/i);
+    expect(text).toMatch(/recommend/i);
+  });
+
+  it("reflects the current opt-in state", () => {
+    mockAuth({ ...baseUser, judge_enabled: true });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    expect(judgeToggle().checked).toBe(true);
+  });
+
+  it("enabling calls the API and refreshes the session", async () => {
+    mockApi.setJudgeEnabled.mockResolvedValue({ user: { ...baseUser, judge_enabled: true } });
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    fireEvent.click(judgeToggle());
+    await waitFor(() => expect(mockApi.setJudgeEnabled).toHaveBeenCalledWith(true));
+    expect(refresh).toHaveBeenCalled();
+  });
+
+  it("surfaces an error and does not leave the toggle stuck", async () => {
+    mockApi.setJudgeEnabled.mockRejectedValue(new ApiError(500, "internal error"));
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    fireEvent.click(judgeToggle());
+    expect(await screen.findByText("internal error")).toBeTruthy();
+    expect(judgeToggle().disabled).toBe(false);
   });
 });
 

@@ -5,8 +5,13 @@ import type { Config } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
 import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
+import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ClaimResponse, ChatClaimResponse } from "../src/protocol.js";
 import { recordingLogger } from "./helpers.js";
+
+// These run-lane / chat-lane tests never claim a judge run, so a no-op JudgeRunner
+// stub satisfies the Worker constructor (the judge lane has its own test file).
+const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
 
 // The worker runs the RUN lane and the CHAT lane as two independent, concurrent
 // claim loops (PRD #39 Decision 4). This proves they actually run at the same time
@@ -120,7 +125,7 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
       },
     } as unknown as ChatRunner;
 
-    const worker = new Worker(fakeConfig(), client, runRunner, chatRunner, logger);
+    const worker = new Worker(fakeConfig(), client, runRunner, chatRunner, noJudge, logger);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 500 && !(ranRun && ranChat); i++) await tick();
     controller.abort();
@@ -164,7 +169,7 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
     } as unknown as ChatRunner;
     const runRunner = { execute: async () => {} } as unknown as RunRunner;
 
-    const worker = new Worker(fakeConfig({ chatSessions: 2 }), client, runRunner, chatRunner, recordingLogger().logger);
+    const worker = new Worker(fakeConfig({ chatSessions: 2 }), client, runRunner, chatRunner, noJudge, recordingLogger().logger);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 300 && active < 2; i++) await tick();
     // Give the loop extra ticks to (wrongly) over-fill if the ceiling were not honored.
@@ -189,7 +194,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     const { logger, lines } = recordingLogger();
 
     // chatRunner unused: the chat lane always claims null here, so execute is never called.
-    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 2 }), client, runner, {} as unknown as ChatRunner, logger);
+    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 2 }), client, runner, {} as unknown as ChatRunner, noJudge, logger);
     const done = worker.run(controller.signal);
 
     for (let i = 0; i < 500 && active() < 2; i++) await tick();
@@ -230,7 +235,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     });
     const { logger, lines } = recordingLogger();
 
-    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 1 }), client, runner, {} as unknown as ChatRunner, logger);
+    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 1 }), client, runner, {} as unknown as ChatRunner, noJudge, logger);
     const done = worker.run(controller.signal);
 
     // run-1 parks holding the only slot; run-2 must NOT start until run-1 frees it.
@@ -287,6 +292,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       client,
       runner,
       {} as unknown as ChatRunner,
+      noJudge,
       recordingLogger().logger,
     );
     const done = worker.run(controller.signal);
@@ -339,6 +345,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       client,
       runner,
       {} as unknown as ChatRunner,
+      noJudge,
       recordingLogger().logger,
     );
     const done = worker.run(controller.signal);
@@ -367,6 +374,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       client,
       runner,
       {} as unknown as ChatRunner,
+      noJudge,
       recordingLogger().logger,
     );
     const done = worker.run(controller.signal);

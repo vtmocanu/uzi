@@ -103,6 +103,138 @@ func TestPrdlessAccessors(t *testing.T) {
 	}
 }
 
+func TestJudgeAccessors(t *testing.T) {
+	// Empty table → compiled-in defaults: OFF, cheap haiku model.
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.JudgeEnabled(context.Background()); err != nil || got != false {
+		t.Fatalf("JudgeEnabled default = %v, %v; want false", got, err)
+	}
+	if got, err := c.JudgeModel(context.Background()); err != nil || got != DefaultJudgeModel {
+		t.Fatalf("JudgeModel default = %q, %v; want %q", got, err, DefaultJudgeModel)
+	}
+
+	// "true"/"false" honored; any other value falls back to the default (false) —
+	// a malformed row never silently turns token spend ON.
+	for _, tc := range []struct {
+		stored string
+		want   bool
+	}{
+		{"true", true},
+		{"false", false},
+		{"", false},       // empty → default false
+		{"banana", false}, // junk → default false
+		{"TRUE", false},   // non-canonical → default, not a lenient parse
+		{"1", false},
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeyJudgeEnabled, tc.stored)}}, time.Minute)
+		if got, _ := c.JudgeEnabled(context.Background()); got != tc.want {
+			t.Errorf("JudgeEnabled(stored=%q) = %v, want %v", tc.stored, got, tc.want)
+		}
+	}
+
+	// A configured model is returned verbatim.
+	c = New(&fakeStore{rows: []store.AppSetting{row(KeyJudgeModel, "sonnet")}}, time.Minute)
+	if got, _ := c.JudgeModel(context.Background()); got != "sonnet" {
+		t.Fatalf("JudgeModel = %q, want sonnet", got)
+	}
+}
+
+func TestSelfimproveAccessors(t *testing.T) {
+	// Empty table → compiled-in defaults: OFF, 48h interval, empty engine state.
+	c := New(&fakeStore{}, time.Minute)
+	if got, err := c.SelfimproveEnabled(context.Background()); err != nil || got != false {
+		t.Fatalf("SelfimproveEnabled default = %v, %v; want false", got, err)
+	}
+	if got, err := c.SelfimproveInterval(context.Background()); err != nil || got != 48*time.Hour {
+		t.Fatalf("SelfimproveInterval default = %v, %v; want 48h", got, err)
+	}
+	if got, ok, err := c.SelfimproveLastRunAt(context.Background()); err != nil || ok || !got.IsZero() {
+		t.Fatalf("SelfimproveLastRunAt unset = (%v, %v, %v); want (zero, false, nil)", got, ok, err)
+	}
+	if got, _ := c.SelfimproveRepo(context.Background()); got != "" {
+		t.Fatalf("SelfimproveRepo unset = %q, want empty", got)
+	}
+	if got, _ := c.SelfimproveUserID(context.Background()); got != "" {
+		t.Fatalf("SelfimproveUserID unset = %q, want empty", got)
+	}
+
+	// A stored interval parses; a junk/zero interval falls back to the default so a
+	// bad row never yields a fire-every-cycle scheduler.
+	for _, tc := range []struct {
+		stored string
+		want   time.Duration
+	}{
+		{"24h", 24 * time.Hour},
+		{"30m", 30 * time.Minute},
+		{"garbage", 48 * time.Hour},
+		{"0s", 48 * time.Hour},
+		{"-5h", 48 * time.Hour},
+	} {
+		c := New(&fakeStore{rows: []store.AppSetting{row(KeySelfimproveInterval, tc.stored)}}, time.Minute)
+		if got, _ := c.SelfimproveInterval(context.Background()); got != tc.want {
+			t.Errorf("SelfimproveInterval(stored=%q) = %v, want %v", tc.stored, got, tc.want)
+		}
+	}
+
+	// Engine state reads back verbatim; last_run_at parses RFC3339.
+	ts := "2026-07-12T10:30:00Z"
+	c = New(&fakeStore{rows: []store.AppSetting{
+		row(KeySelfimproveRepo, "repo-uuid-1"),
+		row(KeySelfimproveUserID, "user-uuid-1"),
+		row(KeySelfimproveLastRunAt, ts),
+	}}, time.Minute)
+	if got, _ := c.SelfimproveRepo(context.Background()); got != "repo-uuid-1" {
+		t.Errorf("SelfimproveRepo = %q, want repo-uuid-1", got)
+	}
+	if got, _ := c.SelfimproveUserID(context.Background()); got != "user-uuid-1" {
+		t.Errorf("SelfimproveUserID = %q, want user-uuid-1", got)
+	}
+	if got, ok, _ := c.SelfimproveLastRunAt(context.Background()); !ok || got.Format(time.RFC3339) != ts {
+		t.Errorf("SelfimproveLastRunAt = (%v, %v), want (%s, true)", got, ok, ts)
+	}
+}
+
+// TestJudgeSelfimproveWritability pins Decision 7/9 + audit H3 at the settings
+// layer: the four admin-configurable keys are Known (writable through the settings
+// PUT) with per-value validation, while the three engine-managed selfimprove keys
+// are deliberately NOT Known — a body PUT to them is rejected as unknown, so
+// selfimprove_user_id can never be set from a request.
+func TestJudgeSelfimproveWritability(t *testing.T) {
+	writable := map[string]string{
+		KeyJudgeEnabled:        "true",
+		KeyJudgeModel:          "haiku",
+		KeySelfimproveEnabled:  "false",
+		KeySelfimproveInterval: "48h",
+	}
+	for k, v := range writable {
+		if !Known(k) {
+			t.Errorf("%s should be Known (admin-writable)", k)
+		}
+		if err := Validate(k, v); err != nil {
+			t.Errorf("Validate(%s, %q) = %v, want nil", k, v, err)
+		}
+	}
+	for _, k := range []string{KeySelfimproveRepo, KeySelfimproveUserID, KeySelfimproveLastRunAt} {
+		if Known(k) {
+			t.Errorf("%s must NOT be Known — it is engine-managed, never body-writable (audit H3)", k)
+		}
+	}
+
+	// Per-value validation rejects the obvious bad inputs.
+	for _, tc := range []struct{ key, value string }{
+		{KeyJudgeEnabled, "yes"},
+		{KeyJudgeModel, ""},
+		{KeyJudgeModel, "two words"},
+		{KeySelfimproveEnabled, "1"},
+		{KeySelfimproveInterval, "soon"},
+		{KeySelfimproveInterval, "-1h"},
+	} {
+		if err := Validate(tc.key, tc.value); err == nil {
+			t.Errorf("Validate(%s, %q) = nil, want an error", tc.key, tc.value)
+		}
+	}
+}
+
 func TestAllReturnsStableShape(t *testing.T) {
 	fs := &fakeStore{rows: []store.AppSetting{row(KeyPRDLabel, "Feature")}}
 	c := New(fs, time.Minute)

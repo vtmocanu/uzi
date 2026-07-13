@@ -13,8 +13,12 @@ import {
   type AppSettings,
   type Chat,
   type CreatedIssue,
+  type Notification,
+  type NotificationList,
   type PrivilegeReport,
   type Run,
+  type SelfimproveConfig,
+  type SelfimproveUpdate,
   type RunMessage,
   type SettingSource,
   type SettingsResponse,
@@ -42,7 +46,11 @@ import {
   mockAllocations,
   mockConnection,
   mockForgeConfig,
+  mockNotifications,
+  type MockNotification,
   mockRepos,
+  mockReviews,
+  type MockReview,
   mockRepoToolProfiles,
   mockSecrets,
   mockSkills,
@@ -84,6 +92,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   prdless_label: "PRDLESS",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
+  judge_enabled: "false",
+  judge_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
   health_slow_seconds: "2700",
@@ -121,6 +131,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.prdless_label === "string" &&
     typeof a.slack_enabled === "string" &&
     typeof a.public_base_url === "string" &&
+    typeof a.judge_enabled === "string" &&
+    typeof a.judge_model === "string" &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
     typeof a.health_slow_seconds === "string" &&
@@ -164,6 +176,18 @@ const loadedSettings = loadSettings();
 // Mutable copies of seed collections (CRUD operates on these).
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
+let notifications: MockNotification[] = mockNotifications.map((n) => ({ ...n }));
+const reviews: MockReview[] = mockReviews.map((r) => ({ ...r, recommendations: r.recommendations.map((x) => ({ ...x })) }));
+let selfimprove: SelfimproveConfig = {
+  enabled: false,
+  interval: "48h",
+  repo_id: null,
+  repo_path: null,
+  user_id: null,
+  user_email: null,
+  last_run_at: null,
+  active: false,
+};
 let secrets: SecretMeta[] = mockSecrets.map((s) => ({ ...s }));
 let userSettings: UserSettings = loadedSettings.userSettings;
 let workers = mockWorkers.map((w) => ({ ...w }));
@@ -319,6 +343,24 @@ function listRunsFor(): Run[] {
   return [...state.runs.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
+// notifDTO maps an internal mock notification row to the API shape, attaching the
+// owner block only for the admin all-view (own-scope rows carry no owner), exactly
+// like the server's two query paths.
+function notifDTO(n: MockNotification, includeOwner: boolean): Notification {
+  return {
+    id: n.id,
+    kind: n.kind,
+    payload: n.payload,
+    run_id: n.run_id,
+    review_id: n.review_id,
+    read_at: n.read_at,
+    created_at: n.created_at,
+    ...(includeOwner
+      ? { owner: { id: n.user_id, email: n.owner_email, display_name: n.owner_display_name } }
+      : {}),
+  };
+}
+
 // sessionBody is the auth/session bootstrap payload: the signed-in user, the
 // current instance labels (PRD #19 M2), and the three resolved theme fields (PRD
 // #21), mirroring the real API so the mocked SPA resolves them the same way.
@@ -395,6 +437,24 @@ export const mockApi = {
   // Demo is fully DEK-sealed (no legacy rows), so the admin migration notice is
   // hidden; the wiring is still exercised by the AdminSettings unit test.
   vaultMigration: async () => delay({ master_sealed: 0 }),
+
+  // ── Self-improvement config (PRD #46 M5) ─────────────────────────────────────
+  getSelfimprove: async () => delay({ selfimprove: { ...selfimprove } }),
+  updateSelfimprove: async (input: SelfimproveUpdate) => {
+    const me = requireSession();
+    selfimprove = { ...selfimprove, enabled: input.enabled };
+    if (input.interval != null) selfimprove.interval = input.interval;
+    if (input.enabled) {
+      // The enabling admin becomes the owner (session identity, mirroring the server).
+      selfimprove.user_id = me.id;
+      selfimprove.user_email = me.email;
+      if (input.repo_id != null) {
+        selfimprove.repo_id = input.repo_id;
+        selfimprove.repo_path = repos.find((r) => r.id === input.repo_id)?.path_with_namespace ?? null;
+      }
+    }
+    return delay({ selfimprove: { ...selfimprove } });
+  },
   updateSettings: async (updates: UpdateSettingsPayload) => {
     // Secret tokens are write-only: validated + recorded as configured, never
     // merged into the readable settings (mirrors the real structural exclusion).
@@ -415,12 +475,20 @@ export const mockApi = {
         nonSecret.default_theme = value;
         continue;
       }
-      // prdless_enabled / slack_enabled are strict bools, not labels.
-      if (key === "prdless_enabled" || key === "slack_enabled") {
+      // prdless_enabled / slack_enabled / judge_enabled are strict bools, not labels.
+      if (key === "prdless_enabled" || key === "slack_enabled" || key === "judge_enabled") {
         if (value !== "true" && value !== "false") {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
         (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      // judge_model is a model alias (PRD #46): non-empty single token, mirroring the
+      // server's PRD #17 ValidateModel rules.
+      if (key === "judge_model") {
+        if (value.trim() === "") throw new ApiError(400, "judge_model: must not be empty");
+        if (/\s/.test(value)) throw new ApiError(400, "judge_model: must be a single token with no spaces");
+        nonSecret.judge_model = value;
         continue;
       }
       // public_base_url must be http(s) (PRD #25).
@@ -460,6 +528,51 @@ export const mockApi = {
     const u = requireSession();
     u.autopilot_enabled = enabled;
     return delay({ user: { ...u } }, 200);
+  },
+
+  // ── Run-judge opt-in (PRD #46) ───────────────────────────────────────────────
+  // Own-user (session identity, never a body id, mirroring the server's audit H3).
+  setJudgeEnabled: async (enabled: boolean) => {
+    const u = requireSession();
+    u.judge_enabled = enabled;
+    return delay({ user: { ...u } }, 200);
+  },
+  // Admin per-user toggle: target from the id argument (the path on the server).
+  setUserJudgeEnabled: async (id: string, enabled: boolean) => {
+    const u = users.find((x) => x.id === id);
+    if (!u) throw new ApiError(404, "user not found");
+    u.judge_enabled = enabled;
+    return delay({ user: { ...u } });
+  },
+
+  // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
+  // Own view filters to the session user; { all: true } shows everyone but only
+  // for an admin (else 403, like the server). `unread` is always the caller's own
+  // count. Rows come back newest-first, paginated.
+  listNotifications: async (params?: { all?: boolean; limit?: number; offset?: number }): Promise<NotificationList> => {
+    const me = requireSession();
+    const all = params?.all ?? false;
+    if (all && !me.is_admin) throw new ApiError(403, "admin only");
+    const limit = Math.min(Math.max(params?.limit ?? 30, 1), 100);
+    const offset = Math.max(params?.offset ?? 0, 0);
+    const scope = all ? notifications : notifications.filter((n) => n.user_id === me.id);
+    const sorted = [...scope].sort((a, b) => b.created_at.localeCompare(a.created_at));
+    const page = sorted.slice(offset, offset + limit).map((n) => notifDTO(n, all));
+    const unread = notifications.filter((n) => n.user_id === me.id && !n.read_at).length;
+    return delay({ notifications: page, unread, total: scope.length });
+  },
+  unreadNotificationCount: async () => {
+    const me = requireSession();
+    return delay({ unread: notifications.filter((n) => n.user_id === me.id && !n.read_at).length }, 40);
+  },
+  markNotificationRead: async (id: string) => {
+    const me = requireSession();
+    // Ownership is the (id, user_id) match — a foreign or unknown id is a 404,
+    // exactly like the server's query.
+    const n = notifications.find((x) => x.id === id && x.user_id === me.id);
+    if (!n) throw new ApiError(404, "notification not found");
+    if (!n.read_at) n.read_at = new Date().toISOString();
+    return delay({ notification: notifDTO(n, false) });
   },
 
   // ── Secrets ─────────────────────────────────────────────────────────────────
@@ -1145,6 +1258,30 @@ export const mockApi = {
       .filter((t) => !LEAD_NAME_RE.test(t.name))
       .map((t) => ({ name: t.name, description: t.description }));
     return delay({ run: { ...run, own_agents } }, 60);
+  },
+  // ── Run judge review (PRD #46 M4) ──────────────────────────────────────────
+  getRunReview: async (id: string) => {
+    if (!getRun(id)) throw new ApiError(404, "run not found");
+    const review = reviews.find((r) => r.target_run_id === id);
+    return delay(
+      { review: review ? { ...review, recommendations: review.recommendations.map((x) => ({ ...x })) } : null },
+      60,
+    );
+  },
+  rerunJudge: async (id: string) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    if (run.status !== "completed" && run.status !== "failed") {
+      throw new ApiError(422, "this run cannot be judged");
+    }
+    if (run.kind !== "issue" && run.kind !== "ci_fix") {
+      throw new ApiError(422, "this run cannot be judged");
+    }
+    // A mock judge run: no worker executes it, so the seeded review is unchanged —
+    // the panel just shows the "re-queued" note. Cloning the target run yields a
+    // valid Run shape for the envelope.
+    const judge: Run = { ...run, id: nextRunId(), kind: "judge", status: "queued" };
+    return delay({ run: judge }, 120);
   },
   getRunMessages: async (id: string, afterSeq = 0) => {
     const log = state.messages.get(id);

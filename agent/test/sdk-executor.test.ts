@@ -176,7 +176,9 @@ describe("SdkExecutor plan gate", () => {
 
     // No repo agents + an absent selection → the run default is the OWN roster
     // (coder, reviewer), reported back for the MR marker (PRD #37).
-    assert.deepStrictEqual(result, { branch: "agent/issue-5", agentSelection: { source: "own", agents: ["coder", "reviewer"] } });
+    // toolEnv is {} here (no tier-1 packages provisioned in this test); it rides the
+    // result so the M9 self_improve check runner can put provisioned tools on PATH.
+    assert.deepStrictEqual(result, { branch: "agent/issue-5", agentSelection: { source: "own", agents: ["coder", "reviewer"] }, toolEnv: {} });
     assert.deepStrictEqual(probe.gated, ["# The Plan\n- step 1"]); // gate saw the plan
     assert.deepStrictEqual(probe.iterations, [1]); // one loop iteration reported
     assert.strictEqual(turns.length, 2); // exactly one planning + one loop turn

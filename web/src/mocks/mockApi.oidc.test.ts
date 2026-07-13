@@ -1,9 +1,31 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect } from "vitest";
 import { mockApi } from "./mockApi";
 
 // The demo mock hides the PRD #45 OIDC UX by default; a ?mock= scenario (read here
 // via the uzi_mock_scenario localStorage key) surfaces it for demo builds / QA.
+
+// This jsdom build does not expose window.localStorage under node 26 (it warns
+// "localStorage is not available because --localstorage-file was not provided"), so
+// back it with a Map-based Storage stub — the same shim prefs/theme/mockApi tests use.
+function makeStorage(): Storage {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+    clear: () => m.clear(),
+    key: (i: number) => [...m.keys()][i] ?? null,
+    get length() {
+      return m.size;
+    },
+  } as Storage;
+}
+
+beforeEach(() => {
+  Object.defineProperty(window, "localStorage", { configurable: true, value: makeStorage() });
+});
+
 afterEach(() => {
   window.localStorage.clear();
 });
