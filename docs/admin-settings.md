@@ -60,11 +60,14 @@ signal off, from **Admin → Instance settings → Run health**:
   even while its toggle is off, so re-enabling it later is always safe.
 - The PRDLESS on/off switch stores a strict `true` or `false` — nothing else
   is accepted.
-- Each run-health threshold above accepts `0` (disables that one signal) or a
-  whole number of seconds from 60 to 86400 (one day); anything else —
-  negative, non-integer, or 1–59 — is rejected, so a fat-fingered value can't
-  silently disable a signal for a day or more. The slow threshold is further
-  clamped, at read time, to stay below `RUN_TIMEOUT`
+- Each field accepts `0` or a whole number of seconds from 60 to 86400 (one
+  day); anything else — negative, non-integer, or 1–59 — is rejected, so a
+  fat-fingered value can't silently misconfigure a signal for a day or more.
+  For the four detection thresholds (stalled, slow, stuck queued, awaiting
+  approval), `0` **disables that signal**. For the Slack nudge cooldown, `0`
+  means something different: no rate limit, so a nudge fires on every
+  ok→flagged transition instead of at most once per window. The slow
+  threshold is further clamped, at read time, to stay below `RUN_TIMEOUT`
   ([Configuration](./configuration.md)) — a value at or past the timeout
   would never fire, since the run fails first.
 - An invalid save is rejected before anything is written. The same rules run
