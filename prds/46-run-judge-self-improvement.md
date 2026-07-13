@@ -407,19 +407,15 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
       is provisionable via the run's tool packages, and whether the worker
       has npm-registry egress — whatever cannot be made real stays honestly
       skipped and is stated as such in the MR.
-- [ ] **M10 — Harden worker git env (pre-existing PAT-exfil vector)** (nearly
-      done — one one-line consistency fix outstanding): surfaced by the M9
+- [x] **M10 — Harden worker git env (pre-existing PAT-exfil vector)**: surfaced by the M9
       audit sweep, PoC-confirmed. `gitEnv` → scrubbed replacement env (worker
       join-token / API vars absent by construction; credential pairs
       preserved); `core.hooksPath` pinned to a ROOT-OWNED mode-0555 dir baked
       at image build (base template) so a non-root uid cannot plant a hook —
       PoC-confirmed ("Permission denied") + e2e-green; `filter.` added to the
       guardrail config-write deny. Auditor cleared (blocking finding resolved),
-      reviewer APPROVE. **Remaining**: add the same baked-dir stanza to the
-      `jvm` worker template (it does NOT `FROM base`; safe today only
-      implicitly, needs the explicit close for consistency + a true
-      "every template" claim) — coder session-limited mid-fix, resumes after
-      reset.
+      reviewer APPROVE. Both worker templates (base + jvm) bake the stanza
+      explicitly (jvm does NOT `FROM base`); reviewer confirmed af267db clean.
 
 ## Milestone dependency / parallelization
 
