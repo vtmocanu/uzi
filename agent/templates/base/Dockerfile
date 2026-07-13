@@ -133,7 +133,8 @@ RUN mkdir -p /data && chown -R uzi:uzi /app /data
 # on every invocation (agent/src/git.ts, M10 audit). The uzi user cannot create a child
 # inside a root-owned 0555 dir, so a self_improve agent — which shares the worker uid
 # until the k8s uid-split — cannot plant a pre-push (or any) hook there. MUST be created
-# as root, BEFORE the USER line below; the jvm template FROMs base and inherits it.
+# as root, BEFORE the USER line below. Each template bakes this stanza EXPLICITLY: jvm
+# builds from the same upstream node image, NOT `FROM base`, so it carries its own copy.
 RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
 USER uzi:uzi
 # /data persists the clone cache + devbox/nix per-user metadata; /nix persists the

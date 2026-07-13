@@ -94,6 +94,11 @@ ENV UZI_DATA_DIR=/data
 # the build arg echoed back — see templates/base.
 ENV UZI_WORKER_TEMPLATE=jvm
 RUN mkdir -p /data && chown -R uzi:uzi /app /data
+# Root-owned 0555 empty git-hooks dir — the SAME explicit stanza as templates/base.
+# jvm builds from the same upstream node image, NOT `FROM base`, so it must bake this
+# itself. core.hooksPath points here (agent/src/git.ts, M10), so the uzi uid cannot
+# plant a git hook. MUST be as root, before the USER line.
+RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
 USER uzi:uzi
 VOLUME ["/data", "/nix"]
 
