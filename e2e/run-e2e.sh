@@ -1921,9 +1921,11 @@ pass "looped run completed with health=ok"
 say "PRD #47 (c): a long single in-flight tool call is NOT flagged stalled (suppression)"
 RUN_IF="$(hrun UZI_STUB_INFLIGHT)"
 wait_status "$RUN_IF" running 60
-# Poll across the 60s stall threshold: health must never read stalled while the one
-# tool call is still open (no matching tool_result yet).
-if_end=$((SECONDS + 70))
+# Poll across the 60s stall threshold with margin (threshold 60 + sweep tick 15 +
+# slack), still under the ~95s stub hold: health must never read stalled while the
+# one tool call is still open (no matching tool_result yet), so a broken suppression
+# cannot slip through a too-short poll window.
+if_end=$((SECONDS + 90))
 while [ $SECONDS -lt $if_end ]; do
   hif="$(apiget "/api/runs/$RUN_IF" | jq -r '.run.health')"
   [ "$hif" = stalled ] && fail "a long in-flight tool call was wrongly flagged stalled"
