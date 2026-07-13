@@ -373,20 +373,30 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
       `CreateSelfImproveRun`, fixed-branch MR reuse, untrusted-framed
       `improve_uzi` recommendations folded into the planning prompt and marked
       addressed, guard-path flagging + test evidence in the MR.
-- [ ] **M6 — Tests green**: Go + web + agent suites covering the gating matrix
+- [x] **M6 — Tests green**: Go + web + agent suites covering the gating matrix
       (global off / user off / no token / vault locked / non-eligible kind / no
       recursion), trace-endpoint authz (wrong worker, terminal judge run,
       target/judge owner mismatch), review-POST validation (bad enum, oversize,
       control chars, secret-family scrub), toggle authz (body-supplied ids
       ignored), inbox visibility (user vs admin, cross-user mark-read), engine
       tick logic, MR-reuse path. `go test ./...`, `npm test` (web + agent).
-- [ ] **M7 — Docs + specs**: `docs/judge.md`, `docs/self-improvement.md`,
+- [x] **M7 — Docs + specs**: `docs/judge.md`, `docs/self-improvement.md`,
       updated pages, `specs/ai.md`; `npm run build` (check-docs) green.
-- [ ] **M8 — Live validation**: judge a real run end-to-end on a dev stack
-      (isolated env per compose rules), one self-improvement tick against a
-      scratch repo (not live uzi) to verify issue/MR reuse; findings folded
-      back.
-- [ ] **M9 — Real test evidence in self-improvement MRs**: thread the PRD #18
+      (fact-checked clean; `specs/ai.md` §195-204 added, `specs/human.md`
+      verified complete.)
+- [ ] **M8 — Live validation** (stub-validated GREEN; live capstone
+      DEFERRED-TO-OPERATOR): judge path end-to-end passed on the isolated
+      stub stack (`run-e2e.sh` PRD #46 section: funnel enqueue →
+      repo-less/no-PAT claim → trace → review → persist-first notification →
+      re-run-judge → `install_worker_tool jq` via the deterministic fallback,
+      UPSERT to one row) — `./e2e/run-e2e.sh` 119/0 GREEN on the rebuilt image
+      (incl. the baked hooksPath dir); MR-reuse + no-force-push proven against
+      the forge-fake; bot=Developer / `main` Maintainers-only verified on the
+      LIVE forge; nonce fence held 20/20. **Remaining, operator-only** (needs a
+      real Anthropic token + scratch repo — must NOT be sourced by the team):
+      a genuinely live LLM judge verdict, and one live self-improvement tick on
+      a scratch repo.
+- [x] **M9 — Real test evidence in self-improvement MRs**: thread the PRD #18
       provisioned tool env (`provision.ts` → `provision-run.ts` `toolEnv`,
       already exported into the SDK env) into `defaultCheckRunner`'s
       `execFile` (today it passes no env at all, so provisioned tools are
@@ -397,6 +407,19 @@ second; they share the settings and inbox plumbing (user decision, 2026-07-12).
       is provisionable via the run's tool packages, and whether the worker
       has npm-registry egress — whatever cannot be made real stays honestly
       skipped and is stated as such in the MR.
+- [ ] **M10 — Harden worker git env (pre-existing PAT-exfil vector)** (nearly
+      done — one one-line consistency fix outstanding): surfaced by the M9
+      audit sweep, PoC-confirmed. `gitEnv` → scrubbed replacement env (worker
+      join-token / API vars absent by construction; credential pairs
+      preserved); `core.hooksPath` pinned to a ROOT-OWNED mode-0555 dir baked
+      at image build (base template) so a non-root uid cannot plant a hook —
+      PoC-confirmed ("Permission denied") + e2e-green; `filter.` added to the
+      guardrail config-write deny. Auditor cleared (blocking finding resolved),
+      reviewer APPROVE. **Remaining**: add the same baked-dir stanza to the
+      `jvm` worker template (it does NOT `FROM base`; safe today only
+      implicitly, needs the explicit close for consistency + a true
+      "every template" claim) — coder session-limited mid-fix, resumes after
+      reset.
 
 ## Milestone dependency / parallelization
 
