@@ -8,7 +8,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 // would. This jsdom build does not expose window.localStorage, so back it with a
 // Map-based Storage stub (same approach as prefs.test.ts / theme.test.ts).
 
-const KEY = "uzi.mock.v1";
+const KEY = "uzi.mock.v2";
 
 function installStorage(initial: Record<string, string> = {}): void {
   const m = new Map<string, string>(Object.entries(initial));
@@ -50,6 +50,14 @@ describe("mockApi settings persistence (demo survives reload)", () => {
           prdless_label: "NOSPEC",
           slack_enabled: "true",
           public_base_url: "https://uzi.example",
+          judge_enabled: "false",
+          judge_model: "haiku",
+          health_enabled: "false",
+          health_stall_seconds: "120",
+          health_slow_seconds: "2700",
+          health_queued_seconds: "600",
+          health_approval_seconds: "3600",
+          health_nudge_cooldown_seconds: "1800",
         },
       }),
     });
@@ -68,6 +76,9 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     // The Slack non-secret keys round-trip too (PRD #25 M1).
     expect(app.slack_enabled).toBe("true");
     expect(app.public_base_url).toBe("https://uzi.example");
+    // The run-health keys round-trip too (PRD #47).
+    expect(app.health_enabled).toBe("false");
+    expect(app.health_stall_seconds).toBe("120");
   });
 
   it("falls back to seed on a corrupt blob", async () => {
@@ -111,5 +122,34 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     // present from the seed, never from persisted state.
     const runs = (await api.listRuns()).runs;
     expect(runs.length).toBeGreaterThan(0);
+  });
+});
+
+describe("mockApi run judge review (PRD #46 M4)", () => {
+  it("returns the seeded review for a judged run, null for an unjudged one, 404 for unknown", async () => {
+    installStorage();
+    const api = await reload();
+
+    const { review } = await api.getRunReview("run-done");
+    expect(review).not.toBeNull();
+    expect(review!.verdict).toBe("issues");
+    expect(review!.recommendations.length).toBeGreaterThan(0);
+
+    // A terminal run with no seeded review reads as null (not judged yet).
+    expect((await api.getRunReview("run-failed")).review).toBeNull();
+
+    await expect(api.getRunReview("does-not-exist")).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("rerunJudge enqueues a judge run for a terminal issue run and rejects a non-terminal one", async () => {
+    installStorage();
+    const api = await reload();
+
+    const { run } = await api.rerunJudge("run-done");
+    expect(run.kind).toBe("judge");
+    expect(run.status).toBe("queued");
+
+    // A still-queued run is not terminal, so it cannot be judged.
+    await expect(api.rerunJudge("run-queued")).rejects.toMatchObject({ status: 422 });
   });
 });

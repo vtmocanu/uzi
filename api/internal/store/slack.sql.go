@@ -43,7 +43,7 @@ func (q *Queries) ConfirmUserSlackLink(ctx context.Context, slackResolvedID pgty
 }
 
 const getConfirmedUserBySlackID = `-- name: GetConfirmedUserBySlackID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject FROM users
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled FROM users
 WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL AND is_active = true
 `
 
@@ -75,6 +75,7 @@ func (q *Queries) GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID
 		&i.SlackLinkConfirmedAt,
 		&i.OidcIssuer,
 		&i.OidcSubject,
+		&i.JudgeEnabled,
 	)
 	return i, err
 }
@@ -97,6 +98,7 @@ func (q *Queries) GetSlackDeliveryForUser(ctx context.Context, id uuid.UUID) (pg
 const getSlackRunContext = `-- name: GetSlackRunContext :one
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.branch, r.failure_reason, r.kind,
+       r.health,
        rp.path_with_namespace, rp.web_url,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -119,6 +121,7 @@ type GetSlackRunContextRow struct {
 	Branch            pgtype.Text `json:"branch"`
 	FailureReason     pgtype.Text `json:"failure_reason"`
 	Kind              string      `json:"kind"`
+	Health            string      `json:"health"`
 	PathWithNamespace string      `json:"path_with_namespace"`
 	WebUrl            string      `json:"web_url"`
 	RepoAgentNames    []string    `json:"repo_agent_names"`
@@ -149,6 +152,7 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 		&i.Branch,
 		&i.FailureReason,
 		&i.Kind,
+		&i.Health,
 		&i.PathWithNamespace,
 		&i.WebUrl,
 		&i.RepoAgentNames,

@@ -6,6 +6,22 @@ import type { Logger } from "./log.js";
 
 const execFileAsync = promisify(execFile);
 
+// A ROOT-OWNED, non-writable (0555) empty dir BAKED into the worker image (see
+// agent/templates/base/Dockerfile, created as root before `USER uzi:uzi`). Every
+// worker git invocation sets core.hooksPath here (via gitEnv's own GIT_CONFIG pairs,
+// which override any config file), so a hook that any WORKER-UID process tries to
+// plant CANNOT be created — a non-root process cannot create a child inside a
+// root-owned 0555 dir. That covers every same-uid planter until the k8s uid-split:
+// the agent's own Bash (out-of-worktree writes are the accepted PRD #42 residual) AND
+// the self_improve check-phase test code, which the worker also runs as this uid
+// before the push. So no pre-push (or any) hook can fire (M10 audit).
+//
+// It is NOT created at runtime: a runtime mkdir would land under the SHARED uid and
+// be agent-writable — exactly the vector this closes (relocating, not fixing). A
+// nonexistent path is harmless (git simply runs no hooks), so this is safe on a
+// host/image without the baked dir (e.g. a unit test), where no hooks run anyway.
+const EMPTY_GIT_HOOKS_DIR = "/usr/share/uzi-git-nohooks";
+
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
 
 export interface WorktreeResult {
@@ -132,6 +148,25 @@ export class GitCache {
       await this.forceRemoveWorktree(barePath, worktreePath);
       await this.tryGit(barePath, ["worktree", "prune"]);
     });
+  }
+
+  /**
+   * Files changed on the worktree's branch since it diverged from the default
+   * branch (three-dot diff against the merge base) — used by a self_improve run to
+   * flag guard-critical paths in its MR (PRD #46). Returns null (NOT []) when the
+   * diff cannot be computed, so the caller fails CLOSED — surfacing a loud
+   * "guard-path check unavailable" note rather than silently raising no flag on a
+   * possibly guard-touching MR (M5 audit). An empty list means "computed, nothing
+   * changed".
+   */
+  async changedFiles(barePath: string, worktreePath: string): Promise<string[] | null> {
+    try {
+      const baseRef = await this.defaultBranchRef(barePath);
+      const out = await this.runGit(worktreePath, ["diff", "--name-only", `${baseRef}...HEAD`]);
+      return out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+    } catch {
+      return null;
+    }
   }
 
   private async cloneBare(repoUrl: string, dest: string, pat?: string, scope?: string, username?: string): Promise<void> {
@@ -275,8 +310,33 @@ function withDir(cwd: string | undefined, args: string[]): string[] {
  * unscoped — harmless because local/file transport ignores http.* config entirely.
  */
 export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
-  const pairs: Array<[string, string]> = [["safe.directory", "*"]];
+  // REPLACEMENT env (M10 audit), NOT a process.env spread. A git subprocess can spawn
+  // agent-controlled code (a hook at the default path) as the worker uid, outside the
+  // SDK hook system — and gitEnv also injects the forge PAT (GIT_CONFIG_VALUE_n). So
+  // the join token (UZI_WORKER_TOKEN[_FILE]) + API URL must be ABSENT BY CONSTRUCTION,
+  // or that hook could read them (join token → claim → PAT + Anthropic token). Only
+  // what git + git-over-HTTPS demonstrably need is carried, all non-secret:
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  // A config-file PATH (not a secret) — the e2e's insteadOf rewrite lives here; unset
+  // in production, so a no-op there. The inline GIT_CONFIG pairs below still OVERRIDE
+  // whatever it contains (higher precedence than any config file).
+  if (process.env.GIT_CONFIG_GLOBAL) env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL;
+  // TLS trust for git-over-HTTPS pushes to the real forge. Carry only if the image set
+  // them; never invent, never carry a secret.
+  for (const k of ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "GIT_SSL_CAINFO"] as const) {
+    if (process.env[k]) env[k] = process.env[k];
+  }
+
+  // core.hooksPath → the empty dir on EVERY invocation: structurally neutralizes a
+  // planted hook regardless of what the agent wrote. safe.directory=* as before.
+  const pairs: Array<[string, string]> = [
+    ["safe.directory", "*"],
+    ["core.hooksPath", EMPTY_GIT_HOOKS_DIR],
+  ];
   if (pat) {
     // HTTP Basic (base64(user:pat)) — git-over-HTTPS auth, unlike GitLab's
     // REST-only PRIVATE-TOKEN. Scope the header + pin followRedirects to the repo
@@ -286,7 +346,8 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     pairs.push([headerKey, `Authorization: Basic ${gitBasicCredential(pat, username)}`]);
     pairs.push([redirKey, "false"]);
   }
-  let count = Number(env.GIT_CONFIG_COUNT ?? "0") || 0;
+  // count starts at 0: the replacement env carries no inherited GIT_CONFIG_COUNT.
+  let count = 0;
   for (const [k, v] of pairs) {
     env[`GIT_CONFIG_KEY_${count}`] = k;
     env[`GIT_CONFIG_VALUE_${count}`] = v;

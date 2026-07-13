@@ -9,6 +9,8 @@ import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { RunRunner, type ExecutorFactory } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
+import { JudgeRunner } from "./judge-runner.js";
+import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { errMessage } from "./util.js";
 
@@ -113,7 +115,18 @@ async function main(): Promise<void> {
     pollMs: config.chatPollMs,
   }, config.workerToken);
 
-  const worker = new Worker(config, client, runner, chatRunner, log);
+  // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
+  // HOME root but needs no executor/clone — it fetches the trace, calls the model
+  // once, and posts a verdict. Under UZI_E2E_EXECUTOR=stub the model call is the
+  // stub judge queryFn (no live Anthropic, deterministic fallback), mirroring the
+  // run/chat stub executors above so the e2e can drive the judge lane with a dummy
+  // token and zero spend.
+  const judgeRunner = new JudgeRunner(client, log, {
+    homeRoot: sdkHomeRoot,
+    ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
+  });
+
+  const worker = new Worker(config, client, runner, chatRunner, judgeRunner, log);
 
   const controller = new AbortController();
   for (const sig of ["SIGINT", "SIGTERM"] as const) {

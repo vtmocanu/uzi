@@ -140,7 +140,11 @@ JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = @user_id
-  AND r.kind <> 'chat'
+  -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
+  -- list never shows. self_improve has a real repo and stays visible. The repos
+  -- INNER JOIN already drops the repo-less kinds; this predicate is the explicit,
+  -- refactor-proof guard (a future LEFT JOIN must not leak judge runs here).
+  AND r.kind NOT IN ('chat', 'judge')
   AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id'))
   AND (sqlc.narg('issue_iid')::bigint IS NULL OR r.issue_iid = sqlc.narg('issue_iid'))
 ORDER BY r.created_at DESC
@@ -155,7 +159,9 @@ JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
-  AND r.kind <> 'chat'
+  -- Exclude chat AND judge (PRD #46): repo-less meta-runs the admin overview omits.
+  -- self_improve has a real repo and stays visible (same rationale as ListRunsForUser).
+  AND r.kind NOT IN ('chat', 'judge')
 ORDER BY r.created_at DESC
 LIMIT 500;
 
@@ -200,7 +206,10 @@ UPDATE runs SET
     status     = 'claimed',
     worker_id  = @worker_id,
     claimed_at = now(),
-    updated_at = now()
+    updated_at = now(),
+    -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
+    -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
+    health = 'ok', health_reason = NULL, health_since = NULL
 WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = @user_id
@@ -257,6 +266,15 @@ UPDATE runs SET
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),
     agent_source     = COALESCE(sqlc.narg('agent_source'), agent_source),
     agent_exclusions = COALESCE(sqlc.narg('agent_exclusions')::jsonb, agent_exclusions),
+    -- Exit contract (PRD #47 Decision 3), guarded so it fires only on ENTRY to
+    -- running. This statement is also the running→running heartbeat (idempotent),
+    -- and an unconditional reset would clear the detector's flag on every heartbeat;
+    -- the CASE keys off the pre-update status (Postgres evaluates SET RHS against
+    -- the old row), so a claimed/awaiting_approval → running transition resets the
+    -- flag while a running → running heartbeat preserves whatever the detector wrote.
+    health        = CASE WHEN status = 'running' THEN health        ELSE 'ok'  END,
+    health_reason = CASE WHEN status = 'running' THEN health_reason ELSE NULL END,
+    health_since  = CASE WHEN status = 'running' THEN health_since  ELSE NULL END,
     updated_at       = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -266,6 +284,10 @@ UPDATE runs SET
     status     = 'awaiting_approval',
     plan_md    = @plan_md,
     session_id = COALESCE(sqlc.narg('session_id'), session_id),
+    -- Exit contract (PRD #47 Decision 3): leaving 'running' clears any running-run
+    -- flag (stalled/looping/slow). The detector re-evaluates for approval_idle from
+    -- this transition's fresh updated_at; health_notified_at is preserved.
+    health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -285,6 +307,8 @@ UPDATE runs SET
     fix_verdict        = COALESCE(sqlc.narg('fix_verdict'), fix_verdict),
     move_pending_since = now(),
     finished_at        = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -298,6 +322,8 @@ UPDATE runs SET
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
     move_pending_since = now(),
     finished_at        = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -311,6 +337,8 @@ UPDATE runs SET
     failure_reason     = @failure_reason,
     move_pending_since = now(),
     finished_at        = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -321,7 +349,10 @@ WHERE id = @id
 -- that will never come. cancelled restores the origin column → stamp. stop_kind is
 -- stamped 'cancelled' for uniformity (PRD #33 Decision 3), though isStoppedRun's
 -- status='cancelled' branch already treats this run as a deliberate stop.
-UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
@@ -330,13 +361,22 @@ WHERE id = @id AND user_id = @user_id
 -- stamped 'plan_rejected' in the same statement as the status/failure_reason write
 -- (PRD #33 Decision 3), so this failed run is recognised as a deliberate stop
 -- regardless of the failure_reason text.
-UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND status NOT IN ('completed', 'failed', 'cancelled');
 
 -- name: UpdateRunLastSeq :execrows
--- Advance the message high-water mark (never regresses).
-UPDATE runs SET last_seq = GREATEST(last_seq, @seq)
+-- Advance the message high-water mark (never regresses) AND bump last_activity_at
+-- (PRD #47 Decision 2). AppendMessages calls this once per batch that carried a
+-- genuinely new (higher-seq) message, so the activity marker rides the existing
+-- write for free — no per-tick run_messages aggregate and no standalone
+-- activity-bump endpoint. A pure-duplicate re-delivery skips this call (maxSeq not
+-- advanced), so last_activity_at reflects real new activity, which is exactly what
+-- the stalled signal wants.
+UPDATE runs SET last_seq = GREATEST(last_seq, @seq), last_activity_at = now()
 WHERE id = @id;
 
 -- Sweeper: run-level timeouts and worker-loss recovery -----------------------
@@ -346,7 +386,11 @@ WHERE id = @id;
 -- kept for affinity so the same disk reclaims it). RETURNING id, user_id, status
 -- so the sweeper can publish each transition through the broadcaster/notifier
 -- fan-out (PRD #25 M3: sweeper-driven transitions were previously silent).
-UPDATE runs SET status = 'queued', updated_at = now()
+UPDATE runs SET status = 'queued',
+    -- Exit contract (PRD #47 Decision 3): reset on the way to a fresh 'queued'; the
+    -- detector re-evaluates the queued signal from this transition's updated_at.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE status = 'claimed' AND claimed_at < @cutoff
 RETURNING id, user_id, status;
 
@@ -361,7 +405,12 @@ RETURNING id, user_id, status;
 -- (not :many like the sweeps): this runs on the claim path, not the sweeper, and
 -- deliberately does not broadcast the claimed→queued transition (matching the
 -- reviewed PRD #32 M3 behavior — it is a rare lock-race requeue, not a sweep).
-UPDATE runs SET status = 'queued', updated_at = now()
+UPDATE runs SET status = 'queued',
+    -- Exit contract (PRD #47 Decision 3): mirrors SweepClaimedNeverStarted — a
+    -- 'claimed' run never carries a flag, so this is defensive, but it keeps every
+    -- claimed→queued path uniform.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE id = @id AND status = 'claimed';
 
 -- name: SweepRunningTimeout :many
@@ -370,7 +419,10 @@ WHERE id = @id AND status = 'claimed';
 -- reconcile loop a marker to restore the origin column later. Chat runs are exempt
 -- (Decision 3): a chat legitimately parks for a long time between turns, so its own
 -- idle/turn clocks (SweepIdleChatRuns + the worker-side timers) bound it instead.
-UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE status = 'running' AND started_at < @cutoff AND kind <> 'chat'
 RETURNING id, user_id, status;
 
@@ -379,7 +431,10 @@ RETURNING id, user_id, status;
 -- failed instead of re-queued. Stamps move_pending_since (reconcile restores the
 -- origin column; the sweep itself never touches the forge — worker-loss recovery
 -- must not wait on a down forge).
-UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= @max_requeues
   AND worker_id IN (
@@ -390,7 +445,11 @@ RETURNING id, user_id, status;
 -- name: RequeueRunsOfStaleWorkers :many
 -- A stale worker's non-terminal run within its re-queue budget → back to queued
 -- (worker_id kept for affinity, requeue_count incremented).
-UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
+UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
+    -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
+    -- detector re-evaluates the queued signal from this transition's updated_at.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count < @max_requeues
   AND worker_id IN (
@@ -400,20 +459,30 @@ RETURNING id, user_id, status;
 
 -- Register-time orphan recovery (worker-scoped) ------------------------------
 
--- name: FailWorkerRunsOverCap :execrows
+-- name: FailWorkerRunsOverCap :many
 -- On register a worker declares a fresh start, so any run it still holds is
 -- orphaned (its execution is gone). Over its re-queue budget → failed. failed →
 -- origin restore, applied by the reconcile loop (register does no forge I/O), so
--- it stamps move_pending_since.
-UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(), updated_at = now()
+-- it stamps move_pending_since. RETURNING id so the caller can funnel these
+-- committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
+-- as the sweeper's FailRunsOfStaleWorkersOverCap does.
+UPDATE runs SET status = 'failed', failure_reason = @failure_reason, move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval')
-  AND requeue_count >= @max_requeues;
+  AND requeue_count >= @max_requeues
+RETURNING id;
 
 -- name: RequeueWorkerRuns :execrows
 -- Within budget → re-queued to this same worker (affinity), which then re-claims
 -- and resumes from the persisted session (handles docker compose down && up).
-UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
+UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
+    -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
+    -- detector re-evaluates the queued signal from this transition's updated_at.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE worker_id = @worker_id
   AND status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count < @max_requeues;
@@ -557,25 +626,34 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 -- build the MR URL; a chat run has no repo, so repo fields are NULL (LEFT JOIN).
 
 -- name: ListRunsForWorkerUser :many
--- Compact list of the worker's user's runs, newest first, bounded by @lim.
+-- Compact list of the worker's user's runs, newest first, bounded by @lim. The
+-- chat agent's investigation surface (PRD #39 Decision 7). judge runs are hidden
+-- (PRD #46, M1-review carry-forward): a judge is a repo-less internal retrospective
+-- with no investigable task, same rationale as excluding it from the general run
+-- lists (f55b37e). self_improve stays visible — it is real work with a repo + MR.
+-- The judge WORKER reads its own run through the M3 judge-scoped trace path, not
+-- this chat surface, so hiding judge here does not affect judging.
 SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
        r.failure_reason, r.created_at, r.updated_at,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.user_id = @user_id
+WHERE r.user_id = @user_id AND r.kind <> 'judge'
 ORDER BY r.created_at DESC
 LIMIT @lim;
 
 -- name: GetRunForWorkerUser :one
 -- One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
+-- judge runs are excluded here too (see ListRunsForWorkerUser): a chat agent asking
+-- for a judge run's detail gets a 404, exactly like an unknown id. self_improve is
+-- visible.
 SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r.mr_state,
        r.failure_reason, r.stop_kind, r.fix_verdict, r.iteration_count, r.plan_md,
        r.created_at, r.updated_at,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.id = @id AND r.user_id = @user_id;
+WHERE r.id = @id AND r.user_id = @user_id AND r.kind <> 'judge';
 
 -- name: ListRunMessagesForWorkerPage :many
 -- A bounded page of a run's messages after a seq (the worker read tool's paging).
@@ -749,3 +827,62 @@ WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid AND move_pending_since
 -- updated_at) only.
 UPDATE runs SET mr_state = @mr_state, updated_at = now()
 WHERE id = @id;
+
+-- Run health detector (PRD #47) ----------------------------------------------
+
+-- name: ListActiveRunsForHealth :many
+-- Every run in a flaggable status (queued / running / awaiting_approval), for the
+-- sweeper's per-tick health pass. 'claimed' is deliberately excluded (Decision 8:
+-- a wedged checkout is already reclaimed by SweepClaimedNeverStarted at ClaimGrace,
+-- tighter than any flag). Chat runs are excluded — they legitimately park between
+-- turns and have their own idle machinery, so a health flag would be a false alarm.
+-- The detector reads current health + reason to skip a no-op write (and its later
+-- broadcast) when nothing changed, and health_since so it can PRESERVE the original
+-- flag time when only the reason changes within the same enum (a queued run whose
+-- reason flips no-worker → waiting must not reset the UI's "stuck for Xm").
+SELECT id, user_id, status, auto_approve,
+       started_at, last_activity_at, updated_at,
+       health, health_reason, health_since, health_notified_at
+FROM runs
+WHERE status IN ('queued', 'running', 'awaiting_approval')
+  AND kind <> 'chat';
+
+-- name: ListRunToolWindow :many
+-- The tail of a running run's tool activity for loop + in-flight detection
+-- (Decisions 4 & 9), newest first over the existing (run_id, seq) unique index.
+-- Both kinds are fetched in ONE query: tool_use rows feed the loop hash, and the
+-- newest tool_use vs the tool_result tool_use_ids answers "is a tool call still in
+-- flight?" (which suppresses the stalled signal). @lim is set well above the 12-wide
+-- loop window so the fetch comfortably contains it plus the interleaved results.
+SELECT seq, kind, payload
+FROM run_messages
+WHERE run_id = @run_id AND kind IN ('tool_use', 'tool_result')
+ORDER BY seq DESC
+LIMIT @lim;
+
+-- name: SetRunHealth :execrows
+-- The detector's single writer of the health columns (Decision 3). Status-scoped
+-- (@status is the status the detector read) so it no-ops if the run left that
+-- status between the read and this write — that is what closes the sweeper-vs-worker
+-- race (the worker's status write already cleared health via the exit contract; this
+-- write then matches zero rows). It deliberately does NOT touch updated_at: the
+-- queued and approval-idle age clocks read updated_at, so bumping it here would reset
+-- the very signal being flagged.
+--
+-- health_notified_at is the rolling last-nudge stamp (PRD #47 Decision 7): the
+-- sweeper passes it non-NULL ONLY when it emits a nudge-worthy event, so the
+-- COALESCE advances it then and preserves it otherwise. It is never cleared here
+-- (nor by the exit contract), so it damps DM flapping across episodes and API
+-- restarts. The detector remains the single writer of every health column.
+UPDATE runs SET
+    health             = @health,
+    health_reason      = sqlc.narg('health_reason'),
+    health_since       = sqlc.narg('health_since'),
+    health_notified_at = COALESCE(sqlc.narg('health_notified_at'), health_notified_at)
+WHERE id = @id AND status = @status;
+
+-- name: CountOnlineWorkersForUser :one
+-- How many of a user's workers are online — the queued-run reason resolver uses it
+-- to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
+-- for a queued run already past its threshold, so it is off the hot path.
+SELECT count(*) FROM workers WHERE user_id = @user_id AND status = 'online';

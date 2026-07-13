@@ -6,7 +6,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -17,9 +17,19 @@ import {
   type Repo,
   type Run,
   type RunMessage,
+  type RunReview,
 } from "../lib/api";
+import { recommendationLabel, verdictLabel, verdictTone } from "../lib/judge";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
-import { isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
+import {
+  formatElapsed,
+  healthFlagLabel,
+  isStoppedRun,
+  mrChipState,
+  mrChipSuffix,
+  mrChipTitle,
+  shouldShowHealthFlag,
+} from "../lib/runBadge";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
@@ -71,6 +81,34 @@ function LiveElapsed({ since }: { since: string }) {
   const start = new Date(since).getTime();
   if (!Number.isFinite(start)) return null;
   return <span className="text-xs tabular-nums text-faint">{formatDuration(now - start)}</span>;
+}
+
+// HealthFlag renders the run-health warn chip next to the LIVE STAGE label (PRD #47
+// Decision 10): `⚠ <label> · stuck for Xm — <reason>`. The run view is owner/admin
+// only, so health_reason is always present here (no gating needed). It ticks the
+// "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
+// re-render. Renders nothing for a healthy run or a non-flaggable status.
+function HealthFlag({ run }: { run: Run }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  if (!shouldShowHealthFlag(run.health, run.status)) return null;
+  const since = run.health_since ? Date.parse(run.health_since) : NaN;
+  const stuck = Number.isFinite(since) ? ` · stuck for ${formatElapsed(now - since)}` : "";
+  return (
+    // role="status" so a screen reader announces the flag when it arrives over WS.
+    // The reason is shown inline below, so no title tooltip (it would be redundant).
+    <span
+      role="status"
+      className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn"
+    >
+      ⚠ {healthFlagLabel(run.health)}
+      {stuck}
+      {run.health_reason && <span className="font-normal"> — {run.health_reason}</span>}
+    </span>
+  );
 }
 
 export function RunView() {
@@ -200,6 +238,8 @@ export function RunView() {
                   <Spinner /> {stage}…
                 </span>
               )}
+              {/* Run-health warn chip (PRD #47), next to the LIVE STAGE label. */}
+              <HealthFlag run={run} />
               {/* The live/offline WS indicator is only meaningful while the run is
                   active; a terminal run has no stream, so never show "completed • live". */}
               {!terminal && (
@@ -301,6 +341,11 @@ export function RunView() {
           </div>
         </div>
       )}
+
+      {/* Run retrospective (PRD #46 M4): the LLM judge's verdict + recommendations,
+          shown once a run is finished. The panel fetches its own review and owns the
+          re-run action; it renders nothing for a non-terminal or ineligible run. */}
+      {terminal && <JudgePanel run={run} />}
 
       {run.status === "awaiting_approval" && (
         <PlanPanel
@@ -515,6 +560,161 @@ function FollowUpComposer({
           Stop run
         </Button>
       </div>
+    </Card>
+  );
+}
+
+// Only issue / ci_fix runs are judged (the enqueue allowlist); a chat/judge/
+// self_improve run never has a review, so the panel is hidden for those kinds.
+const JUDGE_ELIGIBLE_KINDS = new Set(["issue", "ci_fix"]);
+
+// JudgePanel is the run retrospective (PRD #46 M4): the LLM judge's verdict +
+// structured recommendations, plus the "re-run judge" action. It fetches its own
+// review (owner-or-admin scoped server-side) and, after a re-run, polls a bounded
+// number of times for the fresh verdict (the new judge run finishes asynchronously).
+// All judge free text (summary, rationale, target) renders as escaped React text —
+// never markdown/HTML — since it is untrusted judge/worker output (audit carry-forward).
+export function JudgePanel({ run }: { run: Run }) {
+  const [review, setReview] = useState<RunReview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadErr, setLoadErr] = useState("");
+  const [actionErr, setActionErr] = useState("");
+  const [rerunning, setRerunning] = useState(false);
+  const [queued, setQueued] = useState(false);
+  // The verdict's updated_at at the moment a re-run was fired; the poll below stops
+  // once the review's updated_at moves past it (or a first-ever review lands).
+  const baselineUpdatedAt = useRef<string | null>(null);
+
+  const eligible = JUDGE_ELIGIBLE_KINDS.has(run.kind);
+
+  const fetchReview = useCallback(async () => {
+    try {
+      const { review } = await api.getRunReview(run.id);
+      setReview(review);
+      setLoadErr("");
+    } catch (e) {
+      setLoadErr(e instanceof ApiError ? e.message : "Failed to load the review");
+    } finally {
+      setLoading(false);
+    }
+  }, [run.id]);
+
+  useEffect(() => {
+    if (!eligible) {
+      setLoading(false);
+      return;
+    }
+    fetchReview();
+  }, [eligible, fetchReview]);
+
+  // Bounded background poll after a re-run: the fresh verdict arrives when the new
+  // judge run finishes, so check every few seconds for a changed updated_at, giving
+  // up after ~1 minute so a stuck/queued judge doesn't poll forever.
+  useEffect(() => {
+    if (!queued) return;
+    let tries = 0;
+    const id = setInterval(async () => {
+      tries += 1;
+      let next: RunReview | null = null;
+      try {
+        next = (await api.getRunReview(run.id)).review;
+      } catch {
+        next = null;
+      }
+      if (next && next.updated_at !== baselineUpdatedAt.current) {
+        setReview(next);
+        setQueued(false);
+      } else if (tries >= 15) {
+        setQueued(false);
+      }
+    }, 4000);
+    return () => clearInterval(id);
+  }, [queued, run.id]);
+
+  const rerun = async () => {
+    setActionErr("");
+    setRerunning(true);
+    try {
+      await api.rerunJudge(run.id);
+      baselineUpdatedAt.current = review?.updated_at ?? null;
+      setQueued(true);
+    } catch (e) {
+      setActionErr(e instanceof ApiError ? e.message : "Could not re-run the judge");
+    } finally {
+      setRerunning(false);
+    }
+  };
+
+  if (!eligible) return null;
+  if (loading) {
+    return <Card className="animate-pulse p-4 text-sm text-faint">Loading review…</Card>;
+  }
+
+  const rerunLabel = review ? "Re-run judge" : "Run judge";
+  const rerunButton = (
+    <Button variant="secondary" size="sm" disabled={rerunning || queued} onClick={rerun}>
+      {rerunning ? "Re-queuing…" : rerunLabel}
+    </Button>
+  );
+
+  return (
+    <Card className="space-y-4 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Run review</h2>
+          {review && <Badge tone={verdictTone(review.verdict)}>{verdictLabel(review.verdict)}</Badge>}
+          {review?.status === "failed" && (
+            <Badge tone="neutral" title="The judge model call failed; the deterministic findings below still landed.">
+              judge incomplete
+            </Badge>
+          )}
+          {review?.judge_model && <span className="text-xs text-faint">via {review.judge_model}</span>}
+        </div>
+        {rerunButton}
+      </div>
+
+      {actionErr && <Alert message={actionErr} />}
+      {loadErr && <Alert message={loadErr} />}
+      {queued && (
+        <p className="text-xs text-info">Judge re-queued — the new verdict will appear here when it finishes.</p>
+      )}
+
+      {!review ? (
+        <p className="text-sm text-faint">
+          This run hasn't been judged yet. Running the judge reviews the run on your Anthropic token.
+        </p>
+      ) : (
+        <>
+          {/* summary_md and each rationale_md below are UNTRUSTED judge/worker output.
+              They are DELIBERATELY rendered as escaped plain text (React's default +
+              whitespace-pre-wrap), never markdown/HTML. If these are ever switched to a
+              markdown/HTML renderer, add sanitization first: the review-POST ingest scrub
+              (ScrubSecrets + control-strip) does NOT cover markdown/link injection. */}
+          {review.summary_md.trim() !== "" && (
+            <p className="whitespace-pre-wrap text-sm text-muted">{review.summary_md}</p>
+          )}
+          {review.recommendations.length > 0 ? (
+            <ul className="space-y-2">
+              {review.recommendations.map((rec) => (
+                <li key={rec.id} className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge tone="info">{recommendationLabel(rec.category)}</Badge>
+                    {rec.target.trim() !== "" && (
+                      <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{rec.target}</code>
+                    )}
+                    {rec.confidence && <span className="text-xs text-faint">{rec.confidence} confidence</span>}
+                  </div>
+                  {rec.rationale_md.trim() !== "" && (
+                    <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">{rec.rationale_md}</p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-sm text-faint">No recommendations — the judge found nothing to change.</p>
+          )}
+        </>
+      )}
     </Card>
   );
 }

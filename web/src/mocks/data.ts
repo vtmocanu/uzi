@@ -10,7 +10,10 @@ import type {
   ForgeConnection,
   IssueProposal,
   LatestRun,
+  RecommendationCategory,
   Repo,
+  ReviewStatus,
+  ReviewVerdict,
   Run,
   RunListItem,
   RunMessage,
@@ -35,6 +38,7 @@ export const mockAdmin: User = {
   is_admin: true,
   is_active: true,
   autopilot_enabled: false,
+  judge_enabled: false,
   created_at: daysAgo(41),
   last_login: minsAgo(7),
 };
@@ -48,6 +52,7 @@ export const mockUsers: User[] = [
     is_admin: false,
     is_active: true,
     autopilot_enabled: true,
+    judge_enabled: true,
     created_at: daysAgo(33),
     last_login: minsAgo(95),
   },
@@ -58,6 +63,7 @@ export const mockUsers: User[] = [
     is_admin: false,
     is_active: true,
     autopilot_enabled: false,
+    judge_enabled: false,
     created_at: daysAgo(20),
     last_login: daysAgo(1),
   },
@@ -68,8 +74,137 @@ export const mockUsers: User[] = [
     is_admin: false,
     is_active: false,
     autopilot_enabled: false,
+    judge_enabled: false,
     created_at: daysAgo(18),
     last_login: daysAgo(12),
+  },
+];
+
+// ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
+// The mock keeps the full row (incl. user_id + owner) so listNotifications can
+// filter to the caller (own view) or show everyone (admin all-view), exactly like
+// the API. payload follows the { title, body } convention the inbox renders; the
+// judge is the seeded tenant. A couple of rows belong to another user so the admin
+// all-view has cross-owner content to show.
+export interface MockNotification {
+  id: string;
+  user_id: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  run_id: string | null;
+  review_id: string | null;
+  read_at: string | null;
+  created_at: string;
+  owner_email: string;
+  owner_display_name: string | null;
+}
+
+export const mockNotifications: MockNotification[] = [
+  {
+    id: "ntf-1",
+    user_id: mockAdmin.id,
+    kind: "judge_review",
+    payload: { title: "Run review ready", body: "verdict: issues — 2 recommendations, incl. a missing worker tool" },
+    run_id: "run-done",
+    review_id: null,
+    read_at: null,
+    created_at: minsAgo(6),
+    owner_email: mockAdmin.email,
+    owner_display_name: mockAdmin.display_name,
+  },
+  {
+    id: "ntf-2",
+    user_id: mockAdmin.id,
+    kind: "judge_review",
+    payload: { title: "Run review ready", body: "verdict: ideal — nothing to change" },
+    run_id: "run-live",
+    review_id: null,
+    read_at: null,
+    created_at: minsAgo(58),
+    owner_email: mockAdmin.email,
+    owner_display_name: mockAdmin.display_name,
+  },
+  {
+    id: "ntf-3",
+    user_id: mockAdmin.id,
+    kind: "judge_review",
+    payload: { title: "Run review ready", body: "verdict: ok — one template tweak suggested" },
+    run_id: null,
+    review_id: null,
+    read_at: daysAgo(1),
+    created_at: daysAgo(1),
+    owner_email: mockAdmin.email,
+    owner_display_name: mockAdmin.display_name,
+  },
+  {
+    id: "ntf-4",
+    user_id: "u-mira",
+    kind: "judge_review",
+    payload: { title: "Run review ready", body: "verdict: issues — worker missing `jq`" },
+    run_id: null,
+    review_id: null,
+    read_at: null,
+    created_at: minsAgo(120),
+    owner_email: "mira@uzi.local",
+    owner_display_name: "Mira Ionescu",
+  },
+];
+
+// ── Run judge reviews (PRD #46 M4) ───────────────────────────────────────────
+// Seeded verdicts for the run-page review panel, keyed by target run id. run-done
+// carries a full "issues" verdict with recommendations so the panel + preview mode
+// have something to show; other terminal runs (e.g. run-failed) have no review, so
+// their panel renders the "not judged yet" state with a Run-judge button.
+export interface MockReview {
+  id: string;
+  target_run_id: string;
+  verdict: ReviewVerdict;
+  summary_md: string;
+  judge_model: string;
+  status: ReviewStatus;
+  created_at: string;
+  updated_at: string;
+  recommendations: {
+    id: string;
+    category: RecommendationCategory;
+    target: string;
+    rationale_md: string;
+    confidence: "" | "low" | "medium" | "high";
+    created_at: string;
+  }[];
+}
+
+export const mockReviews: MockReview[] = [
+  {
+    id: "rev-done",
+    target_run_id: "run-done",
+    verdict: "issues",
+    summary_md:
+      "The run delivered the feature and opened an MR, but the agent lost time to a missing worker tool and re-ran the same search three times before finding the handler.",
+    judge_model: "haiku",
+    status: "complete",
+    created_at: minsAgo(6),
+    updated_at: minsAgo(6),
+    recommendations: [
+      {
+        id: "rec-1",
+        category: "install_worker_tool",
+        target: "shellcheck",
+        rationale_md:
+          "The agent tried `shellcheck` twice and hit `command not found`; installing it in the worker image would save the fallback.",
+        confidence: "high",
+        created_at: minsAgo(6),
+      },
+      {
+        id: "rec-2",
+        category: "improve_agent",
+        target: "reviewer",
+        rationale_md:
+          "The repo reviewer agent approved on the first pass without checking the migration ordering; tightening its checklist would catch this class of issue.",
+        confidence: "medium",
+        created_at: minsAgo(6),
+      },
+    ],
   },
 ];
 
@@ -180,6 +315,9 @@ function latestRun(fields: Partial<LatestRun> & Pick<LatestRun, "id" | "status">
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     owner_name: "Vlad",
     worker_name: null,
     is_mine: true,
@@ -723,6 +861,9 @@ export const mockRuns: Run[] = [
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     plan_md: null,
     repo_agents: null,
     agent_source: null,
@@ -756,6 +897,9 @@ export const mockRuns: Run[] = [
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     plan_md: null,
     repo_agents: null,
     agent_source: null,
@@ -791,6 +935,9 @@ export const mockRuns: Run[] = [
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     plan_md: SAMPLE_PLAN(),
     // PRD #37: this repo shipped .claude/agents/, so the plan gate shows State A
     // (repo agents detected, default source).
@@ -835,6 +982,9 @@ export const mockRuns: Run[] = [
     mr_state: "merged",
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     plan_md: SAMPLE_PLAN(),
     repo_agents: null,
     agent_source: null,
@@ -871,6 +1021,9 @@ export const mockRuns: Run[] = [
     mr_state: "closed",
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     plan_md: SAMPLE_PLAN(),
     repo_agents: null,
     agent_source: null,
@@ -904,6 +1057,9 @@ export const mockRuns: Run[] = [
     mr_state: null,
     failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     plan_md: null,
     repo_agents: null,
     agent_source: null,
@@ -937,6 +1093,9 @@ export const mockRuns: Run[] = [
     mr_state: null,
     failure_reason: null,
     stop_kind: "cancelled",
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     plan_md: null,
     repo_agents: null,
     agent_source: null,
@@ -1127,6 +1286,9 @@ function chatRun(over: Partial<Run> & { id: string; title: string; status: Run["
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,

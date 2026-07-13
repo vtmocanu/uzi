@@ -68,32 +68,42 @@ type cardDTO struct {
 // no second listRuns fan-in. OwnerName drives the "started by X" treatment;
 // IsMine gates the run-view link (a non-owner would 403 on GetRunByIDForUser).
 type latestRunDTO struct {
-	ID            string    `json:"id"`
-	Status        string    `json:"status"`
-	MrIID         *int64    `json:"mr_iid"`
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	MrIID  *int64 `json:"mr_iid"`
 	// MrState is the PRD #24 watcher's last-observed merge-request state, null when
 	// never observed. Display-only (PRD #33 Decision 1): the board card's chip
 	// renders merged/closed distinctly and everything else as the plain open chip.
 	// Kept fresh by the watcher only for the board card (the issue's latest run).
-	MrState       *string   `json:"mr_state"`
+	MrState *string `json:"mr_state"`
 	// FailureReason is OWNER-ONLY (PRD #33 Decision 5): it can carry a user's verbatim
 	// typed reject reason or a raw agent error, so a shared board must not expose it
 	// to non-owner viewers — they get null. Owners keep it (the failed-badge tooltip).
 	// The non-sensitive StopKind enum below stays visible to everyone for the
 	// stopped-vs-failed badge, so classification never depends on this field.
-	FailureReason *string   `json:"failure_reason"`
+	FailureReason *string `json:"failure_reason"`
 	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
 	// or "plan_rejected", null otherwise. The board badge reads it (not the
 	// failure_reason text) to render a deliberate stop as calm "stopped".
-	StopKind      *string   `json:"stop_kind"`
-	OwnerName     string    `json:"owner_name"`
-	WorkerName    *string   `json:"worker_name"`
-	IsMine        bool      `json:"is_mine"`
+	StopKind *string `json:"stop_kind"`
+	// Health is the run-health flag (PRD #47): ok|stalled|looping|slow|
+	// waiting_worker|approval_idle. Non-sensitive (like StopKind), so it rides the
+	// shared board card unconditionally — runBadge renders the warn variant only for
+	// a flaggable status. HealthSince (when the flag was raised) is likewise
+	// unconditional and drives the "stuck for Xm" elapsed. HealthReason, which can
+	// name owner state ("your vault is locked"), is OWNER-ONLY, exactly like
+	// FailureReason (Decision 6): a non-owner viewer gets null.
+	Health       string     `json:"health"`
+	HealthReason *string    `json:"health_reason"`
+	HealthSince  *time.Time `json:"health_since"`
+	OwnerName    string     `json:"owner_name"`
+	WorkerName   *string    `json:"worker_name"`
+	IsMine       bool       `json:"is_mine"`
 	// RunCount is how many runs the issue has had (this run being the newest). >1
 	// drives the board's "×N" retry hint; full history lives in the issue view.
-	RunCount      int64     `json:"run_count"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	RunCount  int64     `json:"run_count"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // mapLatestRun builds the card's run summary from the shared run + owner + worker
@@ -103,23 +113,28 @@ type latestRunDTO struct {
 // the email (PRD #33 Decision 5): a shared board must not leak another user's email
 // on a card, and the web already renders a no-owner badge for empty. The query no
 // longer even selects the email, so there is nothing to fall back to here.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrState, failureReason, stopKind, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrState, failureReason, stopKind pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
 	dto := &latestRunDTO{
-		ID:         runID.String(),
-		Status:     status,
-		MrState:    textPtrValue(mrState.Valid, mrState.String),
-		StopKind:   textPtrValue(stopKind.Valid, stopKind.String),
-		WorkerName: textPtrValue(workerName.Valid, workerName.String),
-		IsMine:     ownerID == viewerID,
-		RunCount:   runCount,
-		CreatedAt:  createdAt.Time,
-		UpdatedAt:  updatedAt.Time,
+		ID:          runID.String(),
+		Status:      status,
+		MrState:     textPtrValue(mrState.Valid, mrState.String),
+		StopKind:    textPtrValue(stopKind.Valid, stopKind.String),
+		Health:      health,
+		HealthSince: timePtr(healthSince.Valid, healthSince.Time),
+		WorkerName:  textPtrValue(workerName.Valid, workerName.String),
+		IsMine:      ownerID == viewerID,
+		RunCount:    runCount,
+		CreatedAt:   createdAt.Time,
+		UpdatedAt:   updatedAt.Time,
 	}
-	// failure_reason is owner-only (Decision 5): it can carry a verbatim reject reason
-	// or a raw agent error, so a non-owner viewer of a shared board gets null. stop_kind
-	// (above, unconditional) already gives everyone the stopped-vs-failed classification.
+	// failure_reason and health_reason are owner-only (Decisions 5 & 6): both can carry
+	// text about the owner (a verbatim reject reason, a raw agent error, "your vault is
+	// locked"), so a non-owner viewer of a shared board gets null. stop_kind, health, and
+	// health_since (above, unconditional) already give everyone the classification and
+	// the elapsed for the badge.
 	if dto.IsMine {
 		dto.FailureReason = textPtrValue(failureReason.Valid, failureReason.String)
+		dto.HealthReason = textPtrValue(healthReason.Valid, healthReason.String)
 	}
 	if mrIID.Valid {
 		v := mrIID.Int64
@@ -383,7 +398,8 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
-			rr.MrState, rr.FailureReason, rr.StopKind, rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
+			rr.MrState, rr.FailureReason, rr.StopKind, rr.Health, rr.HealthReason, rr.HealthSince,
+			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
 
 	cards := make([]cardDTO, 0, len(issues))
@@ -594,7 +610,8 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
+			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for moved card", "error", err)
 	}
@@ -692,7 +709,8 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	// a toggle never blanks the run badge the board/issue view is showing.
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
-			lr.MrState, lr.FailureReason, lr.StopKind, lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
+			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
+			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Warn("latest run for prdless card", "error", err)
 	}

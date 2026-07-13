@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -125,10 +126,17 @@ func TestOIDCStateCookieRoundTrip(t *testing.T) {
 		}
 	})
 	t.Run("tampered ciphertext", func(t *testing.T) {
-		tampered := []byte(state.Value)
-		tampered[len(tampered)-1] ^= 0x01 // flip a bit; GCM auth must fail
+		// Decode the cookie, flip a byte of the SEALED bytes (the GCM tag tail), then
+		// re-encode — a deterministic tamper. Flipping a bit of the base64 STRING
+		// instead is a no-op whenever it lands in the final char's don't-care bits
+		// (RawURLEncoding, ciphertext-length dependent), which made this test ~30% flaky.
+		sealed, err := base64.RawURLEncoding.DecodeString(state.Value)
+		if err != nil {
+			t.Fatalf("decode state cookie: %v", err)
+		}
+		sealed[len(sealed)-1] ^= 0x01 // flip a GCM-tag bit; AEAD open must fail
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
-		r.AddCookie(&http.Cookie{Name: oidcStateCookieName, Value: string(tampered)})
+		r.AddCookie(&http.Cookie{Name: oidcStateCookieName, Value: base64.RawURLEncoding.EncodeToString(sealed)})
 		if _, ok := h.readOIDCStateCookie(r); ok {
 			t.Error("ok=true for a tampered cookie")
 		}

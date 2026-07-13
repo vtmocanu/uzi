@@ -86,6 +86,8 @@ type Store interface {
 	CreateRun(ctx context.Context, arg store.CreateRunParams) (store.Run, error)
 	// CI-fix runs (PRD #6).
 	CreateCIFixRun(ctx context.Context, arg store.CreateCIFixRunParams) (store.Run, error)
+	// Self-improvement runs (PRD #46 Decision 10).
+	CreateSelfImproveRun(ctx context.Context, arg store.CreateSelfImproveRunParams) (store.Run, error)
 	CountActiveRunsWithBranch(ctx context.Context, arg store.CountActiveRunsWithBranchParams) (int64, error)
 	CountActiveCIFixForRef(ctx context.Context, arg store.CountActiveCIFixForRefParams) (int64, error)
 	GetRunByIDForUser(ctx context.Context, arg store.GetRunByIDForUserParams) (store.Run, error)
@@ -96,6 +98,17 @@ type Store interface {
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
 	ClaimRun(ctx context.Context, arg store.ClaimRunParams) (store.Run, error)
 	GetRunClaimContext(ctx context.Context, runID uuid.UUID) (store.GetRunClaimContextRow, error)
+	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
+	// authz, the command-not-found scan input, and the review upsert.
+	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
+	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
+	GetActiveJudgeRunForWorkerTarget(ctx context.Context, arg store.GetActiveJudgeRunForWorkerTargetParams) (store.Run, error)
+	ListToolResultPayloadsForRun(ctx context.Context, arg store.ListToolResultPayloadsForRunParams) ([][]byte, error)
+	ListRunInputsForRun(ctx context.Context, arg store.ListRunInputsForRunParams) ([]store.RunUserInput, error)
+	UpsertRunReviewWithRecommendations(ctx context.Context, arg store.UpsertRunReviewWithRecommendationsParams) (uuid.UUID, error)
+	// Judge review read side (PRD #46 M4): the run-page verdict + recommendations panel.
+	GetRunReviewForTarget(ctx context.Context, targetRunID uuid.UUID) (store.RunReview, error)
+	ListRecommendationsForReview(ctx context.Context, reviewID uuid.UUID) ([]store.ReviewRecommendation, error)
 	SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error)
 	SetRunAwaitingApproval(ctx context.Context, arg store.SetRunAwaitingApprovalParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
@@ -113,8 +126,16 @@ type Store interface {
 	SweepRunningTimeout(ctx context.Context, arg store.SweepRunningTimeoutParams) ([]store.SweepRunningTimeoutRow, error)
 	FailRunsOfStaleWorkersOverCap(ctx context.Context, arg store.FailRunsOfStaleWorkersOverCapParams) ([]store.FailRunsOfStaleWorkersOverCapRow, error)
 	RequeueRunsOfStaleWorkers(ctx context.Context, arg store.RequeueRunsOfStaleWorkersParams) ([]store.RequeueRunsOfStaleWorkersRow, error)
-	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) (int64, error)
+	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error)
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
+
+	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
+	// tool window (loop + in-flight), the single health writer, and the queued-run
+	// worker-online count.
+	ListActiveRunsForHealth(ctx context.Context) ([]store.ListActiveRunsForHealthRow, error)
+	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
+	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
+	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
 
 	// Messages + inputs.
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
@@ -219,6 +240,15 @@ type Broadcaster interface {
 	PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time)
 	// PublishState signals that a run's status changed.
 	PublishState(runID uuid.UUID, status string)
+	// PublishHealth signals that a run's health flag changed (PRD #47) — raised,
+	// changed, or self-cleared (health=="ok"). health is the flag enum and reason is
+	// the fixed server-controlled template (empty when clearing). nudge is set ONLY
+	// when the sweeper judged this event nudge-worthy (an ok→flagged transition past
+	// the cooldown) and has already stamped health_notified_at — the notifier then
+	// threads one DM; otherwise it only re-renders the root. The live hub maps the
+	// event to a WS run-update (browsers re-read the run, picking up the owner-gated
+	// reason over REST) and ignores nudge. Best-effort, never blocks the sweep.
+	PublishHealth(runID uuid.UUID, health, reason string, nudge bool)
 }
 
 // MultiBroadcaster fans each event out to several Broadcasters — the WS hub AND
@@ -239,6 +269,12 @@ func (m MultiBroadcaster) PublishState(runID uuid.UUID, status string) {
 	}
 }
 
+func (m MultiBroadcaster) PublishHealth(runID uuid.UUID, health, reason string, nudge bool) {
+	for _, b := range m {
+		b.PublishHealth(runID, health, reason, nudge)
+	}
+}
+
 // RunLifecycle is notified after each run status write so the board's column
 // automation can react (queued → In Progress, completed → Human Review,
 // failed/cancelled → origin). It is the seam onto runlifecycle; nil in tests and
@@ -248,6 +284,16 @@ func (m MultiBroadcaster) PublishState(runID uuid.UUID, status string) {
 type RunLifecycle interface {
 	// Notify reports that a run just transitioned to status.
 	Notify(runID uuid.UUID, status string)
+}
+
+// SettingsReader is the narrow slice of the instance settings the judge machinery
+// reads (PRD #46): the global kill-switch gates the terminal-funnel enqueue, the
+// model rides the judge claim. *settings.Cache satisfies it. Optional (nil-safe);
+// a nil reader means the judge feature is off (no enqueue, no model) — the default
+// in tests and any deployment that never wired it.
+type SettingsReader interface {
+	JudgeEnabled(ctx context.Context) (bool, error)
+	JudgeModel(ctx context.Context) (string, error)
 }
 
 // Service holds the store, the secret cipher, and the runtime params.
@@ -272,7 +318,29 @@ type Service struct {
 	// deployment without the vault) disables the gate and falls back to opening the
 	// token under the master box — the pre-vault behavior.
 	vlt *vault.Vault
+	// Two narrow settings views over the same *settings.Cache: `settings` =
+	// judge/self-improve reads, `healthSettings` = run-health reads (interface
+	// segregation — each feature's tests fake only what they use).
+	//
+	// settings reads the instance judge toggles/model (PRD #46). Optional (nil-safe);
+	// set via SetSettings. Nil disables the judge terminal-funnel enqueue entirely.
+	settings SettingsReader
+	// healthSettings reads the runtime-tunable run-health thresholds (PRD #47).
+	// Optional (nil-safe); set via SetHealthSettings. A nil healthSettings disables
+	// the whole health detector, so tests that do not exercise it — and any
+	// deployment without a settings cache — behave exactly as before.
+	healthSettings Settings
+	// lastSlowClampWarn is the last health_slow_seconds value the read-time clamp
+	// warned about (PRD #47), so the warning logs once per distinct misconfigured
+	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
+	// (slowThreshold, reached via detectRunHealth ← Sweep), so it needs no lock.
+	lastSlowClampWarn time.Duration
 }
+
+// SetSettings wires the instance settings reader (PRD #46). Call once at startup,
+// before serving. A nil reader (tests, or a deployment that never enabled the judge)
+// disables the terminal-funnel enqueue and leaves the judge model unset in claims.
+func (s *Service) SetSettings(sr SettingsReader) { s.settings = sr }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
 // startup, before serving. A nil broadcaster disables live fan-out; the persisted
@@ -289,6 +357,11 @@ func (s *Service) SetLifecycle(l RunLifecycle) { s.lifecycle = l }
 // the claim gate and opens the Anthropic token under the master box (pre-vault
 // behavior), which is what the workersvc tests rely on.
 func (s *Service) SetVault(v *vault.Vault) { s.vlt = v }
+
+// SetHealthSettings wires the run-health settings reader (PRD #47). Call once at
+// startup, before the sweeper runs, with the same settings cache the HTTP handlers
+// hold. A nil healthSettings (the default) disables the health detector entirely.
+func (s *Service) SetHealthSettings(cfg Settings) { s.healthSettings = cfg }
 
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
@@ -322,12 +395,20 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // fresh-start signal, which the server cannot infer from heartbeats alone.
 func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int) (store.Worker, error) {
 	max := int32(s.p.RunMaxRequeues)
-	if _, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
+	orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, store.FailWorkerRunsOverCapParams{
 		FailureReason: pgText("worker restarted; run orphaned and out of re-queue budget"),
 		WorkerID:      pgUUID(wkr.ID),
 		MaxRequeues:   max,
-	}); err != nil {
+	})
+	if err != nil {
 		return store.Worker{}, err
+	}
+	// PRD #46 Decision 2: these orphaned-over-cap runs just committed to 'failed'
+	// (worker lost) — the same worker-lost runs the sweeper's identical
+	// FailRunsOfStaleWorkersOverCap funnels into the judge. Funnel them here too.
+	// Best-effort, gated inside; never fails the register.
+	for _, id := range orphanFailed {
+		s.maybeEnqueueJudgeByID(ctx, id)
 	}
 	if _, err := s.q.RequeueWorkerRuns(ctx, store.RequeueWorkerRunsParams{
 		WorkerID:    pgUUID(wkr.ID),
@@ -479,6 +560,14 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID) ([]byte, 
 
 // assembleClaim builds the claim payload for an already-claimed run.
 func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPayload, error) {
+	// Judge lane (PRD #46 Decision 1): a judge run has no repo and no forge
+	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
+	// repos → forge_connections and would treat a repo-less judge run as vanished)
+	// and before the bot-PAT open. Its claim carries only the Anthropic token.
+	if run.Kind == RunKindJudge {
+		return s.assembleJudgeClaim(ctx, run)
+	}
+
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -933,6 +1022,9 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// Only a genuinely-applied transition drives the column automation; a
 		// no-op onto an already-terminal run (rows == 0) must not.
 		s.notify(runID, run.Status)
+		// PRD #46 Decision 2: enqueue a judge on the COMMITTED terminal transition
+		// (rows>0), not the lossy notify seam. Best-effort — never fails the report.
+		s.maybeEnqueueJudge(ctx, run)
 	}
 	return run, rows > 0, err
 }
@@ -1397,6 +1489,10 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 				s.bcast.PublishState(runID, status)
 			}
 			s.notify(runID, status) // cancelled → origin restore; failed (reject) → origin restore
+			// PRD #46 Decision 2: a server-side plan REJECT commits the run to 'failed',
+			// a judged status — enqueue a judge on it. A server-side CANCEL commits
+			// 'cancelled', which the enqueue gate filters out. Best-effort, gated inside.
+			s.maybeEnqueueJudgeByID(ctx, runID)
 			return SubmitInputResult{ServerSide: true}, nil
 		}
 		// Live poller: the worker will consume this verdict. Enqueue it AND stamp the
@@ -1516,6 +1612,9 @@ type SweepResult struct {
 	StaleRequeued      int64
 	ChatIdleCompleted  int64
 	ProposalsRecovered int64
+	// HealthChanged is the number of runs whose health flag the detector wrote this
+	// pass (PRD #47) — raised, changed, or self-cleared. Observability only.
+	HealthChanged int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -1555,6 +1654,9 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.RunningTimeout = int64(len(timedOut))
 	for _, r := range timedOut {
 		s.publishSwept(r.ID, r.Status)
+		// PRD #46 Decision 2: a swept-to-failed run (timed out) is committed-terminal
+		// and worth judging. Best-effort, gated (kind/toggles/token) inside.
+		s.maybeEnqueueJudgeByID(ctx, r.ID)
 	}
 
 	// Fail-over-cap before re-queue: the two are disjoint on requeue_count, but
@@ -1570,6 +1672,9 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	res.StaleFailed = int64(len(failed))
 	for _, r := range failed {
 		s.publishSwept(r.ID, r.Status)
+		// PRD #46 Decision 2: a swept-to-failed run (worker lost, over re-queue budget)
+		// is committed-terminal and worth judging. Best-effort, gated inside.
+		s.maybeEnqueueJudgeByID(ctx, r.ID)
 	}
 
 	requeued, err := s.q.RequeueRunsOfStaleWorkers(ctx, store.RequeueRunsOfStaleWorkersParams{
@@ -1609,6 +1714,12 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 		res.ProposalsRecovered = int64(len(recovered))
 	}
+
+	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
+	// and approval-idle runs from telemetry already in Postgres. Best-effort and
+	// non-terminal — it never kills a run and never fails the sweep (it logs and
+	// returns a count); a nil settings (tests) disables it entirely.
+	res.HealthChanged = s.detectRunHealth(ctx, now)
 	return res, nil
 }
 

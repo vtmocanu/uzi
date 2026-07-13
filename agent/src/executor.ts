@@ -96,6 +96,11 @@ export interface ExecutorResult {
    *  authored, Decision 3b). Absent for a stub/ci_fix-not_code run that assembled
    *  no roster. */
   agentSelection?: { source: AgentSource; agents: string[] };
+  /** PRD #46 M9: the allowlisted provisioned tool env (PATH + nix TLS/locale vars)
+   *  the run's tier-1 packages installed, so the self_improve check runner can put
+   *  go/vitest/tsc on its subprocess PATH. Absent (or `{}`) when nothing was
+   *  provisioned; the check env then falls back to the worker's base PATH. */
+  toolEnv?: Record<string, string>;
 }
 
 /**
@@ -164,6 +169,36 @@ export const STUB_INTERLEAVE_SENTINEL = "UZI_STUB_INTERLEAVE";
  * parallel run yields, and it is what makes name-based attribution non-trivial to
  * preserve across persistence and reconnect replay.
  */
+/**
+ * Run-health E2E sentinels (PRD #47 M6). In an issue's title/description they make
+ * the stub reproduce, with no live SDK, the three telemetry shapes the server-side
+ * detector keys off:
+ *   UZI_STUB_STALL    — go quiet past the stall threshold, then resume.
+ *   UZI_STUB_LOOP     — emit the SAME tool call four times (window-hash → looping).
+ *   UZI_STUB_INFLIGHT — hold ONE tool call open (no result) past the stall
+ *                       threshold, proving `stalled` is SUPPRESSED (working, not stuck).
+ * Off unless present; a normal run skips the simulation entirely.
+ */
+export const STUB_STALL_SENTINEL = "UZI_STUB_STALL";
+export const STUB_LOOP_SENTINEL = "UZI_STUB_LOOP";
+export const STUB_INFLIGHT_SENTINEL = "UZI_STUB_INFLIGHT";
+
+/**
+ * Pause lengths for the health sentinels, in ms. STALL/INFLIGHT sit comfortably
+ * above the 60s minimum health_stall_seconds the E2E sets, so the detector flags
+ * (or, for in-flight, provably does NOT flag) the run before the stub moves on.
+ * RESUME is one-plus sweep ticks so the self-clear is observable while still
+ * running; LOOP_HOLD is shorter — looping is window-based, not time-based, so one
+ * sweep tick after the fourth identical call suffices.
+ */
+// The stall/in-flight pause is 95s: with a 60s stall threshold and the sweeper's
+// 15s tick, the detector flags by threshold+tick (≤75s), so a 95s pause leaves a
+// ≥20s window in which `stalled` is observable before the stub resumes — comfortably
+// above the E2E's poll interval, so the assertion is not tick-timing-flaky.
+export const STUB_HEALTH_STALL_MS = 95_000;
+export const STUB_HEALTH_RESUME_MS = 20_000;
+export const STUB_HEALTH_LOOP_HOLD_MS = 35_000;
+
 export const STUB_INTERLEAVE_STREAM: ReadonlyArray<{ agent: string; text: string }> = [
   { agent: "lead", text: "parallel dispatch: units A (api) and B (web)" },
   { agent: "coder", text: "unit A: editing the api scope" },
@@ -214,6 +249,13 @@ export interface StubExecutorOptions {
   homeDir?: string;
   /** Injected in tests so no real devbox/nix egress happens; default = provisionTools. */
   provision?: typeof provisionTools;
+  /**
+   * E2E-only (PRD #47 M6): override the health-sentinel pause lengths (ms). Unit
+   * tests set 0 so the stall / loop / in-flight simulation runs instantly; the real
+   * E2E leaves it undefined to use the STUB_HEALTH_* defaults (which sit above the
+   * server's stall threshold).
+   */
+  healthPauseMs?: number;
 }
 
 /**
@@ -324,6 +366,11 @@ export class StubExecutor implements Executor {
       });
     }
 
+    // PRD #47 M6: reproduce a stall / loop / long in-flight tool call so the
+    // server-side run-health detector is provable end to end with no live SDK.
+    // Gated on the UZI_STUB_* sentinels; a normal run is unaffected.
+    await this.simulateHealth(ctx);
+
     const markerPath = path.join(ctx.worktreePath, "UZI_RUN.md");
     const marker = [
       `# uzi stub run`,
@@ -375,11 +422,65 @@ export class StubExecutor implements Executor {
     return { branch: ctx.branch };
   }
 
+  /**
+   * PRD #47 M6 run-health simulation. Reproduces, with no live SDK, the three
+   * telemetry shapes the server-side detector keys off, gated on the UZI_STUB_*
+   * sentinels in the issue text. A normal run matches none and returns immediately.
+   * All pauses are well under the worker's own idle/run timeouts.
+   */
+  private async simulateHealth(ctx: RunContext): Promise<void> {
+    const has = (s: string) => ctx.issueDescription.includes(s) || ctx.issueTitle.includes(s);
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const override = this.opts.healthPauseMs;
+    const stallMs = override ?? STUB_HEALTH_STALL_MS;
+    const resumeMs = override ?? STUB_HEALTH_RESUME_MS;
+    const loopHoldMs = override ?? STUB_HEALTH_LOOP_HOLD_MS;
+
+    if (has(STUB_STALL_SENTINEL)) {
+      // Go quiet past the stall threshold (detector flags `stalled`), then resume:
+      // the activity bump self-clears the flag, and the short trailing pause keeps
+      // the run running so the clear is observable before it completes.
+      ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub: pausing to simulate a stall" } });
+      await sleep(stallMs);
+      ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub: resuming after the pause" } });
+      await sleep(resumeMs);
+      return;
+    }
+
+    if (has(STUB_LOOP_SENTINEL)) {
+      // Emit the SAME tool call four times, each with its result (so none is "in
+      // flight"): the detector's window hash counts four identical calls → looping.
+      // Hold briefly so a sweep tick catches it before the run completes.
+      for (let i = 0; i < 4; i++) {
+        const id = `stub-loop-${i}`;
+        ctx.emit({ kind: "tool_use", agent: "worker", payload: { id, name: "Bash", input: { command: "go test ./..." } } });
+        ctx.emit({ kind: "tool_result", agent: "worker", payload: { tool_use_id: id, content: "same failing output", is_error: true } });
+      }
+      await sleep(loopHoldMs);
+      return;
+    }
+
+    if (has(STUB_INFLIGHT_SENTINEL)) {
+      // Emit ONE tool call and hold it OPEN (no result) past the stall threshold:
+      // the newest message is an unmatched tool_use, so `stalled` is SUPPRESSED —
+      // the run is working, not stuck. Close it out afterwards so the run completes.
+      const id = "stub-inflight-0";
+      ctx.emit({ kind: "tool_use", agent: "worker", payload: { id, name: "Bash", input: { command: "make provision" } } });
+      await sleep(stallMs);
+      ctx.emit({ kind: "tool_result", agent: "worker", payload: { tool_use_id: id, content: "provision finished", is_error: false } });
+      return;
+    }
+  }
+
   private async git(cwd: string, args: string[]): Promise<void> {
-    await execFileAsync("git", ["-C", cwd, ...args], {
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-      timeout: 60_000,
-    });
+    // Replacement env, not a process.env spread (M10 discipline): even the stub's
+    // local add/commit is a worker-spawned git child, so keep it off the worker's
+    // secrets by construction. Stub/e2e-only with dummy creds, but consistent with
+    // gitEnv. Commit identity rides -c flags (see the caller), so only PATH/HOME are
+    // needed; GIT_CONFIG_GLOBAL is carried if the e2e set it (a config-file path).
+    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: process.env.HOME, GIT_TERMINAL_PROMPT: "0" };
+    if (process.env.GIT_CONFIG_GLOBAL) env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL;
+    await execFileAsync("git", ["-C", cwd, ...args], { env, timeout: 60_000 });
   }
 }
 

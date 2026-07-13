@@ -160,7 +160,15 @@ type runDTO struct {
 	// or "plan_rejected", null for every other run. It — not the failure_reason
 	// text — is what the client's isStoppedRun reads to style a stop as calm/neutral.
 	StopKind *string `json:"stop_kind"`
-	PlanMd   *string `json:"plan_md"`
+	// Run health (PRD #47). This DTO is owner-scoped (ListRuns owner-only,
+	// AdminListRuns admin-only, GetRun owner/admin), so health_reason rides
+	// unconditionally here, matching failure_reason — the owner-gating that the shared
+	// board applies is unnecessary. Health is the flag enum; HealthSince (when it was
+	// raised) drives the run-view "stuck for Xm".
+	Health       string     `json:"health"`
+	HealthReason *string    `json:"health_reason"`
+	HealthSince  *time.Time `json:"health_since"`
+	PlanMd       *string    `json:"plan_md"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).
@@ -215,6 +223,9 @@ func runToDTO(r store.Run) runDTO {
 		MrState:          textPtrValue(r.MrState.Valid, r.MrState.String),
 		FailureReason:    textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
 		StopKind:         textPtrValue(r.StopKind.Valid, r.StopKind.String),
+		Health:           r.Health,
+		HealthReason:     textPtrValue(r.HealthReason.Valid, r.HealthReason.String),
+		HealthSince:      timePtr(r.HealthSince.Valid, r.HealthSince.Time),
 		PlanMd:           textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
 		PipelineRef:      textPtrValue(r.PipelineRef.Valid, r.PipelineRef.String),
 		FixVerdict:       textPtrValue(r.FixVerdict.Valid, r.FixVerdict.String),

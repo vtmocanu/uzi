@@ -26,12 +26,14 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/oidc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/poller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/selfimprove"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -264,6 +266,15 @@ func run() error {
 	// is built above (ahead of the Slack setup that needs it); vlt just above.
 	wsvc.SetVault(vlt)
 
+	// Instance settings (PRD #46): gate the judge terminal-funnel enqueue on the
+	// global judge_enabled kill-switch and ride the judge model into the claim.
+	wsvc.SetSettings(settingsCache)
+	// Run-health detector settings (PRD #47): the sweeper reads the runtime-tunable
+	// health thresholds from the same settings cache the HTTP handlers hold, so an
+	// admin change takes effect within the cache TTL. Nil would disable detection;
+	// wiring it here turns it on with the compiled-in defaults.
+	wsvc.SetHealthSettings(settingsCache)
+
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and
 	// stateless — every event is already durable in the DB.
@@ -282,6 +293,14 @@ func run() error {
 		slog.Default(),
 	)
 	wsvc.SetBroadcaster(workersvc.MultiBroadcaster{liveHub, slackNotifier})
+
+	// Notifications write seam (PRD #46 M2): the one place that creates inbox rows.
+	// It persists the row first, then delivers best-effort through slackNotifier
+	// (reusing its per-user opt-in gating + drain goroutine via a separate queue).
+	// M3+ tenants (the judge) call notifier.Notify; the M2 REST read endpoints go
+	// straight to the store, so the handler only needs the seam wired for future
+	// producers.
+	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
 
 	// Board column automation (PRD #12): reacts to run status changes with
 	// forge-first label moves, plus a reconcile loop that retries moves a down
@@ -359,6 +378,26 @@ func run() error {
 		slog.Info("privilege sweeper disabled (UZI_PRIVILEGE_CHECK_INTERVAL=0)")
 	}
 
+	// Self-improvement engine (PRD #46 M5): a privcheck-shaped scheduler that, on a
+	// due cycle, files/reuses a tracking issue on the connected uzi repo and creates
+	// an auto-approved self_improve run folding the accumulated improve_uzi backlog.
+	// Shares the same collaborators the rest of the run machinery uses: workersvc
+	// creates the run, forgesvc builds the driver from the stored connection, the
+	// vault gates on the enabling admin being unlocked, and notifysvc delivers the
+	// tick-skip / run-started notifications. 0 disables it entirely; the Boot pass
+	// runs inside the goroutine (poller precedent) so a slow forge can't delay serve.
+	if cfg.SelfimproveCheckInterval > 0 {
+		siEngine := selfimprove.New(q, settingsCache, wsvc, svc, vlt, notifier, cfg.SelfimproveCheckInterval, slog.Default())
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			siEngine.Boot(ctx)
+			siEngine.Run(ctx)
+		}()
+	} else {
+		slog.Info("self-improvement engine disabled (UZI_SELFIMPROVE_CHECK_INTERVAL=0)")
+	}
+
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
 	// Dedicated tighter budget for the two Slack-DM-triggering /me/slack endpoints
@@ -366,6 +405,9 @@ func run() error {
 	slackDMLimiter := mw.NewLimiter(cfg.SlackDMRateLimitMax, cfg.SlackDMRateLimitWindow, cfg.TrustedProxies)
 	// Per-user chat budget (PRD #39): a spend guard on chat create + message posts.
 	chatLimiter := mw.NewLimiter(cfg.ChatRateLimitMax, cfg.ChatRateLimitWindow, cfg.TrustedProxies)
+	// Per-user re-run-judge budget (PRD #46 Decision 8): a dedicated spend guard on the
+	// re-run-judge action, separate from chat so neither consumes the other's allowance.
+	judgeLimiter := mw.NewLimiter(cfg.JudgeRateLimitMax, cfg.JudgeRateLimitWindow, cfg.TrustedProxies)
 	// Per-worker budget on the propose_issue endpoint (PRD #39 M3): a proposal-spam
 	// guard complementing the per-run pending cap.
 	proposalLimiter := mw.NewLimiter(cfg.ProposalRateLimitMax, cfg.ProposalRateLimitWindow, cfg.TrustedProxies)
@@ -384,6 +426,9 @@ func run() error {
 	// their Slack DMs (PRD #25 M3). Best-effort: a nil linker (never in production)
 	// would make those endpoints report Slack as unavailable.
 	h.SetSlackLinker(slackLinker)
+	// Wire the notifications write seam (PRD #46 M2) for future producers (the judge,
+	// M4). The M2 read endpoints don't need it; this makes the seam available.
+	h.SetNotifier(notifier)
 	// Wire the OIDC relying party when configured (PRD #45). Discovery is warmed once
 	// here so a misconfigured or unreachable IdP is surfaced loudly at boot; a failure
 	// leaves the provider configured-but-degraded (login attempts retry discovery)
@@ -410,7 +455,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter),
+		Handler:           h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

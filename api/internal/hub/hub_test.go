@@ -65,6 +65,24 @@ func TestPublishStateCarriesStatus(t *testing.T) {
 	}
 }
 
+func TestPublishHealthEmitsHealthFrameWithoutReason(t *testing.T) {
+	h := New()
+	run := uuid.New()
+	sub := h.Subscribe(run)
+	defer sub.Close()
+
+	// The reason is passed for the shared Broadcaster contract but must NOT ride the
+	// socket — the browser re-reads the run (owner-gated) instead.
+	h.PublishHealth(run, "stalled", "the agent stopped sending updates", true)
+	ev := readFrame(t, sub)
+	if ev.Type != "health" {
+		t.Fatalf("type = %q, want health", ev.Type)
+	}
+	if ev.Status != "" {
+		t.Fatalf("health frame must carry no status/reason, got status=%q", ev.Status)
+	}
+}
+
 func TestUnsubscribeStopsDelivery(t *testing.T) {
 	h := New()
 	run := uuid.New()

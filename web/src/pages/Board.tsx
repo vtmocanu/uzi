@@ -94,6 +94,10 @@ export function Board() {
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
   const [awaitingRuns, setAwaitingRuns] = useState<RunListItem[]>([]);
+  // The viewer's runs on this repo the health detector flagged as looking stuck
+  // (PRD #47): any non-ok flag except approval_idle, which the awaiting bucket above
+  // already covers. Issue runs only (a ci_fix run has no board card to link to).
+  const [stuckRuns, setStuckRuns] = useState<RunListItem[]>([]);
 
   // Toasts announce auto-moves the poll observes ("#42 → Human Review").
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
@@ -153,6 +157,9 @@ export function Board() {
       setHasWorker(workers.length > 0);
       setHasToken(secrets.some((s) => s.kind === "anthropic_token"));
       setAwaitingRuns(runs.filter((r) => isAwaitingApproval(r.status)));
+      setStuckRuns(
+        runs.filter((r) => r.health !== "ok" && r.health !== "approval_idle" && r.issue_iid != null),
+      );
     } catch {
       // Non-fatal: the board still renders; Start-run stays gated conservatively.
     }
@@ -392,12 +399,23 @@ export function Board() {
 
       {error && <Alert message={error} />}
 
-      {awaitingRuns.length > 0 && (
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn">
+      {(awaitingRuns.length > 0 || stuckRuns.length > 0) && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn"
+        >
           <span className="font-medium">
-            {awaitingRuns.length} run{awaitingRuns.length > 1 ? "s" : ""} awaiting your approval
+            {[
+              awaitingRuns.length > 0 &&
+                `${awaitingRuns.length} run${awaitingRuns.length > 1 ? "s" : ""} ${awaitingRuns.length > 1 ? "need" : "needs"} approval`,
+              stuckRuns.length > 0 &&
+                `${stuckRuns.length} run${stuckRuns.length > 1 ? "s" : ""} ${stuckRuns.length > 1 ? "look" : "looks"} stuck`,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
           </span>
-          {awaitingRuns.map((r) => (
+          {[...awaitingRuns, ...stuckRuns].map((r) => (
             <Link
               key={r.id}
               to={`/runs/${r.id}`}

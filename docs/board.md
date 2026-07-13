@@ -102,9 +102,11 @@ board before the state would ever go stale.
 
 ## Attention strip
 
-When any of your runs on this board is **awaiting approval**, a banner
-appears above the columns linking straight to it — a human is the blocker
-while a worker sits idle, so this is designed to be impossible to miss.
+When any of your runs on this board is **awaiting approval**, or the
+[run-health](./run-health.md) detector has flagged one as looking stuck, a
+banner appears above the columns naming both counts ("1 run needs approval ·
+2 runs look stuck") and linking straight to them — a human is the likely
+blocker, so this is designed to be impossible to miss.
 
 ## Opening an issue
 

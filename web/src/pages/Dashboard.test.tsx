@@ -36,6 +36,7 @@ const user = {
   is_admin: false,
   is_active: true,
   autopilot_enabled: false,
+  judge_enabled: false,
   created_at: "2026-01-01T00:00:00Z",
   last_login: null,
 };
@@ -60,6 +61,9 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,

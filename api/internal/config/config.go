@@ -123,6 +123,13 @@ type Config struct {
 	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
 	// connections get a report immediately.
 	PrivilegeCheckInterval time.Duration
+	// SelfimproveCheckInterval is how often the self-improvement engine WAKES to
+	// check whether a cycle is due (PRD #46 Decision 9). It is the tick cadence, NOT
+	// the improvement interval — "due" is the durable selfimprove_last_run_at +
+	// selfimprove_interval, checked each wake. Default 1h; 0 disables the engine
+	// entirely (no boot pass, no loop). A boot pass runs at start when enabled so a
+	// due cycle fires promptly after a restart instead of one cadence later.
+	SelfimproveCheckInterval time.Duration
 	// SeedEmail/SeedPassword/SeedName optionally provision an admin at startup.
 	// Empty SeedEmail disables seeding. Validated at boot (see Load).
 	SeedEmail    string
@@ -233,6 +240,12 @@ type Config struct {
 	ChatMaxTurns          int
 	ChatRateLimitMax      int
 	ChatRateLimitWindow   time.Duration
+	// JudgeRateLimit* is a dedicated per-user budget on the re-run-judge action (PRD
+	// #46 Decision 8): it mints a token-spending judge run, so it gets its OWN budget
+	// (same shape/defaults as chat) rather than sharing the chat limiter — neither
+	// action should consume the other's allowance.
+	JudgeRateLimitMax    int
+	JudgeRateLimitWindow time.Duration
 	// ProposalRateLimit* is the per-worker budget on the propose_issue endpoint
 	// (PRD #39 M3): a spam guard complementing the per-run pending-proposal cap, so a
 	// prompt-injected worker cannot mass-create proposals across its user's chats.
@@ -328,6 +341,7 @@ func Load() (Config, error) {
 	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)
+	cfg.SelfimproveCheckInterval = parseNonNegDuration("UZI_SELFIMPROVE_CHECK_INTERVAL", time.Hour)
 
 	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
@@ -350,6 +364,8 @@ func Load() (Config, error) {
 	cfg.ChatMaxTurns = parseInt("CHAT_MAX_TURNS", 50)
 	cfg.ChatRateLimitMax = parseInt("CHAT_RATE_LIMIT_MAX", 60)
 	cfg.ChatRateLimitWindow = parseDuration("CHAT_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.JudgeRateLimitMax = parseInt("JUDGE_RATE_LIMIT_MAX", 60)
+	cfg.JudgeRateLimitWindow = parseDuration("JUDGE_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalRateLimitMax = parseInt("PROPOSAL_RATE_LIMIT_MAX", 20)
 	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalConfirmStuckTimeout = parseDuration("PROPOSAL_CONFIRM_STUCK_TIMEOUT", 2*time.Minute)

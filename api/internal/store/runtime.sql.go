@@ -138,7 +138,10 @@ func (q *Queries) AdminUsageTotals(ctx context.Context) (AdminUsageTotalsRow, er
 }
 
 const cancelRunServerSide = `-- name: CancelRunServerSide :execrows
-UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE id = $1 AND user_id = $2
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -187,7 +190,10 @@ UPDATE runs SET
     status     = 'claimed',
     worker_id  = $1,
     claimed_at = now(),
-    updated_at = now()
+    updated_at = now(),
+    -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
+    -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
+    health = 'ok', health_reason = NULL, health_since = NULL
 WHERE id = (
     SELECT r.id FROM runs r
     WHERE r.user_id = $2
@@ -200,7 +206,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id
 `
 
 type ClaimRunParams struct {
@@ -259,6 +265,12 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.RepoAgents,
 		&i.Title,
 		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
 	)
 	return i, err
 }
@@ -347,6 +359,20 @@ func (q *Queries) ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]Cons
 	return items, nil
 }
 
+const countOnlineWorkersForUser = `-- name: CountOnlineWorkersForUser :one
+SELECT count(*) FROM workers WHERE user_id = $1 AND status = 'online'
+`
+
+// How many of a user's workers are online — the queued-run reason resolver uses it
+// to say "no worker is online" vs "waiting for a worker" (Decision 8). Only called
+// for a queued run already past its threshold, so it is off the hot path.
+func (q *Queries) CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersForUser, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countWorkerNonTerminalRuns = `-- name: CountWorkerNonTerminalRuns :one
 SELECT count(*) FROM runs
 WHERE worker_id = $1
@@ -426,7 +452,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
 VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id
 `
 
 type CreateRunParams struct {
@@ -501,6 +527,12 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.RepoAgents,
 		&i.Title,
 		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
 	)
 	return i, err
 }
@@ -645,7 +677,10 @@ func (q *Queries) DeleteWorkerForUser(ctx context.Context, arg DeleteWorkerForUs
 }
 
 const failRunsOfStaleWorkersOverCap = `-- name: FailRunsOfStaleWorkersOverCap :many
-UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= $2
   AND worker_id IN (
@@ -690,12 +725,16 @@ func (q *Queries) FailRunsOfStaleWorkersOverCap(ctx context.Context, arg FailRun
 	return items, nil
 }
 
-const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :execrows
+const failWorkerRunsOverCap = `-- name: FailWorkerRunsOverCap :many
 
-UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE worker_id = $2
   AND status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count >= $3
+RETURNING id
 `
 
 type FailWorkerRunsOverCapParams struct {
@@ -708,17 +747,31 @@ type FailWorkerRunsOverCapParams struct {
 // On register a worker declares a fresh start, so any run it still holds is
 // orphaned (its execution is gone). Over its re-queue budget → failed. failed →
 // origin restore, applied by the reconcile loop (register does no forge I/O), so
-// it stamps move_pending_since.
-func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) (int64, error) {
-	result, err := q.db.Exec(ctx, failWorkerRunsOverCap, arg.FailureReason, arg.WorkerID, arg.MaxRequeues)
+// it stamps move_pending_since. RETURNING id so the caller can funnel these
+// committed-terminal (worker-lost) runs into the judge (PRD #46 Decision 2), exactly
+// as the sweeper's FailRunsOfStaleWorkersOverCap does.
+func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, failWorkerRunsOverCap, arg.FailureReason, arg.WorkerID, arg.MaxRequeues)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected(), nil
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -766,12 +819,18 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.RepoAgents,
 		&i.Title,
 		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -821,6 +880,12 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.RepoAgents,
 		&i.Title,
 		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
 	)
 	return i, err
 }
@@ -880,7 +945,7 @@ SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.id = $1 AND r.user_id = $2
+WHERE r.id = $1 AND r.user_id = $2 AND r.kind <> 'judge'
 `
 
 type GetRunForWorkerUserParams struct {
@@ -909,6 +974,9 @@ type GetRunForWorkerUserRow struct {
 }
 
 // One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
+// judge runs are excluded here too (see ListRunsForWorkerUser): a chat agent asking
+// for a judge run's detail gets a 404, exactly like an unknown id. self_improve is
+// visible.
 func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUserParams) (GetRunForWorkerUserRow, error) {
 	row := q.db.QueryRow(ctx, getRunForWorkerUser, arg.ID, arg.UserID)
 	var i GetRunForWorkerUserRow
@@ -997,7 +1065,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -1048,6 +1116,12 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.RepoAgents,
 		&i.Title,
 		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
 	)
 	return i, err
 }
@@ -1224,13 +1298,15 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
-  AND r.kind <> 'chat'
+  -- Exclude chat AND judge (PRD #46): repo-less meta-runs the admin overview omits.
+  -- self_improve has a real repo and stays visible (same rationale as ListRunsForUser).
+  AND r.kind NOT IN ('chat', 'judge')
 ORDER BY r.created_at DESC
 LIMIT 500
 `
@@ -1292,9 +1368,81 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.RepoAgents,
 			&i.Run.Title,
 			&i.Run.ResumeOfRunID,
+			&i.Run.LastActivityAt,
+			&i.Run.Health,
+			&i.Run.HealthReason,
+			&i.Run.HealthSince,
+			&i.Run.HealthNotifiedAt,
+			&i.Run.TargetRunID,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
+
+SELECT id, user_id, status, auto_approve,
+       started_at, last_activity_at, updated_at,
+       health, health_reason, health_since, health_notified_at
+FROM runs
+WHERE status IN ('queued', 'running', 'awaiting_approval')
+  AND kind <> 'chat'
+`
+
+type ListActiveRunsForHealthRow struct {
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	Status           string             `json:"status"`
+	AutoApprove      bool               `json:"auto_approve"`
+	StartedAt        pgtype.Timestamptz `json:"started_at"`
+	LastActivityAt   pgtype.Timestamptz `json:"last_activity_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	Health           string             `json:"health"`
+	HealthReason     pgtype.Text        `json:"health_reason"`
+	HealthSince      pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt pgtype.Timestamptz `json:"health_notified_at"`
+}
+
+// Run health detector (PRD #47) ----------------------------------------------
+// Every run in a flaggable status (queued / running / awaiting_approval), for the
+// sweeper's per-tick health pass. 'claimed' is deliberately excluded (Decision 8:
+// a wedged checkout is already reclaimed by SweepClaimedNeverStarted at ClaimGrace,
+// tighter than any flag). Chat runs are excluded — they legitimately park between
+// turns and have their own idle machinery, so a health flag would be a false alarm.
+// The detector reads current health + reason to skip a no-op write (and its later
+// broadcast) when nothing changed, and health_since so it can PRESERVE the original
+// flag time when only the reason changes within the same enum (a queued run whose
+// reason flips no-worker → waiting must not reset the UI's "stuck for Xm").
+func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRunsForHealthRow, error) {
+	rows, err := q.db.Query(ctx, listActiveRunsForHealth)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveRunsForHealthRow{}
+	for rows.Next() {
+		var i ListActiveRunsForHealthRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.Status,
+			&i.AutoApprove,
+			&i.StartedAt,
+			&i.LastActivityAt,
+			&i.UpdatedAt,
+			&i.Health,
+			&i.HealthReason,
+			&i.HealthSince,
+			&i.HealthNotifiedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1556,8 +1704,53 @@ func (q *Queries) ListRunMessagesForWorkerPage(ctx context.Context, arg ListRunM
 	return items, nil
 }
 
+const listRunToolWindow = `-- name: ListRunToolWindow :many
+SELECT seq, kind, payload
+FROM run_messages
+WHERE run_id = $1 AND kind IN ('tool_use', 'tool_result')
+ORDER BY seq DESC
+LIMIT $2
+`
+
+type ListRunToolWindowParams struct {
+	RunID uuid.UUID `json:"run_id"`
+	Lim   int32     `json:"lim"`
+}
+
+type ListRunToolWindowRow struct {
+	Seq     int32  `json:"seq"`
+	Kind    string `json:"kind"`
+	Payload []byte `json:"payload"`
+}
+
+// The tail of a running run's tool activity for loop + in-flight detection
+// (Decisions 4 & 9), newest first over the existing (run_id, seq) unique index.
+// Both kinds are fetched in ONE query: tool_use rows feed the loop hash, and the
+// newest tool_use vs the tool_result tool_use_ids answers "is a tool call still in
+// flight?" (which suppresses the stalled signal). @lim is set well above the 12-wide
+// loop window so the fetch comfortably contains it plus the interleaved results.
+func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowParams) ([]ListRunToolWindowRow, error) {
+	rows, err := q.db.Query(ctx, listRunToolWindow, arg.RunID, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunToolWindowRow{}
+	for rows.Next() {
+		var i ListRunToolWindowRow
+		if err := rows.Scan(&i.Seq, &i.Kind, &i.Payload); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        ru.input_tokens          AS usage_input_tokens,
        ru.cache_read_tokens      AS usage_cache_read_tokens,
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
@@ -1568,7 +1761,11 @@ JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = $1
-  AND r.kind <> 'chat'
+  -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
+  -- list never shows. self_improve has a real repo and stays visible. The repos
+  -- INNER JOIN already drops the repo-less kinds; this predicate is the explicit,
+  -- refactor-proof guard (a future LEFT JOIN must not leak judge runs here).
+  AND r.kind NOT IN ('chat', 'judge')
   AND ($2::uuid IS NULL OR r.repo_id = $2)
   AND ($3::bigint IS NULL OR r.issue_iid = $3)
 ORDER BY r.created_at DESC
@@ -1649,6 +1846,12 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.RepoAgents,
 			&i.Run.Title,
 			&i.Run.ResumeOfRunID,
+			&i.Run.LastActivityAt,
+			&i.Run.Health,
+			&i.Run.HealthReason,
+			&i.Run.HealthSince,
+			&i.Run.HealthNotifiedAt,
+			&i.Run.TargetRunID,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.UsageInputTokens,
@@ -1674,7 +1877,7 @@ SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.user_id = $1
+WHERE r.user_id = $1 AND r.kind <> 'judge'
 ORDER BY r.created_at DESC
 LIMIT $2
 `
@@ -1705,7 +1908,13 @@ type ListRunsForWorkerUserRow struct {
 // lookup — a compromised worker still reads only its own user's runs, and a foreign
 // run id simply returns no row (404). repo_web_url rides along so the handler can
 // build the MR URL; a chat run has no repo, so repo fields are NULL (LEFT JOIN).
-// Compact list of the worker's user's runs, newest first, bounded by @lim.
+// Compact list of the worker's user's runs, newest first, bounded by @lim. The
+// chat agent's investigation surface (PRD #39 Decision 7). judge runs are hidden
+// (PRD #46, M1-review carry-forward): a judge is a repo-less internal retrospective
+// with no investigable task, same rationale as excluding it from the general run
+// lists (f55b37e). self_improve stays visible — it is real work with a repo + MR.
+// The judge WORKER reads its own run through the M3 judge-scoped trace path, not
+// this chat surface, so hiding judge here does not affect judging.
 func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWorkerUserParams) ([]ListRunsForWorkerUserRow, error) {
 	rows, err := q.db.Query(ctx, listRunsForWorkerUser, arg.UserID, arg.Lim)
 	if err != nil {
@@ -1826,6 +2035,8 @@ UPDATE runs SET
     failure_reason     = $1,
     move_pending_since = now(),
     finished_at        = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $2
   AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -1935,7 +2146,10 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 }
 
 const rejectRunServerSide = `-- name: RejectRunServerSide :execrows
-UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', stop_kind = 'plan_rejected', failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE id = $2 AND user_id = $3
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
@@ -1959,7 +2173,12 @@ func (q *Queries) RejectRunServerSide(ctx context.Context, arg RejectRunServerSi
 }
 
 const requeueClaimedRunToQueued = `-- name: RequeueClaimedRunToQueued :execrows
-UPDATE runs SET status = 'queued', updated_at = now()
+UPDATE runs SET status = 'queued',
+    -- Exit contract (PRD #47 Decision 3): mirrors SweepClaimedNeverStarted — a
+    -- 'claimed' run never carries a flag, so this is defensive, but it keeps every
+    -- claimed→queued path uniform.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE id = $1 AND status = 'claimed'
 `
 
@@ -1982,7 +2201,11 @@ func (q *Queries) RequeueClaimedRunToQueued(ctx context.Context, id uuid.UUID) (
 }
 
 const requeueRunsOfStaleWorkers = `-- name: RequeueRunsOfStaleWorkers :many
-UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
+UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
+    -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
+    -- detector re-evaluates the queued signal from this transition's updated_at.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count < $1
   AND worker_id IN (
@@ -2025,7 +2248,11 @@ func (q *Queries) RequeueRunsOfStaleWorkers(ctx context.Context, arg RequeueRuns
 }
 
 const requeueWorkerRuns = `-- name: RequeueWorkerRuns :execrows
-UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1, updated_at = now()
+UPDATE runs SET status = 'queued', requeue_count = requeue_count + 1,
+    -- Exit contract (PRD #47 Decision 3): reset on the way back to 'queued'; the
+    -- detector re-evaluates the queued signal from this transition's updated_at.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE worker_id = $1
   AND status IN ('claimed', 'running', 'awaiting_approval')
   AND requeue_count < $2
@@ -2112,6 +2339,10 @@ UPDATE runs SET
     status     = 'awaiting_approval',
     plan_md    = $1,
     session_id = COALESCE($2, session_id),
+    -- Exit contract (PRD #47 Decision 3): leaving 'running' clears any running-run
+    -- flag (stalled/looping/slow). The detector re-evaluates for approval_idle from
+    -- this transition's fresh updated_at; health_notified_at is preserved.
+    health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $3 AND worker_id = $4
   AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -2149,6 +2380,8 @@ UPDATE runs SET
     fix_verdict        = COALESCE($4, fix_verdict),
     move_pending_since = now(),
     finished_at        = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $5 AND worker_id = $6
   AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -2188,6 +2421,8 @@ UPDATE runs SET
     session_id         = COALESCE($2, session_id),
     move_pending_since = now(),
     finished_at        = now(),
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $3 AND worker_id = $4
   AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -2208,6 +2443,52 @@ func (q *Queries) SetRunFailed(ctx context.Context, arg SetRunFailedParams) (int
 		arg.SessionID,
 		arg.ID,
 		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setRunHealth = `-- name: SetRunHealth :execrows
+UPDATE runs SET
+    health             = $1,
+    health_reason      = $2,
+    health_since       = $3,
+    health_notified_at = COALESCE($4, health_notified_at)
+WHERE id = $5 AND status = $6
+`
+
+type SetRunHealthParams struct {
+	Health           string             `json:"health"`
+	HealthReason     pgtype.Text        `json:"health_reason"`
+	HealthSince      pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt pgtype.Timestamptz `json:"health_notified_at"`
+	ID               uuid.UUID          `json:"id"`
+	Status           string             `json:"status"`
+}
+
+// The detector's single writer of the health columns (Decision 3). Status-scoped
+// (@status is the status the detector read) so it no-ops if the run left that
+// status between the read and this write — that is what closes the sweeper-vs-worker
+// race (the worker's status write already cleared health via the exit contract; this
+// write then matches zero rows). It deliberately does NOT touch updated_at: the
+// queued and approval-idle age clocks read updated_at, so bumping it here would reset
+// the very signal being flagged.
+//
+// health_notified_at is the rolling last-nudge stamp (PRD #47 Decision 7): the
+// sweeper passes it non-NULL ONLY when it emits a nudge-worthy event, so the
+// COALESCE advances it then and preserves it otherwise. It is never cleared here
+// (nor by the exit contract), so it damps DM flapping across episodes and API
+// restarts. The detector remains the single writer of every health column.
+func (q *Queries) SetRunHealth(ctx context.Context, arg SetRunHealthParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunHealth,
+		arg.Health,
+		arg.HealthReason,
+		arg.HealthSince,
+		arg.HealthNotifiedAt,
+		arg.ID,
+		arg.Status,
 	)
 	if err != nil {
 		return 0, err
@@ -2249,6 +2530,15 @@ UPDATE runs SET
     repo_agents      = COALESCE($3::jsonb, repo_agents),
     agent_source     = COALESCE($4, agent_source),
     agent_exclusions = COALESCE($5::jsonb, agent_exclusions),
+    -- Exit contract (PRD #47 Decision 3), guarded so it fires only on ENTRY to
+    -- running. This statement is also the running→running heartbeat (idempotent),
+    -- and an unconditional reset would clear the detector's flag on every heartbeat;
+    -- the CASE keys off the pre-update status (Postgres evaluates SET RHS against
+    -- the old row), so a claimed/awaiting_approval → running transition resets the
+    -- flag while a running → running heartbeat preserves whatever the detector wrote.
+    health        = CASE WHEN status = 'running' THEN health        ELSE 'ok'  END,
+    health_reason = CASE WHEN status = 'running' THEN health_reason ELSE NULL END,
+    health_since  = CASE WHEN status = 'running' THEN health_since  ELSE NULL END,
     updated_at       = now()
 WHERE id = $6 AND worker_id = $7
   AND status NOT IN ('completed', 'failed', 'cancelled')
@@ -2297,7 +2587,11 @@ func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (i
 
 const sweepClaimedNeverStarted = `-- name: SweepClaimedNeverStarted :many
 
-UPDATE runs SET status = 'queued', updated_at = now()
+UPDATE runs SET status = 'queued',
+    -- Exit contract (PRD #47 Decision 3): reset on the way to a fresh 'queued'; the
+    -- detector re-evaluates the queued signal from this transition's updated_at.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE status = 'claimed' AND claimed_at < $1
 RETURNING id, user_id, status
 `
@@ -2334,7 +2628,10 @@ func (q *Queries) SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Ti
 }
 
 const sweepRunningTimeout = `-- name: SweepRunningTimeout :many
-UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(), updated_at = now()
+UPDATE runs SET status = 'failed', failure_reason = $1, move_pending_since = now(), finished_at = now(),
+    -- Exit contract (PRD #47 Decision 3): a timed-out run must not keep a stale ⚠.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
 WHERE status = 'running' AND started_at < $2 AND kind <> 'chat'
 RETURNING id, user_id, status
 `
@@ -2376,7 +2673,7 @@ func (q *Queries) SweepRunningTimeout(ctx context.Context, arg SweepRunningTimeo
 }
 
 const updateRunLastSeq = `-- name: UpdateRunLastSeq :execrows
-UPDATE runs SET last_seq = GREATEST(last_seq, $1)
+UPDATE runs SET last_seq = GREATEST(last_seq, $1), last_activity_at = now()
 WHERE id = $2
 `
 
@@ -2385,7 +2682,13 @@ type UpdateRunLastSeqParams struct {
 	ID  uuid.UUID `json:"id"`
 }
 
-// Advance the message high-water mark (never regresses).
+// Advance the message high-water mark (never regresses) AND bump last_activity_at
+// (PRD #47 Decision 2). AppendMessages calls this once per batch that carried a
+// genuinely new (higher-seq) message, so the activity marker rides the existing
+// write for free — no per-tick run_messages aggregate and no standalone
+// activity-bump endpoint. A pure-duplicate re-delivery skips this call (maxSeq not
+// advanced), so last_activity_at reflects real new activity, which is exactly what
+// the stalled signal wants.
 func (q *Queries) UpdateRunLastSeq(ctx context.Context, arg UpdateRunLastSeqParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateRunLastSeq, arg.Seq, arg.ID)
 	if err != nil {

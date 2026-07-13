@@ -5256,11 +5256,365 @@ and fact-check findings.
   only, length-capped, never refreshed — uzi lets users edit their own display name and won't
   fight the IdP), `sub`/`iss` → identity. Post-link email drift at the IdP is logged as a
   warning, not auto-applied (email is UNIQUE; auto-rename can collide — deferred).
+
+# PRD #47 — Loop/hang detection (flag slow/stalled/looping runs in UI + Slack)
+
+Serves human: Feature #47 — detect too-slow / stuck runs and flag them in the web UI
+and on Slack (plan.md line 68), as a non-terminal, self-clearing signal that never kills
+a run (user-ratified surface). Full decision log + review/audit trail:
+`prds/47-loop-hang-detection.md`. Migration landed as `00057_run_health.sql` (PRD draft
+said 00054; the live head had moved — renumber again if main moved at land). This section
+records the load-bearing AI decisions; the PRD carries the complete set (Decisions 1-11)
+with the review/audit findings folded in.
+
+## 202. Server-side detection in the sweeper — zero worker changes
+
+- Detection runs inside the existing 15s sweeper tick (`api/internal/sweeper`), computing
+  per-run signals from telemetry already in Postgres — the worker ships every agent block
+  to `run_messages` (tool name + input included). Worker-side loop detection rejected: it
+  dies with the worker, is blind to `queued`/`awaiting_approval`, and the worker is the
+  component we trust least to report its own sickness. (PRD Decision 1.)
+- `last_activity_at timestamptz` added to `runs`, bumped inside the existing
+  `AppendMessages` write path (behind its `runOwnedByWorker` check — no standalone
+  activity-bump endpoint), avoiding a per-tick `max(run_messages.created_at)` aggregate.
+  Backfilled from `updated_at`. The stalled cutoff uses
+  `now - GREATEST(last_activity_at, started_at)` so the pre-first-message checkout window
+  can't false-flag. (PRD Decision 2.)
+- The detector is a Go-driven per-run computation with ONE status-scoped `SetRunHealth`
+  writer per run, NOT Decision 11's literal per-signal SQL `UPDATE`s: priority ordering,
+  same-window in-flight suppression, self-clear, and queued reason-resolution all require
+  in-Go logic. Cost O(active runs)/tick; loop detection's `LIMIT 12` window fetch is the
+  only per-run extra, bounded by laptop-scale single-digit active runs; settings read
+  through the existing 5s cache. (PRD Decision 11 + session AI choice.)
+
+## 203. Health as self-clearing columns on runs — single writer + exit contract
+
+- Health is columns on `runs`: `health TEXT NOT NULL DEFAULT 'ok'`
+  (CHECK `ok|stalled|looping|slow|waiting_worker|approval_idle`), `health_reason`,
+  `health_since`, `health_notified_at`. Exactly one flag at a time, priority
+  `looping > stalled > slow` (looping is the strongest pathology evidence). Orthogonal to
+  `status`. An events/episodes table was rejected — history reconstructs from Slack threads
+  + run_message timestamps, and nothing queries past episodes. (PRD Decision 3.)
+- **Single writer**: only the sweeper detector writes the health columns while a run is in
+  a flaggable status. **Exit contract** (review blocker): every query that moves a run out
+  of a flaggable status resets `health='ok'`, `health_reason=NULL`, `health_since=NULL`.
+  Extended beyond Decision 3's named list to ALL 15 non-chat status-writing queries in
+  `runtime.sql` (reviewer pre-flag); `chat.sql` writers are deliberately excluded (chat
+  runs aren't detected). This closes the sweeper-vs-worker write race — the health write is
+  status-scoped (`WHERE status='running' AND …`) and no-ops after the exit, so whichever
+  write lands last leaves a consistent row. `health_notified_at` is NOT reset — it is a
+  rolling last-nudge stamp. (PRD Decision 3 + session AI choice.)
+- `SetRunRunning` uses a pre-update-status CASE (a running→running heartbeat preserves the
+  flag; any transition INTO running clears it atomically) instead of leaving the clear to
+  the next detector tick — closing a ≤15s stale-flag window. Queued/approval age is measured
+  from `runs.updated_at` (no `entered_status_at` column added); `SetRunHealth` never bumps
+  `updated_at`. (session AI choices.)
+
+## 204. Loop detection — transient hash of the last N tool calls, never surfaced
+
+- Per active `running` run the detector loads the last 12 `tool_use` rows
+  (`ORDER BY seq DESC LIMIT 12` on the existing `(run_id, seq)` index), hashes
+  `sha256(name + canonical-JSON(input))` in Go transiently, and flags `looping` at ≥4
+  identical hashes. Window and threshold are code constants, not settings. Neither the hash
+  nor any tool name/input/repo content ever enters `health_reason`, logs, or Slack —
+  run_messages are secret-scrubbed by the worker but NOT scrubbed of repo content, so all
+  reason strings are fixed templates. (PRD Decision 4, audit major.)
+- Accepted, documented misses: A/B-alternating loops need window fill; semantically-equal
+  but textually-different inputs aren't caught (LLM-judge territory, deferred); after a
+  requeue/resume, gapless `seq` keeps pre-requeue calls in the window, so a fresh resume can
+  re-flag briefly until distinct calls push them out. False-positive guard: legitimate
+  polling (e.g. `go test` between distinct edits) is broken up by interleaved distinct
+  hashes. (PRD Decision 4.)
+
+## 205. Stalled is suppressed while a tool call is in flight
+
+- `last_activity_at` advances only on new messages, and a long `go build` / test suite
+  emits one `tool_use` then silence until its `tool_result` — the worker's own idle watchdog
+  re-arms per message for exactly this reason. So if the newest message for a run is a
+  `tool_use` with no matching `tool_result`, the run is *working*, not stalled — no `stalled`
+  flag regardless of elapsed time (the wall-clock `slow` signal still covers a pathological
+  single call). Detected by comparing the newest `tool_use.id` against existing
+  `tool_result.tool_use_id` payloads in the same window fetch as loop detection — no extra
+  query. (PRD Decision 9, design major.)
+
+## 206. Thresholds as app_settings keys — two-layer validation, read-time clamp
+
+- Six runtime-tunable `app_settings` keys (PRD #19 pattern, no new env vars):
+  `health_enabled` (`"true"`), `health_stall_seconds` (300), `health_slow_seconds` (2700),
+  `health_queued_seconds` (600), `health_approval_seconds` (3600),
+  `health_nudge_cooldown_seconds` (1800). Admin Settings gains a "Run health" card.
+- Write-time validator (net-new, in the pure `Validate()`): value must be in
+  `{0} ∪ [60, 86400]` — `0` disables that signal; negatives, non-integers, 1-59, and >86400
+  are rejected (the upper bound stops a fat-fingered value from silently disabling a signal).
+  Read-time: the sweeper's accessor clamps `health_slow_seconds` to `< RUN_TIMEOUT` (env,
+  mutable across restarts and unavailable to the pure validator) and logs when it clamps.
+  (PRD Decision 5.)
+
+## 207. queued flagged-not-swept; claimed unflagged; approval_idle skips autopilot
+
+- `queued` stays unswept (no requeue) and gains only a flag; its `health_reason`
+  distinguishes what the server can see: "no worker online" (zero online workers) vs "owner
+  vault is locked" (most actionable) vs "waiting for worker". `claimed` deliberately gets no
+  flag — a wedged-but-heartbeating checkout is already requeued by `SweepClaimedNeverStarted`
+  at `ClaimGrace` (5m), tighter than any flag. `auto_approve` runs are excluded from
+  `approval_idle` — autopilot self-resolves its gate and must not nudge anyone to approve it.
+  Chat runs (`kind='chat'`) are excluded from detection entirely; `ci_fix` runs are included.
+  (PRD Decision 8 + session AI choice.)
+
+## 208. Health rides the run DTOs; health_reason owner-gated on the shared board
+
+- The board `latestRunDTO` reaches every authenticated viewer for every card, so
+  `health_reason` (which can say "owner vault is locked") is gated behind `IsMine`, exactly
+  like `failure_reason` (audit blocker); the `health` enum and `health_since` ride
+  unconditionally (non-sensitive, like `stop_kind`). The owner-scoped / admin `runDTO`
+  carries `health_reason` unconditionally, matching `failure_reason`. Web `LatestRun` gains
+  the three fields. Reason strings carry NO durations/counts (stricter than Decision 4); the
+  UI renders elapsed live from `health_since`. (PRD Decision 6 + session AI choice.)
+- UI surfaces (Decision 10's "four surfaces for free" claim was wrong — `runBadge` was
+  board-only in reality): board and run-view render the `runBadge` warn variant
+  `⚠ <label> · <elapsed>`; dashboard and runs-list get a shared `RunHealthBadge` that
+  AUGMENTS `StatusPill` (augment-not-replace), suppressed under `waitingForVault` on the runs
+  list. The board's awaiting-approval attention strip generalizes ("1 run needs approval ·
+  2 runs look stuck"). The run-view header shows `health_reason` (owner/admin) beside the
+  LIVE STAGE label. a11y: the attention strip and run-view health chip are polite live
+  regions (`role="status"`); admin validation errors are linked via `aria-describedby`.
+  (PRD Decision 10 + session AI choices.)
+
+## 209. Slack — dedicated PublishHealth seam, sweeper-owned cooldown stamp
+
+- The `Broadcaster` gains `PublishHealth(runID, health, reason, nudge)` — `PublishState`
+  carries only `status`, so a status-`running` publish is indistinguishable from a heartbeat
+  and health needs its own seam. The live hub maps it to a data-less WS "health" frame (type
+  only — no enum, no reason; browsers re-read via REST, which re-applies ownership gating).
+  Nudge-worthiness is judged detector-side; `health_notified_at` is stamped via COALESCE in
+  the same `SetRunHealth` write and never cleared (rolling stamp). (PRD Decision 7 + session
+  AI choices.)
+- Cooldown, not per-episode: a nudge fires on the ok→flagged transition only when
+  `health_notified_at` is NULL or older than `health_nudge_cooldown_seconds`; the stamp
+  persists across episodes and API restarts, which bounds restart duplicates and damps
+  flapping. Delivery is re-resolved per event through `GetSlackDeliveryForUser` (audit
+  major) — the persisted `slack_run_messages` anchor is never sufficient alone, so a user who
+  opts out mid-run gets nothing; `GetSlackRunContext` was extended to select the health
+  columns (the now-dead `r.health_reason` read was dropped — slacksvc renders from the event
+  payload + its own enum-keyed templates and never imports workersvc constants).
+  (PRD Decision 7 + session AI choice.)
+- Root create-or-edit for health goes through a separate `ensureRoot` helper reusing
+  `renderRoot` (escaping preserved); the root re-renders on every health TRANSITION (not
+  every tick) so the ⚠ clears without a nudge. Fixed templates only; every forge-controlled
+  field passes `EscapeMrkdwn` and the whole message passes `ScrubSecrets`; content is
+  minimized to the reason label (never run-message content — `PublishMessage` stays a no-op).
+  `approval_idle` nudges thread under the existing gate message so Approve/Reject are one
+  scroll away. (PRD Decision 7 + session AI choice.)
+
+## 210. Security posture — operability aid, not a guardrail
+
+- Health detection is early warning for honest-but-stuck agents. A hostile worker can
+  suppress `stalled` (emit junk messages) and evade `looping` (vary inputs); it cannot forge
+  health state (columns are sweeper-written server-side) nor touch another user's runs
+  (`AppendMessages` gates on run ownership). RUN_TIMEOUT / idle / iteration caps remain the
+  only liveness backstops and are unchanged by this PRD; the flag must never be leaned on as
+  a guarantee. (PRD Security posture.)
+
+## 211. As-built — docs placement, board.md fix, and e2e stall+loop verification (M5/M6)
+
+- Docs placement (session AI choice, overriding the PRD's literal "configuration.md"): the
+  `health_*` keys are documented in `docs/admin-settings.md` (the repo's env-vs-app-settings
+  split), cross-linked from `docs/configuration.md`, alongside a new user-facing
+  `docs/run-health.md` (what each flag means, what to do, how to tune, and the explicit "this
+  is not a guardrail" note) and a `docs/slack.md` nudge section; the stale attention-strip
+  description in `docs/board.md` was corrected to match the generalized strip. No CHANGELOG
+  (the repo has no such convention).
+- e2e (M6) drives the stub executor via sentinels `UZI_STUB_STALL` / `UZI_STUB_LOOP` /
+  `UZI_STUB_INFLIGHT` to force a stall and a loop and assert the flag appears, nudges once,
+  and clears. Slack DM delivery is NOT asserted end-to-end (no Slack fake in the harness) —
+  the nudge is asserted at the `health_notified_at` seam; the gap is documented in the
+  scenario comment. `./e2e/run-e2e.sh` green is the gate. (session AI choices.)
+
+# PRD #46 — Run retrospective (LLM judge) + self-improvement job
+
+## 212. Judge is a worker run kind, built as a delta on PRD #39's landed repo-less machinery (PRD #46 M1)
+
+- **The judge must spend the run owner's token, and only workers spend user tokens** (human.md: judge
+  runs on the owner's own Anthropic token) — `api/` has no Anthropic HTTP client, the token leaves the
+  vault only inside a claim. So the judge is a new `runs.kind = 'judge'`, a slim repo-less run (no clone,
+  no worktree, no push, no MR): the `JudgeRunner` fetches the trace, makes one model call, and posts
+  structured output. An API-side Anthropic client was rejected — new credential path, new egress, breaks
+  the "only workers spend user tokens" custody line.
+- **The repo-less-run relaxation was already landed by PRD #39 (chat), not introduced here** (correction
+  to PRD Decision 12's premise, implementation note 2): chat landed first at live head `00055` and, needing
+  the same shape, carried `runs.repo_id`/`issue_iid` DROP NOT NULL and the repo-less `runs_kind_shape`.
+  This PRD's M1 **extended** those constraints rather than introducing them: the `kind` CHECK grows
+  `judge`/`self_improve`; `runs_kind_shape` gains a judge arm (repo/issue NULL + `target_run_id` NOT NULL,
+  FK `ON DELETE CASCADE`, branch IS NULL) and a self_improve arm (issue-shaped, repo-ful). Migrations sit
+  (draft-numbered `00080`–`00083` on the branch) and landed at `00058`–`00061` (`00058` kinds+shape+indexes,
+  `00059` `run_reviews` + `review_recommendations`, `00060` `notifications`, `00061` `users.judge_enabled`),
+  contiguous above PRD #47's run-health head `00057` per the migration-numbering convention.
+- **Two partial unique indexes enforce cost/serialization at the DB, not just the app**
+  (`00058_run_judge_self_improve_kinds.sql:46,54`): `uq_runs_one_active_judge_per_target` (one non-terminal
+  judge per `target_run_id`) and `uq_runs_one_active_self_improve` (one non-terminal self_improve overall).
+  The `run_reviews` UNIQUE(target_run_id) alone would fire only *after* a duplicate judge had already spent
+  tokens (↳review N3); the partial index blocks the duplicate at enqueue. "Non-terminal" excludes
+  `completed`/`failed`/`cancelled`, so a re-judge is a deliberate action taken once the prior judge run is terminal.
+
+## 213. Command-not-found scan runs at claim assembly, not enqueue (PRD #46, implementation note 1)
+
+- **PRD Decision 4 placed the deterministic `command not found` scan at judge-run enqueue; it actually runs
+  at claim assembly** (`assembleJudgeClaim` → `judgeSignal` → `scanCommandNotFound`,
+  `api/internal/workersvc/judge.go:81,138,196`) — off the hot terminal-transition request path, on the worker
+  poll that assembles the claim. The signal rides the claim as a structured `JudgeSignal` (which tool, which
+  agent frame), and doubles as the deterministic fallback content when the LLM call fails, so the two
+  consumers (claim input + fallback) share one code path.
+- **Accepted trade-off** (session decision): a judge run that is never claimed (no worker online) yields no
+  deterministic findings — the scan only runs when a worker picks the run up, not when the run is created. The
+  scan reads the target's `tool_result` payloads, caps the bytes inspected, and the regex never decides
+  anything alone — it is an input signal the judge interprets. Serves human.md's "deterministic command-not-found
+  scan feeds the judge as an input signal."
+
+## 214. Judge claim lane forks before the repo join + PAT open — Anthropic-token-only, wire-asserted (PRD #46 M1/M3)
+
+- **`assembleClaim`'s unconditional bot-PAT open (`service.go`) is the wrong shape for a repo-less judge run.**
+  The judge lane forks in claim assembly **before** the runs→repos→forge_connections join and before the PAT
+  open: `assembleJudgeClaim` carries **only** the Anthropic token + `target_run_id` + judge model + the
+  command-not-found `JudgeSignal`. No `ForgePAT`, no forge-connection dependency. This honors least privilege
+  (a judge does no git) and keeps a judge from spuriously failing when the target's forge connection is gone
+  (audit H2). A wire assertion confirms no `forge_pat` is present on the judge claim.
+- **Trace fetch is a separate Bearer worker endpoint, not carried in the claim.** A trace can be megabytes
+  (`run_messages` + `plan_md` + steering log + roster snapshot), so the claim stays small and the worker pulls
+  the trace paginated through `GET /api/worker/runs/{id}/trace` (existing `ListRunMessagesAfter` replay shape).
+  The `JudgeRunner` compacts/samples the trace to a budget before the single structured-output model call
+  rather than shipping pathological 100k-message traces verbatim.
+
+## 215. Trace-endpoint authz is judge-run-scoped; review POST validates hard at ingest with atomic replace-on-re-judge (PRD #46 M3)
+
+- **The `GetRunOwnedByWorker` user-scoping pattern does not fit the trace endpoint** (audit H1): the worker owns
+  the *judge* run, but `{id}` is the *target*. Plain user-scoping was rejected — it would let any of a user's
+  workers stream any of their traces at will. `GET /api/worker/runs/{id}/trace` instead derives the target
+  server-side: the caller's worker must own a **non-terminal `kind='judge'`** run whose `target_run_id == {id}`,
+  and `target.user_id == judge.user_id` is re-asserted independently (the enqueue invariant is necessary but not
+  sufficient). Uniform 404s on any mismatch; the page/size budget is enforced server-side so a pathological run
+  can't be replayed wholesale (audit L2).
+- **The review POST (`POST /api/worker/runs/{id}/review`) treats worker input as attacker-suppliable** (the worker
+  is a user-controlled container): hard validation at ingest — category against the enum
+  (`enable_tool | install_worker_tool | adjust_template | improve_agent | add_agent | improve_uzi`), length caps +
+  control-char strip on target/rationale/summary (the `sanitizeSelfReported` pattern), and `ScrubSecrets` over free
+  text before persistence. Provenance (producing run + user) is stamped server-side, never from the body. Persist
+  is an **atomic CTE UPSERT** keyed on `run_reviews` UNIQUE(target_run_id) — replace-on-re-judge semantics, so a
+  second review does not 23505 against the unique row (↳review N3, audit M3). Persist-first-then-notify, same
+  ordering discipline as `run_messages`.
+
+## 216. Per-prompt CSPRNG nonce fences everywhere attacker-authorable text enters a prompt (PRD #46 M3/M5)
+
+- **Static untrusted-data fences are forgeable and were rejected** for this PRD's two attacker-authorable inputs:
+  a trace embedding a literal `</untrusted_trace>` (or a recommendation embedding `</untrusted_recommendations>`)
+  could close the fence and inject instructions. Both fences carry a **per-prompt nonce minted from a CSPRNG
+  *after* the untrusted content was captured** (`fenceNonce()`, `agent/src/prompt.ts:286`), so the closing
+  delimiter the attacker would need to emit is unpredictable at content-authoring time — the same pattern as the
+  ci_fix job-log fence.
+  - **Judge trace fence**: `<untrusted_trace_${nonce}>…</…>` around the compacted trace in the judge prompt
+    (`agent/src/judge-runner.ts:271`).
+  - **Self-improvement recommendations fence**: `<untrusted_recommendations_${nonce}>…</…>` around the
+    accumulated `improve_uzi` rows folded into the planning prompt (`agent/src/prompt.ts:224`; nonced in M5 review
+    fixup `d29f472`). The trusted directive ("pick one top thing") sits **outside** the fence; the recommendations
+    are data inside it, never instructions.
+
+## 217. Judge/self_improve run visibility + the two different Slack-suppression mechanisms (PRD #46 M4/M5)
+
+- **Judge runs are hidden from general run lists AND from the chat agent's run-read surface** via explicit kind
+  guards (refactor-proof rather than relying on the repo-less join failing) — a judge run is internal plumbing,
+  not user-facing run history (`a0c1147`). Self_improve runs stay **visible** (they are repo-ful, real runs on
+  the uzi repo with an inspectable plan).
+- **Both kinds' own state transitions are suppressed from the run-state Slack path, by two different mechanisms**
+  (implementation note 5): judge runs are structurally suppressed — `GetSlackRunContext`'s INNER JOIN on repos
+  returns `ErrNoRows` for a repo-less judge run before any suppression logic runs; self_improve runs are repo-ful
+  and would otherwise get a "run completed" DM, so they need an **explicit** `rc.Kind == "judge" || rc.Kind ==
+  "self_improve"` guard in `Notifier.handle` (`api/internal/slacksvc/notifier.go`). Judge/self_improve
+  notifications instead ride the new generic notifications inbox + a new notifier event variant (§218), not the
+  run-state DM path.
+
+## 218. Notifications inbox is generic (tenant #1 = judge); persist-first, bounded prune, scrub-at-producer (PRD #46 M2)
+
+- **No in-app notification store existed** (the WS hub is per-run; the activity feed is a per-run rendering of
+  `run_messages`). New `notifications` table (user_id, kind, payload jsonb, run/review refs, read_at) + REST
+  list/mark-read + a bell + inbox page. The inbox is **generic** — judge is tenant #1; self_improve reuses it.
+  Owner-or-admin scoping reuses the `GetRunForViewer` pattern: list is session-user-scoped, `?all=1` requires
+  admin (and includes the owner in each row), mark-read verifies row ownership even in the admin all-view
+  (audit M2).
+- **A persist-first notify seam**, and **pruning/cap ship with the table, not later** — every finished run of every
+  opted-in user writes here (audit M5): per-user cap `DefaultUserCap = 200` (`api/internal/notifysvc/service.go:30`)
+  enforced by an inline bounded prune on each insert (`PruneNotificationsForUser`, a bounded index read of the
+  newest `@keep` rows, not a full scan).
+- **Payload is verbatim-by-design with a scrub-at-producer contract**: the notifications layer stores the payload as
+  given; the *producer* is responsible for scrubbing. The judge producer (`buildReviewNotification`,
+  `api/internal/handler/judge_worker.go`) ships the verdict + a re-scrubbed 280-rune-capped summary preview + the
+  recommendation count and category list — recommendation `target`/`rationale` free text is **never** copied into the
+  notification; it stays on the run page behind the deep link (implementation note 4). Slack delivery of the same
+  payload is a **real notifier extension**, not a new string: the notifier was structurally run-state-only
+  (`stateEvent{runID,status}` → `GetSlackRunContext` → "run on repo#iid"), so a new event variant + render path was
+  required (↳review N6). Every judge free-text field passes `EscapeMrkdwn` + `ScrubSecrets` on the Slack leg too;
+  inbox + Slack both carry it, per the user decision.
+
+## 219. Re-run judge is owner-only, needs no per-user opt-in, behind a dedicated rate limiter (PRD #46 M4, implementation note 3)
+
+- **The per-user `users.judge_enabled` opt-in gates only the *automatic* judge** (the terminal-funnel enqueue,
+  §221). The owner-initiated "re-run judge" action does **not** additionally require that flag: an explicit,
+  owner-only click is itself the consent to spend that run's token. Still gated by the global kill-switch
+  (`judge_enabled` in `app_settings`), the owner having an Anthropic token, the target being terminal, and the
+  target kind being eligible.
+- **Re-run is owner-only, not viewer-or-admin**: an admin who can *view* another user's run gets **403** on re-run —
+  they cannot spend another user's token (audit H3). `PUT /api/me/judge` (the per-user opt-in toggle) flips only the
+  session user's flag — identity from the session, never the body. Re-run runs behind a **dedicated per-user rate
+  limiter** separate from the chat limiter: `JUDGE_RATE_LIMIT_MAX` (default 60) / `JUDGE_RATE_LIMIT_WINDOW`
+  (default 1m) (`api/internal/config/config.go:216,336`; `bec1c1b`).
+
+## 220. Self-improvement engine — privcheck-shaped ticker with durable due-tracking, fixed-branch MR reuse, fail-closed guard-path flagging (PRD #46 M5)
+
+- **A `selfimprove.Engine` cloned from the privilege-check sweep pattern** (`api/internal/selfimprove/engine.go`,
+  Boot + interval ticker, `0` disables, wired in `main.go`): on tick, if enabled and due, it creates the improvement
+  run. Unlike privcheck's idempotent sweep, a tick is NOT idempotent, so "due" is **durable** — a persisted
+  `selfimprove_last_run_at` setting, not an in-memory ticker that resets on API restart (↳review B3). The engine
+  Invalidates the settings cache after it writes. Settings live in `app_settings`: `selfimprove_enabled`,
+  `selfimprove_interval` (default 48h), `selfimprove_repo`, `selfimprove_last_run_at`, `selfimprove_user_id`. The
+  enabling admin is always the **authenticated session admin** (`selfimprove_user_id` never from the body, audit H3);
+  a narrow token accessor lets a general/instance token slot in later. A tick **skips with an inbox notification** (no
+  silent stall) when a self_improve run is still active (also DB-enforced, §212), the admin's vault is locked, or the
+  repo is disconnected / not owned by the enabling admin (↳review N5).
+- **The improvement run is a normal autonomous run against the uzi repo, guardrails intact.** Creation goes through a
+  **dedicated `CreateSelfImproveRun`** (shaped like `CreateCIFixRun`), not `createRun` — the normal path needs the
+  issue already in the poller cache carrying a PRD link, which a just-filed tracking issue lacks (↳review B2). The
+  tracking issue is filed/reused with a **non-trigger marker label** (never the PRD/autopilot trigger labels — else
+  the poller would enqueue a second `kind='issue'` autopilot run the kind-scoped index would not dedupe, ↳review N1).
+  Auto-approved (no plan gate), but `plan_md` is stored so the plan is inspectable and linked from the notification.
+  MR reuse is free: a fixed branch `uzi/self-improve` + the worker's idempotent `createMergeRequest` (never force-push)
+  extends an open self-improvement MR so every cycle is tested together.
+- **Merge/self-modification fences (audit C1) gate the merge and fence the input, preserving the autonomous run**:
+  recommendations enter the planning prompt only inside the nonce fence (§216) with the trusted directive outside; the
+  bot **structurally cannot merge** (Developer-only role + protected `main`, verified by the privilege-check sweep for
+  the self-improve connection); MRs touching **guard-critical paths** are flagged loudly for extra human review, with
+  the guard-path set **broadened to worker-side token-custody files** and **fail-CLOSED diff handling** (a diff that
+  can't be classified is treated as guard-touching, `5bbaeb6`); the MR carries **exit-status-only** test evidence
+  (`go test`/`npm test`/`npm run build` pass/fail, never stdout — with no CI, an autonomous MR must carry its own
+  proof).
+
+## 221. Enqueue eligibility is an allowlist; judged statuses are completed+failed only; enqueue fires at every committed terminal transition (PRD #46 M3)
+
+- **Judge enqueue is triggered on the *committed* terminal transition, not the best-effort notify goroutine**
+  (`runlifecycle` notify may drop events — fine for comments, not for deciding token spend, ↳review N2). Enqueue fires
+  at **every** committed terminal transition: worker-reported `SetState` (rows>0), the sweeper's terminal sweeps
+  (deliberately including timed-out / worker-lost runs — exactly the runs worth judging), server-side reject, and
+  register-time orphan-fail. When such a transition lands and (global toggle on + owner opted in + owner has an
+  Anthropic token), the API enqueues a `judge` run owned by the **same user** as the judged run — never cross-user.
+- **Eligibility is an explicit allowlist `{issue, ci_fix}`, never a denylist** — a future kind must opt in
+  deliberately, and `judge`/`self_improve` stay outside it (no recursion, no self-feeding loop; audit M4). Judged
+  statuses are **completed and failed only** — user-`cancelled` runs are never judged (the user aborted; don't spend,
+  ↳review N4). **Vault-locked is deliberately NOT an enqueue gate**: token *presence* is the gate, so a locked vault
+  holds the enqueued judge run `queued` (existing "waiting for vault unlock" semantics) rather than dropping it — it
+  runs once the vault unlocks.
+
 # PRD #40 — Token usage & cost reporting (per run / per user / factory-wide)
 
 Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisions:
 
-## 202. Result-frame usage is CUMULATIVE-across-resume (M1 verdict b)
+## 222. Result-frame usage is CUMULATIVE-across-resume (M1 verdict b)
 
 - **Decision (PROVISIONAL, no live run available; evidence decompiled from the exact shipping CLI
   the SDK spawns).** Each phase is its own `query()` invocation resuming the prior session; the
@@ -5273,9 +5627,9 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   same cumulative frames, so both are pinned by this verdict (below). A live two-phase run crossing a
   requeue boundary is the deferred firm-up (M6 residual).
 
-## 203. run_usage snapshot table + greatest-wins rollup centralized in a VIEW
+## 223. run_usage snapshot table + greatest-wins rollup centralized in a VIEW
 
-- **Storage** (`00056_run_usage.sql`): `run_usage(run_id FK ON DELETE CASCADE, session_id, model,
+- **Storage** (`00062_run_usage.sql`): `run_usage(run_id FK ON DELETE CASCADE, session_id, model,
   input/cache_read/cache_creation/output bigint, cost_usd numeric(12,6), updated_at, PK(run_id,
   session_id, model))`, multica's `task_usage` prior art. The fold is server-side in
   `workersvc.AppendMessages` on EVERY delivered result frame (incl. seq-deduped replays), so
@@ -5287,13 +5641,13 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   default (every work run spends the user's tokens, so "every run shows tokens" is the default).
 - **The merge is GREATEST per column, not plain EXCLUDED** — under verdict b a stable session_id can
   see two cumulative snapshots hit one key, so overwrite would let a crash-retry regress the row.
-- **Every rollup reads a `run_usage_totals` VIEW** (`00057`) that computes `MAX` per `(run_id, model)`
+- **Every rollup reads a `run_usage_totals` VIEW** (`00063`) that computes `MAX` per `(run_id, model)`
   then `SUM` across models — the verdict-b rule in ONE place so run list/detail totals, `/api/usage`
   (self, session-authed), and `/api/admin/usage` (RequireAdmin, factory + per-user) can't drift to a
   plain SUM (which would multiply the snapshots when session_id evolves). Pre-feature runs have no
   rows → usage is absent, never a fabricated 0.
 
-## 204. Per-agent attribution is client-derived per-call usage — a different data path
+## 224. Per-agent attribution is client-derived per-call usage — a different data path
 
 - The worker attaches each assistant frame's PER-CALL `message.usage` (BetaUsage, nullable cache
   fields) to exactly one emitted message that survives the executor's signal filter (Decision 11) —
@@ -5302,7 +5656,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   double-count refusal-fallback `supersedes` pairs — footnoted "attributed; may not sum to the run
   total", tokens only.
 
-## 205. Client surfaces derive from the stream; one shared formatter; strip vs list-row can diverge
+## 225. Client surfaces derive from the stream; one shared formatter; strip vs list-row can diverge
 
 - The run view derives its usage strip, per-phase table (DELTAS between consecutive cumulative
   frames, clamped ≥0), per-agent table, and finish-line tokens from the replayed message stream
@@ -5316,7 +5670,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   monotonic case; a requeue reset can make them legitimately differ (client keeps both legs clamped,
   server greatest-wins takes the higher).
 
-## 206. M6 — the isolated e2e stub stands in for the SDK's usage frames
+## 226. M6 — the isolated e2e stub stands in for the SDK's usage frames
 
 - The stub executor (`agent/src/executor.ts`) emits a synthetic per-agent `coder` message with
   per-call usage + a terminal `result` frame with fixed cumulative usage/modelUsage on every run (no
@@ -5325,7 +5679,7 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   the three surfaces M4 renders. Live-credential firm-up (verdict b + strip==list-row across a
   requeue boundary) is the recorded residual.
 
-## 207. M3 read-API shape — window, counts, placement, and the self-reported-trust caveat
+## 227. M3 read-API shape — window, counts, placement, and the self-reported-trust caveat
 
 - **7-day window keys on `runs.created_at`, not a per-message timestamp** — at laptop scale a run's
   creation time is close enough to when it spent, and `run_usage` has only `updated_at` (last fold),
@@ -5346,4 +5700,4 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
 - **Every figure is worker-self-reported — a reporting surface, not an authorization one.** The fold
   trusts the frame's `modelUsage`, so the run/self/factory/per-user rollups (incl. the admin endpoint)
   inherit that trust: a compromised worker can misreport its own runs' spend. This is accounting, not
-  authz — not a basis for billing or enforcement (§205/Decision 8 already frame cost as an estimate).
+  authz — not a basis for billing or enforcement (§225/Decision 8 already frame cost as an estimate).
