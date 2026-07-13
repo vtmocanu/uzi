@@ -139,6 +139,15 @@ Open **Settings → Notifications**:
   running, completed) are never DM'd on their own — only the review-ready /
   cycle-started / cycle-skipped messages above, so you don't get noise like
   "judge run completed" for a run you never see on the board.
+- **Run health nudges**: if a run you own gets flagged (stalled, looping,
+  slow, waiting for a worker, or stuck too long awaiting approval — see
+  [Run health](./run-health.md)), its root status label picks up a `· ⚠
+  <flag>` suffix, and you get one threaded nudge — at most once per cooldown
+  window (30 minutes by default, admin-tunable) even if the run flaps
+  between flags in that time. An approval-idle nudge threads under the
+  existing plan-gate message, right next to the Approve/Reject buttons.
+  When the run recovers, the root label reverts on its own and nudging
+  stops — no action needed.
 
 ## Good to know
 
@@ -160,3 +169,6 @@ Open **Settings → Notifications**:
   workspace member.
 - Slack outages or a dropped socket never affect a run — notifications are
   best-effort and the web UI stays the source of truth throughout.
+- Run health nudges follow the same delivery rules as every other
+  notification: they need Slack enabled and your account linked, and
+  turning your notify toggle off stops them immediately, mid-run included.

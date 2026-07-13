@@ -19,7 +19,7 @@
 
 -- target_run_id: the run a judge run reviews (Decision 1). Self-referential FK,
 -- ON DELETE CASCADE — deleting the reviewed run takes its judge run (and, via
--- run_reviews' own cascade in 00058, its review) with it (Decision 8). NULL for
+-- run_reviews' own cascade in 00059, its review) with it (Decision 8). NULL for
 -- every non-judge kind; the shape CHECK below pins it NOT NULL for judge.
 ALTER TABLE runs ADD COLUMN target_run_id uuid REFERENCES runs (id) ON DELETE CASCADE;
 

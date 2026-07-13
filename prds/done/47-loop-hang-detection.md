@@ -1,7 +1,7 @@
 # PRD #47: Loop/hang detection — flag slow, stalled, or looping runs in UI and Slack
 
 **GitLab Issue**: [#47](https://gitlab.example.com/vtmocanu/uzi/-/issues/47)
-**Status**: Draft — reviewed 2026-07-12 by 3 agents (design, security, fact-check); all blocking/major findings folded in below (marked ↳review where the design changed). Fact-check: 24/25 claims verified; the one miss (migration-number wording) fixed.
+**Status**: Complete — merged 2026-07-13 via MR !46 (all 6 milestones; 4 review waves + audit + web-ux + fact-check clean)
 **Priority**: High (plan.md line 68)
 **Created**: 2026-07-12
 **Depends on**: PRD #4 (runs/sweeper), PRD #19 (app_settings), PRD #25 (Slack) — all done
@@ -229,7 +229,7 @@ idle / iteration caps remain the only liveness backstops.
 
 ## Milestones
 
-- [ ] **M1 — Schema + detector core**: migration (`last_activity_at`, `health`,
+- [x] **M1 — Schema + detector core** (9f97e38, +follow-up 4abe70c; reviewed+audited clean): migration (`last_activity_at`, `health`,
   `health_reason`, `health_since`, `health_notified_at`), `AppendMessages` bump,
   sweeper detector for stalled (with in-flight suppression)/slow/queued/approval
   signals + self-clear, **exit-transition resets in every status-leaving query**
@@ -237,16 +237,16 @@ idle / iteration caps remain the only liveness backstops.
   blocking), settings keys with the `{0} ∪ [60, 86400]` validator + read-time
   RUN_TIMEOUT clamp, unit tests (clear-on-resume, threshold-disable, exit-race,
   auto_approve exclusion).
-- [ ] **M2 — Loop detection**: tool_use window hashing, in-flight detection from
+- [x] **M2 — Loop detection** (22b7b8f; reviewed+audited clean): tool_use window hashing, in-flight detection from
   the same window, priority ordering, tests with real-shaped payload fixtures
   (identical inputs, A/B alternation, interleaved-distinct false-positive,
   resume-boundary re-flag).
-- [ ] **M3 — API + web**: health fields in run DTOs with **board `health_reason`
+- [x] **M3 — API + web** (77c6bcd + 4abe70c + bc83815; reviewed+audited clean, web-ux browser-validated on an isolated stack — dashboard/runs-list coverage added via shared RunHealthBadge beyond the runBadge-only plan): health fields in run DTOs with **board `health_reason`
   gated behind `IsMine`** (audit blocking), `PublishHealth` on the broadcaster +
   live-hub WS mapping; `runBadge` warn variant, board strip generalization,
   run-view reason, admin settings "Run health" card; vitest coverage incl. a
   non-owner-sees-no-reason test.
-- [ ] **M4 — Slack nudges**: `PublishHealth` handling in the notifier — root-label
+- [x] **M4 — Slack nudges** (8169434; reviewed+audited clean — nudge-worthiness judged detector-side, stamped via COALESCE in the same SetRunHealth write): `PublishHealth` handling in the notifier — root-label
   flip + cooldown-gated threaded nudge + clear edit, per-event
   `GetSlackDeliveryForUser` re-resolution, `EscapeMrkdwn` + `ScrubSecrets` on all
   new strings, approval-idle threading under the gate message; tests for opt-out

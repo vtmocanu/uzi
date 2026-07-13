@@ -10,6 +10,7 @@ import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type RunListItem } from "../lib/api";
 import { mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
+import { RunHealthBadge } from "../components/RunHealthBadge";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
@@ -255,6 +256,7 @@ export function Dashboard() {
                       iter {r.iteration_count}
                     </Badge>
                   )}
+                  <RunHealthBadge run={r} />
                   <StatusPill status={r.status} />
                 </Link>
               </li>

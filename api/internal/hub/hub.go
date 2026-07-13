@@ -25,10 +25,11 @@ import (
 const subBuffer = 256
 
 // Event is one WS frame. "message" carries a persisted run message (the client
-// renders it directly, deduped by seq); "state" signals a run state change (the
-// client re-reads the run over REST — WS never carries authoritative run state).
+// renders it directly, deduped by seq); "state" signals a run state change and
+// "health" a run-health flag change (PRD #47) — for both the client re-reads the run
+// over REST, since WS never carries authoritative run state.
 type Event struct {
-	Type      string          `json:"type"` // "message" | "state"
+	Type      string          `json:"type"` // "message" | "state" | "health"
 	Seq       int32           `json:"seq,omitempty"`
 	Kind      string          `json:"kind,omitempty"`
 	Agent     *string         `json:"agent,omitempty"`
@@ -106,6 +107,16 @@ func (h *Hub) PublishMessage(runID uuid.UUID, seq int32, kind, agent string, pay
 // PublishState signals a run state change to its subscribers.
 func (h *Hub) PublishState(runID uuid.UUID, status string) {
 	h.broadcast(runID, Event{Type: "state", Status: status})
+}
+
+// PublishHealth signals a run-health flag change (PRD #47) to its subscribers. Like
+// a "state" frame it carries NO authoritative data — the browser re-reads the run
+// over REST, which applies the owner-gating on health_reason, so the flag reason
+// never rides the socket. The health/reason/nudge args are part of the shared
+// Broadcaster contract (the Slack notifier consumes them); the hub needs only to
+// prompt the repaint, so it ignores them.
+func (h *Hub) PublishHealth(runID uuid.UUID, health, reason string, nudge bool) {
+	h.broadcast(runID, Event{Type: "health"})
 }
 
 // broadcast marshals ev once and sends it to every subscriber of runID,

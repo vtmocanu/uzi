@@ -4,7 +4,10 @@ import {
   canOpenRunView,
   formatElapsed,
   hasActiveRun,
+  healthBadge,
+  healthFlagLabel,
   isAwaitingApproval,
+  isHealthFlaggableStatus,
   isStoppedRun,
   mrChipState,
   mrChipSuffix,
@@ -12,6 +15,7 @@ import {
   retryHint,
   runBadge,
   runStatusTone,
+  shouldShowHealthFlag,
 } from "./runBadge";
 import type { LatestRun, RunStatus } from "./api";
 
@@ -24,6 +28,9 @@ function run(over: Partial<LatestRun> = {}): LatestRun {
     mr_state: null,
     failure_reason: null,
     stop_kind: null,
+    health: "ok",
+    health_reason: null,
+    health_since: null,
     owner_name: "Vlad",
     worker_name: null,
     is_mine: true,
@@ -119,6 +126,69 @@ describe("runBadge taxonomy", () => {
       mrIid: 42,
       mrState: "open",
     });
+  });
+});
+
+describe("runBadge health warn variant (PRD #47)", () => {
+  // health_since is 1m before NOW; created_at is 4m before. The badge must count
+  // from health_since ("stuck for Xm"), not created_at.
+  const flagged = (over: Partial<LatestRun> = {}) =>
+    run({ status: "running", health: "stalled", health_since: "2026-07-04T12:03:00Z", ...over });
+
+  it("a flagged running run renders ⚠ <label> · <elapsed> in the warn tone, keeping the pulse", () => {
+    expect(runBadge(flagged({ health_reason: "the agent stopped sending updates" }), NOW)).toEqual({
+      kind: "badge",
+      label: "⚠ stalled · 1m",
+      tone: "warning",
+      pulse: true,
+      title: "the agent stopped sending updates",
+    });
+  });
+
+  it("elapsed counts from health_since, not created_at", () => {
+    // created_at 4m ago, health_since 1m ago → 1m, proving the source.
+    const b = runBadge(flagged(), NOW);
+    expect(b).toMatchObject({ label: "⚠ stalled · 1m" });
+  });
+
+  it("a non-owner (health_reason null) gets no tooltip", () => {
+    const b = healthBadge(flagged({ health_reason: null }), NOW);
+    if (b?.kind !== "badge") throw new Error("expected a badge");
+    expect(b.title).toBeUndefined();
+  });
+
+  it("labels every flag", () => {
+    expect(healthFlagLabel("stalled")).toBe("stalled");
+    expect(healthFlagLabel("looping")).toBe("looping");
+    expect(healthFlagLabel("slow")).toBe("slow");
+    expect(healthFlagLabel("waiting_worker")).toBe("waiting for worker");
+    expect(healthFlagLabel("approval_idle")).toBe("needs approval");
+    expect(healthFlagLabel("ok")).toBeNull();
+  });
+
+  it("a healthy run keeps its normal status badge (no ⚠)", () => {
+    const b = runBadge(run({ status: "running", health: "ok" }), NOW);
+    expect(b).toMatchObject({ label: "running 4m", tone: "info" });
+  });
+
+  it("belt-and-braces: a terminal run never shows a stale flag", () => {
+    // A completed run carrying a leftover flag must still render its completed/MR
+    // badge, never ⚠ — the warn variant fires only for a flaggable status.
+    expect(isHealthFlaggableStatus("completed")).toBe(false);
+    expect(healthBadge(run({ status: "completed", health: "stalled", mr_iid: 9 }), NOW)).toBeNull();
+    expect(runBadge(run({ status: "completed", health: "stalled", mr_iid: 9 }), NOW)).toEqual({
+      kind: "mr",
+      mrIid: 9,
+      mrState: "open",
+    });
+  });
+
+  it("shouldShowHealthFlag gates on both a non-ok flag and a flaggable status", () => {
+    expect(shouldShowHealthFlag("stalled", "running")).toBe(true);
+    expect(shouldShowHealthFlag("ok", "running")).toBe(false);
+    expect(shouldShowHealthFlag("stalled", "completed")).toBe(false);
+    expect(shouldShowHealthFlag("waiting_worker", "queued")).toBe(true);
+    expect(shouldShowHealthFlag("approval_idle", "awaiting_approval")).toBe(true);
   });
 });
 

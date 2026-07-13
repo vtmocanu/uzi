@@ -84,6 +84,7 @@ type Notifier struct {
 	// (they are not run-state transitions and a judge run is repo-less), so they
 	// share none of the state path's run/repo rendering.
 	notifyCh chan notifyEvent
+	healthCh chan healthEvent
 }
 
 type stateEvent struct {
@@ -101,6 +102,16 @@ type notifyEvent struct {
 	link   string
 }
 
+// healthEvent is a run-health flag change (PRD #47 M4). nudge is set only when the
+// sweeper judged the event nudge-worthy and already stamped health_notified_at, so
+// the notifier threads exactly one DM; otherwise it only re-renders the root.
+type healthEvent struct {
+	runID  uuid.UUID
+	health string
+	reason string
+	nudge  bool
+}
+
 // NewNotifier builds a Notifier. baseURL supplies the public base URL for deep
 // links (settings.PublicBaseURL). Call Run in a goroutine.
 func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (string, error), logger *slog.Logger) *Notifier {
@@ -114,6 +125,7 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 		logger:   logger,
 		ch:       make(chan stateEvent, notifierQueue),
 		notifyCh: make(chan notifyEvent, notifierQueue),
+		healthCh: make(chan healthEvent, notifierQueue),
 	}
 }
 
@@ -143,6 +155,19 @@ func (n *Notifier) PublishState(runID uuid.UUID, status string) {
 // (content minimization — only status/title/links do).
 func (n *Notifier) PublishMessage(uuid.UUID, int32, string, string, []byte, time.Time) {}
 
+// PublishHealth implements workersvc.Broadcaster for the run-health flag (PRD #47).
+// Like PublishState it MUST NOT block: it enqueues and returns, dropping the event
+// if the queue is full (Slack is strictly best-effort). The drain goroutine
+// re-renders the run's root (⚠ flip on flag, back on clear) and, when nudge is set,
+// threads one cooldown-gated DM.
+func (n *Notifier) PublishHealth(runID uuid.UUID, health, reason string, nudge bool) {
+	select {
+	case n.healthCh <- healthEvent{runID: runID, health: health, reason: reason, nudge: nudge}:
+	default:
+		n.logger.Warn("slack: notifier queue full, dropping health event", "run", runID.String(), "health", health)
+	}
+}
+
 // Run drains the queue until ctx is cancelled. Wire it into the background
 // WaitGroup alongside the socket manager.
 func (n *Notifier) Run(ctx context.Context) {
@@ -154,6 +179,8 @@ func (n *Notifier) Run(ctx context.Context) {
 			n.handle(ctx, ev)
 		case ev := <-n.notifyCh:
 			n.handleNotify(ctx, ev)
+		case hev := <-n.healthCh:
+			n.handleHealth(ctx, hev)
 		}
 	}
 }
@@ -338,6 +365,99 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 	}
 }
 
+// handleHealth processes one run-health event (PRD #47 M4): re-render the run's root
+// (⚠ flip on a flag, back on clear) and, when the sweeper marked the event
+// nudge-worthy, thread exactly one DM. Delivery is re-resolved per event
+// (GetSlackDeliveryForUser), so an owner who opted out mid-run gets nothing — the
+// persisted anchor is never sufficient on its own (Decision 7). Every failure path
+// logs redacted and returns; a run is never affected.
+func (n *Notifier) handleHealth(ctx context.Context, ev healthEvent) {
+	rc, err := n.store.GetSlackRunContext(ctx, ev.runID)
+	if err != nil {
+		// A chat run has no repo → ErrNoRows (as in handle); chat runs are never
+		// health-flagged anyway. Skip silently; only a real error is logged.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			n.logf("load run context (health)", err)
+		}
+		return
+	}
+	target, err := n.store.GetSlackDeliveryForUser(ctx, rc.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return // unlinked, opted out mid-run, or unconfirmed → drop silently
+	}
+	if err != nil {
+		n.logf("resolve delivery target (health)", err)
+		return
+	}
+	if !target.Valid || target.String == "" {
+		return
+	}
+
+	channel, err := n.poster.OpenDM(ctx, target.String)
+	if err != nil {
+		n.logf("open dm (health)", err)
+		return
+	}
+	base, _ := n.baseURL(ctx)
+
+	// Re-render the root so the ⚠ label reflects the current flag (create it if a
+	// stuck queued run never got a state DM). renderRoot carries the flag via
+	// healthSuffix, keyed off the run context's current health.
+	anchor, ok := n.ensureRoot(ctx, rc, channel, base)
+	if !ok {
+		return
+	}
+
+	if !ev.nudge {
+		return
+	}
+	// One threaded nudge. approval_idle threads under the open gate message so the
+	// Approve / Reject buttons are one scroll away (Decision 7); every other flag
+	// threads under the root. The reason is server-authored; the whole message still
+	// passes ScrubSecrets as a last line of defense.
+	threadTS := anchor.RootTs
+	if ev.health == healthApprovalIdle && anchor.GateTs.Valid && anchor.GateTs.String != "" {
+		threadTS = anchor.GateTs.String
+	}
+	if _, perr := n.poster.Post(ctx, channel, threadTS, ScrubSecrets(healthNudgeText(ev.health, ev.reason, base, rc.ID))); perr != nil {
+		n.logf("post health nudge", perr)
+	}
+}
+
+// ensureRoot returns the run's DM anchor, posting the root message when none exists
+// yet (a stuck queued run that never sent a state DM still reaches its owner) or
+// editing the existing one to the current health-aware render. ok is false on an
+// unrecoverable error. It is the health path's counterpart to handle's inline anchor
+// flow (which also threads terminal outcome events, so the two are not merged).
+func (n *Notifier) ensureRoot(ctx context.Context, rc store.GetSlackRunContextRow, channel, base string) (store.SlackRunMessage, bool) {
+	root := ScrubSecrets(renderRoot(rc, base))
+	existing, err := n.store.GetSlackRunMessage(ctx, rc.ID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		ts, perr := n.poster.Post(ctx, channel, "", root)
+		if perr != nil {
+			n.logf("post root (health)", perr)
+			return store.SlackRunMessage{}, false
+		}
+		saved, uerr := n.store.UpsertSlackRunMessage(ctx, store.UpsertSlackRunMessageParams{
+			RunID: rc.ID, ChannelID: channel, RootTs: ts,
+		})
+		if uerr != nil {
+			n.logf("record anchor (health)", uerr)
+			return store.SlackRunMessage{RunID: rc.ID, ChannelID: channel, RootTs: ts}, true
+		}
+		return saved, true
+	case err != nil:
+		n.logf("load anchor (health)", err)
+		return store.SlackRunMessage{}, false
+	default:
+		if uerr := n.poster.Update(ctx, existing.ChannelID, existing.RootTs, root); uerr != nil {
+			n.logf("update root (health)", uerr)
+		}
+		return existing, true
+	}
+}
+
 func (n *Notifier) logf(what string, err error) {
 	n.logger.Warn("slack notifier: "+what+" failed (best-effort)", "error", Redact(err.Error()))
 }
@@ -348,8 +468,8 @@ func (n *Notifier) logf(what string, err error) {
 // they cannot inject a spoofed <url|label> link or a <@Uxxx> mention into the DM;
 // the deep-link markup below stays raw (its base is operator-set, its id a uuid).
 func renderRoot(rc store.GetSlackRunContextRow, base string) string {
-	head := fmt.Sprintf("[uzi] run on %s#%d «%s» — %s",
-		EscapeMrkdwn(rc.PathWithNamespace), iid(rc.IssueIid), EscapeMrkdwn(rc.IssueTitle), statusLabel(rc))
+	head := fmt.Sprintf("[uzi] run on %s#%d «%s» — %s%s",
+		EscapeMrkdwn(rc.PathWithNamespace), iid(rc.IssueIid), EscapeMrkdwn(rc.IssueTitle), statusLabel(rc), healthSuffix(rc))
 	if link := runLink(base, rc.ID); link != "" {
 		head += "\n" + link
 	}

@@ -16,6 +16,7 @@ import { MrChip } from "../components/MrChip";
 import { isStoppedRun, mrChipState } from "../lib/runBadge";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
+import { RunHealthBadge } from "../components/RunHealthBadge";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
 
@@ -75,7 +76,12 @@ function RunRow({
               <span aria-hidden="true">🔒</span> waiting for vault unlock
             </Badge>
           ) : (
-            <StatusPill status={pillStatus} />
+            <>
+              {/* The health flag (PRD #47) sits beside the status pill; hidden here
+                  when waitingForVault already explains a locked queued run. */}
+              <RunHealthBadge run={run} />
+              <StatusPill status={pillStatus} />
+            </>
           )}
         </div>
       </Link>

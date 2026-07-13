@@ -421,3 +421,138 @@ func TestNotifierScrubsSecretsOutbound(t *testing.T) {
 		t.Errorf("outbound text leaked a token: %q", fp.posts[0].text)
 	}
 }
+
+// ── Run-health nudges (PRD #47 M4) ───────────────────────────────────────────
+
+// healthRun is baseRun with a health flag set, for the handleHealth tests.
+func healthRun(status, health string) store.GetSlackRunContextRow {
+	rc := baseRun(status)
+	rc.Health = health
+	return rc
+}
+
+func TestNotifierHealthFlipsRootNoNudge(t *testing.T) {
+	rc := healthRun("running", "stalled")
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "stalled", reason: "the agent stopped sending updates", nudge: false})
+
+	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "⚠ stalled") {
+		t.Fatalf("root not flipped to ⚠ stalled: %+v", fp.updates)
+	}
+	if len(fp.posts) != 0 {
+		t.Fatalf("a non-nudge event must not thread a DM: %+v", fp.posts)
+	}
+}
+
+func TestNotifierHealthClearEditsRootBack(t *testing.T) {
+	rc := healthRun("running", "ok")
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "ok", reason: "", nudge: false})
+
+	if len(fp.updates) != 1 || strings.Contains(fp.updates[0].text, "⚠") {
+		t.Fatalf("root should be edited back without ⚠: %+v", fp.updates)
+	}
+	if len(fp.posts) != 0 {
+		t.Fatalf("a clear must not thread a DM: %+v", fp.posts)
+	}
+}
+
+func TestNotifierHealthNudgeThreadsUnderRoot(t *testing.T) {
+	rc := healthRun("running", "stalled")
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "stalled", reason: "the agent stopped sending updates", nudge: true})
+
+	if len(fp.updates) != 1 {
+		t.Fatalf("root should also be re-rendered: %+v", fp.updates)
+	}
+	if len(fp.posts) != 1 || fp.posts[0].thread != "ts1" {
+		t.Fatalf("nudge not threaded under the root ts1: %+v", fp.posts)
+	}
+	if !strings.Contains(fp.posts[0].text, "quiet") {
+		t.Errorf("nudge missing its enum-keyed framing: %q", fp.posts[0].text)
+	}
+}
+
+func TestNotifierHealthApprovalIdleThreadsUnderGate(t *testing.T) {
+	rc := healthRun("awaiting_approval", "approval_idle")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U1"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1", GateTs: txt("gate1")},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "approval_idle", reason: "waiting for the plan to be approved", nudge: true})
+
+	if len(fp.posts) != 1 || fp.posts[0].thread != "gate1" {
+		t.Fatalf("approval_idle nudge should thread under the gate ts: %+v", fp.posts)
+	}
+}
+
+func TestNotifierHealthDropsOptedOutMidRun(t *testing.T) {
+	rc := healthRun("running", "stalled")
+	fs := &fakeNotifStore{rc: rc, deliveryErr: pgx.ErrNoRows}
+	fp := &fakePoster{}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "stalled", reason: "x", nudge: true})
+
+	if len(fp.posts) != 0 || len(fp.updates) != 0 {
+		t.Fatalf("an opted-out owner must get nothing: posts=%+v updates=%+v", fp.posts, fp.updates)
+	}
+}
+
+func TestNotifierHealthCreatesRootWhenAbsent(t *testing.T) {
+	rc := healthRun("queued", "waiting_worker")
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msgErr: pgx.ErrNoRows}
+	fp := &fakePoster{}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "waiting_worker", reason: "no worker is online to pick up this run", nudge: true})
+
+	// Post 1 is the new top-level root (carrying the flag); post 2 is the nudge under it.
+	if len(fp.posts) != 2 {
+		t.Fatalf("want a root post + a threaded nudge, got %+v", fp.posts)
+	}
+	if fp.posts[0].thread != "" || !strings.Contains(fp.posts[0].text, "⚠ waiting for a worker") {
+		t.Fatalf("root not created with the flag: %+v", fp.posts[0])
+	}
+	if fp.posts[1].thread != "ts1" {
+		t.Fatalf("nudge not threaded under the new root: %+v", fp.posts[1])
+	}
+	if len(fs.upserted) != 1 {
+		t.Fatalf("anchor not recorded for the new root: %+v", fs.upserted)
+	}
+}
+
+func TestNotifierHealthNudgeScrubsSecrets(t *testing.T) {
+	rc := healthRun("running", "stalled")
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	// A hostile reason carrying a token must never reach Slack.
+	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: "stalled", reason: "leaked xoxb-abc123DEF token", nudge: true})
+
+	if len(fp.posts) != 1 {
+		t.Fatalf("want a nudge post: %+v", fp.posts)
+	}
+	if strings.Contains(fp.posts[0].text, "xoxb-abc123DEF") {
+		t.Errorf("nudge leaked a token: %q", fp.posts[0].text)
+	}
+	if !strings.Contains(fp.posts[0].text, "[redacted]") {
+		t.Errorf("token not scrubbed in nudge: %q", fp.posts[0].text)
+	}
+}
+
+func TestNotifierHealthNeverBlocks(t *testing.T) {
+	fs := &fakeNotifStore{}
+	n := NewNotifier(fs, &fakePoster{}, fixedBase, nil)
+	// Overfill the queue well past capacity: PublishHealth must drop, never block.
+	for i := 0; i < notifierQueue*2; i++ {
+		n.PublishHealth(uuid.New(), "stalled", "x", true)
+	}
+}
