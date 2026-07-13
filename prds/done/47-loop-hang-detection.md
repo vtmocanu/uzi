@@ -1,7 +1,7 @@
 # PRD #47: Loop/hang detection — flag slow, stalled, or looping runs in UI and Slack
 
 **GitLab Issue**: [#47](https://gitlab.example.com/vtmocanu/uzi/-/issues/47)
-**Status**: In progress — M1-M4 implemented, reviewed, and audited clean (branch `feature/prd-47-loop-hang-detection`, tip bc83815 + M6 in flight); M6 e2e running, M5 docs+specs next. Migration landed as `00057` (PRD draft said 00054; head had moved). Pre-implementation review 2026-07-12 by 3 agents (design, security, fact-check); all blocking/major findings folded in below (marked ↳review where the design changed).
+**Status**: Complete — merged 2026-07-13 via MR !46 (all 6 milestones; 4 review waves + audit + web-ux + fact-check clean)
 **Priority**: High (plan.md line 68)
 **Created**: 2026-07-12
 **Depends on**: PRD #4 (runs/sweeper), PRD #19 (app_settings), PRD #25 (Slack) — all done
