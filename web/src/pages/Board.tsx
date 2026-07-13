@@ -400,7 +400,11 @@ export function Board() {
       {error && <Alert message={error} />}
 
       {(awaitingRuns.length > 0 || stuckRuns.length > 0) && (
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn">
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn"
+        >
           <span className="font-medium">
             {[
               awaitingRuns.length > 0 &&

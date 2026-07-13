@@ -94,9 +94,11 @@ function HealthFlag({ run }: { run: Run }) {
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
   const stuck = Number.isFinite(since) ? ` · stuck for ${formatElapsed(now - since)}` : "";
   return (
+    // role="status" so a screen reader announces the flag when it arrives over WS.
+    // The reason is shown inline below, so no title tooltip (it would be redundant).
     <span
+      role="status"
       className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn"
-      title={run.health_reason ?? undefined}
     >
       ⚠ {healthFlagLabel(run.health)}
       {stuck}

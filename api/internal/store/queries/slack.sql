@@ -109,7 +109,7 @@ RETURNING *;
 -- Names ride in roster order (WITH ORDINALITY).
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.branch, r.failure_reason, r.kind,
-       r.health, r.health_reason,
+       r.health,
        rp.path_with_namespace, rp.web_url,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)

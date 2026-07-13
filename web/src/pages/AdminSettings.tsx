@@ -514,11 +514,16 @@ function HealthSettingsCard({
                     value={values[f.key]}
                     disabled={isEnv(f.key)}
                     aria-invalid={err != null}
+                    aria-describedby={err ? `${f.key}-error` : undefined}
                     onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))}
                   />
                 </Field>
                 {f.hint && <p className="text-xs text-faint">{f.hint}</p>}
-                {err && <p className="text-xs text-warn">{err}</p>}
+                {err && (
+                  <p id={`${f.key}-error`} className="text-xs text-warn">
+                    {err}
+                  </p>
+                )}
               </div>
             );
           })}
