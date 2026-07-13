@@ -5256,3 +5256,176 @@ and fact-check findings.
   only, length-capped, never refreshed — uzi lets users edit their own display name and won't
   fight the IdP), `sub`/`iss` → identity. Post-link email drift at the IdP is logged as a
   warning, not auto-applied (email is UNIQUE; auto-rename can collide — deferred).
+
+# PRD #47 — Loop/hang detection (flag slow/stalled/looping runs in UI + Slack)
+
+Serves human: Feature #47 — detect too-slow / stuck runs and flag them in the web UI
+and on Slack (plan.md line 68), as a non-terminal, self-clearing signal that never kills
+a run (user-ratified surface). Full decision log + review/audit trail:
+`prds/47-loop-hang-detection.md`. Migration landed as `00057_run_health.sql` (PRD draft
+said 00054; the live head had moved — renumber again if main moved at land). This section
+records the load-bearing AI decisions; the PRD carries the complete set (Decisions 1-11)
+with the review/audit findings folded in.
+
+## 202. Server-side detection in the sweeper — zero worker changes
+
+- Detection runs inside the existing 15s sweeper tick (`api/internal/sweeper`), computing
+  per-run signals from telemetry already in Postgres — the worker ships every agent block
+  to `run_messages` (tool name + input included). Worker-side loop detection rejected: it
+  dies with the worker, is blind to `queued`/`awaiting_approval`, and the worker is the
+  component we trust least to report its own sickness. (PRD Decision 1.)
+- `last_activity_at timestamptz` added to `runs`, bumped inside the existing
+  `AppendMessages` write path (behind its `runOwnedByWorker` check — no standalone
+  activity-bump endpoint), avoiding a per-tick `max(run_messages.created_at)` aggregate.
+  Backfilled from `updated_at`. The stalled cutoff uses
+  `now - GREATEST(last_activity_at, started_at)` so the pre-first-message checkout window
+  can't false-flag. (PRD Decision 2.)
+- The detector is a Go-driven per-run computation with ONE status-scoped `SetRunHealth`
+  writer per run, NOT Decision 11's literal per-signal SQL `UPDATE`s: priority ordering,
+  same-window in-flight suppression, self-clear, and queued reason-resolution all require
+  in-Go logic. Cost O(active runs)/tick; loop detection's `LIMIT 12` window fetch is the
+  only per-run extra, bounded by laptop-scale single-digit active runs; settings read
+  through the existing 5s cache. (PRD Decision 11 + session AI choice.)
+
+## 203. Health as self-clearing columns on runs — single writer + exit contract
+
+- Health is columns on `runs`: `health TEXT NOT NULL DEFAULT 'ok'`
+  (CHECK `ok|stalled|looping|slow|waiting_worker|approval_idle`), `health_reason`,
+  `health_since`, `health_notified_at`. Exactly one flag at a time, priority
+  `looping > stalled > slow` (looping is the strongest pathology evidence). Orthogonal to
+  `status`. An events/episodes table was rejected — history reconstructs from Slack threads
+  + run_message timestamps, and nothing queries past episodes. (PRD Decision 3.)
+- **Single writer**: only the sweeper detector writes the health columns while a run is in
+  a flaggable status. **Exit contract** (review blocker): every query that moves a run out
+  of a flaggable status resets `health='ok'`, `health_reason=NULL`, `health_since=NULL`.
+  Extended beyond Decision 3's named list to ALL 15 non-chat status-writing queries in
+  `runtime.sql` (reviewer pre-flag); `chat.sql` writers are deliberately excluded (chat
+  runs aren't detected). This closes the sweeper-vs-worker write race — the health write is
+  status-scoped (`WHERE status='running' AND …`) and no-ops after the exit, so whichever
+  write lands last leaves a consistent row. `health_notified_at` is NOT reset — it is a
+  rolling last-nudge stamp. (PRD Decision 3 + session AI choice.)
+- `SetRunRunning` uses a pre-update-status CASE (a running→running heartbeat preserves the
+  flag; any transition INTO running clears it atomically) instead of leaving the clear to
+  the next detector tick — closing a ≤15s stale-flag window. Queued/approval age is measured
+  from `runs.updated_at` (no `entered_status_at` column added); `SetRunHealth` never bumps
+  `updated_at`. (session AI choices.)
+
+## 204. Loop detection — transient hash of the last N tool calls, never surfaced
+
+- Per active `running` run the detector loads the last 12 `tool_use` rows
+  (`ORDER BY seq DESC LIMIT 12` on the existing `(run_id, seq)` index), hashes
+  `sha256(name + canonical-JSON(input))` in Go transiently, and flags `looping` at ≥4
+  identical hashes. Window and threshold are code constants, not settings. Neither the hash
+  nor any tool name/input/repo content ever enters `health_reason`, logs, or Slack —
+  run_messages are secret-scrubbed by the worker but NOT scrubbed of repo content, so all
+  reason strings are fixed templates. (PRD Decision 4, audit major.)
+- Accepted, documented misses: A/B-alternating loops need window fill; semantically-equal
+  but textually-different inputs aren't caught (LLM-judge territory, deferred); after a
+  requeue/resume, gapless `seq` keeps pre-requeue calls in the window, so a fresh resume can
+  re-flag briefly until distinct calls push them out. False-positive guard: legitimate
+  polling (e.g. `go test` between distinct edits) is broken up by interleaved distinct
+  hashes. (PRD Decision 4.)
+
+## 205. Stalled is suppressed while a tool call is in flight
+
+- `last_activity_at` advances only on new messages, and a long `go build` / test suite
+  emits one `tool_use` then silence until its `tool_result` — the worker's own idle watchdog
+  re-arms per message for exactly this reason. So if the newest message for a run is a
+  `tool_use` with no matching `tool_result`, the run is *working*, not stalled — no `stalled`
+  flag regardless of elapsed time (the wall-clock `slow` signal still covers a pathological
+  single call). Detected by comparing the newest `tool_use.id` against existing
+  `tool_result.tool_use_id` payloads in the same window fetch as loop detection — no extra
+  query. (PRD Decision 9, design major.)
+
+## 206. Thresholds as app_settings keys — two-layer validation, read-time clamp
+
+- Six runtime-tunable `app_settings` keys (PRD #19 pattern, no new env vars):
+  `health_enabled` (`"true"`), `health_stall_seconds` (300), `health_slow_seconds` (2700),
+  `health_queued_seconds` (600), `health_approval_seconds` (3600),
+  `health_nudge_cooldown_seconds` (1800). Admin Settings gains a "Run health" card.
+- Write-time validator (net-new, in the pure `Validate()`): value must be in
+  `{0} ∪ [60, 86400]` — `0` disables that signal; negatives, non-integers, 1-59, and >86400
+  are rejected (the upper bound stops a fat-fingered value from silently disabling a signal).
+  Read-time: the sweeper's accessor clamps `health_slow_seconds` to `< RUN_TIMEOUT` (env,
+  mutable across restarts and unavailable to the pure validator) and logs when it clamps.
+  (PRD Decision 5.)
+
+## 207. queued flagged-not-swept; claimed unflagged; approval_idle skips autopilot
+
+- `queued` stays unswept (no requeue) and gains only a flag; its `health_reason`
+  distinguishes what the server can see: "no worker online" (zero online workers) vs "owner
+  vault is locked" (most actionable) vs "waiting for worker". `claimed` deliberately gets no
+  flag — a wedged-but-heartbeating checkout is already requeued by `SweepClaimedNeverStarted`
+  at `ClaimGrace` (5m), tighter than any flag. `auto_approve` runs are excluded from
+  `approval_idle` — autopilot self-resolves its gate and must not nudge anyone to approve it.
+  Chat runs (`kind='chat'`) are excluded from detection entirely; `ci_fix` runs are included.
+  (PRD Decision 8 + session AI choice.)
+
+## 208. Health rides the run DTOs; health_reason owner-gated on the shared board
+
+- The board `latestRunDTO` reaches every authenticated viewer for every card, so
+  `health_reason` (which can say "owner vault is locked") is gated behind `IsMine`, exactly
+  like `failure_reason` (audit blocker); the `health` enum and `health_since` ride
+  unconditionally (non-sensitive, like `stop_kind`). The owner-scoped / admin `runDTO`
+  carries `health_reason` unconditionally, matching `failure_reason`. Web `LatestRun` gains
+  the three fields. Reason strings carry NO durations/counts (stricter than Decision 4); the
+  UI renders elapsed live from `health_since`. (PRD Decision 6 + session AI choice.)
+- UI surfaces (Decision 10's "four surfaces for free" claim was wrong — `runBadge` was
+  board-only in reality): board and run-view render the `runBadge` warn variant
+  `⚠ <label> · <elapsed>`; dashboard and runs-list get a shared `RunHealthBadge` that
+  AUGMENTS `StatusPill` (augment-not-replace), suppressed under `waitingForVault` on the runs
+  list. The board's awaiting-approval attention strip generalizes ("1 run needs approval ·
+  2 runs look stuck"). The run-view header shows `health_reason` (owner/admin) beside the
+  LIVE STAGE label. a11y: the attention strip and run-view health chip are polite live
+  regions (`role="status"`); admin validation errors are linked via `aria-describedby`.
+  (PRD Decision 10 + session AI choices.)
+
+## 209. Slack — dedicated PublishHealth seam, sweeper-owned cooldown stamp
+
+- The `Broadcaster` gains `PublishHealth(runID, health, reason, nudge)` — `PublishState`
+  carries only `status`, so a status-`running` publish is indistinguishable from a heartbeat
+  and health needs its own seam. The live hub maps it to a data-less WS "health" frame (type
+  only — no enum, no reason; browsers re-read via REST, which re-applies ownership gating).
+  Nudge-worthiness is judged detector-side; `health_notified_at` is stamped via COALESCE in
+  the same `SetRunHealth` write and never cleared (rolling stamp). (PRD Decision 7 + session
+  AI choices.)
+- Cooldown, not per-episode: a nudge fires on the ok→flagged transition only when
+  `health_notified_at` is NULL or older than `health_nudge_cooldown_seconds`; the stamp
+  persists across episodes and API restarts, which bounds restart duplicates and damps
+  flapping. Delivery is re-resolved per event through `GetSlackDeliveryForUser` (audit
+  major) — the persisted `slack_run_messages` anchor is never sufficient alone, so a user who
+  opts out mid-run gets nothing; `GetSlackRunContext` was extended to select the health
+  columns (the now-dead `r.health_reason` read was dropped — slacksvc renders from the event
+  payload + its own enum-keyed templates and never imports workersvc constants).
+  (PRD Decision 7 + session AI choice.)
+- Root create-or-edit for health goes through a separate `ensureRoot` helper reusing
+  `renderRoot` (escaping preserved); the root re-renders on every health TRANSITION (not
+  every tick) so the ⚠ clears without a nudge. Fixed templates only; every forge-controlled
+  field passes `EscapeMrkdwn` and the whole message passes `ScrubSecrets`; content is
+  minimized to the reason label (never run-message content — `PublishMessage` stays a no-op).
+  `approval_idle` nudges thread under the existing gate message so Approve/Reject are one
+  scroll away. (PRD Decision 7 + session AI choice.)
+
+## 210. Security posture — operability aid, not a guardrail
+
+- Health detection is early warning for honest-but-stuck agents. A hostile worker can
+  suppress `stalled` (emit junk messages) and evade `looping` (vary inputs); it cannot forge
+  health state (columns are sweeper-written server-side) nor touch another user's runs
+  (`AppendMessages` gates on run ownership). RUN_TIMEOUT / idle / iteration caps remain the
+  only liveness backstops and are unchanged by this PRD; the flag must never be leaned on as
+  a guarantee. (PRD Security posture.)
+
+## 211. As-built — docs placement, board.md fix, and e2e stall+loop verification (M5/M6)
+
+- Docs placement (session AI choice, overriding the PRD's literal "configuration.md"): the
+  `health_*` keys are documented in `docs/admin-settings.md` (the repo's env-vs-app-settings
+  split), cross-linked from `docs/configuration.md`, alongside a new user-facing
+  `docs/run-health.md` (what each flag means, what to do, how to tune, and the explicit "this
+  is not a guardrail" note) and a `docs/slack.md` nudge section; the stale attention-strip
+  description in `docs/board.md` was corrected to match the generalized strip. No CHANGELOG
+  (the repo has no such convention).
+- e2e (M6) drives the stub executor via sentinels `UZI_STUB_STALL` / `UZI_STUB_LOOP` /
+  `UZI_STUB_INFLIGHT` to force a stall and a loop and assert the flag appears, nudges once,
+  and clears. Slack DM delivery is NOT asserted end-to-end (no Slack fake in the harness) —
+  the nudge is asserted at the `health_notified_at` seam; the gap is documented in the
+  scenario comment. `./e2e/run-e2e.sh` green is the gate. (session AI choices.)
