@@ -299,6 +299,13 @@ export interface LatestRun {
   // Server-stamped deliberate-stop signal (PRD #33); null for every non-stop run.
   // Read by isStoppedRun to render a stop as calm "stopped" instead of rose "failed".
   stop_kind: StopKind | null;
+  // Run-health flag (PRD #47). health + health_since are non-sensitive (like
+  // stop_kind) and always present. health_reason can name owner state ("your vault
+  // is locked"), so the server sends it only to the run's owner (is_mine); a
+  // non-owner viewer of a shared board gets null. runBadge shows the warn variant.
+  health: RunHealth;
+  health_reason: string | null;
+  health_since: string | null;
   owner_name: string;
   worker_name: string | null;
   is_mine: boolean;
@@ -377,6 +384,15 @@ export interface AppSettings {
   // `secrets` on SettingsResponse.
   slack_enabled: string;
   public_base_url: string;
+  // Run-health detector keys (PRD #47). health_enabled is the text "true"/"false";
+  // the rest are integer seconds as strings (the API serves every setting as a
+  // string). 0 disables that one signal.
+  health_enabled: string;
+  health_stall_seconds: string;
+  health_slow_seconds: string;
+  health_queued_seconds: string;
+  health_approval_seconds: string;
+  health_nudge_cooldown_seconds: string;
 }
 
 // SettingSource reports where a setting's effective value comes from (PRD #25):
@@ -510,6 +526,19 @@ export function isTerminalRun(status: string): boolean {
 // verbatim reason is still recognised as a deliberate stop.
 export type StopKind = "cancelled" | "plan_rejected";
 
+// RunHealth is the server-side run-health flag (PRD #47): a non-terminal,
+// self-clearing signal that a run looks slow, stuck, or looping. "ok" is the
+// healthy default. It is orthogonal to RunStatus and never kills a run — the
+// existing timeouts remain the only liveness backstops. runBadge renders the warn
+// variant only while the run is in a flaggable status.
+export type RunHealth =
+  | "ok"
+  | "stalled"
+  | "looping"
+  | "slow"
+  | "waiting_worker"
+  | "approval_idle";
+
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
 // problem" verdict; null means the fix is not yet verified.
@@ -547,6 +576,12 @@ export interface Run {
   /** Server-stamped deliberate-stop signal (PRD #33): "cancelled" or
    *  "plan_rejected", null otherwise. isStoppedRun reads this, not failure_reason. */
   stop_kind: StopKind | null;
+  /** Run-health flag (PRD #47). This owner-scoped DTO carries health_reason
+   *  unconditionally (the run view is owner/admin only); health_since drives the
+   *  header's "stuck for Xm". */
+  health: RunHealth;
+  health_reason: string | null;
+  health_since: string | null;
   /** ci_fix (PRD #6): the failing ref, the failing pipeline's web URL (from the
    *  snapshot), and the fix verdict. All null on an issue run. */
   pipeline_ref: string | null;
@@ -619,10 +654,12 @@ export interface AgentSelectionInput {
 }
 
 // WsEvent is a live frame from /api/ws. A "message" carries a persisted message
-// (rendered directly, deduped by seq); a "state" signals a status change (the
-// client re-reads the run over REST — WS is never the source of truth).
+// (rendered directly, deduped by seq); "state" signals a status change and "health"
+// a run-health flag change (PRD #47). For both "state" and "health" the client
+// re-reads the run over REST — WS is never the source of truth, so the flag reason
+// (owner-gated) never rides the socket.
 export interface WsEvent {
-  type: "message" | "state";
+  type: "message" | "state" | "health";
   seq?: number;
   kind?: string;
   agent?: string | null;

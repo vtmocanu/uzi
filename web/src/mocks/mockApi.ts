@@ -72,7 +72,9 @@ function requireSession(): User {
 // deliberately NOT persisted. Versioned + shape-checked: a blob from an older
 // seed schema (or a corrupt one) is discarded and re-seeded, never served, so
 // stale demo state can't outlive a seed-schema change.
-const MOCK_SETTINGS_KEY = "uzi.mock.v1";
+// Bumped to v2 for PRD #47 (the six health_* keys joined AppSettings): a stale v1
+// blob lacks them, so discarding it re-seeds a complete shape.
+const MOCK_SETTINGS_KEY = "uzi.mock.v2";
 const SEED_USER_SETTINGS: UserSettings = { default_model: null, theme: null };
 const SEED_APP_SETTINGS: AppSettings = {
   prd_label: "PRD",
@@ -82,6 +84,12 @@ const SEED_APP_SETTINGS: AppSettings = {
   prdless_label: "PRDLESS",
   slack_enabled: "false",
   public_base_url: "http://127.0.0.1:8080",
+  health_enabled: "true",
+  health_stall_seconds: "300",
+  health_slow_seconds: "2700",
+  health_queued_seconds: "600",
+  health_approval_seconds: "3600",
+  health_nudge_cooldown_seconds: "1800",
 };
 
 interface PersistedSettings {
@@ -112,7 +120,13 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.prdless_enabled === "string" &&
     typeof a.prdless_label === "string" &&
     typeof a.slack_enabled === "string" &&
-    typeof a.public_base_url === "string";
+    typeof a.public_base_url === "string" &&
+    typeof a.health_enabled === "string" &&
+    typeof a.health_stall_seconds === "string" &&
+    typeof a.health_slow_seconds === "string" &&
+    typeof a.health_queued_seconds === "string" &&
+    typeof a.health_approval_seconds === "string" &&
+    typeof a.health_nudge_cooldown_seconds === "string";
   return okUser && okApp;
 }
 
@@ -1043,6 +1057,9 @@ export const mockApi = {
       mr_state: null,
       failure_reason: null,
       stop_kind: null,
+      health: "ok",
+      health_reason: null,
+      health_since: null,
       pipeline_ref: null,
       pipeline_web_url: null,
       fix_verdict: null,
@@ -1087,6 +1104,9 @@ export const mockApi = {
       mr_state: null,
       failure_reason: null,
       stop_kind: null,
+      health: "ok",
+      health_reason: null,
+      health_since: null,
       pipeline_ref: ref,
       pipeline_web_url: `https://gitlab.example.com/vtmocanu/uzi/-/pipelines/4242`,
       fix_verdict: null,
@@ -1178,6 +1198,9 @@ export const mockApi = {
       mr_state: null,
       failure_reason: null,
       stop_kind: null,
+      health: "ok",
+      health_reason: null,
+      health_since: null,
       pipeline_ref: null,
       pipeline_web_url: null,
       fix_verdict: null,

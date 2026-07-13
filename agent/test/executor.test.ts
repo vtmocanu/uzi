@@ -6,8 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import {
   StubExecutor,
+  STUB_INFLIGHT_SENTINEL,
   STUB_INTERLEAVE_SENTINEL,
   STUB_INTERLEAVE_STREAM,
+  STUB_LOOP_SENTINEL,
+  STUB_STALL_SENTINEL,
   type EmittedMessage,
   type RunContext,
 } from "../src/executor.js";
@@ -83,5 +86,64 @@ describe("StubExecutor — PRD #43 M5 interleaved multi-agent stream", () => {
       wt.cleanup();
     }
     assert.deepStrictEqual(scripted(emitted), [], "a run without the sentinel must emit no scripted frames");
+  });
+});
+
+describe("StubExecutor — PRD #47 M6 run-health sentinels", () => {
+  // healthPauseMs: 0 makes the stall/loop/in-flight pauses instant so the unit test
+  // runs fast; the real E2E leaves it at the STUB_HEALTH_* defaults.
+  const runWith = async (sentinel: string) => {
+    const wt = makeWorktree();
+    const { ctx, emitted } = makeCtx({ worktreePath: wt.path, issueDescription: `x ${sentinel}` });
+    try {
+      await new StubExecutor(nullLogger(), { healthPauseMs: 0 }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    return emitted;
+  };
+  const tools = (emitted: EmittedMessage[], kind: "tool_use" | "tool_result") =>
+    emitted.filter((m) => m.kind === kind);
+
+  it("UZI_STUB_LOOP emits four IDENTICAL tool calls (name+input) so the window hash flags looping", async () => {
+    const emitted = await runWith(STUB_LOOP_SENTINEL);
+    const uses = tools(emitted, "tool_use");
+    assert.equal(uses.length, 4, "four tool_use calls");
+    const fingerprints = new Set(
+      uses.map((m) => JSON.stringify([m.payload.name, m.payload.input])),
+    );
+    assert.equal(fingerprints.size, 1, "all four calls share one name+input fingerprint");
+    // Each call has its matching result, so none is left in flight.
+    assert.equal(tools(emitted, "tool_result").length, 4, "each call has a result");
+  });
+
+  it("UZI_STUB_INFLIGHT emits a tool_use held open past the pause, then its result", async () => {
+    const emitted = await runWith(STUB_INFLIGHT_SENTINEL);
+    const [use] = tools(emitted, "tool_use");
+    const [res] = tools(emitted, "tool_result");
+    assert.ok(use && res, "exactly one tool_use and one tool_result");
+    assert.equal(tools(emitted, "tool_use").length, 1, "exactly one tool_use");
+    assert.equal(tools(emitted, "tool_result").length, 1, "exactly one tool_result");
+    // The use precedes its result and they share an id (the detector matches on it).
+    assert.ok(emitted.indexOf(use) < emitted.indexOf(res), "the tool_use is emitted before its result");
+    assert.equal(use.payload.id, res.payload.tool_use_id, "the result references the tool_use id");
+  });
+
+  it("UZI_STUB_STALL brackets its pause with a quiet-then-resume status pair", async () => {
+    const emitted = await runWith(STUB_STALL_SENTINEL);
+    const texts = emitted.filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+    assert.ok(texts.some((t) => t.includes("pausing")), "emits a pause marker before going quiet");
+    assert.ok(texts.some((t) => t.includes("resuming")), "emits a resume marker (the activity bump that self-clears)");
+  });
+
+  it("emits no health tool calls when no sentinel is present", async () => {
+    const wt = makeWorktree();
+    const { ctx, emitted } = makeCtx({ worktreePath: wt.path });
+    try {
+      await new StubExecutor(nullLogger(), { healthPauseMs: 0 }).run(ctx);
+    } finally {
+      wt.cleanup();
+    }
+    assert.equal(tools(emitted, "tool_use").length, 0, "a normal run emits no stub tool calls");
   });
 });

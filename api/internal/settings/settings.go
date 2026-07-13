@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,16 @@ const (
 	KeyPublicBaseURL = "public_base_url"
 	KeySlackBotToken = "slack_bot_token"
 	KeySlackAppToken = "slack_app_token"
+	// Run-health detector keys (PRD #47). health_enabled is a bool ("true"/"false");
+	// the rest are integer seconds validated as {0} ∪ [60, 86400] — 0 disables that
+	// one signal, and the upper bound stops a fat-fingered value silently disabling
+	// it. No new env vars: these are runtime-tunable from the Admin Settings page.
+	KeyHealthEnabled              = "health_enabled"
+	KeyHealthStallSeconds         = "health_stall_seconds"
+	KeyHealthSlowSeconds          = "health_slow_seconds"
+	KeyHealthQueuedSeconds        = "health_queued_seconds"
+	KeyHealthApprovalSeconds      = "health_approval_seconds"
+	KeyHealthNudgeCooldownSeconds = "health_nudge_cooldown_seconds"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -66,6 +77,24 @@ const (
 	// only resolves for the laptop's own user; a Tailscale/LAN URL overrides it.
 	DefaultSlackEnabled  = "false"
 	DefaultPublicBaseURL = "http://127.0.0.1:8080"
+	// PRD #47 run-health defaults (Decision 5). On by default; a fresh instance with
+	// no seeded rows detects health out of the box. The thresholds mirror the table
+	// in the PRD's Solution Overview.
+	DefaultHealthEnabled              = "true"
+	DefaultHealthStallSeconds         = "300"  // 5m of silence (no tool in flight)
+	DefaultHealthSlowSeconds          = "2700" // 45m wall clock, clamped < RUN_TIMEOUT at read time
+	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
+	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
+	DefaultHealthNudgeCooldownSeconds = "1800" // 30m between Slack nudges per run
+)
+
+// healthSecondsMin / healthSecondsMax bound the integer health settings (Decision
+// 5): a value must be 0 (disable that signal) or within [min, max]. The lower bound
+// keeps a signal from firing on a sub-minute jitter; the upper bound stops a
+// fat-fingered value (e.g. an extra zero) from silently disabling it.
+const (
+	healthSecondsMin = 60
+	healthSecondsMax = 86400
 )
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
@@ -94,6 +123,15 @@ var Defaults = map[string]string{
 	// row: an absent row synthesizes to these defaults, and no migration adds them.
 	KeySlackEnabled:  DefaultSlackEnabled,
 	KeyPublicBaseURL: DefaultPublicBaseURL,
+	// PRD #47 run-health keys. Same no-seeded-row pattern: an absent row synthesizes
+	// to these defaults, so All/AdminView surface them to the settings page and no
+	// migration seeds them.
+	KeyHealthEnabled:              DefaultHealthEnabled,
+	KeyHealthStallSeconds:         DefaultHealthStallSeconds,
+	KeyHealthSlowSeconds:          DefaultHealthSlowSeconds,
+	KeyHealthQueuedSeconds:        DefaultHealthQueuedSeconds,
+	KeyHealthApprovalSeconds:      DefaultHealthApprovalSeconds,
+	KeyHealthNudgeCooldownSeconds: DefaultHealthNudgeCooldownSeconds,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -349,6 +387,57 @@ func (c *Cache) PublicBaseURL(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyPublicBaseURL)
 }
 
+// HealthEnabled reports whether the run-health detector is enabled instance-wide
+// (PRD #47). Stored as "true"/"false"; any other value falls back to the
+// compiled-in default (true), the same junk-tolerance as SlackEnabled but
+// defaulting ON — a malformed value never silently disables detection.
+func (c *Cache) HealthEnabled(ctx context.Context) (bool, error) {
+	v, err := c.get(ctx, KeyHealthEnabled)
+	switch v {
+	case "true":
+		return true, err
+	case "false":
+		return false, err
+	default:
+		return DefaultHealthEnabled == "true", err
+	}
+}
+
+// HealthStallSeconds / HealthSlowSeconds / HealthQueuedSeconds /
+// HealthApprovalSeconds / HealthNudgeCooldownSeconds return the integer-seconds
+// health thresholds (PRD #47 Decision 5). 0 means the caller disables that signal.
+// The RUN_TIMEOUT clamp on the slow threshold is applied read-time by the sweeper,
+// not here (Validate is pure with no config access).
+func (c *Cache) HealthStallSeconds(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyHealthStallSeconds)
+}
+func (c *Cache) HealthSlowSeconds(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyHealthSlowSeconds)
+}
+func (c *Cache) HealthQueuedSeconds(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyHealthQueuedSeconds)
+}
+func (c *Cache) HealthApprovalSeconds(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyHealthApprovalSeconds)
+}
+func (c *Cache) HealthNudgeCooldownSeconds(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyHealthNudgeCooldownSeconds)
+}
+
+// intSetting resolves an integer setting to its parsed value, falling back to the
+// compiled-in default when the effective value is absent or unparseable. Stored
+// values pass validateHealthSeconds at write time, so an unparseable value here is
+// a row predating validation or a hand-edited DB — junk-tolerance mirrors the bool
+// accessors. A cold read error is returned so a strict caller can surface it.
+func (c *Cache) intSetting(ctx context.Context, key string) (int, error) {
+	v, err := c.get(ctx, key)
+	n, perr := strconv.Atoi(strings.TrimSpace(v))
+	if perr != nil {
+		n, _ = strconv.Atoi(Defaults[key])
+	}
+	return n, err
+}
+
 // SlackBotToken returns the effective Slack bot token in plaintext (PRD #25):
 // the ENV value when set, else the sealed DB row decrypted. Empty string + nil
 // error when neither is configured. Only slacksvc calls this — it is the sole
@@ -498,8 +587,11 @@ func Validate(key, value string) error {
 	switch key {
 	case KeyDefaultTheme:
 		return theme.Validate(value)
-	case KeyPrdlessEnabled, KeySlackEnabled:
+	case KeyPrdlessEnabled, KeySlackEnabled, KeyHealthEnabled:
 		return validateBool(value)
+	case KeyHealthStallSeconds, KeyHealthSlowSeconds, KeyHealthQueuedSeconds,
+		KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds:
+		return validateHealthSeconds(value)
 	case KeyPublicBaseURL:
 		return ValidatePublicBaseURL(value)
 	case KeySlackBotToken:
@@ -553,6 +645,26 @@ func ValidatePublicBaseURL(value string) error {
 func validateBool(value string) error {
 	if value != "true" && value != "false" {
 		return errors.New(`must be "true" or "false"`)
+	}
+	return nil
+}
+
+// validateHealthSeconds is the write-time gate for an integer run-health threshold
+// (PRD #47 Decision 5): a base-10 integer that is either 0 (disable that signal) or
+// within [healthSecondsMin, healthSecondsMax]. Negatives, non-integers, 1–59, and
+// values above the day cap are rejected. The health_slow_seconds < RUN_TIMEOUT rule
+// is NOT enforced here — Validate is pure with no config access, so that is a
+// read-time clamp in the sweeper.
+func validateHealthSeconds(value string) error {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New("must be a whole number of seconds")
+	}
+	if n == 0 {
+		return nil
+	}
+	if n < healthSecondsMin || n > healthSecondsMax {
+		return fmt.Errorf("must be 0 (disabled) or between %d and %d seconds", healthSecondsMin, healthSecondsMax)
 	}
 	return nil
 }

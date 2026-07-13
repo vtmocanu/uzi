@@ -19,7 +19,15 @@ import {
   type RunMessage,
 } from "../lib/api";
 import { AgentPicker, selectionLabel, type OwnTemplate } from "../components/AgentPicker";
-import { isStoppedRun, mrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
+import {
+  formatElapsed,
+  healthFlagLabel,
+  isStoppedRun,
+  mrChipState,
+  mrChipSuffix,
+  mrChipTitle,
+  shouldShowHealthFlag,
+} from "../lib/runBadge";
 import { useRunStream } from "../lib/useRunStream";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { formatDuration } from "../components/RunEvent";
@@ -69,6 +77,34 @@ function LiveElapsed({ since }: { since: string }) {
   const start = new Date(since).getTime();
   if (!Number.isFinite(start)) return null;
   return <span className="text-xs tabular-nums text-faint">{formatDuration(now - start)}</span>;
+}
+
+// HealthFlag renders the run-health warn chip next to the LIVE STAGE label (PRD #47
+// Decision 10): `⚠ <label> · stuck for Xm — <reason>`. The run view is owner/admin
+// only, so health_reason is always present here (no gating needed). It ticks the
+// "stuck for Xm" coarsely (30s) since a stalled run emits no messages to force a
+// re-render. Renders nothing for a healthy run or a non-flaggable status.
+function HealthFlag({ run }: { run: Run }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+  if (!shouldShowHealthFlag(run.health, run.status)) return null;
+  const since = run.health_since ? Date.parse(run.health_since) : NaN;
+  const stuck = Number.isFinite(since) ? ` · stuck for ${formatElapsed(now - since)}` : "";
+  return (
+    // role="status" so a screen reader announces the flag when it arrives over WS.
+    // The reason is shown inline below, so no title tooltip (it would be redundant).
+    <span
+      role="status"
+      className="inline-flex items-center gap-1 rounded-full border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] font-medium text-warn"
+    >
+      ⚠ {healthFlagLabel(run.health)}
+      {stuck}
+      {run.health_reason && <span className="font-normal"> — {run.health_reason}</span>}
+    </span>
+  );
 }
 
 export function RunView() {
@@ -193,6 +229,8 @@ export function RunView() {
                   <Spinner /> {stage}…
                 </span>
               )}
+              {/* Run-health warn chip (PRD #47), next to the LIVE STAGE label. */}
+              <HealthFlag run={run} />
               {/* The live/offline WS indicator is only meaningful while the run is
                   active; a terminal run has no stream, so never show "completed • live". */}
               {!terminal && (

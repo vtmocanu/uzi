@@ -223,6 +223,19 @@ wait_verdict() {
   fail "timeout: run $run fix_verdict never reached '$want' (last: ${v:-none})"
 }
 
+# wait_health RUN WANT [TIMEOUT] — poll a run's health flag (PRD #47) until it
+# reaches WANT. Health rides the run DTO. Generous default (a stall needs ~75s of
+# quiet plus a sweep tick).
+wait_health() {
+  local run="$1" want="$2" deadline=$((SECONDS + ${3:-120})) h
+  while [ $SECONDS -lt $deadline ]; do
+    h="$(apiget "/api/runs/$run" | jq -r '.run.health')"
+    [ "$h" = "$want" ] && return 0
+    sleep 3
+  done
+  fail "timeout: run $run health never reached '$want' (last: ${h:-none})"
+}
+
 # card_column IID — the board's resolved column for one issue (empty = Open).
 card_column() {
   apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" \
@@ -1838,4 +1851,92 @@ else
   pass "both re-queued runs completed after restart (requeue_count>=1), MRs !$MRKA + !$MRKB"
 fi
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency; executor=%s)\n' "$EXECUTOR"
+# =============================================================================
+# PRD #47 — run-health detection: the sweeper's server-side detector flags a run
+# that looks stalled or looping and clears it on resume/exit, and does NOT flag a
+# long single in-flight tool call. The stub reproduces the three telemetry shapes
+# via UZI_STUB_* sentinels (stub-only). Slack DELIVERY is NOT asserted: the isolated
+# stack configures no Slack and there is no Slack fake, so the owner nudge is proven
+# at its server seam — the sweeper's health_notified_at stamp (single-writer,
+# nudge-worthiness) — read via db_psql. The health flag itself rides the run DTO.
+say "PRD #47: run-health detection (stall / loop / in-flight suppression)"
+if [ "$EXECUTOR" != stub ]; then
+  say "PRD #47 health scenario: SKIPPED (stub-only — UZI_STUB_STALL/LOOP/INFLIGHT are stub sentinels; executor=$EXECUTOR)"
+else
+login   # fresh admin session re-unlocks the vault for the run claim
+
+# Tighten the stall threshold to its 60s floor so the test doesn't crawl (the stub
+# pauses ~95s, above it). The cache invalidates on write, so the detector sees it on
+# its next tick. Other signals stay at defaults — a <2min run never trips slow (45m)
+# or stuck-queued (10m).
+apiput /api/admin/settings '{"settings":{"health_stall_seconds":"60"}}' >/dev/null
+pass "health_stall_seconds tightened to 60s for the scenario"
+
+# hrun SENTINEL — create a PRD issue carrying the sentinel, start a run, approve the
+# plan gate, and echo the run id (stdout is only the id: the helpers it calls are
+# silent on success).
+hrun() {
+  local iid run
+  iid="$(apipost "/api/repos/$REPO_ID/issues" \
+    "$(jq -cn --arg s "$1" '{title:"E2E health",description:("implements prds/47-loop-hang-detection.md " + $s)}')" | jq -r '.card.iid')"
+  run="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$iid}" | jq -r '.run.id')"
+  wait_status "$run" awaiting_approval
+  apipost "/api/runs/$run/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  echo "$run"
+}
+# notified_at RUN — the sweeper's nudge-worthiness stamp (health_notified_at), or ''.
+notified_at() { db_psql "SELECT COALESCE(to_char(health_notified_at, 'YYYYMMDDHH24MISSUS'), '') FROM runs WHERE id = '$1'"; }
+
+# --- (a) STALL → flagged stalled, nudged once, self-clears on resume -----------
+say "PRD #47 (a): a run that goes quiet is flagged stalled, nudged once, and self-clears on resume"
+RUN_ST="$(hrun UZI_STUB_STALL)"
+wait_status "$RUN_ST" running 60
+wait_health "$RUN_ST" stalled 120
+pass "run $RUN_ST flagged stalled"
+# The owner nudge fired at its seam: the sweeper stamped health_notified_at.
+NA1="$(notified_at "$RUN_ST")"
+[ -n "$NA1" ] || fail "health_notified_at not stamped — the nudge-worthiness seam did not fire"
+# And exactly once per window: after another sweep tick (still stalled) it is unchanged.
+sleep 18
+NA2="$(notified_at "$RUN_ST")"
+[ "$NA1" = "$NA2" ] || fail "health_notified_at re-stamped while still stalled (want one nudge/window): '$NA1' -> '$NA2'"
+pass "nudge stamped exactly once while stalled (Slack DELIVERY not asserted — no Slack fake in the isolated stack)"
+# The stub resumes → activity bump → self-clear back to ok while STILL running.
+wait_health "$RUN_ST" ok 60
+pass "flag self-cleared on resume"
+wait_status "$RUN_ST" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(apiget "/api/runs/$RUN_ST" | jq -r '.run.health')" = ok ] || fail "completed run still carries a health flag"
+pass "run completed with health=ok (exit contract)"
+
+# --- (b) LOOP → flagged looping, clears on exit --------------------------------
+say "PRD #47 (b): a run repeating the same tool call is flagged looping"
+RUN_LP="$(hrun UZI_STUB_LOOP)"
+wait_health "$RUN_LP" looping 60
+pass "run $RUN_LP flagged looping"
+wait_status "$RUN_LP" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(apiget "/api/runs/$RUN_LP" | jq -r '.run.health')" = ok ] || fail "completed looped run still flagged"
+pass "looped run completed with health=ok"
+
+# --- (c) IN-FLIGHT NEGATIVE: a long single tool call is NOT flagged stalled -----
+say "PRD #47 (c): a long single in-flight tool call is NOT flagged stalled (suppression)"
+RUN_IF="$(hrun UZI_STUB_INFLIGHT)"
+wait_status "$RUN_IF" running 60
+# Poll across the 60s stall threshold with margin (threshold 60 + sweep tick 15 +
+# slack), still under the ~95s stub hold: health must never read stalled while the
+# one tool call is still open (no matching tool_result yet), so a broken suppression
+# cannot slip through a too-short poll window.
+if_end=$((SECONDS + 90))
+while [ $SECONDS -lt $if_end ]; do
+  hif="$(apiget "/api/runs/$RUN_IF" | jq -r '.run.health')"
+  [ "$hif" = stalled ] && fail "a long in-flight tool call was wrongly flagged stalled"
+  sleep 5
+done
+pass "in-flight tool call was never flagged stalled across the threshold"
+wait_status "$RUN_IF" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+pass "in-flight run completed cleanly"
+
+# Restore the default threshold so nothing downstream inherits the tightened value.
+apiput /api/admin/settings '{"settings":{"health_stall_seconds":"300"}}' >/dev/null
+fi
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #47 run-health; executor=%s)\n' "$EXECUTOR"

@@ -114,6 +114,14 @@ type Store interface {
 	FailWorkerRunsOverCap(ctx context.Context, arg store.FailWorkerRunsOverCapParams) (int64, error)
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) (int64, error)
 
+	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
+	// tool window (loop + in-flight), the single health writer, and the queued-run
+	// worker-online count.
+	ListActiveRunsForHealth(ctx context.Context) ([]store.ListActiveRunsForHealthRow, error)
+	ListRunToolWindow(ctx context.Context, arg store.ListRunToolWindowParams) ([]store.ListRunToolWindowRow, error)
+	SetRunHealth(ctx context.Context, arg store.SetRunHealthParams) (int64, error)
+	CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error)
+
 	// Messages + inputs.
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
@@ -209,6 +217,15 @@ type Broadcaster interface {
 	PublishMessage(runID uuid.UUID, seq int32, kind, agent string, payload []byte, createdAt time.Time)
 	// PublishState signals that a run's status changed.
 	PublishState(runID uuid.UUID, status string)
+	// PublishHealth signals that a run's health flag changed (PRD #47) — raised,
+	// changed, or self-cleared (health=="ok"). health is the flag enum and reason is
+	// the fixed server-controlled template (empty when clearing). nudge is set ONLY
+	// when the sweeper judged this event nudge-worthy (an ok→flagged transition past
+	// the cooldown) and has already stamped health_notified_at — the notifier then
+	// threads one DM; otherwise it only re-renders the root. The live hub maps the
+	// event to a WS run-update (browsers re-read the run, picking up the owner-gated
+	// reason over REST) and ignores nudge. Best-effort, never blocks the sweep.
+	PublishHealth(runID uuid.UUID, health, reason string, nudge bool)
 }
 
 // MultiBroadcaster fans each event out to several Broadcasters — the WS hub AND
@@ -226,6 +243,12 @@ func (m MultiBroadcaster) PublishMessage(runID uuid.UUID, seq int32, kind, agent
 func (m MultiBroadcaster) PublishState(runID uuid.UUID, status string) {
 	for _, b := range m {
 		b.PublishState(runID, status)
+	}
+}
+
+func (m MultiBroadcaster) PublishHealth(runID uuid.UUID, health, reason string, nudge bool) {
+	for _, b := range m {
+		b.PublishHealth(runID, health, reason, nudge)
 	}
 }
 
@@ -262,6 +285,16 @@ type Service struct {
 	// deployment without the vault) disables the gate and falls back to opening the
 	// token under the master box — the pre-vault behavior.
 	vlt *vault.Vault
+	// settings reads the runtime-tunable run-health thresholds (PRD #47). Optional
+	// (nil-safe); set via SetSettings. A nil settings disables the whole health
+	// detector, so tests that do not exercise it — and any deployment without a
+	// settings cache — behave exactly as before.
+	settings Settings
+	// lastSlowClampWarn is the last health_slow_seconds value the read-time clamp
+	// warned about (PRD #47), so the warning logs once per distinct misconfigured
+	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
+	// (slowThreshold, reached via detectRunHealth ← Sweep), so it needs no lock.
+	lastSlowClampWarn time.Duration
 }
 
 // SetBroadcaster wires the live-event broadcaster (the WS hub). Call once at
@@ -279,6 +312,11 @@ func (s *Service) SetLifecycle(l RunLifecycle) { s.lifecycle = l }
 // the claim gate and opens the Anthropic token under the master box (pre-vault
 // behavior), which is what the workersvc tests rely on.
 func (s *Service) SetVault(v *vault.Vault) { s.vlt = v }
+
+// SetSettings wires the run-health settings reader (PRD #47). Call once at startup,
+// before the sweeper runs, with the same settings cache the HTTP handlers hold. A
+// nil settings (the default) disables the health detector entirely.
+func (s *Service) SetSettings(cfg Settings) { s.settings = cfg }
 
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
@@ -1363,6 +1401,9 @@ type SweepResult struct {
 	StaleRequeued      int64
 	ChatIdleCompleted  int64
 	ProposalsRecovered int64
+	// HealthChanged is the number of runs whose health flag the detector wrote this
+	// pass (PRD #47) — raised, changed, or self-cleared. Observability only.
+	HealthChanged int64
 }
 
 // Sweep enforces the liveness rules the workers cannot: stale workers go offline
@@ -1456,6 +1497,12 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 		res.ProposalsRecovered = int64(len(recovered))
 	}
+
+	// Run-health detector (PRD #47): flag/clear slow, stalled, looping, stuck-queued,
+	// and approval-idle runs from telemetry already in Postgres. Best-effort and
+	// non-terminal — it never kills a run and never fails the sweep (it logs and
+	// returns a count); a nil settings (tests) disables it entirely.
+	res.HealthChanged = s.detectRunHealth(ctx, now)
 	return res, nil
 }
 

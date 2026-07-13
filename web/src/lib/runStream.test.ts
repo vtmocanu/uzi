@@ -98,6 +98,15 @@ describe("applyFrame", () => {
     expect(filled.state.lastSeq).toBe(3);
   });
 
+  it("a health frame re-reads the run but does not replay (PRD #47)", () => {
+    const s = ingestMany(emptyStream(), [msg(1), msg(2)]).state;
+    const r = applyFrame(s, { type: "health" });
+    // A health flip carries no message data and does not imply a dropped tail, so
+    // it asks for a re-read (to pick up the owner-gated health fields) with no replay.
+    expect(r.effects).toEqual({ replay: false, refreshRun: true });
+    expect(seqs(r.state.messages)).toEqual([1, 2]);
+  });
+
   it("ignores an unknown frame type", () => {
     const s = ingestMany(emptyStream(), [msg(1)]).state;
     const r = applyFrame(s, { type: "bogus" as unknown as "state" });

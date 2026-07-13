@@ -1495,8 +1495,10 @@ func TestCreateWorkerEmptyTemplateStoresNull(t *testing.T) {
 // fakeBroadcaster records the run events the service fans out, to assert the
 // persist-then-broadcast contract (dedup on retry, broadcast only on apply).
 type fakeBroadcaster struct {
-	msgSeqs  []int32
-	statuses []string
+	msgSeqs      []int32
+	statuses     []string
+	healths      []string
+	healthNudges []bool
 }
 
 func (b *fakeBroadcaster) PublishMessage(_ uuid.UUID, seq int32, _, _ string, _ []byte, _ time.Time) {
@@ -1504,6 +1506,10 @@ func (b *fakeBroadcaster) PublishMessage(_ uuid.UUID, seq int32, _, _ string, _ 
 }
 func (b *fakeBroadcaster) PublishState(_ uuid.UUID, status string) {
 	b.statuses = append(b.statuses, status)
+}
+func (b *fakeBroadcaster) PublishHealth(_ uuid.UUID, health, _ string, nudge bool) {
+	b.healths = append(b.healths, health)
+	b.healthNudges = append(b.healthNudges, nudge)
 }
 
 func TestAppendMessagesBroadcastsOnlyNewlyInserted(t *testing.T) {
