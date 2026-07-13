@@ -62,11 +62,13 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]runListItemDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, runListItemDTO{
+		item := runListItemDTO{
 			runDTO:     runToDTO(row.Run),
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
-		})
+		}
+		item.Usage = usageFromListRow(row) // nil when the run has no usage rows (PRD #40)
+		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})
 }

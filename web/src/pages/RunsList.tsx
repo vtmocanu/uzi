@@ -9,16 +9,23 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem } from "../lib/api";
+import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type RunUsage } from "../lib/api";
 import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { isStoppedRun, mrChipState } from "../lib/runBadge";
+import { formatTokens, formatCost } from "../lib/formatTokens";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 
 const PAST_STATUS_RANK: Record<string, number> = { failed: 0, cancelled: 1, completed: 2 };
+
+// The meta line's "tok" figure is the run's ALL-token total (fresh + cached + cache
+// creation + output), matching the mock's single "1.33M tok".
+function runUsageTotalTokens(u: RunUsage): number {
+  return u.input_tokens + u.cache_read_tokens + u.cache_creation_tokens + u.output_tokens;
+}
 
 function sortPast(a: RunListItem, b: RunListItem): number {
   const t = b.updated_at.localeCompare(a.updated_at);
@@ -62,6 +69,20 @@ function RunRow({
             <span>· {new Date(run.updated_at).toLocaleString()}</span>
             {run.mr_iid != null && (
               <MrChip variant="inline" label="· MR " mrIid={run.mr_iid} mrState={mrState} href={null} className="font-medium" />
+            )}
+            {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
+                usage rows (a pre-feature run) — never a fabricated 0. A running run
+                shows its "so far" figure, which grows as phases fold. */}
+            {run.usage && (
+              <>
+                <span className="font-mono tabular-nums">
+                  · {formatTokens(runUsageTotalTokens(run.usage))} tok
+                  {run.status === "running" ? " so far" : ""}
+                </span>
+                {run.usage.cost_usd > 0 && (
+                  <span className="font-mono text-brand/90">· {formatCost(run.usage.cost_usd)}</span>
+                )}
+              </>
             )}
           </p>
         </div>

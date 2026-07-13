@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import type { RunMessage } from "../lib/api";
+import type { PhaseUsage } from "../lib/runUsage";
 import { useFollowScroll, useReconnectingBanner } from "../lib/useFollowScroll";
 import { buildToolIndex, describeError, describeStatus, RunEventRow, truncate } from "./RunEvent";
 import { ChevronRightIcon } from "./icons";
@@ -124,11 +125,16 @@ export function ActivityFeed({
   runningLive,
   connected,
   terminal,
+  phaseUsageBySeq,
 }: {
   messages: RunMessage[];
   runningLive: boolean;
   connected: boolean;
   terminal: boolean;
+  // PRD #40: per-result-frame token/cost deltas keyed by seq, so a result frame's
+  // finish line can show its phase's usage. Optional — omitted, finish lines render
+  // exactly as before.
+  phaseUsageBySeq?: Map<number, PhaseUsage>;
 }) {
   const [showAll, setShowAll] = useState(false);
   // Agent collapse is keyed by agent NAME, not by block: groupByAgent emits a
@@ -290,6 +296,7 @@ export function ActivityFeed({
                 now={now}
                 toolIndex={toolIndex}
                 visibleToolUseIds={visibleToolUseIds}
+                phaseUsageBySeq={phaseUsageBySeq}
               />
             );
           })}
@@ -308,6 +315,7 @@ function AgentBlock({
   bodyId,
   toolIndex,
   visibleToolUseIds,
+  phaseUsageBySeq,
 }: {
   group: AgentGroup;
   live: boolean;
@@ -317,6 +325,7 @@ function AgentBlock({
   bodyId: string;
   toolIndex: ReturnType<typeof buildToolIndex>;
   visibleToolUseIds: Set<string>;
+  phaseUsageBySeq?: Map<number, PhaseUsage>;
 }) {
   const accent = agentAccent(group.agent);
 
@@ -359,8 +368,9 @@ function AgentBlock({
       continue;
     }
     // Full-width kinds (text, status→divider, error, plan, unknown) break the rail.
+    // A status/error result frame carries its per-phase usage (undefined otherwise).
     flushRail();
-    rows.push(<RunEventRow key={m.seq} msg={m} live={live} />);
+    rows.push(<RunEventRow key={m.seq} msg={m} live={live} phaseUsage={phaseUsageBySeq?.get(m.seq)} />);
   }
   flushRail();
 

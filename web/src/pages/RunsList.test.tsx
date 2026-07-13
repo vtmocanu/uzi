@@ -160,3 +160,32 @@ describe("RunsList — autopilot badge", () => {
     expect(screen.getAllByText("autopilot")).toHaveLength(1);
   });
 });
+
+describe("RunsList — usage meta line (PRD #40)", () => {
+  it("adds tokens + cost to a run with usage (running → 'so far'), nothing to a run without", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "with",
+          issue_title: "Has usage",
+          status: "running",
+          usage: { input_tokens: 114_400, cache_read_tokens: 1_170_000, cache_creation_tokens: 0, output_tokens: 48_200, cost_usd: 1.87 },
+        }),
+        aRun({ id: "without", issue_title: "No usage", status: "running" }),
+      ],
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Has usage")).toBeTruthy());
+    // total = 114.4k + 1.17M + 0 + 48.2k = 1,332,600 → "1.33M tok so far" (running).
+    expect(screen.getByText(/1\.33M tok so far/)).toBeTruthy();
+    expect(screen.getByText(/\$1\.87/)).toBeTruthy();
+    // The no-usage run contributes no "tok" figure — exactly one run shows usage.
+    expect(screen.queryAllByText(/tok/).length).toBe(1);
+  });
+})

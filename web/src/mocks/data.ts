@@ -17,6 +17,7 @@ import type {
   Run,
   RunListItem,
   RunMessage,
+  RunUsage,
   SecretMeta,
   Skill,
   ToolAllowlistEntry,
@@ -1122,13 +1123,31 @@ export function SAMPLE_PLAN(): string {
 }
 
 // runListItem decorates a Run into the list shape the API returns.
+// PRD #40 demo: usage for a run that actually ran (terminal or running); a queued /
+// awaiting_approval run has none, so its list row shows no tok/cost — exactly the
+// pre-feature "never a fake 0" behavior. A running run shows a smaller "so far".
+function demoRunUsage(r: Run): RunUsage | null {
+  if (r.status === "queued" || r.status === "claimed" || r.status === "awaiting_approval") return null;
+  const scale = r.status === "running" ? 0.4 : 1;
+  const round = (n: number) => Math.round(n * scale);
+  return {
+    input_tokens: round(114_400),
+    cache_read_tokens: round(1_170_000),
+    cache_creation_tokens: 0,
+    output_tokens: round(48_200),
+    cost_usd: Math.round(187 * scale) / 100,
+  };
+}
+
 export function runListItem(r: Run, ownerEmail?: string): RunListItem {
   const repo = mockRepos.find((x) => x.id === r.repo_id);
   const worker = mockWorkers.find((w) => w.id === r.worker_id);
+  const usage = demoRunUsage(r);
   return {
     ...r,
     repo_path: repo?.path_with_namespace ?? r.repo_id ?? "",
     worker_name: worker?.name ?? null,
+    ...(usage ? { usage } : {}),
     ...(ownerEmail ? { owner_email: ownerEmail } : {}),
   };
 }
@@ -1147,26 +1166,44 @@ const dm = (kind: string, agent: string | null, payload: unknown, minAgo: number
 
 export const mockDoneMessages: RunMessage[] = [
   dm("status", null, { event: "init", model: "claude-sonnet-4-6" }, 219),
-  dm("text", "lead", { text: "Reading the PRD and the current run-view rendering to scope the fold-results work." }, 218),
+  dm("text", "lead", { text: "Reading the PRD and the current run-view rendering to scope the fold-results work.", usage: { input_tokens: 38_200, cache_read_input_tokens: 401_500, cache_creation_input_tokens: 2_000, output_tokens: 14_800 } }, 218),
   dm("tool_use", "lead", { id: "tu-1", name: "Read", input: { file_path: "prds/11-run-view-ux.md" } }, 218),
   dm("tool_result", "lead", { tool_use_id: "tu-1", content: "# PRD 11 — Run view UX\n\nFold tool results under their calls…" }, 218),
   dm("tool_use", "lead", { id: "tu-2", name: "Grep", input: { pattern: "tool_result", path: "web/src" } }, 217),
   dm("tool_result", "lead", { tool_use_id: "tu-2", content: "web/src/components/RunEvent.tsx:12\nweb/src/components/ActivityFeed.tsx:44" }, 217),
   dm("plan", "lead", { text: SAMPLE_PLAN() }, 216),
+  // PRD #40: the plan turn's own result frame → a distinct "Plan" per-phase row.
+  dm("status", null, {
+    event: "result",
+    subtype: "success",
+    duration_ms: 5 * 60_000,
+    num_turns: 9,
+    total_cost_usd: 0.24,
+    usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
+    modelUsage: { "claude-sonnet-5": { inputTokens: 21_400, outputTokens: 6_100, cacheReadInputTokens: 188_000, cacheCreationInputTokens: 0, costUSD: 0.24 } },
+  }, 216),
   dm("status", null, { text: "plan submitted — awaiting approval" }, 216),
   dm("status", null, { text: "plan approved by vlad@uzi.local" }, 205),
-  dm("text", "coder", { text: "Implementing the id-based pairing index and the fold-under-call rendering." }, 204),
+  dm("text", "coder", { text: "Implementing the id-based pairing index and the fold-under-call rendering.", usage: { input_tokens: 51_600, cache_read_input_tokens: 583_900, cache_creation_input_tokens: 0, output_tokens: 24_100 } }, 204),
   dm("tool_use", "coder", { id: "tu-3", name: "Edit", input: { file_path: "web/src/components/RunEvent.tsx" } }, 203),
   dm("tool_result", "coder", { tool_use_id: "tu-3", content: "ok" }, 203),
   dm("tool_use", "coder", { id: "tu-4", name: "Bash", input: { command: "cd web && npx vitest run src/components/RunEvent.test.tsx" } }, 200),
   dm("tool_result", "coder", { tool_use_id: "tu-4", content: "✓ 14 tests passed" }, 199),
-  dm("text", "reviewer", { text: "Pairing is by id, orphan results render standalone, and the cap keeps folding correct at the boundary. One nit: memoize the index. Approved after that." }, 195),
+  dm("text", "reviewer", { text: "Pairing is by id, orphan results render standalone, and the cap keeps folding correct at the boundary. One nit: memoize the index. Approved after that.", usage: { input_tokens: 18_900, cache_read_input_tokens: 149_700, cache_creation_input_tokens: 0, output_tokens: 7_600 } }, 195),
   dm("tool_use", "coder", { id: "tu-5", name: "Edit", input: { file_path: "web/src/components/ActivityFeed.tsx" } }, 192),
   dm("tool_result", "coder", { tool_use_id: "tu-5", content: "ok" }, 192),
   dm("tool_use", "coder", { id: "tu-6", name: "Bash", input: { command: "cd web && npm run typecheck && npm test" } }, 190),
   dm("tool_result", "coder", { tool_use_id: "tu-6", content: "typecheck clean\n✓ 61 tests passed" }, 188),
   dm("status", null, { text: "pushing branch agent/issue-18 and opening the MR" }, 185),
-  dm("status", null, { event: "result", subtype: "success", duration_ms: 2_100_000, num_turns: 38, total_cost_usd: 1.87 }, 184),
+  dm("status", null, {
+    event: "result",
+    subtype: "success",
+    duration_ms: 2_100_000,
+    num_turns: 38,
+    total_cost_usd: 1.87,
+    usage: { input_tokens: 114_400, cache_read_input_tokens: 1_170_000, cache_creation_input_tokens: 0, output_tokens: 48_200 },
+    modelUsage: { "claude-sonnet-5": { inputTokens: 114_400, outputTokens: 48_200, cacheReadInputTokens: 1_170_000, cacheCreationInputTokens: 0, costUSD: 1.87 } },
+  }, 184),
 ];
 
 // ── Awaiting-approval history (parked at the plan gate) ───────────────────────
@@ -1202,10 +1239,22 @@ const fm = (kind: string, agent: string | null, payload: unknown): RunMessage =>
 
 export const mockFailedMessages: RunMessage[] = [
   fm("status", null, { event: "init", model: "claude-sonnet-4-6" }),
-  fm("text", "lead", { text: "Benchmarking the pool under load before proposing settings." }),
+  fm("text", "lead", { text: "Benchmarking the pool under load before proposing settings.", usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 } }),
   fm("tool_use", "lead", { id: "f-1", name: "Bash", input: { command: "go test -bench=Pool ./internal/store/..." } }),
   fm("tool_result", "lead", { tool_use_id: "f-1", content: "benchmark hung — no output after 40m", is_error: true }),
   fm("error", null, { text: "run timed out after 2h0m0s (RUN_TIMEOUT)" }),
+  // PRD #40 (Decision 4): a failed run still spent tokens — a usage-bearing error
+  // result frame, so the run view shows its pre-death usage.
+  fm("error", null, {
+    event: "result",
+    subtype: "error_during_execution",
+    errors: ["run timed out after 2h0m0s (RUN_TIMEOUT)"],
+    num_turns: 4,
+    duration_ms: 2 * 60 * 60_000,
+    total_cost_usd: 0.11,
+    usage: { input_tokens: 8_200, cache_read_input_tokens: 42_000, cache_creation_input_tokens: 0, output_tokens: 1_900 },
+    modelUsage: { "claude-sonnet-5": { inputTokens: 8_200, outputTokens: 1_900, cacheReadInputTokens: 42_000, cacheCreationInputTokens: 0, costUSD: 0.11 } },
+  }),
 ];
 
 // ── Chat conversations (PRD #39 M4) ──────────────────────────────────────────

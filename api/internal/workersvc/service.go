@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/big"
 	"strings"
 	"time"
 
@@ -138,6 +140,14 @@ type Store interface {
 	// Messages + inputs.
 	InsertRunMessage(ctx context.Context, arg store.InsertRunMessageParams) (int64, error)
 	ListRunMessagesAfter(ctx context.Context, arg store.ListRunMessagesAfterParams) ([]store.RunMessage, error)
+	// UpsertRunUsage folds a delivered result frame's per-model usage into
+	// run_usage (PRD #40 M2), GREATEST-merged so re-delivery never regresses.
+	UpsertRunUsage(ctx context.Context, arg store.UpsertRunUsageParams) error
+	// Usage read rollups (PRD #40 M3), all over the run_usage_totals view.
+	GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error)
+	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
+	AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error)
+	AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
 	CreateStopVerdictInput(ctx context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error)
 	// CreateApprovePlanInput enqueues an approve_plan AND records the run's agent
@@ -787,6 +797,17 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 			return err
 		}
 	}
+	// Fold every DELIVERED result frame's usage into run_usage (PRD #40 Decision 2)
+	// — over `msgs`, NOT `inserted`: a seq-deduped re-delivery (crash retry) must
+	// still re-run the fold, which is exactly what makes at-least-once delivery plus
+	// the idempotent GREATEST merge converge to correct totals with no crash window.
+	// Malformed/absent usage is skipped inside; a DB error propagates so the worker
+	// re-delivers and the fold retries. No terminal-status guard — a result frame
+	// that lands after a mid-flight cancel still folds (pre-cancel spend is real
+	// spend, Decision 4).
+	if err := s.foldRunUsage(ctx, run, msgs); err != nil {
+		return err
+	}
 	// Fan out after the log + high-water mark are durably advanced, so a browser
 	// that reacts by replaying from last_seq sees a consistent state.
 	if s.bcast != nil {
@@ -796,6 +817,115 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 		}
 	}
 	return nil
+}
+
+// resultUsagePayload is the subset of a terminal result frame's payload the fold
+// reads. mapResult (agent/src/sdk-messages.ts) emits result frames as kind
+// `status` (success) or `error`, both with `event: "result"` and a `modelUsage`
+// per-model breakdown (Decision 1). Only these keys are parsed; everything else
+// in the payload is ignored, and the fields are camelCase to match the SDK's
+// `ModelUsage` shape as forwarded on the wire.
+type resultUsagePayload struct {
+	Event      string                      `json:"event"`
+	ModelUsage map[string]resultModelUsage `json:"modelUsage"`
+}
+
+type resultModelUsage struct {
+	InputTokens              int64   `json:"inputTokens"`
+	OutputTokens             int64   `json:"outputTokens"`
+	CacheReadInputTokens     int64   `json:"cacheReadInputTokens"`
+	CacheCreationInputTokens int64   `json:"cacheCreationInputTokens"`
+	CostUSD                  float64 `json:"costUSD"`
+}
+
+// foldRunUsage upserts run_usage for every delivered result frame in the batch
+// (PRD #40 Decision 2). It is called with ALL delivered messages, not just the
+// newly-inserted ones, so a seq-deduped re-delivery re-runs the fold — the
+// GREATEST merge in UpsertRunUsage makes that idempotent. session_id is sourced
+// from the run row (the frame payload carries none); it is ” until the run has
+// reported one, which the monotonic merge + latest/MAX-per-model rollup tolerate.
+// Malformed/absent usage is skipped (never fails the append); a DB error
+// propagates so the append fails and the worker re-delivers.
+func (s *Service) foldRunUsage(ctx context.Context, run store.Run, msgs []IncomingMessage) error {
+	// Fold work runs — issue AND ci_fix both spend the user's tokens working a card
+	// or a pipeline end to end — and exclude ONLY chat. Chat-run spend is explicitly
+	// OUT of scope for PRD #40 ("Counting tokens spent outside runs, e.g. the PRD #39
+	// chat agent"), yet mapResult is shared with the chat executor so a chat run's
+	// result frames now carry usage too; skip the whole fold for kind='chat' rather
+	// than let chat consumption leak into run_usage. This is an exclude-list (skip
+	// chat), NOT an allowlist of {issue, ci_fix}, so a future WORK-run kind folds by
+	// default — matching the success criterion "every run started after this shows
+	// tokens" (a new non-work kind would need adding here, the same as chat).
+	if run.Kind == RunKindChat {
+		return nil
+	}
+	var sessionID string
+	if run.SessionID.Valid {
+		sessionID = run.SessionID.String
+	}
+	for _, m := range msgs {
+		// Result frames are only ever kind status (success) or error; skip the
+		// rest without paying an unmarshal for every text/tool_use message.
+		if m.Kind != "status" && m.Kind != "error" {
+			continue
+		}
+		var p resultUsagePayload
+		if err := json.Unmarshal(m.Payload, &p); err != nil {
+			continue // malformed payload → skip, never fail the append
+		}
+		if p.Event != "result" || len(p.ModelUsage) == 0 {
+			continue // not a result frame, or no per-model usage to fold
+		}
+		for model, mu := range p.ModelUsage {
+			if model == "" {
+				continue
+			}
+			if err := s.q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
+				RunID:               run.ID,
+				SessionID:           sessionID,
+				Model:               model,
+				InputTokens:         nonNegTokens(mu.InputTokens),
+				CacheReadTokens:     nonNegTokens(mu.CacheReadInputTokens),
+				CacheCreationTokens: nonNegTokens(mu.CacheCreationInputTokens),
+				OutputTokens:        nonNegTokens(mu.OutputTokens),
+				CostUsd:             numericUSD(mu.CostUSD),
+			}); err != nil {
+				return fmt.Errorf("fold run usage (run %s, model %s): %w", run.ID, model, err)
+			}
+		}
+	}
+	return nil
+}
+
+// maxCostUSD is the numeric(12,6) ceiling ($999,999.999999). A single frame's
+// cost is far below this, but the fold MUST clamp to it: a bogus costUSD >= 1e6
+// would quantize past the column and raise Postgres 22003, failing the append —
+// and the worker's batcher retries a failed batch at head forever (poison loop).
+const maxCostUSD = 999999.999999
+
+// numericUSD builds a numeric(12,6) cost from the SDK's float dollar amount by
+// quantizing to microdollars (Int = round(usd*1e6), Exp = -6) — deterministic and
+// free of the float-string-parse ambiguity of Scan. Out-of-range costs (never
+// expected) are clamped into the column's domain rather than poisoning the fold:
+// NaN/negative/-Inf → 0, and anything above the ceiling (incl. +Inf) → the ceiling.
+func numericUSD(usd float64) pgtype.Numeric {
+	switch {
+	case math.IsNaN(usd) || usd < 0:
+		usd = 0
+	case usd > maxCostUSD: // also catches +Inf
+		usd = maxCostUSD
+	}
+	return pgtype.Numeric{Int: big.NewInt(int64(math.Round(usd * 1e6))), Exp: -6, Valid: true}
+}
+
+// nonNegTokens clamps a token count to >= 0 at fold time. GREATEST only protects an
+// existing row; a fresh (run_id, session_id, model) key inserts whatever arrives, so
+// a negative count (buggy/hostile worker) would otherwise land verbatim.
+func nonNegTokens(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // StateRequest is the worker's report of a run's new state. Only the fields
@@ -1273,6 +1403,29 @@ func (s *Service) ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow
 // ListActiveRunsAll returns every non-terminal run across all users (admin).
 func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error) {
 	return s.q.ListActiveRunsAll(ctx)
+}
+
+// RunUsageTotal returns one run's rolled-up token/cost totals (PRD #40 M3). Returns
+// pgx.ErrNoRows for a run with no usage — the caller renders that as "no usage".
+func (s *Service) RunUsageTotal(ctx context.Context, runID uuid.UUID) (store.GetRunUsageTotalRow, error) {
+	return s.q.GetRunUsageTotal(ctx, runID)
+}
+
+// SelfUsage returns the user's own lifetime + last-7-days usage totals and their
+// usage-bearing run count (PRD #40 M3, GET /api/usage).
+func (s *Service) SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error) {
+	return s.q.SelfUsage(ctx, userID)
+}
+
+// AdminUsageTotals returns factory-wide usage totals across all users (PRD #40 M3).
+func (s *Service) AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error) {
+	return s.q.AdminUsageTotals(ctx)
+}
+
+// AdminUsagePerUser returns the per-user usage breakdown for the admin factory view
+// (PRD #40 M3); the rows sum to the factory total by construction.
+func (s *Service) AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error) {
+	return s.q.AdminUsagePerUser(ctx)
 }
 
 // SubmitInputResult reports how a steering input was handled.

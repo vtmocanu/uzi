@@ -12,6 +12,131 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const adminUsagePerUser = `-- name: AdminUsagePerUser :many
+SELECT u.id AS user_id, u.email,
+    COALESCE(SUM(t.input_tokens), 0)::bigint          AS input_tokens,
+    COALESCE(SUM(t.cache_read_tokens), 0)::bigint      AS cache_read_tokens,
+    COALESCE(SUM(t.cache_creation_tokens), 0)::bigint  AS cache_creation_tokens,
+    COALESCE(SUM(t.output_tokens), 0)::bigint          AS output_tokens,
+    COALESCE(SUM(t.cost_usd), 0)::numeric              AS cost_usd,
+    count(t.run_id)::bigint AS run_count
+FROM run_usage_totals t
+JOIN runs r ON r.id = t.run_id
+JOIN users u ON u.id = r.user_id
+WHERE r.kind <> 'chat'
+GROUP BY u.id, u.email
+ORDER BY cost_usd DESC, output_tokens DESC, u.id
+`
+
+type AdminUsagePerUserRow struct {
+	UserID              uuid.UUID      `json:"user_id"`
+	Email               string         `json:"email"`
+	InputTokens         int64          `json:"input_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CostUsd             pgtype.Numeric `json:"cost_usd"`
+	RunCount            int64          `json:"run_count"`
+}
+
+// Per-user lifetime usage rows for the admin factory breakdown (PRD #40 M3). One row
+// per user WITH usage; the client computes each user's share against the factory
+// total. Ordered heaviest-cost first (output tokens tiebreak). Sums the same
+// run_usage_totals as AdminUsageTotals, so the rows sum to the factory lifetime total.
+func (q *Queries) AdminUsagePerUser(ctx context.Context) ([]AdminUsagePerUserRow, error) {
+	rows, err := q.db.Query(ctx, adminUsagePerUser)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminUsagePerUserRow{}
+	for rows.Next() {
+		var i AdminUsagePerUserRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.Email,
+			&i.InputTokens,
+			&i.CacheReadTokens,
+			&i.CacheCreationTokens,
+			&i.OutputTokens,
+			&i.CostUsd,
+			&i.RunCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const adminUsageTotals = `-- name: AdminUsageTotals :one
+WITH scoped AS (
+    SELECT r.created_at,
+           t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
+    FROM run_usage_totals t
+    JOIN runs r ON r.id = t.run_id
+    WHERE r.kind <> 'chat'
+)
+SELECT
+    COALESCE(SUM(input_tokens), 0)::bigint          AS lifetime_input_tokens,
+    COALESCE(SUM(cache_read_tokens), 0)::bigint      AS lifetime_cache_read_tokens,
+    COALESCE(SUM(cache_creation_tokens), 0)::bigint  AS lifetime_cache_creation_tokens,
+    COALESCE(SUM(output_tokens), 0)::bigint          AS lifetime_output_tokens,
+    COALESCE(SUM(cost_usd), 0)::numeric              AS lifetime_cost_usd,
+    COALESCE(SUM(input_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_input_tokens,
+    COALESCE(SUM(cache_read_tokens)      FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_read_tokens,
+    COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
+    COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
+    COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*)::bigint AS run_count,
+    -- The earliest usage-bearing run's creation time, for the factory card's "since
+    -- <date>" (PRD #40 M6). NULL when the factory has no usage yet.
+    MIN(created_at)::timestamptz AS earliest_run
+FROM scoped
+`
+
+type AdminUsageTotalsRow struct {
+	LifetimeInputTokens         int64              `json:"lifetime_input_tokens"`
+	LifetimeCacheReadTokens     int64              `json:"lifetime_cache_read_tokens"`
+	LifetimeCacheCreationTokens int64              `json:"lifetime_cache_creation_tokens"`
+	LifetimeOutputTokens        int64              `json:"lifetime_output_tokens"`
+	LifetimeCostUsd             pgtype.Numeric     `json:"lifetime_cost_usd"`
+	Last7InputTokens            int64              `json:"last7_input_tokens"`
+	Last7CacheReadTokens        int64              `json:"last7_cache_read_tokens"`
+	Last7CacheCreationTokens    int64              `json:"last7_cache_creation_tokens"`
+	Last7OutputTokens           int64              `json:"last7_output_tokens"`
+	Last7CostUsd                pgtype.Numeric     `json:"last7_cost_usd"`
+	RunCount                    int64              `json:"run_count"`
+	EarliestRun                 pgtype.Timestamptz `json:"earliest_run"`
+}
+
+// Factory-wide totals across ALL users' runs (PRD #40 M3, GET /api/admin/usage).
+// Same shape as SelfUsage without the user filter; by construction this equals the
+// SUM of the AdminUsagePerUser rows (both read run_usage_totals joined to non-chat
+// runs), which the handler test asserts.
+func (q *Queries) AdminUsageTotals(ctx context.Context) (AdminUsageTotalsRow, error) {
+	row := q.db.QueryRow(ctx, adminUsageTotals)
+	var i AdminUsageTotalsRow
+	err := row.Scan(
+		&i.LifetimeInputTokens,
+		&i.LifetimeCacheReadTokens,
+		&i.LifetimeCacheCreationTokens,
+		&i.LifetimeOutputTokens,
+		&i.LifetimeCostUsd,
+		&i.Last7InputTokens,
+		&i.Last7CacheReadTokens,
+		&i.Last7CacheCreationTokens,
+		&i.Last7OutputTokens,
+		&i.Last7CostUsd,
+		&i.RunCount,
+		&i.EarliestRun,
+	)
+	return i, err
+}
+
 const cancelRunServerSide = `-- name: CancelRunServerSide :execrows
 UPDATE runs SET status = 'cancelled', stop_kind = 'cancelled', move_pending_since = now(), finished_at = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
@@ -1001,6 +1126,38 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 	return i, err
 }
 
+const getRunUsageTotal = `-- name: GetRunUsageTotal :one
+SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd
+FROM run_usage_totals
+WHERE run_id = $1
+`
+
+type GetRunUsageTotalRow struct {
+	InputTokens         int64          `json:"input_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CostUsd             pgtype.Numeric `json:"cost_usd"`
+}
+
+// One run's rollup totals (PRD #40 M3), for the run-detail usage strip. Reads the
+// run_usage_totals view (greatest-wins per model, summed across models). Returns NO
+// ROW for a run with no usage — the handler maps pgx.ErrNoRows to "no usage" (absent,
+// never a fake 0), so it does not gate detail visibility on ownership here (the
+// caller has already authorized the viewer).
+func (q *Queries) GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (GetRunUsageTotalRow, error) {
+	row := q.db.QueryRow(ctx, getRunUsageTotal, runID)
+	var i GetRunUsageTotalRow
+	err := row.Scan(
+		&i.InputTokens,
+		&i.CacheReadTokens,
+		&i.CacheCreationTokens,
+		&i.OutputTokens,
+		&i.CostUsd,
+	)
+	return i, err
+}
+
 const getWorkerByID = `-- name: GetWorkerByID :one
 SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs FROM workers WHERE id = $1
 `
@@ -1593,10 +1750,16 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+       ru.input_tokens          AS usage_input_tokens,
+       ru.cache_read_tokens      AS usage_cache_read_tokens,
+       ru.cache_creation_tokens  AS usage_cache_creation_tokens,
+       ru.output_tokens          AS usage_output_tokens,
+       ru.cost_usd               AS usage_cost_usd
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
+LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = $1
   -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
   -- list never shows. self_improve has a real repo and stays visible. The repos
@@ -1616,9 +1779,14 @@ type ListRunsForUserParams struct {
 }
 
 type ListRunsForUserRow struct {
-	Run        Run         `json:"run"`
-	RepoPath   string      `json:"repo_path"`
-	WorkerName pgtype.Text `json:"worker_name"`
+	Run                      Run            `json:"run"`
+	RepoPath                 string         `json:"repo_path"`
+	WorkerName               pgtype.Text    `json:"worker_name"`
+	UsageInputTokens         pgtype.Int8    `json:"usage_input_tokens"`
+	UsageCacheReadTokens     pgtype.Int8    `json:"usage_cache_read_tokens"`
+	UsageCacheCreationTokens pgtype.Int8    `json:"usage_cache_creation_tokens"`
+	UsageOutputTokens        pgtype.Int8    `json:"usage_output_tokens"`
+	UsageCostUsd             pgtype.Numeric `json:"usage_cost_usd"`
 }
 
 // The user's runs, newest first (Runs index + Agents-status "your runs"), joined
@@ -1627,6 +1795,9 @@ type ListRunsForUserRow struct {
 // (repo scope) and the in-app issue history (repo + issue); when both are NULL
 // this is the unchanged full list. The per-issue narrowing rides the composite
 // index runs (repo_id, issue_iid, created_at DESC).
+// The usage_* columns are the run's rollup totals (PRD #40 M3), LEFT-joined from
+// run_usage_totals so a run with no usage yields NULLs (rendered as absent, never a
+// fake 0). The view already applies the greatest-wins-per-model rollup (Decision 3b).
 func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams) ([]ListRunsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listRunsForUser, arg.UserID, arg.RepoID, arg.IssueIid)
 	if err != nil {
@@ -1683,6 +1854,11 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.TargetRunID,
 			&i.RepoPath,
 			&i.WorkerName,
+			&i.UsageInputTokens,
+			&i.UsageCacheReadTokens,
+			&i.UsageCacheCreationTokens,
+			&i.UsageOutputTokens,
+			&i.UsageCostUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -2097,6 +2273,67 @@ func (q *Queries) RequeueWorkerRuns(ctx context.Context, arg RequeueWorkerRunsPa
 	return result.RowsAffected(), nil
 }
 
+const selfUsage = `-- name: SelfUsage :one
+WITH scoped AS (
+    SELECT r.created_at,
+           t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
+    FROM run_usage_totals t
+    JOIN runs r ON r.id = t.run_id
+    WHERE r.user_id = $1 AND r.kind <> 'chat'
+)
+SELECT
+    COALESCE(SUM(input_tokens), 0)::bigint          AS lifetime_input_tokens,
+    COALESCE(SUM(cache_read_tokens), 0)::bigint      AS lifetime_cache_read_tokens,
+    COALESCE(SUM(cache_creation_tokens), 0)::bigint  AS lifetime_cache_creation_tokens,
+    COALESCE(SUM(output_tokens), 0)::bigint          AS lifetime_output_tokens,
+    COALESCE(SUM(cost_usd), 0)::numeric              AS lifetime_cost_usd,
+    COALESCE(SUM(input_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_input_tokens,
+    COALESCE(SUM(cache_read_tokens)      FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_read_tokens,
+    COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
+    COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
+    COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*)::bigint AS run_count
+FROM scoped
+`
+
+type SelfUsageRow struct {
+	LifetimeInputTokens         int64          `json:"lifetime_input_tokens"`
+	LifetimeCacheReadTokens     int64          `json:"lifetime_cache_read_tokens"`
+	LifetimeCacheCreationTokens int64          `json:"lifetime_cache_creation_tokens"`
+	LifetimeOutputTokens        int64          `json:"lifetime_output_tokens"`
+	LifetimeCostUsd             pgtype.Numeric `json:"lifetime_cost_usd"`
+	Last7InputTokens            int64          `json:"last7_input_tokens"`
+	Last7CacheReadTokens        int64          `json:"last7_cache_read_tokens"`
+	Last7CacheCreationTokens    int64          `json:"last7_cache_creation_tokens"`
+	Last7OutputTokens           int64          `json:"last7_output_tokens"`
+	Last7CostUsd                pgtype.Numeric `json:"last7_cost_usd"`
+	RunCount                    int64          `json:"run_count"`
+}
+
+// The requesting user's own usage (PRD #40 M3, GET /api/usage): lifetime totals,
+// last-7-days totals, and the count of their runs that carry usage. Windowed on the
+// run's created_at (laptop scale ≈ when it spent). COALESCE(...,0) so a user with no
+// usage gets zeros + run_count 0 (the client reads run_count==0 as "nothing yet").
+// Chat runs are excluded (belt-and-suspenders: the fold never writes chat rows).
+func (q *Queries) SelfUsage(ctx context.Context, userID uuid.UUID) (SelfUsageRow, error) {
+	row := q.db.QueryRow(ctx, selfUsage, userID)
+	var i SelfUsageRow
+	err := row.Scan(
+		&i.LifetimeInputTokens,
+		&i.LifetimeCacheReadTokens,
+		&i.LifetimeCacheCreationTokens,
+		&i.LifetimeOutputTokens,
+		&i.LifetimeCostUsd,
+		&i.Last7InputTokens,
+		&i.Last7CacheReadTokens,
+		&i.Last7CacheCreationTokens,
+		&i.Last7OutputTokens,
+		&i.Last7CostUsd,
+		&i.RunCount,
+	)
+	return i, err
+}
+
 const setRunAwaitingApproval = `-- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
     status     = 'awaiting_approval',
@@ -2458,4 +2695,58 @@ func (q *Queries) UpdateRunLastSeq(ctx context.Context, arg UpdateRunLastSeqPara
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const upsertRunUsage = `-- name: UpsertRunUsage :exec
+
+INSERT INTO run_usage (
+    run_id, session_id, model,
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
+) VALUES (
+    $1, $2, $3,
+    $4, $5, $6, $7, $8, now()
+)
+ON CONFLICT (run_id, session_id, model) DO UPDATE SET
+    input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
+    cache_read_tokens     = GREATEST(run_usage.cache_read_tokens,     EXCLUDED.cache_read_tokens),
+    cache_creation_tokens = GREATEST(run_usage.cache_creation_tokens, EXCLUDED.cache_creation_tokens),
+    output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
+    cost_usd              = GREATEST(run_usage.cost_usd,              EXCLUDED.cost_usd),
+    updated_at            = now()
+`
+
+type UpsertRunUsageParams struct {
+	RunID               uuid.UUID      `json:"run_id"`
+	SessionID           string         `json:"session_id"`
+	Model               string         `json:"model"`
+	InputTokens         int64          `json:"input_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CostUsd             pgtype.Numeric `json:"cost_usd"`
+}
+
+// Usage accounting (PRD #40) ------------------------------------------------
+// Fold one model's usage from a delivered result frame into the run's accounting
+// (Decision 2). The result frame's totals are CUMULATIVE-across-resume (M1's
+// Decision 3 verdict b), so the token/cost columns are monotonic per (run_id,
+// session_id, model) and the merge is GREATEST — never a plain overwrite: a
+// crash-retry that re-delivers an EARLIER frame after a LATER one must not regress
+// the row (that is exactly what makes "re-delivering the whole batch changes
+// nothing" true under verdict b, where a stable session_id can otherwise see two
+// different cumulative snapshots hit the same key). The API calls this for every
+// delivered result frame incl. seq-deduped replays, so at-least-once delivery +
+// this idempotent monotonic merge = correct totals with no crash window.
+func (q *Queries) UpsertRunUsage(ctx context.Context, arg UpsertRunUsageParams) error {
+	_, err := q.db.Exec(ctx, upsertRunUsage,
+		arg.RunID,
+		arg.SessionID,
+		arg.Model,
+		arg.InputTokens,
+		arg.CacheReadTokens,
+		arg.CacheCreationTokens,
+		arg.OutputTokens,
+		arg.CostUsd,
+	)
+	return err
 }

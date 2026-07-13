@@ -99,10 +99,13 @@ function mapUser(msg: Record<string, unknown>): EmittedMessage[] {
 function mapResult(msg: Record<string, unknown>): EmittedMessage[] {
   const subtype = asString(msg["subtype"]) ?? "unknown";
   if (subtype === "success" && msg["is_error"] !== true) {
-    // duration_ms/total_cost_usd are forwarded additively so the run view can
-    // show the finish line's duration and cost (PRD #11). Unguarded passthrough,
-    // same style as num_turns: when the SDK frame omits a field it lands as
-    // undefined and JSON-serialization drops it, so nothing surfaces on the wire.
+    // duration_ms/total_cost_usd are forwarded for the finish line's duration and
+    // cost (PRD #11); usage/modelUsage carry the full token accounting the API
+    // folds into run_usage (PRD #40 M1). Unguarded passthrough, same style as
+    // num_turns: when the SDK frame omits a field it lands as undefined and
+    // JSON-serialization drops it, so nothing surfaces on the wire. These result
+    // totals are CUMULATIVE-across-resume (PRD #40 Decision 3 verdict b), so the
+    // server rollup takes them latest-wins per (run_id, model), never a sum.
     return [
       {
         kind: "status",
@@ -113,17 +116,31 @@ function mapResult(msg: Record<string, unknown>): EmittedMessage[] {
           num_turns: msg["num_turns"],
           duration_ms: msg["duration_ms"],
           total_cost_usd: msg["total_cost_usd"],
+          usage: msg["usage"],
+          modelUsage: msg["modelUsage"],
         },
       },
     ];
   }
-  // error_during_execution / error_max_turns / error_max_budget_usd / etc.
+  // error_during_execution / error_max_turns / error_max_budget_usd / etc. The
+  // SDK's SDKResultError carries the same accounting as a success frame, so a
+  // failed/cancelled run's pre-death spend is still forwarded (PRD #40 Decision 4)
+  // — the runs most worth auditing must not report nothing.
   const errors = Array.isArray(msg["errors"]) ? (msg["errors"] as unknown[]).map(String) : [];
   return [
     {
       kind: "error",
       agent: LEAD,
-      payload: { event: "result", subtype, errors },
+      payload: {
+        event: "result",
+        subtype,
+        errors,
+        usage: msg["usage"],
+        modelUsage: msg["modelUsage"],
+        total_cost_usd: msg["total_cost_usd"],
+        num_turns: msg["num_turns"],
+        duration_ms: msg["duration_ms"],
+      },
     },
   ];
 }
@@ -178,4 +195,21 @@ export function isResult(message: unknown): boolean {
 /** Extract the session_id an SDK message carries, if any (first one wins). */
 export function sessionIdOf(message: unknown): string | undefined {
   return asString(asRecord(message)?.["session_id"]);
+}
+
+/**
+ * The per-API-call token usage an assistant frame carries
+ * (`SDKAssistantMessage.message.usage` — a `BetaUsage`, sdk.d.ts:2762). Returned
+ * raw for the executor to attach to EXACTLY ONE emitted message that survives its
+ * signal filter (PRD #40 Decision 11 — the attach is executor-side, not here,
+ * because mapAssistant explodes one frame into N messages and cannot see that
+ * later drop). This is PER-CALL usage: it is what the per-agent table sums, and is
+ * a DELIBERATELY different data path from the terminal result frame's usage, which
+ * the CLI reports from a cumulative-across-resume accumulator (Decision 3 verdict
+ * b). Undefined for any non-assistant frame, or one with no object-shaped usage.
+ */
+export function assistantUsageOf(message: unknown): Record<string, unknown> | undefined {
+  const msg = asRecord(message);
+  if (!msg || msg["type"] !== "assistant") return undefined;
+  return asRecord(asRecord(msg["message"])?.["usage"]);
 }

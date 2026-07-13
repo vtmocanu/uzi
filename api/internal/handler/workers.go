@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
@@ -200,6 +201,11 @@ type runDTO struct {
 	// only on the run-detail read (GetRun), where the store is in reach; null (a Go
 	// nil slice) on the list/create/worker DTOs, which never drive the picker.
 	OwnAgents []workersvc.RepoAgent `json:"own_agents"`
+	// Usage is the run's rolled-up token/cost totals (PRD #40), present only when the
+	// run has usage rows — null for a pre-feature run so the UI shows nothing rather
+	// than a fabricated 0. Populated on the list (ListRuns) and detail (GetRun) reads;
+	// nil on the create/worker DTO paths, which never render usage.
+	Usage *usageDTO `json:"usage,omitempty"`
 }
 
 func runToDTO(r store.Run) runDTO {
@@ -519,6 +525,20 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		slog.Error("resolve own agent roster", "run_id", run.ID, "error", err)
 	} else {
 		dto.OwnAgents = own
+	}
+	// Attach the run's usage totals (PRD #40). No row → no usage: leave dto.Usage nil
+	// (a pre-feature run shows nothing). Best-effort like OwnAgents above: a lookup
+	// error must not fail the read of an otherwise-fine run.
+	if u, err := h.wsvc.RunUsageTotal(r.Context(), run.ID); err == nil {
+		dto.Usage = &usageDTO{
+			InputTokens:         u.InputTokens,
+			CacheReadTokens:     u.CacheReadTokens,
+			CacheCreationTokens: u.CacheCreationTokens,
+			OutputTokens:        u.OutputTokens,
+			CostUSD:             numericToFloat(u.CostUsd),
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		slog.Error("get run usage total", "run_id", run.ID, "error", err)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"run": dto})
 }

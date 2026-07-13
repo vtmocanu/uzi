@@ -406,6 +406,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// Agents-status overview: every user's workers + active runs.
 			r.Get("/workers", h.AdminListWorkers)
 			r.Get("/runs", h.AdminListRuns)
+			// Factory-wide token/cost usage + per-user breakdown (PRD #40).
+			r.Get("/usage", h.AdminUsage)
 			// Self-improvement config (PRD #46 M5): read/enable the autonomous
 			// improvement job. PUT sets the enabling admin (session, never the body)
 			// as the run owner and requires a repo the admin owns.
@@ -486,6 +488,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// since it mints a token-spending run.
 				r.With(judgeLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
 			})
+
+			// The caller's own token/cost usage (PRD #40): lifetime + last-7-days
+			// totals + run count. Self-scoped; admins use /api/admin/usage for the
+			// factory view.
+			r.Get("/usage", h.SelfUsage)
 
 			// In-app chat agent (PRD #39): conversations ride runs.kind='chat'. The
 			// live view reuses /api/ws + the /api/runs/{id}/messages replay (a chat run

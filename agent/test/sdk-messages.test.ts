@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mapSdkMessage, isErrorResult, isResult, sessionIdOf } from "../src/sdk-messages.js";
+import { mapSdkMessage, isErrorResult, isResult, sessionIdOf, assistantUsageOf } from "../src/sdk-messages.js";
 
 // SDK stream events → run_messages (kinds + agent attribution). Built with
 // hand-rolled SDK-shaped objects; no live session.
@@ -61,12 +61,16 @@ describe("mapSdkMessage", () => {
           num_turns: 3,
           duration_ms: undefined,
           total_cost_usd: undefined,
+          usage: undefined,
+          modelUsage: undefined,
         },
       },
     ]);
   });
 
-  it("forwards duration_ms and total_cost_usd on a success result when present (PRD #11)", () => {
+  it("forwards duration_ms/total_cost_usd + usage/modelUsage on a success result (PRD #11, #40 M1)", () => {
+    const usage = { input_tokens: 1200, output_tokens: 800, cache_read_input_tokens: 400, cache_creation_input_tokens: 50 };
+    const modelUsage = { "claude-fable-5": { inputTokens: 1200, outputTokens: 800, costUSD: 0.0731 } };
     const out = mapSdkMessage({
       type: "result",
       subtype: "success",
@@ -74,6 +78,8 @@ describe("mapSdkMessage", () => {
       num_turns: 3,
       duration_ms: 12400,
       total_cost_usd: 0.0731,
+      usage,
+      modelUsage,
     });
     assert.deepStrictEqual(out, [
       {
@@ -85,20 +91,62 @@ describe("mapSdkMessage", () => {
           num_turns: 3,
           duration_ms: 12400,
           total_cost_usd: 0.0731,
+          usage,
+          modelUsage,
         },
       },
     ]);
   });
 
-  it("maps an error result to an error message", () => {
+  it("maps an error result to an error message, forwarding usage/cost/turns/duration (PRD #40 Decision 4)", () => {
+    const usage = { input_tokens: 500, output_tokens: 120, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+    const modelUsage = { "claude-fable-5": { inputTokens: 500, outputTokens: 120, costUSD: 0.031 } };
     const out = mapSdkMessage({
       type: "result",
       subtype: "error_max_turns",
       is_error: true,
       errors: ["hit the cap"],
+      usage,
+      modelUsage,
+      total_cost_usd: 0.031,
+      num_turns: 7,
+      duration_ms: 44000,
     });
     assert.deepStrictEqual(out, [
-      { kind: "error", agent: "lead", payload: { event: "result", subtype: "error_max_turns", errors: ["hit the cap"] } },
+      {
+        kind: "error",
+        agent: "lead",
+        payload: {
+          event: "result",
+          subtype: "error_max_turns",
+          errors: ["hit the cap"],
+          usage,
+          modelUsage,
+          total_cost_usd: 0.031,
+          num_turns: 7,
+          duration_ms: 44000,
+        },
+      },
+    ]);
+  });
+
+  it("an error result with no usage yields undefined accounting keys (absent → drops on the wire)", () => {
+    const out = mapSdkMessage({ type: "result", subtype: "error_during_execution", is_error: true });
+    assert.deepStrictEqual(out, [
+      {
+        kind: "error",
+        agent: "lead",
+        payload: {
+          event: "result",
+          subtype: "error_during_execution",
+          errors: [],
+          usage: undefined,
+          modelUsage: undefined,
+          total_cost_usd: undefined,
+          num_turns: undefined,
+          duration_ms: undefined,
+        },
+      },
     ]);
   });
 
@@ -132,5 +180,31 @@ describe("sessionIdOf", () => {
     assert.strictEqual(sessionIdOf({ type: "system", session_id: "abc" }), "abc");
     assert.strictEqual(sessionIdOf({ type: "system" }), undefined);
     assert.strictEqual(sessionIdOf(null), undefined);
+  });
+});
+
+describe("assistantUsageOf (PRD #40 Decision 11)", () => {
+  it("returns the assistant frame's per-call message.usage", () => {
+    const usage = { input_tokens: 900, output_tokens: 300, cache_read_input_tokens: 120, cache_creation_input_tokens: 0 };
+    assert.deepStrictEqual(
+      assistantUsageOf({ type: "assistant", message: { usage, content: [{ type: "text", text: "hi" }] } }),
+      usage,
+    );
+  });
+
+  it("keeps working for subagent frames (usage rides alongside subagent_type)", () => {
+    const usage = { input_tokens: 10, output_tokens: 5 };
+    assert.deepStrictEqual(
+      assistantUsageOf({ type: "assistant", subagent_type: "reviewer", message: { usage, content: [] } }),
+      usage,
+    );
+  });
+
+  it("returns undefined for non-assistant frames and missing/malformed usage", () => {
+    assert.strictEqual(assistantUsageOf({ type: "result", subtype: "success", usage: { input_tokens: 1 } }), undefined);
+    assert.strictEqual(assistantUsageOf({ type: "user", message: { usage: { input_tokens: 1 } } }), undefined);
+    assert.strictEqual(assistantUsageOf({ type: "assistant", message: { content: [] } }), undefined);
+    assert.strictEqual(assistantUsageOf({ type: "assistant", message: { usage: 42, content: [] } }), undefined);
+    assert.strictEqual(assistantUsageOf(null), undefined);
   });
 });

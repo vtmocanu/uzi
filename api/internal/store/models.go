@@ -230,6 +230,27 @@ type RunReview struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RunUsage struct {
+	RunID               uuid.UUID          `json:"run_id"`
+	SessionID           string             `json:"session_id"`
+	Model               string             `json:"model"`
+	InputTokens         int64              `json:"input_tokens"`
+	CacheReadTokens     int64              `json:"cache_read_tokens"`
+	CacheCreationTokens int64              `json:"cache_creation_tokens"`
+	OutputTokens        int64              `json:"output_tokens"`
+	CostUsd             pgtype.Numeric     `json:"cost_usd"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RunUsageTotal struct {
+	RunID               uuid.UUID      `json:"run_id"`
+	InputTokens         int64          `json:"input_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CostUsd             pgtype.Numeric `json:"cost_usd"`
+}
+
 type RunUserInput struct {
 	ID         int64              `json:"id"`
 	RunID      uuid.UUID          `json:"run_id"`

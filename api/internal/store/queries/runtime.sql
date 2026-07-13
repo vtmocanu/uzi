@@ -126,10 +126,19 @@ SELECT * FROM runs WHERE id = @id;
 -- (repo scope) and the in-app issue history (repo + issue); when both are NULL
 -- this is the unchanged full list. The per-issue narrowing rides the composite
 -- index runs (repo_id, issue_iid, created_at DESC).
-SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
+-- The usage_* columns are the run's rollup totals (PRD #40 M3), LEFT-joined from
+-- run_usage_totals so a run with no usage yields NULLs (rendered as absent, never a
+-- fake 0). The view already applies the greatest-wins-per-model rollup (Decision 3b).
+SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name,
+       ru.input_tokens          AS usage_input_tokens,
+       ru.cache_read_tokens      AS usage_cache_read_tokens,
+       ru.cache_creation_tokens  AS usage_cache_creation_tokens,
+       ru.output_tokens          AS usage_output_tokens,
+       ru.cost_usd               AS usage_cost_usd
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 LEFT JOIN workers w ON w.id = r.worker_id
+LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = @user_id
   -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
   -- list never shows. self_improve has a real repo and stays visible. The repos
@@ -495,6 +504,119 @@ SELECT id, run_id, seq, kind, agent, payload, created_at
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
 ORDER BY seq ASC;
+
+-- Usage accounting (PRD #40) ------------------------------------------------
+
+-- name: UpsertRunUsage :exec
+-- Fold one model's usage from a delivered result frame into the run's accounting
+-- (Decision 2). The result frame's totals are CUMULATIVE-across-resume (M1's
+-- Decision 3 verdict b), so the token/cost columns are monotonic per (run_id,
+-- session_id, model) and the merge is GREATEST — never a plain overwrite: a
+-- crash-retry that re-delivers an EARLIER frame after a LATER one must not regress
+-- the row (that is exactly what makes "re-delivering the whole batch changes
+-- nothing" true under verdict b, where a stable session_id can otherwise see two
+-- different cumulative snapshots hit the same key). The API calls this for every
+-- delivered result frame incl. seq-deduped replays, so at-least-once delivery +
+-- this idempotent monotonic merge = correct totals with no crash window.
+INSERT INTO run_usage (
+    run_id, session_id, model,
+    input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, updated_at
+) VALUES (
+    @run_id, @session_id, @model,
+    @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, now()
+)
+ON CONFLICT (run_id, session_id, model) DO UPDATE SET
+    input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
+    cache_read_tokens     = GREATEST(run_usage.cache_read_tokens,     EXCLUDED.cache_read_tokens),
+    cache_creation_tokens = GREATEST(run_usage.cache_creation_tokens, EXCLUDED.cache_creation_tokens),
+    output_tokens         = GREATEST(run_usage.output_tokens,         EXCLUDED.output_tokens),
+    cost_usd              = GREATEST(run_usage.cost_usd,              EXCLUDED.cost_usd),
+    updated_at            = now();
+
+-- name: GetRunUsageTotal :one
+-- One run's rollup totals (PRD #40 M3), for the run-detail usage strip. Reads the
+-- run_usage_totals view (greatest-wins per model, summed across models). Returns NO
+-- ROW for a run with no usage — the handler maps pgx.ErrNoRows to "no usage" (absent,
+-- never a fake 0), so it does not gate detail visibility on ownership here (the
+-- caller has already authorized the viewer).
+SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd
+FROM run_usage_totals
+WHERE run_id = @run_id;
+
+-- name: SelfUsage :one
+-- The requesting user's own usage (PRD #40 M3, GET /api/usage): lifetime totals,
+-- last-7-days totals, and the count of their runs that carry usage. Windowed on the
+-- run's created_at (laptop scale ≈ when it spent). COALESCE(...,0) so a user with no
+-- usage gets zeros + run_count 0 (the client reads run_count==0 as "nothing yet").
+-- Chat runs are excluded (belt-and-suspenders: the fold never writes chat rows).
+WITH scoped AS (
+    SELECT r.created_at,
+           t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
+    FROM run_usage_totals t
+    JOIN runs r ON r.id = t.run_id
+    WHERE r.user_id = @user_id AND r.kind <> 'chat'
+)
+SELECT
+    COALESCE(SUM(input_tokens), 0)::bigint          AS lifetime_input_tokens,
+    COALESCE(SUM(cache_read_tokens), 0)::bigint      AS lifetime_cache_read_tokens,
+    COALESCE(SUM(cache_creation_tokens), 0)::bigint  AS lifetime_cache_creation_tokens,
+    COALESCE(SUM(output_tokens), 0)::bigint          AS lifetime_output_tokens,
+    COALESCE(SUM(cost_usd), 0)::numeric              AS lifetime_cost_usd,
+    COALESCE(SUM(input_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_input_tokens,
+    COALESCE(SUM(cache_read_tokens)      FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_read_tokens,
+    COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
+    COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
+    COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*)::bigint AS run_count
+FROM scoped;
+
+-- name: AdminUsageTotals :one
+-- Factory-wide totals across ALL users' runs (PRD #40 M3, GET /api/admin/usage).
+-- Same shape as SelfUsage without the user filter; by construction this equals the
+-- SUM of the AdminUsagePerUser rows (both read run_usage_totals joined to non-chat
+-- runs), which the handler test asserts.
+WITH scoped AS (
+    SELECT r.created_at,
+           t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens, t.output_tokens, t.cost_usd
+    FROM run_usage_totals t
+    JOIN runs r ON r.id = t.run_id
+    WHERE r.kind <> 'chat'
+)
+SELECT
+    COALESCE(SUM(input_tokens), 0)::bigint          AS lifetime_input_tokens,
+    COALESCE(SUM(cache_read_tokens), 0)::bigint      AS lifetime_cache_read_tokens,
+    COALESCE(SUM(cache_creation_tokens), 0)::bigint  AS lifetime_cache_creation_tokens,
+    COALESCE(SUM(output_tokens), 0)::bigint          AS lifetime_output_tokens,
+    COALESCE(SUM(cost_usd), 0)::numeric              AS lifetime_cost_usd,
+    COALESCE(SUM(input_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_input_tokens,
+    COALESCE(SUM(cache_read_tokens)      FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_read_tokens,
+    COALESCE(SUM(cache_creation_tokens)  FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_cache_creation_tokens,
+    COALESCE(SUM(output_tokens)          FILTER (WHERE created_at >= now() - interval '7 days'), 0)::bigint  AS last7_output_tokens,
+    COALESCE(SUM(cost_usd)               FILTER (WHERE created_at >= now() - interval '7 days'), 0)::numeric AS last7_cost_usd,
+    count(*)::bigint AS run_count,
+    -- The earliest usage-bearing run's creation time, for the factory card's "since
+    -- <date>" (PRD #40 M6). NULL when the factory has no usage yet.
+    MIN(created_at)::timestamptz AS earliest_run
+FROM scoped;
+
+-- name: AdminUsagePerUser :many
+-- Per-user lifetime usage rows for the admin factory breakdown (PRD #40 M3). One row
+-- per user WITH usage; the client computes each user's share against the factory
+-- total. Ordered heaviest-cost first (output tokens tiebreak). Sums the same
+-- run_usage_totals as AdminUsageTotals, so the rows sum to the factory lifetime total.
+SELECT u.id AS user_id, u.email,
+    COALESCE(SUM(t.input_tokens), 0)::bigint          AS input_tokens,
+    COALESCE(SUM(t.cache_read_tokens), 0)::bigint      AS cache_read_tokens,
+    COALESCE(SUM(t.cache_creation_tokens), 0)::bigint  AS cache_creation_tokens,
+    COALESCE(SUM(t.output_tokens), 0)::bigint          AS output_tokens,
+    COALESCE(SUM(t.cost_usd), 0)::numeric              AS cost_usd,
+    count(t.run_id)::bigint AS run_count
+FROM run_usage_totals t
+JOIN runs r ON r.id = t.run_id
+JOIN users u ON u.id = r.user_id
+WHERE r.kind <> 'chat'
+GROUP BY u.id, u.email
+ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 
 -- Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
 -- The chat agent investigates its OWNER'S runs (both kinds) via the worker. These

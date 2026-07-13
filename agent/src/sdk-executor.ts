@@ -39,7 +39,7 @@ import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
-import { isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
+import { assistantUsageOf, isErrorResult, isResult, mapSdkMessage, sessionIdOf } from "./sdk-messages.js";
 import { PlanRejectedError } from "./executor.js";
 import { errMessage } from "./util.js";
 
@@ -513,9 +513,22 @@ export class SdkExecutor implements Executor {
 
         // Emit everything EXCEPT the signal tool_use blocks — the plan is
         // surfaced as a `plan` message by the runner, not duplicated as a raw
-        // tool_use payload, and signal_done is infra noise.
+        // tool_use payload, and signal_done is infra noise. An assistant frame's
+        // per-call usage (PRD #40 Decision 11) rides the FIRST message that
+        // survives that filter — attached HERE, not in mapAssistant, which cannot
+        // see this executor-side drop; every phase terminates on a signal frame, so
+        // attaching earlier would systematically lose the lead's terminating-frame
+        // usage. A frame whose messages are ALL filtered loses its usage (accepted).
+        // Result-frame usage travels inside mapResult's payload instead, so it is
+        // never re-attached here (assistantUsageOf is assistant-only, not results).
+        const frameUsage = assistantUsageOf(msg);
+        let usageAttached = false;
         for (const em of mapSdkMessage(msg)) {
           if (em.kind === "tool_use" && isSignalToolName(em.payload["name"])) continue;
+          if (frameUsage && !usageAttached) {
+            em.payload["usage"] = frameUsage;
+            usageAttached = true;
+          }
           ctx.emit(em);
         }
         const sig = scanSignals(msg);

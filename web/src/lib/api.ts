@@ -617,6 +617,23 @@ export interface Run {
   finished_at: string | null;
   created_at: string;
   updated_at: string;
+  /** PRD #40: the run's rolled-up token/cost totals (greatest-wins per model,
+   *  summed across models — the server's run_usage_totals view). Present only when
+   *  the run has usage rows; absent/null for a pre-feature run, so the UI shows
+   *  nothing rather than a fabricated 0. On both the list rows and the detail read. */
+  usage?: RunUsage | null;
+}
+
+// RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
+// derives its own richer per-phase/per-agent breakdown from the message stream
+// (lib/runUsage.ts); this bundle is the cheap total the list row and detail strip
+// read directly.
+export interface RunUsage {
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
 }
 
 // RunListItem is a run row for the index + admin overview: the run plus display
@@ -625,6 +642,34 @@ export interface RunListItem extends Run {
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;
+}
+
+// SelfUsage is the caller's own consumption (GET /api/usage, PRD #40): lifetime and
+// last-7-days totals plus the count of their usage-bearing runs. run_count === 0
+// means "nothing yet" — the card renders that state, not fabricated zeros.
+export interface SelfUsage {
+  lifetime: RunUsage;
+  last_7_days: RunUsage;
+  run_count: number;
+}
+
+// AdminUsageUser is one user's lifetime row in the admin factory breakdown.
+export interface AdminUsageUser {
+  user_id: string;
+  email: string;
+  usage: RunUsage;
+  run_count: number;
+}
+
+// AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the
+// factory totals plus the per-user breakdown. The per-user rows sum to factory
+// lifetime by construction (the server rollup guarantees it).
+export interface AdminUsage {
+  factory: SelfUsage;
+  users: AdminUsageUser[];
+  /** ISO timestamp of the factory's earliest usage-bearing run (for the "since
+   *  <date>" line); null when the factory has no usage yet (PRD #40). */
+  earliest_run: string | null;
 }
 
 // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
@@ -1151,6 +1196,10 @@ const realApi = {
     return request<{ runs: RunListItem[] }>("GET", qs ? `/runs?${qs}` : "/runs");
   },
   getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),
+  /** The caller's own token/cost usage (PRD #40): lifetime + last-7-days + run count. */
+  getUsage: () => request<SelfUsage>("GET", "/usage"),
+  /** Factory-wide usage + per-user breakdown (PRD #40). Admin-only — a non-admin 403s. */
+  getAdminUsage: () => request<AdminUsage>("GET", "/admin/usage"),
   getRunMessages: (id: string, afterSeq = 0) =>
     request<{ messages: RunMessage[] }>(
       "GET",

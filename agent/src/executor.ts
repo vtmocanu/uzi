@@ -208,6 +208,29 @@ export const STUB_INTERLEAVE_STREAM: ReadonlyArray<{ agent: string; text: string
   { agent: "lead", text: "integration: scopes disjoint, committing once" },
 ];
 
+// PRD #40 M6: the stub stands in for the live SDK's usage-bearing frames. It emits
+// a per-agent (coder) assistant message carrying PER-CALL usage (Decision 11) and a
+// terminal `result` frame carrying CUMULATIVE usage + per-model breakdown (folded
+// into run_usage by the API). The live SDK path emits both; without them the E2E
+// could not prove usage lands on the run, aggregates into /api/usage, or surfaces a
+// per-agent row. Numbers are arbitrary but FIXED so the E2E asserts them exactly.
+export const STUB_RESULT_USAGE = {
+  input_tokens: 21400,
+  cache_read_input_tokens: 188000,
+  cache_creation_input_tokens: 0,
+  output_tokens: 6100,
+};
+export const STUB_RESULT_MODEL_USAGE = {
+  "claude-fable-5": { inputTokens: 21400, outputTokens: 6100, cacheReadInputTokens: 188000, cacheCreationInputTokens: 0, costUSD: 0.24 },
+};
+export const STUB_RESULT_COST_USD = 0.24;
+export const STUB_CODER_USAGE = {
+  input_tokens: 12000,
+  cache_read_input_tokens: 90000,
+  cache_creation_input_tokens: 0,
+  output_tokens: 3000,
+};
+
 /** Options for the stub executor. */
 export interface StubExecutorOptions {
   /**
@@ -375,6 +398,26 @@ export class StubExecutor implements Executor {
     ]);
 
     ctx.emit({ kind: "text", agent: "worker", payload: { text: "stub work committed locally" } });
+
+    // PRD #40 M6: stand in for the live SDK's usage frames — a per-agent (coder)
+    // message with per-call usage (Decision 11) and the terminal result frame with
+    // cumulative usage + modelUsage (the API folds it into run_usage). Emitted on
+    // every stub run, so a normal E2E run carries usage without a sentinel.
+    ctx.emit({ kind: "text", agent: "coder", payload: { text: "coder: implemented the change", usage: STUB_CODER_USAGE } });
+    ctx.emit({
+      kind: "status",
+      agent: "lead",
+      payload: {
+        event: "result",
+        subtype: "success",
+        num_turns: 9,
+        duration_ms: 100000,
+        total_cost_usd: STUB_RESULT_COST_USD,
+        usage: STUB_RESULT_USAGE,
+        modelUsage: STUB_RESULT_MODEL_USAGE,
+      },
+    });
+
     this.log.info("stub executor committed marker", { run_id: ctx.runId, branch: ctx.branch });
     return { branch: ctx.branch };
   }

@@ -34,8 +34,11 @@ function clearTimers(runId: string) {
 
 // ── Scripts ──────────────────────────────────────────────────────────────────
 
-const say = (runId: string, agent: string | null, text: string): Timed[] => [
-  { delay: 900, step: () => appendMessage(runId, "text", agent, { text }) },
+// PRD #40: an optional per-call `usage` rides a message so the demo run view can
+// render its per-agent breakdown (Decision 11) — the same shape the worker attaches
+// to a surviving assistant message.
+const say = (runId: string, agent: string | null, text: string, usage?: unknown): Timed[] => [
+  { delay: 900, step: () => appendMessage(runId, "text", agent, usage ? { text, usage } : { text }) },
 ];
 
 const tool = (
@@ -70,7 +73,12 @@ function planningScript(runId: string): Timed[] {
       delay: 400,
       step: () => appendMessage(runId, "status", null, { event: "init", model: "claude-sonnet-4-6" }),
     },
-    ...say(runId, "lead", `Reading the PRD linked from issue #${iid} and mapping the affected code before proposing a plan.`),
+    ...say(runId, "lead", `Reading the PRD linked from issue #${iid} and mapping the affected code before proposing a plan.`, {
+      input_tokens: 38_200,
+      cache_read_input_tokens: 401_500,
+      cache_creation_input_tokens: 2_000,
+      output_tokens: 14_800,
+    }),
     ...tool(runId, "lead", "Read", { file_path: "prds/13-worker-metrics.md" }, "# PRD 13 — Worker heartbeat metrics\n\nExpose heartbeat freshness per worker…"),
     ...tool(runId, "lead", "Grep", { pattern: "heartbeat", path: "api/internal" }, "api/internal/handler/worker.go:88\napi/internal/store/queries/workers.sql:14\napi/internal/poller/sweeper.go:31"),
     {
@@ -85,6 +93,17 @@ function planningScript(runId: string): Timed[] {
       delay: 1600,
       step: () => {
         appendMessage(runId, "plan", "lead", { text: SAMPLE_PLAN() });
+        // PRD #40: the plan TURN ends with its own result frame (cumulative usage so
+        // far), so the per-phase table shows a "Plan" phase distinct from implement.
+        appendMessage(runId, "status", null, {
+          event: "result",
+          subtype: "success",
+          duration_ms: 5 * 60_000,
+          num_turns: 9,
+          total_cost_usd: 0.24,
+          usage: { input_tokens: 21_400, cache_read_input_tokens: 188_000, cache_creation_input_tokens: 0, output_tokens: 6_100 },
+          modelUsage: { "claude-sonnet-5": { inputTokens: 21_400, outputTokens: 6_100, cacheReadInputTokens: 188_000, cacheCreationInputTokens: 0, costUSD: 0.24 } },
+        });
         appendMessage(runId, "status", null, { text: "plan submitted — awaiting approval" });
         patchRun(runId, { status: "awaiting_approval", plan_md: SAMPLE_PLAN() });
       },
@@ -98,7 +117,12 @@ function implementScript(runId: string): Timed[] {
   const iid = run?.issue_iid ?? 0;
   const branch = `agent/issue-${iid}`;
   return [
-    ...say(runId, "coder", "Plan approved — implementing. Adding the query, the handler, and wiring the route."),
+    ...say(runId, "coder", "Plan approved — implementing. Adding the query, the handler, and wiring the route.", {
+      input_tokens: 51_600,
+      cache_read_input_tokens: 583_900,
+      cache_creation_input_tokens: 0,
+      output_tokens: 24_100,
+    }),
     ...tool(runId, "coder", "Edit", { file_path: "api/internal/store/queries/workers.sql" }, "ok"),
     ...tool(runId, "coder", "Bash", { command: "cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate" }, "sqlc: wrote internal/store/workers.sql.go"),
     ...tool(runId, "coder", "Write", { file_path: "api/internal/handler/metrics.go" }, "ok"),
@@ -121,6 +145,7 @@ function implementScript(runId: string): Timed[] {
       runId,
       "reviewer",
       "Reviewed the diff: the endpoint is read-only, reuses the sweeper's staleness rule, and the new query is covered by tests. No blocking findings.",
+      { input_tokens: 18_900, cache_read_input_tokens: 149_700, cache_creation_input_tokens: 0, output_tokens: 7_600 },
     ),
     {
       delay: 800,
@@ -132,9 +157,25 @@ function implementScript(runId: string): Timed[] {
         appendMessage(runId, "status", null, {
           event: "result",
           subtype: "success",
-          duration_ms: 4 * 60_000,
-          num_turns: 24,
-          total_cost_usd: 0.92,
+          duration_ms: 21 * 60_000 + 44_000,
+          num_turns: 61,
+          total_cost_usd: 1.87,
+          // PRD #40: cumulative run usage (the strip/per-phase table fold from here).
+          usage: {
+            input_tokens: 114_400,
+            cache_read_input_tokens: 1_170_000,
+            cache_creation_input_tokens: 0,
+            output_tokens: 48_200,
+          },
+          modelUsage: {
+            "claude-sonnet-5": {
+              inputTokens: 114_400,
+              outputTokens: 48_200,
+              cacheReadInputTokens: 1_170_000,
+              cacheCreationInputTokens: 0,
+              costUSD: 1.87,
+            },
+          },
         });
         patchRun(runId, {
           status: "completed",
