@@ -88,12 +88,21 @@ worker cards.
    - First tick after start has no CPU delta → omit `cpu_pct` on that tick. The
      previous `usage_usec`/hrtime pair lives in collector memory only; a worker
      restart just re-runs the first-tick omission.
-   - **Root-cgroup sanity check** (↳review, audit low): under `cgroupns=host`
-     (older runtimes / explicit config) `/sys/fs/cgroup` shows the *host's* root
-     cgroup — host-wide numbers and `memory.max`=`"max"` masquerading as
-     container stats. If `/proc/self/cgroup` says the process sits in the root
-     cgroup (`0::/`), treat cgroup data as unavailable and use the `process`
-     fallback rather than report the host as if it were the worker.
+   - **Namespace-root sanity check** (↳review, audit low; ↳impl correction
+     2026-07-14, verified empirically on Docker 29.4.0 — private-ns and
+     `cgroupns=host` both tested): with a private cgroup namespace (the modern
+     Docker + kubelet default), `/proc/self/cgroup` reads `0::/` because the
+     container's own cgroup IS the namespace root, and `/sys/fs/cgroup` is mounted
+     at exactly that cgroup — so its files reflect the container. Use the cgroup
+     source in that case. Under `cgroupns=host` (older runtimes / explicit config)
+     the process sits at a *non-root* path (`0::/docker/<id>`, `0::/kubepods/…`)
+     and `/sys/fs/cgroup` is an ancestor (the host root) whose numbers masquerade
+     as the container's (`memory.max` reads `"max"` though the container is
+     capped) — so a non-root `/proc/self/cgroup` path means "treat cgroup data as
+     unavailable, use the `process` fallback" rather than report the host as the
+     worker. (The originally-drafted wording had this inverted — it named `0::/`
+     as the masquerade — which would have forced the process fallback for every
+     normally-containerized worker and defeated Success Criteria 1–2.)
 
 3. **Transport: optional `stats` field on the existing heartbeat — and the
    decode contract is spelled out, because the naive implementation bricks the
@@ -290,3 +299,12 @@ rule), nothing server-side.
   `Dashboard.tsx`/`api.ts` (coordination note fixed); #45/#47 draft numbers
   collide with the landed head and renumber at their own merges (wording fixed);
   minor line-ref precision fixes.
+- 2026-07-14 — Impl correction (M1): Decision 2's root-cgroup sanity check was
+  inverted. Verified empirically on Docker 29.4.0 that a private cgroup namespace
+  (the Docker/kubelet default) reads `/proc/self/cgroup` = `0::/` **with a real
+  `memory.max`** (the good, use-cgroup case), while `cgroupns=host` reads a non-root
+  path (`0::/docker/<id>`) with `memory.max` = `"max"` (the host masquerade). The
+  collector therefore uses the cgroup source at `0::/` and the process fallback on a
+  non-root path — the inverse of the original bullet, which would have forced the
+  process fallback for every normal worker. Bullet text above corrected; check +
+  test isolated in `stats.ts` `cgroupIsNamespaceRoot` (endorsed by the lead).
