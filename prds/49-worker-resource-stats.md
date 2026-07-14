@@ -230,10 +230,10 @@ worker cards.
 - [x] **M3 — Web gauges**: WorkersSettings poll + bars, Dashboard tile line,
   offline dimming, process-source tooltip, mock data; vitest coverage incl.
   no-limit (no bar) and offline (dimmed) rendering.
-- [ ] **M4 — Docs + specs**: `docs/worker-setup` sizing section (compose + k8s
+- [x] **M4 — Docs + specs**: `docs/worker-setup` sizing section (compose + k8s
   limits, what the gauges mean, 15s/10s freshness caveat), `specs/ai.md` design
-  record; `specs/human.md` addition proposed to user (per-worker live stats was a
-  user-stated requirement).
+  record (§228–234); `specs/human.md` addition proposed to user (per-worker live
+  stats was a user-stated requirement).
 - [x] **M5 — E2E verification**: `./e2e/run-e2e.sh` worker (real worker loop, stub
   executor, Linux container → real cgroup v2) asserts the workers API returns
   populated stats after one heartbeat interval; smoke-check the UI renders them.
