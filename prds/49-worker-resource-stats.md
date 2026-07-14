@@ -195,7 +195,7 @@ worker cards.
 
 ## Milestones
 
-- [ ] **M1 — Agent collector + payload**: `agent/src/stats.ts` (cgroup v2 reader,
+- [x] **M1 — Agent collector + payload**: `agent/src/stats.ts` (cgroup v2 reader,
   `inactive_file` subtraction, hrtime CPU delta math with `cpu.max` quota/period,
   root-cgroup check, process fallback, first-tick omission), wired into
   `heartbeatLoop` (`agent/src/worker.ts:55`) via `client.heartbeat()`

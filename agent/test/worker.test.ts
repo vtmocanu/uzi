@@ -6,7 +6,7 @@ import type { WorkerClient } from "../src/client.js";
 import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
-import type { ClaimResponse, ChatClaimResponse } from "../src/protocol.js";
+import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
 import { recordingLogger } from "./helpers.js";
 
 // These run-lane / chat-lane tests never claim a judge run, so a no-op JudgeRunner
@@ -177,6 +177,36 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
     assert.strictEqual(peak, 2, "never more than WORKER_CHAT_SESSIONS chats run at once");
     controller.abort(); // shutdown aborts the parked chats → clean drain
     await done;
+  });
+});
+
+// The heartbeat loop self-reports container stats (PRD #49 M1): each tick collects a
+// sample and passes it to client.heartbeat. On this (non-Linux) test host the cgroup
+// files are absent, so the collector uses its process fallback — enough to prove the
+// wiring: the heartbeat receives a well-formed WorkerStats.
+describe("Worker — heartbeat carries a resource sample (PRD #49 M1)", () => {
+  it("passes a collected WorkerStats to client.heartbeat", async () => {
+    const controller = new AbortController();
+    const seen: (WorkerStats | undefined)[] = [];
+    const client = {
+      register: async () => ({}),
+      heartbeat: async (stats?: WorkerStats) => {
+        seen.push(stats);
+      },
+      claimRun: async (): Promise<ClaimResponse | null> => null,
+      claimChat: async (): Promise<ChatClaimResponse | null> => null,
+    } as unknown as WorkerClient;
+
+    const worker = new Worker(fakeConfig(), client, { execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner, noJudge, recordingLogger().logger);
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 500 && seen.length === 0; i++) await tick();
+    controller.abort();
+    await done;
+
+    const stats = seen.find((s) => s !== undefined);
+    assert.ok(stats, "the heartbeat received a stats sample");
+    assert.ok(stats.source === "cgroup" || stats.source === "process", "source is a valid enum");
+    assert.ok(Number.isFinite(stats.mem_bytes) && stats.mem_bytes >= 0, "mem_bytes is a non-negative number");
   });
 });
 
