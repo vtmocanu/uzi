@@ -73,21 +73,20 @@ The worker image installs a **pinned** devbox binary and nix at build time (no f
 Once a worker is running, **Settings → Workers** and the Dashboard's "Worker load"
 card show live CPU and memory gauges, self-reported by the worker from its own
 cgroup on every heartbeat. A worker under real load (running the e2e suite)
-reported `cpu 1%` / `mem 113 MB of 4 GiB` — a small, honest number, since the SDK
+reported `cpu 1%` / `mem 0.1/4 GiB` — a small, honest number, since the SDK
 subprocess and git were mostly idle between tool calls.
 
 **Setting a memory limit is what makes the percentage bar appear.** With no limit,
-the gauge shows absolute memory used and no bar; CPU always shows a percentage,
-since it's normalized by allowed CPUs, not a byte limit.
+the gauge shows absolute memory used and no bar. CPU shows a percentage whenever
+the collector has a prior sample to diff against — it reads "—" on the very first
+tick or right after a cgroup/process source flip.
 
-**Compose**, on the `agent` service in `docker-compose.yml` (none set by default):
-
-```yaml
-services:
-  agent:
-    mem_limit: "4g"
-    cpus: "2.0"
-```
+**Compose** already sizes the `agent` service by default (`docker-compose.yml`):
+`cpus: ${AGENT_CPUS:-2}` and `mem_limit: ${AGENT_MEM_LIMIT:-4g}` — 2 CPUs, 4 GiB
+out of the box, so the memory bar appears without any extra configuration. Tune it
+via `AGENT_CPUS`/`AGENT_MEM_LIMIT` in `.env` (see [Concurrent runs](#concurrent-runs)
+for how to size these against `WORKER_MAX_CONCURRENT_RUNS`), or edit the service
+directly for a one-off value.
 
 **Kubernetes**, on the worker pod's container:
 
@@ -103,9 +102,9 @@ resources:
 
 What the gauges mean:
 
-- **CPU %** is the share of *allowed* CPUs used, not host CPUs: with `cpus: "2.0"`
-  (compose) or a `2` CPU limit (k8s), 100% means both are saturated. With no CPU
-  limit, it's normalized by the host's core count instead.
+- **CPU %** is the share of *allowed* CPUs used, not host CPUs: with the compose
+  default (`AGENT_CPUS=2`) or a `2` CPU k8s limit, 100% means both are saturated.
+  With no CPU limit, it's normalized by the host's core count instead.
 - **Memory** matches `docker stats`, not the raw cgroup number: reclaimable page
   cache is excluded, so a git-heavy workload pinning cache near the limit doesn't
   cry wolf.

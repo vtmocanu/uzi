@@ -202,10 +202,11 @@ worker cards.
    degrade to `source: "process"`, documented. kubelet/cAdvisor Prometheus
    metrics remain available and complementary for cluster operators; in-app
    stats are the product-level view for users who don't have Grafana. Docs get
-   sizing examples for both: compose `mem_limit`/`cpus` (none set today on the
-   `docker-compose.yml` agent service — though PRD #42 plans to add them, see
-   coordination below) and k8s `resources:` blocks, noting that setting a limit
-   is what makes the percentage bar appear.
+   sizing examples for both: compose `mem_limit`/`cpus` (PRD #42 landed defaults
+   — `AGENT_CPUS` 2 / `AGENT_MEM_LIMIT` 4g — on the `docker-compose.yml` agent
+   service, ↳doc correction 2026-07-14 (fact-check); see coordination below) and
+   k8s `resources:` blocks, noting that setting a limit is what makes the
+   percentage bar appear.
 
 ## Milestones
 
@@ -323,3 +324,10 @@ rule), nothing server-side.
   choice): NOT implemented — a bad tick blanks the gauge for one poll cycle, the PRD's
   documented accepted consequence; chosen for simplicity and to avoid a stale value
   looking live.
+- 2026-07-14 — Doc correction (fact-check, M4): Decision 7's "compose `mem_limit`/
+  `cpus` (none set today ... though PRD #42 plans to add them)" was stale —
+  PRD #42 already landed `cpus: ${AGENT_CPUS:-2}` / `mem_limit: ${AGENT_MEM_LIMIT:-4g}`
+  on the `agent` service (`docker-compose.yml:207-208`), so compose ships sized by
+  default and the memory bar appears out of the box. Decision 7 wording corrected;
+  `docs/worker-setup.md`'s sizing section rewritten to match (tune via
+  `AGENT_CPUS`/`AGENT_MEM_LIMIT` rather than "add this YAML").
