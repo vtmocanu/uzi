@@ -5781,8 +5781,8 @@ Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisi
 
 ## 232. Storage — four nullable columns on `workers`, overwritten (or NULLed) every heartbeat, no history
 
-- Migration `00090_worker_stats.sql` (DRAFT number; renumbers to the live head at merge per the
-  goose-numbering convention) adds `stats_cpu_pct real`, `stats_mem_bytes bigint`,
+- Migration `00064_worker_stats.sql` (landed as 00064 — renumbered from the parallel-PRD draft
+  00090 to the next free slot above the live head 00063 at merge) adds `stats_cpu_pct real`, `stats_mem_bytes bigint`,
   `stats_mem_limit_bytes bigint`, `stats_source text` — all nullable, no new table. `HeartbeatWorker`
   (`queries/runtime.sql`) writes whatever the tick carried and NULLs when it carried nothing, so a
   worker that stops sending (downgrade, collector error) self-clears instead of pinning a stale gauge;

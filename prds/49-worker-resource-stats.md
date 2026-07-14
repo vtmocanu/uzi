@@ -137,12 +137,12 @@ worker cards.
    surface, no cadence change.
 
 4. **Storage: nullable columns on `workers`, overwritten every heartbeat —
-   including to NULL.** Migration (draft `00090` — clear of drafts held by open
-   PRDs #41:00070, #42:00075, #46:00080–83, #45:00053 — the last, like #47's
-   draft 00054, actually collides with the already-landed head
+   including to NULL.** Migration (landed as `00064`; drafted `00090` — clear of
+   drafts held by open PRDs #41:00070, #42:00075, #46:00080–83, #45:00053 — the last,
+   like #47's draft 00054, actually collides with the already-landed head
    (`00054_proposal_confirming.sql`) and those PRDs renumber at their own merge
-   (↳review, fact-check); this PRD renumbers to the live head at merge per
-   CLAUDE.md convention):
+   (↳review, fact-check); this PRD renumbered from the `00090` draft to `00064`, the
+   next free slot above the live head 00063, at merge per CLAUDE.md convention):
    `stats_cpu_pct real`, `stats_mem_bytes bigint`, `stats_mem_limit_bytes bigint`,
    `stats_source text` — all nullable, no new table. `HeartbeatWorker`
    (`queries/runtime.sql:48`) writes whatever the tick carried, nulls when it
@@ -218,7 +218,7 @@ worker cards.
   trees (limited, `max`, quota'd cpu incl. period parse, missing files →
   fallback, malformed → fallback, root-cgroup → fallback). A collector failure
   must never fail the heartbeat.
-- [x] **M2 — API storage + protocol**: migration draft `00090` (with the
+- [x] **M2 — API storage + protocol**: migration `00064` (landed; drafted `00090`) (with the
   display-only SQL comment) + sqlc regen, Decision 3 decode (declared `version`,
   EOF tolerance, two-step `json.RawMessage` stats parse) + Decision 5
   validation/clamping + static-reason drop logging, `HeartbeatWorker` query

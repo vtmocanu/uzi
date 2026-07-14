@@ -11,8 +11,8 @@
 -- NEVER by claim, run assignment, or the sweeper. A hostile worker can report
 -- anything, so these columns must never become a scheduling input — an M2 regression
 -- test asserts no query outside HeartbeatWorker + the worker-list SELECTs references
--- stats_. Renumbered to the next free slot above the live head at landing time (repo
--- convention: the number here is a parallel-PRD draft, not the final version).
+-- stats_. Landed as 00064 — renumbered from the parallel-PRD draft 00090 to the next
+-- free slot above the live head (00063) at merge, per the goose-numbering convention.
 ALTER TABLE workers
     ADD COLUMN stats_cpu_pct         real,
     ADD COLUMN stats_mem_bytes       bigint,
