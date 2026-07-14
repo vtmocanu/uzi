@@ -203,7 +203,7 @@ worker cards.
   trees (limited, `max`, quota'd cpu incl. period parse, missing files →
   fallback, malformed → fallback, root-cgroup → fallback). A collector failure
   must never fail the heartbeat.
-- [ ] **M2 — API storage + protocol**: migration draft `00090` (with the
+- [x] **M2 — API storage + protocol**: migration draft `00090` (with the
   display-only SQL comment) + sqlc regen, Decision 3 decode (declared `version`,
   EOF tolerance, two-step `json.RawMessage` stats parse) + Decision 5
   validation/clamping + static-reason drop logging, `HeartbeatWorker` query

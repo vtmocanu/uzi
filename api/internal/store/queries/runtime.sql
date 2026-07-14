@@ -65,10 +65,21 @@ WHERE id = @id
 RETURNING *;
 
 -- name: HeartbeatWorker :one
+-- Refresh liveness AND overwrite the worker's latest resource sample (PRD #49). The
+-- stats_* columns are written on EVERY heartbeat — including to NULL when the tick
+-- carried no stats (a downgraded/older worker or a collector error), so a stale gauge
+-- self-clears rather than pinning. DISPLAY-ONLY (Decision 5): written here, read only
+-- by the worker DTOs; no claim/scheduling/sweeper query references stats_ (enforced by
+-- an M2 regression test). The handler has already validated + clamped these values;
+-- this statement stores them verbatim.
 UPDATE workers SET
-    status            = 'online',
-    last_heartbeat_at = now(),
-    updated_at        = now()
+    status                = 'online',
+    last_heartbeat_at     = now(),
+    stats_cpu_pct         = sqlc.narg('stats_cpu_pct'),
+    stats_mem_bytes       = sqlc.narg('stats_mem_bytes'),
+    stats_mem_limit_bytes = sqlc.narg('stats_mem_limit_bytes'),
+    stats_source          = sqlc.narg('stats_source'),
+    updated_at            = now()
 WHERE id = @id
 RETURNING *;
 

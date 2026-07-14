@@ -77,7 +77,7 @@ type Store interface {
 	GetWorkerByIDForUser(ctx context.Context, arg store.GetWorkerByIDForUserParams) (store.Worker, error)
 	ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]store.ListWorkersByUserRow, error)
 	RegisterWorker(ctx context.Context, arg store.RegisterWorkerParams) (store.Worker, error)
-	HeartbeatWorker(ctx context.Context, id uuid.UUID) (store.Worker, error)
+	HeartbeatWorker(ctx context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error)
 	DeleteWorkerForUser(ctx context.Context, arg store.DeleteWorkerForUserParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
 	MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
@@ -429,9 +429,36 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	})
 }
 
-// Heartbeat refreshes liveness and returns the (possibly updated) worker.
-func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker) (store.Worker, error) {
-	return s.q.HeartbeatWorker(ctx, wkr.ID)
+// WorkerStats is a validated, clamped container resource sample (PRD #49). The
+// handler decodes the untrusted worker report, validates + clamps it into this, and
+// passes it here; the service only persists it. DISPLAY-ONLY (Decision 5) — no
+// scheduling path ever reads the columns it writes. A nil *WorkerStats writes NULLs
+// (the tick carried no stats), so a downgrade / collector error self-clears the gauge.
+type WorkerStats struct {
+	// CPUPct is finite and clamped to [0, MaxWorkerCPUPct]; nil when the worker
+	// omitted it (the first tick after start, per Decision 2).
+	CPUPct *float64
+	// MemBytes is the working-set memory in bytes, non-negative.
+	MemBytes int64
+	// MemLimit is the cgroup memory limit in bytes (non-negative); nil when unlimited
+	// (memory.max=max) or unknown (the process fallback).
+	MemLimit *int64
+	// Source is the validated enum: "cgroup" or "process".
+	Source string
+}
+
+// Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
+// #49), and returns the updated worker. A nil stats writes NULLs for every stats_
+// column, so a worker that stops reporting self-clears its gauge.
+func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats) (store.Worker, error) {
+	arg := store.HeartbeatWorkerParams{ID: wkr.ID}
+	if stats != nil {
+		arg.StatsCpuPct = pgFloat4Ptr(stats.CPUPct)
+		arg.StatsMemBytes = pgtype.Int8{Int64: stats.MemBytes, Valid: true}
+		arg.StatsMemLimitBytes = int8Param(stats.MemLimit)
+		arg.StatsSource = pgText(stats.Source)
+	}
+	return s.q.HeartbeatWorker(ctx, arg)
 }
 
 // Claim atomically claims the oldest claimable run for the worker's user and
@@ -1770,6 +1797,16 @@ func pgIntPtr(v *int) pgtype.Int4 {
 		return pgtype.Int4{}
 	}
 	return pgtype.Int4{Int32: int32(*v), Valid: true}
+}
+
+// pgFloat4Ptr maps an optional float (nil = "not reported") onto a nullable real
+// column: nil → NULL, else the value. Used for the worker's stats_cpu_pct (PRD #49),
+// which the worker omits on its first tick.
+func pgFloat4Ptr(v *float64) pgtype.Float4 {
+	if v == nil {
+		return pgtype.Float4{}
+	}
+	return pgtype.Float4{Float32: float32(*v), Valid: true}
 }
 
 func pgUUID(id uuid.UUID) pgtype.UUID {

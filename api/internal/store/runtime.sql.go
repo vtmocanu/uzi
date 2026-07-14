@@ -620,7 +620,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared)
 VALUES ($1, $2, $3, $4)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source
 `
 
 type CreateWorkerParams struct {
@@ -655,6 +655,10 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.TemplateDeclared,
 		&i.TemplateReported,
 		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
 	)
 	return i, err
 }
@@ -1159,7 +1163,7 @@ func (q *Queries) GetRunUsageTotal(ctx context.Context, runID uuid.UUID) (GetRun
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -1178,12 +1182,16 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.TemplateDeclared,
 		&i.TemplateReported,
 		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -1207,12 +1215,16 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.TemplateDeclared,
 		&i.TemplateReported,
 		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -1232,21 +1244,50 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.TemplateDeclared,
 		&i.TemplateReported,
 		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
 	)
 	return i, err
 }
 
 const heartbeatWorker = `-- name: HeartbeatWorker :one
 UPDATE workers SET
-    status            = 'online',
-    last_heartbeat_at = now(),
-    updated_at        = now()
-WHERE id = $1
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs
+    status                = 'online',
+    last_heartbeat_at     = now(),
+    stats_cpu_pct         = $1,
+    stats_mem_bytes       = $2,
+    stats_mem_limit_bytes = $3,
+    stats_source          = $4,
+    updated_at            = now()
+WHERE id = $5
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source
 `
 
-func (q *Queries) HeartbeatWorker(ctx context.Context, id uuid.UUID) (Worker, error) {
-	row := q.db.QueryRow(ctx, heartbeatWorker, id)
+type HeartbeatWorkerParams struct {
+	StatsCpuPct        pgtype.Float4 `json:"stats_cpu_pct"`
+	StatsMemBytes      pgtype.Int8   `json:"stats_mem_bytes"`
+	StatsMemLimitBytes pgtype.Int8   `json:"stats_mem_limit_bytes"`
+	StatsSource        pgtype.Text   `json:"stats_source"`
+	ID                 uuid.UUID     `json:"id"`
+}
+
+// Refresh liveness AND overwrite the worker's latest resource sample (PRD #49). The
+// stats_* columns are written on EVERY heartbeat — including to NULL when the tick
+// carried no stats (a downgraded/older worker or a collector error), so a stale gauge
+// self-clears rather than pinning. DISPLAY-ONLY (Decision 5): written here, read only
+// by the worker DTOs; no claim/scheduling/sweeper query references stats_ (enforced by
+// an M2 regression test). The handler has already validated + clamped these values;
+// this statement stores them verbatim.
+func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams) (Worker, error) {
+	row := q.db.QueryRow(ctx, heartbeatWorker,
+		arg.StatsCpuPct,
+		arg.StatsMemBytes,
+		arg.StatsMemLimitBytes,
+		arg.StatsSource,
+		arg.ID,
+	)
 	var i Worker
 	err := row.Scan(
 		&i.ID,
@@ -1261,6 +1302,10 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, id uuid.UUID) (Worker, er
 		&i.TemplateDeclared,
 		&i.TemplateReported,
 		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
 	)
 	return i, err
 }
@@ -1455,7 +1500,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context) ([]ListActiveRuns
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -1508,6 +1553,10 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.TemplateDeclared,
 			&i.Worker.TemplateReported,
 			&i.Worker.MaxConcurrentRuns,
+			&i.Worker.StatsCpuPct,
+			&i.Worker.StatsMemBytes,
+			&i.Worker.StatsMemLimitBytes,
+			&i.Worker.StatsSource,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -1949,7 +1998,7 @@ func (q *Queries) ListRunsForWorkerUser(ctx context.Context, arg ListRunsForWork
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -1967,20 +2016,24 @@ ORDER BY w.created_at ASC
 `
 
 type ListWorkersByUserRow struct {
-	ID                uuid.UUID          `json:"id"`
-	UserID            uuid.UUID          `json:"user_id"`
-	Name              string             `json:"name"`
-	TokenHash         []byte             `json:"token_hash"`
-	Status            string             `json:"status"`
-	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version           pgtype.Text        `json:"version"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared  pgtype.Text        `json:"template_declared"`
-	TemplateReported  pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns pgtype.Int4        `json:"max_concurrent_runs"`
-	Busy              bool               `json:"busy"`
-	ActiveRuns        int64              `json:"active_runs"`
+	ID                 uuid.UUID          `json:"id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	Name               string             `json:"name"`
+	TokenHash          []byte             `json:"token_hash"`
+	Status             string             `json:"status"`
+	LastHeartbeatAt    pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version            pgtype.Text        `json:"version"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared   pgtype.Text        `json:"template_declared"`
+	TemplateReported   pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns  pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct        pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes      pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource        pgtype.Text        `json:"stats_source"`
+	Busy               bool               `json:"busy"`
+	ActiveRuns         int64              `json:"active_runs"`
 }
 
 // Worker list for the owning user. Two derived signals (PRD #42 Decision 10):
@@ -2016,6 +2069,10 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.TemplateDeclared,
 			&i.TemplateReported,
 			&i.MaxConcurrentRuns,
+			&i.StatsCpuPct,
+			&i.StatsMemBytes,
+			&i.StatsMemLimitBytes,
+			&i.StatsSource,
 			&i.Busy,
 			&i.ActiveRuns,
 		); err != nil {
@@ -2102,7 +2159,7 @@ UPDATE workers SET
     last_heartbeat_at   = now(),
     updated_at          = now()
 WHERE id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source
 `
 
 type RegisterWorkerParams struct {
@@ -2141,6 +2198,10 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.TemplateDeclared,
 		&i.TemplateReported,
 		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
 	)
 	return i, err
 }
