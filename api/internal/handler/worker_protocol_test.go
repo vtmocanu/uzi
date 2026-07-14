@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -380,24 +381,36 @@ func TestAdminWorkerDTOIncludesStats(t *testing.T) {
 }
 
 func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
-	// Decision 5 is ENFORCED, not just prose: stats_ columns are display-only, so NO
-	// hand-written query except HeartbeatWorker may reference them. The worker-list and
-	// worker-fetch queries read the row via `*`/`w.*` (which the DTO layer maps) and
-	// never name a stats_ column, so a literal `stats_` outside HeartbeatWorker would be
-	// a claim/scheduling/sweeper path keying on attacker-reported telemetry — exactly
-	// what must never happen.
-	raw, err := os.ReadFile("../store/queries/runtime.sql")
-	if err != nil {
-		t.Fatalf("read runtime.sql: %v", err)
+	// Decision 5 is ENFORCED, not just prose: stats_ columns are display-only, so the
+	// ONLY queries that may name one are the HeartbeatWorker writer and the worker-list
+	// DTO reads. Every other query — in ANY queries file, not just runtime.sql — that
+	// literally references stats_ would be a claim/scheduling/sweeper path keying on
+	// attacker-reported telemetry, exactly what must never happen. Scanning the whole
+	// directory (not just runtime.sql) means a future scheduling query added to another
+	// queries file can't dodge the guard (auditor M2 minor).
+	allowed := map[string]bool{
+		"HeartbeatWorker":   true, // the sole writer of the stats_ columns
+		"ListWorkersByUser": true, // DTO read; today via w.*, allowlisted for a future explicit select
+		"ListAllWorkers":    true, // DTO read (admin); same rationale
 	}
-	blocks := strings.Split(string(raw), "-- name:")
-	for _, block := range blocks[1:] { // blocks[0] is the file preamble
-		name := strings.Fields(block)[0]
-		if name == "HeartbeatWorker" {
-			continue
+	files, err := filepath.Glob("../store/queries/*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("glob queries: %v (matched %d files)", err, len(files))
+	}
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
 		}
-		if strings.Contains(block, "stats_") {
-			t.Fatalf("query %s references a stats_ column; stats_* are display-only (Decision 5) and must appear only in HeartbeatWorker", name)
+		blocks := strings.Split(string(raw), "-- name:")
+		for _, block := range blocks[1:] { // blocks[0] is the file preamble
+			name := strings.Fields(block)[0]
+			if allowed[name] {
+				continue
+			}
+			if strings.Contains(block, "stats_") {
+				t.Fatalf("query %s in %s references a stats_ column; stats_* are display-only (Decision 5) and may appear only in HeartbeatWorker or the worker-list DTO queries", name, filepath.Base(f))
+			}
 		}
 	}
 }
