@@ -77,7 +77,7 @@ export function hasStats(w: Worker): boolean {
   return w.stats_source != null && w.stats_mem_bytes != null;
 }
 
-function Bar({ label, value, fillPct }: { label: string; value: string; fillPct: number }) {
+function Bar({ label, value, valueText, fillPct }: { label: string; value: string; valueText: string; fillPct: number }) {
   // Tone, width, and aria-valuenow all key off the same clamped, rounded integer, so
   // the colour can never disagree with the percentage the label shows (a 94.99% that
   // rounds to "95%" is danger, not warn).
@@ -86,7 +86,9 @@ function Bar({ label, value, fillPct }: { label: string; value: string; fillPct:
   return (
     <div>
       <div className="flex items-center justify-between text-xs">
-        <span className="text-faint">{label}</span>
+        {/* text-muted (not text-faint) so the label clears WCAG AA 4.5:1 at 12px
+            (web-ux finding) and matches the value span. */}
+        <span className="text-muted">{label}</span>
         <span className="tabular-nums text-muted">{value}</span>
       </div>
       <div
@@ -96,6 +98,10 @@ function Bar({ label, value, fillPct }: { label: string; value: string; fillPct:
         aria-valuenow={now}
         aria-valuemin={0}
         aria-valuemax={100}
+        // A screen reader reads valuetext instead of the bare "N percent": the byte
+        // figures for memory, and "no reading yet" for a first-tick CPU (aria-valuenow
+        // is 0 there, which alone would be misread as genuine 0% usage).
+        aria-valuetext={valueText}
       >
         <div className={cx("h-full rounded-full", FILL[tone])} style={{ width: `${now}%` }} />
       </div>
@@ -123,12 +129,24 @@ export function WorkerStatGauges({ worker }: { worker: Worker }) {
       title={isProcess ? "measures the worker process only" : undefined}
       aria-label={offline ? "last-known resource usage (worker offline)" : "resource usage"}
     >
-      <Bar label="CPU" value={cpu == null ? "—" : `${Math.round(cpu)}%`} fillPct={cpu ?? 0} />
+      <Bar
+        label="CPU"
+        value={cpu == null ? "—" : `${Math.round(cpu)}%`}
+        valueText={cpu == null ? "no reading yet" : `${Math.round(cpu)}%`}
+        fillPct={cpu ?? 0}
+      />
       {memPct != null ? (
-        <Bar label="Memory" value={`${formatBytesPair(mem, limit!)} · ${Math.round(memPct)}%`} fillPct={memPct} />
+        <Bar
+          label="Memory"
+          value={`${formatBytesPair(mem, limit!)} · ${Math.round(memPct)}%`}
+          valueText={`${formatBytesPair(mem, limit!)}, ${Math.round(memPct)}%`}
+          fillPct={memPct}
+        />
       ) : (
         <div className="flex items-center justify-between text-xs">
-          <span className="text-faint">Memory</span>
+          {/* Same contrast fix as the Bar label (web-ux); the no-limit case has no
+              progressbar, so the byte count sits in plain, SR-readable text. */}
+          <span className="text-muted">Memory</span>
           <span className="tabular-nums text-muted">
             {formatBytes(mem)}
             <span className="text-faint"> · no limit</span>

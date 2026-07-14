@@ -57,6 +57,9 @@ describe("WorkerStatGauges", () => {
     expect(screen.getByText(/2\.1\/4 GiB · 52%/)).toBeTruthy();
     expect(screen.getByRole("progressbar", { name: "CPU" }).getAttribute("aria-valuenow")).toBe("34");
     expect(screen.getByRole("progressbar", { name: "Memory" }).getAttribute("aria-valuenow")).toBe("52");
+    // aria-valuetext gives a screen reader the byte figures + percent, not a bare "N%".
+    expect(screen.getByRole("progressbar", { name: "CPU" }).getAttribute("aria-valuetext")).toBe("34%");
+    expect(screen.getByRole("progressbar", { name: "Memory" }).getAttribute("aria-valuetext")).toBe("2.1/4 GiB, 52%");
   });
 
   it("shows absolute memory with NO percentage bar when the limit is unknown", () => {
@@ -79,6 +82,8 @@ describe("WorkerStatGauges", () => {
     );
     expect(screen.getByText("—")).toBeTruthy();
     expect(screen.getByRole("progressbar", { name: "CPU" }).getAttribute("aria-valuenow")).toBe("0");
+    // A screen reader hears "no reading yet", not "0 percent" (which would read as real 0% usage).
+    expect(screen.getByRole("progressbar", { name: "CPU" }).getAttribute("aria-valuetext")).toBe("no reading yet");
   });
 
   it("labels a process-source sample 'worker process only'", () => {
