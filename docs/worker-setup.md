@@ -68,6 +68,60 @@ Beyond the image's baked-in tools, a run can install **per-repo CLI tools** (kub
 
 The worker image installs a **pinned** devbox binary and nix at build time (no floating installer, no first-run download). Storage: the nix store is the `agentnix` volume at `/nix`; devbox/nix per-user metadata lands HOME-derived under `/data` (the `agentdata` volume). Both persist across `docker compose down`/`up`, so only a fresh `down -v` re-downloads packages.
 
+## Resource stats and sizing
+
+Once a worker is running, **Settings → Workers** and the Dashboard's "Worker load"
+card show live CPU and memory gauges, self-reported by the worker from its own
+cgroup on every heartbeat. A worker under real load (running the e2e suite)
+reported `cpu 1%` / `mem 113 MB of 4 GiB` — a small, honest number, since the SDK
+subprocess and git were mostly idle between tool calls.
+
+**Setting a memory limit is what makes the percentage bar appear.** With no limit,
+the gauge shows absolute memory used and no bar; CPU always shows a percentage,
+since it's normalized by allowed CPUs, not a byte limit.
+
+**Compose**, on the `agent` service in `docker-compose.yml` (none set by default):
+
+```yaml
+services:
+  agent:
+    mem_limit: "4g"
+    cpus: "2.0"
+```
+
+**Kubernetes**, on the worker pod's container:
+
+```yaml
+resources:
+  requests:
+    memory: "1Gi"
+    cpu: "500m"
+  limits:
+    memory: "4Gi"
+    cpu: "2"
+```
+
+What the gauges mean:
+
+- **CPU %** is the share of *allowed* CPUs used, not host CPUs: with `cpus: "2.0"`
+  (compose) or a `2` CPU limit (k8s), 100% means both are saturated. With no CPU
+  limit, it's normalized by the host's core count instead.
+- **Memory** matches `docker stats`, not the raw cgroup number: reclaimable page
+  cache is excluded, so a git-heavy workload pinning cache near the limit doesn't
+  cry wolf.
+- **Freshness**: the worker samples every 15s (heartbeat) and the UI polls every
+  10s, so a gauge can lag reality by up to ~25s — not a live feed.
+- A dropped or malformed sample self-clears the gauge for that one tick (by
+  design: stale-but-plausible is worse than briefly blank) rather than holding a
+  stale-looking value.
+- **`source: process`** (hover the gauge for the tooltip) means the reading covers
+  the worker process only, blind to the SDK/git/devbox child processes it spawns.
+  This happens on a cgroup v1 host, when running un-containerized in dev, or under
+  `cgroupns=host` (an older/explicit runtime setting) — the common containerized
+  case (private cgroup namespace, the Docker/kubelet default) reports the full
+  container instead and needs no configuration.
+- An **offline** worker shows its last-known stats dimmed, never live-looking.
+
 ## Online, offline, busy
 
 - **online**: a recent heartbeat arrived within the server's staleness window.
