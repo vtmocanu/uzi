@@ -341,6 +341,14 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/47-loop-hang-detection.md`
   run — early-warning only; existing watchdogs keep the kill job.
   [AI-proposed surface, user-ratified via PRD approval 2026-07-12]
 
+## Feature #49 — Worker resource stats (live per-worker CPU/memory)
+
+Tracked as GitLab issue vtmocanu/uzi#49; PRD at `prds/49-worker-resource-stats.md`.
+
+- Live per-worker CPU and memory visibility in the uzi web UI ("worker resource stats"). [user 2026-07-14]
+- Per-worker granularity is sufficient; no per-run attribution. [user-confirmed]
+- Must work the same under docker-compose today and k8s later (portability). [user]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
