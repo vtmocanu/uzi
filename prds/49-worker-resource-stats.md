@@ -181,8 +181,12 @@ worker cards.
      limit is known; warn tone ≥ 80%, danger ≥ 95%). **Bar widths clamp at 100%**
      regardless of stored value (↳review — the server accepts up to 6400% CPU;
      the DOM must not render it).
-   - Dashboard worker tiles (`Dashboard.tsx:84` mount fetch, `:117` the 10s poll —
-     both already fetch workers) — compact "cpu 34% · mem 2.1/4 GiB" line.
+   - Dashboard: a new compact "Worker load" fleet card (↳impl correction
+     2026-07-14 — no per-worker tiles existed; `Dashboard.tsx` had only the
+     aggregate "Workers online N/M" StatTile, and the mount fetch + existing 10s
+     poll already fetch the fleet). One "name · cpu 34% · mem 2.1/4 GiB" line per
+     worker that has reported a sample, dimmed when offline, hidden until any
+     worker reports — the faithful "factory floor at a glance" realization.
    - `status: offline` (sweeper-marked) renders stats dimmed with the stale
      heartbeat age — last-known, clearly not live. `source: "process"` gets a
      tooltip: measures the worker process only.
@@ -308,3 +312,13 @@ rule), nothing server-side.
   non-root path — the inverse of the original bullet, which would have forced the
   process fallback for every normal worker. Bullet text above corrected; check +
   test isolated in `stats.ts` `cgroupIsNamespaceRoot` (endorsed by the lead).
+- 2026-07-14 — Impl correction (M3): Decision 6's "Dashboard worker tiles / worker
+  cards" did not exist — `Dashboard.tsx` rendered only the aggregate "Workers online
+  N/M" StatTile (no per-worker tiles), so there was nothing to hang the compact stats
+  line on. Lead ruled option (a): added a new compact "Worker load" fleet card
+  (one `WorkerStatLine` per worker with a sample, offline-dimmed, hidden until any
+  worker reports), the faithful realization of the "factory floor at a glance" intent.
+  Decision 6 Dashboard bullet corrected above. Flicker-hold (Decision 4, implementer's
+  choice): NOT implemented — a bad tick blanks the gauge for one poll cycle, the PRD's
+  documented accepted consequence; chosen for simplicity and to avoid a stale value
+  looking live.
