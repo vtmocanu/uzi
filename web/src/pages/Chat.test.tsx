@@ -60,6 +60,10 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     version: null,
     last_heartbeat_at: null,
     created_at: "2026-07-01T00:00:00Z",
+    stats_cpu_pct: null,
+    stats_mem_bytes: null,
+    stats_mem_limit_bytes: null,
+    stats_source: null,
     ...over,
   };
 }

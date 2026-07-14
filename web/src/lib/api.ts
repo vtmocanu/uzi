@@ -505,6 +505,18 @@ export interface Worker {
   version: string | null;
   last_heartbeat_at: string | null;
   created_at: string;
+  // Latest container resource sample (PRD #49), all null until the worker reports
+  // one (and re-nulled if it stops). stats_cpu_pct is a percentage of the worker's
+  // ALLOWED CPUs (100 = fully using its quota); null on the worker's first tick.
+  // stats_mem_bytes is working-set bytes; stats_mem_limit_bytes is the container
+  // limit in bytes, null when unlimited or unknown (process fallback) — the UI then
+  // shows absolute usage with no percentage bar. stats_source is "cgroup" (container-
+  // wide, covers children) or "process" (this worker process only; the UI labels it).
+  // Freshness is last_heartbeat_at — an offline worker's stats are last-known, dimmed.
+  stats_cpu_pct: number | null;
+  stats_mem_bytes: number | null;
+  stats_mem_limit_bytes: number | null;
+  stats_source: string | null;
 }
 
 export interface AdminWorker extends Worker {

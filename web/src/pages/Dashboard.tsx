@@ -7,17 +7,21 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage } from "../lib/api";
+import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, type Worker } from "../lib/api";
 import { mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
+import { WorkerStatLine } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
 
 interface Overview {
   runs: RunListItem[];
+  // The full fleet drives both the online/total count and the per-worker load lines
+  // (PRD #49); the mount load and the 10s poll both already fetch it.
+  workers: Worker[];
   workersOnline: number;
   workersTotal: number;
   reposEnabled: number;
@@ -102,6 +106,7 @@ export function Dashboard() {
         if (cancelled) return;
         setData({
           runs,
+          workers,
           workersOnline: workers.filter((w) => w.status === "online").length,
           workersTotal: workers.length,
           reposEnabled: repos.filter((r) => r.enabled).length,
@@ -134,6 +139,7 @@ export function Dashboard() {
           ? {
               ...prev,
               runs,
+              workers,
               workersOnline: workers.filter((w) => w.status === "online").length,
               workersTotal: workers.length,
             }
@@ -184,6 +190,35 @@ export function Dashboard() {
           <StatTile label="Boards" value={data.reposEnabled} hint="enabled repos" to="/repos" />
           <StatTile label="Agent templates" value={data.templates} hint="roles available" to="/agents" />
         </div>
+      )}
+
+      {/* Per-worker resource load (PRD #49): a compact "cpu · mem" line per worker
+          that has reported a sample, so the factory floor shows live pressure at a
+          glance. Hidden until at least one worker reports (no empty card churn). */}
+      {data && data.workers.some((w) => w.stats_source != null) && (
+        <Card>
+          <div className="flex items-center justify-between">
+            <SectionTitle>Worker load</SectionTitle>
+            <Link to="/settings/workers" className="text-xs font-medium text-brand hover:text-brand-hover">
+              Workers →
+            </Link>
+          </div>
+          <ul className="mt-2 divide-y divide-edge">
+            {data.workers
+              .filter((w) => w.stats_source != null)
+              .map((w) => (
+                <li key={w.id} className="flex items-center justify-between gap-3 py-2">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
+                      {w.status}
+                    </Badge>
+                    <span className="truncate text-sm font-medium text-fg">{w.name}</span>
+                  </div>
+                  <WorkerStatLine worker={w} />
+                </li>
+              ))}
+          </ul>
+        </Card>
       )}
 
       {data && !ready && (

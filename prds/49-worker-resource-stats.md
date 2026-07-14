@@ -222,7 +222,7 @@ worker cards.
   `worker_protocol_test.go:93`), empty body → 200, `1e999`/int64-overflow/NaN
   in stats → stats dropped but 200, garbage `source` dropped, null round-trip,
   admin DTO, no-`stats_`-in-scheduling-queries regression grep.
-- [ ] **M3 — Web gauges**: WorkersSettings poll + bars, Dashboard tile line,
+- [x] **M3 — Web gauges**: WorkersSettings poll + bars, Dashboard tile line,
   offline dimming, process-source tooltip, mock data; vitest coverage incl.
   no-limit (no bar) and offline (dimmed) rendering.
 - [ ] **M4 — Docs + specs**: `docs/worker-setup` sizing section (compose + k8s
