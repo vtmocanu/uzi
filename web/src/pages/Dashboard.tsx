@@ -12,7 +12,7 @@ import { mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
-import { WorkerStatLine } from "../components/WorkerStats";
+import { WorkerStatLine, hasStats } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, cx, PageHeader, SectionTitle, Skeleton, StatTile, StatusPill } from "../components/ui";
 import { CheckIcon, ChevronRightIcon } from "../components/icons";
@@ -195,7 +195,7 @@ export function Dashboard() {
       {/* Per-worker resource load (PRD #49): a compact "cpu · mem" line per worker
           that has reported a sample, so the factory floor shows live pressure at a
           glance. Hidden until at least one worker reports (no empty card churn). */}
-      {data && data.workers.some((w) => w.stats_source != null) && (
+      {data && data.workers.some(hasStats) && (
         <Card>
           <div className="flex items-center justify-between">
             <SectionTitle>Worker load</SectionTitle>
@@ -205,7 +205,7 @@ export function Dashboard() {
           </div>
           <ul className="mt-2 divide-y divide-edge">
             {data.workers
-              .filter((w) => w.stats_source != null)
+              .filter(hasStats)
               .map((w) => (
                 <li key={w.id} className="flex items-center justify-between gap-3 py-2">
                   <div className="flex min-w-0 items-center gap-2">

@@ -1,7 +1,8 @@
 # PRD #49: Worker resource stats — live CPU/memory per worker, portable across compose and k8s
 
 **GitLab Issue**: [#49](https://gitlab.example.com/vtmocanu/uzi/-/issues/49)
-**Status**: Draft — reviewed 2026-07-12 by 3 agents (design, security, fact-check);
+**Status**: In progress — M1–M3 + M5 implemented & validated, M4 (docs/specs)
+pending; 2026-07-14. Reviewed 2026-07-12 by 3 agents (design, security, fact-check);
 all blocking/major findings folded in below (marked ↳review where the design
 changed). Fact-check: 24/26 verified; the two misses (#40 file overlap, #47
 migration-number wording) fixed.
@@ -233,7 +234,7 @@ worker cards.
   limits, what the gauges mean, 15s/10s freshness caveat), `specs/ai.md` design
   record; `specs/human.md` addition proposed to user (per-worker live stats was a
   user-stated requirement).
-- [ ] **M5 — E2E verification**: `./e2e/run-e2e.sh` worker (real worker loop, stub
+- [x] **M5 — E2E verification**: `./e2e/run-e2e.sh` worker (real worker loop, stub
   executor, Linux container → real cgroup v2) asserts the workers API returns
   populated stats after one heartbeat interval; smoke-check the UI renders them.
 

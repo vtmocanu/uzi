@@ -69,8 +69,11 @@ const FILL: Record<"ok" | "warn" | "danger", string> = {
   danger: "bg-danger",
 };
 
-/** True once the worker has reported any sample. */
-function hasStats(w: Worker): boolean {
+/** True once the worker has reported a usable sample. The single source of truth for
+ *  "does this worker have stats to render" — the gauges, the compact line, and the
+ *  Dashboard fleet card's filter all gate on this, so no surface can disagree about
+ *  which workers show up (reviewer M3 nit). */
+export function hasStats(w: Worker): boolean {
   return w.stats_source != null && w.stats_mem_bytes != null;
 }
 
