@@ -17,9 +17,9 @@
 -- Cascade-deletes with the user; the token-delete path additionally runs
 -- DeleteRateLimits (D3b) so a token-less user never shows a ghost reading.
 --
--- Draft number 00080; renumber to the next free slot above the live head at merge
--- per the goose-numbering convention (live head 00064; 00070 held by PRD #41,
--- 00095 by PRD #35).
+-- Landed as 00065 — renumbered from the draft 00080 to the next free number above
+-- the live head (00064) at merge, per the goose-numbering convention. Drafts held
+-- by other PRDs' unmerged branches (00070 for #41, 00095 for #35) do not count.
 CREATE TABLE anthropic_rate_limits (
     user_id             UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     five_hour_pct       SMALLINT CHECK (five_hour_pct BETWEEN 0 AND 100),

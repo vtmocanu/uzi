@@ -217,9 +217,11 @@ would wrongly skip master-sealed users (reconciled with D3 at review);
 - [x] **M4 — Docs + polish**: `docs/rate-limits.md`, configuration doc, the
   ARCHITECTURE.md pointer; `check-docs.mjs` green. Validation: page renders
   in-app under /docs.
-- [ ] **M5 — E2E + landing**: e2e happy path (seeded token fixture → meters
+- [x] **M5 — E2E + landing**: e2e happy path (seeded token fixture → meters
   render; admin sees the table, member gets 403 on the admin endpoint);
-  migration renumbered to the live head; PRD moved to `prds/done/`.
+  migration renumbered to the live head (`00080` → `00065`, next free above
+  `00064`). The move of this file to `prds/done/` happens post-merge per repo
+  convention (cf. PRD #49).
 
 ## Milestone dependency / parallelization
 
