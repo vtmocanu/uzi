@@ -137,43 +137,40 @@ before the first deploy. Each mirrors an existing example-app step.
 
 ## Confirm before the first live deploy (pre-M6 gates)
 
-The chart renders and lints today (CI `helm_chart` job), but a live deploy to
-dev-cluster rests on cluster facts the render cannot check. Confirm these first;
-the second is the single most important gate.
+The chart renders and lints today (CI `helm_chart` job). A live deploy to
+dev-cluster also rests on cluster facts the render cannot check; these were
+**confirmed on-cluster 2026-07-15** and the resulting values are already baked
+into `values/dev-cluster.yaml` (re-verify if the cluster changes):
 
-- **`api.networkPolicy.probeCIDRs` MUST be set to the dev-cluster node InternalIP
-  CIDR** (in `values/dev-cluster.yaml`). The api NetworkPolicy is default-deny
-  ingress; kubelet health probes originate from the **node IP** (host network),
-  which no `podSelector` can match. On platform/**Antrea** (which subjects probe
-  traffic to NetworkPolicy) an unset `probeCIDRs` means the api **startup probe
-  is dropped → the pod never goes Ready → CrashLoop**. Set it to the node CIDR,
-  or confirm the CNI exempts host→pod probe traffic. **Do not** deploy with it
-  empty on Antrea. Keep that node CIDR **out of `TRUSTED_PROXIES`** (it is) so a
-  host-network probe source can never be used to spoof XFF.
+- **`api.networkPolicy.probeCIDRs` = `192.0.2.0/24`** — the dev-cluster node
+  InternalIP CIDR (all nodes observed on `192.0.2.x`). The api NetworkPolicy is
+  default-deny ingress; kubelet health probes originate from the **node IP** (host
+  network), which no `podSelector` can match. Antrea (the dev-cluster CNI) subjects
+  probe traffic to NetworkPolicy, so an unset `probeCIDRs` would drop the api
+  **startup probe → the pod never goes Ready → CrashLoop**. The node CIDR is kept
+  **out of `TRUSTED_PROXIES`** so a host-network probe source can never be used to
+  spoof XFF.
 
-- **Pod CIDR ⊆ `100.64.0.0/10`.** `TRUSTED_PROXIES` is set to the platform/Antrea
-  pod net `100.64.0.0/10`. The api's rate-limit `ClientIP` walk trusts XFF only
-  from a `TRUSTED_PROXIES` CIDR; if the real in-cluster hops (web pod +
-  ingress-nginx controller pod) fall **outside** that range, the api resolves
-  every client to the rightmost-non-trusted hop and **per-IP rate-limit buckets
-  collapse** (over-throttling — a functional break, not a bypass). Confirm the
-  dev-cluster pod CIDR is within `100.64.0.0/10`. (dev-cluster ingress-nginx is
-  confirmed **pod-networked**, so its controller pod IP is inside the pod net and
-  the host-network-XFF concern does not apply here — but reconfirm at M6.)
+- **Pod CIDR = `10.244.0.0/16`** (`kube-controller-manager --cluster-cidr`), so
+  `TRUSTED_PROXIES` is set to it. The api's rate-limit `ClientIP` walk trusts XFF
+  only from a `TRUSTED_PROXIES` CIDR; both real in-cluster hops — the web pod and
+  the pod-networked ingress-nginx controller (observed `198.51.100.153`) — fall
+  inside `10.244.0.0/16`, so the api resolves the real browser IP and per-IP
+  rate-limit buckets do not collapse. (An earlier draft used `100.64.0.0/10`, a
+  wrong guess at the pod net — corrected here from the on-cluster CIDR.)
 
-- **Antrea enforces NetworkPolicy.** The in-cluster XFF-spoofing closure (a rogue
+- **Antrea enforces NetworkPolicy** — confirmed (`antrea-agent` running on every
+  node; Antrea enforces by default). The in-cluster XFF-spoofing closure (a rogue
   pod on the shared cluster — `coder.example.com` runs arbitrary dev code —
-  cannot reach the api directly) rests on Antrea actually enforcing the api
-  NetworkPolicy. It does by default on platform; confirm. If enforcement were off,
-  only `TRUSTED_PROXIES` (pod net) remains between a rogue pod and a forged
+  cannot reach the api directly) rests on this. If enforcement were ever disabled,
+  only `TRUSTED_PROXIES` (pod net) would remain between a rogue pod and a forged
   `X-Forwarded-For`.
 
-- **`postgresql:16.3` present in `cloudnative-pg`.** The CNPG cluster pins
-  `harbor.example.com/cloudnative-pg/postgresql:16.3`. Confirm the tag is
-  mirrored before deploy (a missing tag is an M6 pull failure). The MM CNPG fleet
-  is mixed (16.2 most common, 16.3/16.4/16.10 in use); 16.3 was chosen because it
-  is confirmed-mirrored (example-app-3, example-app-2 reference it), not because of an
-  operator ceiling — the dev-cluster CNPG operator 1.23.5 supports up to PG17.
+- **`postgresql:16.4` present in `cloudnative-pg`** — confirmed via `crane ls`
+  (`16.10` also mirrored; `16.3` is **not**). The CNPG cluster pins
+  `harbor.example.com/cloudnative-pg/postgresql:16.4` (also what example-app-2
+  uses on dev-02). PG16 is a fleet-consistency choice, not an operator ceiling — the
+  dev-cluster CNPG operator 1.23.5 supports up to PG17.
 
 - **Forge egress.** The api dials `gitlab.example.com` from the cluster (issue
   sync, MR creation); `FORGE_ALLOWED_BASE_URLS` is set to it. Confirm dev-cluster
