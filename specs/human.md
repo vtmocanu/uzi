@@ -349,6 +349,16 @@ Tracked as GitLab issue vtmocanu/uzi#49; PRD at `prds/49-worker-resource-stats.m
 - Per-worker granularity is sufficient; no per-run attribution. [user-confirmed]
 - Must work the same under docker-compose today and k8s later (portability). [user]
 
+## Feature #53 — Per-user Claude rate-limit visibility
+
+Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/53-rate-limits.md`.
+
+- Show each user's Anthropic account rate-limit headroom (5-hour and 7-day windows) in the uzi web UI.
+- Users see their own meters; admins see every user's, on one page (mirrors the PRD #40 usage split).
+- Server polls with the user's own token; the token never leaves the api container — SPA sees only percentages.
+- The header-probe fallback spends ~1 token/interval of the user's own quota; operators can disable the probe (`UZI_USAGE_PROBE=false`) or the whole poller (`UZI_USAGE_POLL_INTERVAL=0`).
+- No Anthropic token ever appears in a log line, API response, or the SPA.
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
