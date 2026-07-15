@@ -306,7 +306,7 @@ Phase 2 (sequential — depends on M1+M2):
 
 Stretch:
 
-- [ ] **M8 (optional): e2e in CI** *(DEFERRED — stretch, not attempted)* — compose-capable runner or KinD +
+- [x] **M8 (optional): e2e in CI** *(done — KinD chart-install smoke; user opted in 2026-07-15)* — compose-capable runner or KinD +
   chart-based smoke (install chart, run `scripts/smoke.sh` against it).
   Explicitly not a blocker for M6.
 
@@ -405,6 +405,21 @@ dev-cluster `*.example.com` default wildcard, no TLS block.)
   `argo-apps!294` (user chose "MR, not push to main"). Final gates
   green: `glab ci lint` valid, `helm lint` clean, 13 resources render, 0
   plaintext secrets, no app source changed (M1 go/npm gates still hold).
-  Pre-M6 confirmations captured in `deploy/README.md` (pod CIDR ⊆ 100.64/10,
-  probeCIDRs = node CIDR, Antrea NetworkPolicy enforcement, `postgresql:16.3`
-  Harbor mirror presence).
+  Pre-M6 confirmations captured in `deploy/README.md`.
+- 2026-07-15: Pre-M6 gates CHECKED on-cluster (user asked) — caught two real
+  bugs: `TRUSTED_PROXIES` was `100.64.0.0/10` but the dev-cluster pod CIDR is
+  `10.244.0.0/16` (would have collapsed the auth rate-limit buckets), and
+  `postgresql:16.3` is NOT in the `cloudnative-pg` mirror (`16.4`/`16.10`
+  are). Fixed in `21911c9`: `TRUSTED_PROXIES=10.244.0.0/16`,
+  `probeCIDRs=[192.0.2.0/24]` (node CIDR), postgres `16.4`; Antrea CNI +
+  pod-networked ingress confirmed.
+- 2026-07-15: M8 done (user opted in) — a KinD chart-install smoke `e2e` job
+  (`67e6497` + `dc43352`): builds api/web, `kind load`, installs the CNPG
+  operator (pinned **v1.23.5**, matching dev-cluster), pre-creates dummy
+  secrets (`secrets.mode: existing` chart toggle), `helm install`, waits for all
+  pods Ready, runs `scripts/smoke.sh` through the web→api proxy. Validated GREEN
+  in local KinD (12/12 smoke checks, independently reproduced by a second run).
+  Gated to **protected refs only** (privileged DinD must not be reachable from
+  untrusted agent MRs — Decision 2's reasoning on the execution axis); binaries
+  checksum-pinned; credential-less. Runner-side CI execution is unverified (no
+  MM-runner access) — the chart+smoke flow is locally proven.
