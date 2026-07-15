@@ -159,7 +159,7 @@ agent (SDK child)                    api                          Anthropic
      `RUN_TIMEOUT + WORKER_PLAN_APPROVAL_TIMEOUT` with slack) purely so a row that
      somehow escapes the status join cannot live forever. It is a backstop, not the
      mechanism.
-   - Table `run_llm_credentials` (draft migration `00057` — next free above live head
+   - Table `run_llm_credentials` (draft migration `00085` — refreshed 2026-07-15: the original draft `00057` collided with the now-live `00057_run_health.sql` (head `00064`; `00070` held by #41, `00080` by #53, `00095` by #35); was next free above then-head
      `00056_oidc.sql`; renumbered at merge per convention): `run_id` (FK
      `ON DELETE CASCADE`), `token_sha256`, `expires_at`, budget/rate counters. The
      *migration* always applies; only the *behavior* is flag-gated (Decision 7)
@@ -276,7 +276,7 @@ agent (SDK child)                    api                          Anthropic
 ## Milestones
 
 - [ ] **M1 — Credential store + liveness/rotation lifecycle.** `run_llm_credentials`
-  migration (draft `00057`, FK `ON DELETE CASCADE`, `UNIQUE(run_id)`), mint-as-upsert in
+  migration (draft `00085`, FK `ON DELETE CASCADE`, `UNIQUE(run_id)`), mint-as-upsert in
   `assembleClaim` for run + chat lanes, run-scoped plaintext token cache with eviction.
   Tests: rotation on re-claim invalidates the prior bearer; liveness follows
   `runs.status` (live through `awaiting_approval`, dead on every terminal and requeue
