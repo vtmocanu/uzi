@@ -51,6 +51,25 @@ func intPtrValue(i pgtype.Int4) *int {
 	return &v
 }
 
+// float4PtrValue / int8PtrValue apply the same JSON-null vs value convention to the
+// worker's nullable stats columns (PRD #49): a NULL column becomes a JSON null so the
+// UI shows nothing rather than a fabricated 0.
+func float4PtrValue(f pgtype.Float4) *float64 {
+	if !f.Valid {
+		return nil
+	}
+	v := float64(f.Float32)
+	return &v
+}
+
+func int8PtrValue(i pgtype.Int8) *int64 {
+	if !i.Valid {
+		return nil
+	}
+	v := i.Int64
+	return &v
+}
+
 // maxWorkerNameBytes bounds a worker's human label.
 const maxWorkerNameBytes = 200
 
@@ -85,6 +104,16 @@ type workerDTO struct {
 	Version          *string    `json:"version"`
 	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at"`
 	CreatedAt        time.Time  `json:"created_at"`
+	// Latest container resource sample (PRD #49), all null until the worker reports
+	// one (and re-nulled if it stops). StatsMemLimitBytes is null when the container
+	// is unlimited or the sample came from the process fallback; StatsCPUPct is null
+	// on the worker's first tick. StatsSource is "cgroup" or "process" (the UI labels
+	// a process-source sample "worker process only"). Freshness is LastHeartbeatAt —
+	// an offline worker's stats are last-known, dimmed by the client.
+	StatsCPUPct        *float64 `json:"stats_cpu_pct"`
+	StatsMemBytes      *int64   `json:"stats_mem_bytes"`
+	StatsMemLimitBytes *int64   `json:"stats_mem_limit_bytes"`
+	StatsSource        *string  `json:"stats_source"`
 }
 
 // workerDTOFromWorker builds the DTO from a bare worker row plus its active (non-chat)
@@ -94,33 +123,41 @@ type workerDTO struct {
 // 0/false, exactly as they previously passed busy=false.
 func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) workerDTO {
 	return workerDTO{
-		ID:                w.ID.String(),
-		Name:              w.Name,
-		Status:            w.Status,
-		Busy:              busy,
-		ActiveRuns:        activeRuns,
-		MaxConcurrentRuns: intPtrValue(w.MaxConcurrentRuns),
-		TemplateDeclared:  textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
-		TemplateReported:  textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
-		Version:           textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt:   timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:         w.CreatedAt.Time,
+		ID:                 w.ID.String(),
+		Name:               w.Name,
+		Status:             w.Status,
+		Busy:               busy,
+		ActiveRuns:         activeRuns,
+		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),
+		TemplateDeclared:   textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported:   textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:            textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:    timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:          w.CreatedAt.Time,
+		StatsCPUPct:        float4PtrValue(w.StatsCpuPct),
+		StatsMemBytes:      int8PtrValue(w.StatsMemBytes),
+		StatsMemLimitBytes: int8PtrValue(w.StatsMemLimitBytes),
+		StatsSource:        textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
 	}
 }
 
 func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
 	return workerDTO{
-		ID:                w.ID.String(),
-		Name:              w.Name,
-		Status:            w.Status,
-		Busy:              w.Busy,
-		ActiveRuns:        int(w.ActiveRuns),
-		MaxConcurrentRuns: intPtrValue(w.MaxConcurrentRuns),
-		TemplateDeclared:  textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
-		TemplateReported:  textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
-		Version:           textPtrValue(w.Version.Valid, w.Version.String),
-		LastHeartbeatAt:   timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
-		CreatedAt:         w.CreatedAt.Time,
+		ID:                 w.ID.String(),
+		Name:               w.Name,
+		Status:             w.Status,
+		Busy:               w.Busy,
+		ActiveRuns:         int(w.ActiveRuns),
+		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),
+		TemplateDeclared:   textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
+		TemplateReported:   textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
+		Version:            textPtrValue(w.Version.Valid, w.Version.String),
+		LastHeartbeatAt:    timePtr(w.LastHeartbeatAt.Valid, w.LastHeartbeatAt.Time),
+		CreatedAt:          w.CreatedAt.Time,
+		StatsCPUPct:        float4PtrValue(w.StatsCpuPct),
+		StatsMemBytes:      int8PtrValue(w.StatsMemBytes),
+		StatsMemLimitBytes: int8PtrValue(w.StatsMemLimitBytes),
+		StatsSource:        textPtrValue(w.StatsSource.Valid, w.StatsSource.String),
 	}
 }
 

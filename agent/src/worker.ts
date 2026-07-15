@@ -4,6 +4,8 @@ import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
+import type { WorkerStats } from "./protocol.js";
+import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
 
 /**
@@ -61,13 +63,29 @@ export class Worker {
   }
 
   private async heartbeatLoop(signal: AbortSignal): Promise<void> {
+    // One collector for the loop's lifetime so the CPU% delta carries across ticks
+    // (PRD #49). Its first tick omits cpu_pct (no prior sample); a worker restart
+    // just re-runs that omission.
+    const stats = new StatsCollector();
     while (!signal.aborted) {
       try {
-        await this.client.heartbeat();
+        await this.client.heartbeat(this.collectStats(stats));
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
       await sleep(this.config.heartbeatIntervalMs, signal);
+    }
+  }
+
+  /** Sample container stats, never letting a collector failure reach the heartbeat
+   *  (PRD #49 Decision 3 / M1). collect() is already internally guarded; this is the
+   *  belt-and-suspenders outer guard so liveness never hinges on telemetry. */
+  private collectStats(collector: StatsCollector): WorkerStats | undefined {
+    try {
+      return collector.collect();
+    } catch (err) {
+      this.log.warn("stats collection failed", { error: errMessage(err) });
+      return undefined;
     }
   }
 

@@ -2,14 +2,18 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
@@ -26,6 +30,7 @@ type protocolStore struct {
 	ownedRun      store.Run
 	ownedErr      error
 	completedRows int64
+	heartbeatArg  store.HeartbeatWorkerParams
 }
 
 func (p *protocolStore) ClaimRun(context.Context, store.ClaimRunParams) (store.Run, error) {
@@ -48,6 +53,21 @@ func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRu
 }
 func (p *protocolStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerParams) (store.Worker, error) {
 	return store.Worker{ID: arg.ID, Status: "online", Version: arg.Version, TemplateReported: arg.TemplateReported, MaxConcurrentRuns: arg.MaxConcurrentRuns}, nil
+}
+
+// HeartbeatWorker echoes the stats params back onto the returned worker, so a
+// heartbeat test can assert exactly what would have been persisted (and rendered in
+// the DTO) — a valid sample round-trips; a dropped one leaves every stats_ column NULL.
+func (p *protocolStore) HeartbeatWorker(_ context.Context, arg store.HeartbeatWorkerParams) (store.Worker, error) {
+	p.heartbeatArg = arg
+	return store.Worker{
+		ID:                 arg.ID,
+		Status:             "online",
+		StatsCpuPct:        arg.StatsCpuPct,
+		StatsMemBytes:      arg.StatsMemBytes,
+		StatsMemLimitBytes: arg.StatsMemLimitBytes,
+		StatsSource:        arg.StatsSource,
+	}, nil
 }
 
 func newProtocolHandler(t *testing.T, st workersvc.Store) *Handler {
@@ -220,6 +240,178 @@ func TestWorkerRegisterDropsMalformedTemplate(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"template_reported":null`) {
 		t.Fatalf("malformed template must be dropped to null, got %q", rec.Body.String())
+	}
+}
+
+// ── Heartbeat + stats (PRD #49) ────────────────────────────────────────────
+
+func TestWorkerHeartbeatAcceptsVersionBody(t *testing.T) {
+	// THE blocking-finding test (PRD #49 Decision 3): every current worker already
+	// sends {"version":...} on the heartbeat, and DisallowUnknownFields would 400 a
+	// stats-only decode — marking the whole fleet stale within the sweeper window.
+	// Register's name field proved the same trap (TestWorkerRegisterAcceptsNameField).
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, `{"version":"1.2.3"}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (heartbeat must accept the version-only body), body %q", rec.Code, rec.Body.String())
+	}
+	// No stats sent ⇒ every stats_ column is written NULL (null round-trip, Decision 4).
+	if !strings.Contains(rec.Body.String(), `"stats_source":null`) || !strings.Contains(rec.Body.String(), `"stats_mem_bytes":null`) {
+		t.Fatalf("absent stats must render null, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerHeartbeatAcceptsEmptyBody(t *testing.T) {
+	// An empty body decodes to io.EOF, tolerated exactly like register's.
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, "", uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (empty body tolerated), body %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkerHeartbeatStoresValidStats(t *testing.T) {
+	// A well-formed cgroup sample round-trips: validated, persisted, and echoed in the
+	// worker DTO with a percentage, a used/limit pair, and the source.
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	body := `{"version":"1","stats":{"cpu_pct":34.5,"mem_bytes":2100000000,"mem_limit_bytes":4294967296,"source":"cgroup"}}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{`"stats_cpu_pct":34.5`, `"stats_mem_bytes":2100000000`, `"stats_mem_limit_bytes":4294967296`, `"stats_source":"cgroup"`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("expected %s in DTO, got %q", want, rec.Body.String())
+		}
+	}
+	if !st.heartbeatArg.StatsSource.Valid || st.heartbeatArg.StatsSource.String != "cgroup" {
+		t.Fatalf("valid stats must reach the store, got %+v", st.heartbeatArg)
+	}
+}
+
+func TestWorkerHeartbeatOmittedCPUPctIsNull(t *testing.T) {
+	// The worker's first tick omits cpu_pct (no delta). mem + source still store; the
+	// percentage column stays NULL (the UI shows the mem bar without a CPU value).
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, `{"version":"1","stats":{"mem_bytes":100,"source":"process"}}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"stats_cpu_pct":null`) {
+		t.Fatalf("omitted cpu_pct must be null, got %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"stats_source":"process"`) || !strings.Contains(rec.Body.String(), `"stats_mem_bytes":100`) {
+		t.Fatalf("mem + source must still store, got %q", rec.Body.String())
+	}
+	if st.heartbeatArg.StatsMemLimitBytes.Valid {
+		t.Fatalf("absent mem_limit must be NULL, got %+v", st.heartbeatArg.StatsMemLimitBytes)
+	}
+}
+
+func TestWorkerHeartbeatClampsCPUPct(t *testing.T) {
+	// A CPU% above the [0, 6400] ceiling is clamped, not rejected: telemetry stays a
+	// 200, and the stored value can never put 6400000% into the DOM.
+	st := &protocolStore{}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, `{"version":"1","stats":{"cpu_pct":999999,"mem_bytes":1,"source":"cgroup"}}`, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"stats_cpu_pct":6400`) {
+		t.Fatalf("cpu_pct must clamp to 6400, got %q", rec.Body.String())
+	}
+}
+
+func TestWorkerHeartbeatDropsInvalidStats(t *testing.T) {
+	// A malformed or hostile stats object must NEVER fail the heartbeat (telemetry
+	// hygiene never costs liveness) — the whole object is dropped and the columns are
+	// written NULL. Covers the two-step-decode escapes (float64-overflow 1e999,
+	// int64-overflow mem) and the validation rejects (junk source, negative mem, a
+	// missing required mem_bytes).
+	for _, body := range []string{
+		`{"version":"1","stats":{"cpu_pct":1e999,"mem_bytes":1,"source":"cgroup"}}`,         // float64 overflow
+		`{"version":"1","stats":{"mem_bytes":99999999999999999999,"source":"cgroup"}}`,      // int64 overflow
+		`{"version":"1","stats":{"cpu_pct":10,"mem_bytes":1,"source":"../etc/passwd"}}`,     // garbage source enum
+		`{"version":"1","stats":{"mem_bytes":-5,"source":"cgroup"}}`,                          // negative mem
+		`{"version":"1","stats":{"cpu_pct":10,"source":"cgroup"}}`,                            // missing required mem_bytes
+	} {
+		st := &protocolStore{}
+		h := newProtocolHandler(t, st)
+		rec := httptest.NewRecorder()
+		h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (invalid stats must not fail the heartbeat) for %s, body %q", rec.Code, body, rec.Body.String())
+		}
+		if st.heartbeatArg.StatsSource.Valid || st.heartbeatArg.StatsMemBytes.Valid || st.heartbeatArg.StatsCpuPct.Valid {
+			t.Fatalf("invalid stats %s must be dropped (all stats_ NULL), got %+v", body, st.heartbeatArg)
+		}
+	}
+}
+
+func TestAdminWorkerDTOIncludesStats(t *testing.T) {
+	// The stats fields ride the shared workerDTO, so the admin worker DTO inherits them
+	// for free (PRD #49 Decision 6). A worker row with a sample marshals every stats_
+	// field into the admin JSON.
+	w := store.Worker{
+		ID:                 uuid.New(),
+		Name:               "laptop",
+		Status:             "online",
+		StatsCpuPct:        pgtype.Float4{Float32: 12.5, Valid: true},
+		StatsMemBytes:      pgtype.Int8{Int64: 1073741824, Valid: true},
+		StatsMemLimitBytes: pgtype.Int8{Int64: 2147483648, Valid: true},
+		StatsSource:        pgtype.Text{String: "cgroup", Valid: true},
+	}
+	dto := adminWorkerDTO{workerDTO: workerDTOFromWorker(w, 0, false), OwnerEmail: "u@example.test"}
+	b, err := json.Marshal(dto)
+	if err != nil {
+		t.Fatalf("marshal admin dto: %v", err)
+	}
+	for _, want := range []string{`"stats_cpu_pct":12.5`, `"stats_mem_bytes":1073741824`, `"stats_mem_limit_bytes":2147483648`, `"stats_source":"cgroup"`, `"owner_email":"u@example.test"`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("expected %s in admin worker DTO, got %s", want, string(b))
+		}
+	}
+}
+
+func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
+	// Decision 5 is ENFORCED, not just prose: stats_ columns are display-only, so the
+	// ONLY queries that may name one are the HeartbeatWorker writer and the worker-list
+	// DTO reads. Every other query — in ANY queries file, not just runtime.sql — that
+	// literally references stats_ would be a claim/scheduling/sweeper path keying on
+	// attacker-reported telemetry, exactly what must never happen. Scanning the whole
+	// directory (not just runtime.sql) means a future scheduling query added to another
+	// queries file can't dodge the guard (auditor M2 minor).
+	allowed := map[string]bool{
+		"HeartbeatWorker":   true, // the sole writer of the stats_ columns
+		"ListWorkersByUser": true, // DTO read; today via w.*, allowlisted for a future explicit select
+		"ListAllWorkers":    true, // DTO read (admin); same rationale
+	}
+	files, err := filepath.Glob("../store/queries/*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("glob queries: %v (matched %d files)", err, len(files))
+	}
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		blocks := strings.Split(string(raw), "-- name:")
+		for _, block := range blocks[1:] { // blocks[0] is the file preamble
+			name := strings.Fields(block)[0]
+			if allowed[name] {
+				continue
+			}
+			if strings.Contains(block, "stats_") {
+				t.Fatalf("query %s in %s references a stats_ column; stats_* are display-only (Decision 5) and may appear only in HeartbeatWorker or the worker-list DTO queries", name, filepath.Base(f))
+			}
+		}
 	}
 }
 

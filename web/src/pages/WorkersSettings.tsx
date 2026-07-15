@@ -8,6 +8,8 @@ import { SettingsShell } from "../components/SettingsShell";
 import { ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
+import { WorkerStatGauges } from "../components/WorkerStats";
+import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -39,6 +41,20 @@ export function WorkersSettings() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Liveness (PRD #49): re-fetch the fleet every 10s while the tab is visible — the
+  // same rhythm the Dashboard uses — so live CPU/memory gauges refresh without a
+  // reload (heartbeat cadence 15s × this 10s poll). A poll error keeps the last-good
+  // list (it must never blank the fleet or flash an error), unlike the first load.
+  const poll = useCallback(async () => {
+    try {
+      const { workers } = await api.listWorkers();
+      setWorkers(workers);
+    } catch {
+      // keep the last-good list
+    }
+  }, []);
+  usePollWhileVisible(poll, 10000);
 
   const create = async (e: FormEvent) => {
     e.preventDefault();
@@ -165,39 +181,44 @@ export function WorkersSettings() {
             {workers.map((w) => (
               <li
                 key={w.id}
-                className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm"
+                className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm"
               >
-                <div>
-                  <span className="font-medium text-fg">{w.name}</span>
-                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
-                    {w.template_reported ? (
-                      <span>template {w.template_reported}</span>
-                    ) : (
-                      w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <span className="font-medium text-fg">{w.name}</span>
+                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-faint">
+                      {w.template_reported ? (
+                        <span>template {w.template_reported}</span>
+                      ) : (
+                        w.template_declared && <span>template {w.template_declared} (awaiting report)</span>
+                      )}
+                      {w.version && <span>· v{w.version}</span>}
+                      {w.last_heartbeat_at && (
+                        <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {hasTemplateDrift(w.template_declared, w.template_reported) && (
+                      <Badge
+                        tone="warning"
+                        title={`Declared ${w.template_declared}, but the worker reports ${w.template_reported}. Rebuild it with WORKER_TEMPLATE=${w.template_declared} to match.`}
+                      >
+                        template drift
+                      </Badge>
                     )}
-                    {w.version && <span>· v{w.version}</span>}
-                    {w.last_heartbeat_at && (
-                      <span>· last seen {new Date(w.last_heartbeat_at).toLocaleString()}</span>
-                    )}
+                    <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
+                      {w.status}
+                    </Badge>
+                    <WorkerRunBadge worker={w} />
+                    <Button variant="danger" size="sm" onClick={() => remove(w.id)}>
+                      Delete
+                    </Button>
                   </div>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  {hasTemplateDrift(w.template_declared, w.template_reported) && (
-                    <Badge
-                      tone="warning"
-                      title={`Declared ${w.template_declared}, but the worker reports ${w.template_reported}. Rebuild it with WORKER_TEMPLATE=${w.template_declared} to match.`}
-                    >
-                      template drift
-                    </Badge>
-                  )}
-                  <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
-                    {w.status}
-                  </Badge>
-                  <WorkerRunBadge worker={w} />
-                  <Button variant="danger" size="sm" onClick={() => remove(w.id)}>
-                    Delete
-                  </Button>
-                </div>
+                {/* Live resource gauges (PRD #49): renders only once the worker has
+                    reported a sample, so a worker without stats keeps its old row. */}
+                <WorkerStatGauges worker={w} />
               </li>
             ))}
           </ul>

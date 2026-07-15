@@ -5701,3 +5701,128 @@ Full Decision Log in `prds/40-token-usage-reporting.md`. The load-bearing decisi
   trusts the frame's `modelUsage`, so the run/self/factory/per-user rollups (incl. the admin endpoint)
   inherit that trust: a compromised worker can misreport its own runs' spend. This is accounting, not
   authz — not a basis for billing or enforcement (§225/Decision 8 already frame cost as an estimate).
+
+# PRD #49 — Worker resource stats (live CPU/mem per worker, portable across compose and k8s)
+
+Serves the human requirement: live per-worker CPU/memory visibility in the web UI, per-worker
+granularity (no per-run attribution), working identically under docker-compose today and k8s later.
+Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisions:
+
+## 228. Self-reported cgroup v2 on the existing heartbeat — never pulled from outside
+
+- **Decision.** The worker reads its OWN container stats from `/sys/fs/cgroup` (cgroup v2) and ships
+  them on the existing 15s heartbeat (`agent/src/stats.ts` → `agent/src/worker.ts` heartbeat loop →
+  `client.heartbeat()`). No new endpoint, no cadence change, no inbound surface.
+- **Why this over every pull alternative.** The worker is outbound-only by hard invariant (schema
+  comment `migrations/00020_workers_runs.sql`; no inbound port, no cookies). Mounting the docker
+  socket is compose-only AND a root-equivalent hole in a container that also runs a prompt-injected
+  agent's Bash tool; k8s metrics-server/cAdvisor is k8s-only and the API has no network path or creds
+  to it; a metrics endpoint on the worker breaks outbound-only. Reading cgroupfs from inside works
+  identically under docker and kubelet because both put each container in its own cgroup namespaced to
+  exactly that cgroup — so ONE mechanism satisfies the portability requirement with zero
+  environment-specific code beyond the fallback (§230). This is the whole reason k8s needs no changes:
+  in a pod `memory.max`/`cpu.max` already reflect the pod's limits, so the same gauges show "% of pod
+  limit" for free.
+
+## 229. Sample math — docker-stats memory semantics and quota-normalized CPU%
+
+- **Sample shape:** `{cpu_pct?, mem_bytes, mem_limit_bytes?, source}` computed per tick from
+  `memory.current`, `memory.stat`, `memory.max`, `cpu.stat` (`usage_usec`), `cpu.max`. All
+  world-readable; the non-root `uzi` user and the distinct-uid agent subprocess share the container
+  cgroup, so one read covers the worker AND every SDK/git/devbox child — per-worker == per-container.
+- **Reported memory = `memory.current − memory.stat:inactive_file`.** Raw `memory.current` counts
+  reclaimable page cache that git/build workloads pin near the limit while the kernel would evict it
+  long before OOM — it cries wolf. Subtracting `inactive_file` is exactly what `docker stats` shows, so
+  the gauge matches operator intuition and is a real OOM-proximity signal.
+- **CPU% = Δ`usage_usec` ÷ measured monotonic elapsed µs ÷ allowed CPUs** (`cpuPercent`,
+  `stats.ts:112`). Elapsed comes from `process.hrtime.bigint()` between samples, never the nominal 15s
+  (which drifts with request latency and retry backoff). Allowed CPUs = `quota/period` from `cpu.max`
+  (`"50000 100000"` → 0.5 CPU); `"max"` → `os.cpus().length` (the host count, which IS the ceiling when
+  unquoted) — so 100% always means "all the CPU this container may use".
+- `memory.max == "max"` → `mem_limit_bytes: null` (UI shows absolute usage, no %). First tick has no
+  prior delta → omit `cpu_pct`; the prior `usage_usec`/hrtime pair lives in collector memory only, so a
+  restart just re-runs the first-tick omission.
+
+## 230. Namespace-root check picks cgroup vs process fallback (CORRECTED mechanism)
+
+- **Decision.** `cgroupIsNamespaceRoot()` (`stats.ts:188`) gates the source: when
+  `/proc/self/cgroup` reads `0::/` (private cgroup namespace — the modern Docker + kubelet default),
+  the container's own cgroup IS the namespace root and `/sys/fs/cgroup` reflects THIS container → use
+  `source: "cgroup"`. When it reads a NON-root path (`0::/docker/<id>`, `0::/kubepods/…`, i.e.
+  `cgroupns=host` on older runtimes / explicit config), `/sys/fs/cgroup` is the host root whose numbers
+  masquerade as the container's (`memory.max` reads `"max"` though the container is capped) → treat
+  cgroup data as unavailable and use the process fallback rather than report the host as the worker.
+- **The PRD's original wording was INVERTED** (it named `0::/` as the masquerade). Corrected 2026-07-14
+  after empirical verification on Docker 29.4.0 (both private-ns and `cgroupns=host` tested live). The
+  inverted version would have forced the process fallback for EVERY normally-containerized worker and
+  defeated the core success criteria. Only the corrected mechanism is recorded here.
+- **Process fallback** (`process.memoryUsage().rss` + `process.cpuUsage()` deltas, `source:
+  "process"`): honest but children-blind (misses the SDK/git subprocesses), so the UI labels it
+  ("worker process only"). No cgroup v1 parser — v1 hosts get this fallback; Docker Desktop and current
+  k8s default to v2. A collector failure NEVER fails the heartbeat (stats are optional).
+
+## 231. Transport — optional `stats` field with a defensive two-step decode; liveness never hinges on telemetry
+
+- **Wire:** `HeartbeatRequest` (`agent/src/protocol.ts`) gains optional
+  `stats?: {cpu_pct?, mem_bytes, mem_limit_bytes?, source}` — same absent-optional convention as
+  `template` on register.
+- **The decode contract is spelled out because the naive version bricks the fleet.** The server
+  ignored the heartbeat body before, but every current worker already sends `{"version": ...}` and
+  `httpx.DecodeJSON` is strict (`DisallowUnknownFields`). A `struct{ Stats }`-only decode would 400
+  every heartbeat from every worker old and new → within `WORKER_HEARTBEAT_STALE` the sweeper marks the
+  whole fleet offline and requeues its runs. So `worker_protocol.go` mirrors register exactly: the
+  struct DECLARES `version` (ignored), tolerates empty body via the `io.EOF` check, and — critically —
+  decodes `stats` as `json.RawMessage` parsed in a SECOND step whose failure drops the stats and
+  nothing else. A literal `float64` field would abort the whole decode on `1e999`/int64-overflow BEFORE
+  validation runs, turning one malformed number into a self-DoS. Liveness must never hinge on telemetry
+  hygiene.
+- **Back-compat matrix:** new worker + old server → extra body bytes ignored, harmless; old worker +
+  new server → `{"version"}` decodes, stats absent, columns NULLed (§232).
+
+## 232. Storage — four nullable columns on `workers`, overwritten (or NULLed) every heartbeat, no history
+
+- Migration `00064_worker_stats.sql` (landed as 00064 — renumbered from the parallel-PRD draft
+  00090 to the next free slot above the live head 00063 at merge) adds `stats_cpu_pct real`, `stats_mem_bytes bigint`,
+  `stats_mem_limit_bytes bigint`, `stats_source text` — all nullable, no new table. `HeartbeatWorker`
+  (`queries/runtime.sql`) writes whatever the tick carried and NULLs when it carried nothing, so a
+  worker that stops sending (downgrade, collector error) self-clears instead of pinning a stale gauge;
+  freshness is just `last_heartbeat_at`, which the UI already has. DTO fields are `*float64`/`*int64`/
+  `*string` (`handler/workers.go`, `AdminWorker` inherits free).
+- **Latest-sample only — no samples table.** Nothing queries history; time series is Prometheus
+  territory (out of scope). Accepted consequence: one bad collector tick blanks the gauge for ~15s;
+  the flicker-hold (hold last value one poll) was OFFERED to the implementer and NOT taken — a blank
+  tick blanks, chosen for simplicity and to avoid a stale value looking live.
+
+## 233. Display-only, clamped at the door, and ENFORCED — never a scheduling input
+
+- The worker is the least-trusted component; a hostile one can report anything. The server validates
+  post-decode: `cpu_pct` finite, clamped `[0, 6400]` (100% × 64 cores); `mem_bytes`/`mem_limit_bytes`
+  non-negative int64; `source ∈ {cgroup, process}`; any violation drops the WHOLE `stats` object and
+  the heartbeat still 200s. **Drop-log carries `worker_id` + a static reason only** — never the raw
+  values or the pre-validation `source` string (attacker-controlled text), mirroring
+  `sanitizeSelfReported`.
+- **The display-only contract is enforced, not prose:** the migration carries a SQL comment marking
+  `stats_*` display-only, and a regression test in `handler/worker_protocol_test.go` scans ALL queries
+  files and asserts no query outside `HeartbeatWorker`/the worker-list queries references `stats_`
+  (widened from `runtime.sql`-only to all files in 6f047dc). Claim logic, run assignment, and the
+  sweeper never read these columns. The payload is four numbers and an enum — it can't leak secrets or
+  repo content.
+
+## 234. UI — WorkersSettings gauges + a Dashboard "Worker load" fleet card; E2E on real cgroups
+
+- **Shared gauge** (`web/src/components/WorkerStats.tsx`): CPU bar and "used / limit" memory bar,
+  percentage shown ONLY when a limit is known, warn tone ≥ 80%, danger ≥ 95%. **Bar widths clamp at
+  100% in the DOM** regardless of stored value (the server accepts up to 6400%; the DOM must not render
+  it). Offline (sweeper-marked) → dimmed last-known with heartbeat age, never a live-looking gauge;
+  `source: "process"` → tooltip "worker process only".
+- **WorkersSettings** (`web/src/pages/WorkersSettings.tsx`) was mount-only load; gains the same 10s
+  `usePollWhileVisible` the Dashboard uses, plus the per-worker gauges.
+- **Dashboard fleet card** (↳impl correction 2026-07-14): the PRD assumed per-worker tiles existed —
+  they did NOT (`Dashboard.tsx` had only the aggregate "Workers online N/M" StatTile). The lead ruled a
+  NEW compact "Worker load" card: one "name · cpu · mem" line per worker with a sample, offline-dimmed,
+  hidden until any worker reports — the "factory floor at a glance" intent. Web mocks
+  (`mocks/data.ts`, `mockApi.ts`) grow limited/unlimited/offline/process-source samples.
+- **E2E** (`e2e/run-e2e.sh`, M5): a real worker loop (stub executor) in a Linux container hits real
+  cgroup v2; the run asserts the workers API returns populated `source: "cgroup"` stats after one
+  heartbeat interval. An independent tester validated the hostile matrix (overflow/NaN/junk source →
+  stats dropped, heartbeat still 200) live.

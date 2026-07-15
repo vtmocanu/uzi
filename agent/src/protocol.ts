@@ -89,8 +89,38 @@ export interface RegisterResponse {
   worker_id?: string;
 }
 
+/**
+ * Container resource sample the worker self-reports on the heartbeat (PRD #49).
+ * Read from the worker's own cgroup v2 files (or a process-level fallback), so one
+ * sample covers the worker plus every SDK/git/devbox child in the same container
+ * cgroup. Display-only server-side (Decision 5): four numbers and an enum, never a
+ * scheduling input, and it can carry no secret or repo content.
+ */
+export interface WorkerStats {
+  /** Container CPU as a percentage of the cgroup's ALLOWED CPUs (cpu.max quota when
+   *  set, else host core count), so 100 = "all the CPU this container may use".
+   *  Omitted on the first tick after start (no delta yet) and whenever the
+   *  elapsed/usage delta is undefined (Decision 2). */
+  cpu_pct?: number;
+  /** Working-set memory in bytes: `memory.current − inactive_file` under cgroup
+   *  (matches `docker stats`, not the cache-inflated raw current), or
+   *  `process.memoryUsage().rss` under the process fallback. */
+  mem_bytes: number;
+  /** The cgroup memory limit in bytes, or null when unlimited (`memory.max` = "max")
+   *  or unknown (process fallback). null ⇒ the UI shows absolute usage, no bar. */
+  mem_limit_bytes?: number | null;
+  /** Which mechanism produced the sample: "cgroup" (container-wide, covers children)
+   *  or "process" (this worker process only, children-blind — the UI labels it). */
+  source: "cgroup" | "process";
+}
+
 export interface HeartbeatRequest {
   version: string;
+  /** Optional container resource sample (PRD #49), same absent-optional convention
+   *  as `template` on register: the worker omits it when the collector produced
+   *  nothing, and the server both tolerates its absence and (Decision 3) decodes it
+   *  defensively so a malformed sample drops the stats without failing the heartbeat. */
+  stats?: WorkerStats;
 }
 
 /** Kebab-case agent name. Mirrors the API's template nameRe

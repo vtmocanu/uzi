@@ -651,6 +651,11 @@ export const mockWorkers: Worker[] = [
     version: "0.4.2",
     last_heartbeat_at: minsAgo(0.2),
     created_at: daysAgo(14),
+    // cgroup sample with a limit → CPU bar + "used / limit · %" memory bar (ok tone).
+    stats_cpu_pct: 34.2,
+    stats_mem_bytes: 2254857830, // 2.1 GiB
+    stats_mem_limit_bytes: 4294967296, // 4 GiB → ~52%
+    stats_source: "cgroup",
   },
   {
     // Declared jvm at issuance but the running image is base → drift badge demo.
@@ -665,14 +670,40 @@ export const mockWorkers: Worker[] = [
     version: "0.4.1",
     last_heartbeat_at: daysAgo(2),
     created_at: daysAgo(21),
+    // Offline → its last-known cgroup sample renders dimmed, never live-looking.
+    stats_cpu_pct: 12,
+    stats_mem_bytes: 1610612736, // 1.5 GiB
+    stats_mem_limit_bytes: 2147483648, // 2 GiB → 75%
+    stats_source: "cgroup",
+  },
+  {
+    // Un-quota'd / cgroup-v1 host → process fallback: no known limit (absolute mem,
+    // no percentage bar) and the "worker process only" label.
+    id: "w-nas",
+    name: "nas-runner",
+    status: "online",
+    busy: false,
+    active_runs: 0,
+    max_concurrent_runs: null,
+    template_declared: "base",
+    template_reported: "base",
+    version: "0.4.2",
+    last_heartbeat_at: minsAgo(0.4),
+    created_at: daysAgo(6),
+    stats_cpu_pct: 8.3,
+    stats_mem_bytes: 503316480, // 480 MiB
+    stats_mem_limit_bytes: null, // unlimited/unknown → no bar
+    stats_source: "process",
   },
 ];
 
 export const mockAdminWorkers: AdminWorker[] = [
   { ...mockWorkers[0], owner_email: mockAdmin.email },
   { ...mockWorkers[1], owner_email: mockAdmin.email },
+  { ...mockWorkers[2], owner_email: mockAdmin.email },
   {
-    // A cap-2 worker running both slots → "2/2 runs" badge demo (PRD #42).
+    // A cap-2 worker running both slots → "2/2 runs" badge demo (PRD #42), and a
+    // near-limit cgroup sample → danger-tone CPU + memory bars (≥95%).
     id: "w-mira",
     name: "mira-desktop",
     status: "online",
@@ -684,6 +715,10 @@ export const mockAdminWorkers: AdminWorker[] = [
     version: "0.4.2",
     last_heartbeat_at: minsAgo(0.5),
     created_at: daysAgo(9),
+    stats_cpu_pct: 96.4,
+    stats_mem_bytes: 8160437862, // 7.6 GiB
+    stats_mem_limit_bytes: 8589934592, // 8 GiB → 95%
+    stats_source: "cgroup",
     owner_email: "mira@uzi.local",
   },
 ];

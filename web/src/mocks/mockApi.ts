@@ -1131,6 +1131,11 @@ export const mockApi = {
       version: null,
       last_heartbeat_at: null,
       created_at: new Date().toISOString(),
+      // No resource sample until the worker heartbeats (PRD #49) → no gauges yet.
+      stats_cpu_pct: null,
+      stats_mem_bytes: null,
+      stats_mem_limit_bytes: null,
+      stats_source: null,
     };
     workers.push(w);
     const token = `uzi_wk_${Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join("")}`;

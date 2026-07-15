@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"unicode"
@@ -125,20 +127,103 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// WorkerHeartbeat refreshes liveness. No body.
+// maxWorkerCPUPct clamps a worker's self-reported CPU percentage (PRD #49 Decision
+// 5): 100% × 64 CPUs. The worker is the least-trusted component and can report
+// anything; stats are display-only, so this is an absurd-value ceiling that also keeps
+// a hostile 6400000% out of the DOM (the UI additionally clamps the bar to 100%), not
+// a policy limit.
+const maxWorkerCPUPct = 100 * 64
+
+// WorkerHeartbeat refreshes liveness and records the worker's latest resource sample
+// (PRD #49). Accepts an optional {version, stats} body.
 func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
 		return
 	}
-	updated, err := h.wsvc.Heartbeat(r.Context(), wkr)
+	// Decode contract (PRD #49 Decision 3), mirroring register EXACTLY so a strict
+	// decoder never bricks the fleet: declare `version` (accepted, ignored — every
+	// current worker already sends {"version":...} and DisallowUnknownFields would 400
+	// it otherwise, marking the whole fleet stale within the sweeper window), tolerate
+	// an empty body via io.EOF, and capture `stats` as a json.RawMessage so a malformed
+	// NUMBER inside it can never abort THIS decode. A literal float64 field would 400
+	// the entire heartbeat on 1e999 / int64-overflow before any validation runs — one
+	// bad telemetry number becoming a self-DoS. Liveness must never hinge on telemetry
+	// hygiene, so the stats are parsed defensively in a second step below.
+	var req struct {
+		Version string          `json:"version"`
+		Stats   json.RawMessage `json:"stats"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	// Second step: validate + clamp the isolated stats (Decision 5). A malformed or
+	// invalid sample drops to nil (columns written NULL) and the heartbeat still 200s.
+	stats := parseWorkerStats(req.Stats, wkr.ID)
+	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats)
 	if err != nil {
 		slog.Error("worker heartbeat", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"worker": workerDTOFromWorker(updated, 0, false)})
+}
+
+// parseWorkerStats is Decision 3's second-step defensive parse plus Decision 5's
+// validation/clamping of the heartbeat's untrusted `stats`. It NEVER fails the
+// heartbeat: an absent, malformed, or invalid sample returns nil (every stats_ column
+// is written NULL) and the 200 stands. On a drop it logs worker_id + a STATIC reason
+// only — never the raw values or the source string, which is attacker-controlled until
+// the enum check passes (mirrors sanitizeSelfReported's no-echo posture).
+func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.WorkerStats {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil // no stats on this tick (older worker, or the collector produced none)
+	}
+	drop := func() *workersvc.WorkerStats {
+		slog.Warn("worker reported invalid stats; dropping", "worker_id", workerID.String())
+		return nil
+	}
+	// Typed second-step decode of the isolated RawMessage: a 1e999 (float64 overflow)
+	// or an int64-overflow mem value errors HERE only, dropping the stats without
+	// touching the outer heartbeat decode.
+	var s struct {
+		CPUPct   *float64 `json:"cpu_pct"`
+		MemBytes *int64   `json:"mem_bytes"`
+		MemLimit *int64   `json:"mem_limit_bytes"`
+		Source   string   `json:"source"`
+	}
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return drop()
+	}
+	// Validation (Decision 5): any violation drops the WHOLE stats object.
+	if s.MemBytes == nil || *s.MemBytes < 0 {
+		return drop()
+	}
+	if s.MemLimit != nil && *s.MemLimit < 0 {
+		return drop()
+	}
+	if s.Source != "cgroup" && s.Source != "process" {
+		return drop()
+	}
+	out := &workersvc.WorkerStats{MemBytes: *s.MemBytes, MemLimit: s.MemLimit, Source: s.Source}
+	// cpu_pct is optional (omitted on the worker's first tick). When present it must be
+	// finite; clamp to [0, maxWorkerCPUPct].
+	if s.CPUPct != nil {
+		v := *s.CPUPct
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return drop()
+		}
+		switch {
+		case v < 0:
+			v = 0
+		case v > maxWorkerCPUPct:
+			v = maxWorkerCPUPct
+		}
+		out.CPUPct = &v
+	}
+	return out
 }
 
 // WorkerClaim atomically claims the next run for the worker's user. 204 when the

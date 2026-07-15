@@ -18,6 +18,7 @@ import {
   type WorkerRunMessage,
   type JudgeTraceResponse,
   type ReviewRequest,
+  type WorkerStats,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -81,8 +82,12 @@ export class WorkerClient {
     return (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
   }
 
-  async heartbeat(): Promise<void> {
+  async heartbeat(stats?: WorkerStats): Promise<void> {
     const body: HeartbeatRequest = { version: this.version };
+    // Only attach stats when the collector produced a sample (PRD #49): an absent
+    // field is the same wire shape as today, so a pre-#49 server ignores the extra
+    // bytes and a collector-less tick is indistinguishable from an old worker.
+    if (stats) body.stats = stats;
     await this.postJSON(`${WORKER_API_PREFIX}/heartbeat`, body);
   }
 

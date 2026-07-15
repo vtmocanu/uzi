@@ -310,7 +310,7 @@ func (f *fakeStore) RegisterWorker(_ context.Context, arg store.RegisterWorkerPa
 	f.callOrder = append(f.callOrder, "register")
 	return f.registerResult, nil
 }
-func (f *fakeStore) HeartbeatWorker(context.Context, uuid.UUID) (store.Worker, error) {
+func (f *fakeStore) HeartbeatWorker(context.Context, store.HeartbeatWorkerParams) (store.Worker, error) {
 	return f.heartbeat, nil
 }
 func (f *fakeStore) MarkStaleWorkersOffline(_ context.Context, cutoff pgtype.Timestamptz) (int64, error) {

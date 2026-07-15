@@ -1,7 +1,8 @@
 # PRD #49: Worker resource stats — live CPU/memory per worker, portable across compose and k8s
 
 **GitLab Issue**: [#49](https://gitlab.example.com/vtmocanu/uzi/-/issues/49)
-**Status**: Draft — reviewed 2026-07-12 by 3 agents (design, security, fact-check);
+**Status**: In progress — M1–M3 + M5 implemented & validated, M4 (docs/specs)
+pending; 2026-07-14. Reviewed 2026-07-12 by 3 agents (design, security, fact-check);
 all blocking/major findings folded in below (marked ↳review where the design
 changed). Fact-check: 24/26 verified; the two misses (#40 file overlap, #47
 migration-number wording) fixed.
@@ -88,12 +89,21 @@ worker cards.
    - First tick after start has no CPU delta → omit `cpu_pct` on that tick. The
      previous `usage_usec`/hrtime pair lives in collector memory only; a worker
      restart just re-runs the first-tick omission.
-   - **Root-cgroup sanity check** (↳review, audit low): under `cgroupns=host`
-     (older runtimes / explicit config) `/sys/fs/cgroup` shows the *host's* root
-     cgroup — host-wide numbers and `memory.max`=`"max"` masquerading as
-     container stats. If `/proc/self/cgroup` says the process sits in the root
-     cgroup (`0::/`), treat cgroup data as unavailable and use the `process`
-     fallback rather than report the host as if it were the worker.
+   - **Namespace-root sanity check** (↳review, audit low; ↳impl correction
+     2026-07-14, verified empirically on Docker 29.4.0 — private-ns and
+     `cgroupns=host` both tested): with a private cgroup namespace (the modern
+     Docker + kubelet default), `/proc/self/cgroup` reads `0::/` because the
+     container's own cgroup IS the namespace root, and `/sys/fs/cgroup` is mounted
+     at exactly that cgroup — so its files reflect the container. Use the cgroup
+     source in that case. Under `cgroupns=host` (older runtimes / explicit config)
+     the process sits at a *non-root* path (`0::/docker/<id>`, `0::/kubepods/…`)
+     and `/sys/fs/cgroup` is an ancestor (the host root) whose numbers masquerade
+     as the container's (`memory.max` reads `"max"` though the container is
+     capped) — so a non-root `/proc/self/cgroup` path means "treat cgroup data as
+     unavailable, use the `process` fallback" rather than report the host as the
+     worker. (The originally-drafted wording had this inverted — it named `0::/`
+     as the masquerade — which would have forced the process fallback for every
+     normally-containerized worker and defeated Success Criteria 1–2.)
 
 3. **Transport: optional `stats` field on the existing heartbeat — and the
    decode contract is spelled out, because the naive implementation bricks the
@@ -127,12 +137,12 @@ worker cards.
    surface, no cadence change.
 
 4. **Storage: nullable columns on `workers`, overwritten every heartbeat —
-   including to NULL.** Migration (draft `00090` — clear of drafts held by open
-   PRDs #41:00070, #42:00075, #46:00080–83, #45:00053 — the last, like #47's
-   draft 00054, actually collides with the already-landed head
+   including to NULL.** Migration (landed as `00064`; drafted `00090` — clear of
+   drafts held by open PRDs #41:00070, #42:00075, #46:00080–83, #45:00053 — the last,
+   like #47's draft 00054, actually collides with the already-landed head
    (`00054_proposal_confirming.sql`) and those PRDs renumber at their own merge
-   (↳review, fact-check); this PRD renumbers to the live head at merge per
-   CLAUDE.md convention):
+   (↳review, fact-check); this PRD renumbered from the `00090` draft to `00064`, the
+   next free slot above the live head 00063, at merge per CLAUDE.md convention):
    `stats_cpu_pct real`, `stats_mem_bytes bigint`, `stats_mem_limit_bytes bigint`,
    `stats_source text` — all nullable, no new table. `HeartbeatWorker`
    (`queries/runtime.sql:48`) writes whatever the tick carried, nulls when it
@@ -172,8 +182,12 @@ worker cards.
      limit is known; warn tone ≥ 80%, danger ≥ 95%). **Bar widths clamp at 100%**
      regardless of stored value (↳review — the server accepts up to 6400% CPU;
      the DOM must not render it).
-   - Dashboard worker tiles (`Dashboard.tsx:84` mount fetch, `:117` the 10s poll —
-     both already fetch workers) — compact "cpu 34% · mem 2.1/4 GiB" line.
+   - Dashboard: a new compact "Worker load" fleet card (↳impl correction
+     2026-07-14 — no per-worker tiles existed; `Dashboard.tsx` had only the
+     aggregate "Workers online N/M" StatTile, and the mount fetch + existing 10s
+     poll already fetch the fleet). One "name · cpu 34% · mem 2.1/4 GiB" line per
+     worker that has reported a sample, dimmed when offline, hidden until any
+     worker reports — the faithful "factory floor at a glance" realization.
    - `status: offline` (sweeper-marked) renders stats dimmed with the stale
      heartbeat age — last-known, clearly not live. `source: "process"` gets a
      tooltip: measures the worker process only.
@@ -188,14 +202,15 @@ worker cards.
    degrade to `source: "process"`, documented. kubelet/cAdvisor Prometheus
    metrics remain available and complementary for cluster operators; in-app
    stats are the product-level view for users who don't have Grafana. Docs get
-   sizing examples for both: compose `mem_limit`/`cpus` (none set today on the
-   `docker-compose.yml` agent service — though PRD #42 plans to add them, see
-   coordination below) and k8s `resources:` blocks, noting that setting a limit
-   is what makes the percentage bar appear.
+   sizing examples for both: compose `mem_limit`/`cpus` (PRD #42 landed defaults
+   — `AGENT_CPUS` 2 / `AGENT_MEM_LIMIT` 4g — on the `docker-compose.yml` agent
+   service, ↳doc correction 2026-07-14 (fact-check); see coordination below) and
+   k8s `resources:` blocks, noting that setting a limit is what makes the
+   percentage bar appear.
 
 ## Milestones
 
-- [ ] **M1 — Agent collector + payload**: `agent/src/stats.ts` (cgroup v2 reader,
+- [x] **M1 — Agent collector + payload**: `agent/src/stats.ts` (cgroup v2 reader,
   `inactive_file` subtraction, hrtime CPU delta math with `cpu.max` quota/period,
   root-cgroup check, process fallback, first-tick omission), wired into
   `heartbeatLoop` (`agent/src/worker.ts:55`) via `client.heartbeat()`
@@ -203,7 +218,7 @@ worker cards.
   trees (limited, `max`, quota'd cpu incl. period parse, missing files →
   fallback, malformed → fallback, root-cgroup → fallback). A collector failure
   must never fail the heartbeat.
-- [ ] **M2 — API storage + protocol**: migration draft `00090` (with the
+- [x] **M2 — API storage + protocol**: migration `00064` (landed; drafted `00090`) (with the
   display-only SQL comment) + sqlc regen, Decision 3 decode (declared `version`,
   EOF tolerance, two-step `json.RawMessage` stats parse) + Decision 5
   validation/clamping + static-reason drop logging, `HeartbeatWorker` query
@@ -213,14 +228,14 @@ worker cards.
   `worker_protocol_test.go:93`), empty body → 200, `1e999`/int64-overflow/NaN
   in stats → stats dropped but 200, garbage `source` dropped, null round-trip,
   admin DTO, no-`stats_`-in-scheduling-queries regression grep.
-- [ ] **M3 — Web gauges**: WorkersSettings poll + bars, Dashboard tile line,
+- [x] **M3 — Web gauges**: WorkersSettings poll + bars, Dashboard tile line,
   offline dimming, process-source tooltip, mock data; vitest coverage incl.
   no-limit (no bar) and offline (dimmed) rendering.
-- [ ] **M4 — Docs + specs**: `docs/worker-setup` sizing section (compose + k8s
+- [x] **M4 — Docs + specs**: `docs/worker-setup` sizing section (compose + k8s
   limits, what the gauges mean, 15s/10s freshness caveat), `specs/ai.md` design
-  record; `specs/human.md` addition proposed to user (per-worker live stats was a
-  user-stated requirement).
-- [ ] **M5 — E2E verification**: `./e2e/run-e2e.sh` worker (real worker loop, stub
+  record (§228–234); `specs/human.md` addition proposed to user (per-worker live
+  stats was a user-stated requirement).
+- [x] **M5 — E2E verification**: `./e2e/run-e2e.sh` worker (real worker loop, stub
   executor, Linux container → real cgroup v2) asserts the workers API returns
   populated stats after one heartbeat interval; smoke-check the UI renders them.
 
@@ -290,3 +305,29 @@ rule), nothing server-side.
   `Dashboard.tsx`/`api.ts` (coordination note fixed); #45/#47 draft numbers
   collide with the landed head and renumber at their own merges (wording fixed);
   minor line-ref precision fixes.
+- 2026-07-14 — Impl correction (M1): Decision 2's root-cgroup sanity check was
+  inverted. Verified empirically on Docker 29.4.0 that a private cgroup namespace
+  (the Docker/kubelet default) reads `/proc/self/cgroup` = `0::/` **with a real
+  `memory.max`** (the good, use-cgroup case), while `cgroupns=host` reads a non-root
+  path (`0::/docker/<id>`) with `memory.max` = `"max"` (the host masquerade). The
+  collector therefore uses the cgroup source at `0::/` and the process fallback on a
+  non-root path — the inverse of the original bullet, which would have forced the
+  process fallback for every normal worker. Bullet text above corrected; check +
+  test isolated in `stats.ts` `cgroupIsNamespaceRoot` (endorsed by the lead).
+- 2026-07-14 — Impl correction (M3): Decision 6's "Dashboard worker tiles / worker
+  cards" did not exist — `Dashboard.tsx` rendered only the aggregate "Workers online
+  N/M" StatTile (no per-worker tiles), so there was nothing to hang the compact stats
+  line on. Lead ruled option (a): added a new compact "Worker load" fleet card
+  (one `WorkerStatLine` per worker with a sample, offline-dimmed, hidden until any
+  worker reports), the faithful realization of the "factory floor at a glance" intent.
+  Decision 6 Dashboard bullet corrected above. Flicker-hold (Decision 4, implementer's
+  choice): NOT implemented — a bad tick blanks the gauge for one poll cycle, the PRD's
+  documented accepted consequence; chosen for simplicity and to avoid a stale value
+  looking live.
+- 2026-07-14 — Doc correction (fact-check, M4): Decision 7's "compose `mem_limit`/
+  `cpus` (none set today ... though PRD #42 plans to add them)" was stale —
+  PRD #42 already landed `cpus: ${AGENT_CPUS:-2}` / `mem_limit: ${AGENT_MEM_LIMIT:-4g}`
+  on the `agent` service (`docker-compose.yml:207-208`), so compose ships sized by
+  default and the memory bar appears out of the box. Decision 7 wording corrected;
+  `docs/worker-setup.md`'s sizing section rewritten to match (tune via
+  `AGENT_CPUS`/`AGENT_MEM_LIMIT` rather than "add this YAML").

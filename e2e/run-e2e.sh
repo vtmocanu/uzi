@@ -179,6 +179,11 @@ wait_eq() {
 
 # One-shot getters for wait_eq (and for direct point-in-time assertions).
 worker_status()         { apiget /api/workers | jq -r '.workers[0].status // empty'; }
+# Worker resource stats (PRD #49): the sample the worker self-reports from its own
+# cgroup v2 files on each heartbeat, surfaced on the workers DTO. source is the
+# non-empty enum once a sample lands; mem_bytes is the working-set byte count.
+worker_stats_source()   { apiget /api/workers | jq -r '.workers[0].stats_source // empty'; }
+worker_stats_mem()      { apiget /api/workers | jq -r '.workers[0].stats_mem_bytes // empty'; }
 board_pipeline_status() { apiget "/api/repos/$REPO_ID/board" | jq -r '.board.pipeline.status // empty'; }
 card_pipeline_status()  { apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" '.board.cards[] | select(.iid==$iid) | .pipeline.status // empty'; }
 run_verdict()           { apiget "/api/runs/$1" | jq -r '.run.fix_verdict // empty'; }
@@ -537,6 +542,20 @@ write_token
 "${COMPOSE[@]}" up -d --wait agent
 wait_worker_online
 pass "worker registered and is online"
+
+# --- worker self-reported resource stats (PRD #49) ---------------------------
+# The worker reads its OWN cgroup v2 files (memory.current − inactive_file, cpu.stat,
+# cpu.max) on every heartbeat and attaches the sample; the API stores the latest on
+# the workers DTO. The e2e agent is a private-cgroupns Linux container, so the sample
+# must come from the cgroup source (not the process fallback). Poll with a deadline —
+# the first heartbeat lands within one WORKER_HEARTBEAT_INTERVAL (5s here) of online —
+# rather than sleeping a fixed interval and hoping.
+say "worker self-reports container CPU/memory stats (PRD #49)"
+wait_eq cgroup 30 "worker stats source" worker_stats_source
+STATS_MEM="$(worker_stats_mem)"
+[ -n "$STATS_MEM" ] && [ "$STATS_MEM" -gt 0 ] 2>/dev/null \
+  || fail "worker stats mem_bytes not populated after a heartbeat (got '${STATS_MEM:-none}')"
+pass "worker stats populated from cgroup: source=cgroup mem_bytes=$STATS_MEM"
 
 # --- happy path with a mid-run restart ---------------------------------------
 say "happy path: create a PRD issue and start a run"

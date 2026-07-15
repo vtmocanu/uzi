@@ -332,16 +332,20 @@ type UserVault struct {
 }
 
 type Worker struct {
-	ID                uuid.UUID          `json:"id"`
-	UserID            uuid.UUID          `json:"user_id"`
-	Name              string             `json:"name"`
-	TokenHash         []byte             `json:"token_hash"`
-	Status            string             `json:"status"`
-	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
-	Version           pgtype.Text        `json:"version"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	TemplateDeclared  pgtype.Text        `json:"template_declared"`
-	TemplateReported  pgtype.Text        `json:"template_reported"`
-	MaxConcurrentRuns pgtype.Int4        `json:"max_concurrent_runs"`
+	ID                 uuid.UUID          `json:"id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	Name               string             `json:"name"`
+	TokenHash          []byte             `json:"token_hash"`
+	Status             string             `json:"status"`
+	LastHeartbeatAt    pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Version            pgtype.Text        `json:"version"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	TemplateDeclared   pgtype.Text        `json:"template_declared"`
+	TemplateReported   pgtype.Text        `json:"template_reported"`
+	MaxConcurrentRuns  pgtype.Int4        `json:"max_concurrent_runs"`
+	StatsCpuPct        pgtype.Float4      `json:"stats_cpu_pct"`
+	StatsMemBytes      pgtype.Int8        `json:"stats_mem_bytes"`
+	StatsMemLimitBytes pgtype.Int8        `json:"stats_mem_limit_bytes"`
+	StatsSource        pgtype.Text        `json:"stats_source"`
 }
