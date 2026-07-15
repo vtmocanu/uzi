@@ -6028,9 +6028,10 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
 ## 247. CNPG for Postgres, pinned to the dev-cluster operator's support (Decision 4, M2)
 
 - **Postgres is a CNPG `Cluster`, not the compose `postgres:17` container** — org standard, operator
-  already on dev-cluster (in the `appset.cloudnative-pg.yaml` generator). Realized as the vendored
-  `cluster` subchart **0.6.1** (`deploy/chart/charts/cluster-0.6.1.tgz` + `Chart.lock`), chart-parity
-  and compatible with dev-cluster's CNPG operator **1.23.5**.
+  already on dev-cluster (in the `appset.cloudnative-pg.yaml` generator). Realized as the CNPG
+  `cluster` subchart **0.6.1**, pinned in `Chart.lock` (version + digest) and re-fetched via
+  `helm dependency build`; the `.tgz` is gitignored, not committed (chart-parity). Compatible with
+  dev-cluster's CNPG operator **1.23.5**.
 - **In-tree `barmanObjectStore`, not the barman-cloud plugin** — the plugin appset has dev-cluster
   commented out. Dev sizing: `instances: 1`, storageClass `storage-class`. **Backups default OFF**; enabling
   is a documented toggle (S3 creds InfisicalSecret + the `barmanObjectStore` block, bucket convention

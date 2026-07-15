@@ -31,9 +31,11 @@ __pycache__/
 # just & task
 juster
 task-repo
-# Helm
+# Helm — vendored subcharts are re-fetched via `helm dependency build` (Chart.lock
+# pins the version + digest); only Chart.lock is committed (chart-parity).
 helm/charts/*.tgz
 charts/*.tgz
+deploy/chart/charts/*.tgz
 # Infisical
 .infisical.json
 # Terraform
