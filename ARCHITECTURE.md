@@ -562,8 +562,9 @@ rationale.
   `order` among `user` pages, a broken relative link (doc→doc or doc→img),
   reference-style links, or an oversized `docs/img/*` file; it warns
   (without failing) on a `user` page over the 60-line house-style budget.
-  There is no CI yet (`plan.md`: later), so this build step is the only gate
-  keeping in-app docs from rotting.
+  It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
+  runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
+  well as the local build.
 
 ## Deployment: compose (laptop) and k8s (dev-cluster)
 

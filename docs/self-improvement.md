@@ -44,8 +44,10 @@ is skipped (with an inbox note) rather than spending nothing silently.
   self-improvement MR is extended rather than replaced, so everything from
   every cycle is tested together in one MR.
 - The worker installs dependencies (best-effort) and runs the repo's own test
-  suites, including their evidence in the MR description — this repo has no CI,
-  so the MR carries its own proof. Evidence is **best-effort and conditional**:
+  suites, including their evidence in the MR description; the MR also gets uzi's
+  real CI pipeline (validate/test/build), so a reviewer sees both the worker's
+  in-MR proof and CI's independent verdict. Evidence is **best-effort and
+  conditional**:
   a suite runs (and produces real pass/fail) only when its toolchain is present
   in the worker, which for the compiled toolchains means **the connected uzi
   repo's tool profile must provision them**. To get real evidence for every
