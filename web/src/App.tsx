@@ -6,6 +6,7 @@ import { Login } from "./pages/Login";
 import { Register } from "./pages/Register";
 import { Dashboard } from "./pages/Dashboard";
 import { AdminUsers } from "./pages/AdminUsers";
+import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
 import { Settings } from "./pages/Settings";
 import { Agents } from "./pages/Agents";
@@ -191,6 +192,14 @@ export default function App() {
           element={
             <AdminRoute>
               <AdminUsers />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="/admin/rate-limits"
+          element={
+            <AdminRoute>
+              <AdminRateLimits />
             </AdminRoute>
           }
         />

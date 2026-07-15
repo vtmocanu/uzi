@@ -13,7 +13,14 @@ import { useAuth } from "../auth/AuthContext";
 // offline.
 vi.mock("../lib/api", () => ({
   MOCK_MODE: false,
-  api: { listRepos: vi.fn(), listConnections: vi.fn(), unreadNotificationCount: vi.fn() },
+  api: {
+    listRepos: vi.fn(),
+    listConnections: vi.fn(),
+    unreadNotificationCount: vi.fn(),
+    // The sidebar-footer rate-limit micro-meters (PRD #53) self-gate: default to
+    // no_token so they render nothing in these nav/collapse assertions.
+    getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
+  },
 }));
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
