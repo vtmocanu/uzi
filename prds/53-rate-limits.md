@@ -37,7 +37,9 @@ same numbers per account):
 
 A background poller (modeled on the self-improve engine) ticks every
 `UZI_USAGE_POLL_INTERVAL` (default 5m). Each tick it lists users holding an
-`anthropic_token` secret, skips those whose vault is locked, opens the token,
+`anthropic_token` secret, skips those whose dek-sealed token cannot be opened
+while the vault is locked (master-sealed tokens are polled regardless, D3),
+opens the token,
 asks Anthropic (usage endpoint first, header-probe fallback), and upserts one
 row per user. Two read endpoints mirror the PRD #40 usage split: users get
 their own numbers, admins get everyone's. The SPA renders meters in three
@@ -102,7 +104,9 @@ places (mockup): a **Settings card**, a **sidebar-footer micro-meter**, and an
   `GetRateLimits` (one user), `ListRateLimits` (join users for email/name;
   admin), `DeleteRateLimits` (D3b).
 - **`api/internal/usagepoller/`** — engine cloned from
-  `selfimprove.Engine` (`Boot` + `Run` + ticker; `VaultGate.Unlocked` check;
+  `selfimprove.Engine` (`Boot` + `Run` + ticker; vault gate on the OPEN OUTCOME —
+skip only on `vault.ErrLocked`, never a blanket `Unlocked()` pre-check, which
+would wrongly skip master-sealed users (reconciled with D3 at review);
   `settings.Cache` not needed — env-only knobs). Per user: open token via the
   same vault path as `workersvc.openAnthropic` (factor that helper out of
   workersvc rather than duplicating it), call the client, upsert. Bounded
@@ -119,7 +123,9 @@ places (mockup): a **Settings card**, a **sidebar-footer micro-meter**, and an
   `UZI_ANTHROPIC_HTTP_TIMEOUT` (default 15s; the newer `UZI_`-prefixed knob
   convention, cf. `UZI_OIDC_HTTP_TIMEOUT`). Utilization fractions floor+clamp
   to 0–100 ints; ISO resets from the usage endpoint parse to epochs; any
-  missing field fails the whole reading (fail closed, D5). Errors are
+  missing UTILIZATION fails the whole reading (fail closed, D5) — a
+  missing/unparseable reset stores `null`, as the frozen DTO's
+  `resets_at: <epoch|null>` requires (reconciled at review). Errors are
   constructed from status code + a sanitized body excerpt — never from the
   request — so no error path can carry the token (pinned by an M1 test).
   PRD #50's egress proxy, if it lands later, wraps this same client.
@@ -184,7 +190,7 @@ places (mockup): a **Settings card**, a **sidebar-footer micro-meter**, and an
 
 ## Milestones
 
-- [ ] **M1 — API: client + poller + storage**: migration (draft `00080`),
+- [x] **M1 — API: client + poller + storage**: migration (draft `00080`),
   `anthropic` client (usage + probe, pinned probe body, fraction→pct,
   fail-closed parsing, sanitized errors), `usagepoller` engine (vault gate
   incl. master-sealed exception, Boot immediate pass, poke-on-token-save,
