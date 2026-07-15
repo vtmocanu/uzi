@@ -9,6 +9,7 @@ import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleto
 import { ModelSelect } from "../components/ModelSelect";
 import { modelFieldWarning } from "../lib/agentTemplates";
 import { SettingsShell } from "../components/SettingsShell";
+import { RateLimitCard } from "../components/RateLimitMeters";
 import { VaultBadge, useVaultLock } from "../components/VaultControls";
 import { SlackNotifications } from "../components/SlackNotifications";
 import { prefs } from "../lib/prefs";
@@ -266,6 +267,10 @@ export function Settings() {
           </div>
         )}
       </Card>
+
+      {/* Claude rate-limit meters (PRD #53). Self-gates: hidden when no token is
+          set, greyed on "unavailable", live meters once a reading lands. */}
+      <RateLimitCard />
 
       <Card className="space-y-4">
         <div>

@@ -25,6 +25,9 @@ vi.mock("../lib/api", async (importActual) => {
       getMySettings: vi.fn(),
       putMySettings: vi.fn(),
       vaultLock: vi.fn(),
+      // The Claude limits card (PRD #53) self-gates: default to no_token so it
+      // renders nothing and stays out of these token/vault/theme assertions.
+      getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
       // The Notifications section (a child of Settings) loads its own state.
       getMySlack: vi.fn(),
       setMySlackNotify: vi.fn(),

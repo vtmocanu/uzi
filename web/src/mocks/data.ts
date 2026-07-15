@@ -4,12 +4,15 @@
 // ago") always look fresh in a demo.
 
 import type {
+  AdminRateLimitUser,
   AdminWorker,
   AgentTemplate,
   Board,
   ForgeConnection,
   IssueProposal,
   LatestRun,
+  MyRateLimits,
+  RateLimitSource,
   RecommendationCategory,
   Repo,
   ReviewStatus,
@@ -78,6 +81,94 @@ export const mockUsers: User[] = [
     created_at: daysAgo(18),
     last_login: daysAgo(12),
   },
+  // radu + mihai exist so a demo login reaches the WARN and STALE own-reading
+  // states of the rate-limit meters (PRD #53); see mockMyRateLimitsByUser.
+  {
+    id: "u-radu",
+    email: "radu@uzi.local",
+    display_name: "Radu Marin",
+    is_admin: false,
+    is_active: true,
+    autopilot_enabled: false,
+    judge_enabled: false,
+    created_at: daysAgo(15),
+    last_login: minsAgo(20),
+  },
+  {
+    id: "u-mihai",
+    email: "mihai@uzi.local",
+    display_name: "Mihai Radu",
+    is_admin: false,
+    is_active: true,
+    autopilot_enabled: false,
+    judge_enabled: false,
+    created_at: daysAgo(25),
+    last_login: daysAgo(1),
+  },
+];
+
+// ── Claude rate limits (PRD #53) ─────────────────────────────────────────────
+// Resets are epoch SECONDS derived from NOW so the demo countdowns stay fresh.
+const NOW_SECS = Math.floor(NOW / 1000);
+const H = 3600;
+const D = 86_400;
+const MIN = 60;
+
+function okReading(
+  pct5: number,
+  in5: number,
+  pct7: number,
+  in7: number,
+  syncedMins = 2,
+  source: RateLimitSource = "usage_endpoint",
+  stale = false,
+): MyRateLimits {
+  return {
+    status: "ok",
+    five_hour: { pct: pct5, resets_at: NOW_SECS + in5 },
+    seven_day: { pct: pct7, resets_at: NOW_SECS + in7 },
+    source,
+    synced_at: minsAgo(syncedMins),
+    stale,
+  };
+}
+
+// The signed-in demo user's own reading (Settings card + sidebar), matching mockup
+// frame A: 8% / 47%, both green, "Live".
+export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 47, 2 * D + 4 * H);
+
+// Per-persona readings so a demo login as a seeded non-admin reaches every own-
+// reading state; anyone else gets the live-ok default (u-admin). warn (radu) and
+// stale (mihai) are here so the sidebar-dim + Settings "Stale" badge and a warn-
+// tone bar are browsable, not just visible in the admin table.
+export const mockMyRateLimitsByUser: Record<string, MyRateLimits> = {
+  "u-admin": mockMyRateLimits, // live ok
+  "u-radu": okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3), // warn (7d 83%)
+  "u-mira": okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1), // danger (5h 97%)
+  // stale own-reading: no live countdown (resets null), aged synced_at, stale flag.
+  "u-mihai": {
+    status: "ok",
+    five_hour: { pct: 31, resets_at: null },
+    seven_day: { pct: 12, resets_at: null },
+    source: "header_probe",
+    synced_at: minsAgo(180),
+    stale: true,
+  },
+  "u-andrei": { status: "unavailable" },
+  "u-dan": { status: "no_token" },
+};
+
+// The admin all-users table (mockup frame C) plus a warn row and an unavailable
+// row, so every row state is demonstrable: live-ok, live-warn, live-danger,
+// stale+vault-locked, unavailable, no_token.
+export const mockAdminRateLimits: AdminRateLimitUser[] = [
+  { id: "u-admin", email: "vlad@example.com", name: "vlad", vault_locked: false, limits: mockMyRateLimits },
+  { id: "u-radu", email: "radu@example.com", name: "radu", vault_locked: false, limits: okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3) },
+  { id: "u-ana", email: "ana@example.com", name: "ana", vault_locked: false, limits: okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1) },
+  { id: "u-sorin", email: "sorin@example.com", name: "sorin", vault_locked: false, limits: okReading(88, 3 * H + 5 * MIN, 76, 3 * D + 6 * H, 4) },
+  { id: "u-mihai", email: "mihai@example.com", name: "mihai", vault_locked: true, limits: okReading(31, 0, 12, 0, 180, "header_probe", true) },
+  { id: "u-dana", email: "dana@example.com", name: "dana", vault_locked: false, limits: { status: "unavailable" } },
+  { id: "u-irina", email: "irina@example.com", name: "irina", vault_locked: false, limits: { status: "no_token" } },
 ];
 
 // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────

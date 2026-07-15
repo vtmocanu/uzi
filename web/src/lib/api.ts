@@ -684,6 +684,59 @@ export interface AdminUsage {
   earliest_run: string | null;
 }
 
+// ── Claude rate limits (PRD #53) ─────────────────────────────────────────────
+// Anthropic enforces two account-wide windows (5-hour and 7-day); a server-side
+// poller reads each user's own utilization with their stored token and the SPA
+// renders meters in three places. The token never leaves the api container — the
+// SPA only ever sees percentages (Decision 1). These shapes mirror the FROZEN DTO
+// contract in prds/53-rate-limits.md, discriminated on `status`.
+
+// RateLimitWindow is one window's utilization. pct is 0–100 (server floors +
+// clamps the 0–1 fraction Anthropic reports). resets_at is epoch SECONDS, null
+// when Anthropic did not report a reset; the SPA renders it as a live countdown
+// (Decision 7).
+export interface RateLimitWindow {
+  pct: number;
+  resets_at: number | null;
+}
+
+// Which source produced the reading: the free usage endpoint, or the ~1-token
+// header probe fallback (Decision 2).
+export type RateLimitSource = "usage_endpoint" | "header_probe";
+
+// MyRateLimits is the per-user reading, discriminated on status:
+//  - "ok": a real reading (possibly stale — vault-locked users age silently, D3).
+//  - "no_token": the user has no anthropic_token stored.
+//  - "unavailable": token saved but no reading yet, probe disabled, or the
+//    credential was refused.
+export type MyRateLimits =
+  | {
+      status: "ok";
+      five_hour: RateLimitWindow;
+      seven_day: RateLimitWindow;
+      source: RateLimitSource;
+      synced_at: string; // ISO-8601
+      stale: boolean;
+    }
+  | { status: "no_token" }
+  | { status: "unavailable" };
+
+// AdminRateLimitUser is one row of the admin all-users view: every user appears,
+// including no_token ones. vault_locked flags a user whose dek-sealed token can't
+// be opened right now (their reading ages, marked stale). limits is the same
+// union as GET /me/rate-limits.
+export interface AdminRateLimitUser {
+  id: string;
+  email: string;
+  name: string;
+  vault_locked: boolean;
+  limits: MyRateLimits;
+}
+
+export interface AdminRateLimits {
+  users: AdminRateLimitUser[];
+}
+
 // ── Notifications inbox (PRD #46 M2) ─────────────────────────────────────────
 // A generic in-app notification. kind + payload let any feature enqueue one; the
 // judge is tenant #1. payload is the render blob — by convention a `title` and
@@ -1212,6 +1265,11 @@ const realApi = {
   getUsage: () => request<SelfUsage>("GET", "/usage"),
   /** Factory-wide usage + per-user breakdown (PRD #40). Admin-only — a non-admin 403s. */
   getAdminUsage: () => request<AdminUsage>("GET", "/admin/usage"),
+  /** The caller's own Claude rate-limit reading (PRD #53): the two windows, or a
+   *  no_token / unavailable status. Percentages only — the token never leaves the api. */
+  getMyRateLimits: () => request<MyRateLimits>("GET", "/me/rate-limits"),
+  /** Every user's rate-limit reading (PRD #53). Admin-only — a non-admin 403s. */
+  getAdminRateLimits: () => request<AdminRateLimits>("GET", "/admin/rate-limits"),
   getRunMessages: (id: string, afterSeq = 0) =>
     request<{ messages: RunMessage[] }>(
       "GET",

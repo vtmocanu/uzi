@@ -42,10 +42,13 @@ import { bodyError, descriptionError, SKILL_NAME_RE } from "../lib/skills";
 import {
   LIVE_RUN_ID,
   mockAdmin,
+  mockAdminRateLimits,
   mockAdminWorkers,
   mockAllocations,
   mockConnection,
   mockForgeConfig,
+  mockMyRateLimits,
+  mockMyRateLimitsByUser,
   mockNotifications,
   type MockNotification,
   mockRepos,
@@ -1275,6 +1278,15 @@ export const mockApi = {
       ],
       earliest_run: "2026-05-12T09:00:00Z",
     }),
+  // ── Claude rate limits (PRD #53) ───────────────────────────────────────────
+  // The caller's own reading follows the persona (a demo login as a seeded
+  // non-admin shows danger / unavailable / no-token); the admin table covers every
+  // row state. Percentages only — no token material ever appears here.
+  getMyRateLimits: async () => {
+    const me = requireSession();
+    return delay(mockMyRateLimitsByUser[me.id] ?? mockMyRateLimits, 60);
+  },
+  getAdminRateLimits: async () => delay({ users: mockAdminRateLimits.map((u) => ({ ...u })) }, 60),
   getRun: async (id: string) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
