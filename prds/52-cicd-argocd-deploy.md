@@ -238,7 +238,7 @@ Tracked in M5; each mirrors an existing example-app step:
 
 Phase 1 (parallel — independent files):
 
-- [ ] **M1: Real CI — validate + test stages** (`.gitlab-ci.yml`). Replace the
+- [x] **M1: Real CI — validate + test stages** (`.gitlab-ci.yml`). Replace the
   echo placeholders with: api `go vet` + `go build` + `go test ./...` +
   sqlc-drift check (`sqlc generate` && `git diff --exit-code`), web
   `npm run typecheck` + `vitest run` + `check-docs` (via `npm run build` or
@@ -254,7 +254,7 @@ Phase 1 (parallel — independent files):
   in M1. Success: MR and main pipelines run the real gates; a deliberate
   break in any package fails the pipeline; the demo-fail trigger still
   produces a red pipeline.
-- [ ] **M2: Helm chart** (`deploy/chart/`, `deploy/values/dev-cluster.yaml`).
+- [x] **M2: Helm chart** (`deploy/chart/`, `deploy/values/dev-cluster.yaml`).
   web + api + CNPG Cluster + InfisicalSecrets + Ingress, covering every item
   in "K8s-specific adaptations". `helm lint` + `helm template` pass locally.
   Success: `helm template` renders a coherent stack; secrets only via
@@ -262,7 +262,7 @@ Phase 1 (parallel — independent files):
 
 Phase 2 (sequential — depends on M1+M2):
 
-- [ ] **M3: kaniko validation builds in CI** (build stage). `api` image
+- [x] **M3: kaniko validation builds in CI** (build stage). `api` image
   (context `api/`) and `web` image (context repo root, per its Dockerfile
   comment) built `--no-push` on MRs/main. Per Decision 2: MR pipelines build
   **cache-less and credential-less** (no Harbor auth on unprotected refs);
@@ -270,18 +270,21 @@ Phase 2 (sequential — depends on M1+M2):
   `.../gitlab/vtmocanu/uzi/cache`. Helm chart job wired into `needs`.
   Requires admin step 1. Success: MR pipeline proves both images build with
   no Harbor secrets available to it; main warms the cache.
-- [ ] **M4: Tag release pipeline** (publish stage). On `v*` tags: assert chart
+- [x] **M4: Tag release pipeline** (publish stage). On `v*` tags: assert chart
   `version`/`appVersion` == tag; kaniko build+push both images
   (`<tag>` + `<short-sha>`); `helm package` + `helm push` the chart OCI.
   Success: pushing a tag yields images + chart in Harbor at matching versions,
   and a broken chart or failing tests blocks all publish jobs (atomic
   release).
-- [ ] **M5: Platform/admin steps + ArgoCD wiring**. Execute the one-time steps
+- [x] **M5: ArgoCD wiring (files + MR)** — argo files delivered as Draft MR
+  `argo-apps!294` (branch `feature/uzi-argocd-deploy`); the one-time
+  platform/admin steps are DOCUMENTED in `deploy/README.md`, NOT executed
+  (deferred with M6, per this run's scope). **M5: Platform/admin steps + ArgoCD wiring**. Execute the one-time steps
   above; add `argo-apps/apps/uzi/{prj.uzi.yaml,app.uzi.yaml}`
   (multi-source, destination `dev-cluster`, namespace `uzi`, automated+prune,
   `CreateNamespace`). Success: ArgoCD shows the uzi app Synced/Healthy pulling
   chart `targetRevision` from Harbor and values from the uzi repo.
-- [ ] **M6: First release live on dev-cluster, verified end to end**. Cut
+- [ ] **M6: First release live on dev-cluster, verified end to end** *(DEFERRED — out of this run's scope; needs live platform access + the M5 admin steps + the pre-M6 confirmations in `deploy/README.md`)*. Cut
   `v0.1.0` (or next), bump `targetRevision`, sync. Verify: SPA loads over
   HTTPS, seeded admin can log in (cookie flags OK behind TLS), forge connect +
   issue sync work from the cluster (egress to gitlab.example.com,
@@ -289,7 +292,7 @@ Phase 2 (sequential — depends on M1+M2):
   laptop joins via the public URL and completes a run against a test repo.
   Success: the full PRD-issue → agent-run → MR flow executes against the
   deployed instance.
-- [ ] **M7: Docs + specs**. `deploy/README.md` release runbook — explicit
+- [x] **M7: Docs + specs**. `deploy/README.md` release runbook — explicit
   ordering: bump `Chart.yaml` version/appVersion in an MR → merge → tag
   **that** commit (the tag pipeline asserts equality, so a lagging
   Chart.yaml fails the whole publish); rollback = revert the argo
@@ -303,7 +306,7 @@ Phase 2 (sequential — depends on M1+M2):
 
 Stretch:
 
-- [ ] **M8 (optional): e2e in CI** — compose-capable runner or KinD +
+- [ ] **M8 (optional): e2e in CI** *(DEFERRED — stretch, not attempted)* — compose-capable runner or KinD +
   chart-based smoke (install chart, run `scripts/smoke.sh` against it).
   Explicitly not a blocker for M6.
 
@@ -384,3 +387,24 @@ dev-cluster `*.example.com` default wildcard, no TLS block.)
   operator pin (in-tree barmanObjectStore, plugin not on dev-02), ingress
   hostname resolved to `uzi.example.com`, release-ordering runbook
   note.
+- 2026-07-15: Implemented M1–M5 + M7 via an agent team (worktree
+  `feature/prd-52-cicd-argocd`). M6 + the platform-admin steps DEFERRED (need
+  live platform access; documented in `deploy/README.md`). M8 not attempted.
+  Milestone commits: M1 `5073d01`, M2 `b26249b`, M3+M4 `00d37c5`, hardening
+  `b8548d9`, M7 docs `63d0a15`/specs `1dcc98c`+`3ff5f22`, stale-CI fixes
+  `cbebe15`. Each milestone was independently reviewed + audited; M2/M3/M4 also
+  fact-checked and helm-render tested. Validation drove a hardening pass:
+  **api NetworkPolicy** (default-deny ingress, web-pods-only → closes the
+  in-cluster XFF-spoofing exposure on shared dev-cluster), `TRUSTED_PROXIES`
+  narrowed to `100.64.0.0/10`, `probeCIDRs` knob (required pre-M6), **`v*`
+  PROTECTED tags Maintainer-create-only** + Harbor robot push-only scope (admin
+  steps), postgres image `16.3` (confirmed-mirrored; the earlier "1.23.5 caps
+  at PG16" rationale was corrected — 1.23.5 supports up to PG17), plus LOW
+  hardenings (superuser off, SA-token off, InfisicalSecret sync-wave, PDB off,
+  `helm registry login --password-stdin`). ArgoCD wiring delivered as Draft MR
+  `argo-apps!294` (user chose "MR, not push to main"). Final gates
+  green: `glab ci lint` valid, `helm lint` clean, 13 resources render, 0
+  plaintext secrets, no app source changed (M1 go/npm gates still hold).
+  Pre-M6 confirmations captured in `deploy/README.md` (pod CIDR ⊆ 100.64/10,
+  probeCIDRs = node CIDR, Antrea NetworkPolicy enforcement, `postgresql:16.3`
+  Harbor mirror presence).
