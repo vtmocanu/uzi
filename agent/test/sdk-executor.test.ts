@@ -101,7 +101,19 @@ function hangUntilAbort(signal: AbortSignal): AsyncIterable<unknown> {
     async *[Symbol.asyncIterator]() {
       await new Promise<void>((resolve) => {
         if (signal.aborted) return resolve();
-        signal.addEventListener("abort", () => resolve(), { once: true });
+        // A real hung SDK query has pending network I/O that keeps the event loop
+        // alive; the executor's watchdog timers are unref'd, so without a ref'd
+        // keep-alive here node 22 drains the loop before the watchdog fires
+        // ("event loop has already resolved"). Cleared the moment the watchdog aborts.
+        const keepAlive = setInterval(() => {}, 1_000);
+        signal.addEventListener(
+          "abort",
+          () => {
+            clearInterval(keepAlive);
+            resolve();
+          },
+          { once: true },
+        );
       });
     },
   };
