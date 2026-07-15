@@ -25,6 +25,19 @@ const okReading: MyRateLimits = {
   synced_at: new Date(Date.now() - 2 * 60_000).toISOString(),
   stale: false,
 };
+const warnReading: MyRateLimits = {
+  ...okReading,
+  five_hour: { pct: 62, resets_at: nowSecs + 5000 },
+  seven_day: { pct: 83, resets_at: nowSecs + 200_000 },
+};
+const staleReading: MyRateLimits = {
+  status: "ok",
+  five_hour: { pct: 31, resets_at: null },
+  seven_day: { pct: 12, resets_at: null },
+  source: "header_probe",
+  synced_at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+  stale: true,
+};
 
 describe("RateLimitCard (Settings)", () => {
   it("renders the two live meters and a Live badge on an ok reading", async () => {
@@ -54,6 +67,27 @@ describe("RateLimitCard (Settings)", () => {
     await Promise.resolve();
     expect(screen.queryByText("Claude limits")).toBeNull();
   });
+
+  it("swaps Live for a neutral Stale badge on a stale reading", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(staleReading);
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(screen.getByText("Stale")).toBeTruthy();
+    expect(screen.queryByText("Live")).toBeNull();
+    expect(screen.getByText(/reading is stale/)).toBeTruthy();
+    // Percentages still shown; no live countdown when resets_at is null.
+    expect(screen.getByText("31%")).toBeTruthy();
+    expect(screen.queryByText(/resets in/)).toBeNull();
+  });
+
+  it("keeps a warn reading on the Live badge but paints the bar amber", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(warnReading);
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(screen.getByText("Live")).toBeTruthy();
+    const bar7d = screen.getByRole("progressbar", { name: "7-day window" }).firstChild as HTMLElement;
+    expect(bar7d.className).toMatch(/bg-warn/);
+  });
 });
 
 describe("SidebarRateLimits", () => {
@@ -72,5 +106,14 @@ describe("SidebarRateLimits", () => {
     await waitFor(() => expect(mockApi.getMyRateLimits).toHaveBeenCalled());
     await Promise.resolve();
     expect(screen.queryByLabelText("Claude rate limits")).toBeNull();
+  });
+
+  it("dims both micro-bars on a stale reading", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(staleReading);
+    render(<SidebarRateLimits />);
+    await screen.findByLabelText("Claude rate limits");
+    const fills = screen.getAllByRole("progressbar").map((b) => b.firstChild as HTMLElement);
+    expect(fills).toHaveLength(2);
+    for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
   });
 });

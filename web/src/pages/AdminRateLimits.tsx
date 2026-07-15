@@ -30,7 +30,12 @@ function WindowCell({
       <span className={cx("text-right font-mono tabular-nums", limits.stale ? "text-faint" : "text-muted")}>
         {win.pct}%
       </span>
-      <span className="whitespace-nowrap text-xs text-faint">{reset}</span>
+      {/* The live countdown is data → text-muted for WCAG AA at 12px (web-ux); a
+          stale row's "stale" label stays faint (de-emphasised, and the dimmed bar
+          + badge already carry the staleness). */}
+      <span className={cx("whitespace-nowrap text-xs", limits.stale ? "text-faint" : "text-muted")}>
+        {reset}
+      </span>
     </div>
   );
 }
@@ -108,7 +113,9 @@ export function AdminRateLimits() {
                           {badge.label}
                         </Badge>
                       </td>
-                      <td className="px-4 py-3 text-xs tabular-nums text-faint">
+                      {/* text-muted (not faint): the "updated Xm ago" timestamp
+                          must clear WCAG AA at 12px (web-ux finding). */}
+                      <td className="px-4 py-3 text-xs tabular-nums text-muted">
                         {u.limits.status === "ok" ? formatAgo(u.limits.synced_at, now) : "—"}
                       </td>
                     </tr>

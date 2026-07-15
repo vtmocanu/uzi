@@ -109,7 +109,9 @@ export function RateLimitCard() {
         <SettingsWindowRow label="5-hour window" win={data.five_hour} now={now} />
         <SettingsWindowRow label="7-day window" win={data.seven_day} now={now} />
       </div>
-      <div className="flex items-center gap-2 text-xs text-faint">
+      {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
+          this page leans on — clears WCAG AA 4.5:1 at 12px (web-ux finding). */}
+      <div className="flex items-center gap-2 text-xs text-muted">
         {data.stale ? <Badge tone="neutral">Stale</Badge> : <Badge tone="ok" dot>Live</Badge>}
         <span>
           updated {formatAgo(data.synced_at, now)}

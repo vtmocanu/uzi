@@ -81,6 +81,30 @@ export const mockUsers: User[] = [
     created_at: daysAgo(18),
     last_login: daysAgo(12),
   },
+  // radu + mihai exist so a demo login reaches the WARN and STALE own-reading
+  // states of the rate-limit meters (PRD #53); see mockMyRateLimitsByUser.
+  {
+    id: "u-radu",
+    email: "radu@uzi.local",
+    display_name: "Radu Marin",
+    is_admin: false,
+    is_active: true,
+    autopilot_enabled: false,
+    judge_enabled: false,
+    created_at: daysAgo(15),
+    last_login: minsAgo(20),
+  },
+  {
+    id: "u-mihai",
+    email: "mihai@uzi.local",
+    display_name: "Mihai Radu",
+    is_admin: false,
+    is_active: true,
+    autopilot_enabled: false,
+    judge_enabled: false,
+    created_at: daysAgo(25),
+    last_login: daysAgo(1),
+  },
 ];
 
 // ── Claude rate limits (PRD #53) ─────────────────────────────────────────────
@@ -113,11 +137,23 @@ function okReading(
 // frame A: 8% / 47%, both green, "Live".
 export const mockMyRateLimits: MyRateLimits = okReading(8, 1 * H + 23 * MIN, 47, 2 * D + 4 * H);
 
-// Per-persona readings so a demo login as a seeded non-admin shows a different
-// state (danger / unavailable / no-token); anyone else gets the live-ok default.
+// Per-persona readings so a demo login as a seeded non-admin reaches every own-
+// reading state; anyone else gets the live-ok default (u-admin). warn (radu) and
+// stale (mihai) are here so the sidebar-dim + Settings "Stale" badge and a warn-
+// tone bar are browsable, not just visible in the admin table.
 export const mockMyRateLimitsByUser: Record<string, MyRateLimits> = {
-  "u-admin": mockMyRateLimits,
-  "u-mira": okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1),
+  "u-admin": mockMyRateLimits, // live ok
+  "u-radu": okReading(62, 44 * MIN, 83, 1 * D + 9 * H, 3), // warn (7d 83%)
+  "u-mira": okReading(97, 2 * H + 10 * MIN, 71, 4 * D + 1 * H, 1), // danger (5h 97%)
+  // stale own-reading: no live countdown (resets null), aged synced_at, stale flag.
+  "u-mihai": {
+    status: "ok",
+    five_hour: { pct: 31, resets_at: null },
+    seven_day: { pct: 12, resets_at: null },
+    source: "header_probe",
+    synced_at: minsAgo(180),
+    stale: true,
+  },
   "u-andrei": { status: "unavailable" },
   "u-dan": { status: "no_token" },
 };
