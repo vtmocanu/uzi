@@ -17,6 +17,17 @@
 nameOverride: ""
 fullnameOverride: "uzi"
 
+# How the runtime Secrets are provided.
+#   infisical (default): the chart creates the InfisicalSecret CRs below, and the
+#     cluster's Infisical operator syncs `uzi-secrets` + the Harbor pull secret.
+#   existing: SKIP the InfisicalSecret templates entirely and assume `uzi-secrets`
+#     (+ any pull secret) are PRE-CREATED as plain k8s Secrets. Used by the KinD
+#     smoke (deploy/values/kind-smoke.yaml), which has no Infisical operator. The
+#     api still reads `uzi-secrets` by secretKeyRef either way, so nothing else
+#     changes. The CNPG `-app` DB secret is operator-generated in both modes.
+secrets:
+  mode: infisical
+
 # Harbor pull secret (dockerconfigjson), synced from Infisical (/k8s-registry-robot)
 # by the infisicalList entry below. Both the api and web pods pull PRIVATE images
 # from harbor.example.com/gitlab/vtmocanu/uzi/*, and the CNPG pod pulls the

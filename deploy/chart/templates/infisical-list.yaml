@@ -1,9 +1,12 @@
-{{- if .Values.infisical.enabled }}
+{{- if and .Values.infisical.enabled (eq .Values.secrets.mode "infisical") }}
 {{- /*
   One InfisicalSecret per `infisicalList` entry (the list pattern the other MM apps
   use). Shared host/auth config comes from `.Values.infisical`; each entry supplies
   its own scope (projectSlug/envSlug/secretsPath) + managed secret name. `$` is the
   chart root inside the range.
+
+  Skipped entirely when secrets.mode == "existing" (e.g. the KinD smoke): the
+  workloads then read pre-created plain Secrets of the same names.
 */ -}}
 {{- range .Values.infisicalList }}
 ---

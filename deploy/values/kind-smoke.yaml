@@ -1,0 +1,61 @@
+# KinD chart-install smoke values (PRD #52 M8). Installs the uzi stack into an
+# ephemeral KinD cluster with NO Infisical operator and NO Harbor access —
+# everything is local (kind-loaded api/web images) or public (the CNPG postgres
+# image + operator), so the smoke is fully credential-less. This is a TEST target,
+# never a deploy target.
+
+secrets:
+  # SKIP the InfisicalSecret CRs (no operator in KinD). The smoke job pre-creates
+  # `uzi-secrets` as a plain Secret with a random valid UZI_SECRET_KEY + JWT_SECRET
+  # (the api refuses placeholder keys). The CNPG operator generates the -app DB
+  # secret from the Cluster CR.
+  mode: existing
+
+# No Harbor pull secret: api/web are kind-loaded, postgres is public ghcr.io.
+imagePullSecret:
+  name: ""
+
+api:
+  image:
+    # Locally built + kind-loaded: `docker build -t uzi-api:kind ./api` then
+    # `kind load docker-image uzi-api:kind`.
+    repository: uzi-api
+    tag: kind
+    pullPolicy: IfNotPresent
+  # KinD has no ingress-nginx and kindnet friction with probe CIDRs; disable the
+  # api NetworkPolicy for the smoke (default stays enabled for real clusters).
+  networkPolicy:
+    enabled: false
+  config:
+    API_ADDR: ":8080"
+    # http origin => CookieSecure off (KinD is plain http via port-forward).
+    FRONTEND_ORIGIN: http://localhost
+    # Permissive for the single-node test (not a real trust boundary here).
+    TRUSTED_PROXIES: "0.0.0.0/0"
+
+web:
+  image:
+    repository: uzi-web
+    tag: kind
+    pullPolicy: IfNotPresent
+  # Single web replica is enough for the smoke.
+  replicaCount: 1
+  ingress:
+    enabled: false
+
+postgres:
+  enabled: true
+  cluster:
+    # PUBLIC upstream CNPG postgres image (no Harbor mirror / pull secret in KinD).
+    imageName: ghcr.io/cloudnative-pg/postgresql:16.4
+    imagePullSecrets: []
+    instances: 1
+    storage:
+      size: 1Gi
+      # KinD's default local-path provisioner StorageClass.
+      storageClass: standard
+    walStorage:
+      size: 1Gi
+      storageClass: standard
+  backups:
+    enabled: false
