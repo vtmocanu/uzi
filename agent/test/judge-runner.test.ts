@@ -163,7 +163,7 @@ describe("JudgeRunner", () => {
     // hang forever. modelTimeoutMs is injected tiny so the test is fast.
     const hung: SdkQueryFn = (() =>
       (async function* () {
-        await new Promise((r) => setTimeout(r, 60_000)); // longer than the injected cap
+        await new Promise((r) => setTimeout(r, 60_000).unref()); // longer than the injected cap; unref so the abandoned timer never holds the event loop open (else the file exceeds --test-timeout in CI)
       })()) as unknown as SdkQueryFn;
     const runner = new JudgeRunner(client, nullLogger(), { queryFn: hung, modelTimeoutMs: 20 });
     const started = Date.now();
