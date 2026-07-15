@@ -1,10 +1,10 @@
 # PRD #53: Per-user Claude rate-limit visibility — 5h/7d window meters
 
 **GitLab Issue**: [#53](https://gitlab.example.com/vtmocanu/uzi/-/issues/53)
-**Status**: Draft (created 2026-07-15)
+**Status**: Done (merged 2026-07-15, MR !51)
 **Priority**: Medium
 **Depends on**: nothing in-repo. Reuses the vault (PRD #32), the self-improve engine pattern, and the usage endpoint split (PRD #40).
-**Mockup**: [prds/mockups/53-rate-limits-mock.html](mockups/53-rate-limits-mock.html)
+**Mockup**: [prds/mockups/53-rate-limits-mock.html](../mockups/53-rate-limits-mock.html)
 
 ## Problem
 
