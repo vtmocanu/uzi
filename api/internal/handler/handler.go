@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
@@ -80,7 +81,25 @@ type Handler struct {
 	// through h.q directly; this field is the seam future notification producers
 	// (the judge, M4) call to create rows. Wired via SetNotifier; nil-safe.
 	notifier *notifysvc.Service
+	// usagePoker pokes the rate-limit poller when a user saves/replaces their
+	// Anthropic token (PRD #53 D3b), so their meters appear within seconds instead
+	// of up to a full poll interval. Wired via SetUsagePoker; nil-safe (the poller
+	// disabled, or a test handler) — the token still lands, just polled on the next
+	// tick.
+	usagePoker UsagePoker
 }
+
+// UsagePoker is the slice of the rate-limit poller the token-save handler needs
+// (PRD #53 D3b): request an out-of-band poll for one user. *usagepoller.Engine
+// satisfies it.
+type UsagePoker interface {
+	Poke(userID uuid.UUID)
+}
+
+// SetUsagePoker wires the rate-limit poller in after construction (built in main
+// alongside the other background engines). Safe to leave unset — token saves then
+// simply wait for the poller's next tick.
+func (h *Handler) SetUsagePoker(p UsagePoker) { h.usagePoker = p }
 
 // SetNotifier wires the notifications write seam in after construction (built in
 // main alongside the Slack notifier it delivers through). Safe to leave unset in
