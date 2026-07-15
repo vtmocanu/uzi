@@ -110,6 +110,21 @@ api:
     periodSeconds: 20
     timeoutSeconds: 3
     failureThreshold: 6
+  # Default-deny ingress on the api pods, allowing ONLY the web pods (the reverse
+  # proxy) to reach api:8080. This is the LOAD-BEARING control on a shared cluster
+  # like dev-cluster: without it any pod (e.g. coder.example.com runs
+  # arbitrary dev code) could hit the api ClusterIP directly, bypass web nginx, and
+  # spoof X-Forwarded-For to defeat the per-IP auth rate limit / forge audit IPs.
+  # example-app has no such policy (it runs on the non-shared mgmt cluster).
+  networkPolicy:
+    enabled: true
+    # kubelet liveness/readiness/startup probes originate from the NODE IP (host
+    # network), which no podSelector can match. On CNIs that subject probe traffic
+    # to NetworkPolicy (platform/Antrea, Calico), the node CIDR must be allowed here or
+    # the api never goes Ready (startup probe dropped -> CrashLoop). Set per-cluster
+    # to the dev-cluster node InternalIP CIDR(s). Empty = rely on the CNI exempting
+    # host->pod probe traffic; CONFIRM at M6 before trusting empty.
+    probeCIDRs: []
 
 # --- web: nginx serving the SPA + reverse-proxying /api/* to the api Service -----
 web:
@@ -199,6 +214,11 @@ infisical:
 # project the Harbor robot pull secret comes from, so the operator identity needs no
 # new grant. Confirm the project slug + folder before first sync (a wrong scope
 # 403/404s the InfisicalSecret).
+# syncWave: "-10" applies both InfisicalSecrets before the workloads (and before
+# the CNPG cluster at -5), so the api's `uzi-secrets` and the Harbor pull secret
+# `registry-robot-secret-uzi` exist on first deploy instead of causing a transient
+# ImagePullBackOff / api CrashLoop until the operator catches up (self-heal is the
+# real recovery; this just cuts the churn).
 infisicalList:
   - name: infsec-uzi
     projectSlug: example-project
@@ -206,12 +226,14 @@ infisicalList:
     secretsPath: /uzi
     secretName: uzi-secrets
     secretType: Opaque
+    syncWave: "-10"
   - name: infsec-harbor-robot-uzi
     projectSlug: example-project
     envSlug: prod
     secretsPath: /k8s-registry-robot
     secretName: registry-robot-secret-uzi
     secretType: kubernetes.io/dockerconfigjson
+    syncWave: "-10"
 
 # Restricted-PodSecurity contexts (satisfy the `restricted` standard everywhere;
 # harmless where it is not enforced).
@@ -254,9 +276,11 @@ web_containerSecurityContext:
 # in deploy/values/<cluster>.yaml and supplies those. The api's DATABASE_URL is
 # wired to the CNPG-generated postgres-uzi-cluster-app Secret (api.database above).
 #
-# CNPG operator compatibility: dev-cluster runs operator 1.23.5, which supports
-# PostgreSQL up to 16 (PG17 needs 1.24+, PG18 later). The per-cluster values pin the
-# postgres image accordingly; do NOT copy example-app's PG18 image here.
+# Postgres image: the per-cluster values pin a specific tag from the MM Harbor
+# mirror (cloudnative-pg). dev-cluster standardizes on 16.x (fleet-consistent
+# + confirmed mirrored); do NOT copy example-app's PG18 image here. (dev-cluster's CNPG
+# operator 1.23.5 supports up to PG17, so 16.x is a fleet-convention choice, not an
+# operator-imposed ceiling.)
 postgres:
   enabled: false
   type: postgresql
@@ -296,7 +320,13 @@ postgres:
         memory: 1Gi
     primaryUpdateMethod: switchover
     primaryUpdateStrategy: unsupervised
-    enableSuperuserAccess: true
+    # No superuser secret: the app connects as the `-app` role (DATABASE_URL from
+    # the postgres-uzi-cluster-app secret), so the unused `postgres` superuser
+    # credential is dead weight / extra attack surface.
+    enableSuperuserAccess: false
+    # Single-instance dev cluster: a PodDisruptionBudget (subchart default true)
+    # has no failover target and would wedge node drains/upgrades. Disable it.
+    enablePDB: false
     # Off by default: dev-cluster does not necessarily ship the PodMonitor /
     # PrometheusRule CRDs. A cluster with the Prometheus operator can flip these on.
     monitoring:

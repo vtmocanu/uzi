@@ -28,6 +28,8 @@ spec:
         {{- include "uzi.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: api
     spec:
+      # The api never calls the k8s API; drop the auto-mounted SA token.
+      automountServiceAccountToken: false
       {{- with .Values.imagePullSecret.name }}
       imagePullSecrets:
         - name: {{ . }}
