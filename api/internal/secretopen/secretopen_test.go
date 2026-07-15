@@ -11,6 +11,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 )
 
 type fakeStore struct {
@@ -82,6 +83,40 @@ func TestOpenSealed(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), string(bad)) {
 		t.Fatalf("error leaked the ciphertext: %q", err.Error())
+	}
+}
+
+// TestOpenSealedRealVaultLocked exercises the D3 dispatch through a REAL
+// *vault.Vault whose cache is empty (i.e. the user is locked), not the nil-vault
+// shortcut: a master-sealed secret opens regardless of the lock, while a
+// dek-sealed one surfaces ErrVaultLocked. vault.Open never touches the store for
+// either path, so a nil store is sufficient.
+func TestOpenSealedRealVaultLocked(t *testing.T) {
+	box, _ := secretbox.New(key)
+	vlt := vault.New(box, nil) // empty DEK cache ⇒ every user is locked
+	userID := uuid.New()
+	if vlt.Unlocked(userID) {
+		t.Fatal("a fresh vault must report the user as locked")
+	}
+
+	// Master-sealed: opens under the master box even though the vault is locked.
+	sealed, err := box.Seal([]byte("legacy-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := OpenSealed(vlt, box, userID, "anthropic_token", store.SealedWithMaster, sealed)
+	if err != nil {
+		t.Fatalf("master-sealed must open while locked, got %v", err)
+	}
+	if string(plain) != "legacy-token" {
+		t.Fatalf("plaintext = %q, want legacy-token", plain)
+	}
+
+	// Dek-sealed: the locked vault refuses before any decryption, so the ciphertext
+	// value is irrelevant — the lock is what gates it.
+	_, err = OpenSealed(vlt, box, userID, "anthropic_token", store.SealedWithDEK, []byte("irrelevant"))
+	if !errors.Is(err, ErrVaultLocked) {
+		t.Fatalf("dek-sealed while locked must return ErrVaultLocked, got %v", err)
 	}
 }
 

@@ -187,8 +187,9 @@ const secretToken = "sk-ant-oat-SECRETsentinelVALUE-do-not-leak"
 // the token. It exercises HTTP-refusal and transport failures and asserts the
 // sentinel token never appears in the returned error string.
 func TestNoTokenInError(t *testing.T) {
-	// HTTP-refusal path: server 429s with a body that even echoes the auth header
-	// back, to prove the excerpt is Anthropic's body, not our request.
+	// HTTP-refusal path: a real request carrying the token on its Authorization
+	// header gets a 429 whose fixed error body has no token in it; the error is
+	// built from status + that body excerpt, so it cannot leak the token.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`))
