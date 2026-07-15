@@ -5826,3 +5826,195 @@ Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisi
   cgroup v2; the run asserts the workers API returns populated `source: "cgroup"` stats after one
   heartbeat interval. An independent tester validated the hostile matrix (overflow/NaN/junk source →
   stats dropped, heartbeat still 200) live.
+
+# PRD #52 — CI/CD: real pipeline, tag releases, ArgoCD deploy to dev-cluster
+
+Serves the human requirement: real CI/CD (pipeline, tag-driven versioning, ArgoCD deploy to
+dev-cluster), the ArgoCD wiring landing via an MR to `argo-apps` (never a direct push), and
+uzi's own dummy CI staying demonstrable against real pipelines. Full Decision Log in
+`prds/52-cicd-argocd-deploy.md`. Reference implementation is **example-app** (same `vtmocanu` group), copied
+nearly verbatim and adapted to uzi's three-toolchain monorepo (Go `api`, Vite/React `web`, Node
+`agent`), two images, compose-first architecture. This run delivered M1–M5 + M7 (the uzi MR plus a
+SEPARATE Draft MR to `argo-apps`); M6 (cut a real tag, live-deploy, verify) and all
+platform-admin execution are OUT of scope and only documented. The load-bearing decisions:
+
+## 235. Bespoke `.gitlab-ci.yml`, four stages, demo trigger preserved (Decision 1, M1)
+
+- **Bespoke pipeline, not the `myorg/pipelines` `simple-app.yml` include.** That include assumes one
+  image, docker-build-as-artifact, a fixed check set; uzi needs three toolchains, two images (one with
+  a repo-root build context), sqlc-drift checks, and kaniko (no docker daemon). example-app went bespoke in
+  the same group for the same reasons. Cost (we own the pipeline) is mitigated by copying example-app's
+  hardened jobs nearly verbatim.
+- **Stages `validate → test → build → publish`.** validate = api `go vet`/`go build`/sqlc-drift,
+  web typecheck/check-docs, agent typecheck, helm lint/template; test = `go test`, vitest, agent
+  `node --test`; build = kaniko `--no-push` validation of both images (§236); publish = tag-only
+  image push + OCI chart push (§237). Digest-pinned job images, lockfile-keyed caches,
+  `interruptible: true` + `needs: []` DAG, `workflow.auto_cancel` on superseded validate/test.
+- **`workflow.rules` admit MR / default-branch / tag PLUS `$UZI_CI_DEMO_FAIL == "1"`.** example-app's rules
+  stop at the first three and would silently drop the `glab ci run -b <branch> --variables
+  UZI_CI_DEMO_FAIL:1` demo trigger. That extra rule keeps PRD #6's Fix-CI demo working. The
+  `demo-fail` job + `UZI_CI_DEMO_FAIL` gate are kept verbatim (human requirement: dummy CI stays
+  demonstrable); `demo-fail` is re-pinned `image: alpine:3.20` (M1 dropped the top-level default image,
+  so an imageless job would go red as a config error, not the intended `exit 1`).
+- **validate/test job templates carry `rules: - if: '$UZI_CI_DEMO_FAIL != "1"'`** so a demo pipeline
+  runs ONLY `demo-fail` — cleaner PRD #6 demo, and it applies the self-gating principle (§236) to the
+  real gates too. Plain feature-branch pushes (no MR) stop producing pipelines (example-app behavior); safe
+  because uzi's CI-status feature reads pipeline status via MR/branch queries (`api/internal/forge`),
+  not per-push and not stage names — so renaming `lint`/`smoke` → `validate`/`test` is safe.
+
+## 236. Harbor push creds NEVER reach unprotected-ref (agent-authored MR) pipelines (Decision 2, M3/M4)
+
+- **The stricter-than-example-app trust boundary — the load-bearing CI security decision.** uzi's core loop
+  opens agent-authored MRs (model-written code that CAN edit `.gitlab-ci.yml`), and MR pipelines
+  execute the MR's own CI file. example-app's `--no-push-cache` guard lives in YAML the MR author controls,
+  so it only prevents accidental cache writes, not a malicious MR. Therefore `HARBOR_USERNAME`/
+  `HARBOR_PASSWORD` are configured **protected + masked** — unavailable to unprotected-ref pipelines
+  entirely.
+- **Every build/publish job SELF-GATES with explicit `rules`, never `workflow.rules` alone.** Scenario
+  that forces this: a `UZI_CI_DEMO_FAIL=1` pipeline can be triggered on the DEFAULT (protected) branch
+  where Harbor creds exist; a job admitted only by `workflow.rules` would then run WITH creds during an
+  operator demo. So each build/publish job's first rule is `if: '$UZI_CI_DEMO_FAIL == "1"' → when:
+  never`, then `$CI_COMMIT_TAG` (publish) / `$CI_COMMIT_REF_PROTECTED == "true"` (cache-warming build).
+- **Auth is a single toggle `KANIKO_AUTH`, set `"true"` only by the protected-ref rule** (`"false"`
+  otherwise). The `.kaniko` `before_script` writes `config.json` and passes `--cache=true` +
+  `--cache-repo .../gitlab/vtmocanu/uzi/cache` ONLY when `KANIKO_AUTH=true`; MR builds run anonymous,
+  cache-less, `--no-push`. example-app's unconditional per-pipeline auth is deliberately NOT inherited.
+  Consequence accepted: MR validation builds are slower (no shared layer cache); only protected refs
+  authenticate, warm the cache, and (tags only) push. GitLab `cache:` keys are not protected-ref
+  segregated, so image-LAYER caching lives on the Harbor protected-write cache repo, never a GitLab
+  cache path an MR could write; Go/npm caches self-verify via go.sum/lockfile and are safe to share.
+
+## 237. Model B versioning — tag == chart version == appVersion, asserted atomically (Decision 3, M4)
+
+- **Release = push git tag `vX.Y.Z`.** Chart `version` and `appVersion` in `deploy/chart/Chart.yaml`
+  must both equal the tag with the `v` stripped (`VERSION="${CI_COMMIT_TAG#v}"`). `publish:assert-version`
+  is a first, blocking publish-stage job that fails the whole release on any mismatch — a lagging
+  Chart.yaml can never publish a half-versioned release.
+- **Images land at `harbor.example.com/gitlab/vtmocanu/uzi/{api,web}:<tag>` (+ a `<short-sha>` tag);
+  the chart at `oci://harbor.example.com/gitlab/vtmocanu/uzi/uzi:<version>`.** Both image tags default
+  to the chart appVersion in the templates (`.Values.{api,web}.image.tag | default .Chart.AppVersion`)
+  — example-app's single-image Model B mechanism, doubled. ArgoCD's `targetRevision` is that chart version,
+  bumped per release via an MR to `argo-apps` (§242) — explicit reviewable deploy over
+  latest-tracking, one release mechanism for all future clusters.
+- **`helm registry login --password-stdin`** (not `-p "$HARBOR_PASSWORD"`) keeps the password out of
+  process argv on the OCI push.
+
+## 238. CNPG for Postgres, pinned to the dev-cluster operator's support (Decision 4, M2)
+
+- **Postgres is a CNPG `Cluster`, not the compose `postgres:17` container** — org standard, operator
+  already on dev-cluster (in the `appset.cloudnative-pg.yaml` generator). Realized as the vendored
+  `cluster` subchart **0.6.1** (`deploy/chart/charts/cluster-0.6.1.tgz` + `Chart.lock`), chart-parity
+  and compatible with dev-cluster's CNPG operator **1.23.5**.
+- **In-tree `barmanObjectStore`, not the barman-cloud plugin** — the plugin appset has dev-cluster
+  commented out. Dev sizing: `instances: 1`, storageClass `storage-class`. **Backups default OFF**; enabling
+  is a documented toggle (S3 creds InfisicalSecret + the `barmanObjectStore` block, bucket convention
+  `s3://postgres-dev-cluster`) deferred, not wired, this run.
+- **Postgres image `cloudnative-pg/postgresql:16.3`.** The MM CNPG fleet is MIXED (16.2 most
+  common; 16.3, 16.4, 16.10 all in use) with no single dev-02 convention; 16.3 was chosen because it is
+  confirmed-mirrored in Harbor via other MM apps and fleet-consistent — the real goal is a mirrored
+  tag, so 16.2/16.4/16.10 would be equally valid. The `cluster.postgresql: "16"` major matches. Harbor
+  tag presence MUST still be confirmed before M6. (Correction: an earlier "16.4 referenced nowhere /
+  16.3 is THE convention" claim was imprecise; recorded here as the mixed-fleet truth.)
+
+## 239. Chart topology + the compose→k8s adaptations (M2)
+
+Chart (`deploy/chart/`) = `web` (Deployment/Service/Ingress) + `api` (Deployment/Service) + the CNPG
+`cluster` subchart + `InfisicalSecret`s. No worker/agent deployed (Decision 5: workers stay opt-in,
+outbound-only laptop processes reaching the api via the public ingress — the remote-worker posture
+ARCHITECTURE.md already anticipates). e2e stays out of CI (Decision 6: it needs docker-compose on the
+runner; per-package tests + `helm template` are the CI gate; M8 stretch revisits). Adaptations:
+
+- **XFF: k8s appends, compose overwrites.** compose `web/nginx.conf` sets
+  `X-Forwarded-For: $remote_addr` (correct — immediate client is the browser); in k8s the immediate
+  client is ingress-nginx, so overwriting would collapse every user into one per-IP auth rate-limit
+  bucket and lose client IPs in audit logs. The web nginx template is env-toggled to
+  `$proxy_add_x_forwarded_for` (append/pass-through) for k8s while compose stays overwrite;
+  ingress-nginx is the outermost overwriting hop.
+- **api is a hard singleton: `replicas: 1` + `strategy: Recreate` + a generous `startupProbe`.** Three
+  independent reasons it cannot run >1 replica: poller + sweeper hold single-goroutine in-memory state
+  (two replicas double-poll/double-sweep), the Slack Socket Mode manager would double-handle events,
+  and `store.Migrate` runs goose at boot with NO advisory lock (concurrent boots race migrations).
+  Recreate avoids RollingUpdate's surge briefly running two pods; the startupProbe keeps
+  migration-bearing boots from being liveness-killed. Documented as non-horizontally-scalable.
+- **`FRONTEND_ORIGIN=https://uzi.example.com`** in the cluster values (non-secret → values, not
+  Infisical). `CookieSecure` derives from its scheme and the OIDC redirect is
+  `FRONTEND_ORIGIN + /api/auth/oidc/callback`; behind TLS ingress the api sees plain http, so an
+  omitted/ wrong value silently drops Secure cookies and breaks OIDC.
+- **WS idle timeout:** Ingress annotation `nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"`
+  (ingress-nginx defaults 60s and would cull idle live-run sockets; self-heals via REST replay but
+  churns).
+- **nginx `/api/*` upstream:** the api Service is named `api` so the compose `proxy_pass` name resolves
+  identically (same-origin, no CORS). A `dynamicResolution` knob (default off) enables an nginx
+  `resolver` + variable upstream for runtime re-resolution, documenting the Service-recreate wrinkle.
+- **Secrets via Infisical only** (`InfisicalSecret`): `JWT_SECRET`, `UZI_SECRET_KEY`, CNPG `-app`
+  DB creds, optional `UZI_SEED_*`; Harbor pull secret from the existing `/k8s-registry-robot` path.
+  Project slug `example-project`, envSlug `prod`, path `/uzi`. NO plaintext secret values anywhere in
+  repo/chart/values; the api's refuse-to-start-on-placeholder-key check is the safety net.
+- **Ingress `uzi.example.com`, `ingressClassName: nginx`, no per-host TLS block** — dev-cluster
+  serves a `*.example.com` default wildcard cert, matching existing apps.
+
+## 240. NetworkPolicy is the load-bearing control against in-cluster XFF spoofing (hardening)
+
+- **Beyond the PRD's adaptation list: an api NetworkPolicy** (`api-networkpolicy.yaml`) — default-deny
+  ingress, allow ONLY web pods → api:8080. Rationale: dev-cluster is SHARED
+  (`coder.example.com` runs arbitrary dev code on the same cluster); with no policy any pod could
+  hit the api ClusterIP directly, bypass web nginx, and spoof `X-Forwarded-For`
+  (`middleware/ratelimit.go` `ClientIP` honors XFF from trusted CIDRs) → unthrottled auth brute-force +
+  forged audit IPs. example-app has no such policy because it runs on the non-shared mgmt cluster. This is
+  the mandatory, load-bearing control; TRUSTED_PROXIES narrowing is the second layer.
+- **`TRUSTED_PROXIES` narrowed to `100.64.0.0/10`** (the platform/Antrea pod net, validation-wave
+  confirmed) — dropped the blanket `10/8,172.16/12,192.168/16`. With the NetworkPolicy in place only
+  the web pod can deliver XFF anyway.
+- **`api.networkPolicy.probeCIDRs` knob, default `[]`.** A default-deny ingress policy also drops
+  KUBELET health probes (node IP / host-network, unmatchable by podSelector); on platform/Antrea that
+  drops the api startupProbe → never Ready → CrashLoop. Left EMPTY here (chart renders, M6 sets it);
+  BEFORE M6 it must be set to the dev-cluster node InternalIP CIDR OR the CNI confirmed to exempt probe
+  traffic. That node CIDR must stay OUT of TRUSTED_PROXIES so a host-network probe source can't spoof
+  XFF. Enforcement is CNI-dependent (Antrea enforces by default on platform — confirm at M6); if ingress-
+  nginx runs host-network its node IP is the rightmost XFF hop and, being outside `100.64/10`, would
+  collapse rate-limit buckets (over-throttle, fails closed) — add the ingress node CIDR to
+  TRUSTED_PROXIES if so.
+- **LOW hardenings applied:** CNPG `enableSuperuserAccess: false` (app uses `-app` role),
+  `enablePDB: false` (single-instance dev — a PDB can wedge node drains), `automountServiceAccountToken:
+  false` on api + web (neither needs the k8s API), InfisicalSecret `syncWave: "-10"` on both entries
+  (cut first-deploy ImagePullBackOff/api-CrashLoop churn; self-heal is the real mechanism).
+
+## 241. Platform/admin steps — documented, NOT executed this run (M5)
+
+Each mirrors a example-app step and is captured in `deploy/README.md`; none was executed (scope stops before
+M6):
+
+- **Harbor CI creds protected + masked** on `vtmocanu/uzi` (robot injected by the GitLab↔Harbor
+  integration) — the runtime side of Decision 2 (§236). **Scope the Harbor robot push-only on
+  `gitlab/vtmocanu/uzi/*`** (no delete, no cross-project) to contain the accepted protected-ref residual.
+- **Protected `v*` tags = MAINTAINER-create-only (exclude Developers).** The agent/worker PAT has
+  Developer role; creating a `v*` tag is the one path by which it could reach the tag-pipeline push
+  creds. Maintainer-only tag CREATE + main protected closes the agent-authored-MR loop.
+- **Infisical `/uzi` folder is NEW** (slug `example-project`, envSlug `prod`) — must be created before
+  deploy; the operator, universal-auth creds, and `/k8s-registry-robot` pull-secret path are already live
+  on dev-cluster.
+- **DNS + ArgoCD OCI repo cred** for `harbor.example.com/gitlab/vtmocanu/uzi`; git access via the
+  existing `vtmocanu-repo-creds` group-prefix template (verify, no new token).
+- **Release runbook ordering:** bump `Chart.yaml` version/appVersion in an MR → merge → tag THAT
+  (already-merged) commit, so its default-branch pipeline warmed the Harbor layer cache (cold cache =
+  slower publish, not a failure) and `assert-version` (§237) holds. Rollback = revert the argo
+  `targetRevision` MR.
+
+## 242. ArgoCD app lands as an MR to argo-apps, never a push (human requirement, M5)
+
+- **`argo-apps/apps/uzi/{prj.uzi.yaml,app.uzi.yaml}`**, delivered as a SEPARATE Draft MR
+  (`!294`) to the argo repo — the user's explicit "for ArgoCD we do an MR, not a push to main". These
+  files live in the argo repo, not the uzi worktree.
+- **`app.uzi.yaml` is multi-source** (chart-parity): the released chart from Harbor OCI +
+  per-cluster values from `vtmocanu/uzi.git` (`ref: values`, `$values/deploy/values/dev-cluster.yaml`),
+  so operational config can change without cutting a release. Destination `dev-cluster` / namespace
+  `uzi`; automated sync with prune + selfHeal + `CreateNamespace`; explicit `sourceRepos` in
+  `prj.uzi.yaml`; the OCI `repoURL` omits the `oci://` scheme (chart-parity).
+
+## 243. Deferred to pre-M6 — documented, not executed (scope boundary of this run)
+
+Recorded in `deploy/README.md` as the M6 gate, none executed: confirm the dev-cluster pod CIDR ⊆
+`100.64.0.0/10`; set `probeCIDRs` to the node CIDR (or confirm CNI probe exemption); confirm Antrea
+NetworkPolicy enforcement; confirm the `postgresql:16.3` tag is mirrored in `cloudnative-pg`;
+DNS for `uzi.example.com` (or wildcard coverage); ArgoCD OCI repo cred; and all platform-admin
+steps in §241. M8 (e2e in CI) remains a stretch, explicitly not a blocker.
