@@ -423,3 +423,24 @@ dev-cluster `*.example.com` default wildcard, no TLS block.)
   untrusted agent MRs — Decision 2's reasoning on the execution axis); binaries
   checksum-pinned; credential-less. Runner-side CI execution is unverified (no
   MM-runner access) — the chart+smoke flow is locally proven.
+- 2026-07-15: Post-open hardening driven by the FIRST real CI runs on the MR
+  (the whole point of this PRD): `test:agent` failed on the node-22 runner where
+  local (node 26) passed — fixed `apk add bash` (git-secret spawns bash), a
+  dangling 60s timer in judge-runner, and a keep-alive gap in `hangUntilAbort`
+  (the executor's unref'd watchdog timers let node 22 drain the loop before the
+  watchdog fired → cascade). Also switched the vendored CNPG subchart to
+  gitignored + `helm dependency build` (matches example-app; the "commit it" precedent
+  cited earlier was backwards), and added `UZI_PUBLIC_BASE_URL` for Slack deep
+  links. Reproduced/validated each in the exact `node:22-alpine` CI image.
+- 2026-07-15: **MR !50 MERGED to `main`** (`a442653`) — M1-M5, M7, M8 + all CI
+  fixes landed; full pipeline green (validate/test/build/helm across all three
+  toolchains). M6 (first live deploy to dev-cluster) now in progress; remaining
+  one-time steps:
+  - [x] Infisical `/uzi` folder minted (JWT_SECRET, UZI_SECRET_KEY + optional seeds)
+  - [ ] Harbor CI creds for `vtmocanu/uzi` — **protected + masked** (Decision 2)
+  - [ ] `v*` **protected tags, Maintainer-create-only** (Decision 2, execution axis)
+  - [ ] Harbor robot **push-only** scope on `gitlab/vtmocanu/uzi/*`
+  - [ ] ArgoCD Helm **OCI repo cred** for `harbor.example.com/gitlab/vtmocanu/uzi`
+  - [ ] DNS `uzi.example.com` (or confirm `*.example.com` wildcard covers it)
+  - [ ] Merge argo Draft MR `argo-apps!294`, cut `v0.1.0`, bump
+        `targetRevision`, sync, verify end-to-end (see `deploy/README.md` runbook)
