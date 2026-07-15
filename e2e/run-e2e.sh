@@ -1991,4 +1991,60 @@ pass "in-flight run completed cleanly"
 apiput /api/admin/settings '{"settings":{"health_stall_seconds":"300"}}' >/dev/null
 fi
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #47 run-health; executor=%s)\n' "$EXECUTOR"
+# ---------------------------------------------------------------------------
+# PRD #53: per-user Claude rate-limit meters (read endpoints + status union).
+# The poller is DISABLED in the overlay (UZI_USAGE_POLL_INTERVAL=0) — the isolated
+# stack has no live Anthropic and the client's base URL is a hardcoded const, so
+# there is nothing to point at a fake. We seed one gauge row directly (the same
+# direct-seed fixture pattern used for user2's master-sealed row) and drive the
+# frozen contract end to end: unavailable → ok on /me, the admin list showing every
+# user incl. a token-less no_token, and a member 403 on the admin endpoint. The SPA
+# meters are validated against the kept stack by web-ux (KEEP_STACK).
+say "PRD #53: per-user rate-limit meters (seeded gauge row → read endpoints)"
+login  # refresh the admin session
+ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
+[ -n "$ADMIN_ID" ] || fail "could not resolve the admin id for the rate-limit seed"
+
+# The seed admin holds a token but has no reading yet ⇒ unavailable (not no_token,
+# and not a ghost row).
+[ "$(apiget /api/me/rate-limits | jq -r '.status')" = unavailable ] \
+  || fail "admin (token, no reading) should read unavailable before any row is seeded"
+
+# Seed a fresh reading directly (the poller is off).
+db_psql "INSERT INTO anthropic_rate_limits
+           (user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at)
+         VALUES ('$ADMIN_ID', 55, now() + interval '2 hours', 12, now() + interval '3 days', 'usage_endpoint', now())
+         ON CONFLICT (user_id) DO UPDATE SET
+           five_hour_pct = 55, seven_day_pct = 12, source = 'usage_endpoint', synced_at = now()" >/dev/null
+
+ME_RL="$(apiget /api/me/rate-limits)"
+[ "$(jq -r '.status'              <<<"$ME_RL")" = ok ]             || fail "/me/rate-limits status != ok after seeding a row"
+[ "$(jq -r '.five_hour.pct'       <<<"$ME_RL")" = 55 ]            || fail "/me/rate-limits five_hour.pct != 55"
+[ "$(jq -r '.seven_day.pct'       <<<"$ME_RL")" = 12 ]            || fail "/me/rate-limits seven_day.pct != 12"
+[ "$(jq -r '.source'              <<<"$ME_RL")" = usage_endpoint ] || fail "/me/rate-limits source != usage_endpoint"
+[ "$(jq -r '.five_hour.resets_at' <<<"$ME_RL")" != null ]        || fail "/me/rate-limits five_hour.resets_at should be an epoch, not null"
+# Poller disabled ⇒ every served reading is stale.
+[ "$(jq -r '.stale'               <<<"$ME_RL")" = true ]          || fail "/me/rate-limits stale should be true with the poller disabled"
+pass "/api/me/rate-limits returns the ok union for a seeded reading (stale with the poller off)"
+
+# Admin list: every user appears; the admin is ok, the token-less fresh user is no_token.
+ADMIN_RL="$(apiget /api/admin/rate-limits)"
+[ "$(jq -r --arg id "$ADMIN_ID" '.users[] | select(.id==$id) | .limits.status' <<<"$ADMIN_RL")" = ok ] \
+  || fail "the admin's own row should read ok in the admin list"
+[ "$(jq -r --arg e "$FRESH_EMAIL" '.users[] | select(.email==$e) | .limits.status' <<<"$ADMIN_RL")" = no_token ] \
+  || fail "the token-less fresh user should appear as no_token in the admin list"
+for e in "$ADMIN_EMAIL" "$FRESH_EMAIL" user2@uzi.e2e; do
+  [ "$(jq -r --arg e "$e" '[.users[] | select(.email==$e)] | length' <<<"$ADMIN_RL")" = 1 ] \
+    || fail "the admin rate-limit list is missing user $e (every user must appear)"
+done
+pass "/api/admin/rate-limits lists every user; admin=ok, token-less user=no_token"
+
+# A non-admin member is forbidden by the RequireAdmin gate. Refresh the fresh
+# user's session first so this asserts 403 (authz), not 401 (an expired cookie).
+curl -fsS -c "$FRESHJAR" -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$FRESH_EMAIL\",\"password\":\"$FRESH_PASS\"}" >/dev/null
+[ "$(fresh_code GET /api/admin/rate-limits)" = 403 ] \
+  || fail "a non-admin member must get 403 on /api/admin/rate-limits"
+pass "member gets 403 on /api/admin/rate-limits"
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #47 run-health + PRD #53 rate-limits; executor=%s)\n' "$EXECUTOR"

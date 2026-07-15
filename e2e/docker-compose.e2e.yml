@@ -113,6 +113,13 @@ services:
       UZI_SEED_FORGE_PAT: e2e-dummy-forge-pat-000000
       UZI_SEED_FORGE_BASE_URL: https://forge-fake.e2e
       UZI_SEED_FORGE_REPOS: group/repo
+      # PRD #53: disable the rate-limit poller. The isolated stack has no live
+      # Anthropic, and the client's base URL is a hardcoded const (no env knob, an
+      # SSRF-guard decision), so there is nothing to point at a fake — leaving the
+      # poller on would only fire pointless outbound calls with the dummy token.
+      # The harness seeds a gauge row directly (like the master-sealed row it stages
+      # for user2) and asserts the read endpoints; disabled ⇒ readings serve stale.
+      UZI_USAGE_POLL_INTERVAL: "0"
     volumes:
       - ${E2E_RUN_DIR}/certs:/certs:ro
     depends_on:
