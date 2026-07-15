@@ -37,7 +37,17 @@ export function useMyRateLimits(intervalMs: number): { data: MyRateLimits | null
 const CARD_BLURB =
   "Live utilization of your Anthropic account's two rate-limit windows. Runs queue when a window is exhausted and resume after it resets.";
 
-function SettingsWindowRow({ label, win, now }: { label: string; win: RateLimitWindow; now: number }) {
+function SettingsWindowRow({
+  label,
+  win,
+  now,
+  dim = false,
+}: {
+  label: string;
+  win: RateLimitWindow;
+  now: number;
+  dim?: boolean;
+}) {
   const countdown = formatCountdown(win.resets_at, now);
   return (
     <div className="mt-4 first:mt-0">
@@ -48,11 +58,14 @@ function SettingsWindowRow({ label, win, now }: { label: string; win: RateLimitW
           {countdown && <span> · resets in {countdown}</span>}
         </span>
       </div>
+      {/* dim greys the bar on a stale reading (Decision 3), matching the sidebar
+          micro-meters and the admin table. */}
       <MeterTrack
         className="mt-1.5 h-2"
         label={label}
         fillPct={win.pct}
         valueText={`${win.pct}%${countdown ? `, resets in ${countdown}` : ""}`}
+        dim={dim}
       />
     </div>
   );
@@ -106,8 +119,8 @@ export function RateLimitCard() {
         <p className="mt-2 text-sm text-muted">{CARD_BLURB}</p>
       </div>
       <div>
-        <SettingsWindowRow label="5-hour window" win={data.five_hour} now={now} />
-        <SettingsWindowRow label="7-day window" win={data.seven_day} now={now} />
+        <SettingsWindowRow label="5-hour window" win={data.five_hour} now={now} dim={data.stale} />
+        <SettingsWindowRow label="7-day window" win={data.seven_day} now={now} dim={data.stale} />
       </div>
       {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
           this page leans on — clears WCAG AA 4.5:1 at 12px (web-ux finding). */}

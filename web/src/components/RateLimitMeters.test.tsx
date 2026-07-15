@@ -78,6 +78,12 @@ describe("RateLimitCard (Settings)", () => {
     // Percentages still shown; no live countdown when resets_at is null.
     expect(screen.getByText("31%")).toBeTruthy();
     expect(screen.queryByText(/resets in/)).toBeNull();
+    // Both meter bars grey out on a stale reading (Decision 3), like the sidebar
+    // and admin table.
+    const fills = ["5-hour window", "7-day window"].map(
+      (name) => screen.getByRole("progressbar", { name }).firstChild as HTMLElement,
+    );
+    for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
   });
 
   it("keeps a warn reading on the Live badge but paints the bar amber", async () => {
