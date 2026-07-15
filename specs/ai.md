@@ -5826,3 +5826,129 @@ Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisi
   cgroup v2; the run asserts the workers API returns populated `source: "cgroup"` stats after one
   heartbeat interval. An independent tester validated the hostile matrix (overflow/NaN/junk source →
   stats dropped, heartbeat still 200) live.
+
+## 235. Per-user Claude rate-limit meters — background poller + gauge row + read-endpoint split
+
+Serves human: Feature #53 (per-user Claude rate-limit visibility; human.md entry pending lead/user
+confirmation). Full design record: [prds/53-rate-limits.md](../prds/53-rate-limits.md) (D1–D7, the
+frozen DTO, accepted residuals). This file records only the shape and the reconciliations decided
+this session; the PRD is authoritative for rationale.
+
+- **Shape.** A background engine (`api/internal/usagepoller/`, cloned from `selfimprove.Engine`:
+  `Boot` immediate pass + `Run` ticker) polls each user holding an `anthropic_token` secret once per
+  `UZI_USAGE_POLL_INTERVAL`, asks Anthropic (usage endpoint first, 1-token Haiku header-probe
+  fallback via the net-new `api/internal/anthropic/` client), and upserts ONE gauge row per user
+  (`anthropic_rate_limits`, migration draft `00080` renumbered at landing). Read split mirrors PRD
+  #40: `GET /api/me/rate-limits` (own numbers) and `GET /api/admin/rate-limits` (everyone, under
+  `RequireAdmin`). SPA renders meters on the Settings card, the sidebar footer, and Admin → Rate
+  limits. The token never leaves the api container; the SPA sees only percentages (D1).
+- **Why server-side poll over on-demand-at-read.** A gauge that only refreshes when someone opens a
+  page would show nothing to the admin capacity view until each user visited; the ticker keeps every
+  user's row warm and bounds probe spend to one credential-check per interval.
+
+## 236. Vault gate keys on the OPEN OUTCOME, never a blanket `Unlocked()` pre-check
+
+Serves human: Feature #53; reconciles PRD #53 D3.
+
+- **Decision.** The poller decides skip-vs-poll from the RESULT of attempting to open each user's
+  token (skip only when `secretopen` returns `ErrVaultLocked`, i.e. `vault.ErrLocked` on a dek-sealed
+  token), NOT from a per-user `Unlocked()` guard before opening.
+- **Why.** A blanket `Unlocked()` pre-check would wrongly skip users whose token is
+  `sealed_with='master'` (legacy/master-sealed), which `vault.Open` can decrypt regardless of lock
+  state — those users must be polled while the vault is locked. Gating on the open outcome polls
+  master-sealed users and skips only genuinely unopenable dek-sealed ones, which is exactly D3. The
+  PRD's own text had a self-contradiction here; it was corrected in commit d118308 to match this.
+
+## 237. Fail-closed is scoped to utilization; a missing/unparseable reset stores null
+
+Serves human: Feature #53; reconciles PRD #53 D5 against the frozen DTO.
+
+- **Decision.** A missing/unparseable UTILIZATION fraction fails the WHOLE reading (no overwrite of
+  the last good row — fail closed). A missing/unparseable RESET timestamp does NOT fail; it stores
+  `null`, surfaced as `resets_at: null` in the DTO window.
+- **Why.** The frozen DTO defines `resets_at` as `epoch|null`, so a null reset is a valid reading,
+  not a failure — the percentage is still meaningful without a countdown. This is a deliberate
+  deviation from cc-statusline's stricter all-fields-or-nothing rule, justified by the DTO contract.
+
+## 238. `secretopen` factored out of `workersvc.openAnthropic`; bulk ciphertext listed in one query
+
+Serves human: Feature #53; realizes PRD #53's "factor that helper out of workersvc rather than
+duplicating it."
+
+- **Decision.** The Anthropic-token open path is extracted into a shared `secretopen` package with
+  exported sentinels `ErrNoSecret` / `ErrUndecryptable` / `ErrVaultLocked` and an `OpenSealed`
+  (the crypto half) plus a shared dispatch, reused by both `workersvc` and `usagepoller`.
+  `ListUsersWithAnthropicToken` returns `user_id` + ciphertext + `sealed_with` in ONE query (no
+  per-user N+1 select).
+- **Why.** One decrypt path means the vault-gate semantics (§236) can't drift between the worker and
+  the poller. Co-residency of many users' sealed ciphertexts in one query result was explicitly
+  audited and ruled a non-boundary: the bytes are still sealed, decrypt still gates per-user on the
+  DEK/master key.
+
+## 239. `no_token` derives from secret existence, never from gauge-row absence
+
+Serves human: Feature #53; reconciles PRD #53 D3b.
+
+- **Decision.** The `no_token` vs `unavailable` distinction is computed from whether an
+  `anthropic_token` secret EXISTS (`UserHasAnthropicToken` / a `has_token` EXISTS subquery), NOT from
+  the presence/absence of an `anthropic_rate_limits` row.
+- **Why.** Token deletion runs `DeleteRateLimits` (D3b), but if that delete ever failed or lagged, a
+  row-absence-based check could show a ghost meter for a token-less user, or hide a real token-holder
+  who has no reading yet. Deriving from secret existence makes a failed row-delete degrade to
+  `no_token` (correct), and a token-with-no-reading-yet resolve to `unavailable` (correct) —
+  never a ghost.
+
+## 240. Probe uses the `claude-haiku-4-5` alias, a pinned literal body, and hardcoded base URLs
+
+Serves human: Feature #53; realizes the PRD's "pinned probe body" + SSRF stance.
+
+- **Decision.** The header-probe model is the alias `claude-haiku-4-5` (auto-tracks the cheapest
+  Haiku; verified a valid model id). The probe request body is a pinned literal const
+  (`max_tokens: 1`, fixed innocuous "hi" string — never user or run content). The usage and Messages
+  base URLs are hardcoded consts with no env override.
+- **Why.** The alias means uzi never chases Haiku version bumps to keep the probe cheapest. A pinned
+  body guarantees no attacker-authorable text rides the probe. Hardcoded base URLs keep the SSRF
+  surface closed (no `UZI_` knob to redirect outbound Anthropic traffic); PRD #50's egress proxy, if
+  it lands, wraps this same client rather than adding a URL knob here.
+
+## 241. `cfg.UsagePollInterval` encodes both the on/off and the staleness signals — no separate bool
+
+Serves human: Feature #53; realizes PRD #53 D3's disabled-poller behavior.
+
+- **Decision.** A single `time.Duration` carries two meanings: `0` = poller disabled (readings are
+  always served but marked `stale: true`); `>0` = the effective (≥1m-clamped) interval, and `3×` it
+  is the server-side staleness window. No separate "enabled" bool.
+- **Why.** One field can't disagree with itself. A bool + duration could encode "enabled but
+  0-interval" or "disabled but 5m"; folding both into the duration makes the disabled-still-served
+  and the staleness-threshold behaviors fall out of the same value the operator sets.
+
+## 242. Web — shared `MeterTrack` lifted from `WorkerStats`; three surfaces; countdown-only; AA contrast
+
+Serves human: Feature #53; realizes M3 against the frozen DTO + the approved mockup, with the noted
+deviations from the mock.
+
+- **Decision.** `MeterTrack` is lifted out of `WorkerStats` into the shared UI, keeping the shipped
+  one-atom gauge styling (D6's toneFor thresholds: ok <80% ≤ warn <95% ≤ danger) rather than the
+  mockup's 1px-bordered bar. Rendered on three surfaces: Settings "Claude limits" card
+  (countdown-only — the mock's absolute reset time is dropped), sidebar-footer micro-meter, and the
+  Admin → Rate limits page. Stale readings dim the bars on ALL three surfaces, including the Settings
+  card.
+- **Contract & contrast decisions.** The admin DTO carries NO `is_admin` field — the frozen contract
+  stayed frozen, and the mockup's "· admin" row suffix was dropped rather than widen the DTO. For AA
+  contrast: data text (countdowns, "updated" timestamps) is promoted to `--muted`; de-emphasis text
+  (the "stale" label, admin-table emails) stays `--faint` per the existing table convention.
+- **Why.** Reusing the worker gauge gives one visual vocabulary for "resource nearly exhausted"
+  across the app (D6). Dropping mock elements that would have required contract or data changes keeps
+  the DTO frozen for M1/M3 parallelism; the contrast split satisfies AA without flattening the
+  established muted/faint hierarchy.
+
+## 243. e2e disables the poller and seeds the gauge row directly
+
+Serves human: Feature #53 + the testing-credentials policy (no live Anthropic in CI).
+
+- **Decision.** The isolated e2e stack sets `UZI_USAGE_POLL_INTERVAL=0` (poller off) and seeds an
+  `anthropic_rate_limits` row directly, then asserts the meters render, the admin sees the table, and
+  a member gets 403 on the admin endpoint.
+- **Why.** The isolated stack has no live Anthropic reachability and a hardcoded base URL, so a live
+  poll can't succeed; seeding the row is the established fixture pattern (cf. §234's stub-worker
+  approach) and exercises the read/render path deterministically without spending any token.
