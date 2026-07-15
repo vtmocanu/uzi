@@ -43,17 +43,24 @@ const backoffDuration = 15 * time.Minute
 const pokeBuffer = 64
 
 // Store is the query surface the engine needs. *store.Queries satisfies it.
+// ListUsersWithAnthropicToken returns each token's ciphertext + sealed_with so the
+// tick opens them in one pass (no per-user re-fetch); GetUserSecretCiphertext backs
+// the single-user poke path.
 type Store interface {
-	ListUsersWithAnthropicToken(ctx context.Context) ([]uuid.UUID, error)
+	ListUsersWithAnthropicToken(ctx context.Context) ([]store.ListUsersWithAnthropicTokenRow, error)
+	GetUserSecretCiphertext(ctx context.Context, arg store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
 	UpsertRateLimits(ctx context.Context, arg store.UpsertRateLimitsParams) error
 }
 
 // TokenOpener opens a user's Anthropic token via the vault path (PRD #53 D1/D3).
-// *secretopen.Opener satisfies it in production; tests inject a fake. It returns
-// secretopen.ErrVaultLocked for a locked dek-sealed vault (skip, keep the last
-// reading), and ErrNoSecret/ErrUndecryptable when the token is gone/undecryptable.
+// *secretopen.Opener satisfies it in production; tests inject a fake. OpenSealed is
+// the tick path (row already fetched); Open is the poke path (single-user lookup).
+// Both return secretopen.ErrVaultLocked for a locked dek-sealed vault (skip, keep
+// the last reading) and ErrNoSecret/ErrUndecryptable when the token is
+// gone/undecryptable.
 type TokenOpener interface {
 	Open(ctx context.Context, userID uuid.UUID, kind string) ([]byte, error)
+	OpenSealed(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error)
 }
 
 // Client reads rate-limit state from Anthropic. *anthropic.Client satisfies it.
@@ -129,8 +136,12 @@ func (e *Engine) Run(ctx context.Context) {
 			return
 		case userID := <-e.poke:
 			// A freshly saved token: ignore any prior backoff (the new credential may
-			// work where the old refused) and poll just this user.
-			e.pollUser(ctx, userID, true)
+			// work where the old refused) and poll just this user via a single-user
+			// lookup-open (the row wasn't part of a bulk list here).
+			uid := userID
+			e.pollUser(ctx, uid, true, func() ([]byte, error) {
+				return e.opener.Open(ctx, uid, store.KindAnthropicToken)
+			})
 		case <-ticker.C:
 			e.tickAll(ctx)
 		}
@@ -144,7 +155,7 @@ func (e *Engine) tickAll(ctx context.Context) {
 	tickCtx, cancel := context.WithTimeout(ctx, e.interval)
 	defer cancel()
 
-	users, err := e.store.ListUsersWithAnthropicToken(tickCtx)
+	rows, err := e.store.ListUsersWithAnthropicToken(tickCtx)
 	if err != nil {
 		e.logger.Error("usage poller: list users", "error", err)
 		return
@@ -152,29 +163,35 @@ func (e *Engine) tickAll(ctx context.Context) {
 
 	sem := make(chan struct{}, e.maxConc)
 	var wg sync.WaitGroup
-	for _, userID := range users {
+	for _, row := range rows {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(userID uuid.UUID) {
+		go func(row store.ListUsersWithAnthropicTokenRow) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			e.pollUser(tickCtx, userID, false)
-		}(userID)
+			// Open from the already-fetched row (no per-user re-fetch, no N+1). The
+			// ciphertext stays in this goroutine and is never logged.
+			e.pollUser(tickCtx, row.UserID, false, func() ([]byte, error) {
+				return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
+			})
+		}(row)
 	}
 	wg.Wait()
 }
 
 // pollUser polls one user, applying the D2 (usage-first, probe fallback) and D5
-// (fail-closed / backoff) rules. ignoreBackoff is set on the poke path so a
-// just-saved token is polled even if a prior credential was backed off.
-func (e *Engine) pollUser(ctx context.Context, userID uuid.UUID, ignoreBackoff bool) {
+// (fail-closed / backoff) rules. open resolves the user's token via the vault path
+// (bulk OpenSealed on the tick, single-user Open on the poke); ignoreBackoff is set
+// on the poke path so a just-saved token is polled even if a prior credential was
+// backed off.
+func (e *Engine) pollUser(ctx context.Context, userID uuid.UUID, ignoreBackoff bool, open func() ([]byte, error)) {
 	if ignoreBackoff {
 		e.clearBackoff(userID)
 	} else if e.inBackoff(userID) {
 		return
 	}
 
-	token, err := e.opener.Open(ctx, userID, store.KindAnthropicToken)
+	token, err := open()
 	if err != nil {
 		switch {
 		case errors.Is(err, secretopen.ErrVaultLocked):

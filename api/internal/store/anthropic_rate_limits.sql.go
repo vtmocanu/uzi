@@ -113,26 +113,34 @@ func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, erro
 }
 
 const listUsersWithAnthropicToken = `-- name: ListUsersWithAnthropicToken :many
-SELECT user_id FROM user_secrets WHERE kind = 'anthropic_token'
+SELECT user_id, ciphertext, sealed_with FROM user_secrets WHERE kind = 'anthropic_token'
 `
 
-// The user ids that hold an anthropic_token secret — the poller's per-tick work
-// set (PRD #53). It lists candidates only; whether the token can actually be
-// opened (vault unlocked, master-sealed exception) is decided per user at open
-// time, so a locked user still appears here and is skipped downstream (D3).
-func (q *Queries) ListUsersWithAnthropicToken(ctx context.Context) ([]uuid.UUID, error) {
+type ListUsersWithAnthropicTokenRow struct {
+	UserID     uuid.UUID `json:"user_id"`
+	Ciphertext []byte    `json:"ciphertext"`
+	SealedWith string    `json:"sealed_with"`
+}
+
+// The anthropic_token secrets to poll each tick (PRD #53): user id plus the sealed
+// ciphertext and its sealed_with, so the poller opens them in one pass instead of
+// re-fetching each ciphertext per user (N+1). The ciphertext is opened in-process
+// via the vault path and is never logged nor placed in any error string. Whether a
+// given token can actually be opened (vault unlocked, master-sealed exception) is
+// decided at open time, so a locked user still appears here and is skipped (D3).
+func (q *Queries) ListUsersWithAnthropicToken(ctx context.Context) ([]ListUsersWithAnthropicTokenRow, error) {
 	rows, err := q.db.Query(ctx, listUsersWithAnthropicToken)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []uuid.UUID{}
+	items := []ListUsersWithAnthropicTokenRow{}
 	for rows.Next() {
-		var user_id uuid.UUID
-		if err := rows.Scan(&user_id); err != nil {
+		var i ListUsersWithAnthropicTokenRow
+		if err := rows.Scan(&i.UserID, &i.Ciphertext, &i.SealedWith); err != nil {
 			return nil, err
 		}
-		items = append(items, user_id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

@@ -57,17 +57,28 @@ func Open(ctx context.Context, q Store, vlt *vault.Vault, box *secretbox.Box, us
 		}
 		return nil, fmt.Errorf("secretopen: lookup: %w", err)
 	}
+	return OpenSealed(vlt, box, userID, kind, secret.SealedWith, secret.Ciphertext)
+}
+
+// OpenSealed decrypts an already-fetched sealed row, without a DB lookup — the
+// path the rate-limit poller takes when it lists every token in one query (D1).
+// It is the crypto half of Open and shares the exact vault dispatch: a 'dek' row
+// needs the owner unlocked (ErrVaultLocked otherwise), a legacy 'master' row opens
+// under the master box regardless of lock state, and a nil vault opens under box
+// directly. There is no ErrNoSecret here — the caller already has the row. Open
+// errors never carry plaintext, so a decrypt failure collapses to ErrUndecryptable.
+func OpenSealed(vlt *vault.Vault, box *secretbox.Box, userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error) {
 	var plain []byte
+	var err error
 	if vlt != nil {
-		plain, err = vlt.Open(userID, kind, secret.SealedWith, secret.Ciphertext)
+		plain, err = vlt.Open(userID, kind, sealedWith, ciphertext)
 		if errors.Is(err, vault.ErrLocked) {
 			return nil, ErrVaultLocked
 		}
 	} else {
-		plain, err = box.Open(secret.Ciphertext)
+		plain, err = box.Open(ciphertext)
 	}
 	if err != nil {
-		// box/vault Open errors never carry plaintext; collapse to the sentinel.
 		return nil, ErrUndecryptable
 	}
 	return plain, nil
@@ -87,8 +98,14 @@ func NewOpener(q Store, vlt *vault.Vault, box *secretbox.Box) *Opener {
 	return &Opener{q: q, vlt: vlt, box: box}
 }
 
-// Open opens the user's secret of the given kind, returning the same sentinels as
-// the package-level Open.
+// Open opens the user's secret of the given kind with a DB lookup (the poke path:
+// one user, so N+1 is irrelevant), returning the same sentinels as package Open.
 func (o *Opener) Open(ctx context.Context, userID uuid.UUID, kind string) ([]byte, error) {
 	return Open(ctx, o.q, o.vlt, o.box, userID, kind)
+}
+
+// OpenSealed opens an already-fetched sealed row without a lookup (the tick path:
+// the ciphertext + sealed_with came from the bulk list query).
+func (o *Opener) OpenSealed(userID uuid.UUID, kind, sealedWith string, ciphertext []byte) ([]byte, error) {
+	return OpenSealed(o.vlt, o.box, userID, kind, sealedWith, ciphertext)
 }

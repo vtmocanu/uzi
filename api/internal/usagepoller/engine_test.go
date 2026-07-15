@@ -18,17 +18,24 @@ import (
 // --- fakes ---
 
 type fakeStore struct {
-	users []uuid.UUID
+	rows []store.ListUsersWithAnthropicTokenRow
 
 	mu      sync.Mutex
 	upserts map[uuid.UUID]store.UpsertRateLimitsParams
 }
 
 func newFakeStore(users ...uuid.UUID) *fakeStore {
-	return &fakeStore{users: users, upserts: map[uuid.UUID]store.UpsertRateLimitsParams{}}
+	rows := make([]store.ListUsersWithAnthropicTokenRow, 0, len(users))
+	for _, u := range users {
+		rows = append(rows, store.ListUsersWithAnthropicTokenRow{UserID: u, Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK})
+	}
+	return &fakeStore{rows: rows, upserts: map[uuid.UUID]store.UpsertRateLimitsParams{}}
 }
-func (f *fakeStore) ListUsersWithAnthropicToken(context.Context) ([]uuid.UUID, error) {
-	return f.users, nil
+func (f *fakeStore) ListUsersWithAnthropicToken(context.Context) ([]store.ListUsersWithAnthropicTokenRow, error) {
+	return f.rows, nil
+}
+func (f *fakeStore) GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
+	return store.GetUserSecretCiphertextRow{Ciphertext: []byte("ct"), SealedWith: store.SealedWithDEK}, nil
 }
 func (f *fakeStore) UpsertRateLimits(_ context.Context, arg store.UpsertRateLimitsParams) error {
 	f.mu.Lock()
@@ -53,7 +60,7 @@ type fakeOpener struct {
 	errs   map[uuid.UUID]error
 }
 
-func (f *fakeOpener) Open(_ context.Context, userID uuid.UUID, _ string) ([]byte, error) {
+func (f *fakeOpener) resolve(userID uuid.UUID) ([]byte, error) {
 	if f.errs != nil {
 		if e, ok := f.errs[userID]; ok {
 			return nil, e
@@ -63,6 +70,12 @@ func (f *fakeOpener) Open(_ context.Context, userID uuid.UUID, _ string) ([]byte
 		return tok, nil
 	}
 	return []byte("token"), nil
+}
+func (f *fakeOpener) Open(_ context.Context, userID uuid.UUID, _ string) ([]byte, error) {
+	return f.resolve(userID)
+}
+func (f *fakeOpener) OpenSealed(userID uuid.UUID, _ string, _ string, _ []byte) ([]byte, error) {
+	return f.resolve(userID)
 }
 
 type fakeClient struct {
@@ -309,11 +322,15 @@ func TestSuccessClearsBackoff(t *testing.T) {
 func TestPokeIgnoresBackoff(t *testing.T) {
 	u := uuid.New()
 	st := newFakeStore(u)
+	op := &fakeOpener{}
 	cl := &fakeClient{usage: func([]byte) (anthropic.Reading, error) { return reading(5, 5, anthropic.SourceUsageEndpoint), nil }}
-	e, _ := newEngine(t, st, &fakeOpener{}, cl, true)
+	e, _ := newEngine(t, st, op, cl, true)
 
 	e.setBackoff(u) // pretend a prior refusal armed the backoff
-	e.pollUser(context.Background(), u, true /* ignoreBackoff, as the poke path does */)
+	// Mirror the poke path: ignoreBackoff + a single-user lookup-open.
+	e.pollUser(context.Background(), u, true, func() ([]byte, error) {
+		return op.Open(context.Background(), u, store.KindAnthropicToken)
+	})
 
 	if _, ok := st.got(u); !ok {
 		t.Error("poke should poll despite the backoff")

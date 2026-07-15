@@ -3,6 +3,7 @@ package secretopen
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -54,6 +55,33 @@ func TestOpenUndecryptable(t *testing.T) {
 	_, err := Open(context.Background(), fakeStore{row: row}, nil, box, uuid.New(), "anthropic_token")
 	if !errors.Is(err, ErrUndecryptable) {
 		t.Fatalf("want ErrUndecryptable, got %v", err)
+	}
+}
+
+func TestOpenSealed(t *testing.T) {
+	box, _ := secretbox.New(key)
+	sealed, err := box.Seal([]byte("s3cr3t-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Round-trips a master-sealed row with no vault (the tick path).
+	plain, err := OpenSealed(nil, box, uuid.New(), "anthropic_token", store.SealedWithMaster, sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(plain) != "s3cr3t-token" {
+		t.Fatalf("plaintext = %q, want s3cr3t-token", plain)
+	}
+
+	// A bad ciphertext returns ErrUndecryptable, and the ciphertext bytes must not
+	// leak into the error string (auditor: ciphertext out of every error).
+	bad := []byte("BADCIPHERTEXT-sentinel-bytes")
+	_, err = OpenSealed(nil, box, uuid.New(), "anthropic_token", store.SealedWithMaster, bad)
+	if !errors.Is(err, ErrUndecryptable) {
+		t.Fatalf("want ErrUndecryptable, got %v", err)
+	}
+	if strings.Contains(err.Error(), string(bad)) {
+		t.Fatalf("error leaked the ciphertext: %q", err.Error())
 	}
 }
 
