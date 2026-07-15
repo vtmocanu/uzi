@@ -1,0 +1,77 @@
+{{- if .Values.web.enabled }}
+{{- $svc := .Values.web.nginx.apiServiceName -}}
+{{- $port := .Values.web.nginx.apiPort -}}
+{{- $ns := .Release.Namespace -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uzi.fullname" . }}-web-nginx
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+data:
+  # k8s variant of web/nginx.conf. DIFFERENCE FROM COMPOSE: X-Forwarded-For is
+  # APPENDED ($proxy_add_x_forwarded_for), not OVERWRITTEN ($remote_addr) — the
+  # immediate client here is the ingress-nginx controller, and overwriting would
+  # collapse every user into one per-IP auth rate-limit bucket + lose client IPs.
+  # ingress-nginx is the outermost overwriting hop; the api trusts these hops via
+  # TRUSTED_PROXIES. Same-origin / no-CORS is preserved (proxy to the `api` Service).
+  default.conf: |
+    server {
+        listen 8080;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'" always;
+    {{ if .Values.web.nginx.dynamicResolution }}
+        # Runtime Service resolution: re-resolve the api Service name per request so
+        # a Service recreate (new ClusterIP) is picked up without a web restart.
+        resolver {{ .Values.web.nginx.resolver }} valid=30s;
+    {{ end }}
+        # Live-run WebSocket. Dedicated exact-match so the Upgrade/Connection headers
+        # stay OFF the plain REST proxy. Host forwarded as $http_host (with port) so
+        # the api's same-origin Origin-vs-Host check holds. Long read timeout keeps an
+        # idle-but-live socket alive (ingress-nginx also raised to 3600s).
+        location = /api/ws {
+    {{ if .Values.web.nginx.dynamicResolution }}
+            set $api_ws_upstream {{ $svc }}.{{ $ns }}.svc.cluster.local:{{ $port }};
+            proxy_pass http://$api_ws_upstream$request_uri;
+    {{ else }}
+            proxy_pass http://{{ $svc }}:{{ $port }};
+    {{ end }}
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 3600s;
+        }
+
+        # Same-origin API reverse proxy. XFF is APPENDED (see the header comment); the
+        # api reads the real client from it only for hops inside TRUSTED_PROXIES.
+        location /api/ {
+    {{ if .Values.web.nginx.dynamicResolution }}
+            set $api_upstream {{ $svc }}.{{ $ns }}.svc.cluster.local:{{ $port }};
+            proxy_pass http://$api_upstream$request_uri;
+    {{ else }}
+            proxy_pass http://{{ $svc }}:{{ $port }};
+    {{ end }}
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # SPA fallback: any non-file route serves index.html for client routing.
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+    }
+{{- end }}

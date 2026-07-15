@@ -1,0 +1,13 @@
+{{- if and .Values.api.enabled .Values.api.config }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "uzi.fullname" . }}-api-config
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+data:
+  {{- range $k, $v := .Values.api.config }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+{{- end }}
