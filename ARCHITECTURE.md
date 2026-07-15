@@ -312,6 +312,24 @@ only** (`kind`, `created_at`, `updated_at`); there is no reveal endpoint, and
 no admin path to another user's secret value. See
 [docs/anthropic-token.md](docs/anthropic-token.md) for the user-facing flow.
 
+## Claude rate-limit visibility (PRD #53)
+
+A background engine (`api/internal/usagepoller`, cloned from the same
+`Boot`+`Run`+ticker shape as the self-improvement engine) ticks on
+`UZI_USAGE_POLL_INTERVAL` and, for each user holding an Anthropic token it
+can currently open, asks Anthropic for that account's 5-hour/7-day
+rate-limit windows — Anthropic's free usage endpoint first, falling back to
+a 1-token header probe only when the endpoint refuses the credential — and
+upserts one gauge row per user (`anthropic_rate_limits`, no history, D4).
+Two read endpoints (`GET /api/me/rate-limits`, self-scoped; `GET
+/api/admin/rate-limits`, every user) serve the same frozen DTO, and the SPA
+renders it as meters in three places: a Settings card, a sidebar
+micro-meter, and an Admin → Rate limits table. See
+[prds/53-rate-limits.md](prds/53-rate-limits.md) (especially its Design
+Decisions) for the full rationale, including the vault-locked staleness
+rule and the failure/backoff semantics; user-facing behavior is in
+[docs/rate-limits.md](docs/rate-limits.md).
+
 ## Agent runtime: workers, runs, live view
 
 uzi's third surface is the one that acts: a per-user worker container claims

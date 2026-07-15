@@ -30,6 +30,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/jointoken"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/toolprofile"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
@@ -552,37 +553,28 @@ var errRunVanished = errors.New("run vanished before claim assembly")
 var errVaultLocked = errors.New("vault locked during claim")
 
 // openAnthropic opens the owner's decrypted Anthropic token — the one secret both
-// the run lane and the chat lane deliver. With the vault wired (production), route
-// through vault.Open on the row's sealed_with: a 'dek' row needs the owner's vault
-// unlocked, and a lock that landed after the claim gate surfaces as vault.ErrLocked
-// → errVaultLocked (requeue, never fail). A legacy 'master' row opens under the
-// master box without an unlock (the claim gate is what withholds a locked owner's
-// runs; the master box is not DEK-protected). Nil vault (tests) opens under the
-// master box directly. A missing/undecryptable token is errCredentialUnavailable.
+// the run lane and the chat lane deliver. The vault-dispatch logic (dek needs
+// unlock, legacy master opens regardless, nil vault → master box) lives in
+// secretopen, shared with the rate-limit poller (PRD #53); this method maps its
+// sentinels back to workersvc's domain errors, preserving the exact prior
+// behavior: a lock surfaces as errVaultLocked (requeue, never fail), and a
+// missing/undecryptable token as errCredentialUnavailable with its original
+// failure-reason text (which never includes secret bytes).
 func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID) ([]byte, error) {
-	secret, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
-		UserID: userID,
-		Kind:   store.KindAnthropicToken,
-	})
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
-		}
-		return nil, fmt.Errorf("anthropic secret lookup: %w", err)
-	}
-	var anthropic []byte
-	if s.vlt != nil {
-		anthropic, err = s.vlt.Open(userID, store.KindAnthropicToken, secret.SealedWith, secret.Ciphertext)
-		if errors.Is(err, vault.ErrLocked) {
-			return nil, errVaultLocked
-		}
-	} else {
-		anthropic, err = s.box.Open(secret.Ciphertext)
-	}
-	if err != nil {
+	tok, err := secretopen.Open(ctx, s.q, s.vlt, s.box, userID, store.KindAnthropicToken)
+	switch {
+	case err == nil:
+		return tok, nil
+	case errors.Is(err, secretopen.ErrVaultLocked):
+		return nil, errVaultLocked
+	case errors.Is(err, secretopen.ErrNoSecret):
+		return nil, fmt.Errorf("%w: no Anthropic token configured for this user", errCredentialUnavailable)
+	case errors.Is(err, secretopen.ErrUndecryptable):
 		return nil, fmt.Errorf("%w: Anthropic token could not be decrypted", errCredentialUnavailable)
+	default:
+		// A DB lookup/internal error, surfaced verbatim (carries no secret bytes).
+		return nil, err
 	}
-	return anthropic, nil
 }
 
 // assembleClaim builds the claim payload for an already-claimed run.

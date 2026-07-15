@@ -185,3 +185,13 @@ See [judge.md](judge.md) and [self-improvement.md](self-improvement.md) for what
 |---|---|---|
 | `JUDGE_RATE_LIMIT_MAX` / `JUDGE_RATE_LIMIT_WINDOW` | `60` / `1m` | Per-user limiter on the "re-run judge" action. Dedicated budget, separate from `CHAT_RATE_LIMIT_MAX`/`_WINDOW` — re-running the judge and chatting don't share an allowance. |
 | `UZI_SELFIMPROVE_CHECK_INTERVAL` | `1h` | How often the self-improvement engine **wakes** to check whether a cycle is due — the wake cadence, not the improvement interval itself (that's the `selfimprove_interval` admin setting, default `48h`). A boot pass runs immediately when enabled, so a cycle that came due while the API was down fires promptly rather than waiting a full interval. `0` disables the engine entirely (no boot pass, no loop). |
+
+## Claude rate limits (PRD #53)
+
+See [rate-limits.md](rate-limits.md) for what the meters show. The background poller reads each user's Anthropic 5-hour/7-day rate-limit windows with their own token; see [ARCHITECTURE.md](../ARCHITECTURE.md) for the poller design.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_USAGE_POLL_INTERVAL` | `5m` | How often the poller ticks. `0` disables the engine entirely (existing rows are still served, always marked stale). A nonzero value below `1m` is clamped up to `1m` with a boot warning — the header-probe fallback spends a user's own Anthropic tokens, so a too-tight interval is a footgun, not a convenience. |
+| `UZI_USAGE_PROBE` | `true` | `false` disables the ~1-token header-probe fallback entirely; affected users (whose credential the free usage endpoint refuses) then show `unavailable` instead of a reading. See [rate-limits.md](rate-limits.md#the-probe-and-turning-it-off) for the token-cost accounting. |
+| `UZI_ANTHROPIC_HTTP_TIMEOUT` | `15s` | Hard per-call timeout on every outbound request to Anthropic (usage endpoint and header probe), mirroring `FORGE_HTTP_TIMEOUT`'s and `UZI_OIDC_HTTP_TIMEOUT`'s posture. |

@@ -1,0 +1,300 @@
+<title>uzi · Claude rate limits — mock</title>
+<style>
+  /* uzi "ember" tokens, verbatim from web/src/index.css. The app is
+     deliberately dark-only (a dark factory), so this mock commits to dark. */
+  :root {
+    --bg: 8 10 15;
+    --surface: 15 18 26;
+    --raised: 23 27 38;
+    --edge: 39 45 60;
+    --edge-strong: 58 66 86;
+    --fg: 228 232 240;
+    --muted: 148 158 176;
+    --faint: 100 110 130;
+    --brand: 251 146 60;
+    --brand-hover: 253 186 116;
+    --on-brand: 26 16 8;
+    --ok: 52 211 153;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --info: 56 189 248;
+    --radius: 0.625rem;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  html { background: rgb(var(--bg)); }
+  body {
+    margin: 0; padding: 2.5rem 1.25rem 4rem;
+    background: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: var(--font-sans);
+    font-size: 15px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 60rem; margin: 0 auto; display: flex; flex-direction: column; gap: 2.75rem; }
+
+  /* ── page header ── */
+  .eyebrow {
+    font-size: 0.6875rem; letter-spacing: 0.14em; text-transform: uppercase;
+    color: rgb(var(--brand)); font-weight: 600; margin: 0 0 0.5rem;
+  }
+  h1 { font-size: 1.75rem; font-weight: 700; margin: 0 0 0.625rem; text-wrap: balance; letter-spacing: -0.01em; }
+  .lede { color: rgb(var(--muted)); max-width: 46rem; margin: 0; }
+  .lede code { font-family: var(--font-mono); font-size: 0.85em; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 4px; padding: 0.05em 0.35em; }
+
+  /* ── mock frames ── */
+  .frame { display: flex; flex-direction: column; gap: 0.875rem; }
+  .frame-cap { display: flex; align-items: baseline; gap: 0.625rem; flex-wrap: wrap; }
+  .frame-cap .where {
+    font-family: var(--font-mono); font-size: 0.6875rem; letter-spacing: 0.08em;
+    text-transform: uppercase; color: rgb(var(--on-brand));
+    background: rgb(var(--brand)); border-radius: 999px; padding: 0.2rem 0.65rem; font-weight: 700;
+  }
+  .frame-cap h2 { font-size: 1.0625rem; font-weight: 650; margin: 0; }
+  .frame-cap .note { color: rgb(var(--faint)); font-size: 0.8125rem; }
+  .stage {
+    background: rgb(var(--surface));
+    border: 1px solid rgb(var(--edge));
+    border-radius: calc(var(--radius) + 4px);
+    padding: 1.75rem; overflow-x: auto;
+  }
+
+  /* ── uzi primitives (Card, SectionTitle, Badge) ── */
+  .card {
+    background: rgb(var(--raised) / 0.55);
+    border: 1px solid rgb(var(--edge));
+    border-radius: var(--radius);
+    padding: 1.25rem 1.375rem;
+  }
+  .sect { font-size: 0.8125rem; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: rgb(var(--muted)); margin: 0 0 0.25rem; }
+  .sub { color: rgb(var(--faint)); font-size: 0.8125rem; margin: 0 0 1.125rem; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    font-size: 0.6875rem; font-weight: 600; border-radius: 999px;
+    padding: 0.125rem 0.55rem; border: 1px solid; white-space: nowrap;
+  }
+  .badge .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+  .badge.ok      { color: rgb(var(--ok));     border-color: rgb(var(--ok) / 0.35);     background: rgb(var(--ok) / 0.10); }
+  .badge.warn    { color: rgb(var(--warn));   border-color: rgb(var(--warn) / 0.35);   background: rgb(var(--warn) / 0.10); }
+  .badge.danger  { color: rgb(var(--danger)); border-color: rgb(var(--danger) / 0.35); background: rgb(var(--danger) / 0.10); }
+  .badge.neutral { color: rgb(var(--muted));  border-color: rgb(var(--edge));          background: rgb(var(--raised)); }
+
+  /* ── the meter (adapted from WorkerStats' Bar) ── */
+  .meter { display: flex; flex-direction: column; gap: 0.375rem; }
+  .meter + .meter { margin-top: 1rem; }
+  .meter .row { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .meter .win { font-size: 0.8125rem; font-weight: 600; color: rgb(var(--fg)); }
+  .meter .win small { color: rgb(var(--faint)); font-weight: 400; margin-left: 0.4rem; }
+  .meter .val { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 0.8125rem; color: rgb(var(--muted)); white-space: nowrap; }
+  .meter .val b { color: rgb(var(--fg)); font-weight: 650; }
+  .track { height: 8px; border-radius: 999px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge) / 0.6); overflow: hidden; }
+  .fill { height: 100%; border-radius: 999px; }
+  .fill.ok     { background: rgb(var(--ok)); }
+  .fill.warn   { background: rgb(var(--warn)); }
+  .fill.danger { background: rgb(var(--danger)); }
+  .synced { display: flex; align-items: center; gap: 0.5rem; margin-top: 1.125rem; color: rgb(var(--faint)); font-size: 0.75rem; }
+
+  /* ── sidebar-footer micro mock ── */
+  .side { width: 17rem; background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: var(--radius); overflow: hidden; }
+  .side .navrow { display: flex; align-items: center; gap: 0.625rem; padding: 0.5rem 0.875rem; color: rgb(var(--muted)); font-size: 0.8438rem; }
+  .side .navrow.dim { color: rgb(var(--faint)); }
+  .side .foot { border-top: 1px solid rgb(var(--edge)); padding: 0.75rem 0.875rem; display: flex; flex-direction: column; gap: 0.625rem; background: rgb(var(--raised) / 0.4); }
+  .side .who { display: flex; align-items: center; gap: 0.625rem; }
+  .avatar { width: 30px; height: 30px; border-radius: 999px; background: rgb(var(--brand) / 0.2); color: rgb(var(--brand)); display: grid; place-items: center; font-size: 0.75rem; font-weight: 700; flex: none; }
+  .who .nm { font-size: 0.8125rem; font-weight: 600; line-height: 1.2; }
+  .who .rl { font-size: 0.6875rem; color: rgb(var(--faint)); }
+  .micro { display: grid; grid-template-columns: 1.4rem 1fr 2.6rem; align-items: center; gap: 0.5rem; font-size: 0.6875rem; }
+  .micro .lab { color: rgb(var(--faint)); font-family: var(--font-mono); }
+  .micro .val { color: rgb(var(--muted)); font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
+  .micro .track { height: 5px; }
+
+  /* ── admin table ── */
+  table { border-collapse: collapse; width: 100%; min-width: 46rem; font-size: 0.8438rem; }
+  thead th {
+    text-align: left; font-size: 0.6875rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: rgb(var(--faint)); font-weight: 600; padding: 0 0.875rem 0.625rem;
+    border-bottom: 1px solid rgb(var(--edge));
+  }
+  tbody td { padding: 0.8125rem 0.875rem; border-bottom: 1px solid rgb(var(--edge) / 0.55); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.user { white-space: nowrap; }
+  td.user .nm { font-weight: 600; }
+  td.user .em { color: rgb(var(--faint)); font-size: 0.75rem; }
+  .cellbar { display: grid; grid-template-columns: minmax(5rem, 9rem) 3rem 5.5rem; align-items: center; gap: 0.625rem; }
+  .cellbar .pct { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
+  .cellbar .rst { color: rgb(var(--faint)); font-size: 0.75rem; white-space: nowrap; }
+  .cellbar .track { height: 6px; }
+  td .none { color: rgb(var(--faint)); }
+  td.sync { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 0.75rem; color: rgb(var(--faint)); white-space: nowrap; }
+
+  /* ── how-it-updates strip ── */
+  .how { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.875rem; }
+  .how .step { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: var(--radius); padding: 1rem 1.125rem; }
+  .how .k { font-family: var(--font-mono); font-size: 0.6875rem; color: rgb(var(--brand)); letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; margin: 0 0 0.375rem; }
+  .how p { margin: 0; color: rgb(var(--muted)); font-size: 0.8125rem; }
+  .how code { font-family: var(--font-mono); font-size: 0.85em; color: rgb(var(--fg)); }
+
+  @media (max-width: 640px) { .stage { padding: 1rem; } body { padding-top: 1.5rem; } }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">vtmocanu/uzi · design mock · not implemented yet</p>
+    <h1>Claude usage limits, per user</h1>
+    <p class="lede">Anthropic enforces two account-wide windows — <b>5-hour</b> and <b>7-day</b> — but nothing in uzi shows them today, so a run can hit a wall mid-flight. A background poller reads each user's own utilization every 5 minutes with their stored token; every user sees their own two meters, admins see the whole factory. Tones follow uzi's worker-gauge thresholds: <span class="badge ok"><span class="dot"></span>ok</span> under 80%, <span class="badge warn"><span class="dot"></span>80%+</span>, <span class="badge danger"><span class="dot"></span>95%+</span>.</p>
+  </header>
+
+  <!-- ── Frame A: user view ── -->
+  <section class="frame">
+    <div class="frame-cap">
+      <span class="where">every user</span>
+      <h2>Settings → Account &amp; token</h2>
+      <span class="note">new card under the Anthropic-token card · also summarized on the Dashboard</span>
+    </div>
+    <div class="stage">
+      <div class="card" style="max-width: 34rem;">
+        <p class="sect">Claude limits</p>
+        <p class="sub">Live utilization of your Anthropic account's rate-limit windows. Runs queue when a window is exhausted; they resume after the reset.</p>
+
+        <div class="meter">
+          <div class="row">
+            <span class="win">5-hour window <small>resets 11:40</small></span>
+            <span class="val"><b>8%</b> · resets in 1h 23m</span>
+          </div>
+          <div class="track"><div class="fill ok" style="width: 8%"></div></div>
+        </div>
+
+        <div class="meter">
+          <div class="row">
+            <span class="win">7-day window <small>resets Wed 12:30</small></span>
+            <span class="val"><b>47%</b> · resets in 2d 4h</span>
+          </div>
+          <div class="track"><div class="fill ok" style="width: 47%"></div></div>
+        </div>
+
+        <div class="synced">
+          <span class="badge ok"><span class="dot"></span>Live</span>
+          <span>updated 2 min ago · refreshes every 5 min</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Frame B: sidebar footer ── -->
+  <section class="frame">
+    <div class="frame-cap">
+      <span class="where">every user</span>
+      <h2>Sidebar footer micro-meter</h2>
+      <span class="note">always visible, next to the vault badge — the at-a-glance version</span>
+    </div>
+    <div class="stage" style="display:flex; gap:2rem; flex-wrap:wrap; align-items:flex-start;">
+      <div class="side">
+        <div class="navrow dim">⌂&ensp;Overview</div>
+        <div class="navrow dim">▦&ensp;Boards</div>
+        <div class="navrow dim">▶&ensp;Runs</div>
+        <div class="navrow dim">⚙&ensp;Settings</div>
+        <div class="foot">
+          <div class="who">
+            <span class="avatar">RA</span>
+            <span>
+              <span class="nm">radu</span><br>
+              <span class="rl">member · vault unlocked</span>
+            </span>
+          </div>
+          <div class="micro">
+            <span class="lab">5h</span>
+            <div class="track"><div class="fill warn" style="width: 62%"></div></div>
+            <span class="val">62%</span>
+          </div>
+          <div class="micro">
+            <span class="lab">7d</span>
+            <div class="track"><div class="fill warn" style="width: 83%"></div></div>
+            <span class="val">83%</span>
+          </div>
+        </div>
+      </div>
+      <p style="max-width: 22rem; margin:0; color: rgb(var(--faint)); font-size: 0.8125rem;">The footer already pins the signed-in user and vault badge; two 5px bars slot under it. Hover shows the reset countdowns. When a window crosses 95% the bar goes danger — same visual language as a failing worker gauge.</p>
+    </div>
+  </section>
+
+  <!-- ── Frame C: admin view ── -->
+  <section class="frame">
+    <div class="frame-cap">
+      <span class="where">admins only</span>
+      <h2>Admin → Rate limits</h2>
+      <span class="note">new page beside Admin → Users · same table conventions</span>
+    </div>
+    <div class="stage">
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>5-hour window</th>
+            <th>7-day window</th>
+            <th>Status</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="user"><span class="nm">vlad</span><br><span class="em">vlad@example.com · admin</span></td>
+            <td><div class="cellbar"><div class="track"><div class="fill ok" style="width:8%"></div></div><span class="pct">8%</span><span class="rst">1h 23m</span></div></td>
+            <td><div class="cellbar"><div class="track"><div class="fill ok" style="width:47%"></div></div><span class="pct">47%</span><span class="rst">2d 4h</span></div></td>
+            <td><span class="badge ok"><span class="dot"></span>Live</span></td>
+            <td class="sync">2m ago</td>
+          </tr>
+          <tr>
+            <td class="user"><span class="nm">radu</span><br><span class="em">radu@example.com</span></td>
+            <td><div class="cellbar"><div class="track"><div class="fill warn" style="width:62%"></div></div><span class="pct">62%</span><span class="rst">44m</span></div></td>
+            <td><div class="cellbar"><div class="track"><div class="fill warn" style="width:83%"></div></div><span class="pct">83%</span><span class="rst">1d 9h</span></div></td>
+            <td><span class="badge ok"><span class="dot"></span>Live</span></td>
+            <td class="sync">3m ago</td>
+          </tr>
+          <tr>
+            <td class="user"><span class="nm">ana</span><br><span class="em">ana@example.com</span></td>
+            <td><div class="cellbar"><div class="track"><div class="fill danger" style="width:97%"></div></div><span class="pct">97%</span><span class="rst">2h 10m</span></div></td>
+            <td><div class="cellbar"><div class="track"><div class="fill ok" style="width:71%"></div></div><span class="pct">71%</span><span class="rst">4d 1h</span></div></td>
+            <td><span class="badge danger"><span class="dot"></span>5h nearly out</span></td>
+            <td class="sync">1m ago</td>
+          </tr>
+          <tr>
+            <td class="user"><span class="nm">mihai</span><br><span class="em">mihai@example.com</span></td>
+            <td><div class="cellbar"><div class="track"><div class="fill ok" style="width:31%; opacity:.45"></div></div><span class="pct" style="opacity:.55">31%</span><span class="rst">stale</span></div></td>
+            <td><div class="cellbar"><div class="track"><div class="fill ok" style="width:12%; opacity:.45"></div></div><span class="pct" style="opacity:.55">12%</span><span class="rst">stale</span></div></td>
+            <td><span class="badge neutral">🔒 vault locked</span></td>
+            <td class="sync">3h ago</td>
+          </tr>
+          <tr>
+            <td class="user"><span class="nm">irina</span><br><span class="em">irina@example.com</span></td>
+            <td><span class="none">—</span></td>
+            <td><span class="none">—</span></td>
+            <td><span class="badge neutral">no token</span></td>
+            <td class="sync">—</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ── how it updates ── -->
+  <section class="frame">
+    <div class="frame-cap"><h2>How the numbers get there</h2></div>
+    <div class="how">
+      <div class="step">
+        <p class="k">1 · poll</p>
+        <p>A backend engine (modeled on the self-improve poller) ticks every <code>UZI_USAGE_POLL_INTERVAL</code> (default 5m). It lists users holding an <code>anthropic_token</code> secret and skips anyone whose vault is locked — their last reading stays, marked stale.</p>
+      </div>
+      <div class="step">
+        <p class="k">2 · probe</p>
+        <p>Per user it tries the free <code>/api/oauth/usage</code> endpoint first; if that credential is refused (429 for setup-tokens), it sends a minimal Haiku request (<code>max_tokens:&nbsp;1</code>) and reads the <code>anthropic-ratelimit-unified-*</code> response headers. Worst case ≈ 1 token per user per 5 min.</p>
+      </div>
+      <div class="step">
+        <p class="k">3 · store &amp; serve</p>
+        <p>One row per user (5h%, 7d%, resets, <code>synced_at</code>). <code>GET /api/me/rate-limits</code> returns your own; <code>GET /api/admin/rate-limits</code> returns everyone's, admin-gated. The SPA re-reads on its normal 10s visible-poll.</p>
+      </div>
+    </div>
+  </section>
+
+</div>

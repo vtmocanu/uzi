@@ -123,6 +123,20 @@ type Config struct {
 	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
 	// connections get a report immediately.
 	PrivilegeCheckInterval time.Duration
+	// UsagePollInterval is the per-user Claude rate-limit poll cadence (PRD #53).
+	// Default 5m; 0 disables the engine entirely (no Boot pass, no loop). A nonzero
+	// value below 1m is clamped up to 1m with a boot warning — the header-probe
+	// fallback spends the user's own tokens, so a tight interval is a footgun (D2).
+	UsagePollInterval time.Duration
+	// UsageProbe enables the ~1-token Messages header probe fallback (PRD #53 D2).
+	// Default true; false makes users the free usage endpoint refuses show
+	// `unavailable` rather than spend a token. A security/spend control, so a
+	// set-but-malformed value aborts boot (same stance as the other kill-switches).
+	UsageProbe bool
+	// AnthropicHTTPTimeout bounds every outbound Anthropic call (usage endpoint +
+	// header probe), mirroring OIDCHTTPTimeout/ForgeHTTPTimeout/SlackHTTPTimeout so
+	// a slow or unreachable Anthropic can never hang the poller. Default 15s.
+	AnthropicHTTPTimeout time.Duration
 	// SelfimproveCheckInterval is how often the self-improvement engine WAKES to
 	// check whether a cycle is due (PRD #46 Decision 9). It is the tick cadence, NOT
 	// the improvement interval — "due" is the durable selfimprove_last_run_at +
@@ -342,6 +356,24 @@ func Load() (Config, error) {
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)
 	cfg.SelfimproveCheckInterval = parseNonNegDuration("UZI_SELFIMPROVE_CHECK_INTERVAL", time.Hour)
+
+	// Per-user Claude rate-limit poller (PRD #53). parseNonNegDuration (not
+	// parseDuration): 0 is legitimate — it disables the engine. A nonzero value
+	// below the 1m floor is clamped up, because the header-probe fallback spends the
+	// user's own tokens and a tight interval multiplies that spend (D2).
+	cfg.UsagePollInterval = parseNonNegDuration("UZI_USAGE_POLL_INTERVAL", 5*time.Minute)
+	if cfg.UsagePollInterval > 0 && cfg.UsagePollInterval < time.Minute {
+		slog.Warn("UZI_USAGE_POLL_INTERVAL is below the 1m floor; clamping up (the header probe spends users' own Anthropic tokens, so a tight interval is a footgun)",
+			"configured", cfg.UsagePollInterval.String(),
+			"clamped_to", time.Minute.String())
+		cfg.UsagePollInterval = time.Minute
+	}
+	usageProbe, err := parseBool("UZI_USAGE_PROBE", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.UsageProbe = usageProbe
+	cfg.AnthropicHTTPTimeout = parseDuration("UZI_ANTHROPIC_HTTP_TIMEOUT", 15*time.Second)
 
 	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)

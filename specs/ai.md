@@ -5827,6 +5827,132 @@ Full Decision Log in `prds/49-worker-resource-stats.md`. The load-bearing decisi
   heartbeat interval. An independent tester validated the hostile matrix (overflow/NaN/junk source →
   stats dropped, heartbeat still 200) live.
 
+## 235. Per-user Claude rate-limit meters — background poller + gauge row + read-endpoint split
+
+Serves human: Feature #53 (per-user Claude rate-limit visibility; human.md entry pending lead/user
+confirmation). Full design record: [prds/53-rate-limits.md](../prds/53-rate-limits.md) (D1–D7, the
+frozen DTO, accepted residuals). This file records only the shape and the reconciliations decided
+this session; the PRD is authoritative for rationale.
+
+- **Shape.** A background engine (`api/internal/usagepoller/`, cloned from `selfimprove.Engine`:
+  `Boot` immediate pass + `Run` ticker) polls each user holding an `anthropic_token` secret once per
+  `UZI_USAGE_POLL_INTERVAL`, asks Anthropic (usage endpoint first, 1-token Haiku header-probe
+  fallback via the net-new `api/internal/anthropic/` client), and upserts ONE gauge row per user
+  (`anthropic_rate_limits`, migration draft `00080` renumbered at landing). Read split mirrors PRD
+  #40: `GET /api/me/rate-limits` (own numbers) and `GET /api/admin/rate-limits` (everyone, under
+  `RequireAdmin`). SPA renders meters on the Settings card, the sidebar footer, and Admin → Rate
+  limits. The token never leaves the api container; the SPA sees only percentages (D1).
+- **Why server-side poll over on-demand-at-read.** A gauge that only refreshes when someone opens a
+  page would show nothing to the admin capacity view until each user visited; the ticker keeps every
+  user's row warm and bounds probe spend to one credential-check per interval.
+
+## 236. Vault gate keys on the OPEN OUTCOME, never a blanket `Unlocked()` pre-check
+
+Serves human: Feature #53; reconciles PRD #53 D3.
+
+- **Decision.** The poller decides skip-vs-poll from the RESULT of attempting to open each user's
+  token (skip only when `secretopen` returns `ErrVaultLocked`, i.e. `vault.ErrLocked` on a dek-sealed
+  token), NOT from a per-user `Unlocked()` guard before opening.
+- **Why.** A blanket `Unlocked()` pre-check would wrongly skip users whose token is
+  `sealed_with='master'` (legacy/master-sealed), which `vault.Open` can decrypt regardless of lock
+  state — those users must be polled while the vault is locked. Gating on the open outcome polls
+  master-sealed users and skips only genuinely unopenable dek-sealed ones, which is exactly D3. The
+  PRD's own text had a self-contradiction here; it was corrected in commit d118308 to match this.
+
+## 237. Fail-closed is scoped to utilization; a missing/unparseable reset stores null
+
+Serves human: Feature #53; reconciles PRD #53 D5 against the frozen DTO.
+
+- **Decision.** A missing/unparseable UTILIZATION fraction fails the WHOLE reading (no overwrite of
+  the last good row — fail closed). A missing/unparseable RESET timestamp does NOT fail; it stores
+  `null`, surfaced as `resets_at: null` in the DTO window.
+- **Why.** The frozen DTO defines `resets_at` as `epoch|null`, so a null reset is a valid reading,
+  not a failure — the percentage is still meaningful without a countdown. This is a deliberate
+  deviation from cc-statusline's stricter all-fields-or-nothing rule, justified by the DTO contract.
+
+## 238. `secretopen` factored out of `workersvc.openAnthropic`; bulk ciphertext listed in one query
+
+Serves human: Feature #53; realizes PRD #53's "factor that helper out of workersvc rather than
+duplicating it."
+
+- **Decision.** The Anthropic-token open path is extracted into a shared `secretopen` package with
+  exported sentinels `ErrNoSecret` / `ErrUndecryptable` / `ErrVaultLocked` and an `OpenSealed`
+  (the crypto half) plus a shared dispatch, reused by both `workersvc` and `usagepoller`.
+  `ListUsersWithAnthropicToken` returns `user_id` + ciphertext + `sealed_with` in ONE query (no
+  per-user N+1 select).
+- **Why.** One decrypt path means the vault-gate semantics (§236) can't drift between the worker and
+  the poller. Co-residency of many users' sealed ciphertexts in one query result was explicitly
+  audited and ruled a non-boundary: the bytes are still sealed, decrypt still gates per-user on the
+  DEK/master key.
+
+## 239. `no_token` derives from secret existence, never from gauge-row absence
+
+Serves human: Feature #53; reconciles PRD #53 D3b.
+
+- **Decision.** The `no_token` vs `unavailable` distinction is computed from whether an
+  `anthropic_token` secret EXISTS (`UserHasAnthropicToken` / a `has_token` EXISTS subquery), NOT from
+  the presence/absence of an `anthropic_rate_limits` row.
+- **Why.** Token deletion runs `DeleteRateLimits` (D3b), but if that delete ever failed or lagged, a
+  row-absence-based check could show a ghost meter for a token-less user, or hide a real token-holder
+  who has no reading yet. Deriving from secret existence makes a failed row-delete degrade to
+  `no_token` (correct), and a token-with-no-reading-yet resolve to `unavailable` (correct) —
+  never a ghost.
+
+## 240. Probe uses the `claude-haiku-4-5` alias, a pinned literal body, and hardcoded base URLs
+
+Serves human: Feature #53; realizes the PRD's "pinned probe body" + SSRF stance.
+
+- **Decision.** The header-probe model is the alias `claude-haiku-4-5` (auto-tracks the cheapest
+  Haiku; verified a valid model id). The probe request body is a pinned literal const
+  (`max_tokens: 1`, fixed innocuous "hi" string — never user or run content). The usage and Messages
+  base URLs are hardcoded consts with no env override.
+- **Why.** The alias means uzi never chases Haiku version bumps to keep the probe cheapest. A pinned
+  body guarantees no attacker-authorable text rides the probe. Hardcoded base URLs keep the SSRF
+  surface closed (no `UZI_` knob to redirect outbound Anthropic traffic); PRD #50's egress proxy, if
+  it lands, wraps this same client rather than adding a URL knob here.
+
+## 241. `cfg.UsagePollInterval` encodes both the on/off and the staleness signals — no separate bool
+
+Serves human: Feature #53; realizes PRD #53 D3's disabled-poller behavior.
+
+- **Decision.** A single `time.Duration` carries two meanings: `0` = poller disabled (readings are
+  always served but marked `stale: true`); `>0` = the effective (≥1m-clamped) interval, and `3×` it
+  is the server-side staleness window. No separate "enabled" bool.
+- **Why.** One field can't disagree with itself. A bool + duration could encode "enabled but
+  0-interval" or "disabled but 5m"; folding both into the duration makes the disabled-still-served
+  and the staleness-threshold behaviors fall out of the same value the operator sets.
+
+## 242. Web — shared `MeterTrack` lifted from `WorkerStats`; three surfaces; countdown-only; AA contrast
+
+Serves human: Feature #53; realizes M3 against the frozen DTO + the approved mockup, with the noted
+deviations from the mock.
+
+- **Decision.** `MeterTrack` is lifted out of `WorkerStats` into the shared UI, keeping the shipped
+  one-atom gauge styling (D6's toneFor thresholds: ok <80% ≤ warn <95% ≤ danger) rather than the
+  mockup's 1px-bordered bar. Rendered on three surfaces: Settings "Claude limits" card
+  (countdown-only — the mock's absolute reset time is dropped), sidebar-footer micro-meter, and the
+  Admin → Rate limits page. Stale readings dim the bars on ALL three surfaces, including the Settings
+  card.
+- **Contract & contrast decisions.** The admin DTO carries NO `is_admin` field — the frozen contract
+  stayed frozen, and the mockup's "· admin" row suffix was dropped rather than widen the DTO. For AA
+  contrast: data text (countdowns, "updated" timestamps) is promoted to `--muted`; de-emphasis text
+  (the "stale" label, admin-table emails) stays `--faint` per the existing table convention.
+- **Why.** Reusing the worker gauge gives one visual vocabulary for "resource nearly exhausted"
+  across the app (D6). Dropping mock elements that would have required contract or data changes keeps
+  the DTO frozen for M1/M3 parallelism; the contrast split satisfies AA without flattening the
+  established muted/faint hierarchy.
+
+## 243. e2e disables the poller and seeds the gauge row directly
+
+Serves human: Feature #53 + the testing-credentials policy (no live Anthropic in CI).
+
+- **Decision.** The isolated e2e stack sets `UZI_USAGE_POLL_INTERVAL=0` (poller off) and seeds an
+  `anthropic_rate_limits` row directly, then asserts the meters render, the admin sees the table, and
+  a member gets 403 on the admin endpoint.
+- **Why.** The isolated stack has no live Anthropic reachability and a hardcoded base URL, so a live
+  poll can't succeed; seeding the row is the established fixture pattern (cf. §234's stub-worker
+  approach) and exercises the read/render path deterministically without spending any token.
+
 # PRD #52 — CI/CD: real pipeline, tag releases, ArgoCD deploy to dev-cluster
 
 Serves the human requirement: real CI/CD (pipeline, tag-driven versioning, ArgoCD deploy to
@@ -5838,7 +5964,7 @@ nearly verbatim and adapted to uzi's three-toolchain monorepo (Go `api`, Vite/Re
 SEPARATE Draft MR to `argo-apps`); M6 (cut a real tag, live-deploy, verify) and all
 platform-admin execution are OUT of scope and only documented. The load-bearing decisions:
 
-## 235. Bespoke `.gitlab-ci.yml`, four stages, demo trigger preserved (Decision 1, M1)
+## 244. Bespoke `.gitlab-ci.yml`, four stages, demo trigger preserved (Decision 1, M1)
 
 - **Bespoke pipeline, not the `myorg/pipelines` `simple-app.yml` include.** That include assumes one
   image, docker-build-as-artifact, a fixed check set; uzi needs three toolchains, two images (one with
@@ -5847,8 +5973,8 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
   hardened jobs nearly verbatim.
 - **Stages `validate → test → build → publish`.** validate = api `go vet`/`go build`/sqlc-drift,
   web typecheck/check-docs, agent typecheck, helm lint/template; test = `go test`, vitest, agent
-  `node --test`; build = kaniko `--no-push` validation of both images (§236); publish = tag-only
-  image push + OCI chart push (§237). Digest-pinned job images, lockfile-keyed caches,
+  `node --test`; build = kaniko `--no-push` validation of both images (§245); publish = tag-only
+  image push + OCI chart push (§246). Digest-pinned job images, lockfile-keyed caches,
   `interruptible: true` + `needs: []` DAG, `workflow.auto_cancel` on superseded validate/test.
 - **`workflow.rules` admit MR / default-branch / tag PLUS `$UZI_CI_DEMO_FAIL == "1"`.** example-app's rules
   stop at the first three and would silently drop the `glab ci run -b <branch> --variables
@@ -5857,12 +5983,12 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
   demonstrable); `demo-fail` is re-pinned `image: alpine:3.20` (M1 dropped the top-level default image,
   so an imageless job would go red as a config error, not the intended `exit 1`).
 - **validate/test job templates carry `rules: - if: '$UZI_CI_DEMO_FAIL != "1"'`** so a demo pipeline
-  runs ONLY `demo-fail` — cleaner PRD #6 demo, and it applies the self-gating principle (§236) to the
+  runs ONLY `demo-fail` — cleaner PRD #6 demo, and it applies the self-gating principle (§245) to the
   real gates too. Plain feature-branch pushes (no MR) stop producing pipelines (example-app behavior); safe
   because uzi's CI-status feature reads pipeline status via MR/branch queries (`api/internal/forge`),
   not per-push and not stage names — so renaming `lint`/`smoke` → `validate`/`test` is safe.
 
-## 236. Harbor push creds NEVER reach unprotected-ref (agent-authored MR) pipelines (Decision 2, M3/M4)
+## 245. Harbor push creds NEVER reach unprotected-ref (agent-authored MR) pipelines (Decision 2, M3/M4)
 
 - **The stricter-than-example-app trust boundary — the load-bearing CI security decision.** uzi's core loop
   opens agent-authored MRs (model-written code that CAN edit `.gitlab-ci.yml`), and MR pipelines
@@ -5884,7 +6010,7 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
   segregated, so image-LAYER caching lives on the Harbor protected-write cache repo, never a GitLab
   cache path an MR could write; Go/npm caches self-verify via go.sum/lockfile and are safe to share.
 
-## 237. Model B versioning — tag == chart version == appVersion, asserted atomically (Decision 3, M4)
+## 246. Model B versioning — tag == chart version == appVersion, asserted atomically (Decision 3, M4)
 
 - **Release = push git tag `vX.Y.Z`.** Chart `version` and `appVersion` in `deploy/chart/Chart.yaml`
   must both equal the tag with the `v` stripped (`VERSION="${CI_COMMIT_TAG#v}"`). `publish:assert-version`
@@ -5894,12 +6020,12 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
   the chart at `oci://harbor.example.com/gitlab/vtmocanu/uzi/uzi:<version>`.** Both image tags default
   to the chart appVersion in the templates (`.Values.{api,web}.image.tag | default .Chart.AppVersion`)
   — example-app's single-image Model B mechanism, doubled. ArgoCD's `targetRevision` is that chart version,
-  bumped per release via an MR to `argo-apps` (§242) — explicit reviewable deploy over
+  bumped per release via an MR to `argo-apps` (§251) — explicit reviewable deploy over
   latest-tracking, one release mechanism for all future clusters.
 - **`helm registry login --password-stdin`** (not `-p "$HARBOR_PASSWORD"`) keeps the password out of
   process argv on the OCI push.
 
-## 238. CNPG for Postgres, pinned to the dev-cluster operator's support (Decision 4, M2)
+## 247. CNPG for Postgres, pinned to the dev-cluster operator's support (Decision 4, M2)
 
 - **Postgres is a CNPG `Cluster`, not the compose `postgres:17` container** — org standard, operator
   already on dev-cluster (in the `appset.cloudnative-pg.yaml` generator). Realized as the vendored
@@ -5909,14 +6035,14 @@ platform-admin execution are OUT of scope and only documented. The load-bearing 
   commented out. Dev sizing: `instances: 1`, storageClass `storage-class`. **Backups default OFF**; enabling
   is a documented toggle (S3 creds InfisicalSecret + the `barmanObjectStore` block, bucket convention
   `s3://postgres-dev-cluster`) deferred, not wired, this run.
-- **Postgres image `cloudnative-pg/postgresql:16.3`.** The MM CNPG fleet is MIXED (16.2 most
-  common; 16.3, 16.4, 16.10 all in use) with no single dev-02 convention; 16.3 was chosen because it is
-  confirmed-mirrored in Harbor via other MM apps and fleet-consistent — the real goal is a mirrored
-  tag, so 16.2/16.4/16.10 would be equally valid. The `cluster.postgresql: "16"` major matches. Harbor
-  tag presence MUST still be confirmed before M6. (Correction: an earlier "16.4 referenced nowhere /
-  16.3 is THE convention" claim was imprecise; recorded here as the mixed-fleet truth.)
+- **Postgres image `cloudnative-pg/postgresql:16.4`.** The MM CNPG fleet standardizes on 16.x
+  (16.2 most common; example-app-2 on dev-02 uses 16.4) with no single dev-02 convention; the real goal is
+  a Harbor-mirrored tag. 16.4 is pinned because it is confirmed present in `cloudnative-pg`
+  (`crane ls`, pre-M6 check 2026-07-15; 16.10 also available, **16.3 is NOT mirrored**). The
+  `cluster.postgresql: "16"` major matches. (An earlier draft pinned 16.3 on the assumption it was
+  mirrored; the pre-M6 crane check disproved that and moved the pin to 16.4.)
 
-## 239. Chart topology + the compose→k8s adaptations (M2)
+## 248. Chart topology + the compose→k8s adaptations (M2)
 
 Chart (`deploy/chart/`) = `web` (Deployment/Service/Ingress) + `api` (Deployment/Service) + the CNPG
 `cluster` subchart + `InfisicalSecret`s. No worker/agent deployed (Decision 5: workers stay opt-in,
@@ -5953,7 +6079,7 @@ runner; per-package tests + `helm template` are the CI gate; M8 stretch revisits
 - **Ingress `uzi.example.com`, `ingressClassName: nginx`, no per-host TLS block** — dev-cluster
   serves a `*.example.com` default wildcard cert, matching existing apps.
 
-## 240. NetworkPolicy is the load-bearing control against in-cluster XFF spoofing (hardening)
+## 249. NetworkPolicy is the load-bearing control against in-cluster XFF spoofing (hardening)
 
 - **Beyond the PRD's adaptation list: an api NetworkPolicy** (`api-networkpolicy.yaml`) — default-deny
   ingress, allow ONLY web pods → api:8080. Rationale: dev-cluster is SHARED
@@ -5962,30 +6088,30 @@ runner; per-package tests + `helm template` are the CI gate; M8 stretch revisits
   (`middleware/ratelimit.go` `ClientIP` honors XFF from trusted CIDRs) → unthrottled auth brute-force +
   forged audit IPs. example-app has no such policy because it runs on the non-shared mgmt cluster. This is
   the mandatory, load-bearing control; TRUSTED_PROXIES narrowing is the second layer.
-- **`TRUSTED_PROXIES` narrowed to `100.64.0.0/10`** (the platform/Antrea pod net, validation-wave
-  confirmed) — dropped the blanket `10/8,172.16/12,192.168/16`. With the NetworkPolicy in place only
-  the web pod can deliver XFF anyway.
-- **`api.networkPolicy.probeCIDRs` knob, default `[]`.** A default-deny ingress policy also drops
-  KUBELET health probes (node IP / host-network, unmatchable by podSelector); on platform/Antrea that
-  drops the api startupProbe → never Ready → CrashLoop. Left EMPTY here (chart renders, M6 sets it);
-  BEFORE M6 it must be set to the dev-cluster node InternalIP CIDR OR the CNI confirmed to exempt probe
-  traffic. That node CIDR must stay OUT of TRUSTED_PROXIES so a host-network probe source can't spoof
-  XFF. Enforcement is CNI-dependent (Antrea enforces by default on platform — confirm at M6); if ingress-
-  nginx runs host-network its node IP is the rightmost XFF hop and, being outside `100.64/10`, would
-  collapse rate-limit buckets (over-throttle, fails closed) — add the ingress node CIDR to
-  TRUSTED_PROXIES if so.
+- **`TRUSTED_PROXIES` narrowed to the dev-cluster pod CIDR `10.244.0.0/16`** (the kube-controller-
+  manager pod range; the pod-networked ingress-nginx controller falls inside it — confirmed on-cluster
+  by the pre-M6 check 2026-07-15) — dropped the blanket `10/8,172.16/12`. With the NetworkPolicy in
+  place only the web pod can deliver XFF anyway.
+- **`api.networkPolicy.probeCIDRs` knob (chart default `[]`).** A default-deny ingress policy also
+  drops KUBELET health probes (node IP / host-network, unmatchable by podSelector); on platform/Antrea
+  that drops the api startupProbe → never Ready → CrashLoop. The dev-cluster values SET it to the node
+  InternalIP CIDR (`192.0.2.0/24`, all nodes confirmed on-cluster 2026-07-15). That node CIDR is kept
+  OUT of TRUSTED_PROXIES so a host-network probe source can't spoof XFF. Enforcement is CNI-dependent
+  (Antrea enforces by default on platform — verify at M6 live-deploy); if ingress-nginx runs host-network
+  its node IP is the rightmost XFF hop and, being outside `192.168/16`, would collapse rate-limit
+  buckets (over-throttle, fails closed) — add the ingress node CIDR to TRUSTED_PROXIES if so.
 - **LOW hardenings applied:** CNPG `enableSuperuserAccess: false` (app uses `-app` role),
   `enablePDB: false` (single-instance dev — a PDB can wedge node drains), `automountServiceAccountToken:
   false` on api + web (neither needs the k8s API), InfisicalSecret `syncWave: "-10"` on both entries
   (cut first-deploy ImagePullBackOff/api-CrashLoop churn; self-heal is the real mechanism).
 
-## 241. Platform/admin steps — documented, NOT executed this run (M5)
+## 250. Platform/admin steps — documented, NOT executed this run (M5)
 
 Each mirrors a example-app step and is captured in `deploy/README.md`; none was executed (scope stops before
 M6):
 
 - **Harbor CI creds protected + masked** on `vtmocanu/uzi` (robot injected by the GitLab↔Harbor
-  integration) — the runtime side of Decision 2 (§236). **Scope the Harbor robot push-only on
+  integration) — the runtime side of Decision 2 (§245). **Scope the Harbor robot push-only on
   `gitlab/vtmocanu/uzi/*`** (no delete, no cross-project) to contain the accepted protected-ref residual.
 - **Protected `v*` tags = MAINTAINER-create-only (exclude Developers).** The agent/worker PAT has
   Developer role; creating a `v*` tag is the one path by which it could reach the tag-pipeline push
@@ -5997,10 +6123,10 @@ M6):
   existing `vtmocanu-repo-creds` group-prefix template (verify, no new token).
 - **Release runbook ordering:** bump `Chart.yaml` version/appVersion in an MR → merge → tag THAT
   (already-merged) commit, so its default-branch pipeline warmed the Harbor layer cache (cold cache =
-  slower publish, not a failure) and `assert-version` (§237) holds. Rollback = revert the argo
+  slower publish, not a failure) and `assert-version` (§246) holds. Rollback = revert the argo
   `targetRevision` MR.
 
-## 242. ArgoCD app lands as an MR to argo-apps, never a push (human requirement, M5)
+## 251. ArgoCD app lands as an MR to argo-apps, never a push (human requirement, M5)
 
 - **`argo-apps/apps/uzi/{prj.uzi.yaml,app.uzi.yaml}`**, delivered as a SEPARATE Draft MR
   (`!294`) to the argo repo — the user's explicit "for ArgoCD we do an MR, not a push to main". These
@@ -6011,10 +6137,13 @@ M6):
   `uzi`; automated sync with prune + selfHeal + `CreateNamespace`; explicit `sourceRepos` in
   `prj.uzi.yaml`; the OCI `repoURL` omits the `oci://` scheme (chart-parity).
 
-## 243. Deferred to pre-M6 — documented, not executed (scope boundary of this run)
+## 252. Pre-M6 status — on-cluster fact-checks DONE; live deploy + admin steps REMAIN
 
-Recorded in `deploy/README.md` as the M6 gate, none executed: confirm the dev-cluster pod CIDR ⊆
-`100.64.0.0/10`; set `probeCIDRs` to the node CIDR (or confirm CNI probe exemption); confirm Antrea
-NetworkPolicy enforcement; confirm the `postgresql:16.3` tag is mirrored in `cloudnative-pg`;
-DNS for `uzi.example.com` (or wildcard coverage); ArgoCD OCI repo cred; and all platform-admin
-steps in §241. M8 (e2e in CI) remains a stretch, explicitly not a blocker.
+The pre-M6 network/image fact-checks were executed on-cluster 2026-07-15 and their results baked into
+`deploy/values/dev-cluster.yaml`: pod CIDR confirmed `10.244.0.0/16`, `probeCIDRs` set to the node
+CIDR `192.0.2.0/24`, Antrea NetworkPolicy enforcement confirmed, `postgresql:16.4` mirror confirmed
+via `crane ls`. What REMAINS for M6 (recorded in `deploy/README.md` as the M6 gate): the live deploy
+itself, plus the platform-admin steps needing elevated access — Harbor cred injection, protected `v*`
+tags (Maintainer-create-only), Harbor robot push-only scope, the Infisical `/uzi` folder, the ArgoCD
+OCI repo cred, and DNS for `uzi.example.com` (§250). M8 (e2e in CI) remains a stretch, explicitly
+not a blocker.

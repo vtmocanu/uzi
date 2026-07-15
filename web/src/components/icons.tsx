@@ -67,6 +67,15 @@ export const ActivityIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+// Gauge (lucide) — the Admin → Rate limits nav glyph (PRD #53): a needle in a dial,
+// reading "utilization".
+export const GaugeIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="m12 14 4-4" />
+    <path d="M3.34 19a10 10 0 1 1 17.32 0" />
+  </Icon>
+);
+
 export const BotIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <rect x="4" y="8" width="16" height="12" rx="2" />

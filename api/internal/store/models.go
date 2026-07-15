@@ -38,6 +38,16 @@ type AgentTemplateAllocation struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type AnthropicRateLimit struct {
+	UserID           uuid.UUID          `json:"user_id"`
+	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
+	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
+	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
+	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
+	Source           pgtype.Text        `json:"source"`
+	SyncedAt         pgtype.Timestamptz `json:"synced_at"`
+}
+
 type AppSetting struct {
 	Key       string             `json:"key"`
 	Value     string             `json:"value"`

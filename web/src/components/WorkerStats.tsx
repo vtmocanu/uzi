@@ -9,6 +9,7 @@
 // and label a process-source sample "worker process only".
 
 import { cx } from "./ui";
+import { MeterTrack } from "./Meter";
 import type { Worker } from "../lib/api";
 
 const KIB = 1024;
@@ -48,27 +49,6 @@ function pctOf(used: number, limit: number | null): number | null {
   return (used / limit) * 100;
 }
 
-/** Clamp a percentage to a DOM-safe [0,100] bar width — the server accepts up to
- *  6400% cpu_pct, so the bar must never overflow its track (PRD #49 Decision 6). */
-function clampPct(pct: number): number {
-  return Math.max(0, Math.min(100, pct));
-}
-
-/** Warn ≥80%, danger ≥95% (PRD #49 Decision 6). Applied to both bars by their fill
- *  fraction: a worker pinning its CPU allowance is as worth flagging as one near its
- *  memory limit. */
-function toneFor(pct: number): "ok" | "warn" | "danger" {
-  if (pct >= 95) return "danger";
-  if (pct >= 80) return "warn";
-  return "ok";
-}
-
-const FILL: Record<"ok" | "warn" | "danger", string> = {
-  ok: "bg-ok",
-  warn: "bg-warn",
-  danger: "bg-danger",
-};
-
 /** True once the worker has reported a usable sample. The single source of truth for
  *  "does this worker have stats to render" — the gauges, the compact line, and the
  *  Dashboard fleet card's filter all gate on this, so no surface can disagree about
@@ -78,11 +58,10 @@ export function hasStats(w: Worker): boolean {
 }
 
 function Bar({ label, value, valueText, fillPct }: { label: string; value: string; valueText: string; fillPct: number }) {
-  // Tone, width, and aria-valuenow all key off the same clamped, rounded integer, so
-  // the colour can never disagree with the percentage the label shows (a 94.99% that
-  // rounds to "95%" is danger, not warn).
-  const now = Math.round(clampPct(fillPct));
-  const tone = toneFor(now);
+  // The label row; MeterTrack (shared with the PRD #53 rate-limit meters) is the
+  // accessible bar itself, keying tone/width/aria-valuenow off one clamped, rounded
+  // integer. valueText is read by a screen reader instead of the bare "N percent":
+  // the byte figures for memory, and "no reading yet" for a first-tick CPU.
   return (
     <div>
       <div className="flex items-center justify-between text-xs">
@@ -91,20 +70,7 @@ function Bar({ label, value, valueText, fillPct }: { label: string; value: strin
         <span className="text-muted">{label}</span>
         <span className="tabular-nums text-muted">{value}</span>
       </div>
-      <div
-        className="mt-1 h-1.5 overflow-hidden rounded-full bg-raised"
-        role="progressbar"
-        aria-label={label}
-        aria-valuenow={now}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        // A screen reader reads valuetext instead of the bare "N percent": the byte
-        // figures for memory, and "no reading yet" for a first-tick CPU (aria-valuenow
-        // is 0 there, which alone would be misread as genuine 0% usage).
-        aria-valuetext={valueText}
-      >
-        <div className={cx("h-full rounded-full", FILL[tone])} style={{ width: `${now}%` }} />
-      </div>
+      <MeterTrack className="mt-1 h-1.5" label={label} fillPct={fillPct} valueText={valueText} />
     </div>
   );
 }
