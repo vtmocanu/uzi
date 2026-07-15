@@ -204,17 +204,17 @@ would wrongly skip master-sealed users (reconciled with D3 at review);
   failing request's error string must not contain the token). Validation:
   with a real token in a dev stack, the row appears within one Boot pass and
   matches the account's real numbers.
-- [ ] **M2 — API: read endpoints**: `ratelimits.go` handlers + DTOs + routes
+- [x] **M2 — API: read endpoints**: `ratelimits.go` handlers + DTOs + routes
   (self + admin), `stale`/`no_token`/`unavailable` states, row deletion on
   token delete (D3b). Go tests: role gating (403 non-admin), shape per the
   frozen contract, stale computation, deleted-token returns `no_token` with
   no ghost row. Validation: `curl` both endpoints as member and admin.
-- [ ] **M3 — Web: meters everywhere**: shared `Meter`, Settings card, sidebar
+- [x] **M3 — Web: meters everywhere**: shared `Meter`, Settings card, sidebar
   micro-meter, Admin page + route + nav, api client + mocks; vitest for
   toneFor thresholds and the five row states (live/warn+danger/stale/no
   token/unavailable); typecheck green. Validation: mock mode reproduces all
   mockup frames; live mode shows real numbers.
-- [ ] **M4 — Docs + polish**: `docs/rate-limits.md`, configuration doc, the
+- [x] **M4 — Docs + polish**: `docs/rate-limits.md`, configuration doc, the
   ARCHITECTURE.md pointer; `check-docs.mjs` green. Validation: page renders
   in-app under /docs.
 - [ ] **M5 — E2E + landing**: e2e happy path (seeded token fixture → meters
