@@ -37,7 +37,9 @@ same numbers per account):
 
 A background poller (modeled on the self-improve engine) ticks every
 `UZI_USAGE_POLL_INTERVAL` (default 5m). Each tick it lists users holding an
-`anthropic_token` secret, skips those whose vault is locked, opens the token,
+`anthropic_token` secret, skips those whose dek-sealed token cannot be opened
+while the vault is locked (master-sealed tokens are polled regardless, D3),
+opens the token,
 asks Anthropic (usage endpoint first, header-probe fallback), and upserts one
 row per user. Two read endpoints mirror the PRD #40 usage split: users get
 their own numbers, admins get everyone's. The SPA renders meters in three
@@ -102,7 +104,9 @@ places (mockup): a **Settings card**, a **sidebar-footer micro-meter**, and an
   `GetRateLimits` (one user), `ListRateLimits` (join users for email/name;
   admin), `DeleteRateLimits` (D3b).
 - **`api/internal/usagepoller/`** — engine cloned from
-  `selfimprove.Engine` (`Boot` + `Run` + ticker; `VaultGate.Unlocked` check;
+  `selfimprove.Engine` (`Boot` + `Run` + ticker; vault gate on the OPEN OUTCOME —
+skip only on `vault.ErrLocked`, never a blanket `Unlocked()` pre-check, which
+would wrongly skip master-sealed users (reconciled with D3 at review);
   `settings.Cache` not needed — env-only knobs). Per user: open token via the
   same vault path as `workersvc.openAnthropic` (factor that helper out of
   workersvc rather than duplicating it), call the client, upsert. Bounded
@@ -119,7 +123,9 @@ places (mockup): a **Settings card**, a **sidebar-footer micro-meter**, and an
   `UZI_ANTHROPIC_HTTP_TIMEOUT` (default 15s; the newer `UZI_`-prefixed knob
   convention, cf. `UZI_OIDC_HTTP_TIMEOUT`). Utilization fractions floor+clamp
   to 0–100 ints; ISO resets from the usage endpoint parse to epochs; any
-  missing field fails the whole reading (fail closed, D5). Errors are
+  missing UTILIZATION fails the whole reading (fail closed, D5) — a
+  missing/unparseable reset stores `null`, as the frozen DTO's
+  `resets_at: <epoch|null>` requires (reconciled at review). Errors are
   constructed from status code + a sanitized body excerpt — never from the
   request — so no error path can carry the token (pinned by an M1 test).
   PRD #50's egress proxy, if it lands later, wraps this same client.
@@ -184,7 +190,7 @@ places (mockup): a **Settings card**, a **sidebar-footer micro-meter**, and an
 
 ## Milestones
 
-- [ ] **M1 — API: client + poller + storage**: migration (draft `00080`),
+- [x] **M1 — API: client + poller + storage**: migration (draft `00080`),
   `anthropic` client (usage + probe, pinned probe body, fraction→pct,
   fail-closed parsing, sanitized errors), `usagepoller` engine (vault gate
   incl. master-sealed exception, Boot immediate pass, poke-on-token-save,
@@ -198,22 +204,24 @@ places (mockup): a **Settings card**, a **sidebar-footer micro-meter**, and an
   failing request's error string must not contain the token). Validation:
   with a real token in a dev stack, the row appears within one Boot pass and
   matches the account's real numbers.
-- [ ] **M2 — API: read endpoints**: `ratelimits.go` handlers + DTOs + routes
+- [x] **M2 — API: read endpoints**: `ratelimits.go` handlers + DTOs + routes
   (self + admin), `stale`/`no_token`/`unavailable` states, row deletion on
   token delete (D3b). Go tests: role gating (403 non-admin), shape per the
   frozen contract, stale computation, deleted-token returns `no_token` with
   no ghost row. Validation: `curl` both endpoints as member and admin.
-- [ ] **M3 — Web: meters everywhere**: shared `Meter`, Settings card, sidebar
+- [x] **M3 — Web: meters everywhere**: shared `Meter`, Settings card, sidebar
   micro-meter, Admin page + route + nav, api client + mocks; vitest for
   toneFor thresholds and the five row states (live/warn+danger/stale/no
   token/unavailable); typecheck green. Validation: mock mode reproduces all
   mockup frames; live mode shows real numbers.
-- [ ] **M4 — Docs + polish**: `docs/rate-limits.md`, configuration doc, the
+- [x] **M4 — Docs + polish**: `docs/rate-limits.md`, configuration doc, the
   ARCHITECTURE.md pointer; `check-docs.mjs` green. Validation: page renders
   in-app under /docs.
-- [ ] **M5 — E2E + landing**: e2e happy path (seeded token fixture → meters
+- [x] **M5 — E2E + landing**: e2e happy path (seeded token fixture → meters
   render; admin sees the table, member gets 403 on the admin endpoint);
-  migration renumbered to the live head; PRD moved to `prds/done/`.
+  migration renumbered to the live head (`00080` → `00065`, next free above
+  `00064`). The move of this file to `prds/done/` happens post-merge per repo
+  convention (cf. PRD #49).
 
 ## Milestone dependency / parallelization
 

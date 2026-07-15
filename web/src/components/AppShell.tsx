@@ -13,6 +13,7 @@ import { api, MOCK_MODE, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
+import { SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import {
   ActivityIcon,
@@ -23,6 +24,7 @@ import {
   ChatIcon,
   ChevronRightIcon,
   FactoryIcon,
+  GaugeIcon,
   GearIcon,
   PackageIcon,
   GitIcon,
@@ -317,6 +319,13 @@ function SidebarContent({
           <NavGroup label="Admin" collapsed={collapsed}>
             <NavItem to="/admin/users" icon={<UsersIcon />} label="Users" onNavigate={onNavigate} collapsed={collapsed} />
             <NavItem
+              to="/admin/rate-limits"
+              icon={<GaugeIcon />}
+              label="Rate limits"
+              onNavigate={onNavigate}
+              collapsed={collapsed}
+            />
+            <NavItem
               to="/admin/tool-allowlist"
               icon={<PackageIcon />}
               label="Tool allowlist"
@@ -405,6 +414,9 @@ function SidebarContent({
                   <LogOutIcon />
                 </button>
               </div>
+              {/* Claude rate-limit micro-meters (PRD #53): two 5px bars under the
+                  user block. Self-gates — renders nothing without a live reading. */}
+              <SidebarRateLimits />
             </div>
           ))}
       </div>

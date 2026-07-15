@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/anthropic"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
@@ -32,12 +33,14 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/privcheck"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/runlifecycle"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/secretopen"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/seed"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/selfimprove"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/usagepoller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -398,6 +401,27 @@ func run() error {
 		slog.Info("self-improvement engine disabled (UZI_SELFIMPROVE_CHECK_INTERVAL=0)")
 	}
 
+	// Per-user Claude rate-limit poller (PRD #53): each tick it polls every
+	// token-holding user's two Anthropic windows (free usage endpoint first, ~1-token
+	// header probe fallback) and upserts one gauge row per user. The token opener is
+	// the same vault path the run lane uses (secretopen), so a locked owner is
+	// skipped and a master-sealed token still polled. 0 disables it entirely; the
+	// Boot pass runs inside the goroutine (poller precedent) so a slow Anthropic can't
+	// delay serve. Held in an outer var so the token-save handler can poke it (D3b).
+	var usageEngine *usagepoller.Engine
+	if cfg.UsagePollInterval > 0 {
+		anthropicClient := anthropic.New(&http.Client{Timeout: cfg.AnthropicHTTPTimeout})
+		usageEngine = usagepoller.New(q, secretopen.NewOpener(q, vlt, box), anthropicClient, cfg.UsagePollInterval, cfg.UsageProbe, slog.Default())
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			usageEngine.Boot(ctx)
+			usageEngine.Run(ctx)
+		}()
+	} else {
+		slog.Info("usage poller disabled (UZI_USAGE_POLL_INTERVAL=0)")
+	}
+
 	authLimiter := mw.NewLimiter(cfg.RateLimitMax, cfg.RateLimitWindow, cfg.TrustedProxies)
 	forgeLimiter := mw.NewLimiter(cfg.ForgeRateLimitMax, cfg.ForgeRateLimitWindow, cfg.TrustedProxies)
 	// Dedicated tighter budget for the two Slack-DM-triggering /me/slack endpoints
@@ -429,6 +453,12 @@ func run() error {
 	// Wire the notifications write seam (PRD #46 M2) for future producers (the judge,
 	// M4). The M2 read endpoints don't need it; this makes the seam available.
 	h.SetNotifier(notifier)
+	// Wire the rate-limit poller so saving/replacing an Anthropic token pokes it for
+	// an immediate poll (PRD #53 D3b). Only when the poller is enabled — a nil
+	// *usagepoller.Engine must never be handed to the handler.
+	if usageEngine != nil {
+		h.SetUsagePoker(usageEngine)
+	}
 	// Wire the OIDC relying party when configured (PRD #45). Discovery is warmed once
 	// here so a misconfigured or unreachable IdP is surfaced loudly at boot; a failure
 	// leaves the provider configured-but-degraded (login attempts retry discovery)

@@ -125,6 +125,12 @@ func (h *Handler) PutAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// Poke the rate-limit poller so this user's meters appear within seconds of
+	// saving, not up to a full poll interval later (PRD #53 D3b). Best-effort and
+	// non-blocking; nil when the poller is disabled or in tests.
+	if h.usagePoker != nil {
+		h.usagePoker.Poke(user.ID)
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"secret": secretMeta(row.Kind, row.CreatedAt, row.UpdatedAt)})
 }
 
@@ -143,6 +149,13 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		slog.Error("delete anthropic token", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	// Drop the rate-limit gauge row so a token-less user never shows a ghost reading
+	// (PRD #53 D3b). Best-effort: the read endpoints derive no_token from
+	// secret-existence, so even a failed delete here degrades to no_token, never a
+	// stale meter. Idempotent (0 rows when absent).
+	if _, err := h.q.DeleteRateLimits(r.Context(), user.ID); err != nil {
+		slog.Error("delete rate limits on token delete", "error", err)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
