@@ -19,8 +19,10 @@ uzi reads both windows for you, server-side, using your own
 | **Sidebar** | Two thin bars under your signed-in name — a glance without leaving the page you're on. |
 | **Admin → Rate limits** | Every user's meters on one page, sorted so whoever is closest to a limit shows first. |
 
-Both meters are hidden until you've saved a token, and again while uzi is
-waiting on its first reading — no empty bars to puzzle over.
+Both surfaces are hidden entirely until you've saved a token. While uzi is
+waiting on its first reading, the sidebar stays hidden (no empty bars to
+puzzle over), but the Settings card shows a "No reading yet" placeholder
+with two greyed bars — a reading appears within a few minutes of saving.
 
 ## Reading a meter
 
