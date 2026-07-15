@@ -33,13 +33,20 @@ WHERE user_id = $1;
 
 -- name: ListRateLimits :many
 -- Every user LEFT JOINed to their gauge row, for GET /api/admin/rate-limits (M2):
--- the admin view lists everyone, including users with no token / no reading yet
--- (their limit columns come back NULL). vault_locked is computed in-memory from
+-- the admin view lists everyone, including users with no token / no reading yet.
+-- has_token comes from secret-existence (not row-presence) so the handler can tell
+-- `no_token` from `unavailable` even if a DeleteRateLimits ever failed and left a
+-- ghost row (D3b belt-and-suspenders). A NULL synced_at (LEFT JOIN miss) means
+-- token-but-no-reading-yet → `unavailable`. vault_locked is computed in-memory from
 -- the live vault, not stored, so it is not selected here.
 SELECT
     u.id           AS user_id,
     u.email        AS email,
     u.display_name AS display_name,
+    EXISTS (
+        SELECT 1 FROM user_secrets s
+        WHERE s.user_id = u.id AND s.kind = 'anthropic_token'
+    ) AS has_token,
     rl.five_hour_pct,
     rl.five_hour_resets_at,
     rl.seven_day_pct,
@@ -49,6 +56,15 @@ SELECT
 FROM users u
 LEFT JOIN anthropic_rate_limits rl ON rl.user_id = u.id
 ORDER BY u.email ASC;
+
+-- name: UserHasAnthropicToken :one
+-- Whether the user holds an anthropic_token secret, for GET /api/me/rate-limits:
+-- the handler derives `no_token` from this (secret-existence), not from the
+-- rate_limits row being absent, so a failed DeleteRateLimits degrades to `no_token`
+-- (D3b). Never selects the ciphertext.
+SELECT EXISTS (
+    SELECT 1 FROM user_secrets WHERE user_id = $1 AND kind = 'anthropic_token'
+);
 
 -- name: DeleteRateLimits :execrows
 -- Drop a user's gauge row when their token is deleted (D3b) so a token-less user

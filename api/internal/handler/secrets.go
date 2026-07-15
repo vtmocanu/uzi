@@ -150,6 +150,13 @@ func (h *Handler) DeleteAnthropicToken(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// Drop the rate-limit gauge row so a token-less user never shows a ghost reading
+	// (PRD #53 D3b). Best-effort: the read endpoints derive no_token from
+	// secret-existence, so even a failed delete here degrades to no_token, never a
+	// stale meter. Idempotent (0 rows when absent).
+	if _, err := h.q.DeleteRateLimits(r.Context(), user.ID); err != nil {
+		slog.Error("delete rate limits on token delete", "error", err)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

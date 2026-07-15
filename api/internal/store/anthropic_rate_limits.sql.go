@@ -55,6 +55,10 @@ SELECT
     u.id           AS user_id,
     u.email        AS email,
     u.display_name AS display_name,
+    EXISTS (
+        SELECT 1 FROM user_secrets s
+        WHERE s.user_id = u.id AND s.kind = 'anthropic_token'
+    ) AS has_token,
     rl.five_hour_pct,
     rl.five_hour_resets_at,
     rl.seven_day_pct,
@@ -70,6 +74,7 @@ type ListRateLimitsRow struct {
 	UserID           uuid.UUID          `json:"user_id"`
 	Email            string             `json:"email"`
 	DisplayName      pgtype.Text        `json:"display_name"`
+	HasToken         bool               `json:"has_token"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -79,8 +84,11 @@ type ListRateLimitsRow struct {
 }
 
 // Every user LEFT JOINed to their gauge row, for GET /api/admin/rate-limits (M2):
-// the admin view lists everyone, including users with no token / no reading yet
-// (their limit columns come back NULL). vault_locked is computed in-memory from
+// the admin view lists everyone, including users with no token / no reading yet.
+// has_token comes from secret-existence (not row-presence) so the handler can tell
+// `no_token` from `unavailable` even if a DeleteRateLimits ever failed and left a
+// ghost row (D3b belt-and-suspenders). A NULL synced_at (LEFT JOIN miss) means
+// token-but-no-reading-yet → `unavailable`. vault_locked is computed in-memory from
 // the live vault, not stored, so it is not selected here.
 func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, error) {
 	rows, err := q.db.Query(ctx, listRateLimits)
@@ -95,6 +103,7 @@ func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, erro
 			&i.UserID,
 			&i.Email,
 			&i.DisplayName,
+			&i.HasToken,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,
@@ -186,4 +195,21 @@ func (q *Queries) UpsertRateLimits(ctx context.Context, arg UpsertRateLimitsPara
 		arg.SyncedAt,
 	)
 	return err
+}
+
+const userHasAnthropicToken = `-- name: UserHasAnthropicToken :one
+SELECT EXISTS (
+    SELECT 1 FROM user_secrets WHERE user_id = $1 AND kind = 'anthropic_token'
+)
+`
+
+// Whether the user holds an anthropic_token secret, for GET /api/me/rate-limits:
+// the handler derives `no_token` from this (secret-existence), not from the
+// rate_limits row being absent, so a failed DeleteRateLimits degrades to `no_token`
+// (D3b). Never selects the ciphertext.
+func (q *Queries) UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, userHasAnthropicToken, userID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }

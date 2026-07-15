@@ -296,6 +296,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// caller's own tokens judging their finished runs. Session-scoped identity
 			// (never the body), like autopilot.
 			r.Put("/me/judge", h.SetJudgeEnabled)
+			// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
+			// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
+			r.Get("/me/rate-limits", h.SelfRateLimits)
 		})
 
 		// Notifications inbox (PRD #46 M2). Session-authenticated: list + unread
@@ -427,6 +430,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Get("/runs", h.AdminListRuns)
 			// Factory-wide token/cost usage + per-user breakdown (PRD #40).
 			r.Get("/usage", h.AdminUsage)
+			// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors
+			// /usage: admin-only via this group, per-user rows incl. no_token.
+			r.Get("/rate-limits", h.AdminRateLimits)
 			// Self-improvement config (PRD #46 M5): read/enable the autonomous
 			// improvement job. PUT sets the enabling admin (session, never the body)
 			// as the run owner and requires a repo the admin owns.
