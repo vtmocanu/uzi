@@ -64,7 +64,7 @@ node --import tsx --test test/worker.test.ts   # single file
 ./scripts/smoke.sh      # auth-API smoke; expects a FRESH stack (docker compose down -v first)
 ```
 
-There is no CI; these plus the per-package tests are the gate.
+CI (`.gitlab-ci.yml`, PRD #52) now runs the real gates on every MR + `main`: validate/test across all three toolchains + `helm lint`/`template`, plus kaniko validation builds of the api/web images. `v*` tags additionally publish the images + OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the tag), and k8s deploy is GitOps via ArgoCD to dev-cluster — see `deploy/` (the chart + `deploy/README.md` release runbook). e2e is deliberately NOT in CI (it needs docker compose on the runner): `./e2e/run-e2e.sh` + `./scripts/smoke.sh` stay the local pre-merge gate.
 
 ## Architecture
 

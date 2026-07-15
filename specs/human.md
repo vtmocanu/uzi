@@ -349,6 +349,13 @@ Tracked as GitLab issue vtmocanu/uzi#49; PRD at `prds/49-worker-resource-stats.m
 - Per-worker granularity is sufficient; no per-run attribution. [user-confirmed]
 - Must work the same under docker-compose today and k8s later (portability). [user]
 
+## Feature #52 — CI/CD: real pipeline, tag releases, ArgoCD deploy to dev-cluster
+
+Tracked as GitLab issue vtmocanu/uzi#52; PRD at `prds/52-cicd-argocd-deploy.md`.
+
+- Real CI/CD: a working pipeline, tag-driven versioning, and ArgoCD deploy to the dev-cluster cluster. [user 2026-07-13]
+- The ArgoCD wiring lands via an MR to the `argo-apps` repo — never a direct push to that repo's main. [user]
+
 ## Feature #53 — Per-user Claude rate-limit visibility
 
 Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/53-rate-limits.md`.

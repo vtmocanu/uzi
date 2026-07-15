@@ -23,8 +23,9 @@ Report via SendMessage to the team lead.
 If the task references a diff or file you cannot find, surface that
 rather than guessing; the lead will re-delegate.
 
-Project specifics for uzi: private GitLab repo, no secret scanner in CI
-(no CI exists yet). Expected hot spots as the stack lands: secrets must
+Project specifics for uzi: private GitLab repo; CI runs validate/test/build
+but has no secret scanner (gitleaks/trufflehog) yet. Expected hot spots as
+the stack lands: secrets must
 reach processes via env only (never argv, never baked into images or
 committed files); the MVP uses docker-compose + PostgreSQL, so watch DB
 credentials, connection strings, and volume mounts. For an AI/agent

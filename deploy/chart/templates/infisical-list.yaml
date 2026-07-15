@@ -1,0 +1,42 @@
+{{- if and .Values.infisical.enabled (eq .Values.secrets.mode "infisical") }}
+{{- /*
+  One InfisicalSecret per `infisicalList` entry (the list pattern the other MM apps
+  use). Shared host/auth config comes from `.Values.infisical`; each entry supplies
+  its own scope (projectSlug/envSlug/secretsPath) + managed secret name. `$` is the
+  chart root inside the range.
+
+  Skipped entirely when secrets.mode == "existing" (e.g. the KinD smoke): the
+  workloads then read pre-created plain Secrets of the same names.
+*/ -}}
+{{- range .Values.infisicalList }}
+---
+apiVersion: secrets.infisical.com/v1alpha1
+kind: InfisicalSecret
+metadata:
+  name: {{ .name }}
+  {{- if .syncWave }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .syncWave | quote }}
+  {{- end }}
+  labels:
+    {{- include "uzi.labels" $ | nindent 4 }}
+spec:
+  hostAPI: {{ $.Values.infisical.hostAPI }}
+  resyncInterval: {{ default $.Values.infisical.resyncInterval .resyncInterval }}
+  authentication:
+    universalAuth:
+      credentialsRef:
+        secretName: {{ $.Values.infisical.authSecretName }}
+        secretNamespace: {{ $.Values.infisical.authSecretNamespace }}
+      secretsScope:
+        projectSlug: {{ .projectSlug }}
+        envSlug: {{ .envSlug }}
+        secretsPath: {{ .secretsPath | quote }}
+        recursive: {{ default false .recursive }}
+  managedSecretReference:
+    secretName: {{ .secretName }}
+    secretNamespace: {{ $.Release.Namespace }}
+    creationPolicy: {{ default "Owner" .creationPolicy }}
+    secretType: {{ default "Opaque" .secretType }}
+{{- end }}
+{{- end }}

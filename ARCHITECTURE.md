@@ -580,8 +580,86 @@ rationale.
   `order` among `user` pages, a broken relative link (doc→doc or doc→img),
   reference-style links, or an oversized `docs/img/*` file; it warns
   (without failing) on a `user` page over the 60-line house-style budget.
-  There is no CI yet (`plan.md`: later), so this build step is the only gate
-  keeping in-app docs from rotting.
+  It runs both locally (ahead of `npm run build`) and in CI (`validate:web`
+  runs `npm run check-docs` too, PRD #52), so a broken doc fails the pipeline as
+  well as the local build.
+
+## Deployment: compose (laptop) and k8s (dev-cluster)
+
+uzi has two deploy topologies for the **same** services and trust boundaries. The
+compose stack above is the laptop MVP; PRD #52 adds a k8s deployment to the
+**dev-cluster** platform dev cluster via **ArgoCD** GitOps, the way MM deploys
+everything else. The release/deploy runbook is [deploy/README.md](deploy/README.md);
+the design rationale (Decision Log, the compose→chart adaptations) is
+`prds/52-cicd-argocd-deploy.md` — this section is the map, not a duplicate of it.
+
+- **compose** (`docker-compose.yml`) — `web` + `api` + `db` (`postgres:17`) +
+  the opt-in `agent`, secrets from `./.env`, published to `127.0.0.1:8080` only.
+  The path this whole document otherwise describes.
+- **k8s** (`deploy/chart/`, an umbrella chart) — `web` (Deployment/Service/
+  Ingress) + `api` (Deployment/Service/NetworkPolicy) + a **CloudNativePG
+  `Cluster`** (the upstream `cluster` chart as the `postgres` subchart) in place
+  of the `db` container + `InfisicalSecret`s for runtime secrets and the Harbor
+  pull secret. Per-cluster values (`deploy/values/dev-cluster.yaml`) carry the
+  public host, `FRONTEND_ORIGIN`, `TRUSTED_PROXIES`, and the CNPG image/storage,
+  layered over the cluster-agnostic `deploy/chart/values.yaml`. ArgoCD deploys a
+  **multi-source** app (`argo-apps` `apps/uzi/`): the released chart from
+  Harbor OCI + these values from the uzi git repo. Public URL
+  `https://uzi.example.com` behind ingress-nginx (`*.example.com`
+  wildcard TLS). Images + chart are versioned Model B (chart `version` ==
+  `appVersion` == the release git tag; see the runbook).
+
+**Trust boundaries are unchanged by k8s.** The same three boundaries hold: `web`
+is still the sole entry point (now the ingress → web Service, still same-origin,
+no CORS); `api` is still the sole holder of secrets/keys and makes the same
+outbound forge calls; the worker is still outbound-only over the Bearer join
+token. The k8s deployment adds **no** new secret-bearing surface beyond
+Infisical-sourced env, and every [guardrail layer](#guardrail-layers-the-primary-directive)
+is untouched — `main` protected, worker holds the PAT, agent never gets network
+git.
+
+Two adaptations are load-bearing and worth stating here (full detail in the PRD's
+"K8s-specific adaptations"):
+
+- **X-Forwarded-For: append in k8s, overwrite in compose.** In compose the web
+  nginx sets `X-Forwarded-For: $remote_addr` (overwrite) because its immediate
+  client *is* the browser (see [Trust boundaries](#trust-boundaries) above). In
+  k8s the immediate client is the ingress-nginx controller, so the chart's web
+  nginx **appends** (`$proxy_add_x_forwarded_for`) with ingress-nginx as the
+  outermost overwriting hop — overwriting there would collapse every user into
+  one per-IP auth rate-limit bucket and lose client IPs in audit logs.
+  `TRUSTED_PROXIES` is the pod CIDR (`100.64.0.0/10` on dev-cluster) so the api
+  reads the real client IP from the appended chain. The compose behavior stays
+  overwrite; the chart toggles this per-deployment.
+- **api NetworkPolicy (default-deny ingress, web pods only).** dev-cluster is a
+  **shared** cluster — `coder.example.com` runs arbitrary dev code on it —
+  so a per-IP rate limit that trusts XFF from the pod CIDR is only safe if a rogue
+  pod cannot reach the api directly to forge `X-Forwarded-For`. The chart's api
+  NetworkPolicy allows ingress **only from the web pods** on `:8080` (an L3
+  connectivity control, distinct from the XFF-trust value above), closing the
+  direct-to-api spoofing path. example-app has no such policy (it runs on the
+  non-shared mgmt cluster); uzi needs it. Its one operational wrinkle —
+  default-deny also drops kubelet probes, so `api.networkPolicy.probeCIDRs` must
+  be set to the node CIDR on Antrea — is documented in the runbook and values.
+
+**The api is a hard singleton** in both topologies (compose runs one container;
+the chart pins `replicas: 1` + `strategy: Recreate` + a generous `startupProbe`).
+Three independent reasons it cannot run >1 replica today: the forge poller and
+run sweeper hold single-goroutine in-memory state (two replicas double-poll and
+double-sweep), the Slack Socket Mode manager would double-handle events, and
+`store.Migrate` runs goose at boot with **no advisory lock** (two pods booting
+concurrently race the migrations). `Recreate` (not `RollingUpdate`) ensures the
+surge never briefly runs a second pod. The api is documented as
+non-horizontally-scalable this release; `web` is stateless and runs 2 replicas.
+
+**No worker/agent in-cluster (Decision 5).** The per-user worker stays a local,
+opt-in `docker compose --profile agent` process on user machines. There is no
+published worker image; laptop users build from a checkout and point the worker
+at `https://uzi.example.com` (the Bearer join-token flow works through the
+ingress unchanged — this is exactly the remote-worker posture the [worker trust
+boundary](#serverworker-trust-boundary) and [docs/proc-hardening.md](docs/proc-hardening.md)
+anticipate). Running workers server-side is a separate PRD (it interacts with
+PRD #51 uid-split), noted under [Not yet in scope](#not-yet-in-scope) below.
 
 ## Not yet in scope
 

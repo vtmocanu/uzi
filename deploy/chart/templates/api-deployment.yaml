@@ -1,0 +1,94 @@
+{{- if .Values.api.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "uzi.fullname" . }}-api
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicaCount }}
+  strategy:
+    # HARD SINGLETON: Recreate (never RollingUpdate) so the surge never runs a
+    # second api pod. Two would double-poll the forge, double-sweep runs,
+    # double-handle Slack Socket Mode events, and race the goose boot migration
+    # (no advisory lock). See values.yaml api.replicaCount.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      annotations:
+        # Roll the pod when the non-secret config (ConfigMap) changes. Secret
+        # changes are synced by the Infisical operator (restart the pod to pick up).
+        checksum/config: {{ include (print $.Template.BasePath "/api-configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "uzi.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+    spec:
+      # The api never calls the k8s API; drop the auto-mounted SA token.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecret.name }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.api_podSecurityContext | nindent 8 }}
+      containers:
+        - name: api
+          image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.api_containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          {{- if .Values.api.config }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "uzi.fullname" . }}-api-config
+          {{- end }}
+          env:
+            # DATABASE_URL from the CNPG-generated <cluster>-app Secret's `uri` key.
+            # Required at boot (config.Load errors on empty), so NOT optional: the
+            # pod waits for the secret (CNPG creates it at sync-wave -5).
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.api.database.secretName | quote }}
+                  key: {{ .Values.api.database.secretKey | quote }}
+            {{- range $envName, $secretKey := .Values.api.secretEnv }}
+            # {{ $envName }} <- Infisical key "{{ $secretKey }}"
+            - name: {{ $envName }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.infisical.app.managedSecretName }}
+                  key: {{ $secretKey | quote }}
+                  optional: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          {{- with .Values.api.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # Writable /tmp for the read-only-root-fs container (TLS/temp scratch).
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+{{- end }}

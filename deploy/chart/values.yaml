@@ -1,0 +1,357 @@
+# uzi Helm chart — GENERIC defaults (cluster-agnostic).
+#
+# Per-cluster values (image registry overrides, the public host, FRONTEND_ORIGIN,
+# TRUSTED_PROXIES, the CNPG image/storageClass/backup target) live in
+# deploy/values/<cluster>.yaml and are layered on top by BOTH deploy paths:
+#   - the ArgoCD Application in myorg/k8s/argo-apps (multi-source: the Harbor
+#     OCI chart + $values/deploy/values/<cluster>.yaml from the uzi repo)
+#   - a manual `helm upgrade -f deploy/values/<cluster>.yaml`
+# So this file MUST stay deployable to any cluster: do NOT put a concrete host /
+# endpoint / storageClass / image tag here.
+#
+# SECRETS: nothing secret lives in this file or in any values file. JWT_SECRET,
+# UZI_SECRET_KEY, the optional UZI_SEED_* seeds, and the Postgres/Harbor creds all
+# arrive from Infisical (infisicalList below) or are CNPG-generated. The api's
+# refuse-to-start-on-placeholder-key guard is the backstop.
+
+nameOverride: ""
+fullnameOverride: "uzi"
+
+# How the runtime Secrets are provided.
+#   infisical (default): the chart creates the InfisicalSecret CRs below, and the
+#     cluster's Infisical operator syncs `uzi-secrets` + the Harbor pull secret.
+#   existing: SKIP the InfisicalSecret templates entirely and assume `uzi-secrets`
+#     (+ any pull secret) are PRE-CREATED as plain k8s Secrets. Used by the KinD
+#     smoke (deploy/values/kind-smoke.yaml), which has no Infisical operator. The
+#     api still reads `uzi-secrets` by secretKeyRef either way, so nothing else
+#     changes. The CNPG `-app` DB secret is operator-generated in both modes.
+secrets:
+  mode: infisical
+
+# Harbor pull secret (dockerconfigjson), synced from Infisical (/k8s-registry-robot)
+# by the infisicalList entry below. Both the api and web pods pull PRIVATE images
+# from harbor.example.com/gitlab/vtmocanu/uzi/*, and the CNPG pod pulls the
+# postgres image from the cloudnative-pg mirror, so all three reference it.
+imagePullSecret:
+  name: registry-robot-secret-uzi
+
+# --- api: the Go backend (sole holder of secrets/keys, the DB client) -----------
+api:
+  enabled: true
+  image:
+    repository: harbor.example.com/gitlab/vtmocanu/uzi/api
+    # Unset => follows Chart.appVersion (Model B). Pin only to override per-cluster.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # HARD SINGLETON (do NOT raise): three independent reasons the api cannot run
+  # >1 replica today — the forge poller + run sweeper hold single-goroutine
+  # in-memory state (two replicas double-poll/double-sweep), the Slack Socket Mode
+  # manager would double-handle events, and store.Migrate runs goose at boot with
+  # NO advisory lock (two pods booting concurrently race the migrations). Paired
+  # with strategy: Recreate below (RollingUpdate's surge would briefly run two).
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  # The api Service. Named "api" (see uzi.apiServiceName) so the web nginx
+  # `proxy_pass http://api:8080` resolves it — same-origin, no CORS.
+  service:
+    name: api
+    port: 8080
+  # DB connection string. Sourced from the CNPG-generated <cluster>-app Secret's
+  # `uri` key (the model the other MM CNPG apps use). secretName follows the CNPG
+  # cluster's fullnameOverride (postgres-uzi-cluster) + "-app". Point database.*
+  # elsewhere to use a DB outside this chart. REQUIRED at boot (config.Load errors
+  # on an empty DATABASE_URL), so it is NOT optional: the pod waits for the secret
+  # (created by the CNPG cluster at sync-wave -5, before the api at wave 0).
+  database:
+    secretName: postgres-uzi-cluster-app
+    secretKey: uri
+  # Non-secret env -> ConfigMap (envFrom). Only keys that differ from config.go's
+  # safe defaults need setting; the environment-specific ones (FRONTEND_ORIGIN,
+  # TRUSTED_PROXIES, FORGE_ALLOWED_BASE_URLS) live in deploy/values/<cluster>.yaml.
+  config:
+    API_ADDR: ":8080"
+  # Infisical-synced secret env: ENV_VAR -> the key in the `uzi-secrets` Secret.
+  # JWT_SECRET and UZI_SECRET_KEY are REQUIRED (the api refuses to boot without
+  # them — that guard is the backstop, so the k8s secretKeyRef stays optional:true
+  # and a missing key surfaces as a clear boot error, not a stuck ContainerCreating).
+  # The UZI_SEED_* entries are OPTIONAL one-time seeds: uncomment an entry AND add
+  # the matching key to the Infisical /uzi folder to use it. Slack/OIDC secrets
+  # follow the same add-a-line pattern (see docs/ + config.go for the full set).
+  secretEnv:
+    JWT_SECRET: JWT_SECRET
+    UZI_SECRET_KEY: UZI_SECRET_KEY
+    # Optional startup seeds (all belong to the seed admin; see config.go):
+    # UZI_SEED_EMAIL: UZI_SEED_EMAIL
+    # UZI_SEED_PASSWORD: UZI_SEED_PASSWORD
+    # UZI_SEED_NAME: UZI_SEED_NAME
+    # UZI_SEED_FORGE_PAT: UZI_SEED_FORGE_PAT
+    # UZI_SEED_ANTHROPIC_TOKEN: UZI_SEED_ANTHROPIC_TOKEN
+    # Slack integration (PRD #25) — overlay tokens or one-time seeds:
+    # SLACK_BOT_TOKEN: SLACK_BOT_TOKEN
+    # SLACK_APP_TOKEN: SLACK_APP_TOKEN
+    # OIDC SSO (PRD #45) — client secret is env-only (never DB):
+    # UZI_OIDC_CLIENT_SECRET: UZI_OIDC_CLIENT_SECRET
+  # Probes. Startup covers the goose boot migration (nothing listens until it
+  # finishes, then /api/health 200s); readiness gates serving on DB reachability
+  # (/api/health pings the pool); liveness is a dumb socket check so a transient DB
+  # blip does NOT restart the singleton (a restart cannot fix an upstream DB
+  # outage — it only churns).
+  startupProbe:
+    httpGet:
+      path: /api/health
+      port: http
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 60
+  readinessProbe:
+    httpGet:
+      path: /api/health
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  livenessProbe:
+    tcpSocket:
+      port: http
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 6
+  # Default-deny ingress on the api pods, allowing ONLY the web pods (the reverse
+  # proxy) to reach api:8080. This is the LOAD-BEARING control on a shared cluster
+  # like dev-cluster: without it any pod (e.g. coder.example.com runs
+  # arbitrary dev code) could hit the api ClusterIP directly, bypass web nginx, and
+  # spoof X-Forwarded-For to defeat the per-IP auth rate limit / forge audit IPs.
+  # example-app has no such policy (it runs on the non-shared mgmt cluster).
+  networkPolicy:
+    enabled: true
+    # kubelet liveness/readiness/startup probes originate from the NODE IP (host
+    # network), which no podSelector can match. On CNIs that subject probe traffic
+    # to NetworkPolicy (platform/Antrea, Calico), the node CIDR must be allowed here or
+    # the api never goes Ready (startup probe dropped -> CrashLoop). Set per-cluster
+    # to the dev-cluster node InternalIP CIDR(s). Empty = rely on the CNI exempting
+    # host->pod probe traffic; CONFIRM at M6 before trusting empty.
+    probeCIDRs: []
+
+# --- web: nginx serving the SPA + reverse-proxying /api/* to the api Service -----
+web:
+  enabled: true
+  image:
+    repository: harbor.example.com/gitlab/vtmocanu/uzi/web
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Stateless (SPA + reverse proxy): safe to run >1 for availability. 2 gives a
+  # rolling update without a blip.
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  service:
+    port: 80
+  # nginx reverse-proxy config, rendered into a ConfigMap (web-configmap.yaml) and
+  # mounted over the image's compiled-in /etc/nginx/conf.d/default.conf. This is the
+  # k8s variant of web/nginx.conf: it APPENDS X-Forwarded-For
+  # ($proxy_add_x_forwarded_for) instead of OVERWRITING it ($remote_addr) — in k8s
+  # the immediate client is the ingress-nginx controller, so overwriting would
+  # collapse every user into one per-IP rate-limit bucket and lose client IPs. The
+  # compose web/nginx.conf stays overwrite (its immediate client IS the browser).
+  nginx:
+    # api upstream Service name + port (must equal the api Service).
+    apiServiceName: api
+    apiPort: 8080
+    # Upstream resolution mode:
+    #  - false (default): `proxy_pass http://<apiService>:<port>` — nginx resolves
+    #    the Service name ONCE at worker start. Safe here because the api Service is
+    #    applied together with the Deployment (ArgoCD) and its ClusterIP is stable;
+    #    the only wrinkle is that DELETING+recreating the api Service strands the
+    #    cached ClusterIP until the web pods restart (documented, rare).
+    #  - true: emit an nginx `resolver` + a variable upstream so the Service name is
+    #    re-resolved at request time (survives a Service recreate). REQUIRES
+    #    web.nginx.resolver set to the cluster's kube-dns/CoreDNS ClusterIP.
+    dynamicResolution: false
+    # The cluster DNS resolver IP (only used when dynamicResolution: true). Find it
+    # with `kubectl -n kube-system get svc kube-dns -o jsonpath={.spec.clusterIP}`.
+    resolver: ""
+  ingress:
+    enabled: true
+    className: nginx
+    # Per-cluster: the public host (deploy/values/<cluster>.yaml).
+    host: ""
+    path: /
+    pathType: Prefix
+    annotations:
+      # WS idle timeout: web nginx allows 3600s on /api/ws, but ingress-nginx
+      # defaults proxy-read-timeout to 60s and would cull idle live-run sockets at
+      # the controller. Raise both so a quiet-but-live socket survives (REST replay
+      # self-heals, but churn is avoided).
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # dev-cluster serves a *.example.com default wildcard cert at the
+    # controller, so no per-host TLS block is needed there. Set tls.enabled: true +
+    # a secretName (and a cert-manager annotation) for a cluster without one.
+    tls:
+      enabled: false
+      secretName: uzi-tls
+
+# --- Runtime secrets via Infisical ---------------------------------------------
+# Synced from infisical.example.com into k8s Secrets by the cluster's Infisical
+# operator. Shared host/auth config here; each infisicalList entry supplies its
+# own scope (projectSlug/envSlug/secretsPath) + the managed k8s Secret it creates.
+infisical:
+  enabled: true
+  hostAPI: https://infisical.example.com/api
+  resyncInterval: 600
+  authSecretName: universal-auth-credentials
+  authSecretNamespace: infisical-operator
+  # The Opaque Secret the api reads its secret env from (secretKeyRef). MUST equal
+  # the infisicalList entry that creates it (secretName: uzi-secrets).
+  app:
+    managedSecretName: uzi-secrets
+
+# One InfisicalSecret per entry (the list pattern the other MM apps use). To add a
+# secret, append an entry — no new template. `secretName` values MUST match what the
+# workloads reference: `uzi-secrets` == infisical.app.managedSecretName (api env);
+# `registry-robot-secret-uzi` == imagePullSecret.name.
+#
+# ASSUMPTION (M5 open question): uzi's runtime secrets live at /uzi under the
+# k8s-clusters Infisical project (slug example-project, envSlug prod) — the same
+# project the Harbor robot pull secret comes from, so the operator identity needs no
+# new grant. Confirm the project slug + folder before first sync (a wrong scope
+# 403/404s the InfisicalSecret).
+# syncWave: "-10" applies both InfisicalSecrets before the workloads (and before
+# the CNPG cluster at -5), so the api's `uzi-secrets` and the Harbor pull secret
+# `registry-robot-secret-uzi` exist on first deploy instead of causing a transient
+# ImagePullBackOff / api CrashLoop until the operator catches up (self-heal is the
+# real recovery; this just cuts the churn).
+infisicalList:
+  - name: infsec-uzi
+    projectSlug: example-project
+    envSlug: prod
+    secretsPath: /uzi
+    secretName: uzi-secrets
+    secretType: Opaque
+    syncWave: "-10"
+  - name: infsec-harbor-robot-uzi
+    projectSlug: example-project
+    envSlug: prod
+    secretsPath: /k8s-registry-robot
+    secretName: registry-robot-secret-uzi
+    secretType: kubernetes.io/dockerconfigjson
+    syncWave: "-10"
+
+# Restricted-PodSecurity contexts (satisfy the `restricted` standard everywhere;
+# harmless where it is not enforced).
+#
+# api: distroless static-nonroot image (uid/gid 65532); the server writes nothing
+# to disk, so its root fs is read-only (a small emptyDir covers /tmp for TLS/temp).
+api_podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+api_containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# web: nginx-unprivileged (uid/gid 101). Root fs left writable: nginx writes its
+# pid, cache and temp under /var and /tmp at runtime.
+web_podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 101
+  runAsGroup: 101
+  fsGroup: 101
+  seccompProfile:
+    type: RuntimeDefault
+web_containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  capabilities:
+    drop: ["ALL"]
+
+# --- CloudNativePG Postgres (subchart, aliased `postgres`) ----------------------
+# uzi REQUIRES a database (unlike example-app, which wired CNPG for a future feature).
+# SHIPS DISABLED here (generic default, so the chart stays cluster-agnostic — no
+# concrete image/storageClass/S3 target); every cluster that deploys uzi turns it on
+# in deploy/values/<cluster>.yaml and supplies those. The api's DATABASE_URL is
+# wired to the CNPG-generated postgres-uzi-cluster-app Secret (api.database above).
+#
+# Postgres image: the per-cluster values pin a specific tag from the MM Harbor
+# mirror (cloudnative-pg). dev-cluster standardizes on 16.x (fleet-consistent
+# + confirmed mirrored); do NOT copy example-app's PG18 image here. (dev-cluster's CNPG
+# operator 1.23.5 supports up to PG17, so 16.x is a fleet-convention choice, not an
+# operator-imposed ceiling.)
+postgres:
+  enabled: false
+  type: postgresql
+  # standalone = a single primary + in-cluster HA replicas; NO cross-site standby.
+  mode: standalone
+  # The CNPG `Cluster` object name. Stable; the generated secrets
+  # (postgres-uzi-cluster-app, ...) and the S3 serverName follow it.
+  fullnameOverride: postgres-uzi-cluster
+  version:
+    # Major series; the pinned imageName in the per-cluster values is authoritative
+    # for the exact tag. Keep this major in sync with that tag.
+    postgresql: "16"
+  cluster:
+    # Protect the DB from ArgoCD prune: without Prune=false a chart refactor /
+    # rollback / disabling postgres would let Argo delete the Cluster + its PVCs.
+    # sync-wave -5 brings the DB (and its -app secret) up before the api (wave 0).
+    annotations:
+      argocd.argoproj.io/sync-wave: "-5"
+      argocd.argoproj.io/sync-options: Prune=false
+    # Dev sizing: single instance (no HA). Raise per-cluster for stage/prod.
+    instances: 1
+    # Cluster-specific (the MM Harbor mirror) -> set in deploy/values/<cluster>.yaml.
+    imageName: ""
+    imagePullSecrets: []
+    storage:
+      size: 5Gi
+      storageClass: ""        # per-cluster (e.g. storage-class)
+    walStorage:
+      enabled: true
+      size: 5Gi
+      storageClass: ""        # per-cluster
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    primaryUpdateMethod: switchover
+    primaryUpdateStrategy: unsupervised
+    # No superuser secret: the app connects as the `-app` role (DATABASE_URL from
+    # the postgres-uzi-cluster-app secret), so the unused `postgres` superuser
+    # credential is dead weight / extra attack surface.
+    enableSuperuserAccess: false
+    # Single-instance dev cluster: a PodDisruptionBudget (subchart default true)
+    # has no failover target and would wedge node drains/upgrades. Disable it.
+    enablePDB: false
+    # Off by default: dev-cluster does not necessarily ship the PodMonitor /
+    # PrometheusRule CRDs. A cluster with the Prometheus operator can flip these on.
+    monitoring:
+      enabled: false
+      podMonitor:
+        enabled: false
+      prometheusRule:
+        enabled: false
+    initdb:
+      # The application database + owning role created at bootstrap.
+      database: uzi
+      owner: uzi
+  # Backups OFF by default (M5 open question: confirm the s3://postgres-<cluster>
+  # bucket exists + wire the barman S3 creds from Infisical before enabling). The
+  # per-cluster values decide; see deploy/values/dev-cluster.yaml.
+  backups:
+    enabled: false

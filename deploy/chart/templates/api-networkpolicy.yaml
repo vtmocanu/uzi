@@ -1,0 +1,45 @@
+{{- if and .Values.api.enabled .Values.api.networkPolicy.enabled }}
+# Default-deny ingress on the api pods: the only allowed source is the web pods
+# (the same-origin reverse proxy) on 8080. LOAD-BEARING on a shared cluster
+# (dev-cluster): without it any pod could reach the api ClusterIP directly, bypass
+# web nginx, and spoof X-Forwarded-For to defeat the per-IP auth rate limit /
+# forge audit IPs (api trusts XFF from TRUSTED_PROXIES CIDRs). Egress is left
+# unrestricted (the api dials the DB, forge, OIDC, Slack) — only Ingress is policed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-api
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    # web pods (same namespace) -> api:8080.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: web
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- with .Values.api.networkPolicy.probeCIDRs }}
+    # kubelet health probes come from the node IP (host network) which no
+    # podSelector can match; allow the node CIDR(s) on 8080 so probes aren't
+    # dropped by the default-deny (see values.yaml api.networkPolicy.probeCIDRs).
+    - from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+{{- end }}
