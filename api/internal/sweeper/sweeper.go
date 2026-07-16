@@ -24,18 +24,35 @@ type Sweeper interface {
 	Sweep(ctx context.Context) (workersvc.SweepResult, error)
 }
 
+// Pass is an extra sweep the engine runs on the same tick as the run-liveness
+// one, reporting how many rows it touched. It exists so a periodic cleanup that
+// is NOT about run lifecycle (PRD #58's pending-join-token expiry) can ride this
+// ticker instead of spawning a goroutine of its own, and without pulling its
+// concern into workersvc, which owns runs and should not learn about hosted
+// workers.
+//
+// A failing pass is logged and does not abort the others: these are independent
+// cleanups, and one erroring is no reason to skip run recovery.
+type Pass struct {
+	// Name labels the pass in logs (e.g. "hosted_tokens_expired").
+	Name string
+	Run  func(ctx context.Context) (int64, error)
+}
+
 // Engine periodically sweeps.
 type Engine struct {
 	svc      Sweeper
 	interval time.Duration
+	passes   []Pass
 }
 
 // New constructs an Engine. A non-positive interval falls back to the default.
-func New(svc Sweeper, interval time.Duration) *Engine {
+// Extra passes run on every tick alongside the run-liveness sweep.
+func New(svc Sweeper, interval time.Duration, passes ...Pass) *Engine {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
-	return &Engine{svc: svc, interval: interval}
+	return &Engine{svc: svc, interval: interval, passes: passes}
 }
 
 // Boot runs one immediate sweep — the orphan sweep on API boot (bottega). It
@@ -63,6 +80,22 @@ func (e *Engine) Run(ctx context.Context) {
 }
 
 func (e *Engine) runOnce(ctx context.Context) {
+	// Extra passes run first and independently of the run-liveness sweep's outcome:
+	// they are unrelated cleanups, and a DB blip in one must not silently skip the
+	// other (PRD #58's token expiry is an at-rest secret bound — it should not be
+	// hostage to a failure in run recovery).
+	for _, p := range e.passes {
+		n, err := p.Run(ctx)
+		if err != nil {
+			slog.Error("sweeper: pass failed", "pass", p.Name, "error", err)
+			continue
+		}
+		// Quiet on an idle system, like the run-liveness pass below.
+		if n > 0 {
+			slog.Info("sweeper extra pass", "pass", p.Name, "rows", n)
+		}
+	}
+
 	res, err := e.svc.Sweep(ctx)
 	if err != nil {
 		slog.Error("sweeper: sweep failed", "error", err)

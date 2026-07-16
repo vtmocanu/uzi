@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+
+# The hosted-worker controller (PRD #58). Build context is controller/ — this
+# module has no dependency on the api's source, only on its wire contract, so the
+# context stays this directory (the same shape api/Dockerfile has).
+
+# --- build stage ---
+FROM golang:1.26@sha256:f96cc555eb8db430159a3aa6797cd5bae561945b7b0fe7d0e284c63a3b291609 AS build
+WORKDIR /src
+
+# No go.sum: the module is stdlib-only (see go.mod), so there is nothing to
+# download and no lockfile to copy. Add the `COPY go.sum` + `go mod download`
+# pair here the moment M3 brings in the kube client.
+COPY go.mod ./
+
+COPY . .
+# Static, VCS-stamp-free build, matching api/Dockerfile.
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w" -o /out/controller ./cmd/controller
+
+# --- runtime stage ---
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639
+COPY --from=build /out/controller /controller
+# No EXPOSE: the controller listens on nothing. Every exchange is outbound to the
+# api (Decision 2), which is what lets it run with no inbound surface at all.
+USER nonroot:nonroot
+ENTRYPOINT ["/controller"]

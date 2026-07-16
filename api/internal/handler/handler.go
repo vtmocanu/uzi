@@ -14,6 +14,7 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
@@ -81,6 +82,11 @@ type Handler struct {
 	// through h.q directly; this field is the seam future notification producers
 	// (the judge, M4) call to create rows. Wired via SetNotifier; nil-safe.
 	notifier *notifysvc.Service
+	// hsvc is the api's half of the hosted-worker controller protocol (PRD #58).
+	// Wired via SetHostedSvc, and reached only from the /api/controller route group
+	// — which is mounted only when WORKER_HOSTING_ENABLED is true, so it stays nil
+	// on a compose stack and in every test that does not exercise hosting.
+	hsvc *hostedsvc.Service
 	// usagePoker pokes the rate-limit poller when a user saves/replaces their
 	// Anthropic token (PRD #53 D3b), so their meters appear within seconds instead
 	// of up to a full poll interval. Wired via SetUsagePoker; nil-safe (the poller
@@ -105,6 +111,12 @@ func (h *Handler) SetUsagePoker(p UsagePoker) { h.usagePoker = p }
 // main alongside the Slack notifier it delivers through). Safe to leave unset in
 // tests that don't create notifications.
 func (h *Handler) SetNotifier(n *notifysvc.Service) { h.notifier = n }
+
+// SetHostedSvc wires the hosted-worker controller protocol (PRD #58). Call once at
+// startup when WORKER_HOSTING_ENABLED is true; leaving it nil is the compose
+// default and keeps hosting fully dormant — Routes does not mount the controller
+// endpoint at all in that case, so nothing can reach a nil hsvc.
+func (h *Handler) SetHostedSvc(s *hostedsvc.Service) { h.hsvc = s }
 
 // SlackLinker is the slice of the slacksvc linker the /me/slack endpoints drive
 // (PRD #25 M3): re-send the Confirm / Not-me DM to a newly set override target,
@@ -573,6 +585,22 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// user's chats; the per-run pending cap is the other half.
 			r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/proposals", h.WorkerCreateProposal)
 		})
+
+		// Hosted-worker controller protocol (PRD #58): outbound-only like a worker,
+		// authenticated by the controller's own Bearer credential (a hash compare
+		// against config, no DB, no cookies, hence no CSRF step).
+		//
+		// Mounted ONLY when hosting is enabled (Decision 12). Off — the compose
+		// default — this route does not exist rather than existing-and-refusing, so a
+		// compose stack is byte-for-byte the router it was before this PRD, and an
+		// api that was never given a controller credential exposes no surface that
+		// could be probed for one.
+		if h.cfg.WorkerHostingEnabled {
+			r.Route("/controller", func(r chi.Router) {
+				r.Use(mw.RequireController(h.cfg.ControllerTokenSHA256))
+				r.Get("/poll", h.ControllerPoll)
+			})
+		}
 	})
 
 	return r

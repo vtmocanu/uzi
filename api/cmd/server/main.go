@@ -25,6 +25,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
@@ -331,7 +332,20 @@ func run() error {
 	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
 	// immediately, then the goroutine sweeps on its own interval. Both lifetimes
 	// are awaited on shutdown before the pool closes.
-	sweep := sweeper.New(wsvc, 0)
+	//
+	// It also carries PRD #58's pending-join-token expiry, which bounds how long a
+	// sealed, undelivered token sits at rest under UZI_SECRET_KEY. That pass is
+	// wired UNCONDITIONALLY — deliberately NOT behind cfg.WorkerHostingEnabled: a
+	// stack that provisioned hosted workers and then turned hosting off is exactly
+	// the one whose tokens would otherwise never be swept. Riding this existing
+	// ticker (rather than a goroutine of its own) also keeps the flag-off footprint
+	// to one indexed UPDATE that matches nothing on a stack with no hosted workers.
+	sweep := sweeper.New(wsvc, 0, sweeper.Pass{
+		Name: "hosted_tokens_expired",
+		Run: func(ctx context.Context) (int64, error) {
+			return hostedsvc.ExpirePendingTokens(ctx, q, cfg.HostedTokenTTL)
+		},
+	})
 	sweep.Boot(ctx)
 
 	// PAT least-privilege service + sweep (PRD #5). The service is shared by the
@@ -453,6 +467,14 @@ func run() error {
 	// Wire the notifications write seam (PRD #46 M2) for future producers (the judge,
 	// M4). The M2 read endpoints don't need it; this makes the seam available.
 	h.SetNotifier(notifier)
+	// Hosted k8s workers (PRD #58 Decision 12). Only when the feature is on: off (the
+	// compose default) Routes mounts no controller endpoint, so the service would have
+	// no caller. Shares the same secret cipher (sole key holder) as the forge/worker
+	// services — it seals pending join tokens with it.
+	if cfg.WorkerHostingEnabled {
+		h.SetHostedSvc(hostedsvc.New(q, box))
+		slog.Info("hosted k8s workers enabled; serving the controller protocol on /api/controller")
+	}
 	// Wire the rate-limit poller so saving/replacing an Anthropic token pokes it for
 	// an immediate poll (PRD #53 D3b). Only when the poller is enabled — a nil
 	// *usagepoller.Engine must never be handed to the handler.

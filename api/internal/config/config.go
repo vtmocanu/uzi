@@ -4,6 +4,9 @@
 package config
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -287,6 +290,45 @@ type Config struct {
 	// recovery for a confirm handler killed after the claim but before it settled.
 	// Above the forge HTTP timeout so an in-flight confirm is never reaped. 0 disables it.
 	ProposalConfirmStuckTimeout time.Duration
+
+	// Hosted k8s workers (PRD #58 Decision 12). WorkerHostingEnabled gates the whole
+	// feature; it is false by default and on compose, where there is no controller and
+	// no cluster to host anything in — so a compose stack is zero-diff. Off, the
+	// controller-facing route group is not mounted at all: the endpoint does not exist
+	// rather than existing-and-refusing.
+	//
+	// ControllerTokenSHA256 is the sha256 of the controller's bearer credential
+	// (Decision 2), decoded from the hex WORKER_HOSTING_CONTROLLER_TOKEN_SHA256. The
+	// api holds ONLY the hash and never the plaintext, so an api env/memory disclosure
+	// (the very /proc/<pid>/environ class of leak Decision 3 and docs/proc-hardening.md
+	// exist to close) yields nothing that authenticates. The chart generates the token,
+	// mounts the plaintext into the controller, and passes this hash to the api (M6).
+	// Required when hosting is enabled, refused when it is not (see loadWorkerHosting).
+	WorkerHostingEnabled  bool
+	ControllerTokenSHA256 []byte
+	// HostedTokenTTL bounds how long a sealed, undelivered join token may sit at
+	// rest in Postgres before the sweep destroys it (default 1h; 0 disables the
+	// sweep, with a boot warning). This is a residual BEYOND the one Decision 3
+	// documents: the pending copy is sealed under UZI_SECRET_KEY, the master key
+	// PRD #32's vault exists to stop relying on, so an undelivered token must not
+	// linger indefinitely.
+	//
+	// It means "NO POD EVER PROVED IT BOOTED", not "the controller never picked it
+	// up": delivery is settled by the worker's own registration, so the pending
+	// window spans pod scheduling + image pull + container start + register —
+	// minutes, not the ~20-60s two-poll window an ack-based handoff would have had.
+	//
+	// 1h is still right, because expiry is BENIGN in the normal case. It clears the
+	// api's sealed BUFFER; if the controller already wrote the Secret, the plaintext
+	// is in the cluster and workers.token_hash is untouched, so a pod that finally
+	// boots still authenticates, registers, and self-heals the row late. Expiry only
+	// strands when the Secret was never written — precisely what the TTL is for — and
+	// 1h leaves ~10-30x headroom over even a pathological multi-GB image pull.
+	//
+	// Read REGARDLESS of WorkerHostingEnabled: a stack that provisioned hosted
+	// workers and then turned hosting off is exactly the case that would strand
+	// ciphertext, so the sweep — and therefore this knob — outlives the flag.
+	HostedTokenTTL time.Duration
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -300,6 +342,49 @@ var placeholderSecrets = map[string]struct{}{
 	"changeme":                                {},
 	"secret":                                  {},
 	"password":                                {},
+}
+
+// placeholderControllerTokens are plaintext values that must never be accepted as
+// the controller credential (PRD #58) — the hash-side analogue of
+// placeholderSecrets above, sharing its dev-fallback entries.
+//
+// The api never holds this credential's plaintext, so it cannot check length or
+// entropy the way validateSecret does. It can still recognise the hash of a value
+// someone copied out of a README or left in a chart default, which is the failure
+// mode that actually ships; a working default is worse than no default.
+//
+// Listed as PLAINTEXTS and hashed at check time, deliberately, rather than as
+// precomputed hex digests: a table of 64-char hex literals is indistinguishable
+// from a table of real credentials to a secret scanner (gitleaks flags them as
+// generic-api-key) and to a human reader, and it hides which value each entry
+// actually guards. Twelve sha256 calls on a boot path that runs once is free.
+var placeholderControllerTokens = []string{
+	"changeme",
+	"change-me",
+	"changeit",
+	"secret",
+	"password",
+	"token",
+	"replace-me",
+	"example",
+	"uzi-controller-token",
+	"controller-token",
+	"uzi-controller-dev-token",
+	"uzi-dev-secret-change-in-production",
+}
+
+// placeholderControllerToken returns the placeholder whose sha256 is sum, if any.
+// The compare is a plain byte compare: both sides are public (sum is the operator's
+// configured hash, the candidates are well-known strings), so there is no secret
+// here to leak through timing.
+func placeholderControllerToken(sum []byte) (string, bool) {
+	for _, p := range placeholderControllerTokens {
+		h := sha256.Sum256([]byte(p))
+		if bytes.Equal(h[:], sum) {
+			return p, true
+		}
+	}
+	return "", false
 }
 
 // minSecretLen is the minimum acceptable JWT secret length. `openssl rand -hex
@@ -476,6 +561,9 @@ func Load() (Config, error) {
 	if err := loadOIDC(&cfg); err != nil {
 		return Config{}, err
 	}
+	if err := loadWorkerHosting(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
@@ -635,6 +723,69 @@ func parseScopes(raw string) []string {
 		out = append([]string{"openid"}, out...)
 	}
 	return out
+}
+
+// loadWorkerHosting reads and validates the hosted-k8s-worker feature gate (PRD
+// #58 Decision 12) and the controller's credential hash (Decision 2).
+//
+// The two are all-or-nothing, the same stance loadOIDC takes on its gating vars:
+// hosting enabled without a token hash would mount a controller endpoint no
+// controller could ever authenticate to, and a token hash set while hosting is off
+// means an operator provisioned a credential the api will silently ignore while
+// their controller 404s forever. Both are loud boot failures rather than a quiet
+// half-configured feature. Neither var ships as a compose default (compose has no
+// controller), so neither guard can fire on a default stack.
+//
+// WORKER_HOSTING_ENABLED goes through parseBool, so a typo aborts boot instead of
+// silently taking the default — it gates a privileged protocol, and this is the
+// stance every other kill-switch here takes.
+func loadWorkerHosting(cfg *Config) error {
+	// The at-rest bound is loaded FIRST and unconditionally: the expiry sweep runs
+	// whether or not hosting is enabled, because a stack that provisioned hosted
+	// workers and then disabled hosting is precisely the one whose sealed tokens
+	// would otherwise sit in Postgres forever. parseNonNegDuration (not
+	// parseDuration): 0 is a legitimate value here — it disables the sweep.
+	cfg.HostedTokenTTL = parseNonNegDuration("WORKER_HOSTING_PENDING_TOKEN_TTL", time.Hour)
+	if cfg.HostedTokenTTL == 0 {
+		slog.Warn("WORKER_HOSTING_PENDING_TOKEN_TTL=0 disables the pending-join-token expiry sweep; an undelivered token then stays sealed under UZI_SECRET_KEY in the database indefinitely (see docs/vault-threat-model.md)")
+	}
+
+	enabled, err := parseBool("WORKER_HOSTING_ENABLED", false)
+	if err != nil {
+		return err
+	}
+	raw := strings.TrimSpace(os.Getenv("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256"))
+	if !enabled {
+		if raw != "" {
+			return fmt.Errorf("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 is set but WORKER_HOSTING_ENABLED is false; the api would ignore the credential and every controller poll would 404")
+		}
+		// Hosting off ⇒ the credential is not merely unused, it is never loaded.
+		return nil
+	}
+	if raw == "" {
+		return fmt.Errorf("WORKER_HOSTING_ENABLED=true requires WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 (the sha256 of the controller's bearer token, hex-encoded); generate the token with: openssl rand -base64 32")
+	}
+	sum, err := hex.DecodeString(raw)
+	if err != nil {
+		// The value is a HASH, not a secret, but it is adjacent to one — report the
+		// variable name only, never the value, matching loadSeedSlack's discipline.
+		return fmt.Errorf("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 is not valid hex (it must be sha256 of the controller token, hex-encoded — not the token itself)")
+	}
+	if len(sum) != sha256.Size {
+		return fmt.Errorf("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 decodes to %d bytes, expected %d (it must be sha256 of the controller token, hex-encoded)", len(sum), sha256.Size)
+	}
+	// Placeholder guard, mirroring validateSecret's placeholderSecrets and
+	// secretbox.LoadKey's ErrWeakKey: refuse to boot on a credential whose
+	// plaintext is a well-known dev value. The api holds only the hash, so it
+	// cannot judge the plaintext's entropy — but it CAN recognise the hash of an
+	// obvious placeholder, which is the failure mode that actually ships (a chart
+	// default, a copied README line), and a working default is worse than none.
+	if name, bad := placeholderControllerToken(sum); bad {
+		return fmt.Errorf("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 is the hash of the well-known placeholder %q; generate a real controller token with: openssl rand -base64 32", name)
+	}
+	cfg.WorkerHostingEnabled = true
+	cfg.ControllerTokenSHA256 = sum
+	return nil
 }
 
 // loadSeedAdmin reads and validates the optional startup-admin seed. Seeding is

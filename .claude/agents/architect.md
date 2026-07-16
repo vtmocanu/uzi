@@ -100,10 +100,12 @@ only driver, no other package imports a driver), `internal/forgesvc` (shared
 sync; forge is source of truth, `issues` is a cache, writes are forge-first),
 and `internal/secretbox` (AES-256-GCM at rest).
 
-There is **no `docs/adr/` or `docs/design/` convention here** - do not create
-one without proposing it to the lead first. Design rationale lives in
-`prds/*.md` Decision Logs (completed PRDs move to `prds/done/`), linked from
-`ARCHITECTURE.md` rather than duplicated into it. Respect the specs contract:
+ADRs live at root **`adr/NNNN-<slug>.md`, numbered by PRD number** (not by ADR
+sequence): `adr/0042-worker-run-concurrency.md` is the one that exists, linked
+from `ARCHITECTURE.md:421`. There is **no `docs/adr/` or `docs/design/` tree** -
+do not create one. Design rationale otherwise lives in `prds/*.md` Decision Logs
+(completed PRDs move to `prds/done/`), linked from `ARCHITECTURE.md` rather than
+duplicated into it. Respect the specs contract:
 `specs/human.md` is user-stated requirements (never propose edits without user
 approval), `specs/ai.md` records AI design decisions. The `spec-keeper` role
 owns both files - your job is to feed it decisions, not to write them yourself.

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -118,6 +119,37 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	// A hosted worker registering is the PROOF that its join token reached the pod
+	// (PRD #58 Decision 3): RequireWorker resolved wkr by matching sha256(the token
+	// this caller presented) against workers.token_hash, so getting here means a pod
+	// holds the current token and it works. That — not any report from the controller
+	// — is what licenses destroying the api's sealed copy.
+	//
+	// wkr.TokenHash, NOT updated.TokenHash: `wkr` is the row RequireWorker
+	// authenticated against, so its hash is what this caller actually PROVED.
+	// `updated` came back from RegisterWorker's RETURNING *, so its hash is a fresh
+	// read that would already reflect a rotation committed during that round trip —
+	// passing it would silently defeat the qualification and let this request destroy
+	// a token it never held. The store statement re-checks the proved hash is still
+	// current, so a mid-flight rotation matches zero rows and leaves the new token
+	// pending for the pod that actually has it.
+	//
+	// Orchestrated here rather than inside workersvc on purpose: workersvc owns runs
+	// and must not learn about hosted workers, and handler-level orchestration is this
+	// repo's idiom. hsvc is nil unless hosting is enabled, and the Kind check keeps an
+	// ordinary hand-run worker off this path entirely.
+	//
+	// Best-effort and NON-FATAL: this is buffer cleanup, and a worker that has already
+	// registered successfully must never be failed because the cleanup did not land.
+	// The TTL sweep is the backstop. WithoutCancel so a worker that disconnects the
+	// instant its registration lands does not cancel its own cleanup — it would
+	// self-heal on the retry and the TTL, but there is no reason to leave the buffer
+	// sitting for an hour over a dropped connection.
+	if h.hsvc != nil && updated.Kind == "hosted" {
+		if err := h.hsvc.NoteRegistered(context.WithoutCancel(r.Context()), updated.ID, wkr.TokenHash); err != nil {
+			slog.Error("note hosted worker registered", "worker_id", updated.ID.String(), "error", err)
+		}
 	}
 	// worker_id is echoed for the worker's convenience; identity on every other
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
