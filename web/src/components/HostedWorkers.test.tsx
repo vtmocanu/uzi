@@ -171,12 +171,17 @@ describe("HostedWorkers provisioning", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("defaults to the smallest size and the base template", async () => {
+  it("defaults to compose parity — the base template at M", async () => {
+    // M, not S: it is what the repo's own sizing formula computes as the floor for a
+    // working worker (1 run slot + 1 unturnoffable chat session, + headroom = 4 GiB),
+    // and it matches both compose's AGENT_MEM_LIMIT default and the k8s block in
+    // docs/worker-setup.md. It is the preset a user hands themselves by not choosing,
+    // so it must be the known-good one rather than the cheapest.
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2 });
     mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
     renderCard(0);
     fireEvent.click(await provisionButton());
-    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "s"));
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "m"));
   });
 
   it("shows the 409 quota refusal verbatim (the server's words, not ours)", async () => {

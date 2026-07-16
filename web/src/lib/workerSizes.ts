@@ -19,25 +19,36 @@ export const WORKER_SIZES = ["s", "m", "l"] as const;
 export type WorkerSize = (typeof WORKER_SIZES)[number];
 
 /**
- * The size a fresh provision form starts on: the smallest preset.
+ * The size a fresh provision form starts on: M, for parity with the worker every user
+ * already runs by hand.
  *
- * It does NOT save the user any quota — the quota is a COUNT of hosted workers
- * (CountHostedWorkersForUser, compared as n >= quota), so S, M and L each cost
- * exactly one of the user's allowance. What it conserves is CLUSTER resource, which
- * the worker namespace's ResourceQuota/LimitRange actually bounds (Decision 8).
+ * M is NOT "the middle one" — it is what this repo's own sizing formula computes as the
+ * FLOOR for a working worker. docker-compose.yml budgets ~1.5 GiB per slot, and the
+ * default config is 1 run slot + 1 chat session = 2 slots = 3 GiB, plus ~1 GiB headroom
+ * = 4 GiB. That is exactly compose's own AGENT_MEM_LIMIT=4g / AGENT_CPUS=2, and exactly
+ * the k8s block docs/worker-setup.md already publishes. Two independent artifacts
+ * already agree on it, which makes M the only preset that is known-good rather than
+ * guessed.
  *
- * Whether S can in fact run a worker is UNMEASURED — the presets have no quantities
- * yet (see above), so this is the conservative default, not an informed one. Revisit
- * it in M6 against M3's real table: if S turns out to be too small to run anything,
- * defaulting to it sends every user who never opens the field into a worker that
- * cannot work.
+ * The chat slot cannot be switched off, which is what puts the floor at 4 GiB rather
+ * than at one slot: WORKER_CHAT_SESSIONS=0 silently falls back to 1 (positiveInt,
+ * agent/src/config.ts), so every worker budgets a run AND a chat.
  *
- * Open, and larger than the default: given the above, nothing gives a user a reason to
- * pick S over L at all — and M6's numbers will not change that. M6 owes an answer
- * alongside them. The argument lives in PRD #58's M6 bullet and is deliberately not
- * restated here; two prose copies of it would drift.
+ * S stays offered, but is not what we hand someone who never opens the field. Whether
+ * it can run a real session is still UNMEASURED — no benchmark has spawned an SDK
+ * subprocess, which is what dominates a real run — and it sits below even the bare
+ * two-slot total before headroom. The default rests on the asymmetry: an over-sized
+ * default wastes a LIMIT, and limits reserve nothing (only requests do; an idle worker
+ * measures ~130 MiB and ~0 CPU whichever preset it is), whereas an under-sized one OOMs
+ * the shared cgroup, killing the container and requeueing every in-flight run — which
+ * FAILS them past RUN_MAX_REQUEUES, with no pod-phase status in v1 to explain why.
+ *
+ * Still open, and untouched by this: nothing gives a user a reason to pick S over L
+ * either, since the quota counts WORKERS and every size costs exactly one. This fixes
+ * what we hand them, not the incentive. The argument lives in PRD #58's M6 bullet and
+ * is deliberately not restated here; two prose copies of it would drift.
  */
-export const DEFAULT_WORKER_SIZE: WorkerSize = "s";
+export const DEFAULT_WORKER_SIZE: WorkerSize = "m";
 
 /**
  * Display spelling of a size name. Upper-case is for READING only — the wire value
