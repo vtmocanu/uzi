@@ -153,24 +153,25 @@ services:
   # ports; it reaches the api over the compose network with a join token. The
   # bare-clone cache + worktrees live on a persistent volume.
   #
-  # M4 defense-in-depth (audit item 6): drop all Linux capabilities and forbid
-  # privilege escalation for the whole container. This shrinks the blast radius of
-  # a prompt-injected agent (the agent's Bash tool runs in this same container).
-  # M6 /proc hardening: the join token is delivered as a FILE secret (mounted at
-  # /run/secrets/worker_token from UZI_WORKER_TOKEN) instead of an env var, so it is
-  # NOT in the worker's /proc/<pid>/environ — closing the same-uid
-  # `cat <symlink>/self/environ` join-token leak the earlier milestones left open.
-  # The compose secret mount is read-only, so the worker's post-read unlink fails
-  # and the file persists at /run/secrets/worker_token; the environ win holds
-  # regardless (a writable delivery also gets the on-disk unlink). REMAINING
-  # residual: the PAT is in a transient git CHILD env during push/MR; the worker
-  # group-kills the agent tree before that op (B1) so a normal survivor is dead
-  # first, but a `setsid`-escaped survivor could still race that window. The full
-  # STRUCTURAL close (agent under a DISTINCT uid so it can't read the worker's /proc
-  # at all — a two-container pod with different runAsUser + shareProcessNamespace:
-  # false, or gVisor) needs privileges this non-root compose MVP lacks and is
-  # deferred to the remote-worker (k8s/VM) phase. See docs/proc-hardening.md and
-  # killAgentTree in agent/src/sdk-executor.ts.
+  # Capability + uid hardening (PRD #46 audit item 6 + PRD #51 A1). cap_drop: ALL +
+  # no-new-privileges shrink the blast radius of a prompt-injected agent (its Bash
+  # tool runs in this container). PRD #51 splits the single container uid in two: the
+  # credential-holding `worker` (join token, forge PAT, Anthropic token) and a
+  # distinct, cap-less `runner` the worker spawns the untrusted code-execution
+  # surfaces under (SDK agent, self-improve checks, provision hooks). The image runs
+  # as ROOT and the entrypoint (agent/templates/entrypoint.sh) setpriv-drops to
+  # `worker` keeping only CAP_SETUID/SETGID (ambient), and forces the join token to
+  # 0400 worker so the `runner` uid cannot read it off disk.
+  # M6 /proc hardening: the join token is a FILE secret (mounted at
+  # /run/secrets/worker_token from UZI_WORKER_TOKEN), not an env var, so it is not in
+  # the worker's /proc/<pid>/environ. Under the uid split the runner also cannot read
+  # the worker's /proc environ (different uid; root-owned once the worker is
+  # non-dumpable), structurally closing the PAT push-window environ race PRD #46 left
+  # as a residual. The runner-uid SPAWN of the agent (which completes the read-denied
+  # boundary) lands in M4; M2 establishes the uids, the root-entry drop, and the token
+  # perms. The k8s form is separate containers with per-container runAsUser (docs-only
+  # here). See docs/proc-hardening.md, prds/51-worker-uid-split.md, and killAgentTree
+  # in agent/src/sdk-executor.ts.
   agent:
     # Worker template selection (PRD #18): WORKER_TEMPLATE picks which curated
     # Dockerfile under agent/templates/<name>/ builds the worker image. Default
@@ -193,9 +194,25 @@ services:
         UZI_SRC_SHA: ${UZI_SRC_SHA:-}
     profiles: ["agent"]
     security_opt:
+      # Blocks suid privilege GAIN; does NOT block the entrypoint's root -> worker
+      # drop (a setuid to a LOWER uid). Stays on post-drop.
       - "no-new-privileges:true"
     cap_drop:
       - ALL
+    # PRD #51 A1: re-grant ONLY the caps the root entrypoint's startup window needs.
+    # It uses CHOWN + DAC_OVERRIDE to migrate the persisted volumes to the worker uid
+    # (B4) and force the join token to 0400 worker, SETPCAP to tighten the bounding
+    # set, then setpriv-drops root -> worker keeping only SETUID/SETGID as AMBIENT caps
+    # (so the worker can spawn runner-uid children in M4). The setuid-to-non-root
+    # transition clears the permitted set, so CHOWN/DAC_OVERRIDE/SETPCAP do NOT survive
+    # the drop — the run-lifetime worker holds only SETUID/SETGID (Decision 7). The
+    # control is the worker DROPPING the extras, not this bounding-set budget.
+    cap_add:
+      - SETUID
+      - SETGID
+      - SETPCAP
+      - CHOWN
+      - DAC_OVERRIDE
     # Resource limits (PRD #42 Decision 9). The worker is ONE shared cgroup: the
     # run lane and the #39 chat lane draw from this single cpus/mem_limit budget —
     # there is no per-run fairness on compose (that needs per-run cgroups, deferred).
@@ -220,6 +237,8 @@ services:
       # an env var, so it never lands in the worker's /proc/<pid>/environ. The value
       # comes from UZI_WORKER_TOKEN (.env) via the `worker_token` secret below; the
       # worker also accepts UZI_WORKER_TOKEN directly as a backward-compat fallback.
+      # PRD #51 M2: the entrypoint forces this file to 0400 worker (compose delivers
+      # it 0444 root:root) so the runner uid cannot read it — see the secrets comment.
       UZI_WORKER_TOKEN_FILE: /run/secrets/worker_token
       UZI_DATA_DIR: /data
       UZI_WORKER_NAME: ${UZI_WORKER_NAME:-}
@@ -257,9 +276,12 @@ volumes:
   agentnix:
 
 secrets:
-  # The worker join token, delivered to the agent as a FILE (mounted read-only at
+  # The worker join token, delivered to the agent as a FILE (mounted at
   # /run/secrets/worker_token) rather than an env var, so it is absent from the
   # container's environ (the M6 /proc close). Sourced from UZI_WORKER_TOKEN (.env);
   # if unset, the secret is empty and the worker fails fast with a clear error.
+  # PRD #51 M2: an env-sourced compose secret mounts 0444 root:root (world-readable —
+  # the runner uid could read it) and its uid/gid/mode are unreliable (audit L2), so
+  # the entrypoint forces it to 0400 worker at startup rather than trusting compose.
   worker_token:
     environment: UZI_WORKER_TOKEN

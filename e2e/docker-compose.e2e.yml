@@ -138,7 +138,11 @@ services:
       # env var, so it never lands in the worker's /proc/<pid>/environ. The worker
       # reads it once and unlinks it. The harness (re)writes it before every start.
       UZI_WORKER_TOKEN_FILE: /worker-secret/token
-      HOME: /home/uzi
+      # PRD #51 M2: the worker OS user is now `worker` (home /home/worker). The base
+      # entrypoint runs as root and setpriv-drops to `worker` (cap_add inherited from
+      # the base agent service). This overlay's token still comes via the writable
+      # /worker-secret bind mount (M5 does the full uid-boundary e2e retool).
+      HOME: /home/worker
       # Trust forge-fake's cert for the worker's MR fetch (Node) and any git-over-
       # https (git). The git remote is actually local (insteadOf below), so git
       # never does TLS here — GIT_SSL_CAINFO is belt-and-suspenders.
