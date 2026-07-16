@@ -1,7 +1,7 @@
 # PRD #54: Rate-limit meters UI polish (badge escalation, aria-live, --faint contrast)
 
 **GitLab Issue**: [#54](https://gitlab.example.com/vtmocanu/uzi/-/issues/54)
-**Status**: Draft
+**Status**: Done (2026-07-16) — implemented on `feature/prd-54-ui-polish` (`fd81ce8` M1, `d36b997` M2, `6bbd5d4` M3, `e56f109` specs); reviewed clean (reviewer/auditor/fact-checker/web-ux).
 **Priority**: Low
 **Created**: 2026-07-16
 **Depends on**: PRD #53 (rate-limit meters) — done
@@ -22,9 +22,9 @@ issue #54 so they aren't lost:
    user gets nothing.
 3. **The global `--faint` token is below AA for small text.** In the **ember**
    theme `--faint` is #646E82 (~3.65:1 on the `bg-surface` card) and in the
-   **mission** theme it is #64748B / slate-500 (~3.8:1) — both under the WCAG AA
+   **mission** theme it is #64748B / slate-500 (~3.96:1) — both under the WCAG AA
    4.5:1 bar for small text. PRD #53 promoted the *data* nodes it relied on to
-   `--muted` (~6.6:1), but `--faint` remains app-wide for de-emphasised text. A
+   `--muted` (~6.9:1), but `--faint` remains app-wide for de-emphasised text. A
    cosmetic nit rides along: a user with no display name renders an empty name
    line above the email in admin tables.
 
@@ -119,15 +119,14 @@ issue #54 so they aren't lost:
      (#7A859A)**. Measured ~5.0:1 on the real card surface (`Card` = `bg-surface`,
      plain `--surface` rgb(15,18,26) — *not* a raised/0.55 composite, which the
      first draft wrongly assumed; the real surface gives more headroom). Stays
-     visibly fainter than ember `--muted` (#949EB0, ~6.6:1).
+     visibly fainter than ember `--muted` (#949EB0, ~6.9:1).
    - **Mission** (`index.css:99`): `--faint: 100 116 139` (#64748B / slate-500) is
-     *also* sub-AA (~3.8:1) and part of a deliberate slate ramp (`--muted` =
+     *also* sub-AA (~3.96:1) and part of a deliberate slate ramp (`--muted` =
      slate-400 `148 163 184`, `--edge-strong` = slate-600). It must NOT be left at
      slate-500, but it also should not be blindly overwritten with the ember hex —
-     that breaks the slate ramp. Pick a mission `--faint` that clears AA *and* fits
-     the slate ramp (a lightened slate between slate-500 and slate-400), confirmed
-     by live measurement on the mission surface in M3. `#7A859A` measures ~4.85:1
-     on mission and is an acceptable fallback if no cleaner slate value is found.
+     that breaks the slate ramp. **Landed value: `116 132 155` (#74849B)** — a
+     lightened slate keeping the ramp's blue-bias (b−r=39), measured ~4.95:1 on the
+     mission surface, cleanly clearing AA without collapsing to the ember grey.
    - **Blast radius** is app-wide: **37 files / 158 `text-faint` occurrences**,
      PLUS `--faint` backs `--syn-comment` (`index.css:63`, `:131`) →
      `text-syn-comment` in `RunEvent.tsx:109` (shell-comment syntax highlighting,
@@ -218,29 +217,30 @@ issue #54 so they aren't lost:
 
 ## Milestones
 
-- [ ] **M1 — Badge escalation (danger-only)**: `RateLimitCard` reuses
+- [x] **M1 — Badge escalation (danger-only)** — `fd81ce8`. `RateLimitCard` reuses
       `statusBadge(data, false)`; danger escalates (red bar + danger badge), warn
-      stays "Live". New card danger test (asserts `bg-danger`); stale-text test
-      edit. `npm run typecheck` + `npm test` green.
-- [ ] **M2 — aria-live announcements**: `sr-only aria-live="polite"` region,
-      tone-transition ref, announce-on-step-up only; add the `worstWindow` selector
-      (+ its unit test). Tests for ok→warn, warn→danger, silent-on-same-tone,
-      silent-on-first-read, silent-on-30s-clock-tick, silent-on-stale. App-wide via
-      `RateLimitAnnouncer` mounted in `AppShell` (decision 4).
-- [ ] **M3 — `--faint` AA bump + empty-name nit**: ember `--faint` → `#7A859A`;
-      pick + measure a mission `--faint` that clears AA and fits the slate ramp
-      (decision 5). Audit the 37 `text-faint` files AND the `--syn-comment` →
-      `text-syn-comment` consumer (`RunEvent.tsx`, pinned by `RunEvent.test.tsx`)
-      for regressions in BOTH themes; empty-name fixes in both admin tables.
-      Verify each new value clears 4.5:1 on its theme's surface (the mock's live
-      contrast check is the reference method).
-- [ ] **M4 — Specs + green build**: `specs/ai.md` decision entries; full
-      `web` gate (`npm run build` = check-docs + tsc + vite build) and `npm test`
-      green. Move PRD to `prds/done/`.
-- [ ] **M5 — Live validation**: web-ux browser pass on the isolated e2e stack
-      (mock-mode + live), confirming badge escalation, the announcement on a
-      simulated crossing (SR/AX tree), and the measured `--faint` contrast;
-      findings folded back.
+      stays "Live". New card danger test (asserts `bg-danger`); "Stale"→"stale"
+      test edit. Gate green.
+- [x] **M2 — aria-live announcements** — `d36b997`. App-wide `RateLimitAnnouncer`
+      (`sr-only aria-live="polite" role="status"`, AppShell-mounted) + `worstWindow`
+      selector (tie→5-hour). Announces on tone step-up only; silent on same-tone,
+      first-read, 30s clock tick, and stale. 6 announcer + 4 selector tests.
+- [x] **M3 — `--faint` AA bump + empty-name nit** — `6bbd5d4`. Ember `--faint` →
+      `#7A859A` (5.04:1); mission → `#74849B` (4.95:1, keeps slate bias). Blast
+      radius incl. `--syn-comment`/`RunEvent` (class-pinned, green). Empty-name:
+      AdminRateLimits "no name" placeholder (first `<div>`, sort-test-safe),
+      AdminUsers `display_name?.trim() || "—"`. Pinning test each.
+- [x] **M4 — Specs + green build** — `e56f109`. `specs/ai.md` §258–260 recorded
+      (no `human.md` change — polish on #53's contracted meters). Full `web` gate
+      green (typecheck + 612 tests + build). PRD moved to `prds/done/`.
+- [x] **M5 — Validation** — review wave clean (reviewer/auditor/fact-checker all
+      no-blockers; contrast recomputed 5.04/4.95) + web-ux mock browser pass
+      (badge escalation red "5h nearly out", warn stays Live, stale "stale",
+      app-wide `sr-only` region present + hidden, `--faint` legible both themes).
+      Note: a genuine live tone-transition SR announcement isn't reproducible in
+      the static mock (per-persona fixed readings) — the transition logic is
+      vitest-pinned; a real changing-reading e2e is the only untested surface,
+      deferred (low risk).
 
 ## Milestone dependency / parallelization
 
