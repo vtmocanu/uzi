@@ -31,6 +31,11 @@ export type WorkerSize = (typeof WORKER_SIZES)[number];
  * it in M6 against M3's real table: if S turns out to be too small to run anything,
  * defaulting to it sends every user who never opens the field into a worker that
  * cannot work.
+ *
+ * Open, and larger than the default: given the above, nothing gives a user a reason to
+ * pick S over L at all — and M6's numbers will not change that. M6 owes an answer
+ * alongside them. The argument lives in PRD #58's M6 bullet and is deliberately not
+ * restated here; two prose copies of it would drift.
  */
 export const DEFAULT_WORKER_SIZE: WorkerSize = "s";
 
