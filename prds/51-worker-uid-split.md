@@ -726,7 +726,7 @@ model.
       seccomp/cap loosening. Weigh building (A) as throwaway vs going straight to
       (C) (N2). Settle the k8s mapping. Gate: a written, reviewed design incl.
       Decisions 3+4 with B1/B2/B4 resolved.
-- [ ] **M2 — Image + uid boundary + token perms.** Second uid; the (A1) drop
+- [x] **M2 — Image + uid boundary + token perms. DONE + reviewed.** Second uid; the (A1) drop
       wrapper in `base` + `jvm`; token forced `0400`/`worker` **in the entrypoint**
       (env-sourced secret mode is unreliable — L2); startup chown of persisted
       volumes (B4). Note: this gate cannot be *independently* PoC'd — a real
@@ -817,14 +817,27 @@ model.
       only when provisioning moves off the worker (the spawn) is the trio coherent. The
       M3 `/data` carve-out + runner `TMPDIR` go live here (per-run leaf-dir group-write +
       the runner env's `TMPDIR=/tmp/uzi-runner`); PATH hygiene (Decision 6).
-- [ ] **M5 — Preserve PRD #46/#18 behavior + e2e retooling.** devbox/nix
-      provisioning (`toolEnv`), real check evidence (`go test`/`npm test`/`tsc`),
-      runner-clone git, and the agent's own sandbox (`settingSources:[]` + deny-hook)
-      all work across the boundary. (The git-flow relocation moved to M3; M5 is the
-      behavior-preservation + e2e residual.) **Retool the e2e (N4):** under the split the
-      token is worker-owned `0400` and **not** unlinked, so `run-e2e.sh`'s
-      writable-mount delivery and its "token unlinked" assertion must change to
-      uid-boundary reads. Gate: `run-e2e.sh` (judge + self-improve + existing) green.
+- [ ] **M5 — Preserve PRD #46/#18 behavior + e2e retooling.**
+      1. **FIRST / e2e-green BLOCKER (reviewer + auditor M5-forward, now live-reproduced by
+         the tester):** wrap the **stub executor's** `git()` (`executor.ts:475-484`) with
+         `runnerCommand`/`runnerSpawn` so it commits **AS `runner`** — faithful to the real
+         SDK agent (which already commits as runner via `runnerSpawn`, so its git euid
+         matches the runner-owned clone) and matching the runner-owned (10002) clone. The
+         current unwrapped worker-uid stub git hits `fatal: detected dubious ownership` on
+         the runner-owned clone, which is why the e2e happy path is RED. **Do NOT** just add
+         `safe.directory=*` to the worker-uid stub git — that writes worker-owned objects
+         into a runner tree (ownership drift) and diverges from the real path.
+      2. devbox/nix provisioning (`toolEnv`, now runs as `runner`), real check evidence
+         (`go test`/`npm test`/`tsc`), runner-clone git, and the agent's own sandbox
+         (`settingSources:[]` + deny-hook) all work across the boundary. (The git-flow
+         relocation moved to M3; M5 is the behavior-preservation + e2e residual.)
+      3. **Retool the e2e (N4):** under the split the token is worker-owned `0400` and
+         **not** unlinked, so `run-e2e.sh`'s writable-mount delivery and its "token unlinked"
+         assertion must change to uid-boundary reads; **also force `0400`/`worker` on the
+         e2e overlay token** (`/worker-secret/token`), else the M4 runner reads it and the
+         boundary assertions are vacuous (M5 audit LOW).
+      Gate: `run-e2e.sh` (judge + self-improve + existing) green end-to-end (restart-resilience
+      + full approve→implement→push→MR).
 - [ ] **M6 — Tests.** uid-boundary tests: execution uid can't read the token file,
       can't read the worker's `/proc` environ, and can't code-exec via a shared
       git-config write **nor via a `commondir`/`gitdir` rewrite** (moot-by-construction
@@ -885,3 +898,66 @@ model.
   / `docs/proc-hardening.md`) updates from "accepted residual, uid-split is the
   structural close" to "closed for the local path" (with the k8s form mapped in
   docs and deferred to the remote-worker PRD).
+
+## Resume checkpoint — 2026-07-16
+
+**Status: ~70% (M0–M4 core done; M5–M7 + PR remain).** Branch
+`feature/prd-51-worker-uid-split`, tip `fbd916c` (last code commit; the checkpoint doc
+commit sits on top).
+
+Done + reviewed: M0 (gitEnv code-exec-key pins + NOSYSTEM/GLOBAL). M1 (design gate:
+mechanism A1 setpriv, separate-runner-clone B2). M2 (worker/runner uids 10001/10002,
+root-entry setpriv drop, token 0400/worker, B4 volume migration). M3 (git-flow
+relocation: worker bare-only, runner `--shared` clone, `file://`+pack fetch-back,
+`changedFiles` bare tree-diff — reviewer+auditor cleared). M4 (`runner-uid.ts` setpriv
+boundary; all untrusted spawns routed; cross-uid reap via setpriv-to-runner kill;
+`/nix`→`runner:runner` + worker PATH stripped of `/nix`; env/PATH/TMPDIR split — boundary
+verified LIVE on the image by reviewer+auditor: runner cap-less, can't climb back, can't
+read token/environ/mem, setsid-escape closed; judge-HOME chmod-2770 fix + non-root unset
+here).
+
+In flight at checkpoint: the tester's e2e re-run. **Restart-resilience PASSES** (the
+`[ -O ]` carve-out fix works: down/up over volumes survives, re-registers, the orphaned
+run re-queues; the M3 restart crash is GONE). **Full approve→implement→push→MR is RED**
+pending the M5 stub-git-wrap — a harness gap, NOT an M4 relocation flaw: the STUB
+executor's `git()` (`executor.ts:475-484`) runs unwrapped as the WORKER uid on the
+runner-owned (10002) clone → `fatal: detected dubious ownership`, whereas the REAL SDK
+agent commits AS `runner` (via `runnerSpawn`), so its git euid matches the clone. **Not
+PR-ready until the stub is wrapped and `./e2e/run-e2e.sh` is green end-to-end;
+re-dispatch the tester after the wrap.**
+
+Remaining:
+- **M5 — preserve #46/#18 + e2e retool.** FIRST / e2e-green blocker: wrap the stub
+  executor's `git()` (`executor.ts:475-484`) with `runnerCommand`/`runnerSpawn` so it
+  commits AS `runner` (faithful to the real agent + matches the runner-owned clone); do
+  NOT just add `safe.directory=*` to the worker-uid stub git (ownership drift, diverges
+  from the real path). Then: devbox/nix provisioning + self-improve checks
+  (`go test`/`npm test`/`tsc`) + worktree git + agent sandbox all work across the boundary
+  (provisioning now runs as runner). Retool `run-e2e.sh`: token is worker-owned `0400`
+  (not unlinked) → change its writable-mount delivery + "token unlinked" assertion to
+  uid-boundary reads; force `0400`/`worker` on the e2e overlay token too. Gate:
+  `run-e2e.sh` green end-to-end.
+- **M6 — uid-boundary tests** (image-level, need root+setpriv+users, not unit): runner
+  `CapEff=CapAmb=0` + can't setuid back; can't read `/run/secrets/worker_token`
+  (`0400 worker`); can't read worker `/proc/environ` + `/proc/mem` (incl a setsid-escaped
+  survivor); cross-uid reap terminates the runner group; runner child `/proc/self/fd` =
+  `{0,1,2}`+known (fd-leak); runner env scrubbed (carries only its own OAuth); worker
+  still pushes; no regression.
+- **M7 — docs + k8s alignment.** `docs/proc-hardening.md` becomes the implemented design
+  + fix the two review-found doc errors (the "RO secret mount → unlink fails → same-uid
+  readable" framing is inaccurate — the close is `0400`/worker mode+owner, not mount-RO;
+  the worker `/proc/environ` is `worker:worker 0400`, NOT root-owned). `ARCHITECTURE.md`
+  layer-2; close the PRD #46 residual notes (`self-improve.ts` header,
+  `docs/self-improvement.md`). k8s: reference `prds/58-hosted-k8s-workers.md`
+  (Decisions 3, 6); state the containment scope (#51 containment ⇔ root-started A1 path;
+  non-root / compose `user:` forfeits the split); the fsGroup-vs-B2 constraint (k8s
+  two-container form: the WORKER BARE stays off the fsGroup-shared workspace volume —
+  worker-container-private — else fsGroup g+rw + the runner's supplemental gid reopens the
+  commondir/config code-exec channel; shared workspace vol = runner clone only). Manifests
+  deferred to the remote-worker PRD. Keep setpriv version-pinned (base digest pins it; a
+  future base bump = conscious re-check).
+- **Before PR (`/prd-done` up to PR):** merge `origin/main` to reconcile drift — PRD #58 +
+  #44 landed since branch point → expect a trivial `runner.ts` rebase; check #58/#44 didn't
+  add a goose migration to renumber around; re-run all gates + e2e on the merged tip; then
+  push + open the MR (`glab`, `env -u GITLAB_TOKEN`). Do NOT PR until the e2e is green
+  end-to-end.
