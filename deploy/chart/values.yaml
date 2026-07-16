@@ -228,11 +228,17 @@ infisical:
 # workloads reference: `uzi-secrets` == infisical.app.managedSecretName (api env);
 # `registry-robot-secret-uzi` == imagePullSecret.name.
 #
-# ASSUMPTION (M5 open question): uzi's runtime secrets live at /uzi under the
-# k8s-clusters Infisical project (slug example-project, envSlug prod) — the same
-# project the Harbor robot pull secret comes from, so the operator identity needs no
-# new grant. Confirm the project slug + folder before first sync (a wrong scope
-# 403/404s the InfisicalSecret).
+# CONFIRMED (M6 first sync, 2026-07-16 — this replaces the M5 assumption, which was
+# WRONG): uzi's own runtime secrets live at /uzi in the **vtmocanu** Infisical project
+# (slug example-project, envSlug dev), matching the sibling vtmocanu apps —
+# example-app -> example-project/dev:/example-app, dot-ai -> example-project/dev:/dot-ai. Only the
+# SHARED Harbor robot pull secret comes from the k8s-clusters project
+# (example-project, envSlug prod), so the two entries below intentionally differ.
+# The M5 draft assumed BOTH lived in example-project/prod; that 404'd on first sync
+# ("Folder with path '/uzi' in environment 'prod' was not found") and CrashLooped the
+# api on an empty JWT_SECRET. NOTE: a cluster's operator identity needs membership on
+# the vtmocanu project (per-project grant — auth succeeds then 403s without it);
+# dev-cluster's was granted 2026-07-16.
 # syncWave: "-10" applies both InfisicalSecrets before the workloads (and before
 # the CNPG cluster at -5), so the api's `uzi-secrets` and the Harbor pull secret
 # `registry-robot-secret-uzi` exist on first deploy instead of causing a transient
@@ -241,7 +247,7 @@ infisical:
 infisicalList:
   - name: infsec-uzi
     projectSlug: example-project
-    envSlug: prod
+    envSlug: dev
     secretsPath: /uzi
     secretName: uzi-secrets
     secretType: Opaque
