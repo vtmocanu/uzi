@@ -1,0 +1,259 @@
+<title>uzi · Slack notifications UX mock</title>
+<style>
+  :root {
+    --page-bg: #f5f4f1;
+    --page-fg: #23262e;
+    --page-muted: #6b7280;
+    --page-edge: #ddd9d2;
+    --annot: #b45309;
+    --annot-bg: #b4530918;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page-bg: #101319;
+      --page-fg: #e4e8f0;
+      --page-muted: #949eb0;
+      --page-edge: #272d3c;
+      --annot: #fb923c;
+      --annot-bg: #fb923c1a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --page-bg: #101319; --page-fg: #e4e8f0; --page-muted: #949eb0;
+    --page-edge: #272d3c; --annot: #fb923c; --annot-bg: #fb923c1a;
+  }
+  :root[data-theme="light"] {
+    --page-bg: #f5f4f1; --page-fg: #23262e; --page-muted: #6b7280;
+    --page-edge: #ddd9d2; --annot: #b45309; --annot-bg: #b4530918;
+  }
+
+  body {
+    background: var(--page-bg);
+    color: var(--page-fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+    margin: 0;
+    padding: 2.5rem 1.25rem 4rem;
+  }
+  .wrap { max-width: 72rem; margin: 0 auto; }
+  header.intro { max-width: 46rem; margin-bottom: 2.5rem; }
+  header.intro h1 { font-size: 1.5rem; margin: 0 0 .5rem; letter-spacing: -.01em; text-wrap: balance; }
+  header.intro p { color: var(--page-muted); margin: .4rem 0; font-size: .95rem; }
+  header.intro code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .85em; background: var(--annot-bg); padding: .1em .35em; border-radius: .3em;
+  }
+
+  .states { display: grid; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); gap: 1.75rem; }
+  .state h2 {
+    font-size: .75rem; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--page-muted); margin: 0 0 .3rem; font-weight: 600;
+  }
+  .state h2 b { color: var(--page-fg); font-weight: 700; }
+  .state > p.when { font-size: .82rem; color: var(--page-muted); margin: 0 0 .8rem; min-height: 2.4em; }
+
+  /* ---- the uzi app card, faithful to web/src/index.css ember tokens (dark-only app) ---- */
+  .app {
+    --bg: rgb(8 10 15); --surface: rgb(15 18 26); --raised: rgb(23 27 38);
+    --edge: rgb(39 45 60); --fg: rgb(228 232 240); --muted: rgb(148 158 176);
+    --faint: rgb(122 133 154); --brand: rgb(251 146 60); --on-brand: rgb(26 16 8);
+    --ok: rgb(52 211 153); --warn: rgb(251 191 36); --danger: rgb(251 113 133); --info: rgb(56 189 248);
+    --radius: .625rem;
+    background: var(--surface);
+    border: 1px solid var(--edge);
+    border-radius: var(--radius);
+    padding: 1.25rem;
+    color: var(--fg);
+    font-size: .875rem;
+    display: flex; flex-direction: column; gap: 1rem;
+    box-shadow: 0 8px 24px rgb(0 0 0 / .35);
+  }
+  .app .sect { font-size: .7rem; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); font-weight: 600; }
+  .app p { margin: 0; color: var(--muted); font-size: .8rem; }
+  .app .row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+  .app .lbl { color: var(--muted); }
+  .badge {
+    display: inline-flex; align-items: center; gap: .4em;
+    border: 1px solid var(--edge); background: var(--raised); color: var(--muted);
+    border-radius: 999px; padding: .15rem .6rem; font-size: .75rem;
+  }
+  .badge::before { content: ""; width: .45em; height: .45em; border-radius: 50%; background: currentColor; }
+  .badge.warn { color: var(--warn); border-color: rgb(251 191 36 / .35); background: rgb(251 191 36 / .08); }
+  .badge.ok { color: var(--ok); border-color: rgb(52 211 153 / .35); background: rgb(52 211 153 / .08); }
+  .app code.uid {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--raised); color: var(--faint); padding: .1rem .35rem; border-radius: .3rem; font-size: .75rem;
+  }
+  .alert {
+    display: flex; gap: .6rem; align-items: flex-start;
+    border: 1px solid rgb(56 189 248 / .35); background: rgb(56 189 248 / .08);
+    color: var(--fg); border-radius: .5rem; padding: .65rem .8rem; font-size: .8rem;
+  }
+  .alert .ico { color: var(--info); flex: none; font-weight: 700; }
+  .alert p { color: var(--fg); }
+  .alert p .sub { color: var(--muted); }
+  .check { display: flex; align-items: center; gap: .7rem; }
+  .check .box {
+    width: 1rem; height: 1rem; border-radius: .2rem; flex: none;
+    background: var(--brand); color: var(--on-brand);
+    display: inline-flex; align-items: center; justify-content: center; font-size: .7rem; font-weight: 800;
+  }
+  .check.off .box { background: var(--raised); border: 1px solid var(--edge); color: transparent; }
+  .check.dis { opacity: .45; }
+  .field label { display: block; color: var(--muted); font-size: .75rem; margin-bottom: .35rem; }
+  .input {
+    background: var(--bg); border: 1px solid var(--edge); border-radius: .45rem;
+    color: var(--faint); padding: .5rem .7rem; font-size: .8rem;
+  }
+  .input.dis { opacity: .45; }
+  .btns { display: flex; gap: .55rem; flex-wrap: wrap; }
+  .btn {
+    border-radius: .5rem; padding: .45rem .95rem; font-size: .8rem; font-weight: 600;
+    background: var(--brand); color: var(--on-brand); border: 1px solid transparent;
+  }
+  .btn.sec { background: var(--raised); color: var(--fg); border-color: var(--edge); }
+  .btn.dis { opacity: .4; }
+  .hint { color: var(--faint); font-size: .75rem; }
+
+  /* ---- annotation callouts ---- */
+  .new {
+    position: relative;
+    outline: 1.5px dashed var(--annot);
+    outline-offset: 3px;
+    border-radius: .5rem;
+  }
+  .tag {
+    position: absolute; top: -0.7rem; right: -.4rem;
+    background: var(--annot); color: #fff;
+    font-size: .6rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    padding: .1rem .45rem; border-radius: 999px;
+  }
+  .legend { display: flex; gap: .5rem; align-items: center; font-size: .82rem; color: var(--page-muted); margin-top: 1rem; }
+  .legend .swatch { width: 1.1rem; height: .9rem; border: 1.5px dashed var(--annot); border-radius: .25rem; }
+
+  .plan { max-width: 46rem; margin-top: 3rem; border-top: 1px solid var(--page-edge); padding-top: 1.5rem; }
+  .plan h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
+  .plan ol { padding-left: 1.2rem; margin: 0; }
+  .plan li { margin-bottom: .7rem; font-size: .92rem; }
+  .plan li code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .85em; background: var(--annot-bg); padding: .1em .35em; border-radius: .3em;
+  }
+  .plan .note { color: var(--page-muted); font-size: .85rem; }
+</style>
+
+<div class="wrap">
+  <header class="intro">
+    <h1>Slack notifications: tell the user why the DM can't send</h1>
+    <p>Today the Settings → Notifications card looks identical whether Slack is fully working or was never configured by the admin. On dev-cluster Slack isn't set up at all, so auto-match never runs, the status sits at "Not linked" forever, and "Send test DM" is silently disabled with no explanation.</p>
+    <p>Proposal: expose the workspace connection state in <code>GET /me/slack</code> (one non-secret string) and let the card explain itself in each state. Dashed outlines mark what's new.</p>
+    <div class="legend"><span class="swatch"></span> new element or copy</div>
+  </header>
+
+  <div class="states">
+
+    <!-- STATE A -->
+    <section class="state">
+      <h2><b>A · Slack not configured</b> — your current situation</h2>
+      <p class="when">Admin never connected Slack (<code>workspace: "unconfigured"</code>). Everything is disabled, and the card says who can fix it.</p>
+      <div class="app">
+        <div>
+          <div class="sect">Notifications</div>
+          <p style="margin-top:.5rem">Get a Slack DM when a run you own starts, needs your approval, finishes with a merge request, or fails.</p>
+        </div>
+        <div class="alert new"><span class="tag">new</span>
+          <span class="ico">ⓘ</span>
+          <p>Slack isn't connected on this uzi instance yet, so notifications can't be delivered. <span class="sub">An admin can set it up under Admin Settings → Slack.</span></p>
+        </div>
+        <div class="row"><span class="lbl">Link status</span> <span class="badge">Not linked</span></div>
+        <div class="check dis"><span class="box">✓</span> <span>Send me Slack notifications about my runs</span></div>
+        <div class="field">
+          <label>Slack member ID override</label>
+          <div class="input dis">e.g. U0123ABCD — leave blank to match by email</div>
+        </div>
+        <div class="btns">
+          <span class="btn dis">Save override</span>
+          <span class="btn sec dis">Send test DM</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATE B -->
+    <section class="state">
+      <h2><b>B · Connected, not linked yet</b></h2>
+      <p class="when">Slack is up (<code>workspace: "connected"</code>) but your email didn't match. Test DM stays disabled, but now says why.</p>
+      <div class="app">
+        <div>
+          <div class="sect">Notifications</div>
+          <p style="margin-top:.5rem">Get a Slack DM when a run you own starts, needs your approval, finishes with a merge request, or fails. uzi matches you by your account email; if that misses, set your Slack member ID below.</p>
+        </div>
+        <div class="row"><span class="lbl">Link status</span> <span class="badge">Not linked</span></div>
+        <p>No Slack account resolved yet. If uzi can't match your email, paste your Slack member ID below (Slack profile → ⋯ → Copy member ID).</p>
+        <div class="check"><span class="box">✓</span> <span>Send me Slack notifications about my runs</span></div>
+        <div class="field">
+          <label>Slack member ID override</label>
+          <div class="input">e.g. U0123ABCD — leave blank to match by email</div>
+        </div>
+        <div class="btns">
+          <span class="btn dis">Save override</span>
+          <span class="btn sec dis">Send test DM</span>
+        </div>
+        <p class="hint new" style="position:relative"><span class="tag">new</span>Test DMs become available once uzi resolves your Slack account — by email match or the override above.</p>
+      </div>
+    </section>
+
+    <!-- STATE C -->
+    <section class="state">
+      <h2><b>C · Pending confirmation</b></h2>
+      <p class="when">Account resolved, waiting on the Confirm button in the Slack DM. Unchanged except the resolved ID chip already shown today.</p>
+      <div class="app">
+        <div>
+          <div class="sect">Notifications</div>
+          <p style="margin-top:.5rem">Get a Slack DM when a run you own starts, needs your approval, finishes with a merge request, or fails.</p>
+        </div>
+        <div class="row"><span class="lbl">Link status</span> <span class="badge warn">Pending confirmation</span> <code class="uid">U0123ABCD</code></div>
+        <p>Check Slack for a confirmation DM from uzi — notifications start once you press Confirm.</p>
+        <div class="check"><span class="box">✓</span> <span>Send me Slack notifications about my runs</span></div>
+        <div class="field">
+          <label>Slack member ID override</label>
+          <div class="input">U0123ABCD</div>
+        </div>
+        <div class="btns">
+          <span class="btn dis">Save override</span>
+          <span class="btn sec">Send test DM</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATE D -->
+    <section class="state">
+      <h2><b>D · Linked</b></h2>
+      <p class="when">Confirmed in Slack. Fully unchanged — shown for completeness.</p>
+      <div class="app">
+        <div>
+          <div class="sect">Notifications</div>
+          <p style="margin-top:.5rem">Get a Slack DM when a run you own starts, needs your approval, finishes with a merge request, or fails.</p>
+        </div>
+        <div class="row"><span class="lbl">Link status</span> <span class="badge ok">Linked</span> <code class="uid">U0123ABCD</code></div>
+        <div class="check"><span class="box">✓</span> <span>Send me Slack notifications about my runs</span></div>
+        <div class="field">
+          <label>Slack member ID override</label>
+          <div class="input">U0123ABCD</div>
+        </div>
+        <div class="btns">
+          <span class="btn dis">Save override</span>
+          <span class="btn sec">Send test DM</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="plan">
+    <h2>What it takes</h2>
+    <ol>
+      <li><strong>API</strong>: add <code>workspace</code> to the <code>GET /me/slack</code> DTO — the manager's existing state (<code>disabled</code> / <code>connecting</code> / <code>connected</code> / <code>error:*</code>) collapsed to <code>unconfigured | connecting | connected | error</code>. Non-secret, read from <code>h.slackState()</code>, same source the admin chip already polls.</li>
+      <li><strong>Web</strong>: in <code>SlackNotifications.tsx</code>, render the state-A info alert and disable the controls when <code>workspace !== "connected"</code>; add the one-line hint under the disabled "Send test DM" button (state B); add the pending-state helper line (state C).</li>
+    </ol>
+    <p class="note">No schema or behavior changes on the notification path itself; the button was already correctly disabled — it just never said why.</p>
+  </div>
+</div>
