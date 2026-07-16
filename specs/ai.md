@@ -6148,3 +6148,103 @@ itself, plus the platform-admin steps needing elevated access — Harbor cred in
 tags (Maintainer-create-only), Harbor robot push-only scope, the Infisical `/uzi` folder, the ArgoCD
 OCI repo cred, and DNS for `uzi.example.com` (§250). M8 (e2e in CI) remains a stretch, explicitly
 not a blocker.
+
+# PRD #55 — OIDC group → role/access mapping (Keycloak / Pocket ID)
+
+Serves human Feature #55: the IdP owns who is admin (and optionally who may log in) on a shared
+deployment, replacing the first-login-race / env-seed model; authoritative grant-and-demote sync on
+every OIDC login; fail-safe on an absent claim; OIDC-only scope; works with Keycloak and Pocket ID.
+Extends PRD #45 (§195-201); no schema migration (a query-only change). Full decision log +
+review/audit trail: `prds/55-oidc-group-mapping.md` (Design Decisions there TAG provenance). This
+block records the load-bearing AI decisions.
+
+## 253. Groups from the verified ID token only; `GroupsClaimPresent` as the fail-safe discriminator
+
+- **No userinfo-endpoint fallback.** Both targets can put groups in the ID token (Keycloak via a
+  group-membership mapper with "Add to ID token"; Pocket ID via the `groups` scope), and the ID token
+  is already signature/nonce-verified in the PRD #45 flow (§195), so groups inherit that trust with no
+  extra network call. Serves the fail-safe requirement: one trusted source, no second call to fail
+  ambiguously.
+- **The claim name is dynamic** (`config.OIDCGroupsClaim`, threaded to `oidc.Config.GroupsClaim`), so
+  it cannot ride the static `rawClaims` struct. `Exchange` does a SECOND tolerant decode of the
+  verified token into `map[string]json.RawMessage` and looks the name up (`parseGroupsClaim`,
+  `api/internal/oidc/provider.go`).
+- **`Identity` gains `Groups []string` + `GroupsClaimPresent bool`** — the fail-safe needs *absent*
+  distinct from *present-and-empty*. `present == true` ONLY when the claim exists as a JSON array of
+  strings (an empty `[]` counts — an authoritative empty membership that demotes/gates). Every other
+  shape yields `(nil, false)`: claim missing, explicit JSON `null` (treated as absent — far likelier a
+  mapper misconfig than a deliberate empty membership), a bare string, number, object, or mixed/
+  non-string array. `(nil, false)` is the misconfig case the callback fails safe on (Decision 1).
+
+## 254. Config: exact case-sensitive matching, all-or-nothing posture, no auto-scopes
+
+- **`UZI_OIDC_GROUPS_CLAIM`** (default `groups`), **`UZI_OIDC_ADMIN_GROUPS`**,
+  **`UZI_OIDC_ALLOWED_GROUPS`** (both comma-separated). The two lists are split, trimmed, de-duped,
+  empties dropped — but **NOT lowercased**: matching is exact and case-sensitive
+  (`groupsIntersect`, `api/internal/handler/oidc.go`). No glob/regex/path-normalization; Keycloak's
+  "Full group path" mapper option (leading `/`) must be off, or the operator sets the literal
+  `/uzi-admins` in config — documented, keeps the matcher trivially auditable.
+- **All-or-nothing (Decision 7).** Any group var set while OIDC itself is unconfigured → refuse to
+  start (mirrors the PRD #45 issuer/id/secret-triple posture, §200). Empty lists = feature fully
+  dormant, zero behavior change, existing tests pass unchanged.
+- **Scopes are NOT auto-appended, and there is NO boot warning on a "missing `groups` scope".**
+  Requesting an undefined scope is `invalid_scope` on strict IdPs (Keycloak), and Keycloak emits
+  groups via a mapper (a client-scope concern), not a requested scope — so a scope-presence boot
+  warning would false-positive on every Keycloak deploy and train operators to ignore it (review
+  finding). Instead: a one-shot boot INFO points at the docs when gating is active, and the real
+  misconfig signal is the runtime absent-claim warn (§255). Pocket ID operators add `groups` to
+  `UZI_OIDC_SCOPES` themselves.
+
+## 255. Enforcement order — allowlist gate FIRST, before any resolve/JIT/DB write
+
+- In `oidcResolveUser` the allowlist gate runs at step 0, before any DB read or write, so a rejected
+  login never links a row, touches a deactivated row, or JIT-creates. Reject condition:
+  `UZI_OIDC_ALLOWED_GROUPS` set **AND** claim present **AND** no intersection → generic
+  `oidc_forbidden` (reused from PRD #45; detail in the server log only, matching the no-enumeration
+  posture, §201).
+- **Fail-safe split for an absent/unparseable claim (Decision 1).** The top gate lets an EXISTING user
+  pass (they fail safe into their stored role); a per-login WARN fires (only the configured claim
+  NAME is logged, never contents). A brand-new JIT user has no established role to fall back to, so a
+  second guard in the JIT branch refuses provisioning unless the gate is open (no allowlist, or claim
+  present AND intersecting) — this closes the absent-claim case that the top gate deliberately let
+  through. One IdP misconfig thus cannot both demote every admin and lock every existing user out at
+  once.
+
+## 256. Admin sync — grant/demote, seed-admin demotion-only exemption, fail-closed, JIT-at-creation
+
+- **`oidcSyncAdmin`** (in `oidcLoginExisting`, the single funnel all resolve paths pass through) runs
+  ONLY when `UZI_OIDC_ADMIN_GROUPS` is set AND the claim is present. desired = membership; a no-op
+  when it already matches. Grant and demote both flip via the new `SetUserAdmin :one` query (returns
+  the row so the issued session reflects the flip); logs carry user id + direction + the configured
+  group names only.
+- **Seed-admin exemption is DEMOTION-ONLY and guarded on a non-empty `SeedEmail`.** When `desired ==
+  false` and the resolved (canonical, stored) email equals `cfg.SeedEmail` (which is `""`-guarded so
+  disabled seeding can never become a blanket exemption), the demotion is skipped — break-glass; a
+  seed admin can still be *promoted* by group. The exemption covers demotion only: it does NOT exempt
+  the allowlist gate (a seed admin outside the allowed groups can't SSO past step 0 — their break-
+  glass is password login, which bypasses gate + sync by the OIDC-only scope).
+- **Fail-closed on a `SetUserAdmin` DB error** (chosen in implementation, endorsed in review): the
+  login errors (`oidc_internal`) rather than proceeding with a stale role — the privilege-persistence
+  argument for the demote direction. No `token_version` bump is needed (§257).
+- **JIT admin decided at creation, not by a later sync-flip.** When admin groups are configured,
+  `createOIDCUserFirstAdmin` creates the row with `IsAdmin = membership` and the `count == 0`
+  first-admin rule is DISABLED (the group decides — first-OIDC-user-admin off, Decision 4/5). When not
+  configured, `IsAdmin` follows `count == 0`, computed under the same `pg_advisory_xact_lock` as
+  password registration (concurrent-JIT race preserved). The subsequent `oidcSyncAdmin` on a fresh row
+  is a guaranteed no-op (desired == stored), so a JIT user is never double-flipped.
+
+## 257. Propagation model — per-request `is_admin`, no token bump, no forced logout, no admin-UI
+
+- The `is_admin` flip lands at the user's next OIDC login and propagates instantly: `RequireAuth`
+  reloads the user row per request (`api/internal/middleware/auth.go:68`) and `is_admin` is NOT in the
+  JWT, so a demote is visible to every live session on its next request — **no `token_version`
+  bump** (that would force a full re-login for a role change; unnecessary here). The `SetUserAdmin`
+  query comment records this contract.
+- **Staleness is bounded, not zero (documented in `docs/oidc.md`).** A demoted-in-IdP user who never
+  re-logs-in keeps admin until their next OIDC login; for OIDC-only users that is bounded by session
+  TTL (`AUTH_TOKEN_TTL`), a linked user with a password can re-auth via password and retain the stale
+  role longer (OIDC-only scope). The allowlist is a login gate only — removal blocks the next SSO login
+  but does not revoke live sessions; immediate offboarding is the existing admin deactivate-user
+  action (which does kill sessions). **No mid-session forced logout on demotion** (out of scope).
+- **No admin-UI manual role management** (Decision 6): the IdP owns roles; a manual promote/demote
+  endpoint would fight the authoritative sync. Revisit only if a non-OIDC deployment asks for it.

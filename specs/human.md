@@ -366,6 +366,18 @@ Tracked as GitLab issue vtmocanu/uzi#53; PRD at `prds/53-rate-limits.md`.
 - The header-probe fallback spends ~1 token/interval of the user's own quota; operators can disable the probe (`UZI_USAGE_PROBE=false`) or the whole poller (`UZI_USAGE_POLL_INTERVAL=0`).
 - No Anthropic token ever appears in a log line, API response, or the SPA.
 
+## Feature #55 — OIDC group → role/access mapping (Keycloak / Pocket ID)
+
+Tracked as GitLab issue vtmocanu/uzi#55; PRD at `prds/55-oidc-group-mapping.md`. Builds on PRD #45 (OIDC SSO).
+
+- On a shared/team deployment the IdP owns who is admin (and optionally who may log in), replacing the first-login-race / env-seed model. [user 2026-07-16]
+- Two configurable comma-separated group lists: an admin-groups list (membership ⇒ is_admin) and an allowed-groups list (membership required to SSO-login / JIT-provision at all); empty = that feature off. [user 2026-07-16]
+- Authoritative sync on EVERY OIDC login: groups both grant AND demote — leaving the admin group demotes on next login, leaving the allowed group blocks the next login. No sticky roles. [user 2026-07-16]
+- An absent/unparseable groups claim is treated as IdP misconfig, NOT removal (fail-safe): existing users keep their role and pass the gate; a brand-new JIT user is still refused when the allowlist is set. [user 2026-07-16]
+- When admin-groups is configured, first-OIDC-user-becomes-admin is disabled (the group decides). `UZI_SEED_EMAIL` stays as break-glass, exempt from group demotion; with groups configured, seeding is optional (only for break-glass password login + credential seeding). [user 2026-07-16]
+- OIDC-only scope: groups apply only at OIDC login; password-login users (incl. the seed admin) keep their stored `is_admin`; password first-user-admin is untouched. [user 2026-07-16]
+- Must work with BOTH Keycloak and Pocket ID. [user 2026-07-16]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
