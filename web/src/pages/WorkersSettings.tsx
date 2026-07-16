@@ -13,6 +13,11 @@ import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerStatGauges } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 
+// Stable per-row ids: the delete button is a focus target after a dismissed confirm,
+// and the warning is the confirm group's aria-description (PRD #58).
+const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
+const deleteWarningId = (workerId: string) => `worker-delete-warning-${workerId}`;
+
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [loading, setLoading] = useState(true);
@@ -32,6 +37,8 @@ export function WorkersSettings() {
   // button below.
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
   const confirmRef = useRef<HTMLDivElement>(null);
+  // The row whose Delete button should get focus back after a dismissed confirmation.
+  const [restoreFocusTo, setRestoreFocusTo] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -98,6 +105,30 @@ export function WorkersSettings() {
   useEffect(() => {
     if (confirmingDelete) confirmRef.current?.focus();
   }, [confirmingDelete]);
+
+  // Backing out of a confirmation must not cost the user their place. Escape or Cancel
+  // unmounts the confirm, which would drop focus to <body> and leave a keyboard user
+  // tabbing from the top of the document back to the row they were already on — making
+  // the escape hatch feel like a punishment for a misclick. So focus goes back to the
+  // Delete button that armed it.
+  //
+  // Via id rather than a ref because `Button` (components/ui.tsx) does not forward one,
+  // and teaching a primitive every page uses to forward refs is a wider change than
+  // this fix earns. It has to run AFTER the render that re-mounts the button — hence a
+  // state flag and an effect, not a .focus() in the handler, which would fire while the
+  // button is still unmounted.
+  useEffect(() => {
+    if (!restoreFocusTo) return;
+    // Gone if the fleet poll dropped the row underneath us; then there is nothing to
+    // focus and <body> is the honest answer.
+    document.getElementById(deleteButtonId(restoreFocusTo))?.focus();
+    setRestoreFocusTo(null);
+  }, [restoreFocusTo]);
+
+  const dismissConfirm = (id: string) => {
+    setConfirmingDelete(null);
+    setRestoreFocusTo(id);
+  };
 
   const copy = async () => {
     if (!newToken) return;
@@ -264,6 +295,7 @@ export function WorkersSettings() {
                         radius, so only the expensive one asks. */}
                     {confirmingDelete !== w.id && (
                       <Button
+                        id={deleteButtonId(w.id)}
                         variant="danger"
                         size="sm"
                         onClick={() => (w.kind === "hosted" ? setConfirmingDelete(w.id) : remove(w.id))}
@@ -298,12 +330,19 @@ export function WorkersSettings() {
                     tabIndex={-1}
                     role="group"
                     aria-label={`Confirm deleting ${w.name}`}
+                    // The label alone would DEFEAT this control for a screen reader.
+                    // Focusing a named container announces its accessible NAME —
+                    // "Confirm deleting base (M), group" — which sounds like a routine
+                    // are-you-sure, while the warning below stays untethered text the
+                    // user may never hear. The description is what carries the payload,
+                    // and the payload is the entire reason the control exists.
+                    aria-describedby={deleteWarningId(w.id)}
                     onKeyDown={(e) => {
-                      if (e.key === "Escape") setConfirmingDelete(null);
+                      if (e.key === "Escape") dismissConfirm(w.id);
                     }}
                     className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-none"
                   >
-                    <p className="text-xs text-warn">
+                    <p id={deleteWarningId(w.id)} className="text-xs text-warn">
                       Delete is not a restart: a hosted worker’s disks go with it, permanently —{" "}
                       <code className="rounded bg-raised px-1 py-0.5">/data</code> (its workspace) and{" "}
                       <code className="rounded bg-raised px-1 py-0.5">/nix</code> (its cached tools). A replacement
@@ -313,7 +352,7 @@ export function WorkersSettings() {
                       <Button variant="danger" size="sm" onClick={() => remove(w.id)}>
                         Delete anyway
                       </Button>
-                      <Button variant="ghost" size="sm" onClick={() => setConfirmingDelete(null)}>
+                      <Button variant="ghost" size="sm" onClick={() => dismissConfirm(w.id)}>
                         Cancel
                       </Button>
                     </div>

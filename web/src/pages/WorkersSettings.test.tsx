@@ -316,3 +316,62 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
     expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
   });
 });
+
+describe("WorkersSettings hosted confirm keeps a keyboard user's place (PRD #58)", () => {
+  const hostedW = aWorker({ id: "w-h", name: "base (M)", kind: "hosted", hosted_size: "m" });
+  const deleteBtn = () => screen.getByRole("button", { name: "Delete" });
+  const group = () => screen.getByRole("group", { name: /Confirm deleting base \(M\)/ });
+
+  it("returns focus to the Delete button when Escape dismisses the confirm", async () => {
+    // Backing out correctly must not cost the user their place. Without this, Escape
+    // drops focus to <body> and a keyboard user tabs from the top of the document back
+    // to the row they were already on — the escape hatch punishing a misclick.
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.keyDown(group(), { key: "Escape" });
+
+    await waitFor(() => expect(document.activeElement).toBe(deleteBtn()));
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("returns focus to the Delete button when Cancel dismisses the confirm", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(document.activeElement).toBe(deleteBtn()));
+  });
+
+  it("returns focus to the RIGHT row's Delete button when several are listed", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [aWorker({ id: "w-h1", name: "jvm (L)", kind: "hosted", hosted_size: "l" }), hostedW],
+    });
+    renderPage();
+    await screen.findByText("base (M)");
+    // Arm the SECOND row.
+    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[1]);
+    fireEvent.keyDown(group(), { key: "Escape" });
+
+    await waitFor(() => expect(document.activeElement).toBe(screen.getAllByRole("button", { name: "Delete" })[1]));
+  });
+
+  it("describes the confirm group with the warning, so the payload is announced with the name", async () => {
+    // A named container announces its NAME on focus — "Confirm deleting base (M),
+    // group" — which sounds like a routine are-you-sure. Without aria-describedby the
+    // warning stays untethered text a screen-reader user may never hear, which would
+    // defeat the whole control.
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    const describedBy = group().getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    const description = document.getElementById(describedBy!);
+    // The description must be the text that names the losses, not just any element.
+    expect(description?.textContent).toMatch(/Delete is not a restart/);
+    expect(description?.textContent).toMatch(/\/data/);
+    expect(description?.textContent).toMatch(/\/nix/);
+  });
+});
