@@ -26,15 +26,17 @@ import (
 //     with nobody to delegate to.
 //
 // The caps deliberately mirror the worker's (agent/src/repoagents.ts): 16 agents
-// per repo, 64-char names, 1024-char descriptions. They are re-declared rather
+// per repo, 64-char names, 1024-byte descriptions. They are re-declared rather
 // than imported because the two languages cannot share a constant; a drift here
 // means the API rejects a roster the worker considered legal, which surfaces as a
-// clear 400 rather than as silent truncation.
+// clear 400 rather than as silent truncation. The description cap is measured in
+// UTF-8 BYTES on both sides (Go len() here, Buffer.byteLength on the worker) — the
+// real payload bound, and equal across the two runtimes.
 const (
 	// MaxRepoAgents bounds a reported roster (worker cap: REPO_AGENTS_MAX_FILES).
 	MaxRepoAgents = 16
-	// MaxAgentDescriptionLen bounds one roster entry's description
-	// (worker cap: REPO_AGENT_MAX_DESCRIPTION_LEN).
+	// MaxAgentDescriptionLen bounds one roster entry's description in UTF-8 bytes
+	// (worker cap: REPO_AGENT_MAX_DESCRIPTION_LEN, also bytes).
 	MaxAgentDescriptionLen = 1024
 	// MaxAgentExclusions bounds a selection's exclusion list. Twice MaxRepoAgents:
 	// the owner's own template list is not file-capped, so excluding all but one of
@@ -92,7 +94,7 @@ func validateRepoAgents(agents []RepoAgent) error {
 			return fmt.Errorf("%w: repo agent %q must have a description", ErrInvalidSelection, a.Name)
 		}
 		if len(a.Description) > MaxAgentDescriptionLen {
-			return fmt.Errorf("%w: repo agent %q description must be at most %d characters", ErrInvalidSelection, a.Name, MaxAgentDescriptionLen)
+			return fmt.Errorf("%w: repo agent %q description must be at most %d bytes", ErrInvalidSelection, a.Name, MaxAgentDescriptionLen)
 		}
 		if hasUnsafeChar(a.Description) {
 			return fmt.Errorf("%w: repo agent %q description must not contain newlines, control, or bidirectional/format characters", ErrInvalidSelection, a.Name)

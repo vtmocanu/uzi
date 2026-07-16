@@ -79,7 +79,10 @@ function canonicalTool(name: string): string {
  *  worker's payload. */
 export const REPO_AGENTS_MAX_FILES = 16;
 export const REPO_AGENT_MAX_BYTES = 64 * 1024;
-/** Bounds a description before it reaches a run message, the DB, and the gate UI. */
+/** Bounds a description (in UTF-8 BYTES, not UTF-16 units) before it reaches a run
+ *  message, the DB, and the gate UI. Bytes, to match the API's Go len() basis and
+ *  the neighbouring byte caps (REPO_AGENT_MAX_BYTES): UTF-8 bytes >= UTF-16 units,
+ *  so a UTF-16-unit check here would accept payloads the API then 400s. */
 export const REPO_AGENT_MAX_DESCRIPTION_LEN = 1024;
 /** Bounds a declared allowlist (and each entry) so a hostile frontmatter cannot
  *  bloat the AgentDefinition. Over-cap entries are dropped, not the agent. */
@@ -275,7 +278,7 @@ function parseAgentFile(raw: string, slug: string): ParsedAgentFile {
   // visually reorder the rendered text in an approval dialog. Rejected, not
   // scrubbed — a description that needs a format character is not a real one.
   const description = fm.fields.description?.trim() ?? "";
-  if (description === "" || description.length > REPO_AGENT_MAX_DESCRIPTION_LEN || hasUnsafeChar(description)) {
+  if (description === "" || Buffer.byteLength(description, "utf8") > REPO_AGENT_MAX_DESCRIPTION_LEN || hasUnsafeChar(description)) {
     return invalid(name);
   }
 
