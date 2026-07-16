@@ -564,9 +564,28 @@ Non-goals (v1):
   the chart), controller and hosted workers on `https://`, docs for the cert
   values. Success: claim traffic on dev-cluster is TLS; plain-HTTP worker port
   unreachable from the worker namespace.
-- [ ] **M5 — Web UI**: Settings → Workers hosted section — provision dialog
-  (type + size), hosted-marked rows, delete; hidden when hosting is disabled.
-  Success: vitest coverage; web-ux review.
+- [x] **M5 — Web UI** (landed 2026-07-16): Settings → Workers hosted section — provision
+  dialog (type + size), hosted-marked rows, delete; hidden when hosting is disabled.
+  Success: vitest coverage; web-ux review. **Both met**: 612 → 654 tests (+42, +3 files),
+  and web-ux drove the primary journey in a real browser (provision → hosted-marked row →
+  delete) plus the quota loop, confirming the at-quota gate **releases** rather than
+  dead-ending. Reviewer + web-ux both cleared it with no blocking findings.
+  - **Delete gained a hosted-only confirmation** (user decision, 2026-07-16), because M5
+    pointed the page's existing one-click Delete at a far more destructive target: an
+    external delete revokes a token (the container keeps running; re-register to recover),
+    while a hosted delete takes `/data` and `/nix` with it permanently — and with no
+    restart endpoint in v1, Delete is the only lifecycle control a user has, so they will
+    reach for it to restart a stuck worker. External delete stays **one click**, pinned by
+    a test: the confirmation's meaning depends on its rarity.
+  - **Deletes announce and take focus, both kinds.** An announcement is feedback *after*
+    the act, not friction before it, so it costs no clicks and takes nothing from the
+    asymmetry above. Note the conventional "focus the next row's Delete" is **actively
+    unsafe here**: the remaining rows are mostly external one-click destructors, so it
+    would park a keyboard user on a live one, and double-tapping Enter through a confirm
+    would destroy a second worker.
+  - **The default is `m`, not `s`** (user decision, 2026-07-16) — see M6. `s` shipped
+    first with a rationale that was false about this codebase, and the correction outlived
+    the comment fix.
   - **"Dialog" is an inline Card form, not a modal** (architect, 2026-07-16;
     verified): there is **no modal primitive anywhere in `web/`** — no `Modal`, no
     `role="dialog"`, no `<dialog>`. Taken literally the word would have M5 build
