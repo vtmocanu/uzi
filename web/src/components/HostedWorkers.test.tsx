@@ -168,8 +168,10 @@ describe("HostedWorkers provisioning", () => {
     fireEvent.click(await provisionButton());
 
     const msg = await screen.findByText(/Provisioned base \(M\)/);
-    // role="status" carries an implicit aria-live=polite, so a mouse user who never
-    // had focus here still gets it announced.
+    // role="status", not "alert": this is a success, not an error. Its implicit
+    // aria-live is NOT what announces the provision — it is inserted with its text, so
+    // it may never fire; the focus move in the test below is the dependable channel.
+    // Pinned only so the notice stays a success and stays visible.
     expect(msg.getAttribute("role")).toBe("status");
   });
 

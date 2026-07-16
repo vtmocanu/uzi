@@ -84,10 +84,17 @@ export function HostedWorkers({
 
   // Provisioning is otherwise silent, and worse than silent for a keyboard user: the
   // new row lands below the fold, and at quota the submit disables under the user's
-  // own focus, which dumps it to <body>. So move focus onto the confirmation. That is
-  // also what makes the announcement reliable — a live region inserted together with
-  // its text is not reliably read, whereas a focused element always is (Alert's
-  // role="status" still covers the mouse user who never had focus here).
+  // own focus, which dumps it to <body>. So move focus onto the confirmation.
+  //
+  // The focus move is the ONLY dependable announcement here, and it needs no help: it
+  // is unconditional, so a mouse user's focus lands on the notice too. The Alert's
+  // implicit aria-live (role="status") is NOT a second channel — it is inserted
+  // together with its text, and a live region that appears with its content is not
+  // dependably read. The two standard fixes are an always-present region injected into
+  // later (as ActivityFeed.tsx does) or a focus move; this is the latter, and doing
+  // both would only risk announcing twice. The Alert earns its place as the VISIBLE
+  // confirmation. Treat its live region as a bonus that may never fire, not as cover
+  // for anyone.
   useEffect(() => {
     if (notice) noticeRef.current?.focus();
   }, [notice]);
