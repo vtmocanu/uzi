@@ -324,7 +324,71 @@ Non-goals (v1):
      internet, per worker.** That is exactly the cost class `agentnix` was created
      to avoid. So M3's volume answers point opposite ways, for opposite reasons:
      **persist `/nix`** (expensive, off-LAN, first-run-only), **do not persist the
-     bare** (cheap, LAN-local, a pure cache — see Decision 6). All presets pin `WORKER_MAX_CONCURRENT_RUNS=1` until
+     bare** (cheap, LAN-local, a pure cache — see Decision 6).
+   - **CORRECTION — the note above is right that `/nix` must persist and WRONG about
+     how, and taken literally it produces a worker that cannot boot** (tester
+     measured + architect, 2026-07-16; **blocking for M3**). **A k8s volume does not
+     seed itself from image content.** Seeding an empty volume from the image is a
+     **Docker named-volume feature**, which is exactly why compose works and why this
+     went unnoticed: the note assumed the compose mechanism transfers, and it does
+     not. A PVC (or emptyDir) at `/nix` mounts **empty** and **masks** the image's
+     baked 209 MB store — *including the `nix` binary itself*
+     (`/nix/var/nix/profiles/default/bin`, on PATH). Measured under the worker's real
+     posture (`--user uzi`, `no-new-privileges`, `cap-drop ALL`): the binary is gone,
+     `/nix` has 0 entries, and devbox then tries to self-heal by **downloading an
+     unpinned `nix-installer` and escalating via `sudo`** — failing with ENOENT, but
+     only after reintroducing *both* things `agent/templates/base/Dockerfile:28-33`
+     records as blockers it deliberately engineered out. **So it does not degrade to
+     "re-fetch per roll"; it hard-fails, and it fails toward the posture the image
+     exists to prevent.**
+     - *What survives, and it is the substance.* The **goal** was right and is now
+       measured rather than argued: provisioning the full seeded tier-1 allowlist
+       grows `/nix` 209 MB → **1,703 MB / 1,205 store paths in 10m53s of real
+       internet fetch**. Decision 9 rolls every worker on every release, so **not**
+       persisting `/nix` costs that per worker per release. That measurement is the
+       strongest evidence for persisting it this PRD has; only the mechanism was
+       wrong. (e2e can never surface this: the harness bind-mounts a fake devbox
+       because the isolated stack has no substituter egress.)
+     - **M3 must seed the volume explicitly** — an initContainer (from the agent
+       image, so it carries the baked store) copying `/nix` into the volume **only
+       when the volume is empty**, never overwriting a provisioned store. Constraints,
+       none optional: PodSecurity `restricted` (non-root, drop ALL, no privilege
+       escalation — so no root chown escape), writable via the pinned `fsGroup:
+       10001`, idempotent across rolls. **Verify the copy under the real posture
+       rather than assuming it**: a non-root `cp -a` preserving ownership works only
+       while the image's `/nix` is owned by the uid it runs as.
+     - *Known property, inherited from compose rather than introduced here*: once
+       seeded, the store is **never refreshed from a newer image**, so a nix/devbox
+       upgrade baked into a release never reaches an existing worker's `/nix`. Compose
+       has had this forever; it is sharper here only because Decision 9 rolls workers
+       automatically and users will reasonably expect a roll to update things. Remedy
+       is v1's answer to everything: delete + reprovision.
+     - *Rejected — one shared RWX read-only nix store for the fleet.* Read-only cannot
+       work at all: tool-profile provisioning (PRD #18) **writes** to the store.
+       Shared-and-writable is worse than it looks — **the nix store is executable
+       content**, so one compromised worker poisons every other user's binaries,
+       converting a single-worker compromise into fleet-wide cross-tenant code
+       execution. It also needs an RWX StorageClass dev-cluster may not have. **The
+       right long-term answer is a substituter, not a mount**: an in-cluster binary
+       cache (nix-serve, or a Harbor-backed mirror) keeps per-worker store isolation
+       while turning that 10m53s internet fetch into a LAN fetch. Out of scope for M3;
+       the correct v2 shape for this cost.
+     - *Sizing, now measured*: **`/nix` is byte-identical between `base` and `jvm`**
+       (209 MB, 74 store paths — the JDK ships via apk to `/usr/lib/jvm`, never
+       through nix). So **`/nix` does not vary by template or by size** and belongs
+       **outside the preset table** as a flat value. 1,703 MB is the measured worst
+       case, so a flat **4Gi** carries ~2.4x headroom; 8Gi is mostly waste, and storage
+       is the binding fleet constraint (10 users × quota 2 × M ⇒ 10 cores / 20Gi RAM
+       but **560Gi of PVC** at 8Gi nix). *Residual to document, not build*: **nix has
+       no auto-GC**, so a long-lived worker's store only grows and a fixed volume
+       eventually fills. `nix store gc` lives in `agent/` (not M3's file), so v1
+       documents it and delete + reprovision is the remedy.
+     - *It does not change the size-picker debt (M6); it simplifies the table.* The
+       incentive problem is a function of the **count-based quota** — if every preset
+       costs 1 of 2, the biggest is free whatever the preset contains. Removing `/nix`
+       leaves cpu/memory/`/data`, and `/data` does still vary by size, so the picker
+       does move the binding constraint. Users still have no reason to care.
+   All presets pin `WORKER_MAX_CONCURRENT_RUNS=1` until
    PRD #51 lands: cap>1 would server-provision the documented intra-user
    concurrency residuals (`docs/worker-setup.md` §Concurrent runs). Type and
    size are validated server-side against the built-in lists; user input never
