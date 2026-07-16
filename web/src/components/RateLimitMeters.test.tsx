@@ -30,6 +30,11 @@ const warnReading: MyRateLimits = {
   five_hour: { pct: 62, resets_at: nowSecs + 5000 },
   seven_day: { pct: 83, resets_at: nowSecs + 200_000 },
 };
+const dangerReading: MyRateLimits = {
+  ...okReading,
+  five_hour: { pct: 97, resets_at: nowSecs + 5000 },
+  seven_day: { pct: 71, resets_at: nowSecs + 200_000 },
+};
 const staleReading: MyRateLimits = {
   status: "ok",
   five_hour: { pct: 31, resets_at: null },
@@ -68,11 +73,11 @@ describe("RateLimitCard (Settings)", () => {
     expect(screen.queryByText("Claude limits")).toBeNull();
   });
 
-  it("swaps Live for a neutral Stale badge on a stale reading", async () => {
+  it("swaps Live for a neutral stale badge on a stale reading", async () => {
     mockApi.getMyRateLimits.mockResolvedValue(staleReading);
     render(<RateLimitCard />);
     await screen.findByText("Claude limits");
-    expect(screen.getByText("Stale")).toBeTruthy();
+    expect(screen.getByText("stale")).toBeTruthy();
     expect(screen.queryByText("Live")).toBeNull();
     expect(screen.getByText(/reading is stale/)).toBeTruthy();
     // Percentages still shown; no live countdown when resets_at is null.
@@ -84,6 +89,18 @@ describe("RateLimitCard (Settings)", () => {
       (name) => screen.getByRole("progressbar", { name }).firstChild as HTMLElement,
     );
     for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
+  });
+
+  it("escalates the badge to danger on a ≥95% reading and paints the 5h bar red", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(dangerReading);
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(screen.getByText("5h nearly out")).toBeTruthy();
+    expect(screen.queryByText("Live")).toBeNull();
+    // The 5h window bar is red (bg-danger) — NOT amber (bg-warn, which is warn).
+    const bar5h = screen.getByRole("progressbar", { name: "5-hour window" }).firstChild as HTMLElement;
+    expect(bar5h.className).toMatch(/bg-danger/);
+    expect(bar5h.className).not.toMatch(/bg-warn/);
   });
 
   it("keeps a warn reading on the Live badge but paints the bar amber", async () => {

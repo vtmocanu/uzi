@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, type MyRateLimits, type RateLimitWindow } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { formatAgo, formatCountdown, useNow } from "../lib/rateLimits";
+import { formatAgo, formatCountdown, statusBadge, useNow } from "../lib/rateLimits";
 import { Badge, Card, SectionTitle } from "./ui";
 import { MeterTrack } from "./Meter";
 
@@ -112,6 +112,12 @@ export function RateLimitCard() {
     );
   }
 
+  // The badge reuses the shared statusBadge helper (PRD #54, Decision 2) so a
+  // ≥95% window escalates to the danger pill ("5h nearly out") matching the admin
+  // table, instead of the old flat "Stale"/"Live". /me/rate-limits has no
+  // vault_locked field, so vaultLocked is false — a stale self reading reads
+  // "stale" (the single-source-of-truth wording).
+  const badge = statusBadge(data, false);
   return (
     <Card className="space-y-5">
       <div>
@@ -125,7 +131,7 @@ export function RateLimitCard() {
       {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
           this page leans on — clears WCAG AA 4.5:1 at 12px (web-ux finding). */}
       <div className="flex items-center gap-2 text-xs text-muted">
-        {data.stale ? <Badge tone="neutral">Stale</Badge> : <Badge tone="ok" dot>Live</Badge>}
+        <Badge tone={badge.tone} dot={badge.dot}>{badge.label}</Badge>
         <span>
           updated {formatAgo(data.synced_at, now)}
           {data.stale ? " · reading is stale (vault locked or polling off)" : " · refreshes every few minutes"}
