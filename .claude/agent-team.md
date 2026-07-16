@@ -23,8 +23,10 @@ the Task* tools.
 
 Default flow for a typical task:
 1. Spawn coder with the full task context. The coder runs the project's
-   test/lint gate before reporting done (TBD — no gate exists yet; for now
-   that means a `docker compose up` smoke once the stack lands).
+   test/lint gates before reporting done: `cd api && go test ./...`;
+   `cd web && npm test && npm run typecheck`;
+   `cd agent && npm test && npm run typecheck` (plus `./e2e/run-e2e.sh` +
+   `./scripts/smoke.sh` for stack-level changes).
 2. After coder reports done, spawn reviewer + auditor IN PARALLEL with
    coder's diff + report (pin to commit SHAs). Dispatch fact-checker in the
    same wave when the change touches claim-bearing artifacts (README,
@@ -67,13 +69,20 @@ against the actual submodule code, not from memory.
   for testing — `--env-file` with dummy secrets + unique `-p` project.
 - Lint command: none dedicated; `npm run build` in web/ runs the
   check-docs + tsc gate
-- Release flow: none
+- Release flow: tag-driven (PRD #52). `v*` tags publish the api/web images +
+  the OCI Helm chart to Harbor (Model B: chart `version`/`appVersion` == the
+  tag); k8s deploy is GitOps via ArgoCD to dev-cluster (see `deploy/` +
+  `deploy/README.md`)
 - Spec dir: `specs/` (`human.md` = user contract, edits need user approval;
   `ai.md` = AI design decisions)
 - Authoring rules: `CLAUDE.md` at the repo root (commands, architecture map,
   conventions); plan.md is the working plan
-- CI: none; remote is GitLab (`gitlab.example.com:vtmocanu/uzi`, use
-  `glab`, never `gh`/`tea`)
+- CI: real (`.gitlab-ci.yml`, PRD #52) — validate/test across api/web/agent +
+  `helm lint`/`template` + kaniko image validation builds on every MR and
+  `main`; `v*` tags additionally publish the images + OCI chart to Harbor. e2e
+  is deliberately NOT in CI (it needs docker compose on the runner) — it stays
+  the local pre-merge gate. Remote is GitLab (`gitlab.example.com:vtmocanu/uzi`,
+  use `glab`, never `gh`/`tea`)
 - MVP shape: local laptop demo via docker-compose, PostgreSQL DB, persistent
   storage (per plan.md)
 - Inspiration submodules: `inspiration/{bottega,multica,dot-agent-deck}`
