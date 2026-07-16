@@ -14,13 +14,14 @@
 //   2. Only a synthesized packages-only devbox.json is used, written OUTSIDE the
 //      clone. A repo's own devbox.json (init_hook/scripts) is never executed here.
 //
-// RESIDUAL (not closed by the above, same class as the /proc note in
-// docker-compose.yml): the join-token FILE at /run/secrets/worker_token stays
-// same-uid readable, so a nix build hook running as the uzi user could read it —
-// a surface NOT behind the agent's PreToolUse deny-hook. Bounded in M4+ by the
-// admin allowlist (only vetted packages install, and their build hooks run in this
-// scrubbed env), but the structural close is the k8s uid-split (agent under a
-// DISTINCT uid from the worker), deferred to the remote-worker phase.
+// CLOSED for the local path (PRD #51 M4): the provision/nix build hooks now run under
+// the cap-less `runner` uid (via runnerCommand below), and the join-token FILE at
+// /run/secrets/worker_token is 0400 worker-owned, so a build hook can no longer read it
+// — the same-uid residual this used to name is gone on the A1 (root-started) path. The
+// admin allowlist still bounds WHICH packages install (their build hooks run in this
+// scrubbed env). On a #58 single-uid (non-root) start there is no split and the hook runs
+// as the sole uid (that PRD's accepted posture); the cross-container k8s form is mapped in
+// docs/proc-hardening.md.
 //
 // PATH assumption: nix/devbox tooling needs /sbin on PATH (e.g. Alpine's addgroup
 // lives there). The image PATH passed through by buildProvisionEnv includes it

@@ -8,14 +8,15 @@ import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 const execFileAsync = promisify(execFile);
 
 // A ROOT-OWNED, non-writable (0555) empty dir BAKED into the worker image (see
-// agent/templates/base/Dockerfile, created as root before `USER uzi:uzi`). Every
-// worker git invocation sets core.hooksPath here (via gitEnv's own GIT_CONFIG pairs,
-// which override any config file), so a hook that any WORKER-UID process tries to
-// plant CANNOT be created — a non-root process cannot create a child inside a
-// root-owned 0555 dir. That covers every same-uid planter until the k8s uid-split:
-// the agent's own Bash (out-of-worktree writes are the accepted PRD #42 residual) AND
-// the self_improve check-phase test code, which the worker also runs as this uid
-// before the push. So no pre-push (or any) hook can fire (M10 audit).
+// agent/templates/base/Dockerfile, created as root; the image has no `USER` line —
+// the entrypoint drops to the non-root worker at runtime). Every worker git
+// invocation sets core.hooksPath here (via gitEnv's own GIT_CONFIG pairs, which
+// override any config file), so a hook that ANY non-root process tries to plant
+// CANNOT be created — a non-root process cannot create a child inside a root-owned
+// 0555 dir. That covers every planter regardless of uid: the agent's own Bash and the
+// self_improve check-phase test code (both the `runner` uid under the PRD #51 split;
+// out-of-worktree writes are the accepted PRD #42 residual) AND the worker itself. So
+// no pre-push (or any) hook can fire (M10 audit).
 //
 // It is NOT created at runtime: a runtime mkdir would land under the SHARED uid and
 // be agent-writable — exactly the vector this closes (relocating, not fixing). A

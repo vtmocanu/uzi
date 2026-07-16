@@ -922,11 +922,29 @@ model.
       git-child** `/proc/environ` during the window (the actual PAT-race close); and
       the runner child's **own** environ is still scrubbed (no join token / PAT / API
       URL) under the new spawn path. Worker can still push. No regression.
-- [ ] **M7 — Docs (incl. k8s alignment, docs-only).** `docs/proc-hardening.md`
-      becomes the implemented design + the local↔k8s mapping (align at the
-      distinct-uid abstraction, not the mechanism — L3); `ARCHITECTURE.md` layer-2;
-      close the PRD #46 residual notes. Actual k8s manifests deferred to the
-      remote-worker PRD.
+- [x] **M7 — Docs (incl. k8s alignment, docs-only). DONE 2026-07-16 — check-docs OK
+      (28 docs, 0 errors); agent typecheck clean + unit 551/0/1 (comment-only source
+      edits, inert).** `docs/proc-hardening.md` rewritten from the pre-M1 sketch to the
+      IMPLEMENTED A1 design (root-entry setuid-drop to worker 10001 keeping ambient
+      CAP_SETUID/SETGID; `runner-uid.ts` setpriv clearing inh+ambient caps → runner 10002;
+      (b) separate-runner-clone, worker bare-only; token `/run/secrets/worker_token` 0400
+      worker, persisted not unlinked; PATH split; distinct TMPDIRs; M0 config-source
+      hardening) + the local↔k8s mapping (align at the DISTINCT-UID abstraction, NOT
+      mechanism-1:1 — k8s = separate containers with per-container `runAsUser` 10001/10002,
+      no `CAP_SETUID`, no in-process spawn = the (C)/sidecar model; manifests deferred to the
+      remote-worker PRD). `ARCHITECTURE.md` layer-2 updated (the same-uid residual is closed
+      for the local path; the cap>1 push-credential residual too). PRD #46 residual notes
+      flipped from "accepted residual / uid-split is future" to "closed for the local path"
+      across `docs/self-improvement.md`, `agent/src/self-improve.ts` (header + the check-env
+      residual block), `agent/src/provision.ts`, `agent/src/guardrails.ts` (the Bash-secret +
+      file-jail denies are now defense-in-depth on the split), and `agent/src/config.ts`.
+      Doc-freshness sweep (M0–M6 / adjacent staleness): also corrected `docs/worker-setup.md`,
+      `docs/configuration.md` (token 0400-persisted, not unlinked), `agent/src/git.ts` (the
+      hooks-dir comment: no `USER` line, checks now run as `runner`), and the
+      `docker-compose.yml` agent header ("runner spawn lands in M4" → done). Left the deep
+      M0-pin rationale in `git.ts` intact (substantially accurate as the M0 record; its
+      pre-(b) "config.worktree" phrasing flagged, not rewritten). k8s manifests deferred to
+      the remote-worker PRD.
 
 ## Out of Scope
 

@@ -167,11 +167,11 @@ services:
   # the worker's /proc/<pid>/environ. Under the uid split the runner also cannot read
   # the worker's /proc environ (different uid; root-owned once the worker is
   # non-dumpable), structurally closing the PAT push-window environ race PRD #46 left
-  # as a residual. The runner-uid SPAWN of the agent (which completes the read-denied
-  # boundary) lands in M4; M2 establishes the uids, the root-entry drop, and the token
-  # perms. The k8s form is separate containers with per-container runAsUser (docs-only
-  # here). See docs/proc-hardening.md, prds/51-worker-uid-split.md, and killAgentTree
-  # in agent/src/sdk-executor.ts.
+  # as a residual. The worker spawns every untrusted surface as the `runner` uid
+  # (agent/src/runner-uid.ts, M4), which completes the read-denied boundary. The k8s
+  # form is separate containers with per-container runAsUser (docs-only here). See
+  # docs/proc-hardening.md, prds/51-worker-uid-split.md, and killAgentTree in
+  # agent/src/sdk-executor.ts.
   agent:
     # Worker template selection (PRD #18): WORKER_TEMPLATE picks which curated
     # Dockerfile under agent/templates/<name>/ builds the worker image. Default

@@ -1,9 +1,14 @@
 // Self-improvement run support (PRD #46 Decision 10, M5). A self_improve run is
 // the ordinary issue runner with three deltas: it works a FIXED branch so the
 // worker's idempotent createMergeRequest reuses one open MR across cycles; its MR
-// description carries its OWN test-suite evidence (there is no CI on the uzi repo);
-// and it flags changes to guard-critical paths for extra-careful human review. The
-// primary directive is untouched — the bot still never merges to main.
+// description carries its OWN test-suite evidence (the worker's own proof,
+// alongside uzi's CI which independently verifies it since PRD #52); and it flags
+// changes to guard-critical paths for extra-careful human review. The check
+// evidence + `npm ci` run under the cap-less `runner` uid (PRD #51 M4, buildCheckEnv
+// / prepareCheckDeps below), so a hostile self-improvement change's test code cannot
+// read the worker's 0400 token file — the same-OS-user residual this used to carry
+// is closed for the local (A1) path. The primary directive is untouched — the bot
+// still never merges to main.
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -139,21 +144,18 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
 // agent-authored code cannot read them to impersonate the worker
 // (join token → /api/worker/runs/claim → bot forge PAT + the user's Anthropic token).
 //
-// RESIDUAL NOT CLOSED (documented loudly, provision.ts house style): the subprocess
-// still runs as the uzi uid, and the join-token FILE at /run/secrets/worker_token is
-// same-uid readable at a hardcoded, documented path (the worker's post-read unlink
-// fails on the read-only secret mount, so the file persists). Agent-authored test
-// code can read that file directly — a surface behind NO PreToolUse hook. `npm ci`
-// runs with --ignore-scripts (prepareCheckDeps) to delete the lifecycle-script
-// (preinstall/install/postinstall) code-exec entry path — a REDUCTION, not a close:
-// the test runners still execute model-written code. Blast radius if exploited: join
-// token → claim → the bot forge PAT (Developer role, structurally cannot merge
-// protected `main`) + the user's own Anthropic token (which the agent already holds).
-// The structural close is the k8s uid-split (agent under a DISTINCT uid from the
-// worker), deferred to the remote-worker phase. This is the SAME residual class
-// provision.ts documents for build hooks — but those are admin-VETTED packages,
-// whereas these checks run code the model just wrote (M5 silently widened that
-// residual; surfaced by the M9 audit and accepted for the MVP).
+// CLOSED for the local path (PRD #51 M4): the check + `npm ci` subprocesses now run
+// under the cap-less `runner` uid (runnerCommand, below), and the join-token FILE at
+// /run/secrets/worker_token is 0400 worker-owned, so agent-authored test code — even
+// though it executes model-written code the SDK hook system never sees — CANNOT read
+// the worker's token at all. `npm ci` still runs with --ignore-scripts (prepareCheckDeps)
+// as a defense-in-depth REDUCTION of the lifecycle-script code-exec path. What the
+// same-uid residual used to expose (join token → claim → bot forge PAT + the user's
+// Anthropic token) is no longer reachable by these checks on the A1 (root-started) path.
+// On a #58 single-uid (non-root) start there is no split and the checks run as the sole
+// uid (that PRD's accepted posture); the cross-container k8s form is mapped in
+// docs/proc-hardening.md. (This was the same residual class provision.ts documented for
+// build hooks; both are closed together by the M4 spawn-as-runner.)
 
 // buildCheckEnv is the scrubbed replacement env for a check subprocess. PATH comes
 // from the provisioned toolEnv when present (so go/vitest/tsc resolve), else the
