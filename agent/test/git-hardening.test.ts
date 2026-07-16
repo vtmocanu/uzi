@@ -258,6 +258,42 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     assert.match(gitOut(bare, ["rev-parse", ref]), /^[0-9a-f]{40}$/, "the fetch-back still landed the agent branch");
   });
 
+  it("(b) invariant: a runner-planted commondir/gitdir rewrite does NOT reach the worker's bare-only git (moot by construction — explicit M6 regression)", async (t) => {
+    if (!gitAvailable()) return t.skip("git not available");
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 301);
+    fs.writeFileSync(path.join(rc.path, "R.txt"), "1\n");
+    runGit(rc.path, ["add", "R.txt"], plainEnv());
+    runGit(rc.path, [...IDENT, "commit", "-m", "c"], plainEnv());
+
+    // The worker's ONE op that touches the clone is the file://+pack fetch-back, which runs
+    // BEFORE any corruption while the clone is still valid.
+    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-301");
+
+    // Now a compromised runner rewrites its OWN clone's `.git/commondir` to point the
+    // "common" git dir (where config is resolved) at an attacker dir carrying a code-exec
+    // `diff.external` — the classic commondir/gitdir redirection. Under (b) the worker is
+    // BARE-ONLY: `changedFiles` is `git -C <worker-bare> diff`, which resolves the WORKER
+    // bare's git dir and NEVER the runner clone's, so it never follows this commondir into
+    // the attacker config. Proof: after this corruption, the worker's changedFiles STILL
+    // returns the correct tree-diff (it would otherwise fire `evil` OR break with "not a git
+    // directory" if it ever resolved the clone's git dir). Config written directly (not via
+    // the clone's git, which the commondir now breaks).
+    const evilCommon = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-evil-common-"));
+    fs.writeFileSync(path.join(evilCommon, "config"), `[diff]\n\texternal = ${evil}\n`);
+    fs.writeFileSync(path.join(rc.path, ".git", "commondir"), `${evilCommon}\n`);
+
+    resetMarker();
+    const changed = await git.changedFiles(bare, ref);
+    assert.equal(
+      fired(),
+      false,
+      "a runner-planted commondir/gitdir + diff.external must NOT code-exec in the worker's bare-only changedFiles",
+    );
+    assert.deepEqual(changed, ["R.txt"], "the worker's bare tree-diff is UNAFFECTED by the corrupted runner clone (it never resolves the clone's git dir)");
+    fs.rmSync(evilCommon, { recursive: true, force: true });
+  });
+
   // `git credential fill` reads a credential request on stdin then consults the
   // credential helpers / askpass to fill missing fields — the reach point for a
   // planted credential.helper / core.askpass when a worker-side credentialed op

@@ -862,7 +862,50 @@ model.
          boundary assertions are vacuous (M5 audit LOW).
       Gate: `run-e2e.sh` (judge + self-improve + existing) green end-to-end (restart-resilience
       + full approve→implement→push→MR).
-- [ ] **M6 — Tests.** uid-boundary tests: execution uid can't read the token file,
+- [x] **M6 — Tests. DONE 2026-07-16 — agent typecheck clean + unit suite 551 pass / 0
+      fail / 1 skip; `./e2e/run-e2e.sh` green (146 PASS / 0 FAIL, exit 0; KEEP_STACK stack
+      `uzi-e2e-prd51m6c`) with the live uid-boundary block E1–E7 + the tightened token-env
+      scan.**
+      **Delivered — unit-vs-e2e split (stated for review):**
+      • UNIT (agent/test, node --test): NEW `git-hardening.test.ts` explicit commondir/gitdir
+        regression (a runner-planted `.git/commondir` → attacker config does NOT code-exec in the
+        worker's bare-only `changedFiles`, and the worker's tree-diff is unaffected — it never
+        resolves the runner clone's git dir). The remaining invariants already have unit guards,
+        verified passing, NOT duplicated: packObjectsHook + diff.external / credential.helper /
+        core.askpass config-source isolation (`git-hardening`); runner-env scrub — no join token /
+        PAT / API URL — in `sdk-env` (buildSdkEnv), `self-improve` (buildCheckEnv + a spawned-child
+        end-to-end read) and `provision` (buildProvisionEnv); distinct-TMPDIR-env + cap-drop +
+        token-0400 in `templates-guardrails`; the setpriv cap-clear args (`--inh-caps -all` /
+        `--ambient-caps -all`) in `runner-uid`.
+      • E2E (`run-e2e.sh`, live image, every /proc read via a `setpriv` drop — NON-vacuous where a
+        root exec, lacking in-container CAP_SYS_PTRACE, reads a cross-uid environ as EMPTY): E1
+        runner DENIED a worker process's `/proc/environ` (the push-git-child PAT-race close;
+        non-vacuous — the same pid's 0444 cmdline IS runner-readable); E2 a runner child spawned
+        from a parent HOLDING ambient CAP_SETUID/SETGID ends CapInh/Prm/Eff/Amb all zero, uid 10002,
+        not in the worker group (ambient-clear → no climb-back); E3 that child's `/proc/self/fd` is
+        only {0,1,2}+the readdir fd (no leaked worker fds); E4 the worker node has no `--inspect`
+        argv and no inspector-port (9229) listener; E5 worker/runner TMPDIRs are distinct 0700
+        owner-only trees (neither reads the other's); E7 a runner repo-local
+        `uploadpack.packObjectsHook` is ignored on the IMAGE git 2.54.0 (protected-config gate).
+        Worker still pushes; the full approve→implement→push→MR path stays green.
+      • TIGHTENED (auditor M6): the pre-existing `/proc`-environ token scan ran as a ROOT
+        docker-exec, which — lacking in-container CAP_SYS_PTRACE — reads cross-uid environs as EMPTY
+        (partially vacuous). Replaced with (a) STRUCTURAL — the token is not a configured env var
+        (`exec … env` shows only `…_FILE`) + (b) a WORKER-uid scan (genuinely reads same-uid
+        dumpable=1 environs; the credential-holding node is dumpable=0 → unreadable even same-uid,
+        itself a hardening).
+      • NOT live-e2e'd (stated honestly): "runner child's OWN environ scrubbed" — a faithful live
+        check needs a WORKER-spawned runner child (no live SDK in the stub e2e) AND the child is
+        dumpable=0 (externally unreadable); it is covered at the unit level (`self-improve` spawns a
+        real child under the scrubbed env and confirms it cannot see the token vars).
+      • E2E HARNESS FIX (in-scope, lead-approved): a pre-existing flake surfaced — the PRD #43 M5
+        create-issue → immediately-create-run races the fast (2s) poller the MR-close phase leaves
+        on (a board reconcile transiently drops the just-created issue; the next poll re-adds it),
+        1/10 live repro; prod polls at 24h so it cannot occur there. Added a `create_run` helper that
+        bounded-retries ONLY the transient `404 "issue not found on this repo's board"` and fails
+        loudly on any other status or a persistent 404 (all four branches proven with a stubbed
+        curl); used at the racing call site only.
+      uid-boundary tests: execution uid can't read the token file,
       can't read the worker's `/proc` environ, and can't code-exec via a shared
       git-config write **nor via a `commondir`/`gitdir` rewrite** (moot-by-construction
       under (b) — the worker is bare-only and never reads a runner config source — but
