@@ -305,7 +305,9 @@ WHERE runs.id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled')
   AND (status <> 'awaiting_approval' OR EXISTS (
         SELECT 1 FROM run_user_inputs
-        WHERE run_user_inputs.run_id = @id AND kind = 'approve_plan' AND consumed_at IS NOT NULL));
+        WHERE run_user_inputs.run_id = @id
+          AND run_user_inputs.kind = 'approve_plan'
+          AND run_user_inputs.consumed_at IS NOT NULL));
 
 -- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
