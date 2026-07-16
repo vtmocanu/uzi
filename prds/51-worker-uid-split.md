@@ -144,75 +144,117 @@ post-compromise worker could become any uid including 0. Accepted, because it is
 untrusted code-execution surface holds no worker creds and cannot reach the token,
 the worker's `/proc` environ, or worker-side git code-exec).
 
-**B2 — bare-cache ownership: SEPARATE RUNNER CLONE (redesigned per reviewer +
-auditor).** The earlier "shared bare; worker owns `<bare>/config`+`hooks`; runner
-writes `<bare>/objects` + `<bare>/worktrees/<name>`" model is **insufficient** — a
+**B2 — bare-cache ownership: (b) SEPARATE RUNNER CLONE, worker BARE-ONLY (SETTLED
+per reviewer + auditor).** The old "shared bare; worker owns `<bare>/config`+`hooks`;
+runner writes `<bare>/objects`+`worktrees/<name>`" model is **insufficient** — a
 linked worktree shares far more of the common dir than `objects/` + the per-worktree
-admin, and two channels leak:
-- **Shared-ref-write EACCES.** The agent's `git commit` on a linked-worktree branch
-  writes the **shared** branch ref `<bare>/refs/heads/<branch>`, `<bare>/packed-refs`,
-  and `<bare>/logs/refs/heads/<branch>` in the **common** dir (only `HEAD`, `index`,
-  `logs/HEAD`, `ORIG_HEAD` are per-worktree). A "runner writes objects +
-  `worktrees/<name>` only" rule would EACCES the commit.
+admin, leaking two channels:
+- **Shared-ref-write EACCES.** The agent's `git commit` writes the **shared** branch
+  ref `<bare>/refs/heads/<branch>`, `<bare>/packed-refs`, and
+  `<bare>/logs/refs/heads/<branch>` in the **common** dir (only `HEAD`, `index`,
+  `logs/HEAD`, `ORIG_HEAD` are per-worktree) — a "runner writes objects +
+  `worktrees/<name>` only" rule EACCESes the commit.
 - **commondir/gitdir config-redirect (auditor PoC).** The per-worktree admin dir
-  holds the structural pointers `commondir` / `gitdir`; a runner that rewrites
-  `commondir` makes a later worker-side `git -C <worktree>` resolve a
-  **runner-controlled** common dir — reading its `config` (incl. an arbitrary-name
-  `filter.<x>.smudge=/evil`, code-exec) and `info/attributes`. Inline `-c` /
-  `GIT_CONFIG_*` pins **cannot** stop it: git resolves `commondir` from disk before
-  applying inline config.
+  holds `commondir`/`gitdir` structural pointers; a runner rewriting `commondir`
+  makes a later worker-side `git -C <worktree>` resolve a **runner-controlled**
+  common dir — reading its `config` (arbitrary-name `filter.<x>.smudge=/evil`,
+  code-exec) and `info/attributes`. Inline `-c`/`GIT_CONFIG_*` pins can't stop it
+  (git resolves `commondir` from disk before applying inline config).
 
-**Decision: adopt the SEPARATE-RUNNER-CLONE model** (both validators favor it; it
-closes both channels *by construction*). The runner gets its **own** object store /
-clone; the agent's checkout **and** commit happen entirely in the runner store (the
-runner **never** writes the worker's bare); the worker then `fetch`es the agent's
-branch **from** the runner store and `push`es it to the forge with the PAT. Because
-no worker-side git ever reads a runner-writable config / commondir / attributes
-source, the arbitrary-name `filter.*` / `diff.*` / `merge.driver` class is closed
-**structurally** — no fragile ownership `chmod` matrix to get exactly right.
-Ownership reduces to:
-- **worker-only:** the worker's warm bare cache `repos/<bare>.git` (incl. its
-  `config` / `hooks` / `refs` / `objects`) and the worker `.gitconfig` / token.
-- **runner-owned (its own tree):** the runner clone / object store + its worktree
-  checkout + the SDK/provision dirs.
+**Decision — (b) separate-runner-clone (auditor ruling, 12-case PoC matrix on git
+2.55).** Fork (a) shared-bare-with-ownership-matrix is **dropped**: its "never pack
+agent refs" invariant (an auto-gc / `pack-refs` landmine) was too fragile. Fork (b)
+was PoC-confirmed safe — a runner-planted `uploadpack.packObjectsHook` does **not**
+execute in the worker's fetch (git ignores that hook from the *fetched* repo's config
+across local-path / `file://` / `file://--filter`), so (b)'s one worry is closed and
+it kills the commondir/gitdir channel **and** the shared-ref-write EACCES *by
+construction*.
 
-The worker↔runner handoff is a **local `fetch`** of `refs/heads/<agent-branch>` from
-the runner store into the worker bare, then the existing PAT push. Exact seeding —
-a `--no-hardlinks` local clone from the warm bare, or the warm bare as a **read-only
-`alternates`** for base objects with the runner writing only new objects — is
-settled in M3.
+**Architecture — the worker is BARE-ONLY; the working tree lives ONLY in the runner
+clone; the worker NEVER runs `worktree add`/checkout.** Flow:
+1. Worker `git clone --bare` (PAT, from the forge) → the worker's warm bare.
+2. Runner clones/fetches from the **worker bare** to get its own working copy
+   (runner-owned clone + working tree).
+3. Agent checkout **and** commit happen in the **runner** clone (runner-owned).
+4. Worker `git fetch` the agent branch **back from the runner clone** (local, inert).
+5. Worker `git push` (PAT) from its bare.
 
-*Delta vs today's `git.ts`* (my report to the lead): **moderate, not a rabbit
-hole.** Today `GitCache` keeps one worker-owned bare + `git worktree add` linked
-worktrees sharing its objects+refs; separate-clone replaces the linked worktree with
-a runner-owned clone/store and adds a worker-side `fetch <runner-store> <branch>`
-before `pushBranch`. `changedFiles` runs inside the runner store (unaffected).
-Bounded rework of `createOrAttachWorktree` + `pushBranch`, chosen over the fallback
-because it removes the per-path chmod matrix entirely. **Commit-identity edge (M3/M4
-verify):** under separate-clone an agent `git config user.email/name` writes the
-**runner clone's** own config (runner-owned) — fine; this edge only bites the
-fallback (below).
+The one worker-side op that ever fired smudge filters — `worktree add` checkout — is
+**gone by construction**, not walled by ownership. `changedFiles` becomes a
+tree-to-tree diff in the worker bare: `git -C <worker-bare> diff --name-only
+origin/main...<fetched-ref>` — no working tree, `--name-only` fires no drivers, reads
+only worker-owned config; `defaultBranchRef`/`branchExists`/`refExists` are already
+bare ref queries. **All** worker-side git now runs on worker-owned config. Both local
+fetches are safe: (i) the runner-as-fetcher reads the worker bare's **worker-owned**
+config (even a hypothetical hook runs as the *runner* — no escalation, no PAT); (ii)
+the worker fetches **from** the runner clone (inert direction). Worker creds (PAT)
+touch only the forge clone/fetch + final push, on the worker bare.
 
-**FALLBACK (if separate-clone proves a large rework in M3): shared-bare with a
-precise per-path ownership matrix.**
-- **worker-only:** `<bare>/config`, `<bare>/hooks`, `<bare>/worktrees/<name>/commondir`,
-  `<bare>/worktrees/<name>/gitdir`, `<bare>/info/attributes`.
-- **runner-writable:** `<bare>/objects/`, `<bare>/refs/heads/` (scoped to `agent/*`
-  + `ci-fix/*`), `<bare>/packed-refs`, `<bare>/logs/`, and the per-worktree `HEAD` /
-  `index` / `ORIG_HEAD` / `logs/HEAD`.
-- Plus an **M6 test:** a runner that rewrites `commondir` cannot make the worker's
-  checkout/diff read runner-controlled config. **Commit-identity edge:** an agent
-  `git config user.email/name` **without `--worktree`** writes the common
-  worker-only `<bare>/config` → EACCES; confirm commit identity comes from
-  `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env (or a runner-owned config), not a
-  common-config write. **Accepted intra-user residual:** concurrent runs on a shared
-  bare could rewrite a sibling run's ref (same-user, human-reviewed, cannot reach
-  `main`).
+**Six invariants (worker-side surface hardening for the relocated boundary — the
+worker now reads a runner-controlled store via exactly one fetch):**
+1. Runner has its own object store / clone; agent checkout+commit happen there
+   (runner-owned); the runner never writes the worker bare.
+2. The worker fetches **only** the specific agent branch refspec (e.g.
+   `refs/heads/agent/issue-<iid>` → a worker-side tracking ref), **never**
+   `refs/heads/*` — do not admit the runner's whole ref namespace into the worker bare.
+3. Force the **pack-protocol** transport for that fetch (`file://` or explicit
+   `--no-local`) so git's local-copy optimization does **not** traverse a
+   runner-planted `objects/info/alternates` (CVE-2022-39253 class); pin
+   `protocol.file.allow` deliberately.
+4. Keep the worker's fetch on `gitEnv` (`GIT_CONFIG_NOSYSTEM=1` +
+   `GIT_CONFIG_GLOBAL=/dev/null` + the M0 pins) so the worker's **own** config governs
+   the fetching process; no runner-side config file is consulted for it.
+5. **All** worker-side inspection (`changedFiles` / diff / `defaultBranchRef`) runs
+   against the **worker bare** after the fetch, on `gitEnv` — never in the runner's
+   worktree/clone — so no runner-owned config is read for any diff/checkout.
+6. **M3/M6 evidence:** re-run the `packObjectsHook` / upload-pack-hook PoC on the
+   **image's** git (`node:22-alpine` `apk` git, whatever version it ships) — the
+   mitigation is version-dependent, so confirm on the built image, not just a host git.
 
-This ownership (either form) is what closes the **arbitrary-name** class
-`filter.<name>.*` (smudge/clean/process) / `diff.<name>.*` (command/textconv) /
-`merge.<name>.driver` that M0's inline pins cannot cover (M0 audit LOW broadened the
-class). M0's fixed-name pins remain the belt for
+**Two structural wins (auditor's full ruling):**
+- **Closes the commondir/gitdir + shared-ref channels** (above).
+- **Objects integrity.** The worker fetches the agent branch into its **own**
+  worker-owned object store, so post-fetch a compromised runner **cannot
+  delete/corrupt** the objects the worker's push depends on. Fork (a) would have left
+  `<bare>/objects` shared + runner-writable (an intra-user availability/integrity DoS
+  on the push); (b) removes that surface too.
+
+**Namespaces.** The agent branch namespaces are `agent/*`, `ci-fix/*`, **and**
+`uzi/*` (self-improve) — name all three wherever the design says "the agent branch."
+Under (b) the runner clone is fully runner-owned, so there is **no** per-namespace
+ownership matrix, but M3/M4 need the full list. (The worker's `git clone --bare` uses
+the **files** ref backend by default, so the reftable edge the auditor flagged for
+(a) is moot here.)
+
+**Ownership under (b):**
+- **worker-only:** the worker's warm bare `repos/<bare>.git` (its `config`, `hooks`,
+  `refs`, `objects`) + the worker `.gitconfig` / token — the runner touches none of it.
+- **runner-owned:** the runner's clone / object store + its working tree + the
+  SDK/provision dirs.
+
+**Shapes M3/M4/M5** (flag now): **M3** (ownership) gives the runner its own clone +
+the B4 startup chown; **M4** (spawn) runs the checkout/commit under uid `runner`;
+**M5** (git flow) moves `worktreeForBranch`/checkout from the worker to the runner and
+reshapes `changedFiles` into the worker-bare tree-diff — leaving **no** stray
+worker-side checkout. **Commit-identity edge (M4/M5 verify):** the agent's
+`git config user.email/name` writes the **runner clone's** own config (runner-owned)
+— fine under (b); confirm commit identity resolves from the runner config or
+`GIT_AUTHOR_*`/`GIT_COMMITTER_*` env, never a worker-bare config write.
+
+*Delta vs today's `git.ts`* (my report to the lead): **moderate.** Today `GitCache`
+keeps one worker-owned bare + `git worktree add` linked worktrees sharing its
+objects+refs; under (b) the worker stays **bare-only**, a **runner-owned clone** holds
+the working tree (new), `pushBranch` gains a preceding worker-side `git fetch
+<runner-clone> <agent-ref>` with the invariant 2/3 refspec+transport pins, and
+`changedFiles` moves from a worktree `git diff` to the worker-bare tree-diff. The
+worktree lifecycle (`createOrAttachWorktree`/`worktreeForBranch`) relocates to the
+runner. Bounded, but it reshapes the worktree/push/diff surface of `git.ts` (the M5
+git-flow work).
+
+This structurally closes the **arbitrary-name** class `filter.<name>.*`
+(smudge/clean/process) / `diff.<name>.*` (command/textconv) / `merge.<name>.driver`
+that M0's inline pins cannot cover (M0 audit LOW broadened the class) — no worker-side
+git reads a runner config source at all. M0's fixed-name pins remain the belt for
 `fsmonitor`/`diff.external`/`pager`/`sshCommand` regardless.
 
 **B4 — persisted named-volume migration (Decision 4).** `agentnix`/`agentdata`
@@ -237,10 +279,10 @@ window execs **only image-baked, root-owned binaries by ABSOLUTE PATH**, with `P
 against the worker's actual path construction. Everything under `$UZI_DATA_DIR`
 (`/data`) unless noted:
 
-| Path | Access under the split (separate-runner-clone) | Source |
+| Path | Access under the split ((b) separate-runner-clone, worker BARE-ONLY) | Source |
 | --- | --- | --- |
-| `repos/<bare>.git/` — the worker's WARM bare cache (`config`, `hooks`, `refs`, `objects`) | **worker-only** — no runner-side git writes it, and no worker-side git reads a runner config source | `git.ts:100` |
-| the RUNNER clone / object store + its worktree checkout | **runner-owned** — agent checks out + commits here; worker `fetch`es the branch from it | Decision 4 (M3 seeds it) |
+| `repos/<bare>.git/` — the worker's WARM bare cache (`config`, `hooks`, `refs`, `objects`) | **worker-only** — the worker is bare-only (no worktree/checkout); no runner-side git writes it, no worker-side git reads a runner config source | `git.ts:100` |
+| the RUNNER clone / object store + **its working tree** (the ONLY working tree) | **runner-owned** — agent checks out + commits here; worker `fetch`es the branch back from it, then pushes | Decision 4 (M3 seeds it) |
 | `agent-home/<runId>/` (per-run SDK HOME) | runner-owned | `main.ts:55,71`, `runner.ts:126` |
 | `agent-home/` (shared provisioning HOME — nix profile / devbox warm-start metadata) | runner-owned | `main.ts:81`, `sdk-executor.ts:153` |
 | `provision/<runId>/` (`provisionRoot` — synthesized devbox.json, outside any clone) | runner-owned | `sdk-executor.ts:154`, `provision-run.ts:69` |
@@ -248,14 +290,14 @@ against the worker's actual path construction. Everything under `$UZI_DATA_DIR`
 | judge SDK HOME (`homeRoot` = `/data/agent-home` in prod; `mkdtemp` under it) | runner-owned execution-surface HOME (its trace-fetch / review-POST HTTP stays worker-side — Decision 1) | `judge-runner.ts:191`, `main.ts:124` |
 | worker HOME + `.gitconfig`; `/run/secrets/worker_token` | **worker-only** | Decision 5 |
 
-The dividing line under separate-clone: the worker owns its warm bare + `config` +
-token; everything the untrusted execution surface writes (the runner clone/store +
-checkout, SDK HOME, provision dirs, `/nix`) is a **runner-owned tree that the worker
-never reads as a git config source**. Ownership is enforced by the B4 startup chown
-plus the per-run spawn under uid `runner` (M4); the dirs the worker `mkdir`s today
-(`sdk-executor.ts:195-201`, `provision.ts`, `git.ts`) become runner-owned at
-creation. (If the fallback shared-bare matrix is used instead, substitute B2's
-per-path rows for the two bare rows above.)
+The dividing line under (b): the worker is **bare-only** and owns its warm bare +
+`config` + token; everything the untrusted execution surface writes (the runner
+clone/store + **the only working tree**, SDK HOME, provision dirs, `/nix`) is a
+**runner-owned tree that the worker never reads as a git config source**. Ownership is
+enforced by the B4 startup chown plus the per-run spawn under uid `runner` (M4); the
+dirs the worker `mkdir`s today (`sdk-executor.ts:195-201`, `provision.ts`, `git.ts`)
+become runner-owned at creation, and the worktree lifecycle relocates to the runner
+(M5).
 
 **A1 net-ns / TMPDIR / fd invariants (5-bis — LOCAL, not k8s footnotes).** Under
 A1 the worker and runner share one container, hence **one network namespace and one
@@ -615,9 +657,10 @@ model.
 - **agent/ image (`base` + `jvm`)**: second uid; root entrypoint + **util-linux
   `setpriv`** (`apk add setpriv`; the busybox applet can't `--reuid`) drop wrapper
   (mechanism A1, worker **retains** only `CAP_SETUID/SETGID` ambient); `/nix` and the
-  **runner clone/store + its checkout** + runner data paths (Decision 4,
-  separate-runner-clone) owned by the execution uid, while the worker's warm bare
-  `repos/<bare>.git` (config/hooks/refs/objects) stays worker-owned.
+  **runner clone/store + its working tree (the only checkout)** + runner data paths
+  (Decision 4, (b) separate-runner-clone) owned by the execution uid, while the
+  worker's warm bare `repos/<bare>.git` (config/hooks/refs/objects) stays worker-owned
+  and the worker runs bare-only (no worktree/checkout).
 - **docker-compose.yml**: enforce token `0400`/`worker` in the entrypoint (not via
   the env-sourced secret); bounding set `cap_add: [SETUID, SETGID, SETPCAP, CHOWN,
   DAC_OVERRIDE]` with the worker dropping all but `SETUID`/`SETGID` after startup
@@ -674,19 +717,20 @@ model.
       volumes (B4). Note: this gate cannot be *independently* PoC'd — a real
       execution-uid process only exists after M4 (N3), so M2's read-denied check
       rides the M4 spawn path (or a manual `su` PoC).
-- [ ] **M3 — Shared-volume ownership model (SEPARATE-RUNNER-CLONE — B2 redesign).**
-      Give the runner its **own** clone/object store (seed from the warm bare via a
-      `--no-hardlinks` local clone or a read-only `alternates`); the agent checks out
-      + commits there; the worker `fetch`es the agent branch from it, then pushes with
-      the PAT. Full `/nix` + `/data` runner-owned path enumeration (Decision 4:
-      runner clone/store + checkout, `agent-home/<runId>`, `provision/`, shared nix
-      HOME, `/nix`) vs worker-only (the warm bare `repos/<bare>.git`, worker
-      HOME/`.gitconfig`, token); distinct `TMPDIR` per uid on `0700` trees (5-bis).
-      (Decision 3's git hardening already landed in M0.) Gate: agent commit works in
-      the runner store; worker `fetch`+push works; a runner `commondir`/config
-      rewrite cannot reach worker-side git. **Fallback** (if separate-clone is a large
-      rework): the shared-bare per-path ownership matrix in B2 + the M6
-      commondir-rewrite test.
+- [ ] **M3 — Shared-volume ownership model ((b) SEPARATE-RUNNER-CLONE, worker
+      BARE-ONLY — B2 SETTLED).** Give the runner its **own** clone/object store
+      (working tree lives ONLY there; the worker stays bare-only); the agent checks
+      out + commits there; the worker `fetch`es the agent branch back from it (the six
+      B2 invariants: single-branch refspec, pack-protocol/`--no-local` +
+      `protocol.file.allow`, worker fetch on `gitEnv`), then pushes with the PAT. Full
+      `/nix` + `/data` runner-owned path enumeration (Decision 4: runner clone/store +
+      its working tree, `agent-home/<runId>`, `provision/`, shared nix HOME, `/nix`)
+      vs worker-only (the warm bare `repos/<bare>.git`, worker HOME/`.gitconfig`,
+      token); distinct `TMPDIR` per uid on `0700` trees (5-bis). Namespaces `agent/*` +
+      `ci-fix/*` + `uzi/*`. (Decision 3's git hardening already landed in M0.) Gate:
+      agent commit works in the runner store; worker `fetch`+push works; the
+      `packObjectsHook`/upload-pack PoC is re-confirmed on the **image's** git; a
+      runner `commondir`/config rewrite cannot reach worker-side git.
 - [ ] **M4 — Spawn surfaces under the execution uid.** SDK agent, check runner,
       provision hooks launch under the execution uid; the worker retains
       `CAP_SETUID` and does the credentialed git/HTTP; PATH hygiene (Decision 6),
@@ -701,10 +745,13 @@ model.
       uid-boundary reads. Gate: `run-e2e.sh` (judge + self-improve + existing) green.
 - [ ] **M6 — Tests.** uid-boundary tests: execution uid can't read the token file,
       can't read the worker's `/proc` environ, and can't code-exec via a shared
-      git-config write **nor via a `commondir`/`gitdir` rewrite** (the runner cannot
-      make worker-side `git -C <worktree>` read a runner-controlled config —
-      moot-by-construction under separate-clone, an explicit test under the fallback);
-      **plus (A1 net-ns, L1/L5):** the runner child's `/proc/self/fd` is only
+      git-config write **nor via a `commondir`/`gitdir` rewrite** (moot-by-construction
+      under (b) — the worker is bare-only and never reads a runner config source — but
+      keep an explicit regression test) **nor via a runner-planted
+      `uploadpack.packObjectsHook`/upload-pack hook exercised on the IMAGE's git**
+      (B2 invariant 6 — the mitigation is git-version-dependent, so this runs against
+      `node:22-alpine`'s git, not just a host git); **plus (A1 net-ns, L1/L5):** the
+      runner child's `/proc/self/fd` is only
       `{0,1,2}`+known (fd leak — **load-bearing under A1**); the worker node process
       has **no `--inspect`/`NODE_OPTIONS=--inspect` debug port**; worker and runner
       have **distinct `TMPDIR`s**; a runner survivor cannot read the worker's **push
@@ -731,8 +778,11 @@ model.
   provision hook) **cannot**: read `/run/secrets/worker_token`, read the worker's
   `/proc` environ (nor the worker's push git-child's environ during the window),
   **or** achieve code execution in any worker-side git (credentialed **or** the
-  non-credentialed `changedFiles`/`worktree add`) via a shared-git-config write —
-  all PoC-confirmed on the built image — while the worker authenticates and pushes
+  non-credentialed `changedFiles` bare tree-diff and the local fetch from the runner
+  clone — the worker is bare-only, so there is no longer a worker-side `worktree add`
+  checkout) via a shared-git-config write, a `commondir`/`gitdir` redirect, or a
+  runner-planted upload-pack hook — all PoC-confirmed on the built image — while the
+  worker authenticates and pushes
   normally.
 - Capability posture is stated honestly and **minimised**: **for the run lifetime
   the worker holds ONLY `CAP_SETUID/SETGID` (ambient); `CAP_SETPCAP`/`CAP_CHOWN`/
@@ -742,9 +792,10 @@ model.
   retired; leaving `CHOWN`+`DAC_OVERRIDE` on a uid-0-capable worker was too broad —
   B1).
 - The agent's own `git add`/`git commit` still succeeds in the **runner's own
-  clone/store** (separate-runner-clone — B2); the worker `fetch`es the agent branch
-  from that store and pushes with the PAT. (Fallback shared-bare: the commit writes
-  the runner-writable `<bare>/objects` + `refs/heads/agent/*` + per-worktree admin.)
+  clone/store** — the only working tree ((b) separate-runner-clone, worker bare-only
+  — B2); the worker `fetch`es the agent branch back from that store (single-branch
+  refspec, pack transport) and pushes with the PAT from its bare, and runs no
+  worktree/checkout of its own.
 - The PRD #46 self-improvement job still produces real (or honest-skipped) test
   evidence and opens/extends its MR, with the check code under the isolated uid.
 - `run-e2e.sh` (judge + self-improve + existing) stays green.
