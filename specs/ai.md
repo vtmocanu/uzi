@@ -6255,3 +6255,122 @@ block records the load-bearing AI decisions.
   action (which does kill sessions). **No mid-session forced logout on demotion** (out of scope).
 - **No admin-UI manual role management** (Decision 6): the IdP owns roles; a manual promote/demote
   endpoint would fight the authoritative sync. Revisit only if a non-OIDC deployment asks for it.
+
+# PRD #54 — Rate-limit meters UI polish (badge escalation, aria-live, --faint AA)
+
+Serves human Feature #53 (the rate-limit meters shipped by PRD #53) — this is a follow-up
+presentation-polish pass, not a new user-stated feature. It closes three findings the #53 web-ux
+passes deliberately parked in GitLab issue #54: the Settings card badge not escalating on danger, no
+screen-reader announcement on threshold crossings, and the app-wide `--faint` token being below WCAG
+AA for small text. `web/`-only: one component, one CSS file, two admin pages, plus tests — no API,
+DB, migration, forge, or worker change (Decision 7 in the PRD). Full decision log + review trail:
+[prds/done/54-rate-limit-ui-polish.md](../prds/done/54-rate-limit-ui-polish.md). The three
+load-bearing AI decisions below extend §242 (PRD #53's web surfaces); the user-stated calls for this
+PRD are recorded in the PRD's Design Decisions (badge escalation danger-only; per-theme `--faint`
+bump; announcer app-wide; the ember value accepted) — this block records the AI decisions made within
+them.
+
+## 258. Settings badge reuses `statusBadge()` wholesale, `vaultLocked=false`, stale wording aligned
+
+Serves human Feature #53 polish (issue #54 finding 1: card badge disagreed with the bar); user
+decision that escalation is danger-only, warn keeps "Live".
+
+- **Decision.** `RateLimitCard` drops its inline `data.stale ? <Badge>Stale</Badge> : <Badge ok
+  dot>Live</Badge>` and renders `const badge = statusBadge(data, false)` instead — one shared
+  escalation path, not a second one. A ≥95% window now escalates the Settings-card badge to the
+  danger tone/label ("5h / 7d / 5h & 7d nearly out"), matching the admin table; an 80–94% warn window
+  keeps the green "Live" pill and lets the amber bar carry the "running low" signal.
+- **`vaultLocked` is hardcoded `false` on the self card.** `GET /me/rate-limits` (`MyRateLimits`)
+  carries no `vault_locked` field — only the admin `AdminRateLimitUser` does — so a stale *self*
+  reading reads "stale", never "vault locked". That matches the prior behavior (the card already just
+  showed "Stale" on stale), so no regression. We deliberately did NOT widen `/me/rate-limits` with
+  `vault_locked` for this (a locked vault is self-evident in Settings; out of scope).
+- **Stale label wording goes "Stale" → "stale"** to match `statusBadge`'s lowercase (already rendered
+  by the admin table). The one pinned assertion in `RateLimitMeters.test.tsx` was aligned to the
+  shared helper rather than Title-casing `statusBadge` (which would ripple to the admin table).
+- **The `unavailable` early-return branch is untouched** — it renders the two greyed windows plus
+  helper text, richer than a bare badge; only the live/stale badge was swapped.
+- **Why.** The issue explicitly asked to reuse `statusBadge`. Single-source-of-truth means the card
+  and the admin table can never again disagree on tone/label, and warn-keeps-"Live" preserves the #53
+  contract already pinned by `RateLimitMeters.test.tsx` and the #53 mockup (escalating warn too would
+  churn both). Danger-only is the smallest change that fixes the badge/bar disagreement.
+
+## 259. App-wide `RateLimitAnnouncer` — tone step-up ref, silent on first read / step-down / stale / 30s tick
+
+Serves human Feature #53 polish (issue #54 finding 2: silent 60s polls gave screen-reader users no
+threshold signal); user decision that the announcer is app-wide, not Settings-scoped.
+
+- **Decision.** A small always-mounted `RateLimitAnnouncer` (visually-hidden Tailwind `sr-only`
+  `aria-live="polite" role="status"` region) lives in `RateLimitMeters.tsx` and is mounted once by
+  `AppShell` (a one-line add), independent of whether the sidebar/Settings meters are on screen. It
+  runs its own `useMyRateLimits(60_000)` read and announces a window crossing wherever the user is.
+- **Announce only on a tone STEP UP.** A `useRef<MeterTone|null>` holds the last announced worst-window
+  tone; a `TONE_RANK` map (`ok:0, warn:1, danger:2`) gates the write. The effect keys off the reading
+  and announces only when `toneFor(worstWindow(data).pct)` rose above the last seen tone (ok→warn,
+  warn→danger, ok→danger). Silent cases, all pinned by tests:
+  - **First read** seeds the ref (`prev === null`) and never speaks.
+  - **Same-or-lower tone** never speaks — a step *down* (danger→ok after a reset) updates the ref
+    silently (no "you're fine now" chatter).
+  - **Stale / non-`ok` readings never transition the ref** — a frozen 3h-old "96%" must not announce
+    as if fresh; the effect returns early unless `data.status === "ok" && !data.stale`.
+  - **The 30s `useNow` clock tick** does not re-announce: the component calls `useNow()` to re-render
+    on the same 30s cadence as the card, but the announce effect depends on `data` (not the clock), so
+    a bare tick with an unchanged reading is inert.
+- **Announcement text** names the specific window and its countdown, e.g. `"5-hour window at 96%,
+  resets in 40m"`, built from the new `worstWindow` selector + `formatCountdown` (countdown omitted
+  when `resets_at` is null).
+- **`worstWindow` selector** (new, exported from `web/src/lib/rateLimits.ts`) returns the more-utilized
+  window as `{ label: "5-hour"|"7-day"; pct; resets_at }` — not just the max pct (that is the existing
+  module-private `worstPct`), so the announcer can name WHICH window drove the tone. **Tie-break: equal
+  pct → 5-hour**, the shorter and more urgent window (the `>` comparison favors 5-hour on equality).
+  Unit-tested for 5h-worst, 7d-worst, and the tie.
+- **Known limitation (accepted).** The ref tracks the *aggregate* worst tone, so a same-level handoff
+  in one poll — 5h warn→ok while 7d ok→warn — keeps the aggregate at warn and fires nothing even though
+  a window crossed; the bars still show it. Accepted for this low-pri polish; revisit with per-window
+  refs if it matters.
+- **Why app-wide over Settings-scoped.** A crossing is a proactive alert; scoping the region to
+  `RateLimitCard` would only fire while the user sits on the Settings route. The step-up debounce caps
+  output to ~one message per genuine crossing regardless of route, so an always-mounted region is not
+  chatty — it just delivers the alert everywhere. Reuses the existing `aria-live="polite"` precedent
+  (Board, ActivityFeed, Docs) and stock `sr-only`; no new primitive.
+
+## 260. `--faint` lifted to AA per theme (distinct values, slate ramp preserved) + empty-name fallbacks
+
+Serves human Feature #53 polish (issue #54 finding 3: the app-wide `--faint` token was sub-AA for
+small text, plus an empty-name cosmetic nit); user decision that `--faint` is bumped per theme (the
+two theme blocks do NOT share a value) and that the ember value `#7A859A` is accepted.
+
+- **Decision — the token moves, per theme, not per-page overrides.** `index.css` has two dark themes
+  with independent palettes; each `--faint` was bumped once at the token level (one app-wide fix per
+  theme):
+  - **Ember** (`index.css:26`): `100 110 130` (#646E82, ~3.65:1) → **`122 133 154` (#7A859A)**,
+    measured ~5.0:1 on the real ember `bg-surface` card (plain `--surface` rgb(15,18,26) — not a
+    raised/0.55 composite, which an early draft wrongly assumed). Stays visibly fainter than ember
+    `--muted` (#949EB0).
+  - **Mission** (`index.css:99`): `100 116 139` (#64748B / slate-500, ~3.96:1, also sub-AA) →
+    **`116 132 155` (#74849B)**, ~4.95:1 on the mission `bg-surface` rgb(11,17,32). This is a
+    lightened slate between slate-500 and slate-400 that keeps the ramp's blue bias (b−r = 39), NOT the
+    ember grey — mission's `--faint` is part of a deliberate slate ramp (`--muted` = slate-400,
+    `--edge-strong` = slate-600) and must not collapse to ember's neutral grey. (The PRD floated
+    `#7A859A` as a fallback; a cleaner slate-consistent value was found and measured, so mission landed
+    on `#74849B`, not the ember hex.)
+- **Blast radius audited, not just applied.** `--faint` backs 37 files / 158 `text-faint` occurrences
+  app-wide AND `--syn-comment` (`index.css:63`, `:131`) → `text-syn-comment` (shell-comment syntax
+  highlighting in `RunEvent.tsx`, pinned by `RunEvent.test.tsx`); the M3 audit covered the
+  syntax-comment consumer in BOTH themes, not only `text-faint`. It is a slightly lighter grey per
+  theme, low-risk; #53 had already promoted the AA-critical *data* nodes to `--muted`, so what remains
+  on `--faint` is genuinely de-emphasised text that should still clear AA.
+- **Empty-name fallbacks are two distinct code shapes** (grouped here as the same de-emphasised-text
+  polish pass):
+  - `AdminRateLimits.tsx` stacks name **above** email in one cell; an empty `u.name` floated an empty
+    line above the email. Fix: `{u.name || <span className="italic text-faint">no name</span>}`. The
+    placeholder MUST stay the FIRST `<div>`'s `textContent` — the existing sort test reads the name via
+    `getAllByRole("cell")[0].querySelector("div")`.
+  - `AdminUsers.tsx` has a separate Name column that used `{u.display_name ?? "—"}`; `??` only catches
+    `null`/`undefined`, so an empty-string name still rendered blank. Fix: `{u.display_name?.trim() ||
+    "—"}` (empty-string-safe). Both pinned by tests so the nit can't silently reappear.
+- **Why.** WCAG AA (4.5:1 small text) is the project's best-practice bar; both prior `--faint` values
+  failed it. Bumping the token once per theme fixes every de-emphasised caller in one place while
+  respecting that ember and mission are separately-tuned palettes — a shared value would have broken
+  mission's slate ramp. The empty-name fixes ride along because they are the same "de-emphasised text"
+  surface.

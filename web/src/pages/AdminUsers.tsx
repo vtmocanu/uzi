@@ -85,7 +85,9 @@ export function AdminUsers() {
                 {users.map((u) => (
                   <tr key={u.id} className="transition-colors hover:bg-raised/30">
                     <td className="px-4 py-3 text-fg">{u.email}</td>
-                    <td className="px-4 py-3 text-muted">{u.display_name ?? "—"}</td>
+                    {/* ?? only catches null/undefined; an empty-string name would
+                        render blank, so fall back on a trimmed-empty name too. */}
+                    <td className="px-4 py-3 text-muted">{u.display_name?.trim() || "—"}</td>
                     <td className="px-4 py-3">
                       {u.is_admin ? <Badge tone="brand">Admin</Badge> : <Badge>User</Badge>}
                     </td>

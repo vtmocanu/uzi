@@ -6,6 +6,7 @@ import {
   rowState,
   sortAdminRows,
   statusBadge,
+  worstWindow,
   type RowState,
 } from "./rateLimits";
 import type { AdminRateLimitUser, MyRateLimits } from "./api";
@@ -76,6 +77,28 @@ describe("statusBadge", () => {
     expect(statusBadge(ok(97, 71), false)).toMatchObject({ tone: "danger", label: "5h nearly out" });
     expect(statusBadge(ok(71, 97), false)).toMatchObject({ tone: "danger", label: "7d nearly out" });
     expect(statusBadge(ok(96, 99), false)).toMatchObject({ tone: "danger", label: "5h & 7d nearly out" });
+  });
+});
+
+describe("worstWindow (PRD #54)", () => {
+  const okOnly = (limits: MyRateLimits) => limits as Extract<MyRateLimits, { status: "ok" }>;
+
+  it("names the 5-hour window when it is the more utilized", () => {
+    expect(worstWindow(okOnly(ok(97, 71)))).toMatchObject({ label: "5-hour", pct: 97 });
+  });
+
+  it("names the 7-day window when it is the more utilized", () => {
+    expect(worstWindow(okOnly(ok(71, 97)))).toMatchObject({ label: "7-day", pct: 97 });
+  });
+
+  it("breaks a tie toward the 5-hour window (shorter, more urgent)", () => {
+    const w = worstWindow(okOnly(ok(88, 88)));
+    expect(w.label).toBe("5-hour");
+    expect(w.pct).toBe(88);
+  });
+
+  it("carries the winning window's resets_at", () => {
+    expect(worstWindow(okOnly(ok(20, 90))).resets_at).toBe(NOW_SECS + 200_000);
   });
 });
 

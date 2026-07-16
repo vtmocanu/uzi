@@ -62,6 +62,17 @@ describe("AdminRateLimits", () => {
     expect(screen.getAllByText("Live")).toHaveLength(2); // vlad + radu (warn stays Live)
   });
 
+  it("renders a faint 'no name' placeholder for a user with an empty name (PRD #54)", async () => {
+    mockApi.getAdminRateLimits.mockResolvedValue({ users: [row("", ok(8, 47))] });
+    render(<AdminRateLimits />);
+    await screen.findByText("no name");
+    // The placeholder must be the first div's textContent (the sort test reads the
+    // name via querySelector("div")), so the email below never floats an empty line.
+    const nameCell = screen.getAllByRole("cell")[0];
+    expect(nameCell.querySelector("div")!.textContent).toBe("no name");
+    expect(within(nameCell).getByText("no name").className).toMatch(/text-faint/);
+  });
+
   it("shows a dim 'stale' reset on the vault-locked row and dashes for no-reading rows", async () => {
     mockApi.getAdminRateLimits.mockResolvedValue({ users: USERS });
     render(<AdminRateLimits />);

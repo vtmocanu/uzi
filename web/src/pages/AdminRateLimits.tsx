@@ -99,7 +99,13 @@ export function AdminRateLimits() {
                   return (
                     <tr key={u.id} className="transition-colors hover:bg-raised/30">
                       <td className="px-4 py-3">
-                        <div className="font-medium text-fg">{u.name}</div>
+                        {/* Keep the name in this first div (the sort test reads
+                            it via querySelector("div")); a faint placeholder
+                            fills it when the user has no name so the email below
+                            doesn't float under an empty line (PRD #54). */}
+                        <div className="font-medium text-fg">
+                          {u.name || <span className="italic text-faint">no name</span>}
+                        </div>
                         <div className="text-xs text-faint">{u.email}</div>
                       </td>
                       <td className="px-4 py-3">

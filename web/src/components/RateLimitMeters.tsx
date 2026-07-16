@@ -3,12 +3,12 @@
 // token never leaves the api — the SPA only ever sees percentages) and reuse the
 // shared MeterTrack + toneFor thresholds. The admin table is a separate page.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type MyRateLimits, type RateLimitWindow } from "../lib/api";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
-import { formatAgo, formatCountdown, useNow } from "../lib/rateLimits";
+import { formatAgo, formatCountdown, statusBadge, useNow, worstWindow } from "../lib/rateLimits";
 import { Badge, Card, SectionTitle } from "./ui";
-import { MeterTrack } from "./Meter";
+import { MeterTrack, toneFor, type MeterTone } from "./Meter";
 
 // useMyRateLimits polls GET /me/rate-limits while the tab is visible. A failed
 // fetch keeps the last reading (never blanks the meters); the surfaces decide what
@@ -112,6 +112,12 @@ export function RateLimitCard() {
     );
   }
 
+  // The badge reuses the shared statusBadge helper (PRD #54, Decision 2) so a
+  // ≥95% window escalates to the danger pill ("5h nearly out") matching the admin
+  // table, instead of the old flat "Stale"/"Live". /me/rate-limits has no
+  // vault_locked field, so vaultLocked is false — a stale self reading reads
+  // "stale" (the single-source-of-truth wording).
+  const badge = statusBadge(data, false);
   return (
     <Card className="space-y-5">
       <div>
@@ -125,13 +131,55 @@ export function RateLimitCard() {
       {/* text-muted (not text-faint) so the "updated Xm ago" timestamp — data
           this page leans on — clears WCAG AA 4.5:1 at 12px (web-ux finding). */}
       <div className="flex items-center gap-2 text-xs text-muted">
-        {data.stale ? <Badge tone="neutral">Stale</Badge> : <Badge tone="ok" dot>Live</Badge>}
+        <Badge tone={badge.tone} dot={badge.dot}>{badge.label}</Badge>
         <span>
           updated {formatAgo(data.synced_at, now)}
           {data.stale ? " · reading is stale (vault locked or polling off)" : " · refreshes every few minutes"}
         </span>
       </div>
     </Card>
+  );
+}
+
+// Tone severity ordering so the announcer fires only on a *step up* (Decision 3).
+const TONE_RANK: Record<MeterTone, number> = { ok: 0, warn: 1, danger: 2 };
+
+// RateLimitAnnouncer is the app-wide screen-reader alert (PRD #54, Decisions 3 &
+// 4): a visually-hidden aria-live region mounted once by AppShell (not scoped to
+// the Settings card) that speaks a message ONLY when the worst window's tone
+// steps up (ok→warn, warn→danger, ok→danger). A ref holds the last announced
+// tone; step-downs update it silently (no "you're fine now" chatter), the first
+// read seeds it without speaking, and stale readings never transition it (a
+// frozen 3h-old "96%" must not announce as if fresh). It runs its own
+// useMyRateLimits(60s) read so it is independent of whether the meters are on
+// screen. useNow keeps it re-rendering on the 30s clock like the card; the
+// effect keys off the reading, so a bare clock tick never re-announces.
+export function RateLimitAnnouncer() {
+  const { data } = useMyRateLimits(60_000);
+  useNow();
+  const lastTone = useRef<MeterTone | null>(null);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    // Only a live, non-stale reading transitions the ref (Decision 3).
+    if (!data || data.status !== "ok" || data.stale) return;
+    const worst = worstWindow(data);
+    const tone = toneFor(worst.pct);
+    const prev = lastTone.current;
+    lastTone.current = tone;
+    // First read seeds the ref (prev === null) and never announces; announce only
+    // when the tone rose above the last seen one.
+    if (prev === null || TONE_RANK[tone] <= TONE_RANK[prev]) return;
+    const countdown = formatCountdown(worst.resets_at);
+    setMessage(
+      `${worst.label} window at ${worst.pct}%` + (countdown ? `, resets in ${countdown}` : ""),
+    );
+  }, [data]);
+
+  return (
+    <div className="sr-only" aria-live="polite" role="status">
+      {message}
+    </div>
   );
 }
 

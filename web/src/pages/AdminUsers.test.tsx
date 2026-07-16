@@ -69,3 +69,13 @@ describe("AdminUsers judge toggle (PRD #46 M4)", () => {
     await waitFor(() => expect(within(row).getByText("Off")).toBeTruthy());
   });
 });
+
+describe("AdminUsers name fallback (PRD #54)", () => {
+  it("renders an em-dash for an empty-string display_name (?? missed it)", async () => {
+    mockApi.listUsers.mockResolvedValue({ users: [aUser({ display_name: "" })] });
+    render(<AdminUsers />);
+    const row = (await screen.findByText("mira@uzi.local")).closest("tr")!;
+    // Cell 0 is the email, cell 1 the name column: an empty name shows "—".
+    expect(within(row).getAllByRole("cell")[1].textContent).toBe("—");
+  });
+});
