@@ -266,12 +266,17 @@ export function WorkersSettings() {
                         </Badge>
                         {/* Names-only means no quantity appears anywhere, so this chip
                             is the ONLY trace of the size the worker was provisioned
-                            at — a bare "M" announces as "M" and explains nothing.
-                            The title says what the letter is; what it BUYS is M6's,
-                            once the controller's table exists to read it from. */}
-                        {w.hosted_size && (
-                          <Badge title={`Size ${sizeLabel(w.hosted_size)}`}>{sizeLabel(w.hosted_size)}</Badge>
-                        )}
+                            at, and a lone "M" explains nothing. It says so in its TEXT
+                            rather than a title or sr-only, deliberately: Badge renders
+                            a bare <span>, whose ARIA role is `generic`, and naming is
+                            PROHIBITED on generic — aria-label is ignored outright and
+                            title degrades to a hover tooltip no screen reader is
+                            obliged to read. sr-only would answer the screen reader and
+                            still leave a sighted KEYBOARD or TOUCH user with an
+                            unexplained letter and nothing to hover. Text is the only
+                            channel that reaches all three at once, and it needs no ARIA
+                            to do it. What the size BUYS is still M6's. */}
+                        {w.hosted_size && <Badge>size {sizeLabel(w.hosted_size)}</Badge>}
                       </>
                     )}
                     {hasTemplateDrift(w.template_declared, w.template_reported) && (

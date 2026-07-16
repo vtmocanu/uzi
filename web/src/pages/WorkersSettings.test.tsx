@@ -120,19 +120,22 @@ describe("WorkersSettings hosted workers (PRD #58 M5)", () => {
     // One list, marked — not two lists: a hosted worker is an ordinary worker whose
     // container the controller runs, so it keeps the same row, status and delete.
     expect(await screen.findByText("hosted")).toBeTruthy();
-    expect(screen.getByText("M")).toBeTruthy(); // upper-cased for reading; "m" on the wire
+    expect(screen.getByText("size M")).toBeTruthy(); // upper-cased for reading; "m" on the wire
     expect(screen.getAllByText("hosted")).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(2);
   });
 
-  it("gives the size chip an accessible name — a lone letter explains nothing", async () => {
-    // The chip is the only trace of the size anywhere in the UI (names-only means no
-    // quantities), so "M" on its own announces as "M" and tells a screen-reader user
-    // nothing. title names it, mirroring the hosted badge beside it.
+  it("carries the size in the chip's TEXT, where every user can reach it", async () => {
+    // Not a title and not sr-only. Badge renders a bare <span> — ARIA role `generic`,
+    // where naming is prohibited — so a title is a hover tooltip no screen reader must
+    // read, and sr-only would answer the screen reader while leaving a sighted keyboard
+    // or touch user an unexplained letter with nothing to hover. Text reaches all three.
     mockApi.listWorkers.mockResolvedValue({ workers: [hosted] });
     renderPage();
-    expect(await screen.findByTitle("Size M")).toBeTruthy();
-    expect(screen.getByTitle(/controller starts and stops/i)).toBeTruthy();
+    const chip = await screen.findByText("size M");
+    expect(chip.textContent).toBe("size M");
+    // The lone letter is gone: nothing in the row says just "M".
+    expect(screen.queryByText("M")).toBeNull();
   });
 
   it("badges a hosted row even when hosting is switched off (never leave a row lying)", async () => {
