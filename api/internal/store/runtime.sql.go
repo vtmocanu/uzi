@@ -2601,8 +2601,13 @@ UPDATE runs SET
     health_reason = CASE WHEN status = 'running' THEN health_reason ELSE NULL END,
     health_since  = CASE WHEN status = 'running' THEN health_since  ELSE NULL END,
     updated_at       = now()
-WHERE id = $6 AND worker_id = $7
+WHERE runs.id = $6 AND worker_id = $7
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND (status <> 'awaiting_approval' OR EXISTS (
+        SELECT 1 FROM run_user_inputs
+        WHERE run_user_inputs.run_id = $6
+          AND run_user_inputs.kind = 'approve_plan'
+          AND run_user_inputs.consumed_at IS NOT NULL))
 `
 
 type SetRunRunningParams struct {
@@ -2630,6 +2635,20 @@ type SetRunRunningParams struct {
 // human-gated run persists its selection through CreateApprovePlanInput instead).
 // Consequence, deliberate: a worker can never NULL these back out — an empty
 // roster is reported as '[]', which is a distinct, meaningful value.
+//
+// awaiting_approval → running is guarded (PRD #44 F2): a `running` report may be
+// retry-delayed up to ~31s, and two pre-gate fire-and-forget `running` reports
+// exist (the post-checkout roster report and the onSessionId report). One of those
+// landing AFTER the awaited awaiting_approval report would silently flip the run
+// back to running, hiding the plan gate with no self-heal (the run then dies on
+// plan-approval timeout). The EXISTS clause lets the transition through ONLY once a
+// consumed approve_plan input exists — i.e. the legitimate post-approval resume
+// report, which by construction is sent after the worker consumed the verdict. A
+// stale pre-gate report (no consumed approve_plan yet) leaves the gate intact.
+// claimed→running and running→running are unaffected (the guard only narrows the
+// awaiting_approval source status); autopilot never enters awaiting_approval.
+// Accepted residual (out of scope, see specs/ai.md): in a multi-round re-gate a
+// consumed round-1 input lets a stale round-2 pre-gate report through.
 func (q *Queries) SetRunRunning(ctx context.Context, arg SetRunRunningParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunRunning,
 		arg.IterationCount,

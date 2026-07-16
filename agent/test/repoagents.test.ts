@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   REPO_AGENTS_MAX_FILES,
   REPO_AGENT_DENIED_TOOLS,
+  REPO_AGENT_MAX_DESCRIPTION_LEN,
   describeRepoAgentNote,
   detectRepoAgents,
   repoAgentSummaries,
@@ -164,6 +165,24 @@ describe("detectRepoAgents", () => {
     const { agents, notes } = await detectRepoAgents(clone);
     assert.deepEqual(agents.map((a) => a.name), ["coder"]);
     assert.deepEqual(notes, [{ name: "big", reason: "too_large" }]);
+  });
+
+  it("caps the description by UTF-8 bytes, not UTF-16 units (F3)", async () => {
+    // '好' is 3 UTF-8 bytes / 1 UTF-16 unit. 400 of them are 1200 bytes but only 400
+    // units, so the old `.length` (UTF-16) check accepted it while the API's Go
+    // len() (bytes) then 400'd the whole report — and the fire-and-forget swallow
+    // dropped the ENTIRE roster to NULL. Measuring bytes on both sides closes that:
+    // the worker now drops just this agent here, before the API ever sees it.
+    const multibyte = "好".repeat(400);
+    assert.equal([...multibyte].length, 400, "sanity: 400 code points / UTF-16 units");
+    assert.ok(Buffer.byteLength(multibyte, "utf8") > REPO_AGENT_MAX_DESCRIPTION_LEN, "sanity: over the byte cap");
+    writeAgent("cjk.md", `---\nname: cjk\ndescription: ${multibyte}\n---\n\nbody\n`);
+    // An ASCII description exactly at the byte cap still passes: only the unit
+    // changed, not the cap. (1025 would be dropped — proven by the byte-count above.)
+    writeAgent("atcap.md", `---\nname: atcap\ndescription: ${"x".repeat(REPO_AGENT_MAX_DESCRIPTION_LEN)}\n---\n\nbody\n`);
+    const { agents, notes } = await detectRepoAgents(clone);
+    assert.deepEqual(agents.map((a) => a.name), ["atcap"]);
+    assert.deepEqual(notes, [{ name: "cjk", reason: "invalid" }]);
   });
 
   it("caps the roster at 16 files and reports the overflow as ONE aggregated note", async () => {

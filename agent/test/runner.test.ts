@@ -829,8 +829,16 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
 
       const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
       const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
-      const selection = states.find((s) => s.agent_selection !== undefined)?.agent_selection;
-      assert.deepStrictEqual(selection, { source: "repo", exclusions: [] }, "autopilot persisted the repo default");
+      const selectionState = states.find((s) => s.agent_selection !== undefined);
+      assert.deepStrictEqual(selectionState?.agent_selection, { source: "repo", exclusions: [] }, "autopilot persisted the repo default");
+      // F1: the autopilot selection report is self-contained — it carries the roster
+      // alongside the selection, so a failed fire-and-forget roster report above does
+      // not cost the attribution. (The own-source case below carries NO repo_agents.)
+      assert.deepStrictEqual(
+        selectionState?.repo_agents?.map((a) => a.name).sort(),
+        ["coder", "reviewer"],
+        "the repo-source autopilot selection report carries repo_agents",
+      );
       assert.ok(
         texts.some((t) => t.includes("autopilot: using the 2 agent(s) from the repo's .claude/agents/")),
         texts.join("\n"),
@@ -873,10 +881,15 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         repoFx.cleanup();
       }
     })();
-    assert.deepStrictEqual(states.find((s) => s.agent_selection !== undefined)?.agent_selection, {
+    const ownSelectionState = states.find((s) => s.agent_selection !== undefined);
+    assert.deepStrictEqual(ownSelectionState?.agent_selection, {
       source: "own",
       exclusions: [],
     });
+    // F1 guard: on the own default (no repo agents detected) the report must NOT carry
+    // repo_agents — sending [] would flip the column from NULL ("not reported") to []
+    // ("detected none") and erase that distinction.
+    assert.strictEqual(ownSelectionState?.repo_agents, undefined, "the own-source autopilot report carries no repo_agents");
     assert.ok(texts.some((t) => t.includes("autopilot: using your own agent templates")), texts.join("\n"));
   });
 

@@ -6374,3 +6374,88 @@ two theme blocks do NOT share a value) and that the ember value `#7A859A` is acc
   respecting that ember and mission are separately-tuned palettes — a shared value would have broken
   mission's slate ramp. The empty-name fixes ride along because they are the same "de-emphasised text"
   surface.
+
+## 261. F1 — the autopilot selection report carries its own roster, gated on a non-empty detection
+
+Serves PRD #44 (issue #44 M1), hardening the PRD #37 repo-agent roster attribution. The autopilot
+self-approve path (`agent/src/runner.ts` `gatePlan`) persisted its `agent_selection` on a `running`
+report but relied on the earlier post-checkout roster report to have populated `run.RepoAgents`. That
+roster report is fire-and-forget and never retried, so a transient failure left the column NULL,
+`validateSelection("repo", [])` errored, the selection persist was dropped, and `agent_source` stayed
+NULL — the run still ran the repo agents (the executor uses `ctx.repoAgents`), but lost its run-view
+attribution and MR repo-source marker.
+
+- **Decision — make the selection report self-contained.** The report now carries
+  `repo_agents: repoAgentSummaries(repoAgents)` alongside `agent_selection`, so both validate and
+  persist in one atomic statement regardless of whether the earlier roster report landed. `rosterFor`
+  (`api/internal/workersvc/service.go`) already prefers the reported roster over the persisted column,
+  so this is a no-op on the happy path and a repair on the failed-report path — no wire change
+  (`protocol.ts` already permits both fields on a `running` report), no size concern (`MaxRepoAgents`
+  = 16).
+- **The `repoAgents.length > 0` guard is load-bearing, not defensive.** On a detection FAILURE
+  `repoAgents` is `[]` and the selection resolves to `own`; sending `repo_agents: []` would flip the
+  persisted NULL ("not reported") to `[]` ("scanned, found none"), erasing a distinction the roster
+  report deliberately preserves. So the field is attached only when the roster is non-empty (i.e. only
+  when the selection is `repo`), which is exactly when the attribution matters.
+- **Why.** The correct agents always ran; the gap was silent loss of DISPLAY/attribution data on a
+  failed informational report. Folding the roster into the report that actually needs it (the one that
+  sets `agent_source`) closes the ordering dependency without a retry loop on a non-critical report.
+
+## 262. F2 — a stale `running` report cannot regress `awaiting_approval`; the guard keys on a consumed approve_plan
+
+Serves PRD #44 (issue #44 M2). `SetRunRunning`'s WHERE (`api/internal/store/queries/runtime.sql`)
+excluded only terminal statuses, so it treated `awaiting_approval → running` as always legal. But a
+`running` report can be retry-delayed up to ~31s (`agent/src/client.ts` backoff), and two pre-gate
+fire-and-forget `running` reports exist (the post-checkout roster report and the `onSessionId`
+report). One landing AFTER the awaited `awaiting_approval` report silently flipped the run back to
+`running`, and `RunView` renders the PlanPanel only on `awaiting_approval` — so the plan gate
+disappeared with NO self-heal (the worker is alive and heartbeating, the sweeper won't act, the worker
+never re-posts `awaiting_approval`), and the run eventually FAILED on plan-approval timeout. A
+human-approvable plan silently died.
+
+- **Decision — narrow the transition, do not forbid it.** The WHERE gains
+  `AND (status <> 'awaiting_approval' OR EXISTS (SELECT 1 FROM run_user_inputs WHERE run_id = @id AND
+  kind = 'approve_plan' AND consumed_at IS NOT NULL))`. A stale pre-gate report (no consumed
+  approve_plan yet) is a no-op and leaves the gate intact; the legitimate post-approval resume report
+  passes, because the worker consumes the approve_plan input (soft-consume via `consumed_at`) BEFORE it
+  posts that `running` report. A naive "never running from awaiting_approval" guard was rejected: it
+  would break approval resume, since approving does NOT itself change status (`CreateApprovePlanInput`
+  leaves the run at `awaiting_approval`; the resume IS a worker running-report).
+- **Untouched paths.** `claimed → running` and `running → running` heartbeats are unaffected (the new
+  clause only narrows the `awaiting_approval` source status); autopilot never enters
+  `awaiting_approval`. API-only fix, no wire change; requires `sqlc generate`. The two `id`/`run_id`
+  column refs are table-qualified (`runs.id`, `run_user_inputs.run_id`) because sqlc's analyzer flags a
+  bare `id` as ambiguous once `run_user_inputs` (which also has an `id`) is in scope via the EXISTS;
+  the same `@id` param still binds once.
+- **Accepted residual (deliberately out of scope).** In a multi-round re-gate (Decision 8b — a plan
+  rejected and re-planned), a CONSUMED round-1 approve_plan input lets a stale round-2 pre-gate report
+  through, since the EXISTS does not distinguish rounds. The fully-robust fix (per-report ordinals or a
+  statusless roster PATCH) was NOT taken: the window is rare (requires a re-gate AND a ~31s
+  retry-delayed pre-gate report AND the human re-approving), and the ordinal scheme is disproportionate
+  machinery for it. Documented here so the next reader knows the hole is known, not missed.
+- **Why.** This is the only one of the three findings that can KILL an approvable run (F1/F3 lose
+  display/attribution data). The consumed-input discriminator is the minimal correct key: it is exactly
+  the fact that separates "the worker has acted on a human verdict" from "a stale report from before the
+  gate".
+
+## 263. F3 — the repo-agent description cap is UTF-8 bytes on both worker and API
+
+Serves PRD #44 (issue #44 M3). The worker measured a description against the 1024 cap in UTF-16 units
+(`String.length`, `agent/src/repoagents.ts`), while the API measures Go `len()` — bytes
+(`api/internal/workersvc/agent_selection.go`). UTF-8 bytes are always ≥ UTF-16 units, so the divergence
+was one-directional: the worker accepted a description the API then 400'd. Worse, `validateRepoAgents`
+returns on the FIRST over-cap description, so one oversized entry 400'd the whole report, and F1's
+fire-and-forget swallow dropped the ENTIRE roster to NULL — silently, the repo card inert and the run
+falling back to own templates. The trigger is modest: ~513 two-byte Romanian-diacritic characters, not
+exotic 1024-char CJK.
+
+- **Decision — standardize on bytes.** The worker now uses `Buffer.byteLength(description, "utf8") >
+  REPO_AGENT_MAX_DESCRIPTION_LEN`, matching the API (left untouched — already bytes) and the
+  neighbouring byte caps (`REPO_AGENT_MAX_BYTES` 64KB, `MaxIssueDescriptionBytes` 256KB). Bytes is the
+  real payload bound. The now-false "characters" wording was corrected in the Go error message and the
+  comments on both sides; the DB column is `jsonb`, not the binding constraint.
+- **Why bytes, not UTF-16 units on both sides.** Aligning the worker DOWN to the API's existing byte
+  basis is a single-line change and keeps the cap consistent with every other size cap in the system;
+  raising the API to UTF-16 units would have meant re-encoding to measure and would still leave the
+  jsonb payload unbounded in bytes. The one-directional nature (worker accepts / API rejects) meant the
+  fix only had to tighten the worker.

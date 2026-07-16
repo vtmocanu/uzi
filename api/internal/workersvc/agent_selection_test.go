@@ -36,6 +36,12 @@ func repoAgentsJSON(t *testing.T, agents []RepoAgent) []byte {
 
 func TestValidateRepoAgents(t *testing.T) {
 	long := strings.Repeat("a", MaxAgentDescriptionLen+1)
+	// The description cap is UTF-8 BYTES (Go len()), matching the worker (F3). These
+	// prove the byte basis with multibyte text: '好' is 3 bytes / 1 rune, 'ă' (the
+	// PRD's ~513-Romanian-diacritic trigger) is 2 bytes / 1 rune.
+	multibyteOverBytes := strings.Repeat("好", 400)                      // 1200 bytes, 400 runes: over
+	diacriticAtCap := strings.Repeat("ă", MaxAgentDescriptionLen/2)     // 1024 bytes, 512 runes: at the cap
+	diacriticOverCap := strings.Repeat("ă", MaxAgentDescriptionLen/2+1) // 1026 bytes: one 2-byte rune over
 	many := make([]RepoAgent, MaxRepoAgents+1)
 	for i := range many {
 		many[i] = RepoAgent{Name: "a" + string(rune('a'+i%26)) + string(rune('a'+i/26)), Description: "x."}
@@ -66,6 +72,9 @@ func TestValidateRepoAgents(t *testing.T) {
 		},
 		{name: "blank description", agents: []RepoAgent{{Name: "coder", Description: "  "}}, wantErr: true},
 		{name: "over-long description", agents: []RepoAgent{{Name: "coder", Description: long}}, wantErr: true},
+		{name: "multibyte description over the byte cap (fewer runes)", agents: []RepoAgent{{Name: "coder", Description: multibyteOverBytes}}, wantErr: true},
+		{name: "multibyte description exactly at the byte cap", agents: []RepoAgent{{Name: "coder", Description: diacriticAtCap}}},
+		{name: "multibyte description one 2-byte rune over the cap", agents: []RepoAgent{{Name: "coder", Description: diacriticOverCap}}, wantErr: true},
 		{
 			// A newline in a description would forge structure in the run message and
 			// in the approval panel it is rendered into.
