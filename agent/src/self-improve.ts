@@ -1,12 +1,18 @@
 // Self-improvement run support (PRD #46 Decision 10, M5). A self_improve run is
 // the ordinary issue runner with three deltas: it works a FIXED branch so the
 // worker's idempotent createMergeRequest reuses one open MR across cycles; its MR
-// description carries its OWN test-suite evidence (there is no CI on the uzi repo);
-// and it flags changes to guard-critical paths for extra-careful human review. The
-// primary directive is untouched — the bot still never merges to main.
+// description carries its OWN test-suite evidence (the worker's own proof,
+// alongside uzi's CI which independently verifies it since PRD #52); and it flags
+// changes to guard-critical paths for extra-careful human review. The check
+// evidence + `npm ci` run under the cap-less `runner` uid (PRD #51 M4, buildCheckEnv
+// / prepareCheckDeps below), so a hostile self-improvement change's test code cannot
+// read the worker's 0400 token file — the same-OS-user residual this used to carry
+// is closed for the local (A1) path. The primary directive is untouched — the bot
+// still never merges to main.
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 // SELF_IMPROVE_BRANCH is the fixed branch every self_improve cycle pushes to.
 // Reusing one branch is what lets an open self-improvement MR be extended (the
@@ -138,21 +144,18 @@ export async function runSelfImproveChecks(worktreePath: string, runner: CheckRu
 // agent-authored code cannot read them to impersonate the worker
 // (join token → /api/worker/runs/claim → bot forge PAT + the user's Anthropic token).
 //
-// RESIDUAL NOT CLOSED (documented loudly, provision.ts house style): the subprocess
-// still runs as the uzi uid, and the join-token FILE at /run/secrets/worker_token is
-// same-uid readable at a hardcoded, documented path (the worker's post-read unlink
-// fails on the read-only secret mount, so the file persists). Agent-authored test
-// code can read that file directly — a surface behind NO PreToolUse hook. `npm ci`
-// runs with --ignore-scripts (prepareCheckDeps) to delete the lifecycle-script
-// (preinstall/install/postinstall) code-exec entry path — a REDUCTION, not a close:
-// the test runners still execute model-written code. Blast radius if exploited: join
-// token → claim → the bot forge PAT (Developer role, structurally cannot merge
-// protected `main`) + the user's own Anthropic token (which the agent already holds).
-// The structural close is the k8s uid-split (agent under a DISTINCT uid from the
-// worker), deferred to the remote-worker phase. This is the SAME residual class
-// provision.ts documents for build hooks — but those are admin-VETTED packages,
-// whereas these checks run code the model just wrote (M5 silently widened that
-// residual; surfaced by the M9 audit and accepted for the MVP).
+// CLOSED for the local path (PRD #51 M4): the check + `npm ci` subprocesses now run
+// under the cap-less `runner` uid (runnerCommand, below), and the join-token FILE at
+// /run/secrets/worker_token is 0400 worker-owned, so agent-authored test code — even
+// though it executes model-written code the SDK hook system never sees — CANNOT read
+// the worker's token at all. `npm ci` still runs with --ignore-scripts (prepareCheckDeps)
+// as a defense-in-depth REDUCTION of the lifecycle-script code-exec path. What the
+// same-uid residual used to expose (join token → claim → bot forge PAT + the user's
+// Anthropic token) is no longer reachable by these checks on the A1 (root-started) path.
+// On a #58 single-uid (non-root) start there is no split and the checks run as the sole
+// uid (that PRD's accepted posture); the cross-container k8s form is mapped in
+// docs/proc-hardening.md. (This was the same residual class provision.ts documented for
+// build hooks; both are closed together by the M4 spawn-as-runner.)
 
 // buildCheckEnv is the scrubbed replacement env for a check subprocess. PATH comes
 // from the provisioned toolEnv when present (so go/vitest/tsc resolve), else the
@@ -164,11 +167,17 @@ export function buildCheckEnv(
   toolEnv?: Record<string, string>,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    PATH: toolEnv?.PATH ?? source.PATH,
+    // The RUNNER PATH (PRD #51 M4): the provisioned toolchain PATH when present, else
+    // the /nix-bearing runner image PATH under the split (checks run as `runner`), NOT
+    // the worker's stripped PATH. Single-uid (#58): the worker's own PATH.
+    PATH: toolEnv?.PATH ?? runnerPath(source),
     HOME: homeDir,
     // No interactive prompt if a check shells out to git; not a secret.
     GIT_TERMINAL_PROMPT: "0",
   };
+  // 5-bis: check scratch on the runner's private 0700 TMPDIR under the split.
+  const tmp = runnerTmpdir(source);
+  if (tmp) env.TMPDIR = tmp;
   // TLS trust + locale so nix-provided toolchains and `npm ci` over HTTPS work. Prefer
   // the provisioned value, fall back to the image's; never invent, never carry else.
   for (const k of ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"] as const) {
@@ -197,8 +206,12 @@ export async function prepareCheckDeps(
       out.push({ dir, ok: false, detail: "no package.json" });
       continue;
     }
+    // PRD #51 M4: `npm ci` runs agent-authored package.json (even with --ignore-scripts,
+    // the lockfile resolution + any allowed binary) — an untrusted surface, so under the
+    // `runner` uid (setpriv wrapper). Single-uid (#58) runs it directly.
+    const nci = runnerCommand("npm", ["ci", "--ignore-scripts"]);
     const ok = await new Promise<boolean>((resolve) => {
-      execFile("npm", ["ci", "--ignore-scripts"], { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 }, (error) =>
+      execFile(nci.command, nci.args, { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 }, (error) =>
         resolve(!error),
       );
     });
@@ -238,10 +251,16 @@ export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 *
             : `prerequisite missing: ${check.requires}`,
       });
     }
+    // PRD #51 M4: the check runs agent-authored test code (go test / vitest / tsc) — an
+    // untrusted surface — so under the `runner` uid (setpriv wrapper); single-uid (#58)
+    // runs it directly. ENOENT/127 still classify as "skipped" (the wrapper preserves the
+    // target's exit semantics; a missing runner uid is a #58 single-uid start where the
+    // wrapper is absent).
+    const wc = runnerCommand(check.command, check.args);
     return new Promise<CheckResult>((resolve) => {
       execFile(
-        check.command,
-        check.args,
+        wc.command,
+        wc.args,
         { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 },
         (error) => {
           if (!error) {

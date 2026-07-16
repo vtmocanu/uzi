@@ -146,11 +146,6 @@ already today's behavior.
 
 Raising the cap is an informed trade-off, not a free speedup:
 
-- **A live sibling run can briefly read a push in progress.** Runs share the same
-  container user, so a concurrent run's agent can read another run's git-push
-  child's environment (and its credential) during that run's short push window.
-  `main` stays protected by GitLab's branch protection either way; this narrows a
-  defense-in-depth layer, not the primary one.
 - **Bash isn't jailed to its own worktree.** The guardrail denies push and
   credential-reading commands but not writes outside a run's own worktree, so a
   prompt-injected run could shell-write into a sibling's worktree or the shared
@@ -165,9 +160,12 @@ Raising the cap is an informed trade-off, not a free speedup:
 - **Same-repo runs still serialize.** Two concurrent runs against the same repo
   queue behind each other at the git layer — correct, just not actually parallel.
 
-These are same-uid, single-container specifics; the design behind this feature
+These are single-container, shared-resource specifics (a shared filesystem, memory
+budget, and Anthropic token); the cross-run credential read is closed by the
+worker/runner uid split (PRD #51, [proc-hardening.md](proc-hardening.md)) on the
+root-started compose stack (a #58 single-uid start does not split). The design behind this feature
 (`adr/0042-worker-run-concurrency.md`) has the full research and the
-container-per-run model that eventually closes them.
+container-per-run model that eventually closes the rest.
 
 ## Multiple workers, removing a worker
 

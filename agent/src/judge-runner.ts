@@ -13,7 +13,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { HookInput, HookJSONOutput, Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
+import type { HookInput, HookJSONOutput, Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
+import { spawnDetached } from "./sdk-spawn.js";
+import { uidSplitActive } from "./runner-uid.js";
 
 import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
@@ -189,6 +191,15 @@ export class JudgeRunner {
 
   private async runModel(token: string, model: string, prompt: string): Promise<string> {
     const homeDir = await fs.mkdtemp(path.join(this.homeRoot, "uzi-judge-"));
+    // PRD #51 M4: the judge SDK CLI runs as the `runner` uid (spawnClaudeCodeProcess ->
+    // runnerSpawn), but fs.mkdtemp FORCES mode 0700 (Node ignores umask) and JudgeRunner
+    // runs in the WORKER process, so the HOME is worker-owned 0700 — the runner gets ZERO
+    // access (the setgid /data/agent-home parent sets the dir's group `runner`, but 0700
+    // grants the group nothing) and the judge CLI cannot write $HOME/.claude. Under the
+    // split, widen it to 2770 (group `runner` rwx) so the runner can use it and the worker
+    // (a `runner`-group member) can still rm it on cleanup. The unit-test / single-uid (#58)
+    // path leaves 0700 (the judge runs as the worker — same uid, 0700 is correct + tighter).
+    if (uidSplitActive()) await fs.chmod(homeDir, 0o2770);
     // Wall-clock cap: abort the SDK query (native cancellation) AND hard-reject the
     // race, so a hung/retrying model call can never wedge the judge run — runModel
     // settles within JUDGE_MODEL_TIMEOUT_MS and judge() falls back.
@@ -228,6 +239,12 @@ export class JudgeRunner {
       hooks: {
         PreToolUse: [{ hooks: [denyAllTools] }],
       },
+      // PRD #51 M4: the judge's model-reasoning SDK CLI is an execution surface, so route
+      // it through the runner-uid spawn like every other SDK spawn (uniform boundary). The
+      // judge's worker-side HTTP (trace-fetch + verdict POST, which use the join token)
+      // stays on the worker (Decision 1) — those run in this Node process, not the CLI. The
+      // deny-all tool hook already blocks code-exec, so this is defense-in-depth.
+      spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
     };
     if (model) options.model = model;
 

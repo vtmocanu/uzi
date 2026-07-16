@@ -2,29 +2,44 @@
 
 # The `jvm` worker template (PRD #18): the `base` image plus a JDK, for users
 # whose repos build/test Java. It mirrors templates/base/Dockerfile layer-for-
-# layer (same pinned node base, git+bash+tini, non-root `uzi` user, tini as PID 1,
-# no secrets, the SAME pinned nix + devbox provisioning stack) and only ADDS the
-# JDK — templates/base is the source of truth for the common layers; keep this in
-# lockstep with it (a test pins the devbox install + DEVBOX_VERSION match), and
-# never drop a guardrail-relevant layer to add a dependency.
+# layer (same pinned node base, git+bash+tini, the PRD #51 worker/runner uid split
+# + root-entry setpriv drop, tini as PID 1, no secrets, the SAME pinned nix +
+# devbox provisioning stack) and only ADDS the JDK — templates/base is the source
+# of truth for the common layers; keep this in lockstep with it (a test pins the
+# devbox install + DEVBOX_VERSION match), and never drop a guardrail-relevant layer
+# to add a dependency.
 FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2
 WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool; tini as PID 1; curl +
 # xz + tar for the pinned nix/devbox downloads. openjdk17 is this template's reason
-# to exist — a full JDK (java + javac) from Alpine's community repo.
-RUN apk add --no-cache git bash tini curl xz tar openjdk17
+# to exist — a full JDK (java + javac) from Alpine's community repo. setpriv
+# (util-linux) is the PRD #51 A1 drop wrapper (busybox setpriv cannot `--reuid`);
+# the grep fails the build if /bin/setpriv is not the util-linux binary. MIRRORED
+# from templates/base.
+RUN apk add --no-cache git bash tini curl xz tar openjdk17 setpriv \
+    && /bin/setpriv --help 2>&1 | grep -q -- --reuid
 
 # JAVA_HOME + PATH so `java`/`javac` and Maven/Gradle wrappers resolve for the
 # agent's Bash tool. Alpine installs openjdk17 under this fixed prefix.
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# The non-root runtime user, created EARLY so the nix store can be chowned to it.
-RUN addgroup -S uzi && adduser -S -G uzi -h /home/uzi uzi
+# Two runtime uids (PRD #51 A1), MIRRORED from templates/base. `worker` (uid 10001)
+# holds the run credentials and does all credentialed work; `runner` (uid 10002) is
+# the distinct, cap-less uid the worker spawns untrusted code-execution under (M4).
+# Numbered to match the k8s design intent (worker 10001 / runner 10002); `worker`
+# joins group `runner`. Created EARLY so /nix + /data can be chowned; the entrypoint
+# drops root -> worker at run time.
+RUN addgroup -g 10001 worker && adduser -u 10001 -G worker -h /home/worker -D worker \
+    && addgroup -g 10002 runner && adduser -u 10002 -G runner -h /home/runner -D runner \
+    && addgroup worker runner
+# The worker's HOME (the image default is /root; setpriv does not set HOME). Per-run
+# SDK HOME is overridden onto /data (buildSdkEnv) regardless. MIRRORED from base.
+ENV HOME=/home/worker
 
 # --- PRD #18 M3/M4: nix + devbox — MIRRORED FROM templates/base (keep in lockstep) ---
-# Same build-time pinned install + /nix-at-default-path + chown-to-uzi as base; see
+# Same build-time pinned install + /nix-at-default-path + chown-to-worker as base; see
 # templates/base/Dockerfile for the full rationale (musl-confirmed, no floating
 # fetch, no runtime download, store persisted by the agentnix volume). UNVERIFIED
 # in this workspace; the tester re-runs the live smoke.
@@ -39,7 +54,7 @@ RUN NIX_ARCH="$(case "${TARGETARCH}" in amd64) echo x86_64 ;; arm64) echo aarch6
         --extra-conf "sandbox = false" \
         --extra-conf "experimental-features = nix-command flakes" \
     && rm -f /tmp/nix-installer \
-    && chown -R uzi:uzi /nix
+    && chown -R worker:runner /nix
 ENV NIX_REMOTE=""
 ENV PATH="/nix/var/nix/profiles/default/bin:${PATH}"
 
@@ -74,8 +89,8 @@ COPY agent/src ./src
 
 # --- PRD #39 M2: bake uzi's own source, read-only, for the `chat` run kind --------
 # Read-only snapshot of uzi's own source for the chat agent, matched to the deployed
-# image — never a clone, no PAT. Root-owned (final USER is non-root uzi), never
-# chowned to uzi below. Context is the repo root; the per-Dockerfile
+# image — never a clone, no PAT. Root-owned (the runtime worker/runner uids are non-root), never
+# chowned below. Context is the repo root; the per-Dockerfile
 # Dockerfile.dockerignore hard-excludes .env*, .git, inspiration/, node_modules and
 # build artifacts (patterns relative to the CONTEXT ROOT). MIRRORED from
 # templates/base — keep in lockstep. See templates/base/Dockerfile for the rationale.
@@ -93,14 +108,20 @@ ENV UZI_DATA_DIR=/data
 # it was actually built from (PRD #18 register `template`). Hardcoded literal, not
 # the build arg echoed back — see templates/base.
 ENV UZI_WORKER_TEMPLATE=jvm
-RUN mkdir -p /data && chown -R uzi:uzi /app /data
+RUN mkdir -p /data && chown -R worker:worker /app /data
 # Root-owned 0555 empty git-hooks dir — the SAME explicit stanza as templates/base.
 # jvm builds from the same upstream node image, NOT `FROM base`, so it must bake this
-# itself. core.hooksPath points here (agent/src/git.ts, M10), so the uzi uid cannot
-# plant a git hook. MUST be as root, before the USER line.
+# itself. core.hooksPath points here (agent/src/git.ts, M10), so neither the worker
+# nor the runner uid can plant a git hook. MUST be as root; the entrypoint drops later.
 RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
-USER uzi:uzi
+
+# PRD #51 A1 root-entry setpriv drop — the SAME explicit stanza as templates/base (jvm
+# is NOT `FROM base`). Image baseline stays ROOT and the entrypoint drops to `worker`
+# keeping only CAP_SETUID/SETGID ambient (M4 spawns `runner` children). No `USER` line.
+COPY --chmod=0755 agent/templates/entrypoint.sh /usr/local/sbin/uzi-entrypoint
 VOLUME ["/data", "/nix"]
 
-ENTRYPOINT ["/sbin/tini", "--"]
+# tini stays PID 1 (SIGTERM -> clean shutdown), execed by the entrypoint as the dropped
+# worker: uzi-entrypoint -> setpriv (drop) -> tini -> npm run start. MIRRORED from base.
+ENTRYPOINT ["/usr/local/sbin/uzi-entrypoint"]
 CMD ["npm", "run", "start"]

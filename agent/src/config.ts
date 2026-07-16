@@ -37,10 +37,11 @@ export interface Config {
    */
   stubPlanGate: boolean;
   /**
-   * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. A
-   * read-only secret mount (the shipping compose default) can't be unlinked, so
-   * the token file persists and is same-uid readable; the Bash guardrail denies a
-   * `cat` of this path (symmetric with its /proc deny). Undefined for env-var
+   * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. The
+   * shipping compose default is a read-only secret mount the entrypoint forces to
+   * 0400 worker-owned, so it persists (the post-read unlink no-ops) and the cap-less
+   * `runner` uid cannot read it (PRD #51); the Bash guardrail denies a `cat` of this
+   * path (defense-in-depth, symmetric with its /proc deny). Undefined for env-var
    * delivery.
    */
   workerTokenFile?: string;
@@ -150,14 +151,14 @@ function parseBool(v: string | undefined): boolean {
 }
 
 /**
- * Resolve the worker join token. UZI_WORKER_TOKEN_FILE (a path) is preferred and
- * is the STRUCTURAL /proc hardening (M6): delivering the token via a file rather
- * than an env var keeps it out of the worker's `/proc/<pid>/environ`, where a
- * same-uid agent subprocess (`cat <symlink>/self/environ`) could otherwise read
- * it. After reading, the file is unlinked so it does not rest on disk for the
- * agent's Bash to `cat` either — best-effort, since a read-only secret mount
- * (k8s Secret, `--read-only`) cannot be unlinked; the environ win holds
- * regardless. Falls back to UZI_WORKER_TOKEN (env) for backward compatibility.
+ * Resolve the worker join token. UZI_WORKER_TOKEN_FILE (a path) is preferred: it is
+ * the STRUCTURAL /proc hardening (PRD #46 M6) — delivering the token via a file rather
+ * than an env var keeps it out of every process's `/proc/<pid>/environ`. Under the
+ * PRD #51 uid split the file is 0400 worker-owned, so the cap-less `runner` uid (which
+ * runs the agent + checks + provision) cannot read it — the on-disk copy is protected
+ * by the uid boundary, not by removal. The best-effort post-read unlink stays (it
+ * no-ops on a read-only secret mount, the shipping compose default), but the uid
+ * boundary is the close. Falls back to UZI_WORKER_TOKEN (env) for backward compatibility.
  */
 function resolveWorkerToken(env: NodeJS.ProcessEnv): string {
   const file = env.UZI_WORKER_TOKEN_FILE?.trim();

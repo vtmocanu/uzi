@@ -3,166 +3,148 @@ title: Proc hardening
 audience: design
 ---
 
-# Worker `/proc` isolation: the structural residual and its close
+# Worker/agent uid split: the local containment and its k8s mapping
 
-This documents the M3/M4 accepted residual around `/proc/<pid>/environ`, what M6
-investigated, the partial hardening M6 landed in the compose MVP, and the
-concrete pod design that closes it fully on the remote-worker (k8s/VM) phase.
+This is the **implemented** design (PRD #51), not a sketch. On the bundled
+compose stack the worker and the untrusted code-execution surfaces (the Claude
+Agent SDK, the self-improvement check runner, the devbox/nix provision hooks, and
+the runner clone's own git) run **under two different OS uids in one container**,
+so the credential-holding worker's secrets are unreadable by the code the agent
+influences. It supersedes the pre-split "accepted same-uid residual" this page
+used to describe.
 
-## The residual
+## What was closed, and why it mattered
 
-The uzi worker and the agent it drives run in the **same container, under the
-same uid** (`uzi`). The worker spawns the Claude Agent SDK as a subprocess and
-controls it in-process (abort, group-kill, session dir, pid capture). Because
-they share a uid, a survivor the agent leaves behind (a `setsid`-escaped
-process that outlives the per-turn `abort()` and the done-path group-kill) can
-read the worker's own `/proc/<worker-pid>/environ` and any transient git child's
-`/proc/<child-pid>/environ`:
+Before the split, the worker and the agent it drives shared one uid (`uzi`).
+Because they shared a uid, a process the agent left behind could read the
+worker's `/proc/<pid>/environ` (holding the join token) and any transient git
+child's environ (holding the bot PAT during the push window), and any code the
+agent could run as that uid could read the join-token **file** and plant a
+code-exec key into a git config source the worker later read. No in-container
+string guard can stop a same-uid process from reading `/proc` or a
+same-uid-readable file — the robust close is **structural**: the untrusted code
+must not share the worker's uid.
 
-- **Join token.** Historically delivered as the `UZI_WORKER_TOKEN` env var, so it
-  sat in the worker's `environ` for the whole process lifetime. Reading it lets
-  an attacker impersonate the worker against the API (claim runs, receive PATs).
-  Redacted from every run message, but present in `environ`.
-- **Bot PAT.** Never in the worker's persistent env. It enters a git **child's**
-  env only during the push/MR window. M4 audit finding B1 closed the common case
-  by group-killing the whole agent process tree *before* the PAT-bearing push, so
-  a normal backgrounded survivor is dead first. A `setsid`-escaped survivor in
-  its own session is not reached by that group-kill and could still race the
-  short push window.
+## The mechanism, as built (mechanism A1)
 
-No in-container string guard can prevent a same-uid process from reading `/proc`
-(a symlink to `/proc`, `/proc/<pid>/mem`, `ptrace`, etc.). The robust close is
-**structural**: the agent must not share a uid with the worker's own process, or
-`/proc` must hide other pids, or the agent must run in a stronger sandbox.
+Two OS uids are baked into the worker image
+([`agent/templates/base/Dockerfile`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/templates/base/Dockerfile)):
+**`worker`** (uid 10001, the credential custodian) and **`runner`** (uid 10002,
+cap-less, runs the untrusted surfaces). `worker` is a member of group `runner` so
+it can reach runner-group trees; `runner` is **not** in group `worker`.
 
-## What M6 investigated (and the honest finding)
+- **Root entrypoint, then a setuid drop.**
+  [`agent/templates/entrypoint.sh`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/templates/entrypoint.sh)
+  starts as root (compose grants `cap_add: [SETUID, SETGID, SETPCAP, CHOWN,
+  DAC_OVERRIDE]`), runs a minimal startup window (volume-ownership migration,
+  token hardening, per-uid tmp + `/data` carve-out), then `setpriv`-drops to
+  `worker` keeping **only** `CAP_SETUID`/`CAP_SETGID` as **ambient** caps. The
+  worker retains those two for the run lifetime so it can spawn `runner`-uid
+  children per run; `no-new-privileges: true` stays on (it blocks a privilege
+  *gain* on execve, not a root→lower drop).
+- **Per-spawn drop to the cap-less runner.**
+  [`agent/src/runner-uid.ts`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/src/runner-uid.ts)
+  wraps every untrusted spawn (SDK CLI, checks + `npm ci`, provision hooks, the
+  runner-clone seed clone/checkout) in `setpriv --reuid runner --regid runner
+  --init-groups --bounding-set -all --inh-caps -all --ambient-caps -all` (the
+  `--bounding-set -all` is a documented no-op — the worker lacks CAP_SETPCAP to
+  shrink the child's bounding set — kept for intent). The inheritable+ambient
+  cap clear is load-bearing: a plain reuid from a uid holding ambient CAP_SETUID
+  would let the child setuid back, so without the clear the split would be
+  defeated. The runner child ends `CapEff=CapPrm=CapAmb=0`, and — since the image
+  ships no setuid/file-capability binary and `no-new-privileges` blocks any
+  execve-time raise — the inert `CapBnd` residue cannot be climbed.
+- **Cross-uid signalling.** The worker (a different uid, holding no `CAP_KILL`)
+  cannot `kill(2)` a runner process, so the pre-push reap (audit B1) and the
+  watchdog signal via a `setpriv`-to-runner `kill` of the process group.
 
-The compose MVP runs the worker container **non-root** (`USER uzi`) with
-`cap_drop: ALL` and `no-new-privileges: true`. Against that posture:
+### What each close now rests on
 
-| Structural close | Needs | Feasible in the MVP? |
+- **Join token.** Delivered as a file, not an env var, so it is absent from every
+  process `environ` (the PRD #46 M6 close). The entrypoint forces
+  `/run/secrets/worker_token` to `0400 worker:worker`, so the `runner` uid
+  **cannot read it** — the file is **persisted, not unlinked** (a read-only
+  secret mount cannot be unlinked anyway; the uid boundary, not removal, is the
+  close). See [`agent/src/config.ts`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/src/config.ts)
+  `resolveWorkerToken` and the `secrets:` block in `docker-compose.yml`.
+- **Bot PAT (push-window race).** The PAT enters a git **child's** env only during
+  the worker's push/MR. That git child runs as `worker`, so its
+  `/proc/<pid>/environ` is `0400 worker`-owned and a `runner` survivor **cannot
+  read it** — the structural close for the vector B1's group-kill could only
+  race. B1 (reaping the agent tree before the push, via the `setpriv`-to-runner
+  kill) stays as a second layer.
+- **Shared-git write→worker-execute.** `git` has config keys whose value is run as
+  a command (`diff.external`, `core.fsmonitor`, `core.pager`, `core.sshCommand`,
+  `credential.helper`, `core.askpass`, …). The worker pins every fixed-name one
+  via inline `GIT_CONFIG_*` (highest precedence), sets `GIT_CONFIG_NOSYSTEM`, and
+  defaults `GIT_CONFIG_GLOBAL` to `/dev/null` (PRD #51 M0,
+  [`agent/src/git.ts`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/src/git.ts)
+  `gitEnv`). The arbitrary-name class (`filter.<name>.*`, `uploadpack.packObjectsHook`,
+  a `commondir`/`gitdir` rewrite) is closed by **config-source ownership**: under
+  the `(b)` topology the worker is **bare-only** — it never runs `git` with a
+  runner-owned clone as its git dir. The runner gets its **own** clone (working
+  tree + object store): a **runner-run** local `git clone --shared` from the worker
+  bare seeds it (run as the runner uid via `runGitAsRunner`, which is what makes the
+  clone runner-owned), and the agent checks out + commits there. The worker then
+  `fetch`es the agent branch **back** over `file://`+pack (never the local-copy path,
+  so it never traverses the clone's alternates or a planted hook), and pushes from
+  its own bare with the PAT.
+- **PATH + scratch isolation.** `/nix` is runner-owned and group-runner-writable,
+  so the worker's credentialed-exec PATH is stripped to root-owned image dirs only
+  (no `/nix`); the full `/nix`-bearing PATH reaches the runner via `UZI_RUNNER_PATH`.
+  Worker and runner each get a private `0700` `TMPDIR` (`/tmp/uzi-worker`,
+  `/tmp/uzi-runner`), so neither reads the other's git/npm scratch.
+
+### The honest posture (stated, not hidden)
+
+The containment is asymmetric by design: the **worker** (the PAT/token custodian)
+also holds `CAP_SETUID`, so a *compromised worker* could become any uid, including
+0. That is accepted — the worker is the trusted side, and the containment we buy is
+on the **runner** side (the surface that actually runs agent-influenced code). The
+split shrinks the blast radius of an agent/tool compromise, not of a worker
+compromise.
+
+## The `#58` single-uid (non-root) start
+
+The **same image** also runs in a restricted-PodSecurity k8s namespace
+(`runAsUser: 10001`, no addable capabilities — PRD #58 v1). There the entrypoint
+detects a non-root start and runs **single-uid**: no root window, no `runner` uid,
+no `setpriv` drop (an unconditional `--reuid` would `EPERM` → CrashLoop). The #51
+uid-split containment applies only on the **root-started** (compose / A1) path;
+`UZI_UID_SPLIT=1` is exported only there, and its absence makes every
+`runner-uid.ts` primitive a passthrough. Single-uid is PRD #58's own accepted
+posture; the cross-container split for that world is the k8s form below.
+
+## Local ↔ k8s mapping (align at the abstraction, not the mechanism)
+
+The durable abstraction is **"the untrusted execution surface runs under a
+distinct uid from the credential custodian, and cannot read its secrets."** How
+that is realized differs by platform, and the two do **not** map 1:1:
+
+| | Local (compose, A1) — built | k8s remote-worker — design (deferred) |
 | --- | --- | --- |
-| Agent under a **different uid** than the worker (so `/proc/<worker>/environ`, mode `0400` owned by the worker uid, is unreadable to the agent uid) | `CAP_SETUID`/`CAP_SETGID` (a `su-exec`/`gosu` drop), or start as root | **No** — dropped by `cap_drop: ALL`; the container starts as `uzi` and cannot gain a second uid |
-| `/proc` mounted **`hidepid=2`** (other pids invisible) | remount `/proc` → `CAP_SYS_ADMIN` + a private mount namespace; no per-service compose knob exists | **No** — needs privilege the posture forbids |
-| **gVisor / `runsc`** runtime (syscall interception, no host `/proc`) | a runtime the Docker daemon is configured with (`--runtime=runsc`) | **No** — daemon-level, not a compose-file property |
-| Dedicated **agent sidecar** container with its own uid + shared data volume | an IPC protocol between the worker and the out-of-process agent (the worker currently spawns and controls the SDK in-process) | **Not in M6** — an architectural redesign, tracked for the remote-worker phase |
+| Boundary | two uids in **one** container | two **containers** in one pod |
+| Drop | root entrypoint + in-process `setpriv` per spawn | per-container `runAsUser` (10001 / 10002) set by the kubelet |
+| Caps | worker keeps ambient `CAP_SETUID` to spawn the runner | **no `CAP_SETUID`**, no in-process uid spawn (the kubelet assigns uids) |
+| `/proc` | same pid namespace; environ unreadable via `0400`-owner | `shareProcessNamespace: false` → the agent container cannot see worker pids at all |
+| Worker↔runner | in-process spawn + shared `/data` volume | an **IPC** boundary + a shared `emptyDir` worktree (the `(C)`/sidecar model) |
 
-**Conclusion:** a clean structural close is **not achievable** in the non-root,
-`cap_drop: ALL` compose MVP without breaking that very posture (every option above
-either re-adds a capability or requires daemon/runtime privilege). Per the M6
-brief we did **not** force a privileged hack. Instead:
+Do **not** claim mechanism A1 maps onto k8s `runAsUser`: A1 needs `CAP_SETUID` and
+an in-process drop, which the k8s form deliberately does not use. The k8s form is
+the PRD's **(C)** two-container model, which additionally requires making the
+worker↔runner boundary an IPC one (today the worker spawns and controls the SDK
+in-process). **Actual k8s manifests are deferred to the remote-worker PRD** — this
+page aligns the design only. `shareProcessNamespace: false` (or `hidepid=` /
+gVisor) are complements available **once the uids differ across containers**; they
+buy nothing for a same-uid pair.
 
-## What M6 landed (clean, in-posture)
+## Regression guards
 
-**The join token is now delivered by file, not by environment variable.**
-
-Set `UZI_WORKER_TOKEN_FILE` to a path and the worker reads the token once at
-startup, then **unlinks the file** (best-effort — a read-only secret mount can't
-be unlinked, and that's fine). The token then lives only in the worker's process
-**heap**, which a same-uid descendant **cannot** read: with the container's
-`cap_drop: ALL` there is no `CAP_SYS_PTRACE`, and the default `yama`
-`ptrace_scope` forbids a child from `ptrace`-attaching to (or reading
-`/proc/<parent>/mem` of) its ancestor. So:
-
-- the join token is **absent from every process `environ`** (it was never an env
-  var), closing the persistent `/proc/<pid>/environ` leak that the residual named;
-- with the file unlinked it is **not on disk** for the agent's Bash to `cat`
-  either;
-- backward compatible: `UZI_WORKER_TOKEN` (env) still works when the file var is
-  unset, so nothing existing breaks.
-
-**Where it is wired (shipping stack vs test overlay):**
-
-- **The shipping stack** (`docker-compose.yml`, `--profile agent up`) delivers the
-  token as a **compose file secret**: `UZI_WORKER_TOKEN` (from `.env`) is mounted
-  at `/run/secrets/worker_token` and the agent reads it via `UZI_WORKER_TOKEN_FILE`
-  — so the token is **absent from the container `environ`**. Compose secret mounts
-  are **read-only**, so the worker's post-read unlink *fails and the file persists*
-  at `/run/secrets/worker_token`. The **environ vector is closed** (the leak the
-  residual named is the `/proc/<pid>/environ` read). But be precise: that
-  persisted file is a **same-uid-readable copy** of the join token whose
-  reachability for a prompt-injected agent is **equivalent to** (not "lesser
-  than") the environ it replaced — a `cat` reads it just as a `cat` of
-  `/proc/<pid>/environ` did. Two guardrail layers cover the obvious read paths:
-  the **file-tool jail** denies `Read`/`Grep`/`Glob` of it (out-of-worktree), and
-  the **Bash deny-hook** denies a `cat`/read of the `/run/secrets/` prefix (and the
-  configured `UZI_WORKER_TOKEN_FILE`), symmetric with its `/proc` deny. Both are
-  bar-raises, not a complete close: a script that reads the file, a shell-
-  indirection primitive, or any read tool the screener does not model can still
-  reach a same-uid-readable file. The **only complete close is the uid split**
-  (option 1 below), where the file is owned by the worker uid and unreadable to the
-  agent uid.
-- **The E2E overlay** (`e2e/docker-compose.e2e.yml`) delivers the token via a
-  **writable** bind-mounted file, so there the unlink also succeeds and **both**
-  the environ and the on-disk vectors are closed. The harness (`e2e/run-e2e.sh`)
-  asserts the token appears in **zero** process `environ`s and that the delivery
-  file was unlinked.
-
-See `agent/src/config.ts` (`resolveWorkerToken`), the `secrets:` block in
-`docker-compose.yml`, and `e2e/docker-compose.e2e.yml`.
-
-**What this does NOT close:** the **PAT** transient-window vector (a
-`setsid`-escaped survivor racing the push) is unchanged — the PAT is a git
-*child's* env, not the worker's, so file-delivery does not apply. That vector
-still needs one of the structural closes below and remains the honest residual
-for the remote-worker phase.
-
-Intra-run parallel subagents ([Agent templates](./agent-templates.md#parallel-dispatch))
-widen the field of candidates for this same residual, not the residual itself:
-a run whose implementation phase dispatches several coders concurrently has
-that many concurrent processes racing the push window instead of one. No new
-escape class, and the same group-kill still reaps every ordinary survivor
-regardless of how many subagents ran; only the `setsid`-escaped case is
-affected, and only by count.
-
-## The full close: remote-worker (k8s/pod) design
-
-On the remote-worker phase the worker runs as a pod, where the uid split and
-`/proc` hiding the MVP cannot express become first-class:
-
-1. **uid split across two containers in one pod (preferred).** A `worker`
-   container (holds the join token + PAT, does all authenticated git/MR) and an
-   `agent` container (runs the SDK) in the **same pod**, sharing only the
-   worktree via an `emptyDir`:
-
-   ```yaml
-   spec:
-     shareProcessNamespace: false        # agent cannot see worker pids at all
-     containers:
-       - name: worker
-         securityContext: { runAsUser: 10001, runAsNonRoot: true,
-                            allowPrivilegeEscalation: false,
-                            capabilities: { drop: ["ALL"] },
-                            readOnlyRootFilesystem: true }
-       - name: agent
-         securityContext: { runAsUser: 10002, runAsNonRoot: true,   # DIFFERENT uid
-                            allowPrivilegeEscalation: false,
-                            capabilities: { drop: ["ALL"] } }
-     volumes: [ { name: worktree, emptyDir: {} } ]
-   ```
-
-   With `shareProcessNamespace: false` the agent container has its own pid
-   namespace and cannot see, `ptrace`, or read `/proc` of the worker container at
-   all — the environ and `/proc/<pid>/mem` vectors (join token **and** PAT) are
-   both structurally closed. Requires making the worker↔agent boundary an IPC
-   one (the redesign noted above).
-
-2. **`hidepid=2` on `/proc` — only as a COMPLEMENT to the uid split, not alone.**
-   Important caveat: `hidepid=2` hides the `/proc` entries of *other users'*
-   processes; it does **not** hide same-uid processes from each other. So with a
-   same-uid worker+agent it buys nothing — the agent still sees the worker's
-   `/proc/<pid>/environ`. It is only useful **once the uids differ** (option 1),
-   where it additionally hides the worker's entire `/proc` entry from the agent
-   (not just makes `environ` unreadable via the 0400 perm). Do **not** rely on
-   `hidepid` as a standalone same-uid mitigation.
-
-3. **gVisor (`runtimeClassName: gvisor`).** Run the whole pod under `runsc`:
-   `/proc` is a gVisor-synthesized, sandbox-local view and host-level `/proc`
-   reads / `ptrace` do not reach another real process. Defense in depth on top of
-   1 or 2.
-
-**Recommendation:** option 1 (pod-level uid split with a non-shared pid
-namespace) is the clean close and the one to build when the worker moves to
-pods; it closes both the join-token and the PAT vectors at once. Until then the
-MVP keeps the join-token file hardening above plus the M4 B1 group-kill, with the
-PAT `setsid`-race documented as the remaining, accepted residual.
+The uid boundary is asserted end-to-end so it cannot silently regress: unit tests
+(`agent/test/git-hardening.test.ts`, `runner-uid.test.ts`, `sdk-env` /
+`self-improve` / `provision` env-scrub, `templates-guardrails`) and the live
+image-level block in `e2e/run-e2e.sh` (a `setpriv`-to-runner read of the worker's
+`/proc/environ` and token is denied; the runner child's caps are all zero and its
+`/proc/self/fd` carries no leaked worker fds; the worker/runner TMPDIRs are
+distinct `0700` trees; a runner-planted `packObjectsHook` is ignored on the image's
+git). See the PRD #51 M6 milestone.

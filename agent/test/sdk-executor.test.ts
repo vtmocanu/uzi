@@ -552,10 +552,11 @@ describe("SdkExecutor guardrail options", () => {
 
     for (const t of turns) {
       const env = t.options.env!;
-      assert.deepStrictEqual(
-        new Set(Object.keys(env)),
-        new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]),
-      );
+      // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one) — never a
+      // worker secret. TMPDIR is not a secret.
+      const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+      if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
+      assert.deepStrictEqual(new Set(Object.keys(env)), expected);
       const serialized = JSON.stringify(env);
       assert.ok(!serialized.includes(FAKE_PAT), "PAT must not reach the SDK env");
       assert.ok(!serialized.includes(FAKE_JOIN_TOKEN), "join token must not reach the SDK env");
