@@ -137,19 +137,24 @@ migrate_tree /data "$WORKER_OWNER"
 # per-run dirs under them; the worker runs umask 002 (main.ts) so those worker-created
 # per-run dirs are group-`runner`-writable. repos/ is deliberately NOT in this list.
 #
-# NON-RECURSIVE chown, deliberately (resume guard): this runs EVERY boot (cheap — 3
-# dirs), and a `chown -R worker:runner` would re-own the runner's OWN per-run resume
-# state (agent-home/<runId> session transcripts a requeued run resumes from) on every
-# restart, breaking any runner-created file the runner can't reach after the owner flips.
-# Owning only the ROOTS leaves that runner-owned content untouched; a fresh volume's roots
-# are empty, and an upgrade's stale content was already re-owned by migrate_tree /data
-# above (a mid-run upgrade just requeues). chmod BEFORE chown (no CAP_FOWNER); the setgid
-# bit survives chown on a DIRECTORY (Linux clears S_ISGID on chown only for
-# group-executable regular files, never dirs).
+# RESTART-SAFE + resume guard (two independent fixes, same block — reviewer flag B +
+# tester e2e crash-on-restart):
+#   * chmod ONLY while root still OWNS the dir (a fresh dir this boot, `[ -O ]` = owned by
+#     the effective uid = root here). The runtime cap set has NO CAP_FOWNER (deliberate),
+#     so root CANNOT chmod a dir it already handed to `worker` on a prior boot — an
+#     UNCONDITIONAL chmod EPERMs there, and `set -eu` turns that into a DETERMINISTIC
+#     crash on every restart/recreate over the persisted agentdata volume. The setgid +
+#     group-write is set once, when the dir is first created (root-owned); it need not be
+#     re-applied. (chown does NOT clear a directory's setgid on Linux, so it persists.)
+#   * NON-RECURSIVE chown (runs every boot — cheap, CAP_CHOWN needs no FOWNER): a
+#     `chown -R worker:runner` would re-own the runner's OWN per-run resume state
+#     (agent-home/<runId> a requeued run resumes from) runner->worker on every restart.
+#     Owning only the ROOTS leaves runner-owned content untouched; a fresh volume's roots
+#     are empty, and an upgrade's stale content was re-owned by migrate_tree /data above.
 RUNNER_TREE_OWNER=worker:runner
 for d in runner agent-home provision; do
   "$MKDIR" -p "/data/$d"
-  "$CHMOD" 2775 "/data/$d"
+  [ -O "/data/$d" ] && "$CHMOD" 2775 "/data/$d"   # only on a fresh (root-owned) dir
   "$CHOWN" "$RUNNER_TREE_OWNER" "/data/$d"
 done
 
@@ -159,14 +164,17 @@ done
 # runner each a private 0700 tmp. The worker's is exported as TMPDIR below; the runner's
 # is exported as UZI_RUNNER_TMPDIR (the runner env builders put it on the agent/checks/
 # provision children — runner-uid.ts). Its 0700/runner mode is owner-only, so the worker
-# (a `runner`-GROUP member) still cannot read it. chmod BEFORE chown (no CAP_FOWNER).
+# (a `runner`-GROUP member) still cannot read it. The chmod is guarded on root-ownership
+# for the same restart-safety reason as the carve-out above: /tmp is the container's
+# writable layer (NOT a named volume), so a `docker restart` reuses it — an unconditional
+# chmod on the now-worker/runner-owned dir would EPERM (no CAP_FOWNER) -> set -eu crash.
 WORKER_TMPDIR=/tmp/uzi-worker
 RUNNER_TMPDIR=/tmp/uzi-runner
 "$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
-"$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
+[ -O "$WORKER_TMPDIR" ] && "$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
 # runner:runner 0700 — owner-only, so even the worker (a `runner`-GROUP member) cannot
-# reach it (0700 grants the group nothing); true per-uid isolation once M4 wires it.
-"$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
+# reach it (0700 grants the group nothing); true per-uid isolation.
+[ -O "$RUNNER_TMPDIR" ] && "$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
 
 # --- (b) token: force 0400 worker on the join-token secret ---------------------
 # Compose delivers the env-sourced `worker_token` secret 0444 root:root (world-readable

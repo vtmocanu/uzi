@@ -157,6 +157,20 @@ describe("the shared root-entry drop wrapper", () => {
       /"\$CHOWN"\s+-R\s+"\$RUNNER_TREE_OWNER"/,
       "the carve-out chown must be NON-recursive (resume guard) — never chown -R the runner subtrees",
     );
+    // Restart-safety (tester e2e crash-on-restart): the carve-out chmod is guarded on
+    // root-ownership (`[ -O ]`), so it runs ONLY on a fresh (root-owned) dir. An
+    // unconditional chmod on a persisted, now-worker-owned dir EPERMs (no CAP_FOWNER) ->
+    // set -eu -> deterministic crash on every restart.
+    assert.match(
+      entrypoint,
+      /\[\s*-O\s+"\/data\/\$d"\s*\]\s*&&\s*"\$CHMOD"\s+2775\s+"\/data\/\$d"/,
+      "the carve-out chmod must be guarded on root-ownership ([ -O ]) for restart safety",
+    );
+    assert.doesNotMatch(
+      entrypoint,
+      /^\s*"\$CHMOD"\s+2775\s+"\/data\/\$d"/m,
+      "there must be NO unconditional chmod 2775 of the runner subtree (the restart-crash)",
+    );
   });
 
   it("activates the M4 uid split: /nix runner-owned, worker PATH stripped, split env exported (PRD #51 M4)", () => {
