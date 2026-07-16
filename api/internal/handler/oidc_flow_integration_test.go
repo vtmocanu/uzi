@@ -51,6 +51,14 @@ type signingIDP struct {
 	email         string
 	name          string
 	emailVerified any
+
+	// Group-claim controls (PRD #55). groupsClaimName is the claim key emitted AND
+	// threaded into the provider as GroupsClaim (default "groups"). groupsSet=false
+	// omits the claim entirely (absent case); when true, groups is emitted verbatim
+	// ([]any{...} => array; "s" => string/malformed; []any{"a",""} => empty element).
+	groupsClaimName string
+	groupsSet       bool
+	groups          any
 }
 
 func newSigningIDP(t *testing.T) *signingIDP {
@@ -59,7 +67,7 @@ func newSigningIDP(t *testing.T) *signingIDP {
 	if err != nil {
 		t.Fatalf("rsa key: %v", err)
 	}
-	f := &signingIDP{key: key, kid: "k1", client: "uzi-client", emailVerified: true, name: "Test User"}
+	f := &signingIDP{key: key, kid: "k1", client: "uzi-client", emailVerified: true, name: "Test User", groupsClaimName: "groups"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -96,6 +104,9 @@ func newSigningIDP(t *testing.T) *signingIDP {
 		if f.emailVerified != nil {
 			claims["email_verified"] = f.emailVerified
 		}
+		if f.groupsSet {
+			claims[f.groupsClaimName] = f.groups
+		}
 		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 		tok.Header["kid"] = f.kid
 		signed, err := tok.SignedString(f.key)
@@ -121,6 +132,7 @@ func (f *signingIDP) provider() *oidc.Provider {
 		RedirectURL:  "https://uzi.example.com/api/auth/oidc/callback",
 		Scopes:       []string{"openid", "profile", "email"},
 		HTTPTimeout:  5 * time.Second,
+		GroupsClaim:  f.groupsClaimName,
 	})
 }
 
