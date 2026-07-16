@@ -607,6 +607,48 @@ Non-goals (v1):
   Deployment, worker namespace + RBAC + quotas + policies, hosting values;
   ArgoCD rollout to dev-cluster. Success: a tagged release provisions a real
   hosted worker on dev-cluster that completes a run.
+  - **MEASURED 2026-07-16 — a real SDK run peaks at 676 MiB, so the memory question
+    is largely settled and S is not the OOM risk it looked like.** The live capstone
+    (`UZI_E2E_EXECUTOR=sdk`) drove a complete real Claude Agent SDK lifecycle — clone
+    → plan → gate → approve → implement → push → MR !1 on `agent/issue-2`, 78
+    run_messages gapless across a mid-run restart, $0.80, 424k cache-read tokens.
+    Sampled from the worker's own cgroup high-water mark immediately after
+    (`memory.peak`, the number no stub run can produce):
+
+    | | measured |
+    |---|---|
+    | **peak, whole real run** | **708,919,296 B = 676 MiB** (limit 4 GiB) |
+    | worker self-report post-run | 154,775,552 B = 148 MiB, cpu 0.49% |
+    | `/data` after the run | 1 MB |
+    | `/nix` | 209 MB (unchanged — e2e bind-mounts a fake devbox) |
+
+    **This confirms the tester's expectation and refutes the fear behind it: the
+    SDK's own Node heap is NOT the driver.** 676 MiB sits at ~45% of a *single*
+    1.5 GiB compose slot, so the formula's per-slot figure has ~2.2x headroom over a
+    real session. **S (2Gi) fits a real SDK run three times over.**
+    - **What this does NOT measure, and it is the whole remaining question: the
+      user's build.** The e2e repo is a single-commit fake, so this run compiled
+      nothing — `/data` at 1 MB is no signal, exactly as the tester warned. A JVM
+      test suite or a large `go build` is what dwarfs the agent, and it is untested.
+      So: **the agent is cheap; the workload is unmeasured.** Memory limits are now
+      "reasoned about the build" rather than "reasoned about the agent", which is a
+      strictly better place to be but not a measurement.
+    - Consequence for the default: `m` remains right, but for a *different* reason
+      than it was chosen — not because S might OOM on the agent (it will not), but
+      because M is compose parity and the formula's floor, and because an
+      under-sized default fails invisibly in a version with no pod-phase status.
+      **Do not re-litigate `s` on the strength of this number**: it bounds the agent,
+      not the build.
+  - **The live capstone cannot pass as shipped — an e2e harness bug, found by running
+    it** (2026-07-16). `e2e/run-e2e.sh:693` asserts `run.usage.input_tokens = 21400`,
+    and its own comment at `:688` says that is *"the stub emits a synthetic terminal
+    result frame (fixed usage)"*. The assertion is **not gated on `$EXECUTOR`**, so
+    under `UZI_E2E_EXECUTOR=sdk` a real run reports its real usage (2,229 in / 11,171
+    out) and the harness always fails there — after 24 PASS and a fully successful
+    run. `e2e/README.md` claims "no milestone assertion depends on this path", which
+    is true of the *milestones* and false of the *script*. Gate that assertion on the
+    stub executor (or assert `> 0` under sdk) so the capstone is runnable by whoever
+    needs it next.
   - **M6 inherits a debt from M5, and owes TWO things for it: picking the S/M/L
     quantities, and landing the display.** M5 shipped names-only (above). The
     quantities are not merely unwritten — **nobody has ever chosen them**: not this
