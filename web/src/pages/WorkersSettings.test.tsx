@@ -125,6 +125,16 @@ describe("WorkersSettings hosted workers (PRD #58 M5)", () => {
     expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(2);
   });
 
+  it("gives the size chip an accessible name — a lone letter explains nothing", async () => {
+    // The chip is the only trace of the size anywhere in the UI (names-only means no
+    // quantities), so "M" on its own announces as "M" and tells a screen-reader user
+    // nothing. title names it, mirroring the hosted badge beside it.
+    mockApi.listWorkers.mockResolvedValue({ workers: [hosted] });
+    renderPage();
+    expect(await screen.findByTitle("Size M")).toBeTruthy();
+    expect(screen.getByTitle(/controller starts and stops/i)).toBeTruthy();
+  });
+
   it("badges a hosted row even when hosting is switched off (never leave a row lying)", async () => {
     // An admin can turn hosting off while a user still holds hosted workers. The rows
     // must stay listed and deletable — and stay honest about what they are, or they

@@ -220,7 +220,14 @@ export function WorkersSettings() {
                         <Badge tone="info" title="Runs in the cluster: the controller starts and stops its container, not you.">
                           hosted
                         </Badge>
-                        {w.hosted_size && <Badge>{sizeLabel(w.hosted_size)}</Badge>}
+                        {/* Names-only means no quantity appears anywhere, so this chip
+                            is the ONLY trace of the size the worker was provisioned
+                            at — a bare "M" announces as "M" and explains nothing.
+                            The title says what the letter is; what it BUYS is M6's,
+                            once the controller's table exists to read it from. */}
+                        {w.hosted_size && (
+                          <Badge title={`Size ${sizeLabel(w.hosted_size)}`}>{sizeLabel(w.hosted_size)}</Badge>
+                        )}
                       </>
                     )}
                     {hasTemplateDrift(w.template_declared, w.template_reported) && (
