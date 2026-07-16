@@ -160,10 +160,10 @@ Raising the cap is an informed trade-off, not a free speedup:
 - **Same-repo runs still serialize.** Two concurrent runs against the same repo
   queue behind each other at the git layer — correct, just not actually parallel.
 
-These are single-container, shared-resource specifics (a shared filesystem,
-memory budget, and Anthropic token); the cross-run credential read that used to
-be on this list is closed by the worker/runner uid split (PRD #51,
-[proc-hardening.md](proc-hardening.md)). The design behind this feature
+These are single-container, shared-resource specifics (a shared filesystem, memory
+budget, and Anthropic token); the cross-run credential read is closed by the
+worker/runner uid split (PRD #51, [proc-hardening.md](proc-hardening.md)) on the
+root-started compose stack (a #58 single-uid start does not split). The design behind this feature
 (`adr/0042-worker-run-concurrency.md`) has the full research and the
 container-per-run model that eventually closes the rest.
 

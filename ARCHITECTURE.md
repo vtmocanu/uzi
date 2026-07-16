@@ -426,8 +426,9 @@ queued → claimed → running → awaiting_approval → running → completed
   whole time, same as any other non-terminal run. Cap>1 is an informed opt-in with
   one accepted intra-user residual (Bash writes reaching outside a run's own
   worktree) — the sibling push-credential read is now closed by the PRD #51 uid
-  split (a sibling run's agent is the `runner` uid; the push git child is the
-  `worker` uid) — documented at the knob in
+  split on the root-started compose path (a sibling run's agent is the `runner` uid;
+  the push git child is the `worker` uid; a #58 single-uid start does not split) —
+  documented at the knob in
   [docs/worker-setup.md](docs/worker-setup.md#concurrent-runs); the real fix for
   the remaining one — container-per-run — belongs to the future k8s-operator
   deployment (see Not yet in scope, below).

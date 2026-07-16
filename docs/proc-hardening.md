@@ -46,7 +46,9 @@ it can reach runner-group trees; `runner` is **not** in group `worker`.
   [`agent/src/runner-uid.ts`](https://gitlab.example.com/vtmocanu/uzi/-/blob/main/agent/src/runner-uid.ts)
   wraps every untrusted spawn (SDK CLI, checks + `npm ci`, provision hooks, the
   runner-clone seed clone/checkout) in `setpriv --reuid runner --regid runner
-  --init-groups --inh-caps -all --ambient-caps -all`. The inheritable+ambient
+  --init-groups --bounding-set -all --inh-caps -all --ambient-caps -all` (the
+  `--bounding-set -all` is a documented no-op — the worker lacks CAP_SETPCAP to
+  shrink the child's bounding set — kept for intent). The inheritable+ambient
   cap clear is load-bearing: a plain reuid from a uid holding ambient CAP_SETUID
   would let the child setuid back, so without the clear the split would be
   defeated. The runner child ends `CapEff=CapPrm=CapAmb=0`, and — since the image
@@ -81,10 +83,12 @@ it can reach runner-group trees; `runner` is **not** in group `worker`.
   a `commondir`/`gitdir` rewrite) is closed by **config-source ownership**: under
   the `(b)` topology the worker is **bare-only** — it never runs `git` with a
   runner-owned clone as its git dir. The runner gets its **own** clone (working
-  tree + object store, runner-owned); the worker seeds it via a local
-  `git clone --shared`, then `fetch`es the agent branch **back** over `file://`+pack
-  (never the local-copy path, so it never traverses the clone's alternates or a
-  planted hook), and pushes from its own bare with the PAT.
+  tree + object store): a **runner-run** local `git clone --shared` from the worker
+  bare seeds it (run as the runner uid via `runGitAsRunner`, which is what makes the
+  clone runner-owned), and the agent checks out + commits there. The worker then
+  `fetch`es the agent branch **back** over `file://`+pack (never the local-copy path,
+  so it never traverses the clone's alternates or a planted hook), and pushes from
+  its own bare with the PAT.
 - **PATH + scratch isolation.** `/nix` is runner-owned and group-runner-writable,
   so the worker's credentialed-exec PATH is stripped to root-owned image dirs only
   (no `/nix`); the full `/nix`-bearing PATH reaches the runner via `UZI_RUNNER_PATH`.

@@ -24,76 +24,84 @@ const execFileAsync = promisify(execFile);
 // host/image without the baked dir (e.g. a unit test), where no hooks run anyway.
 const EMPTY_GIT_HOOKS_DIR = "/usr/share/uzi-git-nohooks";
 
-// PRD #51 M0 — shared-git write→worker-execute hardening. git has several config
-// keys whose value is run as a COMMAND during ordinary (even non-credentialed)
-// operations. A process that can write a config source a worker-side git reads
-// (today, agent-uid over the shared `agentdata` volume: `<bare>/config`, or under
-// the M3 uid-split a runner-writable `<bare>/worktrees/<name>/config.worktree`)
-// could plant one and get code-exec in the worker's later `git diff`
-// (changedFiles) or `worktree add` (checkout) — no PAT required. The M10
-// `core.hooksPath` pin closed hooks only; these close the other FIXED-name keys.
+// PRD #51 M0 — shared-git write→worker-execute hardening. git has several config keys
+// whose value is run as a COMMAND during ordinary (even non-credentialed) operations. A
+// process that can write a config source a WORKER-side git reads could plant one and get
+// code-exec AS THE WORKER (the PAT/token holder) — no PAT required. The M10
+// `core.hooksPath` pin closed hooks only; these close the other FIXED-name keys. Landed
+// at M0 (pre-split); the threat surface NARROWED under the M3 (b) topology, and both
+// states are described so the pins' role is unambiguous.
 //
-// We pin them via gitEnv's inline GIT_CONFIG_KEY/VALUE pairs, which are HIGHEST
-// precedence (last-value-wins over every config file), so our value OVERRIDES a
-// plant regardless of which config source (bare `config`, per-worktree
-// `config.worktree`) it lives in — verified experimentally, incl. against a
-// worktree-config plant with `extensions.worktreeConfig=true`.
+// Under (b) — the SHIPPED design (see the GitCache layout note below) — the worker is
+// BARE-ONLY: it clones/fetches with the PAT, fetches the agent branch BACK over
+// file://+pack, tree-diffs (`git diff --name-only origin/main...ref`, no working tree),
+// and pushes. It NEVER runs `worktree add`/checkout, `status`, or a content diff, and it
+// reads ONLY its own WORKER-OWNED bare `<bare>/config`, which the runner CANNOT write
+// (config-source ownership). So a runner cannot plant a key the worker reads, and the
+// checkout-/working-tree-only keys never fire worker-side at all. (The runner checks out
+// its OWN clone as the runner uid via runGitAsRunner — the untrusted uid exec'ing in its
+// own tree is not a boundary crossing; runGitAsRunner still uses this gitEnv base, so the
+// pins ride it too.) In M0 (no split, shared agentdata, the WORKER itself did the
+// checkout) these vectors WERE live worker-side; the pins were the M0 close and stay the
+// close on a #58 single-uid start, where there is no split.
+//
+// We pin the FIXED-name keys via gitEnv's inline GIT_CONFIG_KEY/VALUE pairs, which are
+// HIGHEST precedence (last-value-wins over every config file), so our value OVERRIDES a
+// plant regardless of which config source it lives in — verified experimentally. Applied
+// UNCONDITIONALLY on every gitEnv git (worker AND runner), so they also neutralize a key
+// in the runner's own clone config.
 //
 // The values are the empirically-verified inert overrides (git 2.55). Two groups:
 //
 // Command-valued keys — the value is a program git runs, so there is NO boolean
 // "disabled" form; the pin is a harmless no-op command that wins by precedence:
-//   - core.fsmonitor=false — boolean-false disables the monitor hook (fires on
-//     `status` and on `worktree add`'s checkout otherwise).
-//   - diff.external=true — git runs the value as an external-diff command via the
-//     shell, so there is NO "disabled" value; `""`/`false`/`cat` all get exec'd
-//     (and error). `true` is a shell builtin no-op → neutralizes the plant, exits
-//     0, and emits no external diff. The worker's only diff (changedFiles) is
-//     `--name-only`, which never invokes diff.external anyway, so suppressing
-//     external-diff output is harmless here.
+//   - core.fsmonitor=false — boolean-false disables the monitor hook (it fires on a
+//     working-tree scan — `status`/`add`/checkout — which the bare-only worker never does;
+//     pinned defensively + for the runner's checkout).
+//   - diff.external=true — git runs the value as an external-diff command via the shell,
+//     so there is NO "disabled" value; `""`/`false`/`cat` all get exec'd (and error).
+//     `true` is a shell builtin no-op → neutralizes the plant, exits 0, and emits no
+//     external diff. The worker's only diff (changedFiles) is `--name-only`, which never
+//     invokes diff.external anyway, so this is defensive (and covers the runner's git).
 //   - core.pager=cat — disables paging (the git-documented no-op pager). Only ever
-//     reached with a tty or `--paginate`, neither of which the piped worker git
-//     hits, but pinned defensively.
-//   - core.sshCommand=ssh — reverts any plant to the default ssh program. The
-//     worker's forge transport is https + local-file only (never ssh), so this is
-//     pure belt-and-suspenders; it cannot exec an attacker-chosen program.
+//     reached with a tty or `--paginate`, neither of which the piped worker git hits, but
+//     pinned defensively.
+//   - core.sshCommand=ssh — reverts any plant to the default ssh program. The worker's
+//     forge transport is https + local-file only (never ssh), so this is pure
+//     belt-and-suspenders; it cannot exec an attacker-chosen program.
 //
-// Auth / ref keys — reachable when a WORKER-side credentialed op hits an auth
-// challenge (401/407) and git runs `git credential fill`, or when it enumerates
-// alternate refs. For these an EMPTY value is the inert override (verified: plant
-// fires, empty pin neutralizes) — added by the M0 audit (MEDIUM/LOW):
-//   - credential.helper="" — an empty value RESETS git's accumulated helper list,
-//     so a planted `[credential] helper = !evil` is dropped (append-and-reset, not
-//     last-wins). The worker authenticates via the http.extraHeader Basic pair, so
-//     it needs no helper — dropping the list cannot break its auth.
+// Auth / ref keys — reachable when a WORKER-side credentialed op hits an auth challenge
+// (401/407) and git runs `git credential fill`, or when it enumerates alternate refs. For
+// these an EMPTY value is the inert override (verified: plant fires, empty pin neutralizes)
+// — added by the M0 audit (MEDIUM/LOW):
+//   - credential.helper="" — an empty value RESETS git's accumulated helper list, so a
+//     planted `[credential] helper = !evil` is dropped (append-and-reset, not last-wins).
+//     The worker authenticates via the http.extraHeader Basic pair, so it needs no helper
+//     — dropping the list cannot break its auth.
 //   - core.askpass="" — empty overrides a planted askpass so git skips it (it would
 //     otherwise run on a password challenge, even with GIT_TERMINAL_PROMPT=0).
-//   - core.alternateRefsCommand="" — empty falls back to git's built-in alternate-
-//     ref enumeration (no external command). The worker's bare clones carry no
+//   - core.alternateRefsCommand="" — empty falls back to git's built-in alternate-ref
+//     enumeration (no external command). The worker's bare clones carry no
 //     `objects/info/alternates`, so it never fires today; pinned defensively.
 //
-// NOT pinnable / excluded, with the reason (both closed only by M3 config-source
-// ownership, not by an inline pin):
-//   - core.gitProxy — a MULTIVAR: an appended inline entry does NOT override a
-//     planted one (verified: planted proxy still fires under an inline `none`/``),
-//     and `git://` is the only transport that consults it — which the worker never
-//     uses (https + local-file). Excluded: not inline-pinnable AND not reachable.
-//   - core.editor / sequence.editor — no worker fire point: every git this env runs
-//     is non-interactive (clone/fetch/push/worktree/diff/status/config), and the
-//     agent's OWN `git commit` uses the SDK Bash env, NOT gitEnv. Excluded; pin if
-//     an interactive git op is ever routed through gitEnv (reviewer nit — my call).
-//   - The ARBITRARY-name keys `filter.<name>.*` (smudge/clean/process) /
-//     `diff.<name>.*` (command/textconv) / `merge.<name>.driver` CANNOT be
-//     blanket-pinned (driver names are attacker-chosen). Reachability precision:
-//     on `worktree add` (checkout) the FILTER keys fire (the attacker controls the
-//     worktree's `.gitattributes` + plants `[filter "x"]` in config); the diff.*
-//     and textconv keys need a CONTENT diff, which the worker's `--name-only`
-//     changedFiles never runs, so they are lower-reachability today. All are closed
-//     only by config-source OWNERSHIP under the M3 uid-split (`<bare>/config` not
-//     runner-writable, so the attacker cannot enable `extensions.worktreeConfig` to
-//     reach a runner-writable `config.worktree`). In M0 (no uid split) the agent
-//     runs as the same uid that owns `<bare>/config`, so those remain reachable
-//     until M3 — an inline pin cannot help.
+// NOT pinnable / excluded, with the reason:
+//   - core.gitProxy — a MULTIVAR: an appended inline entry does NOT override a planted one
+//     (verified: planted proxy still fires under an inline `none`/``), and `git://` is the
+//     only transport that consults it — which the worker never uses (https + local-file).
+//     Excluded: not inline-pinnable AND not reachable.
+//   - core.editor / sequence.editor — no worker fire point: every git this env runs is
+//     non-interactive (clone/fetch/push/diff/config), and the agent's OWN `git commit` uses
+//     the SDK Bash env, NOT gitEnv. Excluded; pin if an interactive git op is ever routed
+//     through gitEnv (reviewer nit — my call).
+//   - The ARBITRARY-name keys `filter.<name>.*` (smudge/clean/process) / `diff.<name>.*`
+//     (command/textconv) / `merge.<name>.driver` CANNOT be blanket-pinned (driver names are
+//     attacker-chosen). They only fire on a checkout/content-diff — which the bare-only
+//     worker NEVER performs under (b), so they never reach the worker at all; the close is
+//     config-source OWNERSHIP (the worker reads only its worker-owned bare config, which the
+//     runner cannot write, and the worker keeps NO worktrees, so there is no
+//     `config.worktree` to reach). Where the runner checks out its own clone, such a key is
+//     the untrusted uid exec'ing in its OWN tree — not a boundary crossing. In M0 (no split,
+//     the worker did the checkout) they WERE reachable worker-side; (b) removed that path.
 const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string]> = [
   ["core.fsmonitor", "false"],
   ["diff.external", "true"],

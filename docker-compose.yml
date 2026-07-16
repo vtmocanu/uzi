@@ -168,9 +168,11 @@ services:
   # the worker's /proc environ (different uid; root-owned once the worker is
   # non-dumpable), structurally closing the PAT push-window environ race PRD #46 left
   # as a residual. The worker spawns every untrusted surface as the `runner` uid
-  # (agent/src/runner-uid.ts, M4), which completes the read-denied boundary. The k8s
-  # form is separate containers with per-container runAsUser (docs-only here). See
-  # docs/proc-hardening.md, prds/51-worker-uid-split.md, and killAgentTree in
+  # (agent/src/runner-uid.ts, M4), which completes the read-denied boundary. This
+  # applies because the compose stack ROOT-starts (the entrypoint drops root->worker);
+  # the SAME image on a #58 restricted-namespace non-root start runs single-uid, no
+  # split. The k8s form is separate containers with per-container runAsUser (docs-only
+  # here). See docs/proc-hardening.md, prds/51-worker-uid-split.md, and killAgentTree in
   # agent/src/sdk-executor.ts.
   agent:
     # Worker template selection (PRD #18): WORKER_TEMPLATE picks which curated
