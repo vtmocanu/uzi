@@ -39,6 +39,22 @@ export function WorkersSettings() {
   const confirmRef = useRef<HTMLDivElement>(null);
   // The row whose Delete button should get focus back after a dismissed confirmation.
   const [restoreFocusTo, setRestoreFocusTo] = useState<string | null>(null);
+  // ONE announcement slot, shared by provisioning and deleting, and that is why it
+  // lives here rather than in HostedWorkers. Two reasons, both structural: a delete has
+  // to REPLACE a provision's message (once the row is gone, "it appears in your workers
+  // below" is simply false), and HostedWorkers renders nothing at all when hosting is
+  // off — which is exactly where external deletes still happen.
+  //
+  // The seq is load-bearing, not decoration: the focus effect keys on this value, and
+  // derived names are NOT unique ("base (S)" twice is what a quota of 2 produces). Two
+  // deletes in a row would otherwise set an identical string, the effect would not
+  // re-fire, and the second announcement would never take focus.
+  const [notice, setNotice] = useState<{ text: string; seq: number } | null>(null);
+  const noticeSeq = useRef(0);
+  const noticeRef = useRef<HTMLDivElement>(null);
+  const announce = useCallback((text: string) => {
+    setNotice({ text, seq: ++noticeSeq.current });
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -88,15 +104,39 @@ export function WorkersSettings() {
   };
 
   const remove = async (id: string) => {
+    // Read the name before the row is gone — after load() it is unfindable.
+    const name = workers.find((w) => w.id === id)?.name;
     setError("");
     setConfirmingDelete(null);
     try {
       await api.deleteWorker(id);
+      // Both kinds announce. The one-click external delete stays one click — an
+      // announcement is feedback AFTER the act, not friction before it, so it costs no
+      // clicks and takes nothing back from the asymmetry the confirmation buys. A row
+      // that silently vanishes is poor feedback whichever kind it was.
+      announce(`Deleted ${name ?? "worker"}.`);
       await load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to delete worker");
     }
   };
+
+  // Move focus to whatever we just announced. Deleting destroys the control the user
+  // acted through — the row and its button both go — so focus would otherwise land on
+  // <body>, and delete→provision is a LOOP: the user deletes in order to provision, so
+  // dumping them at the top of the document means tabbing back through the whole
+  // sidebar to a form a few hundred pixels above where they were.
+  //
+  // The notice, deliberately, and not the next row's Delete button — the conventional
+  // list-deletion pattern is actively unsafe here. After deleting a hosted worker the
+  // remaining rows are mostly external: one click, no confirmation. Focusing the next
+  // Delete would park a keyboard user on a live one-click destructor, and anyone
+  // double-tapping Enter to get through a confirm would destroy a second worker having
+  // intended one action. The asymmetry we built on purpose is what makes the
+  // conventional answer wrong.
+  useEffect(() => {
+    if (notice) noticeRef.current?.focus();
+  }, [notice]);
 
   // Focus the confirmation when it arms, so a keyboard user meets the warning instead
   // of hunting for it, and a screen reader reads it rather than announcing nothing.
@@ -215,8 +255,23 @@ export function WorkersSettings() {
           status, gauges, run badge and delete rule, and only its origin differs. */}
       <HostedWorkers
         hostedCount={workers.filter((w) => w.kind === "hosted").length}
-        onProvisioned={load}
+        onProvisioned={async (worker) => {
+          announce(`Provisioned ${worker.name} — it appears in your workers below.`);
+          await load();
+        }}
       />
+
+      {/* Between the forms and the list: it is what the forms just did and where the
+          list just changed, and the delete→provision loop wants the user near both.
+          Each announcement replaces the last, so nothing here can outlive its truth —
+          which is why there is no dismiss. (The token card above has a Done button for
+          a different reason: it holds a SECRET that should not linger on screen.) */}
+      {notice && (
+        // tabIndex -1: focusable programmatically, never a tab stop of its own.
+        <div ref={noticeRef} tabIndex={-1} className="outline-none">
+          <Alert tone="success" message={notice.text} />
+        </div>
+      )}
 
       <Card className="space-y-3">
         <SectionTitle>Your workers</SectionTitle>

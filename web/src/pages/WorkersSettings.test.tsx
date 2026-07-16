@@ -378,3 +378,110 @@ describe("WorkersSettings hosted confirm keeps a keyboard user's place (PRD #58)
     expect(description?.textContent).toMatch(/\/nix/);
   });
 });
+
+describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11)", () => {
+  const hostedW = aWorker({ id: "w-h", name: "base (M)", kind: "hosted", hosted_size: "m" });
+  const externalW = aWorker({ id: "w-x", name: "laptop" });
+  const provisioned = aWorker({ id: "w-new", name: "base (S)", kind: "hosted", hosted_size: "s" });
+
+  it("announces a provision, names the server's worker, and takes focus", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2 });
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Provision" }));
+
+    const msg = await screen.findByText("Provisioned base (S) — it appears in your workers below.");
+    // toBe the wrapper, not a textContent match: focus on <body> would match anything,
+    // since body.textContent is the entire page.
+    await waitFor(() => expect(document.activeElement).toBe(msg.parentElement));
+  });
+
+  it("a delete REPLACES the provision notice — it must not outlive the row it describes", async () => {
+    // The bug this exists for: provision, delete, and the page still said "it appears in
+    // your workers below" about a row that was gone. Nothing cleared it but the NEXT
+    // provision, so the only message left in a live region was the false one.
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2 });
+    mockApi.listWorkers.mockResolvedValueOnce({ workers: [] }).mockResolvedValue({ workers: [provisioned] });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    mockApi.deleteWorker.mockResolvedValue(null);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Provision" }));
+    expect(await screen.findByText(/Provisioned base \(S\)/)).toBeTruthy();
+    // The row it describes is now listed.
+    const del = await screen.findByRole("button", { name: "Delete" });
+
+    mockApi.listWorkers.mockResolvedValue({ workers: [] }); // gone after the delete
+    fireEvent.click(del);
+    fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
+
+    expect(await screen.findByText("Deleted base (S).")).toBeTruthy();
+    expect(screen.queryByText(/it appears in your workers below/)).toBeNull();
+  });
+
+  it("announces a hosted delete and takes focus — not the next row's Delete button", async () => {
+    // Focusing the next row's Delete is the conventional list-deletion pattern and is
+    // unsafe here: the remaining rows are mostly external, where Delete is one click and
+    // destroys immediately. A keyboard user double-tapping Enter through the confirm
+    // would take a second worker with them.
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW, externalW] });
+    mockApi.deleteWorker.mockResolvedValue(null);
+    renderPage();
+    await screen.findByText("base (M)");
+    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
+
+    const msg = await screen.findByText("Deleted base (M).");
+    await waitFor(() => expect(document.activeElement).toBe(msg.parentElement));
+    // Not parked on any live one-click destructor.
+    for (const b of screen.getAllByRole("button", { name: "Delete" })) {
+      expect(document.activeElement).not.toBe(b);
+    }
+  });
+
+  it("announces an EXTERNAL delete too — feedback after the act costs no clicks", async () => {
+    // "External delete stays one click" is about friction BEFORE the act. This is
+    // feedback after it: one click is still one click, and a silently vanishing row is
+    // poor feedback whichever kind it was.
+    mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+    mockApi.deleteWorker.mockResolvedValue(null);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(mockApi.deleteWorker).toHaveBeenCalledWith("w-x"));
+    const msg = await screen.findByText("Deleted laptop.");
+    // Still one click: no confirmation was interposed.
+    expect(screen.queryByRole("button", { name: "Delete anyway" })).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(msg.parentElement));
+  });
+
+  it("re-announces when two identically-named workers are deleted in turn", async () => {
+    // Derived names are NOT unique — "base (S)" twice is exactly what a quota of 2
+    // produces. The slot keys on a seq, not the text: otherwise the second delete sets an
+    // identical string, the focus effect never re-fires, and it goes unannounced.
+    const a = aWorker({ id: "w-a", name: "base (S)", kind: "hosted", hosted_size: "s" });
+    const b = aWorker({ id: "w-b", name: "base (S)", kind: "hosted", hosted_size: "s" });
+    mockApi.listWorkers.mockResolvedValue({ workers: [a, b] });
+    mockApi.deleteWorker.mockResolvedValue(null);
+    renderPage();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(2));
+
+    mockApi.listWorkers.mockResolvedValue({ workers: [b] });
+    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+    fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
+    expect(await screen.findByText("Deleted base (S).")).toBeTruthy();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1));
+
+    // Drop focus so a no-op second announcement is detectable rather than invisible.
+    (document.activeElement as HTMLElement)?.blur();
+    expect(document.activeElement).toBe(document.body);
+
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
+
+    const msg = await screen.findByText("Deleted base (S).");
+    await waitFor(() => expect(document.activeElement).toBe(msg.parentElement));
+  });
+});

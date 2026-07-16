@@ -10,8 +10,8 @@
 // The whole card is hidden — never disabled-with-explanation — when hosting is off.
 // A user on an instance without hosting has no use for the concept (Decision 12).
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
-import { api, ApiError, type HostedConfig } from "../lib/api";
+import { useEffect, useState, type FormEvent } from "react";
+import { api, ApiError, type HostedConfig, type Worker } from "../lib/api";
 import { Alert, Button, Card, Field, SectionTitle, Select } from "./ui";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES } from "../lib/workerTemplates";
 import { DEFAULT_WORKER_SIZE, WORKER_SIZES, sizeLabel } from "../lib/workerSizes";
@@ -23,16 +23,16 @@ export function HostedWorkers({
   /** How many hosted workers the user already holds, counted from the fleet list the
    *  page polls. There is no count endpoint and none is wanted. */
   hostedCount: number;
-  /** Refresh the fleet so the new row appears. */
-  onProvisioned: () => void | Promise<void>;
+  /** Hand the new worker to the page: it owns the announcement slot (a delete has to
+   *  be able to replace a provision's message, and deletes are the page's) and the
+   *  fleet refresh. */
+  onProvisioned: (worker: Worker) => void | Promise<void>;
 }) {
   const [config, setConfig] = useState<HostedConfig | null>(null);
   const [template, setTemplate] = useState<string>(DEFAULT_WORKER_TEMPLATE);
   const [size, setSize] = useState<string>(DEFAULT_WORKER_SIZE);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const noticeRef = useRef<HTMLDivElement>(null);
 
   // Fetched once, on mount, and never polled: enabled/quota are operator-set POLICY,
   // which changes on a deploy or an admin edit, not on the 10s liveness rhythm the
@@ -58,7 +58,6 @@ export function HostedWorkers({
   const provision = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
-    setNotice("");
     setBusy(true);
     try {
       // No token comes back and none is rendered — unlike createWorker on this page.
@@ -67,10 +66,10 @@ export function HostedWorkers({
       const { worker } = await api.provisionHostedWorker(template, size);
       setTemplate(DEFAULT_WORKER_TEMPLATE);
       setSize(DEFAULT_WORKER_SIZE);
-      // The server's name, not a guess: it derives one from template + size when the
-      // form sends none, and naming the row is how the user finds it below.
-      setNotice(`Provisioned ${worker.name} — it appears in your workers below.`);
-      await onProvisioned();
+      // The page announces it, naming the worker the SERVER created (it derives a name
+      // from template + size when the form sends none, and naming the row is how the
+      // user finds it below).
+      await onProvisioned(worker);
     } catch (err) {
       // The server's message is what the user reads, verbatim: it distinguishes the
       // quota being reached (409 — delete one and retry) from provisioning being
@@ -81,23 +80,6 @@ export function HostedWorkers({
       setBusy(false);
     }
   };
-
-  // Provisioning is otherwise silent, and worse than silent for a keyboard user: the
-  // new row lands below the fold, and at quota the submit disables under the user's
-  // own focus, which dumps it to <body>. So move focus onto the confirmation.
-  //
-  // The focus move is the ONLY dependable announcement here, and it needs no help: it
-  // is unconditional, so a mouse user's focus lands on the notice too. The Alert's
-  // implicit aria-live (role="status") is NOT a second channel — it is inserted
-  // together with its text, and a live region that appears with its content is not
-  // dependably read. The two standard fixes are an always-present region injected into
-  // later (as ActivityFeed.tsx does) or a focus move; this is the latter, and doing
-  // both would only risk announcing twice. The Alert earns its place as the VISIBLE
-  // confirmation. Treat its live region as a bonus that may never fire, not as cover
-  // for anyone.
-  useEffect(() => {
-    if (notice) noticeRef.current?.focus();
-  }, [notice]);
 
   // Nothing hosted renders until the config says so: not loaded, failed, or disabled
   // all look the same on purpose.
@@ -117,12 +99,11 @@ export function HostedWorkers({
     <Card className="space-y-4">
       <SectionTitle>Provision a hosted worker</SectionTitle>
       {error && <Alert message={error} />}
-      {notice && (
-        // tabIndex -1: focusable programmatically, never a tab stop of its own.
-        <div ref={noticeRef} tabIndex={-1} className="outline-none">
-          <Alert tone="success" message={notice} />
-        </div>
-      )}
+      {/* The success notice is NOT here: the page owns one announcement slot for both
+          provisioning and deleting, because a delete must be able to replace a
+          provision's message ("it appears in your workers below" is a lie once the row
+          is gone) and deletes are the page's. Errors stay local — they belong to this
+          form and only it can retry them. */}
       <form onSubmit={provision} className="flex flex-wrap items-end gap-3">
         <div className="min-w-[10rem]">
           <Field label="Template">
