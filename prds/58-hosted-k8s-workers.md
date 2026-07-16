@@ -138,6 +138,33 @@ Non-goals (v1):
    is a conflict to settle in #51's design. Our reading is that there is none —
    the residual is intra-user and the workspace is meant to be shared — but #51
    should confirm that deliberately rather than inherit it from this PRD.
+   **ANSWERED 2026-07-16 by the PRD #51 session, with a constraint that binds
+   M3.** No conflict: #51's containment fences process/credential access, not
+   general file/volume access, and the shared workspace *is* the runner's clone
+   — runner-writable by intent, not a leak. But `fsGroup` performs a recursive
+   `chgrp` + `g+rwX` on its volume, so **the worker's bare repo must never live
+   on the `fsGroup`-shared volume**: the runner (10002, holding supplemental gid
+   10001) could then write `<bare>/config` and plant a `filter.*` / `commondir`
+   code-exec key that fires in the worker's later git, reopening the exact
+   channel #51's B2 separate-runner-clone design closes by construction. The
+   required k8s layout, once #51's runner container exists: shared workspace
+   volume = **the runner clone only** (`fsGroup` g+rw, as designed here);
+   **worker bare = worker-container-private** (its own volume, not mounted into
+   the runner); the worker fetches the agent branch from the shared runner clone
+   (`file://` + pack, the CVE-2022-39253-safe path). This is the compose→k8s
+   mapping of the same rule: per-file ownership on one volume in #51's compose
+   A1 form becomes volume separation in the k8s (C) form. **Consequence for M3,
+   and a qualification of the additive claim above:** v1 is free to keep
+   `fsGroup: 10001` unchanged, but if M3 renders a single `/data` PVC holding
+   both the bare cache and the worktrees, then #51's k8s phase cannot simply add
+   a container — it must split a volume on live workers, i.e. a migration rather
+   than an addition. M3 should therefore render the two-volume topology up front
+   (worker-bare separate from the shared workspace) even though v1's single
+   container makes the split inert. Open sub-question for M3: whether the
+   worker-bare volume is a second PVC (persists the clone cache across restarts,
+   but doubles the per-worker PVC cost flagged in Risks) or an `emptyDir` (free,
+   but re-clones on every pod restart). #51 records the layout requirement in its
+   own M7 k8s-alignment gate.
 7. **Worker type = template, size = built-in preset.** Type selects the
    published per-template agent image (`agent-base`, `agent-jvm`; tag = release,
    Model B like api/web); the deployed image's baked `UZI_WORKER_TEMPLATE` must
