@@ -4,8 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Every worker template image (PRD #18) must keep the guardrail-relevant layers
-// the base image establishes: run as the non-root uzi user, and use tini as PID 1
+// Every worker template image (PRD #18 + #51) must keep the guardrail-relevant
+// layers the base image establishes: the root-entry setpriv drop to the non-root
+// `worker` uid (with the distinct cap-less `runner` uid present), and tini as PID 1
 // so SIGTERM reaches the worker. A variant may ADD packages but must never drop
 // these — this test turns the "keep in lockstep with base" Dockerfile comment into
 // an enforced invariant, cheaply (text parse, no docker), before more variants land.
@@ -33,12 +34,20 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
   });
 
   for (const { name, text } of dockerfiles) {
-    it(`${name}: runs as the non-root uzi user`, () => {
-      assert.match(text, /^\s*USER\s+uzi:uzi\s*$/m, `${name}/Dockerfile must contain "USER uzi:uzi"`);
-    });
-
-    it(`${name}: uses tini as the entrypoint`, () => {
-      assert.match(text, /ENTRYPOINT\s*\[\s*"\/sbin\/tini"/, `${name}/Dockerfile must use tini as PID 1`);
+    it(`${name}: drops to the non-root worker uid via the root-entry setpriv wrapper (PRD #51 A1)`, () => {
+      // The image runs as root and the entrypoint setpriv-drops to `worker`; there
+      // must be NO `USER` line (which would defeat the root startup window). Both the
+      // credential-holding `worker` and the cap-less `runner` uid must exist, and the
+      // util-linux setpriv drop wrapper must be installed (busybox's cannot --reuid).
+      assert.doesNotMatch(text, /^\s*USER\s+/m, `${name}/Dockerfile must NOT set a USER — the entrypoint drops root -> worker`);
+      assert.match(text, /adduser\s+-u\s+10001\s+-G\s+worker\b/, `${name}/Dockerfile must create the worker uid (10001)`);
+      assert.match(text, /adduser\s+-u\s+10002\s+-G\s+runner\b/, `${name}/Dockerfile must create the runner uid (10002)`);
+      assert.match(text, /apk add[^\n]*\bsetpriv\b/, `${name}/Dockerfile must install util-linux setpriv (the A1 drop wrapper)`);
+      assert.match(
+        text,
+        /ENTRYPOINT\s*\[\s*"\/usr\/local\/sbin\/uzi-entrypoint"/,
+        `${name}/Dockerfile ENTRYPOINT must be the root-entry drop wrapper`,
+      );
     });
 
     it(`${name}: bakes its own template identity`, () => {
@@ -65,6 +74,36 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       assert.match(text, /set -o pipefail/, `${name}/Dockerfile must guard the checksum pipe with 'set -o pipefail'`);
     });
   }
+});
+
+// The shared root-entry drop wrapper (PRD #51 A1) is the single mechanism both
+// templates COPY in. It is the security-load-bearing script: it must drop root to
+// `worker` keeping ONLY setuid/setgid (ambient), keep tini as PID 1 for SIGTERM, and
+// force the join token to 0400 worker with chmod BEFORE chown (the runtime cap set
+// has no CAP_FOWNER, so root can chmod the token only while it still owns it).
+describe("the shared root-entry drop wrapper", () => {
+  const entrypoint = fs.readFileSync(path.join(templatesDir, "entrypoint.sh"), "utf8");
+
+  it("drops root -> worker retaining ONLY setuid/setgid (ambient), tini stays PID 1", () => {
+    assert.match(entrypoint, /--reuid\s+"\$WORKER_USER"/, "must setpriv --reuid to the worker uid");
+    assert.match(entrypoint, /--ambient-caps\s+-all,\+setuid,\+setgid/, "must keep ONLY setuid/setgid as ambient caps");
+    assert.match(entrypoint, /--bounding-set\s+-all,\+setuid,\+setgid/, "must tighten the bounding set to setuid/setgid");
+    assert.match(entrypoint, /"\$TINI"\s+--\s+"\$@"/, "tini must stay PID 1 (SIGTERM -> clean worker shutdown), execing the CMD");
+  });
+
+  it("forces the join token to 0400 worker with chmod BEFORE chown (no CAP_FOWNER)", () => {
+    const chmodAt = entrypoint.search(/"\$CHMOD"\s+0400\s+"\$TOKEN"/);
+    const chownAt = entrypoint.search(/"\$CHOWN"\s+"\$WORKER_OWNER"\s+"\$TOKEN"/);
+    assert.ok(chmodAt >= 0, "must chmod 0400 the token");
+    assert.ok(chownAt >= 0, "must chown the token to worker");
+    assert.ok(chmodAt < chownAt, "chmod 0400 must precede chown (runtime has no CAP_FOWNER)");
+  });
+
+  it("keeps the root startup window off the runner-writable volumes", () => {
+    // PATH excludes /nix and /data so root never resolves a binary from a volume.
+    assert.match(entrypoint, /PATH=\/usr\/local\/sbin:\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/sbin:\/bin/);
+    assert.doesNotMatch(entrypoint, /PATH=[^\n]*\/nix/, "the root-window PATH must not contain /nix");
+  });
 });
 
 // The provisioning stack must be identical across templates (self-contained
