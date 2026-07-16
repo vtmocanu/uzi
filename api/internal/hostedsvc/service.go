@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -18,8 +20,18 @@ import (
 // to insert a worker row and park its sealed token atomically.
 type Store interface {
 	ListHostedWorkersForController(ctx context.Context) ([]store.ListHostedWorkersForControllerRow, error)
-	CreateHostedWorkerToken(ctx context.Context, arg store.CreateHostedWorkerTokenParams) error
-	DeleteHostedWorkerToken(ctx context.Context, workerID uuid.UUID) (int64, error)
+	UpsertHostedWorkerToken(ctx context.Context, arg store.UpsertHostedWorkerTokenParams) error
+	MarkHostedWorkerTokenDelivered(ctx context.Context, workerID uuid.UUID) (int64, error)
+}
+
+// ExpiryStore is the slice of the store the pending-token expiry sweep needs. It
+// is separate from Store, and deliberately so: the sweep must run whether or not
+// WORKER_HOSTING_ENABLED is set (a stack that provisioned hosted workers and then
+// disabled hosting is exactly the case that would otherwise strand sealed
+// ciphertext at rest forever), so it is wired independently of the Service, which
+// exists only when hosting is on.
+type ExpiryStore interface {
+	ExpirePendingHostedWorkerTokens(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 }
 
 // ErrBadWorkerID is returned by Poll when an ack carries something that is not a
@@ -41,12 +53,18 @@ type Service struct {
 func New(q Store, box *secretbox.Box) *Service { return &Service{q: q, box: box} }
 
 // tokenAAD is the additional authenticated data every pending join token is
-// sealed under: it binds the ciphertext to one worker id, so a DB-write operator
-// cannot lift a sealed token onto a different worker's row and have it open. The
-// domain prefix keeps these ciphertexts from being interchangeable with any other
-// secret sealed by the same master key.
+// sealed under (secretbox.SealWithAAD, whose doc names exactly this use: "so a
+// DB-write operator cannot swap a ciphertext onto a different owner/kind and have
+// it still authenticate").
+//
+// It binds worker_id || kind. Without it, an operator who can write the DB moves
+// worker A's sealed token onto worker B's row, the controller faithfully delivers
+// A's token into B's pod, and B's owner registers as A — claiming A's runs and
+// receiving A's decrypted forge PAT and Anthropic token in the claim response.
+// The kind is pinned in the AAD, not just the row, so a ciphertext can never be
+// replayed across a future token kind sealed by the same master key.
 func tokenAAD(workerID uuid.UUID) []byte {
-	return []byte("hosted_worker_join_token|" + workerID.String())
+	return []byte("hosted_worker_join_token|" + workerID.String() + "|hosted")
 }
 
 // SealJoinToken parks a freshly minted join token's plaintext for the controller
@@ -61,10 +79,33 @@ func (s *Service) SealJoinToken(ctx context.Context, workerID uuid.UUID, token s
 	if err != nil {
 		return fmt.Errorf("hostedsvc: seal join token: %w", err)
 	}
-	return s.q.CreateHostedWorkerToken(ctx, store.CreateHostedWorkerTokenParams{
+	return s.q.UpsertHostedWorkerToken(ctx, store.UpsertHostedWorkerTokenParams{
 		WorkerID:        workerID,
 		TokenCiphertext: sealed,
 	})
+}
+
+// ExpirePendingTokens clears every sealed join token that has sat undelivered for
+// longer than ttl, and reports how many it cleared. It is the sweep half of the
+// at-rest bound documented on ExpirePendingHostedWorkerTokens.
+//
+// A package-level function over ExpiryStore, not a Service method, because it must
+// run with hosting DISABLED — a stack that provisioned hosted workers and then
+// flipped WORKER_HOSTING_ENABLED off is precisely the case that would otherwise
+// leave master-key-sealed plaintext in Postgres forever, and no *Service exists in
+// that state to hang a method on.
+//
+// ttl <= 0 disables the sweep; the caller decides, and main warns.
+func ExpirePendingTokens(ctx context.Context, q ExpiryStore, ttl time.Duration) (int64, error) {
+	if ttl <= 0 {
+		return 0, nil
+	}
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-ttl), Valid: true}
+	n, err := q.ExpirePendingHostedWorkerTokens(ctx, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("hostedsvc: expire pending tokens: %w", err)
+	}
+	return n, nil
 }
 
 // Poll is the whole controller protocol: acknowledge, then report desired state.
@@ -103,10 +144,10 @@ func (s *Service) Poll(ctx context.Context, req PollRequest) (PollResponse, erro
 		if err != nil {
 			return PollResponse{}, fmt.Errorf("%w: %q", ErrBadWorkerID, raw)
 		}
-		// A 0-row delete is the normal idempotent case (the controller re-acks a
-		// worker it already acked, because its ack is derived from observed cluster
-		// state and the Secret is still there). Nothing to report.
-		if _, err := s.q.DeleteHostedWorkerToken(ctx, id); err != nil {
+		// A 0-row update is the normal idempotent case (an ack for a worker that
+		// was deleted mid-flight, or that never had a pending token). Nothing to
+		// report.
+		if _, err := s.q.MarkHostedWorkerTokenDelivered(ctx, id); err != nil {
 			return PollResponse{}, fmt.Errorf("hostedsvc: ack token delivery: %w", err)
 		}
 	}

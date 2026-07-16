@@ -21,11 +21,15 @@ type fakeStore struct {
 	// listErr / deleteErr force the failure paths.
 	listErr   error
 	deleteErr error
-	// deletes counts DeleteHostedWorkerToken calls (including no-op re-acks).
+	// deletes counts MarkHostedWorkerTokenDelivered calls (including no-op re-acks).
 	deletes int
+	// delivered records which workers have been acked (the delivered_at stamp).
+	delivered map[uuid.UUID]bool
 }
 
-func newFakeStore() *fakeStore { return &fakeStore{tokens: map[uuid.UUID][]byte{}} }
+func newFakeStore() *fakeStore {
+	return &fakeStore{tokens: map[uuid.UUID][]byte{}, delivered: map[uuid.UUID]bool{}}
+}
 
 func (f *fakeStore) ListHostedWorkersForController(context.Context) ([]store.ListHostedWorkersForControllerRow, error) {
 	if f.listErr != nil {
@@ -41,15 +45,18 @@ func (f *fakeStore) ListHostedWorkersForController(context.Context) ([]store.Lis
 	return out, nil
 }
 
-func (f *fakeStore) CreateHostedWorkerToken(_ context.Context, arg store.CreateHostedWorkerTokenParams) error {
-	if _, exists := f.tokens[arg.WorkerID]; exists {
-		return nil // ON CONFLICT DO NOTHING
-	}
+// UpsertHostedWorkerToken mirrors the real ON CONFLICT DO UPDATE: a re-park
+// replaces the ciphertext and resets delivery, which is the rotation path.
+func (f *fakeStore) UpsertHostedWorkerToken(_ context.Context, arg store.UpsertHostedWorkerTokenParams) error {
 	f.tokens[arg.WorkerID] = arg.TokenCiphertext
+	delete(f.delivered, arg.WorkerID)
 	return nil
 }
 
-func (f *fakeStore) DeleteHostedWorkerToken(_ context.Context, workerID uuid.UUID) (int64, error) {
+// MarkHostedWorkerTokenDelivered mirrors the real UPDATE: the ciphertext is
+// destroyed and delivered_at is stamped, so the row records that it WAS delivered
+// rather than vanishing.
+func (f *fakeStore) MarkHostedWorkerTokenDelivered(_ context.Context, workerID uuid.UUID) (int64, error) {
 	f.deletes++
 	if f.deleteErr != nil {
 		return 0, f.deleteErr
@@ -58,6 +65,7 @@ func (f *fakeStore) DeleteHostedWorkerToken(_ context.Context, workerID uuid.UUI
 		return 0, nil
 	}
 	delete(f.tokens, workerID)
+	f.delivered[workerID] = true
 	return 1, nil
 }
 
@@ -68,6 +76,13 @@ func (f *fakeStore) addWorker(id uuid.UUID, template, size string, generation in
 		HostedSize:       pgtype.Text{String: size, Valid: true},
 		HostedGeneration: generation,
 	})
+}
+
+// newTestWorker seeds a hosted worker and returns its id.
+func newTestWorker(f *fakeStore, template, size string, generation int64) uuid.UUID {
+	id := uuid.New()
+	f.addWorker(id, template, size, generation)
+	return id
 }
 
 func newTestService(t *testing.T, st Store) *Service {

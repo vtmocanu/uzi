@@ -88,6 +88,7 @@ type ForgeConnection struct {
 type HostedWorkerToken struct {
 	WorkerID        uuid.UUID          `json:"worker_id"`
 	TokenCiphertext []byte             `json:"token_ciphertext"`
+	DeliveredAt     pgtype.Timestamptz `json:"delivered_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 

@@ -332,7 +332,20 @@ func run() error {
 	// Run-liveness sweeper (sibling of the poller). Boot runs one orphan sweep
 	// immediately, then the goroutine sweeps on its own interval. Both lifetimes
 	// are awaited on shutdown before the pool closes.
-	sweep := sweeper.New(wsvc, 0)
+	//
+	// It also carries PRD #58's pending-join-token expiry, which bounds how long a
+	// sealed, undelivered token sits at rest under UZI_SECRET_KEY. That pass is
+	// wired UNCONDITIONALLY — deliberately NOT behind cfg.WorkerHostingEnabled: a
+	// stack that provisioned hosted workers and then turned hosting off is exactly
+	// the one whose tokens would otherwise never be swept. Riding this existing
+	// ticker (rather than a goroutine of its own) also keeps the flag-off footprint
+	// to one indexed UPDATE that matches nothing on a stack with no hosted workers.
+	sweep := sweeper.New(wsvc, 0, sweeper.Pass{
+		Name: "hosted_tokens_expired",
+		Run: func(ctx context.Context) (int64, error) {
+			return hostedsvc.ExpirePendingTokens(ctx, q, cfg.HostedTokenTTL)
+		},
+	})
 	sweep.Boot(ctx)
 
 	// PAT least-privilege service + sweep (PRD #5). The service is shared by the

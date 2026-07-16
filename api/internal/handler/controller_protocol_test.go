@@ -50,10 +50,10 @@ type pollStore struct {
 func (p *pollStore) ListHostedWorkersForController(context.Context) ([]store.ListHostedWorkersForControllerRow, error) {
 	return p.rows, nil
 }
-func (p *pollStore) CreateHostedWorkerToken(context.Context, store.CreateHostedWorkerTokenParams) error {
+func (p *pollStore) UpsertHostedWorkerToken(context.Context, store.UpsertHostedWorkerTokenParams) error {
 	return nil
 }
-func (p *pollStore) DeleteHostedWorkerToken(_ context.Context, id uuid.UUID) (int64, error) {
+func (p *pollStore) MarkHostedWorkerTokenDelivered(_ context.Context, id uuid.UUID) (int64, error) {
 	p.acked = append(p.acked, id)
 	return 1, nil
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 )
@@ -135,5 +136,69 @@ func TestWorkerHostingEnabledRejectsAMalformedBool(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() = nil error for a malformed WORKER_HOSTING_ENABLED")
+	}
+}
+
+// A credential whose plaintext is a well-known placeholder must not boot. The api
+// holds only the hash so it cannot judge entropy — but the hash of a value copied
+// from a README or left in a chart default is recognisable, and that is the
+// failure mode that actually ships.
+func TestWorkerHostingRefusesAPlaceholderCredential(t *testing.T) {
+	for _, plaintext := range []string{"changeme", "change-me", "secret", "password", "uzi-controller-token"} {
+		t.Run(plaintext, func(t *testing.T) {
+			hostingBaseEnv(t)
+			t.Setenv("WORKER_HOSTING_ENABLED", "true")
+			t.Setenv("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256", controllerTokenHashHex(plaintext))
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load() = nil error for the hash of placeholder %q", plaintext)
+			}
+			if !strings.Contains(err.Error(), "placeholder") {
+				t.Fatalf("err = %v, want it to name the problem", err)
+			}
+		})
+	}
+}
+
+// The at-rest bound is read REGARDLESS of the flag: a stack that provisioned
+// hosted workers and then disabled hosting is exactly the one whose sealed tokens
+// must still be swept, so the TTL outlives the feature gate.
+func TestHostedTokenTTLIsLoadedEvenWithHostingDisabled(t *testing.T) {
+	hostingBaseEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.WorkerHostingEnabled {
+		t.Fatal("hosting should be off")
+	}
+	if cfg.HostedTokenTTL != time.Hour {
+		t.Fatalf("HostedTokenTTL = %v with hosting off, want the 1h default (the sweep runs regardless)", cfg.HostedTokenTTL)
+	}
+}
+
+func TestHostedTokenTTLIsConfigurableAndDisablable(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"15m", 15 * time.Minute},
+		{"0", 0},               // disabled, with a boot warning
+		{"garbage", time.Hour}, // a tuning knob, not a security control: fall back
+		{"-5m", time.Hour},     // negative is meaningless: fall back
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			hostingBaseEnv(t)
+			t.Setenv("WORKER_HOSTING_PENDING_TOKEN_TTL", tc.raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load(): %v", err)
+			}
+			if cfg.HostedTokenTTL != tc.want {
+				t.Fatalf("TTL for %q = %v, want %v", tc.raw, cfg.HostedTokenTTL, tc.want)
+			}
+		})
 	}
 }
