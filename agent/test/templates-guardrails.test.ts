@@ -108,13 +108,42 @@ describe("the shared root-entry drop wrapper", () => {
   it("tolerates a non-root start (PRD #58): single-uid exec precedes the setpriv drop", () => {
     // A non-root start (k8s runAsUser: 10001, no addable caps) must skip the root
     // window and exec tini directly — an unconditional `setpriv --reuid` would
-    // EPERM -> CrashLoopBackOff. The guard tests uid != 0 via an ABSOLUTE `id` path.
-    assert.match(entrypoint, /"\$ID"\s+-u.*!=\s*"0"|!=\s*"0"/, "must test for a non-root start (uid != 0)");
+    // EPERM -> CrashLoopBackOff. The uid is read via an ABSOLUTE `id` and branched on.
+    assert.match(entrypoint, /uid="\$\("\$ID"\s+-u\)"/, "must read uid via the absolute id binary into a var");
+    assert.match(entrypoint, /\[\s*"\$uid"\s*!=\s*"0"\s*\]/, "must branch the non-root path on uid != 0");
     const nonrootExecAt = entrypoint.search(/exec\s+"\$TINI"\s+--\s+"\$@"/);
     const setprivAt = entrypoint.search(/exec\s+"\$SETPRIV"/);
     assert.ok(nonrootExecAt >= 0, "must exec tini directly on the non-root path");
     assert.ok(setprivAt >= 0, "must setpriv-drop on the root path");
     assert.ok(nonrootExecAt < setprivAt, "the non-root single-uid exec must come before the setpriv drop");
+  });
+
+  it("fails CLOSED on an unreadable uid (never silently takes the non-root branch)", () => {
+    // If `id -u` yields empty/non-numeric, the entrypoint must exit — not default to
+    // the non-root branch, which would run a ROOT start unhardened (token 0444, full
+    // cap_add). The validation must precede the uid != 0 branch.
+    const validateAt = entrypoint.search(/''\|\*\[!0-9\]\*\)/);
+    const branchAt = entrypoint.search(/\[\s*"\$uid"\s*!=\s*"0"\s*\]/);
+    assert.ok(validateAt >= 0, "must reject an empty/non-numeric uid");
+    assert.match(entrypoint, /''\|\*\[!0-9\]\*\)[^\n]*exit 1/, "the non-numeric-uid case must exit 1 (fail closed)");
+    assert.ok(branchAt >= 0 && validateAt < branchAt, "uid validation must precede the uid != 0 branch");
+  });
+
+  it("logs the active containment posture (operator-visible; A1 vs single-uid)", () => {
+    assert.match(entrypoint, /A1 uid-split active \(root-started\)/, "root path must log the A1 posture");
+    assert.match(entrypoint, /single-uid non-root mode \(PRD #58\)/, "non-root path must log the single-uid posture");
+  });
+
+  it("gates the volume migration on a post-completion sentinel (not the top-level owner)", () => {
+    // The reviewer NIT: the skip decision must be a sentinel written AFTER the chown,
+    // so it is robust to the base image's chown -R traversal order (not the top-level
+    // owner, which a pre-order chown could set before the children are done).
+    assert.match(entrypoint, /sentinel="\$path\/\.uzi-migrated-/, "must key the sentinel by the target owner");
+    const skipAt = entrypoint.search(/\[\s*-f\s+"\$sentinel"\s*\]\s*&&\s*return 0/);
+    const chownAt = entrypoint.search(/"\$CHOWN"\s+-R\s+"\$owner"\s+"\$path"/);
+    const writeAt = entrypoint.search(/:\s*>\s*"\$sentinel"/);
+    assert.ok(skipAt >= 0, "must skip when the sentinel exists");
+    assert.ok(chownAt >= 0 && writeAt >= 0 && chownAt < writeAt, "the sentinel must be written AFTER the recursive chown");
   });
 });
 

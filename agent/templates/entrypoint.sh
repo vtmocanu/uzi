@@ -37,7 +37,6 @@ TINI=/sbin/tini
 SETPRIV=/bin/setpriv
 CHOWN=/bin/chown
 CHMOD=/bin/chmod
-STAT=/bin/stat
 
 # --- PRD #58: tolerate a NON-ROOT start ---------------------------------------
 # Started non-root (k8s runAsUser: 10001, PRD #58 single-uid v1)? Then there is no
@@ -50,9 +49,20 @@ STAT=/bin/stat
 # does NOT weaken A1: the #51 uid-split containment applies on the ROOT-started
 # (compose/A1) path; the non-root path is the #58 consumer's own accepted single-uid
 # posture (the two-container split lands later via (C)).
-if [ "$("$ID" -u)" != "0" ]; then
+# Read the uid via the ABSOLUTE id binary and validate it is a clean, non-empty number
+# BEFORE branching, so BOTH paths fail CLOSED under `set -eu`: a failed or garbled `id`
+# must NOT let a ROOT start slip into the non-root branch (which would run a root start
+# single-uid with the token unhardened + full cap_add — asymmetric with the fail-closed
+# setpriv drop below).
+uid="$("$ID" -u)"
+case "$uid" in
+  ''|*[!0-9]*) echo "uzi-entrypoint: cannot determine uid (got '$uid'); refusing to start" >&2; exit 1 ;;
+esac
+if [ "$uid" != "0" ]; then
+  echo "uzi-entrypoint: single-uid non-root mode (PRD #58) — no A1 uid-split on this start" >&2
   exec "$TINI" -- "$@"
 fi
+echo "uzi-entrypoint: A1 uid-split active (root-started) — dropping to worker after the startup window" >&2
 
 # --- ROOT-started (compose / A1): root startup window, then the setpriv drop ---
 # The image's runtime PATH (per template: the nix profile bin, and the JDK bin for jvm)
@@ -71,22 +81,29 @@ NIX_OWNER=worker:runner      # /nix: worker-owned, group `runner` — forward ho
 # persist their ORIGINAL ownership. When an existing install upgrades to this image the
 # execution uid changed (uzi -> worker), so the volumes stay owned by the old uid and
 # every write EACCESes. Re-own them here with CAP_CHOWN (held only during this root
-# window). Guarded by the top-level owner so the one-time recursive migration does not
-# run on every boot: a fresh volume already seeds with the correct build-time ownership,
-# and a previously-migrated volume is a no-op. Ownership only — the finer runner-OWNED
-# carve-out under /data (the separate runner clone/store, agent-home, provision) and
-# /nix group-write for the runner are M3/M4 (they seed those paths and move the spawn);
-# M2 migrates ownership so the worker, which still performs all work pre-split, operates.
+# window). Ownership only — the finer runner-OWNED carve-out under /data (the separate
+# runner clone/store, agent-home, provision) and /nix group-write for the runner are
+# M3/M4 (they seed those paths and move the spawn); M2 migrates ownership so the worker,
+# which still performs all work pre-split, operates.
 migrate_tree() {
-  # $1 = path, $2 = owner:group (owner half is the expected uid to guard on)
+  # $1 = path, $2 = owner:group. One-time volume ownership migration, robust to the base
+  # image's `chown -R` traversal order. The skip decision is a per-owner sentinel written
+  # ONLY AFTER the chown COMPLETES — NOT the top-level owner, whose validity relied on
+  # busybox chown -R being depth-first (top-level chowned LAST); a future swap to a
+  # pre-order chown could leave a partial migration looking complete and be skipped. When
+  # the sentinel is absent the chown runs UNCONDITIONALLY, so an interrupted migration
+  # re-runs fully regardless of order (idempotent), and a later milestone that re-owns a
+  # tree uses a new owner => a new sentinel name => it re-migrates. The only cost on a
+  # fresh (already-correct) volume is one redundant chown on first boot. The sentinel is
+  # NOT a security control — deleting/forging it only forces a redundant idempotent chown.
   path="$1"; owner="$2"
   [ -e "$path" ] || return 0
-  want_user="${owner%%:*}"
-  cur_user="$("$STAT" -c '%U' "$path" 2>/dev/null || echo '?')"
-  if [ "$cur_user" != "$want_user" ]; then
-    echo "uzi-entrypoint: migrating $path ownership ($cur_user -> $owner) [one-time]" >&2
-    "$CHOWN" -R "$owner" "$path"
-  fi
+  sentinel="$path/.uzi-migrated-${owner%:*}-${owner#*:}"
+  [ -f "$sentinel" ] && return 0
+  echo "uzi-entrypoint: ensuring $path ownership -> $owner [one-time]" >&2
+  "$CHOWN" -R "$owner" "$path"
+  : > "$sentinel" 2>/dev/null && "$CHOWN" "$owner" "$sentinel" 2>/dev/null \
+    || echo "uzi-entrypoint: warning: could not persist $sentinel (re-runs next boot)" >&2
 }
 migrate_tree /nix "$NIX_OWNER"
 migrate_tree /data "$WORKER_OWNER"
