@@ -232,14 +232,19 @@ the **files** ref backend by default, so the reftable edge the auditor flagged f
 - **runner-owned:** the runner's clone / object store + its working tree + the
   SDK/provision dirs.
 
-**Shapes M3/M4/M5** (flag now): **M3** (ownership) gives the runner its own clone +
-the B4 startup chown; **M4** (spawn) runs the checkout/commit under uid `runner`;
-**M5** (git flow) moves `worktreeForBranch`/checkout from the worker to the runner and
-reshapes `changedFiles` into the worker-bare tree-diff — leaving **no** stray
-worker-side checkout. **Commit-identity edge (M4/M5 verify):** the agent's
-`git config user.email/name` writes the **runner clone's** own config (runner-owned)
-— fine under (b); confirm commit identity resolves from the runner config or
-`GIT_AUTHOR_*`/`GIT_COMMITTER_*` env, never a worker-bare config write.
+**Shapes M3/M4/M5** (RESEQUENCED 2026-07-16 — coder proposal, lead-approved; the
+milestone list below is authoritative): **M3** gives the runner its own clone **and
+does the git-flow relocation** (was split into M5 in the earlier draft) — it moves
+`worktreeForBranch`/checkout from the worker to the runner (now `runnerCloneForBranch`),
+adds the worker `fetchAgentBranch` back-fetch, reshapes `changedFiles` into the
+worker-bare tree-diff, and lands the safe-half `/data` ownership carve-out + worker
+`TMPDIR` — all **single-uid** (no stray worker-side checkout), so it is provable now.
+**M4** (spawn) runs the seed/checkout/commit under uid `runner` **and lands the
+`/nix` group-write + worker-PATH-strip atomically** (they cannot precede the spawn —
+see M4). **M5** is the PRD #46/#18 behavior-preservation + e2e residual. **Commit-identity
+edge (M4 verify):** the agent's `git config user.email/name` writes the **runner clone's**
+own config (runner-owned) — fine under (b); confirm commit identity resolves from the
+runner config or `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env, never a worker-bare config write.
 
 *Delta vs today's `git.ts`* (my report to the lead): **moderate.** Today `GitCache`
 keeps one worker-owned bare + `git worktree add` linked worktrees sharing its
@@ -728,29 +733,67 @@ model.
       via (C)/two-containers (Decision 8). Verified: root start still drops to
       `worker` with setuid/setgid-only caps + 0400 token; `--user 10001 --cap-drop
       ALL` start runs single-uid, rc=0.
-- [ ] **M3 — Shared-volume ownership model ((b) SEPARATE-RUNNER-CLONE, worker
-      BARE-ONLY — B2 SETTLED).** Give the runner its **own** clone/object store
-      (working tree lives ONLY there; the worker stays bare-only); the agent checks
-      out + commits there; the worker `fetch`es the agent branch back from it (the six
-      B2 invariants: single-branch refspec, pack-protocol/`--no-local` +
-      `protocol.file.allow`, worker fetch on `gitEnv`), then pushes with the PAT. Full
-      `/nix` + `/data` runner-owned path enumeration (Decision 4: runner clone/store +
-      its working tree, `agent-home/<runId>`, `provision/`, shared nix HOME, `/nix`)
-      vs worker-only (the warm bare `repos/<bare>.git`, worker HOME/`.gitconfig`,
-      token); distinct `TMPDIR` per uid on `0700` trees (5-bis). Namespaces `agent/*` +
-      `ci-fix/*` + `uzi/*`. (Decision 3's git hardening already landed in M0.) Gate:
-      agent commit works in the runner store; worker `fetch`+push works; the
-      `packObjectsHook`/upload-pack PoC is re-confirmed on the **image's** git; a
-      runner `commondir`/config rewrite cannot reach worker-side git.
-- [ ] **M4 — Spawn surfaces under the execution uid.** SDK agent, check runner,
-      provision hooks launch under the execution uid; the worker retains
-      `CAP_SETUID` and does the credentialed git/HTTP; PATH hygiene (Decision 6),
-      capability hygiene (Decision 7), root-startup-window hygiene (M5-audit), and
-      no cross-uid IPC channel (5-bis) verified.
+- [x] **M3 — Store topology + git-flow relocation + safe-half ownership ((b)
+      SEPARATE-RUNNER-CLONE, worker BARE-ONLY — B2 SETTLED). DONE 2026-07-16 —
+      single-uid, fully testable now.** RESEQUENCED (coder proposal, lead-approved
+      2026-07-16): the git-flow relocation the earlier draft parked in M5 lands HERE,
+      because under (b) "give the runner its own clone" is inseparable from the
+      `git.ts` reshape (a clone nobody seeds/fetches-back is dead code) and M3's
+      topology gate is only meetable once the flow is relocated — and the whole
+      relocated flow works **single-uid** (no dependency on the M4 spawn), so it is
+      provable now against the real-git harness. Delivered: the runner gets its **own**
+      clone/object store (working tree lives ONLY there; the worker stays bare-only);
+      `git.ts` `runnerCloneForBranch`/`fetchAgentBranch`/`changedFiles` reshape + the
+      `runner.ts` rewiring; the agent checks out + commits in the runner clone; the
+      worker `fetch`es the agent branch back from it (the six B2 invariants:
+      single-branch refspec → worker tracking ref `refs/uzi-runner/<branch>`,
+      `file://`+pack transport + pinned `protocol.file.allow`, worker fetch on `gitEnv`,
+      `--no-tags`), then pushes with the PAT from the tracking ref. **Seed transport
+      (security-relevant, stated for the review):** the runner clone is a local
+      `git clone --shared` from the worker bare — the runner references the bare's
+      objects **read-only via `objects/info/alternates`** (it CANNOT corrupt worker-bare
+      objects through it), and the runner's own new commit objects land in the clone's
+      own store; the worker's fetch-BACK is `file://`+pack (never the local-copy
+      optimization), so it NEVER traverses the runner clone's alternates or a
+      runner-planted `objects/info/alternates` (CVE-2022-39253, invariant 3). Safe-half
+      **ownership**: the `/data` runner-owned subtree carve-out (`runner/` clone store +
+      `agent-home/` + `provision/` → `worker:runner 2775` setgid, worker bare `repos/`
+      worker-only) + the worker's distinct `0700` `TMPDIR` (5-bis) land in the
+      entrypoint, INERT until M4 (no runner process writes them pre-split). Namespaces
+      `agent/*` + `ci-fix/*` + `uzi/*`. (Decision 3's git hardening already landed in
+      M0.) **/nix group-write + the worker-PATH-strip moved to M4** (see M4 — they are
+      unsafe to land here; the atomicity WHY is there). Gate met (single-uid): agent
+      commit lands in the runner store; worker `fetch`+push works; `changedFiles` is a
+      worker-bare `--name-only` tree-diff; a `<bare>/config` plant is unreadable by the
+      runner clone's git (config-source isolation test) and a runner `commondir`/config
+      rewrite cannot reach worker-side git by construction (worker reads no runner config
+      source); the `packObjectsHook`/upload-pack PoC re-confirmed on the **image's** git
+      (node:22-alpine, git 2.54.0) + host git 2.55.0. The **uid-boundary** half of the
+      gate (the `runner` uid specifically does the seed+commit while `worker` owns the
+      bare) is proven in M4.
+- [ ] **M4 — Spawn surfaces under the execution uid ((b) ownership goes live +
+      `/nix` group-write + worker-PATH-strip, ATOMIC).** SDK agent, check runner,
+      provision hooks launch under the execution uid; the worker retains `CAP_SETUID`
+      and does the credentialed git/HTTP; capability hygiene (Decision 7),
+      root-startup-window hygiene (M5-audit), and no cross-uid IPC channel (5-bis)
+      verified. **These THREE land as ONE unit (resequenced from M3, lead-approved):**
+      (a) `/nix` becomes group-runner-writable (handling the `migrate_tree` group guard,
+      which keys on owner only), (b) the worker's credentialed-exec PATH drops `/nix` →
+      root-owned image dirs ONLY (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
+      /sbin:/bin`) with `/nix` carried ONLY on the runner/SDK/provision PATH
+      (`buildSdkEnv`/`buildProvisionEnv`/`toolEnv`), and (c) provisioning + the SDK +
+      checks spawn as `runner`. **Why atomic (Decision 6):** they CANNOT split across
+      milestones — in M3 provisioning still runs as the worker, so stripping `/nix` from
+      the worker PATH would break it, while enabling `/nix` group-write with `/nix` still
+      on the worker PATH is exactly the cross-uid-code-exec-into-the-PAT-holder window;
+      only when provisioning moves off the worker (the spawn) is the trio coherent. The
+      M3 `/data` carve-out + runner `TMPDIR` go live here (per-run leaf-dir group-write +
+      the runner env's `TMPDIR=/tmp/uzi-runner`); PATH hygiene (Decision 6).
 - [ ] **M5 — Preserve PRD #46/#18 behavior + e2e retooling.** devbox/nix
       provisioning (`toolEnv`), real check evidence (`go test`/`npm test`/`tsc`),
-      worktree git, and the agent's own sandbox (`settingSources:[]` + deny-hook)
-      all work across the boundary. **Retool the e2e (N4):** under the split the
+      runner-clone git, and the agent's own sandbox (`settingSources:[]` + deny-hook)
+      all work across the boundary. (The git-flow relocation moved to M3; M5 is the
+      behavior-preservation + e2e residual.) **Retool the e2e (N4):** under the split the
       token is worker-owned `0400` and **not** unlinked, so `run-e2e.sh`'s
       writable-mount delivery and its "token unlinked" assertion must change to
       uid-boundary reads. Gate: `run-e2e.sh` (judge + self-improve + existing) green.
