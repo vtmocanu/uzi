@@ -833,6 +833,11 @@ pass "M6 E3: runner child /proc/self/fd is only {0,1,2}+the readdir fd (no leake
 if "${COMPOSE[@]}" exec -T agent sh -c "tr '\0' '\n' < /proc/$WPID/cmdline | grep -q -- --inspect"; then
   fail "M6 E4: the worker node process was started with --inspect (debug port exposed)"
 fi
+# Presence belt (reviewer M6 follow-up): the listener check is non-vacuous only while
+# `netstat` exists in the image; a future slim-down dropping it would make the grep
+# below silently pass. Fail loudly if it's gone (then switch to /proc/net/tcp).
+"${COMPOSE[@]}" exec -T agent sh -c 'command -v netstat >/dev/null 2>&1' \
+  || fail "M6 E4: netstat is absent in the image — the inspector-port check would be vacuous; switch it to /proc/net/tcp (:240D)"
 if "${COMPOSE[@]}" exec -T agent sh -c "netstat -tlnp 2>/dev/null | grep -qE ':9229([^0-9]|$)'"; then
   fail "M6 E4: something is listening on the Node inspector port 9229 (debug port exposed)"
 fi

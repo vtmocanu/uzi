@@ -258,7 +258,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     assert.match(gitOut(bare, ["rev-parse", ref]), /^[0-9a-f]{40}$/, "the fetch-back still landed the agent branch");
   });
 
-  it("(b) invariant: a runner-planted commondir/gitdir rewrite does NOT reach the worker's bare-only git (moot by construction — explicit M6 regression)", async (t) => {
+  it("(b) moot-by-construction: the worker's bare-only changedFiles never resolves a runner clone's git dir (commondir/gitdir), so runner-clone corruption cannot reach it", async (t) => {
     if (!gitAvailable()) return t.skip("git not available");
     const bare = await git.ensureClone(fx.originPath);
     const rc = await git.createOrAttachRunnerClone(bare, 301);
@@ -270,27 +270,30 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     // BEFORE any corruption while the clone is still valid.
     const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-301");
 
-    // Now a compromised runner rewrites its OWN clone's `.git/commondir` to point the
-    // "common" git dir (where config is resolved) at an attacker dir carrying a code-exec
-    // `diff.external` — the classic commondir/gitdir redirection. Under (b) the worker is
-    // BARE-ONLY: `changedFiles` is `git -C <worker-bare> diff`, which resolves the WORKER
-    // bare's git dir and NEVER the runner clone's, so it never follows this commondir into
-    // the attacker config. Proof: after this corruption, the worker's changedFiles STILL
-    // returns the correct tree-diff (it would otherwise fire `evil` OR break with "not a git
-    // directory" if it ever resolved the clone's git dir). Config written directly (not via
-    // the clone's git, which the commondir now breaks).
+    // Documentation-grade regression MARKER for the commondir/gitdir vector, honest about
+    // what it proves. A compromised runner rewrites its OWN clone's `.git/commondir` to
+    // point the "common" git dir (where config is resolved) at an attacker dir carrying a
+    // code-exec `diff.external` — the classic commondir/gitdir redirection. Under (b) the
+    // worker is BARE-ONLY: `changedFiles` is `git -C <worker-bare> diff --name-only`, which
+    // resolves the WORKER bare's git dir and NEVER the runner clone's.
     const evilCommon = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-evil-common-"));
     fs.writeFileSync(path.join(evilCommon, "config"), `[diff]\n\texternal = ${evil}\n`);
     fs.writeFileSync(path.join(rc.path, ".git", "commondir"), `${evilCommon}\n`);
 
     resetMarker();
     const changed = await git.changedFiles(bare, ref);
-    assert.equal(
-      fired(),
-      false,
-      "a runner-planted commondir/gitdir + diff.external must NOT code-exec in the worker's bare-only changedFiles",
-    );
-    assert.deepEqual(changed, ["R.txt"], "the worker's bare tree-diff is UNAFFECTED by the corrupted runner clone (it never resolves the clone's git dir)");
+    // LOAD-BEARING: corrupting the clone leaves the worker's changedFiles UNAFFECTED — it
+    // would break with "not a git directory" if changedFiles ever targeted the clone as its
+    // git dir. That is the property this test actually guards.
+    assert.deepEqual(changed, ["R.txt"], "the worker's bare-only changedFiles never resolves the runner clone's git dir, so a commondir/gitdir rewrite there cannot reach it");
+    // Belt-and-suspenders, and INERT in this flow by construction (documented so a reader
+    // does not overread it): a normal clone's `.git` is a real dir, so git never even
+    // consults `.git/commondir` (a linked-worktree mechanism), and `--name-only` never
+    // invokes `diff.external` — so `fired()` cannot trip here regardless. The REAL code-exec
+    // baselines for a runner-planted config source are the sibling tests: the config-source
+    // isolation + diff.external / credential.helper / core.askpass PoCs above, the
+    // packObjectsHook fetch-back, and the live E7 assertion on the IMAGE's git (run-e2e.sh).
+    assert.equal(fired(), false, "no code-exec fired (not the primary guard — see the sibling config-source / packObjectsHook / E7 tests)");
     fs.rmSync(evilCommon, { recursive: true, force: true });
   });
 
