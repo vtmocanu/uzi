@@ -817,7 +817,31 @@ model.
       only when provisioning moves off the worker (the spawn) is the trio coherent. The
       M3 `/data` carve-out + runner `TMPDIR` go live here (per-run leaf-dir group-write +
       the runner env's `TMPDIR=/tmp/uzi-runner`); PATH hygiene (Decision 6).
-- [ ] **M5 — Preserve PRD #46/#18 behavior + e2e retooling.**
+- [x] **M5 — Preserve PRD #46/#18 behavior + e2e retooling. DONE 2026-07-16 —
+      `./e2e/run-e2e.sh` green end-to-end (139 PASS / 0 FAIL, exit 0; KEEP_STACK stack
+      `uzi-e2e-prd51m5` left up for validators): full approve→implement→push→MR,
+      restart-resilience, judge + self-improve, tool provisioning as `runner`, AND the
+      new uid-boundary assertions all pass.**
+      **Delivered:** (1) the stub `git()` now runs AS `runner` via `runnerCommand` +
+      `runnerPath`/`runnerTmpdir` (mirrors `GitCache.runGitAsRunner`; NO `safe.directory=*`
+      papering), so it commits into the runner-owned clone exactly like the real SDK agent
+      — this was the RED e2e blocker (`fatal: detected dubious ownership`). (2) behavior
+      preservation (devbox/nix provisioning as `runner`, self-improve checks, runner-clone
+      git, the agent sandbox) is confirmed by the green e2e. (3) **e2e token delivery —
+      DEVIATION from this item's `/worker-secret/token`, reviewer-proposed + lead-scope:**
+      the join token now rides the SAME path prod uses — the base `worker_token` **Docker
+      secret** at `/run/secrets/worker_token` (env-sourced from the minted `UZI_WORKER_TOKEN`,
+      which `run-e2e.sh` exports; a shell export outranks the `--env-file` placeholder,
+      verified). This is container-native tmpfs, so the entrypoint's EXISTING 0400
+      `worker:worker` hardening is reliable — unlike a Docker-Desktop bind mount, where an
+      in-container chown of the token is a silent no-op and would leave the boundary
+      vacuous (auditor HIGH); it is RO + not-unlinked exactly like prod. The old writable
+      `/worker-secret` bind mount + `write_token` re-delivery + "token unlinked" assertion
+      are removed; the replacement asserts, via `setpriv`-to-uid drops (compose exec enters
+      as root, which bypasses 0400), that the **runner** read is DENIED, the **worker** read
+      SUCCEEDS, the secret is `400 worker worker`, and the A1 split is genuinely active
+      ("A1 uid-split active" logged + distinct 10001/10002 uids). No entrypoint LOGIC change
+      (only a stale-comment fix); no Dockerfile change.
       1. **FIRST / e2e-green BLOCKER (reviewer + auditor M5-forward, now live-reproduced by
          the tester):** wrap the **stub executor's** `git()` (`executor.ts:475-484`) with
          `runnerCommand`/`runnerSpawn` so it commits **AS `runner`** — faithful to the real

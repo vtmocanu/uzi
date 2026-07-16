@@ -80,9 +80,13 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
    restart.
 6. **Secret hygiene**: the bot PAT, the Anthropic token, and the worker join
    token appear in **no** container log and **nowhere** on the worker's `/data`.
-7. **`/proc` hardening (M6)**: the join token is delivered by file
-   (`UZI_WORKER_TOKEN_FILE`), so it is absent from every process's
-   `/proc/<pid>/environ`, and its delivery file was unlinked after read. See
+7. **`/proc` hardening (M6) + uid boundary (PRD #51 M4/M5)**: the join token is
+   delivered by file — the `worker_token` Docker secret at
+   `/run/secrets/worker_token` (same path prod uses), so it is absent from every
+   process's `/proc/<pid>/environ`; and the entrypoint forces that secret to
+   `0400 worker:worker`, so a `setpriv`-to-`runner` read is **denied** while a
+   `setpriv`-to-`worker` read **succeeds** — the runner uid, which runs the
+   untrusted agent/checks/provision, cannot read the worker's credential. See
    [../docs/proc-hardening.md](../docs/proc-hardening.md).
 8. **MR-close watcher (PRD #24)**: with the poller sped to ~2s, closing the
    completed run's MR *without merging* (via forge-fake's `/_e2e` mutator) moves

@@ -31,8 +31,10 @@
 # Observable assertions: DB run-state transitions (via the API), gapless
 # run_messages seq, branch pushed to the remote, MR recorded by the fake GitLab,
 # NO secret (PAT / Anthropic token / worker join token) in container logs or on
-# the worker's disk, and — the M6 /proc hardening — the join token is absent from
-# every process's /proc/<pid>/environ and its delivery file was unlinked.
+# the worker's disk; the M6 /proc hardening — the join token is absent from every
+# process's /proc/<pid>/environ; and the PRD #51 M4/M5 uid split — the join token
+# secret is 0400 worker:worker, so the worker uid can read it but the runner uid
+# (which runs the untrusted agent/checks/provision) is DENIED.
 #
 # Everything tears down with `down -v`; the user's own `uzi` stack is never
 # touched (unique project name, project-scoped volumes, its own env-file).
@@ -115,8 +117,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-WTOKEN=""  # the worker join token, minted once and re-written before each start
-write_token() { mkdir -p "$RUNROOT/worker-secret"; printf '%s' "$WTOKEN" > "$RUNROOT/worker-secret/token"; }
+# The worker join token, minted once (after the API is up) then handed to every
+# `up`/recreate via the base compose `worker_token` Docker secret (env source
+# UZI_WORKER_TOKEN, exported below). The entrypoint hardens that secret to 0400
+# worker:worker on every start, so it persists read-only across restarts and the
+# runner uid cannot read it (PRD #51 M5) — no per-start file re-delivery needed.
+WTOKEN=""
 
 # --- api helpers (session cookie + CSRF, like scripts/smoke.sh) --------------
 csrf() { awk '$6=="uzi_csrf"{print $7}' "$JAR"; }
@@ -320,7 +326,7 @@ wait_notes() {
 
 # =============================================================================
 say "provisioning scratch dir $RUNROOT (project $PROJECT, web $BASE, executor $EXECUTOR)"
-mkdir -p "$RUNROOT/certs" "$RUNROOT/worker-secret" "$RUNROOT/agent-gitconfig" "$RUNROOT/fakeremote" "$RUNROOT/forge-fake-state"
+mkdir -p "$RUNROOT/certs" "$RUNROOT/agent-gitconfig" "$RUNROOT/fakeremote" "$RUNROOT/forge-fake-state"
 chmod a+rwX "$RUNROOT/forge-fake-state"  # forge-fake persists its recorded state here (survives the restart)
 
 # Self-signed cert for forge-fake.e2e (trusted by api/worker/git in the overlay).
@@ -419,8 +425,10 @@ fi
 say "git remote mode: $GIT_MODE"
 
 # Per-run env-file: strong generated secrets for the base stack + the scratch dir
-# the overlay bind-mounts. UZI_WORKER_TOKEN is a placeholder that only satisfies
-# the base compose's `:?` guard — the real token is delivered via the file.
+# the overlay bind-mounts. UZI_WORKER_TOKEN is only a placeholder here (the worker is
+# not up yet); run-e2e.sh EXPORTS the real minted token before the agent starts, and a
+# shell export overrides the --env-file value for the `worker_token` secret source
+# (verified: compose ranks shell env above --env-file for an env-sourced secret).
 cat > "$ENVFILE" <<EOF
 E2E_RUN_DIR=$RUNROOT
 E2E_WEB_PORT=$WEB_PORT
@@ -538,7 +546,11 @@ pass "queued run transitioned to cancelled server-side"
 say "issue a worker join token and bring the worker online"
 WTOKEN="$(apipost /api/workers '{"name":"e2e-worker"}' | jq -r '.token')"
 [ -n "$WTOKEN" ] && [ "$WTOKEN" != null ] || fail "no worker token minted"
-write_token
+# Hand the minted token to the base `worker_token` Docker secret (env source). A shell
+# export overrides the --env-file placeholder and persists for every later `up` /
+# recreate / restart in this run, so no per-start re-delivery is needed. The entrypoint
+# hardens /run/secrets/worker_token to 0400 worker on each start.
+export UZI_WORKER_TOKEN="$WTOKEN"
 "${COMPOSE[@]}" up -d --wait agent
 wait_worker_online
 pass "worker registered and is online"
@@ -579,7 +591,8 @@ pass "PRD #37: run detected + reported the repo's .claude/agents/ roster (repo-c
 
 say "restart-resilience: down/up (keep volumes) while parked at the gate"
 "${COMPOSE[@]}" down                       # keeps the named volumes (pgdata, agentdata)
-write_token                                 # the worker unlinked its token file; restore it
+# No token re-delivery: the exported UZI_WORKER_TOKEN re-sources the `worker_token`
+# secret on the next `up`, and the entrypoint re-hardens it 0400 worker (PRD #51 M5).
 "${COMPOSE[@]}" up -d --wait db api web forge-fake
 wait_http
 login
@@ -683,11 +696,9 @@ for sec in "$WTOKEN" "$DUMMY_FORGE_PAT" "$DUMMY_ANTHROPIC"; do
 done
 pass "no secret on the worker's /data (bare clone cache, worktrees, sessions)"
 
-# /proc hardening (M6): the join token was delivered by file, not env, so it must
-# not appear in ANY process's environ; and its delivery file must have been
-# unlinked. The token is passed as argv (not env) so the probe can't self-match.
-"${COMPOSE[@]}" exec -T agent sh -c 'test ! -e /worker-secret/token' \
-  || fail "the worker-token file was not unlinked after read (/proc hardening)"
+# /proc hardening (M6): the join token was delivered by file (the `worker_token`
+# Docker secret), not env, so it must not appear in ANY process's environ. The token
+# is passed as argv (not env) below so the probe can't self-match.
 ENV_HITS="$("${COMPOSE[@]}" exec -T agent sh -c '
   n=0
   for e in /proc/[0-9]*/environ; do
@@ -695,7 +706,36 @@ ENV_HITS="$("${COMPOSE[@]}" exec -T agent sh -c '
   done
   echo "$n"' _ "$WTOKEN")"
 [ "$ENV_HITS" = 0 ] || fail "the join token is present in $ENV_HITS process environ(s) — /proc leak NOT closed"
-pass "/proc hardening: join token absent from every process environ; delivery file unlinked"
+pass "/proc hardening: join token absent from every process environ"
+
+# PRD #51 M4/M5 uid boundary: the join-token secret is 0400 worker:worker, so ONLY the
+# worker uid may read it — the runner uid (which runs the untrusted agent/checks/
+# provision) is DENIED. This is the real containment; the reads below prove it is NOT
+# vacuous. `docker compose exec` enters as ROOT (no USER line), and root bypasses 0400,
+# so we DROP to each uid with setpriv (--init-groups for real supplementary groups) and
+# assert the runner FAILS and the worker SUCCEEDS — no `|| true` swallow.
+#
+# First, the split must genuinely be active (a silent fallback to the #58 single-uid
+# branch would collapse both uids into one and make the negative read pass vacuously).
+printf '%s' "$LOGS" | grep -qF "A1 uid-split active" \
+  || fail "the agent never logged 'A1 uid-split active' — the uid split did not engage (single-uid fallback would make the boundary vacuous)"
+[ "$("${COMPOSE[@]}" exec -T agent id -u worker | tr -d '\r')" = 10001 ] \
+  && [ "$("${COMPOSE[@]}" exec -T agent id -u runner | tr -d '\r')" = 10002 ] \
+  || fail "expected distinct worker(10001)/runner(10002) uids in the running agent"
+pass "PRD #51 uid split active: A1 root drop logged; distinct worker(10001)/runner(10002) uids"
+
+TOK=/run/secrets/worker_token
+if "${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid runner --regid runner --init-groups -- cat "$TOK" >/dev/null 2>&1; then
+  fail "the RUNNER uid could READ the worker join token ($TOK) — uid boundary NOT enforced"
+fi
+pass "PRD #51 uid boundary: runner uid is DENIED read of the worker join token"
+"${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid worker --regid worker --init-groups -- cat "$TOK" >/dev/null 2>&1 \
+  || fail "the WORKER uid could NOT read its own join token ($TOK) — over-tightened"
+pass "PRD #51 uid boundary: worker uid CAN read its own join token"
+TOKMODE="$("${COMPOSE[@]}" exec -T agent stat -c '%a %U %G' "$TOK" | tr -d '\r')"
+[ "$TOKMODE" = "400 worker worker" ] \
+  || fail "worker-token perms are '$TOKMODE', expected '400 worker worker' (a 0444/root regression would let the runner read it, making the boundary vacuous)"
+pass "PRD #51 uid boundary: worker-token secret is 0400 worker:worker (read denial is real)"
 
 # =============================================================================
 # PRD #33 — deliberate-stop signal: a live-poller plan reject carrying a VERBATIM
@@ -1754,10 +1794,9 @@ else
     || fail "could not enable group/repo2"
   pass "second repo group/repo2 enabled (id $REPO2_ID)"
 
-  # Recreate the one worker at cap 2. The token file was unlinked at its first
-  # start (/proc hardening), so restore it before the fresh container reads it.
+  # Recreate the one worker at cap 2. The exported UZI_WORKER_TOKEN still sources the
+  # `worker_token` secret, so the recreated container re-reads the same join token.
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
-  write_token
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
   # Wait for the NEW worker's registration to actually LAND its advertised cap —
   # not merely for `online`. The recreated container reuses the join token (same
@@ -1882,8 +1921,8 @@ else
   pass "sweeper marked the dead worker offline and re-queued BOTH runs (N=2)"
 
   # Restart the worker (same join token ⇒ same worker id): it re-claims both by
-  # affinity and drives them to completion.
-  write_token
+  # affinity and drives them to completion. The exported UZI_WORKER_TOKEN re-sources
+  # the `worker_token` secret; no token re-delivery is needed.
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
   wait_worker_online
   wait_status "$RUN_KA" awaiting_approval 60

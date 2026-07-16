@@ -134,14 +134,18 @@ services:
       # Drive the M4 plan gate from the stub (no live Anthropic session). The SDK
       # executor ignores this flag, so it is harmless in `sdk` mode.
       UZI_STUB_PLAN_GATE: "1"
-      # Structural /proc hardening (M6): deliver the join token via a file, not an
-      # env var, so it never lands in the worker's /proc/<pid>/environ. The worker
-      # reads it once and unlinks it. The harness (re)writes it before every start.
-      UZI_WORKER_TOKEN_FILE: /worker-secret/token
-      # PRD #51 M2: the worker OS user is now `worker` (home /home/worker). The base
-      # entrypoint runs as root and setpriv-drops to `worker` (cap_add inherited from
-      # the base agent service). This overlay's token still comes via the writable
-      # /worker-secret bind mount (M5 does the full uid-boundary e2e retool).
+      # PRD #51 M5: the join token rides the SAME delivery as production — the base
+      # compose `worker_token` Docker secret at /run/secrets/worker_token (base sets
+      # UZI_WORKER_TOKEN_FILE there; no overlay override), sourced from UZI_WORKER_TOKEN
+      # which run-e2e.sh exports to the freshly-minted value before each `up`. This
+      # keeps BOTH structural properties the M6 /proc-hardening + M4 uid-split need,
+      # non-vacuously: (1) the token is delivered by FILE not env, so it is absent from
+      # every process's /proc/<pid>/environ; and (2) the entrypoint forces that secret
+      # to 0400 worker:worker (container-native tmpfs — reliable chown, unlike a
+      # Docker-Desktop bind mount), so the runner uid CANNOT read it — the real
+      # containment the boundary assertion exercises. It is RO and not-unlinked, exactly
+      # like prod (the earlier writable /worker-secret bind mount let the runner read the
+      # world-readable token and the worker unlink it, making the boundary vacuous).
       HOME: /home/worker
       # Trust forge-fake's cert for the worker's MR fetch (Node) and any git-over-
       # https (git). The git remote is actually local (insteadOf below), so git
@@ -169,7 +173,6 @@ services:
       WORKER_CHAT_IDLE_TIMEOUT: 20s
     volumes:
       - ${E2E_RUN_DIR}/certs:/certs:ro
-      - ${E2E_RUN_DIR}/worker-secret:/worker-secret
       - ${E2E_RUN_DIR}/agent-gitconfig:/e2e-git:ro
       - ${E2E_RUN_DIR}/fakeremote:/fakeremote
       # Stub `devbox` over the baked-in binary (PRD #18 M8 tool-provisioning

@@ -8,6 +8,8 @@ import type { PlanVerdict } from "./steering.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { provisionRunTools } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
+import { gitEnv } from "./git.js";
+import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -473,14 +475,27 @@ export class StubExecutor implements Executor {
   }
 
   private async git(cwd: string, args: string[]): Promise<void> {
-    // Replacement env, not a process.env spread (M10 discipline): even the stub's
-    // local add/commit is a worker-spawned git child, so keep it off the worker's
-    // secrets by construction. Stub/e2e-only with dummy creds, but consistent with
-    // gitEnv. Commit identity rides -c flags (see the caller), so only PATH/HOME are
-    // needed; GIT_CONFIG_GLOBAL is carried if the e2e set it (a config-file path).
-    const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: process.env.HOME, GIT_TERMINAL_PROMPT: "0" };
-    if (process.env.GIT_CONFIG_GLOBAL) env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL;
-    await execFileAsync("git", ["-C", cwd, ...args], { env, timeout: 60_000 });
+    // Run AS the RUNNER uid (PRD #51 M5), mirroring GitCache.runGitAsRunner. The stub
+    // commits into `ctx.worktreePath`, which under (b) is the RUNNER-owned clone (the
+    // agent's checkout+commit tree — runner.ts wires runnerClone.path here). The real
+    // SDK agent already commits there as `runner` (via runnerSpawn), so its git euid
+    // matches the runner-owned store; the stub must too. A worker-uid git here hits
+    // `fatal: detected dubious ownership` on the runner tree — and papering over it with
+    // `safe.directory=*` would write worker-owned objects into a runner store (ownership
+    // drift, diverging from the real path), so we run-AS-runner via runnerCommand instead.
+    //
+    // Env is gitEnv()'s REPLACEMENT env (M10 discipline: no process.env spread, so the
+    // join token / API URL are absent by construction), with the RUNNER PATH + the
+    // runner's private 0700 TMPDIR overriding the worker's (else the setpriv child would
+    // inherit the worker's owner-only /tmp/uzi-worker and git scratch would EPERM).
+    // Commit identity rides the caller's `-c` flags, which survive the setpriv `--`
+    // passthrough. Single-uid (#58 / no split): runnerCommand is a passthrough and
+    // runnerPath/runnerTmpdir fall back to the ambient PATH/TMPDIR — a plain git.
+    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
+    const tmp = runnerTmpdir();
+    if (tmp) env.TMPDIR = tmp;
+    const wrapped = runnerCommand("git", ["-C", cwd, ...args]);
+    await execFileAsync(wrapped.command, wrapped.args, { env, timeout: 60_000 });
   }
 }
 

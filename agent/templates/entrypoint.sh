@@ -188,8 +188,10 @@ RUNNER_TMPDIR=/tmp/uzi-runner
 # unreliable (audit L2), so enforce it here rather than trusting compose. chmod BEFORE
 # chown: the runtime cap set has no CAP_FOWNER, so root can chmod the file only while
 # root still owns it; 0400 carries no setuid/setgid bit for chown to strip, so the final
-# mode is 0400 worker:worker. The e2e overlay delivers its token via a different
-# (writable) path and is left untouched here.
+# mode is 0400 worker:worker. The e2e stack (PRD #51 M5) delivers its token via THIS
+# same Docker-secret path (UZI_WORKER_TOKEN_FILE=/run/secrets/worker_token, sourced from
+# the minted UZI_WORKER_TOKEN), so this hardening covers it too — that is exactly what
+# makes the e2e's runner-uid read-denial assertion non-vacuous.
 TOKEN=/run/secrets/worker_token
 if [ -e "$TOKEN" ]; then
   "$CHMOD" 0400 "$TOKEN"
