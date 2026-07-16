@@ -685,27 +685,63 @@ echo "$MSGS" | jq -e '.messages | (length > 0) and ([.[].seq] == [range(1; lengt
   || fail "run_messages seq is not a gapless 1..N sequence (across the restart)"
 pass "run_messages seq is gapless 1..$(echo "$MSGS" | jq '.messages | length') across the restart"
 
-# PRD #40: the stub emits a synthetic terminal result frame (fixed usage) + a
-# per-agent coder message, standing in for the live SDK. Assert the API folded that
-# usage onto the run, aggregated it into /api/usage, and kept the per-agent row in
-# the stream (the three surfaces M4 renders from).
+# PRD #40: the API folds the terminal result frame's usage onto the run, aggregates
+# it into /api/usage, and keeps the per-agent row in the stream (the three surfaces
+# M4 renders from). That PROPERTY is what PRD #40 owns and it holds under either
+# executor; only the NUMBERS are the stub's. The stub emits a synthetic frame with
+# fixed usage (21400/6100, and a coder message at 12000) + a per-agent coder message,
+# standing in for the live SDK, so under the stub we assert the exact values — they
+# also prove the frame was parsed, not merely non-empty.
+#
+# Under UZI_E2E_EXECUTOR=sdk the usage is whatever the real session actually spent, so
+# assert the property instead. Asserting the stub's constants UNCONDITIONALLY is what
+# made the documented capstone unrunnable: every one of these four fails under a live
+# run, and the first one exits, so the harness reported failure after 24 PASS and a
+# fully successful real run (observed 2026-07-16: 2229 in / 11171 out against a
+# hardcoded 21400 — the run had cloned, planned, gated, implemented, pushed and opened
+# an MR). e2e/README.md's "no milestone assertion depends on this path" was true of the
+# milestones and false of this script.
 RUNUSAGE="$(apiget "/api/runs/$RUN")"
-[ "$(echo "$RUNUSAGE" | jq -r '.run.usage.input_tokens // empty')" = 21400 ] \
-  || fail "run.usage.input_tokens is not 21400 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
-[ "$(echo "$RUNUSAGE" | jq -r '.run.usage.output_tokens // empty')" = 6100 ] \
-  || fail "run.usage.output_tokens is not 6100 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
-pass "PRD #40: run.usage folded the result frame (21400 in / 6100 out) via run_usage"
+RU_IN="$(echo "$RUNUSAGE" | jq -r '.run.usage.input_tokens // empty')"
+RU_OUT="$(echo "$RUNUSAGE" | jq -r '.run.usage.output_tokens // empty')"
+if [ "$EXECUTOR" = sdk ]; then
+  # A live frame folded at all: non-empty and positive. The stub's exact-value
+  # assertions below are the ones that prove parsing; here the run's own numbers are
+  # unknowable in advance, so "> 0" is the strongest honest claim.
+  echo "$RUNUSAGE" | jq -e '(.run.usage.input_tokens // 0) > 0 and (.run.usage.output_tokens // 0) > 0' >/dev/null \
+    || fail "run.usage not folded from the live SDK result frame (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
+  pass "PRD #40: run.usage folded the live SDK result frame ($RU_IN in / $RU_OUT out) via run_usage"
+else
+  [ "$RU_IN" = 21400 ] \
+    || fail "run.usage.input_tokens is not 21400 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
+  [ "$RU_OUT" = 6100 ] \
+    || fail "run.usage.output_tokens is not 6100 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
+  pass "PRD #40: run.usage folded the result frame (21400 in / 6100 out) via run_usage"
+fi
 
+# Aggregation, asserted against the RUN's own usage rather than a constant: true under
+# both executors, and a strictly better test — it catches an /api/usage that ignores
+# this run, which `>= 21400` would miss whenever some earlier run had already banked
+# the total.
 SELF_USAGE="$(apiget /api/usage)"
-[ "$(echo "$SELF_USAGE" | jq -r '.lifetime.input_tokens')" -ge 21400 ] \
-  || fail "/api/usage lifetime.input_tokens < 21400 (got: $(echo "$SELF_USAGE" | jq -c '.lifetime'))"
+[ "$(echo "$SELF_USAGE" | jq -r '.lifetime.input_tokens')" -ge "${RU_IN:-0}" ] \
+  || fail "/api/usage lifetime.input_tokens < this run's $RU_IN (got: $(echo "$SELF_USAGE" | jq -c '.lifetime'))"
 [ "$(echo "$SELF_USAGE" | jq -r '.run_count')" -ge 1 ] \
   || fail "/api/usage run_count < 1 (got: $(echo "$SELF_USAGE" | jq -c '.run_count'))"
-pass "PRD #40: /api/usage aggregates the run (lifetime in >= 21400, run_count >= 1)"
+pass "PRD #40: /api/usage aggregates the run (lifetime in >= this run's $RU_IN, run_count >= 1)"
 
-echo "$MSGS" | jq -e '[.messages[] | select(.agent == "coder" and (.payload.usage.input_tokens? == 12000))] | length >= 1' >/dev/null \
-  || fail "no per-agent (coder) usage-bearing message in the run-view data"
-pass "PRD #40: per-agent coder usage message present in the run stream (12000 in)"
+if [ "$EXECUTOR" = sdk ]; then
+  # The live run's agent names come from the cloned repo's roster (PRD #37 selected
+  # agent_source=repo above), so "coder" is not guaranteed and the count is real —
+  # assert only that SOME agent-attributed message carries usage.
+  echo "$MSGS" | jq -e '[.messages[] | select((.payload.usage.input_tokens? // 0) > 0 and .agent != null)] | length >= 1' >/dev/null \
+    || fail "no per-agent usage-bearing message in the run-view data"
+  pass "PRD #40: per-agent usage message present in the run stream"
+else
+  echo "$MSGS" | jq -e '[.messages[] | select(.agent == "coder" and (.payload.usage.input_tokens? == 12000))] | length >= 1' >/dev/null \
+    || fail "no per-agent (coder) usage-bearing message in the run-view data"
+  pass "PRD #40: per-agent coder usage message present in the run stream (12000 in)"
+fi
 
 say "secret-hygiene assertions"
 LOGS="$("${COMPOSE[@]}" logs --no-color 2>&1 || true)"
