@@ -61,6 +61,12 @@ case "$uid" in
 esac
 if [ "$uid" != "0" ]; then
   echo "uzi-entrypoint: single-uid non-root mode (PRD #58) — no A1 uid-split on this start" >&2
+  # Fail-safe against operator misconfig (audit M4 LOW): only the ROOT path below sets
+  # these, but if a non-root deploy carries a stray UZI_UID_SPLIT=1 (compose env), the
+  # single-uid worker would try to setpriv-wrap runner spawns → EPERM (no CAP_SETUID
+  # non-root) → every spawn fails → DoS. Clear them so single-uid mode is robust to a
+  # stray value. Not attacker-reachable (the runner cannot set the worker's env).
+  unset UZI_UID_SPLIT UZI_RUNNER_PATH UZI_RUNNER_TMPDIR
   exec "$TINI" -- "$@"
 fi
 echo "uzi-entrypoint: A1 uid-split active (root-started) — dropping to worker after the startup window" >&2

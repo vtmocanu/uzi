@@ -67,6 +67,16 @@ export function setprivRunnerArgs(): string[] {
     "--reuid", RUNNER_USER,
     "--regid", RUNNER_USER,
     "--init-groups",
+    // NOTE (audit M4): `--bounding-set -all` is effectively a NO-OP here — the worker
+    // lacks CAP_SETPCAP, so it cannot shrink the child's bounding set (it stays 0xc0).
+    // The containment does NOT rely on it: it rests on the `--inh-caps -all` +
+    // `--ambient-caps -all` clears (which zero the runner's Eff/Prm/Amb — verified: a
+    // plain reuid leaks CAP_SETUID and the runner can climb to uid 0), `no-new-privileges`
+    // (blocks any fcap/suid raise on execve), and the image shipping NO file-capability /
+    // setuid binary (getcap-confirmed). It is kept for intent/defense-in-depth. If a
+    // future node:22-alpine base bump changes util-linux `setpriv` to ABORT on an
+    // un-droppable bounding cap (rather than best-effort), this flag would break the spawn
+    // functionally — make a base bump a conscious setpriv re-check.
     "--bounding-set", "-all",
     "--inh-caps", "-all",
     "--ambient-caps", "-all",

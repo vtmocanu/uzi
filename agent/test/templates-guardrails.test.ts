@@ -116,6 +116,11 @@ describe("the shared root-entry drop wrapper", () => {
     assert.ok(nonrootExecAt >= 0, "must exec tini directly on the non-root path");
     assert.ok(setprivAt >= 0, "must setpriv-drop on the root path");
     assert.ok(nonrootExecAt < setprivAt, "the non-root single-uid exec must come before the setpriv drop");
+    // Fail-safe against operator misconfig (audit M4 LOW): the non-root path clears the
+    // split-activation env BEFORE exec, so a stray UZI_UID_SPLIT=1 on a #58 deploy can't
+    // make the single-uid worker try (and EPERM) to setpriv-wrap runner spawns.
+    const unsetAt = entrypoint.search(/unset\s+UZI_UID_SPLIT\s+UZI_RUNNER_PATH\s+UZI_RUNNER_TMPDIR/);
+    assert.ok(unsetAt >= 0 && unsetAt < nonrootExecAt, "the non-root path must unset the split env before exec tini");
   });
 
   it("fails CLOSED on an unreadable uid (never silently takes the non-root branch)", () => {
