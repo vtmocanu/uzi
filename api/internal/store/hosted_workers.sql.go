@@ -12,6 +12,85 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createHostedWorkerWithinQuota = `-- name: CreateHostedWorkerWithinQuota :one
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size)
+SELECT $1::uuid, $2::text, $3::bytea, $4::text,
+       'hosted', $5::text
+WHERE (
+    SELECT count(*) FROM workers WHERE user_id = $1 AND kind = 'hosted'
+) < $6::bigint
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation
+`
+
+type CreateHostedWorkerWithinQuotaParams struct {
+	UserID           uuid.UUID `json:"user_id"`
+	Name             string    `json:"name"`
+	TokenHash        []byte    `json:"token_hash"`
+	TemplateDeclared string    `json:"template_declared"`
+	HostedSize       string    `json:"hosted_size"`
+	Quota            int64     `json:"quota"`
+}
+
+// Provision a hosted worker, but only if the user is under their quota (PRD #58
+// Decision 8). Zero rows returned IS the refusal — sqlc surfaces it as
+// pgx.ErrNoRows, which the handler maps to 409, the same "no row came back means
+// the guard said no" idiom ClaimRun uses in runtime.sql.
+//
+// THIS WHERE CLAUSE IS NOT SELF-SUFFICIENT, AND DELETING THE CALLER'S ADVISORY LOCK
+// SILENTLY BREAKS IT. Under READ COMMITTED (the pool's isolation level) two
+// concurrent provisions each evaluate this subselect against their own snapshot;
+// neither sees the other's uncommitted INSERT; both find count < quota; both insert;
+// the user lands at quota+1. Nothing in this statement can fix that — not FOR UPDATE
+// (it locks rows that already exist and cannot fence a phantom row two transactions
+// are each about to add), and not a stricter predicate. The guard is correct ONLY
+// because the caller holds pg_advisory_xact_lock(HostedProvisionLockClass, <user>)
+// for the whole transaction, which makes the second counter wait for the first to
+// commit and then see its row. See store/migrate.go's HostedProvisionLockClass, and
+// handler/hosted_workers.go's provisionHostedWorker, which is the only caller.
+//
+// The PRD's own Decision 8 wording ("atomic (guarded insert under the same
+// transaction, no TOCTOU)") describes this statement alone and is, on its own,
+// insufficient — recorded here because it reads as if the WHERE were the mechanism.
+// The lock is the mechanism; the WHERE is how the lock's holder decides.
+//
+// kind is hardcoded 'hosted' rather than parameterized: this query exists to create
+// hosted workers, and CreateWorker (runtime.sql) exists to create external ones. A
+// kind parameter would let a caller quota-check one kind while inserting another.
+// hosted_generation takes its column default (0); nothing in M2 bumps it.
+func (q *Queries) CreateHostedWorkerWithinQuota(ctx context.Context, arg CreateHostedWorkerWithinQuotaParams) (Worker, error) {
+	row := q.db.QueryRow(ctx, createHostedWorkerWithinQuota,
+		arg.UserID,
+		arg.Name,
+		arg.TokenHash,
+		arg.TemplateDeclared,
+		arg.HostedSize,
+		arg.Quota,
+	)
+	var i Worker
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Name,
+		&i.TokenHash,
+		&i.Status,
+		&i.LastHeartbeatAt,
+		&i.Version,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
+		&i.Kind,
+		&i.HostedSize,
+		&i.HostedGeneration,
+	)
+	return i, err
+}
+
 const expirePendingHostedWorkerTokens = `-- name: ExpirePendingHostedWorkerTokens :execrows
 UPDATE hosted_worker_tokens SET token_ciphertext = NULL
 WHERE token_ciphertext IS NOT NULL

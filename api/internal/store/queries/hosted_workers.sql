@@ -28,6 +28,41 @@ LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
 WHERE w.kind = 'hosted'
 ORDER BY w.created_at ASC;
 
+-- name: CreateHostedWorkerWithinQuota :one
+-- Provision a hosted worker, but only if the user is under their quota (PRD #58
+-- Decision 8). Zero rows returned IS the refusal — sqlc surfaces it as
+-- pgx.ErrNoRows, which the handler maps to 409, the same "no row came back means
+-- the guard said no" idiom ClaimRun uses in runtime.sql.
+--
+-- THIS WHERE CLAUSE IS NOT SELF-SUFFICIENT, AND DELETING THE CALLER'S ADVISORY LOCK
+-- SILENTLY BREAKS IT. Under READ COMMITTED (the pool's isolation level) two
+-- concurrent provisions each evaluate this subselect against their own snapshot;
+-- neither sees the other's uncommitted INSERT; both find count < quota; both insert;
+-- the user lands at quota+1. Nothing in this statement can fix that — not FOR UPDATE
+-- (it locks rows that already exist and cannot fence a phantom row two transactions
+-- are each about to add), and not a stricter predicate. The guard is correct ONLY
+-- because the caller holds pg_advisory_xact_lock(HostedProvisionLockClass, <user>)
+-- for the whole transaction, which makes the second counter wait for the first to
+-- commit and then see its row. See store/migrate.go's HostedProvisionLockClass, and
+-- handler/hosted_workers.go's provisionHostedWorker, which is the only caller.
+--
+-- The PRD's own Decision 8 wording ("atomic (guarded insert under the same
+-- transaction, no TOCTOU)") describes this statement alone and is, on its own,
+-- insufficient — recorded here because it reads as if the WHERE were the mechanism.
+-- The lock is the mechanism; the WHERE is how the lock's holder decides.
+--
+-- kind is hardcoded 'hosted' rather than parameterized: this query exists to create
+-- hosted workers, and CreateWorker (runtime.sql) exists to create external ones. A
+-- kind parameter would let a caller quota-check one kind while inserting another.
+-- hosted_generation takes its column default (0); nothing in M2 bumps it.
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size)
+SELECT @user_id::uuid, @name::text, @token_hash::bytea, @template_declared::text,
+       'hosted', @hosted_size::text
+WHERE (
+    SELECT count(*) FROM workers WHERE user_id = @user_id AND kind = 'hosted'
+) < @quota::bigint
+RETURNING *;
+
 -- name: UpsertHostedWorkerToken :exec
 -- Park a sealed join-token plaintext for the controller's next poll. Called by the
 -- provision path (M2) in the same transaction that inserts the worker row, so a

@@ -285,6 +285,14 @@ type Config struct {
 	// prompt-injected worker cannot mass-create proposals across its user's chats.
 	ProposalRateLimitMax    int
 	ProposalRateLimitWindow time.Duration
+	// HostedRateLimit* is the per-user budget on the two endpoints that churn
+	// cluster objects (PRD #58 Decision 8): hosted provision and worker delete. A
+	// provision creates a Deployment, a Secret and volumes; a delete tears them
+	// down. Sized between the Slack-DM (6) and proposal (20) budgets — nobody
+	// legitimately provisions or deletes 10 workers a minute, and the quota, not
+	// this, is the real bound on how many can exist.
+	HostedRateLimitMax    int
+	HostedRateLimitWindow time.Duration
 	// ProposalConfirmStuckTimeout is how long a proposal may sit in the transient
 	// 'confirming' state before the sweeper reverts it to pending (PRD #39 M3): the
 	// recovery for a confirm handler killed after the claim but before it settled.
@@ -502,6 +510,8 @@ func Load() (Config, error) {
 	cfg.JudgeRateLimitWindow = parseDuration("JUDGE_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalRateLimitMax = parseInt("PROPOSAL_RATE_LIMIT_MAX", 20)
 	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.HostedRateLimitMax = parseInt("HOSTED_RATE_LIMIT_MAX", 10)
+	cfg.HostedRateLimitWindow = parseDuration("HOSTED_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalConfirmStuckTimeout = parseDuration("PROPOSAL_CONFIRM_STUCK_TIMEOUT", 2*time.Minute)
 	// LOAD-BEARING ordering invariant (reviewer + auditor): the stuck-confirming sweep
 	// must NEVER revert a proposal to pending while a legitimately-slow CreateIssue is

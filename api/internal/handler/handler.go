@@ -247,8 +247,10 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot
 // hammer the upstream forge; slackDMLimiter is a tighter per-user budget on the
 // two Slack-DM-triggering /me/slack endpoints; judgeLimiter is a per-user budget
-// on the re-run-judge action (PRD #46), separate from chat's.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter *mw.Limiter) http.Handler {
+// on the re-run-judge action (PRD #46), separate from chat's; hostedLimiter is a
+// per-user budget on the two endpoints that churn cluster objects (PRD #58
+// Decision 8) — hosted provision and worker delete.
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -509,7 +511,30 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Route("/workers", func(r chi.Router) {
 				r.Post("/", h.CreateWorker)
 				r.Get("/", h.ListWorkers)
-				r.Delete("/{id}", h.DeleteWorker)
+
+				// Hosted workers (PRD #58). Static paths, matched ahead of /{id} — the
+				// shape /agent-templates/allocations uses above. A hosted worker IS a
+				// worker (M1's migration extends `workers` rather than shadowing it), so
+				// these belong in this group rather than a parallel /hosted-workers tree.
+				//
+				// Both routes exist regardless of WORKER_HOSTING_ENABLED, unlike the
+				// controller group: /hosted/config's entire job is to report that hosting
+				// is off, and provision answers a flag-off request with a 403 that the
+				// handler itself gates. That is the opposite trade from the controller
+				// endpoint, which does not exist when hosting is off precisely because an
+				// api holding no controller credential should expose no surface to probe
+				// for one.
+				r.With(hostedLimiter.PerUserMiddleware).Post("/hosted", h.ProvisionHostedWorker)
+				r.Get("/hosted/config", h.HostedConfig)
+
+				// The limiter covers BOTH kinds of worker: the middleware cannot see the
+				// row's kind, and the k8s-object churn Decision 8 wants bounded flows
+				// through this shared endpoint. Accepted deliberately (user-approved): it
+				// caps external-worker deletes at the same per-user budget, where there
+				// was none before. Nobody legitimately deletes 10 workers a minute, and a
+				// hosted-only delete route would duplicate Decision 11's refusal rule and
+				// drift from it.
+				r.With(hostedLimiter.PerUserMiddleware).Delete("/{id}", h.DeleteWorker)
 			})
 			r.Route("/runs", func(r chi.Router) {
 				r.Get("/", h.ListRuns)

@@ -21,6 +21,29 @@ var migrationFS embed.FS
 // registrations both see zero users and both become admin).
 const RegistrationLockKey int64 = 0x757A69 // "uzi"
 
+// HostedProvisionLockClass is the class half of the two-int advisory lock that
+// serializes one user's hosted-worker provisions (PRD #58 M2). Taken as
+// pg_advisory_xact_lock(HostedProvisionLockClass, objid), where objid is derived
+// from the user's uuid — so provisions serialize PER USER rather than globally,
+// which is the only difference from RegistrationLockKey above.
+//
+// It exists for the same reason, stated there: under READ COMMITTED two concurrent
+// transactions each count against their own snapshot, neither sees the other's
+// uncommitted row, and both pass a quota check that was true when each looked. The
+// lock is a mutex rather than a snapshot rule, so the second transaction's count
+// runs only after the first commits and therefore sees its row.
+//
+// Three properties worth knowing before touching this:
+//   - The TWO-int lock space is disjoint from the ONE-bigint space
+//     RegistrationLockKey uses, so the two can never collide despite both being
+//     "uz"-ish constants.
+//   - A uuid's first four bytes are random, so two users can collide on objid. That
+//     serializes two unrelated provisions for a moment: a contention non-event,
+//     never a correctness one.
+//   - It is an XACT lock: it releases on commit or rollback. There is no unlock
+//     path to forget and no way to leak it by returning early.
+const HostedProvisionLockClass int32 = 0x757A6877 // "uzhw"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

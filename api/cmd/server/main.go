@@ -449,6 +449,10 @@ func run() error {
 	// Per-worker budget on the propose_issue endpoint (PRD #39 M3): a proposal-spam
 	// guard complementing the per-run pending cap.
 	proposalLimiter := mw.NewLimiter(cfg.ProposalRateLimitMax, cfg.ProposalRateLimitWindow, cfg.TrustedProxies)
+	// Per-user budget on the cluster-object-churning endpoints (PRD #58 Decision 8):
+	// hosted provision and worker delete. Built unconditionally — it also covers
+	// external-worker deletes, which exist whether or not hosting is enabled.
+	hostedLimiter := mw.NewLimiter(cfg.HostedRateLimitMax, cfg.HostedRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// The settings PUT handler asks the poller to full-sync every repo when a label
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
@@ -508,7 +512,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter),
+		Handler:           h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

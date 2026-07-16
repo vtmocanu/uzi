@@ -78,6 +78,11 @@ const (
 	KeyHealthQueuedSeconds        = "health_queued_seconds"
 	KeyHealthApprovalSeconds      = "health_approval_seconds"
 	KeyHealthNudgeCooldownSeconds = "health_nudge_cooldown_seconds"
+	// Hosted-worker per-user quota (PRD #58 Decision 8): the single knob bounding
+	// self-service provisioning. An integer in {0} ∪ [1, maxHostedWorkerQuota],
+	// where 0 disables self-service entirely (the API then 403s a provision).
+	// Runtime-tunable from the Admin Settings page; no env var.
+	KeyHostedWorkerQuota = "hosted_worker_quota"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -115,6 +120,12 @@ const (
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
 	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
 	DefaultHealthNudgeCooldownSeconds = "1800" // 30m between Slack nudges per run
+	// PRD #58 Decision 8: two hosted workers per user by default. Hosting is itself
+	// off unless WORKER_HOSTING_ENABLED is set (the compose default), so this value
+	// only ever applies on a k8s deployment that deliberately turned hosting on —
+	// which is why a permissive-ish default is safe here and the flag, not this
+	// number, is the real "is this feature on" switch.
+	DefaultHostedWorkerQuota = "2"
 )
 
 // healthSecondsMin / healthSecondsMax bound the integer health settings (Decision
@@ -125,6 +136,14 @@ const (
 	healthSecondsMin = 60
 	healthSecondsMax = 86400
 )
+
+// maxHostedWorkerQuota bounds the per-user hosted-worker quota (PRD #58). Each
+// unit is a real pod plus its volumes, so the number an admin types spends cluster
+// capacity; the worker namespace's ResourceQuota is the actual backstop (Decision
+// 8) and this only catches a typo — an admin meaning 2 and typing 20 gets a
+// crowded namespace, one typing 200 gets a rejected write instead of a
+// ResourceQuota incident.
+const maxHostedWorkerQuota = 20
 
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
@@ -169,6 +188,13 @@ var Defaults = map[string]string{
 	KeyHealthQueuedSeconds:        DefaultHealthQueuedSeconds,
 	KeyHealthApprovalSeconds:      DefaultHealthApprovalSeconds,
 	KeyHealthNudgeCooldownSeconds: DefaultHealthNudgeCooldownSeconds,
+	// PRD #58 hosted-worker quota. Same no-seeded-row pattern, so All/AdminView
+	// surface it to the settings page on every instance — including compose ones,
+	// where hosting is off and the knob is inert. That is deliberate: gating its
+	// VISIBILITY on the flag would put a config-dependent branch in a pure map, and
+	// an inert knob is cheaper than a settings surface that changes shape with the
+	// deployment.
+	KeyHostedWorkerQuota: DefaultHostedWorkerQuota,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -543,6 +569,19 @@ func (c *Cache) HealthNudgeCooldownSeconds(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyHealthNudgeCooldownSeconds)
 }
 
+// HostedWorkerQuota returns the per-user hosted-worker quota (PRD #58 Decision 8);
+// 0 means self-service provisioning is disabled.
+//
+// Its caller (the provision handler) reads it STRICTLY — a non-nil error is a 500,
+// not a fallback — unlike the best-effort `v, _ :=` prdless reads. Those degrade
+// toward the safe side (an unlabeled issue stays gated); this one would degrade
+// toward provisioning against a number no admin chose, on a cold-cache blip. The
+// junk-tolerance inside intSetting still applies to a hand-edited row, which
+// Validate cannot reach retroactively.
+func (c *Cache) HostedWorkerQuota(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyHostedWorkerQuota)
+}
+
 // intSetting resolves an integer setting to its parsed value, falling back to the
 // compiled-in default when the effective value is absent or unparseable. Stored
 // values pass validateHealthSeconds at write time, so an unparseable value here is
@@ -715,6 +754,8 @@ func Validate(key, value string) error {
 	case KeyHealthStallSeconds, KeyHealthSlowSeconds, KeyHealthQueuedSeconds,
 		KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds:
 		return validateHealthSeconds(value)
+	case KeyHostedWorkerQuota:
+		return validateHostedWorkerQuota(value)
 	case KeyPublicBaseURL:
 		return ValidatePublicBaseURL(value)
 	case KeySlackBotToken:
@@ -814,6 +855,32 @@ func validateHealthSeconds(value string) error {
 	}
 	if n < healthSecondsMin || n > healthSecondsMax {
 		return fmt.Errorf("must be 0 (disabled) or between %d and %d seconds", healthSecondsMin, healthSecondsMax)
+	}
+	return nil
+}
+
+// validateHostedWorkerQuota is the write-time gate for the per-user hosted-worker
+// quota (PRD #58 Decision 8): a base-10 integer in {0} ∪ [1, maxHostedWorkerQuota],
+// where 0 is the documented "self-service disabled" value rather than a rejection.
+// Negatives and non-integers are refused.
+//
+// The explicit Validate case this backs is load-bearing, not decoration. Validate's
+// default branch falls through to ValidateLabel, which accepts any non-empty
+// ≤64-char string — so an integer key that is in Defaults but missing from the
+// switch would accept "abc", and intSetting would then silently fall back to the
+// compiled-in default on every read. An admin typing 0 to disable self-service
+// would be told it saved and would still get 2. An int setting must fail the WRITE,
+// which is the only moment a human is present to be told.
+func validateHostedWorkerQuota(value string) error {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New("must be a whole number of workers")
+	}
+	if n == 0 {
+		return nil
+	}
+	if n < 0 || n > maxHostedWorkerQuota {
+		return fmt.Errorf("must be 0 (self-service disabled) or between 1 and %d workers", maxHostedWorkerQuota)
 	}
 	return nil
 }
