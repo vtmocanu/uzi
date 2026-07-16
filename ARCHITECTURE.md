@@ -424,11 +424,14 @@ queued → claimed → running → awaiting_approval → running → completed
   behavior above, unchanged) that the worker advertises at registration but the
   server never enforces. A run parked at `awaiting_approval` holds its slot the
   whole time, same as any other non-terminal run. Cap>1 is an informed opt-in with
-  two accepted intra-user residuals (a same-uid sibling briefly reading a
-  push-window credential; Bash writes reaching outside a run's own worktree),
-  documented at the knob in [docs/worker-setup.md](docs/worker-setup.md#concurrent-runs);
-  the real fix — container-per-run — belongs to the future k8s-operator deployment
-  (see Not yet in scope, below).
+  one accepted intra-user residual (Bash writes reaching outside a run's own
+  worktree) — the sibling push-credential read is now closed by the PRD #51 uid
+  split on the root-started compose path (a sibling run's agent is the `runner` uid;
+  the push git child is the `worker` uid; a #58 single-uid start does not split) —
+  documented at the knob in
+  [docs/worker-setup.md](docs/worker-setup.md#concurrent-runs); the real fix for
+  the remaining one — container-per-run — belongs to the future k8s-operator
+  deployment (see Not yet in scope, below).
 
 ### Secrets: who holds what
 
@@ -458,10 +461,13 @@ defense-in-depth *on top of* this, not instead of it):
 
 This means "worker disk/agent env contain no PAT" (a Success Criterion) holds
 structurally, not by policy — the agent has no credential to push with in the
-first place. See [docs/proc-hardening.md](docs/proc-hardening.md) for the
-one honestly-open residual: a same-uid `/proc` read of a live git child's
-environment during the short push window, and the k8s uid-split design that
-closes it fully.
+first place. On the compose stack the untrusted surfaces (the SDK, the
+self-improve checks, the provision hooks, the runner clone's git) also run under
+a distinct, cap-less `runner` uid from the credential-holding `worker` (PRD #51),
+so a `runner` survivor cannot read the worker's join token or a live push-window
+git child's `/proc/environ` — the same-uid residual this used to name is **closed
+for the local path**. See [docs/proc-hardening.md](docs/proc-hardening.md) for the
+built mechanism and its (deferred) k8s cross-container mapping.
 
 ### Guardrail layers (the primary directive)
 

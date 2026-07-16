@@ -3,8 +3,9 @@
 # The `base` worker template (PRD #18): the minimal image every worker starts
 # from. Heavy/system-dependency variants (e.g. templates/jvm) FROM this same node
 # base and add layers on top; they MUST keep every guardrail-relevant layer here
-# intact (non-root `uzi` user, tini, no secrets). `docker compose` selects the
-# template via the WORKER_TEMPLATE build/compose var (default `base`).
+# intact (the PRD #51 worker/runner uid split + root-entry setpriv drop, tini, no
+# secrets). `docker compose` selects the template via the WORKER_TEMPLATE
+# build/compose var (default `base`).
 #
 # Unlike the api image (distroless), the worker CANNOT be distroless: M3's Claude
 # Agent SDK spawns a real Bash tool and the git flow needs git + coreutils. This
@@ -15,12 +16,28 @@ WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool (M3); tini as PID 1 so
 # SIGTERM reaches the worker and it shuts down cleanly. curl + xz + tar for the
-# pinned nix/devbox downloads below.
-RUN apk add --no-cache git bash tini curl xz tar
+# pinned nix/devbox downloads below. setpriv (util-linux) is the PRD #51 A1 drop
+# wrapper the root entrypoint uses to drop root -> worker keeping only
+# CAP_SETUID/SETGID ambient; the busybox setpriv applet CANNOT `--reuid`, so the
+# grep asserts the util-linux binary is the one on /bin/setpriv (fails the build
+# otherwise).
+RUN apk add --no-cache git bash tini curl xz tar setpriv \
+    && /bin/setpriv --help 2>&1 | grep -q -- --reuid
 
-# The non-root runtime user, created EARLY so the nix store can be chowned to it
-# below (the worker realizes packages as this user at run time).
-RUN addgroup -S uzi && adduser -S -G uzi -h /home/uzi uzi
+# Two runtime uids (PRD #51 A1). `worker` (uid 10001) holds the run credentials
+# (join token, forge PAT, Anthropic token) and does all credentialed work;
+# `runner` (uid 10002) is the distinct, cap-less uid the worker spawns the
+# untrusted code-execution surfaces under (M4). Numbered to match the k8s
+# remote-worker design intent (worker 10001 / runner 10002). `worker` joins group
+# `runner` so it can reach runner-group trees. Created EARLY so /nix + /data can be
+# chowned to them below; the entrypoint drops root -> worker at run time.
+RUN addgroup -g 10001 worker && adduser -u 10001 -G worker -h /home/worker -D worker \
+    && addgroup -g 10002 runner && adduser -u 10002 -G runner -h /home/runner -D runner \
+    && addgroup worker runner
+# The worker's HOME: the image default is /root (setpriv does not set HOME), so pin
+# a worker-owned home for the worker's git/npm metadata. Per-run SDK HOME is
+# overridden onto /data (buildSdkEnv) regardless.
+ENV HOME=/home/worker
 
 # --- PRD #18 M3/M4: nix + devbox for per-run tool provisioning ------------------
 # The worker installs a run's tier-1 tool packages with devbox (nix under the hood)
@@ -39,15 +56,18 @@ RUN addgroup -S uzi && adduser -S -G uzi -h /home/uzi uzi
 #
 # NOTE: the exact installer invocation + store ownership below are implemented per
 # the tester's B1/B2/B3 findings but are NOT built in this workspace — the tester
-# re-runs the live uzi-user provision + warm-start smoke against this image.
+# re-runs the live worker-user provision + warm-start smoke against this image.
 
 # TARGETARCH is auto-populated by buildkit (amd64 / arm64), so both templates build
 # natively on x86_64 AND Apple-Silicon/arm64 hosts. nix-installer uses the
 # GNU-triple arch (x86_64/aarch64); devbox uses the Go arch (amd64/arm64).
 ARG TARGETARCH
 
-# nix, single-user, installed as root then chowned to uzi (the lead-approved path)
-# so the non-root worker can realize packages without a daemon. Determinate
+# nix, single-user, installed as root then chowned to the worker (group `runner`,
+# the M4 forward hook) so the non-root worker can realize packages without a
+# daemon. The worker owns /nix (nix's owner check) and does all provisioning
+# pre-split; group-write for the runner is set up in M4 with a live nix test.
+# Determinate
 # nix-installer, pinned by release tag; `--init none` = no systemd (container),
 # sandbox off (can't nest in a build), flakes on (devbox needs them).
 ARG NIX_INSTALLER_VERSION=3.21.5
@@ -59,16 +79,16 @@ RUN NIX_ARCH="$(case "${TARGETARCH}" in amd64) echo x86_64 ;; arm64) echo aarch6
         --extra-conf "sandbox = false" \
         --extra-conf "experimental-features = nix-command flakes" \
     && rm -f /tmp/nix-installer \
-    && chown -R uzi:uzi /nix
+    && chown -R worker:runner /nix
 # Single-user runtime (no daemon in the container): empty NIX_REMOTE = direct store
-# access, and the default profile bin is on PATH so `nix` resolves for uzi. /sbin
+# access, and the default profile bin is on PATH so `nix` resolves for worker. /sbin
 # must remain on PATH — nix build tooling shells out to it (see provision.ts).
 ENV NIX_REMOTE=""
 ENV PATH="/nix/var/nix/profiles/default/bin:${PATH}"
 
 # devbox: the pinned release BINARY (not the self-updating launcher), verified
-# against the release's own checksums, installed mode 0755 so the non-owner uzi
-# user can exec it (the launcher shipped 0711 root-owned → "Permission denied").
+# against the release's own checksums, installed mode 0755 so a non-owner runtime
+# user (worker/runner) can exec it (the launcher shipped 0711 root-owned → "Permission denied").
 # The tarball is saved under its EXACT release filename so `sha256sum -c` (which
 # opens the filename named in checksums.txt) finds it.
 ARG DEVBOX_VERSION=0.17.5
@@ -102,8 +122,8 @@ COPY agent/src ./src
 # --- PRD #39 M2: bake uzi's own source, read-only, for the `chat` run kind --------
 # The chat agent answers questions about uzi itself from a read-only snapshot of the
 # repo baked here at build time — never a clone, no PAT, matched exactly to the
-# deployed image. Copied as root (the final USER is the non-root uzi) and never
-# chowned to uzi below, so the agent can read it but never mutate it. The context is
+# deployed image. Copied as root (the runtime worker/runner uids are non-root) and never
+# chowned below, so the agent can read it but never mutate it. The context is
 # the repo root and the per-Dockerfile Dockerfile.dockerignore hard-excludes .env*,
 # .git, inspiration/, node_modules and build artifacts — its patterns resolve
 # relative to the CONTEXT ROOT, which is why the compose build context is the root.
@@ -128,18 +148,29 @@ ENV UZI_DATA_DIR=/data
 # Soft signal only (observability, not security — a hostile worker can lie); the
 # join token stays the trust anchor.
 ENV UZI_WORKER_TEMPLATE=base
-RUN mkdir -p /data && chown -R uzi:uzi /app /data
+RUN mkdir -p /data && chown -R worker:worker /app /data
 # A ROOT-owned, non-writable (0555) empty dir the worker points git's core.hooksPath at
-# on every invocation (agent/src/git.ts, M10 audit). The uzi user cannot create a child
-# inside a root-owned 0555 dir, so a self_improve agent — which shares the worker uid
-# until the k8s uid-split — cannot plant a pre-push (or any) hook there. MUST be created
-# as root, BEFORE the USER line below. Each template bakes this stanza EXPLICITLY: jvm
-# builds from the same upstream node image, NOT `FROM base`, so it carries its own copy.
+# on every invocation (agent/src/git.ts, M10 audit). Neither the worker nor the runner
+# uid can create a child inside a root-owned 0555 dir, so no code-execution surface
+# (self_improve agent, SDK agent) can plant a pre-push (or any) hook there. MUST be
+# created as root; the image baseline stays root and the entrypoint drops later. Each
+# template bakes this stanza EXPLICITLY: jvm builds from the same upstream node image,
+# NOT `FROM base`, so it carries its own copy.
 RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
-USER uzi:uzi
+
+# PRD #51 A1: the image runs as ROOT and the entrypoint (a minimal root startup window
+# that migrates the persisted volumes to the worker uid and forces the join token to
+# 0400 worker) setpriv-drops to the unprivileged `worker` uid, keeping only
+# CAP_SETUID/CAP_SETGID (ambient) so the worker can spawn `runner`-uid children (M4).
+# There is deliberately NO `USER` line — the drop happens in the entrypoint, under
+# compose's cap_add + no-new-privileges. The script is shared by every template (copied
+# explicitly; jvm is NOT `FROM base`), root-owned 0755.
+COPY --chmod=0755 agent/templates/entrypoint.sh /usr/local/sbin/uzi-entrypoint
 # /data persists the clone cache + devbox/nix per-user metadata; /nix persists the
 # nix store (warm-start). Compose backs these with the agentdata + agentnix volumes.
 VOLUME ["/data", "/nix"]
 
-ENTRYPOINT ["/sbin/tini", "--"]
+# tini stays PID 1 (SIGTERM -> clean worker shutdown); the entrypoint execs it as the
+# dropped worker: uzi-entrypoint -> setpriv (drop) -> tini -> npm run start.
+ENTRYPOINT ["/usr/local/sbin/uzi-entrypoint"]
 CMD ["npm", "run", "start"]

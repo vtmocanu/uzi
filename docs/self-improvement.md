@@ -75,15 +75,14 @@ To gather the MR's test evidence, the worker runs the self-improvement change's
 scripts, `vite`/`tsc`/`go test`. That code runs in a scrubbed, credential-free
 environment: it cannot read the worker's forge token, its API URL, or the join
 token from its process environment, and `npm ci` runs with `--ignore-scripts`
-to remove the easiest code-execution path in. One residual remains for the MVP:
-the checks run under the same OS user as the worker, and the join-token file is
-readable at a fixed path by that user, so a hostile self-improvement change
-could in principle read it. The blast radius is bounded — that token grants the
-bot's Developer-role GitLab access (which cannot merge protected `main`) plus
-the enabling admin's own Anthropic token (which the run already uses). The
-structural fix — running the agent under a distinct OS user from the worker —
-is planned for the remote-worker phase. Until then, review a self-improvement
-MR the way you would any change from an autonomous author before merging.
+to remove the easiest code-execution path in. It also runs under a distinct,
+cap-less OS user (`runner`) from the credential-holding worker (PRD #51), so the
+join-token file — owned `0400` by the worker uid — is unreadable to it: a hostile
+self-improvement change's test code cannot read the worker's credentials at all.
+(A restricted-PodSecurity single-uid start has no such split; that is PRD #58's
+own accepted posture, with its cross-container close mapped in
+[proc-hardening.md](proc-hardening.md).) Even so, review a self-improvement MR
+the way you would any change from an autonomous author before merging.
 
 ## Inspecting a cycle
 

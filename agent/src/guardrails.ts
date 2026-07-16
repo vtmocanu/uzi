@@ -83,15 +83,14 @@ const REASON_UNKNOWN_SUBAGENT = "denied by guardrail: only the run's assembled s
 
 const MAX_DEPTH = 6;
 
-// The worker's join-token file is delivered under a Docker/k8s secret mount. A
-// read-only mount can't be unlinked, so the file persists and is same-uid
-// readable — and the file-tool jail only covers Read/Grep/Glob, not a Bash `cat`.
-// Deny any Bash reference to the secret-mount prefix (symmetric with the /proc
-// deny). Like the /proc Bash-deny this is a BAR-RAISE, not a complete close: a
-// script that reads the file, a shell-indirection primitive, or another read tool
-// can still reach a same-uid-readable file; the real close is the k8s uid split
-// (docs/proc-hardening.md). The specific UZI_WORKER_TOKEN_FILE path (if outside
-// this prefix) is added at the hook via `extraSecretPaths`.
+// The worker's join-token file is delivered under a Docker/k8s secret mount, forced
+// to 0400 worker-owned and persisted (not unlinked). Deny any Bash reference to the
+// secret-mount prefix (symmetric with the /proc deny). Under the PRD #51 A1 split the
+// agent runs as the cap-less `runner` uid and the file is worker-owned, so a `runner`
+// read is already denied by the UID BOUNDARY — this Bash deny is now defense-in-depth
+// there (and remains the primary bar-raise on a #58 single-uid start, where there is no
+// split; see docs/proc-hardening.md). The specific UZI_WORKER_TOKEN_FILE path (if
+// outside this prefix) is added at the hook via `extraSecretPaths`.
 const SECRET_PATH_PREFIXES = ["/run/secrets/"];
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
@@ -494,20 +493,17 @@ function extractToolPaths(toolInput: unknown): string[] {
  * (a Write target being created) keep the lexical check, so the function stays
  * pure for those and the unit suite can assert it without touching disk.
  *
- * Residual (documented, k8s-phase fix): this only guards the FILE tools. A Bash
- * `cat symlink/1/environ` still bypasses both this and the Bash `/proc/` string
- * guard, because worker and agent share a uid and /proc/<pid>/environ is
- * owner-readable. Two things are readable that way:
- *   - the WORKER's own environ, which holds the join token (redacted from every
- *     message; the PAT is never in the worker's persistent env); and
- *   - during the worker's git push/MR, the PAT lives in a git CHILD's env — but
- *     the executor group-kills the agent's subprocess tree BEFORE the push (B1,
- *     see sdk-executor.killAgentTree), so a normal survivor is already dead. A
- *     survivor that escaped into its OWN session (`setsid`) is not reached by
- *     killing the CLI's group and could still race that window.
- * The real structural close (different uid for the agent vs the worker's git
- * ops / userns / hidepid=2 / gVisor) belongs to the remote-worker phase; see the
- * header of docker-compose's agent service.
+ * Layering (PRD #51): this guards the FILE tools; a Bash `cat symlink/1/environ`
+ * would bypass both it and the Bash `/proc/` string guard. Under the A1 split that no
+ * longer reaches a secret — the agent runs as the cap-less `runner` uid, so the
+ * WORKER's own /proc/environ (join token) and, during the worker's git push/MR, the
+ * git CHILD's /proc/environ (PAT) — both 0400 worker-owned — are UNREADABLE to the
+ * runner. So this path guard and the Bash /proc deny are now defense-in-depth on the
+ * A1 path (they stay the primary bar-raise on a #58 single-uid start, where there is no
+ * split). B1 (the executor reaps the agent tree via a setpriv-to-runner kill BEFORE the
+ * push, sdk-executor.killAgentTree) remains a second layer against a `setsid`-escaped
+ * survivor. The cross-container k8s form (shareProcessNamespace:false / userns / gVisor)
+ * is mapped in docs/proc-hardening.md.
  */
 export function screenToolPath(
   candidate: string,

@@ -37,20 +37,22 @@ afterEach(() => {
 });
 
 describe("buildSdkEnv", () => {
-  it("contains only the OAuth token, HOME, and PATH (plus explicitly-unset ANTHROPIC_*)", () => {
+  it("contains only the OAuth token, HOME, PATH, TMPDIR (plus explicitly-unset ANTHROPIC_*)", () => {
     const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
 
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
     assert.strictEqual(env.HOME, HOME_DIR);
+    // The RUNNER PATH (PRD #51 M4): UZI_RUNNER_PATH under the split, else the worker's own
+    // PATH — unset here (single-uid), so it equals process.env.PATH.
     assert.strictEqual(env.PATH, process.env.PATH);
     assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
     assert.strictEqual(env.ANTHROPIC_AUTH_TOKEN, undefined);
 
-    // Exactly these five keys — no other worker env is spread in.
-    assert.deepStrictEqual(
-      new Set(Object.keys(env)),
-      new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]),
-    );
+    // Exactly the core keys (+ TMPDIR, the 5-bis per-uid scratch dir, when the ambient
+    // env has one) — no other WORKER env is spread in. TMPDIR is not a secret.
+    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+    if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
+    assert.deepStrictEqual(new Set(Object.keys(env)), expected);
   });
 
   it("never carries the join token or the bot PAT", () => {

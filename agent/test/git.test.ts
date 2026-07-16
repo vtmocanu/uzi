@@ -51,47 +51,89 @@ describe("ensureClone", () => {
   });
 });
 
-describe("worktree lifecycle", () => {
-  it("creates a worktree on agent/issue-N off the default branch", async () => {
-    const bare = await git.ensureClone(fx.originPath);
-    const wt = await git.createOrAttachWorktree(bare, 42);
+describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", () => {
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+  function refInBare(bare: string, ref: string): boolean {
+    try {
+      gitIn(bare, ["rev-parse", "--verify", "--quiet", ref]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
-    assert.strictEqual(wt.branch, "agent/issue-42");
-    assert.strictEqual(fs.existsSync(path.join(wt.path, "README.md")), true); // origin content checked out
-    // A worktree's .git is a file pointing at the shared repo, not a directory.
-    assert.strictEqual(fs.statSync(path.join(wt.path, ".git")).isFile(), true);
-    assert.match(gitIn(bare, ["rev-parse", "--verify", "refs/heads/agent/issue-42"]), /^[0-9a-f]{40}$/);
+  it("seeds a runner clone on agent/issue-N off the default branch (a real clone, not a worktree)", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 42);
+
+    assert.strictEqual(rc.branch, "agent/issue-42");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "README.md")), true); // origin content checked out
+    // A clone's .git is a DIRECTORY (its own object store), NOT a worktree pointer file.
+    assert.strictEqual(fs.statSync(path.join(rc.path, ".git")).isDirectory(), true);
+    // The branch lives in the CLONE; the worker bare is bare-only and does NOT get it.
+    assert.match(gitIn(rc.path, ["rev-parse", "--verify", "refs/heads/agent/issue-42"]), /^[0-9a-f]{40}$/);
+    assert.strictEqual(
+      refInBare(bare, "refs/heads/agent/issue-42"),
+      false,
+      "the agent branch must NOT appear in the worker bare's heads (worker is bare-only)",
+    );
   });
 
-  it("attaches to an existing agent/issue-N branch on a later run", async () => {
+  it("round-trips: commit in the clone → worker fetch-back → bare tree-diff → push to origin", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const first = await git.createOrAttachWorktree(bare, 7);
+    const rc = await git.createOrAttachRunnerClone(bare, 7);
 
-    // Advance the branch beyond the default so attach-vs-recreate is observable.
-    fs.writeFileSync(path.join(first.path, "EXTRA.txt"), "x");
-    gitIn(first.path, ["add", "EXTRA.txt"]);
-    gitIn(first.path, ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-m", "extra"]);
-    const advancedSha = gitIn(first.path, ["rev-parse", "HEAD"]);
+    // The agent commits in the runner clone (the only working tree).
+    fs.writeFileSync(path.join(rc.path, "NEW.txt"), "hi\n");
+    gitIn(rc.path, ["add", "NEW.txt"]);
+    gitIn(rc.path, [...IDENT, "commit", "-m", "work"]);
+    const agentSha = gitIn(rc.path, ["rev-parse", "HEAD"]);
 
-    await git.removeWorktree(bare, first.path);
-    const second = await git.createOrAttachWorktree(bare, 7);
+    // The worker fetches the agent branch BACK into a worker-side tracking ref.
+    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-7");
+    assert.strictEqual(ref, "refs/uzi-runner/agent/issue-7");
+    assert.strictEqual(gitIn(bare, ["rev-parse", ref]), agentSha, "fetch-back landed the agent commit in the worker bare");
+    // The fetched objects are now in the worker bare (push does not depend on the clone).
+    assert.strictEqual(gitIn(bare, ["cat-file", "-t", agentSha]), "commit");
 
-    assert.strictEqual(second.branch, "agent/issue-7");
-    assert.strictEqual(second.path, first.path);
-    // Attached to the advanced branch (has EXTRA.txt), not recreated off default.
-    assert.strictEqual(fs.existsSync(path.join(second.path, "EXTRA.txt")), true);
-    assert.strictEqual(gitIn(bare, ["rev-parse", "refs/heads/agent/issue-7"]), advancedSha);
+    // The worker-bare tree-diff sees the changed file (no working tree, --name-only).
+    assert.deepStrictEqual(await git.changedFiles(bare, ref), ["NEW.txt"]);
+
+    // pushBranch pushes FROM the tracking ref to origin's refs/heads/<branch>.
+    await git.pushBranch(bare, "agent/issue-7", "", fx.originPath);
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", "refs/heads/agent/issue-7"]), agentSha, "branch landed at origin");
   });
 
-  it("removes the worktree but keeps the bare clone and branch", async () => {
+  it("resumes off the branch's origin tip when it already exists at origin", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const wt = await git.createOrAttachWorktree(bare, 5);
+    // First cycle: commit + fetch-back + push agent/issue-9 to origin.
+    const first = await git.createOrAttachRunnerClone(bare, 9);
+    fs.writeFileSync(path.join(first.path, "A.txt"), "a\n");
+    gitIn(first.path, ["add", "A.txt"]);
+    gitIn(first.path, [...IDENT, "commit", "-m", "a"]);
+    const sha1 = gitIn(first.path, ["rev-parse", "HEAD"]);
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-9");
+    await git.pushBranch(bare, "agent/issue-9", "", fx.originPath);
+    await git.removeRunnerClone(first.path);
 
-    await git.removeWorktree(bare, wt.path);
+    // Refresh the bare so origin-tracking learns agent/issue-9, then reseed.
+    await git.ensureClone(fx.originPath);
+    const second = await git.createOrAttachRunnerClone(bare, 9);
 
-    assert.strictEqual(fs.existsSync(wt.path), false);
+    assert.strictEqual(second.branch, "agent/issue-9");
+    // Resumed off the fresh origin tip (A.txt present), NOT recreated off default.
+    assert.strictEqual(fs.existsSync(path.join(second.path, "A.txt")), true);
+    assert.strictEqual(gitIn(second.path, ["rev-parse", "HEAD"]), sha1);
+  });
+
+  it("removes the runner clone but keeps the worker bare clone", async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 5);
+
+    await git.removeRunnerClone(rc.path);
+
+    assert.strictEqual(fs.existsSync(rc.path), false);
     assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true);
-    assert.match(gitIn(bare, ["rev-parse", "--verify", "refs/heads/agent/issue-5"]), /^[0-9a-f]{40}$/);
   });
 });
 

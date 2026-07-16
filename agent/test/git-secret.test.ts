@@ -95,9 +95,12 @@ describe("pushBranch secret flow", () => {
 
     const { logger, lines } = recordingLogger();
     const git = new GitCache(fx.dataDir, logger);
-    // Clone + create the branch (without the shim, to keep the log focused on push).
+    // Seed the runner clone + fetch the branch back (without the shim, to keep the log
+    // focused on push). Under (b) pushBranch pushes FROM the worker-side tracking ref
+    // that fetchAgentBranch writes, so the fetch-back must run first.
     const bare = await git.ensureClone(fx.originPath);
-    await git.createOrAttachWorktree(bare, 7);
+    const rc = await git.createOrAttachRunnerClone(bare, 7);
+    await git.fetchAgentBranch(bare, rc.path, "agent/issue-7");
 
     const oldPath = process.env.PATH ?? "";
     process.env.PATH = shimDir + path.delimiter + oldPath;

@@ -14,13 +14,14 @@
 //   2. Only a synthesized packages-only devbox.json is used, written OUTSIDE the
 //      clone. A repo's own devbox.json (init_hook/scripts) is never executed here.
 //
-// RESIDUAL (not closed by the above, same class as the /proc note in
-// docker-compose.yml): the join-token FILE at /run/secrets/worker_token stays
-// same-uid readable, so a nix build hook running as the uzi user could read it —
-// a surface NOT behind the agent's PreToolUse deny-hook. Bounded in M4+ by the
-// admin allowlist (only vetted packages install, and their build hooks run in this
-// scrubbed env), but the structural close is the k8s uid-split (agent under a
-// DISTINCT uid from the worker), deferred to the remote-worker phase.
+// CLOSED for the local path (PRD #51 M4): the provision/nix build hooks now run under
+// the cap-less `runner` uid (via runnerCommand below), and the join-token FILE at
+// /run/secrets/worker_token is 0400 worker-owned, so a build hook can no longer read it
+// — the same-uid residual this used to name is gone on the A1 (root-started) path. The
+// admin allowlist still bounds WHICH packages install (their build hooks run in this
+// scrubbed env). On a #58 single-uid (non-root) start there is no split and the hook runs
+// as the sole uid (that PRD's accepted posture); the cross-container k8s form is mapped in
+// docs/proc-hardening.md.
 //
 // PATH assumption: nix/devbox tooling needs /sbin on PATH (e.g. Alpine's addgroup
 // lives there). The image PATH passed through by buildProvisionEnv includes it
@@ -36,6 +37,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Logger } from "./log.js";
 import { errMessage } from "./util.js";
+import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -86,7 +88,12 @@ const defaultRun = async (
   args: string[],
   opts: { cwd: string; env: NodeJS.ProcessEnv },
 ): Promise<RunResult> => {
-  const { stdout, stderr } = await execFileAsync(cmd, args, {
+  // PRD #51 M4: nix build hooks are arbitrary untrusted code, so run devbox/nix under
+  // the `runner` uid (setpriv wrapper), not the credential-holding worker. Single-uid
+  // (#58) runs it directly. The scrubbed provision env (buildProvisionEnv) is passed
+  // through unchanged.
+  const wrapped = runnerCommand(cmd, args);
+  const { stdout, stderr } = await execFileAsync(wrapped.command, wrapped.args, {
     cwd: opts.cwd,
     env: opts.env,
     // Provisioning can be slow on a cold nix store; bounded so a hung fetch fails
@@ -106,11 +113,16 @@ const defaultRun = async (
  */
 export function buildProvisionEnv(source: NodeJS.ProcessEnv, homeDir: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    // So `devbox`, `nix`, and `sh` resolve. PATH is not a secret.
-    PATH: source.PATH,
+    // So `devbox`, `nix`, and `sh` resolve. The RUNNER PATH (PRD #51 M4): the
+    // /nix-bearing image PATH under the split (provisioning runs as `runner`), NOT the
+    // worker's stripped PATH. Single-uid (#58): the worker's own PATH. Not a secret.
+    PATH: runnerPath(source),
     // nix single-user profile + devbox state live under this (data volume) HOME.
     HOME: homeDir,
   };
+  // 5-bis: nix/devbox scratch on the runner's private 0700 TMPDIR under the split.
+  const tmp = runnerTmpdir(source);
+  if (tmp) env.TMPDIR = tmp;
   // Pass through TLS trust only if the base image set it (needed to fetch from
   // substituters over HTTPS). Never invent it; never carry anything else.
   if (source.NIX_SSL_CERT_FILE) env.NIX_SSL_CERT_FILE = source.NIX_SSL_CERT_FILE;

@@ -31,8 +31,10 @@
 # Observable assertions: DB run-state transitions (via the API), gapless
 # run_messages seq, branch pushed to the remote, MR recorded by the fake GitLab,
 # NO secret (PAT / Anthropic token / worker join token) in container logs or on
-# the worker's disk, and — the M6 /proc hardening — the join token is absent from
-# every process's /proc/<pid>/environ and its delivery file was unlinked.
+# the worker's disk; the M6 /proc hardening — the join token is absent from every
+# process's /proc/<pid>/environ; and the PRD #51 M4/M5 uid split — the join token
+# secret is 0400 worker:worker, so the worker uid can read it but the runner uid
+# (which runs the untrusted agent/checks/provision) is DENIED.
 #
 # Everything tears down with `down -v`; the user's own `uzi` stack is never
 # touched (unique project name, project-scoped volumes, its own env-file).
@@ -115,8 +117,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-WTOKEN=""  # the worker join token, minted once and re-written before each start
-write_token() { mkdir -p "$RUNROOT/worker-secret"; printf '%s' "$WTOKEN" > "$RUNROOT/worker-secret/token"; }
+# The worker join token, minted once (after the API is up) then handed to every
+# `up`/recreate via the base compose `worker_token` Docker secret (env source
+# UZI_WORKER_TOKEN, exported below). The entrypoint hardens that secret to 0400
+# worker:worker on every start, so it persists read-only across restarts and the
+# runner uid cannot read it (PRD #51 M5) — no per-start file re-delivery needed.
+WTOKEN=""
 
 # --- api helpers (session cookie + CSRF, like scripts/smoke.sh) --------------
 csrf() { awk '$6=="uzi_csrf"{print $7}' "$JAR"; }
@@ -131,6 +137,31 @@ apiput()  { curl -fsS -b "$JAR" -X PUT "$BASE$1" -H 'Content-Type: application/j
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 apipatch() { curl -fsS -b "$JAR" -X PATCH "$BASE$1" -H 'Content-Type: application/json' \
   -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+# create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
+# `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use
+# race against the fast (2s) poller the PRD #24 MR-close phase leaves running: a board
+# reconcile that snapshotted the forge BEFORE the just-created issue can momentarily drop
+# it from the board cache, and the NEXT poll re-adds it. Bounded-retry ONLY that exact
+# 404; fail loudly on any OTHER status or a persistent 404 (never blanket-swallow 404s —
+# that would mask a real regression). Prints the run id on stdout; diagnostics to stderr.
+# e2e-only (prod polls at 24h, so this race cannot occur there). PRD #51 M6 hardening.
+create_run() {
+  local repo="$1" iid="$2" code out="$RUNROOT/.run-create.json"
+  for _ in 1 2 3 4 5 6; do
+    code="$(curl -sS -b "$JAR" -o "$out" -w '%{http_code}' -X POST "$BASE/api/repos/$repo/runs" \
+      -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "{\"issue_iid\":$iid}")"
+    case "$code" in
+      200|201) jq -r '.run.id' "$out"; return 0 ;;
+      404)
+        grep -q "issue not found on this repo's board" "$out" \
+          || { echo "create_run: non-transient 404 for issue #$iid: $(cat "$out")" >&2; return 1; }
+        sleep 1 ;;  # transient board-reconcile race; the next poll re-adds the issue
+      *) echo "create_run: HTTP $code for issue #$iid: $(cat "$out")" >&2; return 1 ;;
+    esac
+  done
+  echo "create_run: still transient-404 'issue not found on this repo's board' after 6 tries (issue #$iid)" >&2
+  return 1
+}
 # fresh_code METHOD PATH [BODY] — a non-admin (fresh user) request; prints only the
 # HTTP status (no -f), for authz assertions. CSRF from the fresh user's jar.
 fresh_code() {
@@ -320,7 +351,7 @@ wait_notes() {
 
 # =============================================================================
 say "provisioning scratch dir $RUNROOT (project $PROJECT, web $BASE, executor $EXECUTOR)"
-mkdir -p "$RUNROOT/certs" "$RUNROOT/worker-secret" "$RUNROOT/agent-gitconfig" "$RUNROOT/fakeremote" "$RUNROOT/forge-fake-state"
+mkdir -p "$RUNROOT/certs" "$RUNROOT/agent-gitconfig" "$RUNROOT/fakeremote" "$RUNROOT/forge-fake-state"
 chmod a+rwX "$RUNROOT/forge-fake-state"  # forge-fake persists its recorded state here (survives the restart)
 
 # Self-signed cert for forge-fake.e2e (trusted by api/worker/git in the overlay).
@@ -419,8 +450,10 @@ fi
 say "git remote mode: $GIT_MODE"
 
 # Per-run env-file: strong generated secrets for the base stack + the scratch dir
-# the overlay bind-mounts. UZI_WORKER_TOKEN is a placeholder that only satisfies
-# the base compose's `:?` guard — the real token is delivered via the file.
+# the overlay bind-mounts. UZI_WORKER_TOKEN is only a placeholder here (the worker is
+# not up yet); run-e2e.sh EXPORTS the real minted token before the agent starts, and a
+# shell export overrides the --env-file value for the `worker_token` secret source
+# (verified: compose ranks shell env above --env-file for an env-sourced secret).
 cat > "$ENVFILE" <<EOF
 E2E_RUN_DIR=$RUNROOT
 E2E_WEB_PORT=$WEB_PORT
@@ -538,7 +571,11 @@ pass "queued run transitioned to cancelled server-side"
 say "issue a worker join token and bring the worker online"
 WTOKEN="$(apipost /api/workers '{"name":"e2e-worker"}' | jq -r '.token')"
 [ -n "$WTOKEN" ] && [ "$WTOKEN" != null ] || fail "no worker token minted"
-write_token
+# Hand the minted token to the base `worker_token` Docker secret (env source). A shell
+# export overrides the --env-file placeholder and persists for every later `up` /
+# recreate / restart in this run, so no per-start re-delivery is needed. The entrypoint
+# hardens /run/secrets/worker_token to 0400 worker on each start.
+export UZI_WORKER_TOKEN="$WTOKEN"
 "${COMPOSE[@]}" up -d --wait agent
 wait_worker_online
 pass "worker registered and is online"
@@ -579,7 +616,8 @@ pass "PRD #37: run detected + reported the repo's .claude/agents/ roster (repo-c
 
 say "restart-resilience: down/up (keep volumes) while parked at the gate"
 "${COMPOSE[@]}" down                       # keeps the named volumes (pgdata, agentdata)
-write_token                                 # the worker unlinked its token file; restore it
+# No token re-delivery: the exported UZI_WORKER_TOKEN re-sources the `worker_token`
+# secret on the next `up`, and the entrypoint re-hardens it 0400 worker (PRD #51 M5).
 "${COMPOSE[@]}" up -d --wait db api web forge-fake
 wait_http
 login
@@ -683,19 +721,155 @@ for sec in "$WTOKEN" "$DUMMY_FORGE_PAT" "$DUMMY_ANTHROPIC"; do
 done
 pass "no secret on the worker's /data (bare clone cache, worktrees, sessions)"
 
-# /proc hardening (M6): the join token was delivered by file, not env, so it must
-# not appear in ANY process's environ; and its delivery file must have been
-# unlinked. The token is passed as argv (not env) so the probe can't self-match.
-"${COMPOSE[@]}" exec -T agent sh -c 'test ! -e /worker-secret/token' \
-  || fail "the worker-token file was not unlinked after read (/proc hardening)"
-ENV_HITS="$("${COMPOSE[@]}" exec -T agent sh -c '
+# /proc hardening (M6): the join token is delivered by file (the `worker_token` Docker
+# secret), not env, so it must not appear in any environ. Two NON-vacuous checks — the
+# earlier root-exec scan was partially vacuous (auditor M6): a root docker-exec lacks
+# in-container CAP_SYS_PTRACE, so it reads a cross-uid /proc/<pid>/environ as EMPTY and a
+# leak there would go unseen.
+#   (a) STRUCTURAL: the token must not be a CONFIGURED env var (image ENV / compose
+#       `environment:`) — the exact regression this guards. A fresh `exec … env` shows
+#       that configured env; assert the raw token value is absent (only …_FILE is set).
+"${COMPOSE[@]}" exec -T agent env 2>/dev/null | grep -qF -- "$WTOKEN" \
+  && fail "the join token appears in the worker's configured env — it must be file-delivered, not an env var"
+pass "/proc hardening (a): join token is NOT a configured env var (file-delivered only)"
+#   (b) RUNTIME: scan /proc environs AS THE WORKER uid (not root) so same-uid dumpable=1
+#       environs are GENUINELY read (a root scan cannot); the credential-holding worker
+#       node is dumpable=0 → its environ is unreadable even same-uid (a hardening), and the
+#       token is not there anyway. Token passed as argv so the probe can't self-match.
+ENV_HITS="$("${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid worker --regid worker --init-groups -- sh -c '
   n=0
   for e in /proc/[0-9]*/environ; do
-    tr "\0" "\n" < "$e" 2>/dev/null | grep -qF "$1" && n=$((n+1))
+    # 2>/dev/null BEFORE < "$e": the open of a dumpable=0 (unreadable) environ fails at the
+    # redirection, so fd 2 must already point at /dev/null or the error leaks to the log.
+    tr "\0" "\n" 2>/dev/null < "$e" | grep -qF "$1" && n=$((n+1))
   done
-  echo "$n"' _ "$WTOKEN")"
-[ "$ENV_HITS" = 0 ] || fail "the join token is present in $ENV_HITS process environ(s) — /proc leak NOT closed"
-pass "/proc hardening: join token absent from every process environ; delivery file unlinked"
+  echo "$n"' _ "$WTOKEN" | tr -d '\r')"
+[ "$ENV_HITS" = 0 ] || fail "the join token is present in $ENV_HITS worker-readable process environ(s) — /proc leak NOT closed"
+pass "/proc hardening (b): join token absent from every worker-readable process environ (worker-uid scan)"
+
+# PRD #51 M4/M5 uid boundary: the join-token secret is 0400 worker:worker, so ONLY the
+# worker uid may read it — the runner uid (which runs the untrusted agent/checks/
+# provision) is DENIED. This is the real containment; the reads below prove it is NOT
+# vacuous. `docker compose exec` enters as ROOT (no USER line), and root bypasses 0400,
+# so we DROP to each uid with setpriv (--init-groups for real supplementary groups) and
+# assert the runner FAILS and the worker SUCCEEDS — no `|| true` swallow.
+#
+# First, the split must genuinely be active (a silent fallback to the #58 single-uid
+# branch would collapse both uids into one and make the negative read pass vacuously).
+printf '%s' "$LOGS" | grep -qF "A1 uid-split active" \
+  || fail "the agent never logged 'A1 uid-split active' — the uid split did not engage (single-uid fallback would make the boundary vacuous)"
+[ "$("${COMPOSE[@]}" exec -T agent id -u worker | tr -d '\r')" = 10001 ] \
+  && [ "$("${COMPOSE[@]}" exec -T agent id -u runner | tr -d '\r')" = 10002 ] \
+  || fail "expected distinct worker(10001)/runner(10002) uids in the running agent"
+pass "PRD #51 uid split active: A1 root drop logged; distinct worker(10001)/runner(10002) uids"
+
+TOK=/run/secrets/worker_token
+if "${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid runner --regid runner --init-groups -- cat "$TOK" >/dev/null 2>&1; then
+  fail "the RUNNER uid could READ the worker join token ($TOK) — uid boundary NOT enforced"
+fi
+pass "PRD #51 uid boundary: runner uid is DENIED read of the worker join token"
+"${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid worker --regid worker --init-groups -- cat "$TOK" >/dev/null 2>&1 \
+  || fail "the WORKER uid could NOT read its own join token ($TOK) — over-tightened"
+pass "PRD #51 uid boundary: worker uid CAN read its own join token"
+TOKMODE="$("${COMPOSE[@]}" exec -T agent stat -c '%a %U %G' "$TOK" | tr -d '\r')"
+[ "$TOKMODE" = "400 worker worker" ] \
+  || fail "worker-token perms are '$TOKMODE', expected '400 worker worker' (a 0444/root regression would let the runner read it, making the boundary vacuous)"
+pass "PRD #51 uid boundary: worker-token secret is 0400 worker:worker (read denial is real)"
+
+# =============================================================================
+# PRD #51 M6 — uid-boundary REGRESSION assertions (image-level; every /proc read DROPS TO
+# A UID via setpriv, so it is NON-vacuous where a root docker-exec would be — a root exec
+# lacks in-container CAP_SYS_PTRACE and reads a cross-uid /proc/environ as EMPTY, auditor
+# M6). These lock the A1 containment so it cannot silently regress. The config-source /
+# packObjectsHook / commondir / env-scrub / distinct-TMPDIR-env / cap-clear-args invariants
+# ALSO have agent/test unit guards (git-hardening / sdk-env / self-improve / provision /
+# templates-guardrails / runner-uid); these are the LIVE-kernel half.
+say "PRD #51 M6: uid-boundary regression assertions (live image, setpriv-to-uid)"
+
+# The credential-holding worker node (uid 10001, runs src/main.ts): its /proc/<pid>/environ
+# would hold any leaked join token / PAT, and it stands in for the push git-child (same
+# 0400-owner boundary, uniform across worker processes).
+WPID="$("${COMPOSE[@]}" exec -T agent sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; u=$(awk "/^Uid:/{print \$2}" "$p/status" 2>/dev/null); c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$u:$c" in 10001:*node*main.ts*) echo "$pid"; break;; esac; done' | tr -d '\r')"
+[ -n "$WPID" ] || fail "M6: could not find the worker node process (uid 10001, src/main.ts)"
+
+# E1 — the RUNNER uid cannot read a WORKER process's /proc/<pid>/environ (the PAT-race
+# close: a runner survivor during the worker's push cannot read the PAT out of the push
+# git-child's environ). NON-vacuous control: as the SAME runner uid, that pid's world-
+# readable cmdline (0444) IS readable, so the environ denial is the 0400-owner permission,
+# not a dead/untraversable pid.
+"${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid runner --regid runner --init-groups -- sh -c "head -c1 /proc/$WPID/cmdline >/dev/null 2>&1" \
+  || fail "M6 E1 control: runner could not read the worker's world-readable /proc/$WPID/cmdline (pid not live/traversable)"
+if "${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid runner --regid runner --init-groups -- sh -c "head -c1 /proc/$WPID/environ >/dev/null 2>&1"; then
+  fail "M6 E1: the RUNNER uid could READ the worker's /proc/$WPID/environ — the PAT-race boundary is NOT enforced"
+fi
+pass "M6 E1: runner is DENIED the worker's /proc/environ (its cmdline IS readable → non-vacuous)"
+
+# E2 + E3 — a runner child spawned by a process that HOLDS ambient CAP_SETUID/SETGID (as
+# the real worker does) ends with EVERY capability set cleared (A1: a plain reuid would
+# leak ambient CAP_SETUID → the runner could climb back to worker/root), is a member of
+# ONLY group runner (never worker), and inherits only clean stdio (no leaked worker fds).
+# The two-hop reproduces the exact production drop: the entrypoint's worker drop (ambient
+# setuid/setgid) then runner-uid.ts's setpriv args. BODY stays simple (grep + echo); the
+# outer shell parses.
+PROBE="$("${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid worker --regid worker --init-groups --bounding-set -all,+setuid,+setgid --inh-caps -all,+setuid,+setgid --ambient-caps -all,+setuid,+setgid -- /bin/setpriv --reuid runner --regid runner --init-groups --bounding-set -all --inh-caps -all --ambient-caps -all -- sh -c 'grep -E "^Cap(Inh|Prm|Eff|Amb):" /proc/self/status; echo "MAXFD=$(ls /proc/self/fd | sort -n | tail -1)"; echo "RUID=$(id -u)"; echo "RGROUPS=$(id -G)"' | tr -d '\r' || true)"
+for cap in CapInh CapPrm CapEff CapAmb; do
+  v="$(printf '%s\n' "$PROBE" | grep "^$cap:" | tr -d '[:space:]')"
+  [ "$v" = "$cap:0000000000000000" ] || fail "M6 E2: runner child $cap not fully cleared (ambient cap leak?): got '$v' | probe: $PROBE"
+done
+[ "$(printf '%s\n' "$PROBE" | sed -n 's/^RUID=//p')" = 10002 ] || fail "M6 E2: runner child uid != 10002: $PROBE"
+if printf '%s\n' "$PROBE" | sed -n 's/^RGROUPS=//p' | grep -qw 10001; then
+  fail "M6 E3: runner child is a member of the worker group (10001) — group boundary leak: $PROBE"
+fi
+pass "M6 E2: runner child CapInh/Prm/Eff/Amb all zero, uid 10002, not in the worker group (ambient CAP_SETUID cleared → no climb-back)"
+MAXFD="$(printf '%s\n' "$PROBE" | sed -n 's/^MAXFD=//p')"
+{ [ -n "$MAXFD" ] && [ "$MAXFD" -le 3 ]; } 2>/dev/null \
+  || fail "M6 E3: runner child leaked an fd > 3 (only stdio {0,1,2} + the transient readdir fd expected): MAXFD='$MAXFD' | probe: $PROBE"
+pass "M6 E3: runner child /proc/self/fd is only {0,1,2}+the readdir fd (no leaked worker fds)"
+
+# E4 — the worker node has no Node inspector debug port: no --inspect in its argv AND no
+# listener on the inspector port (9229). A debug port would expose the worker's memory
+# (which holds the decrypted PAT) to anything that can reach it — and NODE_OPTIONS=--inspect
+# would NOT show in argv, so the port listener check is what catches that.
+if "${COMPOSE[@]}" exec -T agent sh -c "tr '\0' '\n' < /proc/$WPID/cmdline | grep -q -- --inspect"; then
+  fail "M6 E4: the worker node process was started with --inspect (debug port exposed)"
+fi
+# Presence belt (reviewer M6 follow-up): the listener check is non-vacuous only while
+# `netstat` exists in the image; a future slim-down dropping it would make the grep
+# below silently pass. Fail loudly if it's gone (then switch to /proc/net/tcp).
+"${COMPOSE[@]}" exec -T agent sh -c 'command -v netstat >/dev/null 2>&1' \
+  || fail "M6 E4: netstat is absent in the image — the inspector-port check would be vacuous; switch it to /proc/net/tcp (:240D)"
+if "${COMPOSE[@]}" exec -T agent sh -c "netstat -tlnp 2>/dev/null | grep -qE ':9229([^0-9]|$)'"; then
+  fail "M6 E4: something is listening on the Node inspector port 9229 (debug port exposed)"
+fi
+pass "M6 E4: worker node has no --inspect flag and no inspector-port (9229) listener"
+
+# E5 — worker and runner have DISTINCT 0700 TMPDIRs (5-bis); each is owner-only, so neither
+# uid can read the other's scratch (git packs, lockfiles, node temp).
+TW="$("${COMPOSE[@]}" exec -T agent stat -c '%a %U' /tmp/uzi-worker | tr -d '\r')"
+TR="$("${COMPOSE[@]}" exec -T agent stat -c '%a %U' /tmp/uzi-runner | tr -d '\r')"
+[ "$TW" = "700 worker" ] || fail "M6 E5: /tmp/uzi-worker is '$TW', expected '700 worker'"
+[ "$TR" = "700 runner" ] || fail "M6 E5: /tmp/uzi-runner is '$TR', expected '700 runner'"
+if "${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid runner --regid runner --init-groups -- sh -c 'ls /tmp/uzi-worker >/dev/null 2>&1'; then
+  fail "M6 E5: the runner uid could list the worker's TMPDIR /tmp/uzi-worker (not owner-isolated)"
+fi
+if "${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid worker --regid worker --init-groups -- sh -c 'ls /tmp/uzi-runner >/dev/null 2>&1'; then
+  fail "M6 E5: the worker uid could list the runner's TMPDIR /tmp/uzi-runner (not owner-isolated)"
+fi
+pass "M6 E5: worker/runner TMPDIRs are distinct 0700 owner-only trees (neither reads the other's)"
+
+# E7 — a runner-planted repo-local uploadpack.packObjectsHook must NOT execute in a local
+# clone on the IMAGE's git (the protected-config gate: repo-local packObjectsHook is ignored
+# — B2 invariant 6; the git-hardening.test.ts unit guard runs on the host git, this is the
+# IMAGE git 2.54.0). Exercised as the runner uid.
+POH="$("${COMPOSE[@]}" exec -T agent /bin/setpriv --reuid runner --regid runner --init-groups -- sh -c '
+  d=$(mktemp -d) || exit 3
+  git init -q "$d/src" && git -C "$d/src" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q --allow-empty -m c || exit 3
+  git -C "$d/src" config uploadpack.packObjectsHook "touch $d/FIRED" || exit 3
+  git clone -q --no-local "file://$d/src" "$d/dst" >/dev/null 2>&1 || true
+  if [ -e "$d/FIRED" ]; then echo FIRED; else echo IGNORED; fi
+  rm -rf "$d"' | tr -d '\r' || true)"
+[ "$POH" = IGNORED ] || fail "M6 E7: a runner repo-local uploadpack.packObjectsHook FIRED on the image git (protected-config gate regressed): '$POH'"
+pass "M6 E7: repo-local uploadpack.packObjectsHook ignored on the image git 2.54.0 (protected-config gate holds)"
 
 # =============================================================================
 # PRD #33 — deliberate-stop signal: a live-poller plan reject carrying a VERBATIM
@@ -1656,7 +1830,11 @@ login   # fresh admin session re-unlocks the vault for the run claim
 IID_IL="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E interleave stream","description":"implements prds/43-intra-run-parallel-subagents.md UZI_STUB_INTERLEAVE"}' \
   | jq -r '.card.iid')"
-RUN_IL="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_IL}" | jq -r '.run.id')"
+# create_run (not apipost) hardens against the transient board-reconcile 404 here: this
+# create-issue → immediately-create-run sits under the fast (2s) poller the MR-close phase
+# leaves on, which occasionally drops the just-created issue from the board for one tick
+# (PRD #51 M6 — see the create_run comment). It still fails hard on any non-transient error.
+RUN_IL="$(create_run "$REPO_ID" "$IID_IL")" || fail "interleave run-create failed (non-transient; see stderr)"
 { [ -n "$RUN_IL" ] && [ "$RUN_IL" != null ]; } || fail "interleave run was not created"
 wait_status "$RUN_IL" awaiting_approval
 apipost "/api/runs/$RUN_IL/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
@@ -1754,10 +1932,9 @@ else
     || fail "could not enable group/repo2"
   pass "second repo group/repo2 enabled (id $REPO2_ID)"
 
-  # Recreate the one worker at cap 2. The token file was unlinked at its first
-  # start (/proc hardening), so restore it before the fresh container reads it.
+  # Recreate the one worker at cap 2. The exported UZI_WORKER_TOKEN still sources the
+  # `worker_token` secret, so the recreated container re-reads the same join token.
   printf 'UZI_E2E_MAX_CONCURRENT_RUNS=2\n' >> "$ENVFILE"
-  write_token
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
   # Wait for the NEW worker's registration to actually LAND its advertised cap —
   # not merely for `online`. The recreated container reuses the join token (same
@@ -1882,8 +2059,8 @@ else
   pass "sweeper marked the dead worker offline and re-queued BOTH runs (N=2)"
 
   # Restart the worker (same join token ⇒ same worker id): it re-claims both by
-  # affinity and drives them to completion.
-  write_token
+  # affinity and drives them to completion. The exported UZI_WORKER_TOKEN re-sources
+  # the `worker_token` secret; no token re-delivery is needed.
   "${COMPOSE[@]}" up -d --wait agent >/dev/null
   wait_worker_online
   wait_status "$RUN_KA" awaiting_approval 60
