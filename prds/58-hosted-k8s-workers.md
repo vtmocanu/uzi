@@ -107,8 +107,23 @@ Non-goals (v1):
    PodSecurity `restricted`; resources from the size preset;
    `imagePullSecrets` from chart values (same Harbor robot pattern as
    api/web). `strategy: Recreate` — RollingUpdate would Multi-Attach-deadlock
-   against the RWO PVC. When PRD #51's k8s phase lands, this pod is where its
-   two-container uid-split applies; nothing here may contradict that design.
+   against the RWO PVC. **v1 pod is single-container at `runAsUser: 10001`**
+   (PRD #51 M2's `worker` uid), **with no uid split.** PRD #51's A1 mechanism
+   (root entry + `setpriv` drop, retaining ambient `CAP_SETUID`/`CAP_SETGID`)
+   is the *compose* mechanism and cannot run under PodSecurity `restricted`,
+   which forbids a root entry and admits no capability beyond
+   `NET_BIND_SERVICE`. Per PRD #51's own Decision 8 ("align at the distinct-uid
+   abstraction, not the mechanism"), the k8s split is its (C)/two-container
+   form and lands with PRD #51's k8s phase, which *adds* the `runner` container
+   (uid 10002) to this pod — the v1 spec is additive-compatible with that, not
+   a placeholder to be rewritten. **Hard dependency on PRD #51 M2:** its
+   `agent/templates/entrypoint.sh` must skip the drop (and the B4 volume chown)
+   when started non-root, or this pod CrashLoopBackOffs at `setpriv --reuid`
+   (EPERM without `CAP_SETUID`). Requirement relayed 2026-07-16 while that file
+   was still uncommitted WIP. Posture disclosed: a hosted worker carries PRD
+   #51's same-uid residual exactly as today's compose worker does — hosting
+   neither widens it (the residual is intra-user, `ARCHITECTURE.md:427-428`)
+   nor closes it.
 7. **Worker type = template, size = built-in preset.** Type selects the
    published per-template agent image (`agent-base`, `agent-jvm`; tag = release,
    Model B like api/web); the deployed image's baked `UZI_WORKER_TEMPLATE` must
@@ -203,6 +218,9 @@ Non-goals (v1):
   documented in the threat model; rotation is v2.
 - **CNI may not express FQDN egress** — M3 verifies; fallback CIDR allowlist
   with the residual documented.
+- **PRD #51 M2's entrypoint must tolerate a non-root start** (Decision 6). If it
+  lands unconditional, M3's pod CrashLoopBackOffs at `setpriv --reuid`; fallback
+  is pinning a pre-#51-M2 agent image tag until the conditional lands.
 - **Per-template images multiply CI cost** — build list bounded by a CI
   variable.
 - **PVCs accrue cost** — deleted with the worker; orphan sweep flags leftovers.
@@ -223,3 +241,24 @@ Non-goals (v1):
   handoff (vault-bypass finding), ResourceQuota/LimitRange backstop, atomic
   quota, upgrade/drift semantics, template-drift invariant, cap=1 presets
   until PRD #51, M5 split across phases in the dependency table.
+- 2026-07-16: Cross-PRD collision with #51 settled (user). #51's M1 gate had
+  since settled mechanism **(A1)**: a root-entry `setpriv` drop needing ambient
+  `CAP_SETUID`/`CAP_SETGID`, with the `USER` line removed from both agent
+  Dockerfiles — structurally incompatible with Decision 6's PodSecurity
+  `restricted` namespace. Options weighed: **(a)** adopt #51's (C)/two-container
+  form now — rejected, it forces #51's deferred `sdk-executor.ts` IPC rebuild
+  (pid capture, `killAgentTree`, in-process abort → RPC) into this PRD's M3,
+  making a Medium-priority convenience feature block on the hardest part of a
+  security PRD, while the only work it saves is ~100 lines of chart YAML;
+  **(b)** relax the namespace to `baseline` + `cap_add` — rejected, it puts
+  `CAP_SETUID` in a pod on a shared cluster and drops the label that bounds a
+  compromised controller, for the sole pod that would need it; **(c)** chart
+  overrides `command:`/`runAsUser:` to bypass #51's wrapper from the pod spec —
+  rejected, it silently bypasses a security wrapper by duplicating the image's
+  CMD in YAML and drifts invisibly whenever #51 touches the entrypoint.
+  **Chosen:** v1 single-container at `runAsUser: 10001`, with a conditional
+  non-root start required of #51 M2 (relayed to that session the same day, while
+  its `entrypoint.sh` was still uncommitted WIP — cheapest possible moment, and
+  its file to own). The prior "nothing here may contradict that design" clause
+  was already false and is struck. Sequencing note: M1/M2/M4/M5/M6-CI need
+  nothing from #51; only M3 and M6-rollout depend on the image posture.
