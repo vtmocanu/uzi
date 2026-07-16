@@ -471,6 +471,7 @@ func run() error {
 			RedirectURL:  cfg.OIDCRedirectURL,
 			Scopes:       cfg.OIDCScopes,
 			HTTPTimeout:  cfg.OIDCHTTPTimeout,
+			GroupsClaim:  cfg.OIDCGroupsClaim,
 		})
 		warmCtx, cancelWarm := context.WithTimeout(ctx, cfg.OIDCHTTPTimeout)
 		if err := oidcProvider.Discover(warmCtx); err != nil {

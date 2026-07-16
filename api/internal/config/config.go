@@ -75,6 +75,23 @@ type Config struct {
 	// exchange), mirroring ForgeHTTPTimeout/SlackHTTPTimeout so a slow or unreachable
 	// IdP can never hang a request (audit L3).
 	OIDCHTTPTimeout time.Duration
+	// OIDCGroupsClaim is the ID-token claim name carrying the user's group
+	// membership (UZI_OIDC_GROUPS_CLAIM, default "groups"; PRD #55). Providers
+	// differ — Keycloak emits it via a group-membership mapper, Pocket ID via the
+	// `groups` scope. Only meaningful when OIDC is enabled; defaulted only then.
+	OIDCGroupsClaim string
+	// OIDCAdminGroups is the set of IdP group names whose membership grants
+	// is_admin on OIDC login (UZI_OIDC_ADMIN_GROUPS, comma-separated, trimmed,
+	// de-duped; PRD #55). Empty = the admin-by-group feature is off (first-OIDC-user
+	// -admin stays in effect). When set, membership is authoritative every login:
+	// leaving the group demotes on the next SSO login. Matching is exact and
+	// case-sensitive (Decision 2). The UZI_SEED_EMAIL admin is exempt from demotion.
+	OIDCAdminGroups []string
+	// OIDCAllowedGroups is the set of IdP group names required to SSO-login or
+	// JIT-provision at all (UZI_OIDC_ALLOWED_GROUPS, comma-separated, trimmed,
+	// de-duped; PRD #55). Empty = no gate (any verified IdP user may log in).
+	// Membership in any one is sufficient; matching is exact and case-sensitive.
+	OIDCAllowedGroups []string
 	// RateLimitMax is the request budget per window for auth endpoints.
 	RateLimitMax int
 	// RateLimitWindow is the fixed window for the rate limiter.
@@ -493,9 +510,24 @@ func loadOIDC(cfg *Config) error {
 	clientID := strings.TrimSpace(os.Getenv("UZI_OIDC_CLIENT_ID"))
 	clientSecret := strings.TrimSpace(os.Getenv("UZI_OIDC_CLIENT_SECRET"))
 
+	// Group-based role/access mapping (PRD #55). Parsed up-front so the "set while
+	// OIDC is off" guard (Decision 7) can fire in the fully-unconfigured branch.
+	// The group lists are comma-split, trimmed, de-duped, empties dropped (NOT
+	// lowercased — matching is exact and case-sensitive, Decision 2).
+	groupsClaim := strings.TrimSpace(os.Getenv("UZI_OIDC_GROUPS_CLAIM"))
+	adminGroups := parseCommaList(os.Getenv("UZI_OIDC_ADMIN_GROUPS"))
+	allowedGroups := parseCommaList(os.Getenv("UZI_OIDC_ALLOWED_GROUPS"))
+	groupVarsSet := groupsClaim != "" || len(adminGroups) > 0 || len(allowedGroups) > 0
+
 	if issuer == "" && clientID == "" && clientSecret == "" {
-		// OIDC fully unconfigured. The only remaining guard is the total-lockout
-		// check: with password login off too, nobody could ever authenticate.
+		// OIDC fully unconfigured. Group mapping is meaningless without it, so a set
+		// group var is a loud misconfiguration, not a silent no-op (Decision 7, same
+		// all-or-nothing posture as the issuer/id/secret triple below).
+		if groupVarsSet {
+			return fmt.Errorf("UZI_OIDC_GROUPS_CLAIM/UZI_OIDC_ADMIN_GROUPS/UZI_OIDC_ALLOWED_GROUPS require OIDC to be configured (set UZI_OIDC_ISSUER_URL/UZI_OIDC_CLIENT_ID/UZI_OIDC_CLIENT_SECRET)")
+		}
+		// The only remaining guard is the total-lockout check: with password login
+		// off too, nobody could ever authenticate.
 		if !pwEnabled {
 			return fmt.Errorf("UZI_PASSWORD_LOGIN_ENABLED=false requires OIDC to be configured (set UZI_OIDC_ISSUER_URL/UZI_OIDC_CLIENT_ID/UZI_OIDC_CLIENT_SECRET), else no one can log in")
 		}
@@ -515,6 +547,26 @@ func loadOIDC(cfg *Config) error {
 	cfg.OIDCProviderName = getenv("UZI_OIDC_PROVIDER_NAME", "SSO")
 	cfg.OIDCRedirectURL = strings.TrimRight(cfg.FrontendOrigin, "/") + "/api/auth/oidc/callback"
 	cfg.OIDCHTTPTimeout = parseDuration("UZI_OIDC_HTTP_TIMEOUT", 15*time.Second)
+
+	// Group mapping (PRD #55). Default the claim name; the group lists stay empty
+	// (feature dormant) unless configured.
+	cfg.OIDCGroupsClaim = groupsClaim
+	if cfg.OIDCGroupsClaim == "" {
+		cfg.OIDCGroupsClaim = "groups"
+	}
+	cfg.OIDCAdminGroups = adminGroups
+	cfg.OIDCAllowedGroups = allowedGroups
+	// A doc-hint at boot when gating is active — deliberately NOT a "missing groups
+	// scope" warning (Decision 3: scopes are not auto-appended, and a scope-presence
+	// warning false-positives on every Keycloak deployment, which emits groups via a
+	// mapper and needs no `groups` scope). The runtime absent-claim warn (Decision 1,
+	// M2) is the real misconfig signal; this only points operators at the docs.
+	if len(cfg.OIDCAdminGroups) > 0 || len(cfg.OIDCAllowedGroups) > 0 {
+		slog.Info("OIDC group mapping active; ensure your IdP emits the configured groups claim in the ID token (Keycloak: a group-membership mapper with 'Add to ID token'; Pocket ID: add 'groups' to UZI_OIDC_SCOPES). See docs/oidc.md",
+			"groups_claim", cfg.OIDCGroupsClaim,
+			"admin_gating", len(cfg.OIDCAdminGroups) > 0,
+			"allowed_gating", len(cfg.OIDCAllowedGroups) > 0)
+	}
 	return nil
 }
 

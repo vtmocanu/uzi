@@ -55,6 +55,12 @@ services:
       UZI_OIDC_SCOPES: ${UZI_OIDC_SCOPES:-openid profile email}
       UZI_OIDC_PROVIDER_NAME: ${UZI_OIDC_PROVIDER_NAME:-SSO}
       UZI_OIDC_HTTP_TIMEOUT: ${UZI_OIDC_HTTP_TIMEOUT:-15s}
+      # Group-based roles/access (PRD #55). Non-secret; require OIDC configured
+      # above (setting any while OIDC is off refuses to start). Empty admin/allowed
+      # groups = feature dormant. Matching is exact + case-sensitive. See docs/oidc.md.
+      UZI_OIDC_GROUPS_CLAIM: ${UZI_OIDC_GROUPS_CLAIM:-groups}
+      UZI_OIDC_ADMIN_GROUPS: ${UZI_OIDC_ADMIN_GROUPS:-}
+      UZI_OIDC_ALLOWED_GROUPS: ${UZI_OIDC_ALLOWED_GROUPS:-}
       # Forge integration (PRD #2). Base URLs are an SSRF allowlist; the sync
       # engine polls each enabled repo on FORGE_POLL_INTERVAL.
       FORGE_ALLOWED_BASE_URLS: ${FORGE_ALLOWED_BASE_URLS:-https://gitlab.example.com}
