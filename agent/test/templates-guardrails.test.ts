@@ -104,6 +104,18 @@ describe("the shared root-entry drop wrapper", () => {
     assert.match(entrypoint, /PATH=\/usr\/local\/sbin:\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/sbin:\/bin/);
     assert.doesNotMatch(entrypoint, /PATH=[^\n]*\/nix/, "the root-window PATH must not contain /nix");
   });
+
+  it("tolerates a non-root start (PRD #58): single-uid exec precedes the setpriv drop", () => {
+    // A non-root start (k8s runAsUser: 10001, no addable caps) must skip the root
+    // window and exec tini directly — an unconditional `setpriv --reuid` would
+    // EPERM -> CrashLoopBackOff. The guard tests uid != 0 via an ABSOLUTE `id` path.
+    assert.match(entrypoint, /"\$ID"\s+-u.*!=\s*"0"|!=\s*"0"/, "must test for a non-root start (uid != 0)");
+    const nonrootExecAt = entrypoint.search(/exec\s+"\$TINI"\s+--\s+"\$@"/);
+    const setprivAt = entrypoint.search(/exec\s+"\$SETPRIV"/);
+    assert.ok(nonrootExecAt >= 0, "must exec tini directly on the non-root path");
+    assert.ok(setprivAt >= 0, "must setpriv-drop on the root path");
+    assert.ok(nonrootExecAt < setprivAt, "the non-root single-uid exec must come before the setpriv drop");
+  });
 });
 
 // The provisioning stack must be identical across templates (self-contained
