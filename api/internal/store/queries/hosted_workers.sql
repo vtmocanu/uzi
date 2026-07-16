@@ -28,39 +28,49 @@ LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
 WHERE w.kind = 'hosted'
 ORDER BY w.created_at ASC;
 
--- name: CreateHostedWorkerWithinQuota :one
--- Provision a hosted worker, but only if the user is under their quota (PRD #58
--- Decision 8). Zero rows returned IS the refusal — sqlc surfaces it as
--- pgx.ErrNoRows, which the handler maps to 409, the same "no row came back means
--- the guard said no" idiom ClaimRun uses in runtime.sql.
+-- name: CountHostedWorkersForUser :one
+-- The user's hosted-worker count, for the quota gate (PRD #58 Decision 8). HOSTED
+-- rows only: the quota bounds what the CLUSTER runs, and an external worker the
+-- user runs by hand on their own laptop costs us nothing.
 --
--- THIS WHERE CLAUSE IS NOT SELF-SUFFICIENT, AND DELETING THE CALLER'S ADVISORY LOCK
--- SILENTLY BREAKS IT. Under READ COMMITTED (the pool's isolation level) two
--- concurrent provisions each evaluate this subselect against their own snapshot;
--- neither sees the other's uncommitted INSERT; both find count < quota; both insert;
--- the user lands at quota+1. Nothing in this statement can fix that — not FOR UPDATE
--- (it locks rows that already exist and cannot fence a phantom row two transactions
--- are each about to add), and not a stricter predicate. The guard is correct ONLY
--- because the caller holds pg_advisory_xact_lock(HostedProvisionLockClass, <user>)
--- for the whole transaction, which makes the second counter wait for the first to
--- commit and then see its row. See store/migrate.go's HostedProvisionLockClass, and
--- handler/hosted_workers.go's provisionHostedWorker, which is the only caller.
+-- THIS IS A SNAPSHOT READ, AND IT IS MEANINGFUL ONLY UNDER THE LOCK ITS CALLER
+-- HOLDS. On its own it is a TOCTOU: READ COMMITTED takes no predicate locks, so two
+-- concurrent provisions both read N-1, both conclude they are under quota, and both
+-- insert — the user lands at quota+1. No rewrite of this statement fixes that. A
+-- guarded `INSERT … WHERE (SELECT count(*) …) < quota` has exactly the same hole
+-- (each subselect evaluates against its own snapshot) while LOOKING self-sufficient,
+-- which is why it was tried and dropped; FOR UPDATE cannot help either, since it
+-- locks rows that exist and the rows that would break the invariant do not exist
+-- yet.
 --
--- The PRD's own Decision 8 wording ("atomic (guarded insert under the same
--- transaction, no TOCTOU)") describes this statement alone and is, on its own,
--- insufficient — recorded here because it reads as if the WHERE were the mechanism.
--- The lock is the mechanism; the WHERE is how the lock's holder decides.
+-- What makes it correct is that its only caller — provisionHostedWorker in
+-- handler/hosted_workers.go — holds
+-- pg_advisory_xact_lock(HostedProvisionLockClass, objid(user_id)) for the whole
+-- transaction, so a second provision's count runs only after the first commits and
+-- therefore sees its row. Measured, not assumed: with that lock removed, 8
+-- concurrent provisions all pass a quota of 2
+-- (TestProvisionHostedWorkerQuotaRaceLiveDB).
+--
+-- ListAppSettingsForUpdate above closes its own TOCTOU the analogous way. It can use
+-- a row lock because it validates the rows it locks; this one cannot, for the reason
+-- named above, which is exactly why the mechanism here is an advisory lock.
+--
+-- Uses idx_workers_user (00020_workers_runs.sql): an index scan filtering kind, not
+-- a scan of the hosted fleet.
+SELECT count(*) FROM workers WHERE user_id = @user_id AND kind = 'hosted';
+
+-- name: CreateHostedWorker :one
+-- Insert a hosted worker. Deliberately UNGUARDED: the quota decision belongs to the
+-- caller, which makes it under the advisory lock using the count above, so the whole
+-- safety property reads top-to-bottom in one Go function (the shape of
+-- createUserFirstAdmin in handler/auth.go) instead of being split half here and half
+-- there.
 --
 -- kind is hardcoded 'hosted' rather than parameterized: this query exists to create
--- hosted workers, and CreateWorker (runtime.sql) exists to create external ones. A
--- kind parameter would let a caller quota-check one kind while inserting another.
+-- hosted workers, and CreateWorker (runtime.sql) exists to create external ones.
 -- hosted_generation takes its column default (0); nothing in M2 bumps it.
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size)
-SELECT @user_id::uuid, @name::text, @token_hash::bytea, @template_declared::text,
-       'hosted', @hosted_size::text
-WHERE (
-    SELECT count(*) FROM workers WHERE user_id = @user_id AND kind = 'hosted'
-) < @quota::bigint
+VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size)
 RETURNING *;
 
 -- name: UpsertHostedWorkerToken :exec

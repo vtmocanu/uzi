@@ -78,14 +78,92 @@ func countHostedWorkers(ctx context.Context, t *testing.T, pool *pgxpool.Pool, u
 	return n
 }
 
-// THE test of this milestone. Decision 8 says quota enforcement is atomic with no
-// TOCTOU; this is the only thing in the suite that can tell whether that is true.
+// The deterministic proof that the real code takes THAT lock with THAT key inside
+// its transaction. Every other test in M2 passes whether or not the lock statement
+// exists — including the race test below, which is timing-dependent in principle.
+// This one is not: it works by contradiction. Hold the advisory lock for user u on a
+// separate connection, and a correct provisionHostedWorker MUST block. If it
+// completes anyway, the lock it takes is not this one — dropped, or keyed
+// differently.
 //
-// The guarded INSERT's WHERE is NOT sufficient by itself: under READ COMMITTED two
-// concurrent provisions each count against their own snapshot, neither sees the
-// other's uncommitted row, and both pass. The advisory lock is what serializes
-// them. Delete the lock from provisionHostedWorker and this test — and only this
-// test — goes red.
+// WHAT THIS TEST DOES NOT CATCH, stated precisely because the obvious reading is
+// wrong and a future reader will otherwise trust it too far: it does NOT catch the
+// lock being taken AFTER the count. That ordering still blocks here (the provision
+// counts, then waits on the lock, then proceeds), so this test passes while the
+// quota is entirely unprotected — the count would have been taken outside the
+// critical section. Verified by mutation, not reasoned: moving the lock below the
+// count leaves this test green and turns QuotaRaceLiveDB red (8 of 8 racers pass a
+// quota of 2).
+//
+// So the two tests divide the failure modes and NEITHER is redundant:
+//   - this one: the lock is missing or mis-keyed (the race test can, in principle,
+//     miss this by luck)
+//   - QuotaRaceLiveDB: the lock is present but in the wrong place (this test cannot
+//     see that at all)
+//
+// Delete either and one real defect ships silently.
+func TestProvisionHostedWorkerLockIsHeldLiveDB(t *testing.T) {
+	h, pool, _, _, userID := hostedLiveDB(t, "2")
+	ctx := context.Background()
+
+	// Hold the lock on our own connection, outside the handler.
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin holder tx: %v", err)
+	}
+	defer holder.Rollback(ctx) //nolint:errcheck // no-op after Commit
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
+		store.HostedProvisionLockClass, hostedProvisionLockObjID(userID)); err != nil {
+		t.Fatalf("take holder lock: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.provisionHostedWorker(ctx, userID, "blocked", "base", "m", 2)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("provisionHostedWorker completed (err=%v) while the per-user advisory lock was "+
+			"held by another transaction — it is not taking pg_advisory_xact_lock("+
+			"HostedProvisionLockClass, objid(user)) inside its tx, so the quota count is "+
+			"unserialized and the guard is decorative", err)
+	case <-time.After(500 * time.Millisecond):
+		// Correct: it is waiting on the lock.
+	}
+
+	// Release, and it must proceed.
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatalf("commit holder tx: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("provision after the lock was released: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("provisionHostedWorker never completed after the lock was released")
+	}
+	if n := countHostedWorkers(ctx, t, pool, userID); n != 1 {
+		t.Errorf("hosted workers = %d, want 1", n)
+	}
+}
+
+// THE headline test of this milestone. Decision 8 requires quota enforcement to be
+// atomic with no TOCTOU; this is what tells us whether it is.
+//
+// The count is a snapshot read and is NOT sufficient by itself: under READ COMMITTED
+// two concurrent provisions both read N-1, neither sees the other's uncommitted row,
+// and both insert. (A guarded `INSERT … WHERE count < quota` has exactly the same
+// hole — it was tried and dropped for reading as though it did not.) The advisory
+// lock is what serializes them. Measured, twice: with the lock removed, all 8 racers
+// below succeed against a quota of 2; with the lock merely moved BELOW the count,
+// the same thing happens, which is the defect only this test can see.
+//
+// Alone it could in principle pass by luck, which is why
+// TestProvisionHostedWorkerLockIsHeldLiveDB above exists — see its comment for how
+// the two split the failure modes.
 func TestProvisionHostedWorkerQuotaRaceLiveDB(t *testing.T) {
 	const quota = 2
 	const racers = 8
@@ -268,6 +346,20 @@ func TestDeleteHostedWorkerCascadesPendingTokenLiveDB(t *testing.T) {
 	}
 	if after != 0 {
 		t.Error("the worker's sealed join token outlived the worker — the FK cascade is gone")
+	}
+	// And it leaves the controller's desired state. The poll returns the fleet as a
+	// SET, so a vanished row IS the teardown cue (Decision 9/11) — there is no delete
+	// signal on the wire, which is exactly why this has to be asserted rather than
+	// assumed.
+	resp, err := hostedsvc.New(q, box).Poll(ctx)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	for _, dw := range resp.Workers {
+		if dw.ID == wkr.ID.String() {
+			t.Error("a deleted hosted worker is still in the controller's desired state — " +
+				"the controller would keep reconciling its Deployment forever")
+		}
 	}
 	// And it frees quota: delete + reprovision is v1's recovery for a stranded
 	// worker (there is no rotation endpoint), so it has to actually work.

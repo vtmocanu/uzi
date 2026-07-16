@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
@@ -31,9 +31,9 @@ import (
 // controller then observes the worker gone from its poll and tears the cluster
 // objects down.
 
-// errHostedQuotaExceeded is the guarded insert's refusal: the user is at their
-// hosted-worker quota. Zero rows back from CreateHostedWorkerWithinQuota (i.e.
-// pgx.ErrNoRows) is the only way this arises — see that query's comment.
+// errHostedQuotaExceeded is the quota refusal: the user already holds their full
+// allowance of hosted workers. Raised by provisionHostedWorker's count, under the
+// lock that makes that count trustworthy.
 var errHostedQuotaExceeded = errors.New("hosted worker quota exceeded")
 
 // ProvisionHostedWorker creates a hosted worker: a worker whose container the
@@ -153,8 +153,19 @@ func derivedHostedWorkerName(template, size string) string {
 	return fmt.Sprintf("%s (%s)", template, strings.ToUpper(size))
 }
 
-// provisionHostedWorker is the provision transaction: lock, guarded insert, seal,
-// commit. It is the ONLY caller of CreateHostedWorkerWithinQuota.
+// provisionHostedWorker is the provision transaction: lock, count, insert, seal,
+// commit — in that order, and the order is the whole design.
+//
+// It is deliberately the same shape as createUserFirstAdmin (auth.go), which
+// solves the identical race: take pg_advisory_xact_lock as the transaction's first
+// statement, then do a count-then-insert that is only sound because the lock is
+// held. Under READ COMMITTED the count alone is a TOCTOU — two concurrent
+// provisions both read N-1 and both insert. The lock, not the count and not any
+// cleverness in the SQL, is the mechanism. An earlier draft pushed the check into a
+// guarded `INSERT … WHERE count < quota`; that was dropped because it has the same
+// hole while reading as though it closed it. Keeping the decision here, in Go,
+// means the safety property reads top-to-bottom in one function and the refusal can
+// name the real count.
 //
 // It returns (store.Worker, error) and NO TOKEN, deliberately. The plaintext's
 // entire lifetime is this function body, so the HTTP layer above literally cannot
@@ -178,14 +189,23 @@ func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, n
 
 	qtx := h.q.WithTx(tx)
 
-	// Serialize this USER's provisions. The guarded insert's WHERE is not atomic on
-	// its own under READ COMMITTED — two concurrent subselects would both see the
-	// pre-insert count — so this lock is what makes the count-then-insert race-free,
-	// exactly as registration's lock does for first-user-becomes-admin (auth.go).
-	// Held until the transaction ends; there is no unlock to forget.
+	// FIRST statement, before the count it protects. Serializes this USER's
+	// provisions (registration's lock is global; this one is keyed per user, the
+	// only difference). Held until the transaction ends; there is no unlock to
+	// forget. Move it below the count and the count is worthless again.
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
 		store.HostedProvisionLockClass, hostedProvisionLockObjID(userID)); err != nil {
 		return store.Worker{}, err
+	}
+
+	n, err := qtx.CountHostedWorkersForUser(ctx, userID)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	if n >= int64(quota) {
+		// Refuse before minting anything: no token is generated, so there is no
+		// plaintext to seal and nothing to roll back but the lock.
+		return store.Worker{}, fmt.Errorf("%w: holds %d of %d", errHostedQuotaExceeded, n, quota)
 	}
 
 	token, hash, err := jointoken.Generate()
@@ -193,19 +213,17 @@ func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, n
 		return store.Worker{}, err
 	}
 
-	wkr, err := qtx.CreateHostedWorkerWithinQuota(ctx, store.CreateHostedWorkerWithinQuotaParams{
+	// Both are non-empty by the gates above, and ck_workers_hosted_metadata requires
+	// them NOT NULL on a hosted row — hence Valid: true unconditionally, unlike
+	// CreateWorker's "empty → NULL" for an external worker's optional template.
+	wkr, err := qtx.CreateHostedWorker(ctx, store.CreateHostedWorkerParams{
 		UserID:           userID,
 		Name:             name,
 		TokenHash:        hash,
-		TemplateDeclared: template,
-		HostedSize:       size,
-		Quota:            int64(quota),
+		TemplateDeclared: pgtype.Text{String: template, Valid: true},
+		HostedSize:       pgtype.Text{String: size, Valid: true},
 	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// The guard refused: no row inserted, nothing sealed, tx rolls back.
-			return store.Worker{}, errHostedQuotaExceeded
-		}
 		return store.Worker{}, err
 	}
 
