@@ -717,6 +717,17 @@ model.
       volumes (B4). Note: this gate cannot be *independently* PoC'd — a real
       execution-uid process only exists after M4 (N3), so M2's read-denied check
       rides the M4 spawn path (or a manual `su` PoC).
+      **Gate additionally (PRD #58 consumer):** the entrypoint tolerates a
+      **non-root start** — a hosted-k8s consumer runs this SAME image in a
+      restricted-PodSecurity namespace (`runAsUser: 10001`, no `cap_add`), where an
+      unconditional `setpriv --reuid` would EPERM → CrashLoop. The root window
+      (B4 migration + token chmod + the A1 drop) is conditional on a root start
+      (`id -u == 0`); a non-root start runs **single-uid** (no root window, no
+      EPERM), which is #58 v1's accepted posture. The #51 uid-split containment
+      applies only on the root-started (compose/A1) path; the k8s split lands later
+      via (C)/two-containers (Decision 8). Verified: root start still drops to
+      `worker` with setuid/setgid-only caps + 0400 token; `--user 10001 --cap-drop
+      ALL` start runs single-uid, rc=0.
 - [ ] **M3 — Shared-volume ownership model ((b) SEPARATE-RUNNER-CLONE, worker
       BARE-ONLY — B2 SETTLED).** Give the runner its **own** clone/object store
       (working tree lives ONLY there; the worker stays bare-only); the agent checks
