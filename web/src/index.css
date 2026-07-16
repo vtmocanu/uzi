@@ -23,7 +23,10 @@
   --edge-strong: 58 66 86;
   --fg: 228 232 240;
   --muted: 148 158 176;
-  --faint: 100 110 130;
+  /* #7A859A, ~5.0:1 on the ember bg-surface card (PRD #54, Decision 5): app-wide
+     de-emphasised text (text-faint) must clear WCAG AA 4.5:1. Stays visibly
+     fainter than --muted (#949EB0, ~6.9:1). Also backs --syn-comment below. */
+  --faint: 122 133 154;
   --brand: 251 146 60;
   --brand-hover: 253 186 116;
   --on-brand: 26 16 8;
@@ -96,7 +99,11 @@
   --edge-strong: 71 85 105;
   --fg: 241 245 249;
   --muted: 148 163 184;
-  --faint: 100 116 139;
+  /* #74849B, ~4.95:1 on the mission bg-surface rgb(11,17,32) (PRD #54, Decision
+     5): slate-500 (#64748B) was sub-AA (~3.96:1). A lightened slate between
+     slate-500 and slate-400 that keeps the ramp's blue bias (b−r=39), NOT the
+     ember grey. Also backs --syn-comment below. */
+  --faint: 116 132 155;
   --brand: 34 211 238;
   --brand-hover: 103 232 249;
   --on-brand: 2 6 23;
