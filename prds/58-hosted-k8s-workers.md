@@ -390,6 +390,20 @@ Non-goals (v1):
 12. **Feature-gated.** `WORKER_HOSTING_ENABLED` on the api (set by the chart);
     off (the compose default) the API reports hosting disabled and the UI hides
     everything hosted. Compose deployments are zero-diff.
+    - **"Hides everything hosted" means the provision AFFORDANCE, not a user's
+      existing rows** (M5, 2026-07-16). The literal reading collides with itself: a
+      hosted worker still exists whether or not the flag is on, and hiding its row
+      strands something the user owns and must be able to delete. So the flag hides
+      the provision card; hosted **rows stay visible, stay badged, and stay
+      deletable**, and the badge follows `workers.kind` alone — it never consults the
+      flag. Note the two readings are **indistinguishable on the deployment this
+      Decision exists to protect**: compose never had hosting on, so no row is ever
+      `kind='hosted'` and zero-diff holds automatically from `kind` alone. They
+      diverge only on an instance that provisioned hosted workers and *then* turned
+      hosting off — where badging is the more honest of the two, since an unbadged
+      hosted row reads as "a worker I forgot to start" and sends its owner looking
+      for a container they never ran. Same principle the quota-0 case already
+      establishes: **the affordance is gated; the rows are not.**
 
 ## Milestones
 
@@ -432,6 +446,56 @@ Non-goals (v1):
   dev-cluster; drift/orphan reconciliation per Decision 9. Success: fake-client
   tests assert rendered objects; a hosted worker on a kind cluster registers,
   goes online, and completes a stub run end to end.
+  - **Inherited from M2 — the size golden is INERT until M3 parses it, and M2
+    shipped it that way knowingly** (architect, 2026-07-16). M2 landed
+    `api/internal/hostedsvc/testdata/hosted_sizes.json` + the producer-side test
+    pinning `workersize.Names` against it. The consumer half is M3's:
+    `controller/internal/protocol` must read the same file and assert its own
+    preset table covers the set. The cross-tree read idiom already exists — the
+    wire golden's own test does
+    `filepath.Join("..","..","..","api","internal","hostedsvc","testdata", …)`.
+    **Until M3 does this, editing one module's size list and not the other is
+    silently legal**, which is the entire failure the golden exists to stop: the
+    api accepts a size the controller cannot resolve, the worker provisions, no pod
+    is ever rendered, and the row sits pending until its token expires — visible
+    only as a worker that never comes online (Decision 10's heartbeat), with the
+    cause invisible.
+  - **M3 must ALSO tolerate an unknown size at runtime — the golden cannot cover
+    this.** It catches dev-time drift, not deployment skew: api and controller are
+    separately-built images, so even under Model B's version pinning a rollout has a
+    window where an old controller polls a new api and sees a size its table lacks.
+    Log and skip that worker; never crash the reconcile (one unknown size must not
+    stall the whole fleet), never guess or substitute a pod spec.
+  - **Decision 9 and Decision 11 collide on a deleted worker's objects, and M3 owns
+    settling it — in design, not in the reconcile loop.** Decision 9 says
+    unrecognized `uzi-hw-*` objects are "flagged as orphans, never adopted";
+    Decision 11 says a deleted worker's objects are torn down. M2 ruled that delete
+    is the existing `DELETE /api/workers/{id}`: the row is deleted outright and
+    `hosted_worker_tokens` cascades away, so **a deleted worker simply leaves the
+    poll's fleet set — and its objects are, by Decision 9's own definition, exactly
+    an orphan.** The poll carries no signal distinguishing "deliberately deleted"
+    from "never recognized", and the two demand opposite responses. Note the shape
+    of the trap before reaching for the obvious fix: a tombstone/`deleted` state on
+    the wire means the api retains a row the delete just removed (a schema and
+    lifecycle change — who deletes the tombstone, and when?), while "tear down
+    anything not in desired state" makes orphan-flagging vacuous and hands a poll
+    blip fleet-wide teardown authority. Neither is obviously right; that is why it
+    is a design question.
+  - **The most likely thing to get backwards**: a `null` `join_token` in the poll
+    means "write no Secret for this worker" — **never** "this worker has no token".
+    Either a pod already proved it holds one (the cluster Secret is then the only
+    copy in existence) or the buffer expired unread. Never invent one, never clear
+    the existing Secret on account of it, never log it. M1's `protocol.go` says this
+    at length; it is repeated here because that file is not what M3 will be briefed
+    from.
+  - Smaller M2 facts M3 inherits: **delete is not gated on
+    `WORKER_HOSTING_ENABLED`** (provision is — a stack that provisioned workers then
+    turned hosting off must still be able to remove them, the same reasoning the
+    expiry sweep already uses); and **`hosted_generation` is 0 on every
+    M2-provisioned worker** (M2 ships no rotation path — user-confirmed
+    2026-07-16, v1 recovery is delete + reprovision), so M3's roll-on-drift
+    annotation is the generation's first consumer and the first thing that will ever
+    change it.
 - [ ] **M4 — TLS worker hop**: api TLS listener + cert wiring (cert-manager in
   the chart), controller and hosted workers on `https://`, docs for the cert
   values. Success: claim traffic on dev-cluster is TLS; plain-HTTP worker port
@@ -439,12 +503,147 @@ Non-goals (v1):
 - [ ] **M5 — Web UI**: Settings → Workers hosted section — provision dialog
   (type + size), hosted-marked rows, delete; hidden when hosting is disabled.
   Success: vitest coverage; web-ux review.
+  - **"Dialog" is an inline Card form, not a modal** (architect, 2026-07-16;
+    verified): there is **no modal primitive anywhere in `web/`** — no `Modal`, no
+    `role="dialog"`, no `<dialog>`. Taken literally the word would have M5 build
+    this codebase's first modal (focus trap, escape, `aria-modal`, scroll lock,
+    restore-focus) for one two-field form. The sibling affordance is twenty lines
+    away: "Register a worker" is an inline `<Card>` with a `<form>`. Read "dialog"
+    as loose language for the provision affordance and mirror the sibling.
+  - **Sizes ship as NAMES ONLY (S/M/L, no quantities); the display is deferred to
+    M6 — an accepted cost, not a design choice** (user decision, 2026-07-16).
+    **The architect recommended against it and that objection stands**: a user
+    choosing a size with no idea what it buys is choosing blind, and a size picker
+    is the one control in this feature whose whole job is to inform that choice.
+    It was accepted because the quantities are **unchosen rather than unwritten**
+    (see M6), and the alternative — M5 inventing numbers that M3 then discovers —
+    is the silent-lie failure the whole question exists to prevent.
 - [ ] **M6 — CI + chart + rollout**: publish per-template agent images
   (`agent-base`, `agent-jvm`; templates listed in a CI variable to bound build
   cost) and the controller image on `v*` tags; chart adds controller
   Deployment, worker namespace + RBAC + quotas + policies, hosting values;
   ArgoCD rollout to dev-cluster. Success: a tagged release provisions a real
   hosted worker on dev-cluster that completes a run.
+  - **M6 inherits a debt from M5, and owes TWO things for it: picking the S/M/L
+    quantities, and landing the display.** M5 shipped names-only (above). The
+    quantities are not merely unwritten — **nobody has ever chosen them**: not this
+    PRD (Decision 7 names the *fields* — cpu, memory, and the volume sizes — but no
+    values), not `api/internal/workersize` (names only, deliberately), not the
+    controller. M3 must pick them to render pods at all, so M6 inherits whatever M3
+    lands; if M3 has not, M6 picks. Sizing a user's agent container is a **product
+    decision** — take it to the user, do not let it become an implementer's guess.
+    Constraints that make the question answerable rather than open-ended:
+    - All presets pin `WORKER_MAX_CONCURRENT_RUNS=1` until PRD #51 lands
+      (Decision 7), so a size buys headroom for **one** run, never parallelism.
+    - `/nix` is a real per-preset volume, not an afterthought (Decision 7): it exists
+      so tier-1 tool provisioning is a first-run-only internet fetch. Each preset
+      therefore sizes **two** volumes.
+    - The worker namespace's ResourceQuota + LimitRange (Decision 8) bounds them:
+      the presets must fit inside whatever budget dev-cluster ends up granting.
+    - Today's compose worker is what every user runs by hand right now — its real
+      footprint is the honest anchor for "M".
+    - **`DEFAULT_WORKER_SIZE = "s"` is the one size choice M5 made, and it was argued
+      from NAMES, not numbers** — deliberately, since the numbers did not exist. It is
+      the pre-selected option in the provision picker, so it is what most users will
+      actually get. Revisit it once real figures exist: the smallest preset is the
+      right default only if "S" can actually run a worker.
+  - **M6 also owes an answer to "why would a user ever pick S?" — and the quantities
+    do NOT answer it** (web-ux, 2026-07-16; verified). **The size picker is
+    structurally decorative, and landing the numbers will not fix that.**
+    - *The finding.* The quota is enforced as a **count of workers** —
+      `CountHostedWorkersForUser`, compared `n >= quota` (`handler/hosted_workers.go`).
+      So **S, M and L each cost exactly 1 of 2**. From the user's chair: I get 2
+      workers, there are three sizes, nobody tells me what they mean, and all three
+      cost the same. **The rational move is to pick L every time.** A user who picks S
+      is a user who did not think about it.
+    - *Why it outlives M6's numbers, which is the whole point.* Presets conserve
+      nothing unless users have a reason to pick smaller. Knowing "L = 4 CPU" fixes
+      the **informed** half and leaves the **incentive** half untouched — L still
+      costs the user nothing over S. So M6 can land every quantity and the picker
+      stays exactly as decorative as it is today. **The numbers are necessary and not
+      sufficient.**
+    - *The honest current state, stated because it is nobody's design.* **The S
+      default is load-bearing**: it is the only thing keeping most users off L, and it
+      works by **inattention**, not by informing anyone. And the only real "incentive"
+      that exists today is a commons failure — if everyone picks L the namespace
+      ResourceQuota (Decision 8) fills and *someone else's* worker stops scheduling,
+      invisibly, in a version with no pod-phase status. Whoever picks the numbers
+      inherits that.
+    - *Two levers, both bigger than M5, **user chose neither** (2026-07-16).*
+      **(a) A resource-weighted quota** (S=1, M=2, L=3 against a budget). Note for
+      whoever costs this: it does **not** reopen Decision 7 — a weight is a *quota
+      price*, not a pod-spec value, so `workersize` could carry `Weight(name)` without
+      the api learning a single quantity. What it does reopen is M2's landed
+      transaction (the count becomes a sum) and, more awkwardly, **the semantics of a
+      shipped admin setting**: `hosted_worker_quota: 2` would silently stop meaning
+      "2 workers" and start meaning "2 points", so the key name becomes a lie and
+      wants renaming. **(b) Offer no choice at all** — one size for everyone. This is
+      the lever that **dissolves the quantities debt too** (one size = one set of
+      numbers to pick and measure), and it is more reversible than it looks: `00066`
+      deliberately has no CHECK on `hosted_size`, so adding presets back later needs
+      no migration.
+    - *Scope note, applied to this PRD's own design.* Three presets that no user has
+      a reason to choose between is speculative generality. Decision 7 committed to
+      S/M/L before anyone noticed the quota made them free; that is worth re-deciding
+      in M6 rather than inheriting.
+    - *Sequencing.* Answer the incentive question **first** — it determines how many
+      number sets M6 needs. This does not strand the footprint measurements now in
+      flight: those measure **what a worker actually needs**, and presets are derived
+      from that, so they inform any of these answers equally.
+  - **The display mechanism is DESIGNED AND UNIMPLEMENTED. Implement it; do not
+    rediscover it** (architect, 2026-07-16). The quantities must reach the UI
+    **without** the api ever learning them — Decision 7 pins that the api sends the
+    preset NAME and that shipping resolved values would make it "the authority on a
+    pod spec it is not allowed to know anything about". Note that reading them from
+    the authority at runtime is **structurally impossible, not merely ugly**:
+    Decision 2 makes the controller outbound-only (it polls the api; the api never
+    dials it), so any such scheme needs the controller to *push* its table to the
+    api — new controller-authenticated write surface whose content the UI would then
+    display, with nothing to show before the first push. The specified design
+    instead:
+    - **`hosted_sizes.json` gains the quantities** — currently names-only, and it
+      stays that way until this lands. Shape: raw k8s quantity strings, never
+      pre-rendered prose (`{"name":"s","cpu":"…","memory":"…","data":"…","nix":"…"}`),
+      so both consumers assert structurally — the controller against
+      `resource.MustParse` values, the web rendering the strings verbatim. Prose is
+      where a lie hides.
+    - **The web keeps a hardcoded constant** (`workerSizes.ts`), exactly as
+      `web/src/lib/workerTemplates.ts` mirrors `workertmpl.Names`, and **a vitest
+      test reads the golden across the tree** to pin it. Not a new idiom:
+      `agent/test/claim-skills-contract.test.ts` already does this against an api
+      golden, and its comment blesses the move. **M5 already built this gate for the
+      size NAMES** (`web/src/lib/workerSizes.test.ts`) — M6 extends the existing test
+      with the quantities rather than creating it.
+    - **The cross-tree read is `import … from "…/hosted_sizes.json?raw"`, NOT
+      `node:fs`** (M5, 2026-07-16 — measured, not reasoned). The architect's design
+      specified `node:fs`, modelled on `agent/test/claim-skills-contract.test.ts`;
+      that **does not transplant**, because `agent/` is a Node project and `web/` is a
+      pure browser one with no `@types/node` — so `node:fs` fails `tsc --noEmit`
+      (TS2307), and adding `@types/node` would widen Node globals across every `src/`
+      typecheck for the sake of one test. `?raw` matches `vite/client`'s ambient
+      wildcard module declaration, so **tsc never resolves the path** while vitest
+      resolves it for real. Recorded because it is invisible until you try it, and
+      M6 would otherwise rediscover the TS2307 from scratch.
+    - **A shipped web source file may NEVER `import` the golden**: `web/Dockerfile`
+      copies `web/` and `docs/` only, so an import would build locally and **break
+      the image**. Test-only read. This is doubly why `?raw` is right: `tsc --noEmit`
+      runs over the test file *inside* the image build, where `api/` does not exist,
+      and the ambient wildcard is what lets it type-check clean there. **Proven, not
+      assumed** (M5): the build context was reconstructed (`web/` + `docs/`, no
+      `api/`) and the real `npm run build` run green inside it, and tsc was shown to
+      pass with a deliberately bogus `?raw` path — so the gate is genuinely invisible
+      to the compiler. The one honest cost: a typo'd path fails only when vitest
+      runs, never at compile time. CI runs vitest, so it is caught; a reader must
+      just not assume tsc has their back.
+    - **Decision 7 is not bent by any of this**: nothing on the wire carries
+      quantities, `workersize` stays names-only, and the controller remains the
+      authority that renders. The golden is a **build-time artifact, not a runtime
+      contract** — the drift gate is a test.
+    - Honest cost: three copies (web constant, golden, controller table) instead of
+      two. The golden buys only that they **cannot drift silently**. It does not
+      cover deployment skew (a released bundle showing last release's numbers) —
+      the same limit the name golden carries, and strictly less harmful here: a
+      stale label misinforms, a stale name strands a worker.
 - [ ] **M7 — Docs + specs**: new `docs/hosted-workers.md` (audience: user);
   updates to `worker-setup.md`, `configuration.md`, `admin-settings.md`,
   `vault-threat-model.md` (join-token-in-etcd residual), `ARCHITECTURE.md`
@@ -584,6 +783,84 @@ Non-goals (v1):
     their own asks retracted or overturned during the wave (the placeholder-guard ask
     was unsatisfiable: a sha256 is uniformly distributed regardless of preimage, so no
     entropy signal survives in it to check).
+- 2026-07-16: **Hosted worker sizes ship as names only; the quantities are deferred
+  to M6** (user). Raised by the architect at M5 design: the provision picker wants to
+  show what S/M/L *buy*, and **the numbers exist nowhere** — Decision 7 names the
+  fields (cpu, memory, the two volume sizes) but no values, `workersize` is
+  deliberately names-only, and the controller's table is unwritten. So the question
+  was never "where does the UI read them from" but "**nobody has chosen them**", and
+  choosing them is a product decision, not an implementer's.
+  - *Chosen*: M5 ships names only; M6 owes both the numbers and the display.
+  - *The architect's objection, preserved because it was overruled rather than
+    answered*: a user choosing a size with no idea what it buys is choosing blind,
+    and that is the size picker's entire job. This is an **accepted cost**, not a
+    design choice — M6 inherits a debt, not a blank.
+  - *Rejected — M5 invents the numbers and M3 matches them later*: that is the
+    silent-lie failure mode this whole question exists to prevent (the UI advertises
+    2 GiB while the controller renders 4, with nothing red anywhere).
+  - *The display mechanism is settled and specified in M6's bullet, unimplemented*:
+    the quantities ride `hosted_sizes.json` (a build-time golden, not the wire),
+    the web mirrors them in a constant, and a vitest test reads the golden across the
+    tree to pin it — so the api never learns them and Decision 7 stands unbent.
+    Reading them from the authority at runtime is structurally impossible: Decision 2
+    makes the controller outbound-only, so the api can never ask it anything.
+- 2026-07-16: **Admin-configurable S/M/L quantities proposed (user), and deferred to
+  v2 — where this PRD's own non-goals had already put it.** The user asked whether
+  S/M/L could be set from the admin webui rather than compiled in. The instinct is
+  sound and the need is real (clusters differ in capacity), and it is **already on
+  the roadmap**: the v1 non-goals say "no preset CRUD… all v2". Recorded here so it
+  is not re-litigated, and because the v2 implementer needs the coupling below.
+  - *It does not dissolve the open question it was raised against.* Even a
+    configurable preset needs a **default**, so somebody still picks S/M/L's initial
+    values (see M6). What it would remove is the display-drift *mechanism* — a
+    ~40-line golden + two tests — not the product decision.
+  - *Architecturally it inverts the authority*: the api would hold the quantities
+    and ship them on the poll, and the controller would render what it is told.
+    Decision 7 pins the opposite (the api sends the NAME; the controller resolves),
+    and that is the same pattern the **template** already follows — the api says
+    `jvm`, the controller resolves it to an image reference. The api sending
+    quantities is far less dangerous than the api sending an image, but it breaks
+    the one rule that makes the boundary checkable: *the api sends names, the
+    controller owns every mapping to a concrete pod-spec value.*
+  - *The decisive fork, and it is a real one — both prongs are bad.* An admin-typed
+    quantity must be validated somewhere. **(a) Validate in the api**: it cannot.
+    `k8s.io/apimachinery` is on `hostedsvc/no_kube_dependency_test.go`'s banned
+    module list, which exists to enforce Decision 1 — so validating means either
+    deleting a line from a tested guardrail for the sake of a display label, or
+    hand-rolling a k8s quantity parser (decimal/binary SI, milli-units, exponents)
+    whose subtle wrongness is worse than none. **(b) Skip api validation** and let
+    the controller parse defensively: then a fat-fingered `2GGi` is accepted by the
+    settings PUT with no feedback and the worker silently never appears — the M2
+    auditor's fail-open finding, upgraded from "a bad quota reverts to a default" to
+    "a bad quantity strands workers, with no error anywhere". That the api cannot
+    cleanly validate a quantity is not a tooling accident; it is the boundary saying
+    the api is the wrong owner. The controller validates trivially — it already
+    imports apimachinery. Responsibility belongs where the knowledge is.
+  - *Why v2 is the right home rather than a compromise.* v1 deliberately has **no
+    pod-phase status in the UI** (Decision 10: heartbeat-only, `kubectl` is the
+    diagnostic) — the same non-goal line that defers preset CRUD. So v1 is the worst
+    possible release in which to let an admin type resource values: the failure mode
+    of the feature lands exactly in the blind spot v1 accepted. The two v2 items are
+    **coupled, not merely co-scheduled** — pod-phase status is what shows the admin
+    why their preset produced no pod. Ship them together; doing either alone is what
+    would be wrong.
+  - *On the costs this would have removed* (three copies, a build-time golden, no
+    protection from deployment skew): those were recorded as honest costs, not as a
+    plea for a better mechanism. They are small, and a stale display label is the
+    mildest failure in this PRD.
+- 2026-07-16: **The design record moved into this PRD, because the working notes
+  were never in git** (architect + coder). The M2/M5 designs and the M3 carry-forward
+  were written to `.claude/agent-team-tasks/`, which **`.gitignore:27` deliberately
+  ignores** (`.claude/agents/` and `agent-team.md` are tracked, so the ignore is
+  considered, not an oversight) — they exist only inside the PRD worktree and die
+  when it is cleaned up after the merge. The coder declined to `git add -f` over a
+  deliberate ignore, correctly calling it a repo-convention decision rather than a
+  coder's. This repo already answers it: PRDs are the design rationale record. The
+  load-bearing consequence, and the reason this is logged rather than just fixed:
+  **M2's `hosted_sizes.json` is inert until M3 parses it**, and the only artifact
+  saying so was an ignored scratch file — had it evaporated, M2 would have shipped a
+  golden nobody knew M3 must consume, and the drift gate would silently never exist.
+  Its content now lives in the M3 bullet above.
 - 2026-07-16: **M6 directive, not a risk** (auditor). `randAlphaNum` re-renders on
   every `helm upgrade` and silently rotates a chart-generated credential unless
   anchored with `lookup` or a pre-created Secret — a real and well-known Helm gotcha,
