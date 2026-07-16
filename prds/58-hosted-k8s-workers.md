@@ -219,24 +219,89 @@ Non-goals (v1):
    the runner); the worker fetches the agent branch from the shared runner clone
    (`file://` + pack, the CVE-2022-39253-safe path). This is the compose→k8s
    mapping of the same rule: per-file ownership on one volume in #51's compose
-   A1 form becomes volume separation in the k8s (C) form. **Consequence for M3,
-   and a qualification of the additive claim above:** v1 is free to keep
-   `fsGroup: 10001` unchanged, but if M3 renders a single `/data` PVC holding
-   both the bare cache and the worktrees, then #51's k8s phase cannot simply add
-   a container — it must split a volume on live workers, i.e. a migration rather
-   than an addition. M3 should therefore render the two-volume topology up front
-   (worker-bare separate from the shared workspace) even though v1's single
-   container makes the split inert. Open sub-question for M3: whether the
-   worker-bare volume is a second PVC (persists the clone cache across restarts,
-   but doubles the per-worker PVC cost flagged in Risks) or an `emptyDir` (free,
-   but re-clones on every pod restart). #51 records the layout requirement in its
-   own M7 k8s-alignment gate.
+   A1 form becomes volume separation in the k8s (C) form. #51 records the layout
+   requirement in its own M7 k8s-alignment gate.
+   - **v1 renders ONE `/data` PVC. Do NOT pre-split the bare onto its own
+     volume** (architect, 2026-07-16, correcting an earlier over-reaction in this
+     PRD that told M3 to render the two-volume topology up front). Two independent
+     reasons, either sufficient. **(a) The bare repo is a pure cache, so there is
+     nothing to migrate**: `ensureClone` (`agent/src/git.ts`) is "clone the repo
+     bare if absent, else fetch to refresh", so the later split is a **cache
+     miss**, not a migration — the controller rolls the pod (Decision 9 already
+     gates rolls on the worker holding no non-terminal run), the worker finds an
+     empty bare path, re-clones from `gitlab.example.com` (LAN-local to
+     dev-cluster, so cheap), and carries on. No data moves and no user acts.
+     **(b) Pre-splitting is not inert — it needs an image contract that does not
+     exist**: `git.ts` derives *both* roots from a single `dataDir`
+     (`reposRoot = dataDir/repos`, `worktreesRoot = dataDir/worktrees`), so a
+     second volume does nothing unless `agent/` gains a bare-dir knob. M3 may not
+     touch `agent/` (that is #51's file and the collision Decision 6 exists to
+     have settled), so pre-splitting means mounting a volume nothing writes to,
+     guessing a path and env name #51 has not chosen. Deferring costs ~8 lines of
+     pod-spec rendering **in the very PR that is already editing the pod spec to
+     add the runner container** — same edit, same file, same review.
+   - **The additive claim survives, with one word sharpened.** "Additive" never
+     meant the pod spec never changes — #51's k8s phase edits it by definition;
+     that is where the runner container comes from. It means **no rewrite and no
+     data migration**: add a container, add a volume, one PR. The volume split
+     rides the container addition for free.
+   - **When the split lands: `emptyDir` for the bare, not a second PVC.** The
+     Multi-Attach worry does not apply (`strategy: Recreate` fully terminates the
+     old pod before the new one starts; that holds for N volumes exactly as for
+     one). It is a cache with a LAN-local source, so persistence buys a `fetch`
+     delta over a `clone` — seconds against seconds. `emptyDir` cannot be
+     orphaned, cannot fail to bind (a second PVC is a second way for a pod to sit
+     Pending forever), costs nothing, needs no sweep, and — decisively — dies with
+     the pod, which is what makes the v1→#51 transition free and leaves no stale
+     bare behind. Honest counter, recorded rather than hidden: Decision 9 rolls on
+     drift and the chart injects the release's image tag, so **every uzi release
+     rolls every hosted worker**, each re-cloning every repo it works; for a large
+     monorepo that is a repeated, visible cost. Start with `emptyDir` anyway —
+     **framework: it is a cache, so take the free option and let a *measured*
+     re-clone cost, not a prediction, buy the PVC.** The swap is itself one more
+     cache miss.
+   - **The bare volume must NEVER be mounted into the runner container, in any
+     mode, and `readOnly: true` is not an acceptable substitute** (it still
+     exposes the objects, and #51's threat is write). This looks like a redundant
+     belt next to the `fsGroup` pin and is not: **`fsGroup` is pod-level**, so it
+     recursively chgrps the private bare volume too and the runner holds
+     supplemental gid 10001 over it. The runner cannot touch the bare **solely
+     because it never mounts that volume** — the fence is mount-namespace
+     isolation, and the group bits offer no protection here whatsoever. If a
+     future reader adds that mount "for convenience", #51's B2 containment
+     silently evaporates and `fsGroup` hands them write access. Mount asymmetry is
+     the whole control: worker container mounts **both** the shared workspace and
+     its private bare (it fetches from the runner's clone into its bare, then
+     pushes bare→origin with the PAT); runner container mounts **the shared
+     workspace only**. Everything else about `file://`+pack is inside the image
+     and is #51's business.
+   - Minor handoff to #51, not a design requirement: after the split the legacy
+     `/data/repos/` sits orphaned on the shared volume — inert (the worker's
+     `reposRoot` is an absolute configured path and never resolves there, so a
+     planted `filter.*` can never fire), but wasted bytes the runner can write.
+     #51's k8s phase should remove a legacy repos dir on first boot under the new
+     layout, or consciously eat the bytes.
 7. **Worker type = template, size = built-in preset.** Type selects the
    published per-template agent image (`agent-base`, `agent-jvm`; tag = release,
    Model B like api/web); the deployed image's baked `UZI_WORKER_TEMPLATE` must
    equal the declared type, or the server would provision a worker that badges
-   its own template drift. Sizes are **code constants** (S/M/L: cpu, memory,
-   PVC size) — no CRUD. All presets pin `WORKER_MAX_CONCURRENT_RUNS=1` until
+   its own template drift. Sizes are **code constants** (S/M/L: cpu, memory, and
+   the volume sizes named below) — no CRUD.
+   - **The preset covers TWO volumes, not one** (architect, 2026-07-16; this
+     Decision previously said "PVC size", singular, which would have quietly cost
+     an internet fetch per worker per release). The compose worker has two for a
+     reason M3 inherits: `agentdata:/data` **and** `agentnix:/nix`. `/nix` is
+     separate precisely because the nix store is an expensive **internet** fetch
+     from `cache.nixos.org` (a first-run-only cost, PRD #18 M3 — the volume exists
+     for provisioning warm-starts), and Decision 5 explicitly allows
+     nix-substituter egress from the worker namespace, so hosted workers *do*
+     provision tools. If M3 renders only a `/data` PVC and lets `/nix` fall back
+     to the image's baked store, then **every roll — i.e. every release, since
+     Decision 9 rolls on image-tag drift — re-fetches tier-1 packages from the
+     internet, per worker.** That is exactly the cost class `agentnix` was created
+     to avoid. So M3's volume answers point opposite ways, for opposite reasons:
+     **persist `/nix`** (expensive, off-LAN, first-run-only), **do not persist the
+     bare** (cheap, LAN-local, a pure cache — see Decision 6). All presets pin `WORKER_MAX_CONCURRENT_RUNS=1` until
    PRD #51 lands: cap>1 would server-provision the documented intra-user
    concurrency residuals (`docs/worker-setup.md` §Concurrent runs). Type and
    size are validated server-side against the built-in lists; user input never
