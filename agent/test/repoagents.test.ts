@@ -358,45 +358,56 @@ describe("repo agents are structurally denied Agent by the assembly path", () =>
 });
 
 describe("repo agents: uzi's own .claude/agents", () => {
-  // The repo this worker package lives in ships the nine dev-team roles. Parsing
-  // them is the acceptance check for M1: real files, real frontmatter, real tools.
+  // A CANARY over real authored files: detectRepoAgents is a PRODUCT function that
+  // parses a user's cloned repo, and this borrows uzi's own `.claude/agents/` as
+  // the most convenient corpus of genuinely hand-written frontmatter. That is its
+  // whole value — the fixtures above are synthetic and prove the parser's rules;
+  // only this proves the rules hold against files a human actually wrote.
   //
-  // The roster below is hardcoded ON PURPOSE — it is a tripwire, not a
-  // convenience. Deriving it from the directory would make this test pass even if
-  // a role silently vanished, which is the one thing it exists to catch. The cost
-  // is that adding a role must update this file in the same commit.
+  // It therefore asserts PROPERTIES, never the roster. `.claude/agents/` is this
+  // repo's dev-team roster, which CLAUDE.md declares "decoupled — it is free to
+  // drift and product changes must never touch it"; it is a DIFFERENT set from the
+  // product's builtin roles in api/internal/agenttmpl/builtins/ (that one has
+  // `lead`, this one has `architect`/`web-ux`). A product test that pinned this
+  // roster by name would break every time the dev team gained a role — which is
+  // exactly what happened when `architect` landed. So the expectations below are
+  // derived from the directory, not hardcoded against it: the test tracks the
+  // roster instead of pinning it, and no count appears in the prose either.
+  //
+  // Naming a specific role here would also be redundant: the role-specific
+  // behaviours this used to assert live above, against controlled fixtures —
+  // inherit-all when no `tools:` key ("keeps a declared tools allowlist, and
+  // inherits when no tools key is present") and WebFetch/WebSearch survival
+  // ("strips the denylisted tools, keeps WebFetch/WebSearch and unknown names").
+  // Duplicating them here bought nothing and cost the coupling.
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-  it("detects all nine dev-team agents, WebFetch/WebSearch honored", async (t) => {
+  it("parses every real authored agent file cleanly, whatever the roster is", async (t) => {
     // Fail-not-skip when the checkout is present but the agents dir moved: skipping
     // silently would disarm this guard on a rename. CLAUDE.md is the stable anchor.
     if (!fs.existsSync(path.join(repoRoot, "CLAUDE.md"))) return t.skip("not in a source checkout");
     const agentsDir = path.join(repoRoot, ".claude", "agents");
     assert.ok(fs.existsSync(agentsDir), `checkout present but ${agentsDir} is missing — did .claude/agents move?`);
 
+    const onDisk = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
+    assert.ok(onDisk.length > 0, `${agentsDir} has no .md files — the corpus this canary reads is gone`);
+
     const { agents, notes } = await detectRepoAgents(repoRoot);
-    assert.deepEqual(
-      agents.map((a) => a.name),
-      ["architect", "auditor", "coder", "documenter", "fact-checker", "reviewer", "spec-keeper", "tester", "web-ux"],
-    );
-    assert.ok(agents.every((a) => a.description.length > 0 && a.prompt_body.trim().length > 0));
-    // `coder` declares no tools (inherit-all).
-    assert.equal(agents.find((a) => a.name === "coder")!.tools, undefined);
-    // WebFetch/WebSearch are now HONORED — the seven files that declare WebFetch
-    // keep it (everyone but coder, which inherits all, and spec-keeper), and both
-    // files that declare WebSearch keep it (architect and fact-checker). Only
-    // Agent/ScheduleWakeup/CronCreate would ever be stripped, and none of these
-    // declare those.
-    assert.ok(agents.find((a) => a.name === "reviewer")!.tools!.includes("WebFetch"));
-    assert.ok(agents.find((a) => a.name === "architect")!.tools!.includes("WebFetch"));
-    assert.ok(agents.find((a) => a.name === "fact-checker")!.tools!.includes("WebSearch"));
-    assert.ok(agents.find((a) => a.name === "architect")!.tools!.includes("WebSearch"));
-    assert.ok(agents.every((a) => !(a.tools ?? []).some((tool) => REPO_AGENT_DENIED_TOOLS.includes(tool))));
-    // The Claude Code team tools these files declare are unknown to the worker SDK:
-    // kept in the allowlist, silently unavailable — not a drop, not an error.
-    assert.ok(agents.find((a) => a.name === "reviewer")!.tools!.includes("SendMessage"));
-    // Nothing is stripped or skipped: the dev-team files declare no denied tool.
+
+    // EVERY authored file yields exactly one agent. This is the real canary: a file
+    // the parser chokes on would be missing here, whatever it is called. Deriving
+    // the count from the directory is what lets the roster drift freely while still
+    // catching a file that silently fails to parse.
+    assert.equal(agents.length, onDisk.length, `parsed ${agents.length} agents from ${onDisk.length} files in ${agentsDir}`);
+
+    // Nothing stripped, skipped, duplicated, or over-cap. This single assertion is
+    // also what proves WebFetch/WebSearch are honored for these files WITHOUT
+    // naming a role: a stripped tool would surface here as a `tools_filtered` note.
     assert.deepEqual(notes, [], JSON.stringify(notes));
+
+    // Properties that hold for any roster, of any size.
+    assert.ok(agents.every((a) => a.description.length > 0 && a.prompt_body.trim().length > 0));
+    assert.ok(agents.every((a) => !(a.tools ?? []).some((tool) => REPO_AGENT_DENIED_TOOLS.includes(tool))));
   });
 });
 
