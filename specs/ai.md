@@ -6184,9 +6184,16 @@ block records the load-bearing AI decisions.
   (`groupsIntersect`, `api/internal/handler/oidc.go`). No glob/regex/path-normalization; Keycloak's
   "Full group path" mapper option (leading `/`) must be off, or the operator sets the literal
   `/uzi-admins` in config — documented, keeps the matcher trivially auditable.
-- **All-or-nothing (Decision 7).** Any group var set while OIDC itself is unconfigured → refuse to
-  start (mirrors the PRD #45 issuer/id/secret-triple posture, §200). Empty lists = feature fully
-  dormant, zero behavior change, existing tests pass unchanged.
+- **All-or-nothing on the GATING vars (Decision 7).** Only a set **`UZI_OIDC_ADMIN_GROUPS`** or
+  **`UZI_OIDC_ALLOWED_GROUPS`** while OIDC itself is unconfigured → refuse to start (mirrors the PRD
+  #45 issuer/id/secret-triple posture, §200). **`UZI_OIDC_GROUPS_CLAIM` does NOT arm the guard**: it
+  is a format knob, inert without a gating group, and ships as a non-empty compose/`.env.example`
+  default (`groups`). Arming the guard on the claim name made a default password-login (no-OIDC) stack
+  refuse to boot — the M5 live-stack default-boot regression (fixed pre-merge; refines Decision 7).
+  Both gating lists empty = feature fully dormant, zero behavior change, existing tests pass unchanged.
+- **General regression principle (M5 review lesson):** any env var shipped as a non-empty
+  compose/`.env` default must NOT arm a refuse-to-start guard, or the zero-config stack breaks. Guards
+  belong on vars an operator opts into, never on ones that ship pre-set.
 - **Scopes are NOT auto-appended, and there is NO boot warning on a "missing `groups` scope".**
   Requesting an undefined scope is `invalid_scope` on strict IdPs (Keycloak), and Keycloak emits
   groups via a mapper (a client-scope concern), not a requested scope — so a scope-presence boot
