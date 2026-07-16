@@ -356,7 +356,7 @@ Non-goals (v1):
 
 ## Milestones
 
-- [ ] **M1 — Controller skeleton + protocol**: new `controller/` component
+- [x] **M1 — Controller skeleton + protocol** (landed 2026-07-16): new `controller/` component
   (Go, reuses api's module or its own — decide in M1), controller bearer auth,
   desired-state poll endpoint, delivered-once token handoff (Decision 3),
   migration extending `workers` with hosted metadata (kind, template, size,
