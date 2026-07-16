@@ -358,11 +358,16 @@ describe("repo agents are structurally denied Agent by the assembly path", () =>
 });
 
 describe("repo agents: uzi's own .claude/agents", () => {
-  // The repo this worker package lives in ships the eight dev-team roles. Parsing
+  // The repo this worker package lives in ships the nine dev-team roles. Parsing
   // them is the acceptance check for M1: real files, real frontmatter, real tools.
+  //
+  // The roster below is hardcoded ON PURPOSE — it is a tripwire, not a
+  // convenience. Deriving it from the directory would make this test pass even if
+  // a role silently vanished, which is the one thing it exists to catch. The cost
+  // is that adding a role must update this file in the same commit.
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-  it("detects all eight dev-team agents, WebFetch/WebSearch honored", async (t) => {
+  it("detects all nine dev-team agents, WebFetch/WebSearch honored", async (t) => {
     // Fail-not-skip when the checkout is present but the agents dir moved: skipping
     // silently would disarm this guard on a rename. CLAUDE.md is the stable anchor.
     if (!fs.existsSync(path.join(repoRoot, "CLAUDE.md"))) return t.skip("not in a source checkout");
@@ -372,16 +377,20 @@ describe("repo agents: uzi's own .claude/agents", () => {
     const { agents, notes } = await detectRepoAgents(repoRoot);
     assert.deepEqual(
       agents.map((a) => a.name),
-      ["auditor", "coder", "documenter", "fact-checker", "reviewer", "spec-keeper", "tester", "web-ux"],
+      ["architect", "auditor", "coder", "documenter", "fact-checker", "reviewer", "spec-keeper", "tester", "web-ux"],
     );
     assert.ok(agents.every((a) => a.description.length > 0 && a.prompt_body.trim().length > 0));
     // `coder` declares no tools (inherit-all).
     assert.equal(agents.find((a) => a.name === "coder")!.tools, undefined);
-    // WebFetch/WebSearch are now HONORED — the six files that declare WebFetch keep
-    // it, fact-checker keeps WebSearch. Only Agent/deferral would ever be stripped,
-    // and none of these declare those.
+    // WebFetch/WebSearch are now HONORED — the seven files that declare WebFetch
+    // keep it (everyone but coder, which inherits all, and spec-keeper), and both
+    // files that declare WebSearch keep it (architect and fact-checker). Only
+    // Agent/ScheduleWakeup/CronCreate would ever be stripped, and none of these
+    // declare those.
     assert.ok(agents.find((a) => a.name === "reviewer")!.tools!.includes("WebFetch"));
+    assert.ok(agents.find((a) => a.name === "architect")!.tools!.includes("WebFetch"));
     assert.ok(agents.find((a) => a.name === "fact-checker")!.tools!.includes("WebSearch"));
+    assert.ok(agents.find((a) => a.name === "architect")!.tools!.includes("WebSearch"));
     assert.ok(agents.every((a) => !(a.tools ?? []).some((tool) => REPO_AGENT_DENIED_TOOLS.includes(tool))));
     // The Claude Code team tools these files declare are unknown to the worker SDK:
     // kept in the allowlist, silently unavailable — not a drop, not an error.
