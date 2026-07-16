@@ -10,7 +10,7 @@
 // The whole card is hidden — never disabled-with-explanation — when hosting is off.
 // A user on an instance without hosting has no use for the concept (Decision 12).
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, type HostedConfig } from "../lib/api";
 import { Alert, Button, Card, Field, SectionTitle, Select } from "./ui";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES } from "../lib/workerTemplates";
@@ -31,6 +31,8 @@ export function HostedWorkers({
   const [size, setSize] = useState<string>(DEFAULT_WORKER_SIZE);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const noticeRef = useRef<HTMLDivElement>(null);
 
   // Fetched once, on mount, and never polled: enabled/quota are operator-set POLICY,
   // which changes on a deploy or an admin edit, not on the 10s liveness rhythm the
@@ -56,14 +58,18 @@ export function HostedWorkers({
   const provision = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
+    setNotice("");
     setBusy(true);
     try {
       // No token comes back and none is rendered — unlike createWorker on this page.
       // The controller collects a hosted worker's token from its poll; the user is
       // never in that path (Decision 3). Success is: the row shows up in the list.
-      await api.provisionHostedWorker(template, size);
+      const { worker } = await api.provisionHostedWorker(template, size);
       setTemplate(DEFAULT_WORKER_TEMPLATE);
       setSize(DEFAULT_WORKER_SIZE);
+      // The server's name, not a guess: it derives one from template + size when the
+      // form sends none, and naming the row is how the user finds it below.
+      setNotice(`Provisioned ${worker.name} — it appears in your workers below.`);
       await onProvisioned();
     } catch (err) {
       // The server's message is what the user reads, verbatim: it distinguishes the
@@ -75,6 +81,16 @@ export function HostedWorkers({
       setBusy(false);
     }
   };
+
+  // Provisioning is otherwise silent, and worse than silent for a keyboard user: the
+  // new row lands below the fold, and at quota the submit disables under the user's
+  // own focus, which dumps it to <body>. So move focus onto the confirmation. That is
+  // also what makes the announcement reliable — a live region inserted together with
+  // its text is not reliably read, whereas a focused element always is (Alert's
+  // role="status" still covers the mouse user who never had focus here).
+  useEffect(() => {
+    if (notice) noticeRef.current?.focus();
+  }, [notice]);
 
   // Nothing hosted renders until the config says so: not loaded, failed, or disabled
   // all look the same on purpose.
@@ -94,6 +110,12 @@ export function HostedWorkers({
     <Card className="space-y-4">
       <SectionTitle>Provision a hosted worker</SectionTitle>
       {error && <Alert message={error} />}
+      {notice && (
+        // tabIndex -1: focusable programmatically, never a tab stop of its own.
+        <div ref={noticeRef} tabIndex={-1} className="outline-none">
+          <Alert tone="success" message={notice} />
+        </div>
+      )}
       <form onSubmit={provision} className="flex flex-wrap items-end gap-3">
         <div className="min-w-[10rem]">
           <Field label="Template">

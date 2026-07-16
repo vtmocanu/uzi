@@ -156,6 +156,55 @@ describe("HostedWorkers provisioning", () => {
     expect(container.querySelector("code")).toBeNull();
   });
 
+  it("announces the provision and names the row the server created", async () => {
+    // Otherwise the flow completes in silence: the new row lands below the fold, the
+    // only visible change is a small muted counter, and the sibling createWorker flow
+    // twenty lines away answers with a prominent card. Naming the worker is how the
+    // user finds it in the list — and the name is the SERVER's, since the form sends
+    // none and the server derives one.
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2 });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    fireEvent.click(await provisionButton());
+
+    const msg = await screen.findByText(/Provisioned base \(M\)/);
+    // role="status" carries an implicit aria-live=polite, so a mouse user who never
+    // had focus here still gets it announced.
+    expect(msg.getAttribute("role")).toBe("status");
+  });
+
+  it("moves focus to the confirmation instead of dumping it on <body>", async () => {
+    // The at-quota case is the sharp one: the submit disables under the user's own
+    // focus, so without this a keyboard user presses Enter and lands at the top of the
+    // document with no idea anything happened. quota 1 + this provision reaches it.
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 1 });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    const { rerender } = render(<HostedWorkers hostedCount={0} onProvisioned={vi.fn()} />);
+
+    fireEvent.click(await provisionButton());
+    await screen.findByText(/Provisioned base \(M\)/);
+
+    // The page's count catches up and the submit disables — the moment focus would be lost.
+    rerender(<HostedWorkers hostedCount={1} onProvisioned={vi.fn()} />);
+    expect(screen.getByRole("button", { name: /provision/i }).hasAttribute("disabled")).toBe(true);
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement?.textContent).toMatch(/Provisioned base \(M\)/);
+  });
+
+  it("clears the last confirmation when a new provision starts", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 3 });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    fireEvent.click(await provisionButton());
+    await screen.findByText(/Provisioned base \(M\)/);
+
+    // A stale success sitting above a failed retry would be a lie.
+    mockApi.provisionHostedWorker.mockRejectedValue(new ApiError(429, "too many requests"));
+    fireEvent.click(await provisionButton());
+    expect(await screen.findByText("too many requests")).toBeTruthy();
+    expect(screen.queryByText(/Provisioned base \(M\)/)).toBeNull();
+  });
+
   it("defaults to the smallest size and the base template", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2 });
     mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
