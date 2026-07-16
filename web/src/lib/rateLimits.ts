@@ -56,6 +56,23 @@ function worstPct(limits: Extract<MyRateLimits, { status: "ok" }>): number {
   return Math.max(limits.five_hour.pct, limits.seven_day.pct);
 }
 
+export interface WorstWindow {
+  label: "5-hour" | "7-day";
+  pct: number;
+  resets_at: number | null;
+}
+
+// worstWindow names the more-utilized of the two windows (not just its pct — that
+// is worstPct) so the aria-live announcer (PRD #54) can say WHICH window drove a
+// tone crossing and read its countdown. Tie → 5-hour, the shorter and more urgent
+// window.
+export function worstWindow(limits: Extract<MyRateLimits, { status: "ok" }>): WorstWindow {
+  const { five_hour: five, seven_day: seven } = limits;
+  return seven.pct > five.pct
+    ? { label: "7-day", pct: seven.pct, resets_at: seven.resets_at }
+    : { label: "5-hour", pct: five.pct, resets_at: five.resets_at };
+}
+
 export function rowState(limits: MyRateLimits): RowState {
   if (limits.status === "no_token") return "no_token";
   if (limits.status === "unavailable") return "unavailable";

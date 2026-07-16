@@ -13,7 +13,7 @@ import { api, MOCK_MODE, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
 import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
-import { SidebarRateLimits } from "./RateLimitMeters";
+import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
 import {
   ActivityIcon,
@@ -480,6 +480,11 @@ export function AppShell({ children }: { children: ReactNode }) {
     // Width/padding are literal class strings in the ternary so Tailwind's JIT
     // emits both — an interpolated `lg:pl-${n}` would never be scanned.
     <div className={cx("min-h-screen", collapsed ? "lg:pl-14" : "lg:pl-60")}>
+      {/* App-wide screen-reader alert for rate-limit tone crossings (PRD #54,
+          Decision 4): a visually-hidden aria-live region mounted once so a
+          window crossing into warn/danger announces on any route, not only
+          while the Settings meters are on screen. */}
+      <RateLimitAnnouncer />
       {/* Desktop sidebar */}
       <aside
         className={cx(

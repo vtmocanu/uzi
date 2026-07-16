@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import { RateLimitCard, SidebarRateLimits } from "./RateLimitMeters";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { RateLimitAnnouncer, RateLimitCard, SidebarRateLimits } from "./RateLimitMeters";
 import { api, type MyRateLimits } from "../lib/api";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -138,5 +138,78 @@ describe("SidebarRateLimits", () => {
     const fills = screen.getAllByRole("progressbar").map((b) => b.firstChild as HTMLElement);
     expect(fills).toHaveLength(2);
     for (const fill of fills) expect(fill.className).toMatch(/opacity-40/);
+  });
+});
+
+describe("RateLimitAnnouncer (aria-live)", () => {
+  // Fake timers so we can advance the 60s poll and the 30s useNow clock and flush
+  // the mocked-fetch microtasks deterministically.
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  // flush advances the fake clock by ms and drains the fetch promises inside act.
+  const flush = (ms = 0) => act(async () => void (await vi.advanceTimersByTimeAsync(ms)));
+  const region = () => screen.getByRole("status").textContent;
+
+  it("announces once when the worst window steps ok → warn", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    render(<RateLimitAnnouncer />);
+    await flush(); // seed the ref at ok — first read never announces
+    expect(region()).toBe("");
+
+    mockApi.getMyRateLimits.mockResolvedValue(warnReading);
+    await flush(60_000); // 60s poll → warn (7d at 83%)
+    expect(region()).toMatch(/^7-day window at 83%, resets in /);
+  });
+
+  it("announces again when the tone steps warn → danger", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(warnReading);
+    render(<RateLimitAnnouncer />);
+    await flush(); // seed at warn, silent (first read)
+    expect(region()).toBe("");
+
+    mockApi.getMyRateLimits.mockResolvedValue(dangerReading);
+    await flush(60_000); // → danger (5h at 97%)
+    expect(region()).toMatch(/^5-hour window at 97%, resets in /);
+  });
+
+  it("stays silent on the first read even when already in danger", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(dangerReading);
+    render(<RateLimitAnnouncer />);
+    await flush();
+    expect(region()).toBe("");
+  });
+
+  it("stays silent when consecutive polls keep the same tone", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    render(<RateLimitAnnouncer />);
+    await flush(); // seed ok
+    await flush(60_000); // a second ok poll — no step up
+    expect(region()).toBe("");
+  });
+
+  it("does not re-announce on a bare 30s clock tick with no tone change", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    render(<RateLimitAnnouncer />);
+    await flush();
+    mockApi.getMyRateLimits.mockResolvedValue(warnReading);
+    await flush(60_000); // announce warn
+    const announced = region();
+    expect(announced).toMatch(/^7-day window at 83%/);
+    const calls = mockApi.getMyRateLimits.mock.calls.length;
+
+    await flush(30_000); // a useNow clock tick, no 60s poll
+    expect(mockApi.getMyRateLimits.mock.calls.length).toBe(calls); // no extra fetch
+    expect(region()).toBe(announced); // message unchanged, not re-fired
+  });
+
+  it("does not announce on a stale reading even at a danger pct", async () => {
+    const staleDanger: MyRateLimits = { ...staleReading, five_hour: { pct: 97, resets_at: null } };
+    mockApi.getMyRateLimits.mockResolvedValue(okReading);
+    render(<RateLimitAnnouncer />);
+    await flush(); // seed ok
+    mockApi.getMyRateLimits.mockResolvedValue(staleDanger);
+    await flush(60_000);
+    expect(region()).toBe("");
   });
 });
