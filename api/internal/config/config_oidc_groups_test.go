@@ -50,14 +50,14 @@ func TestOIDCGroupsUnsetWhenOIDCOff(t *testing.T) {
 	}
 }
 
-// TestOIDCGroupsRefuseWhenOIDCOff: any group var set while OIDC is unconfigured
-// refuses to start (Decision 7 all-or-nothing posture).
+// TestOIDCGroupsRefuseWhenOIDCOff: a GATING var (admin/allowed groups) set while OIDC
+// is unconfigured refuses to start (Decision 7 all-or-nothing posture). The claim-name
+// knob does NOT arm the guard — see TestOIDCGroupsClaimNameAloneDormantWhenOIDCOff.
 func TestOIDCGroupsRefuseWhenOIDCOff(t *testing.T) {
 	cases := map[string]map[string]string{
-		"groups claim only":   {"UZI_OIDC_GROUPS_CLAIM": "roles"},
 		"admin groups only":   {"UZI_OIDC_ADMIN_GROUPS": "uzi-admins"},
 		"allowed groups only": {"UZI_OIDC_ALLOWED_GROUPS": "uzi-users"},
-		"all three":           {"UZI_OIDC_GROUPS_CLAIM": "roles", "UZI_OIDC_ADMIN_GROUPS": "a", "UZI_OIDC_ALLOWED_GROUPS": "b"},
+		"gating + claim name": {"UZI_OIDC_GROUPS_CLAIM": "roles", "UZI_OIDC_ADMIN_GROUPS": "a", "UZI_OIDC_ALLOWED_GROUPS": "b"},
 	}
 	for name, env := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -66,7 +66,31 @@ func TestOIDCGroupsRefuseWhenOIDCOff(t *testing.T) {
 				t.Setenv(k, v)
 			}
 			if _, err := Load(); err == nil {
-				t.Errorf("Load() = nil error for group var set with OIDC off (%v), want refuse-to-start", env)
+				t.Errorf("Load() = nil error for gating var set with OIDC off (%v), want refuse-to-start", env)
+			}
+		})
+	}
+}
+
+// TestOIDCGroupsClaimNameAloneDormantWhenOIDCOff: UZI_OIDC_GROUPS_CLAIM is a format
+// knob that ships as a compose/.env.example default ("groups"); with OIDC off and no
+// gating groups it must boot clean and dormant, NOT trip the refuse-to-start guard —
+// otherwise the default password-login stack would refuse to boot (regression fix).
+func TestOIDCGroupsClaimNameAloneDormantWhenOIDCOff(t *testing.T) {
+	for _, claim := range []string{"groups", "roles"} {
+		t.Run(claim, func(t *testing.T) {
+			oidcBaseEnv(t)
+			t.Setenv("UZI_OIDC_GROUPS_CLAIM", claim)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() rejected a bare UZI_OIDC_GROUPS_CLAIM=%q with OIDC off: %v", claim, err)
+			}
+			// Dormant: OIDC off leaves nothing group-derived populated.
+			if cfg.OIDCGroupsClaim != "" {
+				t.Errorf("OIDCGroupsClaim = %q, want empty when OIDC off", cfg.OIDCGroupsClaim)
+			}
+			if len(cfg.OIDCAdminGroups) != 0 || len(cfg.OIDCAllowedGroups) != 0 {
+				t.Errorf("group lists populated with OIDC off: admin=%v allowed=%v", cfg.OIDCAdminGroups, cfg.OIDCAllowedGroups)
 			}
 		})
 	}

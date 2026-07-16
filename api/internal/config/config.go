@@ -517,14 +517,20 @@ func loadOIDC(cfg *Config) error {
 	groupsClaim := strings.TrimSpace(os.Getenv("UZI_OIDC_GROUPS_CLAIM"))
 	adminGroups := parseCommaList(os.Getenv("UZI_OIDC_ADMIN_GROUPS"))
 	allowedGroups := parseCommaList(os.Getenv("UZI_OIDC_ALLOWED_GROUPS"))
-	groupVarsSet := groupsClaim != "" || len(adminGroups) > 0 || len(allowedGroups) > 0
+	// Only the GATING vars arm the guard. UZI_OIDC_GROUPS_CLAIM is a format knob that
+	// is inert without an admin/allowed group AND ships as a compose default
+	// (docker-compose.yml / .env.example set it to "groups"), so a default password-
+	// login stack with no OIDC would trip a claim-name-aware guard and refuse to boot
+	// — breaking the "fully dormant when unset" criterion. Decision 7 is about the
+	// gating feature, not the claim name.
+	groupVarsSet := len(adminGroups) > 0 || len(allowedGroups) > 0
 
 	if issuer == "" && clientID == "" && clientSecret == "" {
-		// OIDC fully unconfigured. Group mapping is meaningless without it, so a set
-		// group var is a loud misconfiguration, not a silent no-op (Decision 7, same
-		// all-or-nothing posture as the issuer/id/secret triple below).
+		// OIDC fully unconfigured. Group gating is meaningless without it, so a set
+		// admin/allowed group is a loud misconfiguration, not a silent no-op (Decision
+		// 7, same all-or-nothing posture as the issuer/id/secret triple below).
 		if groupVarsSet {
-			return fmt.Errorf("UZI_OIDC_GROUPS_CLAIM/UZI_OIDC_ADMIN_GROUPS/UZI_OIDC_ALLOWED_GROUPS require OIDC to be configured (set UZI_OIDC_ISSUER_URL/UZI_OIDC_CLIENT_ID/UZI_OIDC_CLIENT_SECRET)")
+			return fmt.Errorf("UZI_OIDC_ADMIN_GROUPS/UZI_OIDC_ALLOWED_GROUPS require OIDC to be configured (set UZI_OIDC_ISSUER_URL/UZI_OIDC_CLIENT_ID/UZI_OIDC_CLIENT_SECRET)")
 		}
 		// The only remaining guard is the total-lockout check: with password login
 		// off too, nobody could ever authenticate.
