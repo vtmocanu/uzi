@@ -175,6 +175,30 @@ func (h *Handler) OIDCCallback(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (store.User, string) {
 	ctx := r.Context()
 
+	// 0. Allowlist gate (PRD #55 Decision 4.1) — FIRST, before any DB read or write, so
+	//    a rejected login never links a row, touches a deactivated row, or JIT-creates.
+	//    Fail-safe (Decision 1): reject ONLY when the gate is configured AND the claim
+	//    is present AND there is no intersection. An absent/unparseable claim lets an
+	//    EXISTING user pass here (they fail safe into their stored role); a brand-new
+	//    JIT user is still refused by the JIT-branch guard below. The reject reuses the
+	//    generic oidc_forbidden with detail in the server log only (no enumeration).
+	if len(h.cfg.OIDCAllowedGroups) > 0 && identity.GroupsClaimPresent &&
+		!groupsIntersect(h.cfg.OIDCAllowedGroups, identity.Groups) {
+		slog.Warn("oidc resolve: allowlist gate rejected login (no allowed-group membership)", "subject", identity.Subject)
+		return store.User{}, oidcErrForbidden
+	}
+
+	// Loud misconfig signal (PRD #55 Decision 1): group mapping is configured but the
+	// verified ID token carried no usable groups claim (mapper toggled off, renamed,
+	// or wrong shape). The login still proceeds under fail-safe semantics — existing
+	// users keep their stored role and pass the gate, a gated JIT user is refused
+	// below — but this warns per login so the operator notices until the claim is
+	// fixed. Only the configured claim NAME is logged (there are no claim contents).
+	if (len(h.cfg.OIDCAllowedGroups) > 0 || len(h.cfg.OIDCAdminGroups) > 0) && !identity.GroupsClaimPresent {
+		slog.Warn("oidc resolve: groups claim absent/unparseable while group mapping is configured; applying fail-safe (existing users keep role + pass gate; a gated new user is refused)",
+			"subject", identity.Subject, "groups_claim", h.cfg.OIDCGroupsClaim)
+	}
+
 	// 1. Stable (issuer, subject) identity → log in.
 	user, err := h.q.GetUserByOIDCSubject(ctx, store.GetUserByOIDCSubjectParams{
 		OidcIssuer:  pgtype.Text{String: identity.Issuer, Valid: true},
@@ -187,7 +211,7 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 		if addr, e := mail.ParseAddress(strings.TrimSpace(strings.ToLower(identity.Email))); e == nil && addr.Address != user.Email {
 			slog.Warn("oidc login: idp email drift detected (not auto-applied)", "user", user.ID, "subject", identity.Subject)
 		}
-		return h.oidcLoginExisting(ctx, user)
+		return h.oidcLoginExisting(ctx, user, identity)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Error("oidc resolve: get by subject", "error", err)
@@ -241,7 +265,7 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 			slog.Error("oidc resolve: link", "error", err)
 			return store.User{}, oidcErrInternal
 		}
-		return h.oidcLoginExisting(ctx, linked)
+		return h.oidcLoginExisting(ctx, linked, identity)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Error("oidc resolve: get by email", "error", err)
@@ -258,8 +282,25 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 		slog.Warn("oidc resolve: JIT blocked, domain not allowed")
 		return store.User{}, oidcErrForbidden
 	}
+	// JIT allowlist guard (PRD #55 Decision 1): a brand-new user has no established
+	// role to fail safe into, so provisioning is refused unless the gate is open —
+	// either no allowlist, or the claim is present AND intersects. An absent/
+	// unparseable claim with the gate set refuses here (unlike existing users, who
+	// pass the top gate). The top gate already rejected present-and-no-intersection;
+	// this closes the absent-claim case for new users.
+	if len(h.cfg.OIDCAllowedGroups) > 0 &&
+		!(identity.GroupsClaimPresent && groupsIntersect(h.cfg.OIDCAllowedGroups, identity.Groups)) {
+		slog.Warn("oidc resolve: JIT blocked, not in an allowed group (or groups claim absent/unparseable)", "subject", identity.Subject)
+		return store.User{}, oidcErrForbidden
+	}
 
-	created, err := h.createOIDCUserFirstAdmin(r, email, oidcDisplayName(identity.Name), identity.Issuer, identity.Subject)
+	// Admin-at-creation (PRD #55 Decision 4/5): when admin groups are configured the
+	// group decides (first-OIDC-user-admin is disabled), and an absent claim yields a
+	// non-admin (GroupsClaimPresent gates membership). When not configured, the
+	// count==0 first-admin rule applies, computed under the advisory lock.
+	useGroupAdmin := len(h.cfg.OIDCAdminGroups) > 0
+	groupAdmin := useGroupAdmin && identity.GroupsClaimPresent && groupsIntersect(h.cfg.OIDCAdminGroups, identity.Groups)
+	created, err := h.createOIDCUserFirstAdmin(r, email, oidcDisplayName(identity.Name), identity.Issuer, identity.Subject, useGroupAdmin, groupAdmin)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -270,26 +311,79 @@ func (h *Handler) oidcResolveUser(r *http.Request, identity oidc.Identity) (stor
 		slog.Error("oidc resolve: create user", "error", err)
 		return store.User{}, oidcErrInternal
 	}
-	return h.oidcLoginExisting(ctx, created)
+	// A freshly JIT-created row already has its is_admin set at creation, so the admin
+	// sync inside oidcLoginExisting is a guaranteed no-op here (desired == stored):
+	// Decision 5 "don't ALSO sync-flip a JIT user" holds by construction, and routing
+	// through the same funnel keeps the active-check + SetLastLogin in one place.
+	return h.oidcLoginExisting(ctx, created, identity)
 }
 
 // oidcLoginExisting applies the deactivated-account check (issueSession doesn't do
-// it — review N5) and records the login. It never unlocks the vault (Decision 6).
-func (h *Handler) oidcLoginExisting(ctx context.Context, user store.User) (store.User, string) {
+// it — review N5), syncs is_admin from group membership (PRD #55), and records the
+// login. It never unlocks the vault (Decision 6). Both existing-user paths (subject
+// match + email link) and the JIT/refetch paths funnel through here, so the admin
+// sync runs exactly once per login regardless of how the user was resolved.
+func (h *Handler) oidcLoginExisting(ctx context.Context, user store.User, identity oidc.Identity) (store.User, string) {
 	if !user.IsActive {
 		slog.Warn("oidc login: account deactivated", "user", user.ID)
 		return store.User{}, oidcErrDeactivated
 	}
+	synced, errCode := h.oidcSyncAdmin(ctx, user, identity)
+	if errCode != "" {
+		return store.User{}, errCode
+	}
+	user = synced
 	if err := h.q.SetLastLogin(ctx, user.ID); err != nil {
 		slog.Warn("oidc login: set last login", "error", err)
 	}
 	return user, ""
 }
 
+// oidcSyncAdmin authoritatively syncs is_admin from OIDC group membership (PRD #55
+// Decision 4.3). It runs ONLY when admin groups are configured AND the groups claim
+// is present — an absent/unparseable claim keeps the stored role (fail-safe,
+// Decision 1). Membership grants; loss of membership demotes. The seed admin
+// (cfg.SeedEmail) is exempt from DEMOTION only (break-glass), guarded against an
+// empty SeedEmail so disabled seeding never becomes a blanket exemption. On a flip
+// the returned row is refreshed so the issued session reflects it. Logs carry the
+// user id + direction + configured group names only (never the claimed group list).
+func (h *Handler) oidcSyncAdmin(ctx context.Context, user store.User, identity oidc.Identity) (store.User, string) {
+	if len(h.cfg.OIDCAdminGroups) == 0 || !identity.GroupsClaimPresent {
+		return user, ""
+	}
+	desired := groupsIntersect(h.cfg.OIDCAdminGroups, identity.Groups)
+	if desired == user.IsAdmin {
+		return user, ""
+	}
+	// Seed-admin demotion exemption: compare the RESOLVED, canonical stored email
+	// (not identity.Email — a subject-matched user can have un-applied IdP email
+	// drift). SeedEmail is already lowercased+trimmed at load; the explicit != ""
+	// guard keeps disabled seeding from exempting a user whose email is also "".
+	if !desired && h.cfg.SeedEmail != "" && user.Email == h.cfg.SeedEmail {
+		slog.Info("oidc login: seed admin exempt from group demotion", "user", user.ID)
+		return user, ""
+	}
+	updated, err := h.q.SetUserAdmin(ctx, store.SetUserAdminParams{ID: user.ID, IsAdmin: desired})
+	if err != nil {
+		slog.Error("oidc login: sync is_admin from group membership", "user", user.ID, "error", err)
+		return store.User{}, oidcErrInternal
+	}
+	direction := "demote"
+	if desired {
+		direction = "grant"
+	}
+	slog.Info("oidc login: synced is_admin from group membership", "user", user.ID, "direction", direction, "admin_groups", h.cfg.OIDCAdminGroups)
+	return updated, ""
+}
+
 // createOIDCUserFirstAdmin is the passwordless sibling of createUserFirstAdmin
-// (review B2): the same advisory-locked first-user-admin check-and-insert, but via
-// CreateUserOIDC (NULL password_hash) with the IdP identity attached.
-func (h *Handler) createOIDCUserFirstAdmin(r *http.Request, email string, displayName pgtype.Text, issuer, subject string) (store.User, error) {
+// (review B2): the same advisory-locked check-and-insert, but via CreateUserOIDC
+// (NULL password_hash) with the IdP identity attached. The admin decision (PRD #55
+// Decision 4): when useGroupAdmin is true (UZI_OIDC_ADMIN_GROUPS configured) the row
+// is created with IsAdmin=groupAdmin and the count==0 first-admin rule is disabled;
+// otherwise IsAdmin follows count==0, computed under the advisory lock. The lock is
+// held in both branches, preserving the concurrent-JIT race handling.
+func (h *Handler) createOIDCUserFirstAdmin(r *http.Request, email string, displayName pgtype.Text, issuer, subject string, useGroupAdmin, groupAdmin bool) (store.User, error) {
 	ctx := r.Context()
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -301,14 +395,20 @@ func (h *Handler) createOIDCUserFirstAdmin(r *http.Request, email string, displa
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", store.RegistrationLockKey); err != nil {
 		return store.User{}, err
 	}
-	count, err := qtx.CountUsers(ctx)
-	if err != nil {
-		return store.User{}, err
+	isAdmin := groupAdmin
+	if !useGroupAdmin {
+		// Groups not configured: fall back to the first-OIDC-user-admin rule, decided
+		// under the lock exactly as password registration does.
+		count, err := qtx.CountUsers(ctx)
+		if err != nil {
+			return store.User{}, err
+		}
+		isAdmin = count == 0
 	}
 	user, err := qtx.CreateUserOIDC(ctx, store.CreateUserOIDCParams{
 		Email:       email,
 		DisplayName: displayName,
-		IsAdmin:     count == 0,
+		IsAdmin:     isAdmin,
 		OidcIssuer:  pgtype.Text{String: issuer, Valid: true},
 		OidcSubject: pgtype.Text{String: subject, Valid: true},
 	})
@@ -331,7 +431,7 @@ func (h *Handler) oidcRefetchAfterRace(ctx context.Context, identity oidc.Identi
 		OidcSubject: pgtype.Text{String: identity.Subject, Valid: true},
 	})
 	if err == nil {
-		return h.oidcLoginExisting(ctx, user)
+		return h.oidcLoginExisting(ctx, user, identity)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		slog.Error("oidc resolve: refetch by subject after race", "error", err)
@@ -342,6 +442,26 @@ func (h *Handler) oidcRefetchAfterRace(ctx context.Context, identity oidc.Identi
 	// is ever logged).
 	slog.Warn("oidc login: create raced with a different account on this email; refusing", "subject", identity.Subject)
 	return store.User{}, oidcErrForbidden
+}
+
+// groupsIntersect reports whether any configured group name appears in the claimed
+// set. Exact, case-sensitive comparison (PRD #55 Decision 2): config values are
+// trimmed at load, claim values come verbatim from the verified ID token, and no
+// glob/regex/path-normalization is applied. Either side empty ⇒ no match.
+func groupsIntersect(configured, claimed []string) bool {
+	if len(configured) == 0 || len(claimed) == 0 {
+		return false
+	}
+	set := make(map[string]struct{}, len(claimed))
+	for _, g := range claimed {
+		set[g] = struct{}{}
+	}
+	for _, c := range configured {
+		if _, ok := set[c]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // oidcDisplayName trims and rune-caps an IdP-provided name for JIT storage.

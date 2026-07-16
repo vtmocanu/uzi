@@ -399,6 +399,48 @@ func (q *Queries) SetUserActive(ctx context.Context, arg SetUserActiveParams) (U
 	return i, err
 }
 
+const setUserAdmin = `-- name: SetUserAdmin :one
+UPDATE users SET is_admin = $1 WHERE id = $2
+RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled
+`
+
+type SetUserAdminParams struct {
+	IsAdmin bool      `json:"is_admin"`
+	ID      uuid.UUID `json:"id"`
+}
+
+// Authoritative sync of is_admin from OIDC group membership (PRD #55): membership in
+// an UZI_OIDC_ADMIN_GROUPS group grants, leaving the group demotes, on the user's
+// next OIDC login. is_admin is reloaded per-request by RequireAuth (not carried in
+// the JWT), so a flip propagates to live sessions without a token_version bump. The
+// seed-admin demotion exemption is enforced in the caller, not here.
+func (q *Queries) SetUserAdmin(ctx context.Context, arg SetUserAdminParams) (User, error) {
+	row := q.db.QueryRow(ctx, setUserAdmin, arg.IsAdmin, arg.ID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.DisplayName,
+		&i.IsAdmin,
+		&i.IsActive,
+		&i.TokenVersion,
+		&i.CreatedAt,
+		&i.LastLogin,
+		&i.DefaultModel,
+		&i.AutopilotEnabled,
+		&i.Theme,
+		&i.SlackMemberID,
+		&i.SlackNotify,
+		&i.SlackResolvedID,
+		&i.SlackLinkConfirmedAt,
+		&i.OidcIssuer,
+		&i.OidcSubject,
+		&i.JudgeEnabled,
+	)
+	return i, err
+}
+
 const setUserAutopilotEnabled = `-- name: SetUserAutopilotEnabled :one
 UPDATE users SET autopilot_enabled = $2 WHERE id = $1
 RETURNING id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled
