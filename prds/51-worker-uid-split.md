@@ -162,6 +162,53 @@ before the drop, needing `CAP_CHOWN` (+ `DAC_OVERRIDE`) — folded into the Deci
 runs in the root startup window only (M5-audit hygiene: only static root-owned
 binaries, no runner-writable dir on `PATH`, `/nix` empty at entry).
 
+**Full runner-writable path enumeration (Decision 4 / audit M1).** Cross-checked
+against the worker's actual path construction. Everything under `$UZI_DATA_DIR`
+(`/data`) unless noted:
+
+| Path | Access under the split | Source |
+| --- | --- | --- |
+| `repos/<bare>.git/config`, `repos/<bare>.git/hooks` | **worker-only** (non-runner-writable) — the code-exec config surface | `git.ts:100` |
+| `repos/<bare>.git/objects/` | runner-writable (shared gid) — the agent's own `git commit` writes objects here | Decision 1 / 4 |
+| `repos/<bare>.git/worktrees/<name>/` (`HEAD`, `index`, `logs/`) | runner-writable — the run's worktree admin dir | Decision 4 |
+| `worktrees/<repoDir>/<key>/` (the checkout itself) | runner-writable | `git.ts:101,170` |
+| `agent-home/<runId>/` (per-run SDK HOME) | runner-writable | `main.ts:55,83`, `runner.ts:45,337` |
+| `agent-home/` (shared provisioning HOME — nix profile / devbox warm-start metadata) | runner-writable | `main.ts:81`, `sdk-executor.ts:153` |
+| `provision/<runId>/` (`provisionRoot` — synthesized devbox.json, outside any clone) | runner-writable | `sdk-executor.ts:154`, `provision-run.ts:69` |
+| `/nix` (nix store, `agentnix` volume) | runner-writable — devbox/nix realize packages as the runner | Dockerfile, `docker-compose.yml:245` |
+| judge SDK HOME (`mkdtemp` under `homeRoot`) | runner-writable execution-surface HOME (its trace-fetch / review-POST HTTP stays worker-side — Decision 1) | `judge-runner.ts:107,191` |
+| worker HOME + `.gitconfig`; `/run/secrets/worker_token` | **worker-only** | Decision 5 |
+
+The dividing line: everything the untrusted execution surface must **write** (SDK
+agent, self-improve checks, provision hooks, and the agent's own `git commit`) is
+runner-writable via a shared gid; the two surfaces worker-side git config-reads
+and token custody depend on — `<bare>/config` + `<bare>/hooks` and the token file
+— are worker-only. The mkdirs that create these today run in the worker
+(`sdk-executor.ts:195-201`, `provision.ts`, `git.ts`), so under the split they
+must create the runner-writable ones with the shared gid (setgid dir) or chown
+them (M3/M4).
+
+**Namespace / TMPDIR / IPC hygiene (5-bis).** The uid split does **not** isolate
+the network namespace or `/tmp`; these are closed separately (and apply to the k8s
+form too — pod containers share the net ns even with `shareProcessNamespace:
+false`):
+- **Distinct `TMPDIR` per uid.** Today nothing sets `TMPDIR`, and the judge SDK
+  HOME + the check-runner HOME both fall back to `os.tmpdir()` = the shared `/tmp`
+  (`judge-runner.ts:107`, `runner.ts:270`). Under the split, worker and runner get
+  distinct `TMPDIR`s on their own `0700` trees, and the judge/check SDK HOMEs move
+  off the shared sticky `/tmp` (symlink races + exposure of any worker temp
+  write). Audit worker-side temp writes.
+- **No cross-uid-reachable control channel.** If a worker↔runner IPC channel is
+  ever needed (e.g. an A3 spawn-broker — not the chosen A1), it uses an
+  fd-inherited `socketpair` or a `0600` pathname socket, **never** an abstract unix
+  socket or a loopback port (the runner shares the net ns and could connect).
+- **No debug port on the worker.** None exists today (no `node --inspect` /
+  `9229`); assert it stays absent — a debug port on the token custodian is RCE in
+  the credential holder.
+- **fd/CLOEXEC hygiene at the new spawn helper.** The worker holds the PAT +
+  Anthropic token in memory and live API sockets; Node sets CLOEXEC by default —
+  M6 asserts the runner child's `/proc/self/fd` is only `{0,1,2}` + known.
+
 **k8s mapping (Decision 8 — docs-only here).** Align at the **distinct-uid
 abstraction, not the mechanism.** The k8s form is two containers in one pod with
 per-container `runAsUser` (worker 10001 / runner 10002), `shareProcessNamespace:
