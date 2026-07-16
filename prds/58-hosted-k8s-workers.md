@@ -186,7 +186,30 @@ Non-goals (v1):
    `agent/templates/entrypoint.sh` must skip the drop (and the B4 volume chown)
    when started non-root, or this pod CrashLoopBackOffs at `setpriv --reuid`
    (EPERM without `CAP_SETUID`). Requirement relayed 2026-07-16 while that file
-   was still uncommitted WIP. Posture disclosed: a hosted worker carries PRD
+   was still uncommitted WIP.
+   - **ACCEPTED AND IMPLEMENTED by PRD #51 — verified 2026-07-16 on their branch
+     (`fbd916c`), NOT yet on `main`.** Their shared `agent/templates/entrypoint.sh`
+     (one file, so `base` and `jvm` both inherit it) reads the uid via an absolute
+     `id` and, when non-root, logs "single-uid non-root mode (PRD #58)" and
+     `exec`s tini directly — no volume migration, no token chmod, no `setpriv`
+     drop. It cites this PRD by name and by our reasoning (fresh PVC + `fsGroup`,
+     and the image-layer ownership `/nix=worker:runner` + `/data=worker:worker`
+     already lets uid 10001 write). The image's full PATH is kept on that path, so
+     nix/devbox and the jvm JDK still resolve. They added two hardenings we did not
+     ask for: the uid is **validated as a clean non-empty number before branching**
+     so both paths fail closed under `set -eu` (a garbled `id` must never let a
+     *root* start slip into the non-root branch, which would run root single-uid
+     with the token unhardened and the full `cap_add`), and `UZI_UID_SPLIT` /
+     `UZI_RUNNER_PATH` / `UZI_RUNNER_TMPDIR` are unset there, so a stray
+     `UZI_UID_SPLIT=1` in a non-root deploy cannot EPERM every runner spawn into a
+     DoS.
+   - **Consequence for M3's sequencing: this is now a merge-order dependency, not a
+     design risk.** M3 must build against an agent image that contains #51's
+     entrypoint, i.e. **#51 must land first**, or M3 pins a pre-#51-M2 image tag
+     (whose `USER uzi:uzi` is non-root anyway and needs no conditional). Re-verify
+     the branch still carries the non-root branch before M3 starts rather than
+     trusting this note: #51 is in flight and its M4+ work is still moving.
+   Posture disclosed: a hosted worker carries PRD
    #51's same-uid residual exactly as today's compose worker does — hosting
    neither widens it (the residual is intra-user, `ARCHITECTURE.md:427-428`)
    nor closes it. **M3 MUST render `fsGroup: 10001` on the pod rather than
@@ -425,9 +448,12 @@ Non-goals (v1):
   documented in the threat model; rotation is v2.
 - **CNI may not express FQDN egress** — M3 verifies; fallback CIDR allowlist
   with the residual documented.
-- **PRD #51 M2's entrypoint must tolerate a non-root start** (Decision 6). If it
-  lands unconditional, M3's pod CrashLoopBackOffs at `setpriv --reuid`; fallback
-  is pinning a pre-#51-M2 agent image tag until the conditional lands.
+- ~~**PRD #51 M2's entrypoint must tolerate a non-root start**~~ — **RETIRED
+  2026-07-16.** #51 accepted the requirement and implemented it (verified on their
+  branch at `fbd916c`; see Decision 6). What remains is not a risk but a
+  **merge-order dependency**: M3 must build against an image carrying that
+  entrypoint, so #51 lands first or M3 pins a pre-#51-M2 tag. Re-verify at M3 start
+  rather than trusting this note — #51 is still in flight.
 - **Per-template images multiply CI cost** — build list bounded by a CI
   variable.
 - **PVCs accrue cost** — deleted with the worker; orphan sweep flags leftovers.
