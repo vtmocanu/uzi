@@ -1,7 +1,7 @@
 # PRD #55: OIDC group → role/access mapping (Keycloak / Pocket ID)
 
 **GitLab Issue**: [#55](https://gitlab.example.com/vtmocanu/uzi/-/issues/55)
-**Status**: Draft
+**Status**: Implemented (M1–M5) — awaiting PR review. Real-IdP e2e (live Keycloak / Pocket ID) is a manual verify item (see M5).
 **Priority**: Medium
 **Created**: 2026-07-16
 **Depends on**: PRD #45 (OIDC SSO login) — done
@@ -135,6 +135,15 @@ explainer.
    Config validation: group vars set while OIDC itself is unconfigured → refuse
    to start (same all-or-nothing posture as PRD #45 Decision 8).
 
+   **Refinement (M5 live validation, 2026-07-16):** the refuse-to-start guard
+   keys on the GATING vars only (`UZI_OIDC_ADMIN_GROUPS` / `UZI_OIDC_ALLOWED_GROUPS`).
+   `UZI_OIDC_GROUPS_CLAIM` is an inert format knob that ships as a compose/`.env`
+   default (`groups`), so arming the guard on it made the zero-config
+   password-login stack (OIDC off) refuse to boot — a regression against
+   "fully dormant when unset". General principle recorded in `specs/ai.md` §254:
+   any env var shipped as a non-empty compose/`.env` default must not arm a
+   refuse-to-start guard.
+
 ## Technical Design
 
 ### API (api/)
@@ -177,24 +186,38 @@ explainer.
 
 ## Milestones
 
-- [ ] **M1 — Config + claim parsing**: the three env vars, boot validation +
-      scope-hint warning, `Identity.Groups` with tolerant parse, env plumbing
-      (`.env.example`, compose, chart). Config + provider unit tests.
-- [ ] **M2 — Enforcement**: allowlist gate, admin sync (grant/demote/log),
-      seed-admin exemption, JIT first-admin gating, `SetUserAdmin` + sqlc regen.
-- [ ] **M3 — Tests green**: callback matrix extended — allowed-group
+- [x] **M1 — Config + claim parsing** (`d51c61d`): the three env vars, boot
+      validation + scope-hint doc-log, `Identity.Groups`/`GroupsClaimPresent`
+      with tolerant parse, env plumbing (`.env.example`, compose, chart). Config
+      + provider unit tests. Reviewed + audited clean.
+- [x] **M2 — Enforcement** (`d4d6292`): allowlist gate (before any DB write),
+      admin sync (grant/demote/log), seed-admin demotion-only exemption, JIT
+      first-admin gating, `SetUserAdmin` + sqlc regen. Reviewed + audited clean;
+      fail-closed on `SetUserAdmin` DB error (endorsed in review).
+- [x] **M3 — Tests green** (`6102a5e`): live-DB callback matrix — allowed-group
       member/non-member (existing user AND JIT), admin grant, admin demote,
       seed-admin not demoted, empty-SeedEmail exemption guard, fail-safe cases
       (claim absent/malformed: existing admin keeps role AND passes the gate,
       JIT still refused when gate set, warn logged; claim present-but-empty
       array: demotes/gates), dormant-when-unset regression, first-user NOT
-      admin when admin groups configured. Full `go test ./...`.
-- [ ] **M4 — Docs + specs**: `docs/oidc.md` group section + both provider
-      walkthroughs, `configuration.md`, specs; `npm run build` (check-docs)
-      green.
-- [ ] **M5 — Live validation**: end-to-end against a real Keycloak (and/or
-      Pocket ID) with dummy-env isolation: grant, demote-on-relogin, allowlist
-      block, JIT-gated provisioning; findings folded back.
+      admin when admin groups configured. `go test ./...` green; matrix ran live
+      by coder, reviewer, auditor, tester against a throwaway Postgres.
+- [x] **M4 — Docs + specs** (`36b12a6`, `a43f615`, `9865634`): `docs/oidc.md`
+      group section + Keycloak & Pocket ID walkthroughs, `configuration.md`,
+      `specs/ai.md` §253–257, `specs/human.md` Feature #55; `npm run build`
+      (check-docs) green. Fact-checked 0-refuted; reviewer + auditor doc passes
+      clean.
+- [x] **M5 — Live validation** (`405571f` + doc/spec corrections `76fd9c4`,
+      `37ff691`, `03d47ff`): matrix reproduced green + stack-level boot-config
+      validation (dormant-when-unset, refuse-to-start on the gating vars). Found
+      + fixed a BLOCKING bug — the compose/`.env` `UZI_OIDC_GROUPS_CLAIM=groups`
+      default tripped refuse-to-start, breaking the zero-config no-OIDC stack
+      (Decision 7 refinement above). Re-validated: default stack boots dormant.
+      **Remaining manual verify (PR checklist):** end-to-end against a real
+      Keycloak + Pocket ID (grant / demote-on-relogin / allowlist block /
+      JIT-gate / fail-safe on mapper-off / seed break-glass); Pocket ID
+      groups-scope emission is unverified against a live instance. No live IdP
+      was reachable in the dev env; runbook in the PR description.
 
 ## Milestone dependency / parallelization
 
