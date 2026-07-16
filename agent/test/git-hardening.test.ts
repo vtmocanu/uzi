@@ -190,6 +190,16 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     runGit(wt.path, ["status", "--porcelain"], gitEnv());
     assert.equal(fired(), false, "gitEnv must neutralize core.fsmonitor on status");
 
+    // Baseline for the CHECKOUT path specifically: a pin-less `worktree add` fires
+    // fsmonitor during checkout — so the neutralized worktree-add assertion below
+    // is not vacuous (does not lean only on the status baseline).
+    const baselineWt = path.join(markerDir, "baseline-wt");
+    resetMarker();
+    runGit(bare, ["worktree", "add", "--detach", baselineWt, "HEAD"], plainEnv());
+    assert.equal(fired(), true, "baseline: planted core.fsmonitor must fire during a pin-less worktree add checkout");
+    runGit(bare, ["worktree", "remove", "--force", baselineWt], plainEnv());
+    runGit(bare, ["worktree", "prune"], plainEnv());
+
     // And on the checkout that `worktree add` performs — exercised via GitCache,
     // which routes every git through gitEnv. The plant is live in <bare>/config.
     resetMarker();

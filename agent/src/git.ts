@@ -76,6 +76,10 @@ const EMPTY_GIT_HOOKS_DIR = "/usr/share/uzi-git-nohooks";
 //     planted one (verified: planted proxy still fires under an inline `none`/``),
 //     and `git://` is the only transport that consults it — which the worker never
 //     uses (https + local-file). Excluded: not inline-pinnable AND not reachable.
+//   - core.editor / sequence.editor — no worker fire point: every git this env runs
+//     is non-interactive (clone/fetch/push/worktree/diff/status/config), and the
+//     agent's OWN `git commit` uses the SDK Bash env, NOT gitEnv. Excluded; pin if
+//     an interactive git op is ever routed through gitEnv (reviewer nit — my call).
 //   - The ARBITRARY-name keys `filter.<name>.*` (smudge/clean/process) /
 //     `diff.<name>.*` (command/textconv) / `merge.<name>.driver` CANNOT be
 //     blanket-pinned (driver names are attacker-chosen). Reachability precision:

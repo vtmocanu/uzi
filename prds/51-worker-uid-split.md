@@ -550,17 +550,28 @@ model.
 
 ## Milestones (DRAFT — resequenced 2026-07-16 per review N3)
 
-- [ ] **M0 — Standalone shared-git hardening (fast-follow, NO uid split; review
-      B3).** Land Decision 3 independently of the split, because the shared-git
-      write→worker-execute channel is exploitable **today**: pin the code-exec git
-      keys (`fsmonitor`/`sshCommand`/`diff.external`/`diff.*.textconv`/`core.pager`)
-      **unconditionally** in every worker-side git (not PAT-gated — covers
-      `changedFiles`/`worktree add`), set `GIT_CONFIG_NOSYSTEM` + a `/dev/null`-or-
-      worker-owned `GIT_CONFIG_GLOBAL`, and make `<bare>/config`+`<bare>/hooks`
-      non-writable by the agent uid. Gate: an agent-uid `printf > <bare>/config`
-      of a `diff.external`/`fsmonitor`/`filter` **cannot** achieve code-exec in the
-      worker's later `diff`/`worktree add` (PoC). Ships as its own MR, like PRD #46
-      M10.
+- [x] **M0 — Standalone shared-git hardening (fast-follow, NO uid split; review
+      B3). DONE — landed on this branch (commit 4e4c44e + the M0-audit follow-ups),
+      not a separate MR (single-PR flow, per the team brief).** M0 delivers only the
+      part achievable BEFORE the uid split: pin the **fixed-name** code-exec git keys
+      **unconditionally** in every worker-side git (not PAT-gated — covers the no-PAT
+      `changedFiles`/`worktree add`) — `core.fsmonitor` / `diff.external` /
+      `core.pager` / `core.sshCommand`, plus (M0 audit) `credential.helper` /
+      `core.askpass` / `core.alternateRefsCommand`; and set `GIT_CONFIG_NOSYSTEM` + a
+      `/dev/null` `GIT_CONFIG_GLOBAL` default (the e2e insteadOf passthrough
+      preserved). Gate met: an agent-uid `printf > <bare>/config` of a
+      `diff.external`/`fsmonitor`/`credential.helper`/`core.askpass` **cannot**
+      code-exec in the worker's later `diff`/`status`/`worktree add`/credential fill
+      (functional PoC in `agent/test/git-hardening.test.ts`).
+      **Explicitly DEFERRED to M3 (NOT achievable in M0, so NOT claimed here):**
+      (a) the "`<bare>/config` + `<bare>/hooks` non-writable by the agent uid"
+      ownership wall — meaningless pre-split (the agent runs as the same uid that
+      owns the file, and `chmod` is reversible by the owner, so a chmod here would be
+      theater); and (b) closing the **arbitrary-name** class `filter.<name>.*` /
+      `diff.<name>.*` / `merge.<name>.driver` (driver names are attacker-chosen, not
+      blanket-pinnable — closed only by config-source ownership under the split).
+      `core.gitProxy` and `core.editor` are excluded, documented in `git.ts` (not
+      inline-pinnable / no worker fire point respectively). See Decision 3.
 - [x] **M1 — Threat model + mechanism decision (design gate). DONE 2026-07-16 —
       see "M1 gate resolution" above (A1 chosen, B1/B2/B4 settled, same-uid read
       PoC confirmed on `uzi-agent:latest`, k8s mapping aligned).** Confirm the
