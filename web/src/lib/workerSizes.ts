@@ -19,9 +19,18 @@ export const WORKER_SIZES = ["s", "m", "l"] as const;
 export type WorkerSize = (typeof WORKER_SIZES)[number];
 
 /**
- * The size a fresh provision form starts on. The smallest preset: it is the cheapest
- * choice against a per-user quota, and picking it for the user costs them the least
- * if they never look at the field.
+ * The size a fresh provision form starts on: the smallest preset.
+ *
+ * It does NOT save the user any quota — the quota is a COUNT of hosted workers
+ * (CountHostedWorkersForUser, compared as n >= quota), so S, M and L each cost
+ * exactly one of the user's allowance. What it conserves is CLUSTER resource, which
+ * the worker namespace's ResourceQuota/LimitRange actually bounds (Decision 8).
+ *
+ * Whether S can in fact run a worker is UNMEASURED — the presets have no quantities
+ * yet (see above), so this is the conservative default, not an informed one. Revisit
+ * it in M6 against M3's real table: if S turns out to be too small to run anything,
+ * defaulting to it sends every user who never opens the field into a worker that
+ * cannot work.
  */
 export const DEFAULT_WORKER_SIZE: WorkerSize = "s";
 
