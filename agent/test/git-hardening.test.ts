@@ -8,14 +8,20 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
 import { GitCache, gitEnv } from "../src/git.js";
 
-// PRD #51 M0 — standalone shared-git hardening (no uid split). A process that can
-// write a git config source a worker-side git later reads (today: agent-uid over
-// the shared `agentdata` volume, `<bare>/config`) could plant a FIXED-name
-// code-exec key — core.fsmonitor / diff.external / core.pager / core.sshCommand —
-// and get code execution in the worker's non-credentialed `git diff`
-// (changedFiles) or `worktree add` (checkout). gitEnv must neutralize each via an
-// inline GIT_CONFIG override, plus GIT_CONFIG_NOSYSTEM and a /dev/null
-// GIT_CONFIG_GLOBAL default so no unexpected config source is consulted.
+// PRD #51 M0 — standalone shared-git hardening (the gitEnv belt), PLUS the M3 (b)
+// config-source isolation close. The M0 pins neutralize a FIXED-name code-exec key
+// (core.fsmonitor / diff.external / core.pager / core.sshCommand, + the M0-audit
+// auth/ref keys) planted in a config source a worker-side git reads, via an inline
+// GIT_CONFIG override + GIT_CONFIG_NOSYSTEM + a /dev/null GIT_CONFIG_GLOBAL default.
+//
+// Under M3 (b) separate-runner-clone the worker is BARE-ONLY: it never runs
+// `worktree add`/checkout, so the only worker-side git that reads an on-disk config
+// is over its OWN worker-owned bare (changedFiles' `--name-only` bare tree-diff, the
+// fetch-back, credential fill). The runner clone is a SEPARATE clone with its own
+// config, so a `<bare>/config` plant is NOT even read by the runner's git — the
+// structural close (config-source ownership) proven by the isolation test below,
+// independent of the gitEnv belt. The functional PoCs therefore exercise worker-BARE
+// ops (where a `<bare>/config` plant is read) rather than the retired worktree checkout.
 
 // Collect the inline GIT_CONFIG_* pairs into a key→value map.
 function configPairs(env: NodeJS.ProcessEnv): Record<string, string> {
@@ -125,15 +131,35 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
   function plant(bare: string, key: string, value: string): void {
     execFileSync("git", ["-C", bare, "config", key, value], { env: plainEnv(), stdio: "pipe" });
   }
-  function unplant(bare: string, key: string): void {
-    execFileSync("git", ["-C", bare, "config", "--unset-all", key], { env: plainEnv(), stdio: "pipe" });
-  }
   function runGit(cwd: string, args: string[], env: NodeJS.ProcessEnv): void {
     try {
       execFileSync("git", ["-C", cwd, ...args], { env, stdio: "pipe" });
     } catch {
       // A non-zero exit is fine; we only care whether the marker fired.
     }
+  }
+  function gitOut(cwd: string, args: string[]): string {
+    return execFileSync("git", ["-C", cwd, ...args], { env: plainEnv(), encoding: "utf8" }).trim();
+  }
+  const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+
+  // Seed a runner clone, add a commit with `file`, and fetch the agent branch back
+  // into the worker bare — the (b) round-trip that leaves a bare-reachable tracking
+  // ref + two commits (base, tip) for the worker-bare diff PoCs below.
+  async function commitInCloneAndFetch(
+    bare: string,
+    iid: number,
+    file: string,
+    content: string,
+  ): Promise<{ ref: string; baseSha: string; tipSha: string }> {
+    const rc = await git.createOrAttachRunnerClone(bare, iid);
+    const baseSha = gitOut(rc.path, ["rev-parse", "HEAD"]);
+    fs.writeFileSync(path.join(rc.path, file), content);
+    runGit(rc.path, ["add", file], plainEnv());
+    runGit(rc.path, [...IDENT, "commit", "-m", "work"], plainEnv());
+    const tipSha = gitOut(rc.path, ["rev-parse", "HEAD"]);
+    const ref = await git.fetchAgentBranch(bare, rc.path, `agent/issue-${iid}`);
+    return { ref, baseSha, tipSha };
   }
 
   beforeEach(() => {
@@ -152,77 +178,82 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     if (markerDir) fs.rmSync(markerDir, { recursive: true, force: true });
   });
 
-  it("diff.external planted in <bare>/config does NOT code-exec in a full `git diff` (baseline proves it would)", async (t) => {
+  it("diff.external planted in <bare>/config does NOT code-exec in a worker-BARE content diff (baseline proves it would)", async (t) => {
     if (!gitAvailable()) return t.skip("git not available");
     const bare = await git.ensureClone(fx.originPath);
-    const wt = await git.createOrAttachWorktree(bare, 99);
-    // A second commit so `git diff HEAD~1..HEAD` has content for the external driver.
-    fs.writeFileSync(path.join(wt.path, "README.md"), "# fixture\nchanged\n");
-    runGit(wt.path, ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-am", "c2"], plainEnv());
+    // Two commits reachable in the bare (via the (b) round-trip), so a content diff
+    // in the bare has something for the external driver to run on.
+    const { baseSha, tipSha } = await commitInCloneAndFetch(bare, 99, "CH.txt", "changed\n");
 
     plant(bare, "diff.external", evil);
 
-    // Baseline: a pin-less env runs the planted command — the vector is real.
+    // Baseline: a pin-less env runs the planted command on a worker-bare content diff.
     resetMarker();
-    runGit(wt.path, ["diff", "HEAD~1..HEAD"], plainEnv());
-    assert.equal(fired(), true, "baseline: planted diff.external must fire without the pin (test would be vacuous otherwise)");
+    runGit(bare, ["diff", baseSha, tipSha], plainEnv());
+    assert.equal(fired(), true, "baseline: planted diff.external must fire on a bare content diff (test would be vacuous otherwise)");
 
     // gitEnv's inline diff.external=true overrides the plant → no code-exec.
     resetMarker();
-    runGit(wt.path, ["diff", "HEAD~1..HEAD"], gitEnv());
-    assert.equal(fired(), false, "gitEnv must neutralize the planted diff.external");
+    runGit(bare, ["diff", baseSha, tipSha], gitEnv());
+    assert.equal(fired(), false, "gitEnv must neutralize the planted diff.external on the worker bare");
   });
 
-  it("core.fsmonitor planted in <bare>/config does NOT code-exec in `git status` or `worktree add` checkout", async (t) => {
+  it("(b) config-source isolation: a <bare>/config plant is NOT read by the runner clone's git (structural close, no pin needed)", async (t) => {
     if (!gitAvailable()) return t.skip("git not available");
     const bare = await git.ensureClone(fx.originPath);
-    const wt = await git.createOrAttachWorktree(bare, 100);
+    // Plant BEFORE seeding, so if the runner clone ever consulted <bare>/config it
+    // would inherit the code-exec key.
+    plant(bare, "diff.external", evil);
+    const rc = await git.createOrAttachRunnerClone(bare, 100);
+    // Two commits in the CLONE so a content diff there is possible.
+    fs.writeFileSync(path.join(rc.path, "X.txt"), "1\n");
+    runGit(rc.path, ["add", "X.txt"], plainEnv());
+    runGit(rc.path, [...IDENT, "commit", "-m", "c1"], plainEnv());
+    fs.writeFileSync(path.join(rc.path, "X.txt"), "2\n");
+    runGit(rc.path, [...IDENT, "commit", "-am", "c2"], plainEnv());
 
-    plant(bare, "core.fsmonitor", evil);
-
-    // Baseline: fsmonitor fires on an index-refreshing command without the pin.
+    // Even with a PIN-LESS env, the clone's own config has no diff.external and it
+    // does NOT read <bare>/config — so the plant cannot fire in the runner's git.
+    // This is the (b) close (config-source ownership), independent of the gitEnv belt.
     resetMarker();
-    runGit(wt.path, ["status", "--porcelain"], plainEnv());
-    assert.equal(fired(), true, "baseline: planted core.fsmonitor must fire on status without the pin");
-
-    // Through gitEnv: neutralized on status.
-    resetMarker();
-    runGit(wt.path, ["status", "--porcelain"], gitEnv());
-    assert.equal(fired(), false, "gitEnv must neutralize core.fsmonitor on status");
-
-    // Baseline for the CHECKOUT path specifically: a pin-less `worktree add` fires
-    // fsmonitor during checkout — so the neutralized worktree-add assertion below
-    // is not vacuous (does not lean only on the status baseline).
-    const baselineWt = path.join(markerDir, "baseline-wt");
-    resetMarker();
-    runGit(bare, ["worktree", "add", "--detach", baselineWt, "HEAD"], plainEnv());
-    assert.equal(fired(), true, "baseline: planted core.fsmonitor must fire during a pin-less worktree add checkout");
-    runGit(bare, ["worktree", "remove", "--force", baselineWt], plainEnv());
-    runGit(bare, ["worktree", "prune"], plainEnv());
-
-    // And on the checkout that `worktree add` performs — exercised via GitCache,
-    // which routes every git through gitEnv. The plant is live in <bare>/config.
-    resetMarker();
-    const wt2 = await git.worktreeForBranch(bare, "ci-fix/m0-poc", "m0-poc");
-    assert.equal(fired(), false, "gitEnv must neutralize core.fsmonitor during worktree add (checkout)");
-    assert.ok(fs.existsSync(path.join(wt2.path, "README.md")), "worktree checkout still succeeds");
-
-    unplant(bare, "core.fsmonitor");
+    runGit(rc.path, ["diff", "HEAD~1", "HEAD"], plainEnv());
+    assert.equal(fired(), false, "a <bare>/config plant must NOT reach the runner clone's git (separate config source)");
+    // Control: the clone's diff really did run (it has the two differing commits).
+    assert.match(gitOut(rc.path, ["diff", "--name-only", "HEAD~1", "HEAD"]), /X\.txt/, "the runner clone's diff still works");
   });
 
-  it("changedFiles (the real worker diff path) neither code-execs nor breaks with a planted diff.external", async (t) => {
+  it("changedFiles (worker-BARE --name-only tree-diff) neither code-execs nor breaks with a planted diff.external", async (t) => {
     if (!gitAvailable()) return t.skip("git not available");
     const bare = await git.ensureClone(fx.originPath);
-    const wt = await git.createOrAttachWorktree(bare, 101);
-    fs.writeFileSync(path.join(wt.path, "NEWFILE.txt"), "hello\n");
-    runGit(wt.path, ["add", "NEWFILE.txt"], plainEnv());
-    runGit(wt.path, ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-m", "add file"], plainEnv());
+    const { ref } = await commitInCloneAndFetch(bare, 101, "NEWFILE.txt", "hello\n");
 
     plant(bare, "diff.external", evil);
     resetMarker();
-    const changed = await git.changedFiles(bare, wt.path);
+    const changed = await git.changedFiles(bare, ref);
     assert.equal(fired(), false, "changedFiles must not code-exec a planted diff.external");
     assert.deepEqual(changed, ["NEWFILE.txt"], "changedFiles still computes the diff correctly");
+  });
+
+  it("(b) invariant 6: a runner-planted uploadpack.packObjectsHook does NOT execute in the worker's file:// fetch-back", async (t) => {
+    if (!gitAvailable()) return t.skip("git not available");
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.createOrAttachRunnerClone(bare, 200);
+    fs.writeFileSync(path.join(rc.path, "F.txt"), "x\n");
+    runGit(rc.path, ["add", "F.txt"], plainEnv());
+    runGit(rc.path, [...IDENT, "commit", "-m", "c"], plainEnv());
+
+    // Plant the hook in the RUNNER clone's OWN config (the surface a compromised runner
+    // controls under the split). git does NOT honor a fetched repo's
+    // uploadpack.packObjectsHook over the file://+pack transport git.fetchAgentBranch
+    // uses — re-confirmed on the IMAGE's git (node:22-alpine, git 2.54.0) AND host git
+    // 2.55.0 (B2 invariant 6; the mitigation is version-dependent, so M6 re-runs it in
+    // the built image, but the behavior is captured here as a regression guard).
+    plant(rc.path, "uploadpack.packObjectsHook", evil);
+    resetMarker();
+    const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-200");
+    assert.equal(fired(), false, "a runner-planted uploadpack.packObjectsHook must NOT execute in the worker's fetch-back");
+    // The mitigation must not break the fetch — the agent branch still lands in the bare.
+    assert.match(gitOut(bare, ["rev-parse", ref]), /^[0-9a-f]{40}$/, "the fetch-back still landed the agent branch");
   });
 
   // `git credential fill` reads a credential request on stdin then consults the

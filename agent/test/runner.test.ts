@@ -46,9 +46,11 @@ afterEach(async () => {
   fs.rmSync(homeDir, { recursive: true, force: true });
 });
 
+// PRD #51 M3 (b): the run's working tree is the RUNNER CLONE under runner/, not a
+// linked worktree under worktrees/.
 function worktreeDirFor(iid: number): string {
   const repoDir = path.basename(git.barePathFor(fx.originPath)).replace(/\.git$/, "");
-  return path.join(fx.dataDir, "worktrees", repoDir, `issue-${iid}`);
+  return path.join(fx.dataDir, "runner", repoDir, `issue-${iid}`);
 }
 
 function isAlive(pid: number): boolean {

@@ -104,36 +104,68 @@ const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
 
-export interface WorktreeResult {
-  /** Absolute path to the checked-out worktree. */
+// PRD #51 M3 — (b) separate-runner-clone: the worker-side tracking-ref namespace the
+// worker's fetch-back writes the agent branch into. Deliberately NOT refs/heads/* (B2
+// invariant 2: the runner's branch is admitted only into a demarcated worker-side
+// tracking namespace, never commingled with the bare's heads); pushBranch then pushes
+// FROM this ref to origin's refs/heads/<branch>. The worker owns its bare, so this ref
+// is worker-controlled and read only by worker-side git on gitEnv.
+const RUNNER_TRACKING_PREFIX = "refs/uzi-runner/";
+function runnerTrackingRef(branch: string): string {
+  return `${RUNNER_TRACKING_PREFIX}${branch}`;
+}
+
+export interface RunnerClone {
+  /** Absolute path to the runner clone's working tree (the ONLY working tree under
+   *  (b) — the worker is bare-only). The agent checks out + commits here. */
   path: string;
-  /** Branch the worktree is on — always `agent/issue-{iid}`. */
+  /** Branch the runner clone is on — `agent/issue-{iid}`, `ci-fix/…`, or `uzi/…`. */
   branch: string;
 }
 
 /**
- * Bare-clone cache + per-run worktree lifecycle (PRD §Worker runtime; multica's
- * repocache pattern ported to TS).
+ * Warm bare-clone cache (worker-owned) + per-run RUNNER CLONE lifecycle (PRD #51
+ * M3, (b) separate-runner-clone; multica's repocache pattern ported to TS).
  *
  * Layout under UZI_DATA_DIR:
- *   repos/<host>+<ns>+<repo>.git   — one bare clone per repo, kept across runs
- *   worktrees/<repo>/issue-<iid>   — one worktree per run, removed on terminal
+ *   repos/<host>+<ns>+<repo>.git   — WORKER-ONLY warm bare clone per repo, kept
+ *                                    across runs (config/hooks/refs/objects). The
+ *                                    worker is BARE-ONLY: it clones/fetches with the
+ *                                    PAT, fetches the agent branch BACK from the
+ *                                    runner clone, tree-diffs, and pushes — it never
+ *                                    runs worktree add / checkout.
+ *   runner/<repo>/<key>            — RUNNER-OWNED clone per run (the ONLY working
+ *                                    tree). Seeded from the worker bare via a local
+ *                                    `clone --shared` (objects referenced read-only
+ *                                    from the bare — the runner cannot corrupt the
+ *                                    bare's objects through the alternate); the agent
+ *                                    checks out + commits here. Removed on terminal.
  *
- * PAT handling (primary directive): the token is passed to authenticated git
- * ops (clone/fetch) via env-scoped config (GIT_CONFIG_KEY/VALUE) only, so it
- * never lands in the process argv (visible via `ps`) and is never written to
- * the bare repo's on-disk config. It is never logged: runGit logs args only,
- * and args never carry the token.
+ * The (b) split closes the shared-git cross-uid channels by construction (B2): no
+ * worker-side git ever reads a runner-owned config source (no worktree add checkout,
+ * no shared commondir), and the worker fetches the agent branch back over the
+ * pack-protocol `file://` transport (never the local-copy optimization that would
+ * traverse a runner-planted objects/info/alternates — CVE-2022-39253 class).
+ *
+ * PAT handling (primary directive): the token is passed to authenticated git ops
+ * (clone/fetch/push to origin) via env-scoped config (GIT_CONFIG_KEY/VALUE) only, so
+ * it never lands in the process argv (visible via `ps`) and is never written to the
+ * bare repo's on-disk config. It is never logged: runGit logs args only, and args
+ * never carry the token. The runner-clone seed and the worker's fetch-BACK are LOCAL
+ * (no credential).
  */
 export class GitCache {
   private readonly reposRoot: string;
-  private readonly worktreesRoot: string;
+  /** Runner-owned clone store (the working trees). A distinct /data subtree from the
+   *  worker-only `repos/` bare cache, so the M3 ownership carve-out is a clean
+   *  boundary: `runner/` is runner-writable, `repos/` stays worker-only. */
+  private readonly runnerRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
 
   constructor(dataDir: string, private readonly log: Logger) {
     this.reposRoot = path.join(dataDir, "repos");
-    this.worktreesRoot = path.join(dataDir, "worktrees");
+    this.runnerRoot = path.join(dataDir, "runner");
   }
 
   barePathFor(repoUrl: string): string {
@@ -158,16 +190,28 @@ export class GitCache {
   }
 
   /**
-   * Push the run's branch to origin using the PAT (M4). This is a WORKER-owned
+   * Push the run's branch to origin using the PAT. This is a WORKER-owned
    * authenticated op — the agent never has a push credential — so it runs here,
    * not through the SDK's guardrailed Bash. The PAT rides the host-scoped
    * extraHeader in the env (off argv, off disk), and the push is never forced.
    * Idempotent on resume: a branch already at origin pushes as up-to-date.
+   *
+   * Under (b) the agent's commit lives in the RUNNER clone, so the source is the
+   * worker-side tracking ref `fetchAgentBranch` wrote (refs/uzi-runner/<branch>),
+   * NOT refs/heads/<branch> — the caller MUST fetchAgentBranch first. Pushing from
+   * the tracking ref keeps the runner's branch out of the bare's heads namespace
+   * (B2 invariant 2) while landing the agent's commits at origin's refs/heads.
    */
   async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
+    const src = runnerTrackingRef(branch);
     await this.withLock(barePath, async () => {
-      await this.runGit(barePath, ["push", "origin", `refs/heads/${branch}:refs/heads/${branch}`], pat, scope, username);
+      if (!(await this.refExists(barePath, src))) {
+        // The tracking ref is written by fetchAgentBranch; its absence means the
+        // fetch-back was skipped — refuse rather than silently pushing nothing.
+        throw new Error(`cannot push ${branch}: ${src} not present (fetchAgentBranch must run first)`);
+      }
+      await this.runGit(barePath, ["push", "origin", `${src}:refs/heads/${branch}`], pat, scope, username);
     });
   }
 
@@ -179,70 +223,112 @@ export class GitCache {
   }
 
   /**
-   * Create the run's worktree on branch `agent/issue-{iid}`. If that branch
-   * already exists in the bare repo (a resume, or a prior run on the same
-   * issue), attach to it (agent-deck's worktree-as-ledger idempotency); else
-   * create it off the repo's default branch. The worktree itself is disposable:
-   * a stale one at the target path is removed and recreated cleanly.
+   * Seed the run's RUNNER CLONE on branch `agent/issue-{iid}` (PRD #51 M3). The
+   * working tree lives ONLY here (the worker is bare-only). If the branch already
+   * exists at origin (a resume, or a prior run on the same issue — fetched into the
+   * bare's refs/remotes/origin/<branch>), the clone's branch is based off that fresh
+   * tip so successive runs build on prior work; else off the repo's default branch.
    */
-  async createOrAttachWorktree(barePath: string, issueIid: number): Promise<WorktreeResult> {
-    return this.worktreeForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`);
+  async createOrAttachRunnerClone(barePath: string, issueIid: number): Promise<RunnerClone> {
+    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`);
   }
 
   /**
-   * Create/attach a worktree for an EXPLICIT branch — the PRD #6 ci_fix targets:
-   * a fresh `ci-fix/pipeline-{id}` branch (default-branch fix), or an existing
-   * `agent/issue-{iid}` branch (run-branch fix, updating its MR). branch may or may
-   * not already exist in the bare repo: existing ⇒ attach; absent ⇒ create off the
-   * default branch. worktreeKey names the on-disk worktree dir (branch names carry
-   * `/`, so callers pass a filesystem-safe key). The cross-kind same-branch
-   * exclusion (server-side) guarantees no other active run holds this branch, so a
-   * prune + force-remove is enough to avoid git's "branch already checked out".
+   * Seed a RUNNER CLONE for an EXPLICIT branch — the PRD #6 ci_fix targets (a fresh
+   * `ci-fix/pipeline-{id}` off the default branch, or an existing `agent/issue-{iid}`
+   * run branch, updating its MR) and the PRD #46 self_improve branch. Resume vs fresh
+   * is decided by whether the branch exists at origin (refs/remotes/origin/<branch>
+   * in the bare): existing ⇒ base off that fresh tip; absent ⇒ base off the default.
+   * `key` names the on-disk clone dir (branch names carry `/`, so callers pass a
+   * filesystem-safe key). The cross-kind same-branch exclusion (server-side) plus the
+   * per-run clone dir means a stale dir is simply removed and recloned.
+   *
+   * The seed is a LOCAL `clone --shared` from the worker bare: fast (objects are
+   * referenced read-only from the bare via the clone's objects/info/alternates — the
+   * runner cannot corrupt worker-bare objects through it), and the runner's own new
+   * commit objects land in the clone's own objects store. The clone is a TRUSTED-source
+   * local clone (worker bare → runner clone), so the local optimization here is safe;
+   * the untrusted direction (worker fetching BACK from the runner clone) is the one
+   * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
    */
-  async worktreeForBranch(barePath: string, branch: string, worktreeKey: string): Promise<WorktreeResult> {
+  async runnerCloneForBranch(barePath: string, branch: string, key: string): Promise<RunnerClone> {
     return this.withLock(barePath, async () => {
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
-      const worktreePath = path.join(this.worktreesRoot, repoDir, worktreeKey);
-      await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+      const clonePath = path.join(this.runnerRoot, repoDir, key);
+      await fs.rm(clonePath, { recursive: true, force: true });
+      await fs.mkdir(path.dirname(clonePath), { recursive: true });
 
-      // Clear any stale worktree at the path and prune dangling admin entries so
-      // `worktree add` can't fail with a confusing "already exists".
-      await this.forceRemoveWorktree(barePath, worktreePath);
-      await this.tryGit(barePath, ["worktree", "prune"]);
+      // Resolve the base commit in the BARE (authoritative). A branch already at
+      // origin (fetched into refs/remotes/origin/<branch>) => resume off its fresh
+      // tip; otherwise off the fresh default branch.
+      const originRef = `refs/remotes/origin/${branch}`;
+      const resume = await this.refExists(barePath, originRef);
+      const baseRef = resume ? originRef : await this.defaultBranchRef(barePath);
+      const baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
+      this.log.info("runner clone: seeding", { branch, base: baseRef, resume, path: clonePath });
 
-      if (await this.branchExists(barePath, branch)) {
-        this.log.info("worktree: attaching existing branch", { branch, path: worktreePath });
-        await this.runGit(barePath, ["worktree", "add", worktreePath, branch]);
-      } else {
-        const baseRef = await this.defaultBranchRef(barePath);
-        this.log.info("worktree: creating branch", { branch, base: baseRef, path: worktreePath });
-        await this.runGit(barePath, ["worktree", "add", "-b", branch, worktreePath, baseRef]);
-      }
-      return { path: worktreePath, branch };
-    });
-  }
-
-  /** Remove the run's worktree; the bare clone and branch are kept. */
-  async removeWorktree(barePath: string, worktreePath: string): Promise<void> {
-    await this.withLock(barePath, async () => {
-      await this.forceRemoveWorktree(barePath, worktreePath);
-      await this.tryGit(barePath, ["worktree", "prune"]);
+      // `--shared` references the bare's objects read-only (alternate); `--no-checkout`
+      // skips populating the stale default so we check the agent branch out at the
+      // resolved base SHA (reachable via the alternate) in one step.
+      await this.runGit(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+      await this.runGit(clonePath, ["checkout", "-b", branch, baseSha]);
+      return { path: clonePath, branch };
     });
   }
 
   /**
-   * Files changed on the worktree's branch since it diverged from the default
-   * branch (three-dot diff against the merge base) — used by a self_improve run to
-   * flag guard-critical paths in its MR (PRD #46). Returns null (NOT []) when the
-   * diff cannot be computed, so the caller fails CLOSED — surfacing a loud
-   * "guard-path check unavailable" note rather than silently raising no flag on a
-   * possibly guard-touching MR (M5 audit). An empty list means "computed, nothing
-   * changed".
+   * Worker fetches the agent branch BACK from the runner clone into the worker bare
+   * (PRD #51 M3, B2). The worker is bare-only and the runner clone is runner-owned, so
+   * this is the ONE point the worker reads a runner-controlled store — hardened by the
+   * six B2 invariants:
+   *   - single-branch refspec (`+refs/heads/<branch>:refs/uzi-runner/<branch>`), never
+   *     `refs/heads/*` — the runner's whole ref namespace is never admitted (inv. 2);
+   *   - `file://` transport forces the PACK protocol (upload-pack over a pipe), so the
+   *     local-copy optimization that would traverse a runner-planted
+   *     objects/info/alternates is NOT used (CVE-2022-39253 class, inv. 3);
+   *   - `protocol.file.allow=always` pinned deliberately for that `file://` fetch;
+   *   - runs on gitEnv (GIT_CONFIG_NOSYSTEM + GIT_CONFIG_GLOBAL=/dev/null + the M0
+   *     code-exec-key pins), so the worker's OWN config governs the fetch — no
+   *     runner-side config file is consulted (inv. 4);
+   *   - `--no-tags`: only the branch, no runner-controlled tag namespace.
+   * The agent's new objects transfer into the WORKER bare's own object store, so the
+   * subsequent push does not depend on the (torn-down, possibly compromised) runner
+   * clone (objects-integrity win). Returns the worker-side tracking ref pushBranch/
+   * changedFiles then read.
    */
-  async changedFiles(barePath: string, worktreePath: string): Promise<string[] | null> {
+  async fetchAgentBranch(barePath: string, clonePath: string, branch: string): Promise<string> {
+    const dst = runnerTrackingRef(branch);
+    await this.withLock(barePath, async () => {
+      await this.runGit(barePath, [
+        "-c", "protocol.file.allow=always",
+        "fetch", "--no-tags", `file://${clonePath}`,
+        `+refs/heads/${branch}:${dst}`,
+      ]);
+    });
+    return dst;
+  }
+
+  /** Remove the run's runner clone (a standalone clone, not a linked worktree — no
+   *  bare interaction). The warm bare and the fetched refs/objects are kept. */
+  async removeRunnerClone(clonePath: string): Promise<void> {
+    await fs.rm(clonePath, { recursive: true, force: true });
+  }
+
+  /**
+   * Files changed on the agent branch since it diverged from the default branch
+   * (three-dot diff against the merge base) — used by a self_improve run to flag
+   * guard-critical paths in its MR (PRD #46). Under (b) this is a WORKER-BARE
+   * tree-to-tree diff (no working tree, no runner-owned config source read): the
+   * caller passes the worker-side tracking ref that fetchAgentBranch wrote, and
+   * `--name-only` fires no diff drivers. Returns null (NOT []) when the diff cannot be
+   * computed, so the caller fails CLOSED — a loud "guard-path check unavailable" note
+   * rather than silently raising no flag on a possibly guard-touching MR (M5 audit).
+   * An empty list means "computed, nothing changed".
+   */
+  async changedFiles(barePath: string, trackingRef: string): Promise<string[] | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
-      const out = await this.runGit(worktreePath, ["diff", "--name-only", `${baseRef}...HEAD`]);
+      const out = await this.runGit(barePath, ["diff", "--name-only", `${baseRef}...${trackingRef}`]);
       return out.split("\n").map((l) => l.trim()).filter((l) => l !== "");
     } catch {
       return null;
@@ -257,8 +343,9 @@ export class GitCache {
       throw err;
     }
     // Convert the mirror refspec to remote-tracking so future fetches write to
-    // refs/remotes/origin/* and never collide with the refs/heads/agent/* the
-    // worktrees lock (multica).
+    // refs/remotes/origin/* (multica). Under (b) the bare's refs/heads/* stay the
+    // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
+    // and lands back in refs/uzi-runner/* (fetchAgentBranch), never the bare's heads.
     await this.runGit(dest, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
     await this.fetch(dest, pat, scope, username);
   }
@@ -270,12 +357,8 @@ export class GitCache {
     await this.tryGit(barePath, ["remote", "set-head", "origin", "--auto"]);
   }
 
-  private async branchExists(barePath: string, branch: string): Promise<boolean> {
-    const code = await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
-    return code === 0;
-  }
-
-  /** Resolve a ref usable as a `worktree add` startpoint for the default branch. */
+  /** Resolve a ref for the repo's default branch (the runner-clone base + the
+   *  changedFiles diff base). */
   private async defaultBranchRef(barePath: string): Promise<string> {
     // 1) origin/HEAD, set by `remote set-head --auto`.
     const head = await this.tryGitStdout(barePath, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
@@ -296,14 +379,6 @@ export class GitCache {
 
   private async refExists(barePath: string, ref: string): Promise<boolean> {
     return (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])) === 0;
-  }
-
-  private async forceRemoveWorktree(barePath: string, worktreePath: string): Promise<void> {
-    if (await pathExists(worktreePath)) {
-      // --force twice tolerates a dirty worktree; fall back to rm if git refuses.
-      const code = await this.tryGit(barePath, ["worktree", "remove", "--force", worktreePath]);
-      if (code !== 0) await fs.rm(worktreePath, { recursive: true, force: true });
-    }
   }
 
   // --- git subprocess plumbing -------------------------------------------------
@@ -405,6 +480,11 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     // any key we don't pin. The worker needs nothing from it (PRD #51 M0).
     GIT_CONFIG_NOSYSTEM: "1",
   };
+  // PRD #51 M3 / 5-bis: keep git's scratch (packs, lockfiles) on the worker's private
+  // 0700 TMPDIR (set by the entrypoint) rather than a shared sticky /tmp. Carry it only
+  // if the image set it; git falls back to /tmp otherwise (a host/test without the
+  // entrypoint). The M4 runner-spawned git ops get the RUNNER's TMPDIR via the spawn.
+  if (process.env.TMPDIR) env.TMPDIR = process.env.TMPDIR;
   // The "global" config PATH. In the e2e overlay this points at an insteadOf-rewrite
   // file (a config-file path, not a secret) — pass it through untouched. In production
   // it is unset, and we must NOT let git fall back to $HOME/.gitconfig or

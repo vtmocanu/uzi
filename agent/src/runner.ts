@@ -72,9 +72,11 @@ export interface RunnerOptions {
 
 /**
  * Drives one claimed run through the full M4 workflow:
- *   claim → running → clone/worktree → PLAN turn → approval gate → implement⇄
- *   review loop → worker pushes branch + opens MR → completed | failed
- * and always tears the worktree down (keeping the bare clone).
+ *   claim → running → seed runner clone → PLAN turn → approval gate → implement⇄
+ *   review loop → worker fetches the agent branch back + pushes + opens MR →
+ *   completed | failed
+ * and always tears the runner clone down (keeping the worker bare clone). Under
+ * PRD #51 (b) the agent commits in the runner clone; the worker is bare-only.
  *
  * The plan gate, follow-up injection, and cancel are steered through a single
  * /inputs poller (SteeringChannel); the executor drives the SDK turns and calls
@@ -164,16 +166,16 @@ export class RunRunner {
       steering.start();
 
       barePath = await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
-      const worktree = await this.worktreeForClaim(barePath, claim);
-      worktreePath = worktree.path;
-      batcher.emit({ kind: "status", agent: "worker", payload: { text: `worktree ready on ${worktree.branch}` } });
+      const runnerClone = await this.runnerCloneForClaim(barePath, claim);
+      worktreePath = runnerClone.path;
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: `runner clone ready on ${runnerClone.branch}` } });
 
       // PRD #37: parse the checked-out repo's own agent roster and report it on
       // this first post-checkout `running` state report. It rides the STATE report
       // rather than the gate so that an autopilot run — which never parks at
       // awaiting_approval — records what was detected just the same. The roster is
       // inert data: nothing is assembled until a selection picks the repo source.
-      const detection = await this.parseRepoAgents(worktree.path, batcher, runLog);
+      const detection = await this.parseRepoAgents(runnerClone.path, batcher, runLog);
       const repoAgents = detection.agents;
       if (detection.ok) {
         // Non-fatal, and fire-and-forget (matching the session-id report below): an
@@ -195,8 +197,8 @@ export class RunRunner {
         issueTitle: claim.issue_title,
         issueDescription: claim.issue_description,
         pipeline: claim.pipeline,
-        worktreePath: worktree.path,
-        branch: worktree.branch,
+        worktreePath: runnerClone.path,
+        branch: runnerClone.branch,
         emit: (m) => batcher.emit(m),
         oauthToken: claim.secrets.anthropic_oauth_token,
         agents: claim.agents,
@@ -250,6 +252,16 @@ export class RunRunner {
         return;
       }
 
+      // (b) fetch-back (PRD #51 M3): the agent committed in the RUNNER clone, so the
+      // worker now fetches the agent branch BACK into its own bare (single-branch
+      // refspec, file://+pack transport, protocol.file.allow pinned — the six B2
+      // invariants live in git.fetchAgentBranch) before it inspects or pushes. Done
+      // AFTER killAgentTree so no agent process is concurrently mutating the clone,
+      // and it brings the agent's objects into the worker bare so the push does not
+      // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
+      // changedFiles read; the runner clone is never a git source for either.
+      const trackingRef = await this.git.fetchAgentBranch(barePath, runnerClone.path, result.branch);
+
       // Self-improvement MR evidence (PRD #46 Decision 10): with no CI on the uzi
       // repo, the worker itself runs the test suites and flags any guard-critical
       // path the change touched, folding both into the MR description. Best-effort —
@@ -260,19 +272,21 @@ export class RunRunner {
         batcher.emit({ kind: "status", agent: "worker", payload: { text: "self-improvement: running the test suites for MR evidence" } });
         // changedFiles returns null when the diff could not be computed → pass null
         // through so the MR section fails CLOSED (a loud "guard-path check unavailable"
-        // note) instead of silently suppressing the flag (M5 audit).
-        const changed = await this.git.changedFiles(barePath, worktree.path);
+        // note) instead of silently suppressing the flag (M5 audit). Under (b) this is
+        // a WORKER-BARE tree-diff of the fetched tracking ref (no runner-owned config
+        // source read), while the checks below still run in the runner clone.
+        const changed = await this.git.changedFiles(barePath, trackingRef);
         // M9: the checks execute agent-authored code as the worker uid, so they run
         // under a SCRUBBED replacement env (no join token / API URL / PAT / OAuth token
         // by construction) with the run's provisioned toolchains on PATH. `npm ci
         // --ignore-scripts` installs deps best-effort so vitest/tsc exist; a failure
         // just leaves the check honestly skipped.
         const checkEnv = buildCheckEnv(process.env, runHome ?? os.tmpdir(), result.toolEnv);
-        for (const note of await prepareCheckDeps(worktree.path, checkEnv).catch(() => [])) {
+        for (const note of await prepareCheckDeps(runnerClone.path, checkEnv).catch(() => [])) {
           runLog.info("self-improve: dependency install", note);
         }
         const checkRunner = this.checkRunner ?? defaultCheckRunner(checkEnv);
-        const checks = await runSelfImproveChecks(worktree.path, checkRunner);
+        const checks = await runSelfImproveChecks(runnerClone.path, checkRunner);
         selfImproveSection = selfImproveMrSection(changed === null ? null : flagGuardPaths(changed), checks);
       }
 
@@ -321,14 +335,14 @@ export class RunRunner {
       // requeue (worker death) never returns here, so the evict/HOME-cleanup below
       // only ever fire for a run that will not resume.
       for (const s of runScopedSecrets) this.log.removeSecret(s);
-      if (barePath && worktreePath) {
+      if (worktreePath) {
         await this.git
-          .removeWorktree(barePath, worktreePath)
-          .catch((e) => runLog.warn("worktree cleanup failed", { error: errMessage(e) }));
+          .removeRunnerClone(worktreePath)
+          .catch((e) => runLog.warn("runner clone cleanup failed", { error: errMessage(e) }));
       }
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
-      // M4). It is OUTSIDE the worktree, so removeWorktree does not reach it; leave
-      // it and each run leaks a dir. Best-effort, like the worktree cleanup.
+      // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
+      // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
       if (worktreePath) {
         await fs
           .rm(skillsPluginDir(worktreePath), { recursive: true, force: true })
@@ -390,28 +404,30 @@ export class RunRunner {
   }
 
   /**
-   * Resolve the run's worktree + branch. An issue run works agent/issue-{iid}. A
-   * ci_fix run (PRD #6) targets a fresh `ci-fix/pipeline-{id}` branch when fixing
-   * the default branch, or the existing agent branch (updating its MR) when fixing
-   * a run branch — keyed by pipeline.ref vs the repo's default branch.
+   * Seed the run's RUNNER CLONE + resolve its branch (PRD #51 M3, (b)). An issue run
+   * works agent/issue-{iid}. A ci_fix run (PRD #6) targets a fresh
+   * `ci-fix/pipeline-{id}` branch when fixing the default branch, or the existing
+   * agent branch (updating its MR) when fixing a run branch — keyed by pipeline.ref
+   * vs the repo's default branch. The working tree lives ONLY in this clone; the
+   * worker fetches the agent branch back from it before pushing (fetchAgentBranch).
    */
-  private async worktreeForClaim(barePath: string, claim: ClaimResponse) {
+  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse) {
     if (claim.kind === "ci_fix" && claim.pipeline) {
       const defaultBranch = claim.repo.default_branch?.trim();
       const fixBranch =
         defaultBranch && claim.pipeline.ref === defaultBranch
           ? `ci-fix/pipeline-${claim.pipeline.id}`
           : claim.pipeline.ref;
-      return this.git.worktreeForBranch(barePath, fixBranch, fixBranch.replace(/\//g, "-"));
+      return this.git.runnerCloneForBranch(barePath, fixBranch, fixBranch.replace(/\//g, "-"));
     }
     if (claim.kind === "self_improve") {
       // The FIXED branch (PRD #46 Decision 10): reused every cycle so the worker's
       // idempotent createMergeRequest extends one open MR rather than opening a new
       // one, and successive cycles are tested together.
-      return this.git.worktreeForBranch(barePath, SELF_IMPROVE_BRANCH, SELF_IMPROVE_BRANCH.replace(/\//g, "-"));
+      return this.git.runnerCloneForBranch(barePath, SELF_IMPROVE_BRANCH, SELF_IMPROVE_BRANCH.replace(/\//g, "-"));
     }
     if (claim.issue_iid == null) throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachWorktree(barePath, claim.issue_iid);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid);
   }
 
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
