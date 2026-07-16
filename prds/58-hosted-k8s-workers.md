@@ -331,8 +331,22 @@ Non-goals (v1):
    reaches an image reference or pod spec as free text.
 8. **Self-service + one quota knob.** Any user may provision up to the
    admin-set per-user quota (single admin setting, default 2, 0 disables
-   self-service). Enforcement is atomic (guarded insert under the same
-   transaction, no TOCTOU). Quota counts hosted workers only. Defense-in-depth
+   self-service). Enforcement is atomic: the provision transaction takes
+   `pg_advisory_xact_lock` on the user, then counts, then inserts and seals — one
+   transaction. **The lock is the mechanism.** The quota check alone is not
+   atomic under READ COMMITTED (this repo's default; no `h.pool.Begin` site sets
+   `TxOptions`), in either of its shapes: two concurrent provisions evaluate the
+   count against their own snapshots, neither sees the other's uncommitted row,
+   and both commit at quota+1. **Measured 2026-07-16 against real Postgres**:
+   with the lock removed and the quota check otherwise intact, **8 of 8
+   concurrent provisions passed a quota of 2**; with the lock restored, exactly 2.
+   `FOR UPDATE` over the counted rows cannot fix it either — it locks rows that
+   exist and takes no predicate lock, so it does not fence a phantom insert. The
+   original text ("guarded insert under the same transaction, no TOCTOU") named a
+   mechanism that does not deliver the property it claims; found 2026-07-16 by
+   the M2 priming wave (auditor + reviewer independently, corroborated by the
+   architect) before any code was written against it, and confirmed by
+   measurement during M2. Quota counts hosted workers only. Defense-in-depth
    at the k8s layer: the worker namespace carries a ResourceQuota + LimitRange
    so an app-level bug cannot noisy-neighbor the shared cluster. Provision and
    delete endpoints are rate-limited (existing limiter pattern, PRD #53).
@@ -386,11 +400,20 @@ Non-goals (v1):
   generation), feature flag. api gains no k8s access. Success: protocol unit
   tests against a fake store; compose boots with the flag off, zero behavior
   change.
-- [ ] **M2 — Hosted worker API + quota**: provision (type + size, validated)
+- [x] **M2 — Hosted worker API + quota** (landed 2026-07-16): provision (type + size, validated)
   and delete endpoints; atomic quota enforcement + the admin quota setting;
   rate limits. Success: API tests cover quota races, disabled flag,
   delete-while-busy refusal; provisioning is not user-reachable until M3
   (endpoints ship behind the flag).
+  - Delete added **no endpoint**: `DELETE /api/workers/{id}` already implements
+    Decision 11 for both kinds, so it gained only the per-user limiter — which
+    consequently caps external-worker deletes too (10/min, where there was none).
+    Accepted by the user: the shared route is the only non-bypassable place to put
+    it, and a hosted-only route would duplicate the active-runs guard.
+  - The quota's live-DB tests now run in CI (`test:api-store-it`, a Postgres
+    service). They previously existed but skipped silently — `go test ./...`
+    reports `ok` for a package whose every test skipped, so the milestone's central
+    security property had a green pipeline and zero coverage.
   - **Prerequisite of any rotation path, stated here rather than assumed**
     (auditor, 2026-07-16): a rotation MUST set `workers.token_hash` and park the
     new sealed token (`SealJoinToken`) **in one transaction**. M1's ack destroys
@@ -572,3 +595,30 @@ Non-goals (v1):
   (api env) are two values an operator must keep in sync, and a rotation touching only
   one **fails closed** in both directions (the controller 401s) — the footgun is an
   outage, never a bypass.
+- 2026-07-16: **Decision 8's quota mechanism was wrong, and is amended above** (M2
+  priming wave: auditor + reviewer independently, corroborated by the architect;
+  confirmed by measurement during M2). The requirement ("atomic, no TOCTOU") was
+  always right; the parenthetical named a mechanism that does not deliver it. The
+  correction is recorded in Decision 8 itself rather than only here, because the
+  wrong text was actionable — a coder implementing it verbatim would have shipped an
+  unbounded quota that no fake-store test could see.
+  - *What decided it was a measurement, not an argument.* With the lock removed and
+    the quota check otherwise intact, 8 of 8 concurrent provisions passed a quota of
+    2; with it restored, exactly 2. Every reviewer of the original text had to reason
+    about whether the check was self-sufficient; none of that reasoning was needed
+    once it was run.
+  - *The guarded `INSERT … WHERE count < quota` was tried and dropped.* It has the
+    same hole as a plain count (each subselect evaluates against its own snapshot)
+    while **reading** as though it closed it, and its name asserted in an identifier
+    a property it did not have. No honest name exists for "insert if the caller's
+    lock is held and the count is under" — that is the signal the property does not
+    belong in the statement. The count now happens in Go under the lock, the shape
+    `createUserFirstAdmin` already uses for the identical race.
+  - *A test that cannot fail is not a gate.* Both lock tests were verified by
+    mutation rather than by inspection, and the numbers moved the design: the
+    N-goroutine race test misses a missing lock ~1 run in 20 and a lock taken after
+    the count ~1 in 6, so neither defect may rest on it. The deterministic test
+    (hold the lock, fill the quota underneath the blocked provision, release) decides
+    both by construction. The same lens found this PRD's own M2 live-DB tests
+    skipping silently in CI — green pipeline, zero coverage — now gated by
+    `test:api-store-it`.

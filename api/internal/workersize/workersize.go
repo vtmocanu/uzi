@@ -12,18 +12,22 @@
 //
 // Keep Names in lockstep with the controller's preset table. The two copies are a
 // deliberate consequence of the api and controller being separate Go modules (the
-// module boundary is what keeps a kube client out of the api), and the wire golden
-// testdata/controller_poll_wire.json is what pins the name spelling across it.
-// Drift is not silent-but-harmless: the api would accept a size the controller
-// cannot resolve, and the worker would provision, never be rendered, and sit
-// pending until its token expires.
+// module boundary is what keeps a kube client out of the api), and
+// hostedsvc/testdata/hosted_sizes.json is the golden that pins this list across it —
+// see hostedsvc/size_contract_test.go, which also records what that golden does and
+// does not buy. Drift is not silent-but-harmless: the api would accept a size the
+// controller cannot resolve, and the worker would provision, never be rendered, and
+// sit pending until its token expires.
 package workersize
 
-// Names is the curated set, in display order (smallest first). Lowercase, and
-// that matters: these strings go on the wire as DesiredWorker.Size, where the
-// controller-protocol golden (hostedsvc/testdata/controller_poll_wire.json)
-// already pins "s"/"l" and both modules' contract tests read that file. The UI
-// upper-cases for display; the wire value is what is stored and sent.
+// Names is the curated set, in display order (smallest first). It is pinned by
+// hostedsvc/testdata/hosted_sizes.json, which is the registry contract — not by the
+// wire golden next to it, which carries "s" and "l" only as sample values of one
+// poll response ("m" appears nowhere in it) and was never a gate on this list.
+//
+// Lowercase, and that matters: these strings go on the wire verbatim as
+// DesiredWorker.Size and are stored as workers.hosted_size. The UI upper-cases for
+// display; nothing upper-cased is ever a value.
 var Names = []string{"s", "m", "l"}
 
 // Valid reports whether name is a known size preset (registry membership). Used at

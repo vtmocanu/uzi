@@ -78,31 +78,36 @@ func countHostedWorkers(ctx context.Context, t *testing.T, pool *pgxpool.Pool, u
 	return n
 }
 
-// The deterministic proof that the real code takes THAT lock with THAT key inside
-// its transaction. Every other test in M2 passes whether or not the lock statement
-// exists — including the race test below, which is timing-dependent in principle.
-// This one is not: it works by contradiction. Hold the advisory lock for user u on a
-// separate connection, and a correct provisionHostedWorker MUST block. If it
-// completes anyway, the lock it takes is not this one — dropped, or keyed
-// differently.
+// The deterministic proof of BOTH lock properties: that the real code takes THAT
+// lock with THAT key inside its transaction, AND that it counts after acquiring it.
+// No timing, no goroutine race — the two orderings are distinguished by
+// construction.
 //
-// WHAT THIS TEST DOES NOT CATCH, stated precisely because the obvious reading is
-// wrong and a future reader will otherwise trust it too far: it does NOT catch the
-// lock being taken AFTER the count. That ordering still blocks here (the provision
-// counts, then waits on the lock, then proceeds), so this test passes while the
-// quota is entirely unprotected — the count would have been taken outside the
-// critical section. Verified by mutation, not reasoned: moving the lock below the
-// count leaves this test green and turns QuotaRaceLiveDB red (8 of 8 racers pass a
-// quota of 2).
+// It is worth being precise about why this test has to exist, because the obvious
+// reading of the suite is that the race test below covers this. It does not, and
+// the numbers say so:
 //
-// So the two tests divide the failure modes and NEITHER is redundant:
-//   - this one: the lock is missing or mis-keyed (the race test can, in principle,
-//     miss this by luck)
-//   - QuotaRaceLiveDB: the lock is present but in the wrong place (this test cannot
-//     see that at all)
+//   - Missing lock: the race test detects it 19 times in 20 (the auditor ran it 20
+//     times). That 1-in-20 false green is the whole reason a deterministic test was
+//     mandated — an N-goroutine race is evidence, not proof.
+//   - Lock present but taken AFTER the count: caught only ~83% of the time (red in 5
+//     of 5 isolated sweeps, but green once in a full run-store-it.sh run, landing on
+//     exactly 2 — one false green in six observations). This ordering is the subtler
+//     defect and had the weaker guard, which is backwards.
 //
-// Delete either and one real defect ships silently.
+// The mechanism: hold the lock for user u on a separate connection, so a correct
+// provision MUST block. While it is blocked, insert u's full quota directly. Then
+// release. Now the two orderings answer differently, and neither can get lucky:
+//
+//	correct (lock, then count) -> counts AFTER acquiring -> sees the quota -> refuses
+//	broken  (count, then lock) -> already counted 0 before blocking -> inserts anyway
+//
+// So: no refusal means the count was taken outside the critical section, and a
+// provision that never blocks at all means the lock is missing or mis-keyed. One
+// test, both failure modes, deterministically. QuotaRaceLiveDB below is kept as the
+// end-to-end sanity check on the real concurrent path, not as the proof.
 func TestProvisionHostedWorkerLockIsHeldLiveDB(t *testing.T) {
+	const quota = 2
 	h, pool, _, _, userID := hostedLiveDB(t, "2")
 	ctx := context.Background()
 
@@ -119,7 +124,7 @@ func TestProvisionHostedWorkerLockIsHeldLiveDB(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := h.provisionHostedWorker(ctx, userID, "blocked", "base", "m", 2)
+		_, err := h.provisionHostedWorker(ctx, userID, "blocked", "base", "m", quota)
 		done <- err
 	}()
 
@@ -130,23 +135,47 @@ func TestProvisionHostedWorkerLockIsHeldLiveDB(t *testing.T) {
 			"HostedProvisionLockClass, objid(user)) inside its tx, so the quota count is "+
 			"unserialized and the guard is decorative", err)
 	case <-time.After(500 * time.Millisecond):
-		// Correct: it is waiting on the lock.
+		// Correct: it is waiting on the lock. A lock-after-count implementation also
+		// waits here — it has just already taken its count, which is what the rest of
+		// this test detects.
 	}
 
-	// Release, and it must proceed.
+	// Fill the user's quota from outside, while the provision sits blocked. Raw SQL
+	// on the pool: it takes no advisory lock, so it cannot deadlock against the
+	// holder, and it deliberately bypasses the handler (which would block too).
+	for i := 0; i < quota; i++ {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size)
+			 VALUES ($1, $2, $3, 'base', 'hosted', 'm')`,
+			userID, fmt.Sprintf("preexisting-%d", i),
+			append([]byte(fmt.Sprintf("lockorder-%d-", i)), userID[:]...)); err != nil {
+			t.Fatalf("seed pre-existing hosted worker %d: %v", i, err)
+		}
+	}
+
+	// Release. The blocked provision now acquires the lock and proceeds.
 	if err := holder.Commit(ctx); err != nil {
 		t.Fatalf("commit holder tx: %v", err)
 	}
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("provision after the lock was released: %v", err)
+		// THE assertion. Under READ COMMITTED each statement takes a fresh snapshot, so
+		// a count issued after the lock is acquired sees the rows committed above —
+		// which is exactly the property that makes the lock work at this isolation
+		// level.
+		if !errors.Is(err, errHostedQuotaExceeded) {
+			t.Fatalf("provision returned %v, want errHostedQuotaExceeded — the user's quota was "+
+				"filled while this provision sat blocked on the lock, so a provision that counts "+
+				"AFTER acquiring the lock must see %d workers and refuse. Counting BEFORE the "+
+				"lock (or outside it) reads the pre-block 0 and inserts anyway, which is this "+
+				"failure exactly: the lock is taken but guards nothing.", err, quota)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("provisionHostedWorker never completed after the lock was released")
 	}
-	if n := countHostedWorkers(ctx, t, pool, userID); n != 1 {
-		t.Errorf("hosted workers = %d, want 1", n)
+	if n := countHostedWorkers(ctx, t, pool, userID); n != quota {
+		t.Errorf("hosted workers = %d, want %d — a provision that should have been refused "+
+			"inserted one anyway", n, quota)
 	}
 }
 
@@ -157,13 +186,21 @@ func TestProvisionHostedWorkerLockIsHeldLiveDB(t *testing.T) {
 // two concurrent provisions both read N-1, neither sees the other's uncommitted row,
 // and both insert. (A guarded `INSERT … WHERE count < quota` has exactly the same
 // hole — it was tried and dropped for reading as though it did not.) The advisory
-// lock is what serializes them. Measured, twice: with the lock removed, all 8 racers
-// below succeed against a quota of 2; with the lock merely moved BELOW the count,
-// the same thing happens, which is the defect only this test can see.
+// lock is what serializes them. Measured: with the lock removed, all 8 racers below
+// succeed against a quota of 2.
 //
-// Alone it could in principle pass by luck, which is why
-// TestProvisionHostedWorkerLockIsHeldLiveDB above exists — see its comment for how
-// the two split the failure modes.
+// THIS TEST IS EVIDENCE, NOT PROOF, and an earlier version of this comment claimed
+// otherwise. It is a real concurrent exercise of the real path, which is worth
+// having — but a race that has to be lost to be observed can always fail to happen.
+// Measured rather than reasoned, on both defects it is supposed to see: a missing
+// lock slips through ~1 run in 20, and a lock taken after the count slips through
+// ~1 in 6 (green once in six observations, landing on exactly 2). Neither number is
+// zero, so neither defect may be left to this test alone.
+//
+// TestProvisionHostedWorkerLockIsHeldLiveDB above is the deterministic proof of both,
+// by construction. This one stays because it is the only test that exercises genuine
+// concurrency end-to-end, and because a 19-in-20 detector is a fine second opinion —
+// it is simply not the guard.
 func TestProvisionHostedWorkerQuotaRaceLiveDB(t *testing.T) {
 	const quota = 2
 	const racers = 8
@@ -291,9 +328,21 @@ func TestProvisionHostedWorkerCoWriteLiveDB(t *testing.T) {
 	}
 }
 
-// Nothing is sealed when the guard refuses. A quota-refused provision must leave no
-// trace at all — the rollback covers both writes, which is a property of them being
-// one transaction.
+// Nothing is sealed when the quota refuses: no worker, no parked ciphertext.
+//
+// It does NOT prove the rollback, and an earlier version of this comment claimed it
+// did. The refusal returns BEFORE jointoken.Generate(), so no token is ever minted
+// and there is nothing to roll back — this test would pass with the rollback
+// entirely broken. What it actually pins is better than rollback coverage: that the
+// refusal happens before anything is created at all. Refusing before minting beats
+// minting and unwinding, because it cannot half-fail.
+//
+// The genuine both-writes case (the insert succeeds and SealJoinToken then fails) is
+// untested and stays that way: reaching it needs a fault-injection seam in the tx
+// body, and that seam is a worse thing to own than the gap. The gap is small on
+// purpose — an un-rolled-back insert would leave a token_hash with no parked
+// ciphertext, so the worker is simply never delivered a token, reads offline, and is
+// recovered by delete + reprovision. Not a disclosure, and self-announcing.
 func TestProvisionHostedWorkerRefusalSealsNothingLiveDB(t *testing.T) {
 	h, pool, _, _, userID := hostedLiveDB(t, "0")
 	ctx := context.Background()
