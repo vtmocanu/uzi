@@ -639,16 +639,30 @@ Non-goals (v1):
       under-sized default fails invisibly in a version with no pod-phase status.
       **Do not re-litigate `s` on the strength of this number**: it bounds the agent,
       not the build.
-  - **The live capstone cannot pass as shipped — an e2e harness bug, found by running
-    it** (2026-07-16). `e2e/run-e2e.sh:693` asserts `run.usage.input_tokens = 21400`,
-    and its own comment at `:688` says that is *"the stub emits a synthetic terminal
-    result frame (fixed usage)"*. The assertion is **not gated on `$EXECUTOR`**, so
-    under `UZI_E2E_EXECUTOR=sdk` a real run reports its real usage (2,229 in / 11,171
-    out) and the harness always fails there — after 24 PASS and a fully successful
-    run. `e2e/README.md` claims "no milestone assertion depends on this path", which
-    is true of the *milestones* and false of the *script*. Gate that assertion on the
-    stub executor (or assert `> 0` under sdk) so the capstone is runnable by whoever
-    needs it next.
+  - **The live capstone could not pass as shipped — an e2e harness bug, found by
+    running it. FIXED in `0e04bb2`** (2026-07-16). **Four** assertions in the PRD #40
+    block hardcoded the stub's synthetic usage (21400 in, 6100 out, a `>= 21400`
+    lifetime, a coder message at 12000) and none were gated on `$EXECUTOR`. A real
+    session spends what it spends, so all four failed under `sdk`; the first exits,
+    so the harness reported failure **after 24 PASS and a fully successful real run**
+    (2,229 in / 11,171 out, having cloned, planned, gated, implemented, pushed and
+    opened an MR). `e2e/README.md`'s "no milestone assertion depends on this path"
+    was true of the *milestones* and false of the *script*.
+    - The fix keeps the exact values under the stub — there they also prove the frame
+      was **parsed**, not merely non-empty — and asserts the property PRD #40 actually
+      owns under `sdk` (usage folded, aggregated, attributed), which holds either way.
+    - **Two of the changes are improvements independent of the capstone.** `/api/usage`
+      aggregation now asserts against **the run's own usage** rather than a constant:
+      strictly stronger, since `>= 21400` would pass an `/api/usage` that ignored this
+      run entirely whenever an earlier run had banked the total — a weak assertion
+      wearing a specific-looking number. And the per-agent check no longer pins the
+      agent name under `sdk`, since live runs take their roster from the cloned repo
+      (PRD #37 selects `agent_source=repo` two assertions earlier), so `coder` was
+      never guaranteed there.
+    - Verified rather than read: each branch mutation-checked against the real
+      capstone payload and against absent/zeroed usage, and the full stub e2e is green
+      (exit 0, 146 PASS). **Not yet re-run live** — the logic is verified against the
+      exact payload that broke it, but a second ~13m/$0.80 capstone would close it.
   - **M6 inherits a debt from M5, and owes TWO things for it: picking the S/M/L
     quantities, and landing the display.** M5 shipped names-only (above). The
     quantities are not merely unwritten — **nobody has ever chosen them**: not this
