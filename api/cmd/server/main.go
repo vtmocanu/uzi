@@ -25,6 +25,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/handler"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
@@ -453,6 +454,14 @@ func run() error {
 	// Wire the notifications write seam (PRD #46 M2) for future producers (the judge,
 	// M4). The M2 read endpoints don't need it; this makes the seam available.
 	h.SetNotifier(notifier)
+	// Hosted k8s workers (PRD #58 Decision 12). Only when the feature is on: off (the
+	// compose default) Routes mounts no controller endpoint, so the service would have
+	// no caller. Shares the same secret cipher (sole key holder) as the forge/worker
+	// services — it seals pending join tokens with it.
+	if cfg.WorkerHostingEnabled {
+		h.SetHostedSvc(hostedsvc.New(q, box))
+		slog.Info("hosted k8s workers enabled; serving the controller protocol on /api/controller")
+	}
 	// Wire the rate-limit poller so saving/replacing an Anthropic token pokes it for
 	// an immediate poll (PRD #53 D3b). Only when the poller is enabled — a nil
 	// *usagepoller.Engine must never be handed to the handler.

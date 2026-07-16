@@ -4,6 +4,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -287,6 +289,22 @@ type Config struct {
 	// recovery for a confirm handler killed after the claim but before it settled.
 	// Above the forge HTTP timeout so an in-flight confirm is never reaped. 0 disables it.
 	ProposalConfirmStuckTimeout time.Duration
+
+	// Hosted k8s workers (PRD #58 Decision 12). WorkerHostingEnabled gates the whole
+	// feature; it is false by default and on compose, where there is no controller and
+	// no cluster to host anything in — so a compose stack is zero-diff. Off, the
+	// controller-facing route group is not mounted at all: the endpoint does not exist
+	// rather than existing-and-refusing.
+	//
+	// ControllerTokenSHA256 is the sha256 of the controller's bearer credential
+	// (Decision 2), decoded from the hex WORKER_HOSTING_CONTROLLER_TOKEN_SHA256. The
+	// api holds ONLY the hash and never the plaintext, so an api env/memory disclosure
+	// (the very /proc/<pid>/environ class of leak Decision 3 and docs/proc-hardening.md
+	// exist to close) yields nothing that authenticates. The chart generates the token,
+	// mounts the plaintext into the controller, and passes this hash to the api (M6).
+	// Required when hosting is enabled, refused when it is not (see loadWorkerHosting).
+	WorkerHostingEnabled  bool
+	ControllerTokenSHA256 []byte
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -476,6 +494,9 @@ func Load() (Config, error) {
 	if err := loadOIDC(&cfg); err != nil {
 		return Config{}, err
 	}
+	if err := loadWorkerHosting(&cfg); err != nil {
+		return Config{}, err
+	}
 
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
@@ -635,6 +656,49 @@ func parseScopes(raw string) []string {
 		out = append([]string{"openid"}, out...)
 	}
 	return out
+}
+
+// loadWorkerHosting reads and validates the hosted-k8s-worker feature gate (PRD
+// #58 Decision 12) and the controller's credential hash (Decision 2).
+//
+// The two are all-or-nothing, the same stance loadOIDC takes on its gating vars:
+// hosting enabled without a token hash would mount a controller endpoint no
+// controller could ever authenticate to, and a token hash set while hosting is off
+// means an operator provisioned a credential the api will silently ignore while
+// their controller 404s forever. Both are loud boot failures rather than a quiet
+// half-configured feature. Neither var ships as a compose default (compose has no
+// controller), so neither guard can fire on a default stack.
+//
+// WORKER_HOSTING_ENABLED goes through parseBool, so a typo aborts boot instead of
+// silently taking the default — it gates a privileged protocol, and this is the
+// stance every other kill-switch here takes.
+func loadWorkerHosting(cfg *Config) error {
+	enabled, err := parseBool("WORKER_HOSTING_ENABLED", false)
+	if err != nil {
+		return err
+	}
+	raw := strings.TrimSpace(os.Getenv("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256"))
+	if !enabled {
+		if raw != "" {
+			return fmt.Errorf("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 is set but WORKER_HOSTING_ENABLED is false; the api would ignore the credential and every controller poll would 404")
+		}
+		return nil
+	}
+	if raw == "" {
+		return fmt.Errorf("WORKER_HOSTING_ENABLED=true requires WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 (the sha256 of the controller's bearer token, hex-encoded)")
+	}
+	sum, err := hex.DecodeString(raw)
+	if err != nil {
+		// The value is a HASH, not a secret, but it is adjacent to one — report the
+		// variable name only, never the value, matching loadSeedSlack's discipline.
+		return fmt.Errorf("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 is not valid hex")
+	}
+	if len(sum) != sha256.Size {
+		return fmt.Errorf("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256 decodes to %d bytes, expected %d (it must be sha256 of the controller token, hex-encoded)", len(sum), sha256.Size)
+	}
+	cfg.WorkerHostingEnabled = true
+	cfg.ControllerTokenSHA256 = sum
+	return nil
 }
 
 // loadSeedAdmin reads and validates the optional startup-admin seed. Seeding is

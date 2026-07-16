@@ -85,6 +85,12 @@ type ForgeConnection struct {
 	HumanUsername      pgtype.Text        `json:"human_username"`
 }
 
+type HostedWorkerToken struct {
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	TokenCiphertext []byte             `json:"token_ciphertext"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
 type Issue struct {
 	ID             uuid.UUID          `json:"id"`
 	RepoID         uuid.UUID          `json:"repo_id"`
@@ -358,4 +364,7 @@ type Worker struct {
 	StatsMemBytes      pgtype.Int8        `json:"stats_mem_bytes"`
 	StatsMemLimitBytes pgtype.Int8        `json:"stats_mem_limit_bytes"`
 	StatsSource        pgtype.Text        `json:"stats_source"`
+	Kind               string             `json:"kind"`
+	HostedSize         pgtype.Text        `json:"hosted_size"`
+	HostedGeneration   int64              `json:"hosted_generation"`
 }
