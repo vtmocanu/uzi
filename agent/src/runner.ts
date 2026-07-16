@@ -443,7 +443,16 @@ export class RunRunner {
       // channel a no-input run has, Decision 6), and stated on the feed. The
       // executor re-resolves the SAME absent-parse to build the identical roster.
       const selection = resolveAgentSelection({ status: "absent" }, repoAgents.length > 0).selection;
-      await reportState({ status: "running", agent_selection: selection }).catch((e) =>
+      // Make this report self-contained (F1): carry the roster alongside the selection
+      // so both validate + persist atomically, even if the fire-and-forget running
+      // roster report above failed and left the column NULL. Gated on length > 0 — on
+      // a detection failure repoAgents is [] and the selection resolves to `own`;
+      // sending repo_agents: [] would flip NULL ("not reported") to [] ("detected
+      // none") and break that deliberate distinction. rosterFor already prefers the
+      // reported roster over the column, so this needs no wire change.
+      const autopilotState: StateRequest = { status: "running", agent_selection: selection };
+      if (repoAgents.length > 0) autopilotState.repo_agents = repoAgentSummaries(repoAgents);
+      await reportState(autopilotState).catch((e) =>
         runLog.warn("could not persist autopilot agent selection", { error: errMessage(e) }),
       );
       batcher.emit({ kind: "status", agent: "worker", payload: { text: autopilotSelectionText(selection, repoAgents.length) } });
