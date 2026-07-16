@@ -20,7 +20,7 @@ import (
 type Store interface {
 	ListHostedWorkersForController(ctx context.Context) ([]store.ListHostedWorkersForControllerRow, error)
 	UpsertHostedWorkerToken(ctx context.Context, arg store.UpsertHostedWorkerTokenParams) error
-	MarkHostedWorkerTokenDelivered(ctx context.Context, workerID uuid.UUID) (int64, error)
+	MarkHostedWorkerTokenDelivered(ctx context.Context, arg store.MarkHostedWorkerTokenDeliveredParams) (int64, error)
 }
 
 // ExpiryStore is the slice of the store the pending-token expiry sweep needs. It
@@ -94,25 +94,34 @@ func SealJoinToken(ctx context.Context, q Store, box *secretbox.Box, workerID uu
 // The proof is the registration itself: RequireWorker resolved this worker by
 // looking up sha256(whatever the caller presented) against workers.token_hash, so
 // reaching here means a pod is holding the CURRENT token and using it successfully.
-// Unforgeable, and version-exact for free — after a rotation to T2 a pod still
-// holding T1 fails auth and never gets here, so it cannot ack T2 away.
+// Unforgeable, and version-exact — after a rotation to T2 a pod still holding T1
+// fails auth outright.
 //
-// This replaced a controller-supplied ack, which could only assert "a Secret exists
-// for worker W", never which token was in it. That gap was not theoretical: a
-// rotation racing an in-flight ack destroyed the fresh plaintext before it was ever
-// delivered and then recorded the row as delivered steady-state, while the pod held
-// the old token and 401'd forever. Deriving delivery from auth removes the
-// controller from the token-destruction path entirely — the api decides from its own
-// auth result rather than from a report by the component this PRD exists to bound.
+// provedTokenHash is that proof, carried into the write. It MUST be the hash from
+// the AUTHENTICATED CONTEXT (mw.WorkerFromContext), never a post-register re-read of
+// the worker row: a DB round trip separates auth from this call, so an unqualified
+// destroy would blow away a token parked by a rotation that committed in the gap —
+// the original defect, one layer down. The statement re-checks the hash is still
+// current, so a mid-flight rotation matches zero rows and leaves T2 pending for the
+// pod that actually holds it.
+//
+// This whole mechanism replaced a controller-supplied ack, which could only assert
+// "a Secret exists for worker W", never which token was in it. Deriving delivery
+// from auth removes the controller from the token-destruction path entirely — the
+// api decides from its own auth result rather than from a report by the component
+// this PRD exists to bound.
 //
 // Callers MUST treat a failure as non-fatal: this is cleanup, and a worker that
 // has successfully registered must never be failed because a buffer could not be
 // cleared. The TTL sweep is the backstop.
-func (s *Service) NoteRegistered(ctx context.Context, workerID uuid.UUID) error {
+func (s *Service) NoteRegistered(ctx context.Context, workerID uuid.UUID, provedTokenHash []byte) error {
 	// The guard inside MarkHostedWorkerTokenDelivered makes a re-registration (a pod
 	// rescheduled onto another node presents the same token again) a no-op rather
 	// than a re-stamp.
-	if _, err := s.q.MarkHostedWorkerTokenDelivered(ctx, workerID); err != nil {
+	if _, err := s.q.MarkHostedWorkerTokenDelivered(ctx, store.MarkHostedWorkerTokenDeliveredParams{
+		WorkerID:        workerID,
+		ProvedTokenHash: provedTokenHash,
+	}); err != nil {
 		return fmt.Errorf("hostedsvc: note registered: %w", err)
 	}
 	return nil

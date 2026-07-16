@@ -104,7 +104,7 @@ func TestSealJoinTokenRotatesAStrandedWorker(t *testing.T) {
 
 	seal(t, st, box, id, "uzw_original")
 	// Delivered, then the Secret was lost — M2/M3 rotate a new token in.
-	if err := svc.NoteRegistered(context.Background(), id); err != nil {
+	if err := svc.NoteRegistered(context.Background(), id, hashOf("uzw_original")); err != nil {
 		t.Fatalf("NoteRegistered: %v", err)
 	}
 	if !st.rows[id].delivered {

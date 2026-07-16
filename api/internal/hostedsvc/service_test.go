@@ -1,7 +1,9 @@
 package hostedsvc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"testing"
 
@@ -34,9 +36,12 @@ type tokenRow struct {
 type fakeStore struct {
 	workers []store.ListHostedWorkersForControllerRow
 	// rows is the hosted_worker_tokens table, keyed by worker id. An absent key is
-	// an absent ROW (the only case the real UPDATE reports 0 rows for on a hosted
-	// worker).
+	// an absent ROW.
 	rows map[uuid.UUID]*tokenRow
+	// tokenHashes mirrors workers.token_hash, which the ack's subquery re-checks
+	// against the hash the caller proved. Without it the fake could not model a
+	// rotation at all — and modelling exactly what the SQL does is this fake's job.
+	tokenHashes map[uuid.UUID][]byte
 	// listErr / markErr force the failure paths.
 	listErr error
 	markErr error
@@ -44,7 +49,9 @@ type fakeStore struct {
 	markCalls int
 }
 
-func newFakeStore() *fakeStore { return &fakeStore{rows: map[uuid.UUID]*tokenRow{}} }
+func newFakeStore() *fakeStore {
+	return &fakeStore{rows: map[uuid.UUID]*tokenRow{}, tokenHashes: map[uuid.UUID][]byte{}}
+}
 
 func (f *fakeStore) ListHostedWorkersForController(context.Context) ([]store.ListHostedWorkersForControllerRow, error) {
 	if f.listErr != nil {
@@ -71,24 +78,37 @@ func (f *fakeStore) UpsertHostedWorkerToken(_ context.Context, arg store.UpsertH
 	return nil
 }
 
-// MarkHostedWorkerTokenDelivered mirrors the real UPDATE verbatim, guard included:
+// MarkHostedWorkerTokenDelivered mirrors the real UPDATE verbatim, both predicates
+// included:
 //
 //	WHERE worker_id = $1
-//	  AND worker_id IN (SELECT id FROM workers WHERE kind = 'hosted')
+//	  AND worker_id IN (SELECT id FROM workers
+//	                    WHERE kind = 'hosted' AND token_hash = $2)
 //	  AND (token_ciphertext IS NOT NULL OR delivered_at IS NULL)
 //
-// Note there is NO "has a ciphertext" short-circuit: an expired row (no ciphertext,
-// no delivered_at) satisfies the guard's second disjunct and DOES match, stamping
-// delivered_at. That is the deliberate self-heal, and the fake must show it.
+// Two things the fake must show, because both were once got wrong:
+//
+//   - No "has a ciphertext" short-circuit. An expired row (no ciphertext, no
+//     delivered_at) satisfies the guard's second disjunct and DOES match, stamping
+//     delivered_at — the deliberate self-heal. The old fake short-circuited here and
+//     that divergence hid a High.
+//   - The token_hash re-check. A caller whose proved hash is no longer current (a
+//     rotation committed between its auth and this write) matches zero rows.
+//
 // The kind scope is not modelled — every worker in this fake is hosted.
-func (f *fakeStore) MarkHostedWorkerTokenDelivered(_ context.Context, workerID uuid.UUID) (int64, error) {
+func (f *fakeStore) MarkHostedWorkerTokenDelivered(_ context.Context, arg store.MarkHostedWorkerTokenDeliveredParams) (int64, error) {
 	f.markCalls++
 	if f.markErr != nil {
 		return 0, f.markErr
 	}
-	row, ok := f.rows[workerID]
+	// The subquery: the worker must exist AND still carry the hash the caller proved.
+	cur, ok := f.tokenHashes[arg.WorkerID]
+	if !ok || !bytes.Equal(cur, arg.ProvedTokenHash) {
+		return 0, nil
+	}
+	row, ok := f.rows[arg.WorkerID]
 	if !ok {
-		return 0, nil // no row: the only 0-row case for a hosted worker
+		return 0, nil // no row
 	}
 	if !(row.ciphertext != nil || !row.delivered) {
 		return 0, nil // already delivered: the guard excludes it (idempotence)
@@ -134,12 +154,24 @@ func newTestService(t *testing.T, st Store) *Service {
 	return New(st, newTestBox(t))
 }
 
-// seal is the test-side shorthand for the provision/rotation path.
-func seal(t *testing.T, st Store, box *secretbox.Box, id uuid.UUID, token string) {
+// hashOf is the test-side stand-in for jointoken.Hash.
+func hashOf(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
+}
+
+// seal is the test-side provision/rotation path. It writes workers.token_hash AND
+// parks the sealed ciphertext together, because that atomicity is the premise the
+// ack's token_hash predicate rests on: "the hash I proved is still current" only
+// implies "the parked ciphertext is the token I proved" if one transaction ever
+// writes both. M2's rotation is required to do the same (pinned in the PRD), so the
+// fake must not model a shape M2 is forbidden to produce.
+func seal(t *testing.T, st *fakeStore, box *secretbox.Box, id uuid.UUID, token string) {
 	t.Helper()
 	if err := SealJoinToken(context.Background(), st, box, id, token); err != nil {
 		t.Fatalf("SealJoinToken: %v", err)
 	}
+	st.tokenHashes[id] = hashOf(token)
 }
 
 // The handoff end to end, across the polls a real worker's token lives through.
@@ -170,6 +202,12 @@ func TestPollDeliversTokenUntilTheWorkerRegisters(t *testing.T) {
 	if got.JoinToken == nil || *got.JoinToken != "uzw_the-plaintext" {
 		t.Fatalf("poll 1: join token = %v, want the sealed plaintext round-tripped", got.JoinToken)
 	}
+	// Proof-of-possession stands on three legs; this pins the one that otherwise
+	// rests on inspection alone: a POLL WRITES NOTHING. Only a worker's registration
+	// settles delivery, so no number of polls may ever reach the ack statement.
+	if st.markCalls != 0 {
+		t.Fatalf("the poll reached MarkHostedWorkerTokenDelivered %d times; a poll must be a pure read", st.markCalls)
+	}
 
 	// Poll 2: the pod has not booted yet (a slow image pull), so the SAME token is
 	// re-delivered. A lost poll response must never be the end of the only
@@ -183,7 +221,7 @@ func TestPollDeliversTokenUntilTheWorkerRegisters(t *testing.T) {
 	}
 
 	// The pod boots and registers: proof of possession. The buffer is destroyed.
-	if err := svc.NoteRegistered(context.Background(), id); err != nil {
+	if err := svc.NoteRegistered(context.Background(), id, hashOf("uzw_the-plaintext")); err != nil {
 		t.Fatalf("NoteRegistered: %v", err)
 	}
 	if st.rows[id].ciphertext != nil {
@@ -205,50 +243,60 @@ func TestPollDeliversTokenUntilTheWorkerRegisters(t *testing.T) {
 
 // THE REGRESSION THIS DESIGN EXISTS FOR.
 //
-// The old protocol let the controller ack by bare worker id, so an ack in flight
-// across a rotation destroyed the freshly parked T2 before anyone had it: the row
-// read "delivered, steady state" while the pod still held T1 and 401'd forever.
-// Deterministic, not a race.
+// This drives the exact interleaving that broke the old protocol, and it FAILS
+// without the token_hash predicate on the ack — it is a regression test, not a
+// description.
 //
-// Delivery is now proof of possession, so there is no assertion to race: T2 stays
-// pending until a pod actually registers with T2. A pod holding T1 cannot reach
-// NoteRegistered at all — RequireWorker looks up sha256(presented) against
-// workers.token_hash, which is sha256(T2) after the rotation, so it 401s at the
-// middleware and never touches this row.
-func TestRotationsFreshTokenSurvivesUntilAPodProvesIt(t *testing.T) {
+// The ordering: a healthy pod holding T1 begins a register (auth proves T1 at T0).
+// While its RegisterWorker round trip is in flight, a rotation commits T2 —
+// workers.token_hash becomes sha256(T2) and T2 is parked. The in-flight request
+// then reaches NoteRegistered still carrying the hash it proved: T1's.
+//
+// Unqualified (matching worker_id alone) that request destroys T2 — a token no one
+// has received — and stamps delivered_at, reproducing the original defect one layer
+// down: a row reading "delivered, steady state" while no pod holds the current
+// token. Qualified by the proved hash, it matches zero rows and T2 survives for the
+// pod that will actually hold it.
+func TestInFlightRegisterCannotDestroyARotatedToken(t *testing.T) {
 	st := newFakeStore()
 	box := newTestBox(t)
 	svc := New(st, box)
 	id := newTestWorker(st, "base", "s", 1)
 
-	// T1 delivered and in use.
+	// T1 delivered and in use by a healthy pod.
 	seal(t, st, box, id, "uzw_T1")
-	if err := svc.NoteRegistered(context.Background(), id); err != nil {
+	provedByTheInFlightRequest := hashOf("uzw_T1") // what its auth established at T0
+	if err := svc.NoteRegistered(context.Background(), id, provedByTheInFlightRequest); err != nil {
 		t.Fatalf("NoteRegistered T1: %v", err)
 	}
 
-	// Rotation: T2 is parked, delivery reset.
+	// A rotation commits while that pod's next register is mid-flight: token_hash and
+	// the parked ciphertext both move to T2, atomically.
 	seal(t, st, box, id, "uzw_T2")
 
-	// The controller polls. Under the old design an in-flight ack keyed on the bare
-	// id would have destroyed T2 right here. Nothing can: T2 is still pending and
-	// still delivered.
+	// The in-flight request lands, still carrying T1's hash. This is the write that
+	// used to destroy T2.
+	if err := svc.NoteRegistered(context.Background(), id, provedByTheInFlightRequest); err != nil {
+		t.Fatalf("stale NoteRegistered: %v", err)
+	}
+	if st.rows[id].ciphertext == nil {
+		t.Fatal("a register that proved only T1 destroyed the freshly rotated T2 — the qualification is missing or ineffective")
+	}
+	if st.rows[id].delivered {
+		t.Fatal("T2 was stamped delivered by a request that never held it")
+	}
+
+	// T2 is still there to be collected.
 	resp, err := svc.Poll(context.Background())
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
-	if resp.Workers[0].JoinToken == nil {
-		t.Fatal("the rotated token was destroyed before any pod could receive it — the exact defect proof-of-possession removes")
-	}
-	if *resp.Workers[0].JoinToken != "uzw_T2" {
-		t.Fatalf("join token = %q, want the rotated T2", *resp.Workers[0].JoinToken)
-	}
-	if st.rows[id].delivered {
-		t.Fatal("a rotated token must not read as already delivered")
+	if resp.Workers[0].JoinToken == nil || *resp.Workers[0].JoinToken != "uzw_T2" {
+		t.Fatalf("join token = %v, want the rotated T2 still deliverable", resp.Workers[0].JoinToken)
 	}
 
-	// The new pod boots with T2 and registers. Only now is the buffer destroyed.
-	if err := svc.NoteRegistered(context.Background(), id); err != nil {
+	// The T2-bearing pod boots and registers. Only now is the buffer destroyed.
+	if err := svc.NoteRegistered(context.Background(), id, hashOf("uzw_T2")); err != nil {
 		t.Fatalf("NoteRegistered T2: %v", err)
 	}
 	if st.rows[id].ciphertext != nil || !st.rows[id].delivered {
@@ -267,7 +315,7 @@ func TestNoteRegisteredIsIdempotentOnReRegistration(t *testing.T) {
 	seal(t, st, box, id, "uzw_x")
 
 	for i := range 3 {
-		if err := svc.NoteRegistered(context.Background(), id); err != nil {
+		if err := svc.NoteRegistered(context.Background(), id, hashOf("uzw_x")); err != nil {
 			t.Fatalf("register %d: %v", i, err)
 		}
 		if st.rows[id].ciphertext != nil || !st.rows[id].delivered {
@@ -299,7 +347,9 @@ func TestLateRegistrationSelfHealsAnExpiredRow(t *testing.T) {
 	}
 
 	// The pod finally boots, reads the Secret the controller had written, registers.
-	if err := svc.NoteRegistered(context.Background(), id); err != nil {
+	// The self-heal survives the hash predicate: this pod holds the current token, it
+	// merely booted late.
+	if err := svc.NoteRegistered(context.Background(), id, hashOf("uzw_slow-pull")); err != nil {
 		t.Fatalf("NoteRegistered: %v", err)
 	}
 	if !st.rows[id].delivered {
@@ -311,7 +361,7 @@ func TestLateRegistrationSelfHealsAnExpiredRow(t *testing.T) {
 // error — the worker still registered successfully.
 func TestNoteRegisteredForWorkerWithNoRowIsNotAnError(t *testing.T) {
 	svc := newTestService(t, newFakeStore())
-	if err := svc.NoteRegistered(context.Background(), uuid.New()); err != nil {
+	if err := svc.NoteRegistered(context.Background(), uuid.New(), hashOf("uzw_whatever")); err != nil {
 		t.Fatalf("NoteRegistered: %v", err)
 	}
 }
@@ -381,7 +431,7 @@ func TestNoteRegisteredPropagatesStoreErrors(t *testing.T) {
 	boom := errors.New("db exploded")
 	st := newFakeStore()
 	st.markErr = boom
-	if err := newTestService(t, st).NoteRegistered(context.Background(), uuid.New()); !errors.Is(err, boom) {
+	if err := newTestService(t, st).NoteRegistered(context.Background(), uuid.New(), hashOf("uzw_x")); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want it propagated", err)
 	}
 }

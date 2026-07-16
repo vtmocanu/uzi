@@ -60,8 +60,8 @@ func (p *pollStore) ListHostedWorkersForController(context.Context) ([]store.Lis
 func (p *pollStore) UpsertHostedWorkerToken(context.Context, store.UpsertHostedWorkerTokenParams) error {
 	return nil
 }
-func (p *pollStore) MarkHostedWorkerTokenDelivered(_ context.Context, id uuid.UUID) (int64, error) {
-	p.marked = append(p.marked, id)
+func (p *pollStore) MarkHostedWorkerTokenDelivered(_ context.Context, arg store.MarkHostedWorkerTokenDeliveredParams) (int64, error) {
+	p.marked = append(p.marked, arg.WorkerID)
 	return 1, nil
 }
 

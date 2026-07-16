@@ -122,9 +122,18 @@ UPDATE hosted_worker_tokens SET
     token_ciphertext = NULL,
     delivered_at     = now()
 WHERE worker_id = $1
-  AND worker_id IN (SELECT id FROM workers WHERE kind = 'hosted')
+  AND worker_id IN (
+      SELECT id FROM workers
+      WHERE kind = 'hosted'
+        AND token_hash = $2
+  )
   AND (token_ciphertext IS NOT NULL OR delivered_at IS NULL)
 `
+
+type MarkHostedWorkerTokenDeliveredParams struct {
+	WorkerID        uuid.UUID `json:"worker_id"`
+	ProvedTokenHash []byte    `json:"proved_token_hash"`
+}
 
 // The delivery acknowledgement, driven by PROOF OF POSSESSION: the worker itself
 // registered, and RequireWorker only resolved it by matching sha256(the token it
@@ -138,8 +147,25 @@ WHERE worker_id = $1
 // exists for W" without naming the token in it, so a rotation racing an in-flight
 // ack destroyed the fresh plaintext undelivered and recorded the row as delivered
 // steady-state while the pod 401'd forever on the old token. Registration cannot
-// lie about the version: a pod holding T1 after a rotation to T2 fails auth and
-// never reaches this statement.
+// lie about the version: a pod holding T1 after a rotation to T2 fails auth
+// outright.
+//
+// QUALIFYING THE DESTROY (@proved_token_hash) is what makes that true of the WRITE
+// and not merely of the auth. Auth proves sha256(presented) = token_hash at T0, but
+// a DB round trip (RegisterWorker) sits between T0 and this statement, so matching
+// on worker_id alone would destroy "whatever is parked NOW": a rotation committing
+// in that gap means a request that proved T1 destroys a freshly parked T2,
+// undelivered, stamping delivered_at over it — the original defect, one layer down.
+// Carrying the hash the caller ACTUALLY PROVED into the subquery makes a mid-flight
+// rotation match zero rows, so T2 stays pending and the T2-bearing pod acks it
+// properly when it registers.
+//
+// Load-bearing premise: token_hash and the parked ciphertext are always written by
+// the SAME rotation transaction (an M2 requirement, pinned in the PRD), so "the
+// hash I proved is still current" ≡ "the parked ciphertext is the token I proved".
+// Callers MUST pass the hash from the AUTHENTICATED CONTEXT and never a
+// post-register re-read of the row: RegisterWorker's RETURNING * would already
+// carry the rotated value and defeat this predicate entirely.
 //
 // The (ciphertext IS NOT NULL OR delivered_at IS NULL) guard is for IDEMPOTENCE on
 // re-registration — a pod rescheduled onto another node presents the same token
@@ -149,14 +175,16 @@ WHERE worker_id = $1
 //     Secret was written after all and the pod finally booted (a slow image pull,
 //     an ImagePullBackOff that cleared), so the row is corrected to the truth
 //     rather than left claiming a strand that a rotation would then "fix" for no
-//     reason. Only a proof licenses this transition; a report never could.
+//     reason. Only a proof licenses this transition; a report never could. It
+//     survives the hash predicate untouched — the prover still holds the current
+//     token, it just booted late.
 //
 // and excludes the already-delivered state, which is where re-registration lands.
 //
 // Still scoped to kind='hosted': the handler already checks Kind, so this is
 // defence in depth against a future caller that does not.
-func (q *Queries) MarkHostedWorkerTokenDelivered(ctx context.Context, workerID uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, markHostedWorkerTokenDelivered, workerID)
+func (q *Queries) MarkHostedWorkerTokenDelivered(ctx context.Context, arg MarkHostedWorkerTokenDeliveredParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markHostedWorkerTokenDelivered, arg.WorkerID, arg.ProvedTokenHash)
 	if err != nil {
 		return 0, err
 	}
