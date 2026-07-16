@@ -1,7 +1,7 @@
 // Settings → Workers: register workers, show the one-time join token, and list
 // the fleet with live status. Inside SettingsShell.
 
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, type Worker } from "../lib/api";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
@@ -28,6 +28,10 @@ export function WorkersSettings() {
   // next action.
   const [newToken, setNewToken] = useState<{ worker: string; token: string } | null>(null);
   const [copied, setCopied] = useState(false);
+  // Which hosted worker is armed for deletion (PRD #58). Hosted only — see the Delete
+  // button below.
+  const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
+  const confirmRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
     try {
@@ -78,6 +82,7 @@ export function WorkersSettings() {
 
   const remove = async (id: string) => {
     setError("");
+    setConfirmingDelete(null);
     try {
       await api.deleteWorker(id);
       await load();
@@ -85,6 +90,14 @@ export function WorkersSettings() {
       setError(err instanceof ApiError ? err.message : "Failed to delete worker");
     }
   };
+
+  // Focus the confirmation when it arms, so a keyboard user meets the warning instead
+  // of hunting for it, and a screen reader reads it rather than announcing nothing.
+  // Focus lands on the WARNING, never on "Delete anyway": auto-focusing the
+  // destructive control is how a confirmation becomes a formality.
+  useEffect(() => {
+    if (confirmingDelete) confirmRef.current?.focus();
+  }, [confirmingDelete]);
 
   const copy = async () => {
     if (!newToken) return;
@@ -242,11 +255,70 @@ export function WorkersSettings() {
                       {w.status}
                     </Badge>
                     <WorkerRunBadge worker={w} />
-                    <Button variant="danger" size="sm" onClick={() => remove(w.id)}>
-                      Delete
-                    </Button>
+                    {/* Hosted deletes confirm; external ones stay one click, and that
+                        asymmetry is the whole point. Deleting an EXTERNAL worker
+                        revokes a token — the container keeps running and the user
+                        re-registers to recover. Deleting a HOSTED one takes its disks
+                        with it (PRD: "PVCs accrue cost — deleted with the worker"),
+                        which nothing undoes. Same button, wildly different blast
+                        radius, so only the expensive one asks. */}
+                    {confirmingDelete !== w.id && (
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        onClick={() => (w.kind === "hosted" ? setConfirmingDelete(w.id) : remove(w.id))}
+                      >
+                        Delete
+                      </Button>
+                    )}
                   </div>
                 </div>
+                {/* Confirm-in-place, not a modal: same ruling as the provision form —
+                    there is no modal primitive in web/ and a row action is not where to
+                    invent one. It names what is destroyed rather than asking a
+                    content-free "are you sure", because the whole reason it exists is
+                    that the cost is invisible at the moment of the click.
+
+                    "Delete is not a restart" leads deliberately: v1 ships no restart
+                    endpoint (PRD non-goals: "no restart endpoint (delete +
+                    reprovision)"), so Delete is the ONLY lifecycle control a hosted
+                    user has, and they will reach for it on a stuck worker. Without
+                    this they would silently pay the full /nix re-fetch from
+                    cache.nixos.org — the exact off-LAN cost that volume exists to
+                    prevent (Decision 7).
+
+                    On today's build no controller exists (M3), so nothing is reaped
+                    and there are no disks to lose. The copy states the RULE ("its
+                    disks go with it"), which holds either way and becomes operative
+                    the moment M3 ships — which is when a real user meets it. Warning
+                    early costs a click; warning late costs someone their /nix. */}
+                {confirmingDelete === w.id && (
+                  <div
+                    ref={confirmRef}
+                    tabIndex={-1}
+                    role="group"
+                    aria-label={`Confirm deleting ${w.name}`}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setConfirmingDelete(null);
+                    }}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-none"
+                  >
+                    <p className="text-xs text-warn">
+                      Delete is not a restart: a hosted worker’s disks go with it, permanently —{" "}
+                      <code className="rounded bg-raised px-1 py-0.5">/data</code> (its workspace) and{" "}
+                      <code className="rounded bg-raised px-1 py-0.5">/nix</code> (its cached tools). A replacement
+                      re-downloads its tools from the internet.
+                    </p>
+                    <div className="flex items-center gap-1.5">
+                      <Button variant="danger" size="sm" onClick={() => remove(w.id)}>
+                        Delete anyway
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => setConfirmingDelete(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                )}
                 {/* Live resource gauges (PRD #49): renders only once the worker has
                     reported a sample, so a worker without stats keeps its old row. */}
                 <WorkerStatGauges worker={w} />

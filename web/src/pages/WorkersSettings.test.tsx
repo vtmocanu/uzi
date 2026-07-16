@@ -207,11 +207,112 @@ describe("WorkersSettings hosted quota is escapable (the primary journey)", () =
     expect(provision().hasAttribute("disabled")).toBe(true);
 
     // Delete one → the page reloads the fleet → the count drops → the gate lifts.
+    // Hosted deletes confirm first, so the journey out of the quota is now two clicks.
     mockApi.listWorkers.mockResolvedValue({ workers: [h1] });
     fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[1]);
+    fireEvent.click(await screen.findByRole("button", { name: "Delete anyway" }));
 
     await waitFor(() => expect(mockApi.deleteWorker).toHaveBeenCalledWith("w-h2"));
     expect(await screen.findByText(/1 of 2 used/)).toBeTruthy();
     await waitFor(() => expect(provision().hasAttribute("disabled")).toBe(false));
+  });
+});
+
+describe("WorkersSettings hosted delete confirms; external delete does not (PRD #58)", () => {
+  const hostedW = aWorker({ id: "w-h", name: "base (M)", kind: "hosted", hosted_size: "m" });
+  const externalW = aWorker({ id: "w-x", name: "laptop" });
+
+  it("does NOT delete a hosted worker on the first click — it arms a confirmation", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    expect(mockApi.deleteWorker).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Delete anyway" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+  });
+
+  it("names what is destroyed, rather than asking a content-free 'are you sure'", async () => {
+    // The confirmation exists because the cost is invisible at the moment of the click.
+    // A generic prompt would add friction and inform nobody.
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    expect(screen.getByText("/data")).toBeTruthy();
+    expect(screen.getByText("/nix")).toBeTruthy();
+    // v1 ships no restart endpoint, so Delete is the only lifecycle control a hosted
+    // user has — they will reach for it to restart a stuck worker. Leading with this
+    // is what stops them silently paying the /nix re-fetch.
+    expect(screen.getByText(/Delete is not a restart/)).toBeTruthy();
+    expect(screen.getByText(/re-downloads its tools from the internet/)).toBeTruthy();
+  });
+
+  it("deletes once confirmed", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    mockApi.deleteWorker.mockResolvedValue(null);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete anyway" }));
+    await waitFor(() => expect(mockApi.deleteWorker).toHaveBeenCalledWith("w-h"));
+  });
+
+  it("cancelling deletes nothing and restores the row", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(mockApi.deleteWorker).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Delete anyway" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+  });
+
+  it("Escape cancels, so a keyboard user is not trapped in the confirmation", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    fireEvent.keyDown(screen.getByRole("group", { name: /Confirm deleting base \(M\)/ }), { key: "Escape" });
+
+    expect(screen.queryByRole("button", { name: "Delete anyway" })).toBeNull();
+    expect(mockApi.deleteWorker).not.toHaveBeenCalled();
+  });
+
+  it("focuses the WARNING, not the destructive button — a confirmation must not be a formality", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    const group = screen.getByRole("group", { name: /Confirm deleting base \(M\)/ });
+    expect(document.activeElement).toBe(group);
+    // Auto-focusing "Delete anyway" would let a keyboard user confirm blind, which is
+    // the confirmation defeating itself.
+    expect(document.activeElement).not.toBe(screen.getByRole("button", { name: "Delete anyway" }));
+  });
+
+  it("keeps EXTERNAL delete one click — a token revoke, not a disk wipe", async () => {
+    // The regression guard for shipped behaviour. Deleting an external worker revokes
+    // a token: the container keeps running and the user re-registers to recover. There
+    // is nothing to warn about, and adding friction to a cheap, reversible action is
+    // how a confirmation becomes noise people click through.
+    mockApi.listWorkers.mockResolvedValue({ workers: [externalW] });
+    mockApi.deleteWorker.mockResolvedValue(null);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(mockApi.deleteWorker).toHaveBeenCalledWith("w-x"));
+    expect(screen.queryByRole("button", { name: "Delete anyway" })).toBeNull();
+  });
+
+  it("arms only the row that was clicked", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [hostedW, aWorker({ id: "w-h2", name: "jvm (L)", kind: "hosted", hosted_size: "l" })] });
+    renderPage();
+    await screen.findByText("base (M)");
+    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+
+    expect(screen.getAllByRole("button", { name: "Delete anyway" })).toHaveLength(1);
+    expect(screen.getByRole("group", { name: /Confirm deleting base \(M\)/ })).toBeTruthy();
+    // The other hosted row keeps its ordinary Delete.
+    expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
   });
 });
