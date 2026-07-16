@@ -123,7 +123,21 @@ Non-goals (v1):
    was still uncommitted WIP. Posture disclosed: a hosted worker carries PRD
    #51's same-uid residual exactly as today's compose worker does — hosting
    neither widens it (the residual is intra-user, `ARCHITECTURE.md:427-428`)
-   nor closes it.
+   nor closes it. **M3 MUST render `fsGroup: 10001` on the pod rather than
+   relying on image-baked ownership** (architect pass, 2026-07-16). Two reasons,
+   and it is what makes the additive claim above a property rather than an
+   accident: (a) an RWO PVC mounts `root:root 0755`, so uid 10001 cannot write
+   it, and the usual initContainer-chown escape needs root, which PodSecurity
+   `restricted` forbids — so v1 needs `fsGroup` regardless; (b) `fsGroup`
+   applies to **every** container in the pod, so when PRD #51's k8s phase adds
+   the `runner` container at uid 10002 it inherits supplemental gid 10001 and
+   the setgid/g+rw volume for free, with no pod-spec rework. **Open question
+   owned by PRD #51, not by us:** `fsGroup` grants the runner write access to
+   the shared workspace volume by construction. If #51's k8s phase expects the
+   uid split to fence *volume* access rather than only process/uid access, that
+   is a conflict to settle in #51's design. Our reading is that there is none —
+   the residual is intra-user and the workspace is meant to be shared — but #51
+   should confirm that deliberately rather than inherit it from this PRD.
 7. **Worker type = template, size = built-in preset.** Type selects the
    published per-template agent image (`agent-base`, `agent-jvm`; tag = release,
    Model B like api/web); the deployed image's baked `UZI_WORKER_TEMPLATE` must
