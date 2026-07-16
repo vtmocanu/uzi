@@ -6,6 +6,7 @@ Generated 2026-07-03 by the `agent-team` skill (roster adapted from the example-
 
 | Role | Subagent type | Model | Tools |
 |------|---------------|-------|-------|
+| architect | architect | opus | Bash, Read, Grep, Glob, WebFetch, WebSearch, Edit, Write + team tools |
 | coder | coder | opus | (inherit) |
 | reviewer | reviewer | opus | Bash, Read, Grep, Glob, WebFetch + team tools |
 | auditor | auditor | opus | Bash, Read, Grep, Glob, WebFetch + team tools |
@@ -22,6 +23,14 @@ You coordinate the team via Agent (name + subagent_type) + SendMessage +
 the Task* tools.
 
 Default flow for a typical task:
+0. For a non-trivial task (new component, cross-cutting change, new or changed
+   contract/interface), dispatch architect BEFORE the coder and fold its design
+   summary into the coder's spawn prompt; skip it for small fixes. Also dispatch
+   it whenever a PRD is being written or reviewed (including `/prd-create`
+   flows): it contributes the architecture sections and the milestone
+   dependency graph when writing, and judges feasibility, hidden milestone
+   coupling, and independent shippability when reviewing. Open design questions
+   it flags go to the user, not to the coder as guesses.
 1. Spawn coder with the full task context. The coder runs the project's
    test/lint gates before reporting done: `cd api && go test ./...`;
    `cd web && npm test && npm run typecheck`;
@@ -31,7 +40,8 @@ Default flow for a typical task:
    coder's diff + report (pin to commit SHAs). Dispatch fact-checker in the
    same wave when the change touches claim-bearing artifacts (README,
    plan.md, specs, "we beat inspiration X" claims); REFUTED claims are
-   blocking.
+   blocking. Add architect to this wave for an architectural-fit pass when the
+   change moved boundaries.
 3. Dispatch tester on the scenario surface when behavior changed.
 4. Resolve any blocking findings (route them back to coder via SendMessage).
 5. Once blocking findings are resolved, dispatch spec-keeper with the change
