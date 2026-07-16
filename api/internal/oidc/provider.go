@@ -33,6 +33,12 @@ type Config struct {
 	RedirectURL  string
 	Scopes       []string
 	HTTPTimeout  time.Duration
+	// GroupsClaim is the ID-token claim carrying the user's group membership
+	// (from config.OIDCGroupsClaim, default "groups"; PRD #55). The name is dynamic
+	// at runtime, so Exchange does a second tolerant decode to look it up rather than
+	// carrying it on the static rawClaims struct. Empty disables group parsing
+	// (Groups is always nil, GroupsClaimPresent always false).
+	GroupsClaim string
 }
 
 // Identity is the minimal, verified claim set the callback maps to a uzi user
@@ -44,6 +50,16 @@ type Identity struct {
 	Email         string
 	EmailVerified bool
 	Name          string
+	// Groups is the parsed group membership from the configured groups claim (PRD
+	// #55), non-nil only when the claim was present as a JSON array of strings (an
+	// empty array yields a non-nil empty slice — an authoritative empty membership).
+	// nil in every fail-safe case (see GroupsClaimPresent).
+	Groups []string
+	// GroupsClaimPresent distinguishes "claim absent, null, or unparseable" (false —
+	// the fail-safe misconfig case: keep stored role / pass the gate) from "claim
+	// present as a JSON string array, possibly empty" (true — an authoritative
+	// membership that grants/demotes and gates). PRD #55 Decision 1.
+	GroupsClaimPresent bool
 }
 
 // Sentinel errors let the callback pick an enumerated redirect code without
@@ -203,14 +219,48 @@ func (p *Provider) Exchange(ctx context.Context, code, pkceVerifier, expectedNon
 	if err := idToken.Claims(&claims); err != nil {
 		return Identity{}, fmt.Errorf("oidc id_token claims: %w", err)
 	}
+	groups, groupsPresent := parseGroupsClaim(idToken, p.cfg.GroupsClaim)
 	// sub/iss come from the verified token, not the unmarshalled claims blob.
 	return Identity{
-		Issuer:        idToken.Issuer,
-		Subject:       idToken.Subject,
-		Email:         claims.Email,
-		EmailVerified: claims.emailVerifiedTrue(),
-		Name:          claims.Name,
+		Issuer:             idToken.Issuer,
+		Subject:            idToken.Subject,
+		Email:              claims.Email,
+		EmailVerified:      claims.emailVerifiedTrue(),
+		Name:               claims.Name,
+		Groups:             groups,
+		GroupsClaimPresent: groupsPresent,
 	}, nil
+}
+
+// parseGroupsClaim tolerantly extracts the configured groups claim from the verified
+// ID token (PRD #55 Decision 1). The claim name is dynamic, so it cannot ride the
+// static rawClaims struct: a second decode into a raw map is looked up by name.
+// It returns (groups, present). present is true ONLY when the claim exists and is a
+// JSON array of strings — an empty array counts (an authoritative empty membership).
+// Every other case yields (nil, false): the claim absent, an explicit JSON null, or
+// any non-string-array shape (string, number, object, mixed array). Those are the
+// fail-safe cases the callback treats as IdP misconfig rather than a real removal.
+func parseGroupsClaim(idToken *gooidc.IDToken, claimName string) ([]string, bool) {
+	if claimName == "" {
+		return nil, false
+	}
+	var all map[string]json.RawMessage
+	if err := idToken.Claims(&all); err != nil {
+		return nil, false
+	}
+	raw, ok := all[claimName]
+	// Treat an explicit JSON null the same as absent — a null claim is far more
+	// likely a mapper misconfig than an authoritative empty membership (that is `[]`).
+	if !ok || string(bytes.TrimSpace(raw)) == "null" {
+		return nil, false
+	}
+	var groups []string
+	if err := json.Unmarshal(raw, &groups); err != nil {
+		// Not a JSON array of strings (string, number, object, mixed/non-string
+		// array): unparseable ⇒ fail-safe, not a real empty membership.
+		return nil, false
+	}
+	return groups, true
 }
 
 // rawClaims is the subset of ID-token claims uzi maps. email_verified is kept as

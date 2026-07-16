@@ -35,6 +35,14 @@ type fakeIDP struct {
 	name          string
 	nonce         string
 	emailVerified any // nil => omit the claim entirely
+
+	// Group-claim controls (PRD #55). groupsClaimName is the claim key emitted AND
+	// looked up (provider() threads it as GroupsClaim). groupsSet=false omits the
+	// claim entirely (the absent case); when true, groups is emitted verbatim (nil
+	// => JSON null; []any{...} => array; "s" => string; etc.).
+	groupsClaimName string
+	groupsSet       bool
+	groups          any
 }
 
 func newFakeIDP(t *testing.T, clientID string) *fakeIDP {
@@ -44,13 +52,14 @@ func newFakeIDP(t *testing.T, clientID string) *fakeIDP {
 		t.Fatalf("rsa key: %v", err)
 	}
 	f := &fakeIDP{
-		key:           key,
-		kid:           "test-key-1",
-		clientID:      clientID,
-		sub:           "sub-123",
-		email:         "user@example.com",
-		name:          "Test User",
-		emailVerified: true,
+		key:             key,
+		kid:             "test-key-1",
+		clientID:        clientID,
+		sub:             "sub-123",
+		email:           "user@example.com",
+		name:            "Test User",
+		emailVerified:   true,
+		groupsClaimName: "groups",
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
@@ -107,6 +116,9 @@ func (f *fakeIDP) signIDToken(t *testing.T) string {
 	if f.emailVerified != nil {
 		claims["email_verified"] = f.emailVerified
 	}
+	if f.groupsSet {
+		claims[f.groupsClaimName] = f.groups
+	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	tok.Header["kid"] = f.kid
 	signed, err := tok.SignedString(f.key)
@@ -124,6 +136,7 @@ func (f *fakeIDP) provider() *Provider {
 		RedirectURL:  f.issuer + "/cb",
 		Scopes:       []string{"openid", "profile", "email"},
 		HTTPTimeout:  5 * time.Second,
+		GroupsClaim:  f.groupsClaimName,
 	})
 }
 

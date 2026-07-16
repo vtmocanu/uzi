@@ -101,7 +101,17 @@ See [oidc.md](oidc.md) for the operator setup guide (Keycloak and Pocket ID walk
 
 The redirect URI is not itself a setting: it's derived as `FRONTEND_ORIGIN + /api/auth/oidc/callback`, and must match exactly what's registered at the IdP.
 
-There is no `UZI_OIDC_*` variable to opt into groups/roles-claim → admin mapping, multiple providers, or SAML — out of scope for this iteration (see the PRD).
+### Group-based roles and access (PRD #55)
+
+See [oidc.md](oidc.md#group-based-roles-and-access-prd-55) for the full semantics (authoritative sync, fail-safe on an absent claim, seed-admin exemption, staleness windows) and the Keycloak/Pocket ID walkthroughs. Setting `UZI_OIDC_ADMIN_GROUPS` or `UZI_OIDC_ALLOWED_GROUPS` while OIDC (above) is unconfigured refuses to start, same posture as the core OIDC triple. `UZI_OIDC_GROUPS_CLAIM` is a format knob, not a gate: it's inert on its own (ships as a compose/`.env.example` default of `groups`) and never blocks boot by itself.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_OIDC_GROUPS_CLAIM` | `groups` | The ID-token claim name carrying the user's group membership. Override only if your IdP names it differently; Keycloak and Pocket ID can both be configured to emit `groups`. Dormant on its own — has no effect unless `UZI_OIDC_ADMIN_GROUPS` or `UZI_OIDC_ALLOWED_GROUPS` is also set, and setting it alone never trips the refuse-to-start guard above. |
+| `UZI_OIDC_ADMIN_GROUPS` | — (empty = off) | Comma-separated group names; membership in any one grants `is_admin` on SSO login. Setting this disables the first-OIDC-user-becomes-admin rule outright — the group decides, not order of arrival. Authoritative on every login: leaving the group demotes on the next SSO login. The seed admin (`UZI_SEED_EMAIL`) is exempt from demotion only (break-glass), never from the allowlist gate below. |
+| `UZI_OIDC_ALLOWED_GROUPS` | — (empty = no gate) | Comma-separated group names; membership in any one is required to SSO-login or JIT-provision at all. Checked before any DB read or write, so a rejected login never links or creates a row. A claim that's present but shows no match rejects both existing and brand-new users; a claim that's entirely absent or unparseable (IdP misconfig, not removal) still lets an *existing* user through, but a brand-new JIT user is refused (no established role to fail safe into). |
+
+Matching is exact and case-sensitive after trimming whitespace from the config value — no glob/regex/path normalization. There is no `UZI_OIDC_*` variable for multiple providers or SAML — out of scope for this iteration (see the PRD).
 
 ## Agent runtime (PRD #4)
 

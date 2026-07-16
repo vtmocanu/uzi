@@ -75,6 +75,14 @@ api:
   # TRUSTED_PROXIES, FORGE_ALLOWED_BASE_URLS) live in deploy/values/<cluster>.yaml.
   config:
     API_ADDR: ":8080"
+    # OIDC group-based roles/access (PRD #55) — all NON-secret ConfigMap values
+    # (group names are not secrets, so they live here, not in secretEnv). Require
+    # OIDC configured (issuer/client-id in api.config per-cluster + the client secret
+    # in secretEnv above). Uncomment + set per-cluster to enable; empty admin/allowed
+    # groups = feature dormant. Matching is exact + case-sensitive. See docs/oidc.md.
+    # UZI_OIDC_GROUPS_CLAIM: groups
+    # UZI_OIDC_ADMIN_GROUPS: uzi-admins
+    # UZI_OIDC_ALLOWED_GROUPS: uzi-users
   # Infisical-synced secret env: ENV_VAR -> the key in the `uzi-secrets` Secret.
   # JWT_SECRET and UZI_SECRET_KEY are REQUIRED (the api refuses to boot without
   # them — that guard is the backstop, so the k8s secretKeyRef stays optional:true

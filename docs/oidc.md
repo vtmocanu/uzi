@@ -28,10 +28,13 @@ for the design rationale; this page is the operator setup guide.
   logs you straight back in with no prompt — this is expected, not a bug. To
   actually sign out everywhere, log out of the IdP itself too.
 - First login for an email uzi has never seen **JIT-provisions** a new user
-  (subject to `UZI_REGISTRATION_ENABLED` and `UZI_ALLOWED_EMAIL_DOMAINS`); an
-  existing password-registered account is instead **linked** by verified
-  email. Either way the match requires the IdP's `email_verified` claim to be
-  `true` — see [Enabling email verification](#enabling-email-verification-required)
+  (subject to `UZI_REGISTRATION_ENABLED`, `UZI_ALLOWED_EMAIL_DOMAINS`, and, if
+  configured, `UZI_OIDC_ALLOWED_GROUPS` — see
+  [Group-based roles and access](#group-based-roles-and-access-prd-55)
+  below); an existing password-registered account is instead **linked** by
+  verified email. Either way the match requires the IdP's `email_verified`
+  claim to be `true` — see
+  [Enabling email verification](#enabling-email-verification-required)
   below.
 
 ## Environment variables
@@ -54,15 +57,24 @@ exactly.
 
 ## Fresh-instance admin pre-seeding
 
-**Do this before you enable OIDC on a brand-new instance.** The first-ever
-login — password or OIDC — becomes the admin, same rule either way. If you
-turn on OIDC on a fresh instance with no `UZI_SEED_EMAIL` and no
-`UZI_ALLOWED_EMAIL_DOMAINS` set, the first person anywhere in your
-organization to click "Sign in with SSO" becomes the uzi admin, not you. Set
-`UZI_SEED_EMAIL` (and `UZI_SEED_PASSWORD`) to pre-seed your own admin account,
-and/or set `UZI_ALLOWED_EMAIL_DOMAINS` to your org's domain(s) so JIT
-provisioning can't reach outside it — see
-[configuration.md](configuration.md#access-control-prd-5).
+**Do this before you enable OIDC on a brand-new instance — unless you're
+setting `UZI_OIDC_ADMIN_GROUPS` (below), in which case it's optional.**
+Without admin groups configured, the first-ever login — password or OIDC —
+becomes the admin, same rule either way. If you turn on OIDC on a fresh
+instance with no `UZI_SEED_EMAIL` and no `UZI_ALLOWED_EMAIL_DOMAINS` set, the
+first person anywhere in your organization to click "Sign in with SSO"
+becomes the uzi admin, not you. Set `UZI_SEED_EMAIL` (and
+`UZI_SEED_PASSWORD`) to pre-seed your own admin account, and/or set
+`UZI_ALLOWED_EMAIL_DOMAINS` to your org's domain(s) so JIT provisioning can't
+reach outside it — see [configuration.md](configuration.md#access-control-prd-5).
+
+**With `UZI_OIDC_ADMIN_GROUPS` set, this warning no longer applies.** The
+group decides who's admin, not order of arrival: first-SSO-user-becomes-admin
+is disabled outright, and any member of a configured admin group gets
+`is_admin` on their first login regardless of whether they're first, tenth,
+or the hundredth. Pre-seeding is then optional and only serves as
+break-glass — see [Group-based roles and access](#group-based-roles-and-access-prd-55)
+below.
 
 ## Keycloak walkthrough
 
@@ -124,6 +136,148 @@ and Pocket ID both emit a proper boolean; only other IdPs need checking.
   complete Pocket ID's own email-verification flow. Either way flips the
   per-user flag that uzi checks.
 
+## Group-based roles and access (PRD #55)
+
+By default OIDC login has exactly one role decision: whoever logs in first
+becomes admin (see [Fresh-instance admin pre-seeding](#fresh-instance-admin-pre-seeding)
+above). If your IdP already models teams as groups, you can hand that
+decision to the IdP instead: membership in a configured group grants admin,
+and membership in a configured group can be required just to log in at all.
+Both are opt-in and off by default — see
+[configuration.md](configuration.md#oidc-single-sign-on-prd-45) for the full
+env var reference (`UZI_OIDC_GROUPS_CLAIM`, `UZI_OIDC_ADMIN_GROUPS`,
+`UZI_OIDC_ALLOWED_GROUPS`).
+
+- **`UZI_OIDC_ADMIN_GROUPS`** (comma-separated, empty = off): membership in
+  any listed group makes a user admin. Setting this disables
+  first-SSO-user-becomes-admin outright — see the pre-seeding note above.
+- **`UZI_OIDC_ALLOWED_GROUPS`** (comma-separated, empty = no gate): membership
+  in any listed group is required to SSO-login or JIT-provision at all. A
+  user outside every listed group gets `/login?error=oidc_forbidden`, same as
+  any other rejected login (no detail beyond the server log — see
+  [Troubleshooting](#troubleshooting)).
+- Matching is **exact and case-sensitive** after trimming whitespace from the
+  config value — no glob, no regex, no path normalization. This is why the
+  Keycloak walkthrough below has you turn **Full group path** off: with it
+  left on, Keycloak emits `/uzi-admins` instead of `uzi-admins`, and that
+  won't match `UZI_OIDC_ADMIN_GROUPS=uzi-admins`. (You can instead set
+  `UZI_OIDC_ADMIN_GROUPS=/uzi-admins` verbatim if you'd rather keep Full
+  group path on — either works, as long as the two sides match exactly.)
+
+### Authoritative sync: groups grant AND demote
+
+Group membership is re-checked on **every** OIDC login, not just the first.
+There are no sticky roles:
+
+- A user added to `UZI_OIDC_ADMIN_GROUPS` becomes admin on their next SSO
+  login.
+- A user **removed** from that group is demoted on their next SSO login —
+  no admin action needed, and none available (there is no manual
+  promote/demote in this PRD; the IdP is the source of truth).
+- A user removed from `UZI_OIDC_ALLOWED_GROUPS` is blocked on their next SSO
+  login attempt.
+
+This is a **login-time** sync, not a live one. Two staleness windows follow
+from that:
+
+- A demoted-in-the-IdP user who simply never logs in again keeps their old
+  `is_admin` until they do. For an OIDC-only user, `AUTH_TOKEN_TTL` (default
+  `168h`) is a **max-idle** bound here, not an absolute cap: uzi's rolling
+  refresh (see [How it works](#how-it-works)) slides an active session
+  forward past its half-life on every request, so a continuously-active
+  user's stale `is_admin` can persist well past 168h for as long as they
+  keep using uzi without a gap that long. A user who also has a uzi password
+  can keep re-authenticating that way indefinitely and never trigger the
+  sync at all (groups apply to OIDC logins only — a password login never
+  touches `is_admin`). Use the admin deactivate-user action for an immediate
+  cutoff regardless of session activity.
+- Likewise, removing someone from `UZI_OIDC_ALLOWED_GROUPS` blocks their
+  *next* SSO login but does not revoke a session they're already holding. To
+  cut off access immediately, use the existing admin deactivate-user action,
+  which does kill live sessions.
+
+The other side of that same mechanism works in the sync's favor: once a
+grant or demotion IS written, at the user's next OIDC login, it takes effect
+for every one of that user's **other** live sessions immediately, not just
+the one they just logged into. `is_admin` isn't carried in the JWT — every
+request reloads the user row — so there's no separate per-session
+propagation delay once the write lands.
+
+### The groups claim: present-but-absent isn't the same as present-but-empty
+
+uzi reads groups from the **verified ID token only** — there is no userinfo
+fallback — and treats two situations very differently:
+
+- **The claim is present, as a JSON array of strings, and the user isn't in
+  it** (including an empty array `[]`): that's real, authoritative removal.
+  Demotion and gating apply normally.
+- **The claim is missing entirely, `null`, or not shaped like an array of
+  strings** (a renamed claim, a mapper switched off, a stray string instead
+  of an array): uzi treats this as an **IdP misconfiguration, not a mass
+  removal**. An existing user keeps whatever role they already had and still
+  passes the allowlist gate; the login proceeds, but the server logs a
+  loud warning on every such login so the misconfiguration doesn't go
+  unnoticed. A **brand-new** user hitting JIT provisioning in this state has
+  no established role to fall back on, so they're admitted as non-admin and,
+  if `UZI_OIDC_ALLOWED_GROUPS` is set, refused outright.
+
+  This fail-safe exists so that one broken mapper or one renamed claim can't
+  silently demote every admin and lock every existing user out at the same
+  time.
+
+### Seed admin: exempt from demotion, not from the gate
+
+`UZI_SEED_EMAIL` is your break-glass account, and it keeps that role here:
+it is **never demoted** by the group sync, even if it's missing from
+`UZI_OIDC_ADMIN_GROUPS` or removed from it later. It can, however, still be
+**promoted** by group membership like anyone else.
+
+The exemption does not extend to the allowlist gate. If the seed admin's
+email is used to SSO-login and `UZI_OIDC_ALLOWED_GROUPS` is set without them
+in it, the gate rejects the SSO attempt before user resolution ever runs —
+group config can't grant an SSO exception to itself. The seed admin's actual
+break-glass path is **password login**, which is entirely outside OIDC and
+bypasses both the gate and the sync by design (groups apply to OIDC logins
+only).
+
+### Keycloak: emitting the groups claim
+
+Builds on the client you created in the [Keycloak walkthrough](#keycloak-walkthrough)
+above.
+
+1. **Groups → Create group** for each role you want to map (e.g. `uzi-admins`,
+   `uzi-users`).
+2. Add the relevant users to those groups (**Groups → &lt;group&gt; → Members
+   → Add member**, or per-user under **Users → &lt;user&gt; → Groups → Join
+   Group**).
+3. **Client scopes** → open (or create) a client scope attached to your uzi
+   client → **Mappers** tab → **Add mapper → By configuration → Group
+   Membership**.
+4. In the mapper: set **Token Claim Name** to `groups` (or whatever you set
+   `UZI_OIDC_GROUPS_CLAIM` to), turn **Full group path** **OFF** (see the
+   exact-match note above), and turn **Add to ID token** **ON** — this is the
+   step PRD #45's own setup can't cover, since a plain login mapper doesn't
+   include it by default.
+5. Set `UZI_OIDC_ADMIN_GROUPS` and/or `UZI_OIDC_ALLOWED_GROUPS` to the group
+   name(s) from step 1 (e.g. `UZI_OIDC_ADMIN_GROUPS=uzi-admins`), restart uzi,
+   and log in as a member to confirm.
+
+No scope needs requesting for this on Keycloak — group emission there is a
+client-scope/mapper concern, not something `UZI_OIDC_SCOPES` controls.
+
+### Pocket ID: emitting the groups claim
+
+Builds on the client you created in the [Pocket ID walkthrough](#pocket-id-walkthrough)
+above.
+
+1. In the Pocket ID admin panel, create the **user groups** you want to map
+   (e.g. `uzi-admins`, `uzi-users`) and add the relevant users to them.
+2. Add `groups` to `UZI_OIDC_SCOPES` (e.g.
+   `UZI_OIDC_SCOPES=openid profile email groups`) — unlike Keycloak, Pocket ID
+   emits the groups claim via a requested scope, not a separate mapper step.
+3. Set `UZI_OIDC_ADMIN_GROUPS` and/or `UZI_OIDC_ALLOWED_GROUPS` to the group
+   name(s) from step 1, restart uzi, and log in as a member to confirm.
+
 ## Development setups
 
 Running `api` in a container while the IdP listens on the **host's**
@@ -179,6 +333,6 @@ browser):
 |---|---|
 | `oidc_state` | The state cookie was missing, wouldn't decrypt, or didn't match — usually a stale/expired attempt (the cookie lives 10 minutes) or a cookie blocked by the browser. Retry from the login page. |
 | `oidc_exchange` | Discovery, the token exchange, or ID-token verification failed — e.g. the IdP went unreachable between login and callback, the client secret is wrong, or a clock-skew/nonce mismatch at the token endpoint. Check the API logs. |
-| `oidc_forbidden` | The IdP denied the request, the email claim was missing/unverified, the email's domain isn't in `UZI_ALLOWED_EMAIL_DOMAINS`, registration is disabled and no existing account matched, or the email already belongs to a *different* linked account. See [Enabling email verification](#enabling-email-verification-required) — this is the most common cause. |
+| `oidc_forbidden` | The IdP denied the request, the email claim was missing/unverified, the email's domain isn't in `UZI_ALLOWED_EMAIL_DOMAINS`, registration is disabled and no existing account matched, the email already belongs to a *different* linked account, or (if configured) the user isn't a member of any `UZI_OIDC_ALLOWED_GROUPS` group — see [Group-based roles and access](#group-based-roles-and-access-prd-55). See [Enabling email verification](#enabling-email-verification-required) — this is the most common cause. |
 | `oidc_deactivated` | The matched uzi account has been deactivated by an admin. |
 | `oidc_error` | An internal error (DB, cookie sealing) — check the API logs. |

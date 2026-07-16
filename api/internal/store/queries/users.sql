@@ -93,3 +93,12 @@ SET is_active = @is_active,
     token_version = CASE WHEN @is_active THEN token_version ELSE token_version + 1 END
 WHERE id = @id
 RETURNING *;
+
+-- name: SetUserAdmin :one
+-- Authoritative sync of is_admin from OIDC group membership (PRD #55): membership in
+-- an UZI_OIDC_ADMIN_GROUPS group grants, leaving the group demotes, on the user's
+-- next OIDC login. is_admin is reloaded per-request by RequireAuth (not carried in
+-- the JWT), so a flip propagates to live sessions without a token_version bump. The
+-- seed-admin demotion exemption is enforced in the caller, not here.
+UPDATE users SET is_admin = @is_admin WHERE id = @id
+RETURNING *;
