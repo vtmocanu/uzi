@@ -63,10 +63,16 @@ also structurally closes proc-hardening's *other* documented residual — the PA
 setsid/`/proc`-environ race during the push window (`docs/proc-hardening.md:26-31,104-108`).
 Precision: the PAT lives in the environ of the credentialed **git child** the
 worker spawns during the push (not the worker's *own* environ); both are
-worker-uid-owned `0400`, and after the worker's setuid drop the worker process is
-non-dumpable, so its `/proc/<pid>/*` are in fact **root-owned `0400`** (stronger
-than owner-readable). A runner-uid survivor of a `setsid`-escaped agent therefore
-cannot read either. **This bonus close holds only because Decision 1 keeps all
+**`worker:worker 0400`** (owner-read-only). **Correction (M4 live PoC on the image,
+2026-07-16):** the earlier claim that these `/proc/<pid>/*` are **root-owned `0400`**
+(via post-drop non-dumpability) is FALSE — empirically the worker node and its git
+children are dumpable after the setpriv reuid+exec chain (a same-uid exec resets
+dumpable to `SUID_DUMP_USER`), so `/proc/<pid>/environ` is owned by `worker:worker`,
+mode `0400`. That still denies the runner (uid `runner` is neither the owner nor in
+group `worker`; `0400` grants "other" nothing) — the close holds, it is just
+owner-readable-by-the-worker rather than the overstated "stronger, root-owned." A
+runner-uid survivor of a `setsid`-escaped agent therefore cannot read either
+(PoC-confirmed: `token=DENIED worker-environ=DENIED`). **This bonus close holds only because Decision 1 keeps all
 credentialed git on the worker uid** — it breaks the instant any PAT-bearing git
 moves to the execution uid. This PRD closes the file read **and** that environ
 race, conditioned on Decision 1.
@@ -775,8 +781,26 @@ model.
       (node:22-alpine, git 2.54.0) + host git 2.55.0. The **uid-boundary** half of the
       gate (the `runner` uid specifically does the seed+commit while `worker` owns the
       bare) is proven in M4.
-- [ ] **M4 — Spawn surfaces under the execution uid ((b) ownership goes live +
-      `/nix` group-write + worker-PATH-strip, ATOMIC).** SDK agent, check runner,
+- [x] **M4 — Spawn surfaces under the execution uid ((b) ownership goes live +
+      `/nix` runner-owned + worker-PATH-strip, ATOMIC). DONE 2026-07-16 — live boundary
+      PoC-confirmed on the image.** Mechanism = a `setpriv` wrapper (`runner-uid.ts`)
+      that reuids to `runner` and CLEARS inh+ambient caps (a plain reuid leaves ambient
+      CAP_SETUID intact → runner could setuid back; PoC-proven). All untrusted spawns route
+      through it (SDK/chat/judge CLIs, self-improve checks + `npm ci`, provision hooks, the
+      runner-clone seed clone/checkout); cross-uid signals (B1 reap, watchdog) go via a
+      setpriv-to-runner `kill` (the worker has no CAP_KILL). Env split via `UZI_RUNNER_PATH`
+      (the /nix-bearing PATH; worker PATH stripped to root image dirs) + `UZI_RUNNER_TMPDIR`;
+      `/nix` → `runner:runner`; worker `umask 002` gives the runner-owned /data subtrees
+      group-write (leaf-dir + cleanup). **Live PoC on `node:22-alpine` (image git 2.54.0):**
+      runner child ends `CapEff=CapAmb=0`; **token DENIED**; the worker's `/proc` environ
+      **DENIED** (`worker:worker 0400` — see the Bonus-close correction above); the
+      setpriv-to-runner **reap terminates the runner group**; `getcap -r /` and `/nix` show
+      **no** file-cap/setuid binary (the CapBnd residue is inert; `no-new-privileges` is a
+      second belt); the leaf-dir chain (worker mkdir → runner writes the clone → worker
+      `rm -rf`) works. Gated on `UZI_UID_SPLIT=1` (root/A1 path only); a #58 non-root start
+      stays single-uid (the primitive is a passthrough). **Behavioral end-to-end** (worker
+      still clones/fetches-back/pushes; provisioning + a real SDK turn as `runner`; e2e) is
+      the M5 gate. SDK agent, check runner,
       provision hooks launch under the execution uid; the worker retains `CAP_SETUID`
       and does the credentialed git/HTTP; capability hygiene (Decision 7),
       root-startup-window hygiene (M5-audit), and no cross-uid IPC channel (5-bis)
