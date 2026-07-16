@@ -71,7 +71,117 @@ credentialed git on the worker uid** — it breaks the instant any PAT-bearing g
 moves to the execution uid. This PRD closes the file read **and** that environ
 race, conditioned on Decision 1.
 
-## Design Decisions (DRAFT — mechanism firmed in M1)
+## M1 gate resolution — design firmed (2026-07-16)
+
+This resolves the M1 design gate. The mechanism (Decision 2), the capability
+lifetime (B1 / Decision 7), the per-path bare-cache ownership (B2 / Decision 4),
+the persisted-volume migration (B4 / Decision 4), and the k8s mapping (Decision
+8) are now **decided, not draft**. The detailed analysis is unchanged in the
+Decisions below; this section is the authoritative summary M2–M7 build to.
+
+**Confirmed on the built image (PoC).** The same-uid token read was reproduced
+against `uzi-agent:latest` (base template): the image's default user is
+`uid=100(uzi)`, and a process running as `uzi` reads `/run/secrets/worker_token`
+directly. Two findings:
+- The worker and the SDK agent subprocess share uid `uzi` — no spawn site setuids
+  (`sdk-spawn.ts`, `self-improve.ts:242`, `provision.ts`) — so the agent can
+  `cat` the token → `claim` → forge PAT + Anthropic token. This is the vector the
+  split closes.
+- The compose secret mounts **`0444 root:root` (world-readable)**, not the
+  `0400`/worker the design assumed. This corroborates audit L2: an env-sourced
+  compose secret's `uid`/`gid`/`mode` are unreliable, so **M2 must force
+  `0400`/`worker` on the token file in the entrypoint**, not trust compose to.
+
+**Mechanism = (A1)** (Decision 2). A root entrypoint `setuid`-drops to uid
+`worker`; the worker **retains `CAP_SETUID`/`CAP_SETGID` as ambient caps for the
+run lifetime** (it spawns runner-uid children per-run, in-process) and spawns the
+SDK agent / self-improve checks / provision hooks as a distinct uid `runner`
+holding no caps. `no-new-privileges:true` stays on (it does not block a root→lower
+drop). **Tooling feasibility confirmed on the image:** `/bin/setpriv` (the busybox
+applet) already supports `--ambient-caps`/`--inh-caps`, so the A1 drop wrapper
+needs **no extra package** at the flag level. **M2 must still verify** the ambient
+set actually survives runc clearing the permitted set on the setuid-to-non-root
+transition (the B1 caveat); if the busybox applet proves insufficient, fall back
+to `apk add util-linux` (real `setpriv`) or `su-exec`/`gosu` plus a `capsh`/
+`libcap` ambient step. Compose gains `cap_add: [SETUID, SETGID]` (+ `CAP_SETPCAP`
+to raise ambient caps, + `CAP_CHOWN`/`DAC_OVERRIDE` for the B4 startup chown).
+- **(B) rootless bwrap/userns — DROPPED.** The dev host is darwin/Docker-Desktop;
+  making unprivileged userns work under `cap_drop: ALL` + `no-new-privileges` +
+  seccomp would need `seccomp=unconfined`/`CAP_SYS_ADMIN` or a suid `bwrap` (which
+  `no-new-privileges` neutralises). No host PoC cleared it, so it is not a
+  candidate.
+- **(C) sidecar / second container — the eventual k8s form, not built locally.**
+  See the k8s mapping and the N2 divergence note below.
+
+**Decision 7 rewritten (B1 — the old criterion is RETIRED).** The success
+criterion is now: **the worker holds `CAP_SETUID`/`CAP_SETGID` (and `CAP_CHOWN`
+if a startup volume-chown is used) for the run lifetime; the runner processes hold
+none.** The original "caps added only to perform the drop and dropped immediately
+after / no residual caps" is **impossible for (A)** — the already-dropped worker
+forks runner-uid children per-run and therefore needs `CAP_SETUID` at each spawn —
+and is struck. **Posture disclosed plainly:** the PAT custodian also holds
+`CAP_SETUID`, so a post-compromise worker could become any uid including 0.
+Accepted, because it is the *trusted* side; the containment we buy is entirely on
+the *runner* side (the untrusted code-execution surface holds no worker creds and
+cannot reach the token, the worker's `/proc` environ, or worker-side git
+code-exec).
+
+**B2 — per-path bare-cache ownership (Decision 4).** A blanket "bare cache
+worker-owned, non-runner-writable" is **not implementable**: the agent's own
+`git commit` (kept on the runner uid — Decision 1) writes objects into
+`<bare>/objects/` and updates `<bare>/worktrees/<name>/`, both inside the bare
+dir, so a blanket rule EACCESes the commit. Decided per-path model:
+- **worker-owned, non-runner-writable:** `<bare>/config`, `<bare>/hooks` (the
+  code-exec config surface).
+- **runner-writable (shared gid):** `<bare>/objects/`, the run's
+  `<bare>/worktrees/<name>/` admin dir, and the worktree checkout.
+
+This ownership is what closes the **arbitrary-name** `filter.<name>.process` /
+`diff.<name>.textconv` keys that M0's inline pins cannot cover: with
+`<bare>/config` non-runner-writable the attacker cannot set
+`extensions.worktreeConfig`, so a runner-writable
+`<bare>/worktrees/<name>/config.worktree` is **never read** by worker-side git
+(verified in M0: an inline `extensions.worktreeConfig=false` does **not** block
+that file read — git decides which files to read from on-disk config before inline
+overrides apply — so config-source ownership is the only control). M0's fixed-name
+pins remain the belt for `fsmonitor`/`diff.external`/`pager`/`sshCommand`
+regardless of ownership. **Alternative weighed, not chosen for local:** give the
+runner a **separate clone / object store** and have the worker `fetch` from it
+(avoids shared-write into the bare entirely) — rejected here as an extra fetch hop
+plus a cache split; worth revisiting for the k8s form.
+
+**B4 — persisted named-volume migration (Decision 4).** `agentnix`/`agentdata`
+are seeded from the image on first use and thereafter **persist their original
+ownership**; a Dockerfile chown touches only the image layer, not a populated
+volume. When the execution uid changes from today's `uzi`, an existing install's
+`/nix` + `/data` stay owned by the old uid → provisioning + worktree writes
+EACCES. Decided: a **root-entry startup chown** of the mounted runner-writable
+subpaths (`/nix`, the `/data` worktrees, and the runner-writable bare subpaths)
+before the drop, needing `CAP_CHOWN` (+ `DAC_OVERRIDE`) — folded into the Decision
+7 cap set. A clean install (`down -v`) is the documented alternative. The chown
+runs in the root startup window only (M5-audit hygiene: only static root-owned
+binaries, no runner-writable dir on `PATH`, `/nix` empty at entry).
+
+**k8s mapping (Decision 8 — docs-only here).** Align at the **distinct-uid
+abstraction, not the mechanism.** The k8s form is two containers in one pod with
+per-container `runAsUser` (worker 10001 / runner 10002), `shareProcessNamespace:
+false`, and the token projected only into the worker — that is the PRD's
+**(C)/sidecar**, which needs **no `CAP_SETUID` and no in-process uid spawn**. Do
+**not** claim (A1) "maps 1:1 to `runAsUser`." Actual manifests defer to the
+remote-worker deployment PRD; this PRD only keeps the design aligned so they don't
+drift.
+
+**N2 divergence — build (A1) as the local bridge, pay for (C) at the pod move.**
+(A1) keeps the worker↔SDK boundary in-process (pid capture, `killAgentTree`,
+per-run session dir, in-process abort — `sdk-executor.ts`); (C) rebuilds it as
+IPC. So the M4 spawn wiring is partly throwaway for the eventual k8s (C) redesign.
+Decision: still build (A1) locally — it is kernel-enforced, has no fragile userns
+dependency, and ships on the compose MVP we deploy today; going straight to (C) in
+compose would force the IPC rebuild now for a form we do not yet run, buying the
+**same** containment. The throwaway is the control-plane wiring, not the security
+model.
+
+## Design Decisions (analysis — firmed at the M1 gate above, 2026-07-16)
 
 1. **Boundary = worker-vs-execution (validated by audit).** The **worker** stays
    the sole custodian of the **worker** credentials and runs everything they
@@ -347,13 +457,12 @@ race, conditioned on Decision 1.
    remote-worker deployment PRD; this PRD only aligns the design so they don't
    drift.
 
-## Technical Design (PROVISIONAL until the M1 gate resolves B1/B2/B4)
+## Technical Design (firmed at the M1 gate; B1/B2/B4 resolved above)
 
-> This section sketches the (A1) shape but is **provisional**: the capability
-> lifetime (B1), the per-path bare-cache ownership (B2), and the persisted-volume
-> migration (B4) are open at the M1 design gate. Do not treat `/data/repos`
-> worker-owned as settled — the per-path split (Decision 4) supersedes the coarse
-> "bare cache worker-owned" phrasing below.
+> This section sketches the (A1) shape. B1 (capability lifetime), B2 (per-path
+> bare-cache ownership), and B4 (persisted-volume migration) are **resolved** at
+> the M1 gate — see "M1 gate resolution" above; the per-path split (Decision 4)
+> supersedes any coarse "bare cache worker-owned" phrasing below.
 
 - **agent/ image (`base` + `jvm`)**: second uid; root entrypoint + `gosu`/`setpriv`
   drop wrapper (mechanism A1, worker **retains** `CAP_SETUID/SETGID` ambient);
@@ -386,7 +495,9 @@ race, conditioned on Decision 1.
       of a `diff.external`/`fsmonitor`/`filter` **cannot** achieve code-exec in the
       worker's later `diff`/`worktree add` (PoC). Ships as its own MR, like PRD #46
       M10.
-- [ ] **M1 — Threat model + mechanism decision (design gate).** Confirm the
+- [x] **M1 — Threat model + mechanism decision (design gate). DONE 2026-07-16 —
+      see "M1 gate resolution" above (A1 chosen, B1/B2/B4 settled, same-uid read
+      PoC confirmed on `uzi-agent:latest`, k8s mapping aligned).** Confirm the
       same-uid read on the running image (PoC: uid-`uzi` reads the token). **Pick
       A1/A2/A3 explicitly** (Decision 2) — resolve the capability-lifetime flaw
       (B1: the worker must **retain** `CAP_SETUID/SETGID` to spawn runner children,
