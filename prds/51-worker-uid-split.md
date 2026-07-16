@@ -844,8 +844,10 @@ model.
       under (b) — the worker is bare-only and never reads a runner config source — but
       keep an explicit regression test) **nor via a runner-planted
       `uploadpack.packObjectsHook`/upload-pack hook exercised on the IMAGE's git**
-      (B2 invariant 6 — the mitigation is git-version-dependent, so this runs against
-      `node:22-alpine`'s git, not just a host git); **plus (A1 net-ns, L1/L5):** the
+      (B2 invariant 6 — the close is the **protected-config gate** (repo-local
+      `packObjectsHook` ignored — documented, transport-independent, stable), confirmed
+      on `node:22-alpine`'s git 2.54.0 in M3 and kept as a regression guard here); **plus
+      (A1 net-ns, L1/L5):** the
       runner child's `/proc/self/fd` is only
       `{0,1,2}`+known (fd leak — **load-bearing under A1**); the worker node process
       has **no `--inspect`/`NODE_OPTIONS=--inspect` debug port**; worker and runner
