@@ -28,10 +28,13 @@ for the design rationale; this page is the operator setup guide.
   logs you straight back in with no prompt — this is expected, not a bug. To
   actually sign out everywhere, log out of the IdP itself too.
 - First login for an email uzi has never seen **JIT-provisions** a new user
-  (subject to `UZI_REGISTRATION_ENABLED` and `UZI_ALLOWED_EMAIL_DOMAINS`); an
-  existing password-registered account is instead **linked** by verified
-  email. Either way the match requires the IdP's `email_verified` claim to be
-  `true` — see [Enabling email verification](#enabling-email-verification-required)
+  (subject to `UZI_REGISTRATION_ENABLED`, `UZI_ALLOWED_EMAIL_DOMAINS`, and, if
+  configured, `UZI_OIDC_ALLOWED_GROUPS` — see
+  [Group-based roles and access](#group-based-roles-and-access-prd-55)
+  below); an existing password-registered account is instead **linked** by
+  verified email. Either way the match requires the IdP's `email_verified`
+  claim to be `true` — see
+  [Enabling email verification](#enabling-email-verification-required)
   below.
 
 ## Environment variables
@@ -70,7 +73,7 @@ group decides who's admin, not order of arrival: first-SSO-user-becomes-admin
 is disabled outright, and any member of a configured admin group gets
 `is_admin` on their first login regardless of whether they're first, tenth,
 or the hundredth. Pre-seeding is then optional and only serves as
-break-glass — see [Group-based roles and access](#group-based-roles-and-access)
+break-glass — see [Group-based roles and access](#group-based-roles-and-access-prd-55)
 below.
 
 ## Keycloak walkthrough
@@ -178,15 +181,27 @@ This is a **login-time** sync, not a live one. Two staleness windows follow
 from that:
 
 - A demoted-in-the-IdP user who simply never logs in again keeps their old
-  `is_admin` until they do. For an OIDC-only user that's bounded by their
-  session lifetime (`AUTH_TOKEN_TTL`, default `168h`); a user who also has a
-  uzi password can keep re-authenticating that way indefinitely and never
-  trigger the sync (groups apply to OIDC logins only — a password login
-  never touches `is_admin`).
+  `is_admin` until they do. For an OIDC-only user, `AUTH_TOKEN_TTL` (default
+  `168h`) is a **max-idle** bound here, not an absolute cap: uzi's rolling
+  refresh (see [How it works](#how-it-works)) slides an active session
+  forward past its half-life on every request, so a continuously-active
+  user's stale `is_admin` can persist well past 168h for as long as they
+  keep using uzi without a gap that long. A user who also has a uzi password
+  can keep re-authenticating that way indefinitely and never trigger the
+  sync at all (groups apply to OIDC logins only — a password login never
+  touches `is_admin`). Use the admin deactivate-user action for an immediate
+  cutoff regardless of session activity.
 - Likewise, removing someone from `UZI_OIDC_ALLOWED_GROUPS` blocks their
   *next* SSO login but does not revoke a session they're already holding. To
   cut off access immediately, use the existing admin deactivate-user action,
   which does kill live sessions.
+
+The other side of that same mechanism works in the sync's favor: once a
+grant or demotion IS written, at the user's next OIDC login, it takes effect
+for every one of that user's **other** live sessions immediately, not just
+the one they just logged into. `is_admin` isn't carried in the JWT — every
+request reloads the user row — so there's no separate per-session
+propagation delay once the write lands.
 
 ### The groups claim: present-but-absent isn't the same as present-but-empty
 
@@ -318,6 +333,6 @@ browser):
 |---|---|
 | `oidc_state` | The state cookie was missing, wouldn't decrypt, or didn't match — usually a stale/expired attempt (the cookie lives 10 minutes) or a cookie blocked by the browser. Retry from the login page. |
 | `oidc_exchange` | Discovery, the token exchange, or ID-token verification failed — e.g. the IdP went unreachable between login and callback, the client secret is wrong, or a clock-skew/nonce mismatch at the token endpoint. Check the API logs. |
-| `oidc_forbidden` | The IdP denied the request, the email claim was missing/unverified, the email's domain isn't in `UZI_ALLOWED_EMAIL_DOMAINS`, registration is disabled and no existing account matched, or the email already belongs to a *different* linked account. See [Enabling email verification](#enabling-email-verification-required) — this is the most common cause. |
+| `oidc_forbidden` | The IdP denied the request, the email claim was missing/unverified, the email's domain isn't in `UZI_ALLOWED_EMAIL_DOMAINS`, registration is disabled and no existing account matched, the email already belongs to a *different* linked account, or (if configured) the user isn't a member of any `UZI_OIDC_ALLOWED_GROUPS` group — see [Group-based roles and access](#group-based-roles-and-access-prd-55). See [Enabling email verification](#enabling-email-verification-required) — this is the most common cause. |
 | `oidc_deactivated` | The matched uzi account has been deactivated by an admin. |
 | `oidc_error` | An internal error (DB, cookie sealing) — check the API logs. |
