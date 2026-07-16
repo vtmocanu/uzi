@@ -22,6 +22,51 @@ const execFileAsync = promisify(execFile);
 // host/image without the baked dir (e.g. a unit test), where no hooks run anyway.
 const EMPTY_GIT_HOOKS_DIR = "/usr/share/uzi-git-nohooks";
 
+// PRD #51 M0 — shared-git write→worker-execute hardening. git has several config
+// keys whose value is run as a COMMAND during ordinary (even non-credentialed)
+// operations. A process that can write a config source a worker-side git reads
+// (today, agent-uid over the shared `agentdata` volume: `<bare>/config`, or under
+// the M3 uid-split a runner-writable `<bare>/worktrees/<name>/config.worktree`)
+// could plant one and get code-exec in the worker's later `git diff`
+// (changedFiles) or `worktree add` (checkout) — no PAT required. The M10
+// `core.hooksPath` pin closed hooks only; these close the other FIXED-name keys.
+//
+// We pin them via gitEnv's inline GIT_CONFIG_KEY/VALUE pairs, which are HIGHEST
+// precedence (last-value-wins over every config file), so our value OVERRIDES a
+// plant regardless of which config source (bare `config`, per-worktree
+// `config.worktree`) it lives in — verified experimentally, incl. against a
+// worktree-config plant with `extensions.worktreeConfig=true`.
+//
+// The values are the empirically-verified inert overrides (git 2.55):
+//   - core.fsmonitor=false — boolean-false disables the monitor hook (fires on
+//     `status` and on `worktree add`'s checkout otherwise).
+//   - diff.external=true — git runs the value as an external-diff command via the
+//     shell, so there is NO "disabled" value; `""`/`false`/`cat` all get exec'd
+//     (and error). `true` is a shell builtin no-op → neutralizes the plant, exits
+//     0, and emits no external diff. The worker's only diff (changedFiles) is
+//     `--name-only`, which never invokes diff.external anyway, so suppressing
+//     external-diff output is harmless here.
+//   - core.pager=cat — disables paging (the git-documented no-op pager). Only ever
+//     reached with a tty or `--paginate`, neither of which the piped worker git
+//     hits, but pinned defensively.
+//   - core.sshCommand=ssh — reverts any plant to the default ssh program. The
+//     worker's forge transport is https + local-file only (never ssh), so this is
+//     pure belt-and-suspenders; it cannot exec an attacker-chosen program.
+//
+// NOTE (M0 scope): the ARBITRARY-name keys `filter.<name>.process` and
+// `diff.<name>.textconv` CANNOT be blanket-pinned this way (driver names are
+// attacker-chosen). They are closed only by config-source OWNERSHIP under the M3
+// uid-split (`<bare>/config` not runner-writable, so the attacker cannot enable
+// `extensions.worktreeConfig` to reach a runner-writable `config.worktree`). In
+// M0 (no uid split) the agent runs as the same uid that owns `<bare>/config`, so
+// those remain reachable until M3 — an inline pin cannot help.
+const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string]> = [
+  ["core.fsmonitor", "false"],
+  ["diff.external", "true"],
+  ["core.pager", "cat"],
+  ["core.sshCommand", "ssh"],
+];
+
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
 
 export interface WorktreeResult {
@@ -320,11 +365,19 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     PATH: process.env.PATH,
     HOME: process.env.HOME,
     GIT_TERMINAL_PROMPT: "0",
+    // Neutralize /etc/gitconfig: a system config source is another place a code-exec
+    // key could be planted, and it is outside the inline-pin override guarantee for
+    // any key we don't pin. The worker needs nothing from it (PRD #51 M0).
+    GIT_CONFIG_NOSYSTEM: "1",
   };
-  // A config-file PATH (not a secret) — the e2e's insteadOf rewrite lives here; unset
-  // in production, so a no-op there. The inline GIT_CONFIG pairs below still OVERRIDE
-  // whatever it contains (higher precedence than any config file).
-  if (process.env.GIT_CONFIG_GLOBAL) env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL;
+  // The "global" config PATH. In the e2e overlay this points at an insteadOf-rewrite
+  // file (a config-file path, not a secret) — pass it through untouched. In production
+  // it is unset, and we must NOT let git fall back to $HOME/.gitconfig or
+  // $XDG_CONFIG_HOME/git/config (either could carry a planted code-exec key outside the
+  // pin set), so default it to /dev/null — an empty config that replaces both global
+  // lookups. The inline GIT_CONFIG pairs below still OVERRIDE whatever a passed-through
+  // file contains (higher precedence than any config file). (PRD #51 M0.)
+  env.GIT_CONFIG_GLOBAL = process.env.GIT_CONFIG_GLOBAL || "/dev/null";
   // TLS trust for git-over-HTTPS pushes to the real forge. Carry only if the image set
   // them; never invent, never carry a secret.
   for (const k of ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "GIT_SSL_CAINFO"] as const) {
@@ -333,9 +386,13 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
 
   // core.hooksPath → the empty dir on EVERY invocation: structurally neutralizes a
   // planted hook regardless of what the agent wrote. safe.directory=* as before.
+  // The code-exec key pins (fsmonitor/diff.external/pager/sshCommand) are added
+  // UNCONDITIONALLY — the no-PAT paths (changedFiles' `git diff`, `worktree add`)
+  // must be covered too, so they cannot sit inside the `if (pat)` block below.
   const pairs: Array<[string, string]> = [
     ["safe.directory", "*"],
     ["core.hooksPath", EMPTY_GIT_HOOKS_DIR],
+    ...GIT_CODE_EXEC_KEY_PINS.map(([k, v]) => [k, v] as [string, string]),
   ];
   if (pat) {
     // HTTP Basic (base64(user:pat)) — git-over-HTTPS auth, unlike GitLab's
