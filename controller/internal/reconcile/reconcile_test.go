@@ -12,31 +12,32 @@ import (
 )
 
 type fakePoller struct {
-	resp protocol.PollResponse
-	err  error
-	// gotAcks records the ack list of each Poll call.
-	gotAcks [][]string
+	resp  protocol.PollResponse
+	err   error
+	calls int
 }
 
-func (f *fakePoller) Poll(_ context.Context, materialized []string) (protocol.PollResponse, error) {
-	f.gotAcks = append(f.gotAcks, materialized)
+func (f *fakePoller) Poll(context.Context) (protocol.PollResponse, error) {
+	f.calls++
 	return f.resp, f.err
 }
 
 type fakeMaterializer struct {
-	observed     []string
+	observed     []ObservedWorker
 	observeErr   error
 	reconcileErr error
-	// gotDesired records the desired state of each Reconcile call.
-	gotDesired [][]protocol.DesiredWorker
+	// gotDesired / gotObserved record what each Reconcile was handed.
+	gotDesired  [][]protocol.DesiredWorker
+	gotObserved [][]ObservedWorker
 }
 
-func (f *fakeMaterializer) Observe(context.Context) ([]string, error) {
+func (f *fakeMaterializer) Observe(context.Context) ([]ObservedWorker, error) {
 	return f.observed, f.observeErr
 }
 
-func (f *fakeMaterializer) Reconcile(_ context.Context, desired []protocol.DesiredWorker) error {
+func (f *fakeMaterializer) Reconcile(_ context.Context, desired []protocol.DesiredWorker, observed []ObservedWorker) error {
 	f.gotDesired = append(f.gotDesired, desired)
+	f.gotObserved = append(f.gotObserved, observed)
 	return f.reconcileErr
 }
 
@@ -44,54 +45,66 @@ func testLoop(p Poller, m Materializer) *Loop {
 	return New(p, m, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
-// The cycle's ordering is the handoff's safety property: what the controller
-// OBSERVES in the cluster is what it acks, and it acks before it acts.
-func TestTickAcksWhatItObservedThenReconcilesDesiredState(t *testing.T) {
+// A cycle hands Reconcile both sides: desired from the api, observed from the
+// cluster. Decision 9's drift check needs them side by side.
+func TestTickReconcilesDesiredAgainstObserved(t *testing.T) {
 	token := "uzw_pending"
 	p := &fakePoller{resp: protocol.PollResponse{Workers: []protocol.DesiredWorker{
-		{ID: "w-new", Template: "base", Size: "s", Generation: 1, JoinToken: &token},
+		{ID: "w-new", Template: "base", Size: "s", Generation: 2, JoinToken: &token},
 	}}}
-	m := &fakeMaterializer{observed: []string{"w-existing"}}
+	m := &fakeMaterializer{observed: []ObservedWorker{{ID: "w-existing", Generation: 1}}}
 
 	if err := testLoop(p, m).Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(p.gotAcks) != 1 || len(p.gotAcks[0]) != 1 || p.gotAcks[0][0] != "w-existing" {
-		t.Fatalf("acks = %v, want exactly what Observe reported", p.gotAcks)
-	}
 	if len(m.gotDesired) != 1 || len(m.gotDesired[0]) != 1 || m.gotDesired[0][0].ID != "w-new" {
 		t.Fatalf("desired = %v, want the poll's fleet passed through", m.gotDesired)
 	}
+	if len(m.gotObserved) != 1 || len(m.gotObserved[0]) != 1 || m.gotObserved[0][0].ID != "w-existing" {
+		t.Fatalf("observed = %v, want what Observe reported", m.gotObserved)
+	}
+	if m.gotObserved[0][0].Generation != 1 {
+		t.Fatalf("observed generation = %d, want it carried through for the drift check", m.gotObserved[0][0].Generation)
+	}
 }
 
-// A failed observation must abort the cycle without polling: the acks would be
-// safe (an empty list only re-delivers), but reconciling the cluster against a
-// view we just failed to read is not.
-func TestTickDoesNotPollWhenObserveFails(t *testing.T) {
-	boom := errors.New("apiserver unreachable")
+// The controller reports NOTHING to the api: the poll is a pure read, and delivery
+// is proved by the worker's own registration. The compile-time assertion is the
+// tripwire — a Poll that took a controller assertion again would not satisfy it.
+func TestPollTakesNoControllerAssertion(t *testing.T) {
 	p := &fakePoller{}
-	m := &fakeMaterializer{observeErr: boom}
-
-	if err := testLoop(p, m).Tick(context.Background()); !errors.Is(err, boom) {
-		t.Fatalf("err = %v, want the observe error", err)
+	if err := testLoop(p, &fakeMaterializer{}).Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
 	}
-	if len(p.gotAcks) != 0 {
-		t.Fatal("polled despite a failed observation")
+	if p.calls != 1 {
+		t.Fatalf("poll calls = %d, want 1", p.calls)
 	}
+	var _ func(context.Context) (protocol.PollResponse, error) = p.Poll
 }
 
-// A failed poll must not reconcile: an error carries no desired state, and an
-// empty fleet would read as "delete every hosted worker".
+// A failed poll must not reconcile: an error carries no desired state, and an empty
+// fleet would read as "delete every hosted worker".
 func TestTickDoesNotReconcileWhenPollFails(t *testing.T) {
 	boom := errors.New("api down")
-	p := &fakePoller{err: boom}
 	m := &fakeMaterializer{}
-
-	if err := testLoop(p, m).Tick(context.Background()); !errors.Is(err, boom) {
+	if err := testLoop(&fakePoller{err: boom}, m).Tick(context.Background()); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the poll error", err)
 	}
 	if len(m.gotDesired) != 0 {
 		t.Fatal("reconciled against a failed poll")
+	}
+}
+
+// A failed observation must not reconcile either: acting on a view we just admitted
+// we could not read is how a healthy worker gets clobbered.
+func TestTickDoesNotReconcileWhenObserveFails(t *testing.T) {
+	boom := errors.New("apiserver unreachable")
+	m := &fakeMaterializer{observeErr: boom}
+	if err := testLoop(&fakePoller{}, m).Tick(context.Background()); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the observe error", err)
+	}
+	if len(m.gotDesired) != 0 {
+		t.Fatal("reconciled despite a failed observation")
 	}
 }
 
@@ -102,28 +115,13 @@ func TestTickPropagatesReconcileErrors(t *testing.T) {
 	}
 }
 
-// A restart observes nothing yet, so it acks nothing — the api re-delivers every
-// pending token. That is the at-least-once handoff working as designed, and it is
-// why a controller crash cannot strand a worker.
-func TestTickAfterRestartAcksNothing(t *testing.T) {
-	p := &fakePoller{}
-	m := &fakeMaterializer{observed: nil}
-
-	if err := testLoop(p, m).Tick(context.Background()); err != nil {
-		t.Fatalf("Tick: %v", err)
-	}
-	if len(p.gotAcks) != 1 || len(p.gotAcks[0]) != 0 {
-		t.Fatalf("acks = %v, want none on a cold start", p.gotAcks)
-	}
-}
-
 // signalMaterializer reports each Reconcile over a channel, so the test observes
 // the loop goroutine's progress without racing on a field it writes.
 type signalMaterializer struct{ reconciled chan struct{} }
 
-func (signalMaterializer) Observe(context.Context) ([]string, error) { return nil, nil }
+func (signalMaterializer) Observe(context.Context) ([]ObservedWorker, error) { return nil, nil }
 
-func (s signalMaterializer) Reconcile(context.Context, []protocol.DesiredWorker) error {
+func (s signalMaterializer) Reconcile(context.Context, []protocol.DesiredWorker, []ObservedWorker) error {
 	select {
 	case s.reconciled <- struct{}{}:
 	default: // never block the loop if the test has stopped listening

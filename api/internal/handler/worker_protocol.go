@@ -119,6 +119,25 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// A hosted worker registering is the PROOF that its join token reached the pod
+	// (PRD #58 Decision 3): RequireWorker resolved wkr by matching sha256(the token
+	// this caller presented) against workers.token_hash, so getting here means a pod
+	// holds the current token and it works. That — not any report from the controller
+	// — is what licenses destroying the api's sealed copy.
+	//
+	// Orchestrated here rather than inside workersvc on purpose: workersvc owns runs
+	// and must not learn about hosted workers, and handler-level orchestration is this
+	// repo's idiom. hsvc is nil unless hosting is enabled, and the Kind check keeps an
+	// ordinary hand-run worker off this path entirely.
+	//
+	// Best-effort and NON-FATAL: this is buffer cleanup, and a worker that has already
+	// registered successfully must never be failed because the cleanup did not land.
+	// The TTL sweep is the backstop.
+	if h.hsvc != nil && updated.Kind == "hosted" {
+		if err := h.hsvc.NoteRegistered(r.Context(), updated.ID); err != nil {
+			slog.Error("note hosted worker registered", "worker_id", updated.ID.String(), "error", err)
+		}
+	}
 	// worker_id is echoed for the worker's convenience; identity on every other
 	// call comes from the Bearer token, never a URL path (M2 wire contract).
 	httpx.JSON(w, http.StatusOK, map[string]any{

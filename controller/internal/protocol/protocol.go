@@ -14,16 +14,19 @@
 // on one side fails the other side's build gate.
 package protocol
 
-// PollRequest is what the controller POSTs to /api/controller/poll each cycle.
-type PollRequest struct {
-	// Materialized lists the hosted worker ids whose join-token Secret this
-	// controller can see in the cluster right now. It is re-derived from the
-	// apiserver on every cycle and never remembered across restarts — the api
-	// destroys its only sealed copy of a token on the strength of this field, so
-	// it must assert what the cluster durably holds, never what this process
-	// believes it did earlier.
-	Materialized []string `json:"materialized"`
-}
+// The poll is a GET and carries no request body.
+//
+// There is deliberately no ack: the controller tells the api nothing about token
+// delivery. The api learns it from the worker's own authenticated registration,
+// which proves possession of the current token — something this side could never
+// assert, since it can see only that A Secret exists, not which token is in it.
+// That gap destroyed freshly rotated tokens undelivered.
+//
+// It also means this controller never reads a Secret back, so Decision 1's RBAC
+// ("Secrets create/delete only") holds as written. If you find yourself wanting a
+// `get`/`list` on Secrets here, that is the design telling you something is wrong:
+// k8s has no existence-only verb, and granting it would let a compromised
+// controller harvest every hosted worker's join token for the fleet's lifetime.
 
 // PollResponse is the desired state of the entire hosted fleet — every hosted
 // worker, every poll, never a delta. Anything in the worker namespace that is not
@@ -40,9 +43,13 @@ type DesiredWorker struct {
 	// this side's job: the api is not allowed to know what a pod spec looks like.
 	Size       string `json:"size"`
 	Generation int64  `json:"generation"`
-	// JoinToken is the plaintext, present only until this controller reports the
-	// worker in PollRequest.Materialized. Null means already delivered — the k8s
-	// Secret is by then the only copy that exists, so never treat a null as "this
-	// worker has no token" and never log this field.
+	// JoinToken is the plaintext, present only until a pod proves it holds it (by
+	// registering) or the api's buffer expires unread.
+	//
+	// Null means "write no Secret for this worker" — either one was already
+	// delivered (the k8s Secret is then the only copy that exists) or the buffer
+	// expired and recovery is a rotation. Never read a null as "this worker has no
+	// token", never invent one, never clear the existing Secret on account of it,
+	// and never log this field.
 	JoinToken *string `json:"join_token"`
 }

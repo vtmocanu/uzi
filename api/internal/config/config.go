@@ -310,8 +310,20 @@ type Config struct {
 	// rest in Postgres before the sweep destroys it (default 1h; 0 disables the
 	// sweep, with a boot warning). This is a residual BEYOND the one Decision 3
 	// documents: the pending copy is sealed under UZI_SECRET_KEY, the master key
-	// PRD #32's vault exists to stop relying on, so an unpolled token must not
+	// PRD #32's vault exists to stop relying on, so an undelivered token must not
 	// linger indefinitely.
+	//
+	// It means "NO POD EVER PROVED IT BOOTED", not "the controller never picked it
+	// up": delivery is settled by the worker's own registration, so the pending
+	// window spans pod scheduling + image pull + container start + register —
+	// minutes, not the ~20-60s two-poll window an ack-based handoff would have had.
+	//
+	// 1h is still right, because expiry is BENIGN in the normal case. It clears the
+	// api's sealed BUFFER; if the controller already wrote the Secret, the plaintext
+	// is in the cluster and workers.token_hash is untouched, so a pod that finally
+	// boots still authenticates, registers, and self-heals the row late. Expiry only
+	// strands when the Secret was never written — precisely what the TTL is for — and
+	// 1h leaves ~10-30x headroom over even a pathological multi-GB image pull.
 	//
 	// Read REGARDLESS of WorkerHostingEnabled: a stack that provisioned hosted
 	// workers and then turned hosting off is exactly the case that would strand

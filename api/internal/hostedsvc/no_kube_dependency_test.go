@@ -79,8 +79,13 @@ func TestAPIBuildGraphHasNoKubeClient(t *testing.T) {
 	cmd.Env = append(os.Environ(), "GOFLAGS=-buildvcs=false")
 	out, err := cmd.Output()
 	if err != nil {
-		// A toolchain/network hiccup should not fail the suite spuriously; the
-		// go.mod test above still holds the line.
+		// In CI this is a hard failure: silently downgrading a Decision 1 gate to the
+		// weaker go.mod substring check is exactly how an invariant rots. Locally a
+		// toolchain/network hiccup only skips, so a developer offline on a plane is not
+		// blocked by a check the pipeline will run anyway.
+		if os.Getenv("CI") != "" {
+			t.Fatalf("go list -deps failed in CI (%v); the Decision 1 build-graph gate must not be skipped here", err)
+		}
 		t.Skipf("go list -deps unavailable (%v); TestAPIGoModHasNoKubeClient still enforces the invariant", err)
 	}
 	for _, pkg := range strings.Split(string(out), "\n") {

@@ -52,26 +52,18 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 		t.Fatalf("join_token = %q", *pending.JoinToken)
 	}
 
-	// An already-acked worker: null token, still fully desired state. The nil is
-	// load-bearing — it means "delivered", not "no token" — so the pointer type must
-	// survive the round trip rather than collapsing to "".
-	acked := resp.Workers[1]
-	if acked.JoinToken != nil {
+	// A worker needing no Secret written: null token, still fully desired state. The
+	// nil is load-bearing — it means "write nothing", not "this worker has no token"
+	// — so the pointer type must survive the round trip rather than collapsing to "".
+	noToken := resp.Workers[1]
+	if noToken.JoinToken != nil {
 		t.Fatal("a null join_token must parse as nil")
 	}
-	if acked.Template != "jvm" || acked.Size != "l" || acked.Generation != 4 {
-		t.Fatalf("desired = %+v, want the golden's second worker", acked)
+	if noToken.Template != "jvm" || noToken.Size != "l" || noToken.Generation != 4 {
+		t.Fatalf("desired = %+v, want the golden's second worker", noToken)
 	}
 }
 
-// The request side: what this module marshals must be what the api's decoder reads.
-func TestPollRequestMarshalsTheAPIsShape(t *testing.T) {
-	got, err := json.Marshal(PollRequest{Materialized: []string{"11111111-1111-1111-1111-111111111111"}})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	const want = `{"materialized":["11111111-1111-1111-1111-111111111111"]}`
-	if string(got) != want {
-		t.Fatalf("got %s, want %s", got, want)
-	}
-}
+// There is deliberately no request side to pin: the poll is a GET with no body.
+// The ack that used to travel in one is gone — the api derives delivery from the
+// worker's own registration, so this controller asserts nothing.

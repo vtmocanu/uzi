@@ -21,7 +21,8 @@ import (
 
 const testControllerToken = "uzc_test-controller-credential"
 
-func newControllerHandler(t *testing.T, st hostedsvc.Store, enabled bool) *Handler {
+// newHandlerTestBox builds a secretbox with a varied (non-placeholder) key.
+func newHandlerTestBox(t *testing.T) *secretbox.Box {
 	t.Helper()
 	key := make([]byte, secretbox.KeySize)
 	for i := range key {
@@ -31,6 +32,12 @@ func newControllerHandler(t *testing.T, st hostedsvc.Store, enabled bool) *Handl
 	if err != nil {
 		t.Fatalf("new box: %v", err)
 	}
+	return box
+}
+
+func newControllerHandler(t *testing.T, st hostedsvc.Store, enabled bool) *Handler {
+	t.Helper()
+	box := newHandlerTestBox(t)
 	h := &Handler{cfg: config.Config{
 		WorkerHostingEnabled:  enabled,
 		ControllerTokenSHA256: jointoken.Hash(testControllerToken),
@@ -43,8 +50,8 @@ func newControllerHandler(t *testing.T, st hostedsvc.Store, enabled bool) *Handl
 
 // pollStore is the fake the route tests poll against.
 type pollStore struct {
-	acked []uuid.UUID
-	rows  []store.ListHostedWorkersForControllerRow
+	marked []uuid.UUID
+	rows   []store.ListHostedWorkersForControllerRow
 }
 
 func (p *pollStore) ListHostedWorkersForController(context.Context) ([]store.ListHostedWorkersForControllerRow, error) {
@@ -54,7 +61,7 @@ func (p *pollStore) UpsertHostedWorkerToken(context.Context, store.UpsertHostedW
 	return nil
 }
 func (p *pollStore) MarkHostedWorkerTokenDelivered(_ context.Context, id uuid.UUID) (int64, error) {
-	p.acked = append(p.acked, id)
+	p.marked = append(p.marked, id)
 	return 1, nil
 }
 
@@ -70,7 +77,7 @@ func controllerRoutes(h *Handler) http.Handler {
 // router is exactly the one it was before this PRD.
 func TestControllerRouteIsNotMountedWhenHostingIsDisabled(t *testing.T) {
 	h := newControllerHandler(t, nil, false)
-	req := httptest.NewRequest(http.MethodPost, "/api/controller/poll", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodGet, "/api/controller/poll", nil)
 	req.Header.Set("Authorization", "Bearer "+testControllerToken)
 	rec := httptest.NewRecorder()
 	controllerRoutes(h).ServeHTTP(rec, req)
@@ -89,7 +96,7 @@ func TestControllerPollRequiresTheControllerToken(t *testing.T) {
 		{"wrong token", "Bearer uzc_wrong"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/api/controller/poll", strings.NewReader(`{}`))
+			req := httptest.NewRequest(http.MethodGet, "/api/controller/poll", nil)
 			if tc.authz != "" {
 				req.Header.Set("Authorization", tc.authz)
 			}
@@ -102,14 +109,13 @@ func TestControllerPollRequiresTheControllerToken(t *testing.T) {
 	}
 }
 
-// The endpoint end to end: an authenticated poll acks and returns desired state.
-func TestControllerPollAcksAndReturnsDesiredState(t *testing.T) {
-	id := uuid.New()
+// The endpoint end to end: an authenticated GET returns desired state, asserts
+// nothing, and forbids caching (the body carries join-token plaintext).
+func TestControllerPollReturnsDesiredStateAndForbidsCaching(t *testing.T) {
 	st := &pollStore{}
 	h := newControllerHandler(t, st, true)
 
-	body := `{"materialized":["` + id.String() + `"]}`
-	req := httptest.NewRequest(http.MethodPost, "/api/controller/poll", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodGet, "/api/controller/poll", nil)
 	req.Header.Set("Authorization", "Bearer "+testControllerToken)
 	rec := httptest.NewRecorder()
 	controllerRoutes(h).ServeHTTP(rec, req)
@@ -117,8 +123,12 @@ func TestControllerPollAcksAndReturnsDesiredState(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body)
 	}
-	if len(st.acked) != 1 || st.acked[0] != id {
-		t.Fatalf("acked = %v, want the request's id", st.acked)
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store (the body carries join-token plaintext)", got)
+	}
+	// A poll must never settle delivery: only a worker's registration does.
+	if len(st.marked) != 0 {
+		t.Fatalf("the poll marked %v as delivered; a poll is a pure read", st.marked)
 	}
 	var resp hostedsvc.PollResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
@@ -129,16 +139,15 @@ func TestControllerPollAcksAndReturnsDesiredState(t *testing.T) {
 	}
 }
 
-// A malformed ack is a 400, not a 500: it is the caller's error, and silently
-// skipping it would leave a token sealed forever with no signal.
-func TestControllerPollRejectsAMalformedAck(t *testing.T) {
+// The poll is a GET; the POST the ack once needed is gone and must not linger.
+func TestControllerPollRejectsPost(t *testing.T) {
 	h := newControllerHandler(t, &pollStore{}, true)
-	req := httptest.NewRequest(http.MethodPost, "/api/controller/poll", strings.NewReader(`{"materialized":["nope"]}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/controller/poll", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer "+testControllerToken)
 	rec := httptest.NewRecorder()
 	controllerRoutes(h).ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
 	}
 }

@@ -2,7 +2,6 @@ package hostedsvc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -34,18 +33,12 @@ type ExpiryStore interface {
 	ExpirePendingHostedWorkerTokens(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 }
 
-// ErrBadWorkerID is returned by Poll when an ack carries something that is not a
-// uuid. Surfaced as a 400: a controller that cannot form a uuid is broken or is
-// not our controller, and either way the api should say so rather than quietly
-// skip the entry and let a token linger sealed forever.
-var ErrBadWorkerID = errors.New("hostedsvc: malformed worker id")
-
 // Service is the api's half of the controller protocol.
 type Service struct {
 	q Store
 	// box seals the pending join-token plaintext. Same master key (UZI_SECRET_KEY)
 	// as every other secret at rest; rotating it invalidates pending tokens, which
-	// for a token that lives seconds-to-a-poll is a non-event.
+	// for a buffer that lives minutes is a non-event.
 	box *secretbox.Box
 }
 
@@ -69,20 +62,60 @@ func tokenAAD(workerID uuid.UUID) []byte {
 
 // SealJoinToken parks a freshly minted join token's plaintext for the controller
 // to collect on its next poll. The provision path (M2) calls it inside the same
-// transaction that inserts the worker row, so a hosted worker can never exist
-// with a token_hash whose plaintext was never queued for anyone.
+// transaction that inserts the worker row, so a hosted worker can never exist with
+// a token_hash whose plaintext was never queued for anyone. It is also the
+// ROTATION path: re-parking replaces the ciphertext and resets delivery, so a
+// stranded worker recovers with a NEW token, never a resurrected one.
+//
+// A free function over Store rather than a *Service method, because this repo's
+// transaction idiom binds the queries at the CALL SITE: the handler begins the tx
+// and passes `qtx := h.q.WithTx(tx)` (uniform across handler/template_allocations.go,
+// skill_allocations.go, auth.go, oidc.go, agent_templates.go, settings.go). A method
+// whose store was fixed at construction could not join M2's provision transaction at
+// all. ExpirePendingTokens below has the same shape for the same reason.
 //
 // The plaintext is the caller's to hold only for the moment it takes to seal it:
 // nothing here logs it, and the api never reads it back except to answer a poll.
-func (s *Service) SealJoinToken(ctx context.Context, workerID uuid.UUID, token string) error {
-	sealed, err := s.box.SealWithAAD([]byte(token), tokenAAD(workerID))
+func SealJoinToken(ctx context.Context, q Store, box *secretbox.Box, workerID uuid.UUID, token string) error {
+	sealed, err := box.SealWithAAD([]byte(token), tokenAAD(workerID))
 	if err != nil {
 		return fmt.Errorf("hostedsvc: seal join token: %w", err)
 	}
-	return s.q.UpsertHostedWorkerToken(ctx, store.UpsertHostedWorkerTokenParams{
+	return q.UpsertHostedWorkerToken(ctx, store.UpsertHostedWorkerTokenParams{
 		WorkerID:        workerID,
 		TokenCiphertext: sealed,
 	})
+}
+
+// NoteRegistered records that a hosted worker has PROVED it holds its join token,
+// and destroys the api's sealed copy. It is the delivery acknowledgement, and the
+// whole of it.
+//
+// The proof is the registration itself: RequireWorker resolved this worker by
+// looking up sha256(whatever the caller presented) against workers.token_hash, so
+// reaching here means a pod is holding the CURRENT token and using it successfully.
+// Unforgeable, and version-exact for free — after a rotation to T2 a pod still
+// holding T1 fails auth and never gets here, so it cannot ack T2 away.
+//
+// This replaced a controller-supplied ack, which could only assert "a Secret exists
+// for worker W", never which token was in it. That gap was not theoretical: a
+// rotation racing an in-flight ack destroyed the fresh plaintext before it was ever
+// delivered and then recorded the row as delivered steady-state, while the pod held
+// the old token and 401'd forever. Deriving delivery from auth removes the
+// controller from the token-destruction path entirely — the api decides from its own
+// auth result rather than from a report by the component this PRD exists to bound.
+//
+// Callers MUST treat a failure as non-fatal: this is cleanup, and a worker that
+// has successfully registered must never be failed because a buffer could not be
+// cleared. The TTL sweep is the backstop.
+func (s *Service) NoteRegistered(ctx context.Context, workerID uuid.UUID) error {
+	// The guard inside MarkHostedWorkerTokenDelivered makes a re-registration (a pod
+	// rescheduled onto another node presents the same token again) a no-op rather
+	// than a re-stamp.
+	if _, err := s.q.MarkHostedWorkerTokenDelivered(ctx, workerID); err != nil {
+		return fmt.Errorf("hostedsvc: note registered: %w", err)
+	}
+	return nil
 }
 
 // ExpirePendingTokens clears every sealed join token that has sat undelivered for
@@ -108,50 +141,17 @@ func ExpirePendingTokens(ctx context.Context, q ExpiryStore, ttl time.Duration) 
 	return n, nil
 }
 
-// Poll is the whole controller protocol: acknowledge, then report desired state.
+// Poll returns the desired state of the whole hosted fleet.
 //
-// The ordering is load-bearing and is what makes the handoff safe. Acks are
-// applied FIRST, so a worker the controller has just confirmed materialized has
-// its sealed copy destroyed before this same response is computed — the token is
-// never handed out again once its delivery is durable, and the response never
-// both acks and re-delivers the same worker.
+// It is a pure read: the controller asserts nothing and the api destroys nothing
+// here. Delivery is settled by NoteRegistered, on the worker's own authenticated
+// registration — see protocol.go's header for why a controller ack was removed
+// rather than refined.
 //
-// Delivery is at-least-once against that ack, deliberately NOT the at-most-once
-// reading of "delivered once" (Decision 3). Deleting the sealed copy the moment
-// it is written to a response would mean a response lost to a controller crash,
-// an api crash after commit, or a network partition destroys the only recoverable
-// copy of a token whose hash is already committed to the workers row: the worker
-// could never authenticate, the api could never tell it apart from one that simply
-// had not started yet, and the user would be left with a permanently dead worker
-// and no signal. So a pending token is re-delivered on every poll until the
-// controller reports it materialized, and re-delivery is harmless because the
-// controller's write of the k8s Secret is idempotent.
-//
-// Decision 3's actual security property is preserved exactly: the sealed plaintext
-// is destroyed as soon as it has been consumed, and there is no reveal path. It is
-// only the trigger that moves — from "a response was written" to "the cluster
-// durably holds it", which is the earliest moment at which destroying it is
-// non-destructive.
-//
-// After the ack, the worker's k8s Secret is the sole holder of the plaintext,
-// which is Decision 3's documented residual (plaintext in etcd for the worker's
-// lifetime). Deleting that Secret out of band strands the worker exactly as losing
-// a hand-run worker's token does today; the recovery is the same one — delete and
-// reprovision. Detecting it is the controller's drift/orphan pass (M3, Decision 9).
-func (s *Service) Poll(ctx context.Context, req PollRequest) (PollResponse, error) {
-	for _, raw := range req.Materialized {
-		id, err := uuid.Parse(raw)
-		if err != nil {
-			return PollResponse{}, fmt.Errorf("%w: %q", ErrBadWorkerID, raw)
-		}
-		// A 0-row update is the normal idempotent case (an ack for a worker that
-		// was deleted mid-flight, or that never had a pending token). Nothing to
-		// report.
-		if _, err := s.q.MarkHostedWorkerTokenDelivered(ctx, id); err != nil {
-			return PollResponse{}, fmt.Errorf("hostedsvc: ack token delivery: %w", err)
-		}
-	}
-
+// A worker whose token is still pending gets its plaintext. One whose pod already
+// proved it holds the token, or whose buffer expired unread, gets a nil JoinToken
+// and is reconciled without one.
+func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 	rows, err := s.q.ListHostedWorkersForController(ctx)
 	if err != nil {
 		return PollResponse{}, fmt.Errorf("hostedsvc: list hosted workers: %w", err)

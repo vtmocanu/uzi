@@ -53,18 +53,20 @@ func main() {
 // noopMaterializer is the M1 placeholder for the kube-backed materializer M3
 // brings. It observes nothing and materializes nothing.
 //
-// Observing nothing is the SAFE direction, and not an accident: an empty ack list
-// means the api re-delivers every pending join token on every poll and destroys
-// none of them. So an M1 controller pointed at a real api leaves the token handoff
-// exactly where it found it, rather than acking away tokens it never wrote
-// anywhere.
+// Observing nothing is inert by construction now: the controller reports nothing to
+// the api (delivery is settled by the worker's own registration), so an M1
+// controller pointed at a real api can only read desired state. It cannot destroy a
+// token, strand a worker, or touch a cluster.
 type noopMaterializer struct{ log *slog.Logger }
 
-func (noopMaterializer) Observe(context.Context) ([]string, error) { return nil, nil }
+func (noopMaterializer) Observe(context.Context) ([]reconcile.ObservedWorker, error) {
+	return nil, nil
+}
 
-func (n noopMaterializer) Reconcile(_ context.Context, desired []protocol.DesiredWorker) error {
-	// Count only. The desired state carries join-token plaintext, so nothing here
+func (n noopMaterializer) Reconcile(_ context.Context, desired []protocol.DesiredWorker, observed []reconcile.ObservedWorker) error {
+	// Counts only. The desired state carries join-token plaintext, so nothing here
 	// logs a worker's fields.
-	n.log.Info("reconcile (no-op: cluster materialization lands in M3)", "desired_workers", len(desired))
+	n.log.Info("reconcile (no-op: cluster materialization lands in M3)",
+		"desired_workers", len(desired), "observed_workers", len(observed))
 	return nil
 }

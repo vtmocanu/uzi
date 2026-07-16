@@ -19,8 +19,10 @@ import (
 const wireContractFixture = "testdata/controller_poll_wire.json"
 
 // samplePollResponse is a representative desired-state response covering both
-// token states a hosted worker can be in: one still awaiting delivery, one already
-// acked. Values are fixed (no random uuids) so the golden file is stable, and the
+// token states the wire can carry: one still awaiting delivery, one where no token
+// is to be written (already delivered, or expired unread — indistinguishable to the
+// controller, and deliberately so: both mean "reconcile this worker, touch no
+// Secret"). Values are fixed (no random uuids) so the golden file is stable, and the
 // token is an obvious non-credential so secret scanners never flag the fixture.
 func samplePollResponse() PollResponse {
 	token := "uzw_EXAMPLE-NOT-A-REAL-TOKEN"
@@ -37,7 +39,8 @@ func samplePollResponse() PollResponse {
 			Template:   "jvm",
 			Size:       "l",
 			Generation: 4,
-			// Already acked: its plaintext lives only in the cluster Secret now.
+			// No token to write: a pod already proved it holds one (its plaintext
+			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,
 		},
 	}}
@@ -70,25 +73,6 @@ func TestPollResponseWireContract(t *testing.T) {
 	}
 }
 
-// The request side of the contract: the controller's acks must decode into the
-// field the api reads, and an absent/null list must be an empty ack, never a
-// decode error — a controller with nothing to ack sends exactly that.
-func TestPollRequestWireContract(t *testing.T) {
-	var req PollRequest
-	if err := json.Unmarshal([]byte(`{"materialized":["11111111-1111-1111-1111-111111111111"]}`), &req); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(req.Materialized) != 1 || req.Materialized[0] != "11111111-1111-1111-1111-111111111111" {
-		t.Fatalf("Materialized = %v, want the one acked id", req.Materialized)
-	}
-
-	for _, body := range []string{`{}`, `{"materialized":null}`, `{"materialized":[]}`} {
-		var empty PollRequest
-		if err := json.Unmarshal([]byte(body), &empty); err != nil {
-			t.Fatalf("unmarshal %s: %v", body, err)
-		}
-		if len(empty.Materialized) != 0 {
-			t.Fatalf("%s decoded to %v, want no acks", body, empty.Materialized)
-		}
-	}
-}
+// There is deliberately no request-side contract to pin: the poll is a GET with no
+// body. The ack that used to travel in one is gone — delivery is proved by the
+// worker's own registration, not asserted by the controller.

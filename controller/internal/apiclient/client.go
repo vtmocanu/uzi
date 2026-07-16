@@ -40,29 +40,17 @@ func New(baseURL, token string, timeout time.Duration) *Client {
 	}
 }
 
-// Poll sends the controller's acks and returns the desired state of the hosted
-// fleet.
+// Poll returns the desired state of the hosted fleet.
 //
-// materialized carries the worker ids whose join-token Secret the caller has
-// OBSERVED in the cluster this cycle; the api destroys its sealed copy of each
-// acked token, so passing an id here asserts the cluster durably holds it. Passing
-// one it does not is how a worker gets stranded — see reconcile.Materializer.
-func (c *Client) Poll(ctx context.Context, materialized []string) (protocol.PollResponse, error) {
-	// Never nil: `null` and `[]` are the same to the api's decoder, but an explicit
-	// empty list is what "I have acked nothing this cycle" should look like on the
-	// wire.
-	if materialized == nil {
-		materialized = []string{}
-	}
-	body, err := json.Marshal(protocol.PollRequest{Materialized: materialized})
-	if err != nil {
-		return protocol.PollResponse{}, fmt.Errorf("apiclient: marshal poll request: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/controller/poll", bytes.NewReader(body))
+// A pure read: this controller asserts nothing to the api. Token delivery is
+// settled by the worker's own registration, not by anything sent from here — see
+// protocol.go for why an ack from this side was removed rather than made more
+// precise.
+func (c *Client) Poll(ctx context.Context) (protocol.PollResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/controller/poll", nil)
 	if err != nil {
 		return protocol.PollResponse{}, fmt.Errorf("apiclient: build poll request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.token)
 
 	resp, err := c.http.Do(req)

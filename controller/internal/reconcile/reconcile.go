@@ -1,6 +1,6 @@
-// Package reconcile is the controller's loop: observe the cluster, tell the api
-// what is durably there, fetch the hosted fleet's desired state, drive the cluster
-// towards it.
+// Package reconcile is the controller's loop: fetch the hosted fleet's desired
+// state from the api, observe what the cluster actually has, drive one towards the
+// other.
 //
 // The loop is stateless by construction (PRD #58 Decision 2). It holds nothing
 // across cycles and nothing across restarts: desired state comes from the api on
@@ -8,6 +8,11 @@
 // are reconciled from scratch. A controller restart is therefore not an event —
 // the next tick reconciles again from the same two sources, which is why neither
 // side needs to remember what the other was last told.
+//
+// It tells the api nothing. Token delivery is settled api-side by the worker's own
+// registration (proof of possession), so this component is never in the trust path
+// for destroying a token — which matters, because it is the component the PRD's
+// RBAC exists to bound.
 package reconcile
 
 import (
@@ -18,41 +23,57 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
-// Poller fetches desired state and delivers acks. *apiclient.Client satisfies it;
-// tests substitute a fake.
+// Poller fetches desired state. *apiclient.Client satisfies it; tests substitute a
+// fake.
 type Poller interface {
-	Poll(ctx context.Context, materialized []string) (protocol.PollResponse, error)
+	Poll(ctx context.Context) (protocol.PollResponse, error)
+}
+
+// ObservedWorker is one hosted worker's state as it currently exists in the
+// cluster, read from its DEPLOYMENT — never from its Secret.
+//
+// That restriction is Decision 1's RBAC, and it is not negotiable: the controller
+// holds create/delete on Secrets and nothing more, because k8s has no
+// existence-only verb and a `get`/`list` would let a compromised controller
+// harvest every hosted worker's join token for the fleet's life. A Deployment
+// references its Secret by name without embedding it, which is exactly why reading
+// Deployments is boring and reading Secrets is fleet-wide token disclosure.
+type ObservedWorker struct {
+	// ID is the hosted worker's uuid, recovered from the object's name/labels.
+	ID string
+	// Generation is the hosted_generation the deployed objects were rendered from.
+	// M3 sources it from the pod-template annotation it stamps (which is also what
+	// makes a rotation actually roll the pod); comparing it against
+	// DesiredWorker.Generation is Decision 9's drift check.
+	Generation int64
 }
 
 // Materializer is the cluster side of the loop — the seam M3 implements with the
 // kube client. M1 defines the contract and ships nothing that talks to a cluster.
 //
-// It is deliberately two methods rather than one. Observing is what the api's
-// delivered-once handoff is settled on and must reflect the apiserver as it is
-// *before* this cycle changes anything; reconciling is what changes it. Folding
-// them together would make an ack a statement about a write this process just
-// attempted, which is precisely the thing that must never happen.
+// Two methods rather than one because a reconciler should read the world before it
+// changes it, and because Decision 9's drift check needs observed and desired side
+// by side. Note that nothing observed here is reported to the api any more: the
+// api settles token delivery from the worker's own registration, so this side is
+// purely "drive the cluster towards desired state".
 type Materializer interface {
-	// Observe returns the ids of hosted workers whose join-token Secret exists in
-	// the cluster right now, read fresh from the apiserver.
+	// Observe returns the hosted workers currently deployed in the cluster, read
+	// fresh from the apiserver via Deployments (get/list, both granted).
 	//
-	// This slice is what the api destroys its only sealed copy of a token on, so it
-	// must assert what the cluster durably holds and nothing else. An id reported
-	// here whose Secret is absent strands that worker permanently: its token_hash
-	// is committed, and no plaintext survives anywhere to authenticate against it.
-	// When in doubt — a list error, a partial read — report fewer ids, never more.
-	// Under-reporting costs one redundant re-delivery; over-reporting costs a
-	// worker.
-	Observe(ctx context.Context) (materialized []string, err error)
+	// It must NOT read Secrets — see ObservedWorker. An absent worker here means
+	// "nothing is deployed for it", never "it has no token".
+	Observe(ctx context.Context) ([]ObservedWorker, error)
 
-	// Reconcile drives the cluster towards `desired`: it creates, updates, rolls
-	// and deletes the Secret / Deployment / PVC of each hosted worker, and flags
-	// objects that answer to no desired worker as orphans (Decision 9).
+	// Reconcile drives the cluster towards `desired`, given what `observed` shows:
+	// it creates, updates, rolls and deletes the Secret / Deployment / PVC of each
+	// hosted worker, and flags objects answering to no desired worker as orphans
+	// (Decision 9).
 	//
-	// A worker whose JoinToken is nil has already been acked; its plaintext lives
-	// only in the cluster Secret now, so reconcile it without one rather than
-	// reading the nil as "needs a token".
-	Reconcile(ctx context.Context, desired []protocol.DesiredWorker) error
+	// A worker whose JoinToken is nil needs no Secret written: either a pod already
+	// proved it holds one, or the api's buffer expired and recovery is a rotation.
+	// Never read the nil as "needs a token", and never clear an existing Secret on
+	// account of it.
+	Reconcile(ctx context.Context, desired []protocol.DesiredWorker, observed []ObservedWorker) error
 }
 
 // Loop is the reconcile loop.
@@ -94,25 +115,21 @@ func (l *Loop) Run(ctx context.Context) {
 	}
 }
 
-// Tick is one cycle: observe, then ack + fetch desired state, then reconcile.
+// Tick is one cycle: fetch desired state, observe the cluster, reconcile the two.
 //
-// The order is the safety property. Observation happens first and from the
-// apiserver, so the acks this cycle sends describe the cluster as it stood before
-// this cycle touched it. The acks ride the poll rather than a call of their own,
-// which keeps the protocol to a single endpoint at no cost.
-//
-// An Observe failure aborts the cycle rather than polling with an empty ack list.
-// Both are safe for the tokens — under-reporting only re-delivers — but polling on
-// a failed observation would reconcile the cluster against a view we just admitted
-// we could not read.
+// Either failure aborts the cycle before Reconcile. A failed poll carries no
+// desired state, and an empty fleet would read as "delete every hosted worker"; a
+// failed observation means we cannot tell what is already there, and reconciling
+// against a view we just admitted we could not read is how a healthy worker gets
+// clobbered. Retrying next tick costs one interval.
 func (l *Loop) Tick(ctx context.Context) error {
+	resp, err := l.poller.Poll(ctx)
+	if err != nil {
+		return err
+	}
 	observed, err := l.materializer.Observe(ctx)
 	if err != nil {
 		return err
 	}
-	resp, err := l.poller.Poll(ctx, observed)
-	if err != nil {
-		return err
-	}
-	return l.materializer.Reconcile(ctx, resp.Workers)
+	return l.materializer.Reconcile(ctx, resp.Workers, observed)
 }

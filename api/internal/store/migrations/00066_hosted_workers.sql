@@ -41,12 +41,22 @@ ALTER TABLE workers ADD CONSTRAINT ck_workers_hosted_metadata CHECK (
 CREATE INDEX idx_workers_hosted ON workers (kind) WHERE kind = 'hosted';
 
 -- The delivered-once join-token handoff (Decision 3). At provision the api seals
--- the plaintext here; the controller picks it up on its next poll, writes it into
--- the worker's k8s Secret, and only once it OBSERVES that Secret does it ack —
--- which is what clears the ciphertext. So delivery is at-least-once against a
--- durable ack, never fire-and-forget: a poll response lost to a crash or a
--- partition is simply re-delivered, and no worker is ever stranded holding a
--- token_hash whose plaintext no longer exists anywhere.
+-- the plaintext here; the controller collects it on its next poll and writes it
+-- into the worker's k8s Secret; the pod boots, reads the file, and REGISTERS with
+-- it — and that registration is what clears the ciphertext.
+--
+-- Delivery is settled by proof of possession, never by the controller's say-so.
+-- RequireWorker resolves a worker by matching sha256(the presented token) against
+-- workers.token_hash, so a successful register is unforgeable evidence that a pod
+-- holds the CURRENT token. A controller ack could only assert "a Secret exists for
+-- W" without naming the token inside it, which destroyed a freshly rotated
+-- plaintext undelivered and left this row claiming a delivery that never happened.
+-- It also demanded a Secret read, which Decision 1's RBAC refuses.
+--
+-- Until that proof arrives the plaintext stays parked, so a lost poll response, a
+-- controller crash, or a partition costs nothing but a re-delivery on the next
+-- poll: no worker is ever stranded holding a token_hash whose plaintext no longer
+-- exists anywhere.
 --
 -- Its own table, NOT a column on `workers`: every worker read is a `SELECT *`
 -- (GetWorkerByTokenHash, ListWorkersByUser, RegisterWorker/HeartbeatWorker's
@@ -60,12 +70,17 @@ CREATE INDEX idx_workers_hosted ON workers (kind) WHERE kind = 'hosted';
 -- was one", and those demand opposite responses (nothing / rotate / provision).
 -- The three legal states are:
 --
---   ciphertext NOT NULL, delivered_at NULL      -> pending delivery
---   ciphertext NULL,     delivered_at NOT NULL  -> delivered and destroyed (steady state)
---   ciphertext NULL,     delivered_at NULL      -> EXPIRED unread by the sweeper: the
---                                                  worker is stranded and recovery must
---                                                  mint a NEW token (never resurrect the
---                                                  old plaintext), bumping hosted_generation
+--   ciphertext NOT NULL, delivered_at NULL      -> pending: no pod has proved it holds
+--                                                  this token yet
+--   ciphertext NULL,     delivered_at NOT NULL  -> delivered: a pod registered with it,
+--                                                  the buffer is destroyed (steady state)
+--   ciphertext NULL,     delivered_at NULL      -> EXPIRED unread by the sweeper. Benign
+--                                                  if the Secret was written (a late
+--                                                  register self-heals this to delivered);
+--                                                  a genuine strand if it was not, and
+--                                                  then recovery must mint a NEW token
+--                                                  (never resurrect the old plaintext),
+--                                                  bumping hosted_generation
 --
 -- The fourth combination (a ciphertext still present after delivery) is the one
 -- state that would mean the handoff failed to destroy what it promised to, so the

@@ -5,9 +5,9 @@
 
 -- name: ListHostedWorkersForController :many
 -- Desired state for the controller's poll: every hosted worker, plus its pending
--- sealed join token when one is still awaiting delivery (LEFT JOIN — a worker
--- whose token the controller has already acked, or whose token expired unread,
--- returns NULL here and is simply reconciled without one).
+-- sealed join token when one is still awaiting delivery (LEFT JOIN — a worker whose
+-- pod has already proved it holds its token, or whose token expired unread, returns
+-- NULL here and is simply reconciled without one).
 --
 -- Deliberately carries NO user-controlled text (Decision 7): workers.name is
 -- arbitrary 200-byte user input, and the controller renders k8s object names from
@@ -47,21 +47,40 @@ ON CONFLICT (worker_id) DO UPDATE SET
     created_at       = now();
 
 -- name: MarkHostedWorkerTokenDelivered :execrows
--- The ack: the controller has OBSERVED the token materialized as a k8s Secret, so
--- the api's sealed copy has served its purpose and is destroyed (Decision 3's
--- "never at rest in plaintext server-side"). The row survives with delivered_at
--- stamped, which is what distinguishes a delivery from an expiry.
+-- The delivery acknowledgement, driven by PROOF OF POSSESSION: the worker itself
+-- registered, and RequireWorker only resolved it by matching sha256(the token it
+-- presented) against workers.token_hash. So a pod is demonstrably holding the
+-- CURRENT token, and the api's sealed buffer has served its purpose and is
+-- destroyed (Decision 3's "never at rest in plaintext server-side"). The row
+-- survives with delivered_at stamped, which is what distinguishes a delivery from
+-- an expiry.
 --
--- Scoped to kind='hosted' so a controller ack can never reach a row that is not
--- its business. Idempotent: a re-ack of an already-delivered worker matches the
--- row, rewrites the same NULL, and re-stamps delivered_at — the controller re-acks
--- every poll for the worker's whole life, since its ack is derived from the Secret
--- it keeps observing.
+-- It is NOT a controller assertion. A controller ack could only say "a Secret
+-- exists for W" without naming the token in it, so a rotation racing an in-flight
+-- ack destroyed the fresh plaintext undelivered and recorded the row as delivered
+-- steady-state while the pod 401'd forever on the old token. Registration cannot
+-- lie about the version: a pod holding T1 after a rotation to T2 fails auth and
+-- never reaches this statement.
+--
+-- The (ciphertext IS NOT NULL OR delivered_at IS NULL) guard is for IDEMPOTENCE on
+-- re-registration — a pod rescheduled onto another node presents the same token
+-- again, and that must be a no-op, not a re-stamp. It admits exactly two states:
+--   * pending  (ciphertext, no delivered_at) -> the real delivery
+--   * expired  (neither)                     -> a late but genuine SELF-HEAL: the
+--     Secret was written after all and the pod finally booted (a slow image pull,
+--     an ImagePullBackOff that cleared), so the row is corrected to the truth
+--     rather than left claiming a strand that a rotation would then "fix" for no
+--     reason. Only a proof licenses this transition; a report never could.
+-- and excludes the already-delivered state, which is where re-registration lands.
+--
+-- Still scoped to kind='hosted': the handler already checks Kind, so this is
+-- defence in depth against a future caller that does not.
 UPDATE hosted_worker_tokens SET
     token_ciphertext = NULL,
     delivered_at     = now()
 WHERE worker_id = @worker_id
-  AND worker_id IN (SELECT id FROM workers WHERE kind = 'hosted');
+  AND worker_id IN (SELECT id FROM workers WHERE kind = 'hosted')
+  AND (token_ciphertext IS NOT NULL OR delivered_at IS NULL);
 
 -- name: ExpirePendingHostedWorkerTokens :execrows
 -- Bound how long a sealed join token may sit at rest (PRD #58, a residual BEYOND
@@ -74,12 +93,22 @@ WHERE worker_id = @worker_id
 -- worker abandoned), "delivered once" would quietly degrade into "at rest
 -- indefinitely".
 --
--- Expiring STRANDS the worker by design: its token_hash is committed and no
--- plaintext survives, so it can never register. That is the intended trade — a
--- stranded worker is visible (it never comes online) and recoverable (M2/M3 rotate
--- a new token in via UpsertHostedWorkerToken), whereas an unbounded sealed secret
--- is neither. delivered_at stays NULL, which is exactly what marks the row
--- stranded rather than done.
+-- Expiring is BENIGN in the normal case, and that is what makes 1h a safe default
+-- even though the pending window is now pod-scheduling-plus-image-pull rather than
+-- two poll intervals. This clears the api's sealed BUFFER, not the token: if the
+-- controller already wrote the Secret, the plaintext is in the cluster and
+-- workers.token_hash is untouched, so whenever the pod finally boots it reads the
+-- file, authenticates, registers, and MarkHostedWorkerTokenDelivered corrects the
+-- row late (its expired-state clause exists for exactly that self-heal).
+--
+-- Expiry only strands when the Secret was NEVER written — which is precisely the
+-- case the TTL exists for. A stranded worker is visible (it never comes online,
+-- Decision 10's heartbeat) and recoverable (M2/M3 rotate a new token in via
+-- UpsertHostedWorkerToken), whereas an unbounded sealed secret is neither.
+-- delivered_at stays NULL, which is what marks the row stranded rather than done.
+--
+-- So the TTL now means "no pod ever proved it booted", NOT "the controller never
+-- picked it up".
 UPDATE hosted_worker_tokens SET token_ciphertext = NULL
 WHERE token_ciphertext IS NOT NULL
   AND created_at < @cutoff;

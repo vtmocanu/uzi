@@ -598,7 +598,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		if h.cfg.WorkerHostingEnabled {
 			r.Route("/controller", func(r chi.Router) {
 				r.Use(mw.RequireController(h.cfg.ControllerTokenSHA256))
-				r.Post("/poll", h.ControllerPoll)
+				r.Get("/poll", h.ControllerPoll)
 			})
 		}
 	})

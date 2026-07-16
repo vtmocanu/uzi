@@ -9,23 +9,32 @@
 // module. What crosses is this wire contract and nothing else.
 package hostedsvc
 
-// PollRequest is what the controller POSTs on every cycle. It is a poll and an
-// acknowledgement in one round trip: there is exactly one controller-facing
-// endpoint, and folding the ack into the next poll keeps it that way.
-type PollRequest struct {
-	// Materialized lists the hosted worker ids whose join-token Secret the
-	// controller OBSERVES in the cluster right now — read fresh from the
-	// apiserver each cycle, never remembered across restarts (Decision 2: the
-	// controller is stateless, desired state in the DB, observed state in the
-	// cluster). That is precisely what makes this ack safe to act on: it asserts
-	// a durable fact about the world, not a claim about what the controller did.
-	Materialized []string `json:"materialized"`
-}
+// The poll is a GET and carries no request body.
+//
+// It used to be a POST whose body acked the tokens the controller had
+// materialized. That is gone, and deliberately: an ack is a report from the very
+// component this PRD exists to bound, and it could not name WHICH token it had —
+// so a rotation racing an in-flight ack destroyed the fresh plaintext undelivered
+// and left the row asserting a delivery that never happened. Delivery is now
+// derived from the worker's own registration (see NoteRegistered): a pod
+// authenticating with the token proves it holds it, unforgeably and version-exactly,
+// and the api decides from its own auth result rather than from anyone's assertion.
+//
+// The second reason the ack had to go: an ack meant the controller had to READ
+// Secret existence, and Decision 1 pins its RBAC to "Secrets create/delete only
+// (it writes them, never needs to read them back)". k8s has no existence-only verb,
+// so the old contract would have obligated M3 to widen the Role — turning a
+// controller compromise from "harvest what flows through the compromise window"
+// into "harvest every hosted worker's token for the fleet's life". Nothing here
+// reads a Secret now, so Decision 1's Secrets line stands verbatim.
 
 // PollResponse is the desired state of the whole hosted fleet — every hosted
 // worker, always, not a delta. The controller reconciles it as a set, which is
 // what lets it detect objects that should not exist (Decision 9's orphans); a
 // delta or a page could never express "these are all the workers there are".
+//
+// It carries join-token plaintext, so the handler sets Cache-Control: no-store on
+// it — a POST was never cacheable, a GET is.
 type PollResponse struct {
 	Workers []DesiredWorker `json:"workers"`
 }
@@ -46,13 +55,16 @@ type DesiredWorker struct {
 	// Generation is bumped whenever the desired spec changes; the controller
 	// compares it against what it observes to decide whether to roll (Decision 9).
 	Generation int64 `json:"generation"`
-	// JoinToken is the plaintext join token, present ONLY while its delivery is
-	// still unacknowledged. Once the controller reports the worker in
-	// PollRequest.Materialized, the api destroys its sealed copy and this field is
-	// null forever after (Decision 3).
+	// JoinToken is the plaintext join token, present ONLY while it is still
+	// undelivered. Once the worker itself registers with it — proving it holds it —
+	// the api destroys its sealed copy and this field is null forever after
+	// (Decision 3). The TTL sweep also clears it if no pod ever proves it booted.
 	//
-	// A null here therefore means "already delivered", never "no token" — the
-	// worker's k8s Secret is by then the only place the plaintext exists, exactly
-	// as a hand-run worker's token lives only where its user pasted it.
+	// A null therefore means "this worker needs no token written", never "this
+	// worker has no token": either a pod already proved it holds one (the k8s Secret
+	// is then the only place the plaintext exists, exactly as a hand-run worker's
+	// token lives only where its user pasted it), or the buffer expired unread and
+	// recovery is a rotation. Both are the controller's cue to reconcile the worker
+	// WITHOUT touching its Secret, never to invent or clear one.
 	JoinToken *string `json:"join_token"`
 }

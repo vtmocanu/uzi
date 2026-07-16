@@ -70,25 +70,24 @@ func TestExpirePendingTokensPropagatesErrors(t *testing.T) {
 	}
 }
 
-// An expired token must NOT be delivered: the ciphertext is gone, the worker is
-// stranded, and recovery is a fresh token (never a resurrected one). Poll reports
-// the worker tokenless rather than inventing anything.
+// An expired token must NOT be delivered: the ciphertext is gone, and recovery is
+// a fresh token (never a resurrected one). Poll reports the worker tokenless rather
+// than inventing anything.
 func TestPollDoesNotDeliverAnExpiredToken(t *testing.T) {
 	st := newFakeStore()
-	svc := newTestService(t, st)
+	box := newTestBox(t)
+	svc := New(st, box)
 	id := newTestWorker(st, "base", "s", 1)
-	if err := svc.SealJoinToken(context.Background(), id, "uzw_will-expire"); err != nil {
-		t.Fatalf("SealJoinToken: %v", err)
-	}
+	seal(t, st, box, id, "uzw_will-expire")
 	// The sweep cleared the ciphertext without ever stamping delivered_at.
-	delete(st.tokens, id)
+	st.rows[id].ciphertext = nil
 
-	resp, err := svc.Poll(context.Background(), PollRequest{})
+	resp, err := svc.Poll(context.Background())
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 	if len(resp.Workers) != 1 {
-		t.Fatalf("%d workers, want the stranded worker still in desired state", len(resp.Workers))
+		t.Fatalf("%d workers, want the worker still in desired state", len(resp.Workers))
 	}
 	if resp.Workers[0].JoinToken != nil {
 		t.Fatal("an expired token must never be delivered")
@@ -99,27 +98,24 @@ func TestPollDoesNotDeliverAnExpiredToken(t *testing.T) {
 // row and makes it pending again. The old plaintext is never reachable.
 func TestSealJoinTokenRotatesAStrandedWorker(t *testing.T) {
 	st := newFakeStore()
-	svc := newTestService(t, st)
+	box := newTestBox(t)
+	svc := New(st, box)
 	id := newTestWorker(st, "base", "s", 1)
 
-	if err := svc.SealJoinToken(context.Background(), id, "uzw_original"); err != nil {
-		t.Fatalf("seal original: %v", err)
-	}
+	seal(t, st, box, id, "uzw_original")
 	// Delivered, then the Secret was lost — M2/M3 rotate a new token in.
-	if _, err := svc.Poll(context.Background(), PollRequest{Materialized: []string{id.String()}}); err != nil {
-		t.Fatalf("ack: %v", err)
+	if err := svc.NoteRegistered(context.Background(), id); err != nil {
+		t.Fatalf("NoteRegistered: %v", err)
 	}
-	if !st.delivered[id] {
-		t.Fatal("ack did not stamp delivery")
+	if !st.rows[id].delivered {
+		t.Fatal("registration did not stamp delivery")
 	}
 
-	if err := svc.SealJoinToken(context.Background(), id, "uzw_rotated"); err != nil {
-		t.Fatalf("seal rotated: %v", err)
-	}
-	if st.delivered[id] {
+	seal(t, st, box, id, "uzw_rotated")
+	if st.rows[id].delivered {
 		t.Fatal("rotation must reset delivery, else the fresh token reads as already delivered")
 	}
-	resp, err := svc.Poll(context.Background(), PollRequest{})
+	resp, err := svc.Poll(context.Background())
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
