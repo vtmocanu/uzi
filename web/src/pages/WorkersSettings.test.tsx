@@ -458,8 +458,9 @@ describe("WorkersSettings announces what just happened (PRD #58 findings 10 + 11
 
   it("re-announces when two identically-named workers are deleted in turn", async () => {
     // Derived names are NOT unique — "base (S)" twice is exactly what a quota of 2
-    // produces. The slot keys on a seq, not the text: otherwise the second delete sets an
-    // identical string, the focus effect never re-fires, and it goes unannounced.
+    // produces. The slot holds an OBJECT, so every announcement is a value the focus
+    // effect sees as new; a bare string would let the second delete set an identical
+    // value, React would bail out, and it would go unannounced.
     const a = aWorker({ id: "w-a", name: "base (S)", kind: "hosted", hosted_size: "s" });
     const b = aWorker({ id: "w-b", name: "base (S)", kind: "hosted", hosted_size: "s" });
     mockApi.listWorkers.mockResolvedValue({ workers: [a, b] });

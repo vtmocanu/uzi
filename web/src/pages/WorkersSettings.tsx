@@ -45,15 +45,17 @@ export function WorkersSettings() {
   // below" is simply false), and HostedWorkers renders nothing at all when hosting is
   // off — which is exactly where external deletes still happen.
   //
-  // The seq is load-bearing, not decoration: the focus effect keys on this value, and
-  // derived names are NOT unique ("base (S)" twice is what a quota of 2 produces). Two
-  // deletes in a row would otherwise set an identical string, the effect would not
-  // re-fire, and the second announcement would never take focus.
-  const [notice, setNotice] = useState<{ text: string; seq: number } | null>(null);
-  const noticeSeq = useRef(0);
+  // The OBJECT WRAPPER is the mechanism, and it is not incidental — do not "simplify"
+  // this to a bare string. The focus effect below keys on `notice`, so every announce()
+  // must produce a value the effect sees as new. A fresh object literal always is. A
+  // string would not: derived names are NOT unique ("base (S)" twice is exactly what a
+  // quota of 2 produces), so deleting two identically-named workers would set the same
+  // string, React would bail out, the effect would not re-fire, and the second
+  // announcement would silently never take focus.
+  const [notice, setNotice] = useState<{ text: string } | null>(null);
   const noticeRef = useRef<HTMLDivElement>(null);
   const announce = useCallback((text: string) => {
-    setNotice({ text, seq: ++noticeSeq.current });
+    setNotice({ text });
   }, []);
 
   const load = useCallback(async () => {
