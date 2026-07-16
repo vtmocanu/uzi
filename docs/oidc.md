@@ -131,6 +131,25 @@ and Pocket ID both emit a proper boolean; only other IdPs need checking.
 
 - **Keycloak**: Users → select the user → Details tab → toggle **Email
   verified** ON, Save.
+
+  **LDAP/AD-federated realms** (the user's Details tab shows a **Federation
+  link**): federated accounts typically import with the flag OFF, so every
+  SSO login bounces with `oidc_forbidden` even though the email came from
+  the corporate directory. Three fixes, least- to most-invasive (verified
+  against Keycloak 26 / a Meta AD-federated realm, 2026-07-16):
+
+  1. **Per-user flip** (as above) — fine for a handful of users, but every
+     newly federated user needs the same click.
+  2. **Hardcoded claim mapper, scoped to the uzi client** (recommended when
+     the directory owns the mailboxes): Clients → your uzi client → Client
+     scopes tab → the `<client-id>-dedicated` scope → Add mapper → By
+     configuration → **Hardcoded claim**; Token Claim Name
+     `email_verified`, Claim value `true`, **Claim JSON Type: boolean**
+     (uzi rejects the string `"true"`), Add to ID token ON. Zero per-user
+     maintenance, and no other client in the realm is affected.
+  3. **Trust Email** on the federation provider (User Federation → the
+     LDAP provider) — systematic but realm-wide; clear it with the realm's
+     owner first.
 - **Pocket ID**: either flip the **Emails Verified** setting under
   Application Configuration so new accounts start verified, or have the user
   complete Pocket ID's own email-verification flow. Either way flips the
@@ -152,7 +171,11 @@ env var reference (`UZI_OIDC_GROUPS_CLAIM`, `UZI_OIDC_ADMIN_GROUPS`,
   any listed group makes a user admin. Setting this disables
   first-SSO-user-becomes-admin outright — see the pre-seeding note above.
 - **`UZI_OIDC_ALLOWED_GROUPS`** (comma-separated, empty = no gate): membership
-  in any listed group is required to SSO-login or JIT-provision at all. A
+  in any listed group is required to SSO-login or JIT-provision at all.
+  Admins get no implicit pass: if your admin group is separate (e.g.
+  `uzi-admins` alongside `uzi-users`), list it here too
+  (`UZI_OIDC_ALLOWED_GROUPS=uzi-users,uzi-admins`) or your admins can't log
+  in. A
   user outside every listed group gets `/login?error=oidc_forbidden`, same as
   any other rejected login (no detail beyond the server log — see
   [Troubleshooting](#troubleshooting)).
@@ -250,9 +273,10 @@ above.
 2. Add the relevant users to those groups (**Groups → &lt;group&gt; → Members
    → Add member**, or per-user under **Users → &lt;user&gt; → Groups → Join
    Group**).
-3. **Client scopes** → open (or create) a client scope attached to your uzi
-   client → **Mappers** tab → **Add mapper → By configuration → Group
-   Membership**.
+3. The simplest home for the mapper is the client's own dedicated scope
+   (no separate scope to create or attach): **Clients → your uzi client →
+   Client scopes tab → `<client-id>-dedicated` → Add mapper → By
+   configuration → Group Membership**.
 4. In the mapper: set **Token Claim Name** to `groups` (or whatever you set
    `UZI_OIDC_GROUPS_CLAIM` to), turn **Full group path** **OFF** (see the
    exact-match note above), and turn **Add to ID token** **ON** — this is the
