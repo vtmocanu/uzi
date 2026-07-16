@@ -134,7 +134,7 @@ describe("the shared root-entry drop wrapper", () => {
     assert.match(entrypoint, /single-uid non-root mode \(PRD #58\)/, "non-root path must log the single-uid posture");
   });
 
-  it("carves out the runner-owned /data subtrees to worker:runner 2775, keeping repos/ worker-only (PRD #51 M3 (b))", () => {
+  it("carves out the runner-owned /data subtree ROOTS to worker:runner 2775, keeping repos/ worker-only (PRD #51 M4 (b))", () => {
     // The runner clone store + SDK/provision HOMEs are runner-writable (worker:runner,
     // setgid+group-write); the worker bare cache repos/ (the B2 code-exec surface) is
     // NOT in the carve-out list.
@@ -146,10 +146,34 @@ describe("the shared root-entry drop wrapper", () => {
       "the worker bare cache repos/ must NOT be in the runner-writable carve-out",
     );
     // chmod 2775 (setgid+group-write) BEFORE chown (no CAP_FOWNER; setgid survives a
-    // dir chown), so children inherit group `runner` for the M4 runner's per-run dirs.
+    // dir chown), so children inherit group `runner` for the runner's per-run dirs.
     const chmodAt = entrypoint.search(/"\$CHMOD"\s+2775\s+"\/data\/\$d"/);
-    const chownAt = entrypoint.search(/"\$CHOWN"\s+-R\s+"\$RUNNER_TREE_OWNER"\s+"\/data\/\$d"/);
+    const chownAt = entrypoint.search(/"\$CHOWN"\s+"\$RUNNER_TREE_OWNER"\s+"\/data\/\$d"/);
     assert.ok(chmodAt >= 0 && chownAt >= 0 && chmodAt < chownAt, "chmod 2775 must precede the chown (no CAP_FOWNER)");
+    // Resume guard (PRD #51 M4): the carve-out chown is NON-recursive (roots only) so an
+    // every-boot re-own never clobbers the runner's own per-run resume state.
+    assert.doesNotMatch(
+      entrypoint,
+      /"\$CHOWN"\s+-R\s+"\$RUNNER_TREE_OWNER"/,
+      "the carve-out chown must be NON-recursive (resume guard) — never chown -R the runner subtrees",
+    );
+  });
+
+  it("activates the M4 uid split: /nix runner-owned, worker PATH stripped, split env exported (PRD #51 M4)", () => {
+    // /nix is runner-OWNED under the split (worker fully off /nix); the worker→runner owner
+    // change re-triggers migrate_tree's sentinel (handling the owner-keyed group guard).
+    assert.match(entrypoint, /NIX_OWNER=runner:runner/, "/nix must be runner:runner under the A1 split");
+    // The dropped worker keeps ONLY the stripped root-owned PATH — the full image PATH (nix
+    // + JDK) is handed to the RUNNER via UZI_RUNNER_PATH, never restored onto the worker.
+    assert.doesNotMatch(entrypoint, /export\s+PATH="\$IMAGE_PATH"/, "the worker PATH must NOT be restored to the /nix-bearing image PATH");
+    assert.match(entrypoint, /export UZI_UID_SPLIT=1/, "must export UZI_UID_SPLIT=1 to activate the split");
+    assert.match(entrypoint, /export UZI_RUNNER_PATH="\$IMAGE_PATH"/, "must hand the full image PATH to the runner via UZI_RUNNER_PATH");
+    assert.match(entrypoint, /export UZI_RUNNER_TMPDIR="\$RUNNER_TMPDIR"/, "must export the runner's private TMPDIR");
+    // These split-activating exports must be on the ROOT (A1) path, AFTER the non-root
+    // single-uid exec (which never activates the split).
+    const nonrootExecAt = entrypoint.search(/exec\s+"\$TINI"\s+--\s+"\$@"/);
+    const splitAt = entrypoint.search(/export UZI_UID_SPLIT=1/);
+    assert.ok(nonrootExecAt >= 0 && splitAt > nonrootExecAt, "the split must activate only on the root path, after the non-root exec");
   });
 
   it("gives the worker and runner distinct 0700 TMPDIR trees, exporting only the worker's (5-bis)", () => {

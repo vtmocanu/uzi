@@ -66,16 +66,26 @@ fi
 echo "uzi-entrypoint: A1 uid-split active (root-started) — dropping to worker after the startup window" >&2
 
 # --- ROOT-started (compose / A1): root startup window, then the setpriv drop ---
-# The image's runtime PATH (per template: the nix profile bin, and the JDK bin for jvm)
-# is handed to the dropped worker; the root window itself runs on a constrained PATH
-# containing only root-owned system dirs.
-WORKER_PATH="${PATH}"
+# The image's full runtime PATH (the nix profile bin + the JDK bin for jvm) becomes the
+# RUNNER PATH (PRD #51 M4): the untrusted execution surfaces run as `runner` and need
+# `/nix`, but the credential-holding worker must NOT resolve any binary from `/nix` (now
+# runner-writable — a runner could plant a trojan the PAT-holding worker would run). So
+# the dropped WORKER keeps only the stripped root-owned PATH (below), and the full image
+# PATH is handed to the runner via UZI_RUNNER_PATH at the drop. The root window itself
+# runs on the same stripped PATH.
+IMAGE_PATH="${PATH}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 WORKER_USER=worker
-WORKER_OWNER=worker:worker   # /data, /app: worker-owned (worker does all work pre-split)
-NIX_OWNER=worker:runner      # /nix: worker-owned, group `runner` — forward hook for M4
+WORKER_OWNER=worker:worker   # /data, /app: worker-owned (the worker's own trees)
+# /nix: runner-OWNED under the A1 split (PRD #51 M4) — provisioning moves to `runner`, so
+# it realizes packages as the /nix owner and the worker needs nothing from /nix. The
+# worker→runner OWNER change re-triggers migrate_tree's sentinel (a new owner => a new
+# sentinel name), which also fixes the group (handling the owner-keyed-guard note). On a
+# #58 non-root start this whole root window is skipped, so /nix stays worker:runner from
+# the image layer and the single-uid worker still provisions.
+NIX_OWNER=runner:runner
 
 # --- (a) B4: migrate persisted named volumes to the current uid layout --------
 # agentnix (/nix) and agentdata (/data) seed from the image on first use and then
@@ -96,7 +106,15 @@ migrate_tree() {
   # re-runs fully regardless of order (idempotent), and a later milestone that re-owns a
   # tree uses a new owner => a new sentinel name => it re-migrates. The only cost on a
   # fresh (already-correct) volume is one redundant chown on first boot. The sentinel is
-  # NOT a security control — deleting/forging it only forces a redundant idempotent chown.
+  # NOT a security control. DELETING it only forces a redundant idempotent chown. FORGING
+  # it (writing the sentinel before an upgrade so the migration is skipped) is the more
+  # interesting direction: a pre-split, /data-owning agent could plant the next milestone's
+  # sentinel so the post-upgrade chown skips, leaving the volume owned by the old uid ->
+  # the worker cannot write /data -> the container fails to operate. That is an
+  # AVAILABILITY DoS only (no confidentiality/integrity gain, operator-visible as a broken
+  # boot), by a PRE-split attacker who already had same-uid /data write — accepted, since
+  # the split's containment is about the POST-upgrade world and a clean install (down -v)
+  # or a manual chown recovers it.
   path="$1"; owner="$2"
   [ -e "$path" ] || return 0
   sentinel="$path/.uzi-migrated-${owner%:*}-${owner#*:}"
@@ -109,38 +127,39 @@ migrate_tree() {
 migrate_tree /nix "$NIX_OWNER"
 migrate_tree /data "$WORKER_OWNER"
 
-# --- (a2) PRD #51 M3: runner-owned /data subtree carve-out ((b) ownership model) --
+# --- (a2) PRD #51 M4: runner-owned /data subtree carve-out ((b) ownership model) --
 # Under (b) separate-runner-clone the RUNNER clone store + the SDK/provision HOMEs are
-# runner-owned trees (the agent checks out + commits there as uid `runner` from M4),
-# while the WORKER bare cache repos/ stays worker-only (its config/hooks/refs are the
-# B2 code-exec surface — the runner must never write it). migrate_tree above set ALL of
-# /data to worker:worker, so re-own these subtrees to worker:runner + setgid/group-write
-# (2775) so children inherit group `runner` and the M4 runner (a `runner`-group member)
-# can create its per-run dirs under them. repos/ is deliberately NOT in this list.
+# runner-owned trees (the agent checks out + commits there as uid `runner`), while the
+# WORKER bare cache repos/ stays worker-only (its config/hooks/refs are the B2 code-exec
+# surface — the runner must never write it). migrate_tree above set ALL of /data to
+# worker:worker, so own these subtree ROOTS worker:runner + setgid/group-write (2775) so
+# children inherit group `runner` and the runner (a `runner`-group member) can create its
+# per-run dirs under them; the worker runs umask 002 (main.ts) so those worker-created
+# per-run dirs are group-`runner`-writable. repos/ is deliberately NOT in this list.
 #
-# INERT until M4: no `runner` process exists yet (the spawn relocation is M4), so the
-# worker still creates + writes these pre-split. This establishes the subtree-root
-# ownership only; the per-run LEAF-dir group-write the runner's OWN writes need (setgid
-# propagates the group, not the write bit, through a deep mkdir) + the /nix group-write
-# land WITH the M4 runner spawn (they are unsafe to enable before the worker-PATH-hygiene
-# fix that also lands in M4 — else a runner-writable /nix on the worker's credentialed
-# PATH is cross-uid code-exec into the PAT holder). chmod BEFORE chown (no CAP_FOWNER);
-# the setgid bit survives chown on a DIRECTORY (Linux clears S_ISGID on chown only for
-# group-executable regular files, never dirs). chown -R re-owns any pre-existing content.
+# NON-RECURSIVE chown, deliberately (resume guard): this runs EVERY boot (cheap — 3
+# dirs), and a `chown -R worker:runner` would re-own the runner's OWN per-run resume
+# state (agent-home/<runId> session transcripts a requeued run resumes from) on every
+# restart, breaking any runner-created file the runner can't reach after the owner flips.
+# Owning only the ROOTS leaves that runner-owned content untouched; a fresh volume's roots
+# are empty, and an upgrade's stale content was already re-owned by migrate_tree /data
+# above (a mid-run upgrade just requeues). chmod BEFORE chown (no CAP_FOWNER); the setgid
+# bit survives chown on a DIRECTORY (Linux clears S_ISGID on chown only for
+# group-executable regular files, never dirs).
 RUNNER_TREE_OWNER=worker:runner
 for d in runner agent-home provision; do
   "$MKDIR" -p "/data/$d"
   "$CHMOD" 2775 "/data/$d"
-  "$CHOWN" -R "$RUNNER_TREE_OWNER" "/data/$d"
+  "$CHOWN" "$RUNNER_TREE_OWNER" "/data/$d"
 done
 
 # --- (a3) PRD #51 M3 / 5-bis: distinct per-uid TMPDIR on 0700 trees -------------
-# git/npm/node scratch writes go to a shared sticky /tmp today (symlink races + exposure
-# of any worker temp write across the uid boundary). Give the worker and the runner each
-# a private 0700 tmp. The worker's is exported below (before the drop); the runner's is
-# created here but consumed by the runner env builders in M4 (its 0700/runner mode means
-# the single-uid worker cannot write it pre-split, so it is NOT wired into the worker's
-# env now). chmod BEFORE chown (no CAP_FOWNER).
+# git/npm/node scratch writes would otherwise share a sticky /tmp (symlink races +
+# exposure of any worker temp write across the uid boundary). Give the worker and the
+# runner each a private 0700 tmp. The worker's is exported as TMPDIR below; the runner's
+# is exported as UZI_RUNNER_TMPDIR (the runner env builders put it on the agent/checks/
+# provision children — runner-uid.ts). Its 0700/runner mode is owner-only, so the worker
+# (a `runner`-GROUP member) still cannot read it. chmod BEFORE chown (no CAP_FOWNER).
 WORKER_TMPDIR=/tmp/uzi-worker
 RUNNER_TMPDIR=/tmp/uzi-runner
 "$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
@@ -168,10 +187,21 @@ fi
 # /etc/group) so the worker can access runner-group trees. tini stays PID 1 (now as
 # `worker`) to reap and forward SIGTERM, preserving clean shutdown. The CMD
 # (npm run start) arrives as "$@" and is passed as argv (no shell re-parse).
-# TMPDIR is the worker's private 0700 tmp (5-bis) — inherited by the worker node
-# process and its git children (gitEnv/buildCheckEnv carry it forward).
-export PATH="$WORKER_PATH"
+#
+# The dropped worker's env activates the PRD #51 M4 uid split for the worker process:
+#   - PATH stays the STRIPPED root-owned set (set above, still exported) — NOT the image
+#     PATH — so no worker-side exec ever resolves from the runner-writable /nix (M2-audit
+#     MEDIUM). The worker's own tools (git/node/npm/setpriv/tini) are all in these dirs.
+#   - UZI_UID_SPLIT=1 tells runner-uid.ts to setpriv-wrap every untrusted spawn as `runner`
+#     and to reap runner groups via a setpriv-to-runner kill. Its ABSENCE (a #58 non-root
+#     start, which never reaches this line) = single-uid, no split.
+#   - UZI_RUNNER_PATH = the full image PATH (nix + JDK) the runner env builders put on the
+#     agent/checks/provision children; UZI_RUNNER_TMPDIR = the runner's private 0700 tmp.
+#   - TMPDIR = the worker's own private 0700 tmp (5-bis), inherited by its git children.
 export TMPDIR="$WORKER_TMPDIR"
+export UZI_UID_SPLIT=1
+export UZI_RUNNER_PATH="$IMAGE_PATH"
+export UZI_RUNNER_TMPDIR="$RUNNER_TMPDIR"
 exec "$SETPRIV" \
   --reuid "$WORKER_USER" --regid "$WORKER_USER" --init-groups \
   --bounding-set -all,+setuid,+setgid \
