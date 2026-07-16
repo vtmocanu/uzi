@@ -358,21 +358,32 @@ describe("repo agents are structurally denied Agent by the assembly path", () =>
 });
 
 describe("repo agents: uzi's own .claude/agents", () => {
-  // A CANARY over real authored files: detectRepoAgents is a PRODUCT function that
-  // parses a user's cloned repo, and this borrows uzi's own `.claude/agents/` as
-  // the most convenient corpus of genuinely hand-written frontmatter. That is its
-  // whole value — the fixtures above are synthetic and prove the parser's rules;
-  // only this proves the rules hold against files a human actually wrote.
+  // KNOWN COUPLING, tracked in #62 — this is an interim unblock, not the fix.
   //
-  // It therefore asserts PROPERTIES, never the roster. `.claude/agents/` is this
-  // repo's dev-team roster, which CLAUDE.md declares "decoupled — it is free to
-  // drift and product changes must never touch it"; it is a DIFFERENT set from the
-  // product's builtin roles in api/internal/agenttmpl/builtins/ (that one has
-  // `lead`, this one has `architect`/`web-ux`). A product test that pinned this
-  // roster by name would break every time the dev team gained a role — which is
-  // exactly what happened when `architect` landed. So the expectations below are
-  // derived from the directory, not hardcoded against it: the test tracks the
-  // roster instead of pinning it, and no count appears in the prose either.
+  // detectRepoAgents is a PRODUCT function: it parses agents out of a USER'S cloned
+  // repo (runner.ts calls it with the worktree path). This test points it at uzi's
+  // OWN `.claude/agents/` — the repo's dev-team roster, which CLAUDE.md declares
+  // "decoupled — it is free to drift and product changes must never touch it", and
+  // which is a DIFFERENT set from the product's builtin roles in
+  // api/internal/agenttmpl/builtins/ (that one has `lead`; this one has
+  // `architect`/`web-ux`). Reading that directory from a product test is the
+  // coupling itself; #62 replaces it with a committed fixture, which is the proper
+  // fix.
+  //
+  // What changed here was only the worst of it: the test used to `deepEqual` the
+  // exact roster, so every dev-team role change turned a product test red (that is
+  // how `architect` broke it). The expectations are now derived from the directory
+  // and assert properties only, so the roster may drift freely. Residual coupling
+  // remains and is deliberate-for-now: these assertions still constrain what the
+  // dev team may put in its own files (a role declaring a denied tool, or one that
+  // fails to parse, reds this test), which a directory declared free to drift
+  // should not have to care about. Hence #62.
+  //
+  // This is NOT the place for an appear/vanish guard. A role vanishing is an
+  // ALLOWED event here, not a defect, and how many roles our dev team happens to
+  // have is no business of the product parser. That signal — with an actionable
+  // message rather than an array diff — belongs to #63's dev-team/product parity
+  // nudge.
   //
   // Naming a specific role here would also be redundant: the role-specific
   // behaviours this used to assert live above, against controlled fixtures —
