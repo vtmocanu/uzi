@@ -20,6 +20,13 @@ import { WORKER_SIZES } from "./workerSizes";
 // inside the image type-checks this file clean with api/ absent, while vitest (which
 // runs from a full checkout) resolves it for real and the assertion has teeth.
 // node:fs would need @types/node, which this browser project deliberately lacks.
+//
+// The flip side of tsc not resolving this path is that tsc cannot VALIDATE it either.
+// Move or rename the golden and `npm run typecheck` stays green (measured: it exits 0);
+// only `npm test` tells you, and it fails as a bare ENOENT that takes the whole suite
+// down before any assertion runs — so you get no drift message, just a missing file.
+// CI runs the web tests from a full checkout, so the gate always fires; simply do not
+// expect the compiler to have your back on this one line.
 import goldenRaw from "../../../api/internal/hostedsvc/testdata/hosted_sizes.json?raw";
 
 const GOLDEN = "api/internal/hostedsvc/testdata/hosted_sizes.json";
