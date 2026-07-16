@@ -7,6 +7,7 @@
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 // SELF_IMPROVE_BRANCH is the fixed branch every self_improve cycle pushes to.
 // Reusing one branch is what lets an open self-improvement MR be extended (the
@@ -164,11 +165,17 @@ export function buildCheckEnv(
   toolEnv?: Record<string, string>,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    PATH: toolEnv?.PATH ?? source.PATH,
+    // The RUNNER PATH (PRD #51 M4): the provisioned toolchain PATH when present, else
+    // the /nix-bearing runner image PATH under the split (checks run as `runner`), NOT
+    // the worker's stripped PATH. Single-uid (#58): the worker's own PATH.
+    PATH: toolEnv?.PATH ?? runnerPath(source),
     HOME: homeDir,
     // No interactive prompt if a check shells out to git; not a secret.
     GIT_TERMINAL_PROMPT: "0",
   };
+  // 5-bis: check scratch on the runner's private 0700 TMPDIR under the split.
+  const tmp = runnerTmpdir(source);
+  if (tmp) env.TMPDIR = tmp;
   // TLS trust + locale so nix-provided toolchains and `npm ci` over HTTPS work. Prefer
   // the provisioned value, fall back to the image's; never invent, never carry else.
   for (const k of ["NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"] as const) {
@@ -197,8 +204,12 @@ export async function prepareCheckDeps(
       out.push({ dir, ok: false, detail: "no package.json" });
       continue;
     }
+    // PRD #51 M4: `npm ci` runs agent-authored package.json (even with --ignore-scripts,
+    // the lockfile resolution + any allowed binary) — an untrusted surface, so under the
+    // `runner` uid (setpriv wrapper). Single-uid (#58) runs it directly.
+    const nci = runnerCommand("npm", ["ci", "--ignore-scripts"]);
     const ok = await new Promise<boolean>((resolve) => {
-      execFile("npm", ["ci", "--ignore-scripts"], { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 }, (error) =>
+      execFile(nci.command, nci.args, { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 }, (error) =>
         resolve(!error),
       );
     });
@@ -238,10 +249,16 @@ export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 *
             : `prerequisite missing: ${check.requires}`,
       });
     }
+    // PRD #51 M4: the check runs agent-authored test code (go test / vitest / tsc) — an
+    // untrusted surface — so under the `runner` uid (setpriv wrapper); single-uid (#58)
+    // runs it directly. ENOENT/127 still classify as "skipped" (the wrapper preserves the
+    // target's exit semantics; a missing runner uid is a #58 single-uid start where the
+    // wrapper is absent).
+    const wc = runnerCommand(check.command, check.args);
     return new Promise<CheckResult>((resolve) => {
       execFile(
-        check.command,
-        check.args,
+        wc.command,
+        wc.args,
         { cwd, env, timeout: timeoutMs, maxBuffer: 1 << 20 },
         (error) => {
           if (!error) {

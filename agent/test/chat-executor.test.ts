@@ -296,7 +296,10 @@ describe("ChatExecutor session env + assembly", () => {
     await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler(), secretPaths: [TOKEN_FILE] }).run(probe.ctx);
     assert.strictEqual(turns.length, 1);
     const o = turns[0]!.options;
-    assert.deepStrictEqual(new Set(Object.keys(o.env!)), new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]));
+    // Core keys + TMPDIR (5-bis per-uid scratch, when the ambient env has one); TMPDIR is not a secret.
+    const expectedEnvKeys = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+    if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expectedEnvKeys.add("TMPDIR");
+    assert.deepStrictEqual(new Set(Object.keys(o.env!)), expectedEnvKeys);
     assert.deepStrictEqual(o.tools, [...CHAT_BASE_TOOLS]);
     assert.strictEqual(o.cwd, UZI_SRC_DIR);
     // The user message rode the prompt stream as-is.

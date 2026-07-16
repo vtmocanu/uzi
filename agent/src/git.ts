@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -256,6 +257,11 @@ export class GitCache {
       const repoDir = path.basename(barePath).replace(/\.git$/, "");
       const clonePath = path.join(this.runnerRoot, repoDir, key);
       await fs.rm(clonePath, { recursive: true, force: true });
+      // The clone's parent dir. Under the M4 split it must be group-`runner`-writable so
+      // the runner-uid `git clone` can create <key> inside it: /data/runner is
+      // worker:runner 2775 (setgid) from the entrypoint, and the worker runs with umask
+      // 002 (main.ts), so this mkdir is 2775 group `runner` — the runner (a `runner`-group
+      // member) can then create its clone here. Single-uid (#58): plain worker dir.
       await fs.mkdir(path.dirname(clonePath), { recursive: true });
 
       // Resolve the base commit in the BARE (authoritative). A branch already at
@@ -267,11 +273,13 @@ export class GitCache {
       const baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
       this.log.info("runner clone: seeding", { branch, base: baseRef, resume, path: clonePath });
 
-      // `--shared` references the bare's objects read-only (alternate); `--no-checkout`
+      // The seed clone + checkout run as the RUNNER uid (PRD #51 M4), so the clone +
+      // working tree are runner-owned (the agent commits there; the worker never writes
+      // it). `--shared` references the bare's objects read-only (alternate); `--no-checkout`
       // skips populating the stale default so we check the agent branch out at the
-      // resolved base SHA (reachable via the alternate) in one step.
-      await this.runGit(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
-      await this.runGit(clonePath, ["checkout", "-b", branch, baseSha]);
+      // resolved base SHA (reachable via the alternate) in one step. No PAT (local op).
+      await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+      await this.runGitAsRunner(clonePath, ["checkout", "-b", branch, baseSha]);
       return { path: clonePath, branch };
     });
   }
@@ -285,11 +293,21 @@ export class GitCache {
    *     `refs/heads/*` — the runner's whole ref namespace is never admitted (inv. 2);
    *   - `file://` transport forces the PACK protocol (upload-pack over a pipe), so the
    *     local-copy optimization that would traverse a runner-planted
-   *     objects/info/alternates is NOT used (CVE-2022-39253 class, inv. 3);
-   *   - `protocol.file.allow=always` pinned deliberately for that `file://` fetch;
-   *   - runs on gitEnv (GIT_CONFIG_NOSYSTEM + GIT_CONFIG_GLOBAL=/dev/null + the M0
-   *     code-exec-key pins), so the worker's OWN config governs the fetch — no
-   *     runner-side config file is consulted (inv. 4);
+   *     objects/info/alternates is NOT used — this is the specific job of the file://
+   *     transport (CVE-2022-39253 class, inv. 3);
+   *   - `protocol.file.allow=user` pinned deliberately for that `file://` fetch (the
+   *     minimal-privilege value: this is a top-level, user-initiated fetch, which `user`
+   *     — git's compiled default since 2.38.1 — allows, while NOT enabling file:// in
+   *     the submodule/non-user contexts `always` would);
+   *   - the worker's FETCH side (fetch-pack, ref update, object write) runs on gitEnv
+   *     (GIT_CONFIG_NOSYSTEM + GIT_CONFIG_GLOBAL=/dev/null + the M0 code-exec-key pins),
+   *     so the worker's OWN config governs the process that writes into its bare (inv. 4).
+   *     git DOES spawn upload-pack in the runner clone, which reads the runner clone's
+   *     repo-local config — but that is safe by construction: `uploadpack.packObjectsHook`
+   *     is respected ONLY from PROTECTED config (documented, transport-independent,
+   *     stable), so a runner repo-local plant is ignored; and upload-pack performs no
+   *     checkout/diff, so the command-valued core.* keys never fire there (and the
+   *     worker's inline GIT_CONFIG_* pins are inherited by it regardless);
    *   - `--no-tags`: only the branch, no runner-controlled tag namespace.
    * The agent's new objects transfer into the WORKER bare's own object store, so the
    * subsequent push does not depend on the (torn-down, possibly compromised) runner
@@ -300,7 +318,7 @@ export class GitCache {
     const dst = runnerTrackingRef(branch);
     await this.withLock(barePath, async () => {
       await this.runGit(barePath, [
-        "-c", "protocol.file.allow=always",
+        "-c", "protocol.file.allow=user",
         "fetch", "--no-tags", `file://${clonePath}`,
         `+refs/heads/${branch}:${dst}`,
       ]);
@@ -389,6 +407,33 @@ export class GitCache {
     this.log.debug("git", { cwd, args });
     try {
       const { stdout } = await execFileAsync("git", withDir(cwd, args), {
+        env,
+        timeout: GIT_TIMEOUT_MS,
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      return stdout;
+    } catch (err) {
+      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+    }
+  }
+
+  /**
+   * Run a git op as the RUNNER uid (PRD #51 M4) — the runner-clone seed + checkout,
+   * which must be runner-owned. NEVER carries a PAT (a local, non-credentialed op), and
+   * runs on gitEnv's config pins (safe.directory / hooksPath / M0 code-exec-key pins)
+   * but with the RUNNER PATH + the runner's private TMPDIR so `git` resolves and its
+   * scratch lands on the runner's 0700 tmp (not the worker's, which the runner cannot
+   * write). Single-uid (#58): `runnerCommand` is a passthrough, so this is a plain git.
+   */
+  private async runGitAsRunner(cwd: string | undefined, args: string[]): Promise<string> {
+    const base = gitEnv();
+    const env: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
+    const tmp = runnerTmpdir();
+    if (tmp) env.TMPDIR = tmp;
+    const wrapped = runnerCommand("git", withDir(cwd, args));
+    this.log.debug("git (runner uid)", { cwd, args });
+    try {
+      const { stdout } = await execFileAsync(wrapped.command, wrapped.args, {
         env,
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: 64 * 1024 * 1024,

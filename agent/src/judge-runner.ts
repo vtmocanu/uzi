@@ -13,7 +13,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
-import type { HookInput, HookJSONOutput, Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
+import type { HookInput, HookJSONOutput, Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
+import { spawnDetached } from "./sdk-spawn.js";
 
 import type { WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
@@ -228,6 +229,12 @@ export class JudgeRunner {
       hooks: {
         PreToolUse: [{ hooks: [denyAllTools] }],
       },
+      // PRD #51 M4: the judge's model-reasoning SDK CLI is an execution surface, so route
+      // it through the runner-uid spawn like every other SDK spawn (uniform boundary). The
+      // judge's worker-side HTTP (trace-fetch + verdict POST, which use the join token)
+      // stays on the worker (Decision 1) — those run in this Node process, not the CLI. The
+      // deny-all tool hook already blocks code-exec, so this is defense-in-depth.
+      spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
     };
     if (model) options.model = model;
 

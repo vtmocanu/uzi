@@ -207,9 +207,13 @@ worker now reads a runner-controlled store via exactly one fetch):**
 5. **All** worker-side inspection (`changedFiles` / diff / `defaultBranchRef`) runs
    against the **worker bare** after the fetch, on `gitEnv` — never in the runner's
    worktree/clone — so no runner-owned config is read for any diff/checkout.
-6. **M3/M6 evidence:** re-run the `packObjectsHook` / upload-pack-hook PoC on the
-   **image's** git (`node:22-alpine` `apk` git, whatever version it ships) — the
-   mitigation is version-dependent, so confirm on the built image, not just a host git.
+6. **M3/M6 evidence:** the `packObjectsHook` close is the **protected-config gate** —
+   `uploadpack.packObjectsHook` is honored ONLY from protected config (git-config(1):
+   "only respected when it is specified in protected configuration"), so a runner
+   repo-local plant is ignored; this is documented, **transport-independent, and stable
+   (NOT version-dependent)**. The `file://`+pack transport separately handles the
+   CVE-2022-39253 alternates vector (inv. 3). Confirmed on the **image's** git
+   (`node:22-alpine`, git 2.54.0) + host git 2.55.0 (M3), kept as a regression test.
 
 **Two structural wins (auditor's full ruling):**
 - **Closes the commondir/gitdir + shared-ref channels** (above).

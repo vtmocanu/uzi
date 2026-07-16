@@ -243,11 +243,13 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     runGit(rc.path, [...IDENT, "commit", "-m", "c"], plainEnv());
 
     // Plant the hook in the RUNNER clone's OWN config (the surface a compromised runner
-    // controls under the split). git does NOT honor a fetched repo's
-    // uploadpack.packObjectsHook over the file://+pack transport git.fetchAgentBranch
-    // uses — re-confirmed on the IMAGE's git (node:22-alpine, git 2.54.0) AND host git
-    // 2.55.0 (B2 invariant 6; the mitigation is version-dependent, so M6 re-runs it in
-    // the built image, but the behavior is captured here as a regression guard).
+    // controls under the split). `uploadpack.packObjectsHook` is honored ONLY from
+    // PROTECTED config (git-config(1): "only respected when it is specified in protected
+    // configuration"), so a runner REPO-LOCAL plant is ignored regardless of transport —
+    // a documented, transport-independent, STABLE gate, NOT version-dependent. (The
+    // file://+pack transport's own job is the SEPARATE CVE-2022-39253 alternates vector,
+    // invariant 3.) Confirmed on the IMAGE's git (node:22-alpine, git 2.54.0) + host git
+    // 2.55.0; kept as a regression guard (B2 invariant 6).
     plant(rc.path, "uploadpack.packObjectsHook", evil);
     resetMarker();
     const ref = await git.fetchAgentBranch(bare, rc.path, "agent/issue-200");

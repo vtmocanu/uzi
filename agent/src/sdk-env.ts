@@ -21,6 +21,8 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
+import { runnerPath, runnerTmpdir } from "./runner-uid.js";
+
 /** Keys a provisioned tool env may NEVER set (PRD #18 M3): the OAuth credential,
  *  HOME, and the two ANTHROPIC_* keys pinned to undefined so nothing outranks the
  *  OAuth token in the SDK's auth precedence. */
@@ -59,11 +61,17 @@ export function buildSdkEnv(oauthToken: string, homeDir: string, toolEnv: Record
   const env: SdkEnv = {
     CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
     HOME: homeDir,
-    // Inherited so the bundled CLI can resolve git/bash/coreutils on PATH.
-    PATH: process.env.PATH,
+    // The RUNNER PATH (PRD #51 M4): the /nix-bearing image PATH under the split (the
+    // agent's Bash resolves git/bash/coreutils + provisioned tools), NOT the worker's
+    // stripped PATH. Single-uid (#58): the worker's own PATH. A provisioned toolEnv.PATH
+    // still overrides this below.
+    PATH: runnerPath(),
     ANTHROPIC_API_KEY: undefined,
     ANTHROPIC_AUTH_TOKEN: undefined,
   };
+  // 5-bis: the agent's scratch on the runner's private 0700 TMPDIR under the split.
+  const tmp = runnerTmpdir();
+  if (tmp) env.TMPDIR = tmp;
   // Fold in the provisioned tool env. Only allowlisted keys reach here; PATH (if
   // present) is devbox's PATH with the tool bins prepended, so it replaces the
   // inherited one. Never let a provisioned var overwrite a PROTECTED key: the

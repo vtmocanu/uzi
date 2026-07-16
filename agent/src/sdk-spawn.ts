@@ -9,18 +9,26 @@
 // whole tree. Node's ChildProcess structurally satisfies the SDK's
 // SpawnedProcess contract (stdin/stdout/killed/exitCode/kill/on/once/off).
 //
+// PRD #51 M4: the SDK CLI is an UNTRUSTED execution surface, so it (and its whole
+// tree) runs as the `runner` uid via the setpriv wrapper in runner-uid.ts — the
+// wrapper is the group leader after it execs the CLI, so a detached spawn's pid is
+// still the group id the kill targets. Under the split the worker cannot signal the
+// runner group directly (EPERM), so the group-kill reaps via a setpriv-to-runner
+// `kill` (killRunnerGroup). Single-uid (#58) falls back to a direct spawn/kill.
+//
 // Degrade path: `abortController.abort()` remains the PRIMARY, asserted stop —
-// the SDK closes stdin, waits its grace window, then signals the child. The
-// group kill here is defense for orphaned grandchildren; if the platform can't
-// signal the group it falls back to the child pid, and if even that fails
-// (already gone) it is a no-op.
+// the SDK closes stdin, waits its grace window, then signals the child (that
+// SIGTERM cross-uid-EPERMs under the split, but stdin-EOF still stops the CLI).
+// The group kill here is the load-bearing B1 reap + defense for orphaned
+// grandchildren; if even the single pid fails (already gone) it is a no-op.
 
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
+import { killRunnerGroup, runnerSpawn } from "./runner-uid.js";
 
-/** Spawn the SDK subprocess in its own process group. */
+/** Spawn the SDK subprocess in its own process group, under the `runner` uid. */
 export function spawnDetached(opts: SpawnOptions): ChildProcess {
-  return spawn(opts.command, opts.args, {
+  return runnerSpawn(opts.command, opts.args, {
     cwd: opts.cwd,
     env: opts.env,
     signal: opts.signal,
@@ -30,21 +38,10 @@ export function spawnDetached(opts: SpawnOptions): ChildProcess {
 }
 
 /**
- * Best-effort SIGKILL of the process GROUP led by `pid`, falling back to the
- * single process. Safe with an undefined or already-dead pid.
- * @returns true if a kill signal was dispatched.
+ * Best-effort SIGKILL of the process GROUP led by `pid` (the runner subprocess
+ * tree), via the setpriv-to-runner reap under the split, or directly single-uid.
+ * Safe with an undefined or already-dead pid. @returns true if a kill was dispatched.
  */
 export function killProcessGroup(pid: number | undefined): boolean {
-  if (pid === undefined || pid <= 0) return false;
-  try {
-    process.kill(-pid, "SIGKILL");
-    return true;
-  } catch {
-    try {
-      process.kill(pid, "SIGKILL");
-      return true;
-    } catch {
-      return false; // already gone or not permitted — abort() covers the SDK side
-    }
-  }
+  return killRunnerGroup(pid);
 }

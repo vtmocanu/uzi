@@ -13,12 +13,22 @@ import { JudgeRunner } from "./judge-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { errMessage } from "./util.js";
+import { uidSplitActive } from "./runner-uid.js";
 
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
 let fatalLog: Logger | undefined;
 
 async function main(): Promise<void> {
+  // PRD #51 M4: under the uid split, run the worker with umask 002 so (a) the runner-owned
+  // /data subtrees the worker mkdirs (runner clone parents, per-run SDK HOME, provision)
+  // are group-`runner`-writable — the runner-uid children can then create their per-run
+  // dirs — and (b) the runner children inherit umask 002 (it crosses fork/exec/setpriv),
+  // so their files are group-writable and the worker (a `runner`-group member) can tear
+  // them down on terminal. This never widens a WORKER-owned path to the runner: those are
+  // group `worker` (which the runner is not in), so 002 only adds group-`worker` write
+  // there (inert). Single-uid (#58): unchanged (default umask, no separate runner).
+  if (uidSplitActive()) process.umask(0o002);
   const config = loadConfig();
   const log = createLogger(config.logLevel);
   // Scrub the join token from all output before it can appear anywhere.
