@@ -37,7 +37,10 @@ const EMPTY_GIT_HOOKS_DIR = "/usr/share/uzi-git-nohooks";
 // `config.worktree`) it lives in — verified experimentally, incl. against a
 // worktree-config plant with `extensions.worktreeConfig=true`.
 //
-// The values are the empirically-verified inert overrides (git 2.55):
+// The values are the empirically-verified inert overrides (git 2.55). Two groups:
+//
+// Command-valued keys — the value is a program git runs, so there is NO boolean
+// "disabled" form; the pin is a harmless no-op command that wins by precedence:
 //   - core.fsmonitor=false — boolean-false disables the monitor hook (fires on
 //     `status` and on `worktree add`'s checkout otherwise).
 //   - diff.external=true — git runs the value as an external-diff command via the
@@ -53,18 +56,46 @@ const EMPTY_GIT_HOOKS_DIR = "/usr/share/uzi-git-nohooks";
 //     worker's forge transport is https + local-file only (never ssh), so this is
 //     pure belt-and-suspenders; it cannot exec an attacker-chosen program.
 //
-// NOTE (M0 scope): the ARBITRARY-name keys `filter.<name>.process` and
-// `diff.<name>.textconv` CANNOT be blanket-pinned this way (driver names are
-// attacker-chosen). They are closed only by config-source OWNERSHIP under the M3
-// uid-split (`<bare>/config` not runner-writable, so the attacker cannot enable
-// `extensions.worktreeConfig` to reach a runner-writable `config.worktree`). In
-// M0 (no uid split) the agent runs as the same uid that owns `<bare>/config`, so
-// those remain reachable until M3 — an inline pin cannot help.
+// Auth / ref keys — reachable when a WORKER-side credentialed op hits an auth
+// challenge (401/407) and git runs `git credential fill`, or when it enumerates
+// alternate refs. For these an EMPTY value is the inert override (verified: plant
+// fires, empty pin neutralizes) — added by the M0 audit (MEDIUM/LOW):
+//   - credential.helper="" — an empty value RESETS git's accumulated helper list,
+//     so a planted `[credential] helper = !evil` is dropped (append-and-reset, not
+//     last-wins). The worker authenticates via the http.extraHeader Basic pair, so
+//     it needs no helper — dropping the list cannot break its auth.
+//   - core.askpass="" — empty overrides a planted askpass so git skips it (it would
+//     otherwise run on a password challenge, even with GIT_TERMINAL_PROMPT=0).
+//   - core.alternateRefsCommand="" — empty falls back to git's built-in alternate-
+//     ref enumeration (no external command). The worker's bare clones carry no
+//     `objects/info/alternates`, so it never fires today; pinned defensively.
+//
+// NOT pinnable / excluded, with the reason (both closed only by M3 config-source
+// ownership, not by an inline pin):
+//   - core.gitProxy — a MULTIVAR: an appended inline entry does NOT override a
+//     planted one (verified: planted proxy still fires under an inline `none`/``),
+//     and `git://` is the only transport that consults it — which the worker never
+//     uses (https + local-file). Excluded: not inline-pinnable AND not reachable.
+//   - The ARBITRARY-name keys `filter.<name>.*` (smudge/clean/process) /
+//     `diff.<name>.*` (command/textconv) / `merge.<name>.driver` CANNOT be
+//     blanket-pinned (driver names are attacker-chosen). Reachability precision:
+//     on `worktree add` (checkout) the FILTER keys fire (the attacker controls the
+//     worktree's `.gitattributes` + plants `[filter "x"]` in config); the diff.*
+//     and textconv keys need a CONTENT diff, which the worker's `--name-only`
+//     changedFiles never runs, so they are lower-reachability today. All are closed
+//     only by config-source OWNERSHIP under the M3 uid-split (`<bare>/config` not
+//     runner-writable, so the attacker cannot enable `extensions.worktreeConfig` to
+//     reach a runner-writable `config.worktree`). In M0 (no uid split) the agent
+//     runs as the same uid that owns `<bare>/config`, so those remain reachable
+//     until M3 — an inline pin cannot help.
 const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string]> = [
   ["core.fsmonitor", "false"],
   ["diff.external", "true"],
   ["core.pager", "cat"],
   ["core.sshCommand", "ssh"],
+  ["credential.helper", ""],
+  ["core.askpass", ""],
+  ["core.alternateRefsCommand", ""],
 ];
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.

@@ -26,11 +26,17 @@ function configPairs(env: NodeJS.ProcessEnv): Record<string, string> {
 }
 
 // The FIXED-name code-exec keys M0 pins, with their verified inert override value.
+// Command-valued keys take a no-op command; the auth/ref keys added by the M0
+// audit (credential.helper / core.askpass / core.alternateRefsCommand) take an
+// empty value (reset/disable).
 const EXPECTED_PINS: Record<string, string> = {
   "core.fsmonitor": "false",
   "diff.external": "true",
   "core.pager": "cat",
   "core.sshCommand": "ssh",
+  "credential.helper": "",
+  "core.askpass": "",
+  "core.alternateRefsCommand": "",
 };
 
 describe("gitEnv M0 hardening (unit)", () => {
@@ -207,5 +213,57 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     const changed = await git.changedFiles(bare, wt.path);
     assert.equal(fired(), false, "changedFiles must not code-exec a planted diff.external");
     assert.deepEqual(changed, ["NEWFILE.txt"], "changedFiles still computes the diff correctly");
+  });
+
+  // `git credential fill` reads a credential request on stdin then consults the
+  // credential helpers / askpass to fill missing fields — the reach point for a
+  // planted credential.helper / core.askpass when a worker-side credentialed op
+  // hits an auth challenge (401/407). Bounded by a timeout so a neutralized run
+  // that finds no credential can never hang the suite.
+  function credentialFill(bare: string, request: string, env: NodeJS.ProcessEnv): void {
+    try {
+      execFileSync("git", ["-C", bare, "credential", "fill"], {
+        input: request,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 15000,
+      });
+    } catch {
+      // A non-zero exit (no credential obtained) or a timeout is fine — the only
+      // thing under test is whether the planted marker fired.
+    }
+  }
+
+  it("credential.helper planted in <bare>/config does NOT code-exec on `git credential fill` (M0 audit MEDIUM; baseline proves it would)", async (t) => {
+    if (!gitAvailable()) return t.skip("git not available");
+    const bare = await git.ensureClone(fx.originPath);
+    plant(bare, "credential.helper", evil);
+    const req = "protocol=https\nhost=example.com\n\n";
+
+    resetMarker();
+    credentialFill(bare, req, plainEnv());
+    assert.equal(fired(), true, "baseline: planted credential.helper must fire on credential fill without the pin");
+
+    // gitEnv's inline credential.helper="" RESETS the accumulated helper list.
+    resetMarker();
+    credentialFill(bare, req, gitEnv());
+    assert.equal(fired(), false, "gitEnv must neutralize the planted credential.helper");
+  });
+
+  it("core.askpass planted in <bare>/config does NOT code-exec when git needs a password (M0 audit MEDIUM; baseline proves it would)", async (t) => {
+    if (!gitAvailable()) return t.skip("git not available");
+    const bare = await git.ensureClone(fx.originPath);
+    plant(bare, "core.askpass", evil);
+    // username supplied, password missing → git consults askpass for the password.
+    const req = "protocol=https\nhost=example.com\nusername=x\n\n";
+
+    resetMarker();
+    credentialFill(bare, req, plainEnv());
+    assert.equal(fired(), true, "baseline: planted core.askpass must fire when a password is needed");
+
+    // gitEnv's inline core.askpass="" makes git skip the planted askpass.
+    resetMarker();
+    credentialFill(bare, req, gitEnv());
+    assert.equal(fired(), false, "gitEnv must neutralize the planted core.askpass");
   });
 });

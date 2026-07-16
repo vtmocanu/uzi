@@ -136,8 +136,9 @@ dir, so a blanket rule EACCESes the commit. Decided per-path model:
 - **runner-writable (shared gid):** `<bare>/objects/`, the run's
   `<bare>/worktrees/<name>/` admin dir, and the worktree checkout.
 
-This ownership is what closes the **arbitrary-name** `filter.<name>.process` /
-`diff.<name>.textconv` keys that M0's inline pins cannot cover: with
+This ownership is what closes the **arbitrary-name** class `filter.<name>.*`
+(smudge/clean/process) / `diff.<name>.*` (command/textconv) / `merge.<name>.driver`
+that M0's inline pins cannot cover (M0 audit LOW broadened this class): with
 `<bare>/config` non-runner-writable the attacker cannot set
 `extensions.worktreeConfig`, so a runner-writable
 `<bare>/worktrees/<name>/config.worktree` is **never read** by worker-side git
@@ -324,9 +325,13 @@ model.
    (`/data/worktrees`) share the `agentdata` volume. If a process can write the
    bare repo's on-disk git **config** (a direct `printf >`, which bypasses both
    the `git config` guardrail screen and the guardrail system entirely), it plants
-   a code-exec key — `core.fsmonitor`, `core.sshCommand`, `diff.external`,
-   `diff.*.textconv`, `core.pager`, `filter.*.process` — that fires in a later
-   worker-side git process. PRD #46's `core.hooksPath` pin neutralises hooks only.
+   a code-exec key — the FIXED-name `core.fsmonitor`, `core.sshCommand`,
+   `diff.external`, `core.pager`, plus (M0 audit) `credential.helper`,
+   `core.askpass`, `core.alternateRefsCommand`, AND the ARBITRARY-name class
+   `filter.<name>.*` (smudge/clean/process) / `diff.<name>.*` (command/textconv) /
+   `merge.<name>.driver` — that fires in a later worker-side git process. PRD #46's
+   `core.hooksPath` pin neutralises hooks only. (The authoritative final pin /
+   exclusion set lives in `agent/src/git.ts` `GIT_CODE_EXEC_KEY_PINS`.)
 
    **Two corrections to the earlier framing:**
 
@@ -358,15 +363,29 @@ model.
      `GIT_CONFIG_GLOBAL` points at `/dev/null` or a worker-owned file (in prod the
      worker git otherwise reads `$HOME/.gitconfig` — `git.ts:327` only sets
      `GIT_CONFIG_GLOBAL` under the e2e overlay). This is the **only** control that
-     covers `filter.<name>.process`, whose driver names are arbitrary and so
-     **cannot** be blanket-pinned via `GIT_CONFIG_*` (correcting 3b's "pin
-     `filter.*`"). Consider `extensions.worktreeConfig` too.
+     covers the ARBITRARY-name class `filter.<name>.*` (smudge/clean/process) /
+     `diff.<name>.*` (command/textconv) / `merge.<name>.driver`, whose driver names
+     are attacker-chosen and so **cannot** be blanket-pinned via `GIT_CONFIG_*`
+     (correcting 3b's "pin `filter.*`"). Reachability precision: on `worktree add`
+     (checkout) it is the **filter** keys that fire (the attacker controls the
+     worktree's `.gitattributes` + plants `[filter "x"]` in config); the `diff.*` /
+     `textconv` keys need a **content** diff, which the worker's `--name-only`
+     `changedFiles` never runs, so they are lower-reachability today. Inline
+     `extensions.worktreeConfig=false` does **not** help (verified in M0: git
+     decides which config files to read before inline overrides apply), so the
+     runner-writable per-worktree `config.worktree` is closed only by
+     `<bare>/config` ownership (the attacker cannot then enable `worktreeConfig`).
    - **(b) Hardened worker git (defense-in-depth for the pinnable keys):** pin
-     `core.fsmonitor` / `core.sshCommand` / `diff.external` / `diff.*.textconv` /
-     `core.pager` **unconditionally** (not gated on the PAT — `changedFiles` and
-     every worktree op must be covered) via inline `GIT_CONFIG_*` pairs, the way
-     `core.hooksPath` is already pinned. This is a lagging denylist (git keeps
-     adding code-exec keys), so it is the *backup*, not the primary guarantee.
+     `core.fsmonitor` / `core.sshCommand` / `diff.external` / `core.pager`
+     (command-valued) plus `credential.helper` / `core.askpass` /
+     `core.alternateRefsCommand` (empty-valued reset/disable, M0 audit)
+     **unconditionally** (not gated on the PAT — `changedFiles` and every worktree
+     op must be covered) via inline `GIT_CONFIG_*` pairs, the way `core.hooksPath`
+     is already pinned. `core.gitProxy` is deliberately **excluded**: it is a
+     multivar whose planted entry an inline append does **not** override (verified),
+     and only `git://` consults it — a transport the worker never uses. This is a
+     lagging denylist (git keeps adding code-exec keys), so it is the *backup*, not
+     the primary guarantee.
 
    **Crucial reframing (review B3):** because a git worktree **must** share the
    bare `objects/` store and its per-worktree admin dir (see Decision 4), the
