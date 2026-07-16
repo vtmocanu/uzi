@@ -134,6 +134,34 @@ describe("the shared root-entry drop wrapper", () => {
     assert.match(entrypoint, /single-uid non-root mode \(PRD #58\)/, "non-root path must log the single-uid posture");
   });
 
+  it("carves out the runner-owned /data subtrees to worker:runner 2775, keeping repos/ worker-only (PRD #51 M3 (b))", () => {
+    // The runner clone store + SDK/provision HOMEs are runner-writable (worker:runner,
+    // setgid+group-write); the worker bare cache repos/ (the B2 code-exec surface) is
+    // NOT in the carve-out list.
+    assert.match(entrypoint, /RUNNER_TREE_OWNER=worker:runner/, "must own the runner subtrees worker:runner");
+    assert.match(entrypoint, /for d in runner agent-home provision; do/, "must carve out runner/agent-home/provision");
+    assert.doesNotMatch(
+      entrypoint,
+      /for d in [^\n]*\brepos\b/,
+      "the worker bare cache repos/ must NOT be in the runner-writable carve-out",
+    );
+    // chmod 2775 (setgid+group-write) BEFORE chown (no CAP_FOWNER; setgid survives a
+    // dir chown), so children inherit group `runner` for the M4 runner's per-run dirs.
+    const chmodAt = entrypoint.search(/"\$CHMOD"\s+2775\s+"\/data\/\$d"/);
+    const chownAt = entrypoint.search(/"\$CHOWN"\s+-R\s+"\$RUNNER_TREE_OWNER"\s+"\/data\/\$d"/);
+    assert.ok(chmodAt >= 0 && chownAt >= 0 && chmodAt < chownAt, "chmod 2775 must precede the chown (no CAP_FOWNER)");
+  });
+
+  it("gives the worker and runner distinct 0700 TMPDIR trees, exporting only the worker's (5-bis)", () => {
+    // The worker's private tmp is exported across the drop; the runner's is runner-owned
+    // 0700 (owner-only — the worker, a `runner`-GROUP member, still cannot reach it) and
+    // is wired into the runner env builders in M4.
+    assert.match(entrypoint, /WORKER_TMPDIR=\/tmp\/uzi-worker/, "must define the worker tmp");
+    assert.match(entrypoint, /RUNNER_TMPDIR=\/tmp\/uzi-runner/, "must define the runner tmp");
+    assert.match(entrypoint, /"\$CHOWN"\s+runner:runner\s+"\$RUNNER_TMPDIR"/, "runner tmp must be runner:runner (0700 owner-only)");
+    assert.match(entrypoint, /export TMPDIR="\$WORKER_TMPDIR"/, "must export only the worker tmp across the drop");
+  });
+
   it("gates the volume migration on a post-completion sentinel (not the top-level owner)", () => {
     // The reviewer NIT: the skip decision must be a sentinel written AFTER the chown,
     // so it is robust to the base image's chown -R traversal order (not the top-level

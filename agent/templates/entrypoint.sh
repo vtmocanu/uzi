@@ -37,6 +37,7 @@ TINI=/sbin/tini
 SETPRIV=/bin/setpriv
 CHOWN=/bin/chown
 CHMOD=/bin/chmod
+MKDIR=/bin/mkdir
 
 # --- PRD #58: tolerate a NON-ROOT start ---------------------------------------
 # Started non-root (k8s runAsUser: 10001, PRD #58 single-uid v1)? Then there is no
@@ -108,6 +109,46 @@ migrate_tree() {
 migrate_tree /nix "$NIX_OWNER"
 migrate_tree /data "$WORKER_OWNER"
 
+# --- (a2) PRD #51 M3: runner-owned /data subtree carve-out ((b) ownership model) --
+# Under (b) separate-runner-clone the RUNNER clone store + the SDK/provision HOMEs are
+# runner-owned trees (the agent checks out + commits there as uid `runner` from M4),
+# while the WORKER bare cache repos/ stays worker-only (its config/hooks/refs are the
+# B2 code-exec surface — the runner must never write it). migrate_tree above set ALL of
+# /data to worker:worker, so re-own these subtrees to worker:runner + setgid/group-write
+# (2775) so children inherit group `runner` and the M4 runner (a `runner`-group member)
+# can create its per-run dirs under them. repos/ is deliberately NOT in this list.
+#
+# INERT until M4: no `runner` process exists yet (the spawn relocation is M4), so the
+# worker still creates + writes these pre-split. This establishes the subtree-root
+# ownership only; the per-run LEAF-dir group-write the runner's OWN writes need (setgid
+# propagates the group, not the write bit, through a deep mkdir) + the /nix group-write
+# land WITH the M4 runner spawn (they are unsafe to enable before the worker-PATH-hygiene
+# fix that also lands in M4 — else a runner-writable /nix on the worker's credentialed
+# PATH is cross-uid code-exec into the PAT holder). chmod BEFORE chown (no CAP_FOWNER);
+# the setgid bit survives chown on a DIRECTORY (Linux clears S_ISGID on chown only for
+# group-executable regular files, never dirs). chown -R re-owns any pre-existing content.
+RUNNER_TREE_OWNER=worker:runner
+for d in runner agent-home provision; do
+  "$MKDIR" -p "/data/$d"
+  "$CHMOD" 2775 "/data/$d"
+  "$CHOWN" -R "$RUNNER_TREE_OWNER" "/data/$d"
+done
+
+# --- (a3) PRD #51 M3 / 5-bis: distinct per-uid TMPDIR on 0700 trees -------------
+# git/npm/node scratch writes go to a shared sticky /tmp today (symlink races + exposure
+# of any worker temp write across the uid boundary). Give the worker and the runner each
+# a private 0700 tmp. The worker's is exported below (before the drop); the runner's is
+# created here but consumed by the runner env builders in M4 (its 0700/runner mode means
+# the single-uid worker cannot write it pre-split, so it is NOT wired into the worker's
+# env now). chmod BEFORE chown (no CAP_FOWNER).
+WORKER_TMPDIR=/tmp/uzi-worker
+RUNNER_TMPDIR=/tmp/uzi-runner
+"$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
+"$CHMOD" 0700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
+# runner:runner 0700 — owner-only, so even the worker (a `runner`-GROUP member) cannot
+# reach it (0700 grants the group nothing); true per-uid isolation once M4 wires it.
+"$CHMOD" 0700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
+
 # --- (b) token: force 0400 worker on the join-token secret ---------------------
 # Compose delivers the env-sourced `worker_token` secret 0444 root:root (world-readable
 # — the runner uid could read it), and an env-sourced secret's uid/gid/mode are
@@ -127,7 +168,10 @@ fi
 # /etc/group) so the worker can access runner-group trees. tini stays PID 1 (now as
 # `worker`) to reap and forward SIGTERM, preserving clean shutdown. The CMD
 # (npm run start) arrives as "$@" and is passed as argv (no shell re-parse).
+# TMPDIR is the worker's private 0700 tmp (5-bis) — inherited by the worker node
+# process and its git children (gitEnv/buildCheckEnv carry it forward).
 export PATH="$WORKER_PATH"
+export TMPDIR="$WORKER_TMPDIR"
 exec "$SETPRIV" \
   --reuid "$WORKER_USER" --regid "$WORKER_USER" --init-groups \
   --bounding-set -all,+setuid,+setgid \
