@@ -5958,7 +5958,7 @@ Serves human: Feature #53 + the testing-credentials policy (no live Anthropic in
 Serves the human requirement: real CI/CD (pipeline, tag-driven versioning, ArgoCD deploy to
 dev-cluster), the ArgoCD wiring landing via an MR to `argo-apps` (never a direct push), and
 uzi's own dummy CI staying demonstrable against real pipelines. Full Decision Log in
-`prds/52-cicd-argocd-deploy.md`. Reference implementation is **example-app** (same `vtmocanu` group), copied
+`prds/done/52-cicd-argocd-deploy.md`. Reference implementation is **example-app** (same `vtmocanu` group), copied
 nearly verbatim and adapted to uzi's three-toolchain monorepo (Go `api`, Vite/React `web`, Node
 `agent`), two images, compose-first architecture. This run delivered M1–M5 + M7 (the uzi MR plus a
 SEPARATE Draft MR to `argo-apps`); M6 (cut a real tag, live-deploy, verify) and all

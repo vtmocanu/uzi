@@ -591,7 +591,7 @@ compose stack above is the laptop MVP; PRD #52 adds a k8s deployment to the
 **dev-cluster** platform dev cluster via **ArgoCD** GitOps, the way MM deploys
 everything else. The release/deploy runbook is [deploy/README.md](deploy/README.md);
 the design rationale (Decision Log, the compose→chart adaptations) is
-`prds/52-cicd-argocd-deploy.md` — this section is the map, not a duplicate of it.
+`prds/done/52-cicd-argocd-deploy.md` — this section is the map, not a duplicate of it.
 
 - **compose** (`docker-compose.yml`) — `web` + `api` + `db` (`postgres:17`) +
   the opt-in `agent`, secrets from `./.env`, published to `127.0.0.1:8080` only.

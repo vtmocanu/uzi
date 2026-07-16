@@ -1,7 +1,7 @@
 # PRD #52: CI/CD — real pipeline, tag releases, ArgoCD deploy to dev-cluster
 
 **GitLab Issue**: [#52](https://gitlab.example.com/vtmocanu/uzi/-/issues/52)
-**Status**: Draft (created 2026-07-13)
+**Status**: Complete (created 2026-07-13, completed 2026-07-16)
 **Priority**: High
 **Depends on**: nothing in-repo. Platform prerequisites (Harbor, ArgoCD, dev-cluster cluster services) are listed per milestone.
 
@@ -284,7 +284,7 @@ Phase 2 (sequential — depends on M1+M2):
   (multi-source, destination `dev-cluster`, namespace `uzi`, automated+prune,
   `CreateNamespace`). Success: ArgoCD shows the uzi app Synced/Healthy pulling
   chart `targetRevision` from Harbor and values from the uzi repo.
-- [ ] **M6: First release live on dev-cluster, verified end to end** *(DEFERRED — out of this run's scope; needs live platform access + the M5 admin steps + the pre-M6 confirmations in `deploy/README.md`)*. Cut
+- [x] **M6: First release live on dev-cluster, verified end to end** *(done 2026-07-16 — MR !294 merged and carried the first live deploy, uzi `v0.2.0`; see the 2026-07-16 work-log entry)*. Cut
   `v0.1.0` (or next), bump `targetRevision`, sync. Verify: SPA loads over
   HTTPS, seeded admin can log in (cookie flags OK behind TLS), forge connect +
   issue sync work from the cluster (egress to gitlab.example.com,
@@ -437,10 +437,26 @@ dev-cluster `*.example.com` default wildcard, no TLS block.)
   toolchains). M6 (first live deploy to dev-cluster) now in progress; remaining
   one-time steps:
   - [x] Infisical `/uzi` folder minted (JWT_SECRET, UZI_SECRET_KEY + optional seeds)
-  - [ ] Harbor CI creds for `vtmocanu/uzi` — **protected + masked** (Decision 2)
-  - [ ] `v*` **protected tags, Maintainer-create-only** (Decision 2, execution axis)
-  - [ ] Harbor robot **push-only** scope on `gitlab/vtmocanu/uzi/*`
-  - [ ] ArgoCD Helm **OCI repo cred** for `harbor.example.com/gitlab/vtmocanu/uzi`
-  - [ ] DNS `uzi.example.com` (or confirm `*.example.com` wildcard covers it)
-  - [ ] Merge argo Draft MR `argo-apps!294`, cut `v0.1.0`, bump
-        `targetRevision`, sync, verify end-to-end (see `deploy/README.md` runbook)
+  - [x] Harbor CI creds for `vtmocanu/uzi` — **protected + masked** (Decision 2)
+  - [x] `v*` **protected tags, Maintainer-create-only** (Decision 2, execution axis)
+  - [x] Harbor robot **push-only** scope on `gitlab/vtmocanu/uzi/*`
+  - [x] ArgoCD Helm **OCI repo cred** — no action needed: `oci-helm-creds`
+        repo-creds at the `harbor.example.com` root already cover
+        `gitlab/vtmocanu/uzi` by URL-prefix match (same cred example-app pulls through;
+        see `5695af9`)
+  - [x] DNS `uzi.example.com` (live; carries the deployed SPA + OIDC redirect)
+  - [x] Merge argo MR `argo-apps!294` (merged 2026-07-16), cut release,
+        sync, verify end-to-end — the first live deploy ran uzi `v0.2.0`
+- 2026-07-16: **M6 DONE — PRD complete.** `v0.1.0`/`v0.2.0` tag pipelines
+  published images + OCI chart to Harbor (proving the Harbor creds, push-only
+  robot, and protected `v*` tags work); argo MR !294 merged and carried the
+  first live deploy (uzi `0.2.0` Synced/Healthy on dev-cluster). The first
+  deploy caught one real breakage — the Infisical `/uzi` folder actually lives
+  in the **vtmocanu project (`example-project`, envSlug `dev`)**, not
+  `example-project/prod` as the runbook claimed, so `uzi-secrets` was never
+  created and the api CrashLooped on an empty `JWT_SECRET`; fixed by granting
+  dev-cluster's machine identity access to vtmocanu + pointing the
+  InfisicalSecret at the right scope (`37b6ad3`), and the runbook's four
+  disproved claims were corrected in `5695af9`. Post-M6 work already builds on
+  the live instance: Keycloak OIDC SSO (`a2a070b`) and weekly CNPG S3 backups
+  (`817be64`). Issue #52 closed; PRD moved to `prds/done/`.

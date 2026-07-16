@@ -241,5 +241,5 @@ Then over HTTPS: the SPA loads at `https://uzi.example.com`, the seeded
 admin logs in (Secure cookies hold behind TLS because `FRONTEND_ORIGIN` is
 `https://…`), forge connect + issue sync work from the cluster, and a laptop
 worker joins via the public URL and completes a run against a test repo. See the
-PRD (`../prds/52-cicd-argocd-deploy.md`) M6 for the full end-to-end checklist and
+PRD (`../prds/done/52-cicd-argocd-deploy.md`) M6 for the full end-to-end checklist and
 its Decision Log for the rationale behind each choice above.
