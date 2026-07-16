@@ -67,7 +67,10 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND kind = 'hosted';
 -- there.
 --
 -- kind is hardcoded 'hosted' rather than parameterized: this query exists to create
--- hosted workers, and CreateWorker (runtime.sql) exists to create external ones.
+-- hosted workers, and CreateWorker (runtime.sql) exists to create external ones. A
+-- kind parameter would let a caller quota-check one kind while inserting another —
+-- a hazard the count and the insert being separate statements makes MORE reachable,
+-- not less, since nothing but this hardcoding ties the two to the same kind.
 -- hosted_generation takes its column default (0); nothing in M2 bumps it.
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size)
 VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size)

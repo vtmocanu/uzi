@@ -72,7 +72,10 @@ type CreateHostedWorkerParams struct {
 // there.
 //
 // kind is hardcoded 'hosted' rather than parameterized: this query exists to create
-// hosted workers, and CreateWorker (runtime.sql) exists to create external ones.
+// hosted workers, and CreateWorker (runtime.sql) exists to create external ones. A
+// kind parameter would let a caller quota-check one kind while inserting another —
+// a hazard the count and the insert being separate statements makes MORE reachable,
+// not less, since nothing but this hardcoding ties the two to the same kind.
 // hosted_generation takes its column default (0); nothing in M2 bumps it.
 func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorkerParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, createHostedWorker,
