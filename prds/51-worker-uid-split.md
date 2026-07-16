@@ -74,7 +74,8 @@ race, conditioned on Decision 1.
 ## M1 gate resolution — design firmed (2026-07-16)
 
 This resolves the M1 design gate. The mechanism (Decision 2), the capability
-lifetime (B1 / Decision 7), the per-path bare-cache ownership (B2 / Decision 4),
+lifetime (B1 / Decision 7), the bare-cache ownership (B2 / Decision 4 —
+separate-runner-clone),
 the persisted-volume migration (B4 / Decision 4), and the k8s mapping (Decision
 8) are now **decided, not draft**. The detailed analysis is unchanged in the
 Decisions below; this section is the authoritative summary M2–M7 build to.
@@ -93,18 +94,26 @@ directly. Two findings:
   `0400`/`worker` on the token file in the entrypoint**, not trust compose to.
 
 **Mechanism = (A1)** (Decision 2). A root entrypoint `setuid`-drops to uid
-`worker`; the worker **retains `CAP_SETUID`/`CAP_SETGID` as ambient caps for the
-run lifetime** (it spawns runner-uid children per-run, in-process) and spawns the
-SDK agent / self-improve checks / provision hooks as a distinct uid `runner`
+`worker`; the worker **retains only `CAP_SETUID`/`CAP_SETGID` as ambient caps for
+the run lifetime** (it spawns runner-uid children per-run, in-process) and spawns
+the SDK agent / self-improve checks / provision hooks as a distinct uid `runner`
 holding no caps. `no-new-privileges:true` stays on (it does not block a root→lower
-drop). **Tooling feasibility confirmed on the image:** `/bin/setpriv` (the busybox
-applet) already supports `--ambient-caps`/`--inh-caps`, so the A1 drop wrapper
-needs **no extra package** at the flag level. **M2 must still verify** the ambient
-set actually survives runc clearing the permitted set on the setuid-to-non-root
-transition (the B1 caveat); if the busybox applet proves insufficient, fall back
-to `apk add util-linux` (real `setpriv`) or `su-exec`/`gosu` plus a `capsh`/
-`libcap` ambient step. Compose gains `cap_add: [SETUID, SETGID]` (+ `CAP_SETPCAP`
-to raise ambient caps, + `CAP_CHOWN`/`DAC_OVERRIDE` for the B4 startup chown).
+drop). **Drop tool (corrected — reviewer PoC):** the image's `/bin/setpriv` is the
+**busybox** applet (busybox 1.37.0), which supports only
+`--dump`/`--nnp`/`--inh-caps`/`--ambient-caps` — **NOT `--reuid`/`--regid`/
+`--init-groups`** — so it **cannot** perform the uid drop. (An earlier note that "no
+extra package is needed at the flag level" was wrong: it checked the ambient-caps
+flags but not `--reuid`.) A1 therefore **requires `apk add setpriv`** (real
+util-linux `setpriv`, same `/bin/setpriv` path, doing
+`--reuid --regid --init-groups --ambient-caps +setuid,+setgid PROG` in one call) in
+**both** the base **and** jvm Dockerfiles; `capsh` (`apk add libcap`) is the
+alternative. None of util-linux `setpriv` / `gosu` / `su-exec` / `capsh` is on the
+image today. M2 must still verify the ambient set survives runc clearing the
+permitted set on the setuid-to-non-root transition (the B1 caveat). The container's
+bounding set is `cap_add: [SETUID, SETGID, SETPCAP, CHOWN, DAC_OVERRIDE]`, but the
+worker process keeps only `SETUID`/`SETGID` for the run lifetime and drops
+`SETPCAP`/`CHOWN`/`DAC_OVERRIDE` after the root startup window — see the tightened
+Decision 7 below.
 - **(B) rootless bwrap/userns — DROPPED.** The dev host is darwin/Docker-Desktop;
   making unprivileged userns work under `cap_drop: ALL` + `no-new-privileges` +
   seccomp would need `seccomp=unconfined`/`CAP_SYS_ADMIN` or a suid `bwrap` (which
@@ -113,102 +122,169 @@ to raise ambient caps, + `CAP_CHOWN`/`DAC_OVERRIDE` for the B4 startup chown).
 - **(C) sidecar / second container — the eventual k8s form, not built locally.**
   See the k8s mapping and the N2 divergence note below.
 
-**Decision 7 rewritten (B1 — the old criterion is RETIRED).** The success
-criterion is now: **the worker holds `CAP_SETUID`/`CAP_SETGID` (and `CAP_CHOWN`
-if a startup volume-chown is used) for the run lifetime; the runner processes hold
-none.** The original "caps added only to perform the drop and dropped immediately
-after / no residual caps" is **impossible for (A)** — the already-dropped worker
-forks runner-uid children per-run and therefore needs `CAP_SETUID` at each spawn —
-and is struck. **Posture disclosed plainly:** the PAT custodian also holds
-`CAP_SETUID`, so a post-compromise worker could become any uid including 0.
-Accepted, because it is the *trusted* side; the containment we buy is entirely on
-the *runner* side (the untrusted code-execution surface holds no worker creds and
-cannot reach the token, the worker's `/proc` environ, or worker-side git
-code-exec).
+**Decision 7 rewritten (B1 — old criterion RETIRED, cap set TIGHTENED).** The
+success criterion is now: **for the run lifetime the worker holds ONLY
+`CAP_SETUID`/`CAP_SETGID` (ambient, for the per-run runner spawns); the
+startup-only caps `CAP_SETPCAP` (to establish the ambient set) and `CAP_CHOWN` +
+`CAP_DAC_OVERRIDE` (the B4 volume-chown) are dropped from the worker's permitted
+set immediately after the root startup window; the runner processes hold none.**
+The original "caps added only to perform the drop and dropped immediately after /
+no residual caps" is **impossible for (A)** — the already-dropped worker forks
+runner-uid children per-run and therefore needs `CAP_SETUID` at each spawn — and is
+struck. **Why the tightening matters (reviewer):** under `no-new-privileges` a
+compromised worker that `setuid`s to 0 keeps **exactly** the caps it still holds;
+leaving `CAP_CHOWN` + `CAP_DAC_OVERRIDE` in the permitted set would let that uid-0
+process read/write **any** file in the container (bypassing every permission bit) —
+a strictly larger blast radius than `CAP_SETUID` alone buys. Putting the caps in the
+container **bounding set** (`cap_add`) is fine; the control is the **worker process
+dropping** `SETPCAP`/`CHOWN`/`DAC_OVERRIDE` from its permitted set after startup.
+**Posture disclosed plainly:** the PAT custodian still holds `CAP_SETUID`, so a
+post-compromise worker could become any uid including 0. Accepted, because it is the
+*trusted* side; the containment we buy is entirely on the *runner* side (the
+untrusted code-execution surface holds no worker creds and cannot reach the token,
+the worker's `/proc` environ, or worker-side git code-exec).
 
-**B2 — per-path bare-cache ownership (Decision 4).** A blanket "bare cache
-worker-owned, non-runner-writable" is **not implementable**: the agent's own
-`git commit` (kept on the runner uid — Decision 1) writes objects into
-`<bare>/objects/` and updates `<bare>/worktrees/<name>/`, both inside the bare
-dir, so a blanket rule EACCESes the commit. Decided per-path model:
-- **worker-owned, non-runner-writable:** `<bare>/config`, `<bare>/hooks` (the
-  code-exec config surface).
-- **runner-writable (shared gid):** `<bare>/objects/`, the run's
-  `<bare>/worktrees/<name>/` admin dir, and the worktree checkout.
+**B2 — bare-cache ownership: SEPARATE RUNNER CLONE (redesigned per reviewer +
+auditor).** The earlier "shared bare; worker owns `<bare>/config`+`hooks`; runner
+writes `<bare>/objects` + `<bare>/worktrees/<name>`" model is **insufficient** — a
+linked worktree shares far more of the common dir than `objects/` + the per-worktree
+admin, and two channels leak:
+- **Shared-ref-write EACCES.** The agent's `git commit` on a linked-worktree branch
+  writes the **shared** branch ref `<bare>/refs/heads/<branch>`, `<bare>/packed-refs`,
+  and `<bare>/logs/refs/heads/<branch>` in the **common** dir (only `HEAD`, `index`,
+  `logs/HEAD`, `ORIG_HEAD` are per-worktree). A "runner writes objects +
+  `worktrees/<name>` only" rule would EACCES the commit.
+- **commondir/gitdir config-redirect (auditor PoC).** The per-worktree admin dir
+  holds the structural pointers `commondir` / `gitdir`; a runner that rewrites
+  `commondir` makes a later worker-side `git -C <worktree>` resolve a
+  **runner-controlled** common dir — reading its `config` (incl. an arbitrary-name
+  `filter.<x>.smudge=/evil`, code-exec) and `info/attributes`. Inline `-c` /
+  `GIT_CONFIG_*` pins **cannot** stop it: git resolves `commondir` from disk before
+  applying inline config.
 
-This ownership is what closes the **arbitrary-name** class `filter.<name>.*`
-(smudge/clean/process) / `diff.<name>.*` (command/textconv) / `merge.<name>.driver`
-that M0's inline pins cannot cover (M0 audit LOW broadened this class): with
-`<bare>/config` non-runner-writable the attacker cannot set
-`extensions.worktreeConfig`, so a runner-writable
-`<bare>/worktrees/<name>/config.worktree` is **never read** by worker-side git
-(verified in M0: an inline `extensions.worktreeConfig=false` does **not** block
-that file read — git decides which files to read from on-disk config before inline
-overrides apply — so config-source ownership is the only control). M0's fixed-name
-pins remain the belt for `fsmonitor`/`diff.external`/`pager`/`sshCommand`
-regardless of ownership. **Alternative weighed, not chosen for local:** give the
-runner a **separate clone / object store** and have the worker `fetch` from it
-(avoids shared-write into the bare entirely) — rejected here as an extra fetch hop
-plus a cache split; worth revisiting for the k8s form.
+**Decision: adopt the SEPARATE-RUNNER-CLONE model** (both validators favor it; it
+closes both channels *by construction*). The runner gets its **own** object store /
+clone; the agent's checkout **and** commit happen entirely in the runner store (the
+runner **never** writes the worker's bare); the worker then `fetch`es the agent's
+branch **from** the runner store and `push`es it to the forge with the PAT. Because
+no worker-side git ever reads a runner-writable config / commondir / attributes
+source, the arbitrary-name `filter.*` / `diff.*` / `merge.driver` class is closed
+**structurally** — no fragile ownership `chmod` matrix to get exactly right.
+Ownership reduces to:
+- **worker-only:** the worker's warm bare cache `repos/<bare>.git` (incl. its
+  `config` / `hooks` / `refs` / `objects`) and the worker `.gitconfig` / token.
+- **runner-owned (its own tree):** the runner clone / object store + its worktree
+  checkout + the SDK/provision dirs.
+
+The worker↔runner handoff is a **local `fetch`** of `refs/heads/<agent-branch>` from
+the runner store into the worker bare, then the existing PAT push. Exact seeding —
+a `--no-hardlinks` local clone from the warm bare, or the warm bare as a **read-only
+`alternates`** for base objects with the runner writing only new objects — is
+settled in M3.
+
+*Delta vs today's `git.ts`* (my report to the lead): **moderate, not a rabbit
+hole.** Today `GitCache` keeps one worker-owned bare + `git worktree add` linked
+worktrees sharing its objects+refs; separate-clone replaces the linked worktree with
+a runner-owned clone/store and adds a worker-side `fetch <runner-store> <branch>`
+before `pushBranch`. `changedFiles` runs inside the runner store (unaffected).
+Bounded rework of `createOrAttachWorktree` + `pushBranch`, chosen over the fallback
+because it removes the per-path chmod matrix entirely. **Commit-identity edge (M3/M4
+verify):** under separate-clone an agent `git config user.email/name` writes the
+**runner clone's** own config (runner-owned) — fine; this edge only bites the
+fallback (below).
+
+**FALLBACK (if separate-clone proves a large rework in M3): shared-bare with a
+precise per-path ownership matrix.**
+- **worker-only:** `<bare>/config`, `<bare>/hooks`, `<bare>/worktrees/<name>/commondir`,
+  `<bare>/worktrees/<name>/gitdir`, `<bare>/info/attributes`.
+- **runner-writable:** `<bare>/objects/`, `<bare>/refs/heads/` (scoped to `agent/*`
+  + `ci-fix/*`), `<bare>/packed-refs`, `<bare>/logs/`, and the per-worktree `HEAD` /
+  `index` / `ORIG_HEAD` / `logs/HEAD`.
+- Plus an **M6 test:** a runner that rewrites `commondir` cannot make the worker's
+  checkout/diff read runner-controlled config. **Commit-identity edge:** an agent
+  `git config user.email/name` **without `--worktree`** writes the common
+  worker-only `<bare>/config` → EACCES; confirm commit identity comes from
+  `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env (or a runner-owned config), not a
+  common-config write. **Accepted intra-user residual:** concurrent runs on a shared
+  bare could rewrite a sibling run's ref (same-user, human-reviewed, cannot reach
+  `main`).
+
+This ownership (either form) is what closes the **arbitrary-name** class
+`filter.<name>.*` (smudge/clean/process) / `diff.<name>.*` (command/textconv) /
+`merge.<name>.driver` that M0's inline pins cannot cover (M0 audit LOW broadened the
+class). M0's fixed-name pins remain the belt for
+`fsmonitor`/`diff.external`/`pager`/`sshCommand` regardless.
 
 **B4 — persisted named-volume migration (Decision 4).** `agentnix`/`agentdata`
 are seeded from the image on first use and thereafter **persist their original
 ownership**; a Dockerfile chown touches only the image layer, not a populated
 volume. When the execution uid changes from today's `uzi`, an existing install's
 `/nix` + `/data` stay owned by the old uid → provisioning + worktree writes
-EACCES. Decided: a **root-entry startup chown** of the mounted runner-writable
-subpaths (`/nix`, the `/data` worktrees, and the runner-writable bare subpaths)
-before the drop, needing `CAP_CHOWN` (+ `DAC_OVERRIDE`) — folded into the Decision
-7 cap set. A clean install (`down -v`) is the documented alternative. The chown
-runs in the root startup window only (M5-audit hygiene: only static root-owned
-binaries, no runner-writable dir on `PATH`, `/nix` empty at entry).
+EACCES. Decided: a **root-entry startup chown** of the mounted runner-owned
+subpaths (`/nix`, and the runner clone/store + worktree checkouts under `/data`)
+before the drop, needing `CAP_CHOWN` (+ `CAP_DAC_OVERRIDE`) — which the worker then
+**drops from its permitted set after the startup window** (Decision 7). A clean
+install (`down -v`) is the documented alternative. **Root-startup-window hygiene
+(corrected — the "/nix empty at entry" justification was FALSE):** `agentnix` is a
+named volume seeded from the image's **populated** `/nix` and persists prior-run
+content, so `/nix` is **populated at entry** (and prior-run-influenced on reuse),
+never empty. The correct guarantee is structural, not "safe because empty": the root
+window execs **only image-baked, root-owned binaries by ABSOLUTE PATH**, with `PATH`
+**excluding `/nix` and `/data`**, and **drops before anything resolves from a volume
+— regardless of volume contents**.
 
 **Full runner-writable path enumeration (Decision 4 / audit M1).** Cross-checked
 against the worker's actual path construction. Everything under `$UZI_DATA_DIR`
 (`/data`) unless noted:
 
-| Path | Access under the split | Source |
+| Path | Access under the split (separate-runner-clone) | Source |
 | --- | --- | --- |
-| `repos/<bare>.git/config`, `repos/<bare>.git/hooks` | **worker-only** (non-runner-writable) — the code-exec config surface | `git.ts:100` |
-| `repos/<bare>.git/objects/` | runner-writable (shared gid) — the agent's own `git commit` writes objects here | Decision 1 / 4 |
-| `repos/<bare>.git/worktrees/<name>/` (`HEAD`, `index`, `logs/`) | runner-writable — the run's worktree admin dir | Decision 4 |
-| `worktrees/<repoDir>/<key>/` (the checkout itself) | runner-writable | `git.ts:101,170` |
-| `agent-home/<runId>/` (per-run SDK HOME) | runner-writable | `main.ts:55,83`, `runner.ts:45,337` |
-| `agent-home/` (shared provisioning HOME — nix profile / devbox warm-start metadata) | runner-writable | `main.ts:81`, `sdk-executor.ts:153` |
-| `provision/<runId>/` (`provisionRoot` — synthesized devbox.json, outside any clone) | runner-writable | `sdk-executor.ts:154`, `provision-run.ts:69` |
-| `/nix` (nix store, `agentnix` volume) | runner-writable — devbox/nix realize packages as the runner | Dockerfile, `docker-compose.yml:245` |
-| judge SDK HOME (`mkdtemp` under `homeRoot`) | runner-writable execution-surface HOME (its trace-fetch / review-POST HTTP stays worker-side — Decision 1) | `judge-runner.ts:107,191` |
+| `repos/<bare>.git/` — the worker's WARM bare cache (`config`, `hooks`, `refs`, `objects`) | **worker-only** — no runner-side git writes it, and no worker-side git reads a runner config source | `git.ts:100` |
+| the RUNNER clone / object store + its worktree checkout | **runner-owned** — agent checks out + commits here; worker `fetch`es the branch from it | Decision 4 (M3 seeds it) |
+| `agent-home/<runId>/` (per-run SDK HOME) | runner-owned | `main.ts:55,71`, `runner.ts:126` |
+| `agent-home/` (shared provisioning HOME — nix profile / devbox warm-start metadata) | runner-owned | `main.ts:81`, `sdk-executor.ts:153` |
+| `provision/<runId>/` (`provisionRoot` — synthesized devbox.json, outside any clone) | runner-owned | `sdk-executor.ts:154`, `provision-run.ts:69` |
+| `/nix` (nix store, `agentnix` volume) | runner-owned — devbox/nix realize packages as the runner | Dockerfile, `docker-compose.yml:245` |
+| judge SDK HOME (`homeRoot` = `/data/agent-home` in prod; `mkdtemp` under it) | runner-owned execution-surface HOME (its trace-fetch / review-POST HTTP stays worker-side — Decision 1) | `judge-runner.ts:191`, `main.ts:124` |
 | worker HOME + `.gitconfig`; `/run/secrets/worker_token` | **worker-only** | Decision 5 |
 
-The dividing line: everything the untrusted execution surface must **write** (SDK
-agent, self-improve checks, provision hooks, and the agent's own `git commit`) is
-runner-writable via a shared gid; the two surfaces worker-side git config-reads
-and token custody depend on — `<bare>/config` + `<bare>/hooks` and the token file
-— are worker-only. The mkdirs that create these today run in the worker
-(`sdk-executor.ts:195-201`, `provision.ts`, `git.ts`), so under the split they
-must create the runner-writable ones with the shared gid (setgid dir) or chown
-them (M3/M4).
+The dividing line under separate-clone: the worker owns its warm bare + `config` +
+token; everything the untrusted execution surface writes (the runner clone/store +
+checkout, SDK HOME, provision dirs, `/nix`) is a **runner-owned tree that the worker
+never reads as a git config source**. Ownership is enforced by the B4 startup chown
+plus the per-run spawn under uid `runner` (M4); the dirs the worker `mkdir`s today
+(`sdk-executor.ts:195-201`, `provision.ts`, `git.ts`) become runner-owned at
+creation. (If the fallback shared-bare matrix is used instead, substitute B2's
+per-path rows for the two bare rows above.)
 
-**Namespace / TMPDIR / IPC hygiene (5-bis).** The uid split does **not** isolate
-the network namespace or `/tmp`; these are closed separately (and apply to the k8s
-form too — pod containers share the net ns even with `shareProcessNamespace:
-false`):
-- **Distinct `TMPDIR` per uid.** Today nothing sets `TMPDIR`, and the judge SDK
-  HOME + the check-runner HOME both fall back to `os.tmpdir()` = the shared `/tmp`
-  (`judge-runner.ts:107`, `runner.ts:270`). Under the split, worker and runner get
-  distinct `TMPDIR`s on their own `0700` trees, and the judge/check SDK HOMEs move
-  off the shared sticky `/tmp` (symlink races + exposure of any worker temp
-  write). Audit worker-side temp writes.
-- **No cross-uid-reachable control channel.** If a worker↔runner IPC channel is
-  ever needed (e.g. an A3 spawn-broker — not the chosen A1), it uses an
-  fd-inherited `socketpair` or a `0600` pathname socket, **never** an abstract unix
-  socket or a loopback port (the runner shares the net ns and could connect).
-- **No debug port on the worker.** None exists today (no `node --inspect` /
-  `9229`); assert it stays absent — a debug port on the token custodian is RCE in
-  the credential holder.
-- **fd/CLOEXEC hygiene at the new spawn helper.** The worker holds the PAT +
-  Anthropic token in memory and live API sockets; Node sets CLOEXEC by default —
-  M6 asserts the runner child's `/proc/self/fd` is only `{0,1,2}` + known.
+**A1 net-ns / TMPDIR / fd invariants (5-bis — LOCAL, not k8s footnotes).** Under
+A1 the worker and runner share one container, hence **one network namespace and one
+`/tmp`**, so these are load-bearing invariants for the local build now (they also
+carry to the k8s form, where pod containers still share the net ns even with
+`shareProcessNamespace: false`):
+- **No debug port on the worker node process.** No `--inspect`/`--inspect-brk` on
+  its argv **and** no `NODE_OPTIONS=--inspect…` in its env — a loopback debug port
+  is reachable by the same-net-ns runner and is RCE in the PAT holder. None exists
+  today; assert it stays absent.
+- **The in-process runner spawn helper sets explicit stdio + closes all
+  non-`{0,1,2}` fds.** The worker holds the PAT + Anthropic token in memory and live
+  API sockets; the new spawn path is exactly where an fd could leak to the runner
+  child. Node sets CLOEXEC by default — assert it; the **M6 fd-leak test** (the
+  runner child's `/proc/self/fd` is only `{0,1,2}` + known) is **load-bearing under
+  A1**, not a nicety.
+- **Distinct `TMPDIR` per uid on `0700` trees.** *Not* about the SDK HOMEs — in prod
+  the judge SDK HOME and the check-runner HOME are **overridden onto
+  `/data/agent-home`** (`main.ts:124` passes `homeRoot: sdkHomeRoot` to
+  `JudgeRunner`; `runner.ts:126→270` runs the check with `runHome =
+  agent-home/<runId>`); the `?? os.tmpdir()` in `judge-runner.ts:107` /
+  `runner.ts:270` is only the stub/test default. The real exposure is the
+  **scratch/`TMPDIR` temp writes** `git`/`npm`/`node` make on a shared sticky `/tmp`
+  (symlink races + exposure of any worker temp write). Give worker and runner
+  distinct `TMPDIR`s on their own `0700` trees; audit worker-side temp writes.
+- **No cross-uid-reachable control channel.** If a worker↔runner IPC channel is ever
+  needed (e.g. an A3 spawn-broker — not the chosen A1), it uses an fd-inherited
+  `socketpair` or a `0600` pathname socket, **never** an abstract unix socket or a
+  loopback port (the runner shares the net ns and could connect).
 
 **k8s mapping (Decision 8 — docs-only here).** Align at the **distinct-uid
 abstraction, not the mechanism.** The k8s form is two containers in one pod with
@@ -495,21 +571,27 @@ model.
    worker-side exec.
 
 7. **Capability hygiene for (A) — corrected per H1/B1.** Under the recommended
-   **(A1)**, the **worker retains `CAP_SETUID/SETGID` for the run lifetime** (as
-   ambient caps) because it spawns runner-uid children per-run; the **runner
-   children hold no caps** and a distinct uid. So the success criterion is
-   **"the worker holds `CAP_SETUID/SETGID` (and `CAP_CHOWN` if a startup
-   volume-chown is used); the runner processes hold none"** — **not** "no residual
-   caps," which is impossible for (A). `no-new-privileges` stays on post-drop.
-   Disclose the posture: the PAT custodian holding `CAP_SETUID` can, post-compromise,
-   become any uid including 0 — accepted because it is the *trusted* side and the
-   containment we buy is on the *runner* side.
-   - **Root startup-window hygiene (audit M5).** (A) reintroduces a root
-     entrypoint. The root window must exec only image-baked, root-owned static
-     binaries, with **no runner-writable dir on `PATH`** and no shell
-     interpolation of env/args, and drop before anything runner-influenced runs
-     (`/nix` is empty at entry — state it). The `gosu`/`setpriv` wrapper is not
-     itself a suid-escalation surface.
+   **(A1)**, the **worker retains only `CAP_SETUID/SETGID` for the run lifetime**
+   (as ambient caps) because it spawns runner-uid children per-run; the **runner
+   children hold no caps** and a distinct uid. The success criterion is **tightened
+   at the M1 gate** (see "Decision 7 rewritten" above): **run-lifetime =
+   `SETUID`/`SETGID` ambient only; the startup-only `SETPCAP`/`CHOWN`/`DAC_OVERRIDE`
+   are dropped from the worker's permitted set after the root startup window** — a
+   uid-0-capable worker must not also keep `CHOWN`+`DAC_OVERRIDE` (any-file
+   read/write). **Not** "no residual caps," which is impossible for (A).
+   `no-new-privileges` stays on post-drop. Disclose the posture: the PAT custodian
+   holding `CAP_SETUID` can, post-compromise, become any uid including 0 — accepted
+   because it is the *trusted* side and the containment we buy is on the *runner*
+   side.
+   - **Root startup-window hygiene (audit M5 — corrected).** (A) reintroduces a root
+     entrypoint. The root window must exec **only image-baked, root-owned binaries
+     by ABSOLUTE PATH**, with `PATH` **excluding `/nix` and `/data`**, no shell
+     interpolation of env/args, and drop **before anything resolves from a volume,
+     regardless of volume contents**. (The earlier "`/nix` is empty at entry"
+     justification is FALSE: `agentnix` is seeded from the image's populated `/nix`
+     and persists prior-run content — the guarantee is the absolute-path + PATH
+     exclusion, not emptiness.) The `setpriv` wrapper is not itself a
+     suid-escalation surface.
 
 8. **k8s alignment (docs-only here).** Map the local split onto
    `docs/proc-hardening.md`'s remote-worker design (worker pod holds the token
@@ -530,14 +612,16 @@ model.
 > the M1 gate — see "M1 gate resolution" above; the per-path split (Decision 4)
 > supersedes any coarse "bare cache worker-owned" phrasing below.
 
-- **agent/ image (`base` + `jvm`)**: second uid; root entrypoint + `gosu`/`setpriv`
-  drop wrapper (mechanism A1, worker **retains** `CAP_SETUID/SETGID` ambient);
-  `/nix`, the worktree checkout, `<bare>/objects` + per-worktree admin dir, and
-  the runner data paths (Decision 4) writable by the execution uid, while
-  `<bare>/config` + `<bare>/hooks` stay worker-owned.
+- **agent/ image (`base` + `jvm`)**: second uid; root entrypoint + **util-linux
+  `setpriv`** (`apk add setpriv`; the busybox applet can't `--reuid`) drop wrapper
+  (mechanism A1, worker **retains** only `CAP_SETUID/SETGID` ambient); `/nix` and the
+  **runner clone/store + its checkout** + runner data paths (Decision 4,
+  separate-runner-clone) owned by the execution uid, while the worker's warm bare
+  `repos/<bare>.git` (config/hooks/refs/objects) stays worker-owned.
 - **docker-compose.yml**: enforce token `0400`/`worker` in the entrypoint (not via
-  the env-sourced secret); `cap_add: [SETUID, SETGID]` (+ `CHOWN` if startup
-  volume-chown); root entry; startup chown of persisted `agentnix`/`agentdata`.
+  the env-sourced secret); bounding set `cap_add: [SETUID, SETGID, SETPCAP, CHOWN,
+  DAC_OVERRIDE]` with the worker dropping all but `SETUID`/`SETGID` after startup
+  (Decision 7); root entry; startup chown of persisted `agentnix`/`agentdata`.
 - **agent/src**: a spawn helper launching the SDK subprocess + check runner +
   provision hooks under the execution uid (extends `sdk-spawn.ts` /
   `sdk-executor.ts` / `self-improve.ts` / `provision.ts`); the worker keeps the
@@ -590,13 +674,19 @@ model.
       volumes (B4). Note: this gate cannot be *independently* PoC'd — a real
       execution-uid process only exists after M4 (N3), so M2's read-denied check
       rides the M4 spawn path (or a manual `su` PoC).
-- [ ] **M3 — Shared-volume ownership model.** The full `/nix` + `/data`
-      runner-writable path enumeration (Decision 4: worktrees, `agent-home/<runId>`,
-      `provision/`, shared nix HOME, `<bare>/objects` + per-worktree admin) vs
-      worker-only (`<bare>/config`+`hooks`, worker HOME/`.gitconfig`); distinct
-      `TMPDIR` per uid (5-bis). (Decision 3's git hardening already landed in M0.)
-      Gate: agent commit works (writes `<bare>/objects` + worktree admin); worker
-      still owns `<bare>/config`.
+- [ ] **M3 — Shared-volume ownership model (SEPARATE-RUNNER-CLONE — B2 redesign).**
+      Give the runner its **own** clone/object store (seed from the warm bare via a
+      `--no-hardlinks` local clone or a read-only `alternates`); the agent checks out
+      + commits there; the worker `fetch`es the agent branch from it, then pushes with
+      the PAT. Full `/nix` + `/data` runner-owned path enumeration (Decision 4:
+      runner clone/store + checkout, `agent-home/<runId>`, `provision/`, shared nix
+      HOME, `/nix`) vs worker-only (the warm bare `repos/<bare>.git`, worker
+      HOME/`.gitconfig`, token); distinct `TMPDIR` per uid on `0700` trees (5-bis).
+      (Decision 3's git hardening already landed in M0.) Gate: agent commit works in
+      the runner store; worker `fetch`+push works; a runner `commondir`/config
+      rewrite cannot reach worker-side git. **Fallback** (if separate-clone is a large
+      rework): the shared-bare per-path ownership matrix in B2 + the M6
+      commondir-rewrite test.
 - [ ] **M4 — Spawn surfaces under the execution uid.** SDK agent, check runner,
       provision hooks launch under the execution uid; the worker retains
       `CAP_SETUID` and does the credentialed git/HTTP; PATH hygiene (Decision 6),
@@ -611,11 +701,16 @@ model.
       uid-boundary reads. Gate: `run-e2e.sh` (judge + self-improve + existing) green.
 - [ ] **M6 — Tests.** uid-boundary tests: execution uid can't read the token file,
       can't read the worker's `/proc` environ, and can't code-exec via a shared
-      git-config write; **plus (L1/L5):** the runner child's `/proc/self/fd` is only
-      `{0,1,2}`+known (fd leak); a runner survivor cannot read the worker's **push
+      git-config write **nor via a `commondir`/`gitdir` rewrite** (the runner cannot
+      make worker-side `git -C <worktree>` read a runner-controlled config —
+      moot-by-construction under separate-clone, an explicit test under the fallback);
+      **plus (A1 net-ns, L1/L5):** the runner child's `/proc/self/fd` is only
+      `{0,1,2}`+known (fd leak — **load-bearing under A1**); the worker node process
+      has **no `--inspect`/`NODE_OPTIONS=--inspect` debug port**; worker and runner
+      have **distinct `TMPDIR`s**; a runner survivor cannot read the worker's **push
       git-child** `/proc/environ` during the window (the actual PAT-race close); and
-      the runner child's **own** environ is still scrubbed (no join token / PAT /
-      API URL) under the new spawn path. Worker can still push. No regression.
+      the runner child's **own** environ is still scrubbed (no join token / PAT / API
+      URL) under the new spawn path. Worker can still push. No regression.
 - [ ] **M7 — Docs (incl. k8s alignment, docs-only).** `docs/proc-hardening.md`
       becomes the implemented design + the local↔k8s mapping (align at the
       distinct-uid abstraction, not the mechanism — L3); `ARCHITECTURE.md` layer-2;
@@ -639,12 +734,17 @@ model.
   non-credentialed `changedFiles`/`worktree add`) via a shared-git-config write —
   all PoC-confirmed on the built image — while the worker authenticates and pushes
   normally.
-- Capability posture is stated honestly: **the worker holds `CAP_SETUID/SETGID`
-  (and `CAP_CHOWN` if a startup volume-chown is used) for the run lifetime; the
-  runner processes hold no caps** (the earlier "no residual caps" criterion was
-  impossible for mechanism (A) and is retired — B1).
-- The agent's own `git add`/`git commit` still succeeds under the per-path
-  bare-cache ownership (it writes `<bare>/objects` + its worktree admin dir — B2).
+- Capability posture is stated honestly and **minimised**: **for the run lifetime
+  the worker holds ONLY `CAP_SETUID/SETGID` (ambient); `CAP_SETPCAP`/`CAP_CHOWN`/
+  `CAP_DAC_OVERRIDE` are startup-window-only and dropped from the worker's permitted
+  set after the root startup window; the runner processes hold no caps** (the
+  earlier "no residual caps" criterion was impossible for mechanism (A) and is
+  retired; leaving `CHOWN`+`DAC_OVERRIDE` on a uid-0-capable worker was too broad —
+  B1).
+- The agent's own `git add`/`git commit` still succeeds in the **runner's own
+  clone/store** (separate-runner-clone — B2); the worker `fetch`es the agent branch
+  from that store and pushes with the PAT. (Fallback shared-bare: the commit writes
+  the runner-writable `<bare>/objects` + `refs/heads/agent/*` + per-worktree admin.)
 - The PRD #46 self-improvement job still produces real (or honest-skipped) test
   evidence and opens/extends its MR, with the check code under the isolated uid.
 - `run-e2e.sh` (judge + self-improve + existing) stays green.
