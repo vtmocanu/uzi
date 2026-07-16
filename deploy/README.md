@@ -29,8 +29,10 @@ the sibling reference — uzi follows its Model-B release shape.
 The ArgoCD `Application` is **multi-source** (example-app precedent): the released
 chart from Harbor OCI + the per-cluster values from the uzi git repo, so
 operational config (`values/dev-cluster.yaml`) can change on `main` without
-cutting a new chart release. Wiring lives in `argo-apps`
-`apps/uzi/{prj.uzi.yaml,app.uzi.yaml}`, delivered as **Draft MR !294** (M5). The
+cutting a new chart release — that path is proven: the M6 Infisical-scope fix
+reached the running deploy through it, with no chart release. Wiring lives in
+`argo-apps` `apps/uzi/{prj.uzi.yaml,app.uzi.yaml}`, delivered by MR !294
+(**merged 2026-07-16**; first live deploy = uzi `0.2.0`). The
 api is a **hard singleton** (`replicas: 1` + `Recreate`) — see `ARCHITECTURE.md`
 for why (poller/sweeper/Slack in-memory state + goose boot migration with no
 advisory lock).
@@ -110,25 +112,49 @@ before the first deploy. Each mirrors an existing example-app step.
    a reviewed-but-malicious Dockerfile could still read `config.json`; a
    tightly-scoped robot bounds the blast radius to uzi's own repos.
 
-4. **ArgoCD Helm OCI repo credential** for
-   `harbor.example.com/gitlab/vtmocanu/uzi` (a pull-capable robot):
-   `argocd repo add harbor.example.com/gitlab/vtmocanu/uzi --type helm
+4. **ArgoCD Helm OCI repo credential** — **already covered, no action taken**
+   (confirmed at M6, 2026-07-16). ArgoCD repo-creds match by **URL prefix**, and
+   argo-cluster already carries `oci-helm-creds` registered at the
+   `harbor.example.com` root with `type: helm` + `enableOCI: "true"`, which
+   covers `harbor.example.com/gitlab/vtmocanu/uzi` — the same credential example-app
+   pulls its chart through. uzi's first sync pulled `uzi:0.2.0` with no new cred.
+   Only if that prefix cred is ever removed/narrowed would you need a per-repo
+   one: `argocd repo add harbor.example.com/gitlab/vtmocanu/uzi --type helm
    --enable-oci=true …`, or the equivalent `repo`/`repo-creds` Secret with
-   `enableOCI: "true"` + `type: helm`. Without it ArgoCD cannot pull the chart.
+   `enableOCI: "true"` + `type: helm`. Without some covering cred ArgoCD cannot
+   pull the chart.
 
 5. **ArgoCD git access to `vtmocanu/uzi`** (for the `$values` source): already
    covered by the existing **`vtmocanu-repo-creds`** group-prefix repo-creds
    template (the same one example-app uses for its `ref: values` source). Verify, no
    new token expected.
 
-6. **Infisical `/uzi` folder — NEW.** Create the `/uzi` secret folder in the
-   k8s-clusters project (slug **`example-project`**, envSlug **`prod`**) and
-   populate `JWT_SECRET`, `UZI_SECRET_KEY` (required; the api refuses to boot on a
-   placeholder key), and any optional `UZI_SEED_*` / Slack / OIDC keys the chart
-   maps (`chart/values.yaml` `api.secretEnv`). The operator identity,
-   `universal-auth-credentials`, and the shared `/k8s-registry-robot` pull-secret
-   path are **already live** on dev-cluster (its ingress-nginx + cnpg values use
-   them) — only `/uzi` is new, so no new operator grant is needed.
+6. **Infisical `/uzi` folder + an operator grant on the vtmocanu project.**
+   uzi's own runtime secrets live at `/uzi` in the **vtmocanu** project (slug
+   **`example-project`**, envSlug **`dev`**) — the convention every vtmocanu app
+   follows (`example-app` → `example-project`/`dev`:`/example-app`, `dot-ai` →
+   `example-project`/`dev`:`/dot-ai`). Populate `JWT_SECRET`, `UZI_SECRET_KEY`
+   (required; the api refuses to boot without them) plus any optional
+   `UZI_SEED_*` / Slack / OIDC keys the chart maps (`chart/values.yaml`
+   `api.secretEnv`). Only the **shared Harbor robot pull secret** comes from the
+   k8s-clusters project (`example-project`, envSlug `prod`, `/k8s-registry-robot`),
+   which is why `chart/values.yaml` `infisicalList` intentionally has two
+   different scopes.
+
+   > **The cluster's operator identity needs membership on the `vtmocanu` project.**
+   > Infisical MI permissions are **per-project**: without the grant, auth succeeds
+   > and the sync then 403s. `universal-auth-credentials` on dev-cluster already
+   > had `example-project` (its ingress-nginx/cnpg values use it) but **not**
+   > `vtmocanu` — granted 2026-07-16 (example-app/dot-ai run on argo-cluster, whose
+   > MI already had it). Add it under **vtmocanu → Access Control → Identities**.
+
+   > **History (M5→M6, 2026-07-16).** The M5 draft of this step asserted `/uzi`
+   > lived in `example-project`/`prod` and that "no new operator grant is needed".
+   > **Both were wrong.** First sync 404'd (`Folder with path '/uzi' in
+   > environment 'prod' was not found`), so `uzi-secrets` was never created and the
+   > api CrashLooped on an empty `JWT_SECRET`. Fixed by pointing `infsec-uzi` at
+   > `example-project`/`dev`. Verify the project slug + folder before a first sync on
+   > any new cluster — a wrong scope 403/404s the InfisicalSecret.
 
 7. **DNS `uzi.example.com`.** dev-cluster's ingress-nginx serves a
    `*.example.com` default wildcard cert, so no per-host TLS block /
@@ -196,10 +222,18 @@ shown once at issuance. See `docs/worker-setup.md` for the full procedure and
 
 ## Verify a live deploy
 
+ArgoCD is **hub-and-spoke**: the `Application` object lives on the **argo-cluster**
+cluster (the one running ArgoCD, which reads `argo-apps`) and its
+*destination* is dev-cluster. So the workload pods are on dev-cluster but the
+Application is NOT — `kubectl -n argocd get application` against dev-cluster fails
+with `the server doesn't have a resource type "application"` (no CRD there).
+
 ```sh
-CTX=dev-cluster
-kubectl -n uzi get pods --context $CTX                 # api 1/1, web 2/2, postgres-uzi-cluster-1 1/1
-kubectl get application uzi -n argocd --context $CTX \
+# workloads: on the destination cluster
+kubectl -n uzi get pods --context dev-cluster          # api 1/1, web 2/2, postgres-uzi-cluster-1 1/1
+
+# the Application: on the ArgoCD cluster, NOT the destination
+kubectl get application uzi -n argocd --context argo-cluster \
   -o jsonpath='{.status.sync.status}/{.status.health.status}{"\n"}'   # Synced/Healthy
 ```
 
