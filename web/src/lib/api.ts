@@ -489,6 +489,13 @@ export interface Worker {
   id: string;
   name: string;
   status: string; // "offline" | "online"
+  // Hosted workers (PRD #58). kind is never null — the column is NOT NULL DEFAULT
+  // 'external' — so every worker carries one and a pre-#58 row reports "external".
+  // hosted_size is the preset name ("s"|"m"|"l", lowercase on the wire) and is null
+  // for an external worker. hosted_generation is deliberately not here: it is
+  // controller-internal and the DTO does not carry it.
+  kind: "external" | "hosted";
+  hosted_size: string | null;
   busy: boolean; // derived: holds a claimed/running/awaiting_approval run (== active_runs > 0)
   // Bounded concurrency (PRD #42 Decision 10). active_runs is the live count of the
   // worker's claimed/running/awaiting_approval runs (busy is derived from it);
@@ -521,6 +528,18 @@ export interface Worker {
 
 export interface AdminWorker extends Worker {
   owner_email: string;
+}
+
+/**
+ * Operator-set hosting policy (PRD #58 M2, GET /workers/hosted/config). enabled is
+ * the instance kill-switch; quota is the per-user hosted-worker allowance, reported
+ * even when enabled is false. A client reading enabled: false renders nothing hosted
+ * regardless of the number beside it (Decision 12). quota 0 disables SELF-SERVICE
+ * only — hosted workers the user already holds stay listed and deletable.
+ */
+export interface HostedConfig {
+  enabled: boolean;
+  quota: number;
 }
 
 export type RunStatus =
@@ -1247,6 +1266,28 @@ const realApi = {
   createWorker: (name: string, template?: string) =>
     request<{ worker: Worker; token: string }>("POST", "/workers", { name, template }),
   deleteWorker: (id: string) => request<null>("DELETE", `/workers/${id}`),
+
+  // Hosted workers (PRD #58). Deletion rides deleteWorker above — the route is
+  // kind-blind on purpose, so there is no hosted delete to add here.
+  hostedConfig: () => request<HostedConfig>("GET", "/workers/hosted/config"),
+  /**
+   * Provision a hosted worker: one the CONTROLLER runs in the cluster.
+   *
+   * Returns `{ worker }` and NO TOKEN, unlike createWorker above — and the return
+   * type says so on purpose. A hosted worker's join token has exactly one consumer,
+   * the controller, which collects it from its desired-state poll; the user is never
+   * in that path, so there is nothing to show and nothing to copy (Decision 3). The
+   * server cannot send one either — provisionHostedWorker's transaction returns no
+   * token at all. Reading `.token` off this call is a typecheck failure, which is
+   * the point: the sibling createWorker flow twenty lines away renders a prominent
+   * one-time-token card, and it must not be copied onto this path.
+   *
+   * template and size are mandatory (400 otherwise), unlike createWorker's optional
+   * template: we run the image, so a silent default would pick it for the user.
+   * name is optional — empty means the server derives one from template + size.
+   */
+  provisionHostedWorker: (template: string, size: string, name?: string) =>
+    request<{ worker: Worker }>("POST", "/workers/hosted", { template, size, name }),
 
   createRun: (repoId: string, issueIid: number) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, { issue_iid: issueIid }),

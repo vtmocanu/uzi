@@ -7,6 +7,8 @@ import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Sel
 import { SettingsShell } from "../components/SettingsShell";
 import { ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
+import { sizeLabel } from "../lib/workerSizes";
+import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerStatGauges } from "../components/WorkerStats";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
@@ -163,6 +165,15 @@ export function WorkersSettings() {
         </p>
       </Card>
 
+      {/* Hosted workers (PRD #58): renders itself only when the instance has hosting
+          on and self-service quota left. One list below, not two — a hosted worker is
+          an ordinary worker whose container the controller runs, so it keeps the same
+          status, gauges, run badge and delete rule, and only its origin differs. */}
+      <HostedWorkers
+        hostedCount={workers.filter((w) => w.kind === "hosted").length}
+        onProvisioned={load}
+      />
+
       <Card className="space-y-3">
         <SectionTitle>Your workers</SectionTitle>
         {loading ? (
@@ -199,6 +210,19 @@ export function WorkersSettings() {
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5">
+                    {/* Marked by the row's own data, not by the hosting config: if an
+                        admin turns hosting off while a user still holds hosted rows,
+                        the rows stay listed (nothing may strand them) and must stay
+                        honest about what they are. Hiding the badge there would leave
+                        them looking like workers the user forgot to start. */}
+                    {w.kind === "hosted" && (
+                      <>
+                        <Badge tone="info" title="Runs in the cluster: the controller starts and stops its container, not you.">
+                          hosted
+                        </Badge>
+                        {w.hosted_size && <Badge>{sizeLabel(w.hosted_size)}</Badge>}
+                      </>
+                    )}
                     {hasTemplateDrift(w.template_declared, w.template_reported) && (
                       <Badge
                         tone="warning"

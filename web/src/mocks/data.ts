@@ -734,6 +734,8 @@ export const mockWorkers: Worker[] = [
     id: "w-laptop",
     name: "laptop",
     status: "online",
+    kind: "external",
+    hosted_size: null,
     busy: true,
     active_runs: 1,
     max_concurrent_runs: null,
@@ -753,6 +755,8 @@ export const mockWorkers: Worker[] = [
     id: "w-ci",
     name: "ci-runner-1",
     status: "offline",
+    kind: "external",
+    hosted_size: null,
     busy: false,
     active_runs: 0,
     max_concurrent_runs: null,
@@ -773,6 +777,8 @@ export const mockWorkers: Worker[] = [
     id: "w-nas",
     name: "nas-runner",
     status: "online",
+    kind: "external",
+    hosted_size: null,
     busy: false,
     active_runs: 0,
     max_concurrent_runs: null,
@@ -786,18 +792,44 @@ export const mockWorkers: Worker[] = [
     stats_mem_limit_bytes: null, // unlimited/unknown → no bar
     stats_source: "process",
   },
+  {
+    // A hosted worker (PRD #58): the controller runs this one in the cluster. Seeded
+    // ONLINE with a live sample so the hosted + size badges are seen on a realistic
+    // row rather than on a permanently-pending one — and so the demo starts at 1 of
+    // its quota of 2, one provision away from the at-quota state.
+    id: "w-hosted-eu",
+    name: "base (M)", // derived by the server from template + size; the form sends no name
+    status: "online",
+    kind: "hosted",
+    hosted_size: "m",
+    busy: false,
+    active_runs: 0,
+    max_concurrent_runs: null,
+    template_declared: "base",
+    template_reported: "base",
+    version: "0.4.2",
+    last_heartbeat_at: minsAgo(0.3),
+    created_at: daysAgo(3),
+    stats_cpu_pct: 21.5,
+    stats_mem_bytes: 1181116006, // 1.1 GiB
+    stats_mem_limit_bytes: 4294967296, // 4 GiB → ~27%
+    stats_source: "cgroup",
+  },
 ];
 
 export const mockAdminWorkers: AdminWorker[] = [
   { ...mockWorkers[0], owner_email: mockAdmin.email },
   { ...mockWorkers[1], owner_email: mockAdmin.email },
   { ...mockWorkers[2], owner_email: mockAdmin.email },
+  { ...mockWorkers[3], owner_email: mockAdmin.email },
   {
     // A cap-2 worker running both slots → "2/2 runs" badge demo (PRD #42), and a
     // near-limit cgroup sample → danger-tone CPU + memory bars (≥95%).
     id: "w-mira",
     name: "mira-desktop",
     status: "online",
+    kind: "external",
+    hosted_size: null,
     busy: true,
     active_runs: 2,
     max_concurrent_runs: 2,
