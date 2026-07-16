@@ -368,6 +368,17 @@ Non-goals (v1):
   rate limits. Success: API tests cover quota races, disabled flag,
   delete-while-busy refusal; provisioning is not user-reachable until M3
   (endpoints ship behind the flag).
+  - **Prerequisite of any rotation path, stated here rather than assumed**
+    (auditor, 2026-07-16): a rotation MUST set `workers.token_hash` and park the
+    new sealed token (`SealJoinToken`) **in one transaction**. M1's ack destroys
+    the buffer under `AND token_hash = @proved_token_hash` — the hash the caller
+    actually proved — so its correctness rests on "the hash I proved is still
+    current" being equivalent to "the parked ciphertext is the token I proved",
+    which holds only while the two are co-written. Split them and the predicate's
+    premise breaks silently. M1 reshaped `SealJoinToken` into a free function over
+    `Store` precisely so it can join M2's provision/rotation tx (the repo's
+    handler-binds-`qtx` idiom, six existing sites). **Provision must also gate on
+    `WORKER_HOSTING_ENABLED`** — nothing else stops a flag-off seal.
 - [ ] **M3 — Materialization + policies**: controller renders Secret
   (file-mounted token) / Deployment (Decision 6) / PVC; worker namespace with
   PodSecurity `restricted`, ResourceQuota, LimitRange, both NetworkPolicies
