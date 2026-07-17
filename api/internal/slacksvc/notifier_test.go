@@ -201,6 +201,65 @@ func TestNotifierEditsRootAndThreadsCompleted(t *testing.T) {
 	}
 }
 
+func TestNotifierForgejoRunSaysPullRequestAndUsesPersistedURL(t *testing.T) {
+	// PRD #65 D2/D8: a Forgejo run's DM must read in Forgejo's vocabulary ("PR #7",
+	// not "MR !7") and link the worker-persisted mr_web_url directly — the GitLab
+	// `/-/merge_requests/` reconstruction is wrong for Forgejo.
+	rc := baseRun("completed")
+	rc.MrIid = text8(7)
+	rc.ForgeType = "forgejo"
+	rc.MrWebUrl = txt("https://forge.example/grp/repo/pulls/7")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U123"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "completed"})
+
+	if len(fp.updates) != 1 || !strings.Contains(fp.updates[0].text, "PR #7") {
+		t.Fatalf("root not edited to Forgejo completed: %+v", fp.updates)
+	}
+	if strings.Contains(fp.updates[0].text, "MR !7") {
+		t.Errorf("Forgejo DM must not use GitLab's MR !N form: %q", fp.updates[0].text)
+	}
+	if len(fp.posts) != 1 || !strings.Contains(fp.posts[0].text, "/pulls/7") {
+		t.Fatalf("thread event must link the persisted mr_web_url: %+v", fp.posts)
+	}
+	if strings.Contains(fp.posts[0].text, "/-/merge_requests/") {
+		t.Errorf("Forgejo DM must not reconstruct a GitLab MR URL: %q", fp.posts[0].text)
+	}
+}
+
+// A worker-supplied mr_web_url that is not https must never become a rendered link
+// (Go twin of the web's isHttpsUrl guard, PRD #65 D8).
+func TestNotifierRejectsNonHTTPSMrWebURL(t *testing.T) {
+	rc := baseRun("completed")
+	rc.MrIid = text8(7)
+	rc.ForgeType = "gitlab"
+	rc.MrWebUrl = txt("javascript:alert(1)")
+	fs := &fakeNotifStore{
+		rc:       rc,
+		delivery: txt("U123"),
+		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "completed"})
+
+	if len(fp.posts) != 1 {
+		t.Fatalf("want 1 threaded event, got %+v", fp.posts)
+	}
+	if strings.Contains(fp.posts[0].text, "javascript:") {
+		t.Errorf("a non-https mr_web_url must not be rendered: %q", fp.posts[0].text)
+	}
+	// It falls back to the GitLab reconstruction (this row's forge is gitlab).
+	if !strings.Contains(fp.posts[0].text, "/-/merge_requests/7") {
+		t.Errorf("want the GitLab reconstruction fallback: %q", fp.posts[0].text)
+	}
+}
+
 func TestNotifierDropsUnlinkedOwner(t *testing.T) {
 	fs := &fakeNotifStore{rc: baseRun("running"), deliveryErr: pgx.ErrNoRows}
 	fp := &fakePoster{}

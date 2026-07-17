@@ -779,6 +779,24 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 	return items, nil
 }
 
+const getForgeTypeForRepo = `-- name: GetForgeTypeForRepo :one
+SELECT c.forge_type
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = $1
+`
+
+// The forge_type behind a repo, for the run-detail DTO's per-run MR/PR noun (PRD
+// #65 D2). GetRunByID*/GetRunForViewer return a bare runs row (SELECT *) with no
+// forge context; rather than widen those into join rows (a service-layer ripple),
+// the run-detail handler resolves this best-effort from the run's repo_id.
+func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, getForgeTypeForRepo, repoID)
+	var forge_type string
+	err := row.Scan(&forge_type)
+	return forge_type, err
+}
+
 const getRunByID = `-- name: GetRunByID :one
 SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url FROM runs WHERE id = $1
 `
@@ -1363,9 +1381,11 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+       c.forge_type
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
@@ -1381,6 +1401,7 @@ type ListActiveRunsAllRow struct {
 	RepoPath   string      `json:"repo_path"`
 	WorkerName pgtype.Text `json:"worker_name"`
 	OwnerEmail string      `json:"owner_email"`
+	ForgeType  string      `json:"forge_type"`
 }
 
 // Admin Agents-status: every non-terminal run across all users, with repo path,
@@ -1443,6 +1464,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
+			&i.ForgeType,
 		); err != nil {
 			return nil, err
 		}
@@ -1824,6 +1846,7 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 
 const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+       c.forge_type,
        ru.input_tokens          AS usage_input_tokens,
        ru.cache_read_tokens      AS usage_cache_read_tokens,
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
@@ -1831,6 +1854,7 @@ SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_descripti
        ru.cost_usd               AS usage_cost_usd
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = $1
@@ -1855,6 +1879,7 @@ type ListRunsForUserRow struct {
 	Run                      Run            `json:"run"`
 	RepoPath                 string         `json:"repo_path"`
 	WorkerName               pgtype.Text    `json:"worker_name"`
+	ForgeType                string         `json:"forge_type"`
 	UsageInputTokens         pgtype.Int8    `json:"usage_input_tokens"`
 	UsageCacheReadTokens     pgtype.Int8    `json:"usage_cache_read_tokens"`
 	UsageCacheCreationTokens pgtype.Int8    `json:"usage_cache_creation_tokens"`
@@ -1928,6 +1953,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.MrWebUrl,
 			&i.RepoPath,
 			&i.WorkerName,
+			&i.ForgeType,
 			&i.UsageInputTokens,
 			&i.UsageCacheReadTokens,
 			&i.UsageCacheCreationTokens,

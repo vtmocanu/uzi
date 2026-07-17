@@ -24,11 +24,14 @@ func TestMapLatestRun(t *testing.T) {
 	updated := created.Add(5 * time.Minute)
 
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("merged"), txt("boom"), nullTxt(),
+		dto := mapLatestRun(runID, viewer, "completed", i8(7), txt("https://gl.example/x/-/merge_requests/7"), txt("merged"), txt("boom"), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			txt("Vlad"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer)
 		if dto.MrState == nil || *dto.MrState != "merged" {
 			t.Fatalf("mr_state should be carried, got %v", dto.MrState)
+		}
+		if dto.MrWebURL == nil || *dto.MrWebURL != "https://gl.example/x/-/merge_requests/7" {
+			t.Fatalf("mr_web_url should be carried, got %v", dto.MrWebURL)
 		}
 		if dto.ID != runID.String() || dto.Status != "completed" {
 			t.Fatalf("id/status wrong: %+v", dto)
@@ -63,7 +66,7 @@ func TestMapLatestRun(t *testing.T) {
 		// failure_reason is withheld even though the run has one (it can carry a verbatim
 		// reject reason or a raw agent error). stop_kind (a non-sensitive enum) stays
 		// visible so the badge can still classify the run as stopped.
-		dto := mapLatestRun(runID, otherOwner, "failed", pgtype.Int8{}, nullTxt(),
+		dto := mapLatestRun(runID, otherOwner, "failed", pgtype.Int8{}, nullTxt(), nullTxt(),
 			txt("panic: raw agent internals"), txt("plan_rejected"),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
@@ -91,7 +94,7 @@ func TestMapLatestRun(t *testing.T) {
 	})
 
 	t.Run("blank display name leaves owner name empty", func(t *testing.T) {
-		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(),
+		dto := mapLatestRun(runID, viewer, "queued", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{},
 			txt(""), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if dto.OwnerName != "" {
@@ -102,7 +105,7 @@ func TestMapLatestRun(t *testing.T) {
 	t.Run("health: enum + since unconditional, reason owner-gated (PRD #47)", func(t *testing.T) {
 		since := created.Add(2 * time.Minute)
 		// The owner of a flagged run sees the enum, the since, AND the reason.
-		mine := mapLatestRun(runID, viewer, "running", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(),
+		mine := mapLatestRun(runID, viewer, "running", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"waiting_worker", txt("your vault is locked"), tstamp(since),
 			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if mine.Health != "waiting_worker" {
@@ -118,7 +121,7 @@ func TestMapLatestRun(t *testing.T) {
 		// A non-owner viewer gets the enum and the since (non-sensitive, like stop_kind)
 		// but NOT the reason, which can name owner state (Decision 6).
 		other := uuid.New()
-		theirs := mapLatestRun(runID, other, "running", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(),
+		theirs := mapLatestRun(runID, other, "running", pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"waiting_worker", txt("your vault is locked"), tstamp(since),
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer)
 		if theirs.Health != "waiting_worker" {
@@ -148,20 +151,26 @@ func TestAssembleCards(t *testing.T) {
 	// Deliberately NOT in issue order (20 before 10): a correct assembly keys by
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
-		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", MrIid: i8(5), MrState: txt("closed"),
+		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", MrIid: i8(5), MrWebUrl: txt("https://forge.example/grp/repo/pulls/5"), MrState: txt("closed"),
 			FailureReason: txt("raw agent internals"), OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running",
 			OwnerName: txt("Vlad"), WorkerName: txt("laptop"), RunCount: 1, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 	}
 	position := map[string]int{"In Progress": 0}
 
-	cards := assembleCards(issues, runRows, nil, position, viewer)
+	cards := assembleCards(issues, runRows, nil, position, viewer, "forgejo")
 	byIID := make(map[int64]cardDTO, len(cards))
 	for _, c := range cards {
 		byIID[c.IID] = c
 	}
 	if len(cards) != 3 {
 		t.Fatalf("expected 3 cards, got %d", len(cards))
+	}
+	// PRD #65 D2: every card carries the board's forge for the per-card MR/PR noun.
+	for _, c := range cards {
+		if c.ForgeType != "forgejo" {
+			t.Fatalf("card %d forge_type = %q, want forgejo", c.IID, c.ForgeType)
+		}
 	}
 
 	// (1) each latest_run lands on the RIGHT issue (no cross-keying).
@@ -193,6 +202,9 @@ func TestAssembleCards(t *testing.T) {
 	}
 	if byIID[20].LatestRun.MrState == nil || *byIID[20].LatestRun.MrState != "closed" {
 		t.Fatalf("issue 20: mr_state should flow through, got %v", byIID[20].LatestRun.MrState)
+	}
+	if byIID[20].LatestRun.MrWebURL == nil || *byIID[20].LatestRun.MrWebURL != "https://forge.example/grp/repo/pulls/5" {
+		t.Fatalf("issue 20: mr_web_url should flow through, got %v", byIID[20].LatestRun.MrWebURL)
 	}
 	// Decision 5: another owner's failure_reason is withheld from this viewer.
 	if byIID[20].LatestRun.FailureReason != nil {

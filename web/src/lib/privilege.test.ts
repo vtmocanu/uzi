@@ -33,7 +33,7 @@ describe("privilegeBadge", () => {
       status: "violations",
       token: { scopes: ["api", "sudo"], active: true, violations: ["token scopes exceed"], warnings: [] },
       repos: [
-        { repo_id: "r1", path: "g/one", role: 40, member: true, violations: ["bot role is Maintainer"], warnings: [] },
+        { repo_id: "r1", path: "g/one", role: "admin", member: true, violations: ["bot role is Maintainer"], warnings: [] },
       ],
     });
     expect(privilegeBadge("violations", r)).toEqual({ tone: "danger", label: "2 violations" });
@@ -52,8 +52,8 @@ describe("countFindings", () => {
 describe("repoFindings", () => {
   const r = report({
     repos: [
-      { repo_id: "clean", path: "g/clean", role: 30, member: true, violations: [], warnings: [] },
-      { repo_id: "bad", path: "g/bad", role: 40, member: true, violations: ["bot role is Maintainer (40)"], warnings: [] },
+      { repo_id: "clean", path: "g/clean", role: "write", member: true, violations: [], warnings: [] },
+      { repo_id: "bad", path: "g/bad", role: "admin", member: true, violations: ["bot role is Maintainer (40)"], warnings: [] },
     ],
   });
   it("returns null for a repo with no entry", () => {

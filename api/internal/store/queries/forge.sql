@@ -204,7 +204,7 @@ SELECT * FROM issues WHERE repo_id = $1 ORDER BY forge_issue_iid ASC;
 -- legitimately shows (only a count, no identity), not a per-viewer number. Only
 -- display fields — never session_id, plan_md, or any secret.
 SELECT DISTINCT ON (r.issue_iid)
-       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop_kind,
+       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind,
        r.health, r.health_reason, r.health_since,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
@@ -223,7 +223,7 @@ ORDER BY r.issue_iid, r.created_at DESC;
 -- window count over the issue's runs, already scoped to one issue by the WHERE, and
 -- issue-scoped across all users by design — Decision 6) so the "×N" retry hint
 -- survives a drag. Returns no rows when the issue has never run.
-SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop_kind,
+SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind,
        r.health, r.health_reason, r.health_since, r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count

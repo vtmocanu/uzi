@@ -529,7 +529,7 @@ func statusLabel(rc store.GetSlackRunContextRow) string {
 		return "⏸ needs your approval"
 	case "completed":
 		if rc.MrIid.Valid {
-			return fmt.Sprintf("✅ completed (MR !%d)", rc.MrIid.Int64)
+			return fmt.Sprintf("✅ completed (%s %s%d)", forgeMrAbbrev(rc.ForgeType), forgeMrRef(rc.ForgeType), rc.MrIid.Int64)
 		}
 		return "✅ completed"
 	case "failed":
@@ -566,14 +566,50 @@ func runLink(base string, runID uuid.UUID) string {
 	return ""
 }
 
-// mrLink builds the forge merge-request URL from the repo web url + mr iid. The
-// web url is forge-controlled, so it is mrkdwn-escaped too (a normal URL has no
-// & < >, so this is a no-op for legit links and only neutralizes a hostile one).
+// mrLink is the forge merge/pull-request URL for the completed-run thread line. It
+// prefers the forge-supplied mr_web_url the worker persisted at MR creation (PRD
+// #65 D8) — the only correct link on Forgejo, whose `/{owner}/{repo}/pulls/N`
+// grammar the GitLab reconstruction below never knew. That value is WORKER-supplied
+// and stored without scheme validation, so it is https-guarded here exactly like
+// the web's isHttpsUrl before it becomes a rendered link. Rows created before
+// mr_web_url landed (all GitLab — the forgejo gate flips last) fall back to
+// reconstructing the GitLab URL from the repo web url. The chosen URL is
+// mrkdwn-escaped either way (a normal URL has no & < >, so this is a no-op for legit
+// links and only neutralizes a hostile one).
 func mrLink(rc store.GetSlackRunContextRow) string {
+	if rc.MrWebUrl.Valid && isHTTPSURL(rc.MrWebUrl.String) {
+		return EscapeMrkdwn(rc.MrWebUrl.String)
+	}
 	if !rc.MrIid.Valid || rc.WebUrl == "" {
 		return ""
 	}
 	return fmt.Sprintf("%s/-/merge_requests/%d", EscapeMrkdwn(strings.TrimRight(rc.WebUrl, "/")), rc.MrIid.Int64)
+}
+
+// isHTTPSURL guards a worker-supplied URL before it becomes a rendered link — the
+// Go twin of the web's isHttpsUrl (api.ts). https-only, so a hostile http:/
+// javascript: mr_web_url is never surfaced.
+func isHTTPSURL(u string) bool {
+	return strings.HasPrefix(u, "https://")
+}
+
+// forgeMrAbbrev / forgeMrRef are the Go twins of web/src/lib/forgeNoun.ts (PRD #65
+// D2), kept adjacent-in-review with the SAME mapping so a Forgejo run's DM reads in
+// Forgejo's vocabulary: "PR #N" rather than GitLab's "MR !N". Any unknown/absent
+// forge_type is GitLab's form — the only connection kind that exists until the
+// handler gate flips (M6b).
+func forgeMrAbbrev(forgeType string) string {
+	if forgeType == "forgejo" {
+		return "PR"
+	}
+	return "MR"
+}
+
+func forgeMrRef(forgeType string) string {
+	if forgeType == "forgejo" {
+		return "#"
+	}
+	return "!"
 }
 
 func iid(v pgtype.Int8) int64 {

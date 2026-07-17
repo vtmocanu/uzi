@@ -53,7 +53,7 @@ function violationReport(): PrivilegeReport {
       {
         repo_id: "repo-atlas",
         path: "vtmocanu/atlas-api",
-        role: 40,
+        role: "admin",
         member: true,
         violations: ["bot role is Maintainer (40), expected Developer (30)"],
         warnings: [],
@@ -148,7 +148,7 @@ describe("ForgeSettings privilege surfacing", () => {
             checked_at: "2026-07-05T12:00:00Z",
             status: "ok",
             token: { scopes: ["api"], active: true, violations: [], warnings: [] },
-            repos: [{ repo_id: "r1", path: "vtmocanu/uzi", role: 30, member: true, violations: [], warnings: [] }],
+            repos: [{ repo_id: "r1", path: "vtmocanu/uzi", role: "write", member: true, violations: [], warnings: [] }],
           },
         }),
       ],

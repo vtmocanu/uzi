@@ -182,6 +182,11 @@ type runDTO struct {
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
 	// issue/ci_fix runs.
 	RepoID *string `json:"repo_id"`
+	// ForgeType is the run's forge ("gitlab"|"forgejo"), so the web picks the
+	// per-run MR/PR noun and reference sigil (PRD #65 D2). "" on the worker/create
+	// DTO paths, which never render the MR affordance in a browser; set on the
+	// list/detail reads (ListRuns/AdminListRuns/GetRun) from the run's connection.
+	ForgeType string `json:"forge_type"`
 	// Kind is issue|ci_fix|chat. IssueIID is null for ci_fix (no issue) and chat
 	// runs; the ci_fix fields below carry pipeline context, chat carries Title.
 	Kind             string `json:"kind"`
@@ -200,6 +205,11 @@ type runDTO struct {
 	WorkerID       *string `json:"worker_id"`
 	Branch         *string `json:"branch"`
 	MrIID          *int64  `json:"mr_iid"`
+	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
+	// creation (PRD #65 D8), null on runs created before it landed. The web renders
+	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL
+	// reconstruction for those null rows — it is the only correct link on Forgejo.
+	MrWebURL *string `json:"mr_web_url"`
 	// MrState is the last merge-request state the PRD #24 watcher observed for
 	// mr_iid (opened|closed|merged|locked), null when never observed. Display-only
 	// and best-effort (PRD #33 Decision 1): the chip treats merged/closed distinctly
@@ -271,6 +281,7 @@ func runToDTO(r store.Run) runDTO {
 		IterationCount:   r.IterationCount,
 		AutoApprove:      r.AutoApprove,
 		Branch:           textPtrValue(r.Branch.Valid, r.Branch.String),
+		MrWebURL:         textPtrValue(r.MrWebUrl.Valid, r.MrWebUrl.String),
 		MrState:          textPtrValue(r.MrState.Valid, r.MrState.String),
 		FailureReason:    textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
 		StopKind:         textPtrValue(r.StopKind.Valid, r.StopKind.String),
@@ -567,6 +578,17 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := runToDTO(run)
+	// PRD #65 D2: stamp the run's forge for the run-view MR/PR noun. Best-effort and
+	// only for a repo-ful run (chat runs have no repo, hence no MR affordance): a
+	// lookup error leaves forge_type "" (the web defaults to GitLab's noun), never
+	// failing the read of an otherwise-fine run.
+	if run.RepoID.Valid {
+		if ft, err := h.q.GetForgeTypeForRepo(r.Context(), uuid.UUID(run.RepoID.Bytes)); err != nil {
+			slog.Error("resolve run forge type", "run_id", run.ID, "error", err)
+		} else {
+			dto.ForgeType = ft
+		}
+	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
 	// so the plan-gate picker sources its "My agent templates" chips from exactly the
 	// roster the approve validator + worker use (allocation-resolved, lead stripped).

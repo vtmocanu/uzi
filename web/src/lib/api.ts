@@ -198,7 +198,13 @@ export interface PrivilegeTokenReport {
 export interface PrivilegeRepoReport {
   repo_id: string;
   path: string;
-  role: number;
+  // The bot's role on the repo as the neutral forge.Role enum
+  // (none|read|write|admin|owner), PRD #65 D7. Was a raw GitLab access level
+  // (number); it is now a string because Forgejo has no numeric levels and mapping
+  // write→30 would be a driver lying to satisfy a GitLab-shaped contract. Display
+  // only — the checker asserts role against RoleWrite server-side and renders any
+  // violation copy itself, so the web never compares this numerically.
+  role: string;
   member: boolean;
   violations: string[];
   warnings: string[];
@@ -293,6 +299,11 @@ export interface LatestRun {
   id: string;
   status: RunStatus;
   mr_iid: number | null;
+  // Forge-supplied MR/PR web URL persisted by the worker at creation (PRD #65 D8),
+  // null on runs created before it landed. Rendered directly through isHttpsUrl; a
+  // null falls back to the legacy GitLab URL reconstruction (forgeUrls.ts). It is
+  // the only correct link on Forgejo, whose PR URL grammar differs from GitLab's.
+  mr_web_url: string | null;
   // Last merge-request state the PRD #24 watcher observed for mr_iid
   // (opened|closed|merged|locked), null when never observed. Display-only hint
   // (PRD #33): mrChipState maps it to the chip variant. Kept fresh only for the
@@ -323,6 +334,9 @@ export interface Card {
   state: string;
   labels: string[];
   web_url: string;
+  // The card's forge ("gitlab"|"forgejo"), so the UI picks the per-card MR/PR noun
+  // (PRD #65 D2). A cross-repo view mixes forges, so it rides each card.
+  forge_type: string;
   author: string | null;
   has_prd_link: boolean;
   column: string;
@@ -339,6 +353,10 @@ export interface Board {
   repo_id: string;
   path_with_namespace: string;
   web_url: string;
+  // The board's forge ("gitlab"|"forgejo"), so board-level chrome (the "columns are
+  // <forge> labels" hint, the create-issue "opened on <forge>" note) names the right
+  // platform (PRD #65 D2). A board is one repo/connection, so it is a single value.
+  forge_type: string;
   columns: BoardColumn[];
   cards: Card[];
   // Repo default-branch CI status (PRD #6, the board header badge), null when
@@ -362,6 +380,9 @@ export interface IssueDetail {
   closed: boolean;
   conflict: boolean;
   description: string;
+  // The issue's forge ("gitlab"|"forgejo"), so the "Open on <forge>" button names
+  // the right platform (PRD #65 D2).
+  forge_type: string;
 }
 
 export interface ForgeConfig {
@@ -587,6 +608,11 @@ export interface Run {
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
   repo_id: string | null;
+  /** The run's forge ("gitlab"|"forgejo"), for the per-run MR/PR noun + reference
+   *  sigil (PRD #65 D2). "" on worker/create DTO paths (no browser MR affordance);
+   *  set on the list/detail reads. The web defaults an empty/unknown value to
+   *  GitLab's vocabulary. */
+  forge_type: string;
   /** Run kind (PRD #6): "issue" works issue_iid's card; "ci_fix" fixes a failed
    *  pipeline (pipeline_ref/pipeline_web_url/fix_verdict below); "chat" (PRD #39). */
   kind: string;
@@ -607,6 +633,10 @@ export interface Run {
   worker_id: string | null;
   branch: string | null;
   mr_iid: number | null;
+  /** Forge-supplied MR/PR web URL persisted by the worker at creation (PRD #65 D8),
+   *  null on runs created before it landed. Rendered directly through isHttpsUrl; a
+   *  null falls back to the legacy GitLab reconstruction (forgeUrls.ts). */
+  mr_web_url: string | null;
   /** Last MR state the PRD #24 watcher observed for mr_iid
    *  (opened|closed|merged|locked), null when never observed. Display-only hint
    *  (PRD #33); frozen per run, so a superseded run's value can be stale. */
@@ -1003,6 +1033,17 @@ export function createRunSocket(runId: string): RunSocketLike {
 // never made clickable.
 export function isHttpsUrl(url: string | null | undefined): boolean {
   return typeof url === "string" && url.startsWith("https://");
+}
+
+// preferForgeUrl chooses the forge-supplied persisted MR/PR URL when it is a usable
+// https URL (PRD #65 D8 — the only correct link on Forgejo, whose PR URL grammar the
+// legacy GitLab reconstruction never knew), else the caller's legacy reconstruction.
+// The persisted value is WORKER-supplied and stored without scheme validation, so
+// routing it through isHttpsUrl here is the load-bearing guard: a hostile http: or
+// javascript: mr_web_url is rejected and never becomes an anchor href. Shared by
+// every MR-link surface so the guard can never be forgotten at one of them.
+export function preferForgeUrl(persisted: string | null | undefined, legacy: string | null): string | null {
+  return isHttpsUrl(persisted) ? persisted! : legacy;
 }
 
 export class ApiError extends Error {

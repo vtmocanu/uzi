@@ -96,7 +96,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		// next sync will pick it up, so report success with the forge facts.
 		slog.Warn("cache new issue after create", "repo", repo.PathWithNamespace, "error", err)
 		httpx.JSON(w, http.StatusCreated, map[string]any{
-			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: created.Labels, WebURL: created.WebURL, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
+			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: created.Labels, WebURL: created.WebURL, ForgeType: repo.ForgeType, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
 		})
 		return
 	}
@@ -111,7 +111,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position, repo.ForgeType)})
 }
 
 // issueDetailDTO is the in-app issue view payload (PRD #12 §3): the board card
@@ -130,6 +130,10 @@ type issueDetailDTO struct {
 	Closed      bool     `json:"closed"`
 	Conflict    bool     `json:"conflict"`
 	Description string   `json:"description"`
+	// ForgeType is the issue's forge ("gitlab"|"forgejo"), so the issue view's
+	// "Open on <forge>" button names the right platform (PRD #65 D2). From
+	// repo.ForgeType (the issue's repo has one connection), not the live forge fetch.
+	ForgeType string `json:"forge_type"`
 }
 
 // buildIssueDetail assembles the issue-view payload from a freshly-fetched forge
@@ -137,7 +141,7 @@ type issueDetailDTO struct {
 // computing has_prd_link the same way the board and sync paths do. Pure (no DB or
 // forge I/O) so the resolution is unit-tested directly — the handler itself can't
 // be, since h.q is a concrete *store.Queries.
-func buildIssueDetail(issue forge.Issue, position map[string]int) issueDetailDTO {
+func buildIssueDetail(issue forge.Issue, position map[string]int, forgeType string) issueDetailDTO {
 	col, closed, conflict := board.ResolveColumn(issue.Labels, issue.State, position)
 	labels := issue.Labels
 	if labels == nil {
@@ -154,6 +158,7 @@ func buildIssueDetail(issue forge.Issue, position map[string]int) issueDetailDTO
 		Closed:      closed,
 		Conflict:    conflict,
 		Description: issue.Description,
+		ForgeType:   forgeType,
 	}
 	if issue.Author != "" {
 		a := issue.Author
@@ -199,5 +204,5 @@ func (h *Handler) GetIssueDetail(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"issue": buildIssueDetail(issue, position)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"issue": buildIssueDetail(issue, position, repo.ForgeType)})
 }
