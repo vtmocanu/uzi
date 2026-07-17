@@ -258,13 +258,14 @@ describe("mrChipSuffix / mrChipTitle", () => {
     expect(mrChipSuffix("merged")).toBe(" merged");
     expect(mrChipSuffix("closed")).toBe(" closed");
   });
-  it("title scopes merged/closed to 'as of last sync' with the per-forge noun", () => {
+  it("title scopes merged/closed to 'as of last sync' with the per-forge noun + platform", () => {
     expect(mrChipTitle("merged", "gitlab")).toBe("Merge request merged (as of last sync)");
     expect(mrChipTitle("closed", "gitlab")).toBe("Merge request closed unmerged (as of last sync)");
-    expect(mrChipTitle("open", "gitlab")).toBe("Open the merge request");
-    // Forgejo says "pull request", and the open title no longer names a platform.
+    // GitLab open title is byte-identical to pre-#65 (dark-landing: names the platform).
+    expect(mrChipTitle("open", "gitlab")).toBe("Open the merge request on GitLab");
+    // Forgejo says "pull request" and names its own platform, never "GitLab".
     expect(mrChipTitle("merged", "forgejo")).toBe("Pull request merged (as of last sync)");
-    expect(mrChipTitle("open", "forgejo")).toBe("Open the pull request");
+    expect(mrChipTitle("open", "forgejo")).toBe("Open the pull request on Forgejo");
   });
 });
 

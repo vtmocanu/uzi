@@ -52,3 +52,15 @@ export function mrAbbrev(forgeType: string | null | undefined): string {
 export function mrRefSymbol(forgeType: string | null | undefined): string {
   return forgeType === FORGEJO ? "#" : "!";
 }
+
+// PLATFORM is the display name of the forge, for copy that names the destination
+// platform ("… on GitLab"). Same default rule as MR_NOUN: unknown/absent is GitLab.
+const PLATFORM: Record<string, string> = {
+  gitlab: "GitLab",
+  [FORGEJO]: "Forgejo",
+};
+
+// forgePlatform names the forge for user copy: "GitLab" | "Forgejo".
+export function forgePlatform(forgeType: string | null | undefined): string {
+  return PLATFORM[forgeType ?? ""] ?? PLATFORM.gitlab;
+}
