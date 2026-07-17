@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -44,11 +45,14 @@ const (
 	// so a handful of fresh-code retries turns the loud insert failure into a
 	// non-event rather than a 500.
 	maxUserCodeAttempts = 5
-	// maxCodeChallengeBytes / maxClientDescBytes bound the two client-supplied fields
+	// maxCodeChallengeBytes / maxClientDescRunes bound the two client-supplied fields
 	// on start so a caller cannot store oversized blobs on an UNAUTHENTICATED endpoint.
 	// The challenge is base64url(S256(verifier)) = 43 chars; the desc is display text.
+	// The desc is bounded by RUNE count (not bytes) and REJECTED when over-long: a byte
+	// cap that sliced the string could split a multibyte rune into invalid UTF-8, which
+	// the INSERT rejects → a 500 on an unauthenticated endpoint (mirrors handler/forge.go).
 	maxCodeChallengeBytes = 256
-	maxClientDescBytes    = 200
+	maxClientDescRunes    = 200
 )
 
 // crockfordAlphabet is Crockford base32 (0-9 A-Z minus I, L, O, U): unambiguous when
@@ -141,8 +145,12 @@ func (h *Handler) CLIAuthStart(w http.ResponseWriter, r *http.Request) {
 	if desc == "" {
 		desc = "unknown client"
 	}
-	if len(desc) > maxClientDescBytes {
-		desc = desc[:maxClientDescBytes]
+	if utf8.RuneCountInString(desc) > maxClientDescRunes {
+		// Reject rather than byte-slice: slicing at a byte offset can split a multibyte
+		// rune into invalid UTF-8, which the INSERT rejects → a 500 on this UNAUTH
+		// endpoint. A client_desc is auto-derived hostname/os, so a clear 400 is fine.
+		httpx.Error(w, http.StatusBadRequest, "client_desc is too long")
+		return
 	}
 
 	ctx := r.Context()
@@ -228,7 +236,11 @@ func (h *Handler) CLIAuthPoll(w http.ResponseWriter, r *http.Request) {
 	claimed, err := qtx.ClaimCLIAuthRequest(ctx, id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// No approved-and-unexpired row: report the poll status (pending → keep polling,
-		// anything terminal → stop). Read outside the claim's (soon-rolled-back) tx.
+		// anything terminal → stop). The claim matched 0 rows, so nothing is pending in
+		// this tx — end it NOW to release its connection before the status read (which
+		// uses the pool). Otherwise a pending poll (the hot path) would hold two
+		// connections at once. The deferred Rollback then no-ops (ErrTxClosed).
+		_ = tx.Rollback(ctx)
 		h.writeCLIPollStatus(w, ctx, id)
 		return
 	}
@@ -512,8 +524,11 @@ func browserTokenName(clientDesc string) string {
 	if name == "" {
 		name = "uzi login"
 	}
-	if len(name) > maxCLITokenNameBytes {
-		name = name[:maxCLITokenNameBytes]
+	if utf8.RuneCountInString(name) > maxCLITokenNameBytes {
+		// Rune-safe truncate (mirrors deriveChatTitle): a byte-slice here could split a
+		// multibyte rune into invalid UTF-8 and 500 the mint. Effectively dead because
+		// CLIAuthStart already rejects an over-cap client_desc, but hardened regardless.
+		name = string([]rune(name)[:maxCLITokenNameBytes])
 	}
 	return name
 }

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -411,5 +412,54 @@ func TestCLIAuthGetRequestMetadataLiveDB(t *testing.T) {
 	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
 	if rec := bearerReq(router, http.MethodGet, "/api/auth/cli/request/"+reqID, uzc); rec.Code != http.StatusUnauthorized {
 		t.Errorf("Bearer GET consent metadata = %d, want 401 (RequireAuth, cookie-only)\nbody: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// -------------------------------------------------------------------------
+// (7) N2 regression: a client_desc whose 200-byte truncation boundary lands
+// MID-RUNE must not 500 on this UNAUTH endpoint. The old byte-slice
+// desc[:maxClientDescBytes] could split a multibyte rune into invalid UTF-8,
+// which the INSERT rejected → a 500 at start. The rune-aware handling either
+// stores the whole value (rune count within the cap) or rejects it with a 400 —
+// never a 500, and never an invalid-UTF-8 row.
+// -------------------------------------------------------------------------
+
+func TestCLIAuthStartClientDescRuneSafeLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	jwt := cliMintJWT(t, pool, user)
+
+	// 150 three-byte runes = 450 bytes; byte index 200 (the old truncation boundary)
+	// falls INSIDE a rune, so desc[:200] would have produced invalid UTF-8. 150 runes
+	// is within the cap, so the value must be stored WHOLE (not sliced), and start
+	// must return 201 rather than 500.
+	desc := strings.Repeat("中", 150)
+	verifier := "verifier-" + uuid.NewString()
+	reqID, _ := cliStart(t, router, s256Challenge(verifier), desc)
+
+	// The stored client_desc round-trips intact (valid UTF-8, never byte-sliced).
+	rec := cookieReq(t, router, http.MethodGet, "/api/auth/cli/request/"+reqID, jwt, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get request = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	var meta struct {
+		ClientDesc string `json:"client_desc"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("consent decode: %v (body %s)", err, rec.Body.String())
+	}
+	if meta.ClientDesc != desc {
+		t.Errorf("client_desc round-trip mismatch: stored %d-rune value, want the full %d-rune input intact",
+			utf8.RuneCountInString(meta.ClientDesc), utf8.RuneCountInString(desc))
+	}
+
+	// A client_desc BEYOND the cap (201 runes) is rejected with a 400 — never a 500,
+	// and never a byte-sliced (invalid-UTF-8) row.
+	overLong := strings.Repeat("中", maxClientDescRunes+1)
+	rec = cliPostJSON(router, "/api/auth/cli/start",
+		fmt.Sprintf(`{"code_challenge":%q,"client_desc":%q}`, s256Challenge("v2-"+uuid.NewString()), overLong))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("over-long client_desc start = %d, want 400 (must not 500 on an unauth endpoint)\nbody: %s",
+			rec.Code, rec.Body.String())
 	}
 }
