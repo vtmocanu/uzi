@@ -28,6 +28,11 @@ test("claim wire contract: worker parses the server's skill shape", () => {
   // Repo opt-in flag.
   assert.equal(claim.repo.skills_enabled, true);
 
+  // PRD #65 R8: the worker parses forge_type off the claim (the server emits it on
+  // every claim; "gitlab" for a GitLab connection). Absent ⇒ gitlab on an old api;
+  // present here, so the parse is pinned across the language boundary.
+  assert.equal(claim.repo.forge_type, "gitlab");
+
   // PRD #19's autopilot flag rides the same claim shape (post-landing merge): the
   // worker must still parse the skills fields alongside it.
   assert.equal(claim.auto_approve, true);

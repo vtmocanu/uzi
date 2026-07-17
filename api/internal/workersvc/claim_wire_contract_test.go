@@ -43,6 +43,7 @@ func sampleClaimPayloadWithSkills() ClaimPayload {
 			CloneURL:      "https://gitlab.example.com/g/p.git",
 			DefaultBranch: strptr("main"),
 			SkillsEnabled: true,
+			ForgeType:     "gitlab", // PRD #65 R8: emitted on every claim, "gitlab" for a GitLab connection
 		},
 		Secrets: ClaimSecrets{
 			ForgeUsername:       "uzi-bot",
@@ -109,6 +110,59 @@ func TestClaimSkillsWireContract(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Errorf("claim wire shape drifted from %s.\nThe server output changed; if intended, regenerate with UPDATE_GOLDEN=1 and update the worker-side contract test to match.\n--- got ---\n%s", wireContractFixture, got)
+	}
+}
+
+// TestClaimRepoCarriesForgeType pins the first of PRD #65 R8's two wire changes:
+// forge_type is emitted on every claim (forge_connections.forge_type is NOT NULL, so
+// the server always has a value) as "gitlab" for a GitLab connection. It is additive
+// — an old worker ignores the unknown key and keeps working (proven on the parse side
+// by agent/test/claim-skills-contract.test.ts, which reads this same golden).
+func TestClaimRepoCarriesForgeType(t *testing.T) {
+	b, err := json.Marshal(sampleClaimPayloadWithSkills().Repo)
+	if err != nil {
+		t.Fatalf("marshal repo: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal repo: %v", err)
+	}
+	if got, ok := m["forge_type"]; !ok || got != "gitlab" {
+		t.Errorf("claim repo must carry forge_type=\"gitlab\" (R8); got %v (present=%v)", got, ok)
+	}
+}
+
+// TestCompletionMrWebURLWireContract pins the second of R8's wire changes: mr_web_url
+// on the completion payload is additive + optional. An OLD worker (which never sends
+// the key) must still complete a GitLab run — its StateRequest decodes with a nil
+// MrWebURL, which textParam turns into a NULL mr_web_url so the web falls back to the
+// legacy forgeUrls.ts reconstruction. A NEW worker sends the URL and it lands verbatim.
+func TestCompletionMrWebURLWireContract(t *testing.T) {
+	// Old worker: no mr_web_url key at all (D8/R8 pre-feature shape).
+	const oldWorker = `{"status":"completed","branch":"agent/issue-7","mr_iid":42}`
+	var oldReq StateRequest
+	if err := json.Unmarshal([]byte(oldWorker), &oldReq); err != nil {
+		t.Fatalf("old-worker completion unmarshal: %v", err)
+	}
+	if oldReq.MrWebURL != nil {
+		t.Errorf("old worker: expected nil MrWebURL, got %q", *oldReq.MrWebURL)
+	}
+	if p := textParam(oldReq.MrWebURL); p.Valid {
+		t.Errorf("old worker: expected NULL mr_web_url, got %q", p.String)
+	}
+
+	// New worker: carries the forge-reported URL.
+	const url = "https://gitlab.example.com/g/p/-/merge_requests/42"
+	newWorker := `{"status":"completed","branch":"agent/issue-7","mr_iid":42,"mr_web_url":"` + url + `"}`
+	var newReq StateRequest
+	if err := json.Unmarshal([]byte(newWorker), &newReq); err != nil {
+		t.Fatalf("new-worker completion unmarshal: %v", err)
+	}
+	if newReq.MrWebURL == nil || *newReq.MrWebURL != url {
+		t.Errorf("new worker: expected MrWebURL %q, got %v", url, newReq.MrWebURL)
+	}
+	if p := textParam(newReq.MrWebURL); !p.Valid || p.String != url {
+		t.Errorf("new worker: expected mr_web_url %q, got valid=%v %q", url, p.Valid, p.String)
 	}
 }
 
