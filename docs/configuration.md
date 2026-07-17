@@ -245,6 +245,15 @@ See [judge.md](judge.md) and [self-improvement.md](self-improvement.md) for what
 | `JUDGE_RATE_LIMIT_MAX` / `JUDGE_RATE_LIMIT_WINDOW` | `60` / `1m` | Per-user limiter on the "re-run judge" action. Dedicated budget, separate from `CHAT_RATE_LIMIT_MAX`/`_WINDOW` — re-running the judge and chatting don't share an allowance. |
 | `UZI_SELFIMPROVE_CHECK_INTERVAL` | `1h` | How often the self-improvement engine **wakes** to check whether a cycle is due — the wake cadence, not the improvement interval itself (that's the `selfimprove_interval` admin setting, default `48h`). A boot pass runs immediately when enabled, so a cycle that came due while the API was down fires promptly rather than waiting a full interval. `0` disables the engine entirely (no boot pass, no loop). |
 
+## uzi CLI (PRD #64)
+
+See [cli.md](cli.md) for the user-facing install/auth/command guide. The one
+server-side knob:
+
+| Var | Default | Notes |
+|---|---|---|
+| `CLI_POLL_RATE_LIMIT_MAX` / `CLI_POLL_RATE_LIMIT_WINDOW` | `60` / `1m` | Dedicated budget for `POST /api/auth/cli/poll` (the `uzi login` poll loop). Deliberately separate from the shared `authLimiter` (`RATE_LIMIT_MAX`/`_WINDOW`, `10`/`1m`): an RFC 8628 poll at the server-returned 5s interval is 12/min, which would trip the shared limiter at poll #11. This budget and the returned poll interval are one decision — if the interval ever changes, this must still comfortably exceed it. |
+
 ## Claude rate limits (PRD #53)
 
 See [rate-limits.md](rate-limits.md) for what the meters show. The background poller reads each user's Anthropic 5-hour/7-day rate-limit windows with their own token; see [ARCHITECTURE.md](../ARCHITECTURE.md) for the poller design.
