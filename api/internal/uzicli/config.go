@@ -123,7 +123,11 @@ func (s *Store) LoadCredentials() (*Credentials, error) {
 		return nil, err
 	}
 	if err := toml.Unmarshal(b, c); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", s.credentialsPath(), err)
+		// Deliberately drop the underlying toml error: BurntSushi/toml echoes the
+		// offending line, and this file holds a bearer token, so a corrupt creds
+		// file must not leak a token fragment onto stderr. (config.toml is
+		// non-secret and keeps its detailed parse error.)
+		return nil, fmt.Errorf("failed to parse credentials file at %s", s.credentialsPath())
 	}
 	if c.Contexts == nil {
 		c.Contexts = map[string]Credential{}

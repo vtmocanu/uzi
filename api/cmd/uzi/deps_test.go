@@ -14,19 +14,14 @@ import (
 // red (a build failure, not a review nit).
 //
 // Buildvcs note: in a linked git worktree, `go list` on a main package trips
-// "error obtaining VCS status" unless buildvcs is off. The documented local
-// gate runs `GOFLAGS=-buildvcs=false go test ./...`, and this subprocess
-// inherits that GOFLAGS; CI runs from a normal checkout where it is not needed.
-// If neither applies (a bare `go test` inside a worktree), we skip with
-// guidance rather than commit -buildvcs=false or report a false layering
-// failure — CI, the authoritative gate, always runs the real check.
+// "error obtaining VCS status". `-buildvcs=false` only affects binary VCS
+// stamping, which is irrelevant to listing a package's dependency closure, so
+// passing it makes this check run unconditionally — worktree or normal checkout,
+// GOFLAGS set or not — instead of skipping and leaving CI as the only gate.
 func TestNoServerDeps(t *testing.T) {
-	out, err := exec.Command("go", "list", "-deps", ".").CombinedOutput()
+	out, err := exec.Command("go", "list", "-deps", "-buildvcs=false", ".").CombinedOutput()
 	if err != nil {
-		if strings.Contains(string(out), "buildvcs") {
-			t.Skipf("go list tripped VCS stamping in this worktree; rerun with GOFLAGS=-buildvcs=false (CI runs it unconditionally). output:\n%s", out)
-		}
-		t.Fatalf("go list -deps .: %v\n%s", err, out)
+		t.Fatalf("go list -deps -buildvcs=false .: %v\n%s", err, out)
 	}
 	for _, banned := range []string{"github.com/jackc/pgx", "github.com/go-chi/chi"} {
 		if strings.Contains(string(out), banned) {

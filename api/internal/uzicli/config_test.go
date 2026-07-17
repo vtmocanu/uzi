@@ -3,6 +3,7 @@ package uzicli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,6 +60,37 @@ func TestCredentialsPermsAndRefuse(t *testing.T) {
 	}
 	if _, err := s.LoadCredentials(); err == nil {
 		t.Error("LoadCredentials accepted a 0644 credentials file; want refusal")
+	}
+}
+
+func TestLoadCredentialsParseErrorHidesFileBody(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(filepath.Join(dir, "uzi"))
+	if err := os.MkdirAll(s.Dir(), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// A malformed credentials file whose broken line carries a secret-looking
+	// token: the value is unquoted (a plausible corruption), which makes
+	// BurntSushi/toml's plain Error() echo the whole bareword
+	// (`expected value but found "SUPERSECRETdeadbeefcafetoken" instead`). The
+	// creds path must not surface that. All-alpha so toml's bareword scanner,
+	// which stops at the first digit, echoes it in full. Written 0600 so it
+	// clears the perm gate and the parse is actually reached.
+	const secret = "SUPERSECRETdeadbeefcafetoken"
+	body := "[contexts.default]\ntoken = " + secret + "\n"
+	if err := os.WriteFile(s.credentialsPath(), []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, err := s.LoadCredentials()
+	if err == nil {
+		t.Fatal("LoadCredentials accepted malformed toml; want parse error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("credentials parse error leaked the token: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), s.credentialsPath()) {
+		t.Errorf("parse error should name the file path, got %q", err.Error())
 	}
 }
 
