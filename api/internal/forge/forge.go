@@ -359,6 +359,8 @@ func New(t Type, baseURL, token string, timeout time.Duration) (Forge, error) {
 	switch t {
 	case TypeGitLab:
 		return newGitLab(baseURL, token, timeout)
+	case TypeForgejo:
+		return newForgejo(baseURL, token, timeout)
 	default:
 		return nil, fmt.Errorf("forge: unsupported forge type %q", t)
 	}
