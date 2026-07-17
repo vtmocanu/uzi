@@ -20,8 +20,10 @@ import (
 //     the server (version.go:98-100). So the SDK never rejects Forgejo's
 //     +gitea-1.22.0 compatibility version, and never makes its own /version call.
 //   - GetRepoActionJobLogs returns the whole body via an unbounded io.ReadAll
-//     (client.go), so there is no transfer-time LimitReader to apply as the GitLab
-//     driver does; see JobLogTail.
+//     (client.go). This is the SAME memory profile as the shipped GitLab driver:
+//     client-go's GetTraceFile also buffers the entire trace into a bytes.Buffer
+//     and returns a reader over it (v2.44.0 jobs.go:343), so neither driver is
+//     transfer-bounded. See JobLogTail.
 //
 // Status is passed through verbatim everywhere: the neutral Pipeline/Job.Status is
 // the Forgejo Actions RUN-status enum (unknown|waiting|running|success|failure|
@@ -141,14 +143,16 @@ func (f *forgejo) ListPipelineJobs(ctx context.Context, projectID, pipelineID in
 
 // JobLogTail returns at most maxBytes from the END of a job's log (a failure's
 // cause concludes its log); maxBytes <= 0 returns the whole log. GetRepoActionJobLogs
-// GETs /actions/jobs/{job_id}/logs (text/plain) and returns the whole body — the SDK
-// buffers it with an unbounded io.ReadAll, so unlike the GitLab driver there is no
-// transfer-time LimitReader available. The maxTraceBytes ceiling is still enforced
-// for behavioural parity (a pathological log errors on both drivers rather than being
-// returned/stored); on Forgejo it guards the processing/storage path, not the
-// transfer, because the SDK has already read the body by the time we see its size.
-// The returned tail passes through the PAT redactor: a hostile pipeline could echo
-// the bot's own token into its log, and it must not survive into a snapshot.
+// GETs /actions/jobs/{job_id}/logs (text/plain). The gitea SDK reads the whole body
+// into memory with an unbounded io.ReadAll before we see its size, so the transient
+// download is bounded by FORGE_HTTP_TIMEOUT (time), not bytes. This is NOT weaker than
+// the GitLab driver: its client-go GetTraceFile likewise buffers the entire trace into
+// a bytes.Buffer and returns a reader over it (v2.44.0 jobs.go:343), so that driver's
+// io.LimitReader caps a copy out of an already-full buffer, not the transfer. The
+// maxTraceBytes ceiling here plays the same role on both drivers — a processing/storage
+// guard that errors on a pathological log rather than returning/storing it, never a
+// download bound. The returned tail passes through the PAT redactor: a hostile pipeline
+// could echo the bot's own token into its log, and it must not survive into a snapshot.
 func (f *forgejo) JobLogTail(ctx context.Context, projectID, jobID int64, maxBytes int) (string, error) {
 	c, err := f.newClient(ctx)
 	if err != nil {

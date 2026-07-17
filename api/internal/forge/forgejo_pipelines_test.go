@@ -128,6 +128,29 @@ func TestForgejoLatestMRPipelineNoRuns(t *testing.T) {
 	}
 }
 
+// TestForgejoLatestMRPipelineMalformedPRNotNoPipeline pins the reviewer's nit: a PR
+// whose head commit cannot be resolved (nil head / empty SHA) must return a plain
+// error, NOT the ErrNoPipeline sentinel — folding it into the sentinel would mis-cache
+// a vanished/malformed PR as a settled "no CI". No runs handler is registered because
+// the driver must fail before the runs call.
+func TestForgejoLatestMRPipelineMalformedPRNotNoPipeline(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/pulls/12": func(w http.ResponseWriter, _ *http.Request) {
+			// No "head" field → pr.Head is nil.
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "number": 12})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	_, err := d.LatestMRPipeline(context.Background(), 7, 12)
+	if err == nil {
+		t.Fatal("a PR with no resolvable head commit must return an error")
+	}
+	if errors.Is(err, ErrNoPipeline) {
+		t.Fatalf("a malformed PR must NOT fold into ErrNoPipeline (that mis-caches it as 'no CI'), got %v", err)
+	}
+}
+
 // TestForgejoListPipelineJobs is test #11 (the parse half): the run's jobs come back
 // with name/status mapped, Status passed through as the raw Actions enum, and Stage
 // left empty (Forgejo Actions has no stage model).
