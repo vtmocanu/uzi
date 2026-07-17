@@ -17,6 +17,7 @@
     "url": "https://gitlab.example.com/g/p",
     "clone_url": "https://gitlab.example.com/g/p.git",
     "default_branch": "main",
+    "forge_type": "gitlab",
     "skills_enabled": true
   },
   "secrets": {

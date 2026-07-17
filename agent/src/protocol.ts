@@ -174,6 +174,10 @@ export interface ClaimRepo {
    *  embedded in the URL (so it can't rest in the bare repo's on-disk config). */
   clone_url: string;
   default_branch?: string | null;
+  /** Which forge this repo's connection speaks (PRD #65 D9). Additive and OPTIONAL:
+   *  absent ⇒ "gitlab", so an old api (which never sends it) still drives a GitLab
+   *  run on a new worker (R8). The worker selects its forge client from this. */
+  forge_type?: "gitlab" | "forgejo";
   /** Repo owner's opt-in (PRD #16): load skills from the repo's own
    *  .claude/skills at run time. Default false. When true the worker enumerates
    *  repo skills after checkout, applies the caps, and ranks them below every
@@ -605,6 +609,10 @@ export interface StateRequest {
   /** completed carries the pushed branch + opened MR. */
   branch?: string;
   mr_iid?: number;
+  /** The MR/PR web URL as the forge reported it (PRD #65 D8), reported on completion
+   *  alongside mr_iid. Additive + optional: an old worker omits it, the server stores
+   *  NULL, and the web falls back to reconstructing the URL from mr_iid (forgeUrls.ts). */
+  mr_web_url?: string;
   /** failed carries a human-readable reason. */
   failure_reason?: string;
   /** implement⇄review loop counter, reported on running reports (M4). The
