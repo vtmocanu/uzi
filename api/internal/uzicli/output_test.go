@@ -16,7 +16,14 @@ func TestExitCodeFor(t *testing.T) {
 		{"nil", nil, ExitOK},
 		{"exit-error", Exitf(ExitNotFound, "gone"), ExitNotFound},
 		{"wrapped-exit-error", errWrap(Exitf(ExitConflict, "busy")), ExitConflict},
-		{"plain-error", errors.New("boom"), ExitUsage},
+		// A plain error that is NOT a cobra usage error defaults to generic (1),
+		// not usage (2): a leaked network/decode error must not read as "you
+		// invoked me wrong".
+		{"plain-error", errors.New("boom"), ExitGeneric},
+		// Cobra's own argument/command parse errors (returned unwrapped) are usage.
+		{"cobra-unknown-command", errors.New(`unknown command "bogus" for "uzi"`), ExitUsage},
+		{"cobra-accepts", errors.New("accepts 1 arg(s), received 0"), ExitUsage},
+		{"cobra-required-flag", errors.New(`required flag(s) "id" not set`), ExitUsage},
 	}
 	for _, tc := range cases {
 		if got := ExitCodeFor(tc.err); got != tc.want {
