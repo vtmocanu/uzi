@@ -254,9 +254,17 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.With(authLimiter.Middleware).Get("/oidc/login", h.OIDCLogin)
 			r.With(authLimiter.Middleware).Get("/oidc/callback", h.OIDCCallback)
 
+			// POST /logout is cookie-only (RequireAuth): a CLI logout must NOT bump the
+			// user's token_version, which would kill their browser sessions from a
+			// headless call (route table / Decision 16). GET /me is RequireUser so `uzi
+			// whoami` works — and over a uzc_ it honestly reports is_admin:false (the
+			// masking), over a uza_ true. They must therefore be split into two groups.
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
 				r.Post("/logout", h.Logout)
+			})
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/me", h.Me)
 			})
 		})
@@ -268,6 +276,22 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Get("/", h.ListMySecrets)
 			r.Put("/anthropic_token", h.PutAnthropicToken)
 			r.Delete("/anthropic_token", h.DeleteAnthropicToken)
+		})
+
+		// CLI token management (PRD #64): the credential the `uzi` CLI presents as a
+		// Bearer token. Cookie-only, DELIBERATELY (Decision 16) — never RequireUser:
+		// a Bearer-reachable CRUD would let a stolen uzc_ mint replacements (revocation
+		// becomes whack-a-mole) and let an admin's stolen user-scope token mint a uza_,
+		// escalating past the ceiling (the mint check keys off the user, not the
+		// presenting credential's scope). The list returns metadata only — never a
+		// token value. revoke-all is the panic button (Decision 19); a static path
+		// matched ahead of /{id}.
+		r.Route("/me/cli-tokens", func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
+			r.Get("/", h.ListCLITokens)
+			r.Post("/", h.CreateCLIToken)
+			r.Post("/revoke-all", h.RevokeAllCLITokens)
+			r.Delete("/{id}", h.RevokeCLIToken)
 		})
 
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped
@@ -407,40 +431,60 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			})
 		})
 
+		// Admin split by ROUTING (PRD #64): 9 reads reachable by a session OR an
+		// admin-scoped CLI token, 4 writes cookie-only. The read/write split is
+		// enforced by the middleware chain, not a handler flag, so "a read-only token
+		// reaches a write handler" is structurally impossible: the write group's
+		// RequireAuth is cookie-only, and a Bearer request 401s before any handler
+		// exists to hold a flag.
 		r.Route("/admin", func(r chi.Router) {
-			r.Use(mw.RequireAuth(h.q, h.cfg))
-			r.Use(mw.RequireAdmin)
-			r.Get("/users", h.ListUsers)
-			r.Patch("/users/{id}", h.PatchUser)
-			// Admin per-user run-judge toggle (PRD #46 Decision 7): actor authorized by
-			// RequireAdmin, target from the path, never the body (audit H3).
-			r.Put("/users/{id}/judge", h.SetUserJudgeEnabled)
-			// Instance settings (PRD #19): the configurable forge labels today.
-			r.Get("/settings", h.GetSettings)
-			r.Put("/settings", h.UpdateSettings)
-			// Vault migration progress (PRD #32): count of still-master-sealed secrets.
-			r.Get("/vault-migration", h.VaultMigration)
-			// Lightweight live Slack connection state for the admin webui chip's poll
-			// (PRD #25 M3), so it need not re-fetch the whole settings blob every 5s.
-			r.Get("/slack/status", h.GetAdminSlackStatus)
-			// Agents-status overview: every user's workers + active runs.
-			r.Get("/workers", h.AdminListWorkers)
-			r.Get("/runs", h.AdminListRuns)
-			// Factory-wide token/cost usage + per-user breakdown (PRD #40).
-			r.Get("/usage", h.AdminUsage)
-			// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors
-			// /usage: admin-only via this group, per-user rows incl. no_token.
-			r.Get("/rate-limits", h.AdminRateLimits)
-			// Self-improvement config (PRD #46 M5): read/enable the autonomous
-			// improvement job. PUT sets the enabling admin (session, never the body)
-			// as the run owner and requires a repo the admin owns.
-			r.Get("/selfimprove", h.GetSelfimproveConfig)
-			r.Put("/selfimprove", h.PutSelfimproveConfig)
+			// READS: RequireUser (session OR admin-scoped CLI token) + RequireAdminRO —
+			// which is JUST user.IsAdmin on the context user. RequireUser already masked
+			// any non-admin_ro token to IsAdmin=false, so a re-check of scope here would
+			// be a second mechanism that can drift from the masking. One mechanism, one
+			// place. admin-ness resolves live from the row, so demoting the owner instantly
+			// kills a uza_ token's admin reads with no revocation step.
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireUser(h.q, h.cfg))
+				r.Use(mw.RequireAdminRO)
+				r.Get("/users", h.ListUsers)
+				// Instance settings (PRD #19): the configurable forge labels today.
+				r.Get("/settings", h.GetSettings)
+				// Vault migration progress (PRD #32): count of still-master-sealed secrets.
+				r.Get("/vault-migration", h.VaultMigration)
+				// Lightweight live Slack connection state for the admin webui chip's poll
+				// (PRD #25 M3), so it need not re-fetch the whole settings blob every 5s.
+				r.Get("/slack/status", h.GetAdminSlackStatus)
+				// Agents-status overview: every user's workers + active runs.
+				r.Get("/workers", h.AdminListWorkers)
+				r.Get("/runs", h.AdminListRuns)
+				// Factory-wide token/cost usage + per-user breakdown (PRD #40).
+				r.Get("/usage", h.AdminUsage)
+				// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors
+				// /usage: admin-only via this group, per-user rows incl. no_token.
+				r.Get("/rate-limits", h.AdminRateLimits)
+				// Self-improvement config (PRD #46 M5): read the autonomous improvement job.
+				r.Get("/selfimprove", h.GetSelfimproveConfig)
+			})
+			// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAuth(h.q, h.cfg))
+				r.Use(mw.RequireAdmin)
+				r.Patch("/users/{id}", h.PatchUser)
+				// Admin per-user run-judge toggle (PRD #46 Decision 7): actor authorized by
+				// RequireAdmin, target from the path, never the body (audit H3).
+				r.Put("/users/{id}/judge", h.SetUserJudgeEnabled)
+				r.Put("/settings", h.UpdateSettings)
+				// PUT sets the enabling admin (session, never the body) as the run owner and
+				// requires a repo the admin owns.
+				r.Put("/selfimprove", h.PutSelfimproveConfig)
+			})
 		})
 
-		// Forge integration: connections, repo discovery, and the label-synced
-		// kanban board. Every route is per-user authorized through the owning
-		// connection's user_id (see the handlers).
+		// Forge integration (PRD #64: cookie-only). Connections, repo discovery and
+		// the label-synced kanban board — all per-user authorized through the owning
+		// connection's user_id. POST /forge/connections writes a forge bot PAT, so no
+		// v1 CLI verb reaches this tree; it stays cookie-only.
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 
@@ -459,9 +503,26 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// so it rides the per-user forge budget like the other proxying routes.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/privilege-check", h.PrivilegeCheck)
 			})
+		})
 
-			r.Route("/repos", func(r chi.Router) {
+		// Repos (PRD #64): GET / (uzi repo list) and POST /{id}/runs (uzi run create)
+		// are RequireUser; every other repo route is cookie-only. PATCH /{id} is the F1
+		// admin-write path (repo_skills_enabled / repo_devbox_opt_in via PatchRepo's
+		// IsAdmin branches), so it stays cookie-only — a Bearer credential 401s before
+		// those branches. Split WITHIN the sub-router (not two /repos mounts) so chi
+		// keeps one registration site per path+method.
+		r.Route("/repos", func(r chi.Router) {
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/", h.ListRepos)
+				// Queue an agent run from a card (PRD #4). forgeLimiter runs AFTER
+				// RequireUser: PerUserMiddleware keys on the userKey RequireUser populates
+				// and falls back (silently) to a shared IP bucket if it runs before auth —
+				// so auth first, limiter second (B.4).
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/runs", h.CreateRun)
+			})
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAuth(h.q, h.cfg))
 				r.Put("/{id}", h.SetRepoEnabled)
 				// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 				r.Patch("/{id}", h.PatchRepo)
@@ -482,58 +543,70 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/sync", h.SyncRepo)
 				// Create a PRD issue on the forge (source of truth) → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/issues", h.CreateIssue)
-				// Queue an agent run from a card (PRD #4). Fetches the issue snapshot
-				// from the forge → per-user budget.
-				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/runs", h.CreateRun)
 				// Queue a CI-fix run for a failed pipeline (PRD #6). Snapshots the
 				// failed pipeline's jobs + logs from the forge → per-user budget.
 				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/ci-fix-runs", h.CreateCIFixRun)
 			})
+		})
 
-			// Agent-runtime: the user's workers and their runs. Every route is
-			// authorized to the owning user (admins-see-all is M5).
-			r.Route("/workers", func(r chi.Router) {
-				r.Post("/", h.CreateWorker)
+		// Workers (PRD #64): GET / (uzi worker list) and DELETE /{id} (uzi worker rm)
+		// are RequireUser. POST / is cookie-only, DELIBERATELY (Decision 18): it MINTS a
+		// plaintext uzw_ join token whose claim returns the DECRYPTED forge PAT +
+		// Anthropic token — the one mint a CLI token must never reach (reading a PAT is
+		// strictly worse than writing one). Hosted routes are out of scope (cookie).
+		r.Route("/workers", func(r chi.Router) {
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/", h.ListWorkers)
-
-				// Hosted workers (PRD #58). Static paths, matched ahead of /{id} — the
-				// shape /agent-templates/allocations uses above. A hosted worker IS a
-				// worker (M1's migration extends `workers` rather than shadowing it), so
-				// these belong in this group rather than a parallel /hosted-workers tree.
-				//
-				// Both routes exist regardless of WORKER_HOSTING_ENABLED, unlike the
-				// controller group: /hosted/config's entire job is to report that hosting
-				// is off, and provision answers a flag-off request with a 403 that the
-				// handler itself gates. That is the opposite trade from the controller
-				// endpoint, which does not exist when hosting is off precisely because an
-				// api holding no controller credential should expose no surface to probe
-				// for one.
-				r.With(hostedLimiter.PerUserMiddleware).Post("/hosted", h.ProvisionHostedWorker)
-				r.Get("/hosted/config", h.HostedConfig)
-
-				// The limiter covers BOTH kinds of worker: the middleware cannot see the
-				// row's kind, and the k8s-object churn Decision 8 wants bounded flows
-				// through this shared endpoint. Accepted deliberately (user-approved): it
-				// caps external-worker deletes at the same per-user budget, where there
-				// was none before. Nobody legitimately deletes 10 workers a minute, and a
-				// hosted-only delete route would duplicate Decision 11's refusal rule and
-				// drift from it.
+				// DELETE stays swapped: destroying a worker exfiltrates nothing and the
+				// loss is the owner's own. hostedLimiter runs AFTER RequireUser (B.4) and
+				// covers BOTH worker kinds (the middleware cannot see the row's kind).
 				r.With(hostedLimiter.PerUserMiddleware).Delete("/{id}", h.DeleteWorker)
 			})
-			r.Route("/runs", func(r chi.Router) {
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAuth(h.q, h.cfg))
+				r.Post("/", h.CreateWorker)
+				// Hosted workers (PRD #58), out of scope for v1 CLI. Static paths matched
+				// ahead of /{id}. Both exist regardless of WORKER_HOSTING_ENABLED:
+				// /hosted/config reports that hosting is off, and provision answers a
+				// flag-off request with a handler-gated 403.
+				r.With(hostedLimiter.PerUserMiddleware).Post("/hosted", h.ProvisionHostedWorker)
+				r.Get("/hosted/config", h.HostedConfig)
+			})
+		})
+
+		// Runs (PRD #64): the core CLI loop is RequireUser — list/get/messages/inputs,
+		// and /{id}/review (Decision 21). POST /{id}/rejudge is the SOLE cookie-only
+		// route left in this group: it MINTS a token-spending judge run, excluded on the
+		// read-vs-spend line, NOT by inheritance. Do NOT wrap the whole /runs group in
+		// RequireUser — that shortcut passes the trio 404 and the admin checks while
+		// silently exposing rejudge; the inner split is the point.
+		r.Route("/runs", func(r chi.Router) {
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireUser(h.q, h.cfg))
 				r.Get("/", h.ListRuns)
 				r.Get("/{id}", h.GetRun)
 				r.Get("/{id}/messages", h.ListRunMessages)
 				r.Post("/{id}/inputs", h.CreateRunInput)
-				// Judge surfacing (PRD #46 M4): the run-page verdict + recommendations
-				// panel reads the review (owner-or-admin, GetRunForViewer-scoped).
+				// Judge surfacing (PRD #46 M4 / Decision 21): read the review
+				// (owner-or-admin, GetReviewForTarget → GetRunForViewer-scoped, capped by
+				// the same RequireUser masking as GetRun).
 				r.Get("/{id}/review", h.GetRunReview)
-				// Re-run judge (Decision 8): enqueue a fresh judge for a terminal run.
-				// Owner-only spend (enforced in the service, audit H3); behind a
-				// DEDICATED per-user judge spend limiter (separate budget from chat)
-				// since it mints a token-spending run.
+			})
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAuth(h.q, h.cfg))
+				// Re-run judge (Decision 8/21): enqueue a fresh judge for a terminal run —
+				// cookie-only, since it mints a token-spending run. Owner-only spend
+				// (service-enforced, audit H3); behind a DEDICATED per-user judge spend
+				// limiter (separate budget from chat).
 				r.With(judgeLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
 			})
+		})
+
+		// Cookie-only tail: self usage, chat (mints runs) and the WS follow channel
+		// (deferred — ws.go asserts it runs inside the session-authenticated group).
+		r.Group(func(r chi.Router) {
+			r.Use(mw.RequireAuth(h.q, h.cfg))
 
 			// The caller's own token/cost usage (PRD #40): lifetime + last-7-days
 			// totals + run count. Self-scoped; admins use /api/admin/usage for the
