@@ -776,6 +776,10 @@ Non-goals (v1):
     It was accepted because the quantities are **unchosen rather than unwritten**
     (see M6), and the alternative — M5 inventing numbers that M3 then discovers —
     is the silent-lie failure the whole question exists to prevent.
+    - **The deferral is DISCHARGED (M6, 2026-07-17): the picker now shows the
+      quantities**, sourced from the controller's preset table via a golden, so the
+      architect's objection is answered rather than merely outlived. The **incentive**
+      half it did not cover stays open by user decision — see M6.
 - [ ] **M6 — CI + chart + rollout**: publish per-template agent images
   (`agent-base`, `agent-jvm`; templates listed in a CI variable to bound build
   cost) and the controller image on `v*` tags; chart adds controller
@@ -855,15 +859,20 @@ Non-goals (v1):
       capstone payload and against absent/zeroed usage, and the full stub e2e is green
       (exit 0, 146 PASS). **Not yet re-run live** — the logic is verified against the
       exact payload that broke it, but a second ~13m/$0.80 capstone would close it.
-  - **M6 inherits a debt from M5, and owes TWO things for it: picking the S/M/L
-    quantities, and landing the display.** M5 shipped names-only (above). The
-    quantities are not merely unwritten — **nobody has ever chosen them**: not this
+  - ~~**M6 inherits a debt from M5, and owes TWO things for it: picking the S/M/L
+    quantities, and landing the display.**~~ **BOTH DISCHARGED.** The quantities were
+    picked by the **user** (2026-07-17) and landed in `controller/internal/preset` with
+    M3 — burstable, `s`/`m`/`l` = 250m–1 / 500m–2 / 1–4 CPU, 1–2Gi / 2–4Gi / 4–8Gi RAM,
+    `/data` 5/10/20Gi, `/nix` a flat 4Gi outside the table. The **display** landed in
+    M6 (2026-07-17): the picker now reads `M — up to 2 CPU / 4Gi RAM / 10Gi disk`. The
+    constraints below are kept because they are the reasoning behind those numbers, not
+    an open brief. M5 shipped names-only (above). The
+    quantities were not merely unwritten — **nobody had ever chosen them**: not this
     PRD (Decision 7 names the *fields* — cpu, memory, and the volume sizes — but no
     values), not `api/internal/workersize` (names only, deliberately), not the
-    controller. M3 must pick them to render pods at all, so M6 inherits whatever M3
-    lands; if M3 has not, M6 picks. Sizing a user's agent container is a **product
-    decision** — take it to the user, do not let it become an implementer's guess.
-    Constraints that make the question answerable rather than open-ended:
+    controller. Sizing a user's agent container is a **product
+    decision** — it went to the user rather than becoming an implementer's guess.
+    Constraints that made the question answerable rather than open-ended:
     - All presets pin `WORKER_MAX_CONCURRENT_RUNS=1` until PRD #51 lands
       (Decision 7), so a size buys headroom for **one** run, never parallelism.
     - `/nix` is a real per-preset volume, not an afterthought (Decision 7): it exists
@@ -873,11 +882,19 @@ Non-goals (v1):
       the presets must fit inside whatever budget dev-cluster ends up granting.
     - Today's compose worker is what every user runs by hand right now — its real
       footprint is the honest anchor for "M".
-    - **`DEFAULT_WORKER_SIZE = "s"` is the one size choice M5 made, and it was argued
-      from NAMES, not numbers** — deliberately, since the numbers did not exist. It is
-      the pre-selected option in the provision picker, so it is what most users will
-      actually get. Revisit it once real figures exist: the smallest preset is the
-      right default only if "S" can actually run a worker.
+    - ~~**`DEFAULT_WORKER_SIZE = "s"`**~~ — **WRONG SINCE 2026-07-16, corrected M6
+      (2026-07-17): the default is `m`.** M5 shipped `s` first, then changed it to `m`
+      on a user decision in the same milestone, and this line was never updated. The
+      *point* it was making survives and is worth keeping: it is the pre-selected
+      option, so **it is what most users actually get**, and M5 argued it from NAMES
+      rather than numbers because the numbers did not exist yet.
+      Its "revisit once real figures exist" is now discharged, and the figures moved
+      the *reasoning* rather than the choice: a live capstone measured a real SDK run
+      peaking at **676 MiB**, so `s` (2Gi) fits the agent ~3x over and the OOM fear
+      behind preferring a larger default was wrong. `m` stands anyway, because what 676
+      MiB bounds is the **agent, not the user's build** (unmeasured — the e2e repo
+      compiles nothing), and because `m` is compose parity and the sizing formula's
+      floor. **Do not re-litigate `s` on the strength of that number.**
   - **M6 also owes an answer to "why would a user ever pick S?" — and the quantities
     do NOT answer it** (web-ux, 2026-07-16; verified). **The size picker is
     structurally decorative, and landing the numbers will not fix that.**
@@ -893,13 +910,25 @@ Non-goals (v1):
       costs the user nothing over S. So M6 can land every quantity and the picker
       stays exactly as decorative as it is today. **The numbers are necessary and not
       sufficient.**
-    - *The honest current state, stated because it is nobody's design.* **The S
-      default is load-bearing**: it is the only thing keeping most users off L, and it
-      works by **inattention**, not by informing anyone. And the only real "incentive"
-      that exists today is a commons failure — if everyone picks L the namespace
-      ResourceQuota (Decision 8) fills and *someone else's* worker stops scheduling,
-      invisibly, in a version with no pod-phase status. Whoever picks the numbers
-      inherits that.
+    - *The honest current state, stated because it is nobody's design.* ~~**The S
+      default is load-bearing**: it is the only thing keeping most users off L~~ —
+      **STALE, and the substitution does not rescue it (corrected M6, 2026-07-17).**
+      The default is **`m`**, not `s` (M5, user decision 2026-07-16), so this paragraph
+      described a version that no longer shipped even when it was written. The
+      *mechanism* survives the swap — the default is still the only thing keeping most
+      users off L, and it still works by **inattention** rather than by informing
+      anyone — but the *conclusion* inverts: a default of `m` is not a conservation
+      control at all. It sits mid-table, so inattention now parks the median user at
+      **compose parity**, which is what M was chosen to be. The default is load-bearing
+      for **sizing correctness** (an under-sized default OOMs the shared cgroup and
+      fails runs invisibly) and buys **nothing** against the commons problem below,
+      where `s` at least nudged. So: do not read "the default restrains L" as still
+      true. Nothing restrains L.
+      And the only real "incentive" that exists today is a commons failure — if
+      everyone picks L the namespace ResourceQuota (Decision 8) fills and *someone
+      else's* worker stops scheduling, invisibly, in a version with no pod-phase
+      status. Whoever picks the numbers inherits that. **M6 picked them and did not
+      inherit a fix**: see the resolution below.
     - *Two levers, both bigger than M5, **user chose neither** (2026-07-16).*
       **(a) A resource-weighted quota** (S=1, M=2, L=3 against a budget). Note for
       whoever costs this: it does **not** reopen Decision 7 — a weight is a *quota
@@ -917,12 +946,46 @@ Non-goals (v1):
       a reason to choose between is speculative generality. Decision 7 committed to
       S/M/L before anyone noticed the quota made them free; that is worth re-deciding
       in M6 rather than inheriting.
-    - *Sequencing.* Answer the incentive question **first** — it determines how many
-      number sets M6 needs. This does not strand the footprint measurements now in
-      flight: those measure **what a worker actually needs**, and presets are derived
+    - **RESOLVED 2026-07-17 (user, via the team lead): LAND THE DISPLAY, KEEP THREE
+      SIZES. The incentive question stays OPEN — deliberately deferred, not dropped.**
+      This is the answer to the sequencing note below, which asked for the incentive
+      call first; it was made, and it was "neither lever".
+      - *What shipped*: the quantities now reach the picker (`M — up to 2 CPU / 4Gi RAM
+        / 10Gi disk`), so the **informed** half is closed. That was the architect's
+        actual objection — "a user choosing a size with no idea what it buys is
+        choosing blind" — and it is the half that is cheap and reversible.
+      - *What did NOT ship, and will not be rediscovered*: the **incentive** half is
+        exactly as described above. The quota counts **workers**
+        (`CountHostedWorkersForUser`, `n >= quota`), so S, M and L each cost 1 of 2 and
+        **picking L is still always rational**. The web-ux finding stands unfixed and
+        is not weakened by the numbers: *"the numbers are necessary and not
+        sufficient"* was right, and landing them proves it rather than settling it.
+      - *Why deferred rather than fixed*: the user **declined both structural levers
+        twice** (2026-07-16 and again 2026-07-17). Their costs are unchanged and are
+        the reason — **(a)** the weighted quota reopens M2's landed transaction (the
+        count becomes a sum) and makes the shipped admin setting's own name a lie
+        (`hosted_worker_quota: 2` would mean "2 points"); **(b)** one-size-only
+        dissolves the quantities debt but removes a shipped affordance, and stays
+        reversible (`00066` has no CHECK on `hosted_size`).
+      - *So the standing state, for whoever reads this next*: **this is known,
+        measured, and deliberately deferred — not an oversight to rediscover.** The
+        commons failure above is the live residual: nothing restrains L, the default is
+        `m` and no longer nudges (see the correction above), and the backstop is the
+        namespace ResourceQuota, where the cost of everyone picking L lands on
+        *someone else's* worker failing to schedule, invisibly. Reopen this if that is
+        ever observed, and reach for lever (a) or (b) then — do not re-derive the
+        finding.
+    - *Sequencing.* ~~Answer the incentive question **first**~~ — **answered above
+      (2026-07-17); this note is kept for the reasoning, not as an open action.** It
+      determines how many number sets M6 needs. This does not strand the footprint
+      measurements now in flight: those measure **what a worker actually needs**, and
+      presets are derived
       from that, so they inform any of these answers equally.
-  - **The display mechanism is DESIGNED AND UNIMPLEMENTED. Implement it; do not
-    rediscover it** (architect, 2026-07-16). The quantities must reach the UI
+  - ~~**The display mechanism is DESIGNED AND UNIMPLEMENTED. Implement it; do not
+    rediscover it**~~ — **IMPLEMENTED (M6, 2026-07-17), design honoured with one
+    recorded deviation (the second golden — see the first sub-bullet).** Kept in full
+    because it is the rationale for the shape that shipped, not a brief.
+    (architect, 2026-07-16). The quantities must reach the UI
     **without** the api ever learning them — Decision 7 pins that the api sends the
     preset NAME and that shipping resolved values would make it "the authority on a
     pod spec it is not allowed to know anything about". Note that reading them from
@@ -932,11 +995,41 @@ Non-goals (v1):
     api — new controller-authenticated write surface whose content the UI would then
     display, with nothing to show before the first push. The specified design
     instead:
-    - **`hosted_sizes.json` gains the quantities** — currently names-only, and it
-      stays that way until this lands. Shape: raw k8s quantity strings, never
-      pre-rendered prose, so both consumers assert structurally — the controller
-      against `resource.MustParse` values, the web rendering the strings verbatim.
-      Prose is where a lie hides.
+    - ~~**`hosted_sizes.json` gains the quantities**~~ — **IMPLEMENTED AS A SECOND
+      GOLDEN INSTEAD (M6, 2026-07-17). The design's intent is met exactly; its file
+      layout could not be, and this records why rather than leaving the next reader to
+      re-derive it.** Everything else in this bullet stands: raw k8s quantity strings,
+      never pre-rendered prose (prose is where a lie hides), and both consumers assert
+      structurally — the controller against `resource.MustParse` values, the web
+      rendering the strings verbatim.
+      - *The problem.* `hosted_sizes.json` is **generated** by an api test
+        (`TestHostedSizeNamesContract`: `workersize.Names` IS the golden, marshalled
+        and compared). Adding quantities to it forces one of three things, and each is
+        worse than a second file: **(1)** the api module authors them, so a second copy
+        of the preset table lives in `api/` and the api becomes an authority on a pod
+        spec — the exact thing Decision 7 forbids, and which
+        `size_contract_test.go` already says out loud ("the api may not know
+        cpu/memory"); **(2)** the controller writes into the api's tree, and a
+        regenerate from either side silently clobbers the other's fields; **(3)** the
+        file becomes hand-maintained, which deletes M2's producer gate to buy nothing.
+      - *The shape shipped.* Two goldens, each generated by the module that is actually
+        the authority, and no new authority anywhere:
+        `api/internal/hostedsvc/testdata/hosted_sizes.json` keeps the **names**
+        (untouched, still `workersize.Names`), and
+        `controller/internal/preset/testdata/hosted_size_specs.json` carries the
+        **quantities**. The web pins names against the first and numbers against the
+        second — reading the numbers from the module that renders the pod, which is
+        strictly more honest than reading them out of the api's testdata.
+      - *The chain, every link gated*: `workersize.Names` → `hosted_sizes.json` → the
+        controller's preset table (asserted **both** ways, `preset_contract_test.go`) →
+        `hosted_size_specs.json` → the web constant (`workerSizes.test.ts`). Verified by
+        mutation on both new gates, not by inspection: changing `m`'s memory limit in
+        the table reddens the controller golden, and editing the web constant reddens
+        the web test.
+      - *Order comes from the api's golden, not `SizeNames()`* — that returns **map
+        keys**, so it is randomly ordered and would rewrite the file on every run;
+        "smallest first" is the api registry's decision, so the picker cannot silently
+        reorder itself when the preset table is edited.
       - **CORRECTED 2026-07-17 (M3): the shape here carried a per-size `nix` field,
         which Decision 7's own later correction removes.** `/nix` is measured
         byte-identical across `base` and `jvm` and does not vary by size, so it is a
