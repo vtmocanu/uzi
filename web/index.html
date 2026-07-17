@@ -4,6 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Uzi — AI dark factory</title>
+    <!-- Favicons (PRD #70). PNG first so Safari <26 (no SVG favicon support) is
+         covered; the SVG is the primary mark and carries an id so a later hook can
+         swap its href for the dynamic status overlay. -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/favicon.svg" id="favicon-svg" />
     <!-- Pre-paint theme stamp (PRD #21). External same-origin classic script,
          blocking so it runs before first paint; kept external (not inline) so the
          nginx CSP stays script-src 'self' with no 'unsafe-inline'. -->

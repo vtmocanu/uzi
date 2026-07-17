@@ -15,6 +15,7 @@ import { cx } from "./ui";
 import { VaultBadge, VaultLockedBanner } from "./VaultControls";
 import { RateLimitAnnouncer, SidebarRateLimits } from "./RateLimitMeters";
 import { onNotificationsChanged } from "../lib/notifications";
+import { useFavicon } from "../lib/useFavicon";
 import {
   ActivityIcon,
   BellIcon,
@@ -151,12 +152,17 @@ function SidebarContent({
   onNavigate,
   collapsed = false,
   onToggleCollapse,
+  unread = 0,
 }: {
   onNavigate?: () => void;
   // Desktop-only icon-rail mode. The mobile sheet always renders expanded (it is
   // already a full-width overlay) and passes neither prop.
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  // Notifications unread count for the bell badge (PRD #46 M2). Owned by the
+  // parent AppShell so the single poll feeds both this badge and the status
+  // favicon (PRD #70), and both sidebar instances (desktop + mobile) share it.
+  unread?: number;
 }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
@@ -166,8 +172,6 @@ function SidebarContent({
   // glyph (the Repo DTO has no forge_type). Kept separate from repos so a failed
   // connections call degrades to the Git fallback rather than blanking the boards.
   const [forgeTypeById, setForgeTypeById] = useState<Record<string, string>>({});
-  // Notifications unread badge (PRD #46 M2).
-  const [unread, setUnread] = useState(0);
 
   // Boards in the nav mirror the user's enabled repos; refetched on navigation
   // so enabling/disabling a repo shows up without a reload.
@@ -180,30 +184,6 @@ function SidebarContent({
       .listRepos()
       .then(({ repos }) => setRepos(repos))
       .catch(() => setRepos([]));
-  }, [user, location.pathname]);
-
-  // Unread badge: poll on navigation (no WS — PRD #46 M2) and refresh on the
-  // in-app change event (e.g. after marking one read on the inbox page). A failed
-  // fetch is non-fatal: keep the last known count rather than blanking the badge.
-  useEffect(() => {
-    if (!user) {
-      setUnread(0);
-      return;
-    }
-    let alive = true;
-    const load = () =>
-      api
-        .unreadNotificationCount()
-        .then(({ unread }) => {
-          if (alive) setUnread(unread);
-        })
-        .catch(() => {});
-    load();
-    const off = onNotificationsChanged(load);
-    return () => {
-      alive = false;
-      off();
-    };
   }, [user, location.pathname]);
 
   // Connections change rarely, so this join is fetched once per session, not per
@@ -462,6 +442,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const location = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
+  // Notifications unread badge (PRD #46 M2). Owned here — above the guest early
+  // return — so a single poll feeds both the bell badge (passed to each
+  // SidebarContent) and the status favicon, and it survives across routes.
+  const [unread, setUnread] = useState(0);
   // Desktop sidebar collapse, persisted per browser. Initialised lazily from
   // localStorage so the first paint already matches the stored state — a
   // post-mount effect would flash the sidebar expanded then snap it collapsed.
@@ -469,6 +453,37 @@ export function AppShell({ children }: { children: ReactNode }) {
   useEffect(() => {
     prefs.set(SIDEBAR_COLLAPSED_KEY, collapsed);
   }, [collapsed]);
+
+  // Unread badge: poll on navigation (no WS — PRD #46 M2) and refresh on the
+  // in-app change event (e.g. after marking one read on the inbox page). A failed
+  // fetch is non-fatal: keep the last known count rather than blanking the badge.
+  useEffect(() => {
+    if (!user) {
+      setUnread(0);
+      return;
+    }
+    let alive = true;
+    const load = () =>
+      api
+        .unreadNotificationCount()
+        .then(({ unread }) => {
+          if (alive) setUnread(unread);
+        })
+        .catch(() => {});
+    load();
+    const off = onNotificationsChanged(load);
+    return () => {
+      alive = false;
+      off();
+    };
+  }, [user, location.pathname]);
+
+  // Status favicon (PRD #70 M4): mounted here so it lives on every route incl.
+  // guest and survives logout (enabled flips false → reset to the static mark).
+  // Reuses the unread count above — no second unread poll — and owns its own
+  // runs poll (which fires while the tab is hidden). Called before the guest
+  // early return so the hook order stays stable.
+  useFavicon({ unread, enabled: !!user });
 
   if (!user) return <PublicShell>{children}</PublicShell>;
 
@@ -492,7 +507,11 @@ export function AppShell({ children }: { children: ReactNode }) {
           collapsed ? "w-14" : "w-60",
         )}
       >
-        <SidebarContent collapsed={collapsed} onToggleCollapse={() => setCollapsed((c) => !c)} />
+        <SidebarContent
+          collapsed={collapsed}
+          onToggleCollapse={() => setCollapsed((c) => !c)}
+          unread={unread}
+        />
       </aside>
 
       {/* Mobile top bar + sheet */}
@@ -523,7 +542,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} />
           </div>
         </div>
       )}
