@@ -3,7 +3,9 @@
 # (the same-origin reverse proxy) on 8080. LOAD-BEARING on a shared cluster
 # (dev-cluster): without it any pod could reach the api ClusterIP directly, bypass
 # web nginx, and spoof X-Forwarded-For to defeat the per-IP auth rate limit /
-# forge audit IPs (api trusts XFF from TRUSTED_PROXIES CIDRs). Egress is left
+# (api trusts XFF from TRUSTED_PROXIES CIDRs; the rate limiter is the whole impact —
+# uzi persists no client IP, so there are no "audit IPs" to forge, despite what this
+# comment used to say). Egress is left
 # unrestricted (the api dials the DB, forge, OIDC, Slack) — only Ingress is policed.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -720,9 +720,15 @@ func seedAdmin(ctx context.Context, q *store.Queries, cfg config.Config) error {
 // is exactly what removes that mitigation. Without this, a compromised worker (the
 // agent runs a model against a user's cloned repo — squarely in the threat model,
 // it is why agent/src/guardrails.ts exists) could POST /api/auth/login with a
-// rotating XFF and defeat the per-IP auth rate limit outright, and forge the IP in
-// the audit log. Layer (a) already takes /api/auth/* off this listener; this makes
-// the property hold for every route on it, now and later.
+// rotating XFF and defeat the per-IP auth rate limit outright. Layer (a) already
+// takes /api/auth/* off this listener; this makes the property hold for every route
+// on it, now and later.
+//
+// The blast radius is the RATE LIMITER ONLY, and stating it precisely matters more
+// than stating it dramatically: ClientIP has exactly three call sites, all in
+// ratelimit.go, and no migration defines an IP column — uzi persists no client IP
+// anywhere, so there is no audit attribution to forge. A bypassed brute-force
+// control on the admin login is the whole of it, and is reason enough.
 //
 // Narrowing TRUSTED_PROXIES is NOT the fix and was rejected: pod IPs are dynamic,
 // which is why the whole-CIDR value exists in the first place. This makes

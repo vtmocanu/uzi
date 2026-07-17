@@ -49,8 +49,9 @@ func TestWithoutStripXFFAWorkerPodForgesItsClientIP(t *testing.T) {
 }
 
 // The fix: through stripXFF, the same request keys on the pod's REAL address, so
-// rotating XFF cannot mint fresh rate-limit buckets and the audit log cannot be
-// fed a forged IP.
+// rotating XFF cannot mint fresh rate-limit buckets. (The rate limiter is the whole
+// blast radius — uzi persists no client IP, so there is no audit attribution to
+// forge.)
 func TestStripXFFPinsTheClientIPToTheRealPeer(t *testing.T) {
 	var seen string
 	h := stripXFF(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {

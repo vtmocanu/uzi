@@ -194,7 +194,10 @@ api:
   # proxy) to reach api:8080. This is the LOAD-BEARING control on a shared cluster
   # like dev-cluster: without it any pod (e.g. coder.example.com runs
   # arbitrary dev code) could hit the api ClusterIP directly, bypass web nginx, and
-  # spoof X-Forwarded-For to defeat the per-IP auth rate limit / forge audit IPs.
+  # spoof X-Forwarded-For to defeat the per-IP auth rate limit. (Rate limiting is the
+  # whole impact: uzi persists no client IP, so there are no "audit IPs" to forge —
+  # this comment used to claim otherwise. Verified 2026-07-17: ClientIP has three call
+  # sites, all in ratelimit.go, and no migration defines an IP column.)
   # example-app has no such policy (it runs on the non-shared mgmt cluster).
   networkPolicy:
     enabled: true

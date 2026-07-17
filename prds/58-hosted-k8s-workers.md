@@ -545,6 +545,22 @@ Non-goals (v1):
   dev-cluster; drift/orphan reconciliation per Decision 9. Success: fake-client
   tests assert rendered objects; a hosted worker on a kind cluster registers,
   goes online, and completes a stub run end to end.
+  - **The "completes a stub run" half is RELOCATED TO M6, not waived** (user decision,
+    2026-07-17). M3 proved **register → online** on kind, plus the mechanical claims in
+    the live pod (git init+commit on `/data` as uid 10001; node/git/**nix**/devbox all
+    resolving off the SEEDED volume — the thing that is gone if the seed is wrong).
+    - *Why relocating is stronger than running it on kind, rather than a concession.*
+      M6's own success criterion already requires **a real hosted worker on dev-cluster
+      completing a run**, which is strictly better evidence on a cluster where `/data` is
+      representative. A kind stub run would exercise the agent's run loop — which M3
+      changed nothing about and the compose e2e already covers — and its `/data` evidence
+      would be **exactly as misleading as the fsGroup assertion proved**: kind's PV is
+      hostPath-backed and arrives `0777 root:root`, so a green run there says nothing
+      about the volume a real worker gets.
+    - *And why it is recorded rather than inferred.* The coder reached this judgement and
+      declined to redefine the criterion on its own authority; it needed to be the user's
+      call. A milestone's success criterion is not an implementer's to reinterpret,
+      however sound the reasoning — the honest move is to flag it and let it be decided.
   - **The Decision 9 / Decision 11 collision is settled by PROVENANCE, not by a name
     prefix — no tombstone, no schema change, no wire change.** The collision existed
     only because "orphan" was defined as `uzi-hw-*`-NAMED. The controller stamps
@@ -747,6 +763,23 @@ Non-goals (v1):
   Deployment, worker namespace + RBAC + quotas + policies, hosting values;
   ArgoCD rollout to dev-cluster. Success: a tagged release provisions a real
   hosted worker on dev-cluster that completes a run.
+  - **M6 now carries M3's run proof too** (user decision, 2026-07-17): M3's "completes
+    a stub run" was relocated here rather than waived, because M6's criterion above
+    already subsumes it with strictly better evidence — a REAL run on a cluster where
+    `/data` is representative, instead of a stub run on kind where the PV arrives
+    `0777 root:root`. **No new work: it is the same sentence already written above.**
+    What M6 must not do is let it slip quietly, since it is now the ONLY place a hosted
+    worker is proven to execute anything. See M3's bullet for what is already proven
+    (register → online, and the toolchain resolving off the seeded volume).
+  - **Three gaps land on M6's first real deploy, all deliberately left open by M3**
+    rather than papered over: **NetworkPolicy enforcement** (kindnet enforces none, so
+    nothing about either policy is proven — including the Antrea FQDN egress, where
+    capability is proven but no packet has crossed); **the `fsGroup: 10001` pin** (kind's
+    local-path PV is hostPath-backed and ignores fsGroup, so `/data` and `/nix` arrive
+    `0777 root:root` there and the pin is untested); and **the `items:` CA projection**,
+    which the controller Deployment is the first workload to need — `deploy/README.md`
+    documents it as a requirement and M3 could not discharge it, since a hosted worker
+    never mounts the api's TLS Secret at all.
   - **MEASURED 2026-07-16 — a real SDK run peaks at 676 MiB, so the memory question
     is largely settled and S is not the OOM risk it looked like.** The live capstone
     (`UZI_E2E_EXECUTOR=sdk`) drove a complete real Claude Agent SDK lifecycle — clone
@@ -1230,7 +1263,17 @@ Non-goals (v1):
     attacker pod inside it): 12 `POST /api/auth/login` with a **rotating** XFF →
     **12 × 401, zero 429s: the per-IP auth rate limit bypassed outright**. The same 12
     from the same **unforged** IP → 429 at request 11. So the limiter is real and the
-    forgery defeats it; a compromised worker also forges the audit IP.
+    forgery defeats it.
+    - *Correction to this entry's own first draft, and to the brief it came from
+      (architect, verified independently here 2026-07-17): the blast radius is the
+      **auth rate limiter ONLY**.* "Audit attribution is forgeable the same way" is
+      **false of this codebase** and must not be repeated: `ClientIP` has exactly three
+      call sites, all in `ratelimit.go`; `X-Forwarded-For`/`RemoteAddr` appear in no
+      other non-test Go file; and **no migration defines an IP column at all**
+      (`ip_address`, `client_ip`, `inet` — none exist), so uzi never persists a client
+      IP and there is nothing to attribute. A bypassed brute-force control on the admin
+      login is the whole of the impact, and is reason enough — the case does not need
+      an embellishment that cannot happen.
   - *The fix is TWO layers, and both ship* — CLAUDE.md: "four independent layers…
     don't weaken any layer on the theory another covers it."
     - **(a) The TLS listener serves a SUBSET router**: `/api/worker/*` +
