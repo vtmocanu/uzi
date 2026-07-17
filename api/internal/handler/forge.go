@@ -73,6 +73,15 @@ func connToDTO(c store.ForgeConnection) connectionDTO {
 		var rep privcheck.Report
 		if err := json.Unmarshal(c.PrivilegeReport, &rep); err == nil {
 			dto.PrivilegeReport = &rep
+		} else {
+			// D7: rows written before PRD #65 hold "role" as a number, which no
+			// longer unmarshals against the Role string field. The report blanks
+			// until the next privilege sweep (UZI_PRIVILEGE_CHECK_INTERVAL, default
+			// 24h) re-stamps it in the new shape. This log is deliberate — the
+			// pre-#65 code discarded the error, which would hide a real corruption
+			// behind the same silent blank as this expected one-time migration miss.
+			slog.Warn("forge connection privilege report failed to unmarshal; blanking until the next privilege sweep re-stamps it",
+				"connection", c.ID, "error", err)
 		}
 	}
 	return dto
@@ -188,7 +197,7 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 	// Least-privilege gate (PRD #5): token-level violations block the save — this
 	// is the one moment uzi holds the plaintext and the user is present to fix it.
 	// Per-repo checks can't run here (no repos are enabled yet); those warn later.
-	if tr := h.pcheck.CheckToken(r.Context(), f, identity.IsAdmin); len(tr.Violations) > 0 {
+	if tr := h.pcheck.CheckToken(r.Context(), f, forge.Type(forgeType), identity.IsAdmin); len(tr.Violations) > 0 {
 		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
 			"error":      "the bot token is over-privileged and was not saved; mint a least-privilege token (see the bot setup doc)",
 			"violations": tr.Violations,
