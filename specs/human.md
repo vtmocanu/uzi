@@ -37,7 +37,7 @@ Tracked as GitLab issue vtmocanu/uzi#1; PRD at `prds/1-simple-webui-user-registr
 
 Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/2-forge-integration-kanban.md`.
 
-- Forge-generic design: GitLab first, Forgejo support later.
+- Forge-generic design: GitLab and Forgejo both supported at full parity (Forgejo added by PRD #65, 2026-07-17).
 - Each user creates their own GitLab bot account + PAT, adds it as Developer to the projects they choose.
 - uzi only sees issues the bot has rights to — no shared/ambient identity.
 - Repo list + picker in the UI.
@@ -414,5 +414,5 @@ Tracked as GitLab issue vtmocanu/uzi#58; PRD at `prds/58-hosted-k8s-workers.md`.
     scale-to-zero, and the chat-agent case — a #58 worker is persistent and runs
     until deleted. [design detail in specs/ai.md §264-275]
 - Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
-- Forgejo driver (interface is forge-generic; GitLab implemented first).
+- Forgejo driver — DELIVERED by PRD #65 (2026-07-17): full-parity second driver behind the forge-generic interface; no longer deferred.
 - Agent runtime/execution (spawn, file writes, Anthropic API calls) — PRD #4.
