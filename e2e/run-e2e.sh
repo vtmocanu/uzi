@@ -676,6 +676,64 @@ if [ "$FORGE" = forgejo ]; then
   wait_board_pipeline failure 30
   pass "board cached the NEWEST run (failure) over the older success — id-DESC [0] + failure-caches-as-failure ✓"
 
+  # 7) Fix-CI loop DRIVE — the headline [live] criterion, unblocked by the Go
+  #    pipeline-status classifier (internal/pipelinestatus). main is at "failure"
+  #    (above), so this drives the exact three Go sites the unit tests could not
+  #    reach against a real run: the Fix-CI START GATE (ci_fix.go:88) must ACCEPT a
+  #    Forgejo "failure" pipeline (it rejected everything but GitLab "failed"); the
+  #    failed-job SNAPSHOT (ci_fix.go:144) must include the "failure" job; and the
+  #    fix VERDICT (pipeline_sync.go) must stamp fix_failed on a re-"failure".
+  say "forgejo Fix-CI loop: a 'failure' pipeline drives Fix CI → fix run → fix_failed verdict"
+  FJFIX="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}' | jq -r '.run.id')"
+  { [ -n "$FJFIX" ] && [ "$FJFIX" != null ]; } \
+    || fail "Fix CI not triggered on a Forgejo 'failure' pipeline (the ci_fix.go:88 gate must accept 'failure')"
+  [ "$(apiget "/api/runs/$FJFIX" | jq -r '.run.kind')" = ci_fix ] || fail "run kind is not ci_fix"
+  DUP="$(apipost_code "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}')"
+  [ "$DUP" = 409 ] || fail "a duplicate Fix CI on main should be 409, got $DUP"
+  pass "Fix CI triggered on a Forgejo 'failure' pipeline (gate :88 + job snapshot :144) — ci_fix run $FJFIX"
+
+  wait_status "$FJFIX" awaiting_approval
+  [ "$(apiget "/api/runs/$FJFIX" | jq -r '.run.plan_md // empty')" != "" ] || fail "ci_fix run carried no plan"
+  apipost "/api/runs/$FJFIX/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  wait_status "$FJFIX" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+  FJFIXBR="$(apiget "/api/runs/$FJFIX" | jq -r '.run.branch')"
+  case "$FJFIXBR" in ci-fix/pipeline-*) : ;; *) fail "ci_fix fix branch not ci-fix/pipeline-* (got $FJFIXBR)";; esac
+  [ "$(fake_state | jq -r --arg b "$FJFIXBR" '[.mrs[] | select(.source_branch==$b)] | length')" -ge 1 ] \
+    || fail "the fake recorded no PR from the fix branch $FJFIXBR"
+  pass "fix run $FJFIX completed on $FJFIXBR and opened a PR (snapshot fed the agent)"
+
+  # The fix branch's re-run FAILS again ("failure", a higher id than the failure that
+  # spawned the run): the verdict must stamp fix_failed — the exact pipeline_sync
+  # IsFailed("failure") path a bare == "failed" never reached. The fake's PR head.sha
+  # for the fix branch == the run head_sha, so LatestMRPipeline resolves it.
+  fake_post /_e2e/actions-runs "$(jq -nc --arg b "$FJFIXBR" --arg s "sha-$FJFIXBR" '{branch:$b,sha:$s,status:"failure",jobs:[{name:"build",status:"failure",log:"still broken\nFAIL"}]}')" >/dev/null
+  wait_verdict "$FJFIX" fix_failed 30
+  pass "a re-'failure' fix pipeline stamped fix_failed (pipeline_sync IsFailed path) — the CI-fix loop works for Forgejo ✓"
+
+  # ---------------------------------------------------------------------------
+  # OPT-IN LIVE PASS (D10) — documented TODO, deliberately not wired.
+  #
+  # This lane runs entirely against forge-fake's /api/v1 table (the default, fast
+  # lane). A real released `codeberg.org/forgejo/forgejo:16.0.0` container (boots
+  # ~4s on sqlite: FORGEJO__database__DB_TYPE=sqlite3, __security__INSTALL_LOCK=true;
+  # reports 16.0.0+gitea-1.22.0, passes the D4a gate) would be an opt-in pass adding
+  # the two things a fixture CANNOT prove:
+  #   1. SERVER-side Actions id-DESC ordering — the fake returns id-DESC by
+  #      construction, so this lane proves the DRIVER takes runs[0]; only a real
+  #      server proves it RETURNS newest-first (models/actions/run_list.go ToOrders).
+  #      Enqueue 2+ runs on one branch/sha (a push to a repo with .forgejo/workflows/
+  #      enqueues a queued run even with NO runner) and assert [0] is the newest.
+  #   2. Real job-log RETRIEVAL — a registered forgejo-runner executing a workflow,
+  #      so JobLogTail pulls REAL text/plain logs (auth/redirect/content-type on a
+  #      live run), not canned fixtures. Needs a second container + runner setup.
+  # How-to sketch: a UZI_E2E_FORGE_LIVE=1 flag that (a) `docker run`s the pinned
+  # image BY DIGEST on a loopback port, (b) seeds a bot + token + repo via its API,
+  # (c) points the connection's base_url at it instead of forge-fake, (d) runs the
+  # non-Actions criteria live. Deferred (no runner environment — D10a); the released
+  # image's wire shapes were already probed while writing M2/M4/M5. Do it when a
+  # runner env exists; it blocks nothing on the critical path.
+  # ---------------------------------------------------------------------------
+
   pass "PRD #65 M9 Forgejo lane complete"
   exit 0
 fi
