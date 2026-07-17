@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { ForgeSettings } from "./ForgeSettings";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
+import { mockForgeConfigMultiForge } from "../mocks/data";
 
 // Only the api object is swapped; ApiError and the types stay real so the page's
 // `instanceof ApiError` checks match what the mocked methods throw. The page loads
@@ -204,5 +205,68 @@ describe("ForgeSettings privilege surfacing", () => {
     expect(await screen.findByText(/token scopes \[api sudo\] exceed the required \[api\]/)).toBeTruthy();
     const docLink = screen.getByRole("link", { name: /bot setup guide/ });
     expect(docLink.getAttribute("href")).toBe("/docs/gitlab-bot-setup");
+  });
+});
+
+describe("ForgeSettings — forge-type picker (PRD #65 D11, lands dark)", () => {
+  const tokenInput = () => document.querySelector('input[type="password"]') as HTMLInputElement;
+
+  it("hides the picker and sends forge_type gitlab while only one type is advertised (dark landing)", async () => {
+    // Default beforeEach config advertises forge_types: ["gitlab"].
+    mockApi.createConnection.mockResolvedValue({ connection: conn() });
+    renderPage();
+    await screen.findByText("unchecked"); // page loaded
+
+    // No forge-type picker while a single type is advertised — the form is unchanged.
+    expect(screen.queryByLabelText("Forge type")).toBeNull();
+
+    fireEvent.change(tokenInput(), { target: { value: "glpat-ok" } });
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+
+    // The connect call still carries forge_type "gitlab" — byte-identical to before.
+    await waitFor(() =>
+      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-ok", "gitlab"),
+    );
+  });
+
+  it("shows the picker when >1 type is advertised and defaults the selection to gitlab", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigMultiForge);
+    mockApi.createConnection.mockResolvedValue({ connection: conn() });
+    renderPage();
+    await screen.findByText("unchecked");
+
+    const picker = screen.getByLabelText("Forge type") as HTMLSelectElement;
+    expect(picker).toBeTruthy();
+    // Options render the friendly platform names, default selected is the first (gitlab).
+    expect(picker.value).toBe("gitlab");
+    expect(screen.getByRole("option", { name: "GitLab" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Forgejo" })).toBeTruthy();
+
+    fireEvent.change(tokenInput(), { target: { value: "glpat-ok" } });
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+
+    // Untouched selection still sends gitlab.
+    await waitFor(() =>
+      expect(mockApi.createConnection).toHaveBeenCalledWith("https://gitlab.example.com", "glpat-ok", "gitlab"),
+    );
+  });
+
+  it("threads the chosen forge type through createConnection", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigMultiForge);
+    mockApi.createConnection.mockResolvedValue({ connection: conn({ forge_type: "forgejo" }) });
+    renderPage();
+    const picker = (await screen.findByLabelText("Forge type")) as HTMLSelectElement;
+
+    fireEvent.change(picker, { target: { value: "forgejo" } });
+    fireEvent.change(tokenInput(), { target: { value: "tok-forgejo" } });
+    fireEvent.submit(document.querySelector("form") as HTMLFormElement);
+
+    await waitFor(() =>
+      expect(mockApi.createConnection).toHaveBeenCalledWith(
+        "https://gitlab.example.com",
+        "tok-forgejo",
+        "forgejo",
+      ),
+    );
   });
 });

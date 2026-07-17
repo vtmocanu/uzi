@@ -336,6 +336,15 @@ export const mockForgeConfig = {
   forge_types: ["gitlab"],
 };
 
+// A two-forge config variant (PRD #65 D11) for exercising the connect-form
+// forge-type picker's VISIBLE branch in tests. Deliberately NOT wired into the demo
+// mockApi.forgeConfig — the demo mirrors production, which advertises only
+// ["gitlab"] until M6b, so the picker stays hidden there (dark landing).
+export const mockForgeConfigMultiForge = {
+  allowed_base_urls: ["https://gitlab.example.com", "https://forge.example.com"],
+  forge_types: ["gitlab", "forgejo"],
+};
+
 export const mockRepos: Repo[] = [
   {
     id: "repo-uzi",
