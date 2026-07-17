@@ -341,12 +341,25 @@ func run() error {
 	// the one whose tokens would otherwise never be swept. Riding this existing
 	// ticker (rather than a goroutine of its own) also keeps the flag-off footprint
 	// to one indexed UPDATE that matches nothing on a stack with no hosted workers.
-	sweep := sweeper.New(wsvc, 0, sweeper.Pass{
-		Name: "hosted_tokens_expired",
-		Run: func(ctx context.Context) (int64, error) {
-			return hostedsvc.ExpirePendingTokens(ctx, q, cfg.HostedTokenTTL)
+	sweep := sweeper.New(wsvc, 0,
+		sweeper.Pass{
+			Name: "hosted_tokens_expired",
+			Run: func(ctx context.Context) (int64, error) {
+				return hostedsvc.ExpirePendingTokens(ctx, q, cfg.HostedTokenTTL)
+			},
 		},
-	})
+		// Browser-brokered CLI login requests (PRD #64 M5) are short-lived (~5 min) but
+		// nothing deletes them once expired. The start handler sweeps opportunistically;
+		// this rides the same ticker so a stack no one has logged in through recently
+		// still gets its expired rows cleared, folding into the existing goroutine rather
+		// than spawning its own.
+		sweeper.Pass{
+			Name: "cli_auth_requests_expired",
+			Run: func(ctx context.Context) (int64, error) {
+				return q.DeleteExpiredCLIAuthRequests(ctx)
+			},
+		},
+	)
 	sweep.Boot(ctx)
 
 	// PAT least-privilege service + sweep (PRD #5). The service is shared by the
@@ -454,6 +467,10 @@ func run() error {
 	// hosted provision and worker delete. Built unconditionally — it also covers
 	// external-worker deletes, which exist whether or not hosting is enabled.
 	hostedLimiter := mw.NewLimiter(cfg.HostedRateLimitMax, cfg.HostedRateLimitWindow, cfg.TrustedProxies)
+	// Dedicated per-(path,IP) budget for POST /api/auth/cli/poll (PRD #64 M5). Sized to
+	// comfortably exceed the poll cadence the server itself returns (12/min at 5s) so
+	// uzi login never trips its own limit — which the shared 10/min authLimiter would.
+	cliPollLimiter := mw.NewLimiter(cfg.CLIPollRateLimitMax, cfg.CLIPollRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// The settings PUT handler asks the poller to full-sync every repo when a label
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
@@ -515,7 +532,7 @@ func run() error {
 	// the SAME api on a second port, not a second surface. Building Routes twice
 	// would be two independent middleware chains — and two rate limiters, so a
 	// per-IP budget would silently double.
-	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter)
+	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

@@ -71,6 +71,18 @@ type BoardColumn struct {
 	Position  int32     `json:"position"`
 }
 
+type CliAuthRequest struct {
+	ID            uuid.UUID          `json:"id"`
+	CodeChallenge string             `json:"code_challenge"`
+	ClientDesc    string             `json:"client_desc"`
+	UserCode      string             `json:"user_code"`
+	Status        string             `json:"status"`
+	UserID        pgtype.UUID        `json:"user_id"`
+	Scope         string             `json:"scope"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+}
+
 type CliToken struct {
 	ID          uuid.UUID          `json:"id"`
 	UserID      uuid.UUID          `json:"user_id"`

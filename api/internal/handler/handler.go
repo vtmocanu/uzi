@@ -233,8 +233,10 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // two Slack-DM-triggering /me/slack endpoints; judgeLimiter is a per-user budget
 // on the re-run-judge action (PRD #46), separate from chat's; hostedLimiter is a
 // per-user budget on the two endpoints that churn cluster objects (PRD #58
-// Decision 8) — hosted provision and worker delete.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter *mw.Limiter) http.Handler {
+// Decision 8) — hosted provision and worker delete; cliPollLimiter is a dedicated
+// per-(path,IP) budget on POST /api/auth/cli/poll (PRD #64 M5), sized to exceed the
+// server-returned poll cadence so uzi login cannot trip its own rate limit.
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -253,6 +255,25 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			// the auth limiter like register/login.
 			r.With(authLimiter.Middleware).Get("/oidc/login", h.OIDCLogin)
 			r.With(authLimiter.Middleware).Get("/oidc/callback", h.OIDCCallback)
+
+			// Browser-brokered CLI login (PRD #64 M5). start/poll are UNAUTH — the CLI
+			// has no credential yet, which is the whole point — and rate-limited.
+			// request/approve/deny are the BROWSER side, RequireAuth (this is where the
+			// human's password OR OIDC login happens) + CSRF on the POSTs. poll gets its
+			// OWN limiter: authLimiter is 10/min but a 5s poll is 12/min, so the shared
+			// bucket would trip uzi login at poll #11 (a broken login, not tidiness).
+			r.With(authLimiter.Middleware).Post("/cli/start", h.CLIAuthStart)
+			r.With(cliPollLimiter.Middleware).Post("/cli/poll", h.CLIAuthPoll)
+			r.Group(func(r chi.Router) {
+				r.Use(mw.RequireAuth(h.q, h.cfg))
+				r.Get("/cli/request/{id}", h.CLIAuthGetRequest)
+				// approve makes the human TYPE the user_code, turning this into a
+				// credential-checking endpoint — so it rides the per-user auth limiter,
+				// exactly as vault unlock does for the same reason (a password-guessing
+				// surface). deny is not credential-checking, so it does not.
+				r.With(authLimiter.PerUserMiddleware).Post("/cli/approve", h.CLIAuthApprove)
+				r.Post("/cli/deny", h.CLIAuthDeny)
+			})
 
 			// POST /logout is cookie-only (RequireAuth): a CLI logout must NOT bump the
 			// user's token_version, which would kill their browser sessions from a

@@ -22,6 +22,13 @@ func TestScrubKnownTokensRedactsTokenFamilies(t *testing.T) {
 		"private-token": "PRIVATE-TOKEN: " + secret,
 		"authorization": "Authorization: Bearer " + secret,
 		"bare-bearer":   "sent Bearer " + secret + " upstream",
+		// uzi's own Bearer credentials (PRD #64 Risk 14): the CLI PRD tells users to put
+		// UZI_TOKEN in a GitLab CI variable, so a `uzi ...` invocation echoing its token
+		// into a trace is exactly the path this snapshot ingests. uzc_ (user), uza_
+		// (admin_ro) and uzw_ (worker) must all be stripped before the tail is frozen.
+		"uzc":     "UZI_TOKEN=uzc_" + secret + " in the env",
+		"uza":     "ran with uza_" + secret,
+		"uzw":     "worker joined as uzw_" + secret,
 	}
 	for name, in := range cases {
 		out := scrubKnownTokens(in)
