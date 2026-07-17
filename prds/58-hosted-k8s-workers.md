@@ -1214,3 +1214,51 @@ Non-goals (v1):
     observable, so it reported the gap instead of passing silently). Both defer to M6.
     The design predicted all three divergences before the cluster existed; the run
     confirmed the predictions rather than discovering them.
+- 2026-07-17: **The worker-namespace ingress rule opens an XFF forgery, and M3 closes
+  it with TWO layers** (M4 review: reviewer BLOCKING + auditor, converging from
+  different lenses; verified and then MEASURED by the M3 coder before implementing).
+  - *The defect.* `mw.ClientIP` trusts `X-Forwarded-For` on the **peer IP alone**
+    (`ratelimit.go:157`) — it knows nothing about which listener or route a request
+    arrived on. dev-cluster's `TRUSTED_PROXIES` is the **whole pod CIDR**
+    (`10.244.0.0/16`), because pod IPs are dynamic and no narrower value is
+    maintainable, so **hosted worker pods are trusted proxies by construction**. It was
+    inert only because the api NetworkPolicy admitted web pods and nothing else — and
+    **Decision 5(a)'s rule, which admits the worker namespace to the TLS port, is
+    exactly what removes that mitigation**. So it is M3's precondition, not M4's
+    cleanup: M3 is the milestone that arms it.
+  - *Measured on a live api, not argued* (kind, `TRUSTED_PROXIES` = the pod CIDR,
+    attacker pod inside it): 12 `POST /api/auth/login` with a **rotating** XFF →
+    **12 × 401, zero 429s: the per-IP auth rate limit bypassed outright**. The same 12
+    from the same **unforged** IP → 429 at request 11. So the limiter is real and the
+    forgery defeats it; a compromised worker also forges the audit IP.
+  - *The fix is TWO layers, and both ship* — CLAUDE.md: "four independent layers…
+    don't weaken any layer on the theory another covers it."
+    - **(a) The TLS listener serves a SUBSET router**: `/api/worker/*` +
+      `/api/controller/*` only. `/api/auth/*` and `/api/admin/*` are **not mounted**
+      there, rather than mounted-and-defended — a hosted worker runs an agent against a
+      user's cloned repo, a semi-hostile position by design. The set was **derived from
+      the agent and controller code, not assumed**: the agent declares one base
+      (`WORKER_API_PREFIX = "/api/worker"`) and opens **no websocket**, so `/api/ws` —
+      which an earlier proposal included — is deliberately absent. Verified live from a
+      trusted-proxy pod: every sensitive route 404s on `:8443`; the worker/controller
+      surface 401s (exists, needs a credential).
+    - **(b) `stripXFF` on that listener.** Narrowing the CIDR was **rejected**: pod IPs
+      are dynamic, which is why the whole-CIDR value exists. Stripping makes the
+      property true **by construction** rather than by CIDR bookkeeping that a future
+      pod-CIDR change would silently invalidate.
+    - *The constraint that shaped (a)*: M4 built the router ONCE because building
+      `Routes` twice creates two middleware chains and silently doubles every per-IP
+      budget. The subset therefore **shares the limiter instances** — the mounts are
+      functions both routers call, so there is one registration site per route and the
+      two surfaces cannot drift.
+  - *`docs/configuration.md` asserted the property with nothing enforcing it* ("no
+    `X-Forwarded-For` is trusted from them") and claimed both ports serve the same
+    routes. Both corrected to say what **enforces** them, and to name the one condition
+    that would change it: if anyone ever fronts the TLS port with a real proxy, the
+    strip is the line to revisit.
+  - **Explicitly NOT M3's, recorded so it is not lost**: the same weakness **predates
+    M4 and exists on compose today** (`docker-compose.yml` defaults `TRUSTED_PROXIES`
+    to include the compose network, so the agent container is already a trusted proxy).
+    The measurement above was taken on the plain listener for exactly that reason. M4
+    did not introduce the weakness — it added a document that denied it. The lead is
+    raising the compose half separately.
