@@ -777,3 +777,277 @@ func TestForgejoVersionStringRedacted(t *testing.T) {
 		t.Errorf("refusal must still wrap ErrForgeVersionUnsupported, got %q", err.Error())
 	}
 }
+
+// --- M4: merge requests, timeline, notes, token introspection --------------
+
+// TestForgejoGetMergeRequestStateMapping is test #6, verified live on 16.0.0:
+// Forgejo says state:"open" (not GitLab's "opened") and carries merged separately,
+// so a merged PR is {state:"closed", merged:true}. No "locked" state.
+func TestForgejoGetMergeRequestStateMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		state  string
+		merged bool
+		want   string
+	}{
+		{"open", "open", false, MRStateOpened},
+		{"merged", "closed", true, MRStateMerged}, // merged wins over closed
+		{"closed-not-merged", "closed", false, MRStateClosed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMockForgejo(t, map[string]http.HandlerFunc{
+				"/repos/acme/widgets/pulls/13": func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet {
+						t.Errorf("expected GET, got %s", r.Method)
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"id": 5005, "number": 13, "state": tc.state, "merged": tc.merged,
+						"html_url": "https://fj/acme/widgets/pulls/13",
+					})
+				},
+			})
+			d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+			mr, err := d.GetMergeRequest(context.Background(), 7, 13)
+			if err != nil {
+				t.Fatalf("GetMergeRequest: %v", err)
+			}
+			if mr.IID != 13 || mr.State != tc.want {
+				t.Fatalf("unexpected MR: got %+v, want state %q", mr, tc.want)
+			}
+			if mr.WebURL != "https://fj/acme/widgets/pulls/13" {
+				t.Fatalf("unexpected MR web url: %q", mr.WebURL)
+			}
+		})
+	}
+}
+
+// TestForgejoListIssueLabelEventsMapping is test #5 and the R6 convention pin:
+// a label event records body=="1" for add, body=="" for remove (verified live on
+// 16.0.0). Forgejo serializes the event's label as a SINGLE object, which is why
+// the driver hand-parses rather than using the SDK's []*Label-typed timeline. A
+// non-label timeline entry (a plain comment) must be filtered out, and order is
+// oldest-first, matching the GitLab driver.
+func TestForgejoListIssueLabelEventsMapping(t *testing.T) {
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues/11/timeline": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			if r.Header.Get("Authorization") != "token forgejo-abcdefabcdef" {
+				t.Errorf("hand-rolled GET must carry the token: %q", r.Header.Get("Authorization"))
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				// A plain comment: must be filtered out (not a label event).
+				{"id": 500, "type": "comment", "body": "just a note",
+					"user": map[string]any{"login": "dave"}, "created_at": "2026-07-04T08:00:00Z"},
+				// label add: body "1", single-object label.
+				{"id": 501, "type": "label", "body": "1", "created_at": "2026-07-04T09:00:00Z",
+					"user":  map[string]any{"id": 42, "login": "carol"},
+					"label": map[string]any{"id": 9, "name": "autopilot", "color": "00aabb"}},
+				// label remove: body "".
+				{"id": 502, "type": "label", "body": "", "created_at": "2026-07-04T10:00:00Z",
+					"user":  map[string]any{"id": 42, "login": "carol"},
+					"label": map[string]any{"id": 9, "name": "autopilot", "color": "00aabb"}},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	events, err := d.ListIssueLabelEvents(context.Background(), 7, 11)
+	if err != nil {
+		t.Fatalf("ListIssueLabelEvents: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 label events (the comment filtered out), got %d: %+v", len(events), events)
+	}
+	add := events[0]
+	if add.ID != 501 || add.Action != "add" || add.LabelName != "autopilot" || add.Username != "carol" {
+		t.Fatalf("unexpected add event: %+v", add)
+	}
+	if add.CreatedAt.IsZero() {
+		t.Error("expected a non-zero CreatedAt on the add event")
+	}
+	if events[1].Action != "remove" {
+		t.Errorf("expected the second event to be a remove (body \"\"), got %q", events[1].Action)
+	}
+}
+
+// TestForgejoLabelActionConvention pins the R6 body convention in isolation, so a
+// future SDK/Forgejo change to it fails loudly rather than silently attributing
+// every event as a remove.
+func TestForgejoLabelActionConvention(t *testing.T) {
+	if forgejoLabelAction("1") != "add" {
+		t.Errorf(`body "1" must map to add`)
+	}
+	if forgejoLabelAction("") != "remove" {
+		t.Errorf(`body "" must map to remove`)
+	}
+	// Any other body is a remove (only "1" means add), a conservative default.
+	if forgejoLabelAction("0") != "remove" {
+		t.Errorf(`only body "1" is an add; anything else is a remove`)
+	}
+}
+
+func TestForgejoCreateIssueNoteSendsBody(t *testing.T) {
+	var gotBody string
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues/11/comments": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotBody = body.Body
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001, "body": body.Body})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	note, err := d.CreateIssueNote(context.Background(), 7, 11, "autopilot could not resolve a user")
+	if err != nil {
+		t.Fatalf("CreateIssueNote: %v", err)
+	}
+	if note.ID != 9001 {
+		t.Fatalf("expected created note id 9001, got %d", note.ID)
+	}
+	if gotBody != "autopilot could not resolve a user" {
+		t.Fatalf("wrong note body sent: %q", gotBody)
+	}
+}
+
+// TestForgejoTokenInfoParsesScopes covers the hand-rolled introspection (D5): the
+// driver identifies the bot (GET /user), then GETs its token list and picks the
+// entry whose token_last_eight matches the PAT it authenticates with. Forgejo
+// reports no active flag and no expiry, so Active is true and ExpiresAt is zero;
+// scopes come back reordered (verified live) but are returned verbatim for the
+// checker to compare as a set.
+func TestForgejoTokenInfoParsesScopes(t *testing.T) {
+	const token = "forgejo-pat-aaaa-bbbb-11112222"
+	last8 := token[len(token)-8:]
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/user": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "uzi-bot", "is_admin": false})
+		},
+		"/users/uzi-bot/tokens": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("expected GET, got %s", r.Method)
+			}
+			if r.Header.Get("Authorization") != "token "+token {
+				t.Errorf("hand-rolled GET must carry the token: %q", r.Header.Get("Authorization"))
+			}
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				// A different token the bot also owns: must be skipped.
+				{"id": 1, "name": "other", "token_last_eight": "99998888", "scopes": []string{"read:user"}},
+				// The authenticating token (matching last-eight), scopes reordered.
+				{"id": 2, "name": "uzi", "token_last_eight": last8,
+					"scopes": []string{"write:issue", "write:repository", "read:user"}},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, token)
+
+	info, err := d.TokenInfo(context.Background())
+	if err != nil {
+		t.Fatalf("TokenInfo: %v", err)
+	}
+	if !info.Active {
+		t.Error("a listed, matching, authenticating token must be Active")
+	}
+	if !info.ExpiresAt.IsZero() {
+		t.Error("Forgejo PATs report no expiry; ExpiresAt must be zero")
+	}
+	want := map[string]bool{"write:issue": true, "write:repository": true, "read:user": true}
+	if len(info.Scopes) != len(want) {
+		t.Fatalf("expected the matching token's 3 scopes, got %v", info.Scopes)
+	}
+	for _, s := range info.Scopes {
+		if !want[s] {
+			t.Fatalf("unexpected scope %q in %v", s, info.Scopes)
+		}
+	}
+}
+
+// TestForgejoTokenInfoAmbiguousCollisionFailsSafe covers the fail-SAFE path: if
+// two of the bot's own tokens share token_last_eight (the only fingerprint the API
+// exposes), the driver cannot tell which one authenticated and must NOT pick the
+// first — an over-scoped authenticating token could otherwise be masked by a
+// correctly-scoped sibling, sliding it past D6b's blocking scope check. It returns
+// an error, which the checker downgrades to a warning (honest yellow, not false
+// green). Mutation check: revert TokenInfo to pick-first and this test reddens.
+func TestForgejoTokenInfoAmbiguousCollisionFailsSafe(t *testing.T) {
+	const token = "forgejo-pat-aaaa-bbbb-11112222"
+	last8 := token[len(token)-8:]
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/user": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "uzi-bot", "is_admin": false})
+		},
+		"/users/uzi-bot/tokens": func(w http.ResponseWriter, _ *http.Request) {
+			// Two tokens collide on the last eight: one over-scoped ("all"), one clean.
+			// Picking either would be a guess; the driver must refuse.
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1, "name": "godmode", "token_last_eight": last8, "scopes": []string{"all"}},
+				{"id": 2, "name": "clean", "token_last_eight": last8,
+					"scopes": []string{"write:issue", "write:repository", "read:user"}},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, token)
+
+	info, err := d.TokenInfo(context.Background())
+	if err == nil {
+		t.Fatalf("a last-eight collision must fail safe (error), not pick a match; got %+v", info)
+	}
+	// The error must not leak the token and must be generic enough for the checker to
+	// downgrade to a warning (it is not the introspection-unsupported sentinel).
+	if strings.Contains(err.Error(), token) {
+		t.Errorf("collision error leaked the PAT: %q", err.Error())
+	}
+}
+
+// TestForgejoM4ErrorsAreRedacted is test #12 for the M4 methods, including the two
+// HAND-ROLLED paths (timeline, token introspection) that bypass the SDK — the lead
+// called these out specifically. Each endpoint echoes the token in a 500 body; no
+// method may surface it.
+func TestForgejoM4ErrorsAreRedacted(t *testing.T) {
+	const token = "forgejo-m4-redaction-probe-0123456789"
+	leak := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": "boom " + token})
+	}
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/user": func(w http.ResponseWriter, _ *http.Request) { // TokenInfo gets past bot identification
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "uzi-bot", "is_admin": false})
+		},
+		"/repos/acme/widgets/pulls/13":            leak, // GetMergeRequest (SDK)
+		"/repos/acme/widgets/issues/11/comments":  leak, // CreateIssueNote (SDK)
+		"/repos/acme/widgets/issues/11/timeline":  leak, // ListIssueLabelEvents (hand-rolled)
+		"/users/uzi-bot/tokens":                   leak, // TokenInfo (hand-rolled)
+	})
+	d := newForgejoDriver(t, m, token)
+	ctx := context.Background()
+
+	type check struct {
+		name string
+		err  error
+	}
+	_, e1 := d.GetMergeRequest(ctx, 7, 13)
+	_, e2 := d.CreateIssueNote(ctx, 7, 11, "x")
+	_, e3 := d.ListIssueLabelEvents(ctx, 7, 11)
+	_, e4 := d.TokenInfo(ctx)
+
+	for _, c := range []check{
+		{"GetMergeRequest", e1}, {"CreateIssueNote", e2},
+		{"ListIssueLabelEvents(hand-rolled)", e3}, {"TokenInfo(hand-rolled)", e4},
+	} {
+		if c.err == nil {
+			t.Errorf("%s: expected an error", c.name)
+			continue
+		}
+		if strings.Contains(c.err.Error(), token) {
+			t.Errorf("%s leaked the PAT: %q", c.name, c.err.Error())
+		}
+	}
+}
