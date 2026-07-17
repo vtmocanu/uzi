@@ -73,16 +73,43 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   response carries the user's DECRYPTED forge PAT and Anthropic token — so once
   api.tls.enabled is on, that is the TLS listener and nothing else.
 
-  Selected rather than hardcoded so the NetworkPolicies are correct BOTH before and
-  after M4's TLS rollout: 8080 while TLS is off (the same plain port the existing api
-  policy admits web on), api.tls.port once it is on. M4 deliberately made the two
-  listeners separate ports precisely so a policy could admit the worker namespace to
-  one and not the other.
+  IT REFUSES TO RENDER 8080 FOR HOSTED WORKERS, and that is the whole point of the
+  guard below. This helper is only ever reached when workers.enabled, and the two
+  flags have no coupling: they are separate values blocks, and M6's job is to flip
+  workers.enabled on a cluster where api.tls.enabled defaults false. That
+  combination WORKS PERFECTLY AND IS SILENTLY INSECURE — no error, no failed probe,
+  nothing to notice — because port 8080 serves the FULL router with NO stripXFF
+  (cmd/server/main.go puts both layers on the TLS listener only). A worker admitted
+  there gets back /api/auth/* and /api/admin/*, and its pod IP sits inside the
+  cluster's TRUSTED_PROXIES (the pod CIDR), so it can forge X-Forwarded-For and
+  defeat the login rate limit — the exact bypass measured at 12x401/zero-429s. It
+  also contradicts Decision 5(a) verbatim ("to the TLS port only") and puts the
+  decrypted PAT on the pod network in the clear, which is Decision 4's whole reason
+  for existing.
+
+  Prose in values.yaml cannot hold this: "turn it on together with hosting" is
+  guidance, and guidance is true by bookkeeping rather than by construction — the
+  same failure mode this PRD already rejected twice (narrowing TRUSTED_PROXIES, and
+  the CIDR-vs-FQDN allowlist). So it is a template error instead.
+
+  There is NO legitimate k8s configuration that wants plaintext here: a cluster
+  without cert-manager still sets api.tls.enabled: true and supplies a pre-created
+  api.tls.secretName. "TLS off + hosted workers on" is only ever a mistake — except
+  on KinD, which has no cert-manager at all and is a TEST target, never a deploy
+  one. That deviation gets an explicit opt-in (workers.allowPlaintextAPI) rather
+  than a silent default, so it is visible in the values file that chose it.
+
+  (The previous version of this comment justified the 8080 fallback as keeping the
+  policies correct "BOTH before and after M4's TLS rollout". That transition no
+  longer exists — M4 landed before M3 — so the fallback was accommodating a state
+  that cannot occur.)
 */ -}}
 {{- define "uzi.workerAPIPort" -}}
 {{- if .Values.api.tls.enabled -}}
 {{- .Values.api.tls.port -}}
-{{- else -}}
+{{- else if .Values.workers.allowPlaintextAPI -}}
 8080
+{{- else -}}
+{{- fail "workers.enabled is true but api.tls.enabled is false: hosted workers would be admitted to the api's PLAINTEXT port 8080, which serves the full router (including /api/auth/* and /api/admin/*) and does NOT strip X-Forwarded-For. A worker pod's IP is inside TRUSTED_PROXIES, so it could forge its rate-limit key and defeat the login brute-force control, and its claim traffic — carrying the user's decrypted forge PAT and Anthropic token — would cross the pod network in the clear. Set api.tls.enabled: true (with api.tls.secretName if you have no cert-manager). If you genuinely intend plaintext — a throwaway test cluster, never a deployment — set workers.allowPlaintextAPI: true to say so out loud." -}}
 {{- end -}}
 {{- end -}}

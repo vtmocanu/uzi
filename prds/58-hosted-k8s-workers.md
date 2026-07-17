@@ -60,9 +60,25 @@ Non-goals (v1):
    both violate the recorded spec constraint and turn any api compromise into
    namespace-wide secret exfiltration. The controller model closes this
    structurally; the empty namespace bounds what even a compromised controller
-   reaches. Verbs pinned minimal: Deployments create/get/**list**/patch/delete;
+   reaches. Verbs pinned minimal: Deployments create/**list**/patch/delete;
    Secrets **create/delete only** (it writes them, never needs to read them
-   back); PVCs create/**list**/delete; Pods get/list (drift detection only).
+   back); PVCs create/**list**/delete. **No pod access at all.**
+   - **CORRECTED 2026-07-17 (M3, auditor + reviewer): this list granted two verbs no
+     code uses, and its pods parenthetical was factually wrong.** It said
+     "Deployments create/**get**/list/patch/delete" and "Pods get/list (**drift
+     detection only**)". Drift detection does not touch pods — it reads the
+     DEPLOYMENT's pod-template annotations (`uzi.dev/spec-hash`,
+     `uzi.dev/hosted-generation`) — and an enumeration of every kube call in
+     `controller/` (non-test) finds **nine**: Deployments List/Create/Patch/Delete,
+     Secrets Create/Delete, PVCs List/Create/Delete. **Nothing calls pods, and nothing
+     Gets a Deployment** (Observe reads the whole fleet with List, which orphan
+     detection needs anyway, and reconcile decides create-vs-patch from that
+     observation). Both are dropped: *"Verbs pinned minimal"* is this Decision's own
+     wording, and a verb granted for a call that does not exist is what it forbids.
+     Disclosure today was near-zero either way — worker pods carry no secret material
+     in env, and `pods/exec`/`pods/log` were correctly never granted — so this is the
+     principle holding, not an impact. Decision 9's v2 hook says what to add back, and
+     when.
    - **The Secrets line is load-bearing and stays verbatim** (validated
      2026-07-16 by the M1 review wave, where two of three validators
      independently found M1's first protocol violating it). k8s has no
@@ -477,8 +493,11 @@ Non-goals (v1):
      and the recovery is delete + reprovision. v2 hook worth recording rather than
      building: a pod wedged in `ContainerCreating`/FailedMount is a precisely
      diagnosable "the Secret is missing" state and is the only handle anyone has
-     on this, via `Pods get/list` (already granted). It belongs with the v2
-     pod-phase status work, not v1.
+     on this, via `Pods get/list` — which is **NOT granted** (corrected 2026-07-17:
+     this said "already granted", and M3 dropped it as an unused verb; see Decision
+     1). Building the hook means adding `pods: get, list` to the controller Role in
+     the same change, which loses nothing: least privilege means granting at need. It
+     belongs with the v2 pod-phase status work, not v1.
 10. **Status = heartbeat, unchanged.** Online/offline/busy stay
     heartbeat-driven; hosted rows are visually marked as hosted. Pod-phase
     diagnostics in the UI are v2; v1 docs point admins at
@@ -1305,3 +1324,59 @@ Non-goals (v1):
     The measurement above was taken on the plain listener for exactly that reason. M4
     did not introduce the weakness — it added a document that denied it. The lead is
     raising the compose half separately.
+- 2026-07-17: **The chart re-opened the XFF hole the Go code had just closed, and the
+  fix is a template `fail`** (reviewer BLOCKING + auditor HIGH, independently; both
+  reproduced before implementing). `uzi.workerAPIPort` fell back to **8080** when
+  `api.tls.enabled` was false, and the api-ingress rules admitted the controller AND
+  the worker namespace on it. Port 8080 serves the **full router with no stripXFF**
+  (both layers are on the TLS listener), so that one values combination handed a
+  hosted worker back `/api/auth/*` and `/api/admin/*` **and** a forgeable rate-limit
+  key — the exact bypass measured at 12×401/zero-429s — while putting the decrypted
+  PAT on the pod network in the clear. It also contradicted Decision 5(a) verbatim
+  ("to the TLS port only").
+  - *Why it mattered more than its exploitability.* `workers.enabled: false` on
+    dev-cluster today, **and M6's job is to flip exactly that**. The flags are separate
+    values blocks with no coupling but one prose line — inside the `api.tls` block,
+    which an operator turning on `workers.*` has no reason to read. Flip one without
+    the other and it **works perfectly and is silently insecure**: no error, no failed
+    probe, nothing to notice. This is the same *"true by bookkeeping, not by
+    construction"* failure this PRD already rejected twice (narrowing
+    `TRUSTED_PROXIES`; the CIDR-vs-FQDN allowlist). Third occurrence, same shape.
+  - *The fix*: `fail` when `workers.enabled && !api.tls.enabled`, with an explicit
+    `workers.allowPlaintextAPI` opt-in that `kind-smoke.yaml` sets. A blanket `fail`
+    was NOT available — KinD is a **real consumer** of the 8080 fallback (its worker
+    EGRESS rule renders it; it survives only because its api NetworkPolicy is off, so
+    no ingress rule renders at all). The opt-in makes the test cluster's deviation
+    **visible and deliberate** instead of an inherited default. There is no legitimate
+    k8s config that wants plaintext: a cluster without cert-manager still sets
+    `api.tls.enabled: true` with a pre-created `secretName`.
+  - *Verified across every path*: the bug now fails at template time; the production
+    shape renders on 8443; kind-smoke renders via the opt-in; hosting-off is
+    unaffected; and `dev-cluster + workers.enabled=true` — **M6's exact future
+    mistake** — is caught.
+  - *The helper's old comment justified the fallback as keeping policies correct "BOTH
+    before and after M4's TLS rollout".* **M4 landed before M3**, so it was
+    accommodating a transition that cannot occur. Removed with the fallback.
+- 2026-07-17: **Two of this milestone's own claims were falsified by its own commits,
+  and both are corrected rather than argued** (auditor).
+  - *The worker namespace is NOT empty.* `worker-namespace.yaml` argued "no CNPG, no
+    Infisical-materialized app secrets, no privileged ServiceAccounts. That emptiness
+    IS the control" — and the same commit added `worker-pull-secret.yaml`, which
+    materializes the Harbor robot into it. By that file's own argument (a Role that can
+    create pods there can mount any Secret there), a compromised controller could
+    exfiltrate the robot. The constraint is real and unavoidable — a ServiceAccount's
+    `imagePullSecrets` cannot cross namespaces — so **the fix is honesty, not
+    architecture**: the comment now states the exact inventory and the accepted
+    residual, and keeps the reasoning about why smallness matters. Bounded by the robot
+    being pull-scoped (**M6 confirms no push rights before rollout** — a pushing robot
+    would let a compromised controller poison the fleet's images) and by the workers
+    themselves never mounting it (the kubelet consumes it, not the pod).
+  - *The seed's sentinel could lie, and it was the one silent failure left in it.*
+    `nixSeedScript` ran `producer | consumer` under `set -eu` with **no pipefail**, so
+    only the extracting tar gated the sentinel write: a producer that failed while
+    still emitting a well-formed short archive would write "seeded" over a **partial
+    store**, and every later boot would skip seeding forever. Measured in the real
+    image rather than reasoned — a failing producer piped to a succeeding consumer
+    **exits 0** — and `/bin/sh` there (busybox ash) was verified to both accept
+    `pipefail` and propagate it. Unlike the two CrashLoops M3 already fixed, this one
+    would have been silent.

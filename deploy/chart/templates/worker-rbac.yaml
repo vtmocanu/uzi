@@ -38,7 +38,15 @@ rules:
     # orphan means ENUMERATING objects whose names you do not expect, which get-by-name
     # cannot do. It leaks nothing — a Deployment REFERENCES its Secret by name, it does
     # not embed it. That asymmetry is the whole point of the next rule.
-    verbs: ["create", "get", "list", "patch", "delete"]
+    #
+    # `get` is deliberately ABSENT even though Decision 1's original list named it:
+    # nothing calls it. Observe reads the whole fleet with List (one call, and orphan
+    # detection needs it anyway), and reconcile decides create-vs-patch from that
+    # observation, so a get-by-name would be a second round trip for state already in
+    # hand. Decision 1's own words are "Verbs pinned minimal", and a verb granted for
+    # a call that does not exist is what that forbids. Add it back the day something
+    # calls it.
+    verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["secrets"]
     # ================= DO NOT ADD `get` OR `list` HERE. EVER. =================
@@ -70,12 +78,19 @@ rules:
     # is otherwise invisible entirely (Pods get/list does not cover it: an orphan
     # Deployment scaled to zero has no pods).
     verbs: ["create", "list", "delete"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    # Drift and diagnostics only. Recorded v2 hook: a pod wedged in
-    # ContainerCreating/FailedMount is the only handle anyone has on "the token Secret
-    # is missing", which is undetectable by design (see the Secrets rule).
-    verbs: ["get", "list"]
+  # PODS ARE DELIBERATELY NOT GRANTED AT ALL, and Decision 1's original list said
+  # "Pods get/list (drift detection only)". That parenthetical was wrong: drift
+  # detection reads the DEPLOYMENT's pod-template annotations (uzi.dev/spec-hash and
+  # uzi.dev/hosted-generation), never a pod — and an enumeration of every kube call in
+  # controller/ finds no pod call at all. Granting a verb for a feature that does not
+  # exist is exactly what "Verbs pinned minimal" forbids.
+  #
+  # The real recorded use is Decision 9's V2 hook: a pod wedged in
+  # ContainerCreating/FailedMount is the only handle anyone has on "the token Secret is
+  # missing", which is undetectable by design (see the Secrets rule). Decision 9 places
+  # that with the v2 pod-phase status work, "not v1" — so it gets `pods: get, list`
+  # when it is built, and loses nothing by being granted then. Least privilege means
+  # granting at need.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -73,6 +73,20 @@ web:
 # so /nix at 4Gi is unenforced here.
 workers:
   enabled: true
+  # KinD has no cert-manager, so this is the one place plaintext is intended. The
+  # chart REFUSES to admit hosted workers to the api's plaintext port without this
+  # flag (uzi.workerAPIPort) — the combination is silently insecure on a real
+  # cluster, so it must be said out loud rather than inherited.
+  #
+  # It is safe HERE and nowhere else: this is a TEST target, never a deploy target,
+  # and its api NetworkPolicy is off anyway (below), so no api ingress rule renders
+  # at all. The worker EGRESS rule is the real consumer of the 8080 value.
+  #
+  # THE COST, recorded rather than hidden: with TLS off, this run does NOT exercise
+  # the TLS listener, the subset router, stripXFF, or the CA relay — the four things
+  # most likely to break on a real cluster. M6's rollout is where they are first
+  # proven together.
+  allowPlaintextAPI: true
   namespace: uzi-workers
   # No Harbor in KinD: the agent image is kind-loaded and needs no pull secret.
   imagePullSecretName: ""

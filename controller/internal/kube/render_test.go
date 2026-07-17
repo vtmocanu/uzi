@@ -559,6 +559,32 @@ func TestSeedScriptNeverRestoresMetadataOntoTheMountRoot(t *testing.T) {
 	}
 }
 
+// THE SENTINEL MUST NEVER LIE, and this is the only failure in the whole seed that
+// would be SILENT rather than a CrashLoop.
+//
+// The pipeline is producer|consumer, and without pipefail only the CONSUMER's status
+// gates the sentinel write. A producer that dies while still emitting a well-formed
+// short archive therefore writes "seeded" over a PARTIAL store — and every later boot
+// skips seeding forever, on a store missing paths. Verified in the real image: a
+// failing producer piped to a succeeding consumer exits 0.
+func TestSeedScriptNeverWritesTheSentinelOnAProducerFailure(t *testing.T) {
+	if !strings.Contains(nixSeedScript("/nix", "/nix-seed"), "set -o pipefail") {
+		t.Fatal("the seed pipeline must set pipefail: without it a producer failure that still yields a " +
+			"well-formed short archive writes the 'seeded' sentinel over a partial store, and every later " +
+			"boot skips seeding forever")
+	}
+
+	// Behavioural half: a source that cannot be read must NOT leave a sentinel behind.
+	dst := t.TempDir()
+	out, err := runSeed(t, filepath.Join(t.TempDir(), "does-not-exist"), dst)
+	if err == nil {
+		t.Fatalf("seeding from a missing source must fail loudly, got success:\n%s", out)
+	}
+	if _, statErr := os.Stat(filepath.Join(dst, nixSentinel)); statErr == nil {
+		t.Fatal("a failed seed wrote the sentinel — every later boot would skip seeding a store that was never copied")
+	}
+}
+
 // tar, never cp. Nix store paths are 0555 read-only dirs, and `cp` in this image is
 // BUSYBOX (the image installs no coreutils), so its -a behaviour on read-only dirs
 // and hardlinks is exactly what must not be assumed.

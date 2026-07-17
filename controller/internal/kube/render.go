@@ -308,8 +308,19 @@ func renderPVC(cfg RenderConfig, id, name string, size resource.Quantity) *corev
 //     cache, so starting clean is correct and cheap. `-mindepth 1` is what makes it
 //     work at all: busybox `chmod -R` ABORTS on the un-chmodable root and never
 //     reaches the children.
+//
+// `set -o pipefail` IS THE SENTINEL'S HONESTY, not shell hygiene. Without it only
+// the EXTRACTING tar's status gates the write, so a producer that fails while still
+// emitting a well-formed short archive writes "seeded" over a partial store — and
+// every later boot then SKIPS seeding, forever, on a store missing paths. Measured
+// in this image rather than reasoned: a failing producer piped to a succeeding
+// consumer exits 0 today. That is the one failure mode this design must never have,
+// because unlike the two CrashLoops above it is SILENT. Verified that /bin/sh here
+// (busybox ash) both accepts pipefail and propagates it; a shell that lacked it
+// would abort under `set -e`, which fails loudly and in the safe direction.
 func nixSeedScript(src, dst string) string {
 	return fmt.Sprintf(`set -eu
+set -o pipefail
 if [ -f %[2]s/%[3]s ]; then
   echo "uzi-seed-nix: store already seeded; nothing to do"
   exit 0

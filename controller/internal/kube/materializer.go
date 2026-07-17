@@ -284,6 +284,19 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 // patchFor builds the merge patch that re-renders a drifted Deployment's pod
 // template. The selector is deliberately absent: it is immutable, and sending it
 // would be a rejected request at best.
+//
+// KNOWN LIMIT of using a JSON MERGE patch, recorded so nobody assumes more than it
+// gives: drift correction is convergent for the CONTAINERS (lists are replaced
+// wholesale, so a hand-edited image or env is overwritten) but NOT for pod-level
+// booleans. Go's `omitempty` drops zero-valued fields from the marshalled template,
+// and a merge patch treats an absent key as "leave it alone" — so a hand-set
+// `hostNetwork: true` would survive a roll rather than be reset to false.
+//
+// Not exploitable, and that is why it is a comment and not a fix: PodSecurity
+// `restricted` rejects hostNetwork/hostPID/hostIPC at admission, and only a cluster
+// admin can edit objects in the worker namespace (the workers' own SA has zero RBAC
+// and no mounted token). A strategic-merge or apply-based patch would close it if
+// this ever needs to be true in general.
 func patchFor(dep *appsv1.Deployment) ([]byte, error) {
 	patch := map[string]any{
 		"spec": map[string]any{

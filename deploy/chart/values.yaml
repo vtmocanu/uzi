@@ -218,7 +218,21 @@ api:
 # SHIPS DISABLED. Compose deployments are zero-diff by construction (they render no
 # chart), and a cluster that has not opted in gets no extra namespace.
 workers:
+  # TURNING THIS ON REQUIRES api.tls.enabled: true. Not a convention — the chart
+  # REFUSES TO RENDER otherwise (uzi.workerAPIPort), because the two flags live in
+  # separate blocks and nothing else couples them. With TLS off, hosted workers get
+  # admitted to the api's plaintext 8080, which serves the FULL router and does not
+  # strip X-Forwarded-For: /api/auth/* comes back into a worker's reach, and a worker
+  # pod's IP is inside TRUSTED_PROXIES so it can forge its own rate-limit key. That
+  # combination works perfectly and is silently insecure, which is exactly why it is
+  # a template error rather than a line of advice.
   enabled: false
+  # The escape hatch for the ONE case that legitimately has no TLS: a throwaway test
+  # cluster with no cert-manager (deploy/values/kind-smoke.yaml). NEVER set this on a
+  # real deployment — a cluster without cert-manager still sets api.tls.enabled: true
+  # and supplies a pre-created api.tls.secretName. It exists so that deviation is
+  # VISIBLE in the values file that chose it, instead of being an inherited default.
+  allowPlaintextAPI: false
   # The DEDICATED namespace, which must contain NOTHING but hosted workers. A Role
   # that can create pods in a namespace can mount any Secret and impersonate any
   # ServiceAccount in it — RBAC cannot scope `create` by label — so this namespace's
