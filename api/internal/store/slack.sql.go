@@ -97,9 +97,9 @@ func (q *Queries) GetSlackDeliveryForUser(ctx context.Context, id uuid.UUID) (pg
 
 const getSlackRunContext = `-- name: GetSlackRunContext :one
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
-       r.mr_iid, r.branch, r.failure_reason, r.kind,
+       r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.kind,
        r.health,
-       rp.path_with_namespace, rp.web_url,
+       rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
             FROM jsonb_array_elements(COALESCE(r.repo_agents, '[]'::jsonb)) WITH ORDINALITY AS names(elem, ord)
@@ -108,6 +108,7 @@ SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        )::text[] AS repo_agent_names
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the MR/PR noun (PRD #65 D2); repo-ful runs only, same rows the repos join already keeps
 WHERE r.id = $1
 `
 
@@ -118,12 +119,14 @@ type GetSlackRunContextRow struct {
 	IssueIid          pgtype.Int8 `json:"issue_iid"`
 	IssueTitle        string      `json:"issue_title"`
 	MrIid             pgtype.Int8 `json:"mr_iid"`
+	MrWebUrl          pgtype.Text `json:"mr_web_url"`
 	Branch            pgtype.Text `json:"branch"`
 	FailureReason     pgtype.Text `json:"failure_reason"`
 	Kind              string      `json:"kind"`
 	Health            string      `json:"health"`
 	PathWithNamespace string      `json:"path_with_namespace"`
 	WebUrl            string      `json:"web_url"`
+	ForgeType         string      `json:"forge_type"`
 	RepoAgentNames    []string    `json:"repo_agent_names"`
 }
 
@@ -149,12 +152,14 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 		&i.IssueIid,
 		&i.IssueTitle,
 		&i.MrIid,
+		&i.MrWebUrl,
 		&i.Branch,
 		&i.FailureReason,
 		&i.Kind,
 		&i.Health,
 		&i.PathWithNamespace,
 		&i.WebUrl,
+		&i.ForgeType,
 		&i.RepoAgentNames,
 	)
 	return i, err

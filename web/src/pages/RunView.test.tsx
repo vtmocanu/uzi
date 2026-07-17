@@ -29,6 +29,8 @@ function run(over: Partial<Run>): Run {
   return {
     id: "r1",
     repo_id: "repo1",
+    forge_type: "gitlab",
+    mr_web_url: null,
     kind: "issue",
     issue_iid: 87,
     issue_title: "Add rate limiting",

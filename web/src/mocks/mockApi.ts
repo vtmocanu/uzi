@@ -951,7 +951,7 @@ export const mockApi = {
         .map((r) => ({
           repo_id: r.id,
           path: r.path_with_namespace,
-          role: 30,
+          role: "write",
           member: true,
           violations: [],
           warnings: [],
@@ -1105,6 +1105,7 @@ export const mockApi = {
       state: "opened",
       labels: [appSettings.prd_label],
       web_url: `${b.web_url}/-/issues/${iid}`,
+      forge_type: "gitlab",
       author: requireSession().display_name?.toLowerCase() ?? "you",
       has_prd_link: /prds\/[\w.-]+\.md/.test(description),
       column: "",
@@ -1207,6 +1208,8 @@ export const mockApi = {
     const run: Run = {
       id: nextRunId(),
       repo_id: repoId,
+      forge_type: "gitlab",
+      mr_web_url: null,
       kind: "issue",
       issue_iid: issueIid,
       issue_title: card.title,
@@ -1254,6 +1257,8 @@ export const mockApi = {
     const run: Run = {
       id: nextRunId(),
       repo_id: repoId,
+      forge_type: "gitlab",
+      mr_web_url: null,
       kind: "ci_fix",
       issue_iid: null,
       issue_title: `Fix CI: ${ref} pipeline`,
@@ -1404,6 +1409,8 @@ export const mockApi = {
     const run: Run = {
       id: nextRunId(),
       repo_id: null,
+      forge_type: "",
+      mr_web_url: null,
       kind: "chat",
       issue_iid: null,
       issue_title: truncateChatTitle(message),

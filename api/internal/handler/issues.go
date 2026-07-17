@@ -96,7 +96,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		// next sync will pick it up, so report success with the forge facts.
 		slog.Warn("cache new issue after create", "repo", repo.PathWithNamespace, "error", err)
 		httpx.JSON(w, http.StatusCreated, map[string]any{
-			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: created.Labels, WebURL: created.WebURL, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
+			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: created.Labels, WebURL: created.WebURL, ForgeType: repo.ForgeType, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
 		})
 		return
 	}
@@ -111,7 +111,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position, repo.ForgeType)})
 }
 
 // issueDetailDTO is the in-app issue view payload (PRD #12 §3): the board card

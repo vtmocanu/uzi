@@ -1,6 +1,7 @@
 import { cx } from "./ui";
 import { CheckIcon } from "./icons";
 import { type MrChipState, mrChipSuffix, mrChipTitle } from "../lib/runBadge";
+import { mrRefSymbol } from "../lib/forgeNoun";
 
 type MrChipVariant = "pill" | "inline";
 // openTone is the colour of the OPEN state only: the issue-history link keeps brand,
@@ -8,22 +9,26 @@ type MrChipVariant = "pill" | "inline";
 // muted, regardless of openTone.
 type OpenTone = "ok" | "brand";
 
-// MrChip renders a run's merge-request chip from its derived MR-state (mrChipState),
-// single-sourcing the tone / suffix / title / strike / accessible-name logic across
-// every surface (PRD #33), so the four call sites can never drift again. Two layouts:
+// MrChip renders a run's merge/pull-request chip from its derived MR-state
+// (mrChipState), single-sourcing the tone / suffix / title / strike / accessible-name
+// logic across every surface (PRD #33), so the call sites can never drift again. The
+// reference sigil and hover-title noun are per-forge (forgeType, PRD #65 D2): "!42"
+// on GitLab, "#42" on Forgejo. Two layouts:
 //   "pill"   — the board card's bordered box (a check-marked "!N merged" etc.).
 //   "inline" — a text chip in a run's meta line (dashboard / runs list / issue history).
 // State tone: merged is ok-toned (green) EVERYWHERE; closed is muted (text-muted, the
 // AA-contrast token) with the number struck through; open keeps the surface's base
 // tone via openTone (brand for the issue-history link, ok elsewhere). The state word
 // ("merged"/"closed") is rendered INSIDE the link/pill, so a screen reader hears
-// "!42 merged", not a bare "!42". href makes the chip a link to the MR; a null href is
-// plain text (e.g. a dashboard row that already links to the run view). label is an
-// optional prefix ("MR ", "· MR ") the meta surfaces put before the number.
+// "!42 merged", not a bare "!42". href makes the chip a link to the request; a null
+// href is plain text (e.g. a dashboard row that already links to the run view). label
+// is an optional forge-aware prefix ("MR "/"PR ") the meta surfaces put before the
+// number.
 export function MrChip({
   mrIid,
   mrState,
   href,
+  forgeType,
   variant = "pill",
   label = "",
   openTone = "ok",
@@ -32,6 +37,9 @@ export function MrChip({
   mrIid: number;
   mrState: MrChipState;
   href: string | null;
+  // The run/card's forge, so the chip picks the reference sigil ("!42" on GitLab,
+  // "#42" on Forgejo) and the per-forge noun in its hover title (PRD #65 D2).
+  forgeType: string;
   variant?: MrChipVariant;
   label?: string;
   openTone?: OpenTone;
@@ -39,7 +47,7 @@ export function MrChip({
 }) {
   const closed = mrState === "closed";
   const merged = mrState === "merged";
-  const title = mrChipTitle(mrState);
+  const title = mrChipTitle(mrState, forgeType);
 
   // The accessible unit: prefix + number (struck when closed) + state word, all in one
   // element so the state is part of the link/chip's accessible name.
@@ -47,7 +55,10 @@ export function MrChip({
     <>
       {variant === "pill" && merged && <CheckIcon className="h-3 w-3" aria-hidden />}
       {label}
-      <span className={closed ? "line-through" : undefined}>!{mrIid}</span>
+      <span className={closed ? "line-through" : undefined}>
+        {mrRefSymbol(forgeType)}
+        {mrIid}
+      </span>
       {mrState !== "open" && <span>{mrChipSuffix(mrState)}</span>}
     </>
   );

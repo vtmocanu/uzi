@@ -23,6 +23,8 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
   return {
     id: "run-1",
     repo_id: "repo-1",
+    forge_type: "gitlab",
+    mr_web_url: null,
     kind: "issue",
     issue_iid: 7,
     issue_title: "A run",

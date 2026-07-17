@@ -14,6 +14,7 @@ import {
   api,
   ApiError,
   isHttpsUrl,
+  preferForgeUrl,
   type Board as BoardData,
   type Card as CardData,
   type RunListItem,
@@ -597,9 +598,16 @@ function IssueCard({
   // awaiting_approval is the loudest card state: a human is the blocker while a
   // worker is held busy. Give the whole card a warn ring so it can't be missed.
   const loud = isAwaitingApproval(run?.status ?? "");
+  // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
+  // (the only correct link on Forgejo), guarded through isHttpsUrl by preferForgeUrl
+  // before it becomes an anchor. A null (rows created before it landed — all GitLab)
+  // falls back to the legacy GitLab reconstruction from the project base.
   const mrHref =
-    badge?.kind === "mr" && isHttpsUrl(projectWebUrl)
-      ? `${projectWebUrl}/-/merge_requests/${badge.mrIid}`
+    badge?.kind === "mr"
+      ? preferForgeUrl(
+          run?.mr_web_url,
+          isHttpsUrl(projectWebUrl) ? `${projectWebUrl}/-/merge_requests/${badge.mrIid}` : null,
+        )
       : null;
   return (
     <div
@@ -643,7 +651,7 @@ function IssueCard({
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
         {badge &&
           (badge.kind === "mr" ? (
-            <MrChip mrIid={badge.mrIid} mrState={badge.mrState} href={mrHref} />
+            <MrChip mrIid={badge.mrIid} mrState={badge.mrState} href={mrHref} forgeType={card.forge_type} />
           ) : (
             <span className={badge.pulse ? "animate-pulse" : ""}>
               <Badge tone={badge.tone} title={badge.title}>

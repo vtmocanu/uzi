@@ -547,7 +547,7 @@ function SelfImproveSettingsCard() {
         <p className="mt-2 text-sm text-muted">
           When on, uzi periodically reviews its own codebase and the accumulated{" "}
           <code className="rounded bg-raised px-1 py-0.5 text-fg">improve_uzi</code> recommendations, then
-          autonomously opens (or extends) one merge request on the chosen repo &mdash; picking a single top
+          autonomously opens (or extends) one merge/pull request on the chosen repo &mdash; picking a single top
           improvement each cycle.
         </p>
         <p className="mt-2 text-sm text-warn">

@@ -61,6 +61,7 @@ function aCard(labels: string[]): Card {
     state: "opened",
     labels,
     web_url: "https://gitlab.example.com/grp/proj/-/issues/7",
+    forge_type: "gitlab",
     author: "alice",
     has_prd_link: false,
     column: "",

@@ -39,13 +39,18 @@ type columnDTO struct {
 }
 
 type cardDTO struct {
-	IID        int64    `json:"iid"`
-	Title      string   `json:"title"`
-	State      string   `json:"state"`
-	Labels     []string `json:"labels"`
-	WebURL     string   `json:"web_url"`
-	Author     *string  `json:"author"`
-	HasPRDLink bool     `json:"has_prd_link"`
+	IID    int64    `json:"iid"`
+	Title  string   `json:"title"`
+	State  string   `json:"state"`
+	Labels []string `json:"labels"`
+	WebURL string   `json:"web_url"`
+	// ForgeType is the card's forge ("gitlab"|"forgejo"), so the web picks the
+	// per-card MR/PR noun (PRD #65 D2). Every card on one board shares the repo's
+	// connection, but a cross-repo view (dashboard) mixes forges, so it rides the
+	// card. Threaded from the repo's connection, not a query change.
+	ForgeType  string  `json:"forge_type"`
+	Author     *string `json:"author"`
+	HasPRDLink bool    `json:"has_prd_link"`
 	// Column is the resolved column label; "" means the implicit Open column.
 	// Ignored when Closed is true.
 	Column string `json:"column"`
@@ -71,6 +76,13 @@ type latestRunDTO struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
 	MrIID  *int64 `json:"mr_iid"`
+	// MrWebURL is the forge-supplied merge/pull-request web URL persisted by the
+	// worker at MR creation (PRD #65 D8), null on rows created before it landed —
+	// the web renders it directly (through isHttpsUrl) and falls back to the legacy
+	// GitLab URL reconstruction only for those null rows. Stops uzi guessing a URL
+	// the forge already told it, and is the ONLY correct MR link on Forgejo (whose
+	// `/{owner}/{repo}/pulls/N` grammar the reconstruction never knew).
+	MrWebURL *string `json:"mr_web_url"`
 	// MrState is the PRD #24 watcher's last-observed merge-request state, null when
 	// never observed. Display-only (PRD #33 Decision 1): the board card's chip
 	// renders merged/closed distinctly and everything else as the plain open chip.
@@ -113,10 +125,11 @@ type latestRunDTO struct {
 // the email (PRD #33 Decision 5): a shared board must not leak another user's email
 // on a card, and the web already renders a no-owner badge for empty. The query no
 // longer even selects the email, so there is nothing to fall back to here.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrState, failureReason, stopKind pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:          runID.String(),
 		Status:      status,
+		MrWebURL:    textPtrValue(mrWebURL.Valid, mrWebURL.String),
 		MrState:     textPtrValue(mrState.Valid, mrState.String),
 		StopKind:    textPtrValue(stopKind.Valid, stopKind.String),
 		Health:      health,
@@ -341,8 +354,9 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	cardPipelines := h.cardPipelines(r, repo.ID)
 
 	// repo.UserID is the board viewer (the connection owner); IsMine gates the
-	// owner-only run-view link.
-	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID)
+	// owner-only run-view link. repo.ForgeType stamps every card's forge for the
+	// per-card MR/PR noun (all cards on one board share the repo's connection).
+	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType)
 
 	return boardDTO{
 		RepoID:   repo.ID.String(),
@@ -394,10 +408,10 @@ func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*pi
 // and the board viewer. It is the pure, DB-free core of the board payload: it
 // keys each issue's latest_run by issue_iid (issues with no run get null), and
 // resolves each card's column. viewerID drives IsMine.
-func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*pipelineDTO, position map[string]int, viewerID uuid.UUID) []cardDTO {
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*pipelineDTO, position map[string]int, viewerID uuid.UUID, forgeType string) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
-		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid,
+		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid, rr.MrWebUrl,
 			rr.MrState, rr.FailureReason, rr.StopKind, rr.Health, rr.HealthReason, rr.HealthSince,
 			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID)
 	}
@@ -415,6 +429,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			State:      is.State,
 			Labels:     labels,
 			WebURL:     is.WebUrl,
+			ForgeType:  forgeType,
 			HasPRDLink: is.HasPrdLink,
 			Column:     col,
 			Closed:     closed,
@@ -605,11 +620,11 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	card := issueToCard(updated, position)
+	card := issueToCard(updated, position, repo.ForgeType)
 	// Carry the issue's latest run on the single-card response too, so a drag never
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
-		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
+		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -704,11 +719,11 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	card := issueToCard(updated, position)
+	card := issueToCard(updated, position, repo.ForgeType)
 	// Carry the issue's latest run on the single-card response (like MoveIssue), so
 	// a toggle never blanks the run badge the board/issue view is showing.
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
-		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid,
+		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.Health, lr.HealthReason, lr.HealthSince,
 			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -717,8 +732,9 @@ func (h *Handler) SetIssuePrdless(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"card": card})
 }
 
-// issueToCard resolves a cached issue row into a card DTO.
-func issueToCard(is store.Issue, position map[string]int) cardDTO {
+// issueToCard resolves a cached issue row into a card DTO. forgeType stamps the
+// card's forge for the per-card MR/PR noun (PRD #65 D2), from the repo's connection.
+func issueToCard(is store.Issue, position map[string]int, forgeType string) cardDTO {
 	var labels []string
 	if err := json.Unmarshal(is.Labels, &labels); err != nil {
 		labels = []string{}
@@ -730,6 +746,7 @@ func issueToCard(is store.Issue, position map[string]int) cardDTO {
 		State:      is.State,
 		Labels:     labels,
 		WebURL:     is.WebUrl,
+		ForgeType:  forgeType,
 		HasPRDLink: is.HasPrdLink,
 		Column:     col,
 		Closed:     closed,
