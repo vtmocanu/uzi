@@ -339,13 +339,15 @@ func TestScopesPerForge(t *testing.T) {
 	}
 }
 
-// TestMergeFindingsAreWarningsNotViolations is the dark-landing proof for D6a-1.
-// A protected branch the bot may push nothing to but may still merge into is the
-// case D6a-1 exists to surface. In PRD #65 it must surface as a WARNING, not a
-// violation: a violation would flip a real GitLab connection from ok to
-// violations, the exact behaviour change that splitting enforcement into PRD #66
-// exists to keep out of #65. #66 is what turns these into blocking.
-func TestMergeFindingsAreWarningsNotViolations(t *testing.T) {
+// TestMergeFindingsAreViolations pins D6a-1's tier: a bot that can merge its own
+// PR into protected main breaks the primary directive exactly as one that can
+// push does, so the merge findings are Violations, the same tier as the push
+// sibling. This is non-blocking in #65 in the sense that matters — a per-repo
+// Violation never blocks a save (only token violations do) and nothing gates a
+// run on privilege_status — so the badge going ok->violations for the
+// merge-lowered GitLab population is the intended, user-confirmed behaviour, not
+// a refusal. #66 promotes these fields to run-refusals, not the badge tier.
+func TestMergeFindingsAreViolations(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
@@ -360,18 +362,19 @@ func TestMergeFindingsAreWarningsNotViolations(t *testing.T) {
 	}
 	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
 	rr := rep.Repos[0]
-	if len(rr.Violations) != 0 {
-		t.Fatalf("merge findings must not be violations in #65, got %v", rr.Violations)
+	if len(rr.Warnings) != 0 {
+		t.Fatalf("merge findings must be violations, not warnings, got warnings %v", rr.Warnings)
 	}
-	if !hasFinding(rr.Warnings, "the write role may merge into protected") {
-		t.Fatalf("want a write-role merge warning, got %v", rr.Warnings)
+	if !hasFinding(rr.Violations, "the write role may merge into protected") {
+		t.Fatalf("want a write-role merge violation, got %v", rr.Violations)
 	}
-	if !hasFinding(rr.Warnings, "the bot has a direct merge grant on protected") {
-		t.Fatalf("want a bot merge-grant warning, got %v", rr.Warnings)
+	if !hasFinding(rr.Violations, "the bot has a direct merge grant on protected") {
+		t.Fatalf("want a bot merge-grant violation, got %v", rr.Violations)
 	}
-	// The connection-level status is warnings, not violations: nothing blocks.
-	if rep.Status != StatusWarnings {
-		t.Fatalf("a merge-only finding must leave status at warnings, got %q", rep.Status)
+	// A merge finding drives the connection status to violations (the badge), but
+	// this blocks nothing: no save is rejected and no run is refused on it in #65.
+	if rep.Status != StatusViolations {
+		t.Fatalf("a merge finding must drive status to violations, got %q", rep.Status)
 	}
 }
 
@@ -386,10 +389,13 @@ func TestEvaluateRepoProtectedFirst(t *testing.T) {
 
 	// Unprotected, with the fields truthfully reporting the bot can push and merge
 	// (as both drivers now do). The strongest finding wins and nothing else fires.
+	// Push and merge findings are both Violations now, so a leaked per-field
+	// finding would show up as an EXTRA violation — the exact-count assertion
+	// below is what catches it, on whichever array it would land.
 	var unprot RepoReport
 	unprot.Violations, unprot.Warnings = []string{}, []string{}
 	evaluateRepo(&unprot, repo, forge.RoleWrite, true, nil, true,
-		forge.BranchProtection{Protected: false, WriteRoleCanPush: true, WriteRoleCanMerge: true}, nil)
+		forge.BranchProtection{Protected: false, WriteRoleCanPush: true, BotCanPush: true, WriteRoleCanMerge: true, BotCanMerge: true}, nil)
 	if !hasFinding(unprot.Violations, "is not protected") {
 		t.Fatalf("unprotected must yield the not-protected violation, got %v", unprot.Violations)
 	}
@@ -397,7 +403,7 @@ func TestEvaluateRepoProtectedFirst(t *testing.T) {
 		t.Fatalf("unprotected must short-circuit to the single strongest finding, got %v", unprot.Violations)
 	}
 	if len(unprot.Warnings) != 0 {
-		t.Fatalf("unprotected must not also emit per-field merge findings, got %v", unprot.Warnings)
+		t.Fatalf("unprotected must not emit any secondary finding, got %v", unprot.Warnings)
 	}
 
 	// A fully clean protected branch produces nothing — the negative control that

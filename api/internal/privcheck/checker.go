@@ -181,17 +181,23 @@ func evaluateRepo(rr *RepoReport, repo Repo, role forge.Role, member bool, roleE
 	if bp.BotCanPush {
 		rr.Violations = append(rr.Violations, fmt.Sprintf("the bot has a direct push grant on protected %q", repo.DefaultBranch))
 	}
-	// Merge findings are WARNINGS in PRD #65, not violations (D6a-1). #65 reports;
-	// PRD #66 flips them to blocking. This tier is what keeps #65 dark: a
-	// violation here would flip a GitLab connection whose main permits write-role
-	// merge from ok to violations — a new GitLab verdict, which is exactly the
-	// behaviour change that splitting enforcement into #66 exists to keep out of a
-	// Forgejo PRD.
+	// Merge findings are violations, the same tier as the push sibling above and
+	// for the same reason: a bot that can merge its own PR into protected main
+	// breaks the primary directive exactly as one that can push directly to it
+	// does (report.go reserves Violations for "branch problems that break the
+	// directive"). This is NOT a new GitLab behaviour — the push sibling is
+	// already a Violation that flips a GitLab badge under PRD #5, so surfacing a
+	// merge one is the same existing tier, not a change #66 was split out to
+	// avoid. What #66 defers is the REFUSAL, not the surfacing: a per-repo
+	// Violation never blocks a save (only token violations do, report.go:37-38)
+	// and nothing gates a run on privilege_status — verified, the run/claim path
+	// never reads it. #66 promotes these fields to run-refusals via a
+	// Protected-first read (evaluateRepo above), never via the badge tier.
 	if bp.WriteRoleCanMerge {
-		rr.Warnings = append(rr.Warnings, fmt.Sprintf("the write role may merge into protected %q", repo.DefaultBranch))
+		rr.Violations = append(rr.Violations, fmt.Sprintf("the write role may merge into protected %q", repo.DefaultBranch))
 	}
 	if bp.BotCanMerge {
-		rr.Warnings = append(rr.Warnings, fmt.Sprintf("the bot has a direct merge grant on protected %q", repo.DefaultBranch))
+		rr.Violations = append(rr.Violations, fmt.Sprintf("the bot has a direct merge grant on protected %q", repo.DefaultBranch))
 	}
 }
 
