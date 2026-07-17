@@ -36,6 +36,18 @@ type Env struct {
 	// Store reads config/credentials. May be nil (e.g. no home dir), in which
 	// case only env/flags supply settings.
 	Store *uzicli.Store
+
+	// SkillHome is the base dir the bundled skill installs under
+	// (SkillHome/.claude/skills/uzi-cli/). Empty means os.UserHomeDir(). This is a
+	// TEST/INJECTION SEAM only — DefaultEnv leaves it empty (real home) and it is
+	// never populated from a flag/env/config, so the "no user-supplied path
+	// component" property (PRD #64) holds. Tests point it at a temp dir.
+	SkillHome string
+
+	// AutoUpgradeSkill enables the best-effort skill self-upgrade run before every
+	// command. DefaultEnv enables it; command tests leave it false so unrelated
+	// tests do no filesystem writes. UZI_SKILL_AUTO_UPGRADE=0 disables it at runtime.
+	AutoUpgradeSkill bool
 }
 
 // DefaultEnv wires the real dependencies.
@@ -47,8 +59,9 @@ func DefaultEnv() Env {
 		Stdin:     os.Stdin,
 		StdoutTTY: uzicli.IsTerminal(os.Stdout),
 		StdinTTY:  uzicli.IsTerminal(os.Stdin),
-		NewClient: func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
-		Store:     store,
+		NewClient:        func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
+		Store:            store,
+		AutoUpgradeSkill: true,
 	}
 }
 
@@ -86,6 +99,17 @@ func newRootCmd(env Env) *cobra.Command {
 		// own error/usage dumping so output stays under our control.
 		SilenceErrors: true,
 		SilenceUsage:  true,
+	}
+	// Best-effort skill self-upgrade before every command, so an agent always
+	// drives the CLI with a SKILL.md matching THIS binary. It is deliberately
+	// skipped for the `uzi skill ...` verbs (which manage the skill directly, and
+	// would otherwise race their own report). Never fatal, never blocking: any
+	// error warns on stderr and the real command still runs — a read-only $HOME in
+	// CI must not break `uzi run list --json`.
+	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
+		if env.AutoUpgradeSkill && !underSkillCmd(cmd) {
+			maybeAutoUpgradeSkill(env)
+		}
 	}
 	root.SetOut(env.Stdout)
 	root.SetErr(env.Stderr)
@@ -157,13 +181,4 @@ func (env Env) client(gf *globalFlags) (uzicli.Client, error) {
 // printer builds the output renderer for the current global flags.
 func (env Env) printer(gf *globalFlags) *uzicli.Printer {
 	return uzicli.NewPrinter(env.Stdout, env.StdoutTTY, gf.json, gf.noColor, gf.quiet)
-}
-
-// stubRunE returns a RunE that reports the verb is not implemented in this
-// build. --help still renders (cobra handles it before RunE), which is the M3
-// success criterion for these commands.
-func stubRunE(name string) func(*cobra.Command, []string) error {
-	return func(*cobra.Command, []string) error {
-		return uzicli.Exitf(uzicli.ExitGeneric, "%s: not implemented in this build (M3 skeleton)", name)
-	}
 }
