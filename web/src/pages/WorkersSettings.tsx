@@ -321,18 +321,22 @@ export function WorkersSettings() {
                         <Badge tone="info" title="Runs in the cluster: the controller starts and stops its container, not you.">
                           hosted
                         </Badge>
-                        {/* Names-only means no quantity appears anywhere, so this chip
-                            is the ONLY trace of the size the worker was provisioned
-                            at, and a lone "M" explains nothing. It says so in its TEXT
-                            rather than a title or sr-only, deliberately: Badge renders
-                            a bare <span>, whose ARIA role is `generic`, and naming is
-                            PROHIBITED on generic — aria-label is ignored outright and
-                            title degrades to a hover tooltip no screen reader is
-                            obliged to read. sr-only would answer the screen reader and
-                            still leave a sighted KEYBOARD or TOUCH user with an
-                            unexplained letter and nothing to hover. Text is the only
-                            channel that reaches all three at once, and it needs no ARIA
-                            to do it. What the size BUYS is still M6's. */}
+                        {/* A bare letter here, deliberately. M6 put the quantities in
+                            the provision picker ("M — up to 2 CPU / 4Gi RAM / 10Gi
+                            disk"), which is where they inform anything: choice time.
+                            And once the worker reports, the memory bar below this row
+                            spells the ceiling out ("1.1/4 GiB · 27%"), so the row can
+                            recover what the size bought. Repeating the quantities on
+                            every row would be noise on a list.
+                            If anyone ever does want them here, they must go in the
+                            TEXT: Badge renders a bare <span>, whose ARIA role is
+                            `generic`, and naming is PROHIBITED on generic — aria-label
+                            is ignored outright and title degrades to a hover tooltip no
+                            screen reader is obliged to read. sr-only would answer the
+                            screen reader and still leave a sighted KEYBOARD or TOUCH
+                            user with an unexplained letter and nothing to hover. Text
+                            is the only channel that reaches all three at once, and it
+                            needs no ARIA to do it. */}
                         {w.hosted_size && <Badge>size {sizeLabel(w.hosted_size)}</Badge>}
                       </>
                     )}
