@@ -8,9 +8,18 @@
 **Touches the contracts of**: PRD #5 (privilege checks — this PRD adds fields + findings, changes no tiers), PRD #6 (CI status/fix), PRD #19 (autopilot attribution), PRD #24 (MR-close watcher), PRD #42 (worker claim wire contract).
 **Related**: PRD #2 (forge integration — established the seam this PRD tests).
 
-**This PRD changes no existing behaviour.** Every milestone lands dark: until M6b
-flips the handler gate, `forgejo` is unreachable, and nothing here alters a GitLab
-connection's verdicts, tiers, or runs.
+**This PRD adds no new refusal or block.** Every milestone lands dark: until M6b
+flips the handler gate, `forgejo` is unreachable, and **no run is refused and no save is
+rejected that would have succeeded before** — on either forge. *(Precision added 2026-07-17,
+D6a-1 tier ruling: "dark" is about **blocking** verdicts and runs, not the badge — the badge can
+still change. The earlier flat claim "alters no verdicts, **tiers**, or runs" was too strong:
+the D6a-1 merge check flips `privilege_status` **OK→Violations** for the narrow GitLab population
+whose *protected* `main` has `merge_access_levels` lowered to include the write role — a
+non-default, legal config. That is a tier change on the badge, but **nothing gates on
+`privilege_status`** — lead-verified: no run/claim/lifecycle/autopilot/poller path reads it, only
+the handler DTO, privcheck, and store. So the **blocking** invariant holds while the badge
+correctly reddens: uzi is surfacing a real primary-directive breach it was blind to, the same
+finding-class #5 already surfaces for the push sibling. #66 is what turns it into a refusal.)*
 
 ## Problem
 
@@ -348,7 +357,7 @@ The corrected mapping is **better than GitLab's**, not a workaround:
 | Bot cannot push to it | inferred from push access levels | **`user_can_push == false`** |
 | Bot has no direct push grant | per-user allow-to-push entry | **subsumed by `user_can_push`** |
 | **Bot cannot merge to it** (new field, D6a-1) | `merge_access_levels` excludes Developer | **`user_can_merge == false`** |
-| No unprotected-file bypass (D6e) | n/a | `unprotected_file_patterns` is empty |
+| ~~No unprotected-file bypass (D6e)~~ | n/a | ~~`unprotected_file_patterns` is empty~~ **DROPPED — no write-role source (D6e). Manual-audit gap in the docs.** |
 
 `GET /repos/{o}/{r}/branches/{branch}` sits under `reqRepoReader(unit.TypeCode)`
 (`api.go:852-858`) — readable by a `write` bot — and returns `protected`,
@@ -388,8 +397,13 @@ protection to direct-push on Forgejo.
 
 #### D6a — Detect that the bot can merge. **Enforcement is PRD #66.**
 
-**This PRD reports; it does not refuse.** Findings stay at PRD #5's existing
-warn-don't-block tier, so #65 changes **no** GitLab behaviour and lands dark.
+**This PRD reports; it does not refuse.** The merge finding surfaces as a per-repo **Violation**
+(D6a-1's tier ruling) — the tier of its push sibling — which, like every per-repo finding,
+**blocks nothing** (`report.go:37-38`). So #65 adds **no new refusal or block** on either forge;
+the only new observable is a non-blocking `OK→Violations` badge flip on the narrow GitLab
+population whose protected `main` was configured to let the write role merge. #66 is what turns
+that finding into a refusal — reading the `BranchProtection` fields via a shared Protected-first
+predicate, not the badge tier.
 
 That was not the original plan, and the history is worth keeping. The security audit
 found that a Forgejo `write` bot can merge its own PR into protected `main` by
@@ -446,6 +460,59 @@ ever open an MR' guarantee"). That sentence is true on GitLab by luck of default
 `merge_access_levels` — which defaults to Maintainer, but **is configurable, and
 "safe by default" is not "safe"**. In #65 the finding is reported like any other;
 PRD #66 makes it block.
+
+**Tier (settling coder-m1's M3 question — the explicit sentence #66 must not have to guess):
+the merge finding surfaces as a per-repo *Violation*, not a *Warning*.** It goes in
+`RepoReport.Violations`, the **same tier as its push sibling** at `checker.go:178-182` ("the
+write role may push to protected `main`"). This flips `privilege_status` **OK→Violations** for
+the narrow GitLab population whose *protected* `main` has `merge_access_levels` lowered to
+include the write role (a legal, non-default config); default GitLab repos (merge at Maintainer)
+see no change, and Forgejo is gate-unreachable in #65. **The flip blocks nothing** — lead-verified
+2026-07-17 that no run/claim/lifecycle/autopilot/poller path reads `privilege_status` or the
+report; only the handler DTO, privcheck, and store do — so the **blocking** dark-landing
+invariant holds even as the badge correctly reddens.
+
+The severity is not a judgment call: a bot that can merge its own PR into protected `main`
+breaks the primary directive ("an agent can only ever open an MR") **exactly as** one that can
+push does, and `report.go:48-50` reserves the `Violations` array for precisely "role/branch
+problems that break the directive". Push and merge to `main` are the two halves of one
+guarantee; they must sit in the **same** tier.
+
+**History, kept because this PRD's value is recording what it got wrong (do not erase — the
+conclusion inverted, the deliberation stands):**
+
+- **M3 committed the merge finding as a *Warning*** (`checker.go:190-194`, `checker_test.go`'s
+  `TestMergeFindingsAreWarningsNotViolations`) — coder-m1's instinct that #65 must not change a
+  working GitLab connection's tier. **Reconsidered and overruled to *Violation* (user-confirmed
+  2026-07-17, architect-recommended).** The Warning tier located the right requirement
+  (non-blocking) on the wrong lever (severity): **non-blocking is already a property of per-repo
+  Violations** in PRD #5 (`report.go:37-38`: per-repo findings never block a save; enforcement
+  is #66), so preserving "reported, not blocking" does **not** require downgrading severity.
+  Downgrading would understate a real breach as advisory and split one guarantee across two badge
+  tiers — the exact "safe by default is not safe" error D6a-1 exists to correct.
+- **The "a Warning forces #66 to re-tier" argument the architect first offered for Violation is
+  a wash and is withdrawn** — it does **not** hold either way: #66 refuses by reading the
+  `BranchProtection` fields through a shared Protected-first predicate (see the #66 boundary
+  below), **never the #65 badge tier**, so the tier has no coupling to #66's enforcement. The
+  Violation ruling rests solely on **severity-correctness and push/merge symmetry**, which stand
+  on their own.
+- **The residual cost is real and accepted**: on a GitLab repo whose `merge_access_levels` was
+  widened to the write role *independently of push*, the badge flips `OK→Violations` at #65's
+  sweep — a new, non-blocking observable on a GitLab-only deployment. Accepted because it is the
+  **same finding-class #5 already reddens** for the push sibling (a branch-protection Violation
+  flipping a GitLab badge is *existing* #5 behaviour), and the D6a split defers the **refusal**,
+  never the **surfacing** ("should not find their working GitLab repos *refused*" — a badge is
+  not a refusal). Not separately user-gated: Success Criteria promise only "no new *blocking*
+  behaviour", which holds, and the user chose to check merge on both drivers (D6a-1) knowing uzi
+  would now see a breach it was blind to.
+
+**#66 boundary (carry into #66; recorded here because #65 shapes the fields — see R12).** M2's
+F1 fix scopes the driver comment but does **not** set `BotCanPush`/`BotCanMerge` to `true` on
+unprotected data — on an unprotected branch they are literally `false` because unevaluated, not
+because safe. **#66 must consume these through `evaluateRepo` / a shared `Protected`-first
+predicate, never a raw `if bp.BotCanMerge` struct read**, or R12's inversion reopens exactly
+where it does the most damage: a refusal guard reading `false,false` on an unprotected branch as
+"safe".
 
 #### D6b — Per-forge required token scope set
 
@@ -538,13 +605,43 @@ Unlike GitLab, Forgejo has no `omitempty`, so `is_admin: false` is always emitte
 *means* non-admin. GitLab's absent-means-pass reasoning (PRD #5's risk section) does
 not transfer, but the conclusion does.
 
-#### D6e — `unprotected_file_patterns` bypass
+#### D6e — `unprotected_file_patterns` bypass: real, but **unimplementable at write role** — a documented manual-audit gap
 
-If any rule sets `unprotected_file_patterns` (e.g. `*.md`), the bot's PAT can push
-directly to `main` for commits touching only those files, despite `enable_push=false`
-(`hook_pre_receive.go:391-406`). No GitLab equivalent. `user_can_push` reflects the
-rule but not this per-commit override, so **check the pattern list is empty
-explicitly**; non-empty is a violation.
+The **risk is real**: if any rule sets `unprotected_file_patterns` (e.g. `*.md`), the bot's
+PAT can push directly to `main` for commits touching only those files, despite
+`enable_push=false` (`hook_pre_receive.go:391-406`). No GitLab equivalent.
+
+**But uzi cannot detect it.** ~~`user_can_push` reflects the rule but not this per-commit
+override, so check the pattern list is empty explicitly; non-empty is a violation.~~
+**Superseded (2026-07-17, architect, verified live on `forgejo:16.0.0`).** The check as specced
+was written against the pre-D6 mapping and never re-checked after D6 moved to
+`GET /branches/{branch}` — **the same methodological failure this PRD's risk section catalogs,
+caught here before it shipped** (credit: coder-m1). `unprotected_file_patterns` lives **only**
+on the `BranchProtection` definition (`GET .../branch_protections/{name}`), which is
+`reqAdmin()`. The write-bot-readable `GET /branches/{branch}` — D6's chosen, authoritative
+endpoint — **does not carry the field**, and `user_can_push` does not reflect the per-file
+override either. There is **no write-role source for it.**
+
+Reproduced on a released 16.0.0 (write bot, `main` protected with `unprotected_file_patterns: "*.md"`):
+
+| Read as the `write` bot | Result |
+|---|---|
+| `GET /branches/main` (D6's endpoint) | 200, fields `{name, commit, protected, required_approvals, enable_status_check, status_check_contexts, user_can_push, user_can_merge, effective_branch_protection_name}` — **no file-pattern field** |
+| `GET /branches/main`.`user_can_push` with the `*.md` rule active | **`false`** — the general rule, *not* the per-file override; the bypass is invisible here too |
+| `GET /branch_protections/main` | **403** (`reqAdmin()`) |
+| `GET /branch_protections` (list) | **403** |
+
+**Ruling: drop the D6e check. No `BranchProtection` field is added** (M1 correctly added none).
+`unprotected_file_patterns` becomes a **documented manual-audit gap** in
+`docs/forgejo-bot-setup.md`, exactly like the **team-whitelist gap D6 already documents** — a
+thing uzi tells the operator to verify because uzi's write-role bot provably cannot. Reading it
+would require handing the bot repo-admin, which D6 forbids and which is strictly worse (it also
+grants `DELETE` on the rule). **Nothing is blocked either way**: the gate is unflipped in #65,
+and even in #66 a check with no data source cannot fire.
+
+Rejected: (a) escalating the bot to admin to read it — D6 forbids it and it is strictly worse;
+(b) inferring it by attempting a `*.md` push to `main` — uzi never pushes to `main`, by the
+primary directive, so this is a non-starter.
 
 ### D7 — Interface: `Role` enum, and it is NOT contained in `api/`
 
@@ -746,7 +843,7 @@ the moment it merged.)
 |---|---|---|---|
 | **M1** | Interface: `TypeForgejo`, `Role` enum, `WriteRoleCanPush`, **`WriteRoleCanMerge` + `BotCanMerge`** (D6a-1); conform `gitlab.go` **and every implementer/call site**. **Not scoped to `forge/`** — `ProjectRole` has 5 fakes + a live consumer outside it, so "green `go test ./...`" is only achievable if M1 fixes them all | `forge/forge.go`, `forge/gitlab.go`, `forge/gitlab_test.go`, `privcheck/checker.go`, `privcheck/checker_test.go`, **`privcheck/service_test.go`** (`BranchProtection` literals at `:83,:111`), `handler/forge_test.go:55`, `seed/seed_test.go:57`, `poller/autopilot_test.go:171`, `forgesvc/sync_test.go:110` | — |
 | **M2** | Driver core + **compiling stubs for the whole interface** + `forge.New()` arm (`forge.go:302`) + **version gate in `VerifyToken`** (D4, semantics fixed by **D4a**: strict semver ≥ `v16.0.0` via `golang.org/x/mod/semver`, prerelease refused, unparseable refused) + ~~**D3 empirical probe**~~ (**done — R3 closed 2026-07-17, D10**): `VerifyToken`, `ListProjects` (**client-side `permissions.push` filter**), `ListLabels`, `EnsureLabels`, `ListIssues` (**PR filter, R4**), `GetIssue`, `CreateIssue`, `UpdateIssueLabels` (D3), `UserExists`, `ProjectRole` (**`member` derivation, D7**), `DefaultBranchProtection` (**via `GET /branches/{branch}`, D6**) | `forge/forgejo.go`, `forge/forgejo_pipelines.go` (stubs), `forge/forgejo_test.go`, `forge/forge.go` (arm only) | M1 |
-| **M3** | privcheck: `Role` enum, **per-forge scope rule** (D6b), **merge + `unprotected_file_patterns` findings** (D6a-1, D6e — reported, not blocking), **one shared `evaluateRepo` with `Protected` checked first** (R12), **version re-check on sweep** (D4); drop `30`/`roleName()`; **log the ignored unmarshal error** (D7) | `privcheck/checker.go`, `privcheck/report.go`, `privcheck/checker_test.go`, `privcheck/service_test.go`, `handler/forge.go` (unmarshal logging only) | M1 |
+| **M3** | privcheck: `Role` enum, **per-forge scope rule** (D6b), **merge finding as a per-repo Violation** — same tier as its push sibling, non-blocking, flips the badge OK→Violations for merge-permissive GitLab repos (D6a-1; ~~`unprotected_file_patterns`~~ **D6e dropped — no write-role source**), **one shared `evaluateRepo` with `Protected` checked first** (R12), **version re-check on sweep** (D4); drop `30`/`roleName()`; **log the ignored unmarshal error** (D7) | `privcheck/checker.go`, `privcheck/report.go`, `privcheck/checker_test.go`, `privcheck/service_test.go`, `handler/forge.go` (unmarshal logging only) | M1 |
 | **M4** | Driver: `GetMergeRequest` (state mapping), `ListIssueLabelEvents` (timeline), `CreateIssueNote`, `TokenInfo` (hand-rolled, D5) | `forge/forgejo.go`†, `forge/forgejo_test.go`† | M2 |
 | **M5** | Driver: `LatestPipeline`, `LatestMRPipeline`, `ListPipelineJobs`, `JobLogTail` (all ≥16; gitea-sdk has `GetRepoActionJobLogs`, no hand-roll) | `forge/forgejo_pipelines.go`†, `forgejo_pipelines_test.go` | M2 |
 | **M6a** | Migration: `forge_type` CHECK gains `'forgejo'`; `runs.mr_web_url`; **the extended completion query + regenerated sqlc** (D8 — without it M7 cannot add the param); **`seed.go:74,85,112` hardcodes** | `store/migrations/`, `store/queries/`, `seed/seed.go` | — |
@@ -839,10 +936,13 @@ way. `forgejo_test.go` mirrors it with a `mockForgejo` recording `Authorization:
    **`32363b81+gitea-1.22.0` (bare sha from `git describe --always`) refuses as unparseable**;
    `""` refuses. *A test asserting codeberg's string connects would be pinning the bug.*
 9. **Branch protection via `GET /branches/{branch}`** (D6): `user_can_push:false` +
-   `user_can_merge:false` → no finding; `user_can_push:true` → finding;
-   `user_can_merge:true` → finding (D6a-1); non-empty `unprotected_file_patterns` →
-   finding (D6e). Assert the driver **never calls `branch_protections/`** (it would
-   403).
+   `user_can_merge:false` → no finding; `user_can_push:true` → push **Violation**;
+   `user_can_merge:true` → merge **Violation** (D6a-1 — assert the finding lands in
+   `RepoReport.Violations`, same tier as the push sibling).
+   ~~non-empty `unprotected_file_patterns` → finding (D6e)~~ — **dropped: the field is not on this
+   endpoint (D6e), verified live.** Assert the driver **never calls `branch_protections/`** (it
+   403s a write bot — and it is the only place `unprotected_file_patterns` lives, which is why
+   D6e cannot be checked).
 9b. **Unprotected branch reports the strongest finding, on both drivers** (R12 — the
    inversion). Forgejo's unprotected early-return gives `protected:false` with
    `user_can_push`/`user_can_merge` **true**; the GitLab driver's 404 gives
@@ -956,7 +1056,11 @@ residual).
   mergeable by the bot, **reports** that finding on the Repos page — and still runs
   (D6c; PRD #66 turns this into a refusal).
 - **[fixture]** **Nothing in #65 refuses anything that ran before it.** An existing
-  GitLab connection sees no new blocking behaviour — the enforcement flip is #66.
+  GitLab connection sees no new *blocking* behaviour — no run refused, no save rejected — the
+  enforcement flip is #66. **Note the scope precisely (D6a-1 tier ruling): #65 *may* newly flip
+  the badge `OK→Violations` on a GitLab repo whose protected `main` lets the write role merge.**
+  That is the merge check landing as a non-blocking finding, the same class #5 already reddens
+  for push — "no new blocking" is not "no new badge".
 - **[fixture]** An **unprotected** branch reports the *strongest* finding, not a clean
   bill of health (R12 — the early-return inversion).
 - **[fixture]** A `PRD`-labelled Forgejo issue appears on the board as a card — and
@@ -987,6 +1091,8 @@ residual).
 | D6 | Guardrails: full equivalent or refuse | 2026-07-17 | User. **Original mapping was unsafe** — three rows read an admin-gated endpoint a `write` bot 403s on, degrading to a warning. Corrected to `GET /branches/{branch}` + `user_can_push`, which is authoritative rather than inferred. |
 | D6a | **Detect can-merge here; enforce in [PRD #66](66-guardrail-enforcement.md)** | 2026-07-17 | User, after three moves: "add the merge check" → "block on push or merge" (once the D6c conflict surfaced) → **split enforcement out** (once the architect surfaced that blocking is a *GitLab* behaviour change with no Forgejo content, riding in a Forgejo PRD). #65 reports and stays dark; #66 owns the flip, its impact count, and its release note. |
 | D6a-1 | `WriteRoleCanMerge` + `BotCanMerge` on **both** drivers | 2026-07-17 | User. A Forgejo `write` bot can merge its own PR to protected `main` by default; GitLab's default forbids it — but `merge_access_levels` is configurable, and safe-by-default is not safe. uzi modelled merge on neither forge. |
+| D6a-1 (tier) | **The merge finding is a per-repo `Violation`, not a `Warning`** | 2026-07-17 | **User-confirmed, architect-recommended.** Same tier as its push sibling (`checker.go:178-182`, a Violation for the same breach-class); `report.go:48-50` reserves `Violations` for branch problems that break the directive. Non-blocking is already a property of per-repo Violations (`report.go:37-38`), so "reported, not blocking" does **not** require downgrading severity — which would understate a real breach and split one guarantee across two tiers. **History kept: M3 committed this as a `Warning`** (coder-m1's instinct to spare a working GitLab badge; `TestMergeFindingsAreWarningsNotViolations`), **reconsidered and inverted** — coder-m1 makes the code follow-up (Warning→Violation + tests). The architect's earlier "Warning forces #66 to re-tier" argument is **withdrawn as a wash** — #66 refuses off the `BranchProtection` fields via a shared Protected-first predicate, never the badge tier. Cost: badge flips `OK→Violations` for merge-permissive GitLab repos at #65's sweep — non-blocking (nothing gates on `privilege_status`, lead-verified), same class #5 already reddens for push; the D6a split defers the *refusal*, not the *surfacing*. |
+| D6e | **DROP the `unprotected_file_patterns` check — no write-role source** | 2026-07-17 | Architect, verified live on `forgejo:16.0.0` (caught by coder-m1). The field lives **only** on the `reqAdmin()`-gated `BranchProtection`; D6's write-readable `GET /branches/{branch}` does not carry it and `user_can_push` does not reflect the per-file override (both confirmed with a `*.md` rule active). Same methodological failure the risk section catalogs — a check specced against the pre-D6 endpoint, never re-checked after D6 moved. No `BranchProtection` field added (M1 added none). Becomes a **documented manual-audit gap** like the team-whitelist gap. Rejected: escalate the bot to admin (D6 forbids; grants `DELETE` on the rule too); infer by test-pushing `*.md` to `main` (the primary directive forbids uzi ever pushing to `main`). |
 | D6b | Per-forge required scope set, "exactly" kept | 2026-07-17 | User. Forgejo has no `api` scope; as specced every Forgejo connection was rejected at save. `all` rejected as god-mode; superset rejected as deleting PRD #5's only blocking token check. |
 | D6c | Unprotected default branch: **warn, don't block** (restored) | 2026-07-17 | User chose warn-not-block; it was briefly superseded by D6a's blocking rule (unprotected-main *is* can-merge, `convert.go:76-85`), then **restored when enforcement moved to #66**. The round trip is recorded, not erased — a future reader will otherwise re-derive the same conflict. The doc obligation is what #65 carries. |
 | D7 | `ProjectRole` → `Role` enum; `WriteRoleCanPush` | 2026-07-17 | Architect. Forgejo has no numeric levels; `write`→30 would be a driver lying. **Not contained in `api/`** — the role is persisted JSONB + typed in the web, and existing rows silently fail to unmarshal. `member` needs its own derivation (404 ≠ non-member). |
@@ -1027,6 +1133,7 @@ Claims below were checked by at least two independent agents.
 | **D3's lost update is real** (closes R3) | Executed on released 16.0.0: `['PRD']` + human `keep-me` → `PUT {labels:[3]}` → **`['Doing']`**. The unrelated label is dropped |
 | **D6a-1 confirmed live** | Released 16.0.0, protected `main` + defaults, bot at `write`: `protected=true, user_can_push=false, `**`user_can_merge=true`** |
 | **D6's authz gates confirmed live** | Released 16.0.0: write bot `GET branch_protections/main` → **403**; owner → 200; write bot `GET branches/main` → **200**, `effective_branch_protection_name` empty |
+| **D6e has no write-role source** (confirms the DROP) | Released 16.0.0, `main` protected with `unprotected_file_patterns: "*.md"`: write bot `GET branches/main` returns no file-pattern field and `user_can_push: false` (unchanged by the `*.md` rule); write bot `GET branch_protections/main` and `GET branch_protections` both **403**. `unprotected_file_patterns` is readable only on the admin-gated `BranchProtection` |
 | **D6b's reordering trap confirmed live** | Minted `[write:repository, write:issue, read:user]` → API returns `['write:issue','write:repository','read:user']`, un-expanded. **A string compare would be a coin flip**, as D6b said |
 | Released `forgejo:16.0.0` image exists | `codeberg.org/forgejo/forgejo:16.0.0` and `data.forgejo.org/forgejo/forgejo:16.0.0`, published 2026-07-16 (matching the tag); boots ~4s on sqlite |
 
