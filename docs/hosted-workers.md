@@ -26,20 +26,19 @@ available if your admin has turned hosting on for this instance.
 [Worker templates](./worker-setup.md#worker-templates) for a self-run worker:
 `base` (Node + git, most repos) or `jvm` (`base` plus a JDK).
 
-**Size** picks how much CPU, memory, and disk the worker gets:
+**Size** picks how much CPU, memory, and disk the worker gets: **S**, **M**
+(the default), or **L**, each step roughly doubling the last. The provision
+form shows the exact numbers next to each option when you pick — they live
+there, not here, so they can't say something different from what you'll
+actually get. Every size also gets the same 4Gi tools cache (`/nix`),
+regardless of size or type — the one number that doesn't change with your
+choice.
 
-| Size | CPU | Memory | Workspace disk |
-|---|---|---|---|
-| S | up to 1 | up to 2Gi | 5Gi |
-| M (default) | up to 2 | up to 4Gi | 10Gi |
-| L | up to 4 | up to 8Gi | 20Gi |
-
-Every size also gets a 4Gi tools cache (`/nix`), sized the same regardless of
-worker size or type. **M** is the default because it matches what a
-self-run worker gets out of the box; pick **L** if you build large projects
-(a big JVM test suite, a large `go build`) and **S** for light repos. All
-three sizes count the same toward your quota below, so there's no quota cost
-to picking a larger one — size for your workload, not to save quota.
+**M** is the default because it matches what a self-run worker gets out of
+the box; pick **L** if you build large projects (a big JVM test suite, a
+large `go build`) and **S** for light repos. **All three sizes count the
+same, 1, toward your quota below** — there's no quota cost to picking a
+larger one, so size for your workload, not to save quota.
 
 ## Your quota
 
