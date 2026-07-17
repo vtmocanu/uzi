@@ -53,7 +53,7 @@ func (h *Handler) CreateChat(w http.ResponseWriter, r *http.Request) {
 }
 
 // chatListDTO is one conversation in the Chat page's list: the display + activity
-// fields the list needs, distinct from the full runDTO (a chat has no repo/issue/MR
+// fields the list needs, distinct from the full apitypes.RunDTO (a chat has no repo/issue/MR
 // context to carry). turn_count is the user-turn count (persisted follow_ups incl.
 // the seeded first message); last_message_at is the newest run_message time (null
 // until the worker emits one) the list sorts on.
