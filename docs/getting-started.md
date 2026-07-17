@@ -18,7 +18,8 @@ automatically; every account after that is a regular user.
 ## 2. Create a bot and connect a forge
 
 uzi acts on your behalf through a bot account, never your own identity.
-Create one and connect its token: see [GitLab bot setup](./gitlab-bot-setup.md).
+Create one and connect its token: see [GitLab bot setup](./gitlab-bot-setup.md) or
+[Forgejo bot setup](./forgejo-bot-setup.md), whichever forge you use.
 
 ## 3. Open a board
 

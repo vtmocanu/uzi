@@ -55,6 +55,7 @@ browsable in-app under **Docs**:
 
 - [Getting started](docs/getting-started.md)
 - [GitLab bot setup](docs/gitlab-bot-setup.md)
+- [Forgejo bot setup](docs/forgejo-bot-setup.md)
 - [Board](docs/board.md)
 - [Anthropic token](docs/anthropic-token.md)
 - [Agent templates](docs/agent-templates.md)
