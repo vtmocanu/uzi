@@ -581,52 +581,97 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Get("/ws", h.ServeWS)
 		})
 
-		// Worker protocol (PRD #4): outbound-only workers, authenticated by a
-		// Bearer join token (sha256 lookup), not a session cookie. No CSRF step —
-		// the credential is a held bearer secret, not an ambient cookie.
-		r.Route("/worker", func(r chi.Router) {
-			r.Use(mw.RequireWorker(h.q))
-			r.Post("/register", h.WorkerRegister)
-			r.Post("/heartbeat", h.WorkerHeartbeat)
-			r.Post("/runs/claim", h.WorkerClaim)
-			r.Post("/runs/{id}/messages", h.WorkerRunMessages)
-			r.Post("/runs/{id}/state", h.WorkerRunState)
-			r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
-
-			// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
-			// verdict. Both are judge-run-scoped (the worker must own the active judge
-			// run reviewing {id}); {id} is the TARGET run, not the judge run.
-			r.Get("/runs/{id}/trace", h.WorkerRunTrace)
-			r.Post("/runs/{id}/review", h.WorkerRunReview)
-
-			// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
-			// investigates its OWNER'S runs. Every query is scoped to the worker's
-			// user_id (a foreign run id is 404), never a bare run_id lookup.
-			r.Get("/chat/runs", h.WorkerChatListRuns)
-			r.Get("/chat/runs/{id}", h.WorkerChatGetRun)
-			r.Get("/chat/runs/{id}/messages", h.WorkerChatRunMessages)
-			// propose_issue (Decision 8): persists a PENDING proposal (never a forge
-			// write). The per-worker proposal limiter caps mass-creation across a
-			// user's chats; the per-run pending cap is the other half.
-			r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/proposals", h.WorkerCreateProposal)
-		})
-
-		// Hosted-worker controller protocol (PRD #58): outbound-only like a worker,
-		// authenticated by the controller's own Bearer credential (a hash compare
-		// against config, no DB, no cookies, hence no CSRF step).
-		//
-		// Mounted ONLY when hosting is enabled (Decision 12). Off — the compose
-		// default — this route does not exist rather than existing-and-refusing, so a
-		// compose stack is byte-for-byte the router it was before this PRD, and an
-		// api that was never given a controller credential exposes no surface that
-		// could be probed for one.
-		if h.cfg.WorkerHostingEnabled {
-			r.Route("/controller", func(r chi.Router) {
-				r.Use(mw.RequireController(h.cfg.ControllerTokenSHA256))
-				r.Get("/poll", h.ControllerPoll)
-			})
-		}
+		h.mountWorkerRoutes(r, proposalLimiter)
+		h.mountControllerRoutes(r)
 	})
 
 	return r
+}
+
+// WorkerRoutes is the SUBSET router served on the TLS listener (PRD #58 M3).
+//
+// The TLS listener exists for exactly two callers — hosted worker pods and the
+// controller — and it is NOT the same surface as the plain listener. Serving the
+// full router there puts /api/auth/* and /api/admin/* inside a hosted worker's
+// reach, and a hosted worker is a semi-hostile position BY DESIGN: it runs the
+// agent SDK against a user's cloned repo, which is the whole reason
+// agent/src/guardrails.ts exists. "It can reach the login endpoint but the limiter
+// holds" is a strictly worse resting place than "it cannot reach the login
+// endpoint", so the routes are simply not mounted here.
+//
+// This is layer (a) of two. Layer (b) is stripXFF in cmd/server, and BOTH are
+// wanted: this codebase's guardrails are explicitly layered, and no layer may be
+// weakened on the theory another covers it.
+//
+// IT SHARES THE LIMITER INSTANCES, and that is load-bearing. The callers pass the
+// SAME *mw.Limiter pointers Routes got, so the buckets are one set of buckets — a
+// second Limiter would give :8443 its own budget and silently double the per-worker
+// cap. That is why the mounts below are functions called by both routers rather
+// than a second Routes(): there is exactly one registration site per route, so the
+// two can never drift into two different surfaces.
+func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
+	r := chi.NewRouter()
+	r.Use(chimw.Recoverer)
+	r.Use(chimw.RequestID)
+
+	r.Route("/api", func(r chi.Router) {
+		h.mountWorkerRoutes(r, proposalLimiter)
+		h.mountControllerRoutes(r)
+	})
+
+	return r
+}
+
+// mountWorkerRoutes registers the worker protocol. Called by BOTH routers — never
+// inline — so the plain and TLS listeners cannot drift apart.
+//
+// Worker protocol (PRD #4): outbound-only workers, authenticated by a Bearer join
+// token (sha256 lookup), not a session cookie. No CSRF step — the credential is a
+// held bearer secret, not an ambient cookie.
+func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
+	r.Route("/worker", func(r chi.Router) {
+		r.Use(mw.RequireWorker(h.q))
+		r.Post("/register", h.WorkerRegister)
+		r.Post("/heartbeat", h.WorkerHeartbeat)
+		r.Post("/runs/claim", h.WorkerClaim)
+		r.Post("/runs/{id}/messages", h.WorkerRunMessages)
+		r.Post("/runs/{id}/state", h.WorkerRunState)
+		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
+
+		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
+		// verdict. Both are judge-run-scoped (the worker must own the active judge
+		// run reviewing {id}); {id} is the TARGET run, not the judge run.
+		r.Get("/runs/{id}/trace", h.WorkerRunTrace)
+		r.Post("/runs/{id}/review", h.WorkerRunReview)
+
+		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
+		// investigates its OWNER'S runs. Every query is scoped to the worker's
+		// user_id (a foreign run id is 404), never a bare run_id lookup.
+		r.Get("/chat/runs", h.WorkerChatListRuns)
+		r.Get("/chat/runs/{id}", h.WorkerChatGetRun)
+		r.Get("/chat/runs/{id}/messages", h.WorkerChatRunMessages)
+		// propose_issue (Decision 8): persists a PENDING proposal (never a forge
+		// write). The per-worker proposal limiter caps mass-creation across a
+		// user's chats; the per-run pending cap is the other half.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/proposals", h.WorkerCreateProposal)
+	})
+}
+
+// mountControllerRoutes registers the hosted-worker controller protocol (PRD #58):
+// outbound-only like a worker, authenticated by the controller's own Bearer
+// credential (a hash compare against config, no DB, no cookies, hence no CSRF
+// step). Called by BOTH routers.
+//
+// Mounted ONLY when hosting is enabled (Decision 12). Off — the compose default —
+// this route does not exist rather than existing-and-refusing, so a compose stack
+// is byte-for-byte the router it was before this PRD, and an api that was never
+// given a controller credential exposes no surface that could be probed for one.
+func (h *Handler) mountControllerRoutes(r chi.Router) {
+	if !h.cfg.WorkerHostingEnabled {
+		return
+	}
+	r.Route("/controller", func(r chi.Router) {
+		r.Use(mw.RequireController(h.cfg.ControllerTokenSHA256))
+		r.Get("/poll", h.ControllerPoll)
+	})
 }

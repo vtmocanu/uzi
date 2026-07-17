@@ -791,8 +791,15 @@ func loadTLS(cfg *Config) error {
 	// Both listeners are bound, so a shared address is not a preference to resolve
 	// but a boot that half-works: one Listen wins, the other errors, and which is
 	// which is a race. Catch it here rather than as a 3am "address already in use".
-	if cfg.TLSAddr == cfg.Addr {
-		return fmt.Errorf("API_TLS_ADDR (%s) must differ from API_ADDR: the plain and TLS listeners are separate ports (the plain one serves web's reverse proxy and the kubelet probes; the TLS one serves the workers)", cfg.TLSAddr)
+	//
+	// Compare the PORTS, not the strings. A string compare passes `API_ADDR` of
+	// `0.0.0.0:8443` against the default `API_TLS_ADDR` of `:8443` — different text,
+	// same socket, since an empty host means all interfaces. The chart cannot produce
+	// that shape and it fails closed either way (the losing Listen takes the process
+	// down), but the guard exists precisely to name the problem instead of letting it
+	// surface as a race.
+	if samePort(cfg.Addr, cfg.TLSAddr) {
+		return fmt.Errorf("API_TLS_ADDR (%s) and API_ADDR (%s) resolve to the same port: the plain and TLS listeners are separate ports (the plain one serves web's reverse proxy and the kubelet probes; the TLS one serves the workers)", cfg.TLSAddr, cfg.Addr)
 	}
 	cfg.TLSCertFile = cert
 	cfg.TLSKeyFile = key
@@ -1214,4 +1221,29 @@ func parseNonNegInt(key string, def int) int {
 		return n
 	}
 	return def
+}
+
+// samePort reports whether two listen addresses would bind the same TCP port on an
+// overlapping interface (PRD #58 M3).
+//
+// It is deliberately conservative: it compares ports, and treats an empty/wildcard
+// host as overlapping ANY host, because that is what it does at bind time. Two
+// concrete, different hosts on the same port are left alone — that is a legitimate
+// (if unusual) configuration and not ours to refuse.
+func samePort(a, b string) bool {
+	hostA, portA, errA := net.SplitHostPort(a)
+	hostB, portB, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		// Not a host:port pair we can reason about; fall back to the literal compare
+		// rather than guessing.
+		return a == b
+	}
+	if portA != portB {
+		return false
+	}
+	wildcard := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" || h == "[::]" }
+	if wildcard(hostA) || wildcard(hostB) {
+		return true
+	}
+	return hostA == hostB
 }

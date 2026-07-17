@@ -540,8 +540,21 @@ func run() error {
 			return err
 		}
 		tlsSrv = &http.Server{
-			Addr:              cfg.TLSAddr,
-			Handler:           routes,
+			Addr: cfg.TLSAddr,
+			// NOT `routes`. Two independent layers, and both are wanted — this codebase's
+			// guardrails are layered on purpose and no layer may be weakened on the theory
+			// another covers it (PRD #58 M3).
+			//
+			// (a) A SUBSET router: only /api/worker/* and /api/controller/* — the exact set
+			//     the agent and the controller dial, derived from their code rather than
+			//     assumed (the agent's only base is WORKER_API_PREFIX = "/api/worker"; it
+			//     opens no websocket). So /api/auth/* and /api/admin/* are not reachable
+			//     from a hosted worker at all, rather than reachable-but-rate-limited.
+			// (b) stripXFF: the header cannot be forged because it is gone.
+			//
+			// It shares the limiter INSTANCES with the plain listener (same pointers), so
+			// this is not a second middleware chain and no per-IP budget is doubled.
+			Handler:           stripXFF(h.WorkerRoutes(proposalLimiter)),
 			TLSConfig:         reloader.ServerConfig(),
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       15 * time.Second,
@@ -584,14 +597,31 @@ func run() error {
 	// listeners share one router and one pool, so both must drain before that.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
-		runErr = err
-	}
-	if tlsSrv != nil {
-		if err := tlsSrv.Shutdown(shutdownCtx); err != nil && runErr == nil {
-			runErr = err
+	// CONCURRENTLY, against the shared deadline — not one after the other. Draining
+	// them in sequence lets the plain listener consume the whole budget (WriteTimeout
+	// is 15s, LONGER than the 10s here), leaving tlsSrv.Shutdown an already-expired
+	// context: it would close the listener and return WITHOUT draining in-flight TLS
+	// requests, and the deferred pool.Close() would then race an in-flight worker
+	// claim. Each server gets the full 10s this way, which is what the budget meant.
+	var drainWG sync.WaitGroup
+	var drainMu sync.Mutex
+	drain := func(s *http.Server) {
+		defer drainWG.Done()
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			drainMu.Lock()
+			if runErr == nil {
+				runErr = err
+			}
+			drainMu.Unlock()
 		}
 	}
+	drainWG.Add(1)
+	go drain(srv)
+	if tlsSrv != nil {
+		drainWG.Add(1)
+		go drain(tlsSrv)
+	}
+	drainWG.Wait()
 	stop() // cancel ctx so the poller + sweeper + reconciler Run return (covers the server-error path too)
 	bgWG.Wait()
 	// The HTTP server has drained, so no new inline Notify can be fired; wait for
@@ -672,4 +702,47 @@ func seedAdmin(ctx context.Context, q *store.Queries, cfg config.Config) error {
 	}
 	slog.Info("seeded admin user", "email", cfg.SeedEmail)
 	return nil
+}
+
+// stripXFF removes the forwarding headers from every request on the TLS listener
+// (PRD #58 M3). Layer (b) of two — layer (a) is the subset router in
+// handler.WorkerRoutes.
+//
+// WHY THIS EXISTS, so nobody simplifies it away:
+//
+// mw.ClientIP trusts X-Forwarded-For based on the PEER IP alone — it knows nothing
+// about which listener or route the request arrived on. On dev-cluster
+// TRUSTED_PROXIES is the whole pod CIDR (10.244.0.0/16), because pod IPs are
+// dynamic and no narrower value is maintainable. Hosted worker pods get IPs inside
+// it, so they are trusted proxies BY CONSTRUCTION. Until PRD #58 M3 nothing could
+// exploit that, because the api NetworkPolicy admitted web pods and nothing else —
+// and M3's own Decision 5(a) rule, which admits the worker namespace to this port,
+// is exactly what removes that mitigation. Without this, a compromised worker (the
+// agent runs a model against a user's cloned repo — squarely in the threat model,
+// it is why agent/src/guardrails.ts exists) could POST /api/auth/login with a
+// rotating XFF and defeat the per-IP auth rate limit outright, and forge the IP in
+// the audit log. Layer (a) already takes /api/auth/* off this listener; this makes
+// the property hold for every route on it, now and later.
+//
+// Narrowing TRUSTED_PROXIES is NOT the fix and was rejected: pod IPs are dynamic,
+// which is why the whole-CIDR value exists in the first place. This makes
+// docs/configuration.md's claim ("no X-Forwarded-For is trusted from workers") true
+// BY CONSTRUCTION rather than by CIDR bookkeeping that a future pod-CIDR change
+// would silently invalidate.
+//
+// THE ONE CONDITION THAT WOULD CHANGE THIS: the TLS listener exists for clients
+// that dial the api DIRECTLY — hosted workers and the controller — so they are
+// never proxied and an XFF on this hop can only be forgery. If anyone ever fronts
+// this port with a real reverse proxy, this is the line they must revisit; deleting
+// it silently re-opens the bypass above.
+//
+// Only X-Forwarded-For is read today (mw.ClientIP); X-Real-IP and Forwarded are
+// dropped too so a future middleware that reads either cannot inherit the hole.
+func stripXFF(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Del("X-Forwarded-For")
+		r.Header.Del("X-Real-IP")
+		r.Header.Del("Forwarded")
+		next.ServeHTTP(w, r)
+	})
 }
