@@ -68,11 +68,13 @@ State-changing requests (POST/PATCH) additionally run CSRF validation inside `Re
 
 ## Forge integration
 
-uzi's second surface connects each user to a git forge (GitLab now, via a forge-generic interface that keeps a later Forgejo driver from touching callers, schema, or UI) so the board has real work to show. It adds no new service — everything below lives inside `api` — but it does add a second trust boundary: `api` now makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge described above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md) for the operator/user procedure and the PRD (`prds/2-forge-integration-kanban.md`) for the full design rationale.
+uzi's second surface connects each user to a git forge (**GitLab and Forgejo**, behind a forge-generic interface) so the board has real work to show. The Forgejo driver (PRD #65) is the second driver, and it landed exactly as the abstraction promised: no caller, schema, or REST-shape change — the seam held. It adds no new service — everything below lives inside `api` — but it does add a second trust boundary: `api` now makes authenticated *outbound* calls to a third party (the forge) on top of the inbound boundary at the nginx edge described above. See [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md) and [docs/forgejo-bot-setup.md](docs/forgejo-bot-setup.md) for the per-forge operator/user procedure, [adr/0065-forgejo-driver.md](adr/0065-forgejo-driver.md) for the second-driver design record, and the PRDs (`prds/2-forge-integration-kanban.md`, `prds/65-forgejo-support.md`) for the full rationale.
 
 ### Forge abstraction
 
-`api/internal/forge` defines the `Forge` interface (`VerifyToken`, `ListProjects`, `ListLabels`, `EnsureLabels`, `ListIssues`, `UpdateIssueLabels`) and a neutral domain vocabulary (`BotIdentity`, `Project`, `Label`, `Issue`); `forge.New` selects a driver by `forge.Type` (`gitlab.go` today) so no other package ever imports a driver directly. Every driver call goes through an `*http.Client` bounded by `FORGE_HTTP_TIMEOUT` (`timeoutClient` in `forge.go`) — closing the untimeouted-`http.DefaultClient` wart the `multica` inspiration carries — and every returned error is passed through a `redactor` (`redact.go`) that scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN` header value before the error can reach a log line or an HTTP response body.
+`api/internal/forge` defines the `Forge` interface (`VerifyToken`, `ListProjects`, `ListLabels`, `EnsureLabels`, `ListIssues`, `UpdateIssueLabels`, the four CI reads, plus the guardrail reads `ProjectRole`/`DefaultBranchProtection`) and a neutral domain vocabulary (`BotIdentity`, `Project`, `Label`, `Issue`, `Role`, `BranchProtection`); `forge.New` selects a driver by `forge.Type` — **`gitlab.go` or `forgejo.go`** — so no other package ever imports a driver directly. Every driver call goes through an `*http.Client` bounded by `FORGE_HTTP_TIMEOUT` (`timeoutClient` in `forge.go`) — closing the untimeouted-`http.DefaultClient` wart the `multica` inspiration carries — and every returned error is passed through a `redactor` (`redact.go`) that scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN`/`token`-scheme header value before the error can reach a log line or an HTTP response body.
+
+The Forgejo driver (`code.gitea.io/sdk/gitea`, Forgejo ≥16.0.0 — [ADR-65](adr/0065-forgejo-driver.md) for why both) proved the abstraction was more than Go-deep by finding the three places it was **not**: (1) the worker held a second, un-abstracted GitLab client, now a minimal TS forge seam (`agent/src/forge.ts`, `GitLabClient`/`ForgejoClient`); (2) the web reconstructed forge URLs by string surgery, now a per-card/run `forge_type` DTO field mapped only at `web/src/lib/forgeNoun.ts` (`forgeNoun`/`forgePlatform`, one Go twin in `slacksvc/notifier.go`); (3) each forge stored its pipeline status verbatim, so `api/internal/pipelinestatus` is the one Go-side classifier that folds both vocabularies — the domain twin of `web/src/lib/pipelineBadge.ts`, kept in sync by `TestMirrorsWebPipelineBadge`. Merge-permission is now modelled on both forges (`BranchProtection.WriteRoleCanMerge`/`BotCanMerge`); #65 **reports** it, and **enforcement — refusing runs when the bot can push or merge to `main` — is deferred to [PRD #66](prds/66-guardrail-enforcement.md)**, because that is a GitLab-behaviour change with no Forgejo content.
 
 ### Bot PATs, encrypted at rest
 
@@ -488,10 +490,19 @@ built mechanism and its (deferred) k8s cross-container mapping.
 
 Four independent layers, any one of which failing still leaves the others:
 
-1. **GitLab role.** The bot account is Developer, never Maintainer/Owner, and
-   `main` is a protected branch — see
+1. **Forge role + protected `main`.** The bot account sits at exactly the write
+   role (GitLab **Developer** / Forgejo **`write`**), never higher, and `main` is
+   a protected branch the bot can neither push nor merge to — the outermost,
+   platform-enforced backstop. On **GitLab** this is protection-by-default; on
+   **Forgejo** it is **user-supplied**, because Forgejo creates repos with no
+   protection and lets a `write` bot merge its own PR by default (D6c), so
+   [docs/forgejo-bot-setup.md](docs/forgejo-bot-setup.md) leads with "protect
+   `main` and enable the merge whitelist — uzi will not do it for you." uzi's
+   privilege checker **detects and reports** a bot that can push or merge to
+   `main` on both forges (`BranchProtection.BotCanPush`/`BotCanMerge`); turning
+   that report into a run **refusal** is [PRD #66](prds/66-guardrail-enforcement.md).
+   Layers 2–4 below hold regardless of layer 1's configuration. See
    [docs/gitlab-bot-setup.md](docs/gitlab-bot-setup.md#protected-main-branch).
-   A GitLab-side rejection is the outermost, platform-enforced backstop.
 2. **Worker-owned network git** (above). The agent process has no push
    credential at all, so a protected-branch write is impossible regardless of
    what the model attempts — this is the layer the other three exist to
