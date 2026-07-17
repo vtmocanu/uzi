@@ -457,8 +457,14 @@ func (f *forgejo) issueLabelNames(c *gitea.Client, slug repoSlug, issueIID int64
 
 // resolveLabelIDs maps label names to Forgejo label ids. It uses known (already
 // on the issue) ids first, then fetches the repo catalog once for any remaining
-// name. An unresolved name is an error: silently dropping it would corrupt the
-// board's single-column invariant.
+// name. A name still unresolved is CREATED (with the default color) and its new id
+// used — matching GitLab, whose issue-create / add_labels auto-create a referenced
+// label server-side (gitlab.go CreateIssue just forwards the labels param). This is
+// load-bearing: uzi's CreateIssue stamps the PRD trigger label, which is NOT a
+// board column and so is never EnsureLabels'd, so erroring here would 502 every
+// issue creation on a Forgejo repo that lacks the label — parity that a Forgejo
+// e2e (M9) caught. Silently dropping a name is still never done: the board's
+// single-column invariant needs every target label present.
 func (f *forgejo) resolveLabelIDs(c *gitea.Client, slug repoSlug, names []string, known map[string]int64) ([]int64, error) {
 	ids := make([]int64, 0, len(names))
 	var missing []string
@@ -483,7 +489,11 @@ func (f *forgejo) resolveLabelIDs(c *gitea.Client, slug repoSlug, names []string
 	for _, name := range missing {
 		id, ok := byName[name]
 		if !ok {
-			return nil, fmt.Errorf("forgejo: label %q does not exist on the repo", name)
+			created, _, err := c.CreateLabel(slug.owner, slug.repo, gitea.CreateLabelOption{Name: name, Color: forgejoDefaultLabelColor})
+			if err != nil {
+				return nil, f.redact.error(fmt.Errorf("forgejo: create missing label %q: %w", name, err))
+			}
+			id = created.ID
 		}
 		ids = append(ids, id)
 	}

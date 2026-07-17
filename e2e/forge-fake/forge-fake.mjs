@@ -116,6 +116,10 @@ const state = {
   nextForgejoRunId: 3000,
   nextForgejoJobId: 3500,
   nextForgejoLabelId: 200,
+  // The version /api/v1/version reports. Default is a D4a-passing release; the
+  // harness flips it (via /_e2e/forgejo-version) to a < 16.0.0 string for one
+  // assertion, to prove the privilege sweep raises the version-downgrade finding.
+  forgejoVersion: "16.0.0+gitea-1.22.0",
 };
 
 function persist() {
@@ -323,7 +327,12 @@ function mrToForgejoIssue(mr) {
   const s = forgejoPRState(mr.state);
   return {
     id: mr.id,
-    number: mr.iid,
+    // A distinct high number (NOT mr.iid) so a card leaking here is DETECTABLE: if
+    // the driver's R4 filter regressed, this PR would surface as card #(10000+iid),
+    // which no real issue ever has. The entry is always dropped (pull_request !=
+    // null) before the driver reads its number, so the offset is invisible in
+    // practice; it only makes a filter FAILURE visible.
+    number: 10000 + mr.iid,
     title: mr.title || `PR ${mr.iid}`,
     body: mr.description ?? "",
     state: s.state,
@@ -592,13 +601,24 @@ const server = https.createServer(
       return send(res, 201, { id, status: run.status });
     }
 
+    // Set the version /api/v1/version reports (PRD #65 M9): the harness flips it
+    // below 16.0.0 to prove the privilege sweep raises the version-downgrade
+    // finding, then restores it. Body: {version}.
+    if (method === "POST" && path === "/_e2e/forgejo-version") {
+      const body = await readBody(req);
+      state.forgejoVersion = String(body.version || "16.0.0+gitea-1.22.0");
+      log("forgejo version ->", state.forgejoVersion);
+      return send(res, 200, { version: state.forgejoVersion });
+    }
+
     // --- Forgejo /api/v1 subset (PRD #65 M9) ----------------------------------
     // Selected by path prefix, over the SAME state as the GitLab table. The driver
     // hits this table when the connection's forge_type is 'forgejo'; the GitLab
     // lane never reaches it, so /api/v4 behaviour is byte-identical.
     if (path === "/api/v1/version") {
-      // Must pass the driver's D4a gate (strict semver >= v16.0.0; build metadata OK).
-      return send(res, 200, { version: "16.0.0+gitea-1.22.0" });
+      // Default is a D4a-passing release; the harness can flip it below 16.0.0 to
+      // exercise the version gate on the sweep (/_e2e/forgejo-version).
+      return send(res, 200, { version: state.forgejoVersion });
     }
     if (method === "GET" && path === "/api/v1/user") {
       // GetMyUserInfo (VerifyToken + TokenInfo bot-identify). is_admin is emitted
