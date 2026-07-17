@@ -1,0 +1,102 @@
+{{- if .Values.workers.enabled }}
+{{- /*
+  The hosted-worker namespace and its admission envelope (PRD #58 Decisions 1, 6, 8).
+
+  WHY A DEDICATED NAMESPACE, and why it must stay empty: a Role that can create pods
+  in a namespace can mount any Secret and impersonate any ServiceAccount in it —
+  RBAC cannot scope `create` by label. So the blast radius of a compromised
+  controller is exactly "whatever else lives in this namespace". Nothing else lives
+  here: no CNPG, no Infisical-materialized app secrets, no privileged
+  ServiceAccounts. That emptiness IS the control. Do not park anything here.
+*/ -}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.workers.namespace }}
+  annotations:
+    # Ahead of the InfisicalSecrets (-10) and the CNPG cluster (-5): the pull secret
+    # this namespace needs is materialized INTO it, so it must exist first.
+    argocd.argoproj.io/sync-wave: "-20"
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+    # PodSecurity `restricted`, ENFORCED. This is what makes the worker pod's posture
+    # a property of the namespace rather than of the controller remembering to render
+    # it: no root entry, no capability beyond NET_BIND_SERVICE, no privilege
+    # escalation. It is also why PRD #51's A1 compose mechanism (root entry +
+    # setpriv drop, ambient CAP_SETUID/SETGID) cannot run here, and why v1 is
+    # single-container at runAsUser 10001 — the image's entrypoint detects the
+    # non-root start and skips the drop.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+{{- if .Values.workers.quota.enabled }}
+{{- /*
+  Defense in depth at the k8s layer (Decision 8): an app-level bug must not let
+  hosted workers noisy-neighbour a shared cluster. The per-user quota in the api is
+  the product control; this is the floor under it.
+
+  NOTE THE SIDE EFFECT, it is load-bearing: a ResourceQuota on requests.* makes
+  admission REJECT any pod with a container that declares no requests —
+  initContainers included. The controller renders them explicitly for exactly this
+  reason; the LimitRange below is the backstop, not the source.
+
+  Sized against the fleet: 20 x `m` = 10 CPU / 40Gi requested, and 20 x (10Gi data +
+  4Gi nix) = 280Gi of PVC. Storage is the binding constraint, not CPU or memory.
+  dev-cluster's real budget is M6's rollout conversation.
+*/}}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "uzi.fullname" . }}-hosted-workers
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  hard:
+    requests.cpu: {{ .Values.workers.quota.requestsCPU | quote }}
+    requests.memory: {{ .Values.workers.quota.requestsMemory | quote }}
+    requests.storage: {{ .Values.workers.quota.requestsStorage | quote }}
+    persistentvolumeclaims: {{ .Values.workers.quota.persistentVolumeClaims | quote }}
+    count/deployments.apps: {{ .Values.workers.quota.deployments | quote }}
+{{- end }}
+{{- if .Values.workers.limitRange.enabled }}
+{{- /*
+  The backstop. Every hosted worker pod arrives from the controller with explicit
+  requests AND limits from its size preset, so these defaults should never apply —
+  they exist for anything that reaches this namespace some other way.
+
+  `max` MUST stay >= the LARGEST preset's limits or the biggest preset stops being
+  admissible, which would surface as a worker that provisions and never appears.
+  There is deliberately NO `min`: it would have to sit below the seed
+  initContainer's 100m/128Mi, and a min that low protects nothing while adding one
+  more way for a pod to be rejected.
+*/}}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "uzi.fullname" . }}-hosted-workers
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  limits:
+    - type: Container
+      default:
+        {{- toYaml .Values.workers.limitRange.default | nindent 8 }}
+      defaultRequest:
+        {{- toYaml .Values.workers.limitRange.defaultRequest | nindent 8 }}
+      max:
+        {{- toYaml .Values.workers.limitRange.max | nindent 8 }}
+    - type: PersistentVolumeClaim
+      max:
+        storage: {{ .Values.workers.limitRange.maxPVCStorage | quote }}
+{{- end }}
+{{- end }}

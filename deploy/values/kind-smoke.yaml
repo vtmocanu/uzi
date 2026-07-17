@@ -43,6 +43,49 @@ web:
   ingress:
     enabled: false
 
+# Hosted workers (PRD #58 M3). The envelope is created so the KinD run exercises
+# what KinD CAN prove: the tar-based /nix seed under real PodSecurity `restricted` +
+# non-root + 0555 store dirs, object rendering, and ResourceQuota/LimitRange/
+# PodSecurity ADMISSION. All of that is apiserver- or kubelet-side.
+#
+# WHAT A GREEN KIND RUN DOES NOT PROVE — three ways KinD's defaults make it lie,
+# each verified rather than assumed:
+#
+#  1. NO NETWORK POLICY IS ENFORCED, AT ALL. kindnet does not implement NetworkPolicy
+#     by design (kind#3705, kind#842) — not the Antrea ANNP (there is no Antrea) and
+#     not even the default-deny floor. The policies below are CREATED and silently
+#     never enforced, so a worker here has unrestricted egress and a stub run goes
+#     green even if the entire policy set is wrong. Deferred to M6, with the FQDN
+#     enforcement gap; they are the same gap.
+#  2. THE fsGroup PIN IS INVISIBLE. local-path-provisioner's setup script is
+#     `mkdir -m 0777`, and the PV is a Local/hostPath source — so uid 10001 writes the
+#     volume regardless of fsGroup, and a test would pass for a reason that does not
+#     exist on dev-cluster (where an RWO ext4 volume mounts root:root 0755 and fsGroup
+#     is the ONLY thing making it writable). Assert the OBSERVABLE (stat the mount for
+#     gid 10001 + setgid), never writability.
+#  3. THE lost+found SENTINEL TRAP IS INVISIBLE. local-path makes a plain directory,
+#     so a fresh PVC here really IS empty and an emptiness check passes — while
+#     dev-cluster's hypervisor CSI formats ext4 and a fresh PVC carries lost+found. That
+#     is closed by a UNIT test instead (controller/internal/kube/render_test.go): it is
+#     a property of the check and needs no kubelet.
+#
+# Minor, same family: local-path IGNORES the requested PVC size (it is a directory),
+# so /nix at 4Gi is unenforced here.
+workers:
+  enabled: true
+  namespace: uzi-workers
+  # No Harbor in KinD: the agent image is kind-loaded and needs no pull secret.
+  imagePullSecretName: ""
+  # KinD's default local-path provisioner.
+  storageClass: standard
+  # Created but NOT enforced by kindnet (see 1 above). Left on so the manifests are at
+  # least admitted, never as evidence they work.
+  networkPolicy:
+    enabled: true
+  # No Antrea in KinD — the CRD does not exist, so this would be a rejected manifest.
+  fqdnEgress:
+    enabled: false
+
 postgres:
   enabled: true
   cluster:

@@ -54,3 +54,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "uzi.apiTLSDir" -}}
 /etc/uzi/tls
 {{- end -}}
+
+{{- /*
+  uzi.workerAPIPort: the api port the CONTROLLER and the HOSTED WORKERS dial
+  (PRD #58). They reach the api directly, with no nginx in the path, and a claim
+  response carries the user's DECRYPTED forge PAT and Anthropic token — so once
+  api.tls.enabled is on, that is the TLS listener and nothing else.
+
+  Selected rather than hardcoded so the NetworkPolicies are correct BOTH before and
+  after M4's TLS rollout: 8080 while TLS is off (the same plain port the existing api
+  policy admits web on), api.tls.port once it is on. M4 deliberately made the two
+  listeners separate ports precisely so a policy could admit the worker namespace to
+  one and not the other.
+*/ -}}
+{{- define "uzi.workerAPIPort" -}}
+{{- if .Values.api.tls.enabled -}}
+{{- .Values.api.tls.port -}}
+{{- else -}}
+8080
+{{- end -}}
+{{- end -}}

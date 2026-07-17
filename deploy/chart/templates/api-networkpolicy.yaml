@@ -42,4 +42,43 @@ spec:
         - protocol: TCP
           port: 8080
     {{- end }}
+    {{- if .Values.workers.enabled }}
+    # --- PRD #58 Decision 5(a): the hosted-worker clients ----------------------
+    #
+    # TWO rules, not one. Decision 5(a) names only the worker namespace, and taken
+    # literally it would ship a controller that CANNOT WORK: the controller runs in
+    # THIS namespace and polls the api, so the default-deny above drops every poll.
+    # Nothing has caught it because the chart shipped no controller until now. The
+    # PRD is corrected in the same commit as this fix.
+    #
+    # Both dial the port uzi.workerAPIPort selects — the TLS listener once
+    # api.tls.enabled is on, since a claim response carries the user's decrypted
+    # forge PAT and Anthropic token and dev-cluster is a shared cluster running
+    # arbitrary dev pods. Neither is admitted to any other port.
+
+    # 1. The controller (this namespace) -> api. It polls for desired state.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+
+    # 2. Hosted worker pods (the worker namespace) -> api. They register, claim,
+    #    heartbeat. Matched by namespace AND pod label: both selectors in ONE `from`
+    #    entry, which is an AND — a separate entry would be an OR and would admit
+    #    every pod in that namespace, plus this pod label in every namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: uzi-hosted-worker
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+    {{- end }}
 {{- end }}
