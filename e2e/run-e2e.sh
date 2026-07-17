@@ -46,24 +46,52 @@
 
 set -euo pipefail
 
-# --- shell hygiene: test the SHIPPED defaults, not the developer's shell ------
-# Compose ranks a shell-exported variable ABOVE --env-file (CLAUDE.md), so anything
-# the operator's profile exports silently replaces docker-compose.yml's default for
-# THIS harness. The e2e overlay already neutralizes the dangerous ones by pinning
-# literals (UZI_SECRET_KEY, the UZI_SEED_* set) — but pinning only works for values
-# the harness wants to CHOOSE.
+# --- shell hygiene: re-exec under a CLEAN environment ------------------------
+# THE HARNESS MUST TEST WHAT THE REPO SHIPS, NOT WHAT THE OPERATOR'S SHELL EXPORTS.
 #
-# These three are different: their whole point is that the harness must exercise the
-# value docker-compose.yml SHIPS. Pinning them in the overlay would make the XFF gate
-# below assert against the overlay's own literal and quietly stop testing the shipped
-# default — i.e. it would still pass with the vulnerable default restored. So they are
-# unset instead, which leaves `${VAR:-default}` to supply the real thing.
+# Compose ranks a shell-exported variable ABOVE --env-file (CLAUDE.md), so any var in
+# the caller's profile silently replaces docker-compose.yml's `${VAR:-default}` for
+# this run. That is not hypothetical and it is not cheap: the PRD #58 XFF gate below
+# was developed against a shell exporting the OLD
+# TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12,... — so the pre-fix AND post-fix runs both
+# tested the same vulnerable value, and BOTH RESULTS WERE MEANINGLESS. A measurement
+# taken through a dirty environment is not a weaker measurement, it is not one.
 #
-# Not hypothetical: this was found by the XFF gate failing against a fix that was
-# already correct. The author's shell exported the OLD
-# TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12,... and it overrode the repo entirely, so
-# both the pre-fix and post-fix runs tested the same vulnerable value.
-unset TRUSTED_PROXIES RATE_LIMIT_MAX RATE_LIMIT_WINDOW
+# Measured on the author's laptop when that surfaced: **19 of 62** vars
+# docker-compose.yml reads were exported in an ordinary dev shell, including real
+# UZI_SEED_FORGE_PAT, UZI_SEED_ANTHROPIC_TOKEN and JWT_SECRET.
+#
+# WHY AN ALLOWLIST AND NOT A LIST OF `unset`s (user decision). The overlay pins the
+# dangerous vars it wants to CHOOSE (UZI_SECRET_KEY, the UZI_SEED_* set), and unsetting
+# the rest one by one works only while someone remembers to extend the list every time
+# docker-compose.yml grows a knob. That is "true by bookkeeping, not by construction" —
+# the same shape PRD #58 rejected three times over (narrowing TRUSTED_PROXIES; the
+# CIDR-vs-FQDN allowlist; the chart's plaintext-port fallback). Deny-by-default means a
+# var added tomorrow cannot leak into a run without someone adding it HERE, on purpose.
+# CLAUDE.md already mandates this exact shape for compose smoke tests; e2e was exempted
+# only because it was believed immune, which it was not.
+#
+# WHAT IS DELIBERATELY *NOT* ALLOWED, and why the list must stay this short: every var
+# docker-compose.yml reads as `${VAR:-default}` — above all TRUSTED_PROXIES and
+# RATE_LIMIT_* — because the assertions here exist to exercise those SHIPPED defaults.
+# Passing them through (or pinning them in the overlay) would make the gate assert
+# against a value the harness chose, so it would keep passing with the vulnerable
+# default restored. Do not add one to buy a local convenience.
+#
+# What IS allowed: how to reach the machine (PATH/HOME/TMPDIR/TERM/docker daemon
+# addressing) and the harness's own knobs. None of these reach the api's config.
+if [ -z "${UZI_E2E_SANITIZED:-}" ]; then
+  _e2e_env=(UZI_E2E_SANITIZED=1)
+  for _v in \
+    HOME PATH TMPDIR TERM CI \
+    DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY DOCKER_TLS_CERTDIR \
+    UZI_E2E_EXECUTOR UZI_E2E_COMPOSE_PROJECT UZI_E2E_COMPLETE_TIMEOUT \
+    E2E_RUN_DIR E2E_GIT_SMART_HTTP KEEP_STACK KEEP_RUNDIR
+  do
+    [ -n "${!_v+set}" ] && _e2e_env+=("$_v=${!_v}")
+  done
+  exec env -i "${_e2e_env[@]}" bash "${BASH_SOURCE[0]}" "$@"
+fi
 
 # --- layout ------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
