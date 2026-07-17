@@ -35,10 +35,12 @@ regardless of size or type — the one number that doesn't change with your
 choice.
 
 **M** is the default because it matches what a self-run worker gets out of
-the box; pick **L** if you build large projects (a big JVM test suite, a
-large `go build`) and **S** for light repos. **All three sizes count the
-same, 1, toward your quota below** — there's no quota cost to picking a
-larger one, so size for your workload, not to save quota.
+the box. **Every size costs you the same, 1 of your quota below** — there's
+no personal cost to picking bigger. Size for your actual workload anyway,
+not to save quota: **L** for large projects (a big JVM test suite, a large
+`go build`), **S** for light repos. A hosted worker's CPU, memory and disk
+are real capacity on a shared cluster, so an oversized pick you don't need
+is capacity someone else's worker doesn't get.
 
 ## Your quota
 
