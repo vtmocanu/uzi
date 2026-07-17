@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -356,9 +357,9 @@ func TestWorkerHeartbeatDropsInvalidStats(t *testing.T) {
 }
 
 func TestAdminWorkerDTOIncludesStats(t *testing.T) {
-	// The stats fields ride the shared workerDTO, so the admin worker DTO inherits them
-	// for free (PRD #49 Decision 6). A worker row with a sample marshals every stats_
-	// field into the admin JSON.
+	// The stats fields ride the shared apitypes.WorkerDTO, so the admin worker DTO
+	// inherits them for free (PRD #49 Decision 6). A worker row with a sample marshals
+	// every stats_ field into the admin JSON.
 	w := store.Worker{
 		ID:                 uuid.New(),
 		Name:               "laptop",
@@ -368,7 +369,7 @@ func TestAdminWorkerDTOIncludesStats(t *testing.T) {
 		StatsMemLimitBytes: pgtype.Int8{Int64: 2147483648, Valid: true},
 		StatsSource:        pgtype.Text{String: "cgroup", Valid: true},
 	}
-	dto := adminWorkerDTO{workerDTO: workerDTOFromWorker(w, 0, false), OwnerEmail: "u@example.test"}
+	dto := apitypes.AdminWorkerDTO{WorkerDTO: workerDTOFromWorker(w, 0, false), OwnerEmail: "u@example.test"}
 	b, err := json.Marshal(dto)
 	if err != nil {
 		t.Fatalf("marshal admin dto: %v", err)

@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/notifysvc"
@@ -99,7 +100,7 @@ func (h *Handler) WorkerRunTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msgs := make([]messageDTO, 0, len(res.Messages))
+	msgs := make([]apitypes.MessageDTO, 0, len(res.Messages))
 	for _, m := range res.Messages {
 		msgs = append(msgs, messageToDTO(m))
 	}
