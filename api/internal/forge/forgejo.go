@@ -465,6 +465,11 @@ func (f *forgejo) issueLabelNames(c *gitea.Client, slug repoSlug, issueIID int64
 // issue creation on a Forgejo repo that lacks the label — parity that a Forgejo
 // e2e (M9) caught. Silently dropping a name is still never done: the board's
 // single-column invariant needs every target label present.
+//
+// Shared with UpdateIssueLabels (not CreateIssue-only): in the rare case a board
+// column is deleted mid-move, this recreates it with the DEFAULT color, not its
+// configured one, until the next EnsureLabels re-pins it — a benign self-heal,
+// delete-race edge only.
 func (f *forgejo) resolveLabelIDs(c *gitea.Client, slug repoSlug, names []string, known map[string]int64) ([]int64, error) {
 	ids := make([]int64, 0, len(names))
 	var missing []string

@@ -678,11 +678,14 @@ if [ "$FORGE" = forgejo ]; then
 
   # 7) Fix-CI loop DRIVE — the headline [live] criterion, unblocked by the Go
   #    pipeline-status classifier (internal/pipelinestatus). main is at "failure"
-  #    (above), so this drives the exact three Go sites the unit tests could not
-  #    reach against a real run: the Fix-CI START GATE (ci_fix.go:88) must ACCEPT a
-  #    Forgejo "failure" pipeline (it rejected everything but GitLab "failed"); the
-  #    failed-job SNAPSHOT (ci_fix.go:144) must include the "failure" job; and the
-  #    fix VERDICT (pipeline_sync.go) must stamp fix_failed on a re-"failure".
+  #    (above), so this drives the loop end to end and OBSERVES two of the three Go
+  #    sites against a real run: the Fix-CI START GATE (ci_fix.go:88) must ACCEPT a
+  #    Forgejo "failure" (no run id is returned unless IsFailed("failure") passes),
+  #    and the fix VERDICT (pipeline_sync.go) must stamp fix_failed on a re-"failure".
+  #    The failed-job SNAPSHOT filter (ci_fix.go:144) is deliberately NOT asserted
+  #    here — an empty snapshot does not error and the fix run is created regardless,
+  #    so this lane cannot see its content — its "failure"-job inclusion is
+  #    unit-covered (handler.TestSnapshotFailedPipelineIncludesForgejoFailureJobs).
   say "forgejo Fix-CI loop: a 'failure' pipeline drives Fix CI → fix run → fix_failed verdict"
   FJFIX="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}' | jq -r '.run.id')"
   { [ -n "$FJFIX" ] && [ "$FJFIX" != null ]; } \
@@ -690,7 +693,7 @@ if [ "$FORGE" = forgejo ]; then
   [ "$(apiget "/api/runs/$FJFIX" | jq -r '.run.kind')" = ci_fix ] || fail "run kind is not ci_fix"
   DUP="$(apipost_code "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}')"
   [ "$DUP" = 409 ] || fail "a duplicate Fix CI on main should be 409, got $DUP"
-  pass "Fix CI triggered on a Forgejo 'failure' pipeline (gate :88 + job snapshot :144) — ci_fix run $FJFIX"
+  pass "Fix CI triggered on a Forgejo 'failure' pipeline (the ci_fix.go:88 gate accepts 'failure') — ci_fix run $FJFIX"
 
   wait_status "$FJFIX" awaiting_approval
   [ "$(apiget "/api/runs/$FJFIX" | jq -r '.run.plan_md // empty')" != "" ] || fail "ci_fix run carried no plan"
@@ -700,7 +703,7 @@ if [ "$FORGE" = forgejo ]; then
   case "$FJFIXBR" in ci-fix/pipeline-*) : ;; *) fail "ci_fix fix branch not ci-fix/pipeline-* (got $FJFIXBR)";; esac
   [ "$(fake_state | jq -r --arg b "$FJFIXBR" '[.mrs[] | select(.source_branch==$b)] | length')" -ge 1 ] \
     || fail "the fake recorded no PR from the fix branch $FJFIXBR"
-  pass "fix run $FJFIX completed on $FJFIXBR and opened a PR (snapshot fed the agent)"
+  pass "fix run $FJFIX completed on $FJFIXBR and opened a PR"
 
   # The fix branch's re-run FAILS again ("failure", a higher id than the failure that
   # spawned the run): the verdict must stamp fix_failed — the exact pipeline_sync
