@@ -824,10 +824,23 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 	// server does not impose for the GET (D5). The list carries no secret — sha1 is
 	// empty except at creation, only token_last_eight is returned — but the error
 	// path still routes through the redactor (rawGet does this).
+	//
+	// token_last_eight is the ONLY per-token fingerprint the list exposes (sha1 is
+	// empty post-creation), so on the astronomically rare last-eight COLLISION
+	// between two of the bot's own tokens, uzi cannot tell which one authenticated.
+	// This is a known, accepted Forgejo-API limit, not an oversight — there is no
+	// better disambiguator to invent. We therefore scan every page, require EXACTLY
+	// one match, and on 0 or >1 fail SAFE: a generic error that the checker
+	// downgrades to a "could not verify scopes" warning. Picking the first match
+	// would fail OPEN — an over-scoped ("all") authenticating token could be masked
+	// by a correctly-scoped colliding sibling, sliding it past PRD #5's only blocking
+	// token check (D6b).
 	var last8 string
 	if len(f.token) >= 8 {
 		last8 = f.token[len(f.token)-8:]
 	}
+	var matchedScopes []string
+	matches := 0
 	for page := 1; ; page++ {
 		raw, _, err := f.rawGet(ctx, fmt.Sprintf("/users/%s/tokens?page=%d&limit=%d",
 			url.PathEscape(u.UserName), page, forgejoPerPage))
@@ -839,24 +852,30 @@ func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
 			return TokenInfo{}, f.redact.error(fmt.Errorf("forgejo: parse tokens: %w", err))
 		}
 		for _, tk := range tokens {
-			if tk.TokenLastEight != last8 {
-				continue
+			if tk.TokenLastEight == last8 {
+				matches++
+				matchedScopes = append([]string(nil), tk.Scopes...)
 			}
-			// The matching, listed token authenticated this very request, so it is
-			// active. Forgejo PATs report neither an active flag nor an expiry (the
-			// API has no such fields — verified live on 16.0.0), so Active is true and
-			// ExpiresAt stays zero ("never expires"). Scopes come back normalized and
-			// REORDERED (Forgejo re-emits in canonical order, not mint order), which is
-			// why the privilege checker compares them as an unordered set (D6b).
-			return TokenInfo{Scopes: tk.Scopes, Active: true}, nil
 		}
 		if len(tokens) < forgejoPerPage {
 			break
 		}
 	}
-	// The token authenticated but does not appear in its own owner's token list —
-	// cannot report scopes. Surfaced as a generic error, which the privilege checker
-	// downgrades to a "could not verify scopes" warning rather than a hard block.
+	if matches == 1 {
+		// The unique, listed match authenticated this very request, so it is active.
+		// Forgejo PATs report neither an active flag nor an expiry (the API has no such
+		// fields — verified live on 16.0.0), so Active is true and ExpiresAt stays zero
+		// ("never expires"). Scopes come back normalized and REORDERED (Forgejo
+		// re-emits in canonical order, not mint order), which is why the privilege
+		// checker compares them as an unordered set (D6b).
+		return TokenInfo{Scopes: matchedScopes, Active: true}, nil
+	}
+	if matches > 1 {
+		return TokenInfo{}, fmt.Errorf("forgejo: token info: %d tokens share the authenticating token's last-eight fingerprint; cannot uniquely identify its scopes", matches)
+	}
+	// 0 matches: the token authenticated but does not appear in its own owner's token
+	// list. Surfaced as a generic error, which the privilege checker downgrades to a
+	// "could not verify scopes" warning rather than a hard block.
 	return TokenInfo{}, fmt.Errorf("forgejo: token info: the authenticating token was not found in its owner's token list")
 }
 

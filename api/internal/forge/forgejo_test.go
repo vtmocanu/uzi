@@ -970,6 +970,43 @@ func TestForgejoTokenInfoParsesScopes(t *testing.T) {
 	}
 }
 
+// TestForgejoTokenInfoAmbiguousCollisionFailsSafe covers the fail-SAFE path: if
+// two of the bot's own tokens share token_last_eight (the only fingerprint the API
+// exposes), the driver cannot tell which one authenticated and must NOT pick the
+// first — an over-scoped authenticating token could otherwise be masked by a
+// correctly-scoped sibling, sliding it past D6b's blocking scope check. It returns
+// an error, which the checker downgrades to a warning (honest yellow, not false
+// green). Mutation check: revert TokenInfo to pick-first and this test reddens.
+func TestForgejoTokenInfoAmbiguousCollisionFailsSafe(t *testing.T) {
+	const token = "forgejo-pat-aaaa-bbbb-11112222"
+	last8 := token[len(token)-8:]
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/user": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "uzi-bot", "is_admin": false})
+		},
+		"/users/uzi-bot/tokens": func(w http.ResponseWriter, _ *http.Request) {
+			// Two tokens collide on the last eight: one over-scoped ("all"), one clean.
+			// Picking either would be a guess; the driver must refuse.
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1, "name": "godmode", "token_last_eight": last8, "scopes": []string{"all"}},
+				{"id": 2, "name": "clean", "token_last_eight": last8,
+					"scopes": []string{"write:issue", "write:repository", "read:user"}},
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, token)
+
+	info, err := d.TokenInfo(context.Background())
+	if err == nil {
+		t.Fatalf("a last-eight collision must fail safe (error), not pick a match; got %+v", info)
+	}
+	// The error must not leak the token and must be generic enough for the checker to
+	// downgrade to a warning (it is not the introspection-unsupported sentinel).
+	if strings.Contains(err.Error(), token) {
+		t.Errorf("collision error leaked the PAT: %q", err.Error())
+	}
+}
+
 // TestForgejoM4ErrorsAreRedacted is test #12 for the M4 methods, including the two
 // HAND-ROLLED paths (timeline, token introspection) that bypass the SDK — the lead
 // called these out specifically. Each endpoint echoes the token in a 500 body; no
