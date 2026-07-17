@@ -1,7 +1,7 @@
-# PRD #69: Judge mode (off / optional / enforced) + per-user judge model + opus default + spend guards
+# PRD #69: Judge mode (off / optional / enforced) + per-user judge model + opus default + spend guards + judge run cost/time visibility
 
 **GitLab Issue**: [#69](https://gitlab.example.com/vtmocanu/uzi/-/issues/69)
-**Status**: Draft (created 2026-07-17; revised 2026-07-17 after fact-check + architecture + risk review, then spend guards folded in per user request)
+**Status**: Draft (created 2026-07-17; revised 2026-07-17 after fact-check + architecture + risk review, then spend guards folded in per user request, then judge run cost/time visibility (M6) folded in per user request)
 **Priority**: Medium
 **Supersedes**: PRD #59 (default judge model → sonnet). #59's single change (flip the compiled-in default) is folded in here, but the value is **opus**, not sonnet — see Decision 1, which reverses #59's Decision 1. #59 is closed as superseded.
 **Related**: PRD #46 (run judge + self-improvement — introduced `judge_enabled`, `judge_model`, and the per-user `users.judge_enabled` opt-in this PRD extends). PRD #17 (per-user `default_model` — the layering pattern this PRD mirrors for the judge model).
@@ -239,6 +239,51 @@ What does **not** change:
      defaults keep that to genuine runaways. Follows the existing
      `health_nudge_cooldown_seconds` int-setting pattern (`settings.go:568`).
 
+10. **Judge run time/token/cost are captured through the existing PRD #40 fold,
+    not a new accounting path, and fold into the run owner's usage totals (user
+    decision, 2026-07-17).** Today a judge run records its cost **nowhere**: the
+    `JudgeRunner` posts no `run_messages` and discards the model call's terminal
+    result-frame `modelUsage` (`agent/src/judge-runner.ts:259` keeps only the
+    text), so `foldRunUsage` — which already does **not** exclude `kind='judge'`
+    (it skips only chat, `workersvc/service.go:878`) — never runs for a judge
+    run. PRD #46 deferred this explicitly ("Token/cost data joins the input when
+    PRD #40 lands"); #40 has landed, so this closes that gap. The fix reuses the
+    proven work-run path rather than inventing a judge-specific cost field:
+    - **Capture:** when the single judge turn's terminal result frame arrives in
+      `consumeModel`, the worker POSTs it as **one** `run_message` for the judge
+      run via the existing `postMessages` endpoint. `AppendMessages` →
+      `foldRunUsage` then writes a `run_usage` row keyed on the judge `run_id`
+      (empty `session_id` is already tolerated), with the same GREATEST merge and
+      untrusted-worker clamps (`nonNegTokens` / `numericUSD`) as work runs — **no
+      new trust boundary** (the worker's reported usage was already trusted for
+      work runs). The judge lane still posts no other messages; it is not made a
+      streamed run.
+    - **Folds into totals for free:** `SelfUsage` / `AdminUsageTotals` /
+      `AdminUsagePerUser` already aggregate `run_usage_totals` over
+      `kind <> 'chat'` (`runtime.sql:587/613/647`), so a judge `run_usage` row
+      appears in the owner's lifetime / 7-day totals and the admin per-user /
+      factory breakdown with **zero query change**. This is the user-chosen
+      behavior: judge spend is the owner's own token spend and now shows up where
+      the rest of it does, instead of being silently absent — with the opus
+      default (Decision 1) the single most expensive per-run call was the one
+      missing from the bill.
+    - **Duration:** the `JudgeRunner` reports only the terminal state, so a judge
+      run's `started_at` is NULL (`SetRunRunning` never fires) and only
+      `claimed_at` / `finished_at` exist. Add one `reportState({status:"running"})`
+      at the start of `execute()` so `started_at` is stamped like every other
+      run and duration is the uniform `finished_at - started_at`; the
+      claimed→running transition is unaffected by the awaiting_approval guard (a
+      judge never enters that state).
+    - **Surface (user pick: the 4-tile strip, mock option C):** the judge run
+      stays hidden from the run lists (it is not a work run), but its time /
+      tokens / cost surface on the **reviewed** run's `JudgePanel`, as a compact
+      4-tile strip (Tokens in · Tokens out · Duration · Cost) mirroring the
+      work-run `RunUsagePanel` directly above it, so judge cost reads as the same
+      kind of thing. `run_reviews.judge_run_id` already links the judge run, so
+      `reviewDTO` gains `judge_run_id`, the judge run's timing, and the five usage
+      figures; a judge run predating the feature (no `run_usage` row) renders no
+      strip, never a fabricated 0 (the pre-feature-run rule PRD #40 already uses).
+
 ## Data model
 
 - **New column** `users.judge_model text` (nullable, no default) — migration
@@ -265,6 +310,13 @@ What does **not** change:
   `COUNT(*) WHERE kind='judge' AND user_id=$1 AND created_at > $2` (budget). Both
   cheap; note a partial index `runs(user_id, created_at) WHERE kind='judge'` if
   either shows up hot (optional — the judge funnel is low-QPS).
+- **`run_usage` now covers judge runs** (M6): **no schema change** — the fold
+  already admits `kind='judge'`; the only change is that the judge lane now
+  *delivers* its terminal result frame. One **new read query**
+  `GetJudgeRunUsageForTarget(target_run_id)` returns the target's most-recent
+  judge run's timing (`started_at`/`finished_at`) LEFT-joined to its
+  `run_usage_totals` row (NULLs for a pre-feature judge), so the review panel can
+  show time+token+cost without exposing the judge run in any run list.
 
 ## Touchpoints
 
@@ -336,6 +388,29 @@ What does **not** change:
   haiku→opus upgrade jump. `web/scripts/check-docs.mjs` green via `npm run
   build`.
 
+**M6 — judge run cost/time capture + surface** (depends only on the #46 judge;
+independent of M1/M2/M3/M5 — touches disjoint files):
+- `agent/src/judge-runner.ts`: in `execute()`, `reportState({status:"running"})`
+  once at the start (stamps `started_at`); in `consumeModel`, on the terminal
+  result frame, map it and `postMessages(judgeRunId, [resultFrame])` so the fold
+  sees it. Everything else (deny-all tool hook, `settingSources:[]`, text
+  collection, deterministic fallback) is unchanged.
+- `agent/test/judge-runner.test.ts`: assert the result frame is posted (usage
+  reaches the API) and a `running` report is sent.
+- `api/internal/store/queries/judge.sql`: `GetJudgeRunUsageForTarget` (the
+  target's most-recent judge run joined LEFT to `run_usage_totals`); `sqlc
+  generate`. No fold change — `foldRunUsage` already folds `kind='judge'`.
+- `api/internal/handler/judge.go`: `reviewDTO` gains `judge_run_id`, the judge
+  run's `started_at`/`finished_at`, and a usage bundle (reuse `usageDTO`);
+  `GetReviewForTarget` (`workersvc/judge_read.go`) returns them.
+- `web/src/pages/RunView.tsx` (`JudgePanel`) + `web/src/lib/api.ts` (`RunReview`
+  type): render the 4-tile strip (Tokens in · Tokens out · Duration · Cost)
+  matching `RunUsagePanel`, reusing `lib/formatTokens.ts` + `formatDuration`;
+  absent when the judge predates the feature.
+- `web/src/mocks/*`: judge run usage + timing on the review fixtures.
+- `docs/judge.md`: judge spend is the owner's own token spend and now appears in
+  their usage totals and on the run's review panel.
+
 ## Milestones
 
 Dependency notes (corrected after arch review finding 3):
@@ -353,10 +428,14 @@ Dependency notes (corrected after arch review finding 3):
   independent: land it after M1+M2 (serialized), not in parallel with them.
 - **M4 depends on M1+M2+M3+M5** (it wires UI, the `/me` fields, the spend-guard
   admin inputs, and docs for everything).
+- **M6 (judge cost/time) is independent of M1/M2/M3/M4/M5.** It touches the judge
+  runner, the review read path, and the `JudgePanel` — none of the mode/model/
+  spend-guard files — so it can land in parallel with M2/M3 (or any time), and
+  needs `sqlc generate` for its one read query like M2 does.
 
-So the safe fan-out is M1 first, then M2 and M3 in parallel on top of it, then M5
-after M2 (shared enqueue/sqlc surface), then M4 last — not all-wide from a cold
-start.
+So the safe fan-out is M1 first, then M2 and M3 (and M6) in parallel on top of it,
+then M5 after M2 (shared enqueue/sqlc surface), then M4 last — not all-wide from a
+cold start.
 
 - [ ] **M1 — Judge mode (enforce-all)**: `judge_enforce_all` setting +
   default-false-on-junk accessor + `SettingsReader` widening (+ all fakes) +
@@ -373,6 +452,12 @@ start.
   Gate 5 in `maybeEnqueueJudge` (skip-not-defer, all modes). `go test
   ./internal/settings ./internal/workersvc` green, including a loop test (N rapid
   failures → judges throttled by cooldown, capped by budget).
+- [ ] **M6 — Judge run cost/time**: `JudgeRunner` posts its terminal result frame
+  + one `running` report; `GetJudgeRunUsageForTarget` (sqlc); `reviewDTO` gains
+  `judge_run_id` + timing + usage; `JudgePanel` 4-tile strip; `docs/judge.md`.
+  Verify a completed judge writes a `run_usage` row and its cost appears in
+  `SelfUsage`/`AdminUsage`. `go test ./internal/workersvc ./internal/handler`,
+  `cd agent && npm test`, `cd web && npm run build` green.
 - [ ] **M4 — Consent surface + web + docs + specs**: `/me` effective fields,
   admin enforce toggle (with cost copy + greying) + the two spend-guard inputs,
   user judge card (enforced banner + per-user model input), stale-comment fix,
@@ -404,6 +489,11 @@ start.
   faster than once per 60s gets at most one judge per 60s (the rest skipped);
   with `judge_daily_budget=N>0`, that user gets at most N judges per rolling 24h;
   `0`/`0` disables each guard; a skipped judge is silent and leaves no run.
+- **Judge cost/time (M6)**: a completed judge run writes a `run_usage` row; its
+  cost appears in the owner's usage totals (self + admin) and its time + tokens +
+  cost render on the reviewed run's review panel as the 4-tile strip; a judge run
+  predating the feature shows no strip (never a fabricated 0); the judge run
+  itself remains hidden from every run list.
 
 ## Out of Scope
 
@@ -416,7 +506,10 @@ start.
   `run_usage` dollars/tokens, and a "skip-after-N-identical-failure-signatures"
   refinement that suppresses only *repeated* failures while still judging diverse
   runs, are both deferrable improvements — the count-based guards bound the
-  runaway case, and the surgical signature approach is materially harder.
+  runaway case, and the surgical signature approach is materially harder. (M6
+  makes each judge's actual cost available *after* the fact, so a cost-denominated
+  budget becomes a smaller follow-up, but it stays out of scope here — the gate
+  still runs at enqueue, before the about-to-run judge's cost is known.)
 - Changing the judge prompt/compaction or the self-improvement engine.
   `self_improve` runs stay un-judged (allowlist, `judge_enqueue.go:19`)
   regardless of `enforce_all`.
