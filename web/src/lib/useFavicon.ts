@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import { applyFavicon, deriveFaviconState, failedRunIds, type FaviconRun } from "./favicon";
+import {
+  applyFavicon,
+  deriveFaviconState,
+  failedRunIds,
+  type FaviconRun,
+  type FaviconState,
+} from "./favicon";
 import { onNotificationsChanged } from "./notifications";
 
 // useFavicon (PRD #70 M4) owns the status-favicon poll: it keeps the browser-tab
@@ -27,6 +33,12 @@ export function useFavicon({ unread, enabled }: { unread: number; enabled: boole
   // fresh (deriveFaviconState only reddens a failure NOT in this set). null means "no
   // successful poll yet", which also gates the derive effect from applying too early.
   const baselineRef = useRef<Set<string> | null>(null);
+  // The last state actually pushed to the tab icon. The runs poll hands back a
+  // fresh array every tick even when nothing changed, so the derive effect below
+  // re-runs each ~20s; without this guard it would regenerate the canvas and
+  // rewrite the <link> href on every tick forever. We only re-apply when the
+  // DERIVED state changes. Reset on disable so a re-enable re-applies.
+  const lastStateRef = useRef<FaviconState | null>(null);
 
   // The poll lifecycle is keyed ONLY on `enabled` — never on `unread`. `unread` is
   // consumed purely by the derive effect below, so a changing unread prop never tears
@@ -37,6 +49,7 @@ export function useFavicon({ unread, enabled }: { unread: number; enabled: boole
       // Logged out / disabled: no fetch, drop the baseline so a later sign-in
       // re-seeds it, and restore the plain static brand mark.
       baselineRef.current = null;
+      lastStateRef.current = null;
       setRuns([]);
       applyFavicon("idle");
       return;
@@ -46,11 +59,11 @@ export function useFavicon({ unread, enabled }: { unread: number; enabled: boole
     const poll = () => {
       api
         .listRuns()
-        .then(({ runs }) => {
+        .then(({ runs: latest }) => {
           if (!alive) return;
           // Seed the failed baseline on the first successful poll only.
-          if (baselineRef.current === null) baselineRef.current = failedRunIds(runs);
-          setRuns(runs);
+          if (baselineRef.current === null) baselineRef.current = failedRunIds(latest);
+          setRuns(latest);
         })
         // A failed poll is non-fatal: keep the last state rather than blanking the
         // icon (mirrors AppShell's unread-count poll tolerance).
@@ -78,9 +91,13 @@ export function useFavicon({ unread, enabled }: { unread: number; enabled: boole
   }, [enabled]);
 
   // Derive the tab signal and apply it whenever the runs or the unread count change.
-  // Gated on a seeded baseline so nothing is applied before the first poll resolves.
+  // Gated on a seeded baseline so nothing is applied before the first poll resolves,
+  // and on an actual state change so a no-op poll tick doesn't redraw the icon.
   useEffect(() => {
     if (!enabled || baselineRef.current === null) return;
-    applyFavicon(deriveFaviconState(runs, unread, baselineRef.current));
+    const next = deriveFaviconState(runs, unread, baselineRef.current);
+    if (next === lastStateRef.current) return;
+    lastStateRef.current = next;
+    applyFavicon(next);
   }, [runs, unread, enabled]);
 }

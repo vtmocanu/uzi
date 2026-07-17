@@ -37,6 +37,9 @@ describe("deriveFaviconState — priority ladder (first match wins)", () => {
   it("unread > 0 outranks a concurrent running → attention", () => {
     expect(deriveFaviconState([run("running")], 1, NONE)).toBe("attention");
   });
+  it("a fresh failure outranks unread > 0 → failed", () => {
+    expect(deriveFaviconState([run("failed")], 5, NONE)).toBe("failed");
+  });
 });
 
 describe("deriveFaviconState — a deliberate stop is not a failure", () => {
@@ -59,6 +62,10 @@ describe("deriveFaviconState — fresh vs. baseline", () => {
   it("a baselined failure still yields attention if another run awaits approval", () => {
     const baseline = new Set(["run-failed"]);
     expect(deriveFaviconState([run("failed"), run("awaiting_approval")], 0, baseline)).toBe("attention");
+  });
+  it("a baselined failure alongside a running run falls through to running", () => {
+    const baseline = new Set(["run-failed"]);
+    expect(deriveFaviconState([run("failed"), run("running")], 0, baseline)).toBe("running");
   });
 });
 
