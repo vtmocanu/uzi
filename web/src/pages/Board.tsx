@@ -33,6 +33,7 @@ import { prefs } from "../lib/prefs";
 import { Alert, Badge, Button, Card, cx, Field, Input, PageHeader, SectionTitle, Skeleton, Textarea } from "../components/ui";
 import { FixCiButton, PipelineBadge } from "../components/PipelineBadge";
 import { MrChip } from "../components/MrChip";
+import { forgePlatform } from "../lib/forgeNoun";
 import { ExternalLinkIcon, PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
 
@@ -364,7 +365,7 @@ export function Board() {
             )}
           </div>
         }
-        description="Columns are GitLab labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here."
+        description={`Columns are ${forgePlatform(board?.forge_type)} labels. Cards move automatically as their runs progress; you can still drag a card to change its label on the forge. Only PRD-labeled issues appear here.`}
         actions={
           <>
             <label className="flex cursor-pointer select-none items-center gap-1.5 py-1.5 text-xs text-muted">
@@ -431,6 +432,7 @@ export function Board() {
       {creatingIssue && (
         <CreateIssueForm
           repoId={repoId}
+          forgeType={board?.forge_type ?? ""}
           onCreated={() => {
             setCreatingIssue(false);
             load();
@@ -638,8 +640,8 @@ function IssueCard({
               target="_blank"
               rel="noreferrer"
               draggable={false}
-              aria-label="Open on GitLab"
-              title="Open on GitLab"
+              aria-label={`Open on ${forgePlatform(card.forge_type)}`}
+              title={`Open on ${forgePlatform(card.forge_type)}`}
               className="text-faint transition-colors hover:text-brand"
             >
               <ExternalLinkIcon />
@@ -740,10 +742,12 @@ function IssueCard({
 // immediately run-able.
 function CreateIssueForm({
   repoId,
+  forgeType,
   onCreated,
   onError,
 }: {
   repoId: string;
+  forgeType: string;
   onCreated: () => void;
   onError: (m: string) => void;
 }) {
@@ -770,7 +774,7 @@ function CreateIssueForm({
     <Card className="max-w-2xl space-y-3">
       <SectionTitle>Create a PRD issue</SectionTitle>
       <p className="text-xs text-faint">
-        Opened on GitLab with the <span className="font-medium text-muted">{prdLabel}</span> label.
+        Opened on {forgePlatform(forgeType)} with the <span className="font-medium text-muted">{prdLabel}</span> label.
         Link a <code className="rounded bg-raised px-1 py-0.5 text-muted">prds/*.md</code> file in the
         description so a run can be started from it.
       </p>

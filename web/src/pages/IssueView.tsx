@@ -6,6 +6,7 @@ import { activeRunInHistory, isStoppedRun, mrChipState, runStatusTone } from "..
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
 import { Markdown } from "../components/Markdown";
 import { MrChip } from "../components/MrChip";
+import { forgePlatform } from "../lib/forgeNoun";
 import { formatDuration } from "../components/RunEvent";
 import { Alert, Badge, Button, Card } from "../components/ui";
 import { useAuth } from "../auth/AuthContext";
@@ -188,7 +189,7 @@ export function IssueView() {
               )}
               {isHttpsUrl(issue.web_url) && (
                 <a href={issue.web_url} target="_blank" rel="noreferrer">
-                  <Button variant="ghost">Open on GitLab</Button>
+                  <Button variant="ghost">Open on {forgePlatform(issue.forge_type)}</Button>
                 </a>
               )}
             </div>

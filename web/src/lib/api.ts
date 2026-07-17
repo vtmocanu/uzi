@@ -353,6 +353,10 @@ export interface Board {
   repo_id: string;
   path_with_namespace: string;
   web_url: string;
+  // The board's forge ("gitlab"|"forgejo"), so board-level chrome (the "columns are
+  // <forge> labels" hint, the create-issue "opened on <forge>" note) names the right
+  // platform (PRD #65 D2). A board is one repo/connection, so it is a single value.
+  forge_type: string;
   columns: BoardColumn[];
   cards: Card[];
   // Repo default-branch CI status (PRD #6, the board header badge), null when
@@ -376,6 +380,9 @@ export interface IssueDetail {
   closed: boolean;
   conflict: boolean;
   description: string;
+  // The issue's forge ("gitlab"|"forgejo"), so the "Open on <forge>" button names
+  // the right platform (PRD #65 D2).
+  forge_type: string;
 }
 
 export interface ForgeConfig {

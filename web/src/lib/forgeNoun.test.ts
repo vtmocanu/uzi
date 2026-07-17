@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { forgeNoun, forgeNounLower, forgeNounSentence, mrAbbrev, mrRefSymbol } from "./forgeNoun";
+import { forgeNoun, forgeNounLower, forgeNounSentence, forgePlatform, mrAbbrev, mrRefSymbol } from "./forgeNoun";
 
 describe("forgeNoun", () => {
   it("returns the per-forge Title-Case noun", () => {
@@ -26,5 +26,14 @@ describe("forgeNoun", () => {
     expect(mrAbbrev("forgejo")).toBe("PR");
     expect(mrRefSymbol("gitlab")).toBe("!");
     expect(mrRefSymbol("forgejo")).toBe("#");
+  });
+
+  it("names the destination platform per forge, defaulting to GitLab", () => {
+    expect(forgePlatform("gitlab")).toBe("GitLab");
+    expect(forgePlatform("forgejo")).toBe("Forgejo");
+    // dark-landing: unknown/absent renders GitLab, so an existing card is unchanged.
+    expect(forgePlatform("")).toBe("GitLab");
+    expect(forgePlatform(null)).toBe("GitLab");
+    expect(forgePlatform(undefined)).toBe("GitLab");
   });
 });

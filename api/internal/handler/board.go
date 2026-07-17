@@ -162,11 +162,16 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, mrIID pgtype.Int8, mr
 }
 
 type boardDTO struct {
-	RepoID  string      `json:"repo_id"`
-	Path    string      `json:"path_with_namespace"`
-	WebURL  string      `json:"web_url"`
-	Columns []columnDTO `json:"columns"`
-	Cards   []cardDTO   `json:"cards"`
+	RepoID string `json:"repo_id"`
+	Path   string `json:"path_with_namespace"`
+	WebURL string `json:"web_url"`
+	// ForgeType is the board's forge ("gitlab"|"forgejo"), so board-level chrome
+	// (the "columns are <forge> labels" hint, the create-issue "opened on <forge>"
+	// note) names the right platform (PRD #65 D2). A board is one repo/connection, so
+	// this is a single value; per-card forge rides each card. From repo.ForgeType.
+	ForgeType string      `json:"forge_type"`
+	Columns   []columnDTO `json:"columns"`
+	Cards     []cardDTO   `json:"cards"`
 	// Pipeline is the repo's default-branch CI status (PRD #6, the board header
 	// badge), null when there is no cached default-branch pipeline.
 	Pipeline *pipelineDTO `json:"pipeline"`
@@ -359,12 +364,13 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	cards := assembleCards(issues, runRows, cardPipelines, position, repo.UserID, repo.ForgeType)
 
 	return boardDTO{
-		RepoID:   repo.ID.String(),
-		Path:     repo.PathWithNamespace,
-		WebURL:   repo.WebUrl,
-		Columns:  columns,
-		Cards:    cards,
-		Pipeline: repoPipeline,
+		RepoID:    repo.ID.String(),
+		Path:      repo.PathWithNamespace,
+		WebURL:    repo.WebUrl,
+		ForgeType: repo.ForgeType,
+		Columns:   columns,
+		Cards:     cards,
+		Pipeline:  repoPipeline,
 	}, true
 }
 

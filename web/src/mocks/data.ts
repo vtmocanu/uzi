@@ -424,6 +424,7 @@ export const mockBoards: Record<string, Board> = {
   "repo-uzi": {
     repo_id: "repo-uzi",
     path_with_namespace: "vtmocanu/uzi",
+    forge_type: "gitlab",
     web_url: "https://gitlab.example.com/vtmocanu/uzi",
     columns: [
       { label_name: "Ready", position: 0 },
@@ -659,6 +660,7 @@ export const mockBoards: Record<string, Board> = {
   "repo-atlas": {
     repo_id: "repo-atlas",
     path_with_namespace: "vtmocanu/atlas-api",
+    forge_type: "gitlab",
     web_url: "https://gitlab.example.com/vtmocanu/atlas-api",
     columns: [
       { label_name: "Ready", position: 0 },
