@@ -36,15 +36,34 @@ func TestScrubTokens(t *testing.T) {
 }
 
 func TestScrubSecretsCoversAllFamilies(t *testing.T) {
-	in := "leak xoxb-bottok xapp-apptok sk-ant-not-a-real-key glpat-not-a-real-pat end"
+	// uziToken is a fake uzi CLI credential (uzc_ + a ≥16-char body): the scrub must
+	// strip it (PRD #64 Risk 14 — UZI_TOKEN lives in a GitLab CI variable and could
+	// echo into a status/title string bound for Slack), never a real secret.
+	const uziToken = "uzc_A1b2C3d4E5f6G7h8i9j0k1" //gitleaks:allow
+	in := "leak xoxb-bottok xapp-apptok sk-ant-not-a-real-key glpat-not-a-real-pat " + uziToken + " end"
 	got := ScrubSecrets(in)
-	for _, secret := range []string{"xoxb-bottok", "xapp-apptok", "sk-ant-not-a-real-key", "glpat-not-a-real-pat"} {
+	for _, secret := range []string{"xoxb-bottok", "xapp-apptok", "sk-ant-not-a-real-key", "glpat-not-a-real-pat", uziToken} {
 		if contains(got, secret) {
 			t.Errorf("ScrubSecrets left %q in %q", secret, got)
 		}
 	}
 	if !contains(got, "leak") || !contains(got, "end") {
 		t.Errorf("ScrubSecrets removed non-secret content: %q", got)
+	}
+}
+
+// The uzw_/uzc_/uza_ family is scrubbed for all three class prefixes, and the short
+// "uzc_a1b2" display stub (a non-secret, only 4 body chars) is NOT over-matched.
+func TestScrubSecretsUziTokenFamily(t *testing.T) {
+	for _, prefix := range []string{"uzc_", "uza_", "uzw_"} {
+		tok := prefix + "A1b2C3d4E5f6G7h8i9j0k1" //gitleaks:allow
+		if got := ScrubSecrets("using " + tok + " now"); contains(got, tok) {
+			t.Errorf("ScrubSecrets left %q in %q", tok, got)
+		}
+	}
+	// A display stub (uzc_ + 4 chars) is not a secret and must survive untouched.
+	if got := ScrubSecrets("token uzc_a1b2 in list"); !contains(got, "uzc_a1b2") {
+		t.Errorf("ScrubSecrets over-matched the short display stub: %q", got)
 	}
 }
 
