@@ -52,13 +52,20 @@ export function Login() {
 
   const oidcError = oidcErrorMessage(searchParams.get("error"));
 
+  // Where to land after login. Defaults to /dashboard; a ?next= (set by the CLI
+  // consent page so it is returned to after logging in) overrides it, but only for
+  // a same-origin internal path — reject absolute/protocol-relative values so it
+  // can never become an open redirect.
+  const nextParam = searchParams.get("next");
+  const returnTo = nextParam && nextParam.startsWith("/") && !nextParam.startsWith("//") ? nextParam : "/dashboard";
+
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
     setSubmitting(true);
     try {
       await login(email, password);
-      navigate("/dashboard");
+      navigate(returnTo);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong");
     } finally {
