@@ -27,6 +27,22 @@ var ErrTokenIntrospectionUnsupported = errors.New("forge: token introspection no
 // treating it as a failure. It carries no secret material.
 var ErrNoPipeline = errors.New("forge: no pipeline for ref")
 
+// ErrForgeVersionUnsupported is wrapped by the error VerifyToken returns when the
+// forge server is older than the driver's minimum supported version (Forgejo <
+// 16.0.0, D4 — the CI-fix loop's job-logs route first ships in 16.0.0). The
+// wrapping error names the reported and required versions so it stays actionable
+// when surfaced verbatim at connect. A re-run of VerifyToken on the periodic
+// privilege sweep re-fires the gate automatically; today a downgrade surfaces
+// there as the sweep's generic StatusError report (fail-safe — flagged, not
+// silently OK). This sentinel exists so a privcheck consumer can errors.Is it and
+// give a downgrade its own distinct finding — that consumer is not wired yet. It
+// carries no secret material. The version gate is a FEATURE gate, never a security
+// control (D4 L2): GET /version is public, unauthenticated and self-reported, so
+// nothing security-relevant may hang on it. GitLab has no version floor and never
+// returns this; it lives here because the sentinel is part of the driver contract,
+// not one driver's implementation.
+var ErrForgeVersionUnsupported = errors.New("forge: server version is older than this driver's minimum")
+
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
 // column, which is CHECK-constrained to the same set.
 type Type string
@@ -101,16 +117,32 @@ type TokenInfo struct {
 // BranchProtection reports a branch's protection state, returned by
 // DefaultBranchProtection.
 //
-// Every field is always evaluated, including when Protected is false. That is a
-// deliberate invariant, not an incidental one: an unprotected branch is the case
-// where a write-role bot CAN push and CAN merge, so a driver that returned the
-// zero value there would report the most dangerous branch in the repo as
-// "cannot push, cannot merge". A consumer would then have to remember to check
-// Protected first to avoid reading that as a clean bill of health — and the one
-// that forgets inverts its guardrail on exactly the worst case. Drivers must
-// therefore report what is true of the branch, never what was convenient to
-// skip. See TestDefaultBranchProtectionUnprotectedIsNotSafe, which fails if the
-// GitLab driver ever reverts to the zero value on a 404.
+// Protected, WriteRoleCanPush, and WriteRoleCanMerge are evaluated on EVERY path,
+// including when Protected is false. That is a deliberate invariant, not an
+// incidental one: an unprotected branch is the case where a write-role bot CAN
+// push and CAN merge, so a driver that returned the zero value there would report
+// the most dangerous branch in the repo as "cannot push, cannot merge". A
+// consumer that reads those three without checking Protected first would invert
+// its guardrail on exactly the worst case — so drivers report what is true of the
+// branch, never what was convenient to skip (the GitLab 404 arm hardcodes these
+// two CanPush/CanMerge fields true; the Forgejo unprotected early-return returns
+// them true for the supported write-bot config — its user_can_* are bot-scoped, so
+// a non-write bot, already a ProjectRole finding, reads false there, but the
+// Protected-first guard fires "not protected" regardless). See
+// TestDefaultBranchProtectionUnprotectedIsNotSafe and its Forgejo twin, which fail
+// if either driver reverts to the zero value there.
+//
+// BotCanPush and BotCanMerge are DIFFERENT and the invariant above does NOT extend
+// to them: they are per-user-grant flags — "a push/merge access level names the
+// bot user directly" — meaningful ONLY when Protected is true. On an unprotected
+// branch no such grant exists, so they are legitimately false there. That makes
+// them a trap read on their own: a consumer writing `if BotCanPush || BotCanMerge`
+// without a Protected-first guard reads false,false on unprotected main and
+// concludes safe — the same R12 inversion. The GitLab driver populates them from a
+// protected branch's access levels; the Forgejo driver never sets them (its branch
+// endpoint folds the bot's own rights into user_can_push/user_can_merge, which map
+// onto WriteRoleCan*), so on Forgejo they are always false. Consumers must gate on
+// Protected first — M3's evaluateRepo does.
 type BranchProtection struct {
 	// Protected is false when the branch has no protection rule at all (the
 	// driver maps a 404 from the protected-branches endpoint to this). It is a
@@ -131,9 +163,12 @@ type BranchProtection struct {
 	// branch even at write role — a false negative the role/WriteRoleCanPush
 	// checks alone would miss. Group-level push grants to the bot are NOT detected
 	// (they need an extra membership call); that gap is documented for manual audit.
+	// GitLab only: the Forgejo driver never sets this (see the type doc). Read it
+	// behind a Protected-first guard, never on its own.
 	BotCanPush bool
 	// BotCanMerge is the merge counterpart of BotCanPush: a merge access level
-	// naming the bot user directly. Same group-level gap.
+	// naming the bot user directly. Same group-level gap; likewise GitLab-only and
+	// meaningful only when Protected is true.
 	BotCanMerge bool
 }
 
@@ -359,6 +394,8 @@ func New(t Type, baseURL, token string, timeout time.Duration) (Forge, error) {
 	switch t {
 	case TypeGitLab:
 		return newGitLab(baseURL, token, timeout)
+	case TypeForgejo:
+		return newForgejo(baseURL, token, timeout)
 	default:
 		return nil, fmt.Errorf("forge: unsupported forge type %q", t)
 	}
