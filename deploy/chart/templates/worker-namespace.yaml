@@ -18,11 +18,21 @@
   ServiceAccount's imagePullSecrets can only reference a Secret in its OWN namespace,
   so a worker cannot pull its image without a copy here. By this comment's own
   argument, a compromised controller could create a pod that mounts it and exfiltrate
-  the robot credential. Bounded by what that robot is (a shared, pull-scoped Harbor
-  identity — M6 confirms it has no push rights before rollout, since a pushing robot
-  would let a compromised controller poison the fleet's images) and by there being
-  nothing else here to reach. The workers themselves cannot read it: it is never
-  mounted into the pod, only consumed by the kubelet.
+  the robot credential. Bounded by what that robot is, and by there being nothing else
+  here to reach. The workers themselves cannot read it: it is never mounted into the
+  pod, only consumed by the kubelet.
+
+  THE ROBOT IS PULL-ONLY — VERIFIED 2026-07-17 (M6), not assumed from its name. This
+  comment used to say "M6 confirms it has no push rights before rollout"; it did, so
+  here is the evidence rather than the promise. The account behind
+  registry-robot-secret-uzi is `registry-robot`, and Harbor's registry token service, asked for
+  `pull,push,delete` on five repos (including agent-base, which did not exist yet),
+  granted `[pull]` and nothing else every time. That is the authoritative answer: the
+  token's `access` claim is what the registry enforces, and Harbor's
+  /users/current/permissions returned an empty list, so the API route could not settle
+  it. The check matters because a PUSHING robot would upgrade this residual from
+  "exfiltrate a pull credential" to "poison every hosted worker's image, fleet-wide".
+  Re-verify if the robot is ever re-scoped.
 */ -}}
 apiVersion: v1
 kind: Namespace
