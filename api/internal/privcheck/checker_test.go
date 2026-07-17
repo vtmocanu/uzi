@@ -3,6 +3,7 @@ package privcheck
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -293,6 +294,32 @@ func TestCheckErrorReport(t *testing.T) {
 	}
 	// The redacted error must not embed the raw forge message.
 	if hasFinding(rep.Token.Warnings, "401 unauthorized") {
+		t.Fatalf("report leaked the raw forge error: %v", rep.Token.Warnings)
+	}
+}
+
+// TestCheckVersionDowngradeDistinctFinding: when VerifyToken refuses because the
+// forge downgraded below the driver minimum (Forgejo <16, D4/D4a), the sweep
+// surfaces a distinct upgrade-the-server finding via errors.Is on
+// forge.ErrForgeVersionUnsupported — NOT the generic revoked/unreachable message
+// that would send the user to re-mint a working token. Still StatusError.
+func TestCheckVersionDowngradeDistinctFinding(t *testing.T) {
+	// Wrap the sentinel the way the driver does (%w through a redacted message),
+	// so errors.Is reaches it through the wrapper.
+	f := &fakeForge{verifyErr: fmt.Errorf("forgejo: server version %q is below the required Forgejo %s: %w", "15.0.4", "16.0.0", forge.ErrForgeVersionUnsupported)}
+	rep := NewChecker().Check(context.Background(), f, forge.TypeForgejo, []Repo{{ID: "r1", ForgeProjectID: 1}}, now)
+	if rep.Status != StatusError {
+		t.Fatalf("status = %q, want error", rep.Status)
+	}
+	if !hasFinding(rep.Token.Warnings, "older than the minimum version uzi requires") {
+		t.Fatalf("want the distinct version-downgrade finding, got %v", rep.Token.Warnings)
+	}
+	// It must NOT collapse to the generic token-failure message.
+	if hasFinding(rep.Token.Warnings, "could not verify the bot token") {
+		t.Fatalf("a version downgrade must not read as a token failure: %v", rep.Token.Warnings)
+	}
+	// And it must not leak the raw driver error (version string / wrapper text).
+	if hasFinding(rep.Token.Warnings, "15.0.4") || hasFinding(rep.Token.Warnings, "forgejo:") {
 		t.Fatalf("report leaked the raw forge error: %v", rep.Token.Warnings)
 	}
 }

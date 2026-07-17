@@ -59,13 +59,22 @@ func (c *Checker) CheckToken(ctx context.Context, f forge.Forge, forgeType forge
 func (c *Checker) Check(ctx context.Context, f forge.Forge, forgeType forge.Type, repos []Repo, now time.Time) Report {
 	identity, err := f.VerifyToken(ctx)
 	if err != nil {
+		// A version-gate refusal is a different condition from a bad token, and
+		// pointing the user at the wrong fix wastes their time. VerifyToken owns the
+		// Forgejo >=16 comparison (D4/D4a) and wraps forge.ErrForgeVersionUnsupported
+		// when the instance is below the driver minimum; the sweep re-fires that
+		// gate here for free, so an instance that connected at 16.x and later
+		// downgraded resurfaces on the next pass. Give it its own finding — the fix
+		// is to upgrade the server, not to re-mint the token. The tier stays
+		// StatusError (the check could not complete against a usable forge), and the
+		// raw driver error is not embedded: it is PAT-redacted but we keep the
+		// report generic on both arms, and the driver already surfaces the
+		// reported/required versions verbatim at connect.
+		if errors.Is(err, forge.ErrForgeVersionUnsupported) {
+			return errorReport(now, "the forge server is older than the minimum version uzi requires; upgrade the server (re-minting the token will not help)")
+		}
 		// err is already PAT-redacted by the driver, but we keep the report
-		// generic rather than embedding the raw forge error at all. On the sweep,
-		// this is also where a version-gate refusal surfaces: VerifyToken owns the
-		// Forgejo >=16 comparison (D4/D4a), so an instance that connected at 16.x
-		// and later downgraded re-fails here on the next pass with no duplicate
-		// comparison in this package. See the M3 report for the open question of
-		// giving that a message distinct from a revoked token.
+		// generic rather than embedding the raw forge error at all.
 		return errorReport(now, "could not verify the bot token against the forge (revoked, expired, or forge unreachable)")
 	}
 	token := c.CheckToken(ctx, f, forgeType, identity.IsAdmin, now)
