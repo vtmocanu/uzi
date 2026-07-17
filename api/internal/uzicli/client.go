@@ -1,6 +1,7 @@
 package uzicli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -41,6 +42,24 @@ type Client interface {
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
+
+	// StartCLIAuth begins a browser-brokered login: POST /api/auth/cli/start with the
+	// PKCE S256 challenge and a client description. UNAUTH by design (the CLI has no
+	// credential yet). Returns the request_id, the display user_code, the request
+	// lifetime, and the poll cadence to honour.
+	StartCLIAuth(ctx context.Context, challenge, clientDesc string) (CLIAuthStartResult, error)
+	// PollCLIAuth polls POST /api/auth/cli/poll {request_id, verifier} once and
+	// classifies the reply: 202 pending, 200 authorized (Token/User set, once), or 410
+	// terminal (Reason set). POST not GET so the verifier never lands in an access log.
+	PollCLIAuth(ctx context.Context, requestID, verifier string) (CLIAuthPollResult, error)
+	// CreateRun queues an agent run on a repo's PRD issue: POST /api/repos/{id}/runs
+	// {issue_iid}. Returns the created run.
+	CreateRun(ctx context.Context, repoID string, issueIID int64) (apitypes.RunDTO, error)
+	// SubmitRunInput submits a steering input: POST /api/runs/{id}/inputs
+	// {kind, body, selection}. kind ∈ {approve_plan, reject_plan, cancel, follow_up}.
+	// sel is legal only with approve_plan; the server validates it against the run's
+	// real roster (the client never composes the worker-bound body itself).
+	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error)
 }
 
 // maxRespBytes caps how much of a response body the client reads, so a broken or
@@ -85,14 +104,15 @@ func refuseRedirect(req *http.Request, _ []*http.Request) error {
 
 var _ Client = (*HTTPClient)(nil)
 
-// newRequest builds a GET request to base+path, rejecting a non-https base URL
-// before any credential is attached. This is a credential-leak guard, not a
-// nicety: --url / $UZI_URL / config flow verbatim into BaseURL, and every method
-// attaches `Authorization: Bearer <uzc_/uza_>` — so a plaintext or
-// attacker-controlled URL would leak the token in the clear. https everywhere,
-// with an http exception ONLY for the loopback compose stack
-// (127.0.0.1/localhost). Mirrors the server's https-only FORGE_ALLOWED_BASE_URLS.
-func (c *HTTPClient) newRequest(ctx context.Context, method, path string) (*http.Request, error) {
+// newRequest builds a request to base+path with an optional JSON body, rejecting a
+// non-https base URL before any credential is attached. This is a credential-leak
+// guard, not a nicety: --url / $UZI_URL / config flow verbatim into BaseURL, and
+// every authenticated method attaches `Authorization: Bearer <uzc_/uza_>` — so a
+// plaintext or attacker-controlled URL would leak the token in the clear (and the
+// login flow's PKCE verifier rides these requests too). https everywhere, with an
+// http exception ONLY for the loopback compose stack (127.0.0.1/localhost). Mirrors
+// the server's https-only FORGE_ALLOWED_BASE_URLS.
+func (c *HTTPClient) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
 	base := strings.TrimSpace(c.BaseURL)
 	if base == "" {
 		return nil, Exitf(ExitUsage, "no uzi API URL configured: pass --url or set $UZI_URL")
@@ -107,11 +127,14 @@ func (c *HTTPClient) newRequest(ctx context.Context, method, path string) (*http
 			base)
 	}
 	full := strings.TrimRight(u.String(), "/") + path
-	req, err := http.NewRequestWithContext(ctx, method, full, nil)
+	req, err := http.NewRequestWithContext(ctx, method, full, body)
 	if err != nil {
 		return nil, Exitf(ExitGeneric, "build request: %v", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
@@ -129,26 +152,64 @@ func isLoopbackURL(u *url.URL) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// get executes a GET and, on a 2xx, decodes the body into out (out may be nil to
-// discard). Every failure — transport, HTTP status, or decode — is returned as an
-// *ExitError carrying the right process exit code (never a bare error): a raw
-// error leaking to main would be misclassified as a usage error (see ExitCodeFor).
-func (c *HTTPClient) get(ctx context.Context, path string, out any) error {
-	req, err := c.newRequest(ctx, http.MethodGet, path)
+// doJSONRead performs one request with an optional JSON body and returns the
+// response plus its (capped) body, already drained and closed. Every transport
+// failure is returned as an *ExitError (ExitUnreachable): a raw error leaking to
+// main would be misclassified as a usage error (see ExitCodeFor). The caller owns
+// HTTP-status classification, since some callers (the poll loop) branch on
+// non-error statuses like 202/410 that others treat as failures.
+func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBody any) (*http.Response, []byte, error) {
+	var body io.Reader
+	if reqBody != nil {
+		b, err := json.Marshal(reqBody)
+		if err != nil {
+			return nil, nil, Exitf(ExitGeneric, "encode request: %v", err)
+		}
+		body = bytes.NewReader(b)
+	}
+	req, err := c.newRequest(ctx, method, path, body)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		// Any error from Do is a transport failure (dial refused, DNS, TLS,
 		// timeout, context deadline): the server is effectively unreachable.
-		return Exitf(ExitUnreachable, "cannot reach uzi at %s: %v", c.BaseURL, transportMsg(err))
+		return nil, nil, Exitf(ExitUnreachable, "cannot reach uzi at %s: %v", c.BaseURL, transportMsg(err))
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 	if err != nil {
-		return Exitf(ExitUnreachable, "reading response from uzi: %v", err)
+		return nil, nil, Exitf(ExitUnreachable, "reading response from uzi: %v", err)
 	}
+	return resp, respBody, nil
+}
+
+// get executes a GET and, on a 2xx, decodes the body into out (out may be nil to
+// discard). Every failure — transport, HTTP status, or decode — is returned as an
+// *ExitError carrying the right process exit code.
+func (c *HTTPClient) get(ctx context.Context, path string, out any) error {
+	resp, body, err := c.doJSONRead(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	return decode2xx(resp, body, path, out)
+}
+
+// postJSON executes a POST with a JSON body and, on a 2xx, decodes the reply into
+// out (out may be nil). Non-2xx maps to the documented exit code via statusError.
+func (c *HTTPClient) postJSON(ctx context.Context, path string, reqBody, out any) error {
+	resp, body, err := c.doJSONRead(ctx, http.MethodPost, path, reqBody)
+	if err != nil {
+		return err
+	}
+	return decode2xx(resp, body, path, out)
+}
+
+// decode2xx maps a non-2xx status to an *ExitError and otherwise decodes the body
+// into out (nil to discard). Shared by get and postJSON so success/error handling
+// is identical across verbs.
+func decode2xx(resp *http.Response, body []byte, path string, out any) error {
 	if resp.StatusCode/100 != 2 {
 		return statusError(resp.StatusCode, body)
 	}
@@ -347,4 +408,85 @@ func (c *HTTPClient) AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateL
 		return nil, err
 	}
 	return env.Users, nil
+}
+
+func (c *HTTPClient) StartCLIAuth(ctx context.Context, challenge, clientDesc string) (CLIAuthStartResult, error) {
+	reqBody := map[string]string{"code_challenge": challenge, "client_desc": clientDesc}
+	var out struct {
+		RequestID string `json:"request_id"`
+		UserCode  string `json:"user_code"`
+		ExpiresIn int    `json:"expires_in"`
+		Interval  int    `json:"interval"`
+	}
+	if err := c.postJSON(ctx, "/api/auth/cli/start", reqBody, &out); err != nil {
+		return CLIAuthStartResult{}, err
+	}
+	return CLIAuthStartResult{
+		RequestID: out.RequestID,
+		UserCode:  out.UserCode,
+		ExpiresIn: out.ExpiresIn,
+		Interval:  out.Interval,
+	}, nil
+}
+
+func (c *HTTPClient) PollCLIAuth(ctx context.Context, requestID, verifier string) (CLIAuthPollResult, error) {
+	reqBody := map[string]string{"request_id": requestID, "verifier": verifier}
+	resp, body, err := c.doJSONRead(ctx, http.MethodPost, "/api/auth/cli/poll", reqBody)
+	if err != nil {
+		return CLIAuthPollResult{}, err
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// 200 {token, user} — approved and minted, returned once. Store, never print.
+		var out struct {
+			Token string           `json:"token"`
+			User  apitypes.UserDTO `json:"user"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			return CLIAuthPollResult{}, Exitf(ExitGeneric, "malformed login response from uzi: %v", err)
+		}
+		return CLIAuthPollResult{Status: CLIAuthAuthorized, Token: out.Token, User: out.User}, nil
+	case http.StatusAccepted:
+		// 202 {status:"pending"} — keep polling.
+		return CLIAuthPollResult{Status: CLIAuthPending}, nil
+	case http.StatusGone:
+		// 410 {status:"expired"|"denied"|"consumed"} — terminal, stop.
+		return CLIAuthPollResult{Status: CLIAuthTerminal, Reason: pollStatusField(body)}, nil
+	default:
+		// 400/401/429/5xx etc. — map to the documented exit code (auth/usage/...).
+		return CLIAuthPollResult{}, statusError(resp.StatusCode, body)
+	}
+}
+
+// pollStatusField pulls {"status": "..."} from a poll reply, defaulting to
+// "expired" when absent — the request_id is not a secret, so a missing/opaque
+// terminal body reads as expired rather than leaking existence.
+func pollStatusField(body []byte) string {
+	var s struct {
+		Status string `json:"status"`
+	}
+	if json.Unmarshal(body, &s) == nil && strings.TrimSpace(s.Status) != "" {
+		return s.Status
+	}
+	return "expired"
+}
+
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64) (apitypes.RunDTO, error) {
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	reqBody := map[string]int64{"issue_iid": issueIID}
+	if err := c.postJSON(ctx, "/api/repos/"+url.PathEscape(repoID)+"/runs", reqBody, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+func (c *HTTPClient) SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error) {
+	reqBody := apitypes.RunInputRequest{Kind: kind, Body: body, Selection: sel}
+	var out apitypes.RunInputResponse
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/inputs", reqBody, &out); err != nil {
+		return apitypes.RunInputResponse{}, err
+	}
+	return out, nil
 }

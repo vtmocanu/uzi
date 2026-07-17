@@ -425,8 +425,10 @@ func TestUnknownFlagExit2(t *testing.T) {
 	}
 }
 
+// A still-stubbed verb (skill install lands in M9) reports the generic exit code.
+// login/logout and the run write verbs are no longer stubs (M8).
 func TestStubExit1(t *testing.T) {
-	_, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "login")
+	_, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "skill", "status")
 	if code != uzicli.ExitGeneric {
 		t.Fatalf("exit = %d, want %d (generic/not-implemented)", code, uzicli.ExitGeneric)
 	}

@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -9,6 +11,24 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+)
+
+// Run-input kinds, the exact wire strings the inputs endpoint accepts
+// (handler/workers.go runInputKinds). Named so a typo is a compile error, not a
+// silent 400.
+const (
+	kindApprovePlan = "approve_plan"
+	kindRejectPlan  = "reject_plan"
+	kindCancel      = "cancel"
+	kindFollowUp    = "follow_up"
+)
+
+// agentSources are the two rosters a plan approval may draw its subagents from
+// (apitypes.AgentSelection.Source). "own" is the run owner's template roster; "repo"
+// is the set the worker detected in the clone's .claude/agents/.
+const (
+	agentSourceOwn  = "own"
+	agentSourceRepo = "repo"
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls
@@ -165,38 +185,216 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	create := &cobra.Command{
 		Use:   "create",
-		Short: "Start a run on a repo/issue",
-		RunE:  stubRunE("run create"),
+		Short: "Start a run on a repo's PRD issue",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repoID, _ := cmd.Flags().GetString("repo")
+			issue, _ := cmd.Flags().GetInt64("issue")
+			if strings.TrimSpace(repoID) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "--repo is required (a repo id from `uzi repo list`)")
+			}
+			if issue <= 0 {
+				return uzicli.Exitf(uzicli.ExitUsage, "--issue must be a positive issue IID")
+			}
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			run, err := c.CreateRun(cmd.Context(), repoID, issue)
+			if err != nil {
+				return err
+			}
+			return renderCreatedRun(env, gf, run)
+		},
 	}
-	create.Flags().StringSlice("agents", nil, "restrict the run to these agents")
+	create.Flags().String("repo", "", "repo id to run against (see 'uzi repo list')")
+	create.Flags().Int64("issue", 0, "the PRD issue IID to run")
 
 	approve := &cobra.Command{
 		Use:   "approve <run-id>",
 		Short: "Approve a run's plan gate",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("run approve"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			source, _ := cmd.Flags().GetString("agent-source")
+			exclude, _ := cmd.Flags().GetStringSlice("exclude-agents")
+			sel, err := approveSelection(source, exclude)
+			if err != nil {
+				return err
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel)
+		},
 	}
+	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")
+	approve.Flags().StringSlice("exclude-agents", nil, "subagents to drop from the chosen source (requires --agent-source)")
+
 	reject := &cobra.Command{
 		Use:   "reject <run-id>",
 		Short: "Reject a run's plan gate",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("run reject"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			msg, _ := cmd.Flags().GetString("message")
+			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil)
+		},
 	}
+	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (optional)")
+
 	cancel := &cobra.Command{
 		Use:   "cancel <run-id>",
 		Short: "Cancel a run",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("run cancel"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, "", nil)
+		},
 	}
+
 	followUp := &cobra.Command{
 		Use:   "follow-up <run-id>",
 		Short: "Send a follow-up message to a run",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("run follow-up"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			if strings.TrimSpace(msg) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "a follow-up needs a message: pass -m <message> or pipe it on stdin")
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindFollowUp, msg, nil)
+		},
 	}
+	followUp.Flags().StringP("message", "m", "", "the follow-up message (or pipe it on stdin)")
 
 	cmd.AddCommand(list, get, logs, review, create, approve, reject, cancel, followUp)
 	return cmd
+}
+
+// approveSelection maps the plan-gate flags to the wire AgentSelection
+// {source, exclusions} (PRD #37 Decision 4: pick a source, exclude individual
+// agents — either/or, no mixing, no allow-list). It NEVER fetches the run: the
+// server validates the selection against the run's live roster, so the CLI just
+// forwards the structured choice.
+//
+//   - neither flag → nil: send NO selection; the server applies the run's default
+//     (repo-when-detected else own, no exclusions). This is the common case.
+//   - --agent-source own|repo → that source, with any --exclude-agents.
+//   - --exclude-agents without --agent-source → usage error: without a fetch the CLI
+//     can't know the run's default source, and exclusions are validated against the
+//     chosen source's roster server-side.
+//
+// `lead` is never excludable; if a user names it, the server rejects it — the CLI
+// does not special-case it client-side.
+func approveSelection(source string, exclude []string) (*apitypes.AgentSelection, error) {
+	exclude = nonEmpty(exclude)
+	if source == "" {
+		if len(exclude) > 0 {
+			return nil, uzicli.Exitf(uzicli.ExitUsage, "specify --agent-source with --exclude-agents")
+		}
+		return nil, nil
+	}
+	if source != agentSourceOwn && source != agentSourceRepo {
+		return nil, uzicli.Exitf(uzicli.ExitUsage, "--agent-source must be 'own' or 'repo'")
+	}
+	return &apitypes.AgentSelection{Source: source, Exclusions: exclude}, nil
+}
+
+// submitInput sends one steering input and reports the outcome. server_side (a
+// cancel/reject applied without a live worker) is surfaced so the caller knows the
+// action took effect immediately rather than being queued.
+func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection) error {
+	res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, sel)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(res)
+	}
+	if !gf.quiet {
+		p.Printf("%s: %s\n", runID, inputOutcome(kind, res.ServerSide))
+	}
+	return nil
+}
+
+// inputOutcome is the human confirmation line for a submitted input.
+func inputOutcome(kind string, serverSide bool) string {
+	switch kind {
+	case kindApprovePlan:
+		return "plan approved"
+	case kindRejectPlan:
+		if serverSide {
+			return "plan rejected (run stopped)"
+		}
+		return "plan rejection sent"
+	case kindCancel:
+		if serverSide {
+			return "run cancelled"
+		}
+		return "cancellation sent"
+	case kindFollowUp:
+		return "follow-up sent"
+	default:
+		return "input submitted"
+	}
+}
+
+// renderCreatedRun prints a newly created run and — Risk 4 — warns on stderr when it
+// already carries a health reason (e.g. a locked vault parks it queued). The reliable
+// surface remains `uzi run get`/`run list`, which poll the same reason; this warns at
+// create time so an agent that queues then polls is not left blind on the first read.
+func renderCreatedRun(env Env, gf *globalFlags, run apitypes.RunDTO) error {
+	if run.HealthReason != nil && strings.TrimSpace(*run.HealthReason) != "" {
+		fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(strings.TrimSpace(*run.HealthReason)))
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(map[string]any{"run": run})
+	}
+	if !gf.quiet {
+		return renderRunDetail(p, run)
+	}
+	return nil
+}
+
+// resolveMessage returns the -m flag value when set, else a message piped on stdin
+// (non-TTY only, mirroring `uzi auth token`), capped so a hostile pipe cannot make
+// the CLI allocate without bound.
+func resolveMessage(env Env, flagVal string) string {
+	if strings.TrimSpace(flagVal) != "" {
+		return flagVal
+	}
+	if env.Stdin != nil && !env.StdinTTY {
+		b, _ := io.ReadAll(io.LimitReader(env.Stdin, 1<<20))
+		return strings.TrimSpace(string(b))
+	}
+	return ""
+}
+
+// nonEmpty drops blank entries from a StringSlice flag (e.g. --exclude-agents "" or
+// a trailing comma), so a flag artifact never rides as an empty exclusion. It
+// returns a non-nil slice so a source-only selection marshals as `exclusions: []`
+// (matching the web AgentPicker), not `null`.
+func nonEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // renderRunDetail prints a run as an aligned key/value block. Health + the health
