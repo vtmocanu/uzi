@@ -295,8 +295,13 @@ const repoToolProfiles = new Map<string, string[]>(
 let toolEntryCounter = 0;
 
 // ── CLI tokens + browser-login requests (PRD #64 M6) ─────────────────────────
-let cliTokens: CliToken[] = mockCliTokens.map((t) => ({ ...t }));
+// Tokens are owner-attributed (user_id) so every read/write is scoped to the
+// session user, mirroring the real endpoints (`WHERE user_id=$1`). user_id is
+// mock-internal — stripped before responding, since the wire CliToken has none.
+type OwnedCliToken = CliToken & { user_id: string };
+let cliTokens: OwnedCliToken[] = mockCliTokens.map((t) => ({ ...t }));
 let cliTokenCounter = 0;
+const stripOwner = ({ user_id: _user_id, ...t }: OwnedCliToken): CliToken => t;
 // The seeded consent request; approve/deny flip its status in place.
 const cliAuthRequests = new Map<string, CliAuthRequestMeta & { user_code: string }>([
   [MOCK_CLI_AUTH_REQUEST_ID, { ...mockCliAuthRequest }],
@@ -1534,8 +1539,10 @@ export const mockApi = {
   // plaintext once, admin_ro is admin-only, revoked rows stay (the incident
   // trail), and revoke-all is idempotent.
   listCliTokens: async () => {
-    requireSession();
-    return delay({ tokens: cliTokens.map((t) => ({ ...t })) });
+    const me = requireSession();
+    // Only the caller's own tokens — the real endpoint filters `WHERE user_id=$1`,
+    // so as a non-admin persona you must not see the admin's tokens.
+    return delay({ tokens: cliTokens.filter((t) => t.user_id === me.id).map(stripOwner) });
   },
   createCliToken: async (name: string, scope: CliTokenScope) => {
     const me = requireSession();
@@ -1548,8 +1555,9 @@ export const mockApi = {
     const cls = scope === "admin_ro" ? "uza" : "uzc";
     const body = Array.from(crypto.getRandomValues(new Uint8Array(24)), (b) => b.toString(16).padStart(2, "0")).join("");
     const now = new Date().toISOString();
-    const row: CliToken = {
+    const row: OwnedCliToken = {
       id: `cli-new-${++cliTokenCounter}`,
+      user_id: me.id,
       name: trimmed,
       token_prefix: `${cls}_${body.slice(0, 4)}`,
       scope,
@@ -1562,18 +1570,20 @@ export const mockApi = {
       expires_at: scope === "admin_ro" ? new Date(Date.now() + 90 * 86_400_000).toISOString() : null,
     };
     cliTokens = [row, ...cliTokens];
-    return delay({ token: `${cls}_${body}`, cli_token: { ...row } }, 200);
+    return delay({ token: `${cls}_${body}`, cli_token: stripOwner(row) }, 200);
   },
   revokeCliToken: async (id: string) => {
-    requireSession();
-    const t = cliTokens.find((x) => x.id === id && !x.revoked);
+    const me = requireSession();
+    // Owner-scoped: a foreign id is a 404, exactly like the server.
+    const t = cliTokens.find((x) => x.id === id && x.user_id === me.id && !x.revoked);
     if (!t) throw new ApiError(404, "token not found");
     t.revoked = true;
     return delay(null);
   },
   revokeAllCliTokens: async () => {
-    requireSession();
-    cliTokens = cliTokens.map((t) => ({ ...t, revoked: true }));
+    const me = requireSession();
+    // Only the caller's tokens, mirroring `WHERE user_id=$1`.
+    cliTokens = cliTokens.map((t) => (t.user_id === me.id ? { ...t, revoked: true } : t));
     return delay(null);
   },
 

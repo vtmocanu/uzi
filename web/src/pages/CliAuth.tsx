@@ -16,7 +16,8 @@ import {
   type CliAuthStatus,
   type CliTokenScope,
 } from "../lib/api";
-import { Alert, Button, Card, Field, Input, Select, Skeleton } from "../components/ui";
+import { Alert, Button, Card, Field, Input, Skeleton } from "../components/ui";
+import { ScopePicker } from "../components/ScopePicker";
 
 // A non-pending fetched request is terminal — there is nothing to approve. Map
 // each status to the line the page shows instead of the consent form.
@@ -154,7 +155,11 @@ export function CliAuth() {
               <dl className="divide-y divide-edge rounded-lg border border-edge bg-raised/40 text-sm">
                 <div className="flex justify-between gap-3 px-3 py-2">
                   <dt className="text-muted">Requesting device</dt>
-                  <dd className="min-w-0 truncate text-fg">{meta.client_desc}</dd>
+                  {/* title so the full value is readable when truncated on a
+                      narrow viewport (plain text — still safe, never a link). */}
+                  <dd className="min-w-0 truncate text-fg" title={meta.client_desc}>
+                    {meta.client_desc}
+                  </dd>
                 </div>
                 <div className="flex justify-between gap-3 px-3 py-2">
                   <dt className="text-muted">Signed in as</dt>
@@ -182,20 +187,10 @@ export function CliAuth() {
                   />
                 </Field>
 
-                {/* Scope picker: admin-only, exactly like the static mint. A
-                    non-admin can only grant a 'user'-scoped login. */}
-                {isAdmin && (
-                  <Field label="Scope" htmlFor="cli-auth-scope">
-                    <Select
-                      id="cli-auth-scope"
-                      value={scope}
-                      onChange={(e) => setScope(e.target.value as CliTokenScope)}
-                    >
-                      <option value="user">User — your own access</option>
-                      <option value="admin_ro">Admin (read-only) — whole factory</option>
-                    </Select>
-                  </Field>
-                )}
+                {/* Scope picker: admin-only, exactly like the static mint (same
+                    shared component owns the gate). A non-admin can only grant a
+                    'user'-scoped login. */}
+                <ScopePicker admin={isAdmin} value={scope} onChange={setScope} id="cli-auth-scope" />
 
                 <p className="text-xs text-faint">
                   Only approve this if you just ran{" "}

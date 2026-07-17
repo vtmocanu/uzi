@@ -1538,9 +1538,16 @@ export const mockChatMessages: Record<string, RunMessage[]> = {
 // admin_ro (scope badge), a never-used one, a STALE one (unused 90+ days, so the
 // hint fires), and a revoked one (the soft-deleted incident trail — no Revoke
 // button, dimmed).
-export const mockCliTokens: CliToken[] = [
+// Each seed token carries a user_id so the mock can filter by the session user,
+// mirroring the real list endpoint's `WHERE user_id=$1` (the public CliToken type
+// has no user_id — the server never returns it — so it lives only on the fixture
+// and mockApi strips it before responding). Attribution splits the tokens across
+// the admin (u-admin) and a non-admin persona (u-mira) so logging in as mira in
+// the demo shows only mira's own token, not the admin's.
+export const mockCliTokens: (CliToken & { user_id: string })[] = [
   {
     id: "cli-1",
+    user_id: mockAdmin.id,
     name: "laptop",
     token_prefix: "uzc_a1b2",
     scope: "user",
@@ -1552,6 +1559,7 @@ export const mockCliTokens: CliToken[] = [
   },
   {
     id: "cli-2",
+    user_id: mockAdmin.id,
     name: "ci-runner",
     token_prefix: "uzc_9f3e",
     scope: "user",
@@ -1563,6 +1571,7 @@ export const mockCliTokens: CliToken[] = [
   },
   {
     id: "cli-3",
+    user_id: mockAdmin.id,
     name: "factory audit (read-only)",
     token_prefix: "uza_77c0",
     scope: "admin_ro",
@@ -1574,6 +1583,7 @@ export const mockCliTokens: CliToken[] = [
   },
   {
     id: "cli-4",
+    user_id: "u-mira",
     name: "old-thinkpad",
     token_prefix: "uzc_5d2a",
     scope: "user",
@@ -1585,6 +1595,7 @@ export const mockCliTokens: CliToken[] = [
   },
   {
     id: "cli-5",
+    user_id: mockAdmin.id,
     name: "leaked-in-a-gist",
     token_prefix: "uzc_0b11",
     scope: "user",

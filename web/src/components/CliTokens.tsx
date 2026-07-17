@@ -7,7 +7,8 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { useAuth } from "../auth/AuthContext";
 import { api, ApiError, type CliToken, type CliTokenScope } from "../lib/api";
 import { CLI_TOKEN_STALE_DAYS, isCliTokenStale } from "../lib/cliTokens";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select } from "./ui";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle } from "./ui";
+import { ScopePicker } from "./ScopePicker";
 import { KeyIcon } from "./icons";
 
 const scopeLabel = (scope: CliTokenScope) => (scope === "admin_ro" ? "admin (read-only)" : "user");
@@ -28,6 +29,10 @@ export function CliTokens() {
   // is stored server-side) and cleared on the next action.
   const [minted, setMinted] = useState<{ token: string; row: CliToken } | null>(null);
   const [copied, setCopied] = useState(false);
+  // The show-once secret appears dynamically after Create. role="status" makes a
+  // screen reader announce it; moving focus here takes a keyboard/SR user to the
+  // one-time value instead of leaving them where the form was (a11y should-fix).
+  const mintedRef = useRef<HTMLDivElement>(null);
 
   // Revoke-all is the only confirmed action here: single revoke is a one-click,
   // owner-only act (its blast radius is the owner's own tokens), but revoke-all is
@@ -55,6 +60,12 @@ export function CliTokens() {
   useEffect(() => {
     if (confirmingAll) confirmRef.current?.focus();
   }, [confirmingAll]);
+
+  // Move focus to the minted card the moment the secret appears (same pattern as
+  // the confirm above), so the one-time token is announced and reachable.
+  useEffect(() => {
+    if (minted) mintedRef.current?.focus();
+  }, [minted]);
 
   const create = async (e: FormEvent) => {
     e.preventDefault();
@@ -128,7 +139,12 @@ export function CliTokens() {
           time the value appears — the copy affordance + warning mirror the worker
           join-token card. */}
       {minted && (
-        <Card className="space-y-3 border-ok/40">
+        <div
+          ref={mintedRef}
+          tabIndex={-1}
+          role="status"
+          className="space-y-3 rounded-xl border border-edge bg-surface p-5 outline-none border-ok/40"
+        >
           <SectionTitle className="text-ok">Token “{minted.row.name}” created</SectionTitle>
           <p className="text-sm text-muted">
             Copy it now — it is shown <strong className="text-fg">once and never again</strong> (only
@@ -147,7 +163,7 @@ export function CliTokens() {
               Done
             </Button>
           </div>
-        </Card>
+        </div>
       )}
 
       <form onSubmit={create} className="flex flex-wrap items-end gap-3">
@@ -161,24 +177,17 @@ export function CliTokens() {
             />
           </Field>
         </div>
-        {/* Scope picker: admin-only. A 'user' token is capped to the owner's own
-            access; 'admin_ro' reads the whole factory and only an admin may mint
-            it (the server also enforces this — the hidden control is UX, not the
-            security boundary). */}
-        {isAdmin && (
-          <div className="min-w-[12rem]">
-            <Field label="Scope" htmlFor="cli-token-scope">
-              <Select
-                id="cli-token-scope"
-                value={scope}
-                onChange={(e) => setScope(e.target.value as CliTokenScope)}
-              >
-                <option value="user">User — your own access</option>
-                <option value="admin_ro">Admin (read-only) — whole factory</option>
-              </Select>
-            </Field>
-          </div>
-        )}
+        {/* Scope picker: admin-only (the shared component owns the gate). A 'user'
+            token is capped to the owner's own access; 'admin_ro' reads the whole
+            factory and only an admin may mint it (the server also enforces this —
+            the hidden control is UX, not the security boundary). */}
+        <ScopePicker
+          admin={isAdmin}
+          value={scope}
+          onChange={setScope}
+          id="cli-token-scope"
+          className="min-w-[12rem]"
+        />
         <Button type="submit" disabled={busy || name.trim() === ""}>
           {busy ? "Creating…" : "Create token"}
         </Button>
@@ -270,8 +279,9 @@ function TokenRow({ token, onRevoke }: { token: CliToken; onRevoke: () => void }
             <span className="truncate font-medium text-fg">{token.name}</span>
             <Badge tone={token.scope === "admin_ro" ? "info" : "neutral"}>{scopeLabel(token.scope)}</Badge>
             {token.revoked && <Badge tone="danger">revoked</Badge>}
-            {/* Render-time staleness hint only (no new column/endpoint/policy). */}
-            {stale && !token.revoked && (
+            {/* Render-time staleness hint only (no new column/endpoint/policy).
+                isCliTokenStale already returns false for a revoked token. */}
+            {stale && (
               <Badge
                 tone="warning"
                 title={`Unused for ${CLI_TOKEN_STALE_DAYS}+ days. If you don't recognise it, revoke it.`}

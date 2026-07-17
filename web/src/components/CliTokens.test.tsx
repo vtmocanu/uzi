@@ -152,6 +152,24 @@ describe("CliTokens mint is show-once", () => {
     expect(screen.getByText(/once and never again/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Copy" })).toBeTruthy();
   });
+
+  it("announces the minted card via role=status and moves focus to it", async () => {
+    mockApi.createCliToken.mockResolvedValue({
+      token: "uzc_deadbeefdeadbeef",
+      cli_token: aToken({ id: "new", name: "laptop" }),
+    });
+    renderPage();
+
+    fireEvent.change(await screen.findByPlaceholderText(/laptop, ci-runner/), { target: { value: "laptop" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+
+    // The dynamically-shown secret is a live region so a screen reader announces it,
+    // and it carries the plaintext token so the announcement is the value itself.
+    const status = await screen.findByRole("status");
+    expect(status.textContent).toContain("uzc_deadbeefdeadbeef");
+    // Focus is moved into the card so a keyboard/SR user lands on the one-time value.
+    await waitFor(() => expect(document.activeElement).toBe(status));
+  });
 });
 
 describe("CliTokens revoke", () => {
