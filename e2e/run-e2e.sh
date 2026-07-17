@@ -80,8 +80,26 @@ set -euo pipefail
 #
 # What IS allowed: how to reach the machine (PATH/HOME/TMPDIR/TERM/docker daemon
 # addressing) and the harness's own knobs. None of these reach the api's config.
-if [ -z "${UZI_E2E_SANITIZED:-}" ]; then
-  _e2e_env=(UZI_E2E_SANITIZED=1)
+#
+# WHY THE GATE IS AN ARGUMENT AND NOT AN ENVIRONMENT VARIABLE. The re-exec has to fire
+# whenever the caller's environment is dirty, so the "have I sanitized yet?" test must
+# not be something that environment can answer. This gate WAS an env sentinel
+# (`[ -z "${UZI_E2E_SANITIZED:-}" ]`), and a sentinel is inherited like any other var:
+# `export UZI_E2E_SANITIZED=1` skipped the entire re-exec and handed the stack the real
+# JWT_SECRET, the real UZI_SEED_FORGE_PAT and the vulnerable TRUSTED_PROXIES, with no
+# warning. The realistic path there is accident, not malice — it reads exactly like the
+# intended escape hatch, so a developer wanting one var through for debugging finds it by
+# reading this very block, and it then lives in their profile forever. It was also the
+# same shape the paragraphs above reject three times over: a claim the environment makes
+# about itself, trusted without verification.
+#
+# `$1` cannot be inherited. `env -i` clears the environment, and the argv below is one we
+# construct ourselves, so the only way to reach the sanitized branch is through that exec
+# (or by typing the flag, which is a deliberate act, not an ambient one). Do not
+# "simplify" this back into an env check, and do not swap in a cleverer sentinel — any
+# value the ambient environment can supply is this same bug wearing a different hat.
+if [ "${1:-}" != "--e2e-sanitized" ]; then
+  _e2e_env=()
   for _v in \
     HOME PATH TMPDIR TERM CI \
     DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY DOCKER_TLS_CERTDIR \
@@ -90,8 +108,9 @@ if [ -z "${UZI_E2E_SANITIZED:-}" ]; then
   do
     [ -n "${!_v+set}" ] && _e2e_env+=("$_v=${!_v}")
   done
-  exec env -i "${_e2e_env[@]}" bash "${BASH_SOURCE[0]}" "$@"
+  exec env -i "${_e2e_env[@]}" bash "${BASH_SOURCE[0]}" --e2e-sanitized "$@"
 fi
+shift  # drop --e2e-sanitized; safe — this line is reached only when $1 held it
 
 # --- layout ------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
