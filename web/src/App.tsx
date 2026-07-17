@@ -9,6 +9,8 @@ import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
 import { Settings } from "./pages/Settings";
+import { AccessSettings } from "./pages/AccessSettings";
+import { CliAuth } from "./pages/CliAuth";
 import { Agents } from "./pages/Agents";
 import { AgentNew } from "./pages/AgentNew";
 import { AgentDetail } from "./pages/AgentDetail";
@@ -91,6 +93,18 @@ export default function App() {
             </ProtectedRoute>
           }
         />
+        <Route
+          path="/settings/access"
+          element={
+            <ProtectedRoute>
+              <AccessSettings />
+            </ProtectedRoute>
+          }
+        />
+        {/* CLI browser-login consent (PRD #64). Not wrapped in ProtectedRoute: it
+            handles its own auth so it can preserve ?request= across the login
+            redirect (ProtectedRoute would drop the query on the way to /login). */}
+        <Route path="/cli-auth" element={<CliAuth />} />
         <Route
           path="/runs"
           element={

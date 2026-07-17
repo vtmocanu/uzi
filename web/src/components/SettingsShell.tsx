@@ -12,6 +12,7 @@ const TABS = [
   { to: "/settings", label: "Account & token", end: true },
   { to: "/settings/forge", label: "Forge", end: false },
   { to: "/settings/workers", label: "Workers", end: false },
+  { to: "/settings/access", label: "Access", end: false },
 ];
 
 export function SettingsShell({ description, children }: { description: string; children: ReactNode }) {
