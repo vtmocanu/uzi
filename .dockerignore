@@ -1,7 +1,23 @@
 # Root .dockerignore. It applies ONLY to the `web` image, whose build context is
 # the repo root (docker-compose.yml web.build.context) so it can bundle docs/.
-# The api and agent images build from their own subdir contexts (./api, ./agent)
-# with their own .dockerignore, so nothing here affects them.
+# The api image builds from its own subdir context (./api) with its own
+# .dockerignore, so nothing here affects it.
+#
+# CORRECTED 2026-07-17 (PRD #58 M6): this used to say the AGENT image also builds
+# "from its own subdir context (./agent)". It does not, and has not since PRD #39
+# Decision 5 — its context is the REPO ROOT (docker-compose.yml agent.build.context
+# is `.`), because the worker image bakes uzi's own source at /opt/uzi-src for the
+# `chat` run kind. agent/.dockerignore is a leftover of the old subdir context and
+# is read by nothing.
+#
+# So this file is NOT irrelevant to the agent — it is the FALLBACK it must never
+# reach. What actually trims the agent context is the per-Dockerfile ignore next to
+# each template (agent/templates/<t>/Dockerfile.dockerignore), which both BuildKit
+# and kaniko prefer over this file (kaniko v1.24.0 pkg/util/fs_util.go:777 tries
+# "<dockerfile>.dockerignore" first and only then the context root's). That
+# precedence is load-bearing: the `agent/` exclusion below would break the agent
+# build outright (its Dockerfile COPYs agent/package.json), so deleting a template's
+# named ignore does not merely widen its context — it breaks the build.
 #
 # Load-bearing: this must NOT blanket-exclude *.md (the way web/.dockerignore
 # does) — docs/*.md are exactly the files the web image bundles. The web/
@@ -21,7 +37,9 @@
 **/.env.*
 
 # Submodules and sibling services the web build does not need. inspiration/ is
-# large; api/ and agent/ build from their own contexts; e2e/ is test-only.
+# large; api/ builds from its own context; e2e/ is test-only. `agent/` is excluded
+# for the WEB image only — the agent image shares this context root but is trimmed
+# by its own per-Dockerfile ignore instead (see the header), never by this file.
 inspiration/
 api/
 agent/
