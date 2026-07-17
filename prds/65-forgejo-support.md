@@ -866,12 +866,56 @@ not verified.** It is where R2's residual severity now lives, and M9 should budg
 remains the right real-world dogfooding target — but because it must not *gate* M9. It moves
 off the critical path and becomes optional.
 
+### D11 — Connect requires an explicit forge-type picker, not auto-detection (the gap M6b's "two-line flip" missed)
+
+**The headline `[live]` criterion — "a user connects a Forgejo ≥16.0.0 instance" — was unreachable
+through the product as the PRD stood** (found investigating M8's deferred connect copy, 2026-07-17;
+the **11th** team-caught claim). Verified: `handler.ForgeConfig` was built to feed the connect UI
+its valid choices and returns **both** `allowed_base_urls` **and** `forge_types` (the field, the
+`ForgeConfig` TS type at `api.ts:390`, and the mock all exist), but **the web connect form only ever
+consumed `allowed_base_urls`** — there is a base-URL `<Select>` and **no forge-type picker anywhere
+in `web/src`** (grep-confirmed), and `ForgeSettings.tsx:69` calls `api.createConnection(baseUrl,
+token)` dropping the third `forgeType` argument the function already accepts. So even after M6b flips
+the API to advertise+accept `forgejo`, the UI sends no `forge_type` → `CreateConnection` defaults it
+to `gitlab` → **every product-created connection is GitLab.** A `curl` could post `forge_type:forgejo`;
+no user can. **M6b as specced ("advertise + accept, two lines") cannot satisfy its own Success
+Criterion.**
+
+**Decision: an explicit picker, and auto-detection is rejected.** `CreateConnection` selects the
+driver — `ForgeForToken(forge.Type(forgeType), baseURL, token)` — **before** `VerifyToken` can talk to
+the instance, so `forge_type` must be known **up front**, and `ForgeConfig` already advertises
+`forge_types` precisely so a UI picker can offer them. That is the design intent; honor it.
+
+Rejected — **auto-detection** (probe `/api/v1/version` vs `/api/v4/version`, then pick the driver):
+1. **It leaks the forge boundary.** Discriminating forges by raw HTTP shape is a **driver-less
+   pre-probe in the handler** — "how to tell GitLab from Forgejo" logic living *outside* the `forge`
+   package, the exact leak the abstraction exists to prevent. The picker keeps all forge-type
+   knowledge in three honest places: the advertised list (config), the user's choice, and
+   `ForgeForToken`'s dispatch.
+2. **It solves a non-problem.** The user knows which forge they are connecting; a dropdown is not a
+   burden. Auto-detection is speculative generality.
+3. **It doubles the round-trips** (a detect probe *and* D4a's version gate) and adds new failure modes
+   (both/neither endpoint answers) for zero user benefit.
+
+The SSRF posture is unchanged either way (the base URL is allowlisted before any call), so this is a
+boundary/complexity decision, not a security one.
+
+### D11a — Known limitation, accepted: base-URL and forge-type are picked independently
+
+`ForgeConfig.allowed_base_urls` is a **flat list not associated with forge types**, so the form
+offers base URL and forge type as independent choices. A user can pick `gitlab` + a Forgejo URL (or
+the reverse); `VerifyToken` then fails against the wrong API shape and the save is rejected with an
+error — the safety net, not a silent miswrite. Associating URLs with forge types would be a
+`ForgeConfig` **contract change** (out of scope here, and it would need the lead/user); noted as a
+future refinement, not fixed in #65.
+
 ## Milestones
 
-Eleven milestones, six phases. **The gate flip is the last code change** (M6b), so
+Twelve milestones, six phases. **M6b (the go-live) is the last code change**, so
 everything before it lands dark on `main`: until `handler/forge.go` advertises
-`forgejo`, the type is unreachable from the API. (Guardrail *enforcement* was a
-twelfth milestone until it was split out to [PRD #66](66-guardrail-enforcement.md) —
+`forgejo`, the type is unreachable from the API — **including M11's connect-UI picker, which is
+itself dark** (hidden while `forge_types=[gitlab]`, D11). (Guardrail *enforcement* was another
+milestone until it was split out to [PRD #66](66-guardrail-enforcement.md) —
 it was the one milestone that would **not** have landed dark, refusing GitLab repos
 the moment it merged.)
 
@@ -887,7 +931,8 @@ the moment it merged.)
 | **M8** | **API + web** (not web-only): `forge_type` onto board cards (**D2** — DTO field only, cards already select it) **and runs (query change: new `forge_connections` joins on `ListRunsForUser`/`ListActiveRunsAll` + a best-effort `GetForgeTypeForRepo` for the detail path + sqlc regen — corrected from the draft's "no query change", see D2)**, `role` → string in the web (**D7**), merged **forge-blind** pipeline map (**R5** — keyed on status only, never `forge_type`), `mr_web_url` rendering **through `isHttpsUrl`** (D8, Go twin `isHTTPSURL` in `notifier.go`), `forgeNoun()` as the single mapping site + its `slacksvc/notifier.go` Go twin | `handler/board.go`, run handlers, `slacksvc/notifier.go`, `web/src/lib/*`, `web/src/components/*`, `mocks/` | M6a, M7 |
 | **M9** | e2e (**Variant A**, user 2026-07-17): `forge-fake` speaks `/api/v1` incl. **canned Actions** (`runs`/`runs/{id}/jobs`/`jobs/{id}/logs` → fixture `text/plain`); `UZI_E2E_FORGE` lane; **live validation vs a pinned ephemeral `forgejo/forgejo:16.0.0`** (D10, **not** an upgraded instance — R2 superseded) for the **non-Actions** surface. Fake stays default; container is the opt-in pass. **CI-fix `[live]` is met by fixture logs** (exercises `ListPipelineJobs`/`JobLogTail` parse + loop deterministically). **Real `forgejo-runner` log emission is UNVERIFIED — no runner environment available; deferred as an open R2 residual, to be done when one exists.** | `e2e/forge-fake/forge-fake.mjs`, `run-e2e.sh` | M4, M5, M7 |
 | **M10** | Docs + ADR + `ARCHITECTURE.md:71`; **correct `specs/ai.md` §16 via spec-keeper** (R1); `specs/human.md:40,396` (user-approved 2026-07-17); `docs/forgejo-bot-setup.md` (**unique `order`** — `gitlab-bot-setup.md` is `order: 20`; a copied frontmatter fails `check-docs.mjs` inside `npm run build`) | `docs/`, `adr/0065-forgejo-driver.md`, `ARCHITECTURE.md`, `specs/` | M8, M9 |
-| **M6b** | **Gate flip — go-live**: `handler/forge.go:125` advertises `forgejo`; `:156,158` accept it | `handler/forge.go` | M8, M9, M10 |
+| **M11** | **Connect-UI forge-type picker (D11), lands DARK**: `ForgeSettings.tsx` consumes `cfg.forge_types`, renders a forge-type `<Select>` mirroring the base-URL one, **shown only when `forge_types.length > 1`** (hidden/defaulted to the single value otherwise — so **zero change while the advert is `[gitlab]`**), and threads `forgeType` through the existing `api.createConnection(baseUrl, token, forgeType)` call. **No copy change here** (that rides M6b, so nothing is user-visible pre-go-live). Update `mocks/` for a 2-type config | `web/src/pages/ForgeSettings.tsx`, `web/src/lib/api.ts` (call site only — the param exists), `web/src/mocks/` | — |
+| **M6b** | **Gate flip — go-live, now genuinely usable (D11)**: advertise `forgejo` (`ForgeConfig.forge_types`) + accept `forgejo` (drop the non-gitlab reject in `CreateConnection`) + **flip the forge-less connect lead-in copy neutral** now that both forges are selectable — `Dashboard.tsx:243` "Connect your GitLab bot"→"Connect your bot", `Repos.tsx:202` "uzi needs a GitLab bot"→"…a bot", `ForgeSettings.tsx:160` "the GitLab bot account"→"the bot account" (restructure past the noun, D2; `ForgeSettings.tsx:186,332` already say "bot account" — no change). **The picker (M11) is what makes this flip reach a user** | `handler/forge.go`, `web/src/pages/{Dashboard,Repos,ForgeSettings}.tsx` | M8, M9, M10, **M11** |
 
 † M4 and M5 are collision-free **only because M2 lands both files as stubs**. If M2
 ships one file, M4 → M5 must run sequentially.
@@ -900,10 +945,13 @@ ships one file, M4 → M5 must run sequentially.
 | **2** | **M2** ∥ **M3** ∥ **M7** | Driver core / privcheck / worker. Disjoint. |
 | **3** | **M4** ∥ **M5** ∥ **M8** | Driver MR / driver pipelines / api+web. Disjoint **given M2's stubs**. |
 | **4** | **M9** alone | e2e, green before the gate. |
-| **5** | **M10** alone | Docs once the as-built is known. |
-| **6** | **M6b** alone | The go-live. Two lines, deliberately last. |
+| **5** | **M10** ∥ **M11** | Docs (once the as-built is known) and the connect-UI picker (dark, web-only). Disjoint files. |
+| **6** | **M6b** alone | The go-live: API flip + forge-neutral connect copy. Deliberately last, and now **usable** because M11 shipped the picker (dark) first. |
 
-Peak parallelism 3.
+Peak parallelism 3. **The [live] connect criterion is reachable only once M11's picker + M6b's
+advert both land** (D11). Two distinct paths validate it: M9's e2e connects a Forgejo instance
+**via the API** (`forge_type` in the create-connection POST — the machine path, independent of the
+picker), while M11's web tests + **web-ux post-M6b** validate the human path through the picker.
 
 **Why M6 is split — this was a real bug, not a tidy-up.** An earlier draft put the
 whole of M6 (migration **and** gate flip) in Phase 2 while claiming "M1–M5 land dark".
@@ -919,7 +967,8 @@ is inert and wants to be early (M8 needs it); the gate flip is the go-live and m
 last. Split, the dark-landing property is finally **true**: M6a only *widens* a CHECK
 (no `forgejo` row can exist while the handler rejects the type), M6a/M7 emit
 `forge_type: "gitlab"` for existing connections, and the driver is unreachable.
-**M6b is the only milestone that changes observable behaviour.**
+**M6b is the only milestone that changes observable behaviour** — M11's picker lands dark
+(hidden until M6b's advert makes `forge_types` multi-valued), so it too is invisible until the flip.
 
 **One caveat, stated because "dark" invites carelessness: M3 is not inert.** It is a
 behaviour-preserving refactor of a **live GitLab path**. Verify it against the
@@ -1086,8 +1135,10 @@ residual, not claimed as done.**
 
 - **[fixture]** A Forgejo instance < 16.0.0 is **refused at connect**, with an error
   naming the required version reaching the user (D4).
-- **[live]** A user connects a Forgejo ≥16.0.0 instance, and the privilege checker
-  applies the **same PRD #5 verdicts** it applies to GitLab (D6) — including the
+- **[live]** A user connects a Forgejo ≥16.0.0 instance **through the connect form's
+  forge-type picker** (D11 — this criterion is only reachable once **M11** ships the picker and
+  **M6b** advertises `forgejo`; before both, the UI can only create GitLab connections), and the
+  privilege checker applies the **same PRD #5 verdicts** it applies to GitLab (D6) — including the
   per-forge scope rule (D6b), refusing rather than warning where a check cannot be
   satisfied.
 - **[live]** A Forgejo repo whose `main` is unprotected, **or** protected but
@@ -1148,6 +1199,7 @@ residual, not claimed as done.**
 | D8 | Persist `runs.mr_web_url`, written by the worker | 2026-07-17 | Architect. The driver has the URL and discards it. Worker path chosen over `mr_watch` (immediate + complete vs first-tick + Human-Review-only); `isHttpsUrl` guard survives. |
 | D9 | Minimal TS forge seam (`createMr` only) | 2026-07-17 | Architect. Worker needs ~2 endpoints, not 19. Three transport guards (https, `redirect:"error"`, 409-resume) are interface requirements. |
 | D10 | **M9's live target = pinned ephemeral `forgejo/forgejo:16.0.0`**, not an upgraded instance; **codeberg.org rejected** | 2026-07-17 | Architect. The released image exists on both registries, boots ~4s on sqlite, and reports `16.0.0+gitea-1.22.0` — a release, so it **passes D4a** where codeberg does not. **R3 was settled and D6a-1 / D6 / D6b / D7 / D4 were each confirmed on it while writing this** — the first time any of them ran against a released 16.0.0. codeberg rejected on three counts, **any one sufficient**: it is volunteer-run production infrastructure and the [live] criteria write to it (**decisive, and independent of every technical fact**); D4a refuses it; it is a moving dev build that can only ever prove *routes exist*, never *a release behaves this way*. Removes R2's human dependency from the critical path; the self-hosted upgrade stays wanted for dogfooding but gates nothing. **Residual: real job logs need a `forgejo-runner` (unverified) — see D10a.** |
+| D11 | **Connect needs an explicit forge-type picker (not auto-detection); M11 lands it dark, M6b flips advert+accept+copy** | 2026-07-17 | Architect, surfaced to user as a scope finding. The `[live]` connect criterion was **unreachable**: the web form never sent `forge_type`, so post-M6b it still created GitLab connections (11th team-caught claim). Picker chosen over auto-detection because the driver is selected **before** `VerifyToken` (forge_type must be known up front), `ForgeConfig` already advertises `forge_types` for exactly this, and auto-detection would leak forge-discrimination logic outside the `forge` package into a driver-less handler pre-probe. Picker hides while `forge_types=[gitlab]` → dark. **M6b's "two lines" was insufficient for its own Success Criterion.** Base-URL/forge-type picked independently (D11a): mismatch fails at `VerifyToken`, accepted limitation. |
 | D10a | **M9 CI-fix live coverage: fixtures only; real-runner verification deferred** | 2026-07-17 | User, choosing **Variant A**. The e2e lane proves `ListPipelineJobs`/`JobLogTail` + the CI-fix loop against `forge-fake`'s canned `text/plain` job logs; the non-Actions surface is validated live against the ephemeral `forgejo:16.0.0`. The one-time real-`forgejo-runner` job-log check is **deferred, not done** — the user has no runner environment. **Recorded as unverified, not claimed** (this PRD does not claim verification that did not happen). Acceptable because the log route is verified on a release and `JobLogTail` does near-zero forge-specific parsing (SDK call + tail-truncate), so the fixture lane's fidelity loss is narrow; the residual gap is the live *retrieval* path (auth/redirect/content-type on a real run), an open R2 item blocking nothing on the critical path. |
 
 ## Evidence Base
