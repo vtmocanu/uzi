@@ -21,10 +21,11 @@ the sibling reference — uzi follows its Model-B release shape.
 | --- | --- | --- |
 | Brought up by | `docker compose up` | ArgoCD (auto-sync) from `argo-apps` `apps/uzi/` |
 | web / api images | built locally | `harbor.example.com/gitlab/vtmocanu/uzi/{web,api}:<tag>` |
+| controller / agent images | n/a (compose runs no controller) | `.../uzi/controller:<tag>`, `.../uzi/agent-{base,jvm}:<tag>` (PRD #58 M6) |
 | Postgres | `postgres:17` container | CNPG `Cluster` (`postgres-uzi-cluster`, 1 instance, `storage-class`) |
 | Secrets | `./.env` | Infisical (`/uzi` folder) + CNPG-generated `-app` creds |
 | Public URL | `http://127.0.0.1:8080` | `https://uzi.example.com` (ingress-nginx, `*.example.com` wildcard TLS) |
-| Worker | `docker compose --profile agent` | **not deployed** — laptop only (Decision 5) |
+| Worker | `docker compose --profile agent` | laptop workers unchanged; **hosted workers ship but are OFF** — see [Hosted workers](#hosted-workers-prd-58) |
 
 The ArgoCD `Application` is **multi-source** (example-app precedent): the released
 chart from Harbor OCI + the per-cluster values from the uzi git repo, so
@@ -203,10 +204,17 @@ into `values/dev-cluster.yaml` (re-verify if the cluster changes):
   egress to `gitlab.example.com` is open. Anthropic egress is **not** needed
   in-cluster this release — runs execute on laptop workers.
 
-## Worker onboarding (no in-cluster worker)
+## Worker onboarding (laptop workers)
 
-Per Decision 5 there is **no published worker image** and no worker deployed to
-dev-cluster. Laptop users run their own worker against the deployed api:
+**Corrected 2026-07-17 (PRD #58 M6): there IS a published worker image now.** This
+section used to open "per Decision 5 there is no published worker image and no worker
+deployed to dev-cluster". The first half stopped being true when M6's CI began
+publishing `agent-base` / `agent-jvm` on `v*` tags; the second is still true, because
+hosted workers are shipped but disabled (see [Hosted workers](#hosted-workers-prd-58)).
+PRD #52's Decision 5 was about *that* release's scope, not a standing rule.
+
+Laptop users run their own worker against the deployed api, exactly as before —
+hosted workers are an addition, never a replacement:
 
 ```sh
 # from a repo checkout on the laptop
@@ -219,6 +227,104 @@ The worker is outbound-only and authenticates with a **Bearer join token** (no
 cookies, no CSRF), so it works through the TLS ingress unchanged. The token is
 shown once at issuance. See `docs/worker-setup.md` for the full procedure and
 `ARCHITECTURE.md` for the trust model.
+
+## Hosted workers (PRD #58)
+
+**Shipped and OFF.** The chart carries the whole feature — the worker namespace and
+its RBAC/quotas/policies, the controller Deployment, the api's hosting switch — and
+`deploy/values/dev-cluster.yaml` still sets `workers.enabled: false`. Nothing about
+hosted workers renders until that flips. Compose is untouched either way.
+
+**What runs.** A `uzi-controller` Deployment in the release namespace: the only
+component in uzi holding a kube credential (the api holds none and must never hold
+one). It polls the api outbound, listens on nothing, and materializes each hosted
+worker's Deployment + Secret + PVCs into the `uzi-workers` namespace, which contains
+nothing else by design.
+
+### Turning it on
+
+**Order matters, and step 1 is not optional.** Enabling hosting without the
+controller token does not merely break hosted workers — the api refuses to boot
+(`WORKER_HOSTING_ENABLED=true requires WORKER_HOSTING_CONTROLLER_TOKEN_SHA256`),
+which takes uzi down. It fails closed, but the blast radius is the whole product.
+
+1. **Generate the controller's bearer token and put BOTH halves in Infisical**
+   (`example-project` / `dev` / `/uzi`, the same folder `JWT_SECRET` lives in):
+
+   ```sh
+   TOKEN=$(openssl rand -base64 32)
+   printf '%s' "$TOKEN" | shasum -a 256 | cut -d' ' -f1   # the hex hash
+   ```
+
+   | Infisical key | Who reads it | How |
+   | --- | --- | --- |
+   | `UZI_CONTROLLER_TOKEN` | the controller | file-mounted (`UZI_CONTROLLER_TOKEN_FILE`) |
+   | `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` | the api | env var (a hash, not a credential) |
+
+   The plaintext is file-mounted rather than env-injected because an env-borne secret
+   is readable through `/proc/<pid>/environ` — the leak class `docs/proc-hardening.md`
+   closed for the worker, and the reason the worker's join token is a file too.
+
+   **The chart deliberately does not generate this.** A `randAlphaNum` default would
+   re-render on every `helm upgrade` and silently rotate the credential — the one
+   rotation an operator cannot see coming.
+
+   > **Rotating: change both halves, then restart the controller** (it reads the file
+   > at boot). Updating only one fails **closed** in either direction: the
+   > controller's polls 401 and it stops reconciling. Hosted workers are then not
+   > created, rolled or torn down — existing ones keep running on their own join
+   > tokens — so the cost is an outage of the feature, never a bypass.
+
+2. **Flip both flags in `deploy/values/dev-cluster.yaml`:**
+
+   ```yaml
+   api:
+     tls:
+       enabled: true          # REQUIRED with workers.enabled
+   workers:
+     enabled: true
+   ```
+
+   The chart **refuses to render** with one without the other (`uzi.workerAPIPort`),
+   so this is enforced, not remembered: with TLS off, hosted workers would be admitted
+   to the api's plaintext `:8080` — the full router including `/api/auth/*`, no XFF
+   stripping, and claim traffic carrying the user's *decrypted* forge PAT and
+   Anthropic token in the clear across a shared cluster's pod network. **Never set
+   `workers.allowPlaintextAPI` here**; it exists for KinD (no cert-manager), and
+   wanting it on a real cluster means something else is wrong.
+
+3. **Release, then point ArgoCD at it** (the ordinary procedure above). The agent and
+   controller images publish at the same version as api/web.
+
+### Values worth knowing
+
+| Value | Default | Notes |
+|---|---|---|
+| `workers.enabled` | `false` | The envelope + (with the controller) the whole feature. |
+| `workers.controller.enabled` | `true` | `false` = M3's envelope-only shape: namespace/RBAC/quotas/policies with nothing running. Also turns the api's hosting switch off — the two are one flag (`uzi.apiHostingEnabled`), because hosting with no controller means users provision workers nothing ever materializes. Only `kind-smoke.yaml` sets it. |
+| `workers.image.repository` | `.../gitlab/vtmocanu/uzi` | The **prefix**; the controller appends `/agent-<template>:<tag>`. Must match CI's `HARBOR_AGENT_IMAGE_PREFIX` minus `-agent`. |
+| `workers.image.tag` | `""` → `appVersion` | Changing it **rolls the whole fleet** (Decision 9), each worker once it holds no non-terminal run. |
+| `workers.storageClass` | `""` (cluster default) | `storage-class` on dev-cluster. |
+
+### Not proven until the first real rollout
+
+Recorded because a green render and a green KinD run both say nothing about these —
+each was checked rather than assumed:
+
+- **NetworkPolicy enforcement: nothing at all.** kindnet implements no NetworkPolicy
+  — not the Antrea ANNP, not even the default-deny floor — so both policies are
+  created on KinD and silently never enforced. The YAML is the only artifact.
+- **FQDN egress: capability proven, enforcement not.** Antrea v1.13.3 accepts the
+  namespaced ANNP through the live `annpvalidator` webhook, and the behaviour was read
+  out of the v1.13 source. **No packet has crossed.** The first real hosted worker
+  either reaches `gitlab.example.com` or does not.
+- **The `fsGroup: 10001` pin.** KinD's local-path PV is hostPath-backed and ignores
+  fsGroup (`/data` and `/nix` arrive `0777 root:root`), so uid 10001 writes them there
+  for a reason that does not exist here — dev-cluster's RWO ext4 volumes mount
+  `root:root 0755` and fsGroup is the only thing making them writable.
+- **The controller has never run.** KinD runs no controller (see above), so its first
+  start is the rollout: watch that it reads its token, verifies the api's cert against
+  the projected CA, and that its polls are not dropped by the api's default-deny.
 
 ## The api TLS listener (`api.tls.*`, PRD #58)
 
@@ -264,15 +370,23 @@ Any client that mounts it **must project `ca.crt` alone** (`items:`), because
 mounting the Secret whole would put the api's **private key** into that client's
 filesystem.
 
-> **Status, stated because the rule above is a requirement and not yet a fact.**
-> No `items:` projection exists in `deploy/chart/templates/` today, and the
-> property holds only because **nothing but the api pod mounts that Secret** — and
-> the api legitimately needs the whole pair. The projection becomes real with the
-> **controller Deployment, which is M6's**: it is the first workload that mounts the
-> leaf Secret as a *client*. **Hosted workers never mount it at all** (see the
-> cross-namespace note below), so M3 did not introduce a client and could not
-> discharge this. Whoever writes that Deployment owns the `items:` block; do not
-> read this paragraph as describing something already in the chart.
+> **Status: this is now a fact, not just a requirement** (M6, 2026-07-17). The
+> projection exists in `deploy/chart/templates/controller-deployment.yaml` — the
+> controller is the first (and today the only) workload that mounts the leaf Secret
+> as a *client*, and it projects `ca.crt` alone:
+>
+> ```yaml
+> - name: api-ca
+>   secret:
+>     secretName: {{ include "uzi.apiTLSSecretName" . }}
+>     items:
+>       - key: ca.crt          # ONLY this key — never the whole Secret
+>         path: ca.crt
+> ```
+>
+> **Hosted workers never mount this Secret at all** (see the cross-namespace note
+> below), so the controller is the one place this rule has to hold. Any future client
+> owns its own `items:` block.
 
 The controller reads the CA via `UZI_API_CA_FILE` and pins it *exclusively* (the
 system roots are not also trusted). There is no skip-verification knob in this path
