@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,19 +101,54 @@ func cliSeedUser(t *testing.T, pool *pgxpool.Pool, isAdmin bool) uuid.UUID {
 	return id
 }
 
-// cliMintToken inserts a cli_tokens row for userID and returns the plaintext token.
-// expires_at is left NULL (never expires) — the NULL-trap path, which is exactly the
-// agent/CI token these tests care about; expiry is not what they exercise.
-func cliMintToken(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID, scope string) string {
+// cliInsertToken inserts a cli_tokens row for userID and returns the plaintext token
+// plus the row id. expiresAt nil = NULL (never expires); revoked toggles the flag.
+// Those two knobs are the fail-closed half of GetCLITokenByHash's NULL trap — a NULL
+// expiry is accepted while a past expiry or a revoked row is not.
+func cliInsertToken(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID, scope string, expiresAt *time.Time, revoked bool) (string, uuid.UUID) {
 	t.Helper()
 	token, hash, prefix, err := clitoken.Generate(scope)
 	if err != nil {
 		t.Fatalf("clitoken.Generate: %v", err)
 	}
-	cliMustExec(t, pool,
-		`INSERT INTO cli_tokens (user_id, name, token_hash, token_prefix, scope) VALUES ($1, 'test', $2, $3, $4)`,
-		userID, hash, prefix, scope)
+	var id uuid.UUID
+	if err := pool.QueryRow(context.Background(),
+		`INSERT INTO cli_tokens (user_id, name, token_hash, token_prefix, scope, expires_at, revoked)
+		 VALUES ($1, 'test', $2, $3, $4, $5, $6) RETURNING id`,
+		userID, hash, prefix, scope, expiresAt, revoked).Scan(&id); err != nil {
+		t.Fatalf("insert cli token: %v", err)
+	}
+	return token, id
+}
+
+// cliMintToken inserts a NULL-expiry, un-revoked cli_tokens row and returns the
+// plaintext token — the never-expiring agent/CI token the NULL-trap path serves,
+// which is exactly what most of these tests care about; expiry is not what they
+// exercise.
+func cliMintToken(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID, scope string) string {
+	t.Helper()
+	token, _ := cliInsertToken(t, pool, userID, scope, nil, false)
 	return token
+}
+
+// cookieReq drives router on the browser (cookie + CSRF) path for userID's session
+// JWT, with an optional JSON body. The cli-tokens CRUD routes are cookie-only
+// (RequireAuth), so their success/gate paths are reachable only this way.
+func cookieReq(t *testing.T, router http.Handler, method, path, jwt, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, r)
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	req.Header.Set(auth.CSRFHeaderName, cliCSRFHeader(t, jwt))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
 }
 
 // cliSeedJudgedRun seeds a forge connection, a repo, a completed run owned by
@@ -475,5 +512,108 @@ func TestCLIRevokeAllLiveDB(t *testing.T) {
 	}
 	if rev, _ := countRevoked(other); rev != 0 {
 		t.Errorf("other user's token revoked after idempotent second call (%d)", rev)
+	}
+}
+
+// -------------------------------------------------------------------------
+// (h) admin_ro mint gate (privilege-escalation guard, cli_tokens.go:123). A NON-admin
+// minting scope=admin_ro is 403; an ADMIN minting admin_ro succeeds — so the gate is
+// proven to gate on admin-ness, not to always-fail. Cookie-only path (RequireAuth):
+// this route is DELIBERATELY not Bearer-reachable, so a stolen uzc_ can never mint a
+// uza_ (Decision 16). is_admin is read live from the row, never from the credential.
+// -------------------------------------------------------------------------
+
+func TestCLIAdminROMintGateLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	admin := cliSeedUser(t, pool, true)
+	nonAdmin := cliSeedUser(t, pool, false)
+
+	// A non-admin minting admin_ro is forbidden — the guard, not a masking artifact
+	// (this is the cookie path, where no masking runs).
+	rec := cookieReq(t, router, http.MethodPost, "/api/me/cli-tokens",
+		cliMintJWT(t, pool, nonAdmin), `{"name":"esc","scope":"admin_ro"}`)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("non-admin mint admin_ro = %d, want 403 (privilege-escalation guard)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// An admin minting admin_ro succeeds (201 Created): proves the gate keys off
+	// admin-ness, not that admin_ro always fails.
+	rec = cookieReq(t, router, http.MethodPost, "/api/me/cli-tokens",
+		cliMintJWT(t, pool, admin), `{"name":"ok","scope":"admin_ro"}`)
+	if rec.Code != http.StatusCreated {
+		t.Errorf("admin mint admin_ro = %d, want 201 (gate passes for an admin)\nbody: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// -------------------------------------------------------------------------
+// (i) The fail-closed half of GetCLITokenByHash's NULL trap: a past-expiry token and a
+// revoked token are both rejected at the RequireUser bearer path (401). Every other
+// LiveDB token is NULL-expiry + un-revoked, so this is the only place the closed half
+// is exercised (elsewhere it is only mutation-proven).
+// -------------------------------------------------------------------------
+
+func TestCLIExpiredRevokedReject401LiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+
+	past := time.Now().Add(-time.Hour)
+	expired, _ := cliInsertToken(t, pool, user, clitoken.ScopeUser, &past, false)
+	revoked, _ := cliInsertToken(t, pool, user, clitoken.ScopeUser, nil, true)
+
+	// Sanity: a NULL-expiry, un-revoked token of the SAME user IS accepted, so a 401
+	// below is the expiry/revocation and not a broken fixture or a wrong route.
+	valid := cliMintToken(t, pool, user, clitoken.ScopeUser)
+	if rec := bearerReq(router, http.MethodGet, "/api/auth/me", valid); rec.Code != http.StatusOK {
+		t.Fatalf("valid uzc_ GET /auth/me = %d, want 200 (fixture sanity)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	if rec := bearerReq(router, http.MethodGet, "/api/auth/me", expired); rec.Code != http.StatusUnauthorized {
+		t.Errorf("expired token GET /auth/me = %d, want 401 (fail closed on a past expires_at)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := bearerReq(router, http.MethodGet, "/api/auth/me", revoked); rec.Code != http.StatusUnauthorized {
+		t.Errorf("revoked token GET /auth/me = %d, want 401 (fail closed on revoked)\nbody: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// -------------------------------------------------------------------------
+// (j) cli-tokens CRUD Bearer-reject completeness + single-delete owner-scoping. The
+// POST is already pinned in the shared cookie-only group (c/d); GET, DELETE /{id}, and
+// revoke-all share that group but are pinned here explicitly. And a single-delete of
+// ANOTHER user's token id is a 404, never a cross-user revoke — mirroring the
+// revoke-all cross-user test (g).
+// -------------------------------------------------------------------------
+
+func TestCLICRUDBearerRejectAndOwnerScopeLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+
+	// Every cli-tokens CRUD verb is cookie-only: a Bearer credential is rejected (401).
+	bearerReject := []struct{ name, method, path string }{
+		{"list", http.MethodGet, "/api/me/cli-tokens"},
+		{"revoke one", http.MethodDelete, "/api/me/cli-tokens/" + uuid.New().String()},
+		{"revoke all", http.MethodPost, "/api/me/cli-tokens/revoke-all"},
+	}
+	for _, tc := range bearerReject {
+		if rec := bearerReq(router, tc.method, tc.path, uzc); rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s over Bearer = %d, want 401 (cli-tokens CRUD is cookie-only)\nbody: %s", tc.name, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Single-delete owner-scoping: an attacker with a valid session deleting the
+	// victim's token id touches zero rows ⇒ 404, never a cross-user revoke.
+	owner := cliSeedUser(t, pool, false)
+	attacker := cliSeedUser(t, pool, false)
+	_, victimID := cliInsertToken(t, pool, owner, clitoken.ScopeUser, nil, false)
+
+	if rec := cookieReq(t, router, http.MethodDelete, "/api/me/cli-tokens/"+victimID.String(),
+		cliMintJWT(t, pool, attacker), ""); rec.Code != http.StatusNotFound {
+		t.Errorf("attacker DELETE owner's token = %d, want 404 (never cross-user revoke)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	// The victim's own DELETE succeeds (204): proves the 404 was the scoping, not a
+	// missing/already-revoked row.
+	if rec := cookieReq(t, router, http.MethodDelete, "/api/me/cli-tokens/"+victimID.String(),
+		cliMintJWT(t, pool, owner), ""); rec.Code != http.StatusNoContent {
+		t.Errorf("owner DELETE own token = %d, want 204 (proves the 404 was scoping, not a missing row)\nbody: %s", rec.Code, rec.Body.String())
 	}
 }
