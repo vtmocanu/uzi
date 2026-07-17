@@ -960,6 +960,24 @@ Non-goals (v1):
         **picking L is still always rational**. The web-ux finding stands unfixed and
         is not weakened by the numbers: *"the numbers are necessary and not
         sufficient"* was right, and landing them proves it rather than settling it.
+      - *The deferral's cost MOVED, and it is measured (web-ux, 2026-07-17) — this is
+        why the incentive half got MORE urgent rather than less.* The question posed was
+        whether showing `L — up to 4 CPU / 8Gi` makes L **more** obviously the free pick
+        than a bare `L` did. **It does.** At 1280px the provision form's children render
+        on one line: `[Size: "L — up to 4 CPU / 8Gi RAM / 20Gi disk"]` right=780,
+        `[Provision]` right=884, `["1 of 2 used"]` right=958. **The resource quantities
+        and the counter that prices them identically are 12px apart on the same line.**
+        Before M6 that line read `[M] [Provision] [1 of 2 used]` — a bare letter gave a
+        user nothing to compute with, and they might reasonably have assumed sizes cost
+        differently, since sizes usually do. The picker now lays the arithmetic out at
+        the exact moment of choosing. So the cost of deferring moved from **neutral**
+        ("the numbers are necessary and not sufficient" — the display merely fails to
+        discourage L) to **mildly negative**: it renders the free-lunch inference
+        *adjacently*. **Shipping the display is still right** (web-ux says so
+        explicitly; informing beats not informing), and this is **not a reopening** —
+        the user declined both levers twice, and their costs below are unchanged. It is
+        recorded so whoever picks the incentive half up inherits the measurement instead
+        of rediscovering it.
       - *Why deferred rather than fixed*: the user **declined both structural levers
         twice** (2026-07-16 and again 2026-07-17). Their costs are unchanged and are
         the reason — **(a)** the weighted quota reopens M2's landed transaction (the
