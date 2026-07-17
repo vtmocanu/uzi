@@ -13,8 +13,19 @@ import (
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls
 // /api/runs/{id}/messages?after=<seq>. REST polling ships instead of a WebSocket
-// (PRD #64 Out of scope).
-const logsPollInterval = 2 * time.Second
+// (PRD #64 Out of scope). A var, not a const, only so tests can shrink the wait;
+// nothing at runtime reassigns it.
+var logsPollInterval = 2 * time.Second
+
+// terminalRunStatuses are the run states from which no further messages can
+// arrive. `uzi run logs --follow` stops once the run reaches one of them (after a
+// final drain) instead of polling forever — otherwise an agent capturing a
+// finished run hangs. Mirrors the store's `status NOT IN (...)` active filter.
+var terminalRunStatuses = map[string]bool{
+	"completed": true,
+	"failed":    true,
+	"cancelled": true,
+}
 
 // newRunCmd — `uzi run` and its verbs. list/get/logs/review are wired to the
 // Client; create/approve/reject/cancel/follow-up are stubs (M8).
@@ -83,7 +94,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			after, _ := cmd.Flags().GetInt32("after")
 			p := env.printer(gf)
 			seq := after
-			for {
+			drain := func() error {
 				msgs, err := c.RunLogs(cmd.Context(), args[0], seq)
 				if err != nil {
 					return err
@@ -96,8 +107,26 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 						seq = m.Seq
 					}
 				}
+				return nil
+			}
+			for {
+				if err := drain(); err != nil {
+					return err
+				}
 				if !follow {
 					return nil
+				}
+				// Stop once the run reaches a terminal state: no further messages can
+				// arrive, so an agent running `--follow` on a finished run must exit
+				// (exit 0), not poll forever. Check AFTER draining this round; on a
+				// terminal run drain once more (messages are persisted before the run
+				// flips terminal — a gapless-seq guarantee) so nothing is dropped.
+				run, err := c.GetRun(cmd.Context(), args[0])
+				if err != nil {
+					return err
+				}
+				if terminalRunStatuses[run.Status] {
+					return drain()
 				}
 				select {
 				case <-cmd.Context().Done():
@@ -184,12 +213,31 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		{"HEALTH", r.Health},
 	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
-		rows = append(rows, []string{"HEALTH_REASON", *r.HealthReason})
+		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
-		rows = append(rows, []string{"FAILURE_REASON", *r.FailureReason})
+		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
 	}
 	return p.Table(nil, rows)
+}
+
+// sanitizeTTY strips terminal control characters from UNTRUSTED free text before
+// it is written to a human TTY (Risk 13). Judge/run content can carry attacker-
+// shaped bytes that repo/issue/CI text fed the LLM; printed verbatim, an embedded
+// ANSI escape/CSI sequence could clear the screen, recolour, hide, or spoof
+// output. It removes C0 controls (0x00–0x1F) except tab and newline, and C1
+// controls (0x80–0x9F); every other rune, including all printable UTF-8, passes
+// through unchanged. It iterates runes (not bytes) so a multibyte UTF-8 codepoint
+// whose bytes fall in 0x80–0x9F is never corrupted. Human render path ONLY —
+// --json output stays byte-exact (structural JSON encoding already escapes these
+// and agents decode it verbatim, so sanitizing there would corrupt payloads).
+func sanitizeTTY(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r < 0x20 && r != '\t' && r != '\n') || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // renderMessage prints one run message. In --json mode it emits one compact JSON
@@ -216,7 +264,7 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 // human table. The payload is server-forwarded run content; it is DATA, printed
 // verbatim (never interpreted).
 func compactPayload(raw json.RawMessage) string {
-	s := strings.TrimSpace(string(raw))
+	s := sanitizeTTY(strings.TrimSpace(string(raw)))
 	s = strings.ReplaceAll(s, "\n", " ")
 	const max = 200
 	if len(s) > max {
@@ -252,7 +300,7 @@ func renderReview(p *uzicli.Printer, id string, rv *apitypes.ReviewDTO) error {
 		// "incomplete" would silently treat every fallback review as complete.
 		p.Println("note: judge incomplete — this review is a fallback and may be partial")
 	}
-	if s := strings.TrimSpace(rv.SummaryMd); s != "" {
+	if s := sanitizeTTY(strings.TrimSpace(rv.SummaryMd)); s != "" {
 		p.Println()
 		p.Println(s)
 	}
@@ -260,8 +308,8 @@ func renderReview(p *uzicli.Printer, id string, rv *apitypes.ReviewDTO) error {
 		p.Println()
 		p.Printf("recommendations (%d):\n", len(rv.Recommendations))
 		for _, rec := range rv.Recommendations {
-			p.Printf("- [%s] %s → %s\n", rec.Confidence, rec.Category, rec.Target)
-			if r := strings.TrimSpace(rec.RationaleMd); r != "" {
+			p.Printf("- [%s] %s → %s\n", rec.Confidence, rec.Category, sanitizeTTY(rec.Target))
+			if r := sanitizeTTY(strings.TrimSpace(rec.RationaleMd)); r != "" {
 				for _, line := range strings.Split(r, "\n") {
 					p.Printf("    %s\n", line)
 				}

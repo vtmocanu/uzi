@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
@@ -204,6 +205,46 @@ func TestHTTPClientRejectsNonHTTPS(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "https") {
 		t.Errorf("message = %q, want an https guard message", err.Error())
+	}
+}
+
+// A TLS endpoint that 302-redirects to plain http must NOT cause the client to
+// replay the bearer token in cleartext. The shipped CheckRedirect refuses every
+// redirect, so the http target is never contacted and the Authorization header
+// can never leak. Mirrors the auditor's proof of the https→http scheme-downgrade
+// token leak: without CheckRedirect, Go follows the hop and forwards Bearer over
+// http. The https guard in newRequest only vets the INITIAL URL, not redirect
+// hops — this is the layer that closes the gap.
+func TestHTTPClientRefusesRedirect(t *testing.T) {
+	var httpSawAuth atomic.Bool
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			httpSawAuth.Store(true)
+		}
+		w.Write([]byte(`{"user":{"id":"leaked"}}`))
+	}))
+	defer plain.Close()
+
+	// A TLS server that 302s every request down to the plain-http endpoint (same
+	// loopback host, scheme downgraded https→http).
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/api/auth/me", http.StatusFound)
+	}))
+	defer tlsSrv.Close()
+
+	// The SHIPPED client (its CheckRedirect), but trusting the test's TLS cert.
+	c := NewHTTPClient(Settings{URL: tlsSrv.URL, Token: "uzc_secret"})
+	c.HTTP.Transport = tlsSrv.Client().Transport
+
+	_, err := c.Whoami(context.Background())
+	if err == nil {
+		t.Fatal("want an error when the API redirects (the hop must not be followed), got nil")
+	}
+	if ExitCodeFor(err) != ExitUnreachable {
+		t.Errorf("redirect refusal exit = %d, want %d (transport failure)", ExitCodeFor(err), ExitUnreachable)
+	}
+	if httpSawAuth.Load() {
+		t.Fatal("Authorization: Bearer leaked to the http redirect target in cleartext")
 	}
 }
 

@@ -61,8 +61,26 @@ func NewHTTPClient(s Settings) *HTTPClient {
 	return &HTTPClient{
 		BaseURL: s.URL,
 		Token:   s.Token,
-		HTTP:    &http.Client{Timeout: 30 * time.Second},
+		HTTP: &http.Client{
+			Timeout: 30 * time.Second,
+			// Refuse every redirect. The https guard in newRequest only vets the
+			// INITIAL URL; without this, Go's default policy would follow a 3xx
+			// and replay `Authorization: Bearer <uzc_/uza_>` across a same-host
+			// scheme downgrade (https→http), handing the token to a cleartext
+			// endpoint. A legitimate uzi /api/* endpoint never redirects, so a
+			// redirect is refused (surfaces as a clean transport failure, exit 6),
+			// never followed — mirroring the worker's redirect:"error" posture.
+			CheckRedirect: refuseRedirect,
+		},
 	}
+}
+
+// refuseRedirect is the CheckRedirect policy for the live client: it rejects any
+// redirect hop rather than let net/http forward the bearer token to the redirect
+// target. Returning a non-nil error makes Client.Do fail (and, per net/http, the
+// intermediate response body is already closed) instead of following the hop.
+func refuseRedirect(req *http.Request, _ []*http.Request) error {
+	return fmt.Errorf("refusing to follow redirect to %s: uzi API endpoints never redirect", req.URL.Redacted())
 }
 
 var _ Client = (*HTTPClient)(nil)
