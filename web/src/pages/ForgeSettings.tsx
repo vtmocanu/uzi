@@ -7,6 +7,7 @@ import { Fragment, useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
 import { privilegeBadge } from "../lib/privilege";
+import { forgePlatform } from "../lib/forgeNoun";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
 import { BranchIcon } from "../components/icons";
@@ -17,6 +18,12 @@ export function ForgeSettings() {
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
   const [allowedUrls, setAllowedUrls] = useState<string[]>([]);
   const [baseUrl, setBaseUrl] = useState("");
+  // The advertised forge types (PRD #65 D11). The picker below is shown only when
+  // more than one is advertised; while the API advertises just ["gitlab"] (today,
+  // until M6b), it stays hidden and forgeType defaults to that single value, so the
+  // connect form behaves exactly as before — the milestone lands dark.
+  const [forgeTypes, setForgeTypes] = useState<string[]>([]);
+  const [forgeType, setForgeType] = useState("gitlab");
   const [token, setToken] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -39,6 +46,10 @@ export function ForgeSettings() {
       const [cfg, conns] = await Promise.all([api.forgeConfig(), api.listConnections()]);
       setAllowedUrls(cfg.allowed_base_urls);
       setBaseUrl((prev) => prev || cfg.allowed_base_urls[0] || "");
+      setForgeTypes(cfg.forge_types);
+      // Default the selection to the first advertised type (gitlab today), so a
+      // single-type config sends forge_type: "gitlab" exactly as the form does now.
+      setForgeType((prev) => prev || cfg.forge_types[0] || "gitlab");
       setConnections(conns.connections);
       setUsernameDrafts(
         Object.fromEntries(conns.connections.map((c) => [c.id, c.human_username ?? ""])),
@@ -66,7 +77,7 @@ export function ForgeSettings() {
     resetMessages();
     setConnecting(true);
     try {
-      const { connection } = await api.createConnection(baseUrl, token);
+      const { connection } = await api.createConnection(baseUrl, token, forgeType);
       setToken("");
       setNotice(`Connected as ${connection.bot_username}.`);
       await load();
@@ -198,6 +209,21 @@ export function ForgeSettings() {
               ))}
             </Select>
           </Field>
+          {/* Forge-type picker (PRD #65 D11): shown only when the API advertises more
+              than one type. While it advertises just ["gitlab"] the picker is hidden
+              and forgeType stays "gitlab", so the form is unchanged. Base URL and type
+              are independent choices (D11a): a mismatch is caught by VerifyToken. */}
+          {forgeTypes.length > 1 && (
+            <Field label="Forge type">
+              <Select value={forgeType} onChange={(e) => setForgeType(e.target.value)}>
+                {forgeTypes.map((t) => (
+                  <option key={t} value={t}>
+                    {forgePlatform(t)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          )}
           <Field label="Bot personal access token (scope: api)">
             <Input
               type="password"
@@ -207,7 +233,7 @@ export function ForgeSettings() {
               onChange={(e) => setToken(e.target.value)}
             />
           </Field>
-          <Button type="submit" disabled={connecting || !baseUrl || !token}>
+          <Button type="submit" disabled={connecting || !baseUrl || !forgeType || !token}>
             {connecting ? "Verifying…" : "Connect"}
           </Button>
         </form>
