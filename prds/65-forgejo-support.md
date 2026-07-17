@@ -102,11 +102,19 @@ mixed-forge**, so one board can say "Merge Request" on one card and "Pull Reques
 the next. Two consequences M8 owns:
 
 - **`forge_type` must reach the web, per card/run** — the architect's design concluded
-  the web needs no `forge_type` at all, and D2 makes that false. **But the cost is
-  lower than first estimated**: the queries **already** `SELECT c.forge_type`
-  (`runtime.sql:247`, `forge.sql:85,134`) and `api.ts:216` already carries
-  `ForgeConnection.forge_type` (Settings renders it as a badge today). So this is a
-  **DTO field addition, not a query change**.
+  the web needs no `forge_type` at all, and D2 makes that false. **The cost was lower than
+  first estimated for the board, but the "DTO field only, not a query change" claim was an
+  overgeneralization — corrected at M8 (2026-07-17, the ~8th team-corrected claim in this
+  PRD).** It held for the **board/repo path**: those queries already `SELECT c.forge_type`, so
+  cards got it as a pure DTO addition. It did **not** hold for the **standalone run surfaces**:
+  `ListRunsForUser` and `ListActiveRunsAll` (the Runs index + admin overview, which render the
+  MR/PR noun and chip) had **no** `forge_type` and needed a new `JOIN forge_connections c ON
+  c.id = rp.connection_id` + `c.forge_type` + sqlc regen; the run-**detail** path
+  (`GetRun`/`GetRunByID*`, bare `SELECT *` rows) got a new `GetForgeTypeForRepo :one`
+  resolved best-effort from `repo_id`, rather than widening those rows into joins (which would
+  ripple through every `GetRunByID` consumer at the service layer). **The insight stands (board
+  cards were free); the generalization to "no query change anywhere" was wrong** — run parity
+  cost three queries + a helper.
   - **One `forgeNoun(forgeType)` helper is the only mapping site.** Do not scatter
     ternaries across ~8 components. Acceptance: `grep -r '"Merge Request"' web/src`
     returns exactly one non-test hit.
@@ -876,7 +884,7 @@ the moment it merged.)
 | **M5** | Driver: `LatestPipeline`, `LatestMRPipeline`, `ListPipelineJobs`, `JobLogTail` (all ≥16; gitea-sdk has `GetRepoActionJobLogs`, no hand-roll) | `forge/forgejo_pipelines.go`†, `forgejo_pipelines_test.go` | M2 |
 | **M6a** | Migration: `forge_type` CHECK gains `'forgejo'`; `runs.mr_web_url`; **the extended completion query + regenerated sqlc** (D8 — without it M7 cannot add the param); **`seed.go:74,85,112` hardcodes** | `store/migrations/`, `store/queries/`, `seed/seed.go` | — |
 | **M7** | Worker: `gitlab.ts` → `forge.ts` + `ForgejoClient` (**+3 transport guards, D9**); `forge_type` on `ClaimRepo`; **`mr_web_url` on the completion payload** (D8); subpath base-URL fix; `claim.go` emits it | `agent/src/forge.ts`, `protocol.ts`, `runner.ts`, `agent/test/`, `workersvc/claim.go`, `workersvc/service.go`, `claim_wire_contract_test.go` | **M6a only** |
-| **M8** | **API + web** (not web-only): `forge_type` onto board cards + runs (**D2** — DTO field only, the queries already select it), `role` → string in the web (**D7**), merged pipeline map (**R5**), `mr_web_url` rendering **through `isHttpsUrl`** (D8), `forgeNoun()` as the single mapping site + `slacksvc/notifier.go` | `handler/board.go`, run handlers, `slacksvc/notifier.go`, `web/src/lib/*`, `web/src/components/*`, `mocks/` | M6a, M7 |
+| **M8** | **API + web** (not web-only): `forge_type` onto board cards (**D2** — DTO field only, cards already select it) **and runs (query change: new `forge_connections` joins on `ListRunsForUser`/`ListActiveRunsAll` + a best-effort `GetForgeTypeForRepo` for the detail path + sqlc regen — corrected from the draft's "no query change", see D2)**, `role` → string in the web (**D7**), merged **forge-blind** pipeline map (**R5** — keyed on status only, never `forge_type`), `mr_web_url` rendering **through `isHttpsUrl`** (D8, Go twin `isHTTPSURL` in `notifier.go`), `forgeNoun()` as the single mapping site + its `slacksvc/notifier.go` Go twin | `handler/board.go`, run handlers, `slacksvc/notifier.go`, `web/src/lib/*`, `web/src/components/*`, `mocks/` | M6a, M7 |
 | **M9** | e2e (**Variant A**, user 2026-07-17): `forge-fake` speaks `/api/v1` incl. **canned Actions** (`runs`/`runs/{id}/jobs`/`jobs/{id}/logs` → fixture `text/plain`); `UZI_E2E_FORGE` lane; **live validation vs a pinned ephemeral `forgejo/forgejo:16.0.0`** (D10, **not** an upgraded instance — R2 superseded) for the **non-Actions** surface. Fake stays default; container is the opt-in pass. **CI-fix `[live]` is met by fixture logs** (exercises `ListPipelineJobs`/`JobLogTail` parse + loop deterministically). **Real `forgejo-runner` log emission is UNVERIFIED — no runner environment available; deferred as an open R2 residual, to be done when one exists.** | `e2e/forge-fake/forge-fake.mjs`, `run-e2e.sh` | M4, M5, M7 |
 | **M10** | Docs + ADR + `ARCHITECTURE.md:71`; **correct `specs/ai.md` §16 via spec-keeper** (R1); `specs/human.md:40,396` (user-approved 2026-07-17); `docs/forgejo-bot-setup.md` (**unique `order`** — `gitlab-bot-setup.md` is `order: 20`; a copied frontmatter fails `check-docs.mjs` inside `npm run build`) | `docs/`, `adr/0065-forgejo-driver.md`, `ARCHITECTURE.md`, `specs/` | M8, M9 |
 | **M6b** | **Gate flip — go-live**: `handler/forge.go:125` advertises `forgejo`; `:156,158` accept it | `handler/forge.go` | M8, M9, M10 |
@@ -1109,7 +1117,12 @@ residual, not claimed as done.**
   truncates correctly — **NOT verified**; no runner environment available; open R2 residual, to
   be done when one exists. Not claimed as done anywhere in this PRD.
 - **[fixture]** A Forgejo card says "Pull Request"; a GitLab card on the same board
-  says "Merge Request"; shared chrome says "merge request" (D2).
+  says "Merge Request"; **forge-less chrome (nav/app-shell, admin, docs) names both
+  ("merge/pull request") or restructures past the noun — never defaulting to one forge's
+  word** (D2). *(Corrected 2026-07-17, the ~10th team-corrected claim: an earlier draft's
+  "shared chrome says 'merge request'" survived into this criterion after D2's body killed it —
+  the exact "the story rots" pattern this PRD documents. coder-m8 followed the D2 decision, not
+  the stale criterion: Landing/AdminSettings render "merge/pull request".)*
 - **[fixture]** An old worker (no `forge_type`, no `mr_web_url`) still claims and
   completes a GitLab run (R8).
 - **[n/a]** `specs/ai.md` §16 no longer claims a blocker that does not exist (R1).
