@@ -79,7 +79,7 @@ func TestCheckConnectionPersists(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
 		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true}}},
 	}
 	svc := NewService(st, &fakeBuilder{forge: f})
@@ -107,7 +107,7 @@ func TestSweepGrandfatheredAndDrift(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
 		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true}}},
 	}
 	svc := NewService(st, &fakeBuilder{forge: f})
@@ -125,7 +125,7 @@ func TestSweepGrandfatheredAndDrift(t *testing.T) {
 	}
 
 	// Drift: a teammate promotes the bot to Maintainer; the next sweep flips it.
-	f.roles[1] = roleResult{role: 40, member: true}
+	f.roles[1] = roleResult{role: forge.RoleAdmin, member: true}
 	res, err = svc.CheckAllConnections(context.Background())
 	if err != nil {
 		t.Fatalf("sweep 2: %v", err)

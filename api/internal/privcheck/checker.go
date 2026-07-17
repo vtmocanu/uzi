@@ -11,9 +11,6 @@ import (
 )
 
 const (
-	// developerAccess is GitLab's Developer role access level: the exact level the
-	// bot must hold on every enabled repo.
-	developerAccess = 30
 	// requiredScope is uzi's documented minimum PAT scope. Exactly this and
 	// nothing more (see docs/gitlab-bot-setup.md); read_api is insufficient and
 	// anything beyond api is over-privilege.
@@ -120,11 +117,13 @@ func (c *Checker) checkRepo(ctx context.Context, f forge.Forge, botUserID int64,
 		rr.Member = member
 		switch {
 		case !member:
-			rr.Violations = append(rr.Violations, "bot is no longer a Developer member of this repo; sync is broken")
-		case role > developerAccess:
-			rr.Violations = append(rr.Violations, fmt.Sprintf("bot role is %s (%d), expected Developer (%d)", roleName(role), role, developerAccess))
-		case role < developerAccess:
-			rr.Violations = append(rr.Violations, fmt.Sprintf("bot role is %s (%d), below Developer (%d)", roleName(role), role, developerAccess))
+			rr.Violations = append(rr.Violations, "bot is no longer a member of this repo; sync is broken")
+		case role == forge.RoleWrite:
+			// Exactly the role uzi wants: no finding.
+		case role.AtLeast(forge.RoleWrite):
+			rr.Violations = append(rr.Violations, fmt.Sprintf("bot role is %s, above the expected write role", role))
+		default:
+			rr.Violations = append(rr.Violations, fmt.Sprintf("bot role is %s, below the expected write role", role))
 		}
 	}
 
@@ -141,8 +140,8 @@ func (c *Checker) checkRepo(ctx context.Context, f forge.Forge, botUserID int64,
 		rr.Violations = append(rr.Violations, fmt.Sprintf("default branch %q is not protected", repo.DefaultBranch))
 		return rr
 	}
-	if bp.DevelopersCanPush {
-		rr.Violations = append(rr.Violations, fmt.Sprintf("Developers may push to protected %q", repo.DefaultBranch))
+	if bp.WriteRoleCanPush {
+		rr.Violations = append(rr.Violations, fmt.Sprintf("the write role may push to protected %q", repo.DefaultBranch))
 	}
 	if bp.BotCanPush {
 		rr.Violations = append(rr.Violations, fmt.Sprintf("the bot has a direct push grant on protected %q", repo.DefaultBranch))
@@ -201,24 +200,4 @@ func scopesEqualRequired(scopes []string) bool {
 	}
 	_, hasAPI := seen[requiredScope]
 	return hasAPI && len(seen) == 1
-}
-
-// roleName maps a GitLab access level to a human label for finding messages.
-func roleName(level int) string {
-	switch level {
-	case 10:
-		return "Guest"
-	case 20:
-		return "Reporter"
-	case 30:
-		return "Developer"
-	case 40:
-		return "Maintainer"
-	case 50:
-		return "Owner"
-	case 60:
-		return "Admin"
-	default:
-		return fmt.Sprintf("access level %d", level)
-	}
 }
