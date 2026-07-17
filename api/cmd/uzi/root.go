@@ -23,6 +23,10 @@ type Env struct {
 	Stderr    io.Writer
 	Stdin     io.Reader
 	StdoutTTY bool
+	// StdinTTY reports whether stdin is a terminal. `uzi auth token` uses it to
+	// decide between prompting (TTY) and reading a piped token (non-TTY); the
+	// credential is never taken from argv (PRD #64).
+	StdinTTY bool
 
 	// NewClient builds the API client from resolved settings. M3 wires the
 	// real-client stub; tests inject a fake; M7 replaces the default with the
@@ -42,6 +46,7 @@ func DefaultEnv() Env {
 		Stderr:    os.Stderr,
 		Stdin:     os.Stdin,
 		StdoutTTY: uzicli.IsTerminal(os.Stdout),
+		StdinTTY:  uzicli.IsTerminal(os.Stdin),
 		NewClient: func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
 		Store:     store,
 	}
@@ -87,6 +92,12 @@ func newRootCmd(env Env) *cobra.Command {
 	if env.Stdin != nil {
 		root.SetIn(env.Stdin)
 	}
+	// Wrap cobra's flag parse errors (unknown/invalid flag) into an *ExitError so
+	// they map to the usage exit code (2), keeping ExitCodeFor's default free to be
+	// the generic error (1) for anything that leaks unwrapped.
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return uzicli.Exitf(uzicli.ExitUsage, "%v", err)
+	})
 
 	pf := root.PersistentFlags()
 	pf.BoolVar(&gf.json, "json", false, "machine-readable JSON output (for agents)")

@@ -2,17 +2,22 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // fakeEnv builds an Env backed by the given fake client, with no config store
-// (so no file IO) and a non-TTY stdout (so no colour).
-func fakeEnv(fc *uzicli.FakeClient) Env {
+// (so no file IO) and a non-TTY stdout (so no colour). It takes the Client
+// interface (not *FakeClient) so tests can inject bespoke fakes too.
+func fakeEnv(fc uzicli.Client) Env {
 	return Env{
 		Stdout:    &bytes.Buffer{},
 		Stderr:    &bytes.Buffer{},
@@ -101,7 +106,7 @@ func TestHelpRendersTree(t *testing.T) {
 }
 
 func TestWhoamiJSON(t *testing.T) {
-	fc := &uzicli.FakeClient{User: uzicli.User{ID: "u1", Email: "a@example.com", IsAdmin: false}}
+	fc := &uzicli.FakeClient{User: apitypes.UserDTO{ID: "u1", Email: "a@example.com", IsAdmin: false}}
 	out, _, code := runCLI(t, fakeEnv(fc), "whoami", "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
@@ -112,7 +117,7 @@ func TestWhoamiJSON(t *testing.T) {
 }
 
 func TestWhoamiTable(t *testing.T) {
-	fc := &uzicli.FakeClient{User: uzicli.User{ID: "u1", Email: "a@example.com", IsAdmin: true}}
+	fc := &uzicli.FakeClient{User: apitypes.UserDTO{ID: "u1", Email: "a@example.com", IsAdmin: true}}
 	out, _, code := runCLI(t, fakeEnv(fc), "whoami")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
@@ -123,7 +128,9 @@ func TestWhoamiTable(t *testing.T) {
 }
 
 func TestRunListJSON(t *testing.T) {
-	fc := &uzicli.FakeClient{Runs: []uzicli.Run{{ID: "r1", Status: "running", Title: "fix"}}}
+	fc := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "r1", Status: "running", Kind: "issue", IssueTitle: "fix"}},
+	}}
 	out, _, code := runCLI(t, fakeEnv(fc), "run", "list", "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
@@ -133,19 +140,266 @@ func TestRunListJSON(t *testing.T) {
 	}
 }
 
+func TestRunListTableTitle(t *testing.T) {
+	fc := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "r1", Status: "running", Kind: "issue", IssueTitle: "fix login"}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "fix login") || !strings.Contains(out, "KIND") {
+		t.Errorf("unexpected table:\n%s", out)
+	}
+}
+
 func TestRunGetPresent(t *testing.T) {
-	fc := &uzicli.FakeClient{RunByID: map[string]uzicli.Run{"r1": {ID: "r1", Status: "queued"}}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: "queued"}}}
 	_, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
 }
 
+func TestRunGetHealthReason(t *testing.T) {
+	reason := "waiting for vault unlock"
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"r1": {ID: "r1", Status: "queued", Health: "blocked", HealthReason: &reason},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "HEALTH_REASON") || !strings.Contains(out, reason) {
+		t.Errorf("run get did not surface the health reason (Risk 4):\n%s", out)
+	}
+}
+
 func TestRunGetMissingExit4(t *testing.T) {
-	fc := &uzicli.FakeClient{RunByID: map[string]uzicli.Run{}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{}}
 	_, _, code := runCLI(t, fakeEnv(fc), "run", "get", "nope")
 	if code != uzicli.ExitNotFound {
 		t.Fatalf("exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+	}
+}
+
+// A visible-but-unjudged run (200 {"review":null}) is exit 0 "not judged", NOT
+// exit 4 (D21). The fake models it as a present-but-nil map entry.
+func TestRunReviewNotJudgedExit0(t *testing.T) {
+	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{"r1": nil}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (not judged)", code)
+	}
+	if !strings.Contains(out, "not judged") {
+		t.Errorf("want a 'not judged' line, got:\n%s", out)
+	}
+}
+
+// A real 404 (absent id) is exit 4 — reserved, distinct from the null case above.
+func TestRunReviewMissingExit4(t *testing.T) {
+	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{}}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "review", "nope")
+	if code != uzicli.ExitNotFound {
+		t.Fatalf("exit = %d, want %d", code, uzicli.ExitNotFound)
+	}
+}
+
+// status:"failed" renders the "judge incomplete" caveat (wire value is "failed",
+// not "incomplete").
+func TestRunReviewFailedCaveat(t *testing.T) {
+	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{
+		"r1": {Verdict: "needs_work", Status: "failed", SummaryMd: "partial"},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "judge incomplete") {
+		t.Errorf("failed review missing the incomplete caveat:\n%s", out)
+	}
+}
+
+// --json passes the {"review": ...} envelope through, including recommendations.
+func TestRunReviewJSONEnvelope(t *testing.T) {
+	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{
+		"r1": {ID: "rv1", Verdict: "good", Status: "complete", Recommendations: []apitypes.RecommendationDTO{
+			{Category: "improve_uzi", Target: "docs", Confidence: "high", RationaleMd: "add examples"},
+		}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"review"`) || !strings.Contains(out, `"verdict": "good"`) {
+		t.Errorf("--json did not pass the envelope through:\n%s", out)
+	}
+}
+
+func TestRunReviewNullJSONEnvelope(t *testing.T) {
+	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{"r1": nil}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, `"review": null`) {
+		t.Errorf("null review --json should emit {\"review\": null}:\n%s", out)
+	}
+}
+
+func TestRunLogs(t *testing.T) {
+	agent := "coder"
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {
+			{Seq: 1, Kind: "assistant", Agent: &agent, Payload: []byte(`{"text":"hello"}`)},
+			{Seq: 2, Kind: "tool", Payload: []byte(`{"name":"bash"}`)},
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "#1") || !strings.Contains(out, "assistant") || !strings.Contains(out, "hello") {
+		t.Errorf("unexpected logs:\n%s", out)
+	}
+}
+
+func TestRunLogsAfterFilter(t *testing.T) {
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {
+			{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"one"}`)},
+			{Seq: 2, Kind: "assistant", Payload: []byte(`{"text":"two"}`)},
+		},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "logs", "r1", "--after", "1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(out, "one") || !strings.Contains(out, "two") {
+		t.Errorf("--after=1 should skip seq 1:\n%s", out)
+	}
+}
+
+// Untrusted judge free text carrying ANSI escape/CSI sequences must render to the
+// human TTY with the control bytes stripped (Risk 13 — no screen-clear, recolour,
+// hide, or spoof). Only the C0/C1 control bytes go; visible text — including a
+// multibyte codepoint whose UTF-8 bytes overlap the C1 byte range — survives,
+// proving the strip is rune-wise, not byte-wise.
+func TestRunReviewSanitizesHumanRender(t *testing.T) {
+	const summary = "\x1b[2J\x1b[31mFAKE ERROR" // CSI screen-clear + red
+	const target = "docs–end"                  // C1 NEL (U+0085) + en dash (U+2013, 0xE2 0x80 0x93)
+	const rationale = "before\x1b[1mafter"      // SGR bold
+	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{
+		"r1": {Verdict: "needs_work", Status: "complete", SummaryMd: summary,
+			Recommendations: []apitypes.RecommendationDTO{
+				{Category: "improve_uzi", Target: target, Confidence: "high", RationaleMd: rationale},
+			}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.ContainsRune(out, 0x1b) {
+		t.Errorf("human render leaked ESC (0x1b):\n%q", out)
+	}
+	if strings.ContainsRune(out, 0x85) {
+		t.Errorf("human render leaked C1 control (U+0085):\n%q", out)
+	}
+	// The en dash's UTF-8 encoding contains a 0x80 byte; a byte-wise strip would
+	// corrupt it, a rune-wise strip keeps "docs–end" intact.
+	for _, want := range []string{"FAKE ERROR", "docs–end", "before", "after"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("human render dropped visible text %q:\n%q", want, out)
+		}
+	}
+}
+
+// --json is the agent contract: it MUST NOT sanitize. The raw bytes survive the
+// round-trip (encoding/json escapes the ESC byte as a \u sequence that decodes
+// back to it), so a --json consumer sees exactly what the server sent.
+func TestRunReviewJSONPreservesControlChars(t *testing.T) {
+	const summary = "\x1b[2J\x1b[31mFAKE"
+	fc := &uzicli.FakeClient{Reviews: map[string]*apitypes.ReviewDTO{
+		"r1": {Verdict: "needs_work", Status: "complete", SummaryMd: summary},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "review", "r1", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	// Human render would strip the ESC; --json must instead carry it as a \u escape.
+	if strings.ContainsRune(out, 0x1b) {
+		t.Error("--json emitted a literal ESC byte; want it JSON-escaped, not raw")
+	}
+	var env struct {
+		Review *apitypes.ReviewDTO `json:"review"`
+	}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("decode --json envelope: %v\n%s", err, out)
+	}
+	got := "<nil review>"
+	if env.Review != nil {
+		got = env.Review.SummaryMd
+	}
+	if got != summary {
+		t.Fatalf("--json must preserve raw bytes; summary_md = %q, want %q", got, summary)
+	}
+}
+
+// followFake is a Client whose run flips to a terminal status after terminalAfter
+// GetRun polls, so `run logs --follow` can be driven to completion
+// deterministically. Every other method comes from the embedded FakeClient.
+type followFake struct {
+	*uzicli.FakeClient
+	terminalAfter int
+	getRunCalls   int
+}
+
+func (f *followFake) GetRun(_ context.Context, id string) (apitypes.RunDTO, error) {
+	f.getRunCalls++
+	st := "running"
+	if f.getRunCalls >= f.terminalAfter {
+		st = "completed"
+	}
+	return apitypes.RunDTO{ID: id, Status: st}, nil
+}
+
+// `run logs --follow` must terminate (exit 0) once the run reaches a terminal
+// state, after draining remaining messages — not poll forever (the stated
+// agent-audience footgun). A fake whose run goes terminal after 3 polls proves it
+// returns rather than hanging.
+func TestRunLogsFollowStopsOnTerminal(t *testing.T) {
+	t.Setenv("UZI_URL", "")
+	t.Setenv("UZI_TOKEN", "")
+	old := logsPollInterval
+	logsPollInterval = time.Millisecond
+	defer func() { logsPollInterval = old }()
+
+	fc := &uzicli.FakeClient{LogsByID: map[string][]apitypes.MessageDTO{
+		"r1": {{Seq: 1, Kind: "assistant", Payload: []byte(`{"text":"hi"}`)}},
+	}}
+	ff := &followFake{FakeClient: fc, terminalAfter: 3}
+
+	var out bytes.Buffer
+	env := fakeEnv(ff)
+	env.Stdout = &out
+	env.Stderr = &bytes.Buffer{}
+
+	done := make(chan int, 1)
+	go func() { done <- Main(env, []string{"run", "logs", "r1", "--follow"}) }()
+
+	select {
+	case code := <-done:
+		if code != uzicli.ExitOK {
+			t.Fatalf("--follow exit = %d, want 0", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run logs --follow did not terminate on a terminal run (hung)")
+	}
+	if !strings.Contains(out.String(), "hi") {
+		t.Errorf("--follow dropped the message before terminating:\n%s", out.String())
+	}
+	if ff.getRunCalls < 3 {
+		t.Errorf("GetRun polled %d times, want >= 3 (should poll until terminal)", ff.getRunCalls)
 	}
 }
 

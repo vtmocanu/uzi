@@ -32,9 +32,9 @@ func newRepoCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(repos))
 			for _, r := range repos {
-				rows = append(rows, []string{r.ID, r.Name})
+				rows = append(rows, []string{r.ID, r.PathWithNamespace, boolStr(r.Enabled)})
 			}
-			return p.Table([]string{"ID", "NAME"}, rows)
+			return p.Table([]string{"ID", "PATH", "ENABLED"}, rows)
 		},
 	}
 
