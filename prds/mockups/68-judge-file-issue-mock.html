@@ -347,7 +347,7 @@ quoted text above is LLM-authored and unverified.</div>
           <p class="why">The reviewer treats a failed tool call as a skipped check rather than a finding. Its template should require reporting any check it could not run, so a missing tool surfaces instead of silently narrowing the review.</p>
         </div>
       </div>
-      <p class="hint" style="color:var(--page-muted);margin-top:.6rem">Re-running the judge replaces the review (upsert semantics, PRD #46 Decision 8) and with it the recommendation rows — the filed links on the old rows go with them. See the open question in the plan below.</p>
+      <p class="hint" style="color:var(--page-muted);margin-top:.6rem">Re-running the judge replaces the recommendation rows (upsert semantics, PRD #46 Decision 8), but the filed link lives in its own table keyed by (review, category, target), so it survives. If the re-judge re-emits the same recommendation with a changed rationale, the row is flagged "filed for an earlier version" rather than silently refiled.</p>
     </section>
 
     <!-- STATE D -->
@@ -452,11 +452,13 @@ quoted text above is LLM-authored and unverified.</div>
       <tr><td><code>enable_tool</code></td><td><code>selfimprove_repo</code></td><td>weakest fit: often a pure admin toggle, not a code change — see below</td></tr>
     </table>
 
-    <h2 style="margin-top:1.5rem">Open questions for the PRD</h2>
+    <h2 style="margin-top:1.5rem">Resolved after review (3× fable: architect, fact-checker, auditor)</h2>
     <ol>
-      <li><b>Re-judge wipes filed links.</b> <code>UpsertRunReviewWithRecommendations</code> clears and reinserts recommendation rows, so a re-run judge drops the <code>filed_issue_*</code> columns with the old rows. Options: keep the filed rows and only replace unfiled ones; or move the filed link to its own table keyed by review+category+target; or accept the loss (the issue itself survives on the forge regardless).</li>
-      <li><b><code>enable_tool</code> and <code>adjust_template</code> may not want an issue at all.</b> Enabling a tool is an admin settings toggle. A "File issue" button on that row files a code issue for a config change. Options: hide the button for <code>enable_tool</code>; or keep it (an admin can still want a tracked task) and let the repo override carry it.</li>
-      <li><b>Who may file?</b> Settled by the existing pattern, not open: the issue is authored by the <b>connection's bot</b>, never the logged-in user — uzi has no per-user forge identity, and <code>CreateIssue</code> already builds its client from <code>repo.token_ciphertext</code> (<code>handler/issues.go:54</code>). So the rule is just <code>repoForRequest</code>'s: you may file only against repos <i>you</i> connected, and the picker lists exactly those. The one wrinkle worth deciding: a review is <i>owner-or-admin</i> scoped, so an admin can read another user's recommendations — filing then goes out as the <i>admin's</i> bot against the <i>admin's</i> repo. Consistent, but worth stating.</li>
+      <li><b>Re-judge no longer wipes filed links.</b> The link moves to its own table keyed <code>(review_id, category, target)</code>, which survives the recommendation delete-reinsert and makes a duplicate-file structurally impossible — <code>(category, target)</code> is not unique on the recommendation row, so the originally-drafted carry-forward LEFT JOIN would have fanned out.</li>
+      <li><b><code>enable_tool</code> / <code>adjust_template</code> keep the button.</b> The ask was a button on <i>each</i> improvement; the human reads the draft before any write, and special-casing 2 of 6 categories buys a rule to learn against a mis-click that's already visible and cancellable. Revisit if these dominate the filed mix and get closed invalid.</li>
+      <li><b>Who may file: owner + admin, with provenance shown.</b> The bot authors the issue (uzi has no per-user forge identity), and the picker lists only repos you connected. An admin reading another user's review can file too — so the draft shows "from user X's worker, run &lt;id&gt;" prominently, because that text is attacker-influencable (worker-forged).</li>
+      <li><b>Untrusted text is fenced, not blockquoted.</b> A markdown blockquote does not neutralize inline links/images or GitLab quick-actions; the filed body puts every untrusted field in a code block and strips leading <code>/</code>-command lines, plus a broader secret-shape scan at draft time (the ingest scrub only covers 4 secret families, and this flow can write to a different project than the run's repo).</li>
+      <li><b>Concurrent filing is claim-first.</b> A read-then-write 409 only catches sequential re-clicks; the row is claimed atomically before the forge write, mirroring the chat-proposal flow uzi already audited into that shape.</li>
     </ol>
 
     <h2 style="margin-top:1.5rem">What this does not change</h2>
