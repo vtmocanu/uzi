@@ -159,14 +159,17 @@ func (f *forgejo) VerifyToken(ctx context.Context) (BotIdentity, error) {
 // is refused (§11.3). An unparseable version refuses: the gate is a feature gate
 // (buys and costs no security, D4 L2), so refusing is purely the safer failure
 // mode — one clear error at connect beats a bare 404 mid-run. The returned error
-// names the required version and carries no secret, so it is not redacted.
+// names the required version and carries no secret, so it is not redacted; it
+// wraps ErrForgeVersionUnsupported so the privilege sweep can errors.Is it and
+// raise a distinct downgrade finding.
 func checkForgejoVersion(reported string) error {
+	min := strings.TrimPrefix(forgejoMinVersion, "v")
 	v := "v" + strings.TrimPrefix(strings.TrimSpace(reported), "v")
 	if !semver.IsValid(v) {
-		return fmt.Errorf("forgejo: server reports an unrecognized version %q; uzi requires Forgejo %s or newer", reported, strings.TrimPrefix(forgejoMinVersion, "v"))
+		return fmt.Errorf("forgejo: server reports an unrecognized version %q; uzi requires Forgejo %s or newer: %w", reported, min, ErrForgeVersionUnsupported)
 	}
 	if semver.Compare(v, forgejoMinVersion) < 0 {
-		return fmt.Errorf("forgejo: server version %q is below the required Forgejo %s", reported, strings.TrimPrefix(forgejoMinVersion, "v"))
+		return fmt.Errorf("forgejo: server version %q is below the required Forgejo %s: %w", reported, min, ErrForgeVersionUnsupported)
 	}
 	return nil
 }

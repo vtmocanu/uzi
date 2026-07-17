@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -161,6 +162,11 @@ func TestForgejoVersionGate(t *testing.T) {
 			// (CreateConnection surfaces VerifyToken's error verbatim).
 			if !strings.Contains(err.Error(), "16.0.0") {
 				t.Errorf("refusal error must name the required version, got %q", err.Error())
+			}
+			// It must wrap the sentinel so the privilege sweep can errors.Is it and
+			// raise a distinct downgrade finding (not the generic "could not verify").
+			if !errors.Is(err, ErrForgeVersionUnsupported) {
+				t.Errorf("refusal error must wrap ErrForgeVersionUnsupported, got %q", err.Error())
 			}
 		})
 	}
@@ -737,6 +743,9 @@ func TestCheckForgejoVersion(t *testing.T) {
 		err := checkForgejoVersion(tc.reported)
 		if (err != nil) != tc.wantErr {
 			t.Errorf("checkForgejoVersion(%q): err=%v, wantErr=%v", tc.reported, err, tc.wantErr)
+		}
+		if err != nil && !errors.Is(err, ErrForgeVersionUnsupported) {
+			t.Errorf("checkForgejoVersion(%q) must wrap ErrForgeVersionUnsupported, got %q", tc.reported, err.Error())
 		}
 	}
 }
