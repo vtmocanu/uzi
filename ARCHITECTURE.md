@@ -341,7 +341,7 @@ Full design rationale lives in the PRD (`prds/4-agent-runtime-workers.md`,
 especially its Decision Log); this section is the map.
 
 ```
-browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (TLS deferred), poll/claim/report── agent (worker, per user)
+browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (compose) / HTTPS (k8s), poll/claim/report── agent (worker, per user)
                                        │  ▲                                        │
                                        ▼  │ decrypted per-run secrets              ▼
                                       db  └── forge (GitLab): issues, MRs     repo clone + worktrees
@@ -355,16 +355,31 @@ the server looks up (`mw.RequireWorker`) — never a session cookie, so there is
 no CSRF step on this path. The token is shown once, at issuance (Settings →
 Workers), and only its hash is ever stored.
 
-**TLS on this hop is accepted as deferred, not met, by the MVP.** The `api`
-service listens plain HTTP on the compose network; the join token gives
-*authentication* now, but not *transport encryption*. This is fine while the
-worker is another container on the same private compose network; it becomes a
-real gap the moment a worker runs off-network (a laptop, a remote VM) with
-`UZI_API_URL` pointed at a public `api` endpoint over plain HTTP. Closing it —
-a TLS-terminated ingress in front of `api` — is scoped to the same later phase
-that moves the worker off compose onto its own host/pod (see
-[docs/proc-hardening.md](docs/proc-hardening.md)'s remote-worker design); it is
-flagged here so it is never silently assumed solved by "outbound-only".
+**TLS on this hop is deferred on compose and MET on Kubernetes** (PRD #58 M4).
+The join token gives *authentication* on both; transport encryption depends on
+where the worker runs:
+
+- **Compose**: still plain HTTP, and still fine for the reason it always was —
+  the worker is another container on the same private network. It becomes a real
+  gap the moment a worker runs off-network (a laptop, a remote VM) with
+  `UZI_API_URL` pointed at a public `api` over plain HTTP. Flagged here so it is
+  never silently assumed solved by "outbound-only".
+- **Kubernetes**: closed. The `api` gains an **optional second listener in-process**
+  (`API_TLS_CERT`/`API_TLS_KEY`, default `:8443`), and hosted workers plus the
+  worker controller dial it over `https://`, verifying a cert-manager-issued CA
+  that they pin *exclusively*. Note the mechanism, because an earlier version of
+  this section named the wrong one: it is **not** a TLS-terminating ingress in front
+  of `api`. Workers dial the `api` **directly**, so an ingress was never in their
+  path and would not have encrypted this hop at all. The plain listener stays for
+  `web`'s nginx and the kubelet probes, and the two are separate ports on purpose —
+  a NetworkPolicy admits the worker namespace to the TLS one and nothing else.
+
+Two properties of that listener that are easy to get backwards, both enforced in
+code rather than intended: it serves **only** `/api/worker/*` + `/api/controller/*`
+(not the full router), and it **strips `X-Forwarded-For`** — on a cluster
+`TRUSTED_PROXIES` is the pod CIDR, so a worker pod is a trusted proxy by
+construction and could otherwise forge its own rate-limit key. See
+[docs/configuration.md](docs/configuration.md) §The optional TLS listener.
 
 `api` remains the **sole holder of the encryption keys** (`UZI_SECRET_KEY`, see
 above) throughout: it decrypts a user's Anthropic token and forge bot PAT and

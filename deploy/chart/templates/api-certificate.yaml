@@ -89,7 +89,14 @@ spec:
     size: 256
     # Rotate the key with the certificate rather than reusing it forever.
     rotationPolicy: Always
+  # NOTE: this list REPLACES cert-manager's defaults rather than adding to them. With
+  # `server auth` alone the leaf carried EKU serverAuth and NO KeyUsage extension at
+  # all — which is harmless (an absent KeyUsage is unrestricted per RFC 5280; Go and
+  # Node both accept it) but reads like deliberate hardening while being closer to the
+  # opposite. `digital signature` is what a TLS server leaf is actually supposed to
+  # carry, and restores the convention the narrowed list silently dropped.
   usages:
+    - digital signature
     - server auth
   # Every name a client could dial the api Service by. The hosted workers live in
   # ANOTHER namespace, so the FQDN is the one that actually gets used — the short

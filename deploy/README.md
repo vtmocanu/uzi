@@ -260,11 +260,28 @@ is.
 
 **How clients get the CA.** cert-manager writes `ca.crt` alongside `tls.crt` and
 `tls.key` into the leaf Secret, so that Secret is also the CA distribution point.
-Clients mount `ca.crt` **by key projection** (`items:`), which is what keeps the
-api's private key out of a client's filesystem. The controller reads it via
-`UZI_API_CA_FILE` and pins it *exclusively* (the system roots are not also
-trusted). There is no skip-verification knob in this path and there must not be
-one — an unverified peer is the attack the encryption exists to stop.
+Any client that mounts it **must project `ca.crt` alone** (`items:`), because
+mounting the Secret whole would put the api's **private key** into that client's
+filesystem.
+
+> **Status, stated because the rule above is a requirement and not yet a fact.**
+> No `items:` projection exists in `deploy/chart/templates/` today, and the
+> property holds only because **nothing but the api pod mounts that Secret** — and
+> the api legitimately needs the whole pair. The projection becomes real with the
+> **controller Deployment, which is M6's**: it is the first workload that mounts the
+> leaf Secret as a *client*. **Hosted workers never mount it at all** (see the
+> cross-namespace note below), so M3 did not introduce a client and could not
+> discharge this. Whoever writes that Deployment owns the `items:` block; do not
+> read this paragraph as describing something already in the chart.
+
+The controller reads the CA via `UZI_API_CA_FILE` and pins it *exclusively* (the
+system roots are not also trusted). There is no skip-verification knob in this path
+and there must not be one — an unverified peer is the attack the encryption exists
+to stop.
+
+Related trap, worth one line so nobody "simplifies" the projection away: do **not**
+mount the `uzi-ca` Secret instead. That one holds the **CA private key**, which is
+strictly worse than the leaf's.
 
 > **Cross-namespace note (M3/M6).** Hosted workers run in a **different**
 > namespace and so cannot mount this Secret. The CA reaches them via the Secret the

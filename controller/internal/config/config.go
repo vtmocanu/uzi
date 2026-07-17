@@ -71,10 +71,21 @@ type Config struct {
 	// field. Changing it is what rolls every hosted worker onto a new release
 	// (Decision 9), via the spec hash.
 	WorkerImageTag string
-	// WorkerAPIURL is what a WORKER dials — necessarily the FQDN
-	// (https://api.<ns>.svc.cluster.local:8443), since a short Service name does not
-	// resolve cross-namespace. Deliberately separate from APIBaseURL, which is this
-	// controller's own hop and may legitimately be the short name.
+	// WorkerAPIURL is what a WORKER dials — necessarily the FQDN, since a short
+	// Service name does not resolve cross-namespace. Deliberately separate from
+	// APIBaseURL, which is this controller's own hop and may legitimately be the
+	// short name.
+	//
+	// THE NAMESPACE IN IT IS THE API'S RELEASE NAMESPACE, NOT THE WORKER'S — the one
+	// thing here that is easy to get backwards and fails as an opaque TLS handshake
+	// error rather than a DNS one. The api's certificate SANs are templated off the
+	// RELEASE namespace (api, api.<release-ns>, api.<release-ns>.svc,
+	// api.<release-ns>.svc.<clusterDomain> — see deploy/chart/templates/
+	// api-certificate.yaml), so a worker pointed at api.<WORKER-ns>.svc.cluster.local
+	// would not merely fail to resolve: if it did resolve it would fail verification
+	// against a cert that never carried that name. Concretely, for a release in
+	// namespace `uzi`: https://api.uzi.svc.cluster.local:8443, dialled from the
+	// `uzi-workers` namespace.
 	WorkerAPIURL string
 	// WorkerStorageClass is optional; empty means the cluster default.
 	WorkerStorageClass string

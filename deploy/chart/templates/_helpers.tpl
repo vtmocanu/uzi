@@ -43,7 +43,19 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   cert-manager is not doing the issuing.
 */ -}}
 {{- define "uzi.apiTLSSecretName" -}}
-{{- default (printf "%s-api-tls" (include "uzi.fullname" .)) .Values.api.tls.secretName -}}
+{{- if .Values.api.tls.secretName -}}
+{{- .Values.api.tls.secretName -}}
+{{- else if .Values.api.tls.certManager.enabled -}}
+{{- printf "%s-api-tls" (include "uzi.fullname" .) -}}
+{{- else -}}
+{{- /*
+  cert-manager off AND no secretName: nothing creates the Secret, so defaulting the
+  name would render a pod mounting a Secret that does not exist — it templates fine,
+  installs fine, and then hangs in ContainerCreating with nothing saying why. Fail at
+  TEMPLATE time instead, where the message can name the fix.
+*/ -}}
+{{- required "api.tls.secretName is required when api.tls.certManager.enabled is false: with cert-manager off the chart creates no Certificate, so you must point this at a PRE-CREATED Secret holding tls.crt + tls.key (and ca.crt for the clients). Otherwise the api pod mounts a Secret nobody creates and hangs in ContainerCreating." .Values.api.tls.secretName -}}
+{{- end -}}
 {{- end -}}
 
 {{- /*
