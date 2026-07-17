@@ -31,6 +31,24 @@ type FakeClient struct {
 	AdminUsageV  apitypes.AdminUsageDTO
 	RateLimits   []apitypes.AdminRateLimitRowDTO
 
+	// Auth-flow canned replies (uzi login). StartCLIAuth returns AuthStart;
+	// PollCLIAuth pops the front of AuthPolls each call (and repeats the last entry
+	// once drained), so a test can script start → pending → authorized.
+	AuthStart CLIAuthStartResult
+	AuthPolls []CLIAuthPollResult
+
+	// Write-verb capture + canned replies. CreateRun returns CreatedRun and records
+	// its args; SubmitRunInput returns InputResp and records kind/body/selection, so
+	// a test can assert the exact wire mapping of each write verb.
+	CreatedRun         apitypes.RunDTO
+	LastCreateRepoID   string
+	LastCreateIssueIID int64
+	InputResp          apitypes.RunInputResponse
+	LastInputRunID     string
+	LastInputKind      string
+	LastInputBody      string
+	LastInputSelection *apitypes.AgentSelection
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
@@ -132,4 +150,45 @@ func (f *FakeClient) AdminRateLimits(context.Context) ([]apitypes.AdminRateLimit
 		return nil, f.Err
 	}
 	return f.RateLimits, nil
+}
+
+func (f *FakeClient) StartCLIAuth(context.Context, string, string) (CLIAuthStartResult, error) {
+	if f.Err != nil {
+		return CLIAuthStartResult{}, f.Err
+	}
+	return f.AuthStart, nil
+}
+
+func (f *FakeClient) PollCLIAuth(context.Context, string, string) (CLIAuthPollResult, error) {
+	if f.Err != nil {
+		return CLIAuthPollResult{}, f.Err
+	}
+	if len(f.AuthPolls) == 0 {
+		return CLIAuthPollResult{}, nil
+	}
+	res := f.AuthPolls[0]
+	if len(f.AuthPolls) > 1 {
+		f.AuthPolls = f.AuthPolls[1:]
+	}
+	return res, nil
+}
+
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64) (apitypes.RunDTO, error) {
+	f.LastCreateRepoID = repoID
+	f.LastCreateIssueIID = issueIID
+	if f.Err != nil {
+		return apitypes.RunDTO{}, f.Err
+	}
+	return f.CreatedRun, nil
+}
+
+func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error) {
+	f.LastInputRunID = runID
+	f.LastInputKind = kind
+	f.LastInputBody = body
+	f.LastInputSelection = sel
+	if f.Err != nil {
+		return apitypes.RunInputResponse{}, f.Err
+	}
+	return f.InputResp, nil
 }

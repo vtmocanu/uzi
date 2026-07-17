@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -9,6 +12,24 @@ import (
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
+)
+
+// Run-input kinds, the exact wire strings the inputs endpoint accepts
+// (handler/workers.go runInputKinds). Named so a typo is a compile error, not a
+// silent 400.
+const (
+	kindApprovePlan = "approve_plan"
+	kindRejectPlan  = "reject_plan"
+	kindCancel      = "cancel"
+	kindFollowUp    = "follow_up"
+)
+
+// agentSources are the two rosters a plan approval may draw its subagents from
+// (apitypes.AgentSelection.Source). "own" is the run owner's template roster; "repo"
+// is the set the worker detected in the clone's .claude/agents/.
+const (
+	agentSourceOwn  = "own"
+	agentSourceRepo = "repo"
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls
@@ -165,38 +186,248 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	create := &cobra.Command{
 		Use:   "create",
-		Short: "Start a run on a repo/issue",
-		RunE:  stubRunE("run create"),
+		Short: "Start a run on a repo's PRD issue",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			repoID, _ := cmd.Flags().GetString("repo")
+			issue, _ := cmd.Flags().GetInt64("issue")
+			if strings.TrimSpace(repoID) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "--repo is required (a repo id from `uzi repo list`)")
+			}
+			if issue <= 0 {
+				return uzicli.Exitf(uzicli.ExitUsage, "--issue must be a positive issue IID")
+			}
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			run, err := c.CreateRun(cmd.Context(), repoID, issue)
+			if err != nil {
+				return err
+			}
+			return renderCreatedRun(env, gf, run)
+		},
 	}
-	create.Flags().StringSlice("agents", nil, "restrict the run to these agents")
+	create.Flags().String("repo", "", "repo id to run against (see 'uzi repo list')")
+	create.Flags().Int64("issue", 0, "the PRD issue IID to run")
 
 	approve := &cobra.Command{
 		Use:   "approve <run-id>",
 		Short: "Approve a run's plan gate",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("run approve"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			agents, _ := cmd.Flags().GetStringSlice("agents")
+			source, _ := cmd.Flags().GetString("agent-source")
+			sel, err := resolveSelection(cmd, c, args[0], source, agents)
+			if err != nil {
+				return err
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel)
+		},
 	}
+	approve.Flags().StringSlice("agents", nil, "restrict the run to these subagents (names from 'uzi run get'); default runs the full roster")
+	approve.Flags().String("agent-source", agentSourceOwn, "which roster --agents names come from: own|repo")
+
 	reject := &cobra.Command{
 		Use:   "reject <run-id>",
 		Short: "Reject a run's plan gate",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("run reject"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			msg, _ := cmd.Flags().GetString("message")
+			return submitInput(env, gf, c, cmd, args[0], kindRejectPlan, msg, nil)
+		},
 	}
+	reject.Flags().StringP("message", "m", "", "reason to send back to the agent (optional)")
+
 	cancel := &cobra.Command{
 		Use:   "cancel <run-id>",
 		Short: "Cancel a run",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("run cancel"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindCancel, "", nil)
+		},
 	}
+
 	followUp := &cobra.Command{
 		Use:   "follow-up <run-id>",
 		Short: "Send a follow-up message to a run",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("run follow-up"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			msg, _ := cmd.Flags().GetString("message")
+			msg = resolveMessage(env, msg)
+			if strings.TrimSpace(msg) == "" {
+				return uzicli.Exitf(uzicli.ExitUsage, "a follow-up needs a message: pass -m <message> or pipe it on stdin")
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindFollowUp, msg, nil)
+		},
 	}
+	followUp.Flags().StringP("message", "m", "", "the follow-up message (or pipe it on stdin)")
 
 	cmd.AddCommand(list, get, logs, review, create, approve, reject, cancel, followUp)
 	return cmd
+}
+
+// resolveSelection turns the `--agents` allow-list into the wire AgentSelection
+// {source, exclusions}. It is the ONE write-verb path that must fetch the run: the
+// server's selection is exclusion-based (name the agents to DROP), while the CLI
+// exposes the friendlier "run only these" allow-list, so the complement can only be
+// computed against the run's real roster. An empty --agents means "no selection" —
+// approve keeps the plain path and the worker runs the run's default roster.
+//
+// The fetched roster is used to COMPUTE exclusions and to give a helpful error on a
+// mistyped name; it does not replace the server's own validation, which still runs
+// against the live roster when the approve lands.
+func resolveSelection(cmd *cobra.Command, c uzicli.Client, runID, source string, agents []string) (*apitypes.AgentSelection, error) {
+	agents = nonEmpty(agents)
+	if len(agents) == 0 {
+		return nil, nil
+	}
+	if source != agentSourceOwn && source != agentSourceRepo {
+		return nil, uzicli.Exitf(uzicli.ExitUsage, "--agent-source must be 'own' or 'repo'")
+	}
+	run, err := c.GetRun(cmd.Context(), runID)
+	if err != nil {
+		return nil, err
+	}
+	var roster []apitypes.RepoAgent
+	if source == agentSourceOwn {
+		roster = run.OwnAgents
+	} else {
+		roster = run.RepoAgents
+	}
+	rosterNames := make(map[string]bool, len(roster))
+	for _, a := range roster {
+		rosterNames[a.Name] = true
+	}
+	if len(rosterNames) == 0 {
+		return nil, uzicli.Exitf(uzicli.ExitUsage, "this run has no %s agents to select from", source)
+	}
+	keep := make(map[string]bool, len(agents))
+	for _, name := range agents {
+		if !rosterNames[name] {
+			return nil, uzicli.Exitf(uzicli.ExitUsage,
+				"unknown %s agent %q; this run's %s agents are: %s", source, name, source, strings.Join(sortedKeys(rosterNames), ", "))
+		}
+		keep[name] = true
+	}
+	exclusions := make([]string, 0, len(rosterNames))
+	for name := range rosterNames {
+		if !keep[name] {
+			exclusions = append(exclusions, name)
+		}
+	}
+	sort.Strings(exclusions)
+	return &apitypes.AgentSelection{Source: source, Exclusions: exclusions}, nil
+}
+
+// submitInput sends one steering input and reports the outcome. server_side (a
+// cancel/reject applied without a live worker) is surfaced so the caller knows the
+// action took effect immediately rather than being queued.
+func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection) error {
+	res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, sel)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(res)
+	}
+	if !gf.quiet {
+		p.Printf("%s: %s\n", runID, inputOutcome(kind, res.ServerSide))
+	}
+	return nil
+}
+
+// inputOutcome is the human confirmation line for a submitted input.
+func inputOutcome(kind string, serverSide bool) string {
+	switch kind {
+	case kindApprovePlan:
+		return "plan approved"
+	case kindRejectPlan:
+		if serverSide {
+			return "plan rejected (run stopped)"
+		}
+		return "plan rejection sent"
+	case kindCancel:
+		if serverSide {
+			return "run cancelled"
+		}
+		return "cancellation sent"
+	case kindFollowUp:
+		return "follow-up sent"
+	default:
+		return "input submitted"
+	}
+}
+
+// renderCreatedRun prints a newly created run and — Risk 4 — warns on stderr when it
+// already carries a health reason (e.g. a locked vault parks it queued). The reliable
+// surface remains `uzi run get`/`run list`, which poll the same reason; this warns at
+// create time so an agent that queues then polls is not left blind on the first read.
+func renderCreatedRun(env Env, gf *globalFlags, run apitypes.RunDTO) error {
+	if run.HealthReason != nil && strings.TrimSpace(*run.HealthReason) != "" {
+		fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(strings.TrimSpace(*run.HealthReason)))
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(map[string]any{"run": run})
+	}
+	if !gf.quiet {
+		return renderRunDetail(p, run)
+	}
+	return nil
+}
+
+// resolveMessage returns the -m flag value when set, else a message piped on stdin
+// (non-TTY only, mirroring `uzi auth token`), capped so a hostile pipe cannot make
+// the CLI allocate without bound.
+func resolveMessage(env Env, flagVal string) string {
+	if strings.TrimSpace(flagVal) != "" {
+		return flagVal
+	}
+	if env.Stdin != nil && !env.StdinTTY {
+		b, _ := io.ReadAll(io.LimitReader(env.Stdin, 1<<20))
+		return strings.TrimSpace(string(b))
+	}
+	return ""
+}
+
+// nonEmpty drops blank entries from a StringSlice flag (e.g. --agents "" or a
+// trailing comma), so an accidental empty value never reads as a real selection.
+func nonEmpty(in []string) []string {
+	out := in[:0:0]
+	for _, s := range in {
+		if strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// sortedKeys returns a set's keys in sorted order (for a stable error message).
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // renderRunDetail prints a run as an aligned key/value block. Health + the health
