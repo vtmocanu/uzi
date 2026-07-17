@@ -14,6 +14,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/pipelinestatus"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -85,7 +86,7 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if ps.Status != "failed" {
+	if !pipelinestatus.IsFailed(ps.Status) {
 		httpx.Error(w, http.StatusConflict, "the latest pipeline for this ref is not failed")
 		return
 	}
@@ -141,7 +142,7 @@ func (h *Handler) snapshotFailedPipeline(ctx context.Context, f forge.Forge, pro
 		return workersvc.FailureSnapshot{}, err
 	}
 	for _, j := range jobs {
-		if j.Status != "failed" {
+		if !pipelinestatus.IsFailed(j.Status) {
 			continue
 		}
 		if len(snap.FailedJobs) >= h.cfg.CIFixMaxJobs {
