@@ -17,6 +17,10 @@ vi.mock("../lib/api", () => ({
     listRepos: vi.fn(),
     listConnections: vi.fn(),
     unreadNotificationCount: vi.fn(),
+    // The status favicon (PRD #70) polls listRuns on mount via useFavicon; stub it
+    // so the poll resolves to an empty run set instead of throwing on an undefined
+    // mock (the throw is synchronous, so the hook's own .catch never sees it).
+    listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     // The sidebar-footer rate-limit micro-meters (PRD #53) self-gate: default to
     // no_token so they render nothing in these nav/collapse assertions.
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
