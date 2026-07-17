@@ -384,9 +384,11 @@ func resolveMessage(env Env, flagVal string) string {
 }
 
 // nonEmpty drops blank entries from a StringSlice flag (e.g. --exclude-agents "" or
-// a trailing comma), so a flag artifact never rides as an empty exclusion.
+// a trailing comma), so a flag artifact never rides as an empty exclusion. It
+// returns a non-nil slice so a source-only selection marshals as `exclusions: []`
+// (matching the web AgentPicker), not `null`.
 func nonEmpty(in []string) []string {
-	out := in[:0:0]
+	out := make([]string, 0, len(in))
 	for _, s := range in {
 		if strings.TrimSpace(s) != "" {
 			out = append(out, s)

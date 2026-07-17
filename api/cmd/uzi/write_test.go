@@ -95,6 +95,10 @@ func TestRunApproveSourceOnly(t *testing.T) {
 	if fc.LastInputSelection == nil || fc.LastInputSelection.Source != "repo" || len(fc.LastInputSelection.Exclusions) != 0 {
 		t.Fatalf("source-only selection = %+v, want {repo, []}", fc.LastInputSelection)
 	}
+	// Non-nil so it marshals as `exclusions: []` (web parity), not `null`.
+	if fc.LastInputSelection.Exclusions == nil {
+		t.Error("source-only exclusions should be a non-nil empty slice ([]), not nil")
+	}
 }
 
 // --exclude-agents without --agent-source is a usage error: the CLI can't infer the
