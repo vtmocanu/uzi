@@ -392,6 +392,12 @@ Tracked as GitLab issue vtmocanu/uzi#55; PRD at `prds/55-oidc-group-mapping.md`.
   work appears — e.g. a future in-app chat agent, whose users chat in the web UI
   without knowing a worker serves them. [user, 2026-07-10; design detail in
   specs/ai.md §168]
+  - PARTIALLY delivered by PRD #58 (2026-07-17), k8s only: the dedicated operator
+    exists (a `controller` component, never the api) and provisions per-user workers
+    **on user request** (Settings → Workers; opt-in, quota-bounded). NOT delivered,
+    still deferred: the **when-queued-work-appears trigger**, autoscaling,
+    scale-to-zero, and the chat-agent case — a #58 worker is persistent and runs
+    until deleted. [design detail in specs/ai.md §264-275]
 - Auto-creating bot accounts / bot role enforcement (forge ships with user-managed bots).
 - Forgejo driver (interface is forge-generic; GitLab implemented first).
 - Agent runtime/execution (spawn, file writes, Anthropic API calls) — PRD #4.
