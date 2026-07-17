@@ -103,7 +103,7 @@ if [ "${1:-}" != "--e2e-sanitized" ]; then
   for _v in \
     HOME PATH TMPDIR TERM CI \
     DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY DOCKER_TLS_CERTDIR \
-    UZI_E2E_EXECUTOR UZI_E2E_COMPOSE_PROJECT UZI_E2E_COMPLETE_TIMEOUT \
+    UZI_E2E_EXECUTOR UZI_E2E_COMPOSE_PROJECT UZI_E2E_COMPLETE_TIMEOUT UZI_E2E_FORGE \
     E2E_RUN_DIR E2E_GIT_SMART_HTTP KEEP_STACK KEEP_RUNDIR
   do
     [ -n "${!_v+set}" ] && _e2e_env+=("$_v=${!_v}")
@@ -115,6 +115,15 @@ shift  # drop --e2e-sanitized; safe — this line is reached only when $1 held i
 # --- layout ------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXECUTOR="${UZI_E2E_EXECUTOR:-stub}"
+# UZI_E2E_FORGE selects the forge lane: "gitlab" (default — the full suite,
+# byte-identical) or "forgejo" (PRD #65 M9 — a focused Forgejo lifecycle against
+# the same fake's /api/v1 table, run INSTEAD of the GitLab suite). It is a HARNESS
+# knob like UZI_E2E_EXECUTOR, NOT a docker-compose.yml ${VAR:-default} var, so it is
+# safe in the env -i allowlist above: the allowlist excludes compose-read vars
+# precisely so the gate exercises the SHIPPED defaults, and this var never reaches
+# the api's config (it only branches the harness).
+FORGE="${UZI_E2E_FORGE:-gitlab}"
+case "$FORGE" in gitlab|forgejo) : ;; *) echo "error: UZI_E2E_FORGE must be gitlab or forgejo (got '$FORGE')" >&2; exit 2 ;; esac
 PROJECT="${UZI_E2E_COMPOSE_PROJECT:-uzi-e2e-$$}"
 # Compose project-name guard (PRD #33 Decision 7): reject an invalid RESOLVED
 # project name up front — before any scratch-dir or compose work — so a branch-like
@@ -553,6 +562,184 @@ pass "admin logged in; repo $REPO_ID enabled"
 # the column state clean for the run-lifecycle path and the PRD #24 MR-close phase.
 apiget "/api/repos/$REPO_ID/board" >/dev/null
 pass "board columns seeded"
+
+# =============================================================================
+# PRD #65 M9 — the Forgejo lane (UZI_E2E_FORGE=forgejo). A FOCUSED lifecycle
+# against the same fake's /api/v1 table, run INSTEAD of the GitLab suite. Skipped
+# entirely when FORGE=gitlab, so the GitLab lane below is byte-identical.
+#
+# Connection mechanism (lead-approved): there is NO shipped path to a forgejo
+# connection before M6b — CreateConnection refuses non-gitlab (handler/forge.go)
+# and the boot seed hardcodes gitlab (seed.go), both DELIBERATE (M6a dark-landing).
+# So the harness flips the boot-seeded connection's forge_type to 'forgejo'
+# directly in the THROWAWAY test DB: migration 00067's CHECK admits it, the sealed
+# PAT is forge-agnostic, base_url is unchanged (the driver just hits /api/v1). This
+# is test state only — no api/seed change — so production dark-landing is fully
+# intact, and it exercises exactly the runtime M2-M8 made forgejo-capable. The
+# CreateConnection-POST-forgejo path (save-time version/scope block) stays gated
+# until M6b and is validated there; it is unit-tested in forgejo_test.go today.
+# =============================================================================
+if [ "$FORGE" = forgejo ]; then
+  say "PRD #65 M9 (Forgejo lane): flip the seeded connection to forgejo in the test DB"
+  FJPGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
+  fj_psql() { "${COMPOSE[@]}" exec -T -e PGPASSWORD="$FJPGPW" db psql -U uzi -d uzi -tAc "$1" | tr -d '\r\n'; }
+  FJFLIP="$(fj_psql "UPDATE forge_connections SET forge_type='forgejo' WHERE forge_type='gitlab' RETURNING id")"
+  [ -n "$FJFLIP" ] || fail "forgejo flip updated no connection row"
+  [ "$(fj_psql "SELECT forge_type FROM forge_connections")" = forgejo ] || fail "connection is not forgejo after the flip"
+  pass "connection flipped to forge_type=forgejo (test DB only; production dark-landing intact)"
+
+  CONN_ID="$(apiget /api/forge/connections | jq -r '.connections[0].id // empty')"
+  [ -n "$CONN_ID" ] || fail "no connection after the flip"
+
+  # 1) Privilege sweep against forgejo: the on-demand privilege-check re-runs
+  #    VerifyToken (the version gate) + privcheck (D6/D6b) — the SAME code the
+  #    periodic sweep runs — so it validates the [live] "same PRD #5 verdicts"
+  #    criterion against forgejo without the connect POST (deferred to M6b).
+  say "forgejo privilege check: the compliant flipped connection reports least-privilege"
+  FJPRIV="$(apipost "/api/forge/connections/$CONN_ID/privilege-check" '')"
+  echo "$FJPRIV" | jq -e '.report.status == "ok"' >/dev/null 2>&1 \
+    || fail "forgejo privilege-check not ok (VerifyToken + privcheck against /api/v1): $FJPRIV"
+  pass "forgejo connection reports least-privilege ✓ (VerifyToken + D6/D6b via the sweep)"
+
+  # 2) Version gate on the sweep: a < 16.0.0 server is refused with the DISTINCT
+  #    version-downgrade finding (D4 + forge.ErrForgeVersionUnsupported), not the
+  #    generic "could not verify token".
+  say "forgejo version gate: a < 16.0.0 server is refused with the downgrade finding"
+  fake_post /_e2e/forgejo-version '{"version":"15.0.4+gitea-1.22.0"}' >/dev/null
+  FJDOWN="$(apipost "/api/forge/connections/$CONN_ID/privilege-check" '')"
+  echo "$FJDOWN" | jq -e '.report.status == "error"' >/dev/null 2>&1 \
+    || fail "a < 16 forge should make the check error, got: $FJDOWN"
+  echo "$FJDOWN" | jq -e '.report.token.warnings | any(test("older than the minimum version"))' >/dev/null 2>&1 \
+    || fail "downgrade should raise the distinct version finding, got: $FJDOWN"
+  pass "< 16.0.0 forge refused with the version-downgrade finding (ErrForgeVersionUnsupported) ✓"
+  fake_post /_e2e/forgejo-version '{"version":"16.0.0+gitea-1.22.0"}' >/dev/null  # restore
+
+  # 3) Bring the worker online (same path as the GitLab lane).
+  say "issue a worker join token and bring the worker online"
+  WTOKEN="$(apipost /api/workers '{"name":"e2e-worker-fj"}' | jq -r '.token')"
+  { [ -n "$WTOKEN" ] && [ "$WTOKEN" != null ]; } || fail "no worker token minted"
+  export UZI_WORKER_TOKEN="$WTOKEN"
+  "${COMPOSE[@]}" up -d --wait agent
+  wait_worker_online
+  pass "worker registered and is online"
+
+  # 4) Headline lifecycle: a PRD issue -> run -> plan gate -> approve -> completed,
+  #    with the worker cloning, working, pushing agent/issue-N and opening a PULL
+  #    REQUEST via /api/v1/.../pulls — never touching main. The issue is created
+  #    through the api's forgejo CreateIssue (POST /api/v1/.../issues).
+  say "forgejo run lifecycle: issue -> run -> gate -> approve -> completed (branch + PR)"
+  FJIID="$(apipost "/api/repos/$REPO_ID/issues" \
+    '{"title":"E2E forgejo","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+  { [ -n "$FJIID" ] && [ "$FJIID" != null ]; } || fail "forgejo issue not created via /api/v1"
+  FJRUN="$(create_run "$REPO_ID" "$FJIID")" || fail "forgejo run not created"
+  wait_status "$FJRUN" awaiting_approval
+  [ "$(apiget "/api/runs/$FJRUN" | jq -r '.run.plan_md // empty')" != "" ] || fail "forgejo run reached the gate with no plan"
+  pass "run $FJRUN reached the plan gate (awaiting_approval)"
+  apipost "/api/runs/$FJRUN/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  wait_status "$FJRUN" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+  pass "run completed"
+
+  # The worker recorded a PR iid; the fake holds exactly one PR, open, against main.
+  FJMR="$(apiget "/api/runs/$FJRUN" | jq -r '.run.mr_iid // empty')"
+  { [ -n "$FJMR" ] && [ "$FJMR" != null ] && [ "$FJMR" != 0 ]; } || fail "run did not record a PR iid (mr_iid)"
+  PRS="$(fake_state | jq '[.mrs[]] | length')"
+  [ "$PRS" = 1 ] || fail "expected exactly one PR opened on the fake, got $PRS"
+  [ "$(fake_state | jq -r '.mrs[0].target_branch')" = main ] || fail "PR base is not main"
+  [ "$(fake_state | jq -r '.mrs[0].state')" = opened ] || fail "PR is not open"
+  # D8: the worker persisted the forge-supplied PR web URL (mr_web_url), not a guess.
+  MRURL="$(apiget "/api/runs/$FJRUN" | jq -r '.run.mr_web_url // empty')"
+  case "$MRURL" in https://*) : ;; *) fail "mr_web_url not a persisted https URL (D8): '$MRURL'";; esac
+  pass "worker pushed a branch and opened PR !$FJMR against main (mr_web_url persisted) — never touching main ✓"
+
+  # 5) R4: no pull request reaches the board as a card. The fake serves the PR in
+  #    the /issues list (pull_request != null, number 10000+iid); the driver must
+  #    filter it. A regressed filter would surface card #(10000+iid).
+  say "forgejo R4: a pull request must NOT appear on the board as a card"
+  BADCARD="$(apiget "/api/repos/$REPO_ID/board" | jq '[.board.cards[] | select(.iid >= 10000)] | length')"
+  [ "$BADCARD" = 0 ] || fail "a pull request leaked onto the board as a card (R4 regression)"
+  pass "no PR on the board — R4 holds ✓"
+
+  # 6) CI status + id-DESC: speed the poller, then enqueue 2 Actions runs on main —
+  #    an older SUCCESS and a newer FAILURE. LatestPipeline takes runs[0] of the
+  #    id-DESC list, so the board must cache the NEWEST (failure), proving the
+  #    driver picks newest-of-2 AND that a failure caches as "failure" (not dropped/
+  #    neutral, R5-at-cache). NOTE: the fake returns id-DESC, so this proves the
+  #    driver takes [0]; the SERVER-side id-DESC ordering is the live-container check
+  #    (deferred — no runner env, D10a).
+  say "forgejo CI status + id-DESC: newest of 2 runs on main wins (failure over older success)"
+  printf 'E2E_FORGE_POLL_INTERVAL=2s\nFORGE_RECONCILE_EVERY=2\n' >> "$ENVFILE"
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
+  wait_http
+  login
+  fake_post /_e2e/actions-runs '{"branch":"main","sha":"sha-main","status":"success","jobs":[{"name":"build","status":"success","log":"ok"}]}' >/dev/null
+  fake_post /_e2e/actions-runs '{"branch":"main","sha":"sha-main","status":"failure","jobs":[{"name":"build","status":"failure","log":"boom at line 5\nFAIL"}]}' >/dev/null
+  wait_board_pipeline failure 30
+  pass "board cached the NEWEST run (failure) over the older success — id-DESC [0] + failure-caches-as-failure ✓"
+
+  # 7) Fix-CI loop DRIVE — the headline [live] criterion, unblocked by the Go
+  #    pipeline-status classifier (internal/pipelinestatus). main is at "failure"
+  #    (above), so this drives the loop end to end and OBSERVES two of the three Go
+  #    sites against a real run: the Fix-CI START GATE (ci_fix.go:88) must ACCEPT a
+  #    Forgejo "failure" (no run id is returned unless IsFailed("failure") passes),
+  #    and the fix VERDICT (pipeline_sync.go) must stamp fix_failed on a re-"failure".
+  #    The failed-job SNAPSHOT filter (ci_fix.go:144) is deliberately NOT asserted
+  #    here — an empty snapshot does not error and the fix run is created regardless,
+  #    so this lane cannot see its content — its "failure"-job inclusion is
+  #    unit-covered (handler.TestSnapshotFailedPipelineIncludesForgejoFailureJobs).
+  say "forgejo Fix-CI loop: a 'failure' pipeline drives Fix CI → fix run → fix_failed verdict"
+  FJFIX="$(apipost "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}' | jq -r '.run.id')"
+  { [ -n "$FJFIX" ] && [ "$FJFIX" != null ]; } \
+    || fail "Fix CI not triggered on a Forgejo 'failure' pipeline (the ci_fix.go:88 gate must accept 'failure')"
+  [ "$(apiget "/api/runs/$FJFIX" | jq -r '.run.kind')" = ci_fix ] || fail "run kind is not ci_fix"
+  DUP="$(apipost_code "/api/repos/$REPO_ID/ci-fix-runs" '{"ref":"main"}')"
+  [ "$DUP" = 409 ] || fail "a duplicate Fix CI on main should be 409, got $DUP"
+  pass "Fix CI triggered on a Forgejo 'failure' pipeline (the ci_fix.go:88 gate accepts 'failure') — ci_fix run $FJFIX"
+
+  wait_status "$FJFIX" awaiting_approval
+  [ "$(apiget "/api/runs/$FJFIX" | jq -r '.run.plan_md // empty')" != "" ] || fail "ci_fix run carried no plan"
+  apipost "/api/runs/$FJFIX/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+  wait_status "$FJFIX" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+  FJFIXBR="$(apiget "/api/runs/$FJFIX" | jq -r '.run.branch')"
+  case "$FJFIXBR" in ci-fix/pipeline-*) : ;; *) fail "ci_fix fix branch not ci-fix/pipeline-* (got $FJFIXBR)";; esac
+  [ "$(fake_state | jq -r --arg b "$FJFIXBR" '[.mrs[] | select(.source_branch==$b)] | length')" -ge 1 ] \
+    || fail "the fake recorded no PR from the fix branch $FJFIXBR"
+  pass "fix run $FJFIX completed on $FJFIXBR and opened a PR"
+
+  # The fix branch's re-run FAILS again ("failure", a higher id than the failure that
+  # spawned the run): the verdict must stamp fix_failed — the exact pipeline_sync
+  # IsFailed("failure") path a bare == "failed" never reached. The fake's PR head.sha
+  # for the fix branch == the run head_sha, so LatestMRPipeline resolves it.
+  fake_post /_e2e/actions-runs "$(jq -nc --arg b "$FJFIXBR" --arg s "sha-$FJFIXBR" '{branch:$b,sha:$s,status:"failure",jobs:[{name:"build",status:"failure",log:"still broken\nFAIL"}]}')" >/dev/null
+  wait_verdict "$FJFIX" fix_failed 30
+  pass "a re-'failure' fix pipeline stamped fix_failed (pipeline_sync IsFailed path) — the CI-fix loop works for Forgejo ✓"
+
+  # ---------------------------------------------------------------------------
+  # OPT-IN LIVE PASS (D10) — documented TODO, deliberately not wired.
+  #
+  # This lane runs entirely against forge-fake's /api/v1 table (the default, fast
+  # lane). A real released `codeberg.org/forgejo/forgejo:16.0.0` container (boots
+  # ~4s on sqlite: FORGEJO__database__DB_TYPE=sqlite3, __security__INSTALL_LOCK=true;
+  # reports 16.0.0+gitea-1.22.0, passes the D4a gate) would be an opt-in pass adding
+  # the two things a fixture CANNOT prove:
+  #   1. SERVER-side Actions id-DESC ordering — the fake returns id-DESC by
+  #      construction, so this lane proves the DRIVER takes runs[0]; only a real
+  #      server proves it RETURNS newest-first (models/actions/run_list.go ToOrders).
+  #      Enqueue 2+ runs on one branch/sha (a push to a repo with .forgejo/workflows/
+  #      enqueues a queued run even with NO runner) and assert [0] is the newest.
+  #   2. Real job-log RETRIEVAL — a registered forgejo-runner executing a workflow,
+  #      so JobLogTail pulls REAL text/plain logs (auth/redirect/content-type on a
+  #      live run), not canned fixtures. Needs a second container + runner setup.
+  # How-to sketch: a UZI_E2E_FORGE_LIVE=1 flag that (a) `docker run`s the pinned
+  # image BY DIGEST on a loopback port, (b) seeds a bot + token + repo via its API,
+  # (c) points the connection's base_url at it instead of forge-fake, (d) runs the
+  # non-Actions criteria live. Deferred (no runner environment — D10a); the released
+  # image's wire shapes were already probed while writing M2/M4/M5. Do it when a
+  # runner env exists; it blocks nothing on the critical path.
+  # ---------------------------------------------------------------------------
+
+  pass "PRD #65 M9 Forgejo lane complete"
+  exit 0
+fi
 
 # --- PRD #5: least-privilege journey (steps 3-4) -----------------------------
 # The forge base the seed + SSRF allowlist use (docker-compose.e2e.yml).

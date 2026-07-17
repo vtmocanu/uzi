@@ -342,6 +342,61 @@ func TestForgejoCreateIssueResolvesLabelIDs(t *testing.T) {
 	}
 }
 
+// TestForgejoCreateIssueAutoCreatesMissingLabel pins the GitLab-parity fix (found
+// by the M9 e2e): a label the repo does not yet have — e.g. the PRD trigger label,
+// which is never EnsureLabels'd — is CREATED, not errored on, so CreateIssue does
+// not 502 on a Forgejo repo that lacks it. Asserts a CreateLabel POST fires and its
+// new id is what the issue is created with.
+func TestForgejoCreateIssueAutoCreatesMissingLabel(t *testing.T) {
+	var createdLabel string
+	var sentLabelIDs []int64
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/labels": func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				_ = json.NewEncoder(w).Encode([]map[string]any{}) // empty catalog: PRD is missing
+			case http.MethodPost:
+				var body struct {
+					Name  string `json:"name"`
+					Color string `json:"color"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				createdLabel = body.Name
+				if body.Color == "" {
+					t.Error("CreateLabel must carry a color (Forgejo validates it)")
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 77, "name": body.Name, "color": body.Color})
+			}
+		},
+		"/repos/acme/widgets/issues": func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Labels []int64 `json:"labels"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			sentLabelIDs = body.Labels
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 200, "number": 42, "title": "New PRD", "state": "open",
+				"labels": []map[string]any{{"id": 77, "name": "PRD"}}, "html_url": "https://fj/acme/widgets/issues/42",
+			})
+		},
+	})
+	d := newForgejoDriver(t, m, "forgejo-abcdefabcdef")
+
+	issue, err := d.CreateIssue(context.Background(), 7, "New PRD", "see prds/9-foo.md", []string{"PRD"})
+	if err != nil {
+		t.Fatalf("CreateIssue with an unknown label must auto-create it, not error: %v", err)
+	}
+	if createdLabel != "PRD" {
+		t.Fatalf("the missing PRD label must be created, got created=%q", createdLabel)
+	}
+	if len(sentLabelIDs) != 1 || sentLabelIDs[0] != 77 {
+		t.Fatalf("the issue must be created with the newly-created label id 77, got %v", sentLabelIDs)
+	}
+	if issue.IID != 42 {
+		t.Fatalf("expected created issue iid 42, got %d", issue.IID)
+	}
+}
+
 // TestForgejoUpdateIssueLabelsFullSetReplace is test #3: exactly one PUT with the
 // correct FULL set. Forgejo replaces, not deltas, so an unrelated label already
 // on the issue (keep-me) must survive into the PUT, and the target is computed
