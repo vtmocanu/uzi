@@ -52,8 +52,8 @@ func (f *fakeUserForge) GetMergeRequest(context.Context, int64, int64) (forge.Me
 func (f *fakeUserForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 	return forge.TokenInfo{}, nil
 }
-func (f *fakeUserForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
-	return 0, false, nil
+func (f *fakeUserForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
+	return forge.RoleNone, false, nil
 }
 func (f *fakeUserForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
 	return forge.BranchProtection{}, nil

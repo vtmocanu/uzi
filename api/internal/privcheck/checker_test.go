@@ -12,7 +12,7 @@ import (
 
 // roleResult / protResult script the per-project forge answers.
 type roleResult struct {
-	role   int
+	role   forge.Role
 	member bool
 	err    error
 }
@@ -38,7 +38,7 @@ func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
 func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 	return f.tokenInfo, f.tokenErr
 }
-func (f *fakeForge) ProjectRole(_ context.Context, projectID, _ int64) (int, bool, error) {
+func (f *fakeForge) ProjectRole(_ context.Context, projectID, _ int64) (forge.Role, bool, error) {
 	r := f.roles[projectID]
 	return r.role, r.member, r.err
 }
@@ -167,15 +167,15 @@ func TestCheckFullReport(t *testing.T) {
 		identity:  forge.BotIdentity{ForgeUserID: 42, IsAdmin: false},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
 		roles: map[int64]roleResult{
-			1: {role: 30, member: true}, // compliant Developer
-			2: {role: 40, member: true}, // Maintainer → violation
-			3: {member: false},          // not a member → violation
-			4: {role: 30, member: true}, // Developer but branch problems below
+			1: {role: forge.RoleWrite, member: true}, // compliant write role
+			2: {role: forge.RoleAdmin, member: true}, // admin → violation
+			3: {member: false},                       // not a member → violation
+			4: {role: forge.RoleWrite, member: true}, // write role but branch problems below
 		},
 		prots: map[int64]protResult{
-			1: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false}},
-			2: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false}},
-			3: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false}},
+			1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false}},
+			2: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false}},
+			3: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false}},
 			4: {bp: forge.BranchProtection{Protected: false}}, // unprotected → violation
 		},
 	}
@@ -200,10 +200,10 @@ func TestCheckFullReport(t *testing.T) {
 	if len(byID["r1"].Violations) != 0 {
 		t.Errorf("r1 should be clean, got %v", byID["r1"].Violations)
 	}
-	if !hasFinding(byID["r2"].Violations, "Maintainer (40)") {
-		t.Errorf("r2 want Maintainer violation, got %v", byID["r2"].Violations)
+	if !hasFinding(byID["r2"].Violations, "role is admin, above") {
+		t.Errorf("r2 want above-write violation, got %v", byID["r2"].Violations)
 	}
-	if !hasFinding(byID["r3"].Violations, "no longer a Developer member") {
+	if !hasFinding(byID["r3"].Violations, "no longer a member") {
 		t.Errorf("r3 want not-a-member violation, got %v", byID["r3"].Violations)
 	}
 	if !hasFinding(byID["r4"].Violations, "not protected") {
@@ -211,28 +211,28 @@ func TestCheckFullReport(t *testing.T) {
 	}
 }
 
-func TestCheckDevelopersCanPushIsViolation(t *testing.T) {
+func TestCheckWriteRoleCanPushIsViolation(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
-		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: true}}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: true}}},
 	}
 	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
-	if !hasFinding(rep.Repos[0].Violations, "Developers may push") {
-		t.Fatalf("want developers-can-push violation, got %v", rep.Repos[0].Violations)
+	if !hasFinding(rep.Repos[0].Violations, "the write role may push") {
+		t.Fatalf("want write-role-can-push violation, got %v", rep.Repos[0].Violations)
 	}
 }
 
-// TestCheckBotDirectPushGrantIsViolation: a protected branch that Developers
+// TestCheckBotDirectPushGrantIsViolation: a protected branch the write role
 // cannot push, but which grants the bot a direct per-user push, is still a
 // violation (the false negative the role check alone would miss).
 func TestCheckBotDirectPushGrantIsViolation(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
-		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false, BotCanPush: true}}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false, BotCanPush: true}}},
 	}
 	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
 	if !hasFinding(rep.Repos[0].Violations, "direct push grant") {
@@ -244,7 +244,7 @@ func TestCheckEmptyDefaultBranchWarns(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
 	}
 	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: ""}}, now)
 	if len(rep.Repos[0].Violations) != 0 {
@@ -264,7 +264,7 @@ func TestCheckDrift(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
 		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true}}},
 	}
 	repos := []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}
@@ -274,7 +274,7 @@ func TestCheckDrift(t *testing.T) {
 		t.Fatalf("initial status = %q, want ok", rep.Status)
 	}
 	// A teammate promotes the bot to Maintainer.
-	f.roles[1] = roleResult{role: 40, member: true}
+	f.roles[1] = roleResult{role: forge.RoleAdmin, member: true}
 	if rep := c.Check(context.Background(), f, repos, now); rep.Status != StatusViolations {
 		t.Fatalf("post-drift status = %q, want violations", rep.Status)
 	}

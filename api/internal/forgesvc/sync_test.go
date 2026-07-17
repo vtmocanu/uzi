@@ -107,8 +107,8 @@ func (f *fakeForge) CreateIssueNote(context.Context, int64, int64, string) (forg
 func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 	return forge.TokenInfo{}, nil
 }
-func (f *fakeForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
-	return 0, false, nil
+func (f *fakeForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
+	return forge.RoleNone, false, nil
 }
 func (f *fakeForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
 	return forge.BranchProtection{}, nil
