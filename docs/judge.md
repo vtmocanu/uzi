@@ -70,6 +70,13 @@ its owner). Unread rows are highlighted; **Mark read** clears them from your
 unread count. Marking read is scoped to your own rows even in the admin
 all-view.
 
+That same unread count, together with your own runs' state, also drives a
+small dot on the browser tab icon: rose if one of your runs has failed,
+amber if one is awaiting your approval or you have something unread here,
+ember while work is running, and no dot when everything's idle. It's a
+convenience for a backgrounded or pinned tab, updating live in Chrome and
+Firefox (Safari shows the plain uzi mark, without the live dot).
+
 ## Good to know
 
 - **Cost**: a judge run is one model round-trip over a compacted version of
