@@ -527,8 +527,10 @@ func TestProjectRoleUsesEffectiveMembership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProjectRole: %v", err)
 	}
-	if !member || role != 40 {
-		t.Fatalf("expected role=40 member=true, got role=%d member=%v", role, member)
+	// Maintainer (40) maps onto the neutral admin role: the driver's job is to
+	// translate GitLab's number, never to hand it out.
+	if !member || role != RoleAdmin {
+		t.Fatalf("expected role=admin member=true, got role=%q member=%v", role, member)
 	}
 	// Effective membership (direct + inherited) is load-bearing — a group
 	// -inherited Maintainer role is invisible to the direct-members endpoint.
@@ -549,8 +551,32 @@ func TestProjectRoleNotAMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a 404 (not a member) must be a nil error, got %v", err)
 	}
-	if member || role != 0 {
-		t.Fatalf("expected not-a-member (role 0, member false), got role=%d member=%v", role, member)
+	if member || role != RoleNone {
+		t.Fatalf("expected not-a-member (role none, member false), got role=%q member=%v", role, member)
+	}
+}
+
+// TestRoleForAccessLevel pins the GitLab access-level → neutral Role mapping.
+// Developer (30) is the hinge: it is exactly the write role uzi's bot must hold,
+// so the boundary either side of it is what privcheck's above/below findings key
+// on.
+func TestRoleForAccessLevel(t *testing.T) {
+	for _, tc := range []struct {
+		level int
+		want  Role
+	}{
+		{0, RoleNone},
+		{5, RoleRead},  // Minimal
+		{10, RoleRead}, // Guest
+		{20, RoleRead}, // Reporter
+		{30, RoleWrite},
+		{40, RoleAdmin},
+		{50, RoleOwner},
+		{60, RoleOwner}, // Admin
+	} {
+		if got := roleForAccessLevel(tc.level); got != tc.want {
+			t.Errorf("roleForAccessLevel(%d) = %q, want %q", tc.level, got, tc.want)
+		}
 	}
 }
 
@@ -560,9 +586,11 @@ func TestDefaultBranchProtectionParsesPushLevels(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": 1, "name": "main",
 				"push_access_levels": []map[string]any{
-					{"access_level": 30},                  // Developers may push → DevelopersCanPush
+					{"access_level": 30},                  // the write role may push → WriteRoleCanPush
 					{"access_level": 60, "user_id": 4242}, // a per-user grant naming the bot → BotCanPush
 				},
+				// Maintainer-only merge: the safe half, so this fixture isolates push.
+				"merge_access_levels": []map[string]any{{"access_level": 40}},
 			})
 		},
 	})
@@ -575,21 +603,32 @@ func TestDefaultBranchProtectionParsesPushLevels(t *testing.T) {
 	if !bp.Protected {
 		t.Fatal("expected Protected")
 	}
-	if !bp.DevelopersCanPush {
-		t.Fatal("the level-30 push entry must set DevelopersCanPush")
+	if !bp.WriteRoleCanPush {
+		t.Fatal("the level-30 push entry must set WriteRoleCanPush")
 	}
 	if !bp.BotCanPush {
 		t.Fatal("the per-user (user_id=4242) push entry must set BotCanPush")
 	}
+	if bp.WriteRoleCanMerge || bp.BotCanMerge {
+		t.Fatalf("Maintainer-only merge must leave the merge fields clear, got %+v", bp)
+	}
 }
 
-func TestDefaultBranchProtectionCleanBranch(t *testing.T) {
+// TestDefaultBranchProtectionParsesMergeLevels covers D6a-1: GitLab's initial
+// default puts merge_access_levels at Maintainer, so a Developer bot cannot
+// merge — but it is a setting, and this fixture is what a repo looks like once
+// someone has changed it. uzi modelled merge on no forge before PRD #65.
+func TestDefaultBranchProtectionParsesMergeLevels(t *testing.T) {
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id": 1, "name": "main",
-				// Maintainer-only push, no per-user grant: a compliant protected main.
+				// Maintainer-only push: the bot cannot push. It can still merge.
 				"push_access_levels": []map[string]any{{"access_level": 40}},
+				"merge_access_levels": []map[string]any{
+					{"access_level": 30},                  // the write role may merge → WriteRoleCanMerge
+					{"access_level": 60, "user_id": 4242}, // a per-user merge grant naming the bot → BotCanMerge
+				},
 			})
 		},
 	})
@@ -599,12 +638,55 @@ func TestDefaultBranchProtectionCleanBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultBranchProtection: %v", err)
 	}
-	if !bp.Protected || bp.DevelopersCanPush || bp.BotCanPush {
-		t.Fatalf("Maintainer-only push should be clean, got %+v", bp)
+	if bp.WriteRoleCanPush || bp.BotCanPush {
+		t.Fatalf("Maintainer-only push must leave the push fields clear, got %+v", bp)
+	}
+	if !bp.WriteRoleCanMerge {
+		t.Fatal("the level-30 merge entry must set WriteRoleCanMerge")
+	}
+	if !bp.BotCanMerge {
+		t.Fatal("the per-user (user_id=4242) merge entry must set BotCanMerge")
 	}
 }
 
-func TestDefaultBranchProtectionUnprotected(t *testing.T) {
+func TestDefaultBranchProtectionCleanBranch(t *testing.T) {
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "name": "main",
+				// Maintainer-only push and merge, no per-user grant: this is what
+				// GitLab's "Fully protected" initial default produces, and it is the
+				// only fixture here that must come back completely clean.
+				"push_access_levels":  []map[string]any{{"access_level": 40}},
+				"merge_access_levels": []map[string]any{{"access_level": 40}},
+			})
+		},
+	})
+	d := newTestDriver(t, m, "glpat-abcdefabcdef")
+
+	bp, err := d.DefaultBranchProtection(context.Background(), 7, "main", 4242)
+	if err != nil {
+		t.Fatalf("DefaultBranchProtection: %v", err)
+	}
+	if !bp.Protected || bp.WriteRoleCanPush || bp.BotCanPush || bp.WriteRoleCanMerge || bp.BotCanMerge {
+		t.Fatalf("Maintainer-only push+merge should be clean, got %+v", bp)
+	}
+}
+
+// TestDefaultBranchProtectionUnprotectedIsNotSafe is the R12 regression test.
+//
+// An unprotected branch is the branch a write-role bot most certainly CAN push
+// to and merge into. The 404 path used to return BranchProtection{Protected:
+// false} and leave the rest at the zero value, which reads identically to
+// "evaluated, and the bot cannot do either" — so a consumer writing the obvious
+// `if canPush || canMerge { refuse }` would wave through the single worst case
+// in the product. The fields must therefore be evaluated on this path too.
+//
+// This test fails if the driver reverts to the zero value: drop the two `true`s
+// in the 404 arm of DefaultBranchProtection and the assertion below goes red,
+// which is what makes BranchProtection's doc comment an assertion rather than a
+// hope.
+func TestDefaultBranchProtectionUnprotectedIsNotSafe(t *testing.T) {
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		"/api/v4/projects/7/protected_branches/main": func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
@@ -618,6 +700,14 @@ func TestDefaultBranchProtectionUnprotected(t *testing.T) {
 	}
 	if bp.Protected {
 		t.Fatal("a 404 must map to Protected=false")
+	}
+	// The load-bearing half: a consumer that never looks at Protected must still
+	// not be able to read this as a clean branch.
+	if !bp.WriteRoleCanPush {
+		t.Fatal("an unprotected branch admits a write-role push; reporting false inverts the guardrail")
+	}
+	if !bp.WriteRoleCanMerge {
+		t.Fatal("an unprotected branch admits a write-role merge; reporting false inverts the guardrail")
 	}
 }
 

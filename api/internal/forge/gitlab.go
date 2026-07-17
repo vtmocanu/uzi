@@ -83,7 +83,29 @@ func (g *gitLab) TokenInfo(ctx context.Context) (TokenInfo, error) {
 	return info, nil
 }
 
-func (g *gitLab) ProjectRole(ctx context.Context, projectID, forgeUserID int64) (int, bool, error) {
+// roleForAccessLevel maps a GitLab access level onto the neutral Role. GitLab's
+// levels are 0 (none), 5 (Minimal), 10 (Guest), 20 (Reporter), 30 (Developer),
+// 40 (Maintainer), 50 (Owner), 60 (Admin). Developer is exactly the write role —
+// it is the level uzi's bot must hold — so everything under it collapses to read
+// and everything over it to admin/owner. The precision uzi loses (Guest vs
+// Reporter) is precision it never used: privcheck asserts write and reports
+// anything else.
+func roleForAccessLevel(lvl int) Role {
+	switch {
+	case lvl <= 0:
+		return RoleNone
+	case lvl < developerAccessLevel:
+		return RoleRead
+	case lvl == developerAccessLevel:
+		return RoleWrite
+	case lvl < int(gitlab.OwnerPermissions):
+		return RoleAdmin
+	default:
+		return RoleOwner
+	}
+}
+
+func (g *gitLab) ProjectRole(ctx context.Context, projectID, forgeUserID int64) (Role, bool, error) {
 	// members/all resolves EFFECTIVE membership (direct + inherited group), which
 	// is what actually governs what the bot can do — a group-inherited Maintainer
 	// role would be invisible to the direct-members endpoint.
@@ -92,19 +114,26 @@ func (g *gitLab) ProjectRole(ctx context.Context, projectID, forgeUserID int64) 
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			// Not a member (removed or demoted below any membership after the repo
 			// was enabled). Reported as a finding by the checker, not an error.
-			return 0, false, nil
+			return RoleNone, false, nil
 		}
-		return 0, false, g.redact.error(fmt.Errorf("gitlab: project role: %w", err))
+		return RoleNone, false, g.redact.error(fmt.Errorf("gitlab: project role: %w", err))
 	}
-	return int(m.AccessLevel), true, nil
+	return roleForAccessLevel(int(m.AccessLevel)), true, nil
 }
 
 func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, branch string, botUserID int64) (BranchProtection, error) {
 	pb, resp, err := g.client.ProtectedBranches.GetProtectedBranch(projectID, branch, gitlab.WithContext(ctx))
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			// No protection rule for this branch at all.
-			return BranchProtection{Protected: false}, nil
+			// No protection rule for this branch at all — so nothing restricts push
+			// or merge, and a write-role bot may do both. Reporting the zero value
+			// here would say "cannot push, cannot merge" about the one branch state
+			// where the bot certainly can: see BranchProtection's invariant.
+			return BranchProtection{
+				Protected:         false,
+				WriteRoleCanPush:  true,
+				WriteRoleCanMerge: true,
+			}, nil
 		}
 		return BranchProtection{}, g.redact.error(fmt.Errorf("gitlab: branch protection: %w", err))
 	}
@@ -114,12 +143,27 @@ func (g *gitLab) DefaultBranchProtection(ctx context.Context, projectID int64, b
 		// A push level of 0 is "No one"; >= Maintainer (40) excludes a Developer
 		// bot. Only a nonzero level at or below Developer (30) lets the bot push.
 		if lvl > 0 && lvl <= developerAccessLevel {
-			bp.DevelopersCanPush = true
+			bp.WriteRoleCanPush = true
 		}
 		// A per-user allow-to-push entry naming the bot lets it push regardless of
 		// role (a false negative the role check alone would miss).
 		if botUserID != 0 && pl.UserID == botUserID {
 			bp.BotCanPush = true
+		}
+	}
+	// merge_access_levels is the same shape as push_access_levels and governs who
+	// may merge an MR into the branch. GitLab's initial default for a new project
+	// sets it to Maintainer, so a Developer bot cannot merge — but it is a
+	// setting, and safe-by-default is not safe. uzi modelled merge on no forge
+	// until now, delegating "the agent can only ever open an MR" to a sentence in
+	// the setup docs.
+	for _, ml := range pb.MergeAccessLevels {
+		lvl := int(ml.AccessLevel)
+		if lvl > 0 && lvl <= developerAccessLevel {
+			bp.WriteRoleCanMerge = true
+		}
+		if botUserID != 0 && ml.UserID == botUserID {
+			bp.BotCanMerge = true
 		}
 	}
 	return bp, nil
