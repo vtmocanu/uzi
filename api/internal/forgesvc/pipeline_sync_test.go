@@ -229,6 +229,29 @@ func TestSyncPipelinesStampsFixFailedOnRedPipeline(t *testing.T) {
 	}
 }
 
+// TestSyncPipelinesStampsFixFailedOnForgejoFailure is the cross-vocabulary guard:
+// a Forgejo fix branch whose re-run FAILS reports the Actions status "failure", not
+// GitLab's "failed". A bare `case "failed"` here never stamped it — the fix run
+// stayed unverified forever. Classifying via pipelinestatus fixes it. Mutation
+// check: revert maybeStampFixVerdict to `case "failed"` and this reddens while the
+// GitLab test above stays green.
+func TestSyncPipelinesStampsFixFailedOnForgejoFailure(t *testing.T) {
+	fixRun := store.Run{ID: uuid.New()}
+	st := &fakeStore{
+		watchedRefs: []store.ListWatchedRunRefsForRepoRow{runRef("ci-fix/pipeline-4200", 77)},
+		stampTarget: fixRun,
+	}
+	svc := newTestService(st)
+	f := &fakeForge{pipelineByMR: map[int64]forge.Pipeline{77: pipelineAt(4300, "failure")}}
+
+	if err := svc.SyncPipelines(context.Background(), uuid.New(), 7, f, syncOpts(false)); err != nil {
+		t.Fatalf("SyncPipelines: %v", err)
+	}
+	if len(st.stamps) != 1 || st.stamps[0].FixVerdict.String != "fix_failed" {
+		t.Fatalf("a Forgejo 'failure' post-fix pipeline must stamp 'fix_failed', got %+v", st.stamps)
+	}
+}
+
 func TestSyncPipelinesDoesNotStampWhileRunning(t *testing.T) {
 	st := &fakeStore{
 		watchedRefs: []store.ListWatchedRunRefsForRepoRow{runRef("ci-fix/pipeline-4200", 77)},

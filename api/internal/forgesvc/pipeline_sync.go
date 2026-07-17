@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/pipelinestatus"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -164,16 +165,18 @@ func (s *Service) syncOneRef(ctx context.Context, repoID uuid.UUID, forgeProject
 // failed ref would false-stamp from unrelated commits. It stamps only when the
 // observed pipeline is TERMINAL and newer than the failure that spawned the run
 // (id > the run's snapshot pipeline id — see FindCIFixStampTarget), so a fix
-// branch's own original failing pipeline never triggers a stamp. success →
-// verified, failed → fix_failed; canceled/skipped/in-flight leave the run
-// unverified (NULL). All errors are contained: verification is best-effort and must
-// not stall the sync.
+// branch's own original failing pipeline never triggers a stamp. A terminal PASS →
+// verified, a terminal FAILURE → fix_failed (classified via pipelinestatus, so both
+// GitLab's "failed" and Forgejo Actions' "failure"/"error" count — a bare == "failed"
+// here never stamped a re-failed Forgejo fix); cancelled/skipped/in-flight leave the
+// run unverified (NULL). All errors are contained: verification is best-effort and
+// must not stall the sync.
 func (s *Service) maybeStampFixVerdict(ctx context.Context, repoID uuid.UUID, ref string, p forge.Pipeline) {
 	var verdict string
-	switch p.Status {
-	case "success":
+	switch {
+	case pipelinestatus.IsSuccess(p.Status):
 		verdict = "verified"
-	case "failed":
+	case pipelinestatus.IsFailed(p.Status):
 		verdict = "fix_failed"
 	default:
 		return // not a terminal pass/fail — nothing to stamp yet
