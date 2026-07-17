@@ -1,0 +1,479 @@
+package handler
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/auth"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/clitoken"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/hub"
+	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/settings"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
+)
+
+// M2's CEILING tests (PRD #64), the milestone's real deliverable. They exist as a
+// live-DB suite, and against the REAL h.Routes() router, on purpose: the property
+// under test is the token's authority CEILING — enforced by the RequireUser masking
+// and by which routes carry RequireUser vs RequireAuth — and a fake store cannot
+// exhibit cross-user visibility, nor can a hand-rolled middleware chain prove that
+// handler.go wired the ACTUAL route the way the security model requires. A suite
+// that only checked "uzc_ is 403 by /api/admin/*" would go green with the F1 hole
+// wide open, so these test the property, not the route prefix.
+//
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
+// ./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix.
+
+// cliTestSecret is a 32-byte HS256 key. Config validation is not run here (we build
+// Config directly), so any non-empty secret works for IssueToken/ParseToken.
+var cliTestSecret = []byte("0123456789abcdef0123456789abcdef")
+
+// cliLiveDB builds a live-DB-backed Handler wired with the collaborators the ceiling
+// tests actually reach (wsvc for run reads, settings for /auth/me + the admin
+// settings read), plus its full Routes() router mounting the real RequireUser /
+// RequireAdminRO chain. The limiters are generous (these are not rate-limit tests).
+func cliLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
+	t.Helper()
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	q := store.New(pool)
+	box := newHandlerTestBox(t)
+	h := &Handler{
+		pool: pool,
+		q:    q,
+		box:  box,
+		cfg: config.Config{
+			JWTSecret:    cliTestSecret,
+			AuthTokenTTL: time.Hour,
+		},
+		wsvc:     workersvc.New(q, box, workersvc.Params{}),
+		settings: settings.New(&settingsStore{}, time.Minute),
+		hub:      hub.New(),
+	}
+	lim := mw.NewLimiter(100000, time.Minute, nil)
+	router := h.Routes(lim, lim, lim, lim, lim, lim, lim)
+	return h, router, pool
+}
+
+func cliMustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatalf("exec %q: %v", sql, err)
+	}
+}
+
+// cliSeedUser inserts a fresh user (unique email; the runner shares one DB across
+// the LiveDB set) and returns its id.
+func cliSeedUser(t *testing.T, pool *pgxpool.Pool, isAdmin bool) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	cliMustExec(t, pool, `INSERT INTO users (id, email, password_hash, is_admin) VALUES ($1, $2, 'x', $3)`,
+		id, fmt.Sprintf("cli-%s@e2e", id), isAdmin)
+	return id
+}
+
+// cliMintToken inserts a cli_tokens row for userID and returns the plaintext token.
+// expires_at is left NULL (never expires) — the NULL-trap path, which is exactly the
+// agent/CI token these tests care about; expiry is not what they exercise.
+func cliMintToken(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID, scope string) string {
+	t.Helper()
+	token, hash, prefix, err := clitoken.Generate(scope)
+	if err != nil {
+		t.Fatalf("clitoken.Generate: %v", err)
+	}
+	cliMustExec(t, pool,
+		`INSERT INTO cli_tokens (user_id, name, token_hash, token_prefix, scope) VALUES ($1, 'test', $2, $3, $4)`,
+		userID, hash, prefix, scope)
+	return token
+}
+
+// cliSeedJudgedRun seeds a forge connection, a repo, a completed run owned by
+// ownerID, and a JUDGED review (verdict + one recommendation) on that run. The
+// review's presence is load-bearing for the /review trio assertion: an unjudged
+// foreign run returns 404 too, but only a judged one proves VERDICT CONTENT never
+// crosses to a masked admin token. Returns the target run id.
+func cliSeedJudgedRun(t *testing.T, pool *pgxpool.Pool, ownerID uuid.UUID) uuid.UUID {
+	t.Helper()
+	connID, repoID, runID := uuid.New(), uuid.New(), uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, connID, ownerID, []byte{0x1})
+	cliMustExec(t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/r', 'https://forge.e2e/g/r', 'main', true)`, repoID, connID)
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+		 VALUES ($1, $2, $3, 42, 'Do X', 'desc', 'completed', 'issue')`, runID, ownerID, repoID)
+	cliMustExec(t, pool,
+		`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 1, 'text', $2)`,
+		runID, []byte(`{"text":"hello"}`))
+
+	var reviewID uuid.UUID
+	if err := pool.QueryRow(context.Background(),
+		`INSERT INTO run_reviews (target_run_id, user_id, verdict, summary_md, status)
+		 VALUES ($1, $2, 'issues', 'a summary that must not cross', 'complete') RETURNING id`,
+		runID, ownerID).Scan(&reviewID); err != nil {
+		t.Fatalf("insert review: %v", err)
+	}
+	cliMustExec(t, pool,
+		`INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+		 VALUES ($1, 'improve_uzi', 'x', 'because', 'high')`, reviewID)
+	return runID
+}
+
+// bearerReq drives router with an Authorization: Bearer credential and no cookie.
+func bearerReq(router http.Handler, method, path, token string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+// cliMintJWT issues a valid session JWT cookie value for userID, reading the row's
+// live token_version so RequireAuth's revocation check passes (the users default is
+// not 0).
+func cliMintJWT(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) string {
+	t.Helper()
+	var tokenVersion int32
+	if err := pool.QueryRow(context.Background(), `SELECT token_version FROM users WHERE id = $1`, userID).Scan(&tokenVersion); err != nil {
+		t.Fatalf("read token_version: %v", err)
+	}
+	tok, err := auth.IssueToken(cliTestSecret, userID.String(), tokenVersion, time.Hour)
+	if err != nil {
+		t.Fatalf("IssueToken: %v", err)
+	}
+	return tok
+}
+
+// cliCSRFHeader computes the CSRF header value ValidateCSRF expects for a state-
+// changing request: hex(nonce).hex(hmac_sha256(key=authCookieValue, nonce)).
+func cliCSRFHeader(t *testing.T, jwt string) string {
+	t.Helper()
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	mac := hmac.New(sha256.New, []byte(jwt))
+	mac.Write(nonce)
+	return hex.EncodeToString(nonce) + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+// -------------------------------------------------------------------------
+// (a) The load-bearing trio: an admin's uzc_ gets 404 on ANOTHER user's run,
+// messages, AND review — the review fixture JUDGED — while the owner's token and
+// the admin's uza_ both see it. That triangulation proves the 404 is the F1 masking
+// (an admin's default-scope token reduced to owner-only), not a broken fixture.
+// -------------------------------------------------------------------------
+
+func TestCLICeilingTrioCrossUser404LiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+
+	admin := cliSeedUser(t, pool, true)
+	owner := cliSeedUser(t, pool, false)
+	runID := cliSeedJudgedRun(t, pool, owner)
+
+	adminUzc := cliMintToken(t, pool, admin, clitoken.ScopeUser)     // masked to IsAdmin=false
+	adminUza := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO)  // keeps IsAdmin
+	ownerUzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+
+	paths := []string{
+		"/api/runs/" + runID.String(),
+		"/api/runs/" + runID.String() + "/messages",
+		"/api/runs/" + runID.String() + "/review",
+	}
+	for _, p := range paths {
+		// The ceiling: admin's uzc_ is owner-only ⇒ another user's run is 404.
+		if rec := bearerReq(router, http.MethodGet, p, adminUzc); rec.Code != http.StatusNotFound {
+			t.Errorf("admin uzc_ GET %s = %d, want 404 (masking makes it owner-only)\nbody: %s", p, rec.Code, rec.Body.String())
+		}
+		// The owner sees their own run: proves the fixture is genuinely visible, so the
+		// 404 above is the masking, not a missing row.
+		if rec := bearerReq(router, http.MethodGet, p, ownerUzc); rec.Code != http.StatusOK {
+			t.Errorf("owner uzc_ GET %s = %d, want 200 (owner sees own run)\nbody: %s", p, rec.Code, rec.Body.String())
+		}
+		// The admin's uza_ (unmasked) sees it: proves the account really is admin, so
+		// the uzc_ 404 is specifically the scope ceiling, not a non-admin account.
+		if rec := bearerReq(router, http.MethodGet, p, adminUza); rec.Code != http.StatusOK {
+			t.Errorf("admin uza_ GET %s = %d, want 200 (admin_ro sees any run)\nbody: %s", p, rec.Code, rec.Body.String())
+		}
+	}
+
+	// The /review body must be a real 404, not a 200 {"review":null}: verdict content
+	// (the seeded review + recommendation) must never reach the masked admin token.
+	rec := bearerReq(router, http.MethodGet, "/api/runs/"+runID.String()+"/review", adminUzc)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("admin uzc_ /review = %d, want 404 (a null review would leak that the run exists + verdict crossing)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	// And the owner's /review is genuinely a judged, non-null review — otherwise the
+	// judged-fixture requirement is not actually met.
+	rec = bearerReq(router, http.MethodGet, "/api/runs/"+runID.String()+"/review", ownerUzc)
+	var body struct {
+		Review *json.RawMessage `json:"review"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("owner /review decode: %v (body %s)", err, rec.Body.String())
+	}
+	if body.Review == nil {
+		t.Fatalf("owner /review is null; the trio fixture must be JUDGED for the test to prove verdict non-crossing")
+	}
+}
+
+// -------------------------------------------------------------------------
+// (b) Self-report honesty: /auth/me over a uzc_ reports is_admin:false (the masking
+// copy is what makes this true), over a uza_ reports is_admin:true.
+// -------------------------------------------------------------------------
+
+func TestCLISelfReportHonestyLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	admin := cliSeedUser(t, pool, true)
+	uzc := cliMintToken(t, pool, admin, clitoken.ScopeUser)
+	uza := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO)
+
+	meAdmin := func(token string) bool {
+		rec := bearerReq(router, http.MethodGet, "/api/auth/me", token)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("/auth/me = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+		}
+		var body struct {
+			User struct {
+				IsAdmin bool `json:"is_admin"`
+			} `json:"user"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("/auth/me decode: %v (body %s)", err, rec.Body.String())
+		}
+		return body.User.IsAdmin
+	}
+
+	if meAdmin(uzc) {
+		t.Errorf("/auth/me over uzc_ reported is_admin:true; the masking must report this credential's authority (false)")
+	}
+	if !meAdmin(uza) {
+		t.Errorf("/auth/me over uza_ reported is_admin:false; an admin_ro token keeps admin")
+	}
+}
+
+// -------------------------------------------------------------------------
+// (c/d) Cross-credential-class + spend containment: a Bearer credential is rejected
+// on the cookie-only routes — the D18 POST /api/workers (mint of a plaintext uzw_
+// whose claim yields decrypted secrets) and the D21 POST /api/runs/{id}/rejudge
+// (the sole cookie-only /runs route; catches the "wrap the whole /runs group"
+// shortcut), plus the other PAT-writing / factory-killing / run-minting routes.
+// -------------------------------------------------------------------------
+
+func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+	runID := uuid.New()
+
+	cases := []struct {
+		name, method, path string
+	}{
+		{"mint worker (D18: strictly worse than PAT-write)", http.MethodPost, "/api/workers"},
+		{"rejudge (D21: sole cookie-only /runs route)", http.MethodPost, "/api/runs/" + runID.String() + "/rejudge"},
+		{"forge connection (writes a bot PAT)", http.MethodPost, "/api/forge/connections"},
+		{"delete anthropic token (factory kill)", http.MethodDelete, "/api/me/secrets/anthropic_token"},
+		{"create chat (mints a run)", http.MethodPost, "/api/chats"},
+		{"logout (must not bump token_version)", http.MethodPost, "/api/auth/logout"},
+		{"cli-token CRUD self-mint (Decision 16)", http.MethodPost, "/api/me/cli-tokens"},
+	}
+	for _, tc := range cases {
+		rec := bearerReq(router, tc.method, tc.path, uzc)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: %s %s over Bearer = %d, want 401 (cookie-only route rejects the bearer path)\nbody: %s",
+				tc.name, tc.method, tc.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// -------------------------------------------------------------------------
+// (e) CSRF-bypass shape: a cookie request carrying a bogus Authorization header is
+// rejected on the bearer path and NEVER silently falls back to the cookie path;
+// and the cookie path still enforces CSRF on writes through RequireUser.
+// -------------------------------------------------------------------------
+
+func TestCLICSRFBypassShapeLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	jwt := cliMintJWT(t, pool, user)
+
+	// Baseline: a valid cookie alone reaches the RequireUser handler (GET, no CSRF).
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid cookie GET /auth/me = %d, want 200 (cookie path must work)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// The attack: the SAME valid cookie plus a bogus Authorization header. Presence-
+	// dispatch takes the bearer path (bogus token → 401) and must NOT fall back to the
+	// cookie path — which would be the CSRF bypass.
+	req = httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	req.Header.Set("Authorization", "Bearer uzc_not-a-real-token")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("cookie + bogus Bearer GET /auth/me = %d, want 401 (must NOT fall back to the cookie path)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// The cookie path still enforces CSRF on writes through RequireUser: a valid cookie
+	// POST without the CSRF header is 403 (the unchanged RequireAuth pin).
+	req = httptest.NewRequest(http.MethodPost, "/api/runs/"+uuid.New().String()+"/inputs", nil)
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("cookie POST /runs/{id}/inputs without CSRF = %d, want 403 (cookie path enforces CSRF through RequireUser)\nbody: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// -------------------------------------------------------------------------
+// (f) Admin surface: a uza_ reads all 9 admin GETs and is rejected by all 4 admin
+// writes; a uzc_ is rejected by every admin read; /api/vault/* rejects any CLI
+// token; live demotion of the owner kills the uza_'s admin reads with no revoke.
+// -------------------------------------------------------------------------
+
+var adminReadPaths = []string{
+	"/api/admin/users",
+	"/api/admin/settings",
+	"/api/admin/vault-migration",
+	"/api/admin/slack/status",
+	"/api/admin/workers",
+	"/api/admin/runs",
+	"/api/admin/usage",
+	"/api/admin/rate-limits",
+	"/api/admin/selfimprove",
+}
+
+func TestCLIAdminSurfaceLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	admin := cliSeedUser(t, pool, true)
+	uza := cliMintToken(t, pool, admin, clitoken.ScopeAdminRO)
+	uzc := cliMintToken(t, pool, admin, clitoken.ScopeUser) // admin owner, but user scope
+
+	// A uza_ reads all 9 admin GETs; the same admin's uzc_ is rejected by every one
+	// (the masking, not the route prefix, is doing the work here).
+	for _, p := range adminReadPaths {
+		if rec := bearerReq(router, http.MethodGet, p, uza); rec.Code != http.StatusOK {
+			t.Errorf("uza_ GET %s = %d, want 200\nbody: %s", p, rec.Code, rec.Body.String())
+		}
+		if rec := bearerReq(router, http.MethodGet, p, uzc); rec.Code != http.StatusForbidden {
+			t.Errorf("uzc_ GET %s = %d, want 403 (admin's default-scope token is masked to non-admin)\nbody: %s", p, rec.Code, rec.Body.String())
+		}
+	}
+
+	// All 4 admin WRITES are cookie-only: even a uza_ Bearer is rejected at the
+	// middleware (RequireAuth), so a read-only token reaching a write handler is
+	// structurally impossible.
+	writes := []struct{ method, path string }{
+		{http.MethodPatch, "/api/admin/users/" + uuid.New().String()},
+		{http.MethodPut, "/api/admin/users/" + uuid.New().String() + "/judge"},
+		{http.MethodPut, "/api/admin/settings"},
+		{http.MethodPut, "/api/admin/selfimprove"},
+	}
+	for _, wr := range writes {
+		if rec := bearerReq(router, wr.method, wr.path, uza); rec.Code != http.StatusUnauthorized {
+			t.Errorf("uza_ %s %s = %d, want 401 (admin writes are cookie-only)\nbody: %s", wr.method, wr.path, rec.Code, rec.Body.String())
+		}
+	}
+
+	// /api/vault/* rejects any CLI token — the password surface is cookie-only.
+	if rec := bearerReq(router, http.MethodGet, "/api/vault/status", uza); rec.Code != http.StatusUnauthorized {
+		t.Errorf("uza_ GET /api/vault/status = %d, want 401 (vault is cookie-only)\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if rec := bearerReq(router, http.MethodPost, "/api/vault/unlock", uzc); rec.Code != http.StatusUnauthorized {
+		t.Errorf("uzc_ POST /api/vault/unlock = %d, want 401 (vault is cookie-only)\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// Live demotion: clearing the owner's is_admin makes the uza_'s admin reads fail
+	// on the very next request — no revocation step, because admin-ness is read live
+	// from the row (never cached in the credential).
+	cliMustExec(t, pool, `UPDATE users SET is_admin = false WHERE id = $1`, admin)
+	if rec := bearerReq(router, http.MethodGet, "/api/admin/users", uza); rec.Code != http.StatusForbidden {
+		t.Errorf("after demotion, uza_ GET /api/admin/users = %d, want 403 (live demotion, no revoke)\nbody: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// -------------------------------------------------------------------------
+// (g) revoke-all revokes every un-revoked token of the CALLER and nobody else's,
+// and is idempotent. Cookie-only, so it exercises the real RequireAuth+CSRF path.
+// -------------------------------------------------------------------------
+
+func TestCLIRevokeAllLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	caller := cliSeedUser(t, pool, false)
+	other := cliSeedUser(t, pool, false)
+	cliMintToken(t, pool, caller, clitoken.ScopeUser)
+	cliMintToken(t, pool, caller, clitoken.ScopeUser)
+	cliMintToken(t, pool, other, clitoken.ScopeUser)
+
+	countRevoked := func(userID uuid.UUID) (revoked, total int) {
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FILTER (WHERE revoked), count(*) FROM cli_tokens WHERE user_id = $1`, userID).
+			Scan(&revoked, &total); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return
+	}
+
+	jwt := cliMintJWT(t, pool, caller)
+	revokeAll := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/api/me/cli-tokens/revoke-all", nil)
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+		req.Header.Set(auth.CSRFHeaderName, cliCSRFHeader(t, jwt))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := revokeAll(); code != http.StatusNoContent {
+		t.Fatalf("revoke-all = %d, want 204", code)
+	}
+	if rev, total := countRevoked(caller); rev != total || total != 2 {
+		t.Errorf("caller: %d/%d revoked, want 2/2", rev, total)
+	}
+	if rev, _ := countRevoked(other); rev != 0 {
+		t.Errorf("other user's token was revoked (%d); revoke-all must be caller-scoped", rev)
+	}
+
+	// Idempotent: a second call is a no-op that still returns 204 and touches nothing.
+	if code := revokeAll(); code != http.StatusNoContent {
+		t.Fatalf("second revoke-all = %d, want 204 (idempotent)", code)
+	}
+	if rev, _ := countRevoked(other); rev != 0 {
+		t.Errorf("other user's token revoked after idempotent second call (%d)", rev)
+	}
+}
