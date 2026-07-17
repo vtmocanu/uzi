@@ -2,8 +2,11 @@ package forge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -660,34 +663,240 @@ func sameNameSet(a, b map[string]struct{}) bool {
 	return true
 }
 
-// --- Stubs filled by later milestones -------------------------------------
-//
-// M2 lands the whole Forge interface as compiling code so M4 and M5 (which fill
-// these in) touch disjoint files and can run in parallel. Each stub returns
-// errForgejoNotImplemented; none is reachable from the API until the M6b gate
-// flip, and no caller exercises them before M4/M5 land.
+// --- Merge requests, issue timeline, notes, token introspection (M4) -------
 
-// errForgejoNotImplemented marks a Forge method whose Forgejo implementation has
-// not landed yet. It carries no secret.
-var errForgejoNotImplemented = fmt.Errorf("forgejo: method not implemented yet")
-
-// GetMergeRequest is filled by M4.
 func (f *forgejo) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (MergeRequest, error) {
-	return MergeRequest{}, errForgejoNotImplemented
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return MergeRequest{}, err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return MergeRequest{}, err
+	}
+	pr, _, err := c.GetPullRequest(slug.owner, slug.repo, mrIID)
+	if err != nil {
+		return MergeRequest{}, f.redact.error(fmt.Errorf("forgejo: get merge request: %w", err))
+	}
+	return toForgejoMergeRequest(pr), nil
 }
 
-// ListIssueLabelEvents is filled by M4.
-func (f *forgejo) ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]LabelEvent, error) {
-	return nil, errForgejoNotImplemented
+// toForgejoMergeRequest maps a gitea PullRequest onto the neutral MergeRequest.
+// Forgejo's PR index (json "number") is GitLab's iid, and its state vocabulary
+// differs — see forgejoMRState.
+func toForgejoMergeRequest(pr *gitea.PullRequest) MergeRequest {
+	return MergeRequest{IID: pr.Index, State: forgejoMRState(pr), WebURL: pr.HTMLURL}
 }
 
-// CreateIssueNote is filled by M4.
+// forgejoMRState maps a Forgejo PR onto the neutral MRState* vocabulary. Forgejo
+// says "open"/"closed" (not GitLab's "opened") and carries merged separately, so a
+// merged PR is state="closed" with merged=true — verified live on 16.0.0. Merged
+// therefore wins over closed. Forgejo has no "locked" lifecycle state (IsLocked is
+// a separate flag, not a state), so MRStateLocked is never produced. An unknown
+// state passes through verbatim; IsKnownMRState then ignores it, so a transient
+// forge glitch cannot poison the MR-close watcher's baseline.
+func forgejoMRState(pr *gitea.PullRequest) string {
+	if pr.HasMerged {
+		return MRStateMerged
+	}
+	switch pr.State {
+	case gitea.StateOpen:
+		return MRStateOpened
+	case gitea.StateClosed:
+		return MRStateClosed
+	default:
+		return string(pr.State)
+	}
+}
+
 func (f *forgejo) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error) {
-	return IssueNote{}, errForgejoNotImplemented
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return IssueNote{}, err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return IssueNote{}, err
+	}
+	note, _, err := c.CreateIssueComment(slug.owner, slug.repo, issueIID, gitea.CreateIssueCommentOption{Body: body})
+	if err != nil {
+		return IssueNote{}, f.redact.error(fmt.Errorf("forgejo: create issue note: %w", err))
+	}
+	return IssueNote{ID: note.ID, Body: note.Body}, nil
 }
 
-// TokenInfo is filled by M4 (hand-rolled — the SDK's ListAccessTokens gates on
-// BasicAuth client-side, D5).
-func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
-	return TokenInfo{}, errForgejoNotImplemented
+func (f *forgejo) ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]LabelEvent, error) {
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	slug, err := f.repoSlugFor(c, projectID)
+	if err != nil {
+		return nil, err
+	}
+	// Hand-rolled parse rather than the SDK's ListIssueTimeline: gitea-sdk types the
+	// timeline's `label` field as []*Label, but Forgejo 16.0.0 serializes a label
+	// event's label as a SINGLE object (verified live + swagger $ref), so the SDK
+	// call ERRORS on exactly the label events we need. See forgejoTimelineEntry.
+	var out []LabelEvent
+	for page := 1; ; page++ {
+		raw, _, err := f.rawGet(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/timeline?page=%d&limit=%d",
+			url.PathEscape(slug.owner), url.PathEscape(slug.repo), issueIID, page, forgejoPerPage))
+		if err != nil {
+			return nil, err // already redacted by rawGet
+		}
+		var entries []forgejoTimelineEntry
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			return nil, f.redact.error(fmt.Errorf("forgejo: parse issue timeline: %w", err))
+		}
+		for _, e := range entries {
+			// Only label events; other timeline entries (comments, milestone/title
+			// changes, assignments) have type != "label" and a null label.
+			if e.Type != "label" || e.Label == nil {
+				continue
+			}
+			ev := LabelEvent{
+				ID:        e.ID,
+				Action:    forgejoLabelAction(e.Body),
+				LabelName: e.Label.Name,
+				CreatedAt: e.CreatedAt,
+			}
+			if e.User != nil {
+				ev.Username = e.User.Login
+			}
+			out = append(out, ev)
+		}
+		// The timeline is chronological (oldest first), matching the GitLab driver.
+		if len(entries) < forgejoPerPage {
+			break
+		}
+	}
+	return out, nil
 }
+
+// forgejoLabelAction decodes Forgejo's UNDOCUMENTED label-event convention (R6):
+// a label add records body == "1" (issue_label.go: Content "1"), a remove records
+// body == "" (deleteIssueLabel omits Content). Both verified live on 16.0.0. This
+// is pinned by a test so an SDK/Forgejo change to the convention fails loudly
+// rather than silently attributing every event as a remove.
+func forgejoLabelAction(body string) string {
+	if body == "1" {
+		return "add"
+	}
+	return "remove"
+}
+
+// forgejoTimelineEntry is the subset of a Forgejo issue-timeline entry uzi reads.
+// It exists because the gitea SDK's TimelineComment types `label` as []*Label,
+// which cannot unmarshal Forgejo's single-object label (verified live). Only the
+// fields the label-event mapping needs are modelled.
+type forgejoTimelineEntry struct {
+	ID        int64            `json:"id"`
+	Type      string           `json:"type"`
+	Body      string           `json:"body"`
+	User      *forgejoUserRef  `json:"user"`
+	Label     *forgejoLabelRef `json:"label"`
+	CreatedAt time.Time        `json:"created_at"`
+}
+
+type forgejoUserRef struct {
+	Login string `json:"login"`
+}
+
+type forgejoLabelRef struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
+func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {
+	c, err := f.newClient(ctx)
+	if err != nil {
+		return TokenInfo{}, err
+	}
+	// GET /users/{username}/tokens is keyed by username and gated reqSelfOrAdmin (it
+	// admits the bot querying itself, D5), so resolve the bot's own login first.
+	u, _, err := c.GetMyUserInfo()
+	if err != nil {
+		return TokenInfo{}, f.redact.error(fmt.Errorf("forgejo: token info: identify bot: %w", err))
+	}
+	// Hand-rolled, NOT via the SDK: gitea-sdk's ListAccessTokens refuses without
+	// BasicAuth ("username not set: only BasicAuth allowed"), a CLIENT-side gate the
+	// server does not impose for the GET (D5). The list carries no secret — sha1 is
+	// empty except at creation, only token_last_eight is returned — but the error
+	// path still routes through the redactor (rawGet does this).
+	var last8 string
+	if len(f.token) >= 8 {
+		last8 = f.token[len(f.token)-8:]
+	}
+	for page := 1; ; page++ {
+		raw, _, err := f.rawGet(ctx, fmt.Sprintf("/users/%s/tokens?page=%d&limit=%d",
+			url.PathEscape(u.UserName), page, forgejoPerPage))
+		if err != nil {
+			return TokenInfo{}, err // already redacted by rawGet
+		}
+		var tokens []forgejoAccessToken
+		if err := json.Unmarshal(raw, &tokens); err != nil {
+			return TokenInfo{}, f.redact.error(fmt.Errorf("forgejo: parse tokens: %w", err))
+		}
+		for _, tk := range tokens {
+			if tk.TokenLastEight != last8 {
+				continue
+			}
+			// The matching, listed token authenticated this very request, so it is
+			// active. Forgejo PATs report neither an active flag nor an expiry (the
+			// API has no such fields — verified live on 16.0.0), so Active is true and
+			// ExpiresAt stays zero ("never expires"). Scopes come back normalized and
+			// REORDERED (Forgejo re-emits in canonical order, not mint order), which is
+			// why the privilege checker compares them as an unordered set (D6b).
+			return TokenInfo{Scopes: tk.Scopes, Active: true}, nil
+		}
+		if len(tokens) < forgejoPerPage {
+			break
+		}
+	}
+	// The token authenticated but does not appear in its own owner's token list —
+	// cannot report scopes. Surfaced as a generic error, which the privilege checker
+	// downgrades to a "could not verify scopes" warning rather than a hard block.
+	return TokenInfo{}, fmt.Errorf("forgejo: token info: the authenticating token was not found in its owner's token list")
+}
+
+// forgejoAccessToken is the subset of Forgejo's access-token payload uzi reads:
+// the scopes, and token_last_eight to identify which listed token is the one
+// authenticating the call. Forgejo emits no expiry or active field.
+type forgejoAccessToken struct {
+	TokenLastEight string   `json:"token_last_eight"`
+	Scopes         []string `json:"scopes"`
+}
+
+// rawGet performs an authenticated GET against {baseURL}/api/v1{path} using the
+// driver's shared timeout client, for the two endpoints uzi cannot drive through
+// the gitea SDK (the issue timeline, whose SDK type mis-models the label field;
+// and token introspection, whose SDK method imposes a client-side BasicAuth gate —
+// both D5/M4). It returns the body and status. Every error is routed through the
+// PAT redactor, including a non-2xx body, so a hostile forge echoing the token in
+// an error cannot leak it (test #12).
+func (f *forgejo) rawGet(ctx context.Context, path string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.baseURL+"/api/v1"+path, nil)
+	if err != nil {
+		return nil, 0, f.redact.error(fmt.Errorf("forgejo: build request: %w", err))
+	}
+	req.Header.Set("Authorization", "token "+f.token)
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, 0, f.redact.error(fmt.Errorf("forgejo: request %s: %w", path, err))
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, f.redact.error(fmt.Errorf("forgejo: read response: %w", err))
+	}
+	if resp.StatusCode/100 != 2 {
+		return body, resp.StatusCode, f.redact.error(fmt.Errorf("forgejo: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body))))
+	}
+	return body, resp.StatusCode, nil
+}
+
+// errForgejoNotImplemented still backs the pipeline stubs in forgejo_pipelines.go
+// (LatestPipeline, LatestMRPipeline, ListPipelineJobs, JobLogTail), which M5 fills.
+// It carries no secret.
+var errForgejoNotImplemented = fmt.Errorf("forgejo: method not implemented yet")
