@@ -158,8 +158,9 @@ Non-goals (v1):
    web pods, and the api sees the worker's real peer address.
 5. **NetworkPolicies, both directions, default-deny.** (a) The existing api
    ingress policy (`api-networkpolicy.yaml`, today web-pods-only — it would
-   silently break this feature) gains one rule: worker-namespace pods, matched
-   by namespace + pod label selector, to the TLS port only. (b) The worker
+   silently break this feature) gains **TWO** rules: **controller pods** (release
+   namespace) and **worker-namespace pods**, each matched by namespace + pod
+   label selector, to the TLS port only. (b) The worker
    namespace gets default-deny ingress (nothing dials a worker) and
    default-deny egress with explicit allows: DNS, api (TLS port), forge, nix
    substituters, Anthropic API — explicitly excluding the kube-apiserver
@@ -167,6 +168,32 @@ Non-goals (v1):
    need CNI support (Cilium/Antrea) — M3 verifies what dev-cluster's CNI can
    express; fallback is a maintained CIDR allowlist with the gap documented as
    an accepted residual, not silently dropped.
+   - **CORRECTED 2026-07-17 (M3): (a) said ONE rule and named the wrong half. The
+     omission was a LIVE BUG, not a doc slip** — the controller runs in the release
+     namespace and polls the api, so under the existing default-deny (web pods only)
+     **every controller poll was dropped**. Nothing had caught it because the chart
+     shipped no controller until M3. Fixed in the same commit as the text. Both rules
+     select the port via the `uzi.workerAPIPort` helper rather than hardcoding 8443,
+     so the policy is correct before and after M4's TLS rollout.
+   - **CNI question ANSWERED (M3, 2026-07-17): dev-cluster CAN express FQDN egress,
+     so the CIDR-allowlist fallback is NOT needed.** Antrea v1.13.3, the
+     `AntreaPolicy` feature gate true on both agent and controller, the CRDs present,
+     and a server-side dry-run of the real policy accepted through the live
+     `annpvalidator` webhook. Three consequences that shaped the split, each verified
+     rather than assumed: **FQDN cannot be used for in-cluster destinations** (AntreaProxy
+     rewrites a ClusterIP before enforcement), so DNS and the api are selector-based in
+     the k8s policy; **DNS egress must be allowed** or every FQDN rule silently matches
+     nothing (Antrea learns the IPs by snooping DNS responses); and **the explicit Drop
+     belt is NOT redundant** with default-deny, because an FQDN allow programs whatever
+     IPs the DNS answer carried — so a poisoned answer for an allowed name would open
+     the metadata IP *through* the allow rule. Drops go first, in the same policy.
+   - **The enforcement gap stays OPEN, and M6 inherits it.** Capability is proven;
+     **no packet has crossed**. Behaviour was established by reading the Antrea v1.13
+     source, not by running a probe pod on the shared cluster. **kind cannot close it**:
+     kindnet implements no NetworkPolicy at all — not the ANNP and not even the
+     default-deny floor — so the policies are created and silently never enforced there.
+     A green kind run says nothing about this. Do not record it closed until a real
+     hosted worker on dev-cluster either reaches `gitlab.example.com` or does not.
 6. **Worker pod posture.** Dedicated zero-permission ServiceAccount with
    `automountServiceAccountToken: false`; `runAsNonRoot`, drop ALL caps,
    `allowPrivilegeEscalation: false`, default seccomp; namespace labeled
@@ -415,12 +442,20 @@ Non-goals (v1):
    so an app-level bug cannot noisy-neighbor the shared cluster. Provision and
    delete endpoints are rate-limited (existing limiter pattern, PRD #53).
 9. **Upgrade/drift semantics.** The chart injects the release's agent image
-   tag into the api config; a hosted worker whose Deployment differs from
+   tag into the **controller's** config; a hosted worker whose Deployment differs from
    desired (image tag, spec hash) is *drifted*. The controller rolls a drifted
    worker only when it holds no non-terminal run (same predicate as delete);
    busy workers roll after their runs finish. Missing objects are recreated
    (**except Secrets — see below**); unrecognized `uzi-hw-*` objects are flagged
    as orphans, never adopted.
+   - **CORRECTED 2026-07-17 (M3): this said the tag goes into the API's config, and
+     implementing that verbatim would have violated Decisions 1 and 7.** The text
+     predates M1's protocol. It is not implementable as written: the api knows no image
+     tag (nothing in `api/internal/config` or the chart carries one) and M1's wire has
+     no image field (`DesiredWorker` = id/template/size/generation/join_token). The tag
+     belongs in the **controller's** config (`UZI_WORKER_IMAGE_TAG`) — the only reading
+     consistent with the rule that makes this boundary checkable: *the api sends the
+     NAME; the controller owns every mapping to a concrete pod-spec value.*
    - **A token rotation must be stamped as a pod-template annotation or the pod
      never rolls** (architect pass, 2026-07-16; blocking for M3). Rotation
      changes the Secret's *content*, but the Deployment mounts it by *name*, so
@@ -503,13 +538,98 @@ Non-goals (v1):
     `Store` precisely so it can join M2's provision/rotation tx (the repo's
     handler-binds-`qtx` idiom, six existing sites). **Provision must also gate on
     `WORKER_HOSTING_ENABLED`** — nothing else stops a flag-off seal.
-- [ ] **M3 — Materialization + policies**: controller renders Secret
+- [x] **M3 — Materialization + policies** (landed 2026-07-17): controller renders Secret
   (file-mounted token) / Deployment (Decision 6) / PVC; worker namespace with
   PodSecurity `restricted`, ResourceQuota, LimitRange, both NetworkPolicies
   (incl. the api-ingress amendment); CNI FQDN-egress capability verified on
   dev-cluster; drift/orphan reconciliation per Decision 9. Success: fake-client
   tests assert rendered objects; a hosted worker on a kind cluster registers,
   goes online, and completes a stub run end to end.
+  - **The Decision 9 / Decision 11 collision is settled by PROVENANCE, not by a name
+    prefix — no tombstone, no schema change, no wire change.** The collision existed
+    only because "orphan" was defined as `uzi-hw-*`-NAMED. The controller stamps
+    `app.kubernetes.io/managed-by: uzi-controller` + `uzi.dev/hosted-worker-id` on
+    everything it creates, and the two sets become disjoint: **teardown** =
+    `{objects we stamped} \ {desired fleet}` (Decision 11), **orphan** = `uzi-hw-*`-named
+    but NOT stamped — flagged, logged, never adopted, never deleted (Decision 9, and
+    not vacuous: hand-made objects, an older label scheme, a partial create from a
+    crashed reconcile). "Never adopted" gains a precise meaning: *the controller never
+    takes ownership of an object it did not stamp.* It also settles the Secret
+    asymmetry — the controller cannot enumerate Secrets, but it can DELETE BY NAME
+    from the worker id on the observed Deployment/PVC labels, so a deleted worker's
+    Secret IS cleaned up and the residual is only "Secrets whose worker id we can no
+    longer learn" — exactly the accepted gap, no wider.
+    - *Rejected — a bulk-teardown circuit breaker* ("refuse a reconcile tearing down
+      more than N% of the fleet"): a user deleting 3 of their 5 workers is routine and
+      **indistinguishable** from a bad restore, so it would page an operator during
+      normal use, to protect caches. Recorded so it is not re-proposed.
+    - *The residual accepted*: a poll that succeeds and LIES (a DB restored from a
+      backup predating a provision). A hosted worker's volumes hold no irreplaceable
+      data, and a worker whose row is gone has no `workers.token_hash` — its pod cannot
+      authenticate and is already dead weight. A poll BLIP cannot trigger it: `Tick`
+      returns before `Reconcile` if `Poll` errors, and hosting-disabled 404s. Both fail
+      closed.
+  - **Sizes chosen (user, 2026-07-17) and they are BURSTABLE — requests < limits.**
+    The PRD's own fleet arithmetic ("10 users x quota 2 x M => 10 cores / 20Gi RAM") is
+    only coherent as REQUESTS; it is impossible as a limit, since a real run peaks at
+    676 MiB and compose grants 4 GiB. So each preset carries **both**, a distinction
+    Decision 7 never draws (it names "cpu, memory" as if singular). Guaranteed was
+    rejected: it contradicts that math and would strand 4Gi per IDLE worker (measured
+    idle: 148 MiB) on a shared cluster. `s`: 250m–1 / 1–2Gi / `/data` 5Gi. `m`: 500m–2 /
+    2–4Gi / 10Gi. `l`: 1–4 / 4–8Gi / 20Gi. `/nix` is a **flat 4Gi outside the table**.
+    Requests sit deliberately ABOVE the measured peak: kubelet evicts pods exceeding
+    their REQUESTS first, so a request below real usage would make workers the first
+    thing evicted under node pressure.
+  - **THE TWO TRAPS, both now mechanical gates verified BY MUTATION** (this PRD's own
+    Decision Log records that a test which cannot fail is not a gate):
+    - **Teardown must be `{ours} \ {ALL desired ids}`, INCLUDING ids we could not
+      render.** An unknown size or template means skip *rendering*, never leave the
+      desired set. Get it backwards and an old controller polling a new api tears down
+      **every worker carrying the new size or template** — the exact deployment skew the
+      tolerance exists for becomes fleet destruction. **Template is equal to Size here**:
+      the PRD only ever discussed Size, but the controller resolves both against its own
+      tables, so both skew identically. Introducing the bug is caught for both.
+    - **The `hosted_generation` annotation is INERT in v1** (no rotation path exists; it
+      is 0 on every provisioned worker). It is stamped and unit-tested, and **nothing
+      end-to-end can exercise the roll** — no green e2e may be read as "rotation rolls".
+  - **The kind run: what it proved, and what it CANNOT.** Proved, on a real kubelet: the
+    tar seed under real PodSecurity `restricted` + non-root + 0555 store dirs; the whole
+    object set rendered and admitted; ResourceQuota/LimitRange/PodSecurity admission; the
+    `s` preset rendering exactly (250m / 1Gi / 5Gi+4Gi); **register → online**; and
+    teardown removing every object by name. **Did NOT prove**, and each was checked
+    rather than assumed: **NetworkPolicy at all** (kindnet enforces none — see Decision 5);
+    **the fsGroup pin** — asserted as the OBSERVABLE rather than as writability, and it
+    duly reported the gap: kind's local-path PV is hostPath-backed and **fsGroup is not
+    applied** (`/data` and `/nix` arrive `0777 root:root`, so uid 10001 writes them for a
+    reason that does not exist on dev-cluster, where an RWO ext4 volume mounts
+    `root:root 0755` and fsGroup is the only thing making it writable). Deferred to M6.
+  - **`0440` is confirmed on a real kubelet, not reasoned**: the worker's token mounts
+    `440 root:10001` and uid 10001 reads it via group 10001. `0400` would have made a
+    worker unable to read its own join token — the file is owned by ROOT, not by
+    `runAsUser`.
+  - **The nix seed CrashLooped on first contact with a real kubelet, twice, and no fake
+    client could have caught either.** (1) `tar -C /nix .` archives a `./` member, so
+    extraction ends by chmod/utime-ing the DESTINATION ROOT — the kubelet's mount point,
+    owned `root:<fsGroup>`, which uid 10001 does not own. It EPERMs, tar exits non-zero,
+    the sentinel is never written, and the pod CrashLoops **having copied the store
+    perfectly**. Fixed by archiving the top-level entries so `.` never enters the archive
+    (`--no-overwrite-dir` does NOT fix it). (2) An interrupted seed could never recover:
+    tar will not extract over the 0555 dirs a previous pass sealed, so the retry failed
+    forever behind a manual PVC deletion. Fixed by wiping before extracting, scoped
+    **below** the root — busybox `chmod -R` ABORTS on the un-chmodable root and never
+    reaches the children, which is why the first attempt at the wipe silently did nothing.
+  - **The `lost+found` sentinel trap is closed by a UNIT test, deliberately**, because
+    kind cannot catch it: local-path makes a plain directory, so a fresh PVC there really
+    IS empty and an emptiness check passes — while dev-cluster's hypervisor CSI formats ext4
+    and a fresh PVC carries `lost+found`. It is a property of the check, so it needs no
+    kubelet.
+  - **The size/template goldens are gates only with `-count=1`, and CI now passes it.**
+    Go's test cache hashes only the files a test opens INSIDE its module root
+    (`cmd/go/internal/test/test.go:2041`, verified in go1.26.4); every golden lives in
+    `api/`, outside `controller/`, so editing one leaves the controller module's cache key
+    untouched and `go test ./...` reports "ok (cached)" with the gate never running. It was
+    invisible only because `test:controller` had no `cache:` — and that job's own comment
+    told M3 to add one, which is exactly what would have armed the trap.
   - **Inherited from M2 — the size golden is INERT until M3 parses it, and M2
     shipped it that way knowingly** (architect, 2026-07-16). M2 landed
     `api/internal/hostedsvc/testdata/hosted_sizes.json` + the producer-side test
@@ -560,10 +680,30 @@ Non-goals (v1):
     2026-07-16, v1 recovery is delete + reprovision), so M3's roll-on-drift
     annotation is the generation's first consumer and the first thing that will ever
     change it.
-- [ ] **M4 — TLS worker hop**: api TLS listener + cert wiring (cert-manager in
+- [x] **M4 — TLS worker hop** (landed 2026-07-17): api TLS listener + cert wiring (cert-manager in
   the chart), controller and hosted workers on `https://`, docs for the cert
   values. Success: claim traffic on dev-cluster is TLS; plain-HTTP worker port
   unreachable from the worker namespace.
+  - **M4's own recorded residual is CLOSED (M3, 2026-07-17), and its reasoning was
+    right.** M4 verified the api binary and the chart render separately but never
+    together, flagging that `defaultMode: 0400` + `fsGroup: 65532` + uid 65532 might
+    CrashLoop the api on `permission denied` reading `tls.key` — "that is reasoning, not
+    an observation". Settled opportunistically on M3's kind cluster, where it is
+    representative (a tmpfs secret volume, not storage-backed): the api pod comes up
+    Running, logs `api listening (tls) addr=:8443`, and serves **HTTP 200 over TLS from
+    another pod**. Kubelet ORs `0040` onto read-only secret volumes exactly as M4
+    reasoned, so `0400` lands as `0440 root:65532` and uid 65532 reads it via its group.
+    No change needed to `api-deployment.yaml`.
+  - **The CA relay to workers is M3's and needs no new RBAC verb** (Decision 1 untouched):
+    the controller mounts the CA and copies it into the per-worker Secret it already
+    creates, and the worker trusts it via `NODE_EXTRA_CA_CERTS` — pure pod spec, since
+    Node reads that path before startup and `agent/src/client.ts` uses plain `fetch`.
+    Consequence worth knowing: that Secret is written ONCE and never updated (there is no
+    Secret read, and delete+recreate would destroy the join token, which after delivery is
+    the only copy in existence), so a CA **root** rotation strands existing workers and the
+    remedy is delete + reprovision. The leaf rotating every 90 days does not touch `ca.crt`,
+    and the chart's `caDuration` is 5 years precisely because re-trusting a new root means
+    touching every worker at once.
 - [x] **M5 — Web UI** (landed 2026-07-16): Settings → Workers hosted section — provision
   dialog (type + size), hosted-marked rows, delete; hidden when hosting is disabled.
   Success: vitest coverage; web-ux review. **Both met**: 612 → 654 tests (+42, +3 files),
@@ -742,10 +882,18 @@ Non-goals (v1):
     instead:
     - **`hosted_sizes.json` gains the quantities** — currently names-only, and it
       stays that way until this lands. Shape: raw k8s quantity strings, never
-      pre-rendered prose (`{"name":"s","cpu":"…","memory":"…","data":"…","nix":"…"}`),
-      so both consumers assert structurally — the controller against
-      `resource.MustParse` values, the web rendering the strings verbatim. Prose is
-      where a lie hides.
+      pre-rendered prose, so both consumers assert structurally — the controller
+      against `resource.MustParse` values, the web rendering the strings verbatim.
+      Prose is where a lie hides.
+      - **CORRECTED 2026-07-17 (M3): the shape here carried a per-size `nix` field,
+        which Decision 7's own later correction removes.** `/nix` is measured
+        byte-identical across `base` and `jvm` and does not vary by size, so it is a
+        flat 4Gi OUTSIDE the preset table (and M3's `controller/internal/preset` ships
+        it that way, pinned by a test). Left alone, M6 would ship a per-size field with
+        one repeated value. The shape is
+        **`{"name":"s","cpu_request":"…","cpu_limit":"…","memory_request":"…","memory_limit":"…","data":"…"}`**
+        — note it also needs REQUEST and LIMIT, not one value per resource: M3's presets
+        are Burstable, and Decision 7 names "cpu, memory" as if each were singular.
     - **The web keeps a hardcoded constant** (`workerSizes.ts`), exactly as
       `web/src/lib/workerTemplates.ts` mirrors `workertmpl.Names`, and **a vitest
       test reads the golden across the tree** to pin it. Not a new idiom:
@@ -1038,3 +1186,31 @@ Non-goals (v1):
     both by construction. The same lens found this PRD's own M2 live-DB tests
     skipping silently in CI — green pipeline, zero coverage — now gated by
     `test:api-store-it`.
+- 2026-07-17: **M3's design questions settled, and three of this PRD's own claims
+  corrected in the commits that disproved them** (architect design + coder). The four
+  open questions are answered in the M3 bullet: the Decision 9/11 collision (by
+  provenance), unknown-name tolerance (log, skip rendering, KEEP desired), the
+  template golden (in scope, both halves), and chart ownership (M3 = the whole
+  security envelope; M6 = the controller Deployment + rollout).
+  - *Correction 1 — Decision 5(a) named ONE ingress rule and forgot the controller.
+    A LIVE BUG, not a doc slip*: every controller poll would have been dropped by the
+    api's default-deny. Invisible because the chart shipped no controller.
+  - *Correction 2 — Decision 9's "the chart injects the agent image tag into the api
+    config" is not implementable*: the api knows no image tag and M1's wire carries no
+    image field. The text predates M1's protocol. The tag is the controller's.
+  - *Correction 3 — M6's display golden carried a per-size `nix`* that Decision 7's own
+    later correction removes, and it was missing the request/limit split M3's Burstable
+    presets require.
+  - *What running it changed, and the reason the kind gate was worth its cost.* Both
+    of M3's own hard failures were found by a real kubelet and were invisible to every
+    fake-client test, because both are about the volume the kubelet mounts, not about
+    the objects we render: tar restoring metadata onto a mount root it does not own,
+    and an interrupted seed that could never re-run. Each CrashLooped the pod **after
+    copying the store perfectly** — the worst shape of failure, since the work is right
+    and the exit code is not.
+  - *And the reason to keep saying what it did NOT prove.* The same green run says
+    nothing about NetworkPolicy (kindnet enforces none) and nothing about the fsGroup
+    pin (kind's local-path PV is hostPath-backed and ignores fsGroup — asserted as an
+    observable, so it reported the gap instead of passing silently). Both defer to M6.
+    The design predicted all three divergences before the cluster existed; the run
+    confirmed the predictions rather than discovering them.
