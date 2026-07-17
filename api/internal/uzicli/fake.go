@@ -49,6 +49,9 @@ type FakeClient struct {
 	LastInputBody      string
 	LastInputSelection *apitypes.AgentSelection
 
+	// DeleteWorker capture: records the id it was asked to delete.
+	LastDeletedWorkerID string
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
@@ -108,6 +111,11 @@ func (f *FakeClient) ListWorkers(context.Context) ([]apitypes.WorkerDTO, error) 
 		return nil, f.Err
 	}
 	return f.Workers, nil
+}
+
+func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
+	f.LastDeletedWorkerID = id
+	return f.Err
 }
 
 func (f *FakeClient) ListRepos(context.Context) ([]apitypes.RepoDTO, error) {

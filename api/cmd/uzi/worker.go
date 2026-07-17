@@ -44,7 +44,23 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "rm <worker-id>",
 		Short: "Remove a worker",
 		Args:  cobra.ExactArgs(1),
-		RunE:  stubRunE("worker rm"),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			if err := c.DeleteWorker(cmd.Context(), args[0]); err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(map[string]any{"id": args[0], "deleted": true})
+			}
+			if !gf.quiet {
+				p.Printf("worker %s removed\n", args[0])
+			}
+			return nil
+		},
 	}
 
 	cmd.AddCommand(list, rm)

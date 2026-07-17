@@ -168,6 +168,23 @@ func TestRunFollowUp(t *testing.T) {
 	}
 }
 
+// A follow-up message piped on stdin (non-TTY, no -m) is read and submitted —
+// the counterpart to TestRunFollowUpRequiresMessage's empty-stdin case (M8 nit).
+func TestRunFollowUpFromStdin(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	env := fakeEnv(fc)
+	env.Stdin = strings.NewReader("please keep going\n")
+	env.StdinTTY = false
+	_, _, code := runCLI(t, env, "run", "follow-up", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastInputKind != "follow_up" || fc.LastInputBody != "please keep going" {
+		t.Fatalf("follow-up from stdin = kind %q body %q, want follow_up/'please keep going'",
+			fc.LastInputKind, fc.LastInputBody)
+	}
+}
+
 func TestRunFollowUpRequiresMessage(t *testing.T) {
 	fc := &uzicli.FakeClient{}
 	_, _, code := runCLI(t, fakeEnv(fc), "run", "follow-up", "r1")

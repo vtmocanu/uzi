@@ -60,6 +60,11 @@ type Client interface {
 	// sel is legal only with approve_plan; the server validates it against the run's
 	// real roster (the client never composes the worker-bound body itself).
 	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection) (apitypes.RunInputResponse, error)
+	// DeleteWorker removes one of the caller's workers: DELETE /api/workers/{id}
+	// (204 No Content on success). A worker with active runs is a 409 (exit 5); an
+	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
+	// there is no create counterpart here.
+	DeleteWorker(ctx context.Context, id string) error
 }
 
 // maxRespBytes caps how much of a response body the client reads, so a broken or
@@ -206,6 +211,16 @@ func (c *HTTPClient) postJSON(ctx context.Context, path string, reqBody, out any
 	return decode2xx(resp, body, path, out)
 }
 
+// del executes a DELETE and treats any 2xx (the endpoint answers 204) as success,
+// discarding the (empty) body. Non-2xx maps to the documented exit code.
+func (c *HTTPClient) del(ctx context.Context, path string) error {
+	resp, body, err := c.doJSONRead(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+	return decode2xx(resp, body, path, nil)
+}
+
 // decode2xx maps a non-2xx status to an *ExitError and otherwise decodes the body
 // into out (nil to discard). Shared by get and postJSON so success/error handling
 // is identical across verbs.
@@ -350,6 +365,10 @@ func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, err
 		return nil, err
 	}
 	return env.Workers, nil
+}
+
+func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
+	return c.del(ctx, "/api/workers/"+url.PathEscape(id))
 }
 
 func (c *HTTPClient) ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error) {

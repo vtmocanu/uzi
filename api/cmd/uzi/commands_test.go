@@ -425,12 +425,17 @@ func TestUnknownFlagExit2(t *testing.T) {
 	}
 }
 
-// A still-stubbed verb (skill install lands in M9) reports the generic exit code.
-// login/logout and the run write verbs are no longer stubs (M8).
-func TestStubExit1(t *testing.T) {
-	_, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "skill", "status")
-	if code != uzicli.ExitGeneric {
-		t.Fatalf("exit = %d, want %d (generic/not-implemented)", code, uzicli.ExitGeneric)
+// Every verb is now wired (M9 landed the last stubs: worker rm, skill
+// status/install). `skill status` runs against a temp home and succeeds.
+func TestSkillStatusRuns(t *testing.T) {
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.SkillHome = t.TempDir()
+	out, _, code := runCLI(t, env, "skill", "status")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "INSTALLED") {
+		t.Errorf("skill status output missing INSTALLED:\n%s", out)
 	}
 }
 
