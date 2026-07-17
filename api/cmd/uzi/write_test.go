@@ -65,15 +65,11 @@ func TestRunApprovePlain(t *testing.T) {
 	}
 }
 
-// --agents is an allow-list ("run only these"); the CLI resolves it against the
-// run's roster and sends the complement as the wire selection's exclusions.
-func TestRunApproveWithAgents(t *testing.T) {
-	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
-		"r1": {ID: "r1", Status: "awaiting_approval", OwnAgents: []apitypes.RepoAgent{
-			{Name: "coder"}, {Name: "reviewer"}, {Name: "tester"},
-		}},
-	}}
-	_, _, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--agents", "coder,reviewer")
+// Option B (PRD #37 wire model): --agent-source + --exclude-agents map 1:1 to the
+// structured selection {source, exclusions}. No roster fetch; the server validates.
+func TestRunApproveWithSelection(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--agent-source", "own", "--exclude-agents", "tester,auditor")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
@@ -84,35 +80,48 @@ func TestRunApproveWithAgents(t *testing.T) {
 	if sel.Source != "own" {
 		t.Errorf("source = %q, want own", sel.Source)
 	}
-	// keep {coder, reviewer} ⇒ exclude {tester}.
-	if len(sel.Exclusions) != 1 || sel.Exclusions[0] != "tester" {
-		t.Errorf("exclusions = %v, want [tester]", sel.Exclusions)
+	if len(sel.Exclusions) != 2 || sel.Exclusions[0] != "tester" || sel.Exclusions[1] != "auditor" {
+		t.Errorf("exclusions = %v, want [tester auditor] (verbatim, server validates)", sel.Exclusions)
 	}
 }
 
-func TestRunApproveUnknownAgentIsUsageError(t *testing.T) {
-	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
-		"r1": {ID: "r1", OwnAgents: []apitypes.RepoAgent{{Name: "coder"}, {Name: "reviewer"}}},
-	}}
-	_, errb, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--agents", "nope")
+// --agent-source alone selects that source with no exclusions.
+func TestRunApproveSourceOnly(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--agent-source", "repo")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if fc.LastInputSelection == nil || fc.LastInputSelection.Source != "repo" || len(fc.LastInputSelection.Exclusions) != 0 {
+		t.Fatalf("source-only selection = %+v, want {repo, []}", fc.LastInputSelection)
+	}
+}
+
+// --exclude-agents without --agent-source is a usage error: the CLI can't infer the
+// run's default source without a fetch, and exclusions are validated per source.
+func TestRunApproveExcludeWithoutSourceIsUsageError(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, errb, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--exclude-agents", "tester")
 	if code != uzicli.ExitUsage {
 		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
 	}
-	if !strings.Contains(errb, "coder") || !strings.Contains(errb, "reviewer") {
-		t.Errorf("unknown-agent error should list the available agents:\n%s", errb)
+	if !strings.Contains(errb, "agent-source") {
+		t.Errorf("error should point at --agent-source:\n%s", errb)
 	}
 	if fc.LastInputKind != "" {
-		t.Error("a bad --agents must not submit an input")
+		t.Error("an unsourced exclusion must not submit an input")
 	}
 }
 
-func TestRunApproveRepoSourceNoRoster(t *testing.T) {
-	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
-		"r1": {ID: "r1"}, // no repo_agents detected
-	}}
-	_, _, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--agents", "coder", "--agent-source", "repo")
+// An invalid --agent-source is a usage error (own|repo only).
+func TestRunApproveBadSourceIsUsageError(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--agent-source", "both")
 	if code != uzicli.ExitUsage {
-		t.Fatalf("exit = %d, want %d (no repo agents to select from)", code, uzicli.ExitUsage)
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if fc.LastInputKind != "" {
+		t.Error("a bad --agent-source must not submit an input")
 	}
 }
 

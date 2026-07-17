@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"time"
 
@@ -220,17 +219,17 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			agents, _ := cmd.Flags().GetStringSlice("agents")
 			source, _ := cmd.Flags().GetString("agent-source")
-			sel, err := resolveSelection(cmd, c, args[0], source, agents)
+			exclude, _ := cmd.Flags().GetStringSlice("exclude-agents")
+			sel, err := approveSelection(source, exclude)
 			if err != nil {
 				return err
 			}
 			return submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel)
 		},
 	}
-	approve.Flags().StringSlice("agents", nil, "restrict the run to these subagents (names from 'uzi run get'); default runs the full roster")
-	approve.Flags().String("agent-source", agentSourceOwn, "which roster --agents names come from: own|repo")
+	approve.Flags().String("agent-source", "", "which subagent roster to run: own|repo (default: the run's own default)")
+	approve.Flags().StringSlice("exclude-agents", nil, "subagents to drop from the chosen source (requires --agent-source)")
 
 	reject := &cobra.Command{
 		Use:   "reject <run-id>",
@@ -283,57 +282,33 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	return cmd
 }
 
-// resolveSelection turns the `--agents` allow-list into the wire AgentSelection
-// {source, exclusions}. It is the ONE write-verb path that must fetch the run: the
-// server's selection is exclusion-based (name the agents to DROP), while the CLI
-// exposes the friendlier "run only these" allow-list, so the complement can only be
-// computed against the run's real roster. An empty --agents means "no selection" —
-// approve keeps the plain path and the worker runs the run's default roster.
+// approveSelection maps the plan-gate flags to the wire AgentSelection
+// {source, exclusions} (PRD #37 Decision 4: pick a source, exclude individual
+// agents — either/or, no mixing, no allow-list). It NEVER fetches the run: the
+// server validates the selection against the run's live roster, so the CLI just
+// forwards the structured choice.
 //
-// The fetched roster is used to COMPUTE exclusions and to give a helpful error on a
-// mistyped name; it does not replace the server's own validation, which still runs
-// against the live roster when the approve lands.
-func resolveSelection(cmd *cobra.Command, c uzicli.Client, runID, source string, agents []string) (*apitypes.AgentSelection, error) {
-	agents = nonEmpty(agents)
-	if len(agents) == 0 {
+//   - neither flag → nil: send NO selection; the server applies the run's default
+//     (repo-when-detected else own, no exclusions). This is the common case.
+//   - --agent-source own|repo → that source, with any --exclude-agents.
+//   - --exclude-agents without --agent-source → usage error: without a fetch the CLI
+//     can't know the run's default source, and exclusions are validated against the
+//     chosen source's roster server-side.
+//
+// `lead` is never excludable; if a user names it, the server rejects it — the CLI
+// does not special-case it client-side.
+func approveSelection(source string, exclude []string) (*apitypes.AgentSelection, error) {
+	exclude = nonEmpty(exclude)
+	if source == "" {
+		if len(exclude) > 0 {
+			return nil, uzicli.Exitf(uzicli.ExitUsage, "specify --agent-source with --exclude-agents")
+		}
 		return nil, nil
 	}
 	if source != agentSourceOwn && source != agentSourceRepo {
 		return nil, uzicli.Exitf(uzicli.ExitUsage, "--agent-source must be 'own' or 'repo'")
 	}
-	run, err := c.GetRun(cmd.Context(), runID)
-	if err != nil {
-		return nil, err
-	}
-	var roster []apitypes.RepoAgent
-	if source == agentSourceOwn {
-		roster = run.OwnAgents
-	} else {
-		roster = run.RepoAgents
-	}
-	rosterNames := make(map[string]bool, len(roster))
-	for _, a := range roster {
-		rosterNames[a.Name] = true
-	}
-	if len(rosterNames) == 0 {
-		return nil, uzicli.Exitf(uzicli.ExitUsage, "this run has no %s agents to select from", source)
-	}
-	keep := make(map[string]bool, len(agents))
-	for _, name := range agents {
-		if !rosterNames[name] {
-			return nil, uzicli.Exitf(uzicli.ExitUsage,
-				"unknown %s agent %q; this run's %s agents are: %s", source, name, source, strings.Join(sortedKeys(rosterNames), ", "))
-		}
-		keep[name] = true
-	}
-	exclusions := make([]string, 0, len(rosterNames))
-	for name := range rosterNames {
-		if !keep[name] {
-			exclusions = append(exclusions, name)
-		}
-	}
-	sort.Strings(exclusions)
-	return &apitypes.AgentSelection{Source: source, Exclusions: exclusions}, nil
+	return &apitypes.AgentSelection{Source: source, Exclusions: exclude}, nil
 }
 
 // submitInput sends one steering input and reports the outcome. server_side (a
@@ -408,8 +383,8 @@ func resolveMessage(env Env, flagVal string) string {
 	return ""
 }
 
-// nonEmpty drops blank entries from a StringSlice flag (e.g. --agents "" or a
-// trailing comma), so an accidental empty value never reads as a real selection.
+// nonEmpty drops blank entries from a StringSlice flag (e.g. --exclude-agents "" or
+// a trailing comma), so a flag artifact never rides as an empty exclusion.
 func nonEmpty(in []string) []string {
 	out := in[:0:0]
 	for _, s := range in {
@@ -417,16 +392,6 @@ func nonEmpty(in []string) []string {
 			out = append(out, s)
 		}
 	}
-	return out
-}
-
-// sortedKeys returns a set's keys in sorted order (for a stable error message).
-func sortedKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
 	return out
 }
 
