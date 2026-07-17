@@ -222,6 +222,7 @@ type Run struct {
 	HealthSince          pgtype.Timestamptz `json:"health_since"`
 	HealthNotifiedAt     pgtype.Timestamptz `json:"health_notified_at"`
 	TargetRunID          pgtype.UUID        `json:"target_run_id"`
+	MrWebUrl             pgtype.Text        `json:"mr_web_url"`
 }
 
 type RunMessage struct {

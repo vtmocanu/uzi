@@ -330,6 +330,15 @@ UPDATE runs SET
     status             = 'completed',
     branch             = @branch,
     mr_iid             = @mr_iid,
+    -- The MR's web URL as the forge reported it (PRD #65 D8), written here because
+    -- the worker that opens the MR is the only thing holding the URL at the moment
+    -- it exists. Plain assignment, deliberately matching mr_iid rather than
+    -- session_id's COALESCE-narg: the iid and the URL are ONE fact reported by one
+    -- worker in one payload, so they must not persist under different conventions.
+    -- An old worker omits it (R8) and textParam(nil) lands NULL, which the web
+    -- renders via the legacy forgeUrls.ts reconstruction exactly as it did before
+    -- the column existed.
+    mr_web_url         = @mr_web_url,
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
     -- fix_verdict carries a ci_fix run's outbound 'not_code' verdict on completion
     -- (PRD #6); NULL for every issue run and for a ci_fix that produced a fix (its

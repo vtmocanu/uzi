@@ -19,6 +19,29 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
+// seedForgeType is the forge the startup seed provisions. It is the seed's ONE
+// forge-type site: the presence check, the client build, and the persisted row
+// below must all name the same forge, and before this constant they were three
+// independent literals that merely happened to agree. Disagreement between them
+// is not a compile error — it is a seed that verifies one forge, stores another,
+// and re-seeds on every boot because its own presence check never matches the row
+// it wrote. One name makes that class of bug unrepresentable.
+//
+// Pinned to GitLab, and NOT read from config, deliberately (PRD #65 M6a). The
+// migration alongside this widens the forge_type CHECK to admit 'forgejo', but
+// that widening is only safe while nothing can write such a row: handler/forge.go
+// still refuses the type (:158), so the API cannot create one. The seed bypasses
+// that handler entirely — it calls UpsertForgeConnection directly — so an
+// operator-settable seed type would be a second, ungated door to the exact row
+// the gate exists to prevent, and PRD #65's dark-landing property ("no forgejo row
+// can exist while the handler rejects the type") would be false the moment it
+// landed.
+//
+// Making the seed genuinely forge-aware therefore belongs with the gate flip
+// (M6b), not here, and needs a UZI_SEED_FORGE_TYPE in config that does not exist
+// yet. When that lands, this constant is what it replaces.
+const seedForgeType = forge.TypeGitLab
+
 // Store is the subset of *store.Queries the forge seed needs. Narrowing to an
 // interface lets the seed logic be unit-tested against a fake store (and a
 // mocked Forge) without a live database, mirroring forgesvc's IssueStore.
@@ -64,14 +87,14 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 	}
 
 	// Never touch an existing connection: if the seed user already has one for
-	// (gitlab, base_url), do nothing — no re-verify, no overwrite — consistent
-	// with the never-touch-existing-user stance of the admin seed.
+	// (seedForgeType, base_url), do nothing — no re-verify, no overwrite —
+	// consistent with the never-touch-existing-user stance of the admin seed.
 	conns, err := q.ListForgeConnectionsByUser(ctx, user.ID)
 	if err != nil {
 		return fmt.Errorf("seed forge: list connections: %w", err)
 	}
 	for _, c := range conns {
-		if c.ForgeType == string(forge.TypeGitLab) && c.BaseUrl == cfg.SeedForgeBaseURL {
+		if c.ForgeType == string(seedForgeType) && c.BaseUrl == cfg.SeedForgeBaseURL {
 			slog.Info("seed forge connection already present, leaving untouched",
 				"email", cfg.SeedEmail, "base_url", cfg.SeedForgeBaseURL)
 			return nil
@@ -82,7 +105,7 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 	// half-seeded connection — which the guard above would otherwise skip
 	// forever, stranding the repos. Once we persist below, the connection and
 	// its repo enablement land together in this same pass.
-	f, err := svc.ForgeForToken(forge.TypeGitLab, cfg.SeedForgeBaseURL, cfg.SeedForgePAT)
+	f, err := svc.ForgeForToken(seedForgeType, cfg.SeedForgeBaseURL, cfg.SeedForgePAT)
 	if err != nil {
 		slog.Error("seed forge: build forge client failed; skipping seed", "error", err)
 		return nil
@@ -109,7 +132,7 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 
 	conn, err := q.UpsertForgeConnection(ctx, store.UpsertForgeConnectionParams{
 		UserID:          user.ID,
-		ForgeType:       string(forge.TypeGitLab),
+		ForgeType:       string(seedForgeType),
 		BaseUrl:         cfg.SeedForgeBaseURL,
 		BotUsername:     identity.Username,
 		BotForgeUserID:  identity.ForgeUserID,
