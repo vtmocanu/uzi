@@ -98,11 +98,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   on KinD, which has no cert-manager at all and is a TEST target, never a deploy
   one. That deviation gets an explicit opt-in (workers.allowPlaintextAPI) rather
   than a silent default, so it is visible in the values file that chose it.
-
-  (The previous version of this comment justified the 8080 fallback as keeping the
-  policies correct "BOTH before and after M4's TLS rollout". That transition no
-  longer exists — M4 landed before M3 — so the fallback was accommodating a state
-  that cannot occur.)
 */ -}}
 {{- define "uzi.workerAPIPort" -}}
 {{- if .Values.api.tls.enabled -}}
