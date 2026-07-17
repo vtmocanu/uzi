@@ -46,8 +46,8 @@ func NewService(q Store, forges ForgeBuilder) *Service {
 // client (the save-time path in CreateConnection, which holds the plaintext
 // token and the bot identity). It makes at most one forge call (TokenInfo) and
 // persists nothing — the caller decides whether the violations block the save.
-func (s *Service) CheckToken(ctx context.Context, f forge.Forge, isAdmin bool) TokenReport {
-	return s.checker.CheckToken(ctx, f, isAdmin, s.now())
+func (s *Service) CheckToken(ctx context.Context, f forge.Forge, forgeType forge.Type, isAdmin bool) TokenReport {
+	return s.checker.CheckToken(ctx, f, forgeType, isAdmin, s.now())
 }
 
 // CheckConnection runs the full report for one connection, persists it, and
@@ -69,7 +69,7 @@ func (s *Service) CheckConnection(ctx context.Context, conn store.ForgeConnectio
 	if err != nil {
 		return Report{}, err
 	}
-	rep := s.checker.Check(ctx, f, toRepos(repos), s.now())
+	rep := s.checker.Check(ctx, f, forge.Type(conn.ForgeType), toRepos(repos), s.now())
 	if err := s.persist(ctx, conn.ID, rep); err != nil {
 		return Report{}, err
 	}
