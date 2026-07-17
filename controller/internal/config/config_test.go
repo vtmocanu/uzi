@@ -25,7 +25,20 @@ func writeToken(t *testing.T, contents string) string {
 	return path
 }
 
+// setWorkerEnv supplies the worker-namespace settings M3 made required. Tests that
+// expect Load to SUCCEED need it; tests asserting a failure earlier in Load do not,
+// since Load validates in order.
+func setWorkerEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("UZI_WORKER_NAMESPACE", "uzi-workers")
+	t.Setenv("UZI_WORKER_SERVICE_ACCOUNT", "uzi-hosted-worker")
+	t.Setenv("UZI_WORKER_IMAGE_REPO", "harbor.example.com/uzi")
+	t.Setenv("UZI_WORKER_IMAGE_TAG", "v1.0.0")
+	t.Setenv("UZI_WORKER_API_URL", "https://api.uzi.svc.cluster.local:8443")
+}
+
 func TestLoadReadsTheTokenFromFileAndDefaultsTheKnobs(t *testing.T) {
+	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "https://uzi.example.com/some/path")
 	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "the-controller-token\n"))
 
@@ -92,6 +105,7 @@ func TestLoadRejectsABadAPIURL(t *testing.T) {
 // http is permitted: the controller runs beside the api in-cluster before M4's TLS
 // listener lands, and this URL is one operator-set destination, not user input.
 func TestLoadAllowsPlainHTTPForTheInClusterHop(t *testing.T) {
+	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "http://uzi-api:8080")
 	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "t"))
 
@@ -105,6 +119,7 @@ func TestLoadAllowsPlainHTTPForTheInClusterHop(t *testing.T) {
 }
 
 func TestLoadParsesTheIntervalKnobs(t *testing.T) {
+	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "https://uzi.example.com")
 	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "t"))
 	t.Setenv("CONTROLLER_POLL_INTERVAL", "30s")
@@ -123,6 +138,7 @@ func TestLoadParsesTheIntervalKnobs(t *testing.T) {
 // boot: these are tuning values, not security controls, which is the same split the
 // api's config package draws.
 func TestLoadFallsBackOnMalformedKnobs(t *testing.T) {
+	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "https://uzi.example.com")
 	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "t"))
 	t.Setenv("CONTROLLER_POLL_INTERVAL", "not-a-duration")
@@ -173,6 +189,7 @@ func writeCA(t *testing.T, contents []byte) string {
 // The api's certificate is cert-manager's, issued by a CA in nobody's trust store
 // (PRD #58 Decision 4), so the pool is what makes the hop verifiable at all.
 func TestLoadReadsTheAPICABundle(t *testing.T) {
+	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
 	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
 	t.Setenv("UZI_API_CA_FILE", writeCA(t, caPEM(t)))
@@ -189,6 +206,7 @@ func TestLoadReadsTheAPICABundle(t *testing.T) {
 // Unset is not an error: a controller pointed at a plain local api has no pod
 // network to cross, and one behind a publicly-trusted cert wants the system roots.
 func TestLoadWithoutACAFileLeavesTheSystemRoots(t *testing.T) {
+	setWorkerEnv(t)
 	t.Setenv("UZI_API_URL", "https://uzi.example.com")
 	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
 
@@ -231,4 +249,129 @@ func TestLoadRejectsABadAPICAFile(t *testing.T) {
 			t.Fatal("Load: want error for UZI_API_CA_FILE with an http UZI_API_URL, got nil")
 		}
 	})
+}
+
+// --- worker-namespace settings (M3) ----------------------------------------
+
+func TestLoadReadsTheWorkerSettings(t *testing.T) {
+	setWorkerEnv(t)
+	t.Setenv("UZI_API_URL", "https://uzi.example.com")
+	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+	t.Setenv("UZI_WORKER_STORAGE_CLASS", "storage-class")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerNamespace != "uzi-workers" || cfg.WorkerServiceAccount != "uzi-hosted-worker" {
+		t.Errorf("namespace/sa = %q/%q", cfg.WorkerNamespace, cfg.WorkerServiceAccount)
+	}
+	if cfg.WorkerImageRepo != "harbor.example.com/uzi" || cfg.WorkerImageTag != "v1.0.0" {
+		t.Errorf("image = %q:%q", cfg.WorkerImageRepo, cfg.WorkerImageTag)
+	}
+	if cfg.WorkerAPIURL != "https://api.uzi.svc.cluster.local:8443" {
+		t.Errorf("WorkerAPIURL = %q", cfg.WorkerAPIURL)
+	}
+	if cfg.WorkerStorageClass != "storage-class" {
+		t.Errorf("WorkerStorageClass = %q", cfg.WorkerStorageClass)
+	}
+}
+
+// Every one of these is required, and none has a defensible default: an empty image
+// repo silently means Docker Hub, a "latest" tag means a fleet on an unknown
+// release, and a guessed namespace means listing where this controller has no RBAC.
+// A controller that cannot describe the pods it renders has nothing to do.
+func TestLoadRequiresEveryWorkerSetting(t *testing.T) {
+	for _, key := range []string{
+		"UZI_WORKER_NAMESPACE",
+		"UZI_WORKER_SERVICE_ACCOUNT",
+		"UZI_WORKER_IMAGE_REPO",
+		"UZI_WORKER_IMAGE_TAG",
+		"UZI_WORKER_API_URL",
+	} {
+		t.Run(key, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			t.Setenv(key, "")
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("Load succeeded with %s unset", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Fatalf("err = %v, want it to name %s", err, key)
+			}
+		})
+	}
+}
+
+// The storage class is the one optional knob: empty legitimately means "the cluster
+// default", which is a real configuration rather than a missing one.
+func TestLoadLeavesTheStorageClassOptional(t *testing.T) {
+	setWorkerEnv(t)
+	t.Setenv("UZI_API_URL", "https://uzi.example.com")
+	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerStorageClass != "" {
+		t.Errorf("WorkerStorageClass = %q, want empty (the cluster default)", cfg.WorkerStorageClass)
+	}
+}
+
+func TestLoadRejectsABadWorkerAPIURL(t *testing.T) {
+	for _, bad := range []string{"api.uzi.svc.cluster.local:8443", "ftp://api", "https://"} {
+		t.Run(bad, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			t.Setenv("UZI_WORKER_API_URL", bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("UZI_WORKER_API_URL=%q loaded without error", bad)
+			}
+		})
+	}
+}
+
+// A CA pinned for THIS process's hop but not consultable by the workers is a
+// half-finished TLS rollout that fails at the far end instead of here. The workers'
+// claim traffic carries the user's decrypted forge PAT and Anthropic token, so it
+// is exactly the hop that must not silently stay plaintext.
+func TestLoadRejectsAPinnedCAWithPlainHTTPWorkers(t *testing.T) {
+	setWorkerEnv(t)
+	t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+	t.Setenv("UZI_API_CA_FILE", writeCA(t, caPEM(t)))
+	t.Setenv("UZI_WORKER_API_URL", "http://api.uzi.svc.cluster.local:8080")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load succeeded with a pinned CA and plain-http workers")
+	}
+	if !strings.Contains(err.Error(), "UZI_WORKER_API_URL") {
+		t.Fatalf("err = %v, want it to name the worker URL", err)
+	}
+}
+
+// The PEM is kept alongside the parsed pool: the pool verifies this process's hop,
+// the PEM is what gets relayed into each worker's Secret so the worker can verify
+// its own. Hosted workers are in a different namespace and cannot mount the api's
+// TLS Secret, so this relay is the whole mechanism — and it needs no new RBAC verb.
+func TestLoadKeepsTheCAPEMForRelayToWorkers(t *testing.T) {
+	pem := caPEM(t)
+	setWorkerEnv(t)
+	t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+	t.Setenv("UZI_API_CA_FILE", writeCA(t, pem))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if string(cfg.APICAPEM) != string(pem) {
+		t.Error("APICAPEM must carry the raw bundle for relay to the worker Secrets")
+	}
 }
