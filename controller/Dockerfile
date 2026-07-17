@@ -8,10 +8,11 @@
 FROM golang:1.26@sha256:f96cc555eb8db430159a3aa6797cd5bae561945b7b0fe7d0e284c63a3b291609 AS build
 WORKDIR /src
 
-# No go.sum: the module is stdlib-only (see go.mod), so there is nothing to
-# download and no lockfile to copy. Add the `COPY go.sum` + `go mod download`
-# pair here the moment M3 brings in the kube client.
-COPY go.mod ./
+# M3 brought in the kube client, so the go.sum + `go mod download` this comment
+# previously deferred are now here — copied before the source so the dependency
+# layer caches independently of a code change (the same shape api/Dockerfile has).
+COPY go.mod go.sum ./
+RUN go mod download
 
 COPY . .
 # Static, VCS-stamp-free build, matching api/Dockerfile.

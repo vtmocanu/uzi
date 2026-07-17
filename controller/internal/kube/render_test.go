@@ -496,18 +496,66 @@ func TestSeedScriptSkipsOnTheSentinel(t *testing.T) {
 // The sentinel is written LAST, so an interrupted copy re-runs IN FULL rather than
 // resuming into a half-seeded store — the same property migrate_tree's sentinel
 // idiom already has in agent/templates/entrypoint.sh.
-func TestSeedScriptReRunsInFullAfterAnInterruptedCopy(t *testing.T) {
+//
+// The 0555 dirs are the point, not decoration: tar will NOT extract over a
+// read-only directory a previous pass already sealed ("Cannot open: File exists"),
+// so without the wipe this re-run CrashLoops forever and strands the worker behind
+// a manual PVC deletion. Found by running it on a real kubelet, reproduced here.
+func TestSeedScriptReRunsInFullOverAnInterruptedCopysReadOnlyDirs(t *testing.T) {
 	dst := t.TempDir()
-	// A copy that died partway: some content, no sentinel.
-	if err := os.MkdirAll(filepath.Join(dst, "store"), 0o755); err != nil {
+	// A previous attempt that got as far as sealing a store path read-only.
+	sealed := filepath.Join(dst, "store", "abc-pkg")
+	if err := os.MkdirAll(sealed, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(sealed, "bin"), []byte("stale"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sealed, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sealed, 0o755) }) // so t.TempDir can clean up
+
 	out, err := runSeed(t, seedSource(t), dst)
 	if err != nil {
-		t.Fatalf("seed failed: %v\n%s", err, out)
+		t.Fatalf("an interrupted seed must re-run in full over its own read-only dirs: %v\n%s", err, out)
 	}
 	if !seeded(t, dst) {
-		t.Fatal("an interrupted seed (no sentinel) must re-run in full")
+		t.Fatal("the store was not re-seeded")
+	}
+	// The stale content must be REPLACED, not merged around: a half-written store
+	// path is corrupt, and the store is content-addressed.
+	got, err := os.ReadFile(filepath.Join(dst, "store", "abc-pkg", "bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "payload" {
+		t.Errorf("stale content survived the re-seed: %q", got)
+	}
+}
+
+// The destination root is the KUBELET'S MOUNT POINT, owned root:<fsGroup>. uid
+// 10001 does not own it, so any attempt to restore metadata onto it EPERMs, tar
+// exits non-zero, the sentinel is never written, and the pod CrashLoops forever
+// having copied the store perfectly. Archiving `.` is what causes that; archiving
+// the top-level entries is what avoids it.
+//
+// This is the failure the kind run actually produced, and no fake client could have.
+func TestSeedScriptNeverRestoresMetadataOntoTheMountRoot(t *testing.T) {
+	script := nixSeedScript("/nix", "/nix-seed")
+	if strings.Contains(script, "tar -cf - -C /nix .") {
+		t.Error("archiving `.` puts a `./` member in the archive, so extraction ends by chmod/utime-ing " +
+			"the destination ROOT — the kubelet's mount point, which uid 10001 does not own. It EPERMs, " +
+			"tar exits non-zero, and the pod CrashLoops with a perfectly copied store.")
+	}
+	if !strings.Contains(script, "$(ls -A)") {
+		t.Error("the archive must enumerate the top-level entries so `.` never enters it")
+	}
+	// -mindepth 1 is load-bearing twice: it keeps the wipe off the mount root, and
+	// busybox chmod -R ABORTS on the un-chmodable root without ever reaching the
+	// children.
+	if !strings.Contains(script, "-mindepth 1") {
+		t.Error("the wipe must be scoped below the mount root: busybox chmod -R aborts on the root it cannot chmod")
 	}
 }
 
@@ -522,11 +570,16 @@ func TestSeedScriptUsesTarNotCp(t *testing.T) {
 	if strings.Contains(script, "cp -a") || strings.Contains(script, "cp -r") {
 		t.Error("cp is BusyBox in this image and fails on the store's 0555 dirs; use tar")
 	}
-	// An emptiness check is the ext4 trap. Guard the guard.
-	if strings.Contains(script, "ls -A") {
-		t.Error("idempotence must be a POSITIVE sentinel, never an emptiness check: a fresh ext4 PVC carries lost+found")
+	// The SKIP DECISION must be the sentinel and nothing else. An emptiness check is
+	// the ext4 trap — and note `ls -A` legitimately appears in this script to
+	// enumerate the archive's top-level entries, so the thing to forbid is testing
+	// emptiness, not the command. TestSeedScriptStillSeedsAVolumeThatCameWithLostAndFound
+	// is the behavioural half of this; this half stops the shape coming back.
+	if strings.Contains(script, `-z "$(ls -A`) || strings.Contains(script, `-n "$(ls -A`) {
+		t.Error("idempotence must be a POSITIVE sentinel, never an emptiness check: a fresh ext4 PVC carries lost+found, " +
+			"so an emptiness check passes on kind's local-path provisioner and strands every worker on dev-cluster")
 	}
-	if !strings.Contains(script, "/nix-seed") || strings.Contains(script, "-C /nix-seed .") {
-		t.Error("the init container extracts INTO /nix-seed and reads FROM /nix")
+	if !strings.Contains(script, "if [ -f /nix-seed/"+nixSentinel+" ]") {
+		t.Error("the skip must be decided by the sentinel file")
 	}
 }

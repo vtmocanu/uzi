@@ -288,14 +288,37 @@ func renderPVC(cfg RenderConfig, id, name string, size resource.Quantity) *corev
 //     behaviour on read-only dirs and hardlinks is exactly what must not be assumed.
 //     GNU tar 1.35 is present in both templates and preserves hardlinks, which the
 //     store relies on.
+//
+// TWO THINGS BELOW LOOK LIKE FUSS AND ARE NOT. Both were found by running this on a
+// real kubelet against a real fsGroup volume, and each one CrashLooped the pod:
+//
+//  1. It archives the TOP-LEVEL ENTRIES (`$(ls -A)`), never `.`. A `tar -C /nix .`
+//     puts a `./` member in the archive, so extraction ends by applying the image's
+//     /nix metadata to the DESTINATION ROOT — which is the kubelet's mount point,
+//     owned root:<fsGroup>. uid 10001 does not own it, so the chmod/utime EPERMs,
+//     tar exits non-zero, the sentinel is never written, and the pod CrashLoops
+//     forever having copied the store perfectly. The mount root's mode is kubelet's
+//     business, not the image's; we have no business restoring it.
+//
+//  2. It WIPES before extracting, scoped BELOW the root (-mindepth 1). Reaching here
+//     means the sentinel is absent, so any content present is a partial copy from an
+//     interrupted attempt — and tar will not overwrite into the 0555 dirs a previous
+//     pass already sealed ("Cannot open: File exists"), so a re-run would CrashLoop
+//     forever and strand the worker behind a manual PVC deletion. The store is a
+//     cache, so starting clean is correct and cheap. `-mindepth 1` is what makes it
+//     work at all: busybox `chmod -R` ABORTS on the un-chmodable root and never
+//     reaches the children.
 func nixSeedScript(src, dst string) string {
 	return fmt.Sprintf(`set -eu
 if [ -f %[2]s/%[3]s ]; then
   echo "uzi-seed-nix: store already seeded; nothing to do"
   exit 0
 fi
-echo "uzi-seed-nix: seeding the nix store from the image into an empty volume"
-tar -cf - -C %[1]s . | tar -xpf - -C %[2]s
+echo "uzi-seed-nix: seeding the nix store from the image"
+find %[2]s -mindepth 1 -type d -exec chmod u+w {} + 2>/dev/null || true
+find %[2]s -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+cd %[1]s
+tar -cf - -- $(ls -A) | tar -xpf - -C %[2]s
 : > %[2]s/%[3]s
 echo "uzi-seed-nix: seeded"
 `, src, dst, nixSentinel)
