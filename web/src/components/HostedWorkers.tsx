@@ -14,7 +14,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, ApiError, type HostedConfig, type Worker } from "../lib/api";
 import { Alert, Button, Card, Field, SectionTitle, Select } from "./ui";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES } from "../lib/workerTemplates";
-import { DEFAULT_WORKER_SIZE, WORKER_SIZES, sizeLabel } from "../lib/workerSizes";
+import { DEFAULT_WORKER_SIZE, WORKER_SIZES, sizeOptionLabel } from "../lib/workerSizes";
 
 export function HostedWorkers({
   hostedCount,
@@ -120,14 +120,19 @@ export function HostedWorkers({
             </Select>
           </Field>
         </div>
-        <div className="min-w-[8rem]">
+        <div className="min-w-[18rem]">
           <Field label="Size">
             <Select aria-label="Hosted worker size" value={size} onChange={(e) => setSize(e.target.value)}>
               {WORKER_SIZES.map((s) => (
+                // "M — up to 2 CPU / 4Gi RAM / 10Gi disk". The quantities are IN the
+                // option, not in a table elsewhere, because the point is to inform the
+                // choice at the moment it is made — before M6 this select offered three
+                // bare letters and a user picking one was picking blind.
+                //
                 // Upper-cased for reading only — the value stays the lowercase wire
                 // spelling, which is the one the api accepts.
                 <option key={s} value={s}>
-                  {sizeLabel(s)}
+                  {sizeOptionLabel(s)}
                 </option>
               ))}
             </Select>

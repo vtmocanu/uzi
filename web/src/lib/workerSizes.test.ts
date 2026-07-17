@@ -1,56 +1,147 @@
 import { describe, it, expect } from "vitest";
-import { WORKER_SIZES } from "./workerSizes";
+import { WORKER_SIZES, WORKER_SIZE_SPECS, sizeOptionLabel, sizeSummary } from "./workerSizes";
 
-// The drift gate for the size mirror (PRD #58 Decision 7).
+// The drift gates for the size mirror (PRD #58 Decision 7 + M6).
 //
-// api/internal/workersize is the authority on which size names are legal; this test
-// pins WORKER_SIZES to the golden that registry generates, so the mirror cannot drift
-// silently. Drift is not cosmetic in either direction: a size the web offers but the
-// api dropped is a 400 the user cannot avoid, and a size the api gained but the web
-// omits is a preset nobody can pick.
+// TWO authorities, so TWO goldens, and that split is the design rather than an
+// accident of layout:
 //
-// Reaching into the api tree from a web test mirrors agent/test/claim-skills-contract
-// .test.ts, which reads api/internal/workersvc/testdata the same way, and the same
-// caveat applies: this catches DEV-TIME drift, never deployment skew.
+//   * WHICH NAMES ARE LEGAL is api/internal/workersize's call — the api validates a
+//     provision against it. Golden: api/internal/hostedsvc/testdata/hosted_sizes.json.
+//   * WHAT A NAME BUYS is controller/internal/preset's call, and the api may not know
+//     it (Decision 1: the api holds no kube access and may not be the authority on a
+//     pod spec). Golden: controller/internal/preset/testdata/hosted_size_specs.json.
 //
-// The `?raw` import, not node:fs, and that is load-bearing. web/Dockerfile copies
-// web/ and docs/ and nothing else, so a shipped source file that imported this golden
+// So the numbers below are pinned against the CONTROLLER's golden — the module that
+// actually renders the pod — and the names against the api's. Reading the quantities
+// out of the api's tree would have meant the api carrying pod-spec values, which is
+// the thing Decision 7 exists to prevent.
+//
+// Drift is not cosmetic in any direction: a size the web offers but the api dropped is
+// a 400 the user cannot avoid; a size the api gained but the web omits is a preset
+// nobody can pick; and a QUANTITY that drifts is a label that lies about the pod the
+// user gets — which is worse than showing nothing, because it is believed.
+//
+// Reaching into another module's tree from a web test mirrors
+// agent/test/claim-skills-contract.test.ts, and the same caveat applies: this catches
+// DEV-TIME drift, never deployment skew.
+//
+// The `?raw` import, not node:fs, and that is load-bearing. web/Dockerfile copies web/
+// and docs/ and nothing else, so a shipped source file that imported either golden
 // would build locally and break the image. `?raw` matches vite/client's ambient
-// wildcard module declaration, so tsc never resolves the path — `npm run build`
-// inside the image type-checks this file clean with api/ absent, while vitest (which
-// runs from a full checkout) resolves it for real and the assertion has teeth.
+// wildcard module declaration, so tsc never resolves the path — `npm run build` inside
+// the image type-checks this file clean with api/ and controller/ absent, while vitest
+// (which runs from a full checkout) resolves it for real and the assertion has teeth.
 // node:fs would need @types/node, which this browser project deliberately lacks.
 //
-// The flip side of tsc not resolving this path is that tsc cannot VALIDATE it either.
-// Move or rename the golden and `npm run typecheck` stays green (measured: it exits 0);
-// only `npm test` tells you, and it fails as a bare ENOENT that takes the whole suite
-// down before any assertion runs — so you get no drift message, just a missing file.
-// CI runs the web tests from a full checkout, so the gate always fires; simply do not
-// expect the compiler to have your back on this one line.
-import goldenRaw from "../../../api/internal/hostedsvc/testdata/hosted_sizes.json?raw";
+// The flip side of tsc not resolving these paths is that tsc cannot VALIDATE them
+// either. Move or rename a golden and `npm run typecheck` stays green (measured: it
+// exits 0); only `npm test` tells you, and it fails as a bare ENOENT that takes the
+// whole suite down before any assertion runs — so you get no drift message, just a
+// missing file. CI runs the web tests from a full checkout, so the gate always fires;
+// simply do not expect the compiler to have your back on these two lines.
+import namesRaw from "../../../api/internal/hostedsvc/testdata/hosted_sizes.json?raw";
+import specsRaw from "../../../controller/internal/preset/testdata/hosted_size_specs.json?raw";
 
-const GOLDEN = "api/internal/hostedsvc/testdata/hosted_sizes.json";
+const NAMES_GOLDEN = "api/internal/hostedsvc/testdata/hosted_sizes.json";
+const SPECS_GOLDEN = "controller/internal/preset/testdata/hosted_size_specs.json";
+
+type SpecEntry = {
+  name: string;
+  cpu_request: string;
+  cpu_limit: string;
+  memory_request: string;
+  memory_limit: string;
+  data: string;
+};
+
+const names = JSON.parse(namesRaw) as { sizes: string[] };
+const specs = JSON.parse(specsRaw) as { sizes: SpecEntry[]; nix: string };
 
 describe("WORKER_SIZES mirrors the api's size registry", () => {
   it("matches the cross-module golden, name for name and in order", () => {
-    const golden = JSON.parse(goldenRaw) as { sizes: string[] };
     expect(
       [...WORKER_SIZES],
-      `WORKER_SIZES (web/src/lib/workerSizes.ts) drifted from ${GOLDEN}.\n` +
+      `WORKER_SIZES (web/src/lib/workerSizes.ts) drifted from ${NAMES_GOLDEN}.\n` +
         "The golden is generated from api/internal/workersize, which is the authority: " +
         "if the registry deliberately changed, update the constant here to match it " +
         "(and check the size select still reads sensibly). If the constant is what " +
         "changed, revert it — the web cannot add a size the api will not accept.",
-    ).toEqual(golden.sizes);
+    ).toEqual(names.sizes);
+  });
+});
+
+describe("WORKER_SIZE_SPECS mirrors the controller's preset table", () => {
+  // The two goldens must agree with each other before either can pin anything: they
+  // are generated by different modules, and the specs golden takes its ORDER from the
+  // names golden precisely so the picker cannot silently reorder itself.
+  it("the specs golden covers exactly the api's sizes, in the same order", () => {
+    expect(
+      specs.sizes.map((s) => s.name),
+      `${SPECS_GOLDEN} and ${NAMES_GOLDEN} disagree. The controller generates the specs ` +
+        "golden in the api's display order; if these differ, one module's table changed " +
+        "and its golden was not regenerated.",
+    ).toEqual(names.sizes);
   });
 
-  it("carries no quantities — the controller is the authority on those (M6)", () => {
-    // Guards the deferral, not a value: the moment someone adds "s = 1 CPU, 2Gi" to
-    // the constant, they have invented a number no artifact in this repo has chosen,
-    // and M3's real preset table will contradict it silently. The golden is names-only
-    // for the same reason.
-    for (const size of WORKER_SIZES) {
-      expect(size).toMatch(/^[a-z]+$/);
+  it("displays the controller's real quantities, verbatim", () => {
+    for (const entry of specs.sizes) {
+      const spec = WORKER_SIZE_SPECS[entry.name as keyof typeof WORKER_SIZE_SPECS];
+      expect(
+        spec,
+        `WORKER_SIZE_SPECS has no entry for size "${entry.name}", which ${SPECS_GOLDEN} ships.`,
+      ).toBeDefined();
+      expect(
+        { cpuLimit: spec.cpuLimit, memoryLimit: spec.memoryLimit, data: spec.data },
+        `WORKER_SIZE_SPECS["${entry.name}"] drifted from ${SPECS_GOLDEN}.\n` +
+          "controller/internal/preset is the authority — it renders the actual pod. If the " +
+          "preset changed deliberately, regenerate that golden (UPDATE_GOLDEN=1 go test " +
+          "./internal/preset/...) and copy the values here. Never edit these numbers to " +
+          "taste: a size label that disagrees with the pod is believed by the user.",
+      ).toEqual({
+        cpuLimit: entry.cpu_limit,
+        memoryLimit: entry.memory_limit,
+        data: entry.data,
+      });
     }
+  });
+
+  it("mirrors the LIMITS, not the requests — the ceiling is what a user picks between", () => {
+    // Pins the deliberate choice rather than a value. The presets are Burstable, so
+    // every size has a request strictly below its limit; showing the request would tell
+    // a user what is reserved, which is not the question they are asking and is not what
+    // bounds their build.
+    for (const entry of specs.sizes) {
+      const spec = WORKER_SIZE_SPECS[entry.name as keyof typeof WORKER_SIZE_SPECS];
+      expect(spec.cpuLimit).toBe(entry.cpu_limit);
+      expect(spec.cpuLimit).not.toBe(entry.cpu_request);
+      expect(spec.memoryLimit).toBe(entry.memory_limit);
+      expect(spec.memoryLimit).not.toBe(entry.memory_request);
+    }
+  });
+
+  it("carries no /nix — it is flat across every size and cannot inform a choice", () => {
+    // The golden ships nix OUTSIDE the per-size list (it is measured byte-identical
+    // across sizes and templates). If it ever appears per-size, the picker would show
+    // one repeated number as if it were a differentiator.
+    expect(specs.nix).toBeTruthy();
+    for (const entry of specs.sizes) {
+      expect(Object.keys(entry)).not.toContain("nix");
+    }
+  });
+});
+
+describe("the picker's option text", () => {
+  it("puts the quantities where the choice is made", () => {
+    expect(sizeOptionLabel("m")).toBe("M — up to 2 CPU / 4Gi RAM / 10Gi disk");
+    expect(sizeSummary("s")).toBe("up to 1 CPU / 2Gi RAM / 5Gi disk");
+  });
+
+  it("degrades to the bare label for an unknown size rather than throwing", () => {
+    // Deployment skew is the only way here (a newer api shipping a size this bundle
+    // predates); a settings page that crashes on it would be a worse outcome than one
+    // unlabelled option.
+    expect(sizeOptionLabel("xxl")).toBe("XXL");
+    expect(sizeSummary("xxl")).toBe("");
   });
 });
