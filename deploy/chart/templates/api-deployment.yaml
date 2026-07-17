@@ -46,12 +46,32 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if .Values.api.tls.enabled }}
+            # The worker/controller hop (PRD #58 Decision 4). A SECOND port, not a
+            # replacement: the plain one above still serves web's nginx and the
+            # kubelet probes, and keeping them apart is what lets the NetworkPolicy
+            # admit the worker namespace to this one and nothing else.
+            - name: https
+              containerPort: {{ .Values.api.tls.port }}
+              protocol: TCP
+            {{- end }}
           {{- if .Values.api.config }}
           envFrom:
             - configMapRef:
                 name: {{ include "uzi.fullname" . }}-api-config
           {{- end }}
           env:
+            {{- if .Values.api.tls.enabled }}
+            # PATHS to the mounted pair, never the material: cert-manager renews the
+            # cert in place and the api re-reads the files, so nothing here goes
+            # stale and no rollout is needed to pick up a renewal.
+            - name: API_TLS_ADDR
+              value: ":{{ .Values.api.tls.port }}"
+            - name: API_TLS_CERT
+              value: {{ printf "%s/tls.crt" (include "uzi.apiTLSDir" .) | quote }}
+            - name: API_TLS_KEY
+              value: {{ printf "%s/tls.key" (include "uzi.apiTLSDir" .) | quote }}
+            {{- end }}
             # DATABASE_URL from the CNPG-generated <cluster>-app Secret's `uri` key.
             # Required at boot (config.Load errors on empty), so NOT optional: the
             # pod waits for the secret (CNPG creates it at sync-wave -5).
@@ -87,8 +107,22 @@ spec:
             # Writable /tmp for the read-only-root-fs container (TLS/temp scratch).
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.api.tls.enabled }}
+            - name: api-tls
+              mountPath: {{ include "uzi.apiTLSDir" . }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi
+        {{- if .Values.api.tls.enabled }}
+        # NOT marked optional: an api told to serve TLS refuses to boot without the
+        # pair, so waiting in ContainerCreating for cert-manager to issue is the
+        # honest failure mode. It resolves itself within seconds on a first deploy.
+        - name: api-tls
+          secret:
+            secretName: {{ include "uzi.apiTLSSecretName" . }}
+            defaultMode: 0400
+        {{- end }}
 {{- end }}

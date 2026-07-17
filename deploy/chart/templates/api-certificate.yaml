@@ -1,0 +1,115 @@
+{{- if and .Values.api.enabled .Values.api.tls.enabled .Values.api.tls.certManager.enabled }}
+{{- if not .Values.api.tls.certManager.issuerRef.name }}
+# Chart-owned issuing chain: selfSigned Issuer -> CA Certificate -> CA Issuer.
+#
+# WHY the chart ships its own CA instead of using a cluster ClusterIssuer: the only
+# ClusterIssuer on dev-cluster is `letsencrypt-prod`, an ACME issuer whose DNS-01
+# solver is scoped to the dev.example.com zone (verified 2026-07-17). ACME can
+# only issue for publicly resolvable names, and the name on this certificate is
+# `api.<ns>.svc.cluster.local` — a cluster-internal Service name that no public
+# ACME challenge can ever validate. A private CA is not a shortcut here; it is the
+# only thing that can issue for this name, and it is the pattern the rest of the
+# cluster already uses for internal hops (ingress-nginx, keycloak and otel each run
+# a selfsigned issuer of their own).
+#
+# The CA is per-release and its whole trust domain is this one hop. Nothing else
+# trusts it: the controller and the hosted workers pin it EXCLUSIVELY (see
+# UZI_API_CA_FILE), and no browser is ever pointed at this listener — users reach
+# uzi through the ingress, which serves the cluster's public wildcard cert.
+#
+# Set api.tls.certManager.issuerRef.name to hand the job to an existing issuer
+# instead; everything below is then skipped.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "uzi.fullname" . }}-selfsign
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "uzi.fullname" . }}-ca
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  isCA: true
+  commonName: {{ include "uzi.fullname" . }}-ca
+  # Long-lived on purpose: rotating this root means re-trusting it in the
+  # controller and in every hosted worker pod at once. The LEAF rotates on the
+  # ordinary 90/30 day cadence below, which is what the api's cert reloader exists
+  # to pick up without a restart.
+  duration: {{ .Values.api.tls.certManager.caDuration | quote }}
+  renewBefore: {{ .Values.api.tls.certManager.caRenewBefore | quote }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  secretName: {{ include "uzi.fullname" . }}-ca
+  issuerRef:
+    name: {{ include "uzi.fullname" . }}-selfsign
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "uzi.fullname" . }}-ca-issuer
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  ca:
+    secretName: {{ include "uzi.fullname" . }}-ca
+---
+{{- end }}
+# The api's server certificate.
+#
+# cert-manager writes tls.crt + tls.key + ca.crt into this Secret. The api mounts
+# the pair; everything that DIALS the api mounts ca.crt alone, projected by key so
+# the server's private key never enters a client's filesystem. That projection is
+# the reason this Secret is the CA distribution point and no second Certificate is
+# needed just to publish the root.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "uzi.fullname" . }}-api-tls
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  secretName: {{ include "uzi.apiTLSSecretName" . }}
+  duration: {{ .Values.api.tls.certManager.duration | quote }}
+  renewBefore: {{ .Values.api.tls.certManager.renewBefore | quote }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    # Rotate the key with the certificate rather than reusing it forever.
+    rotationPolicy: Always
+  usages:
+    - server auth
+  # Every name a client could dial the api Service by. The hosted workers live in
+  # ANOTHER namespace, so the FQDN is the one that actually gets used — the short
+  # forms do not resolve from there. All four are listed because the same
+  # certificate serves the in-namespace controller too, and a client picking the
+  # short name it can resolve must not trip a name mismatch.
+  dnsNames:
+    - {{ include "uzi.apiServiceName" . }}
+    - {{ printf "%s.%s" (include "uzi.apiServiceName" .) .Release.Namespace }}
+    - {{ printf "%s.%s.svc" (include "uzi.apiServiceName" .) .Release.Namespace }}
+    - {{ printf "%s.%s.svc.%s" (include "uzi.apiServiceName" .) .Release.Namespace .Values.api.tls.clusterDomain }}
+    {{- with .Values.api.tls.extraDNSNames }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  issuerRef:
+    {{- if .Values.api.tls.certManager.issuerRef.name }}
+    {{- toYaml .Values.api.tls.certManager.issuerRef | nindent 4 }}
+    {{- else }}
+    name: {{ include "uzi.fullname" . }}-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+    {{- end }}
+{{- end }}

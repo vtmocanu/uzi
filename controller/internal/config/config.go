@@ -4,6 +4,7 @@
 package config
 
 import (
+	"crypto/x509"
 	"fmt"
 	"net/url"
 	"os"
@@ -14,9 +15,20 @@ import (
 // Config holds the controller's runtime settings.
 type Config struct {
 	// APIBaseURL is the uzi api's base URL (scheme://host[:port], no path). https
-	// from M4 on, when the api gains its TLS listener (Decision 4) — this is the hop
+	// in k8s, where the api serves its TLS listener (Decision 4) — this is the hop
 	// that carries join tokens across a shared cluster's pod network.
 	APIBaseURL string
+	// APICAPool verifies the api's TLS certificate (UZI_API_CA_FILE, a PEM bundle).
+	//
+	// nil means "use the system roots", which is right for an api behind a
+	// publicly-trusted cert and wrong for the cluster-issued one: cert-manager's CA
+	// is in nobody's trust store, so verification against the system roots would
+	// fail closed (a loud connection error, never a silent downgrade).
+	//
+	// The pool is EXCLUSIVE, not additive, when set: the api is one operator-set
+	// destination with one known issuer, so trusting every public CA on top of it
+	// only widens who can impersonate the hop that hands out join tokens.
+	APICAPool *x509.CertPool
 	// Token is the controller's bearer credential. Read from a FILE, never an env
 	// var: an env-borne secret is readable via /proc/<pid>/environ, the leak class
 	// docs/proc-hardening.md closed for the worker and that PRD #58 Decision 3
@@ -66,13 +78,48 @@ func Load() (Config, error) {
 	if cfg.Token == "" {
 		return Config{}, fmt.Errorf("UZI_CONTROLLER_TOKEN_FILE: %s is empty", path)
 	}
+
+	if err := loadAPICA(&cfg); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
+// loadAPICA reads the optional CA bundle used to verify the api's TLS certificate
+// (Decision 4). Unset leaves verification on the system roots.
+//
+// A CA file against an http base URL is a loud failure rather than an ignored
+// setting: it is precisely the shape of a half-finished TLS rollout, and the
+// operator who set it believes the hop is encrypted. The same reasoning the api
+// applies to a controller token hash set while hosting is off.
+func loadAPICA(cfg *Config) error {
+	path := strings.TrimSpace(os.Getenv("UZI_API_CA_FILE"))
+	if path == "" {
+		return nil
+	}
+	if !strings.HasPrefix(cfg.APIBaseURL, "https://") {
+		return fmt.Errorf("UZI_API_CA_FILE is set but UZI_API_URL is not https; the CA would never be consulted and the join tokens this controller carries would cross the pod network in the clear")
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("UZI_API_CA_FILE: read %s: %w", path, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		// AppendCertsFromPEM reports only "did anything parse", so there is nothing
+		// more specific to say. An empty pool would fail every handshake at runtime;
+		// failing here makes it a boot error instead.
+		return fmt.Errorf("UZI_API_CA_FILE: %s contains no PEM certificate", path)
+	}
+	cfg.APICAPool = pool
+	return nil
+}
+
 // normalizeBaseURL validates the api base URL and strips it to scheme://host[:port].
-// http is permitted: the controller may run beside the api inside the cluster
-// before M4 adds the TLS listener, and unlike the forge allowlist this URL is not
-// an SSRF surface (it is one operator-set destination, not user input).
+// http is still permitted (a local dev controller pointed at a plain api, where
+// there is no pod network to cross), and unlike the forge allowlist this URL is not
+// an SSRF surface (it is one operator-set destination, not user input) — but the
+// k8s deployment sets https and a CA: see loadAPICA, and the chart's api.tls values.
 func normalizeBaseURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {

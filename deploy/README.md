@@ -220,6 +220,69 @@ cookies, no CSRF), so it works through the TLS ingress unchanged. The token is
 shown once at issuance. See `docs/worker-setup.md` for the full procedure and
 `ARCHITECTURE.md` for the trust model.
 
+## The api TLS listener (`api.tls.*`, PRD #58)
+
+**Off by default, and off is a no-op**: with `api.tls.enabled: false` the chart
+renders exactly what it rendered before this existed (no Certificate, no extra
+port, no extra env, no mount). Turn it on only together with hosted workers — on
+its own it opens a port nothing dials.
+
+**What it is for.** Hosted workers and the worker controller dial the api
+**directly**, with no nginx in the path, and a claim response on that hop carries
+the run owner's *decrypted* forge PAT and Anthropic token. dev-cluster is a shared
+cluster running arbitrary dev pods, so that hop gets its own TLS listener on a
+second port (`:8443`). The plain `:8080` port stays exactly as it was — it is what
+`web`'s nginx and the kubelet probes use, and `api.networkPolicy` keeps everything
+else off it. Users are unaffected: they reach uzi through the ingress, which serves
+dev-cluster's `*.example.com` wildcard cert.
+
+**Why the chart ships its own CA instead of using `letsencrypt-prod`.** The name
+being certified is `api.<ns>.svc.cluster.local`, a cluster-internal Service name.
+dev-cluster's only ClusterIssuer is `letsencrypt-prod` — ACME, DNS-01, scoped to
+the `dev.example.com` zone (verified on-cluster 2026-07-17) — and ACME can only
+issue for publicly resolvable names, so it **cannot** issue this certificate at
+all. The chart therefore renders its own `selfSigned → CA → leaf` chain, scoped to
+the release. This is the cluster's existing convention for internal hops:
+`ingress-nginx`, `keycloak` and `otel` each run a selfsigned issuer of their own.
+The CA's entire trust domain is this one hop; no browser ever sees it.
+
+Point `api.tls.certManager.issuerRef.name` at a real internal CA if one is ever
+added, and the chart will issue from it and skip its own chain. Set
+`api.tls.certManager.enabled: false` with `api.tls.secretName` to supply a pair
+from outside cert-manager.
+
+**Renewal needs no restart.** The api is given the mounted *paths*
+(`API_TLS_CERT`/`API_TLS_KEY`) and re-reads them when the files change, so a
+cert-manager leaf renewal (90d issue / 30d renew) is picked up live. The CA is
+deliberately long-lived: rotating the *root* means re-trusting it in the controller
+and every hosted worker pod at once, which is not the routine operation — the leaf
+is.
+
+**How clients get the CA.** cert-manager writes `ca.crt` alongside `tls.crt` and
+`tls.key` into the leaf Secret, so that Secret is also the CA distribution point.
+Clients mount `ca.crt` **by key projection** (`items:`), which is what keeps the
+api's private key out of a client's filesystem. The controller reads it via
+`UZI_API_CA_FILE` and pins it *exclusively* (the system roots are not also
+trusted). There is no skip-verification knob in this path and there must not be
+one — an unverified peer is the attack the encryption exists to stop.
+
+> **Cross-namespace note (M3/M6).** Hosted workers run in a **different**
+> namespace and so cannot mount this Secret. The CA reaches them via the Secret the
+> controller already creates for each worker; the controller mounts the CA itself
+> and relays it. This is why no `trust-manager` `Bundle` is involved — there is no
+> trust-manager on dev-cluster (verified 2026-07-17).
+
+Values worth knowing:
+
+| Value | Default | Notes |
+|---|---|---|
+| `api.tls.enabled` | `false` | The whole feature. Off renders nothing. |
+| `api.tls.port` | `8443` | The worker/controller port. Also the port the NetworkPolicy admits the worker namespace to (M3). |
+| `api.tls.clusterDomain` | `cluster.local` | Used for the FQDN SAN — the name hosted workers actually dial, since the short forms do not resolve cross-namespace. |
+| `api.tls.secretName` | `""` → `uzi-api-tls` | Holds `tls.crt` + `tls.key` + `ca.crt`. |
+| `api.tls.certManager.enabled` | `true` | `false` = bring your own Secret. |
+| `api.tls.certManager.issuerRef.name` | `""` | Empty = the chart's own chain (see above). |
+
 ## Verify a live deploy
 
 ArgoCD is **hub-and-spoke**: the `Application` object lives on the **argo-cluster**

@@ -9,6 +9,8 @@ package apiclient
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,11 +34,30 @@ type Client struct {
 
 // New constructs a Client. timeout bounds every call end to end (dial through
 // body read), so a hung api can never wedge the reconcile loop.
-func New(baseURL, token string, timeout time.Duration) *Client {
+//
+// caPool verifies the api's TLS certificate (PRD #58 Decision 4). nil uses the
+// system roots — right for a publicly-trusted cert, and the only option for an
+// http base URL, where it is moot. It is never a way to skip verification: there
+// is no InsecureSkipVerify knob here and there must not be one. The whole reason
+// this hop is TLS is that its responses carry a decrypted forge PAT and Anthropic
+// token across a shared cluster's pod network; an unverified peer on that hop is
+// the exact attack the encryption exists to stop, so "TLS with verification off"
+// would be strictly worse than the plain http it replaced — it would look solved.
+func New(baseURL, token string, timeout time.Duration, caPool *x509.CertPool) *Client {
+	// Clone the default transport rather than building one: it carries the
+	// connection pooling, proxy handling and HTTP/2 support net/http has tuned, and
+	// only the TLS roots need changing.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if caPool != nil {
+		tr.TLSClientConfig = &tls.Config{
+			RootCAs:    caPool,
+			MinVersion: tls.VersionTLS12,
+		}
+	}
 	return &Client{
 		baseURL: baseURL,
 		token:   token,
-		http:    &http.Client{Timeout: timeout},
+		http:    &http.Client{Timeout: timeout, Transport: tr},
 	}
 }
 

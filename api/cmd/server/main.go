@@ -41,6 +41,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/slacksvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/sweeper"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/tlsx"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/usagepoller"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/vault"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
@@ -510,22 +511,66 @@ func run() error {
 		h.SetOIDC(oidcProvider)
 	}
 
+	// One router, shared by both listeners: the TLS listener (when configured) is
+	// the SAME api on a second port, not a second surface. Building Routes twice
+	// would be two independent middleware chains — and two rate limiters, so a
+	// per-IP budget would silently double.
+	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter)
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter),
+		Handler:           routes,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	// Optional TLS listener (PRD #58 Decision 4): the hop the hosted workers and
+	// the controller dial across a shared cluster's pod network, carrying claim
+	// responses that hold a decrypted forge PAT and Anthropic token. Unconfigured
+	// (the compose default) nothing below happens and the api is exactly what it
+	// was. The plain listener is NOT replaced when this is on: web's nginx and the
+	// kubelet probes speak to it, and the NetworkPolicy is what keeps anything else
+	// off it.
+	var tlsSrv *http.Server
+	if cfg.TLSEnabled() {
+		reloader, err := tlsx.NewReloader(cfg.TLSCertFile, cfg.TLSKeyFile, slog.Default())
+		if err != nil {
+			return err
+		}
+		tlsSrv = &http.Server{
+			Addr:              cfg.TLSAddr,
+			Handler:           routes,
+			TLSConfig:         reloader.ServerConfig(),
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+	}
+
+	// Buffered for both listeners: an unbuffered channel would leak whichever
+	// goroutine lost the race to report its error.
+	errCh := make(chan error, 2)
 	go func() {
 		slog.Info("api listening", "addr", cfg.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
+	if tlsSrv != nil {
+		go func() {
+			slog.Info("api listening (tls)", "addr", cfg.TLSAddr, "cert_file", cfg.TLSCertFile)
+			// The pair is already loaded and served by the reloader's GetCertificate;
+			// the empty arguments are how net/http says "use TLSConfig".
+			if err := tlsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	} else {
+		slog.Info("api tls listener disabled (API_TLS_CERT/API_TLS_KEY unset)")
+	}
 
 	var runErr error
 	select {
@@ -534,12 +579,18 @@ func run() error {
 		slog.Info("shutting down")
 	}
 
-	// Drain the HTTP server, then stop and await the background goroutines before
-	// returning so the deferred pool.Close() cannot race an in-flight query.
+	// Drain the HTTP server(s), then stop and await the background goroutines before
+	// returning so the deferred pool.Close() cannot race an in-flight query. Both
+	// listeners share one router and one pool, so both must drain before that.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
 		runErr = err
+	}
+	if tlsSrv != nil {
+		if err := tlsSrv.Shutdown(shutdownCtx); err != nil && runErr == nil {
+			runErr = err
+		}
 	}
 	stop() // cancel ctx so the poller + sweeper + reconciler Run return (covers the server-error path too)
 	bgWG.Wait()

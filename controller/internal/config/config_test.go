@@ -1,6 +1,13 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,4 +135,100 @@ func TestLoadFallsBackOnMalformedKnobs(t *testing.T) {
 	if cfg.PollInterval != 10*time.Second || cfg.HTTPTimeout != 15*time.Second {
 		t.Fatalf("knobs = %v / %v, want the defaults", cfg.PollInterval, cfg.HTTPTimeout)
 	}
+}
+
+// caPEM returns a self-signed CA certificate in PEM form. Only the certificate is
+// needed: the pool is a trust anchor, never a signing identity.
+func caPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "uzi-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func writeCA(t *testing.T, contents []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(path, contents, 0o644); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
+	return path
+}
+
+// The api's certificate is cert-manager's, issued by a CA in nobody's trust store
+// (PRD #58 Decision 4), so the pool is what makes the hop verifiable at all.
+func TestLoadReadsTheAPICABundle(t *testing.T) {
+	t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+	t.Setenv("UZI_API_CA_FILE", writeCA(t, caPEM(t)))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.APICAPool == nil {
+		t.Fatal("APICAPool = nil, want the mounted bundle parsed")
+	}
+}
+
+// Unset is not an error: a controller pointed at a plain local api has no pod
+// network to cross, and one behind a publicly-trusted cert wants the system roots.
+func TestLoadWithoutACAFileLeavesTheSystemRoots(t *testing.T) {
+	t.Setenv("UZI_API_URL", "https://uzi.example.com")
+	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.APICAPool != nil {
+		t.Fatal("APICAPool != nil with UZI_API_CA_FILE unset")
+	}
+}
+
+func TestLoadRejectsABadAPICAFile(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_CA_FILE", filepath.Join(t.TempDir(), "absent.crt"))
+		if _, err := Load(); err == nil {
+			t.Fatal("Load: want error for an unreadable CA file, got nil")
+		}
+	})
+
+	// An empty pool would fail every handshake at runtime. Boot is the honest place.
+	t.Run("no PEM in it", func(t *testing.T) {
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_CA_FILE", writeCA(t, []byte("not a certificate")))
+		if _, err := Load(); err == nil {
+			t.Fatal("Load: want error for a CA file with no PEM certificate, got nil")
+		}
+	})
+
+	// The shape of a half-finished TLS rollout: the operator set a CA and believes
+	// the hop is encrypted, while http quietly ignores it.
+	t.Run("CA against an http api aborts boot", func(t *testing.T) {
+		t.Setenv("UZI_API_URL", "http://api:8080")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_CA_FILE", writeCA(t, caPEM(t)))
+		if _, err := Load(); err == nil {
+			t.Fatal("Load: want error for UZI_API_CA_FILE with an http UZI_API_URL, got nil")
+		}
+	})
 }

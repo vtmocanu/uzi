@@ -129,6 +129,67 @@ api:
     periodSeconds: 20
     timeoutSeconds: 3
     failureThreshold: 6
+  # --- Optional TLS listener on the api (PRD #58 Decision 4) -------------------
+  #
+  # WHAT IT IS FOR: the hosted workers and the worker controller dial the api
+  # DIRECTLY (no nginx in the path), and a claim response carries the user's
+  # DECRYPTED forge PAT and Anthropic token. dev-cluster is a shared cluster
+  # running arbitrary dev pods, so that plaintext does not cross the pod network.
+  # Nothing else changes: users still reach uzi through the ingress -> web -> the
+  # PLAIN api port, which never leaves the namespace and is policed by
+  # networkPolicy above.
+  #
+  # ADDITIVE, NEVER A REPLACEMENT. Off (this default) the api binds :8080 alone and
+  # behaves exactly as it always has — compose is unaffected by all of this. On, it
+  # binds BOTH: :8080 for web's nginx and the kubelet probes, and this port for the
+  # workers. Turn it on together with the hosted-worker feature; on its own it just
+  # opens a port nothing dials.
+  #
+  # The api reads PATHS (API_TLS_CERT/API_TLS_KEY) from a mounted Secret and
+  # re-reads them when they change, so a cert-manager renewal needs no restart.
+  tls:
+    enabled: false
+    port: 8443
+    # The Secret holding tls.crt + tls.key (and ca.crt, which is what the clients
+    # mount). Empty => <fullname>-api-tls, which is what the Certificate below
+    # writes. Set it to a PRE-CREATED Secret when certManager.enabled is false.
+    secretName: ""
+    # The cluster's DNS domain, for the FQDN on the certificate. The hosted workers
+    # live in another namespace and can only dial the api by FQDN, so this is the
+    # name that actually gets verified.
+    clusterDomain: cluster.local
+    # Extra SANs, if something dials the api by a name the four Service names below
+    # do not cover (see api-certificate.yaml).
+    extraDNSNames: []
+    certManager:
+      # false => the chart creates no Certificate and you supply tls.secretName
+      # yourself (an external PKI, or a cluster with no cert-manager).
+      enabled: true
+      # WHICH ISSUER. Empty (the default) => the chart ships its own
+      # selfSigned -> CA -> leaf chain, scoped to this release.
+      #
+      # This is not a fallback, it is the correct answer for this hop: the name
+      # being certified is `api.<ns>.svc.cluster.local`, and dev-cluster's only
+      # ClusterIssuer is ACME (letsencrypt-prod, DNS-01 on the dev.example.com
+      # zone), which cannot issue for a cluster-internal name — no public challenge
+      # can validate one. Per-app selfsigned chains are what the rest of the cluster
+      # already does for internal hops (ingress-nginx, keycloak, otel).
+      #
+      # Point this at a real internal CA (Issuer or ClusterIssuer) if one ever
+      # exists; the chart then issues from it and skips its own chain.
+      issuerRef:
+        name: ""
+        kind: Issuer
+        group: cert-manager.io
+      # Leaf lifetime: the ordinary 90/30. Renewal is picked up live by the api.
+      duration: 2160h
+      renewBefore: 720h
+      # CA lifetime. Long, because rotating the ROOT means re-trusting it in the
+      # controller and every hosted worker pod at once — it is not the routine
+      # rotation, the leaf is.
+      caDuration: 43800h
+      caRenewBefore: 2160h
+
   # Default-deny ingress on the api pods, allowing ONLY the web pods (the reverse
   # proxy) to reach api:8080. This is the LOAD-BEARING control on a shared cluster
   # like dev-cluster: without it any pod (e.g. coder.example.com runs

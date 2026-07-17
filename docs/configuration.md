@@ -21,8 +21,26 @@ All configuration is via environment variables, set in `.env` (copied from `.env
 | `TRUSTED_PROXIES` | `10.0.0.0/8,172.16.0.0/12,10.244.0.0/16,127.0.0.1/32` | CIDRs whose direct connections are trusted to speak for a real client via `X-Forwarded-For`. Only requests whose `RemoteAddr` falls in one of these ranges get their `X-Forwarded-For` header honored; everyone else's is ignored. The compose default trusts the private compose network (the nginx hop) — see [auth-design.md](auth-design.md) for why this is safe here. Leave empty to never trust `X-Forwarded-For` and rely on `RemoteAddr` only. |
 | `DATABASE_URL` | set by compose | pgx connection string, built from `POSTGRES_*` and the `db` service name. Not meant to be set directly when using compose. |
 | `API_ADDR` | `:8080` | Address the `api` binary listens on inside its container. Set by compose; no need to change it. |
+| `API_TLS_CERT` | unset (no TLS listener) | Path to a PEM certificate. Set together with `API_TLS_KEY` to make the `api` serve a **second, TLS** listener alongside the plain one. Unset on compose, where nothing needs it. See [the TLS listener](#the-optional-tls-listener) below. |
+| `API_TLS_KEY` | unset (no TLS listener) | Path to the matching PEM private key. Setting exactly one of the pair refuses to boot: a cert without a key cannot serve TLS, and treating that as "TLS off" would silently hand you a plaintext hop you believed was encrypted. |
+| `API_TLS_ADDR` | `:8443` | Address of the TLS listener. Ignored unless the cert/key pair is set. Must differ from `API_ADDR`. |
 
-Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last one is logged as a warning); only a bad `JWT_SECRET`, a bad `UZI_SECRET_KEY`, or a missing `DATABASE_URL` refuses to start.
+Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last one is logged as a warning); only a bad `JWT_SECRET`, a bad `UZI_SECRET_KEY`, a missing `DATABASE_URL`, or a broken `API_TLS_CERT`/`API_TLS_KEY` pair refuses to start.
+
+### The optional TLS listener
+
+The `api` normally serves one plain HTTP port, reached only by the `web` reverse proxy on the same private network. That is all a compose stack needs, and leaving `API_TLS_CERT`/`API_TLS_KEY` unset keeps it exactly that.
+
+On Kubernetes there is a second kind of client: **hosted workers and the worker controller dial the `api` directly**, with no nginx in the path. A claim response on that hop carries the run owner's *decrypted* forge PAT and Anthropic token, and on a shared cluster the pod network is not private. Setting the pair adds a TLS listener for those clients:
+
+- It is **additive**. The plain listener stays, because that is what `web`'s nginx and the kubelet probes speak to. Both ports serve the same routes.
+- The two are **separate ports on purpose**: it is what lets a NetworkPolicy admit the worker namespace to the TLS port and to nothing else, while the plain port stays reachable only from the `web` pods.
+- `TRUSTED_PROXIES` is unaffected. Workers are not proxied, so the `api` sees their real peer address and no `X-Forwarded-For` is trusted from them.
+- The values are **paths, not material**. The `api` re-reads them when they change, so a cert-manager renewal is picked up without a restart. A malformed pair fails at boot rather than at the first handshake.
+
+Clients verify the certificate against the issuing CA (`UZI_API_CA_FILE` on the controller). There is no "skip verification" switch anywhere in this path, by design: an unverified peer is the exact attack the encryption exists to prevent, so TLS-without-verification would be worse than the plain HTTP it replaced — it would look solved.
+
+On Kubernetes the Helm chart wires all of this from `api.tls.*` (certificate included); see [deploy/README.md](../deploy/README.md).
 
 There is no CORS configuration to make, by design: nginx serves the SPA and proxies `/api/*` to the API on the same origin (see [ARCHITECTURE.md](../ARCHITECTURE.md)), so the browser never makes a cross-origin request.
 

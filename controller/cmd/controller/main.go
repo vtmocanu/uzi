@@ -35,7 +35,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := apiclient.New(cfg.APIBaseURL, cfg.Token, cfg.HTTPTimeout)
+	client := apiclient.New(cfg.APIBaseURL, cfg.Token, cfg.HTTPTimeout, cfg.APICAPool)
 
 	// M1 ships the protocol and the loop; the kube client is M3's. Until then the
 	// controller reconciles against a materializer that touches no cluster, so this
@@ -45,6 +45,10 @@ func main() {
 
 	log.Info("controller starting",
 		"api_base_url", cfg.APIBaseURL,
+		// The hop's posture, at a glance, in the first line of the log: this is the
+		// connection that carries join tokens across the pod network, and "is it
+		// actually verifying a CA" should not require reading the env to answer.
+		"api_ca_pinned", cfg.APICAPool != nil,
 		"poll_interval", cfg.PollInterval.String())
 	loop.Run(ctx)
 	log.Info("controller stopped")

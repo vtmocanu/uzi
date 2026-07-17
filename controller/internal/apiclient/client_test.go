@@ -2,6 +2,7 @@ package apiclient
 
 import (
 	"context"
+	"crypto/x509"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +24,7 @@ func TestPollSendsBearerOnAGetAndParsesDesiredState(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := New(srv.URL, "the-token", 5*time.Second).Poll(context.Background())
+	resp, err := New(srv.URL, "the-token", 5*time.Second, nil).Poll(context.Background())
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
@@ -57,7 +58,7 @@ func TestPollTreatsNon200AsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := New(srv.URL, "wrong", 5*time.Second).Poll(context.Background())
+	resp, err := New(srv.URL, "wrong", 5*time.Second, nil).Poll(context.Background())
 	if err == nil {
 		t.Fatal("want an error on 401")
 	}
@@ -78,11 +79,52 @@ func TestPollDecodeErrorDoesNotLeakTheBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := New(srv.URL, "t", 5*time.Second).Poll(context.Background())
+	_, err := New(srv.URL, "t", 5*time.Second, nil).Poll(context.Background())
 	if err == nil {
 		t.Fatal("want a decode error")
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("decode error leaked the token plaintext: %v", err)
+	}
+}
+
+// The hop that matters: a real TLS handshake against a certificate signed by a CA
+// the system does not trust, verified through the pool the controller mounts.
+//
+// httptest's TLS server generates its own certificate and hands it back via
+// srv.Certificate(), which stands in for cert-manager's leaf; feeding it to the
+// pool is exactly what the chart does with the CA it mounts.
+func TestPollVerifiesTheAPICertificateAgainstTheGivenCA(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"workers":[]}`)
+	}))
+	defer srv.Close()
+
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+
+	if _, err := New(srv.URL, "tok", 5*time.Second, pool).Poll(context.Background()); err != nil {
+		t.Fatalf("Poll over TLS with the issuing CA pooled: %v", err)
+	}
+}
+
+// The other half of the same claim: without the CA, the handshake FAILS. A client
+// that silently accepted the peer would make the encryption theatre — this hop's
+// responses carry a decrypted forge PAT and Anthropic token.
+func TestPollRefusesAnAPICertificateItCannotVerify(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"workers":[]}`)
+	}))
+	defer srv.Close()
+
+	// An empty pool: a well-formed trust anchor set that simply does not contain
+	// this server's issuer. nil would fall back to the system roots, which reject it
+	// too but for a less specific reason.
+	_, err := New(srv.URL, "tok", 5*time.Second, x509.NewCertPool()).Poll(context.Background())
+	if err == nil {
+		t.Fatal("Poll: want a certificate verification failure, got nil (the client trusted an unverifiable api)")
+	}
+	if !strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("Poll error = %v, want a certificate verification failure", err)
 	}
 }
