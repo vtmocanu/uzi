@@ -240,7 +240,7 @@ export function Dashboard() {
             <Step
               done={data.hasForge}
               index={2}
-              title="Connect your GitLab bot"
+              title="Connect your bot"
               hint="A bot PAT with the api scope lets uzi see and move your issues."
               to="/settings/forge"
               cta="Forge"

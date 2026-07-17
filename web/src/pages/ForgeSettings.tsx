@@ -12,7 +12,13 @@ import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Sel
 import { SettingsShell } from "../components/SettingsShell";
 import { BranchIcon } from "../components/icons";
 
-const BOT_SETUP_DOC = "/docs/gitlab-bot-setup";
+// botSetupDoc is the in-app bot-setup guide for a forge (PRD #65 M6b). Each forge
+// has its own guide (both audience: user); the over-privilege violation card links
+// to the one for the forge the user is connecting, not always GitLab's. gitlab (and
+// any unknown/absent type — the only kind pre-M6b) keeps the exact GitLab path.
+function botSetupDoc(forgeType: string): string {
+  return forgeType === "forgejo" ? "/docs/forgejo-bot-setup" : "/docs/gitlab-bot-setup";
+}
 
 export function ForgeSettings() {
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
@@ -47,8 +53,9 @@ export function ForgeSettings() {
       setAllowedUrls(cfg.allowed_base_urls);
       setBaseUrl((prev) => prev || cfg.allowed_base_urls[0] || "");
       setForgeTypes(cfg.forge_types);
-      // Default the selection to the first advertised type (gitlab today), so a
-      // single-type config sends forge_type: "gitlab" exactly as the form does now.
+      // The selection defaults to gitlab (the useState seed above), so a single-type
+      // config sends forge_type: "gitlab" exactly as the form does now. Once the user
+      // opens the picker (only shown when >1 type is advertised) their choice wins.
       setForgeType((prev) => prev || cfg.forge_types[0] || "gitlab");
       setConnections(conns.connections);
       setUsernameDrafts(
@@ -168,7 +175,7 @@ export function ForgeSettings() {
   };
 
   return (
-    <SettingsShell description="Connect the GitLab bot account uzi acts through.">
+    <SettingsShell description="Connect the bot account uzi acts through.">
       {error && <Alert message={error} />}
       {connectViolations && (
         <Card className="border-danger/40 bg-danger/5">
@@ -181,7 +188,7 @@ export function ForgeSettings() {
           <p className="mt-3 text-sm text-muted">
             Mint a least-privilege token (scope <code className="rounded bg-raised px-1 py-0.5 text-fg">api</code> only,
             non-admin bot) — see the{" "}
-            <Link to={BOT_SETUP_DOC} className="text-brand hover:underline">
+            <Link to={botSetupDoc(forgeType)} className="text-brand hover:underline">
               bot setup guide
             </Link>
             .
