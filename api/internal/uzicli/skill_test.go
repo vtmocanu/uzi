@@ -106,10 +106,10 @@ func TestSkillInstallPreservesUserEdit(t *testing.T) {
 	}
 }
 
-// A stale on-disk skill (old content) is rewritten to the embedded one; because
-// the content differs from what we last wrote, it is NOT flagged as an edit only
-// when a sidecar recorded it — here there is no sidecar match, so it is treated as
-// a genuine prior write and rewritten cleanly.
+// A stale on-disk skill (old content, with a sidecar recording that same old
+// content) is rewritten to the embedded skill WITHOUT a .bak. The sidecar hash
+// matches the on-disk hash, so the file is recognised as our own prior write —
+// stale, not a user edit — and is refreshed cleanly with no backup.
 func TestSkillInstallRewritesStaleContent(t *testing.T) {
 	home := t.TempDir()
 	dir := filepath.Join(home, ".claude", "skills", "uzi-cli")

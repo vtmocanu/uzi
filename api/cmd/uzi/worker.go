@@ -6,7 +6,7 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// newWorkerCmd — `uzi worker`. list is wired; rm is a stub (M7). There is no
+// newWorkerCmd — `uzi worker`. list and rm are both wired. There is no
 // `create`: minting a join token is a webui action (it returns a credential
 // that reads decrypted secrets), so it stays cookie-only (Decision 18).
 func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
