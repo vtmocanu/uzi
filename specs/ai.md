@@ -216,8 +216,15 @@ users(
 - **Rotating `UZI_SECRET_KEY` invalidates every stored secret** — forge bot
   PATs and per-user Anthropic tokens alike; no re-encrypt path in MVP, so each
   user reconnects/re-pastes. Accepted (see §17, §29).
-- **Forgejo label-swap atomicity** is GitLab-only; single-column enforcement is
-  best-effort on any future non-GitLab driver (see §16, §20).
+- **Forgejo label writes use a full-set replace (`PUT …/issues/{index}/labels`)**,
+  not GitLab's `add_labels`/`remove_labels` delta, so uzi computes the target set
+  client-side (read-modify-write) and an UNRELATED label a human adds in the ~1-RTT
+  window is silently dropped by the PUT (no ETag/If-Match to close it). Accepted:
+  narrow window, self-corrects at the next sync (not the human's lost label); uzi
+  no-ops when the target set already equals current (D3, §276). **Single-column
+  enforcement is ATOMIC on BOTH forges** — the earlier claim here ("atomicity is
+  GitLab-only; best-effort on any non-GitLab driver") was **FALSE and is corrected**
+  (2026-07-17, PRD #65, evidence in §16/§276).
 - **Move-to-Closed is unsupported** from the board; closing/reopening stays on the
   forge (see §20).
 - **Untrusted-markdown remote images** in the run view load loopback-only; a remote
@@ -256,10 +263,22 @@ issues the bot has rights to".
   (`redact.go`) scrubs the PAT and any `Authorization`/`PRIVATE-TOKEN` value from
   every returned error before it can reach a log or response (redaction unit test
   required and present).
-- **Forgejo** deferred: interface, schema (`forge_type`), and UI copy stay
-  forge-neutral. Forgejo has no atomic add+remove label call, so
-  `UpdateIssueLabels` would be non-atomic and single-column enforcement
-  best-effort there.
+- **Forgejo** is now a **shipped second driver** (`forgejo.go`, PRD #65 — full
+  detail §276), at full parity behind this same interface; no call site changed.
+  - **CORRECTION (2026-07-17, PRD #65).** The note that stood here for months —
+    *"Forgejo has no atomic add+remove label call, so `UpdateIssueLabels` would be
+    non-atomic and single-column enforcement best-effort there"* — was **FALSE**, and
+    it was the recorded blocker that deferred this feasible work (why PRD #65 exists).
+    Evidence: Forgejo's `PUT /repos/{owner}/{repo}/issues/{index}/labels` runs its
+    label diff inside a DB transaction (`models/issues/issue_label.go`
+    `ReplaceIssueLabels` → `db.TxContext`; route `routers/api/v1/api.go`), so
+    **single-column enforcement is ATOMIC on Forgejo too** — by a different mechanism
+    than GitLab's `add_labels`/`remove_labels` delta, but atomic.
+  - **Nuance (not a break of the invariant):** the single PUT is atomic server-side,
+    but uzi computes the target set client-side (`current − remove + add`), a
+    read-modify-write, so an UNRELATED label added by a human in the ~1-RTT window is
+    lost. That is a documented **accepted limitation** (D3, §276/§15), NOT a weakening
+    of single-column enforcement.
 
 ## 17. Bot PAT encryption at rest
 
@@ -1903,8 +1922,9 @@ Serves human Feature #24; extends the forge seam (§16) and runtime schema (§37
 - **Forge interface grows `GetMergeRequest(ctx, projectID, mrIID) (MergeRequest,
   error)`** with a neutral `MergeRequest{IID, State, WebURL}` type. `State` is one
   of the `MRState*` constants (`opened|closed|merged|locked`, as GitLab reports on
-  the single-MR GET — distinguishable from the multi-MR list). GitLab driver only
-  (Forgejo still deferred, §16); read-only; errors pass the existing PAT-scrubbing
+  the single-MR GET — distinguishable from the multi-MR list). GitLab driver only at
+  the time; **the Forgejo driver now implements it too** (PRD #65, §276); read-only;
+  errors pass the existing PAT-scrubbing
   redactor (§16). `IsKnownMRState` gates recording (§91).
 - **Migration `00029`** (`ALTER TABLE runs ADD COLUMN mr_state text`; reversible;
   no backfill). Reserved slot in the goose ledger (`00021` head, `00030+` PRD #5,
@@ -2345,8 +2365,9 @@ Serves human: "can uzi verify the glpat does not have more permissions than need
 for an MR — per repo, at save, and afterwards?" (plan.md line 48); primary directive
 (agents must not modify main).
 
-- **Three neutral-domain `Forge` methods** (GitLab driver only, same discipline as
-  the existing methods; Forgejo still deferred, §16): `TokenInfo`
+- **Three neutral-domain `Forge` methods** (GitLab driver only at the time, same
+  discipline as the existing methods; **the Forgejo driver now implements all three**,
+  PRD #65, §276 — per-forge scope set + branch-read mapping): `TokenInfo`
   (`GET /personal_access_tokens/self` — scopes/active/expiry), `ProjectRole`
   (`GET /projects/:id/members/all/:user_id` — **effective** direct-or-inherited
   access level, 404 = not a member), `DefaultBranchProtection`
@@ -7144,3 +7165,229 @@ Serves human: as §264. Recorded because the honest inventory is part of the con
   - **An in-cluster nix substituter** (nix-serve or a Harbor-backed mirror) is the right v2 answer to
     the 10m53s per-worker store fetch — it keeps per-worker isolation while turning an internet fetch
     into a LAN one (§267).
+
+---
+
+# PRD #65 — Forgejo support (the second forge driver)
+
+Serves human Feature #2 ("forge-generic design, GitLab first, Forgejo later"). PRD at
+`prds/65-forgejo-support.md` (Decision Log D1–D11 is the provenance record). This PRD
+lands the second driver at full parity and corrects the false blocker that deferred it
+(see §16/§15). **Every milestone lands dark**: until M6b flips the handler gate, a
+`forgejo` connection is unreachable, and **no run is refused and no save is rejected**
+that would have succeeded before — on either forge. The one non-blocking observable is a
+`privilege_status` OK→Violations badge flip on the narrow GitLab population whose
+*protected* `main` lets the write role merge (D6a-1); nothing gates on `privilege_status`
+(lead-verified: only the handler DTO, privcheck, and store read it).
+
+## 276. Second `forgejo.go` driver behind the existing `Forge` interface, full parity (D1/D2)
+
+Serves human: "forge-generic design, GitLab first, Forgejo later".
+
+- **`api/internal/forge/forgejo.go`** is the second driver behind the same `Forge`
+  interface; **no Go call site changed** — `ForgeForConnection` already threads
+  `forge_type` through every one. Two drivers is not a pattern: **no third driver, no
+  plugin/registry** (out of scope). `gitlab.go` stays the only other driver.
+- **Terminology stays internal (D2, user, overruling the architect).** Go types, DB
+  columns (`mr_iid`, `mr_state`), and the REST API keep `MergeRequest`/`IID` — no
+  migration, no rename. Forgejo's PR `index` **is** GitLab's `iid` (per-project
+  sequential), so the domain type carries over honestly; only its name is
+  GitLab-flavoured. Only user-visible copy switches per forge (§281).
+- **The blocker that deferred this was false (headline correction, see §16/§15).** It
+  claimed Forgejo could not do atomic single-column label enforcement; it can, via
+  `PUT …/issues/{index}/labels` inside a DB transaction. Corrected 2026-07-17 with
+  evidence.
+- **Migration `00067_forgejo_and_mr_web_url.sql`** carries this PRD's schema (mr_web_url,
+  §281). Number assigned at landing above the live head `00066` (F4); renumber if a
+  sibling lands first.
+
+## 277. Version gate ≥ 16.0.0, in `VerifyToken`, strict semver (D4/D4a)
+
+Serves human: primary directive support (the CI-fix loop needs job logs, first shipped
+in Forgejo 16.0.0) — and D1's "full parity, or the forge is not supported".
+
+- **uzi refuses Forgejo < 16.0.0 at connect** with an error naming the required version.
+  No degraded mode, no `ErrCIUnsupported` sentinel, no version branches in the driver
+  (D4, user, overruling the architect's 15.x-floor-with-degradation proposal). The gate
+  is real but narrow: only `ListPipelineJobs`/`JobLogTail` (the CI-**fix** loop) need 16;
+  `LatestPipeline` alone would work on 15.x.
+- **The gate lives in `VerifyToken`, not driver construction** (`forgejo.go:24`
+  `forgejoMinVersion = "v16.0.0"`). `CreateConnection` surfaces `VerifyToken`'s error
+  verbatim but collapses `New()` errors to a generic "could not initialize" — so a gate
+  in `New()` would never show the user the version. One `/version` call per `VerifyToken`.
+- **Re-checked on the privilege sweep**: an instance that connects at 16.x and later
+  downgrades otherwise hits a bare 404; the sweep re-asserts the version and raises a
+  violation.
+- **Comparison mechanics (D4a): strict semver 2.0.0 via `golang.org/x/mod/semver`.**
+  `semver.IsValid` is the parse gate (unparseable → refuse); `semver.Compare(v, floor)`.
+  Forgejo strips the leading `v` that x/mod requires, so the driver re-prepends
+  (`"v" + strings.TrimPrefix(reported, "v")`). Prerelease ordering intact, **build
+  metadata (`+gitea-1.22.0`) ignored**. Consequence, correct on the merits: a
+  `16.0.0-dev-N` prerelease sorts *below* the release and is **refused** — including
+  codeberg.org, whose `-dev` class spans builds with and without the gating route, so
+  refusing it is right, not a bug. `x/mod` chosen over `Masterminds/semver` /
+  `hashicorp/go-version`: the Go team's own leaf module, and uzi already carries six
+  `golang.org/x/*` modules.
+- **The version gate is a feature gate, never a security control (L2).**
+  `GET /api/v1/version` is public, unauthenticated, self-reported; a hostile instance can
+  claim anything. Failing closed on an unparseable version buys and costs no security —
+  it is purely a failure-mode choice, and refusing beats dying at a 404 mid-run. **Nothing
+  security-relevant may ever hang on it.**
+
+## 278. Client library `code.gitea.io/sdk/gitea` v0.25.1, with two deliberate hand-rolls (D5)
+
+Serves human: the Forgejo driver's wire layer.
+
+- **`code.gitea.io/sdk/gitea` v0.25.1**, NOT `codeberg.org/mvdkleijn/forgejo-sdk` (D5).
+  The forgejo-sdk (v2.2.0, 13 months stale) has no issue timeline and Actions-secrets
+  only; gitea-sdk has `ListIssueTimeline` + the full Actions surface (`GetRepoActionJobLogs`,
+  `ListRepoActionRuns`, `ListRepoActionRunJobs`). Forgejo keeps the `+gitea-1.22.0`
+  compatibility suffix precisely for this. **Not a Gitea compatibility promise** — the SDK
+  is an implementation detail (out of scope).
+- **SDK wart: client-scoped `context`.** `c.ctx` is per-client, not per-request, so a
+  long-lived shared client leaks cancellation. Mitigation: **construct a client per call**
+  over a shared `*http.Client`, and `SetGiteaVersion("")` to skip `NewClient`'s `/version`
+  round-trip. (The earlier data-race worry was false: gitea-sdk mutex-guards `c.ctx`.)
+- **Hand-roll #1 — issue-timeline label events.** gitea-sdk types the timeline entry's
+  `label` field as `[]*Label`, but Forgejo serializes a **single object** (verified live on
+  a 16.0.0 container). The driver hand-parses one object: `body:"1"` → add, `body:""` →
+  remove (`forgejo.go:~753,794`).
+- **Hand-roll #2 — `TokenInfo`.** The SDK's `ListAccessTokens` errors client-side
+  (`"username" not set: only BasicAuth allowed`), a client gate the server does not impose
+  (the GET carries `reqSelfOrAdmin()` only). The driver calls `GET /users/{u}/tokens`
+  directly, sets `Active=true` and `ExpiresAt=zero` (Forgejo returns no expiry), and matches
+  the current token by `token_last_eight` (`forgejo.go:~882`) — one match, else the fail-safe
+  ambiguity warning fires.
+
+## 279. Label writes: full-set replace + accepted lost-update window (D3)
+
+Serves human: "board kept in two-way sync"; single-column board contract.
+
+- **Forgejo's label API is a full-set replace** (`PUT …/issues/{index}/labels`), not
+  GitLab's `add_labels`/`remove_labels` delta. The single PUT is **atomic server-side**
+  (the corrected fact), but uzi computes the target set client-side (`current − remove +
+  add`), and that read is outside the transaction.
+- **Accepted lost-update window (D3, user):** a human's UNRELATED label added in the
+  ~1-RTT window is dropped by the PUT (no ETag/If-Match). Narrow, rare, self-corrects at
+  the next sync (not the human's lost label). Mitigations: read immediately before the PUT;
+  **no-op entirely when target set already equals current** (a no-change card move issues
+  zero PUTs); documented in `docs/forgejo-bot-setup.md`.
+- **The single-column invariant is NOT weakened** — atomic on both forges by different
+  mechanisms. Rejected: Forgejo exclusive scoped labels (would enforce single-column
+  server-side with no read-modify-write, but fork the board's label contract per forge; no
+  free GitLab equivalent). Recorded as the escape hatch if collateral loss proves painful.
+
+## 280. Guardrails on both drivers: branch-read, per-forge scopes, `Role` enum; merge finding = Violation (D6/D6a/D6a-1/D6b/D7)
+
+Serves human Feature #5 (PAT least-privilege) and the primary directive ("an agent can
+only ever open an MR"). **Enforcement of the merge finding is PRD #66** — this PRD reports,
+it does not refuse.
+
+- **Every PRD #5 check maps to Forgejo or the connection is refused (D6).** The original
+  mapping was unsafe — three rows read `branch_protections/{name}` (route group gated
+  `reqAdmin()`), which a `write` bot 403s on, degrading to a warning forever. **Corrected**
+  to a single `GET /repos/{o}/{r}/branches/{branch}` (readable by a write bot), returning
+  `protected`, `user_can_push`, `user_can_merge` **computed for the calling bot** by the same
+  path the pre-receive hook enforces. That is a direct authoritative answer, better than
+  GitLab's inference, and moots the glob/name-match class of bugs.
+- **`BranchProtection` gained `WriteRoleCanMerge` + `BotCanMerge` on both drivers (D6a-1,
+  user).** Forgejo maps both from the branch read (free); GitLab reads `merge_access_levels`
+  (defaults to Maintainer, but configurable — "safe by default is not safe"). uzi previously
+  modelled merge on **neither** forge and delegated the guarantee to a doc sentence true on
+  GitLab by luck of defaults and **false on Forgejo** (a default `write` bot can merge its own
+  PR into protected `main`).
+- **The merge finding is a per-repo `Violation`, not a `Warning`** (D6a-1 tier ruling, user,
+  overruling M3's initial Warning): `privcheck/checker.go:205-206` appends "the write role may
+  merge into protected …" to `RepoReport.Violations`, the **same tier as its push sibling**.
+  Non-blocking is a property of per-repo Violations already (PRD #5), so preserving "reported,
+  not blocking" needs no severity downgrade. **#66 must consume these through
+  `evaluateRepo`/a shared `Protected`-first predicate, never a raw `if bp.BotCanMerge`** — on
+  an unprotected Forgejo branch the fields are bot-scoped and read `false,false` for a
+  non-write bot, so the `Protected`-first check is load-bearing, not belt-and-suspenders (the
+  drivers scope `WriteRoleCan*` differently: GitLab = "any principal at write level,"
+  hardcoded `true,true` on unprotected; Forgejo = the calling bot's rights).
+- **Per-forge required token scope set (D6b, user), keeping "exactly N" semantics.** GitLab:
+  exactly `{api}`. Forgejo: exactly `{write:repository, write:issue, read:user}`
+  (`privcheck/checker.go:262 requiredScopesFor`) — PRs + the worker's HTTPS branch push live
+  under `write:repository`, the board under `write:issue`, token/identity introspection under
+  `read:user`. Verified sufficient **and** minimal (Actions runs/jobs/logs sit inside the repo
+  group — no extra Actions scope). **Compare as an unordered set, never a string**: Forgejo
+  re-emits scopes in canonical order at mint time and collapses a full `write:*` run to the
+  literal `all` — the god-mode token is rejected by matching `["all"]`, not by expanding it.
+- **`Role` enum (D7).** `forge.go` `Role` is forge-neutral (`none|read|write|admin|owner`);
+  `ProjectRole` returns the bot's effective role + membership. GitLab maps numeric access
+  levels; Forgejo maps `permission` strings. A non-write bot is flagged by `ProjectRole`
+  independently of the branch fields.
+- uzi never **creates** branch protection (needs admin, out of scope), and blocks on no
+  principal but the bot's PAT — a write **deploy key** can push to protected `main` invisibly
+  and uzi provisions none; the docs say "the bot's PAT cannot," not "nothing can."
+
+## 281. MR web URL persisted, per-forge UI copy, and the pipeline-status classifier (D8 + D2-web + Feature #6)
+
+Serves human Feature #2 (board), #6 (CI status), #12 (MR link on card), D2 (per-forge copy).
+
+- **`mr_web_url` (D8): the driver already receives the MR/PR web URL and used to discard it.**
+  Migration `00067` adds the column; the driver persists it end-to-end, so the web no longer
+  reconstructs `/-/merge_requests/N` by string surgery from the issue URL
+  (`web/src/lib/forgeUrls.ts`) — a GitLab-only assumption that breaks on Forgejo's
+  `/pulls/N` path.
+- **`forge_type` reaches the web per card/run (D2).** The board/repo queries already
+  `SELECT c.forge_type` (cards got it free), but the **standalone run surfaces** did not:
+  `ListRunsForUser`/`ListActiveRunsAll` gained a `JOIN forge_connections … + c.forge_type`,
+  and the run-detail path got a new `GetForgeTypeForRepo :one` resolved from `repo_id` (rather
+  than widening `GetRunByID*`'s bare `SELECT *` rows). The "no query change anywhere" claim was
+  an overgeneralization — run parity cost three queries + a helper.
+- **One `forgeNoun(forgeType)` helper is the only mapping site** (`web/src/lib/forgeNoun.ts`):
+  `gitlab → "Merge Request"`, `forgejo → "Pull Request"`, everything else/empty/null →
+  "Merge Request" (safe default). Sibling helpers `forgeNounLower`/`forgeNounSentence`/
+  `forgePlatform`/`mrAbbrev`/`mrRefSymbol`. Acceptance: exactly one non-test hit for
+  `"Merge Request"` in `web/src`. **`slacksvc/notifier.go` carries the same mapping in Go** —
+  an unavoidable second copy across the language boundary. **Shared/forge-less chrome names
+  both ("merge request / pull request") or restructures past the noun — never defaults to one
+  forge's word** (that would reintroduce GitLab's term wearing a neutral label).
+- **The pipeline badge stays forge-blind.** `forge_type` reaching the web does not license
+  keying the badge off it — one merged status map, no per-forge drift.
+- **`api/internal/pipelinestatus` — a Go classifier** normalizes each forge's raw pipeline/
+  Actions status into uzi's neutral badge state, so the badge map has one source. Forgejo's
+  Actions runs/jobs report a single raw enum (`success|failure|cancelled|…`) with no
+  GitHub-style status/conclusion split; the classifier folds both forges into the shared set.
+
+## 282. Worker forge seam: per-forge REST driver keyed on the claim's `forge_type` (D9)
+
+Serves human Feature #4 (the worker opens the MR) at parity across forges.
+
+- **The worker held a second, unabstracted GitLab client** (`agent/src/gitlab.ts`, hardcoded
+  `/api/v4/…/merge_requests` + `PRIVATE-TOKEN`) — the forge abstraction was Go-side only, and
+  the worker could not know which forge it was talking to (`ClaimRepo` carried no `forge_type`).
+- **`agent/src/forge.ts` is the new seam.** Two REST drivers: GitLab (`/api/v4`,
+  `PRIVATE-TOKEN` header) and Forgejo (`/api/v1`, `Authorization: token` header; PRs modelled
+  as issues-with-`pull_request`). `forgeClientFor(forgeType)` picks the driver from the claim's
+  `forge_type` (**absent ⇒ gitlab**, R8 back-compat). The claim wire contract now carries
+  `forge_type` so the worker no longer string-parses the web URL to guess the forge.
+
+## 283. Connect picker, save-time validation, and the e2e db-flip lane (D11 + D10/D10a)
+
+Serves human Feature #2 (connect a forge) and the testing-credentials policy.
+
+- **Connect picker (D11):** the Settings → connect flow lets the user pick the forge type
+  (gitlab | forgejo). M6b flips `CreateConnection`'s non-gitlab rejection so a `forgejo`
+  connection can be saved; the forge-less connect copy names both forges.
+- **Save-time validation surfaced at connect:** `POST forge_type:"forgejo"` succeeds for a
+  good ≥16 instance and **refuses** a `< 16.0.0` instance (D4 version gate) or a wrong scope
+  set (D6b), both unit-tested in `forgejo_test.go`/`checker_test.go`.
+- **e2e (D10/D10a): validated against a pinned ephemeral `forgejo/forgejo:16.0.0` container,
+  not the self-hosted instance** — so **no human upgrade gates anything** (supersedes R2's
+  original human-owned dependency). The `forge-fake` route table mirrors the driver's actual
+  wire quirks (single-object timeline label; token payload with `token_last_eight`+`scopes`,
+  no `expires_at`; version string `16.0.0+gitea-1.22.0`; Actions runs as
+  `{total_count, workflow_runs:[…]}` ordered id-DESC; branch read computed for the caller).
+  M9 got a forgejo connection into its throwaway DB by boot-sealing as gitlab then
+  `UPDATE forge_connections SET forge_type='forgejo'` (the connect POST path itself is
+  M6b's to validate, since M9 runs before the gate flip).
+- **Live-runner validation deferred (D10a, user: no runner environment).** M9's CI-fix lane is
+  validated by fixtures; the one claim fixtures cannot prove — that `LatestPipeline`/
+  `LatestMRPipeline` take `runs[0]` as newest because Forgejo returns Actions runs **id-DESC**
+  (server behaviour, not in the SDK/swagger) — is a documented deferred check, not
+  assumed-covered. Runs are enqueue-able without a runner (a push to a repo with a
+  `.forgejo/workflows/` file enqueues a queued run), so this is verifiable at rollout despite
+  the deferred runner.
