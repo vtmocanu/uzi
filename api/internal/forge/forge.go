@@ -31,15 +31,16 @@ var ErrNoPipeline = errors.New("forge: no pipeline for ref")
 // forge server is older than the driver's minimum supported version (Forgejo <
 // 16.0.0, D4 — the CI-fix loop's job-logs route first ships in 16.0.0). The
 // wrapping error names the reported and required versions so it stays actionable
-// when surfaced verbatim at connect; this sentinel lets the privilege sweep
-// errors.Is it and raise a distinct "downgraded below the required version"
-// finding instead of the generic "could not verify token" (a re-run of VerifyToken
-// on the periodic sweep re-fires the gate automatically). It carries no secret
-// material. The version gate is a FEATURE gate, never a security control (D4 L2):
-// GET /version is public, unauthenticated and self-reported, so nothing
-// security-relevant may hang on it. GitLab has no version floor and never returns
-// this; it lives here because the sentinel is part of the driver contract, not one
-// driver's implementation.
+// when surfaced verbatim at connect. A re-run of VerifyToken on the periodic
+// privilege sweep re-fires the gate automatically; today a downgrade surfaces
+// there as the sweep's generic StatusError report (fail-safe — flagged, not
+// silently OK). This sentinel exists so a privcheck consumer can errors.Is it and
+// give a downgrade its own distinct finding — that consumer is not wired yet. It
+// carries no secret material. The version gate is a FEATURE gate, never a security
+// control (D4 L2): GET /version is public, unauthenticated and self-reported, so
+// nothing security-relevant may hang on it. GitLab has no version floor and never
+// returns this; it lives here because the sentinel is part of the driver contract,
+// not one driver's implementation.
 var ErrForgeVersionUnsupported = errors.New("forge: server version is older than this driver's minimum")
 
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
@@ -123,8 +124,11 @@ type TokenInfo struct {
 // the most dangerous branch in the repo as "cannot push, cannot merge". A
 // consumer that reads those three without checking Protected first would invert
 // its guardrail on exactly the worst case — so drivers report what is true of the
-// branch, never what was convenient to skip (the GitLab 404 arm and the Forgejo
-// unprotected early-return both set these two CanPush/CanMerge fields true). See
+// branch, never what was convenient to skip (the GitLab 404 arm hardcodes these
+// two CanPush/CanMerge fields true; the Forgejo unprotected early-return returns
+// them true for the supported write-bot config — its user_can_* are bot-scoped, so
+// a non-write bot, already a ProjectRole finding, reads false there, but the
+// Protected-first guard fires "not protected" regardless). See
 // TestDefaultBranchProtectionUnprotectedIsNotSafe and its Forgejo twin, which fail
 // if either driver reverts to the zero value there.
 //

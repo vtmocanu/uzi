@@ -726,6 +726,10 @@ func TestForgejoErrorsAreRedacted(t *testing.T) {
 // TestCheckForgejoVersion unit-tests the gate helper directly, independent of the
 // HTTP round-trip, so the D4a comparison semantics are pinned in isolation.
 func TestCheckForgejoVersion(t *testing.T) {
+	f, err := newForgejo("https://example.test", "unused-token-placeholder", time.Second)
+	if err != nil {
+		t.Fatalf("newForgejo: %v", err)
+	}
 	for _, tc := range []struct {
 		reported string
 		wantErr  bool
@@ -740,12 +744,36 @@ func TestCheckForgejoVersion(t *testing.T) {
 		{"32363b81+gitea-1.22.0", true},
 		{"", true},
 	} {
-		err := checkForgejoVersion(tc.reported)
+		err := f.checkForgejoVersion(tc.reported)
 		if (err != nil) != tc.wantErr {
 			t.Errorf("checkForgejoVersion(%q): err=%v, wantErr=%v", tc.reported, err, tc.wantErr)
 		}
 		if err != nil && !errors.Is(err, ErrForgeVersionUnsupported) {
 			t.Errorf("checkForgejoVersion(%q) must wrap ErrForgeVersionUnsupported, got %q", tc.reported, err.Error())
 		}
+	}
+}
+
+// TestForgejoVersionStringRedacted covers the auditor's defense-in-depth point:
+// the /version string is the server's self-reported, UNTRUSTED value. A hostile
+// instance that holds the PAT could reflect it into the version field; the
+// unparseable refusal must not leak it. Asserts the token is scrubbed from the
+// error while the sentinel and its errors.Is still survive.
+func TestForgejoVersionStringRedacted(t *testing.T) {
+	const token = "forgejo-token-reflected-into-version-0123456789"
+	m := newMockForgejo(t, map[string]http.HandlerFunc{
+		"/version": versionHandler(token), // {"version":"<token>"}
+	})
+	d := newForgejoDriver(t, m, token)
+
+	_, err := d.VerifyToken(context.Background())
+	if err == nil {
+		t.Fatal("a token-as-version string is unparseable and must be refused")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("the untrusted version string leaked the PAT: %q", err.Error())
+	}
+	if !errors.Is(err, ErrForgeVersionUnsupported) {
+		t.Errorf("refusal must still wrap ErrForgeVersionUnsupported, got %q", err.Error())
 	}
 }

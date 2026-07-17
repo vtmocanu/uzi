@@ -140,7 +140,7 @@ func (f *forgejo) VerifyToken(ctx context.Context) (BotIdentity, error) {
 	if err != nil {
 		return BotIdentity{}, f.redact.error(fmt.Errorf("forgejo: read server version: %w", err))
 	}
-	if err := checkForgejoVersion(raw); err != nil {
+	if err := f.checkForgejoVersion(raw); err != nil {
 		return BotIdentity{}, err
 	}
 	u, _, err := c.GetMyUserInfo()
@@ -158,18 +158,25 @@ func (f *forgejo) VerifyToken(ctx context.Context) (BotIdentity, error) {
 // comparison (SemVer §10) and a prerelease (-dev-N) sorts below the release and
 // is refused (§11.3). An unparseable version refuses: the gate is a feature gate
 // (buys and costs no security, D4 L2), so refusing is purely the safer failure
-// mode — one clear error at connect beats a bare 404 mid-run. The returned error
-// names the required version and carries no secret, so it is not redacted; it
-// wraps ErrForgeVersionUnsupported so the privilege sweep can errors.Is it and
-// raise a distinct downgrade finding.
-func checkForgejoVersion(reported string) error {
+// mode — one clear error at connect beats a bare 404 mid-run.
+//
+// The error wraps ErrForgeVersionUnsupported (so a privcheck consumer can
+// errors.Is it — see that sentinel's doc) and is NOT routed through redact.error,
+// which would sever the Unwrap chain that errors.Is walks. But the reported
+// version is the server's self-reported, UNTRUSTED string, so the interpolated
+// value alone is scrubbed with the value-based string redactor: a hostile instance
+// that holds the PAT and reflects it into /version (`{"version":"<token>"}` →
+// unparseable → refused) cannot leak it through this error.
+func (f *forgejo) checkForgejoVersion(reported string) error {
 	min := strings.TrimPrefix(forgejoMinVersion, "v")
+	// Parse from the raw value; interpolate only the scrubbed value into the message.
 	v := "v" + strings.TrimPrefix(strings.TrimSpace(reported), "v")
+	safe := f.redact.string(reported)
 	if !semver.IsValid(v) {
-		return fmt.Errorf("forgejo: server reports an unrecognized version %q; uzi requires Forgejo %s or newer: %w", reported, min, ErrForgeVersionUnsupported)
+		return fmt.Errorf("forgejo: server reports an unrecognized version %q; uzi requires Forgejo %s or newer: %w", safe, min, ErrForgeVersionUnsupported)
 	}
 	if semver.Compare(v, forgejoMinVersion) < 0 {
-		return fmt.Errorf("forgejo: server version %q is below the required Forgejo %s: %w", reported, min, ErrForgeVersionUnsupported)
+		return fmt.Errorf("forgejo: server version %q is below the required Forgejo %s: %w", safe, min, ErrForgeVersionUnsupported)
 	}
 	return nil
 }
