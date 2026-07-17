@@ -45,6 +45,36 @@ On Kubernetes the Helm chart wires all of this from `api.tls.*` (certificate inc
 
 There is no CORS configuration to make, by design: nginx serves the SPA and proxies `/api/*` to the API on the same origin (see [ARCHITECTURE.md](../ARCHITECTURE.md)), so the browser never makes a cross-origin request.
 
+## Hosted k8s workers (PRD #58)
+
+k8s-only: nothing here applies to compose, and every variable below is set by the Helm chart, not hand-edited — this table exists for completeness and for anyone reading the chart's rendered env. See [Hosted workers](hosted-workers.md) for the user-facing feature, [Admin settings](admin-settings.md#hosted-worker-quota) for the per-user quota, and [deploy/README.md](../deploy/README.md#hosted-workers-prd-58) for the operator rollout runbook (turning it on, rotating the controller token, and the residuals that are only proven on a real cluster).
+
+### `api`
+
+| Var | Default | Notes |
+|---|---|---|
+| `WORKER_HOSTING_ENABLED` | `false` | The feature gate. `true` requires `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` to also be set, or the api refuses to boot — enabling hosting with no way to authenticate a controller would be a silent no-op, and this is a security control rather than a tuning knob, so a malformed value also refuses to start. |
+| `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` | — | The sha256 (hex) of the controller's bearer credential, generated once with `openssl rand -base64 32` and hashed. Setting this while `WORKER_HOSTING_ENABLED` is `false` also refuses to boot — a hash with nothing to gate it is a stray credential the api would silently ignore. |
+| `WORKER_HOSTING_PENDING_TOKEN_TTL` | `1h` | How long a hosted worker's join token may sit sealed in Postgres, undelivered, before the expiry sweep destroys it. Read regardless of `WORKER_HOSTING_ENABLED`, so a stack that provisioned workers and then turned hosting off doesn't strand ciphertext. `0` disables the sweep — an undelivered token then stays sealed under `UZI_SECRET_KEY` indefinitely; see [vault-threat-model.md](vault-threat-model.md#hosted-worker-join-tokens-prd-58). |
+
+### `controller`
+
+A new component, one per deployment, the only thing in uzi holding a kube-API credential:
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_API_URL` | — (required) | The api's base URL, as the controller itself dials it (the release namespace's short Service name is fine here). |
+| `UZI_CONTROLLER_TOKEN_FILE` | — (required) | Path to the controller's own bearer credential, file-mounted like the worker's join token and for the same reason: an env-borne secret is readable via `/proc/<pid>/environ`. |
+| `UZI_API_CA_FILE` | — (optional) | PEM bundle to verify the api's TLS certificate against, pinned exclusively (not additive to the system roots). Required in practice whenever `UZI_API_URL` is `https://`. |
+| `UZI_WORKER_NAMESPACE` | — (required) | The dedicated namespace hosted workers render into — empty of everything else by design (see [ARCHITECTURE.md](../ARCHITECTURE.md#worker-controller-k8s-only)). |
+| `UZI_WORKER_SERVICE_ACCOUNT` | — (required) | The workers' own zero-permission ServiceAccount (no token automount). |
+| `UZI_WORKER_IMAGE_REPO` | — (required) | Registry prefix the per-template agent images live under; the controller appends `/agent-<template>:<tag>`. |
+| `UZI_WORKER_IMAGE_TAG` | — (required) | The release tag to run. Lives here, not on the api — the api never learns an image tag (Decision 1/7 in the PRD). Changing it rolls every hosted worker onto the new release once each holds no non-terminal run. |
+| `UZI_WORKER_API_URL` | — (required) | The FQDN a **worker** dials — necessarily the full cluster-DNS name, since a short Service name doesn't resolve cross-namespace. Deliberately separate from `UZI_API_URL` above. |
+| `UZI_WORKER_STORAGE_CLASS` | *(cluster default)* | StorageClass for a hosted worker's PVCs. |
+| `CONTROLLER_POLL_INTERVAL` | `10s` | How often the controller fetches desired state and reconciles the fleet. The controller is stateless, so a restart loses nothing between polls. |
+| `CONTROLLER_HTTP_TIMEOUT` | `15s` | Per-call timeout on every request to the api. |
+
 ## Forge integration
 
 See [gitlab-bot-setup.md](gitlab-bot-setup.md) for the bot-account procedure these variables support.

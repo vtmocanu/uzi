@@ -50,6 +50,21 @@ the connected repo it targets, and its interval (default `48h`). Unlike the
 run judge, enabling this spends **the enabling admin's own token** on a
 standing basis — see the linked doc for what that means before turning it on.
 
+## Hosted worker quota
+
+On a k8s deployment with [hosted workers](./hosted-workers.md) turned on, a
+single setting bounds self-service provisioning:
+
+| Setting | Default | Controls |
+|---|---|---|
+| Hosted worker quota | 2 | Max hosted workers any one user may hold at once. `0` disables self-service entirely — the provision card disappears for everyone, but nobody's existing hosted workers are touched or hidden. |
+
+Every size counts the same 1 against this quota; see
+[Hosted workers](./hosted-workers.md#type-and-size). This setting exists (and
+is editable) on every instance, including compose ones — it's simply inert
+there, since hosting itself is off unless an admin turns it on for the
+deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
+
 ## Run health
 
 uzi can flag a run that looks slow, stuck, or looping — see

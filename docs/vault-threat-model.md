@@ -90,6 +90,39 @@ this fits into the OIDC login flow.
    that each pod must be unlocked independently. Do **not** replicate DEKs across
    pods.
 
+## Hosted worker join tokens (PRD #58)
+
+[Hosted workers](hosted-workers.md) (k8s only) introduce a second secret this
+vault does not touch: the worker's own join token. Two residuals, both
+accepted and bounded rather than closed:
+
+1. **The token is plaintext in etcd for the worker's lifetime.** The
+   controller delivers it as a file-mounted k8s Secret (never an env var —
+   the same `/proc/<pid>/environ` leak class [proc-hardening.md](proc-hardening.md)
+   closes for the worker's own credentials), and a k8s Secret is
+   base64-encoded, not encrypted, at that layer. Anyone who can read it can
+   impersonate that worker: claim its owner's runs, and receive their
+   decrypted forge PAT and Anthropic token in the claim response. Bounded by
+   the worker namespace holding nothing else and the controller's own RBAC
+   being create/delete-only on Secrets (it never reads one back, so a
+   controller compromise cannot harvest the whole fleet's tokens in one
+   call). Per-worker rotation is a future PRD.
+2. **While a token is pending delivery, its sealed copy sits in Postgres
+   under `UZI_SECRET_KEY`** — the very key this vault exists to stop relying
+   on for the Anthropic token. This is temporary: the api destroys the
+   sealed copy the moment the worker actually authenticates with it, proving
+   delivery. `WORKER_HOSTING_PENDING_TOKEN_TTL` (default 1h) bounds the
+   worst case — a controller that never picks the token up (chart not
+   deployed, controller down, hosting disabled mid-flight) — by expiring the
+   buffer instead of leaving it at rest indefinitely. The expiry sweep runs
+   regardless of whether hosting is currently enabled, since a stack that
+   provisioned workers and then turned hosting off is exactly the case that
+   would otherwise strand ciphertext.
+
+See `ARCHITECTURE.md`'s [worker controller](../ARCHITECTURE.md#worker-controller-k8s-only)
+section for the RBAC this leans on, and the PRD's Decision 3 for the full
+reasoning.
+
 ## Operator hardening
 
 For the seed admin, after first boot:

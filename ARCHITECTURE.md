@@ -628,7 +628,10 @@ the design rationale (Decision Log, the compose→chart adaptations) is
   Harbor OCI + these values from the uzi git repo. Public URL
   `https://uzi.example.com` behind ingress-nginx (`*.example.com`
   wildcard TLS). Images + chart are versioned Model B (chart `version` ==
-  `appVersion` == the release git tag; see the runbook).
+  `appVersion` == the release git tag; see the runbook). **Optionally** (PRD
+  #58, off by default — `workers.enabled: false`) a `uzi-controller`
+  Deployment and a dedicated `uzi-workers` namespace it renders hosted worker
+  pods into; see [Worker controller](#worker-controller-k8s-only) below.
 
 **Trust boundaries are unchanged by k8s.** The same three boundaries hold: `web`
 is still the sole entry point (now the ingress → web Service, still same-origin,
@@ -673,26 +676,79 @@ concurrently race the migrations). `Recreate` (not `RollingUpdate`) ensures the
 surge never briefly runs a second pod. The api is documented as
 non-horizontally-scalable this release; `web` is stateless and runs 2 replicas.
 
-**No worker/agent in-cluster (Decision 5).** The per-user worker stays a local,
-opt-in `docker compose --profile agent` process on user machines. There is no
-published worker image; laptop users build from a checkout and point the worker
-at `https://uzi.example.com` (the Bearer join-token flow works through the
-ingress unchanged — this is exactly the remote-worker posture the [worker trust
-boundary](#serverworker-trust-boundary) and [docs/proc-hardening.md](docs/proc-hardening.md)
-anticipate). Running workers server-side is a separate PRD (it interacts with
-PRD #51 uid-split), noted under [Not yet in scope](#not-yet-in-scope) below.
+**Laptop workers need no published image change.** The per-user worker stays
+available as a local, opt-in `docker compose --profile agent` process on user
+machines, and a laptop worker still points at `https://uzi.example.com`
+and joins through the ingress unchanged (the remote-worker posture the [worker
+trust boundary](#serverworker-trust-boundary) and
+[docs/proc-hardening.md](docs/proc-hardening.md) anticipate). What changed
+under PRD #58: there is now a published worker image too
+(`.../uzi/agent-{base,jvm}:<tag>`, built on every `v*` tag), and an optional
+in-cluster alternative — see the next section.
+
+### Worker controller (k8s only)
+
+**PRD #58** adds one new, deliberately small component: `uzi-controller`, the
+only thing in uzi that ever holds a kube-API credential — `api` holds none and
+must never hold one (the spec constraint this component exists to satisfy).
+Shipped in the chart but **off by default** (`workers.enabled: false`); see
+[docs/hosted-workers.md](docs/hosted-workers.md) for the user-facing feature
+and [deploy/README.md](deploy/README.md#hosted-workers-prd-58) for turning it
+on.
+
+- **Scoped to one empty namespace.** Its ServiceAccount carries a `Role`
+  bound to a dedicated `uzi-workers` namespace containing nothing but hosted
+  worker objects — no CNPG, no other app's Secrets, no privileged
+  ServiceAccounts. A `Role` that can create pods in a namespace can mount any
+  Secret and impersonate any ServiceAccount already there, so the emptiness
+  is what actually bounds a compromised controller, not the RBAC verbs alone.
+  Those verbs are pinned minimal on top: Deployments/PVCs
+  create/list/patch(Deployments only)/delete; Secrets **create/delete
+  only** — no `get`/`list`, so the controller writes each worker's join
+  token once and can never read any token back, including one it didn't
+  create. No pod access at all.
+- **Outbound-only, like a worker.** The controller authenticates to `api`
+  with its own bearer credential and polls a controller-facing endpoint for
+  desired state; there is no inbound port on the controller and `api` never
+  dials it — the same direction of trust as the worker protocol above, just a
+  second, differently-scoped credential.
+- **Stateless.** Desired state lives in Postgres, observed state in the
+  cluster; every poll reconciles the two from scratch, so a controller or api
+  restart loses nothing.
+- **The join token still never rests server-side in plaintext** (Decision 3):
+  `api` seals it as a delivery buffer, the controller writes it into the
+  worker's Secret as a **file** mount (never `secretKeyRef` — the same
+  `/proc/<pid>/environ` leak class [docs/proc-hardening.md](docs/proc-hardening.md)
+  closes elsewhere), and `api` destroys its own sealed copy only once the
+  worker actually authenticates with it — proof of delivery, not a
+  controller-asserted claim. Residuals (plaintext in etcd for the worker's
+  lifetime; the pending buffer's own TTL) are documented in
+  [docs/vault-threat-model.md](docs/vault-threat-model.md#hosted-worker-join-tokens-prd-58).
+- **TLS on this hop, not an ingress.** The controller and every hosted worker
+  dial `api`'s TLS listener directly (see
+  [Server/worker trust boundary](#serverworker-trust-boundary) above) — there
+  is no ingress in front of `api` for this traffic.
+- **Provisioning is user-triggered, not autoscaled.** A user clicks
+  "Provision" in Settings → Workers; the controller then renders that one
+  worker's Deployment/Secret/PVCs and keeps it running until deleted.
+  Spawn-on-queued-work and scale-to-zero remain deferred — see
+  [Not yet in scope](#not-yet-in-scope) below.
+
+Full design rationale — why a dedicated controller rather than the api, the
+RBAC verb-by-verb reasoning, the namespace/NetworkPolicy split, and the sizing
+presets — is `prds/58-hosted-k8s-workers.md` (its Decision Log especially).
 
 ## Not yet in scope
 
 Auto-starting a run from a GitLab label, a CI-status watching/fixing agent,
 `AskUserQuestion` mid-run steering, WS wakeup for idle workers (a 3s poll is
-the MVP), API-spawned worker containers (pods/VMs the server provisions
-itself — decided 2026-07-10, specs/ai.md §168: on compose the worker just runs
-always-on since idling is cheap; on the k8s phase a dedicated operator — never
-`api`, which must never hold container-runtime credentials — spawns per-user
-worker pods on demand when queued work appears; any worker-dependent feature,
-e.g. a future in-app chat agent, targets the deployment-agnostic worker
-claim/poll protocol so it works identically under both shapes), per-user
+the MVP), **autoscaled/spawn-on-demand hosted workers** (PRD #58 delivered the
+static-provisioning subset of the item decided 2026-07-10, specs/ai.md §168 —
+a user-triggered click provisions a persistent worker via the dedicated
+controller described [above](#worker-controller-k8s-only); the controller
+never spawns one on its own when queued work appears, and there is no
+scale-to-zero — a hosted worker runs until deleted, same as one you start by
+hand), per-user
 skills-management UI, encrypting secrets with the user's
 own password instead of a shared server key, PAT least-privilege
 verification, and a second (e.g. OpenAI) execution provider are all
