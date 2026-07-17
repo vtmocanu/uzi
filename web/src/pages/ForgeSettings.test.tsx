@@ -291,3 +291,31 @@ describe("ForgeSettings — forge-type picker (PRD #65 D11, lands dark)", () => 
     );
   });
 });
+
+describe("ForgeSettings — connect-form token hints follow the forge (M6b, D6b)", () => {
+  it("shows GitLab's api scope + Developer role + glpat placeholder by default", async () => {
+    renderPage();
+    await screen.findByText("unchecked");
+    // Byte-identical to pre-M6b — GitLab dark landing.
+    expect(screen.getByText("Bot personal access token (scope: api)")).toBeTruthy();
+    expect(screen.getByPlaceholderText("glpat-…")).toBeTruthy();
+    expect(screen.getByText(/add it as Developer to the projects/)).toBeTruthy();
+  });
+
+  it("switches to Forgejo's D6b scopes + write role + neutral placeholder when forgejo is picked", async () => {
+    mockApi.forgeConfig.mockResolvedValue(mockForgeConfigMultiForge);
+    renderPage();
+    const picker = (await screen.findByLabelText("Forge type")) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "forgejo" } });
+
+    // The exact D6b required set (must match what VerifyToken accepts) and the write role.
+    expect(
+      screen.getByText("Bot personal access token (scopes: write:repository, write:issue, read:user)"),
+    ).toBeTruthy();
+    expect(screen.getByPlaceholderText("your Forgejo token")).toBeTruthy();
+    expect(screen.getByText(/add it at the write role to the projects/)).toBeTruthy();
+    // GitLab's hints are gone — no wrong-forge instructions remain.
+    expect(screen.queryByText("Bot personal access token (scope: api)")).toBeNull();
+    expect(screen.queryByPlaceholderText("glpat-…")).toBeNull();
+  });
+});

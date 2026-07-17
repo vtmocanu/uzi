@@ -20,6 +20,45 @@ function botSetupDoc(forgeType: string): string {
   return forgeType === "forgejo" ? "/docs/forgejo-bot-setup" : "/docs/gitlab-bot-setup";
 }
 
+// ConnectHints is the connect form's inline token guidance for one forge. On a
+// full-parity feature (D1) the form must not instruct the wrong forge's scopes — a
+// Forgejo user told to mint an `api`-scoped Developer token gets rejected by
+// VerifyToken and cannot connect without leaving the form.
+type ConnectHints = {
+  scopeLabel: string; // token Field label suffix: "scope: api" / "scopes: …"
+  scopeCode: string; // the scope string rendered in <code> in the help + violation card
+  scopeWord: string; // "scope" (one) vs "scopes" (several) for the help sentence
+  roleClause: string; // "as Developer" (GitLab) vs "at the write role" (Forgejo)
+  placeholder: string; // token input placeholder
+};
+
+// connectHints is the per-forge twin of privcheck's D6b required-scope set and
+// docs/{gitlab,forgejo}-bot-setup.md — the scopes shown here MUST match what
+// VerifyToken accepts (D6b: GitLab exactly `api`; Forgejo exactly `write:repository,
+// write:issue, read:user`) and the role the guide tells the user to grant, or the
+// form instructs a token the server will reject. Keep the three in sync. This is the
+// accepted 2-forge twin pattern (like forgeNoun/forgePlatform), NOT plumbed through
+// ForgeConfig (a contract change, out of scope — same call as D11a). gitlab (and any
+// unknown/absent type — the only kind pre-M6b) keeps the exact GitLab strings.
+function connectHints(forgeType: string): ConnectHints {
+  if (forgeType === "forgejo") {
+    return {
+      scopeLabel: "scopes: write:repository, write:issue, read:user",
+      scopeCode: "write:repository, write:issue, read:user",
+      scopeWord: "scopes",
+      roleClause: "at the write role",
+      placeholder: "your Forgejo token",
+    };
+  }
+  return {
+    scopeLabel: "scope: api",
+    scopeCode: "api",
+    scopeWord: "scope",
+    roleClause: "as Developer",
+    placeholder: "glpat-…",
+  };
+}
+
 export function ForgeSettings() {
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
   const [allowedUrls, setAllowedUrls] = useState<string[]>([]);
@@ -174,6 +213,10 @@ export function ForgeSettings() {
     }
   };
 
+  // The connect form's token hints follow the selected forge (M6b): pre-M6b the
+  // picker is hidden and forgeType is "gitlab", so these are the exact GitLab strings.
+  const hints = connectHints(forgeType);
+
   return (
     <SettingsShell description="Connect the bot account uzi acts through.">
       {error && <Alert message={error} />}
@@ -186,7 +229,8 @@ export function ForgeSettings() {
             ))}
           </ul>
           <p className="mt-3 text-sm text-muted">
-            Mint a least-privilege token (scope <code className="rounded bg-raised px-1 py-0.5 text-fg">api</code> only,
+            Mint a least-privilege token ({hints.scopeWord}{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> only,
             non-admin bot) — see the{" "}
             <Link to={botSetupDoc(forgeType)} className="text-brand hover:underline">
               bot setup guide
@@ -202,9 +246,9 @@ export function ForgeSettings() {
         <SectionTitle>Connect a bot PAT</SectionTitle>
         <p className="mt-2 text-sm text-muted">
           Create a bot account, give it a personal access token with the{" "}
-          <code className="rounded bg-raised px-1 py-0.5 text-fg">api</code> scope, and add it as
-          Developer to the projects uzi should see. The token is stored encrypted and never shown
-          again.
+          <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> {hints.scopeWord}, and add
+          it {hints.roleClause} to the projects uzi should see. The token is stored encrypted and never
+          shown again.
         </p>
         <form className="mt-4 space-y-4" onSubmit={connect}>
           <Field label="Forge base URL">
@@ -231,11 +275,11 @@ export function ForgeSettings() {
               </Select>
             </Field>
           )}
-          <Field label="Bot personal access token (scope: api)">
+          <Field label={`Bot personal access token (${hints.scopeLabel})`}>
             <Input
               type="password"
               autoComplete="off"
-              placeholder="glpat-…"
+              placeholder={hints.placeholder}
               value={token}
               onChange={(e) => setToken(e.target.value)}
             />
