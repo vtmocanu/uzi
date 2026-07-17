@@ -4085,7 +4085,11 @@ Serves human: per-repo toolchains; "command not found" surfacing (plan.md 44/64)
   exec). `/nix` stays at its DEFAULT path (relocating forfeits cache.nixos.org
   substitution) and is persisted by the `agentnix:/nix` compose volume; devbox/nix
   per-user metadata lands HOME-derived under `/data` (`agentdata`).
-- **`ARG TARGETARCH`** drives arch (amd64→x86_64, arm64→aarch64). **Devbox verified
+- **`ARG TARGETARCH`** drives arch (amd64→x86_64, arm64→aarch64). Buildkit auto-populates
+  it (compose builds are native on both); **kaniko implements none of buildkit's automatic
+  platform args**, so CI passes `--build-arg TARGETARCH=amd64` (the runners' arch) in
+  `build:agent` + `publish:agent`. The ARG has **no default on purpose** — an unset value
+  must fail the build loudly rather than bake a silently wrong-arch image. **Devbox verified
   against the release `checksums.txt`** (tag-pinned artifact, not a hardcoded sha —
   lead-accepted tradeoff): tarball saved under its EXACT release filename so
   `sha256sum -c` finds it, and the `grep|sha256sum` pipe runs under **`set -o pipefail`**

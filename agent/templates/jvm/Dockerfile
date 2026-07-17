@@ -43,7 +43,9 @@ ENV HOME=/home/worker
 # templates/base/Dockerfile for the full rationale (musl-confirmed, no floating
 # fetch, no runtime download, store persisted by the agentnix volume). UNVERIFIED
 # in this workspace; the tester re-runs the live smoke.
-# TARGETARCH (buildkit) → native amd64 + arm64 builds; see templates/base.
+# TARGETARCH → native amd64 + arm64 builds; buildkit auto-populates it, kaniko does
+# not (CI passes it explicitly), and it has no default on purpose. See
+# templates/base for the full rationale.
 ARG TARGETARCH
 ARG NIX_INSTALLER_VERSION=3.21.5
 RUN NIX_ARCH="$(case "${TARGETARCH}" in amd64) echo x86_64 ;; arm64) echo aarch64 ;; *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; esac)" \
