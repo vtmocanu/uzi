@@ -1,0 +1,186 @@
+{{- if and .Values.workers.enabled .Values.workers.controller.enabled }}
+{{- /*
+  The hosted-worker controller (PRD #58 M6).
+
+  The component M3's envelope was built for, and the ONLY thing in uzi that holds a
+  kube credential. The api holds none and must never hold one (Decision 1): a Role
+  that can create pods in a namespace can mount any Secret and impersonate any
+  ServiceAccount in it, so the api holding that power would turn any api compromise
+  into namespace-wide secret exfiltration. That is why this is a separate image, a
+  separate Deployment and a separate identity rather than a goroutine in the api.
+
+  It listens on NOTHING. Every exchange is outbound to the api (Decision 2), which is
+  what lets it run with no Service, no inbound port and no ingress surface at all.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.workers.controller.replicaCount }}
+  strategy:
+    # Recreate, never RollingUpdate: the surge would run two controllers polling and
+    # reconciling the same fleet against one namespace. Each pass is idempotent, so
+    # this buys quiet rather than correctness — but there is nothing to gain from the
+    # overlap either, since the controller serves no traffic and has no availability
+    # to protect.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "uzi.selectorLabels" . | nindent 8 }}
+        # LOAD-BEARING, not cosmetic: api-networkpolicy.yaml admits the controller to
+        # the api's TLS port by exactly this selector + component label. Change either
+        # and every poll is silently dropped by the default-deny — which looks like an
+        # api outage from here, not a policy mismatch.
+        app.kubernetes.io/component: controller
+    spec:
+      # TRUE — the one workload in uzi where it is. This SA's whole purpose is the
+      # kube API (its Role is in the worker namespace, see worker-rbac.yaml); api and
+      # web both set this false and must keep doing so.
+      automountServiceAccountToken: true
+      serviceAccountName: {{ .Values.workers.controllerServiceAccountName }}
+      {{- with .Values.imagePullSecret.name }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.controller_podSecurityContext | nindent 8 }}
+      containers:
+        - name: controller
+          image: "{{ .Values.workers.controller.image.repository }}:{{ .Values.workers.controller.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.workers.controller.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.controller_containerSecurityContext | nindent 12 }}
+          # No ports: it listens on nothing (Decision 2). No probes either — there is
+          # no endpoint to probe, and a controller whose poll loop has wedged is not
+          # something an HTTP check on a port it does not open would notice. Its
+          # liveness signal is the fleet reconciling, i.e. workers coming online.
+          env:
+            # --- this process's own hop to the api ---------------------------------
+            - name: UZI_API_URL
+              value: {{ include "uzi.apiInClusterURL" . | quote }}
+            - name: UZI_CONTROLLER_TOKEN_FILE
+              value: {{ printf "%s/token" (include "uzi.controllerTokenDir" .) | quote }}
+            {{- if .Values.api.tls.enabled }}
+            # The CA that verifies the api's cert. Pinned EXCLUSIVELY by the
+            # controller (the system roots are not also trusted), which is right: the
+            # api is one operator-set destination with one known issuer, and trusting
+            # every public CA on top would only widen who can impersonate the hop that
+            # hands out join tokens. There is no skip-verify knob in this path.
+            - name: UZI_API_CA_FILE
+              value: {{ printf "%s/ca.crt" (include "uzi.controllerCADir" .) | quote }}
+            {{- end }}
+            {{- with .Values.workers.controller.pollInterval }}
+            - name: CONTROLLER_POLL_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.controller.httpTimeout }}
+            - name: CONTROLLER_HTTP_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            # --- the pods it renders ----------------------------------------------
+            # All required, none defaulted by the controller: the api sends NAMES and
+            # this side owns every mapping to a concrete pod-spec value (Decision 1),
+            # so none of it can come off the wire, and a controller that cannot
+            # describe the pods it renders refuses to boot rather than guess.
+            - name: UZI_WORKER_NAMESPACE
+              value: {{ .Values.workers.namespace | quote }}
+            - name: UZI_WORKER_SERVICE_ACCOUNT
+              value: {{ .Values.workers.serviceAccountName | quote }}
+            - name: UZI_WORKER_IMAGE_REPO
+              value: {{ .Values.workers.image.repository | quote }}
+            # The release's agent tag. Changing it is what rolls the fleet
+            # (Decision 9): the controller stamps it into each worker's pod-spec hash,
+            # and a drifted worker rolls once it holds no non-terminal run.
+            - name: UZI_WORKER_IMAGE_TAG
+              value: {{ .Values.workers.image.tag | default .Chart.AppVersion | quote }}
+            # The api URL a WORKER dials — the same FQDN this process uses, and
+            # necessarily the API's RELEASE namespace, not the worker's. See
+            # uzi.apiInClusterURL for why both halves matter.
+            - name: UZI_WORKER_API_URL
+              value: {{ include "uzi.apiInClusterURL" . | quote }}
+            {{- with .Values.workers.storageClass }}
+            - name: UZI_WORKER_STORAGE_CLASS
+              value: {{ . | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.workers.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: controller-token
+              mountPath: {{ include "uzi.controllerTokenDir" . }}
+              readOnly: true
+            {{- if .Values.api.tls.enabled }}
+            - name: api-ca
+              mountPath: {{ include "uzi.controllerCADir" . }}
+              readOnly: true
+            {{- end }}
+            # Writable /tmp for the read-only-root-fs container, mirroring the api's.
+            # Nothing in the controller is known to need it; it is here because a
+            # read-only root with no scratch is a failure mode that surfaces only at
+            # runtime, and this is the one component whose first real run is on a
+            # cluster (the rollout), not in any test we can run before it.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The bearer credential, projected BY KEY out of the shared uzi-secrets
+        # Secret so this pod's filesystem carries that one value and not every
+        # other secret uzi holds (JWT_SECRET, UZI_SECRET_KEY, the OIDC client
+        # secret...). A whole-Secret mount here would hand the component whose blast
+        # radius this PRD exists to bound the api's master key.
+        #
+        # optional: true is deliberate. The key missing means an operator has not
+        # populated Infisical yet, and the controller's own boot error names the file
+        # and the variable — which is a better diagnostic than a pod stuck in
+        # ContainerCreating with the reason buried in kubelet events. Same reasoning
+        # the api's secretKeyRefs already use.
+        - name: controller-token
+          secret:
+            secretName: {{ .Values.infisical.app.managedSecretName }}
+            optional: true
+            items:
+              - key: {{ .Values.workers.controller.tokenSecretKey | quote }}
+                path: token
+            # 0440, landing as root:<fsGroup>. Not 0400: a secret volume's files are
+            # owned by ROOT, not by runAsUser, so the group bit is what makes them
+            # readable at all (M3 measured this on a real kubelet with the worker's
+            # join token). The kubelet ORs 0040 onto read-only secret volumes anyway,
+            # so this is what 0400 would become — spelled out rather than inherited
+            # from a quirk.
+            defaultMode: 0440
+        {{- if .Values.api.tls.enabled }}
+        # THE `items:` PROJECTION, and it is not a style preference (PRD #58 M4/M6).
+        #
+        # This Deployment is the FIRST client of the api's leaf Secret, and that Secret
+        # holds tls.crt + tls.key + ca.crt. Mounting it WHOLE would put the api's
+        # PRIVATE KEY into this pod's filesystem — the one component with a kube
+        # credential — for no reason at all: a client needs the CA and nothing else.
+        # cert-manager writing ca.crt alongside the pair is exactly what makes this
+        # Secret the CA distribution point, so no second Certificate exists to publish
+        # the root.
+        #
+        # And do NOT "simplify" this by mounting the uzi-ca Secret instead: that one
+        # holds the CA PRIVATE KEY, which is strictly worse than the leaf's.
+        #
+        # Hosted workers never mount this Secret at all — they are in another namespace
+        # and cannot. The controller relays ca.crt into each per-worker Secret it
+        # already creates (no new RBAC verb; Decision 1 stays verbatim).
+        - name: api-ca
+          secret:
+            secretName: {{ include "uzi.apiTLSSecretName" . }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+            defaultMode: 0440
+        {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+{{- end }}

@@ -209,11 +209,13 @@ api:
     # host->pod probe traffic; CONFIRM at M6 before trusting empty.
     probeCIDRs: []
 
-# --- hosted workers: the namespace, its RBAC and its policies (PRD #58) ---------
+# --- hosted workers: the namespace, its RBAC, its policies, the controller -------
 #
-# The security ENVELOPE lives here (M3). The controller Deployment that fills it,
-# and the api-side hosting flags, are M6 — this block on its own creates a namespace
-# nothing runs in, which is deliberately inert rather than half-on.
+# M3 built the security ENVELOPE (namespace, RBAC, quotas, policies); M6 added the
+# CONTROLLER that fills it and the api-side hosting flags. `workers.enabled` now
+# turns on a working feature rather than an inert namespace — except with
+# `controller.enabled: false`, which keeps M3's envelope-only shape (the KinD smoke
+# is the one consumer).
 #
 # SHIPS DISABLED. Compose deployments are zero-diff by construction (they render no
 # chart), and a cluster that has not opted in gets no extra namespace.
@@ -243,9 +245,96 @@ workers:
   # Role anywhere, token never automounted.
   serviceAccountName: uzi-hosted-worker
   # The controller's ServiceAccount (RELEASE namespace) — the only kube credential in
-  # uzi. Its Deployment is M6's; the identity + Role are created together in M3 so the
-  # boundary is one reviewable unit.
+  # uzi. The identity + Role were created together in M3 so the boundary is one
+  # reviewable unit; M6's Deployment below is what runs under it.
   controllerServiceAccountName: uzi-controller
+
+  # --- the controller Deployment (M6) -------------------------------------------
+  #
+  # The component that turns the envelope above into running workers. It is the ONLY
+  # thing in uzi holding a kube credential (Decision 1) — the api holds none and must
+  # never hold one.
+  controller:
+    # Off with workers.enabled: true = M3's envelope-only shape: the namespace, RBAC,
+    # quotas and policies exist and nothing runs in them. The api's hosting flags
+    # follow this flag, not workers.enabled, and that coupling is deliberate: hosting
+    # on with no controller means users provision workers that no process ever
+    # materializes — a row that sits pending until its token expires, visible only as
+    # a worker that never comes online (Decision 10).
+    #
+    # The KinD smoke is the one place false is right: it exercises what KinD can
+    # prove (admission, the /nix seed, object rendering) and has neither a controller
+    # image nor a controller token.
+    enabled: true
+    image:
+      repository: harbor.example.com/gitlab/vtmocanu/uzi/controller
+      # Unset => follows Chart.appVersion (Model B), exactly like api/web.
+      tag: ""
+      pullPolicy: IfNotPresent
+    # HARD SINGLETON, for the same class of reason the api is one: two controllers
+    # would poll and reconcile the same fleet concurrently, racing each other's
+    # create/patch/delete against one namespace. Paired with strategy: Recreate.
+    # The reconcile is idempotent, so this is about avoiding pointless churn and
+    # duplicate work, not about correctness of a single pass.
+    replicaCount: 1
+    # It polls, renders and applies — no compilation, no large payloads. The api's
+    # own requests are 50m/128Mi and it does far more.
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+    # Empty => the controller's own defaults (10s poll, 15s HTTP timeout). Both are
+    # ordinary Go durations ("30s", "1m").
+    pollInterval: ""
+    httpTimeout: ""
+    # --- the controller's bearer credential (Decision 2) --------------------------
+    #
+    # TWO values, ONE secret, and they MUST be kept in sync by whoever sets them:
+    #   * tokenSecretKey     — the PLAINTEXT token. Mounted as a FILE into the
+    #                          controller (never an env var: /proc/<pid>/environ is
+    #                          the leak docs/proc-hardening.md closed for the worker,
+    #                          and the same argument applies to this credential).
+    #   * tokenHashSecretKey — its sha256, HEX-encoded. Read by the API as an env var.
+    #                          A hash is not a credential: holding it does not let you
+    #                          authenticate, so env is fine for this half.
+    #
+    # Generate the pair:
+    #   TOKEN=$(openssl rand -base64 32)
+    #   printf '%s' "$TOKEN" | shasum -a 256      # the hex hash
+    # then put BOTH in Infisical /uzi (or the pre-created uzi-secrets under
+    # secrets.mode: existing).
+    #
+    # THE CHART DELIBERATELY DOES NOT GENERATE THIS. A `randAlphaNum` default would
+    # re-render on every `helm upgrade` and silently rotate the credential, which is
+    # the one failure an operator cannot see coming. Sourcing it like every other
+    # secret keeps rotation an explicit act.
+    #
+    # A rotation that updates only ONE of the two FAILS CLOSED, in both directions:
+    # the controller's polls 401 and it stops reconciling. Nothing is admitted that
+    # should not be — the cost is an outage (hosted workers stop being created,
+    # rolled or torn down; existing ones keep running on their own join tokens), never
+    # a bypass. Rotate both, then restart the controller so it re-reads the file.
+    tokenSecretKey: UZI_CONTROLLER_TOKEN
+    tokenHashSecretKey: WORKER_HOSTING_CONTROLLER_TOKEN_SHA256
+
+  # --- the per-template agent images the controller renders (M6) ------------------
+  #
+  # The REPO PREFIX only. The controller appends "/agent-<template>:<tag>"
+  # (controller/internal/preset), so this must equal what CI publishes:
+  # .gitlab-ci.yml HARBOR_AGENT_IMAGE_PREFIX is this value + "/agent".
+  #
+  # A template the product offers (api/internal/workertmpl) but CI never published
+  # provisions a worker that sits in ImagePullBackOff forever — which in v1 surfaces
+  # only as a worker that never comes online. The two lists are kept equal by review,
+  # not by a gate.
+  image:
+    repository: harbor.example.com/gitlab/vtmocanu/uzi
+    # Unset => Chart.appVersion (Model B). Changing the tag is what rolls every hosted
+    # worker onto a new release (Decision 9) — the controller stamps it into the pod
+    # spec hash, so a release rolls the fleet as its workers finish their runs.
+    tag: ""
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -474,6 +563,26 @@ api_podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 api_containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# controller: same distroless static-nonroot base as the api (uid/gid 65532), same
+# posture. It writes nothing to disk (a small emptyDir covers /tmp).
+#
+# fsGroup is what makes its two mounted files readable: a secret volume's files are
+# owned by ROOT with the group set to fsGroup, never by runAsUser (measured on a real
+# kubelet in M3). Without it the controller cannot read its own bearer token.
+controller_podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+controller_containerSecurityContext:
   allowPrivilegeEscalation: false
   privileged: false
   readOnlyRootFilesystem: true

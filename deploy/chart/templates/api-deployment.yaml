@@ -55,7 +55,7 @@ spec:
               containerPort: {{ .Values.api.tls.port }}
               protocol: TCP
             {{- end }}
-          {{- if .Values.api.config }}
+          {{- if or .Values.api.config (include "uzi.apiHostingEnabled" .) }}
           envFrom:
             - configMapRef:
                 name: {{ include "uzi.fullname" . }}-api-config
@@ -87,6 +87,29 @@ spec:
                 secretKeyRef:
                   name: {{ $.Values.infisical.app.managedSecretName }}
                   key: {{ $secretKey | quote }}
+                  optional: true
+            {{- end }}
+            {{- if include "uzi.apiHostingEnabled" . }}
+            # The controller's bearer credential, as a HASH (PRD #58 Decision 2). The
+            # api only ever compares sha256(presented) against this, so the hash is not
+            # itself a credential and env is the right shape for it — unlike the
+            # controller's plaintext half, which is file-mounted precisely because env
+            # is readable through /proc/<pid>/environ.
+            #
+            # Rendered ONLY with hosting on, and that is not tidiness: the api REFUSES
+            # TO BOOT if this is set while WORKER_HOSTING_ENABLED is false ("the api
+            # would ignore the credential and every controller poll would 404"). So it
+            # cannot live in the static api.secretEnv map — the moment an operator put
+            # the key in Infisical, every hosting-off stack would CrashLoop.
+            #
+            # optional: true, so a missing key surfaces as the api's own boot error
+            # naming the variable (hosting on REQUIRES it) rather than a pod wedged in
+            # ContainerCreating. Same convention as JWT_SECRET/UZI_SECRET_KEY above.
+            - name: WORKER_HOSTING_CONTROLLER_TOKEN_SHA256
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.infisical.app.managedSecretName }}
+                  key: {{ .Values.workers.controller.tokenHashSecretKey | quote }}
                   optional: true
             {{- end }}
           resources:

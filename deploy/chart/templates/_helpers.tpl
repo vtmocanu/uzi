@@ -108,3 +108,62 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- fail "workers.enabled is true but api.tls.enabled is false: hosted workers would be admitted to the api's PLAINTEXT port 8080, which serves the full router (including /api/auth/* and /api/admin/*) and does NOT strip X-Forwarded-For. A worker pod's IP is inside TRUSTED_PROXIES, so it could forge its rate-limit key and defeat the login brute-force control, and its claim traffic — carrying the user's decrypted forge PAT and Anthropic token — would cross the pod network in the clear. Set api.tls.enabled: true (with api.tls.secretName if you have no cert-manager). If you genuinely intend plaintext — a throwaway test cluster, never a deployment — set workers.allowPlaintextAPI: true to say so out loud." -}}
 {{- end -}}
 {{- end -}}
+
+{{- /*
+  uzi.apiInClusterURL: the base URL the CONTROLLER and the HOSTED WORKERS dial
+  (PRD #58 M6). Always the FQDN, and always the RELEASE namespace.
+
+  Both halves are the easy things to get wrong, and both fail obscurely:
+    * a SHORT name (api:8443) resolves for the controller (same namespace) and NOT
+      for a worker (another namespace) — so it would work in every render you look
+      at and break only the pods you cannot see;
+    * the WORKER's namespace in the name would be a name the certificate never
+      carried (api-certificate.yaml templates its SANs off .Release.Namespace), so
+      it fails as an opaque TLS verification error rather than a DNS one.
+  One helper for both clients means there is one thing to get right.
+
+  The scheme follows api.tls.enabled, and the port comes from uzi.workerAPIPort —
+  so the plaintext guard above governs this URL too, and http is only ever
+  reachable through the explicit workers.allowPlaintextAPI opt-in.
+*/ -}}
+{{- define "uzi.apiInClusterURL" -}}
+{{- $scheme := ternary "https" "http" .Values.api.tls.enabled -}}
+{{- printf "%s://%s.%s.svc.%s:%v" $scheme (include "uzi.apiServiceName" .) .Release.Namespace .Values.api.tls.clusterDomain (include "uzi.workerAPIPort" .) -}}
+{{- end -}}
+
+{{- /*
+  Where the controller's own two mounted files live. It reads PATHS
+  (UZI_CONTROLLER_TOKEN_FILE / UZI_API_CA_FILE) and never takes either as an env
+  var, so these are the one place the layout is decided.
+
+  The token is file-mounted rather than env-injected on purpose: an env-borne
+  secret is readable through /proc/<pid>/environ, the leak class
+  docs/proc-hardening.md closed for the worker. The controller's config has no
+  env fallback to be tempted by.
+*/ -}}
+{{- define "uzi.controllerTokenDir" -}}
+/etc/uzi/controller
+{{- end -}}
+
+{{- define "uzi.controllerCADir" -}}
+/etc/uzi/ca
+{{- end -}}
+
+{{- /*
+  uzi.apiHostingEnabled: whether the API turns its hosted-worker surface on
+  (WORKER_HOSTING_ENABLED — the provision endpoints, the quota setting, the UI's
+  provision card). Non-empty = true, per Helm's truthiness.
+
+  It follows the CONTROLLER, not workers.enabled, and that is the whole point of the
+  helper. `workers.enabled` alone means the envelope exists; without a controller
+  nothing materializes a pod, so hosting-on would let users provision workers that
+  never appear — a row pending until its token expires, surfacing only as a worker
+  that never comes online (Decision 10), with the cause invisible.
+
+  The api and the controller therefore switch on together, from one place.
+*/ -}}
+{{- define "uzi.apiHostingEnabled" -}}
+{{- if and .Values.workers.enabled .Values.workers.controller.enabled -}}
+true
+{{- end -}}
+{{- end -}}

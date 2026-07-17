@@ -73,6 +73,23 @@ web:
 # so /nix at 4Gi is unenforced here.
 workers:
   enabled: true
+  # NO CONTROLLER HERE (PRD #58 M6). This keeps the KinD run at M3's envelope-only
+  # shape — the namespace, RBAC, quotas and policies, with nothing running in them.
+  #
+  # Two independent reasons, either sufficient. (1) The controller image is not
+  # kind-loaded and there is no Harbor credential in this cluster, so it could only
+  # ImagePullBackOff. (2) Turning it on also turns on the api's hosting flags
+  # (uzi.apiHostingEnabled), and the api then REFUSES TO BOOT without a controller
+  # token hash — which this smoke has no way to supply, since the job pre-creates
+  # uzi-secrets with JWT_SECRET + UZI_SECRET_KEY alone. That would fail the smoke at
+  # `wait deploy/uzi-api Available`, breaking a job that has nothing to do with
+  # hosted workers.
+  #
+  # So the first place a controller ever runs is M6's rollout, on a real cluster. That
+  # is honest rather than convenient: with TLS off here, KinD could not exercise the
+  # CA relay or the TLS hop the controller's whole config revolves around.
+  controller:
+    enabled: false
   # KinD has no cert-manager, so this is the one place plaintext is intended. The
   # chart REFUSES to admit hosted workers to the api's plaintext port without this
   # flag (uzi.workerAPIPort) — the combination is silently insecure on a real
