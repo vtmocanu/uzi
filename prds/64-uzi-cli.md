@@ -154,7 +154,7 @@ and M2 is scoped accordingly.
 | `GET /api/runs/{id}/review`, `POST /api/runs/{id}/rejudge` | cookie-only | no v1 verb |
 | `GET /api/repos`, `POST /api/repos/{id}/runs` | **`RequireUser`** | `uzi repo list`, `uzi run create` |
 | `PATCH /api/repos/{id}`, `PUT /api/repos/{id}`, tool-profile, board, issues, sync, ci-fix-runs | cookie-only | no v1 verb; `PATCH` is also the F1 admin-write path |
-| `GET /api/workers`, `DELETE /api/workers/{id}` | **`RequireUser`** | `uzi worker list` / `uzi worker rm`. **`DELETE` stays swapped deliberately**: destroying a worker cannot exfiltrate anything, and the loss is the owner's own (their worker stops; runs requeue) — the asymmetry with `POST` is *mint vs unmint*, not *read vs write*. Stated rather than inherited, per Decision 15(e) |
+| `GET /api/workers`, `DELETE /api/workers/{id}` | **`RequireUser`** | `uzi worker list` / `uzi worker rm`. **`DELETE` stays swapped deliberately**: destroying a worker cannot exfiltrate anything, and the loss is the owner's own (their worker stops; runs requeue) — the asymmetry with `POST` is *mint vs unmint*, not *read vs write*. Stated rather than inherited, per Decision 15(d) |
 | **`POST /api/workers`** | **cookie-only** | **mints a plaintext `uzw_` join token** (`handler/workers.go:394-397`) — see below. `uzi worker create` is a webui action |
 | `/api/admin/*` **9 GETs** | **`RequireUser` + `RequireAdminRO`** | admin reads |
 | `/api/admin/*` **4 writes** | cookie-only | Decision 5 |
