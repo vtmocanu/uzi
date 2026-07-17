@@ -1,7 +1,7 @@
-# PRD #69: Judge mode (off / optional / enforced) + per-user judge model + opus default
+# PRD #69: Judge mode (off / optional / enforced) + per-user judge model + opus default + spend guards
 
 **GitLab Issue**: [#69](https://gitlab.example.com/vtmocanu/uzi/-/issues/69)
-**Status**: Draft (created 2026-07-17; revised 2026-07-17 after fact-check + architecture + risk review)
+**Status**: Draft (created 2026-07-17; revised 2026-07-17 after fact-check + architecture + risk review, then spend guards folded in per user request)
 **Priority**: Medium
 **Supersedes**: PRD #59 (default judge model → sonnet). #59's single change (flip the compiled-in default) is folded in here, but the value is **opus**, not sonnet — see Decision 1, which reverses #59's Decision 1. #59 is closed as superseded.
 **Related**: PRD #46 (run judge + self-improvement — introduced `judge_enabled`, `judge_model`, and the per-user `users.judge_enabled` opt-in this PRD extends). PRD #17 (per-user `default_model` — the layering pattern this PRD mirrors for the judge model).
@@ -32,7 +32,8 @@ to soften:
 
 ## Solution Overview
 
-Three layered changes, each independently shippable:
+Four changes (the first three are independently shippable; the fourth builds on
+the enqueue gate the first adds):
 
 1. **Instance judge mode.** Keep `judge_enabled` as the master kill-switch and
    add an admin `judge_enforce_all` boolean. The enqueue gate resolves to three
@@ -69,6 +70,28 @@ resolution) — so a non-admin's settings card can state "Judge: enforced by you
 admin, runs on your Anthropic token with model X" with the model override right
 there. A non-admin cannot read `/api/admin/settings`, so this is the only way
 the SPA can surface the mode (arch review finding 2; risk review R2).
+
+### Spend guards (enforced-cost backstop)
+
+Enforced mode + the opus default + the fact that *failed* runs are judged
+(`judge_enqueue.go:46`) is the max-cost configuration: a systematically failing
+setup would fire an opus retrospective per failure, in a loop, on the user's
+token — worse on a subscription plan, where it eats the rate-limit quota the
+user's real runs need (risk review R3 + R1). Two admin-tuned guards, checked
+per-user at a new **Gate 5** in `maybeEnqueueJudge` *before* a judge is enqueued,
+in every mode (a loop is bad even for an opted-in user):
+
+- **`judge_cooldown_seconds`** (default `60`, on) — skip if this user had a judge
+  enqueued within the last N seconds. Kills tight loops; safe on 60s because real
+  runs take minutes, so sub-minute completions are almost always failures.
+- **`judge_daily_budget`** (default `0` = unlimited, opt-in) — skip if this user
+  already had ≥ N judge runs in the rolling last 24h. A hard total ceiling for
+  admins who want one; `0` disables it.
+
+Both are **count-based and best-effort**: on trip the judge is skipped silently
+(no defer, no queue, no notification — identical to a Gate 3/4 miss), logged at
+debug. They are blunt (a legitimate high-throughput burst also loses some
+retrospectives), which the generous defaults keep to genuine runaways.
 
 What does **not** change:
 
@@ -189,6 +212,33 @@ What does **not** change:
    remedy (pin `judge_model` to `haiku`/`sonnet`). (Risk R4 recommended a
    pin-migration; the user chose the simpler documented-jump path.)
 
+9. **Spend guards are two count-based settings, checked in every mode, cooldown
+   default-on + budget opt-in.** User decision (2026-07-17): both a per-user
+   cooldown and a per-user daily budget. Design choices and why:
+   - **Both, because they cover different axes and are not redundant.** Cooldown
+     caps *rate* (kills a tight failure burst); budget caps *volume* (kills the
+     slow drip a cooldown lets through — 1 fail/min under a 60s cooldown is still
+     ~1,440 opus judges/day). Together they bound both.
+   - **Count-based, not cost/token-based.** The gate runs at *enqueue* time,
+     before the judge runs, so the about-to-run judge's cost is unknown, and
+     `run_usage` (PRD #40, `00062_run_usage.sql`) is folded only *after* a run
+     completes. Counting the user's judge runs over the window is the clean,
+     lag-free signal; a cost-based budget is a possible future refinement (Out
+     of Scope).
+   - **Enforced at a new Gate 5 in `maybeEnqueueJudge`, in every mode**
+     (optional too), not enforced-mode-only: a runaway loop is a footgun even
+     for a user who opted in, and the generous defaults never trip on normal
+     cadence. On trip the judge is *skipped* silently (no defer/queue/notify —
+     identical to a Gate 3/4 miss), logged at debug.
+   - **Defaults: `judge_cooldown_seconds=60` (on), `judge_daily_budget=0`
+     (unlimited, opt-in).** 60s is safe because real runs take minutes, so
+     sub-minute completions are almost always failures — the cooldown protects
+     even an admin who flips enforce+opus without thinking about loops. The
+     budget is a policy ceiling admins opt into (`0` disables). Both are blunt
+     (a legitimate high-throughput burst also loses some retrospectives); the
+     defaults keep that to genuine runaways. Follows the existing
+     `health_nudge_cooldown_seconds` int-setting pattern (`settings.go:568`).
+
 ## Data model
 
 - **New column** `users.judge_model text` (nullable, no default) — migration
@@ -202,6 +252,19 @@ What does **not** change:
   `settings.go:677/701`), the `Known` set, the `Validate` **bool** branch
   (`settings.go:748`), and a typed `JudgeEnforceAll(ctx)` accessor. No migration
   (an absent row synthesizes from `Defaults`).
+- **Two new app settings** `judge_cooldown_seconds` (default `"60"`) and
+  `judge_daily_budget` (default `"0"`), both integers. Same no-seeded-row
+  pattern; registered in `Defaults`/`Known`, the `Validate` **int** branch
+  (alongside `KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds` at
+  `settings.go:755`), with `intSetting`-backed accessors (`settings.go:568`
+  precedent). Bounds: cooldown `0` (off) or `[60, 86400]` reusing the health
+  seconds bound; budget `0` (off) or a positive count.
+- **Two new store queries** (read-only, count-based) over `runs`:
+  `LastJudgeEnqueuedAt(user_id)` → `MAX(created_at) WHERE kind='judge' AND
+  user_id=$1` (cooldown), and `CountJudgesSince(user_id, since)` →
+  `COUNT(*) WHERE kind='judge' AND user_id=$1 AND created_at > $2` (budget). Both
+  cheap; note a partial index `runs(user_id, created_at) WHERE kind='judge'` if
+  either shows up hot (optional — the judge funnel is low-QPS).
 
 ## Touchpoints
 
@@ -256,7 +319,8 @@ What does **not** change:
   user→instance→default chain as the claim path.
 - `web/src/pages/AdminSettings.tsx`: `judge_enforce_all` toggle with copy
   naming the effective default model (opus) + the own-token / subscription-quota
-  cost warning; grey it when the judge is off. Grey/annotate the admin per-user
+  cost warning; grey it when the judge is off. Add the `judge_cooldown_seconds`
+  + `judge_daily_budget` inputs (0 = off). Grey/annotate the admin per-user
   judge toggle on the Users page when `enforce_all` is on.
 - `web/src/pages/Settings.tsx` (user judge card, `:350`): render the enforced
   banner from the new `/me` fields + a per-user judge-model input (blank = "use
@@ -284,11 +348,15 @@ Dependency notes (corrected after arch review finding 3):
 - **M1 and M3 both edit `settings.go` + `settings_test.go`** — no logical
   conflict, but a guaranteed textual rebase. Cheapest is to serialize M3 after
   M1 (or accept the trivial rebase).
-- **M4 depends on M1+M2+M3** (it wires UI, the `/me` fields, and docs for all
-  three).
+- **M5 (spend guards) shares M1's files** (`settings.go`, `judge_enqueue.go`)
+  and needs `sqlc generate` like M2 (its two new queries). It is not
+  independent: land it after M1+M2 (serialized), not in parallel with them.
+- **M4 depends on M1+M2+M3+M5** (it wires UI, the `/me` fields, the spend-guard
+  admin inputs, and docs for everything).
 
-So the safe fan-out is M1 first, then M2 and M3 in parallel on top, then M4 —
-not three-wide from a cold start.
+So the safe fan-out is M1 first, then M2 and M3 in parallel on top of it, then M5
+after M2 (shared enqueue/sqlc surface), then M4 last — not all-wide from a cold
+start.
 
 - [ ] **M1 — Judge mode (enforce-all)**: `judge_enforce_all` setting +
   default-false-on-junk accessor + `SettingsReader` widening (+ all fakes) +
@@ -300,11 +368,16 @@ not three-wide from a cold start.
 - [ ] **M3 — Default judge model → opus**: `DefaultJudgeModel="opus"`, comment
   trail + settings tests + web mock defaults. `go test ./internal/settings`;
   `npm run typecheck` + `npm test`.
+- [ ] **M5 — Per-user spend guards**: `judge_cooldown_seconds` +
+  `judge_daily_budget` int settings + accessors, the two count queries (sqlc),
+  Gate 5 in `maybeEnqueueJudge` (skip-not-defer, all modes). `go test
+  ./internal/settings ./internal/workersvc` green, including a loop test (N rapid
+  failures → judges throttled by cooldown, capped by budget).
 - [ ] **M4 — Consent surface + web + docs + specs**: `/me` effective fields,
-  admin enforce toggle (with cost copy + greying), user judge card (enforced
-  banner + per-user model input), stale-comment fix, docs for all three
-  changes, `specs/ai.md` entries, release note, close #59. `npm run build`
-  (check-docs) green.
+  admin enforce toggle (with cost copy + greying) + the two spend-guard inputs,
+  user judge card (enforced banner + per-user model input), stale-comment fix,
+  docs for all four changes, `specs/ai.md` entries, release note, close #59.
+  `npm run build` (check-docs) green.
 
 ## Success Criteria
 
@@ -327,6 +400,10 @@ not three-wide from a cold start.
 - **Opus default**: fresh instance with the judge enabled and no `judge_model`
   set assembles judge claims with `opus`; an explicitly set instance value still
   wins; no UI/docs surface still calls haiku (or sonnet) the default.
+- **Spend guards**: with `judge_cooldown_seconds=60`, a user whose runs fail
+  faster than once per 60s gets at most one judge per 60s (the rest skipped);
+  with `judge_daily_budget=N>0`, that user gets at most N judges per rolling 24h;
+  `0`/`0` disables each guard; a skipped judge is silent and leaves no run.
 
 ## Out of Scope
 
@@ -334,13 +411,12 @@ not three-wide from a cold start.
   zero migration cost; add only if a real need appears).
 - Admin cap/lock on the *per-user* judge model (own-token spend makes a ceiling
   unnecessary).
-- **A per-user judge-spend damper** (cooldown / skip-after-N-identical-failures).
-  Enforced mode + opus + the fact that *failed* runs are judged
-  (`judge_enqueue.go:46`) means a systematically failing setup yields repeated
-  opus retrospectives on the user's token with no throttle (risk R3). The
-  "own-token spend needs no ceiling" rejection covers a user raising their *own*
-  cost, not an admin+default raising it for them. Not built here; file a
-  follow-up issue.
+- **Cost/token-based spend guards and failure-signature dedup.** The M5 guards
+  are count-based (cooldown + daily count budget). A budget denominated in
+  `run_usage` dollars/tokens, and a "skip-after-N-identical-failure-signatures"
+  refinement that suppresses only *repeated* failures while still judging diverse
+  runs, are both deferrable improvements — the count-based guards bound the
+  runaway case, and the surgical signature approach is materially harder.
 - Changing the judge prompt/compaction or the self-improvement engine.
   `self_improve` runs stay un-judged (allowlist, `judge_enqueue.go:19`)
   regardless of `enforce_all`.
