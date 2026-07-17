@@ -378,6 +378,21 @@ Tracked as GitLab issue vtmocanu/uzi#55; PRD at `prds/55-oidc-group-mapping.md`.
 - OIDC-only scope: groups apply only at OIDC login; password-login users (incl. the seed admin) keep their stored `is_admin`; password first-user-admin is untouched. [user 2026-07-16]
 - Must work with BOTH Keycloak and Pocket ID. [user 2026-07-16]
 
+## Feature #58 — Hosted k8s workers (self-service worker provisioning)
+
+Tracked as GitLab issue vtmocanu/uzi#58; PRD at `prds/58-hosted-k8s-workers.md`. Partially delivers the Deferred "on-demand worker spawning" item below — spawn-on-queued-work is NOT in scope here.
+
+- Self-service: any user provisions their own worker from the web UI, bounded by an admin-set per-user quota. [user 2026-07-16]
+- The user picks two things: a worker type (image template) and a size (S/M/L). [user 2026-07-16]
+- k8s only; docker-compose/laptop users keep the manual worker flow. [user 2026-07-16]
+- A dedicated controller — never the api — holds the cluster credentials and creates the worker pods. [user 2026-07-16]
+- The worker→api hop is TLS in v1. [user 2026-07-16]
+- Trimmed v1 surface: sizes are built-in constants (no preset CRUD), no restart endpoint, heartbeat-only status. [user 2026-07-16]
+- Sizes are Burstable (requests < limits): `s` 250m–1 CPU / 1–2Gi RAM; `m` 500m–2 / 2–4Gi; `l` 1–4 / 4–8Gi; `/data` 5/10/20Gi; `/nix` a flat 4Gi. [user 2026-07-17]
+- Default size is `m`, not `s`. [user 2026-07-16]
+- Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
+- Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
