@@ -2,7 +2,8 @@
 #
 # This file is the SOURCE OF TRUTH. Release CI (the tag-only `publish_brew` job,
 # M10) copies this formula into the shared vtmocanu tap (vtmocanu/homebrew-tap) and
-# bumps BOTH the `version` and the `tag:` below to the release tag. The tap's
+# bumps ONLY the `tag:` line below to the release tag (there is no `version` line —
+# Homebrew scans the version from the tag; see below). The tap's
 # Formula/uzi-cli.rb is fully GENERATED from this one on every release, so edit
 # HERE, never the tap copy (tap edits are overwritten).
 #
