@@ -1,7 +1,7 @@
 # PRD #70: Status favicon (GitLab-style) + brand favicon
 
 **GitLab Issue**: [#70](https://gitlab.example.com/vtmocanu/uzi/-/issues/70)
-**Status**: Draft (created 2026-07-17)
+**Status**: Complete (2026-07-17, MR !66)
 **Priority**: Low
 **Related**: PRD #46 (run judge + notifications — introduced `unreadNotificationCount`, the "attention" signal this favicon reuses). PRD #21 (theme system + `theme-preinit.js` — the CSP-vs-`<head>`-asset precedent this PRD follows). PRD #33 (`stop_kind` — how a deliberate stop is told apart from a genuine `failed`, so the favicon never reddens on a cancel).
 
@@ -160,22 +160,22 @@ mark, no polling.
 
 ## Milestones
 
-- [ ] **M1 — Static brand favicon**: `web/public/favicon.svg` (ember factory mark,
+- [x] **M1 — Static brand favicon**: `web/public/favicon.svg` (ember factory mark,
       stroke bumped for small-size legibility) + `favicon-32.png`; both `<link
       rel="icon">` tags wired in `web/index.html` (PNG for Safari, SVG `sizes="any"`
       for Chrome/Firefox). Idle tab shows the ember factory mark, checked
       specifically at ~16 px in Chrome + Safari. `npm run build` green.
-- [ ] **M2 — State derivation (pure)**: `web/src/lib/favicon.ts` exports
+- [x] **M2 — State derivation (pure)**: `web/src/lib/favicon.ts` exports
       `deriveFaviconState(runs, unread, baselineFailedIds)` with the four-state
       priority ladder; unit tests cover each state, the priority order (a fresh
       failure beats a concurrent `awaiting_approval`), the cancel-is-not-failed
       guard, the fresh-vs-baseline scoping (a pre-existing failed run does **not**
       redden; a newly-failed one does), and `queued`→running-tier.
-- [ ] **M3 — Canvas render + link swap**: `renderFavicon(state)` draws mark + dot on
+- [x] **M3 — Canvas render + link swap**: `renderFavicon(state)` draws mark + dot on
       a 64×64 canvas and swaps the icon `href` (idle → static mark); dot colours
       match `--danger`/`--warn`/`--brand`; the ring keeps the dot legible on light
       and dark tab strips.
-- [ ] **M4 — Wire-up (`useFavicon` in AppShell)**: owns the runs poll + failed
+- [x] **M4 — Wire-up (`useFavicon` in AppShell)**: owns the runs poll + failed
       baseline, reads AppShell's shared unread state (no second unread poll),
       immediate refresh on `visibilitychange → visible` and `uzi:notifications-changed`,
       reset to idle on logout, no poll while logged out. The poll must run **while
@@ -185,7 +185,7 @@ mark, no polling.
       (`src/mocks`) drives all four states. **Exit criterion**: the failed / amber /
       ember / idle badges are verified in a real Chrome **and** Safari (Safari:
       static mark only, per Decision 5) via mock mode.
-- [ ] **M5 — Docs + specs**: `specs/ai.md` records the favicon design decisions; if
+- [x] **M5 — Docs + specs**: `specs/ai.md` records the favicon design decisions; if
       a user-facing docs page fits (`docs/*.md`), a short note that the tab icon
       reflects run state. `web` typecheck + tests green.
 
