@@ -8,6 +8,8 @@ audience: user
 
 A **worker** is the `uzi-agent` container: it connects to your uzi server, claims your queued runs, and drives them with the Claude Agent SDK. One worker per user is normal; it runs anywhere that can reach the server outbound (laptop, VM, CI runner), since it never needs an inbound port.
 
+On a k8s deployment where an admin has turned hosting on, you can skip this whole page: provision a worker from **Settings → Workers** instead and the cluster runs the container for you. See [Hosted workers](./hosted-workers.md).
+
 ## 1. Generate a join token
 
 In uzi, open **Settings → Workers** and register a worker (give it a name, e.g. `laptop`). The join token is shown **once**: copy it now, since only its hash is stored server-side (register a new worker if you lose it).

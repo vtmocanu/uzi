@@ -1125,6 +1125,10 @@ export const mockApi = {
       name,
       status: "offline",
       busy: false,
+      // Hand-run: the user starts this container themselves, so it has no size
+      // (PRD #58). provisionHostedWorker below is the other kind.
+      kind: "external" as const,
+      hosted_size: null,
       // No runs and no advertised cap until the worker registers (PRD #42).
       active_runs: 0,
       max_concurrent_runs: null,
@@ -1147,6 +1151,47 @@ export const mockApi = {
   deleteWorker: async (id: string) => {
     workers = workers.filter((w) => w.id !== id);
     return delay(null);
+  },
+
+  // Hosted workers (PRD #58). The demo is the only place M5 can be seen working: on a
+  // real stack WORKER_HOSTING_ENABLED is off by default, and turning it on gets you a
+  // worker that sits offline forever, because the controller that would run its pod is
+  // M3's. So hosting is hardcoded ON here — a demo of a feature that renders nothing
+  // is not a demo — and quota 2 against one seeded hosted worker puts the whole
+  // journey three clicks away: provision → 2 of 2 → the button disables → delete →
+  // it enables again.
+  hostedConfig: async () => delay({ enabled: true, quota: 2 }),
+  provisionHostedWorker: async (template: string, size: string, name?: string) => {
+    const w = {
+      id: `w-hosted-${++workerCounter}`,
+      // Empty name → the server derives one from template + size (handler's
+      // derivedHostedWorkerName). The M5 form sends none, so this is the live path.
+      name: name?.trim() || `${template} (${size.toUpperCase()})`,
+      // Offline until the controller starts the pod and it registers — the same
+      // lifecycle a hand-run worker has, just with the controller doing the running.
+      status: "offline",
+      busy: false,
+      active_runs: 0,
+      max_concurrent_runs: null,
+      kind: "hosted" as const,
+      hosted_size: size,
+      template_declared: template,
+      template_reported: null,
+      version: null,
+      last_heartbeat_at: null,
+      created_at: new Date().toISOString(),
+      stats_cpu_pct: null,
+      stats_mem_bytes: null,
+      stats_mem_limit_bytes: null,
+      stats_source: null,
+    };
+    workers.push(w);
+    // { worker } and NOTHING ELSE. Do not mint a token here the way createWorker does
+    // above: the real endpoint's transaction returns none, its response cannot carry
+    // one, and a mock that invents one documents a contract the server structurally
+    // cannot honor. TypeScript will not catch it (delay() infers its own T, so an
+    // extra field type-checks clean) — mockApi.hosted.test.ts is what does.
+    return delay({ worker: { ...w } });
   },
 
   // ── Runs ────────────────────────────────────────────────────────────────────

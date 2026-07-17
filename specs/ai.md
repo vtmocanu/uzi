@@ -4085,7 +4085,11 @@ Serves human: per-repo toolchains; "command not found" surfacing (plan.md 44/64)
   exec). `/nix` stays at its DEFAULT path (relocating forfeits cache.nixos.org
   substitution) and is persisted by the `agentnix:/nix` compose volume; devbox/nix
   per-user metadata lands HOME-derived under `/data` (`agentdata`).
-- **`ARG TARGETARCH`** drives arch (amd64→x86_64, arm64→aarch64). **Devbox verified
+- **`ARG TARGETARCH`** drives arch (amd64→x86_64, arm64→aarch64). Buildkit auto-populates
+  it (compose builds are native on both); **kaniko implements none of buildkit's automatic
+  platform args**, so CI passes `--build-arg TARGETARCH=amd64` (the runners' arch) in
+  `build:agent` + `publish:agent`. The ARG has **no default on purpose** — an unset value
+  must fail the build loudly rather than bake a silently wrong-arch image. **Devbox verified
   against the release `checksums.txt`** (tag-pinned artifact, not a hardcoded sha —
   lead-accepted tradeoff): tarball saved under its EXACT release filename so
   `sha256sum -c` finds it, and the `grep|sha256sum` pipe runs under **`set -o pipefail`**
@@ -6459,3 +6463,684 @@ exotic 1024-char CJK.
   raising the API to UTF-16 units would have meant re-encoding to measure and would still leave the
   jsonb payload unbounded in bytes. The one-directional nature (worker accepts / API rejects) meant the
   fix only had to tighten the worker.
+
+## 264. Hosted k8s workers — a dedicated `controller`, because the api may never hold cluster credentials
+
+Serves human: the Deferred "on-demand worker spawning" item — **its operator half only**. That item
+requires a dedicated operator, "never the api, which must never hold container-runtime credentials";
+PRD #58 delivers exactly that operator, and provisions workers **on user request** rather than when
+queued work appears. The queued-work trigger, autoscaling and scale-to-zero remain deferred; a hosted
+worker is persistent and runs until deleted. Design rationale: `prds/58-hosted-k8s-workers.md`
+(Decision 1). Supersedes the k8s half of §168 — §168's compose half (always-on worker, no spawning,
+`docker.sock` never mounted into the api) stands unchanged and is what compose still does.
+
+- **What the feature is.** Opt-in, k8s-only. A user picks a **type** (image template: `base`, `jvm`)
+  and a **size** (`s`/`m`/`l`) in Settings → Workers; a Deployment + Secret + PVCs are materialized in
+  a dedicated worker namespace; the worker registers over the **normal join-token flow** and is an
+  ordinary worker thereafter. No new worker trust model — the join token stays the sole anchor.
+  Users may still run external workers by hand alongside hosted ones.
+- **Decision — a new `controller` component (own Go module, own image, own Deployment) holds the ONLY
+  kube-API credential.** The api keeps `automountServiceAccountToken: false` and zero kube access; a
+  test (`api/internal/hostedsvc/no_kube_dependency_test.go`) bans `k8s.io/apimachinery` and friends
+  from the api module so the boundary is enforced by the build, not by discipline.
+  - **Why the api cannot be the operator, beyond the recorded constraint.** RBAC cannot scope `create`
+    by label: a Role that can create pods in a namespace can mount **any** Secret and impersonate
+    **any** ServiceAccount in it. So an api holding that power would turn any api compromise into
+    namespace-wide secret exfiltration — and the api is already the sole holder of `UZI_SECRET_KEY`
+    and `JWT_SECRET`. The controller model closes this structurally.
+- **The Role is scoped to one dedicated worker namespace, and the verbs are pinned to what code
+  actually calls** — nine kube calls exist in `controller/` (non-test): Deployments
+  **List/Create/Patch/Delete**; Secrets **Create/Delete only**; PVCs **List/Create/Delete**. **No pod
+  access at all.**
+  - **Secrets are create/delete-only and this line is load-bearing.** k8s has no existence-only verb
+    for Secrets — `get`/`list` returns contents, and `resourceNames` cannot scope a dynamic set — so
+    granting either would convert a controller compromise from "harvest whatever flows through the
+    compromise window" (the controller is stateless and retains nothing) into "harvest every hosted
+    worker's join token in one call, including pre-existing ones". Each token is worker
+    impersonation → claim that owner's runs → receive their decrypted forge PAT and Anthropic token.
+    §266's registration-derived ack is what makes never reading Secrets back **achievable**; the two
+    are one decision.
+  - **`list` on Deployments and PVCs is required, not incidental**: orphan detection means enumerating
+    objects whose names you do not expect, which `get`-by-name cannot do. It leaks nothing — a
+    Deployment references its Secret by name, it does not embed it. That asymmetry is the point.
+    Consequence accepted: **orphan Secrets are undetectable**, and that is the trade, not a gap.
+  - **`Deployments get` and `Pods get/list` were granted in the design and dropped in
+    implementation** (2026-07-17): nothing Gets a Deployment (Observe reads the fleet with List, which
+    orphan detection needs anyway, and reconcile decides create-vs-patch from that observation), and
+    drift detection never touches pods — it reads the **Deployment's** pod-template annotations. A
+    verb granted for a call that does not exist is what "pinned minimal" forbids.
+- **The namespace's emptiness is the second bound, and its inventory is stated honestly.** The
+  worker namespace holds nothing but hosted-worker objects **plus the Harbor pull Secret** — a
+  ServiceAccount's `imagePullSecrets` cannot cross namespaces, so the robot must live there. By the
+  namespace's own argument a compromised controller could exfiltrate it; bounded by the robot being
+  **pull-scoped** (a pushing robot would let a compromised controller poison the fleet's images) and
+  by workers never mounting it (the kubelet consumes it). Recorded as an accepted residual rather
+  than argued away.
+
+## 265. Controller ⇄ api protocol — outbound-only poll, stateless reconcile, and the names-not-values rule
+
+Serves human: as §264. PRD #58 Decision 2.
+
+- **Decision — the controller polls the api like a worker does; nothing dials the controller.** It
+  authenticates with its own Bearer credential (sha256 compared against api config — no DB lookup, no
+  cookies, hence no CSRF step) and GETs `/api/controller/poll` for desired state. No inbound port, no
+  Service, no webhook, no CRD.
+  - Why: it keeps the network shape identical to the worker's (outbound-only from a semi-trusted
+    component), and it means the api never needs to know a controller exists at any address.
+- **The controller is stateless.** Desired state lives in the DB, observed state in the cluster; it
+  reconciles the two on **every** poll, so api or controller restarts lose nothing and there is no
+  controller-side store to corrupt, back up, or migrate.
+- **THE RULE THAT MAKES THE BOUNDARY CHECKABLE: the api sends NAMES; the controller owns every
+  mapping to a concrete pod-spec value.** The wire is
+  `DesiredWorker{id, template, size, generation, join_token}` — no image, no CPU, no memory, no volume
+  size, ever. The api validates names against its own registries (`workersize.Names`,
+  `workertmpl.Names`) so user input never reaches an image reference or pod spec as free text; the
+  controller resolves those names against its own tables (§268).
+  - Why it is a rule and not a preference: the moment the api ships resolved values it becomes the
+    authority on a pod spec it is not allowed to know anything about, and the `no_kube_dependency`
+    ban becomes theatre. It is also why **admin-configurable S/M/L is v2, not v1** — it inverts the
+    authority (the api would hold quantities and the controller would render what it is told), and an
+    admin-typed quantity cannot be validated by an api that may not import `apimachinery`. See §275.
+- **The poll carries `Cache-Control: no-store` and is a GET.** The response carries plaintext join
+  tokens, and a GET is cacheable by any future mesh or sidecar. (It was a POST in the first draft only
+  because that draft's ack rode the request — see §266.)
+- **`/api/controller/*` is not mounted at all when hosting is off** (§273), rather than
+  mounted-and-refusing: an api that was never given a controller credential should expose no surface
+  to probe for one, and a compose stack stays byte-for-byte the router it was before this PRD.
+
+## 266. Join token: delivered once, and delivery is PROVEN by registration rather than asserted by the controller
+
+Serves human: as §264, plus the vault threat model ("no decryption key at rest anywhere an operator
+can read", §Feature #32). PRD #58 Decision 3.
+
+- **Decision — the api seals the plaintext join token as a delivery BUFFER and destroys it once
+  delivery is proven.** At provision the api generates the token, stores `sha256` in
+  `workers.token_hash` as for any worker, and parks the plaintext secretbox-sealed in
+  `hosted_worker_tokens`. The poll hands it to the controller, which writes it into the worker's k8s
+  Secret; the api destroys its sealed copy when **a worker authenticates with that token**.
+- **The ack is a proof of possession, not a report.** `RequireWorker` already resolves
+  `sha256(presented)` against `workers.token_hash`, so a successful auth **is** proof the token
+  arrived and works. Three properties fall out for free: it is **unforgeable** (only a holder of the
+  current token can trigger it); it is **version-exact with no wire discriminator** (after a rotation
+  to T2, a pod still holding T1 fails auth and therefore cannot ack T2 away); and it needs **no Secret
+  read**, which is what lets §264's Secrets line stay create/delete-only.
+  - **Why not a controller-asserted ack** (the first design: `Materialized: []string` of worker ids,
+    UPDATE guarded on `worker_id` alone). It asserts "a Secret exists for W" while the api destroys
+    "whatever plaintext is parked for W". Those diverge on rotation: the api parks T2 → an in-flight
+    poll whose observation predates the rotation acks the id → **T2 is destroyed, never delivered** →
+    the pod holds T1 while `token_hash` is sha256(T2) → 401 forever, in a row that reads exactly like
+    the healthy steady state. Deterministic, not a race.
+  - **Why not "observe the Deployment/Pod instead"** (stays inside the granted verbs, and a Running
+    pod is genuinely stronger evidence than object existence): its proof rests on a
+    **controller-internal ordering invariant** (write Secret(T2) before patching the generation
+    annotation). Patch first, or die between the two calls, and the pod acks a T2 that was never
+    written anywhere — silent and unrecoverable. The deeper reason, which generalizes: **the api must
+    not destroy its only plaintext on the strength of a report from the component whose blast radius
+    the RBAC exists to bound.** Not needing the report is strictly stronger than refining it.
+  - The ack hooks into `handler.WorkerRegister`, hosted-only, **best-effort and non-fatal** — a
+    cleanup failure must never fail a registration; the TTL is the backstop. `workersvc` still never
+    learns hosted workers exist.
+  - Its guard is `AND (token_ciphertext IS NOT NULL OR delivered_at IS NULL)`, not the strict
+    `IS NOT NULL`: under proof-of-possession, promoting an expired row to `delivered_at` is a **true
+    self-heal**, and the loose clause keeps re-registration idempotent (a rescheduled pod re-registers
+    with the same token and must be a no-op). Under the rejected controller-asserted ack the identical
+    transition would have **laundered** the strand signal, so the strict clause would have been right
+    — same SQL, opposite verdict, because the trigger's epistemic content changed from a report to a
+    proof.
+- **`join_token: null` on the wire means "write no Secret for this worker" — NEVER "this worker has no
+  token".** Either a pod already proved it holds one (the cluster Secret is then the only copy in
+  existence) or the buffer expired unread. Never invent one, never clear the existing Secret on
+  account of it, never log it. This is the single most dangerous thing to get backwards here.
+- **The pending TTL (1h) means "no pod ever proved it booted", not "the controller never picked it
+  up".** Expiry is **benign whenever the Secret was written** — it destroys only the api's buffer; the
+  plaintext is already in the cluster and `token_hash` is unchanged, so a pod that finally boots after
+  an ImagePullBackOff or an unbindable PVC still authenticates and acks late and correctly. Expiry
+  therefore strands a worker only when the Secret was **never** written, which is what the TTL is for.
+- **Any rotation path MUST set `workers.token_hash` and park the new sealed token in ONE
+  transaction.** The ack destroys the buffer under `AND token_hash = @proved_token_hash`, so its
+  correctness rests on "the hash I proved is still current" ≡ "the parked ciphertext is the token I
+  proved" — which holds only while the two are co-written. `SealJoinToken` is a free function over
+  `Store` precisely so it can join that transaction. v1 ships **no rotation**; `hosted_generation` is
+  0 on every provisioned worker and recovery is delete + reprovision.
+- **Two residuals, distinct, both real** (documented in `docs/vault-threat-model.md`):
+  1. **The token is plaintext in etcd for the worker's lifetime.** Anyone who reads it impersonates
+     that worker and claims its owner's runs, receiving the decrypted Anthropic token when the vault
+     is unlocked. Bounded by the near-empty namespace + create/delete-only Secret RBAC. Rotation is
+     v2.
+  2. **While pending, the sealed copy sits in Postgres under `UZI_SECRET_KEY`** — precisely the key
+     the vault exists to stop relying on (an operator with the api env plus the DB holds every
+     master-sealed value). **The TTL is what bounds this, so the expiry sweep runs UNCONDITIONALLY,
+     regardless of `WORKER_HOSTING_ENABLED`**: a stack that provisioned workers and then disabled
+     hosting is exactly the case that strands ciphertext.
+
+## 267. Hosted worker pod: single-uid non-root, `fsGroup`-pinned volumes, and an explicitly seeded `/nix`
+
+Serves human: as §264, plus "workers run the agent" (Feature #4) and the uid-split posture (PRD #51).
+PRD #58 Decision 6.
+
+- **Posture.** Dedicated zero-permission ServiceAccount with `automountServiceAccountToken: false`;
+  `runAsNonRoot`, drop ALL caps, `allowPrivilegeEscalation: false`, default seccomp; the namespace is
+  labeled PodSecurity **`restricted`**; `imagePullSecrets` from chart values.
+- **`strategy: Recreate`, never RollingUpdate** — a surge pod would Multi-Attach-deadlock against the
+  RWO PVC. This also holds for N volumes, which is what makes the future volume split free.
+- **v1 is SINGLE-container at `runAsUser: 10001` (PRD #51's `worker` uid), with no uid split.** #51's
+  compose mechanism (root entry + `setpriv` drop, retaining ambient `CAP_SETUID`/`CAP_SETGID`) cannot
+  run under PodSecurity `restricted`, which forbids a root entry and admits no capability beyond
+  `NET_BIND_SERVICE`. Per #51's own rule — *align at the distinct-uid abstraction, not the mechanism*
+  — the k8s split is its two-container form and lands with #51's k8s phase, which **adds** the
+  `runner` container (uid 10002) to this pod. Rejected alternatives: adopting the two-container form
+  now (forces #51's hardest deferred work into this PRD); relaxing the namespace to `baseline` +
+  `cap_add` (puts `CAP_SETUID` in a pod on a shared cluster and drops the label that bounds a
+  compromised controller); chart-overriding `command:`/`runAsUser:` (silently bypasses a security
+  wrapper by duplicating the image's CMD in YAML). **Hard dependency, accepted and implemented by
+  #51**: `agent/templates/entrypoint.sh` skips the drop when started non-root.
+- **`fsGroup: 10001` is pinned on the pod and is load-bearing TWICE.** (a) An RWO PVC mounts
+  `root:root 0755`, so uid 10001 cannot write it, and the usual initContainer-chown escape needs root,
+  which `restricted` forbids — so v1 needs it regardless. (b) `fsGroup` applies to **every** container,
+  so when #51's `runner` container arrives at uid 10002 it inherits supplemental gid 10001 and the
+  volume for free, with no pod-spec rework. That is what makes "additive" a property rather than an
+  accident — additive never meant the pod spec never changes, it means **no rewrite and no data
+  migration**.
+- **The token mounts `0440`, not `0400`** — a Secret volume's files are owned `root:<fsGroup>`, **not**
+  by `runAsUser`, so `0400` would make a worker unable to read its own join token. Consumed via
+  `UZI_WORKER_TOKEN_FILE` as a **file**, never a `secretKeyRef` env var, which would reopen the
+  `/proc/<pid>/environ` leak that compose hardening closed (`docs/proc-hardening.md`).
+- **The CA reaches the worker through the Secret the controller already creates** — it mounts the CA
+  and copies it in; the worker trusts it via `NODE_EXTRA_CA_CERTS` (Node reads that path before
+  startup, and `agent/src/client.ts` uses plain `fetch`). No new RBAC verb. **Consequence**: that
+  Secret is written ONCE and never updated (there is no Secret read, and delete+recreate would destroy
+  the join token, which after delivery is the only copy in existence), so a CA **root** rotation
+  strands existing workers — remedy is delete + reprovision. The chart's `caDuration` is 5 years for
+  exactly this reason; the 90-day leaf rotation never touches `ca.crt`.
+- **`/nix` MUST be a persisted volume, and a k8s volume DOES NOT SEED ITSELF FROM IMAGE CONTENT.**
+  Image-seeding an empty volume is a **Docker named-volume feature** — which is why compose works and
+  why the assumption that it transfers went unnoticed. A PVC at `/nix` mounts **empty** and **masks**
+  the image's baked 209 MB store, *including the `nix` binary itself*, whereupon devbox tries to
+  self-heal by downloading an unpinned `nix-installer` and escalating via `sudo`. It does not degrade
+  to "re-fetch per roll"; it **hard-fails toward the exact posture the image exists to prevent**.
+  - **So an initContainer (from the agent image, carrying the baked store) seeds the volume only when
+    it is empty**, never overwriting a provisioned store, idempotent across rolls, under `restricted`
+    and writable only via the `fsGroup` pin.
+  - Why persist at all: provisioning the tier-1 allowlist grows `/nix` 209 MB → **1,703 MB / 1,205
+    store paths in 10m53s of real internet fetch**, and §272 rolls every worker on every release — so
+    not persisting costs that per worker per release.
+  - **Rejected — one shared RWX read-only store for the fleet.** Read-only cannot work (tool
+    provisioning **writes** to the store), and shared-and-writable is far worse than it looks: the nix
+    store is **executable content**, so one compromised worker poisons every other user's binaries —
+    single-worker compromise becomes fleet-wide cross-tenant code execution. **The right long-term
+    answer is a substituter, not a mount** (in-cluster binary cache turns the internet fetch into a
+    LAN fetch, keeping per-worker isolation). v2.
+  - Known property inherited from compose: once seeded, the store is **never refreshed from a newer
+    image**, so a nix/devbox upgrade never reaches an existing worker's `/nix`. Sharper here only
+    because rolls are automatic. Remedy: delete + reprovision.
+  - Residual: **nix has no auto-GC**, so a long-lived worker's store only grows into a fixed volume.
+    `nix store gc` lives in `agent/`; v1 documents it.
+- **v1 renders ONE `/data` PVC; the bare repo is NOT pre-split onto its own volume.** The bare repo is
+  a pure cache (`ensureClone` is "clone bare if absent, else fetch"), so the later split is a **cache
+  miss, not a migration** — and pre-splitting is not inert, since `git.ts` derives both roots from a
+  single `dataDir` and a second volume does nothing until `agent/` gains a bare-dir knob that #51 has
+  not chosen. When the split lands it should be an **`emptyDir`, not a second PVC**: a cache with a
+  LAN-local source, it cannot be orphaned, cannot fail to bind, needs no sweep, and dies with the pod.
+- **BINDING CONSTRAINT for #51's k8s phase — the worker's bare repo must NEVER live on the
+  `fsGroup`-shared volume, and must never be mounted into the runner container in any mode**
+  (`readOnly: true` is not a substitute; the threat is write, and it still exposes the objects).
+  `fsGroup` recursively chgrps and g+rwX's its volume, so a runner holding supplemental gid 10001
+  could write `<bare>/config` and plant a `filter.*` / `commondir` code-exec key that fires in the
+  worker's later git — reopening exactly the channel #51's separate-runner-clone design closes by
+  construction. **The fence is mount-namespace isolation, not the group bits** — this looks like a
+  redundant belt next to the `fsGroup` pin and is the opposite. Required layout: shared workspace
+  volume = the runner clone only; worker bare = worker-container-private; the worker fetches the agent
+  branch from the shared runner clone (`file://` + pack, the CVE-2022-39253-safe path).
+
+## 268. Presets: Burstable quantities (user-chosen), a flat `/nix`, and two goldens generated by their real authority
+
+Serves human: as §264 (sizes are a user-stated part of the feature: type + size pickers). PRD #58
+Decision 7.
+
+- **The quantities are a USER decision (2026-07-17), not an implementer's guess.** Sizing a user's
+  agent container is a product decision, and the numbers existed **nowhere** before — not in the PRD
+  (which named the *fields*, never values), not in `workersize` (names-only, deliberately), not in the
+  controller. Measured basis: a live capstone drove a complete real Claude Agent SDK run (clone → plan
+  → gate → approve → implement → push → MR) peaking at **676 MiB** (cgroup `memory.peak`), idle 148
+  MiB, against compose's 4 GiB grant.
+
+  | size | cpu req–limit | memory req–limit | `/data` |
+  |---|---|---|---|
+  | `s` | 250m–1 | 1–2Gi | 5Gi |
+  | `m` (default) | 500m–2 | 2–4Gi | 10Gi |
+  | `l` | 1–4 | 4–8Gi | 20Gi |
+
+  `/nix` is a **flat 4Gi outside the table**.
+- **QoS is BURSTABLE (requests < limits), not Guaranteed** (user). The PRD's own fleet arithmetic
+  ("10 users × quota 2 × M ⇒ 10 cores / 20Gi") is only coherent as **requests** — it is impossible as
+  a limit given the measurements above — so Guaranteed would contradict the PRD's own math while
+  stranding 4Gi per **idle** worker on a shared cluster. Each preset therefore carries **both**, a
+  distinction Decision 7 never drew (it named "cpu, memory" as if singular).
+  - **Requests sit deliberately ABOVE the measured peak**: kubelet evicts pods exceeding their
+    **requests** first, so a request below real usage would make workers the first thing evicted under
+    node pressure.
+- **`m` is the default, and it is defended on the right grounds.** 676 MiB fits `s` (2Gi) three times
+  over, so the OOM fear behind preferring a larger default was **wrong**. `m` stands anyway because
+  what 676 MiB bounds is **the agent, not the user's build** (the e2e repo compiles nothing, so the
+  build is unmeasured), because `m` is compose parity, and because an under-sized default fails
+  invisibly in a version with no pod-phase status. **Do not re-litigate `s` on the strength of that
+  number.**
+- **`/nix` sits outside the table because it is measured byte-identical across `base` and `jvm`** (209
+  MB / 74 store paths — the JDK ships via apk to `/usr/lib/jvm`, never through nix) and does not vary
+  by size. 4Gi is ~2.4× the measured 1,703 MB worst case; storage is the binding fleet constraint
+  (20 × `m` = 10 CPU / 40Gi requested but **280Gi of PVC**).
+- **All presets pin `WORKER_MAX_CONCURRENT_RUNS=1` until PRD #51 lands** — cap>1 would
+  server-provision the documented intra-user concurrency residuals. A size buys headroom for **one**
+  run, never parallelism.
+- **`templateImages` is spelled out per template, never computed as `"agent-"+template`.** A computed
+  name resolves ANY template, which makes both the table and its golden vacuous — a new template would
+  render a pod pulling an image CI never published, moving the failure from a red test to an
+  ImagePullBackOff on a user's worker. The explicit entry is what M6's CI build list must agree with.
+  The image tag is the **controller's** config (`UZI_WORKER_IMAGE_TAG`); neither repo nor tag has a
+  defensible default (an empty repo silently means Docker Hub; `latest` renders an unpinned fleet), so
+  both are required at boot.
+- **TWO goldens, each generated by the module that is actually the authority** — this deviates from
+  the design (one file), and the deviation is the point:
+  - `api/internal/hostedsvc/testdata/hosted_sizes.json` carries the **names** (it *is*
+    `workersize.Names`, marshalled); `controller/internal/preset/testdata/hosted_size_specs.json`
+    carries the **quantities**. Adding quantities to the api's golden would force one of: the api
+    module authoring them (**a second preset table in `api/`, which is precisely what §265's rule
+    forbids**), the controller writing into the api's tree (a regenerate from either side clobbers the
+    other), or a hand-maintained file (deletes the producer gate to buy nothing).
+  - The chain, every link gated: `workersize.Names` → `hosted_sizes.json` → the controller's preset
+    table (asserted both ways) → `hosted_size_specs.json` → the web constant (`workerSizes.ts`).
+  - Raw k8s quantity strings, **never pre-rendered prose** — prose is where a lie hides. The
+    controller asserts against `resource.MustParse` values; the web renders the strings verbatim.
+  - Order comes from the api's golden, not `SizeNames()` (map keys are randomly ordered and would
+    rewrite the file every run). "Smallest first" is the api registry's decision, so the picker cannot
+    silently reorder itself.
+  - **The golden is a build-time artifact, not a runtime contract.** Nothing on the wire carries
+    quantities. Reading them from the authority at runtime is **structurally impossible**: §265 makes
+    the controller outbound-only, so the api can never ask it anything.
+  - The web reads it as `import … from "…json?raw"`, **not `node:fs`**: `web/` is a pure browser
+    project with no `@types/node`, so `node:fs` fails `tsc --noEmit` (TS2307). `?raw` matches
+    `vite/client`'s ambient wildcard, so tsc never resolves the path while vitest resolves it for
+    real. **A shipped web source file may NEVER import the golden** — `web/Dockerfile` copies `web/`
+    and `docs/` only, so an import builds locally and breaks the image. Honest cost: a typo'd path
+    fails only when vitest runs, never at compile time.
+  - Honest cost overall: three copies (web constant, golden, controller table) instead of two, and the
+    golden buys only that they cannot drift **silently**. It does not cover deployment skew — see
+    below.
+- **An unknown size or template at RUNTIME must be tolerated; the golden cannot cover this.** It
+  catches dev-time drift, not **deployment skew**: api and controller are separately-built images, so
+  even under Model B's version pinning a rollout has a window where an old controller polls a new api.
+  `Resolve` returns a typed `UnknownError` (never a partial Spec); the caller logs, **skips rendering
+  that one worker, and KEEPS it in desired state**. Never crash the reconcile (one unknown size must
+  not stall the fleet), never guess or substitute a pod spec. **Getting this backwards is fleet
+  destruction** — see §272.
+
+## 269. Quota: an advisory lock is the mechanism, and the count-based quota leaves the size picker with no incentive half
+
+Serves human: as §264 (self-service + an admin-set quota are user-stated). PRD #58 Decision 8.
+
+- **Any user may provision up to an admin-set per-user quota** (`hosted_worker_quota`, default 2,
+  **0 disables self-service**, max 20). The quota counts **hosted** workers only. Provision and delete
+  are rate-limited per user (10/min).
+- **Decision — `pg_advisory_xact_lock` on the user, then count, then insert and seal, in ONE
+  transaction. The LOCK is the mechanism.** A quota check alone is not atomic under READ COMMITTED
+  (this repo's default): two concurrent provisions evaluate the count against their own snapshots,
+  neither sees the other's uncommitted row, and both commit at quota+1.
+  - **Measured against real Postgres, which is what decided it**: with the lock removed and the check
+    otherwise intact, **8 of 8 concurrent provisions passed a quota of 2**; with it restored, exactly
+    2. The original design text ("guarded insert under the same transaction, no TOCTOU") named a
+    mechanism that does not deliver the property it claims.
+  - **`FOR UPDATE` cannot fix it** — it locks rows that exist and takes no predicate lock, so it does
+    not fence a phantom insert. **The guarded `INSERT … WHERE count < quota` was tried and dropped**:
+    same hole (each subselect evaluates against its own snapshot) while *reading* as though it closed
+    it. No honest name exists for "insert if the caller's lock is held and the count is under" — which
+    is the signal the property does not belong in the statement. The count happens in Go under the
+    lock, the shape `createUserFirstAdmin` already uses for the identical race.
+  - **A test that cannot fail is not a gate**: the N-goroutine race test misses a missing lock ~1 run
+    in 20 and a lock-taken-after-the-count ~1 in 6, so neither defect may rest on it. The
+    deterministic test (hold the lock, fill the quota underneath the blocked provision, release)
+    decides both by construction. These live-DB tests previously **skipped silently in CI** — `go test
+    ./...` reports `ok` for a package whose every test skipped — so the central security property had
+    a green pipeline and zero coverage; now gated by `test:api-store-it`.
+- **Defense in depth at the k8s layer**: the worker namespace carries a ResourceQuota + LimitRange, so
+  an app-level bug cannot noisy-neighbor the shared cluster.
+- **Delete is NOT gated on `WORKER_HOSTING_ENABLED`** (provision is) — a stack that provisioned
+  workers then turned hosting off must still be able to remove them; the same reasoning the expiry
+  sweep uses. Delete added **no new endpoint**: `DELETE /api/workers/{id}` already refuses while a
+  worker holds a non-terminal run, for both kinds. It gained only the limiter, which consequently caps
+  external-worker deletes too (user-accepted: the shared route is the only non-bypassable place to put
+  it, and a hosted-only route would duplicate the active-runs guard).
+- **LIVE RESIDUAL — the size picker informs but does not restrain, and the deferral's cost is
+  measured.** The quota counts **workers**, so `s`, `m` and `l` each cost 1 of 2 and **picking `l` is
+  always rational**. Landing the quantities (§268) closed the **informed** half — the architect's
+  objection was "a user choosing a size with no idea what it buys is choosing blind" — and left the
+  **incentive** half untouched: the numbers are necessary and not sufficient.
+  - **The display made it mildly worse, and shipping it was still right.** Measured at 1280px: the
+    provision form renders `[Size: "L — up to 4 CPU / 8Gi RAM / 20Gi disk"]` and `["1 of 2 used"]`
+    **12px apart on the same line** — the resource quantities and the counter that prices them
+    identically, laid out adjacently at the exact moment of choosing. Before, a bare `L` gave a user
+    nothing to compute with. So the cost moved from **neutral** to **mildly negative**; informing
+    still beats not informing.
+  - **Nothing restrains `l`.** The default is `m`, which sits mid-table, so inattention parks the
+    median user at compose parity — the default is load-bearing for **sizing correctness**, not as a
+    conservation control (`s` at least nudged). The backstop is the namespace ResourceQuota, where the
+    cost of everyone picking `l` lands on **someone else's worker failing to schedule, invisibly**, in
+    a version with no pod-phase status.
+  - **The user declined both structural levers TWICE (2026-07-16 and 2026-07-17) — deliberately
+    deferred, not an oversight to rediscover.** (a) A **resource-weighted quota** (s=1, m=2, l=3
+    against a budget) does **not** reopen §265 — a weight is a quota *price*, not a pod-spec value —
+    but it reopens the landed transaction (the count becomes a sum) and makes a shipped admin
+    setting's name a lie (`hosted_worker_quota: 2` would mean "2 points"). (b) **One size for
+    everyone** dissolves the quantities debt too and is more reversible than it looks (the migration
+    deliberately has no CHECK on `hosted_size`), but removes a shipped affordance. Reopen only if the
+    commons failure is **observed**; reach for (a) or (b) then, and do not re-derive the finding.
+
+## 270. The TLS worker hop, and the XFF forgery it would otherwise arm — two layers, never either
+
+Serves human: "no Anthropic token ever appears in a log line, API response, or the SPA" (Feature #53)
+and the vault threat model; PRD #58 Decision 4. Also serves CLAUDE.md's standing rule: *four
+independent layers… don't weaken any layer on the theory another covers it.*
+
+- **Decision — the api gains an OPTIONAL SECOND listener (TLS, `API_TLS_ADDR` default `:8443`,
+  cert-manager-issued), and hosted workers + the controller dial it over `https://`**, verifying the
+  cluster-issued CA. Claim responses carry the decrypted forge PAT and Anthropic token, and
+  dev-cluster is a shared cluster running arbitrary dev pods — that plaintext does not cross the pod
+  network. Config is **all-or-nothing** (a cert without a key is a boot error, not "TLS off"), the two
+  listeners may not resolve to the same port, and `API_TLS_CERT`/`KEY` are **paths** to a mounted PEM
+  pair, never material.
+  - Workers hit the api **directly** (no nginx in the path), so `TRUSTED_PROXIES` still only covers
+    web pods and the api sees the worker's real peer address.
+- **THE DEFECT THIS ARMS, and why it is in scope.** `mw.ClientIP` trusts `X-Forwarded-For` on the
+  **peer IP alone** — it knows nothing about which listener or route a request arrived on.
+  dev-cluster's `TRUSTED_PROXIES` is the **whole pod CIDR** (`10.244.0.0/16`), because pod IPs are
+  dynamic and no narrower value is maintainable, so **hosted worker pods are trusted proxies by
+  construction**. It was inert only because the api NetworkPolicy admitted web pods and nothing else —
+  and §271's rule admitting the worker namespace is exactly what removes that mitigation.
+  - **Measured on a live api, not argued**: 12 `POST /api/auth/login` with a **rotating** XFF →
+    **12 × 401, zero 429s** (the per-IP auth rate limit bypassed outright); the same 12 from an
+    unforged IP → 429 at request 11. The limiter is real and the forgery defeats it.
+  - **Blast radius is the auth rate limiter ONLY, and the embellishment must not be repeated.** "Audit
+    attribution is forgeable the same way" is **false of this codebase**: `ClientIP` has exactly three
+    call sites, all in `ratelimit.go`; `X-Forwarded-For`/`RemoteAddr` appear in no other non-test Go
+    file; and **no migration defines an IP column at all** — uzi never persists a client IP, so there
+    is nothing to attribute. A bypassed brute-force control on the admin login is reason enough.
+- **The fix is TWO layers and both ship.**
+  - **(a) The TLS listener serves a SUBSET router**: `/api/worker/*` + `/api/controller/*` only.
+    `/api/auth/*` and `/api/admin/*` are **not mounted** there, rather than mounted-and-defended — a
+    hosted worker runs an agent against a user's cloned repo, a semi-hostile position **by design**.
+    The set was **derived from the agent and controller code**: the agent declares one base
+    (`WORKER_API_PREFIX`) and opens **no websocket**, so `/api/ws` — which an earlier proposal
+    included — is deliberately absent (13 routes vs 116 on plain).
+  - **(b) `stripXFF` on that listener** — the header cannot be forged because it is gone. **Narrowing
+    the CIDR was rejected**: pod IPs are dynamic, which is why the whole-CIDR value exists. Stripping
+    makes the property true **by construction** rather than by CIDR bookkeeping a future pod-CIDR
+    change would silently invalidate.
+  - **The router is built ONCE**: building `Routes` twice creates two middleware chains and silently
+    doubles every per-IP budget, so the subset **shares the limiter instances** — the mounts are
+    functions both routers call, one registration site per route, and the two surfaces cannot drift.
+  - If anyone ever fronts the TLS port with a real proxy, **(b) is the line to revisit** — that is the
+    single condition that changes the reasoning.
+- **THE SAME WEAKNESS EXISTED ON COMPOSE, and the fix is to DELETE the override** (user decision:
+  land it here rather than track it separately). `docker-compose.yml` defaulted `TRUSTED_PROXIES` to
+  the private RFC1918 space "so the real client IP is read from the XFF nginx sets". Both halves of
+  that reasoning fail:
+  - **It bought nothing.** `web` publishes on 127.0.0.1 only, so every browser connection arrives
+    through Docker's userland proxy and nginx sees the **bridge gateway** — itself inside
+    `172.16.0.0/12`. `ClientIP` finds no non-trusted XFF entry and falls through to RemoteAddr = the
+    nginx container IP: **exactly what an empty set produces**. Same bucket key, shorter path.
+  - **Its only live effect was the exploit.** The one address the filter does not swallow is an
+    attacker's invented public IP — non-trusted, therefore returned and used as the rate-limit key.
+    The `agent` container shares the network and runs a model against a user's cloned repo. The old
+    comment's claim ("a direct hit that bypasses nginx from a non-trusted source has its XFF ignored")
+    was true of an outside attacker and **false of the agent container** — the one caller running
+    untrusted code, and the only one inside the trusted set.
+  - So the default is now **empty** (matching the api's own Go default). Rejected: narrowing the CIDR
+    — no IP-based scheme can separate the agent from a proxy when they share a network. **Honest
+    cost**, scoped to one topology outside the supported path: publishing `web` on a public interface
+    with no proxy collapses every browser into one shared login bucket (an **availability** trade, not
+    a security one; the cap still holds).
+- **The e2e harness re-execs under a CLEAN environment (`env -i` + a short allowlist), by user
+  decision.** Compose ranks a shell-exported var **above** `--env-file`, so the caller's profile
+  silently replaces `docker-compose.yml`'s `${VAR:-default}`. This is not hypothetical: the XFF gate
+  above was first developed against a shell exporting the **old** `TRUSTED_PROXIES`, so the pre-fix
+  and post-fix runs tested the same vulnerable value and **both results were meaningless**. Measured:
+  **19 of 62** vars compose reads were exported in an ordinary dev shell, including real
+  `UZI_SEED_FORGE_PAT` and `JWT_SECRET`. **An allowlist, not a list of `unset`s** — unsetting works
+  only while someone remembers to extend the list every time compose grows a knob, which is the same
+  "true by bookkeeping" shape rejected three times above. Vars read as `${VAR:-default}` (above all
+  `TRUSTED_PROXIES` and `RATE_LIMIT_*`) are **deliberately not allowed through**: the assertions exist
+  to exercise the **shipped defaults**, so passing them would make the gate assert against a value the
+  harness chose and keep passing with the vulnerable default restored.
+
+## 271. NetworkPolicies both directions; Antrea FQDN egress is expressible, and enforcement is UNPROVEN
+
+Serves human: as §264. PRD #58 Decision 5.
+
+- **(a) The api's ingress policy gains TWO rules** — **controller pods** (release namespace) and
+  **worker-namespace pods**, each matched by namespace + pod label selector, **to the TLS port only**.
+  The design said one rule and named the wrong half; the omission was a **live bug, not a doc slip**:
+  the controller runs in the release namespace and polls the api, so under the existing default-deny
+  (web pods only) **every controller poll would have been dropped**. Invisible because the chart
+  shipped no controller until then. Both rules select the port via a helper rather than hardcoding it.
+- **(b) The worker namespace gets default-deny ingress** (nothing dials a worker) **and default-deny
+  egress** with explicit allows: DNS, api (TLS port), forge, nix substituters, Anthropic — explicitly
+  **excluding** the kube-apiserver ClusterIP and the cloud metadata IP (169.254.169.254).
+- **The CNI question is ANSWERED: dev-cluster CAN express FQDN egress, so the CIDR-allowlist fallback
+  is not needed.** Antrea v1.13.3, `AntreaPolicy` feature gate true on agent and controller, CRDs
+  present, and a server-side dry-run of the real policy accepted through the live webhook. Three
+  consequences, each verified rather than assumed:
+  - **FQDN cannot be used for in-cluster destinations** (AntreaProxy rewrites a ClusterIP before
+    enforcement), so DNS and the api are selector-based in the k8s policy.
+  - **DNS egress must be allowed** or every FQDN rule silently matches nothing (Antrea learns the IPs
+    by snooping DNS responses).
+  - **The explicit Drop belt is NOT redundant** with default-deny: an FQDN allow programs whatever IPs
+    the DNS answer carried, so a poisoned answer for an allowed name would open the metadata IP
+    *through* the allow rule. Drops go first, in the same policy.
+- **THE ENFORCEMENT GAP IS OPEN. Capability is proven; no packet has crossed.** Behaviour was
+  established by reading the Antrea v1.13 source, not by running a probe pod. **kind cannot close it**:
+  kindnet implements no NetworkPolicy at all — not the ANNP, not even the default-deny floor — so the
+  policies are created and silently never enforced there, and a green kind run says nothing. Do not
+  record it closed until a real hosted worker on dev-cluster either reaches `gitlab.example.com` or
+  does not.
+
+## 272. Teardown vs orphan is settled by PROVENANCE, not by a name prefix
+
+Serves human: as §264. PRD #58 Decisions 9 and 11.
+
+- **The collision.** Decision 9 said unrecognized `uzi-hw-*` objects are "flagged as orphans, never
+  adopted"; Decision 11 said a deleted worker's objects are torn down. But delete removes the row
+  outright, so a deleted worker simply **leaves the poll's fleet set** — and its objects are, by
+  Decision 9's own definition, exactly an orphan. Two demands, opposite responses, no signal
+  distinguishing them.
+- **Decision — define orphan by PROVENANCE, and the two sets become disjoint.** The controller stamps
+  `app.kubernetes.io/managed-by: uzi-controller` + `uzi.dev/hosted-worker-id` on everything it
+  creates. Then: **teardown** = `{objects we stamped} \ {desired fleet}`; **orphan** = `uzi-hw-*`-named
+  but **not** stamped → logged, never adopted, never deleted. "Never adopted" gains a precise meaning:
+  *the controller never takes ownership of an object it did not stamp.* **No tombstone, no schema
+  change, no wire change** — the alternatives were a `deleted` state on the wire (the api retains a row
+  the delete just removed; who deletes the tombstone, and when?) or "tear down anything not desired"
+  (makes orphan-flagging vacuous and hands a poll blip fleet-wide teardown authority).
+  - The orphan set is **not vacuous**: hand-made objects, an older label scheme, a partial create from
+    a crashed reconcile.
+  - The list carries **no label selector, deliberately** — an orphan is by definition an object whose
+    labels we do not expect, so selecting on our own stamp would make orphan detection see nothing.
+  - It also settles the Secret asymmetry: the controller cannot enumerate Secrets, but it can
+    **delete by name** derived from the worker id on the observed Deployment/PVC labels, so a deleted
+    worker's Secret **is** cleaned up. The residual narrows to "Secrets whose worker id we can no
+    longer learn" — exactly the accepted gap, no wider.
+- **TEARDOWN MUST BE `{ours} \ {ALL desired ids}`, INCLUDING ids we could not render.** An unknown size
+  or template means skip **rendering**, never leave the desired set (§268). Backwards, an old
+  controller polling a new api tears down **every worker carrying the new size or template** — the
+  exact deployment skew the tolerance exists for becomes fleet destruction. Verified **by mutation**
+  for both fields, because a test that cannot fail is not a gate.
+- **Rejected — a bulk-teardown circuit breaker** ("refuse a reconcile tearing down more than N% of the
+  fleet"): a user deleting 3 of their 5 workers is routine and **indistinguishable** from a bad
+  restore, so it would page an operator during normal use, to protect caches.
+- **Accepted residual — a poll that succeeds and LIES** (a DB restored from a backup predating a
+  provision). Bounded: a hosted worker's volumes hold no irreplaceable data, and a worker whose row is
+  gone has no `token_hash`, so its pod cannot authenticate and is already dead weight. A poll **blip**
+  cannot trigger it — `Tick` returns before `Reconcile` if `Poll` errors, and hosting-disabled 404s.
+  Both fail closed.
+- **Drift.** The chart injects the release's agent image tag into the **controller's** config; a worker
+  whose Deployment differs from desired (image tag, spec hash) is drifted and is rolled **only when it
+  holds no non-terminal run** (same predicate as delete). Two independent annotations,
+  `uzi.dev/spec-hash` and `uzi.dev/hosted-generation`, live on the **pod template**.
+  - **A token rotation must be stamped as a pod-template annotation or the pod never rolls**: rotation
+    changes the Secret's *content*, but the Deployment mounts it by *name*, so the pod template is
+    byte-identical and nothing restarts — the kubelet eventually refreshes the file (~60-90s) while the
+    worker holds the old token in memory and 401s forever, with the correct token sitting on its own
+    filesystem. Stamping the generation changes the pod-template hash and forces the roll (the standard
+    Helm `checksum/config` idiom), using `patch` and needing **no Secret read**. **This is what the
+    generation is for** — notably *not* the delivery ack (§266).
+  - **`hosted_generation` is INERT in v1**: no rotation path exists, so it is 0 on every provisioned
+    worker. It is stamped and unit-tested, and **nothing end-to-end can exercise the roll** — no green
+    e2e may be read as "rotation rolls".
+- **"Missing objects are recreated" is FALSE for Secrets, by design.** After delivery no plaintext
+  exists server-side anywhere (§266), so a deleted token Secret can neither be recreated **nor
+  detected** (detection needs the Secret read §264 refuses). The real detection is the worker going
+  offline (heartbeat, the documented v1 diagnostic); the recovery is delete + reprovision. v2 hook: a
+  pod wedged in `ContainerCreating`/FailedMount is precisely diagnosable and is the only handle anyone
+  has on this — via `pods: get, list`, which is **not granted**, so building the hook means adding the
+  verb in the same change. Least privilege means granting **at need**.
+
+## 273. Feature gating and the hosted UI: the flag hides the AFFORDANCE, never a user's rows
+
+Serves human: as §264 (opt-in; compose unaffected). PRD #58 Decisions 10 and 12.
+
+- **`WORKER_HOSTING_ENABLED` (api, set by the chart) gates the feature; compose is ZERO-DIFF.** Off —
+  the compose default — the api reports hosting disabled, `/api/controller/*` is not mounted at all
+  (§265), and the UI hides everything hosted.
+- **"Hides everything hosted" means the provision AFFORDANCE, not existing rows.** The literal reading
+  collides with itself: a hosted worker exists whether or not the flag is on, and hiding its row
+  strands something the user owns and must be able to delete. So the flag hides the provision card;
+  hosted **rows stay visible, stay badged, and stay deletable**, and the badge follows `workers.kind`
+  **alone** — it never consults the flag.
+  - The two readings are **indistinguishable on the deployment this protects**: compose never had
+    hosting on, so no row is ever `kind='hosted'` and zero-diff holds from `kind` alone. They diverge
+    only on an instance that provisioned workers and *then* turned hosting off — where badging is the
+    more honest, since an unbadged hosted row reads as "a worker I forgot to start" and sends its owner
+    looking for a container they never ran. **The affordance is gated; the rows are not** — the same
+    principle the quota-0 case establishes.
+  - Correspondingly, `/api/workers/hosted` and `/hosted/config` exist regardless of the flag
+    (`/hosted/config`'s entire job is to report that hosting is off; provision answers a flag-off
+    request with a 403 the handler itself gates). That is the **opposite** trade from the controller
+    endpoint, and deliberately so.
+- **Status stays heartbeat-driven** — online/offline/busy, unchanged; hosted rows are visually marked.
+  Pod-phase diagnostics are v2; v1 docs point admins at `kubectl -n <worker-ns> get pods`.
+- **The provision "dialog" is an inline `<Card>` form, not a modal.** There is **no modal primitive
+  anywhere in `web/`** — no `Modal`, no `role="dialog"`, no `<dialog>` — so taken literally the word
+  would have meant building this codebase's first modal (focus trap, escape, `aria-modal`, scroll lock,
+  restore-focus) for one two-field form. The sibling affordance ("Register a worker") is an inline Card
+  with a form, twenty lines away; mirror it.
+- **Delete gained a HOSTED-ONLY confirmation** (user decision), and the asymmetry is pinned by a test.
+  An external delete revokes a token (the container keeps running; re-register to recover); a hosted
+  delete takes `/data` and `/nix` with it **permanently** — and with no restart endpoint in v1, Delete
+  is the only lifecycle control a user has, so they **will** reach for it to restart a stuck worker.
+  External delete stays **one click**: the confirmation's meaning depends on its rarity.
+  - **Deletes announce and take focus, both kinds** — an announcement is feedback *after* the act, not
+    friction before it. The conventional "focus the next row's Delete" is **actively unsafe here**: the
+    remaining rows are mostly external one-click destructors, so it would park a keyboard user on a
+    live one, and double-tapping Enter through a confirm would destroy a second worker.
+- **The size picker renders the quantities from the golden** (`M — up to 2 CPU / 4Gi RAM / 10Gi disk`),
+  and the docs **point at the picker rather than duplicating the numbers** — a third copy in prose is a
+  third thing to drift, and prose is where a lie hides. The size shown in a worker row is a **bare
+  letter**: the row reports what a worker *is*, not what the sizes *are*.
+
+## 274. Chart shape: the invariant that renders nothing, and the plaintext port that must not be reachable
+
+Serves human: "CI/CD: real pipeline, tag releases, ArgoCD deploy to dev-cluster" (Feature #52).
+PRD #58 M3/M6.
+
+- **The chart re-opened the XFF hole the Go code had just closed, and the fix is a template `fail`.**
+  `uzi.workerAPIPort` fell back to **8080** when `api.tls.enabled` was false, and the api-ingress rules
+  admitted the controller and the worker namespace on it. Port 8080 serves the **full router with no
+  `stripXFF`** (both layers are on the TLS listener), so that one values combination handed a hosted
+  worker back `/api/auth/*` and `/api/admin/*` **and** a forgeable rate-limit key — while putting the
+  decrypted PAT on the pod network in the clear.
+  - **Why it mattered more than its exploitability**: the flags are separate values blocks coupled only
+    by one prose line, inside the `api.tls` block, which an operator turning on `workers.*` has no
+    reason to read. Flip one without the other and it **works perfectly and is silently insecure**.
+  - The fix is `fail` when `workers.enabled && !api.tls.enabled`, with an explicit
+    `workers.allowPlaintextAPI` opt-in that the kind-smoke values set. **A blanket `fail` was not
+    available** — kind is a real consumer of the 8080 fallback — and the opt-in makes the test
+    cluster's deviation **visible and deliberate** instead of an inherited default. There is no
+    legitimate k8s config that wants plaintext: a cluster without cert-manager still sets
+    `api.tls.enabled: true` with a pre-created `secretName`.
+- **`worker-invariants.yaml` renders NOTHING, on purpose.** The `fail` above was correct and every path
+  that **reached** it fired; the problem was reachability — the helper was only evaluated by templates
+  with other jobs and their own toggles (both NetworkPolicies, the controller Deployment), so turning
+  all of those off meant a workers-on/TLS-off stack rendered clean (**measured, not theorised**). The
+  invariant was attached to whichever template happened to render, rather than to the
+  **configuration**. This file is gated on `workers.enabled` **alone**, so no combination of sub-toggles
+  turns hosting on and the invariant off. It is an **additional call site, not a replacement** —
+  duplicating the condition would create the drift it prevents.
+  - **Why a dedicated file and not `worker-namespace.yaml`**, the other always-rendered template: that
+    one has its own job, and a chart that later grows a "bring your own namespace" toggle would silently
+    re-open the seam. **A file that does nothing else cannot acquire a reason to be switched off.**
+- **Do NOT flip `workers.enabled` on dev-cluster's values in this branch.** That file is ArgoCD's live
+  `$values` from `main`, so a merged flip **silently arms the next release**. The rollout is a
+  deliberate operator step, documented in `deploy/README.md`.
+- **The controller credential is sourced through the existing Infisical/existing-Secret pattern and is
+  never chart-generated.** `randAlphaNum` re-renders on every `helm upgrade` and silently rotates a
+  chart-generated credential unless anchored — a real Helm gotcha whose premise does not apply here
+  (the chart has none), so the directive is to keep it that way. Related: the plaintext (controller file
+  mount) and its hash (api env) are two values an operator must keep in sync, and a rotation touching
+  only one **fails closed** in both directions (the controller 401s) — the footgun is an outage, never a
+  bypass.
+- **`-count=1` is mandatory for the cross-module goldens in CI.** Go's test cache hashes only the files
+  a test opens **inside its module root**, and every api golden lives outside `controller/` — so editing
+  one leaves the controller module's cache key untouched and `go test ./...` reports "ok (cached)" with
+  the gate never running.
+
+## 275. What PRD #58 ships UNPROVEN, and what is deliberately v2
+
+Serves human: as §264. Recorded because the honest inventory is part of the contract, not a postscript.
+
+- **FOUR THINGS ARE UNPROVEN UNTIL THE FIRST REAL ROLLOUT** (dev-cluster), each deliberately left open
+  rather than papered over. A green kind run says nothing about any of them:
+  1. **NetworkPolicy enforcement** — kindnet enforces none (§271), including the Antrea FQDN egress
+     where capability is proven and no packet has crossed.
+  2. **FQDN egress enforcement** — as above; established by reading the Antrea source, not by a probe.
+  3. **The `fsGroup: 10001` pin** — kind's local-path PV is hostPath-backed and **ignores fsGroup**, so
+     `/data` and `/nix` arrive `0777 root:root` there and uid 10001 writes them for a reason that does
+     not exist on dev-cluster (an RWO ext4 volume mounts `root:root 0755`, and fsGroup is the only
+     thing making it writable). Asserted as an **observable** rather than as writability, so it duly
+     reported the gap instead of passing silently.
+  4. **The controller has never run anywhere** but kind, and **no hosted worker has completed a run** —
+     M3's "completes a stub run" was **relocated** to the real-cluster rollout (user decision), because
+     that criterion already subsumes it with strictly better evidence: a **real** run where `/data` is
+     representative, versus a stub run on kind exercising an agent loop this PRD changed nothing about.
+     It is now the **only** place a hosted worker is proven to execute anything, so it must not slip
+     quietly.
+- **What kind DID prove, on a real kubelet**: the tar seed under real PodSecurity `restricted` +
+  non-root + 0555 store dirs; the whole object set rendered and admitted; ResourceQuota/LimitRange/
+  PodSecurity admission; the `s` preset rendering exactly; **register → online**; teardown removing
+  every object by name; the api serving HTTP 200 **over TLS** from another pod (closing the
+  `defaultMode: 0400` + `fsGroup: 65532` worry by observation — the kubelet ORs `0040` onto read-only
+  secret volumes, so `0400` lands as `0440 root:65532`); and the toolchain (node/git/**nix**/devbox)
+  resolving off the **seeded** volume.
+  - **Both of the seed's hard failures were found by a real kubelet and were invisible to every fake
+    client**, because both are about the volume the kubelet mounts, not the objects we render: `tar -C
+    /nix .` archives a `./` member, so extraction chmod/utimes the **mount root** it does not own,
+    EPERMs, and CrashLoops the pod **having copied the store perfectly**; and an interrupted seed could
+    never recover, since tar will not extract over the 0555 dirs a previous pass sealed. A third was
+    **silent**: `producer | consumer` under `set -eu` with **no pipefail** would write the "seeded"
+    sentinel over a **partial store**, and every later boot would skip seeding forever.
+  - **The `lost+found` sentinel trap is closed by a UNIT test, deliberately**: kind's local-path makes a
+    plain directory, so a fresh PVC there really is empty, while dev-cluster's hypervisor CSI formats ext4
+    and a fresh PVC carries `lost+found`. It is a property of the check, so it needs no kubelet.
+- **Deliberately v2, recorded so it is not re-litigated**: no docker-compose hosting (laptop users keep
+  the manual flow); no autoscaling / scale-to-zero / spawn-on-demand; no preset CRUD; no restart
+  endpoint (delete + reprovision is v1's answer to everything); no pod-phase status in the UI; no token
+  rotation; no orphan-Secret detection.
+  - **Admin-configurable S/M/L is v2 and the two v2 items are COUPLED, not merely co-scheduled.** v1
+    deliberately has no pod-phase status, so it is the **worst possible release** in which to let an
+    admin type resource values: the failure mode lands exactly in the blind spot v1 accepted. Pod-phase
+    status is what shows the admin why their preset produced no pod. Ship them together; doing either
+    alone is what would be wrong. Note also the decisive fork — an admin-typed quantity must be
+    validated somewhere, and the api **cannot** (`apimachinery` is on its banned-module list, and
+    hand-rolling a quantity parser is worse than none), while skipping validation means a fat-fingered
+    `2GGi` strands workers with no error anywhere. **That the api cannot cleanly validate a quantity is
+    not a tooling accident; it is the boundary saying the api is the wrong owner.**
+  - **An in-cluster nix substituter** (nix-serve or a Harbor-backed mirror) is the right v2 answer to
+    the 10m53s per-worker store fetch — it keeps per-worker isolation while turning an internet fetch
+    into a LAN one (§267).

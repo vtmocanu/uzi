@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# Live-DB coverage for the store queries the fake-store unit tests cannot exercise
-# (the SQL itself): the PRD #24 MR-close watcher's candidate selection
-# (ListMRWatchCandidates) and the PRD #6 pipeline-status cache
-# (ListWatchedRunRefsForRepo window/cap/DISTINCT-ON, the per-card most-recent-run
-# join, default-branch projection, upsert-latest-per-ref, reconcile eviction).
+# Live-DB coverage for the behavior the fake-store unit tests cannot exercise:
+# the SQL itself, and the transaction semantics around it.
+#
+#   * the PRD #24 MR-close watcher's candidate selection (ListMRWatchCandidates)
+#   * the PRD #6 pipeline-status cache (ListWatchedRunRefsForRepo window/cap/
+#     DISTINCT-ON, the per-card most-recent-run join, default-branch projection,
+#     upsert-latest-per-ref, reconcile eviction)
+#   * the PRD #58 hosted-worker quota: a guarded insert under a per-user advisory
+#     lock. A fake store has no snapshot isolation and no locks, so it cannot
+#     exhibit the TOCTOU this gate exists to catch — it would go green against a
+#     quota that lets four workers through here.
 #
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
 # real goose migrations, seeds fixtures, and runs every store integration test
@@ -43,11 +49,27 @@ done
 docker exec "$NAME" pg_isready -U uzi -d uzi >/dev/null 2>&1 \
   || { echo "postgres never became ready"; exit 1; }
 
-say "running the store live-DB integration tests"
+say "running the live-DB integration tests"
 cd "$ROOT/api"
 # -buildvcs=false: this linked worktree confuses go's VCS stamping (git run from
 # $HOME); it only affects the embedded commit hash, never compile/test behavior.
-UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v \
-  -run 'LiveDB$' ./internal/store/...
+#
+# ./internal/handler/... joined ./internal/store/... for PRD #58 M2: the hosted
+# provision quota is enforced by an advisory lock plus a guarded insert ACROSS one
+# transaction, which lives in the handler (Handler.pool/.q are concrete types, so
+# there is no fake-store seam) and whose race a fake store could never exhibit. -run
+# filters by name, so only the *LiveDB tests run here — the rest of the handler
+# suite stays in `go test ./...`.
+#
+# -p 1 IS LOAD-BEARING, NOT A SPEED KNOB — do not drop it to parallelize the run.
+# go test runs PACKAGE binaries concurrently by default, and these two packages
+# share one database (there is exactly one throwaway Postgres above). Concurrently:
+# both call store.Migrate, and goose races itself into "relation already exists";
+# worse, the handler suite's resetUsers() TRUNCATEs users mid-flight under the store
+# suite's fixtures, failing tests that have nothing to do with the change being
+# made. Both were observed the first time this line swept two packages. -p 1
+# serializes the binaries; tests within a package are already sequential.
+UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+  -run 'LiveDB$' ./internal/store/... ./internal/handler/...
 
 printf '\n\033[32mStore integration tests passed.\033[0m\n'

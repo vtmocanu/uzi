@@ -1,0 +1,138 @@
+{{- if .Values.workers.enabled }}
+{{- /*
+  The controller's identity and the workers' (PRD #58 Decision 1).
+
+  This file IS the security boundary of the whole feature. Everything else in the
+  PRD assumes these verbs; read the Secrets line below before changing anything here.
+*/ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  # The controller runs in the RELEASE namespace and holds the only kube credential
+  # in uzi. Its Deployment lands in M6; the identity is created here with the Role it
+  # binds to, so the security envelope is one reviewable unit.
+  name: {{ .Values.workers.controllerServiceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+{{- if .Values.imagePullSecret.name }}
+imagePullSecrets:
+  - name: {{ .Values.imagePullSecret.name }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller
+  # A Role, in the WORKER namespace — never a ClusterRole. The controller's reach is
+  # exactly one namespace, and that namespace holds nothing but hosted workers.
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # `list` is what makes Decision 9's orphan detection possible at all: detecting an
+    # orphan means ENUMERATING objects whose names you do not expect, which get-by-name
+    # cannot do. It leaks nothing — a Deployment REFERENCES its Secret by name, it does
+    # not embed it. That asymmetry is the whole point of the next rule.
+    #
+    # `get` is deliberately ABSENT even though Decision 1's original list named it:
+    # nothing calls it. Observe reads the whole fleet with List (one call, and orphan
+    # detection needs it anyway), and reconcile decides create-vs-patch from that
+    # observation, so a get-by-name would be a second round trip for state already in
+    # hand. Decision 1's own words are "Verbs pinned minimal", and a verb granted for
+    # a call that does not exist is what that forbids. Add it back the day something
+    # calls it.
+    verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # ================= DO NOT ADD `get` OR `list` HERE. EVER. =================
+    #
+    # k8s has no existence-only verb for Secrets: get/list returns CONTENTS, and RBAC
+    # cannot scope it to the dynamic set of hosted-worker Secrets via resourceNames.
+    # Granting either converts a controller compromise from "harvest the tokens that
+    # happen to flow through the compromise window" (the controller is stateless and
+    # retains nothing) into "harvest every hosted worker's join token in ONE call,
+    # including every pre-existing one" — each token being worker impersonation ->
+    # claim that owner's runs -> receive their decrypted forge PAT and Anthropic token.
+    #
+    # The controller needs neither, and that is a design property rather than luck:
+    #   * it never reads a Secret back to check existence — it issues `create` and
+    #     treats AlreadyExists as success (that is the whole of Secret idempotence);
+    #   * it never reports delivery — the api learns that from the worker's own
+    #     authenticated registration, which PROVES possession (Decision 3). The two
+    #     are one decision: the ack is what makes this line affordable.
+    #   * it deletes by NAME, derived from the worker id on the Deployment's labels,
+    #     so teardown needs no enumeration either.
+    #
+    # Two of three validators independently caught M1's first protocol violating this
+    # line. controller/internal/kube asserts over the whole fake-client action log
+    # that no Secret get/list is ever issued, so this is a gate, not vigilance.
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    # `list` for the same orphan-detection reason as Deployments — and an orphan PVC
+    # is otherwise invisible entirely (Pods get/list does not cover it: an orphan
+    # Deployment scaled to zero has no pods).
+    verbs: ["create", "list", "delete"]
+  # PODS ARE DELIBERATELY NOT GRANTED AT ALL, and Decision 1's original list said
+  # "Pods get/list (drift detection only)". That parenthetical was wrong: drift
+  # detection reads the DEPLOYMENT's pod-template annotations (uzi.dev/spec-hash and
+  # uzi.dev/hosted-generation), never a pod — and an enumeration of every kube call in
+  # controller/ finds no pod call at all. Granting a verb for a feature that does not
+  # exist is exactly what "Verbs pinned minimal" forbids.
+  #
+  # The real recorded use is Decision 9's V2 hook: a pod wedged in
+  # ContainerCreating/FailedMount is the only handle anyone has on "the token Secret is
+  # missing", which is undetectable by design (see the Secrets rule). Decision 9 places
+  # that with the v2 pod-phase status work, "not v1" — so it gets `pods: get, list`
+  # when it is built, and loses nothing by being granted then. Least privilege means
+  # granting at need.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "uzi.fullname" . }}-controller
+subjects:
+  # The binding crosses namespaces deliberately: the subject lives in the release
+  # namespace, the Role in the worker namespace. That IS the grant — the controller
+  # reaches into the worker namespace and nowhere else.
+  - kind: ServiceAccount
+    name: {{ .Values.workers.controllerServiceAccountName }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  # The workers' own identity: ZERO permissions. It is bound to no Role and no
+  # ClusterRole anywhere, and there is nothing below this comment that grants it
+  # anything — a hosted worker's trust anchor is its join token and nothing else.
+  name: {{ .Values.workers.serviceAccountName }}
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+# Belt to the pod spec's own automountServiceAccountToken: false. A worker that
+# mounts no kube token cannot talk to the apiserver even if the namespace's RBAC
+# were widened by mistake.
+automountServiceAccountToken: false
+{{- if .Values.workers.imagePullSecretName }}
+# imagePullSecrets ride the ServiceAccount rather than the pod spec: one less thing
+# the controller must know, and it keeps the Harbor robot a chart/Infisical concern.
+# The Secret must exist in THIS namespace — a SA's imagePullSecrets cannot reference
+# another namespace's — which is why infisicalList carries a worker-namespace entry.
+imagePullSecrets:
+  - name: {{ .Values.workers.imagePullSecretName }}
+{{- end }}
+{{- end }}

@@ -129,11 +129,75 @@ api:
     periodSeconds: 20
     timeoutSeconds: 3
     failureThreshold: 6
+  # --- Optional TLS listener on the api (PRD #58 Decision 4) -------------------
+  #
+  # WHAT IT IS FOR: the hosted workers and the worker controller dial the api
+  # DIRECTLY (no nginx in the path), and a claim response carries the user's
+  # DECRYPTED forge PAT and Anthropic token. dev-cluster is a shared cluster
+  # running arbitrary dev pods, so that plaintext does not cross the pod network.
+  # Nothing else changes: users still reach uzi through the ingress -> web -> the
+  # PLAIN api port, which never leaves the namespace and is policed by
+  # networkPolicy above.
+  #
+  # ADDITIVE, NEVER A REPLACEMENT. Off (this default) the api binds :8080 alone and
+  # behaves exactly as it always has — compose is unaffected by all of this. On, it
+  # binds BOTH: :8080 for web's nginx and the kubelet probes, and this port for the
+  # workers. Turn it on together with the hosted-worker feature; on its own it just
+  # opens a port nothing dials.
+  #
+  # The api reads PATHS (API_TLS_CERT/API_TLS_KEY) from a mounted Secret and
+  # re-reads them when they change, so a cert-manager renewal needs no restart.
+  tls:
+    enabled: false
+    port: 8443
+    # The Secret holding tls.crt + tls.key (and ca.crt, which is what the clients
+    # mount). Empty => <fullname>-api-tls, which is what the Certificate below
+    # writes. Set it to a PRE-CREATED Secret when certManager.enabled is false.
+    secretName: ""
+    # The cluster's DNS domain, for the FQDN on the certificate. The hosted workers
+    # live in another namespace and can only dial the api by FQDN, so this is the
+    # name that actually gets verified.
+    clusterDomain: cluster.local
+    # Extra SANs, if something dials the api by a name the four Service names below
+    # do not cover (see api-certificate.yaml).
+    extraDNSNames: []
+    certManager:
+      # false => the chart creates no Certificate and you supply tls.secretName
+      # yourself (an external PKI, or a cluster with no cert-manager).
+      enabled: true
+      # WHICH ISSUER. Empty (the default) => the chart ships its own
+      # selfSigned -> CA -> leaf chain, scoped to this release.
+      #
+      # This is not a fallback, it is the correct answer for this hop: the name
+      # being certified is `api.<ns>.svc.cluster.local`, and dev-cluster's only
+      # ClusterIssuer is ACME (letsencrypt-prod, DNS-01 on the dev.example.com
+      # zone), which cannot issue for a cluster-internal name — no public challenge
+      # can validate one. Per-app selfsigned chains are what the rest of the cluster
+      # already does for internal hops (ingress-nginx, keycloak, otel).
+      #
+      # Point this at a real internal CA (Issuer or ClusterIssuer) if one ever
+      # exists; the chart then issues from it and skips its own chain.
+      issuerRef:
+        name: ""
+        kind: Issuer
+        group: cert-manager.io
+      # Leaf lifetime: the ordinary 90/30. Renewal is picked up live by the api.
+      duration: 2160h
+      renewBefore: 720h
+      # CA lifetime. Long, because rotating the ROOT means re-trusting it in the
+      # controller and every hosted worker pod at once — it is not the routine
+      # rotation, the leaf is.
+      caDuration: 43800h
+      caRenewBefore: 2160h
+
   # Default-deny ingress on the api pods, allowing ONLY the web pods (the reverse
   # proxy) to reach api:8080. This is the LOAD-BEARING control on a shared cluster
   # like dev-cluster: without it any pod (e.g. coder.example.com runs
   # arbitrary dev code) could hit the api ClusterIP directly, bypass web nginx, and
-  # spoof X-Forwarded-For to defeat the per-IP auth rate limit / forge audit IPs.
+  # spoof X-Forwarded-For to defeat the per-IP auth rate limit. (Rate limiting is the
+  # whole impact: uzi persists no client IP, so there are no "audit IPs" to forge —
+  # this comment used to claim otherwise. Verified 2026-07-17: ClientIP has three call
+  # sites, all in ratelimit.go, and no migration defines an IP column.)
   # example-app has no such policy (it runs on the non-shared mgmt cluster).
   networkPolicy:
     enabled: true
@@ -144,6 +208,232 @@ api:
     # to the dev-cluster node InternalIP CIDR(s). Empty = rely on the CNI exempting
     # host->pod probe traffic; CONFIRM at M6 before trusting empty.
     probeCIDRs: []
+
+# --- hosted workers: the namespace, its RBAC, its policies, the controller -------
+#
+# M3 built the security ENVELOPE (namespace, RBAC, quotas, policies); M6 added the
+# CONTROLLER that fills it and the api-side hosting flags. `workers.enabled` now
+# turns on a working feature rather than an inert namespace — except with
+# `controller.enabled: false`, which keeps M3's envelope-only shape (the KinD smoke
+# is the one consumer).
+#
+# SHIPS DISABLED. Compose deployments are zero-diff by construction (they render no
+# chart), and a cluster that has not opted in gets no extra namespace.
+workers:
+  # TURNING THIS ON REQUIRES api.tls.enabled: true. Not a convention — the chart
+  # REFUSES TO RENDER otherwise (uzi.workerAPIPort), because the two flags live in
+  # separate blocks and nothing else couples them. With TLS off, hosted workers get
+  # admitted to the api's plaintext 8080, which serves the FULL router and does not
+  # strip X-Forwarded-For: /api/auth/* comes back into a worker's reach, and a worker
+  # pod's IP is inside TRUSTED_PROXIES so it can forge its own rate-limit key. That
+  # combination works perfectly and is silently insecure, which is exactly why it is
+  # a template error rather than a line of advice.
+  enabled: false
+  # The escape hatch for the ONE case that legitimately has no TLS: a throwaway test
+  # cluster with no cert-manager (deploy/values/kind-smoke.yaml). NEVER set this on a
+  # real deployment — a cluster without cert-manager still sets api.tls.enabled: true
+  # and supplies a pre-created api.tls.secretName. It exists so that deviation is
+  # VISIBLE in the values file that chose it, instead of being an inherited default.
+  allowPlaintextAPI: false
+  # The DEDICATED namespace, which must contain NOTHING but hosted workers. A Role
+  # that can create pods in a namespace can mount any Secret and impersonate any
+  # ServiceAccount in it — RBAC cannot scope `create` by label — so this namespace's
+  # emptiness is precisely what bounds a compromised controller. Do not park anything
+  # else here.
+  namespace: uzi-workers
+  # The workers' own zero-permission ServiceAccount (worker namespace), bound to no
+  # Role anywhere, token never automounted.
+  serviceAccountName: uzi-hosted-worker
+  # The controller's ServiceAccount (RELEASE namespace) — the only kube credential in
+  # uzi. The identity + Role were created together in M3 so the boundary is one
+  # reviewable unit; M6's Deployment below is what runs under it.
+  controllerServiceAccountName: uzi-controller
+
+  # --- the controller Deployment (M6) -------------------------------------------
+  #
+  # The component that turns the envelope above into running workers. It is the ONLY
+  # thing in uzi holding a kube credential (Decision 1) — the api holds none and must
+  # never hold one.
+  controller:
+    # Off with workers.enabled: true = M3's envelope-only shape: the namespace, RBAC,
+    # quotas and policies exist and nothing runs in them. The api's hosting flags
+    # follow this flag, not workers.enabled, and that coupling is deliberate: hosting
+    # on with no controller means users provision workers that no process ever
+    # materializes — a row that sits pending until its token expires, visible only as
+    # a worker that never comes online (Decision 10).
+    #
+    # The KinD smoke is the one place false is right: it exercises what KinD can
+    # prove (admission, the /nix seed, object rendering) and has neither a controller
+    # image nor a controller token.
+    enabled: true
+    image:
+      repository: harbor.example.com/gitlab/vtmocanu/uzi/controller
+      # Unset => follows Chart.appVersion (Model B), exactly like api/web.
+      tag: ""
+      pullPolicy: IfNotPresent
+    # HARD SINGLETON, for the same class of reason the api is one: two controllers
+    # would poll and reconcile the same fleet concurrently, racing each other's
+    # create/patch/delete against one namespace. Paired with strategy: Recreate.
+    # The reconcile is idempotent, so this is about avoiding pointless churn and
+    # duplicate work, not about correctness of a single pass.
+    replicaCount: 1
+    # It polls, renders and applies — no compilation, no large payloads. The api's
+    # own requests are 50m/128Mi and it does far more.
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
+    # Empty => the controller's own defaults (10s poll, 15s HTTP timeout). Both are
+    # ordinary Go durations ("30s", "1m").
+    pollInterval: ""
+    httpTimeout: ""
+    # --- the controller's bearer credential (Decision 2) --------------------------
+    #
+    # TWO values, ONE secret, and they MUST be kept in sync by whoever sets them:
+    #   * tokenSecretKey     — the PLAINTEXT token. Mounted as a FILE into the
+    #                          controller (never an env var: /proc/<pid>/environ is
+    #                          the leak docs/proc-hardening.md closed for the worker,
+    #                          and the same argument applies to this credential).
+    #   * tokenHashSecretKey — its sha256, HEX-encoded. Read by the API as an env var.
+    #                          A hash is not a credential: holding it does not let you
+    #                          authenticate, so env is fine for this half.
+    #
+    # Generate the pair:
+    #   TOKEN=$(openssl rand -base64 32)
+    #   printf '%s' "$TOKEN" | shasum -a 256      # the hex hash
+    # then put BOTH in Infisical /uzi (or the pre-created uzi-secrets under
+    # secrets.mode: existing).
+    #
+    # THE CHART DELIBERATELY DOES NOT GENERATE THIS. A `randAlphaNum` default would
+    # re-render on every `helm upgrade` and silently rotate the credential, which is
+    # the one failure an operator cannot see coming. Sourcing it like every other
+    # secret keeps rotation an explicit act.
+    #
+    # A rotation that updates only ONE of the two FAILS CLOSED, in both directions:
+    # the controller's polls 401 and it stops reconciling. Nothing is admitted that
+    # should not be — the cost is an outage (hosted workers stop being created,
+    # rolled or torn down; existing ones keep running on their own join tokens), never
+    # a bypass. Rotate both, then restart the controller so it re-reads the file.
+    tokenSecretKey: UZI_CONTROLLER_TOKEN
+    tokenHashSecretKey: WORKER_HOSTING_CONTROLLER_TOKEN_SHA256
+
+  # --- the per-template agent images the controller renders (M6) ------------------
+  #
+  # The REPO PREFIX only. The controller appends "/agent-<template>:<tag>"
+  # (controller/internal/preset), so this must equal what CI publishes:
+  # .gitlab-ci.yml HARBOR_AGENT_IMAGE_PREFIX is this value + "/agent".
+  #
+  # A template the product offers (api/internal/workertmpl) but CI never published
+  # provisions a worker that sits in ImagePullBackOff forever — which in v1 surfaces
+  # only as a worker that never comes online. The two lists are kept equal by review,
+  # not by a gate.
+  image:
+    repository: harbor.example.com/gitlab/vtmocanu/uzi
+    # Unset => Chart.appVersion (Model B). Changing the tag is what rolls every hosted
+    # worker onto a new release (Decision 9) — the controller stamps it into the pod
+    # spec hash, so a release rolls the fleet as its workers finish their runs.
+    tag: ""
+  # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
+  # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
+  # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
+  # is kind-loaded). Materialized by worker-pull-secret.yaml — deliberately its own
+  # template rather than an infisicalList entry, since its lifecycle is workers.enabled
+  # and not the release's.
+  imagePullSecretName: registry-robot-secret-uzi-workers
+  # Where that robot comes from. The SHARED k8s-clusters project, exactly like the
+  # release namespace's copy (uzi's own runtime secrets live in the vtmocanu project;
+  # only the Harbor robot is shared — the same split infisicalList already makes).
+  pullSecretSource:
+    projectSlug: example-project
+    envSlug: prod
+    secretsPath: /k8s-registry-robot
+  # StorageClass for the worker PVCs. Empty = the cluster default.
+  #
+  # Worth a moment at rollout: dev-cluster's storage-class is volumeBindingMode Immediate,
+  # while storage-class-latebinding (WaitForFirstConsumer) is safer for a 2-PVC pod. uzi's
+  # own CNPG already runs on storage-class here, so this is a default worth thinking about,
+  # not a blocker.
+  storageClass: ""
+  # Namespace ResourceQuota (Decision 8). Defense in depth under the api's per-user
+  # quota: an app-level bug must not noisy-neighbour a shared cluster.
+  #
+  # Sized for a fleet of 20 x `m`: 10 CPU / 40Gi requested, 20 x (10Gi data + 4Gi nix)
+  # = 280Gi of PVC. STORAGE is the binding constraint, not CPU or memory.
+  # dev-cluster's real budget is M6's rollout conversation.
+  #
+  # SIDE EFFECT, and it is load-bearing: a quota on requests.* makes admission reject
+  # any pod with a container declaring no requests — initContainers included. The
+  # controller renders them explicitly for exactly this reason.
+  quota:
+    enabled: true
+    requestsCPU: "10"
+    requestsMemory: 40Gi
+    requestsStorage: 280Gi
+    persistentVolumeClaims: "40"
+    deployments: "20"
+  # The backstop, never the source: every hosted worker pod arrives from the
+  # controller with explicit requests + limits from its size preset.
+  #
+  # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 8Gi) or that preset
+  # stops being admissible — which would surface as a worker that provisions and never
+  # appears. maxPVCStorage likewise >= l's /data (20Gi).
+  limitRange:
+    enabled: true
+    default:
+      cpu: "2"
+      memory: 4Gi
+    defaultRequest:
+      cpu: 500m
+      memory: 2Gi
+    max:
+      cpu: "4"
+      memory: 8Gi
+    maxPVCStorage: 20Gi
+  # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
+  # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
+  # ClusterIP before policy enforcement, so FQDN cannot match a Service).
+  networkPolicy:
+    enabled: true
+    dns:
+      # Where the cluster's DNS runs. DNS egress is NOT optional: Antrea learns an
+      # FQDN's addresses by snooping DNS RESPONSES, so blocking DNS makes every FQDN
+      # rule below match nothing at all.
+      namespace: kube-system
+      podSelector:
+        k8s-app: kube-dns
+    # Extra egress rules, appended verbatim. For a cluster that needs an in-cluster
+    # destination the two rules above do not cover (a substituter mirror, a proxy).
+    extraEgress: []
+  # Named egress, Antrea-native (crd.antrea.io). OFF by default: it needs Antrea, and
+  # a cluster without it would just get a rejected manifest.
+  #
+  # Off is FAIL-CLOSED, not fail-open — the k8s floor still denies everything but DNS
+  # and the api, so a worker without this simply cannot reach its forge.
+  #
+  # dev-cluster turns it on (deploy/values/dev-cluster.yaml); the KinD smoke leaves it
+  # off (no Antrea there, and kindnet enforces no NetworkPolicy whatsoever).
+  fqdnEgress:
+    enabled: false
+    tier: application
+    priority: 5
+    # DROPPED FIRST, and not redundant with the default-deny floor: an FQDN rule
+    # programs the datapath with whatever IPs the DNS RESPONSE carried, so a poisoned
+    # answer for an allowed name mapping to the metadata IP would open egress to it
+    # THROUGH the allow rule. Per-cluster (the apiserver/node CIDRs differ).
+    denyCIDRs:
+      - name: drop-cloud-metadata
+        cidr: 169.254.169.254/32
+    # Expand from a REAL provisioning failure, never from prediction. Values-driven so
+    # a missing name does not need a code change and a release to fix.
+    allowFQDNs:
+      - name: allow-anthropic
+        fqdn: "*.anthropic.com"
+        ports: [443]
+      - name: allow-nix-substituters
+        fqdn: "cache.nixos.org"
+        ports: [443]
 
 # --- web: nginx serving the SPA + reverse-proxying /api/* to the api Service -----
 web:
@@ -273,6 +563,26 @@ api_podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 api_containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# controller: same distroless static-nonroot base as the api (uid/gid 65532), same
+# posture. It writes nothing to disk (a small emptyDir covers /tmp).
+#
+# fsGroup is what makes its two mounted files readable: a secret volume's files are
+# owned by ROOT with the group set to fsGroup, never by runAsUser (measured on a real
+# kubelet in M3). Without it the controller cannot read its own bearer token.
+controller_podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+controller_containerSecurityContext:
   allowPrivilegeEscalation: false
   privileged: false
   readOnlyRootFilesystem: true

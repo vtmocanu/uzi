@@ -12,6 +12,8 @@ function aWorker(over: Partial<Worker> = {}): Worker {
     name: "laptop",
     status: "online",
     busy: false,
+    kind: "external",
+    hosted_size: null,
     active_runs: 0,
     max_concurrent_runs: null,
     template_declared: null,

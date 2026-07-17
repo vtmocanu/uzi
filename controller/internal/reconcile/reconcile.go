@@ -38,14 +38,33 @@ type Poller interface {
 // harvest every hosted worker's join token for the fleet's life. A Deployment
 // references its Secret by name without embedding it, which is exactly why reading
 // Deployments is boring and reading Secrets is fleet-wide token disclosure.
+// A worker id enters the observed set if ANY object we stamped carries it — which
+// is what lets a Deployment-less leftover PVC still be torn down.
+//
+// Orphans (uzi-hw-*-named but NOT stamped by us) deliberately never cross this
+// interface. They are logged inside Observe and never acted on, so giving Reconcile
+// the power to see them is power it should not have.
 type ObservedWorker struct {
-	// ID is the hosted worker's uuid, recovered from the object's name/labels.
+	// ID is the hosted worker's uuid, read from the uzi.dev/hosted-worker-id LABEL —
+	// never parsed back out of the object's name.
 	ID string
-	// Generation is the hosted_generation the deployed objects were rendered from.
-	// M3 sources it from the pod-template annotation it stamps (which is also what
-	// makes a rotation actually roll the pod); comparing it against
-	// DesiredWorker.Generation is Decision 9's drift check.
+	// HasDeployment distinguishes "nothing is deployed" from "deployed at generation
+	// 0", which are different states that a bare Generation field cannot tell apart.
+	HasDeployment bool
+	// Generation is the hosted_generation the deployed pod template was rendered from
+	// (the uzi.dev/hosted-generation annotation). Comparing it against
+	// DesiredWorker.Generation is half of Decision 9's drift check. 0 when
+	// HasDeployment is false.
 	Generation int64
+	// SpecHash is the uzi.dev/spec-hash annotation: the other half of the drift check,
+	// and the one that catches a new agent image tag (which the controller resolves
+	// from its own config, so the generation never moves for it). "" when
+	// HasDeployment is false.
+	SpecHash string
+	// HasDataPVC / HasNixPVC let a partially-created worker (a crashed reconcile
+	// between calls) converge without a read of anything sensitive.
+	HasDataPVC bool
+	HasNixPVC  bool
 }
 
 // Materializer is the cluster side of the loop — the seam M3 implements with the
@@ -58,7 +77,7 @@ type ObservedWorker struct {
 // purely "drive the cluster towards desired state".
 type Materializer interface {
 	// Observe returns the hosted workers currently deployed in the cluster, read
-	// fresh from the apiserver via Deployments (get/list, both granted).
+	// fresh from the apiserver via Deployments and PVCs (list on both, granted).
 	//
 	// It must NOT read Secrets — see ObservedWorker. An absent worker here means
 	// "nothing is deployed for it", never "it has no token".

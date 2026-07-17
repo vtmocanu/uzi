@@ -107,10 +107,52 @@ services:
       UZI_SEED_SLACK_BOT_TOKEN: ${UZI_SEED_SLACK_BOT_TOKEN:-}
       UZI_SEED_SLACK_APP_TOKEN: ${UZI_SEED_SLACK_APP_TOKEN:-}
       UZI_SEED_PUBLIC_BASE_URL: ${UZI_SEED_PUBLIC_BASE_URL:-}
-      # Trust the nginx hop (the compose network is private RFC1918) so the
-      # real client IP is read from the XFF nginx sets. A direct hit that
-      # bypasses nginx from a non-trusted source has its XFF ignored.
-      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,10.244.0.0/16,127.0.0.1/32}
+      # EMPTY BY DEFAULT: never trust X-Forwarded-For. This matches the api's own
+      # Go default, which config.go calls "the conservative default" — compose was
+      # what widened it.
+      #
+      # The old default trusted the whole private RFC1918 space "so the real client
+      # IP is read from the XFF nginx sets". That reasoning does not survive contact
+      # with this topology, in BOTH directions:
+      #
+      #  * It bought nothing. `web` publishes on 127.0.0.1 only, so every browser
+      #    connection arrives through Docker's userland proxy and nginx sees the
+      #    BRIDGE GATEWAY as $remote_addr — an address itself inside 172.16.0.0/12.
+      #    ClientIP looks for the rightmost NON-trusted XFF entry, finds none, and
+      #    falls through to RemoteAddr = the nginx container IP. That is exactly what
+      #    an empty set produces. Same bucket key, shorter path. (docs/auth-design.md
+      #    already documents and accepts this shared bucket on compose.)
+      #  * Its only live effect was the exploit. The one address the filter does NOT
+      #    swallow is an attacker's invented public IP (203.0.113.x) — non-trusted,
+      #    therefore returned and used as the rate-limit key. The `agent` container
+      #    shares this network and runs a model against a user's cloned repo, i.e.
+      #    semi-hostile code BY DESIGN (see agent/src/guardrails.ts). It could POST
+      #    /api/auth/login with a rotating XFF, land in a fresh per-IP bucket every
+      #    time, and defeat the brute-force control on the admin login outright.
+      #
+      # The previous comment here claimed "a direct hit that bypasses nginx from a
+      # non-trusted source has its XFF ignored". True of an outside attacker, and
+      # FALSE of the agent container — the one caller that runs untrusted code, and
+      # the only one that was inside the trusted set.
+      #
+      # THE ONE THING THE CHANGE DOES COST, stated because "bought nothing" is scoped
+      # to the topology above and one topology sits outside it: if you publish `web`
+      # on a PUBLIC interface with no proxy in front, the old broad default did give
+      # per-public-IP rate-limit buckets (a browser's public XFF entry is non-trusted,
+      # so ClientIP returns it), and the empty default collapses every browser into the
+      # single shared bucket keyed on the nginx container IP. Brute force is still
+      # capped — the limit holds, which is why this is the right default anyway — but
+      # the cap is now SHARED, so one noisy client can exhaust the login bucket for
+      # everyone else. That is an availability trade, not a security one, and it lands
+      # only on a self-exposed stack, which is off the supported path (the fix is a
+      # real proxy and the narrow value below, not a wider CIDR — which would hand the
+      # agent container XFF forgery to buy it back).
+      #
+      # SET THIS ONLY for a real reverse proxy you run in front of uzi, and set it to
+      # THAT PROXY'S ADDRESS, narrowly. Any CIDR broad enough to be typed by hand
+      # (10.0.0.0/8, 172.16.0.0/12) covers the agent container too and hands it XFF
+      # forgery — no IP-based scheme can separate them, because they share a network.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       # Agent-runtime knobs (PRD #4), read by the API's config.Load (server side).
       # RUN_TIMEOUT and RUN_MAX_REQUEUES drive the run sweeper; WORKER_HEARTBEAT_STALE
       # and WORKER_AFFINITY_GRACE drive worker liveness + claim affinity; RUN_IDLE_TIMEOUT

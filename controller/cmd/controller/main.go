@@ -14,9 +14,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/apiclient"
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/config"
-	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
+	"gitlab.example.com/vtmocanu/uzi/controller/internal/kube"
+	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
@@ -35,38 +39,56 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := apiclient.New(cfg.APIBaseURL, cfg.Token, cfg.HTTPTimeout)
+	client := apiclient.New(cfg.APIBaseURL, cfg.Token, cfg.HTTPTimeout, cfg.APICAPool)
 
-	// M1 ships the protocol and the loop; the kube client is M3's. Until then the
-	// controller reconciles against a materializer that touches no cluster, so this
-	// binary is exercisable end to end (it authenticates, polls, and honours the
-	// desired state's shape) without a kube-apiserver anywhere near it.
-	loop := reconcile.New(client, noopMaterializer{log: log}, cfg.PollInterval, log)
+	resolver, err := preset.NewResolver(cfg.WorkerImageRepo, cfg.WorkerImageTag)
+	if err != nil {
+		log.Error("worker image configuration", "error", err)
+		os.Exit(1)
+	}
+
+	// The in-cluster client. This is uzi's ONLY kube-apiserver credential, and it is
+	// why this component exists at all: a Role that can create pods in a namespace can
+	// mount any Secret and impersonate any ServiceAccount in it, so the api holding it
+	// would turn any api compromise into namespace-wide secret exfiltration. Here it
+	// is scoped to a namespace containing nothing but hosted workers.
+	//
+	// InClusterConfig, with no kubeconfig fallback: this process only ever runs as a
+	// pod, and a fallback would let it silently pick up a developer's admin
+	// kubeconfig — vastly wider than the Role it is supposed to be bounded by.
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		log.Error("kube client: this controller must run in-cluster with its own ServiceAccount", "error", err)
+		os.Exit(1)
+	}
+	kubeClient, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		log.Error("kube client", "error", err)
+		os.Exit(1)
+	}
+
+	materializer := kube.New(kubeClient, kube.RenderConfig{
+		Namespace:          cfg.WorkerNamespace,
+		ServiceAccountName: cfg.WorkerServiceAccount,
+		APIURL:             cfg.WorkerAPIURL,
+		StorageClass:       cfg.WorkerStorageClass,
+		APICAPEM:           cfg.APICAPEM,
+	}, resolver, log)
+
+	loop := reconcile.New(client, materializer, cfg.PollInterval, log)
 
 	log.Info("controller starting",
 		"api_base_url", cfg.APIBaseURL,
-		"poll_interval", cfg.PollInterval.String())
+		// The hop's posture, at a glance, in the first line of the log: this is the
+		// connection that carries join tokens across the pod network, and "is it
+		// actually verifying a CA" should not require reading the env to answer.
+		"api_ca_pinned", cfg.APICAPool != nil,
+		"poll_interval", cfg.PollInterval.String(),
+		"worker_namespace", cfg.WorkerNamespace,
+		// The image tag is the thing that rolls the fleet on a release, so it belongs in
+		// the line you read first when a worker is running the wrong code.
+		"worker_image", cfg.WorkerImageRepo+"/agent-<template>:"+cfg.WorkerImageTag,
+		"worker_ca_relayed", len(cfg.APICAPEM) > 0)
 	loop.Run(ctx)
 	log.Info("controller stopped")
-}
-
-// noopMaterializer is the M1 placeholder for the kube-backed materializer M3
-// brings. It observes nothing and materializes nothing.
-//
-// Observing nothing is inert by construction now: the controller reports nothing to
-// the api (delivery is settled by the worker's own registration), so an M1
-// controller pointed at a real api can only read desired state. It cannot destroy a
-// token, strand a worker, or touch a cluster.
-type noopMaterializer struct{ log *slog.Logger }
-
-func (noopMaterializer) Observe(context.Context) ([]reconcile.ObservedWorker, error) {
-	return nil, nil
-}
-
-func (n noopMaterializer) Reconcile(_ context.Context, desired []protocol.DesiredWorker, observed []reconcile.ObservedWorker) error {
-	// Counts only. The desired state carries join-token plaintext, so nothing here
-	// logs a worker's fields.
-	n.log.Info("reconcile (no-op: cluster materialization lands in M3)",
-		"desired_workers", len(desired), "observed_workers", len(observed))
-	return nil
 }

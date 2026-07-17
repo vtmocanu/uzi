@@ -58,9 +58,15 @@ ENV HOME=/home/worker
 # the tester's B1/B2/B3 findings but are NOT built in this workspace — the tester
 # re-runs the live worker-user provision + warm-start smoke against this image.
 
-# TARGETARCH is auto-populated by buildkit (amd64 / arm64), so both templates build
-# natively on x86_64 AND Apple-Silicon/arm64 hosts. nix-installer uses the
-# GNU-triple arch (x86_64/aarch64); devbox uses the Go arch (amd64/arm64).
+# TARGETARCH drives the arch of both downloads below: nix-installer uses the
+# GNU-triple arch (x86_64/aarch64), devbox the Go arch (amd64/arm64). Buildkit
+# auto-populates it, so a compose build is native on x86_64 AND Apple-Silicon
+# hosts — but ONLY buildkit does. Kaniko implements none of buildkit's automatic
+# platform args, so CI passes --build-arg TARGETARCH explicitly (.gitlab-ci.yml,
+# build:agent / publish:agent).
+#
+# Deliberately NO default: a builder that forgets to set this must fail loudly on
+# the empty value, not silently bake an image for the wrong architecture.
 ARG TARGETARCH
 
 # nix, single-user, installed as root then chowned to the worker (group `runner`,

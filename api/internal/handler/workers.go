@@ -86,6 +86,16 @@ type workerDTO struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Status string `json:"status"`
+	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
+	// controller runs in the cluster, PRD #58). HostedSize is the S/M/L preset name,
+	// null for an external worker. Together they are what lets the UI mark hosted
+	// rows (Decision 10: status stays heartbeat-driven for both kinds).
+	//
+	// hosted_generation is deliberately absent: it is controller-internal reconcile
+	// state, not browser state — the same rule that keeps session_id/last_seq off
+	// runDTO below.
+	Kind       string  `json:"kind"`
+	HostedSize *string `json:"hosted_size"`
 	// Busy is the any-kind non-terminal signal (PRD #42 Decision 10): true whenever
 	// the worker holds ANY active run, chat included — so a lone active chat still
 	// reads as busy even though active_runs (run-lane only) is 0.
@@ -126,6 +136,8 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) workerDTO {
 		ID:                 w.ID.String(),
 		Name:               w.Name,
 		Status:             w.Status,
+		Kind:               w.Kind,
+		HostedSize:         textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
 		Busy:               busy,
 		ActiveRuns:         activeRuns,
 		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),
@@ -146,6 +158,8 @@ func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
 		ID:                 w.ID.String(),
 		Name:               w.Name,
 		Status:             w.Status,
+		Kind:               w.Kind,
+		HostedSize:         textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
 		Busy:               w.Busy,
 		ActiveRuns:         int(w.ActiveRuns),
 		MaxConcurrentRuns:  intPtrValue(w.MaxConcurrentRuns),

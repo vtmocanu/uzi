@@ -513,3 +513,88 @@ func TestPrivilegeCheckInterval(t *testing.T) {
 		}
 	})
 }
+
+// TestLoadTLSListener covers the optional TLS listener's boot gate (PRD #58
+// Decision 4). The flag-off path is the one that matters most: it is every
+// compose stack, and it must stay a strict no-op.
+func TestLoadTLSListener(t *testing.T) {
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	setBase := func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+		t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+		t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+	}
+
+	t.Run("unset: no TLS listener, no boot failure", func(t *testing.T) {
+		setBase(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.TLSEnabled() {
+			t.Fatal("TLSEnabled() = true with API_TLS_CERT/KEY unset")
+		}
+	})
+
+	t.Run("both set: the paths load", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("API_TLS_CERT", "/etc/uzi/tls/tls.crt")
+		t.Setenv("API_TLS_KEY", "/etc/uzi/tls/tls.key")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.TLSEnabled() {
+			t.Fatal("TLSEnabled() = false with both API_TLS_CERT and API_TLS_KEY set")
+		}
+		if cfg.TLSCertFile != "/etc/uzi/tls/tls.crt" || cfg.TLSKeyFile != "/etc/uzi/tls/tls.key" {
+			t.Fatalf("cert/key = %q/%q, want the configured paths", cfg.TLSCertFile, cfg.TLSKeyFile)
+		}
+		// Config holds PATHS, never material: cert-manager rotates the files
+		// underneath a running api, so a snapshot here would go stale (see tlsx).
+		if cfg.TLSAddr != ":8443" {
+			t.Fatalf("TLSAddr = %q, want the :8443 default", cfg.TLSAddr)
+		}
+	})
+
+	// Half-configured is a loud boot failure, not "TLS off": taking it as off would
+	// hand an operator who meant to encrypt the worker hop a plaintext one.
+	t.Run("cert without key aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("API_TLS_CERT", "/etc/uzi/tls/tls.crt")
+		if _, err := Load(); err == nil {
+			t.Fatal("Load: want error for API_TLS_CERT without API_TLS_KEY, got nil")
+		}
+	})
+	t.Run("key without cert aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("API_TLS_KEY", "/etc/uzi/tls/tls.key")
+		if _, err := Load(); err == nil {
+			t.Fatal("Load: want error for API_TLS_KEY without API_TLS_CERT, got nil")
+		}
+	})
+
+	t.Run("API_TLS_ADDR colliding with API_ADDR aborts boot", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("API_TLS_CERT", "/etc/uzi/tls/tls.crt")
+		t.Setenv("API_TLS_KEY", "/etc/uzi/tls/tls.key")
+		t.Setenv("API_TLS_ADDR", ":8080")
+		if _, err := Load(); err == nil {
+			t.Fatal("Load: want error for API_TLS_ADDR == API_ADDR, got nil (one listener would lose the bind race)")
+		}
+	})
+
+	// The collision guard must not fire on the flag-off path: an operator who set
+	// API_TLS_ADDR (or left a stale one around) without a cert pair still has no
+	// TLS listener to collide with.
+	t.Run("colliding addr without a cert pair is inert", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("API_TLS_ADDR", ":8080")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load: TLS is off, the addr collision cannot matter: %v", err)
+		}
+	})
+}

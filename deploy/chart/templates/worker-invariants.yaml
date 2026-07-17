@@ -1,0 +1,48 @@
+{{- if .Values.workers.enabled }}
+{{- /*
+  THIS TEMPLATE RENDERS NOTHING, ON PURPOSE. It exists to evaluate the hosted-worker
+  configuration invariants unconditionally. Deleting it deletes a security control,
+  and `helm template` will not miss it — nothing downstream references it, which is
+  exactly the property that makes it worth naming and commenting this loudly.
+
+  WHY IT EXISTS (PRD #58 M6, from the M3 delta review). The plaintext guard lives in
+  `uzi.workerAPIPort`, which fails when hosted workers would be admitted to the api's
+  PLAINTEXT :8080. That guard is correct, and every path that REACHES it fires. The
+  problem was reachability: the helper was only ever evaluated by templates that have
+  other jobs and their own toggles —
+
+    * worker-networkpolicy.yaml   (workers.networkPolicy.enabled)
+    * api-networkpolicy.yaml      (api.networkPolicy.enabled)
+    * controller-deployment.yaml  (workers.controller.enabled, via uzi.apiInClusterURL)
+
+  — so turning all of those off meant the guard was never reached and a
+  workers-on/TLS-off stack rendered clean. Measured, not theorised: at b3944d1,
+  `workers.enabled=true` with both NetworkPolicies off AND the controller off rendered
+  with no error.
+
+  The invariant was therefore attached to whichever template happened to render,
+  rather than to the CONFIGURATION. That is the "true by bookkeeping rather than by
+  construction" shape this PRD has now rejected four times (narrowing TRUSTED_PROXIES,
+  the CIDR-vs-FQDN allowlist, prose in values.yaml, the compose XFF default). This
+  file is the fix: it is gated on `workers.enabled` ALONE, so there is no combination
+  of sub-toggles that turns hosted workers on and the invariant off.
+
+  IT IS AN ADDITIONAL CALL SITE, NOT A REPLACEMENT. `uzi.workerAPIPort` keeps its
+  `fail` and stays the single definition of the rule — duplicating the condition here
+  would create exactly the drift this is meant to prevent. The `$_ :=` assignment
+  discards the returned port; the point is the evaluation, not the value.
+
+  WHY NOT worker-namespace.yaml, the other always-rendered template: it has its own
+  job, and a chart that later grows the ordinary "bring your own namespace" toggle
+  (workers.createNamespace: false) would silently re-open the seam in precisely the
+  way described above. A file that does nothing else cannot acquire a reason to be
+  switched off.
+
+  NOTE the seam was never a live hole, and this is not a fix for an exposure: with
+  both NetworkPolicies off there is no api ingress policy at all, so EVERY pod in the
+  cluster can already reach api:8080 — a strictly broader and separately documented
+  "you disabled the load-bearing control" posture. No shipped values file has both
+  off. This closes the seam because an invariant should hold because of what it is.
+*/ -}}
+{{- $_ := include "uzi.workerAPIPort" . -}}
+{{- end }}

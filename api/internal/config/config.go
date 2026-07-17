@@ -26,6 +26,26 @@ import (
 type Config struct {
 	// Addr is the TCP address the API listens on (e.g. ":8080").
 	Addr string
+	// TLSAddr, TLSCertFile and TLSKeyFile configure the OPTIONAL SECOND listener
+	// (PRD #58 Decision 4): the same routes, served over TLS, on a separate port.
+	//
+	// Optional and additive by design. Unset (the compose default) the api binds
+	// Addr alone and behaves exactly as it did before this existed. Set, it binds
+	// BOTH: the plain listener stays because it is what web's nginx and the kubelet
+	// probes speak to (in k8s the api sits behind an in-namespace reverse proxy, so
+	// that hop is already policed by the api NetworkPolicy — web pods only), while
+	// the TLS listener is the one the hosted workers and the controller dial ACROSS
+	// a shared cluster's pod network. That hop carries claim responses holding a
+	// decrypted forge PAT and Anthropic token, which is why it does not go in the
+	// clear; the two listeners are separate ports precisely so a NetworkPolicy can
+	// admit the worker namespace to the TLS one and nothing else.
+	//
+	// TLSCertFile/TLSKeyFile are PATHS (PEM), not the material — cert-manager
+	// delivers the pair as a mounted Secret and rotates it in place, so the files
+	// are re-read on rotation rather than snapshotted at boot (see internal/tlsx).
+	TLSAddr     string
+	TLSCertFile string
+	TLSKeyFile  string
 	// DatabaseURL is the pgx connection string.
 	DatabaseURL string
 	// JWTSecret is the validated HS256 signing key.
@@ -285,6 +305,14 @@ type Config struct {
 	// prompt-injected worker cannot mass-create proposals across its user's chats.
 	ProposalRateLimitMax    int
 	ProposalRateLimitWindow time.Duration
+	// HostedRateLimit* is the per-user budget on the two endpoints that churn
+	// cluster objects (PRD #58 Decision 8): hosted provision and worker delete. A
+	// provision creates a Deployment, a Secret and volumes; a delete tears them
+	// down. Sized between the Slack-DM (6) and proposal (20) budgets — nobody
+	// legitimately provisions or deletes 10 workers a minute, and the quota, not
+	// this, is the real bound on how many can exist.
+	HostedRateLimitMax    int
+	HostedRateLimitWindow time.Duration
 	// ProposalConfirmStuckTimeout is how long a proposal may sit in the transient
 	// 'confirming' state before the sweeper reverts it to pending (PRD #39 M3): the
 	// recovery for a confirm handler killed after the claim but before it settled.
@@ -400,6 +428,7 @@ const defaultForgeBaseURL = "https://gitlab.example.com"
 func Load() (Config, error) {
 	cfg := Config{
 		Addr:            getenv("API_ADDR", ":8080"),
+		TLSAddr:         getenv("API_TLS_ADDR", ":8443"),
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		FrontendOrigin:  getenv("FRONTEND_ORIGIN", "http://127.0.0.1:8080"),
 		AuthTokenTTL:    parseDuration("AUTH_TOKEN_TTL", 168*time.Hour),
@@ -502,6 +531,8 @@ func Load() (Config, error) {
 	cfg.JudgeRateLimitWindow = parseDuration("JUDGE_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalRateLimitMax = parseInt("PROPOSAL_RATE_LIMIT_MAX", 20)
 	cfg.ProposalRateLimitWindow = parseDuration("PROPOSAL_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.HostedRateLimitMax = parseInt("HOSTED_RATE_LIMIT_MAX", 10)
+	cfg.HostedRateLimitWindow = parseDuration("HOSTED_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.ProposalConfirmStuckTimeout = parseDuration("PROPOSAL_CONFIRM_STUCK_TIMEOUT", 2*time.Minute)
 	// LOAD-BEARING ordering invariant (reviewer + auditor): the stuck-confirming sweep
 	// must NEVER revert a proposal to pending while a legitimately-slow CreateIssue is
@@ -562,6 +593,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := loadWorkerHosting(&cfg); err != nil {
+		return Config{}, err
+	}
+	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
+	if err := loadTLS(&cfg); err != nil {
 		return Config{}, err
 	}
 
@@ -723,6 +758,52 @@ func parseScopes(raw string) []string {
 		out = append([]string{"openid"}, out...)
 	}
 	return out
+}
+
+// TLSEnabled reports whether the optional TLS listener is configured. Boot
+// validation guarantees the cert and key are set together, so the cert alone is a
+// sufficient signal.
+func (c Config) TLSEnabled() bool { return c.TLSCertFile != "" }
+
+// loadTLS reads and validates the optional TLS listener (PRD #58 Decision 4).
+//
+// All-or-nothing, the stance loadOIDC and loadWorkerHosting take on their gating
+// vars: a cert without a key (or the reverse) cannot serve TLS, and taking it as
+// "TLS off" would hand an operator who meant to encrypt the worker hop a silently
+// plaintext one. Both unset is the compose default and a strict no-op — this is
+// the whole of the flag-off path.
+//
+// The files are NOT read here. tlsx.NewReloader parses them at boot (so a bad pair
+// is still a loud boot failure, not a failed handshake an hour later) and re-reads
+// them on rotation; loading them into Config would snapshot material that
+// cert-manager replaces underneath us.
+func loadTLS(cfg *Config) error {
+	cert := strings.TrimSpace(os.Getenv("API_TLS_CERT"))
+	key := strings.TrimSpace(os.Getenv("API_TLS_KEY"))
+	switch {
+	case cert == "" && key == "":
+		return nil
+	case cert == "":
+		return fmt.Errorf("API_TLS_KEY is set but API_TLS_CERT is not; both are required to serve TLS (they are the paths to the mounted PEM pair)")
+	case key == "":
+		return fmt.Errorf("API_TLS_CERT is set but API_TLS_KEY is not; both are required to serve TLS (they are the paths to the mounted PEM pair)")
+	}
+	// Both listeners are bound, so a shared address is not a preference to resolve
+	// but a boot that half-works: one Listen wins, the other errors, and which is
+	// which is a race. Catch it here rather than as a 3am "address already in use".
+	//
+	// Compare the PORTS, not the strings. A string compare passes `API_ADDR` of
+	// `0.0.0.0:8443` against the default `API_TLS_ADDR` of `:8443` — different text,
+	// same socket, since an empty host means all interfaces. The chart cannot produce
+	// that shape and it fails closed either way (the losing Listen takes the process
+	// down), but the guard exists precisely to name the problem instead of letting it
+	// surface as a race.
+	if samePort(cfg.Addr, cfg.TLSAddr) {
+		return fmt.Errorf("API_TLS_ADDR (%s) and API_ADDR (%s) resolve to the same port: the plain and TLS listeners are separate ports (the plain one serves web's reverse proxy and the kubelet probes; the TLS one serves the workers)", cfg.TLSAddr, cfg.Addr)
+	}
+	cfg.TLSCertFile = cert
+	cfg.TLSKeyFile = key
+	return nil
 }
 
 // loadWorkerHosting reads and validates the hosted-k8s-worker feature gate (PRD
@@ -1140,4 +1221,29 @@ func parseNonNegInt(key string, def int) int {
 		return n
 	}
 	return def
+}
+
+// samePort reports whether two listen addresses would bind the same TCP port on an
+// overlapping interface (PRD #58 M3).
+//
+// It is deliberately conservative: it compares ports, and treats an empty/wildcard
+// host as overlapping ANY host, because that is what it does at bind time. Two
+// concrete, different hosts on the same port are left alone — that is a legitimate
+// (if unusual) configuration and not ours to refuse.
+func samePort(a, b string) bool {
+	hostA, portA, errA := net.SplitHostPort(a)
+	hostB, portB, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		// Not a host:port pair we can reason about; fall back to the literal compare
+		// rather than guessing.
+		return a == b
+	}
+	if portA != portB {
+		return false
+	}
+	wildcard := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" || h == "[::]" }
+	if wildcard(hostA) || wildcard(hostB) {
+		return true
+	}
+	return hostA == hostB
 }

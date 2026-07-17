@@ -1,0 +1,78 @@
+{{- if and .Values.workers.enabled .Values.workers.fqdnEgress.enabled }}
+{{- /*
+  Named egress for the hosted workers (PRD #58 Decision 5b), Antrea-native.
+
+  WHY THIS EXISTS SEPARATELY: vanilla networking.k8s.io/v1 NetworkPolicy cannot
+  express a NAME — only CIDRs. The worker legitimately needs gitlab.example.com,
+  the Anthropic API and the nix substituters, and their addresses are neither stable
+  nor ours. The PRD's documented fallback was a maintained CIDR allowlist; it is not
+  needed, because dev-cluster CAN express FQDN egress (verified 2026-07-17: Antrea
+  v1.13.3, the AntreaPolicy feature gate true on both agent and controller, the CRDs
+  present, and a server-side dry-run of exactly this shape ACCEPTED by the
+  annpvalidator webhook).
+
+  A NAMESPACED policy, not a cluster-scoped ACNP. Upstream's docs only ever document
+  FQDN on the ACNP — but that is a DOCUMENTATION gap, not a capability gap
+  (v1.13's namespaced path calls the same toAntreaPeerForCRD that handles FQDN peers,
+  and the agent's gate is "not a K8s NetworkPolicy", true for ACNP and ANNP alike).
+  Namespaced is the right choice regardless: the policy is then confined to this
+  namespace and cannot be mis-selectored onto another tenant of a shared cluster.
+
+  VALUES-GATED because kind has no Antrea. Off, the k8s floor still denies
+  everything except DNS and the api — so a worker on a cluster without Antrea fails
+  CLOSED (it cannot reach its forge) rather than open.
+*/ -}}
+apiVersion: crd.antrea.io/v1beta1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-egress
+  namespace: {{ .Values.workers.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  priority: {{ .Values.workers.fqdnEgress.priority }}
+  tier: {{ .Values.workers.fqdnEgress.tier }}
+  appliedTo:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: uzi-hosted-worker
+  egress:
+    {{- /*
+      THE DROP BELT GOES FIRST, and within one ANNP that is what makes it a belt:
+      "rules assume the priority in which they are written... rule set at top takes
+      precedence" (Antrea v1.13 docs).
+
+      It is NOT redundant with the default-deny floor, which is the non-obvious part
+      and the thing that retroactively justifies Decision 5's "explicitly excluding"
+      language with a mechanism: an FQDN rule programs the datapath with WHATEVER IPs
+      THE DNS RESPONSE CARRIED. A poisoned or hostile answer for an allowed name
+      resolving to 169.254.169.254 would open egress to the metadata IP THROUGH the
+      allow rule — which an allowlist-plus-default-deny does not cover, because the
+      allow is what is being abused. Dropping first closes that.
+    */ -}}
+    {{- range .Values.workers.fqdnEgress.denyCIDRs }}
+    - name: {{ .name }}
+      action: Drop
+      to:
+        - ipBlock:
+            cidr: {{ .cidr }}
+    {{- end }}
+    {{- /*
+      Then the named allows. The list is values-driven on purpose: a missing name
+      surfaces as a provisioning failure inside someone's run, so it must be editable
+      without a code change and a release. Expand it from a REAL failure, never from
+      prediction.
+    */ -}}
+    {{- range .Values.workers.fqdnEgress.allowFQDNs }}
+    - name: {{ .name }}
+      action: Allow
+      to:
+        - fqdn: {{ .fqdn | quote }}
+      ports:
+        {{- range .ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+{{- end }}

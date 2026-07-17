@@ -18,13 +18,62 @@ All configuration is via environment variables, set in `.env` (copied from `.env
 | `FRONTEND_ORIGIN` | `http://127.0.0.1:8080` | User-facing origin. Its scheme decides the cookie `Secure` flag: `https://` makes cookies `Secure`, anything else does not. Use an `https://` origin behind TLS in production. |
 | `RATE_LIMIT_MAX` | `10` | Max requests per window, per (route, client IP), for `/api/auth/register` and `/api/auth/login`. |
 | `RATE_LIMIT_WINDOW` | `1m` | Fixed window for the rate limiter, as a Go duration. |
-| `TRUSTED_PROXIES` | `10.0.0.0/8,172.16.0.0/12,10.244.0.0/16,127.0.0.1/32` | CIDRs whose direct connections are trusted to speak for a real client via `X-Forwarded-For`. Only requests whose `RemoteAddr` falls in one of these ranges get their `X-Forwarded-For` header honored; everyone else's is ignored. The compose default trusts the private compose network (the nginx hop) — see [auth-design.md](auth-design.md) for why this is safe here. Leave empty to never trust `X-Forwarded-For` and rely on `RemoteAddr` only. |
+| `TRUSTED_PROXIES` | *(empty)* | CIDRs whose direct connections are trusted to speak for a real client via `X-Forwarded-For`. Only requests whose `RemoteAddr` falls in one of these ranges get their `X-Forwarded-For` honored; everyone else's is ignored. **Empty (the default) never trusts `X-Forwarded-For`, and that is correct for compose** — see [auth-design.md](auth-design.md). Set it **only** if you front uzi with your own reverse proxy, and set it to *that proxy's address*, narrowly: a hand-typed CIDR also covers the `agent` container, which shares the network and runs untrusted code by design. |
 | `DATABASE_URL` | set by compose | pgx connection string, built from `POSTGRES_*` and the `db` service name. Not meant to be set directly when using compose. |
 | `API_ADDR` | `:8080` | Address the `api` binary listens on inside its container. Set by compose; no need to change it. |
+| `API_TLS_CERT` | unset (no TLS listener) | Path to a PEM certificate. Set together with `API_TLS_KEY` to make the `api` serve a **second, TLS** listener alongside the plain one. Unset on compose, where nothing needs it. See [the TLS listener](#the-optional-tls-listener) below. |
+| `API_TLS_KEY` | unset (no TLS listener) | Path to the matching PEM private key. Setting exactly one of the pair refuses to boot: a cert without a key cannot serve TLS, and treating that as "TLS off" would silently hand you a plaintext hop you believed was encrypted. |
+| `API_TLS_ADDR` | `:8443` | Address of the TLS listener. Ignored unless the cert/key pair is set. Must differ from `API_ADDR`. |
 
-Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last one is logged as a warning); only a bad `JWT_SECRET`, a bad `UZI_SECRET_KEY`, or a missing `DATABASE_URL` refuses to start.
+Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last one is logged as a warning); only a bad `JWT_SECRET`, a bad `UZI_SECRET_KEY`, a missing `DATABASE_URL`, or a broken `API_TLS_CERT`/`API_TLS_KEY` pair refuses to start.
+
+### The optional TLS listener
+
+The `api` normally serves one plain HTTP port, reached only by the `web` reverse proxy on the same private network. That is all a compose stack needs, and leaving `API_TLS_CERT`/`API_TLS_KEY` unset keeps it exactly that.
+
+On Kubernetes there is a second kind of client: **hosted workers and the worker controller dial the `api` directly**, with no nginx in the path. A claim response on that hop carries the run owner's *decrypted* forge PAT and Anthropic token, and on a shared cluster the pod network is not private. Setting the pair adds a TLS listener for those clients:
+
+- It is **additive**. The plain listener stays, because that is what `web`'s nginx and the kubelet probes speak to.
+- The two are **separate ports on purpose**: it is what lets a NetworkPolicy admit the worker namespace to the TLS port and to nothing else, while the plain port stays reachable only from the `web` pods.
+- **The TLS port serves a smaller surface**, not the same one. Only `/api/worker/*` and `/api/controller/*` are mounted there — the exact set the agent and the controller dial. `/api/auth/*`, `/api/admin/*` and the rest are not reachable from a hosted worker at all. This is deliberate: a hosted worker runs an agent against a user's cloned repo, so it is a semi-hostile position by design, and "unreachable" is a better resting place than "reachable but defended".
+- **No `X-Forwarded-For` is trusted on the TLS port, because the header is removed before routing.** This one needs care, and the enforcement is the point rather than the intent: `TRUSTED_PROXIES` is matched on the *peer IP alone* — it knows nothing about listeners or routes. On a cluster it is typically the whole pod CIDR (pod IPs are dynamic, so no narrower value is maintainable), which means **hosted worker pods fall inside it and are trusted proxies by construction**. Stripping the header at this listener is what makes "the `api` sees a worker's real peer address" true; narrowing the CIDR cannot, and a future pod-CIDR change would silently invalidate it. The listener exists for clients that dial the `api` *directly*, so they are never proxied and an `X-Forwarded-For` on this hop could only be forgery. **If you ever front this port with a real reverse proxy, that strip is the thing to revisit.**
+- The values are **paths, not material**. The `api` re-reads them when they change, so a cert-manager renewal is picked up without a restart. A malformed pair fails at boot rather than at the first handshake.
+
+Clients verify the certificate against the issuing CA (`UZI_API_CA_FILE` on the controller). There is no "skip verification" switch anywhere in this path, by design: an unverified peer is the exact attack the encryption exists to prevent, so TLS-without-verification would be worse than the plain HTTP it replaced — it would look solved.
+
+On Kubernetes the Helm chart wires all of this from `api.tls.*` (certificate included); see [deploy/README.md](../deploy/README.md).
 
 There is no CORS configuration to make, by design: nginx serves the SPA and proxies `/api/*` to the API on the same origin (see [ARCHITECTURE.md](../ARCHITECTURE.md)), so the browser never makes a cross-origin request.
+
+## Hosted k8s workers (PRD #58)
+
+k8s-only: nothing here applies to compose, and every variable below is set by the Helm chart, not hand-edited — this table exists for completeness and for anyone reading the chart's rendered env. See [Hosted workers](hosted-workers.md) for the user-facing feature, [Admin settings](admin-settings.md#hosted-worker-quota) for the per-user quota, and [deploy/README.md](../deploy/README.md#hosted-workers-prd-58) for the operator rollout runbook (turning it on, rotating the controller token, and the residuals that are only proven on a real cluster).
+
+### `api`
+
+| Var | Default | Notes |
+|---|---|---|
+| `WORKER_HOSTING_ENABLED` | `false` | The feature gate. `true` requires `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` to also be set, or the api refuses to boot — enabling hosting with no way to authenticate a controller would be a silent no-op, and this is a security control rather than a tuning knob, so a malformed value also refuses to start. |
+| `WORKER_HOSTING_CONTROLLER_TOKEN_SHA256` | — | The sha256 (hex) of the controller's bearer credential, generated once with `openssl rand -base64 32` and hashed. Setting this while `WORKER_HOSTING_ENABLED` is `false` also refuses to boot — a hash with nothing to gate it is a stray credential the api would silently ignore. |
+| `WORKER_HOSTING_PENDING_TOKEN_TTL` | `1h` | How long a hosted worker's join token may sit sealed in Postgres, undelivered, before the expiry sweep destroys it. Read regardless of `WORKER_HOSTING_ENABLED`, so a stack that provisioned workers and then turned hosting off doesn't strand ciphertext. `0` disables the sweep — an undelivered token then stays sealed under `UZI_SECRET_KEY` indefinitely; see [vault-threat-model.md](vault-threat-model.md#hosted-worker-join-tokens-prd-58). |
+
+### `controller`
+
+A new component, one per deployment, the only thing in uzi holding a kube-API credential:
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_API_URL` | — (required) | The api's base URL, as the controller itself dials it (the release namespace's short Service name is fine here). |
+| `UZI_CONTROLLER_TOKEN_FILE` | — (required) | Path to the controller's own bearer credential, file-mounted like the worker's join token and for the same reason: an env-borne secret is readable via `/proc/<pid>/environ`. |
+| `UZI_API_CA_FILE` | — (optional) | PEM bundle to verify the api's TLS certificate against, pinned exclusively (not additive to the system roots). Required in practice whenever `UZI_API_URL` is `https://`. |
+| `UZI_WORKER_NAMESPACE` | — (required) | The dedicated namespace hosted workers render into — empty of everything else by design (see [ARCHITECTURE.md](../ARCHITECTURE.md#worker-controller-k8s-only)). |
+| `UZI_WORKER_SERVICE_ACCOUNT` | — (required) | The workers' own zero-permission ServiceAccount (no token automount). |
+| `UZI_WORKER_IMAGE_REPO` | — (required) | Registry prefix the per-template agent images live under; the controller appends `/agent-<template>:<tag>`. |
+| `UZI_WORKER_IMAGE_TAG` | — (required) | The release tag to run. Lives here, not on the api — the api never learns an image tag (Decision 1/7 in the PRD). Changing it rolls every hosted worker onto the new release once each holds no non-terminal run. |
+| `UZI_WORKER_API_URL` | — (required) | The FQDN a **worker** dials — necessarily the full cluster-DNS name, since a short Service name doesn't resolve cross-namespace. Deliberately separate from `UZI_API_URL` above. |
+| `UZI_WORKER_STORAGE_CLASS` | *(cluster default)* | StorageClass for a hosted worker's PVCs. |
+| `CONTROLLER_POLL_INTERVAL` | `10s` | How often the controller fetches desired state and reconciles the fleet. The controller is stateless, so a restart loses nothing between polls. |
+| `CONTROLLER_HTTP_TIMEOUT` | `15s` | Per-call timeout on every request to the api. |
 
 ## Forge integration
 

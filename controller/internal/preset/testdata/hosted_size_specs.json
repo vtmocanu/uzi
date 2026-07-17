@@ -1,0 +1,29 @@
+{
+  "sizes": [
+    {
+      "name": "s",
+      "cpu_request": "250m",
+      "cpu_limit": "1",
+      "memory_request": "1Gi",
+      "memory_limit": "2Gi",
+      "data": "5Gi"
+    },
+    {
+      "name": "m",
+      "cpu_request": "500m",
+      "cpu_limit": "2",
+      "memory_request": "2Gi",
+      "memory_limit": "4Gi",
+      "data": "10Gi"
+    },
+    {
+      "name": "l",
+      "cpu_request": "1",
+      "cpu_limit": "4",
+      "memory_request": "4Gi",
+      "memory_limit": "8Gi",
+      "data": "20Gi"
+    }
+  ],
+  "nix": "4Gi"
+}

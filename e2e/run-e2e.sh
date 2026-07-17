@@ -46,6 +46,72 @@
 
 set -euo pipefail
 
+# --- shell hygiene: re-exec under a CLEAN environment ------------------------
+# THE HARNESS MUST TEST WHAT THE REPO SHIPS, NOT WHAT THE OPERATOR'S SHELL EXPORTS.
+#
+# Compose ranks a shell-exported variable ABOVE --env-file (CLAUDE.md), so any var in
+# the caller's profile silently replaces docker-compose.yml's `${VAR:-default}` for
+# this run. That is not hypothetical and it is not cheap: the PRD #58 XFF gate below
+# was developed against a shell exporting the OLD
+# TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12,... — so the pre-fix AND post-fix runs both
+# tested the same vulnerable value, and BOTH RESULTS WERE MEANINGLESS. A measurement
+# taken through a dirty environment is not a weaker measurement, it is not one.
+#
+# Measured on the author's laptop when that surfaced: **19 of 62** vars
+# docker-compose.yml reads were exported in an ordinary dev shell, including real
+# UZI_SEED_FORGE_PAT, UZI_SEED_ANTHROPIC_TOKEN and JWT_SECRET.
+#
+# WHY AN ALLOWLIST AND NOT A LIST OF `unset`s (user decision). The overlay pins the
+# dangerous vars it wants to CHOOSE (UZI_SECRET_KEY, the UZI_SEED_* set), and unsetting
+# the rest one by one works only while someone remembers to extend the list every time
+# docker-compose.yml grows a knob. That is "true by bookkeeping, not by construction" —
+# the same shape PRD #58 rejected three times over (narrowing TRUSTED_PROXIES; the
+# CIDR-vs-FQDN allowlist; the chart's plaintext-port fallback). Deny-by-default means a
+# var added tomorrow cannot leak into a run without someone adding it HERE, on purpose.
+# CLAUDE.md already mandates this exact shape for compose smoke tests; e2e was exempted
+# only because it was believed immune, which it was not.
+#
+# WHAT IS DELIBERATELY *NOT* ALLOWED, and why the list must stay this short: every var
+# docker-compose.yml reads as `${VAR:-default}` — above all TRUSTED_PROXIES and
+# RATE_LIMIT_* — because the assertions here exist to exercise those SHIPPED defaults.
+# Passing them through (or pinning them in the overlay) would make the gate assert
+# against a value the harness chose, so it would keep passing with the vulnerable
+# default restored. Do not add one to buy a local convenience.
+#
+# What IS allowed: how to reach the machine (PATH/HOME/TMPDIR/TERM/docker daemon
+# addressing) and the harness's own knobs. None of these reach the api's config.
+#
+# WHY THE GATE IS AN ARGUMENT AND NOT AN ENVIRONMENT VARIABLE. The re-exec has to fire
+# whenever the caller's environment is dirty, so the "have I sanitized yet?" test must
+# not be something that environment can answer. This gate WAS an env sentinel
+# (`[ -z "${UZI_E2E_SANITIZED:-}" ]`), and a sentinel is inherited like any other var:
+# `export UZI_E2E_SANITIZED=1` skipped the entire re-exec and handed the stack the real
+# JWT_SECRET, the real UZI_SEED_FORGE_PAT and the vulnerable TRUSTED_PROXIES, with no
+# warning. The realistic path there is accident, not malice — it reads exactly like the
+# intended escape hatch, so a developer wanting one var through for debugging finds it by
+# reading this very block, and it then lives in their profile forever. It was also the
+# same shape the paragraphs above reject three times over: a claim the environment makes
+# about itself, trusted without verification.
+#
+# `$1` cannot be inherited. `env -i` clears the environment, and the argv below is one we
+# construct ourselves, so the only way to reach the sanitized branch is through that exec
+# (or by typing the flag, which is a deliberate act, not an ambient one). Do not
+# "simplify" this back into an env check, and do not swap in a cleverer sentinel — any
+# value the ambient environment can supply is this same bug wearing a different hat.
+if [ "${1:-}" != "--e2e-sanitized" ]; then
+  _e2e_env=()
+  for _v in \
+    HOME PATH TMPDIR TERM CI \
+    DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY DOCKER_TLS_CERTDIR \
+    UZI_E2E_EXECUTOR UZI_E2E_COMPOSE_PROJECT UZI_E2E_COMPLETE_TIMEOUT \
+    E2E_RUN_DIR E2E_GIT_SMART_HTTP KEEP_STACK KEEP_RUNDIR
+  do
+    [ -n "${!_v+set}" ] && _e2e_env+=("$_v=${!_v}")
+  done
+  exec env -i "${_e2e_env[@]}" bash "${BASH_SOURCE[0]}" --e2e-sanitized "$@"
+fi
+shift  # drop --e2e-sanitized; safe — this line is reached only when $1 held it
+
 # --- layout ------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXECUTOR="${UZI_E2E_EXECUTOR:-stub}"
@@ -685,27 +751,63 @@ echo "$MSGS" | jq -e '.messages | (length > 0) and ([.[].seq] == [range(1; lengt
   || fail "run_messages seq is not a gapless 1..N sequence (across the restart)"
 pass "run_messages seq is gapless 1..$(echo "$MSGS" | jq '.messages | length') across the restart"
 
-# PRD #40: the stub emits a synthetic terminal result frame (fixed usage) + a
-# per-agent coder message, standing in for the live SDK. Assert the API folded that
-# usage onto the run, aggregated it into /api/usage, and kept the per-agent row in
-# the stream (the three surfaces M4 renders from).
+# PRD #40: the API folds the terminal result frame's usage onto the run, aggregates
+# it into /api/usage, and keeps the per-agent row in the stream (the three surfaces
+# M4 renders from). That PROPERTY is what PRD #40 owns and it holds under either
+# executor; only the NUMBERS are the stub's. The stub emits a synthetic frame with
+# fixed usage (21400/6100, and a coder message at 12000) + a per-agent coder message,
+# standing in for the live SDK, so under the stub we assert the exact values — they
+# also prove the frame was parsed, not merely non-empty.
+#
+# Under UZI_E2E_EXECUTOR=sdk the usage is whatever the real session actually spent, so
+# assert the property instead. Asserting the stub's constants UNCONDITIONALLY is what
+# made the documented capstone unrunnable: every one of these four fails under a live
+# run, and the first one exits, so the harness reported failure after 24 PASS and a
+# fully successful real run (observed 2026-07-16: 2229 in / 11171 out against a
+# hardcoded 21400 — the run had cloned, planned, gated, implemented, pushed and opened
+# an MR). e2e/README.md's "no milestone assertion depends on this path" was true of the
+# milestones and false of this script.
 RUNUSAGE="$(apiget "/api/runs/$RUN")"
-[ "$(echo "$RUNUSAGE" | jq -r '.run.usage.input_tokens // empty')" = 21400 ] \
-  || fail "run.usage.input_tokens is not 21400 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
-[ "$(echo "$RUNUSAGE" | jq -r '.run.usage.output_tokens // empty')" = 6100 ] \
-  || fail "run.usage.output_tokens is not 6100 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
-pass "PRD #40: run.usage folded the result frame (21400 in / 6100 out) via run_usage"
+RU_IN="$(echo "$RUNUSAGE" | jq -r '.run.usage.input_tokens // empty')"
+RU_OUT="$(echo "$RUNUSAGE" | jq -r '.run.usage.output_tokens // empty')"
+if [ "$EXECUTOR" = sdk ]; then
+  # A live frame folded at all: non-empty and positive. The stub's exact-value
+  # assertions below are the ones that prove parsing; here the run's own numbers are
+  # unknowable in advance, so "> 0" is the strongest honest claim.
+  echo "$RUNUSAGE" | jq -e '(.run.usage.input_tokens // 0) > 0 and (.run.usage.output_tokens // 0) > 0' >/dev/null \
+    || fail "run.usage not folded from the live SDK result frame (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
+  pass "PRD #40: run.usage folded the live SDK result frame ($RU_IN in / $RU_OUT out) via run_usage"
+else
+  [ "$RU_IN" = 21400 ] \
+    || fail "run.usage.input_tokens is not 21400 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
+  [ "$RU_OUT" = 6100 ] \
+    || fail "run.usage.output_tokens is not 6100 (got: $(echo "$RUNUSAGE" | jq -c '.run.usage'))"
+  pass "PRD #40: run.usage folded the result frame (21400 in / 6100 out) via run_usage"
+fi
 
+# Aggregation, asserted against the RUN's own usage rather than a constant: true under
+# both executors, and a strictly better test — it catches an /api/usage that ignores
+# this run, which `>= 21400` would miss whenever some earlier run had already banked
+# the total.
 SELF_USAGE="$(apiget /api/usage)"
-[ "$(echo "$SELF_USAGE" | jq -r '.lifetime.input_tokens')" -ge 21400 ] \
-  || fail "/api/usage lifetime.input_tokens < 21400 (got: $(echo "$SELF_USAGE" | jq -c '.lifetime'))"
+[ "$(echo "$SELF_USAGE" | jq -r '.lifetime.input_tokens')" -ge "${RU_IN:-0}" ] \
+  || fail "/api/usage lifetime.input_tokens < this run's $RU_IN (got: $(echo "$SELF_USAGE" | jq -c '.lifetime'))"
 [ "$(echo "$SELF_USAGE" | jq -r '.run_count')" -ge 1 ] \
   || fail "/api/usage run_count < 1 (got: $(echo "$SELF_USAGE" | jq -c '.run_count'))"
-pass "PRD #40: /api/usage aggregates the run (lifetime in >= 21400, run_count >= 1)"
+pass "PRD #40: /api/usage aggregates the run (lifetime in >= this run's $RU_IN, run_count >= 1)"
 
-echo "$MSGS" | jq -e '[.messages[] | select(.agent == "coder" and (.payload.usage.input_tokens? == 12000))] | length >= 1' >/dev/null \
-  || fail "no per-agent (coder) usage-bearing message in the run-view data"
-pass "PRD #40: per-agent coder usage message present in the run stream (12000 in)"
+if [ "$EXECUTOR" = sdk ]; then
+  # The live run's agent names come from the cloned repo's roster (PRD #37 selected
+  # agent_source=repo above), so "coder" is not guaranteed and the count is real —
+  # assert only that SOME agent-attributed message carries usage.
+  echo "$MSGS" | jq -e '[.messages[] | select((.payload.usage.input_tokens? // 0) > 0 and .agent != null)] | length >= 1' >/dev/null \
+    || fail "no per-agent usage-bearing message in the run-view data"
+  pass "PRD #40: per-agent usage message present in the run stream"
+else
+  echo "$MSGS" | jq -e '[.messages[] | select(.agent == "coder" and (.payload.usage.input_tokens? == 12000))] | length >= 1' >/dev/null \
+    || fail "no per-agent (coder) usage-bearing message in the run-view data"
+  pass "PRD #40: per-agent coder usage message present in the run stream (12000 in)"
+fi
 
 say "secret-hygiene assertions"
 LOGS="$("${COMPOSE[@]}" logs --no-color 2>&1 || true)"
@@ -775,6 +877,53 @@ TOKMODE="$("${COMPOSE[@]}" exec -T agent stat -c '%a %U %G' "$TOK" | tr -d '\r')
 [ "$TOKMODE" = "400 worker worker" ] \
   || fail "worker-token perms are '$TOKMODE', expected '400 worker worker' (a 0444/root regression would let the runner read it, making the boundary vacuous)"
 pass "PRD #51 uid boundary: worker-token secret is 0400 worker:worker (read denial is real)"
+
+# PRD #58: the compose XFF trust boundary. TRUSTED_PROXIES ships EMPTY, so the api
+# never honors an X-Forwarded-For and every caller keys on its own peer address.
+#
+# THE GATE RUNS FROM INSIDE THE AGENT CONTAINER, which is the whole point: the agent
+# runs a model against a user's cloned repo (semi-hostile BY DESIGN — it is why
+# guardrails.ts exists) and shares the compose network with the api. It IS the
+# attacker this boundary exists to stop, so a test from anywhere else would model the
+# exploit instead of reproducing it.
+#
+# It is mutation-proof by construction rather than by inspection: with the OLD default
+# (TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12,...) the agent's own IP is inside the
+# trusted set, every forged XFF below is a FRESH rate-limit bucket, no 429 ever
+# arrives, and this fails. Measured on a real stack before the fix: N+1 requests, zero
+# 429s.
+#
+# Note the isolation this rests on, because pre-fix it is exactly what did not exist:
+# the agent keys on its own container IP, a different bucket from the nginx-proxied
+# browser traffic the rest of this harness logs in with — so hammering the limiter here
+# cannot lock the harness out of its own login.
+say "PRD #58: XFF forgery from the agent container must NOT mint fresh rate-limit buckets"
+# `|| true` is required, not defensive: this harness runs under `set -euo pipefail`,
+# the e2e env file does NOT set RATE_LIMIT_MAX, so grep exits 1, pipefail propagates
+# it, and the assignment itself aborts the script BEFORE the ${:-10} fallback can
+# apply. Empty here therefore means "not overridden" and 10 is the compose default
+# (docker-compose.yml: RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}).
+RL_MAX="$( (grep -E '^RATE_LIMIT_MAX=' "$ENVFILE" || true) | cut -d= -f2 | tr -d '\r')"
+RL_MAX="${RL_MAX:-10}"
+XFF_CODES="$("${COMPOSE[@]}" exec -T agent sh -c '
+  n=$(( '"$RL_MAX"' + 1 ))
+  i=1
+  while [ "$i" -le "$n" ]; do
+    curl -s -o /dev/null -w "%{http_code} " \
+      -X POST "http://api:8080/api/auth/login" \
+      -H "Content-Type: application/json" \
+      -H "X-Forwarded-For: 203.0.113.$i" \
+      -d "{\"email\":\"xff-probe@e2e.invalid\",\"password\":\"wrong-on-purpose\"}"
+    i=$(( i + 1 ))
+  done' | tr -d '\r')"
+case "$XFF_CODES" in
+  *429*) pass "PRD #58 compose XFF: $((RL_MAX + 1)) forged X-Forwarded-For logins from the agent hit ONE bucket and got a 429 (codes: $XFF_CODES)" ;;
+  *) fail "PRD #58 compose XFF: $((RL_MAX + 1)) logins with DISTINCT forged X-Forwarded-For headers never hit the rate limit (codes: $XFF_CODES).
+     The agent minted a fresh per-IP bucket per request, so the brute-force control on
+     /api/auth/login is bypassed. TRUSTED_PROXIES must be EMPTY on compose: any CIDR
+     broad enough to type by hand covers the agent container, which shares this network
+     and runs untrusted code by design." ;;
+esac
 
 # =============================================================================
 # PRD #51 M6 — uid-boundary REGRESSION assertions (image-level; every /proc read DROPS TO

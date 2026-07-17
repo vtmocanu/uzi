@@ -62,6 +62,67 @@ Therefore every spawn prompt MUST include:
 - If context is long, write it to `.claude/agent-team-tasks/<slug>.md` and
   reference that path in the prompt instead of pasting inline
 
+## Re-derive the claim at the moment you assert it (CRITICAL)
+
+**Rule: re-derive a claim from the code at the moment you assert it, however
+sure you are.** Having verified something once is not knowing it — you verified
+a *past* state, and you assert in the present. This applies to every role.
+
+**A comment is an assertion, so it deserves the same mutation as a test.**
+Freeze the field, drop the line, move the path, and watch the assertion fail.
+If nothing fails, the comment is describing a mechanism that is not there.
+
+Earned the hard way on PRD #58 (2026-07-16), where **nine claims fell over**, all
+believed by someone competent, each disproved in seconds once someone ran it:
+
+- The PRD said quota enforcement was atomic. Measured: with the lock removed,
+  **8 of 8 concurrent provisions passed a quota of 2**. Its stated mechanism was
+  a guarded insert; the real one is the advisory lock.
+- The design said one test caught a misplaced lock. Mutation: it stays **green**
+  — a misplaced lock still blocks, so a blocking-assertion cannot see placement.
+- The design said only a browser could prove a gate escapable. A page-level test
+  does it; the blindness was the *component's*, not the boundary's.
+- Three code comments named mechanisms the code did not have (a `seq` nothing
+  read; a live region "covering" users it cannot; a `?raw` benefit whose
+  corollary was omitted). **The logic was right every time — the story was wrong.**
+- A test-count baseline was carried from memory (641 vs the real 612).
+- A handoff note outlived the fix that killed it, and was reported as open twice.
+- A browser pass "verified" a `title` attribute that reaches **no** screen-reader
+  user — it checked *presence*, not *efficacy*.
+
+The root, from the coder that made four of them: *"I trusted any claim I had
+personally verified once, and stopped re-checking it, because having checked it
+felt like knowing it."*
+
+**Where it hides: the artifacts with no gate on them.** Comments get read in
+review, tests get run, commit messages get diffed. A "still open" list, a
+checkpoint, a handoff note — that is prose nobody executes, and it is what
+decides where the next person spends their time. Re-derive those too.
+
+**Corollaries worth knowing:**
+- **Presence ≠ efficacy.** "The attribute is there" and "it reaches anyone" are
+  different claims. Two validators can both be right and disagree, because they
+  asked different questions. When two reports conflict, find the two questions
+  before picking a winner.
+- **The experiment that justifies a choice usually also bounds it.** Record both
+  halves, not the flattering one.
+
+### Traps in this repo that cost real time
+
+- **`expect(document.activeElement?.textContent).toMatch(...)` is vacuous** — on
+  `<body>`, `textContent` is the whole page, so it matches anything. Assert
+  **identity** (`toBe(el)`), and cross-check text: identity alone gives false
+  *negatives* when a selector drifts, text alone gives false *positives*. **The
+  disagreement between them is the signal.**
+- **`web/` has two `role="status"` regions** — `RateLimitAnnouncer` (app-wide,
+  always-present, empty) comes first in the DOM, so any `querySelector("[role=status]")`
+  silently grabs the wrong one. Selector-by-role here is ambiguous by construction.
+- **A green Go suite can mean nothing ran.** Every `*LiveDB` test skips without
+  `UZI_TEST_DATABASE_URL` and the package still prints `ok` — **51 of them were
+  skipping in CI, silently, since they were written.** Check tests *ran*, not
+  just passed. `test:api-store-it` now fails on zero-passed or any-skipped for
+  exactly this reason.
+
 ## Inspiration-first rule
 
 Before implementing something, check the submodules under `inspiration/`
