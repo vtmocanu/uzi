@@ -18,6 +18,25 @@ describe("pipelineTone", () => {
     expect(pipelineTone("some_future_status")).toBe("neutral");
     expect(pipelineTone("")).toBe("neutral");
   });
+
+  // PRD #65 R5: the merged map must fold in Forgejo's status strings without a
+  // Forgejo failure or cancellation ever rendering as a benign badge.
+  it("maps Forgejo Actions/commit statuses without rendering a red build benign", () => {
+    // The two R5 traps: `failure` (not GitLab's `failed`) must be failed, and the
+    // two-L `cancelled` must be recognised distinctly from GitLab's `canceled`.
+    expect(pipelineTone("failure")).toBe("failed");
+    expect(pipelineTone("cancelled")).toBe("neutral");
+    expect(pipelineTone("canceled")).toBe("neutral"); // GitLab spelling still works
+    // a commit-status error is a failure, never benign
+    expect(pipelineTone("error")).toBe("failed");
+    // Forgejo in-flight statuses read as running (live), not neutral
+    for (const s of ["waiting", "blocked"]) {
+      expect(pipelineTone(s)).toBe("running");
+    }
+    // shared strings mean the same thing on both forges
+    expect(pipelineTone("success")).toBe("passed");
+    expect(pipelineTone("skipped")).toBe("neutral");
+  });
 });
 
 describe("pipelineBadge", () => {
@@ -32,6 +51,12 @@ describe("pipelineBadge", () => {
 
   it("humanizes underscored statuses in the label", () => {
     expect(pipelineBadge("waiting_for_resource").label).toBe("waiting for resource");
+  });
+
+  it("renders a failed Forgejo build as danger, not neutral (R5)", () => {
+    expect(pipelineBadge("failure")).toEqual({ label: "failure", tone: "danger", pulse: false });
+    expect(pipelineBadge("error")).toEqual({ label: "error", tone: "danger", pulse: false });
+    expect(pipelineBadge("cancelled")).toEqual({ label: "cancelled", tone: "neutral", pulse: false });
   });
 });
 

@@ -147,6 +147,7 @@ func runToDTO(r store.Run) apitypes.RunDTO {
 		IterationCount:   r.IterationCount,
 		AutoApprove:      r.AutoApprove,
 		Branch:           textPtrValue(r.Branch.Valid, r.Branch.String),
+		MrWebURL:         textPtrValue(r.MrWebUrl.Valid, r.MrWebUrl.String),
 		MrState:          textPtrValue(r.MrState.Valid, r.MrState.String),
 		FailureReason:    textPtrValue(r.FailureReason.Valid, r.FailureReason.String),
 		StopKind:         textPtrValue(r.StopKind.Valid, r.StopKind.String),
@@ -435,6 +436,17 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := runToDTO(run)
+	// PRD #65 D2: stamp the run's forge for the run-view MR/PR noun. Best-effort and
+	// only for a repo-ful run (chat runs have no repo, hence no MR affordance): a
+	// lookup error leaves forge_type "" (the web defaults to GitLab's noun), never
+	// failing the read of an otherwise-fine run.
+	if run.RepoID.Valid {
+		if ft, err := h.q.GetForgeTypeForRepo(r.Context(), uuid.UUID(run.RepoID.Bytes)); err != nil {
+			slog.Error("resolve run forge type", "run_id", run.ID, "error", err)
+		} else {
+			dto.ForgeType = ft
+		}
+	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
 	// so the plan-gate picker sources its "My agent templates" chips from exactly the
 	// roster the approve validator + worker use (allocation-resolved, lead stripped).

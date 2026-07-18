@@ -18,7 +18,11 @@ func TestBuildIssueDetail(t *testing.T) {
 			WebURL:      "https://gitlab.example.com/x/-/issues/42",
 			Description: "Do the thing. See prds/12-board.md",
 			Author:      "vlad",
-		}, position)
+		}, position, "forgejo")
+
+		if dto.ForgeType != "forgejo" {
+			t.Fatalf("forge_type should be carried onto the issue detail, got %q", dto.ForgeType)
+		}
 
 		if dto.IID != 42 || dto.Title != "ship it" || dto.State != "opened" {
 			t.Fatalf("scalar fields wrong: %+v", dto)
@@ -42,7 +46,7 @@ func TestBuildIssueDetail(t *testing.T) {
 			IID:    7,
 			State:  "closed",
 			Labels: []string{"In Progress"},
-		}, position)
+		}, position, "gitlab")
 		if !dto.Closed || dto.Column != "" {
 			t.Fatalf("closed issue should be Closed with empty column, got closed=%v col=%q", dto.Closed, dto.Column)
 		}
@@ -53,7 +57,7 @@ func TestBuildIssueDetail(t *testing.T) {
 			IID:    9,
 			State:  "opened",
 			Labels: []string{"In Progress", "Later"},
-		}, position)
+		}, position, "gitlab")
 		if !dto.Conflict {
 			t.Fatal("two column labels must flag conflict")
 		}
@@ -68,7 +72,7 @@ func TestBuildIssueDetail(t *testing.T) {
 			State:       "opened",
 			Description: "just a note, no link",
 			Labels:      nil,
-		}, position)
+		}, position, "gitlab")
 		if dto.HasPRDLink {
 			t.Fatal("a description with no prds/*.md link must not set has_prd_link")
 		}

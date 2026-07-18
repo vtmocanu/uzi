@@ -1,35 +1,60 @@
 // Pure, framework-free pipeline-badge logic (PRD #6): the taxonomy that collapses
-// GitLab's full pipeline-status set to the handful of tones the UI renders, plus
-// the display label. Kept out of the components so the mapping is unit-tested in
-// isolation (pipelineBadge.test.ts), the same split runBadge.ts uses.
+// each forge's full pipeline-status set to the handful of tones the UI renders,
+// plus the display label. Kept out of the components so the mapping is unit-tested
+// in isolation (pipelineBadge.test.ts), the same split runBadge.ts uses.
 
 import type { BadgeTone } from "./runBadge";
 
-// PipelineTone collapses the GitLab pipeline status set to five UI tones:
+// PipelineTone collapses a forge's pipeline status set to five UI tones:
 //  - passed    → success
-//  - failed    → failed
-//  - running   → created / waiting_for_resource / preparing / pending / running /
-//                scheduled (anything still in flight)
-//  - attention → manual (a human must click "play" in GitLab for it to proceed)
-//  - neutral   → canceled / skipped, and any status we do not recognize (defensive)
+//  - failed    → a genuine build failure
+//  - running   → anything still in flight
+//  - attention → a human must act for it to proceed (GitLab manual)
+//  - neutral   → cancelled / skipped, and any status we do not recognize (defensive)
 export type PipelineTone = "passed" | "failed" | "running" | "attention" | "neutral";
 
+// ONE merged map across BOTH forges (PRD #65 D2/R5): the pipeline badge is
+// forge-BLIND — it is never keyed off forge_type. The collision claim holds because
+// every string the two forges share (`success`, `running`, `skipped`, `pending`)
+// means the same thing, so one map is sound. Two Forgejo-only traps this map exists
+// to close (R5 — either one renders a red build benign otherwise):
+//   - Forgejo spells it `cancelled` (two Ls); GitLab `canceled` (one). BOTH keys are
+//     present, or a Forgejo-cancelled build falls through `?? "neutral"` by accident
+//     (harmless here, but it must be deliberate, not luck).
+//   - Forgejo Actions reports a failure as `failure`, not GitLab's `failed`; a
+//     commit-status failure as `error`. WITHOUT these keys a failed Forgejo build
+//     has no `failed` entry and renders neutral/benign — the whole point of R5.
+// Forgejo has two status enums (the PRD's "two enums, not one"): Actions run status
+// (unknown|waiting|running|success|failure|cancelled|skipped|blocked) and
+// CommitStatusState (pending|success|error|failure|warning|skipped). Both are folded
+// in below so uzi never mis-reads whichever the driver surfaces.
 const PIPELINE_TONES: Record<string, PipelineTone> = {
+  // shared, same meaning on both forges
   success: "passed",
+  running: "running",
+  pending: "running",
+  skipped: "neutral",
+  // GitLab
   failed: "failed",
   created: "running",
   waiting_for_resource: "running",
   preparing: "running",
-  pending: "running",
-  running: "running",
   scheduled: "running",
   manual: "attention",
   canceled: "neutral",
-  skipped: "neutral",
+  // Forgejo Actions run status
+  failure: "failed", // R5: must map to failed, or a red build renders benign
+  cancelled: "neutral", // R5: two-L spelling, distinct from GitLab's `canceled`
+  waiting: "running",
+  blocked: "running",
+  unknown: "neutral",
+  // Forgejo CommitStatusState extras
+  error: "failed", // an errored status is a failure, never benign
+  warning: "attention",
 };
 
-// pipelineTone maps a raw GitLab pipeline status to its UI tone. An unknown status
-// is neutral, never a crash — the forge could add a status uzi has not seen.
+// pipelineTone maps a raw forge pipeline status to its UI tone. An unknown status
+// is neutral, never a crash — a forge could add a status uzi has not seen.
 export function pipelineTone(status: string): PipelineTone {
   return PIPELINE_TONES[status] ?? "neutral";
 }

@@ -60,9 +60,9 @@ func TestAgentSelectionTags(t *testing.T) {
 // runDTOKeys is the RunDTO tag set with Usage nil (usage is omitempty). Shared by
 // the RunDTO pin and the RunListItemDTO embed pin.
 var runDTOKeys = []string{
-	"id", "repo_id", "kind", "issue_iid", "issue_title", "issue_description",
+	"id", "repo_id", "forge_type", "kind", "issue_iid", "issue_title", "issue_description",
 	"title", "resume_of_run_id", "status", "requeue_count", "iteration_count",
-	"auto_approve", "worker_id", "branch", "mr_iid", "mr_state", "failure_reason",
+	"auto_approve", "worker_id", "branch", "mr_iid", "mr_web_url", "mr_state", "failure_reason",
 	"stop_kind", "health", "health_reason", "health_since", "plan_md",
 	"pipeline_ref", "pipeline_web_url", "fix_verdict", "claimed_at", "started_at",
 	"finished_at", "created_at", "updated_at", "repo_agents", "agent_source",

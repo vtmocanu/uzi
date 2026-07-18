@@ -130,6 +130,16 @@ SELECT * FROM runs WHERE id = @id AND user_id = @user_id;
 -- admin (owners go through GetRunByIDForUser).
 SELECT * FROM runs WHERE id = @id;
 
+-- name: GetForgeTypeForRepo :one
+-- The forge_type behind a repo, for the run-detail DTO's per-run MR/PR noun (PRD
+-- #65 D2). GetRunByID*/GetRunForViewer return a bare runs row (SELECT *) with no
+-- forge context; rather than widen those into join rows (a service-layer ripple),
+-- the run-detail handler resolves this best-effort from the run's repo_id.
+SELECT c.forge_type
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = @repo_id;
+
 -- name: ListRunsForUser :many
 -- The user's runs, newest first (Runs index + Agents-status "your runs"), joined
 -- to the repo path and the nullable worker name for display. The optional
@@ -141,6 +151,7 @@ SELECT * FROM runs WHERE id = @id;
 -- run_usage_totals so a run with no usage yields NULLs (rendered as absent, never a
 -- fake 0). The view already applies the greatest-wins-per-model rollup (Decision 3b).
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name,
+       c.forge_type,
        ru.input_tokens          AS usage_input_tokens,
        ru.cache_read_tokens      AS usage_cache_read_tokens,
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
@@ -148,6 +159,7 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
        ru.cost_usd               AS usage_cost_usd
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = @user_id
@@ -164,9 +176,11 @@ LIMIT 200;
 -- name: ListActiveRunsAll :many
 -- Admin Agents-status: every non-terminal run across all users, with repo path,
 -- worker name, and owner email for the admin overview.
-SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+       c.forge_type
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
@@ -330,6 +344,15 @@ UPDATE runs SET
     status             = 'completed',
     branch             = @branch,
     mr_iid             = @mr_iid,
+    -- The MR's web URL as the forge reported it (PRD #65 D8), written here because
+    -- the worker that opens the MR is the only thing holding the URL at the moment
+    -- it exists. Plain assignment, deliberately matching mr_iid rather than
+    -- session_id's COALESCE-narg: the iid and the URL are ONE fact reported by one
+    -- worker in one payload, so they must not persist under different conventions.
+    -- An old worker omits it (R8) and textParam(nil) lands NULL, which the web
+    -- renders via the legacy forgeUrls.ts reconstruction exactly as it did before
+    -- the column existed.
+    mr_web_url         = @mr_web_url,
     session_id         = COALESCE(sqlc.narg('session_id'), session_id),
     -- fix_verdict carries a ci_fix run's outbound 'not_code' verdict on completion
     -- (PRD #6); NULL for every issue run and for a ci_fix that produced a fix (its

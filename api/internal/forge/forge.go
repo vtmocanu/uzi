@@ -27,6 +27,22 @@ var ErrTokenIntrospectionUnsupported = errors.New("forge: token introspection no
 // treating it as a failure. It carries no secret material.
 var ErrNoPipeline = errors.New("forge: no pipeline for ref")
 
+// ErrForgeVersionUnsupported is wrapped by the error VerifyToken returns when the
+// forge server is older than the driver's minimum supported version (Forgejo <
+// 16.0.0, D4 — the CI-fix loop's job-logs route first ships in 16.0.0). The
+// wrapping error names the reported and required versions so it stays actionable
+// when surfaced verbatim at connect. A re-run of VerifyToken on the periodic
+// privilege sweep re-fires the gate automatically; today a downgrade surfaces
+// there as the sweep's generic StatusError report (fail-safe — flagged, not
+// silently OK). This sentinel exists so a privcheck consumer can errors.Is it and
+// give a downgrade its own distinct finding — that consumer is not wired yet. It
+// carries no secret material. The version gate is a FEATURE gate, never a security
+// control (D4 L2): GET /version is public, unauthenticated and self-reported, so
+// nothing security-relevant may hang on it. GitLab has no version floor and never
+// returns this; it lives here because the sentinel is part of the driver contract,
+// not one driver's implementation.
+var ErrForgeVersionUnsupported = errors.New("forge: server version is older than this driver's minimum")
+
 // Type identifies a forge driver. It maps 1:1 to the forge_connections.forge_type
 // column, which is CHECK-constrained to the same set.
 type Type string
@@ -34,7 +50,43 @@ type Type string
 const (
 	// TypeGitLab is the GitLab REST driver.
 	TypeGitLab Type = "gitlab"
+	// TypeForgejo is the Forgejo REST driver.
+	TypeForgejo Type = "forgejo"
 )
+
+// Role is a bot's effective permission level on a project, in forge-neutral
+// terms. It deliberately carries no number: GitLab's access levels (30 =
+// Developer) are a GitLab implementation detail, and Forgejo has no numeric
+// levels at all — its API returns exactly this vocabulary
+// (none|read|write|admin|owner). A driver that mapped "write" onto 30 to satisfy
+// a GitLab-shaped contract would be leaking one forge's model through the seam
+// this package exists to be.
+type Role string
+
+const (
+	// RoleNone is no access.
+	RoleNone Role = "none"
+	// RoleRead can read but not write.
+	RoleRead Role = "read"
+	// RoleWrite can push branches and open merge requests. This is the exact role
+	// uzi's bot must hold: enough to do the work, not enough to be trusted with
+	// main.
+	RoleWrite Role = "write"
+	// RoleAdmin administers the project (settings, protection rules).
+	RoleAdmin Role = "admin"
+	// RoleOwner owns the project.
+	RoleOwner Role = "owner"
+)
+
+// roleRank orders the roles least- to most-privileged. Unlike a forge's access
+// level it is not a wire value and never leaves this package — AtLeast is the
+// only way to read it, so no caller can reintroduce an "access level 30"
+// comparison against a neutral type.
+var roleRank = map[Role]int{RoleNone: 0, RoleRead: 1, RoleWrite: 2, RoleAdmin: 3, RoleOwner: 4}
+
+// AtLeast reports whether r is min or more privileged. An unrecognized role
+// ranks as RoleNone, so an unknown value from a forge never reads as privileged.
+func (r Role) AtLeast(min Role) bool { return roleRank[r] >= roleRank[min] }
 
 // BotIdentity is the connected bot account, returned by VerifyToken.
 type BotIdentity struct {
@@ -64,21 +116,60 @@ type TokenInfo struct {
 
 // BranchProtection reports a branch's protection state, returned by
 // DefaultBranchProtection.
+//
+// Protected, WriteRoleCanPush, and WriteRoleCanMerge are evaluated on EVERY path,
+// including when Protected is false. That is a deliberate invariant, not an
+// incidental one: an unprotected branch is the case where a write-role bot CAN
+// push and CAN merge, so a driver that returned the zero value there would report
+// the most dangerous branch in the repo as "cannot push, cannot merge". A
+// consumer that reads those three without checking Protected first would invert
+// its guardrail on exactly the worst case — so drivers report what is true of the
+// branch, never what was convenient to skip (the GitLab 404 arm hardcodes these
+// two CanPush/CanMerge fields true; the Forgejo unprotected early-return returns
+// them true for the supported write-bot config — its user_can_* are bot-scoped, so
+// a non-write bot, already a ProjectRole finding, reads false there, but the
+// Protected-first guard fires "not protected" regardless). See
+// TestDefaultBranchProtectionUnprotectedIsNotSafe and its Forgejo twin, which fail
+// if either driver reverts to the zero value there.
+//
+// BotCanPush and BotCanMerge are DIFFERENT and the invariant above does NOT extend
+// to them: they are per-user-grant flags — "a push/merge access level names the
+// bot user directly" — meaningful ONLY when Protected is true. On an unprotected
+// branch no such grant exists, so they are legitimately false there. That makes
+// them a trap read on their own: a consumer writing `if BotCanPush || BotCanMerge`
+// without a Protected-first guard reads false,false on unprotected main and
+// concludes safe — the same R12 inversion. The GitLab driver populates them from a
+// protected branch's access levels; the Forgejo driver never sets them (its branch
+// endpoint folds the bot's own rights into user_can_push/user_can_merge, which map
+// onto WriteRoleCan*), so on Forgejo they are always false. Consumers must gate on
+// Protected first — M3's evaluateRepo does.
 type BranchProtection struct {
 	// Protected is false when the branch has no protection rule at all (the
-	// driver maps a 404 from the protected-branches endpoint to this).
+	// driver maps a 404 from the protected-branches endpoint to this). It is a
+	// finding in its own right, not a precondition for reading the fields below.
 	Protected bool
-	// DevelopersCanPush is true when the branch's push access levels admit the
-	// Developer role (access level 30) or lower-but-nonzero. It is load-bearing:
-	// a protected default branch that Developers may still push to does not
-	// protect main, so a Developer-role bot could push directly.
-	DevelopersCanPush bool
+	// WriteRoleCanPush is true when any principal at the write role may push to
+	// the branch — either because a push access level admits it, or because the
+	// branch is unprotected and so admits every writer. It is load-bearing: a
+	// default branch a write-role bot may push to does not protect main.
+	WriteRoleCanPush bool
+	// WriteRoleCanMerge is true when any principal at the write role may merge
+	// into the branch. uzi's "an agent can only ever open a merge request"
+	// guarantee needs this as much as it needs WriteRoleCanPush: a bot that can
+	// merge its own MR does not need push to land code on main.
+	WriteRoleCanMerge bool
 	// BotCanPush is true when a push access level names the bot user directly (a
 	// per-user allow-to-push grant), which lets the bot push to the protected
-	// branch even at Developer role — a false negative the role/DevelopersCanPush
+	// branch even at write role — a false negative the role/WriteRoleCanPush
 	// checks alone would miss. Group-level push grants to the bot are NOT detected
 	// (they need an extra membership call); that gap is documented for manual audit.
+	// GitLab only: the Forgejo driver never sets this (see the type doc). Read it
+	// behind a Protected-first guard, never on its own.
 	BotCanPush bool
+	// BotCanMerge is the merge counterpart of BotCanPush: a merge access level
+	// naming the bot user directly. Same group-level gap; likewise GitLab-only and
+	// meaningful only when Protected is true.
+	BotCanMerge bool
 }
 
 // Project is a repo the bot has membership on.
@@ -252,16 +343,18 @@ type Forge interface {
 	// /personal_access_tokens/self. Returns ErrTokenIntrospectionUnsupported when
 	// the forge version lacks the endpoint (so the caller warns, not blocks).
 	TokenInfo(ctx context.Context) (TokenInfo, error)
-	// ProjectRole returns the bot's effective (direct or inherited) access level
-	// on a project, and whether the bot is a member at all. member is false with
-	// a nil error when the bot has no effective membership (a 404 from the
-	// members/all lookup). GitLab: GET /projects/:id/members/all/:user_id.
-	ProjectRole(ctx context.Context, projectID, forgeUserID int64) (role int, member bool, err error)
-	// DefaultBranchProtection reports whether the given branch is protected,
-	// whether Developer-level push is allowed on it, and whether the bot user has
-	// a direct per-user push grant on it. GitLab: GET
-	// /projects/:id/protected_branches/:name (a 404 means unprotected). botUserID
-	// is the bot's forge user id, used to flag a per-user allow-to-push entry.
+	// ProjectRole returns the bot's effective (direct or inherited) role on a
+	// project, and whether the bot is a member at all. member is false with a nil
+	// error when the bot has no effective membership (a 404 from the members/all
+	// lookup). GitLab: GET /projects/:id/members/all/:user_id, whose numeric
+	// access level the driver maps onto Role.
+	ProjectRole(ctx context.Context, projectID, forgeUserID int64) (role Role, member bool, err error)
+	// DefaultBranchProtection reports whether the given branch is protected, and
+	// whether the write role or the bot specifically may push to or merge into it.
+	// GitLab: GET /projects/:id/protected_branches/:name (a 404 means
+	// unprotected). botUserID is the bot's forge user id, used to flag a per-user
+	// grant. Every returned field is evaluated on every path — see
+	// BranchProtection.
 	DefaultBranchProtection(ctx context.Context, projectID int64, branch string, botUserID int64) (BranchProtection, error)
 	// LatestPipeline returns the newest branch pipeline for a ref, or
 	// ErrNoPipeline when the ref has none (no CI configured, or it never ran).
@@ -301,6 +394,8 @@ func New(t Type, baseURL, token string, timeout time.Duration) (Forge, error) {
 	switch t {
 	case TypeGitLab:
 		return newGitLab(baseURL, token, timeout)
+	case TypeForgejo:
+		return newForgejo(baseURL, token, timeout)
 	default:
 		return nil, fmt.Errorf("forge: unsupported forge type %q", t)
 	}

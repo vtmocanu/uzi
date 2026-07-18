@@ -206,7 +206,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url
 `
 
 type ClaimRunParams struct {
@@ -271,6 +271,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		&i.HealthSince,
 		&i.HealthNotifiedAt,
 		&i.TargetRunID,
+		&i.MrWebUrl,
 	)
 	return i, err
 }
@@ -452,7 +453,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, origin_column, move_pending_since, auto_approve)
 VALUES ($1, $2::uuid, $3, $4, $5, $6, now(), $7)
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url
 `
 
 type CreateRunParams struct {
@@ -533,6 +534,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.HealthSince,
 		&i.HealthNotifiedAt,
 		&i.TargetRunID,
+		&i.MrWebUrl,
 	)
 	return i, err
 }
@@ -777,8 +779,26 @@ func (q *Queries) FailWorkerRunsOverCap(ctx context.Context, arg FailWorkerRunsO
 	return items, nil
 }
 
+const getForgeTypeForRepo = `-- name: GetForgeTypeForRepo :one
+SELECT c.forge_type
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = $1
+`
+
+// The forge_type behind a repo, for the run-detail DTO's per-run MR/PR noun (PRD
+// #65 D2). GetRunByID*/GetRunForViewer return a bare runs row (SELECT *) with no
+// forge context; rather than widen those into join rows (a service-layer ripple),
+// the run-detail handler resolves this best-effort from the run's repo_id.
+func (q *Queries) GetForgeTypeForRepo(ctx context.Context, repoID uuid.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, getForgeTypeForRepo, repoID)
+	var forge_type string
+	err := row.Scan(&forge_type)
+	return forge_type, err
+}
+
 const getRunByID = `-- name: GetRunByID :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id FROM runs WHERE id = $1
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url FROM runs WHERE id = $1
 `
 
 // Admin viewer path: fetch any run regardless of owner. The per-run authz check
@@ -832,12 +852,13 @@ func (q *Queries) GetRunByID(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.HealthSince,
 		&i.HealthNotifiedAt,
 		&i.TargetRunID,
+		&i.MrWebUrl,
 	)
 	return i, err
 }
 
 const getRunByIDForUser = `-- name: GetRunByIDForUser :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id FROM runs WHERE id = $1 AND user_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url FROM runs WHERE id = $1 AND user_id = $2
 `
 
 type GetRunByIDForUserParams struct {
@@ -893,6 +914,7 @@ func (q *Queries) GetRunByIDForUser(ctx context.Context, arg GetRunByIDForUserPa
 		&i.HealthSince,
 		&i.HealthNotifiedAt,
 		&i.TargetRunID,
+		&i.MrWebUrl,
 	)
 	return i, err
 }
@@ -1072,7 +1094,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 }
 
 const getRunOwnedByWorker = `-- name: GetRunOwnedByWorker :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id FROM runs WHERE id = $1 AND worker_id = $2
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url FROM runs WHERE id = $1 AND worker_id = $2
 `
 
 type GetRunOwnedByWorkerParams struct {
@@ -1129,6 +1151,7 @@ func (q *Queries) GetRunOwnedByWorker(ctx context.Context, arg GetRunOwnedByWork
 		&i.HealthSince,
 		&i.HealthNotifiedAt,
 		&i.TargetRunID,
+		&i.MrWebUrl,
 	)
 	return i, err
 }
@@ -1358,9 +1381,11 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 }
 
 const listActiveRunsAll = `-- name: ListActiveRunsAll :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
+       c.forge_type
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id
 WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
@@ -1376,6 +1401,7 @@ type ListActiveRunsAllRow struct {
 	RepoPath   string      `json:"repo_path"`
 	WorkerName pgtype.Text `json:"worker_name"`
 	OwnerEmail string      `json:"owner_email"`
+	ForgeType  string      `json:"forge_type"`
 }
 
 // Admin Agents-status: every non-terminal run across all users, with repo path,
@@ -1434,9 +1460,11 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context) ([]ListActiveRunsAllRow
 			&i.Run.HealthSince,
 			&i.Run.HealthNotifiedAt,
 			&i.Run.TargetRunID,
+			&i.Run.MrWebUrl,
 			&i.RepoPath,
 			&i.WorkerName,
 			&i.OwnerEmail,
+			&i.ForgeType,
 		); err != nil {
 			return nil, err
 		}
@@ -1817,7 +1845,8 @@ func (q *Queries) ListRunToolWindow(ctx context.Context, arg ListRunToolWindowPa
 }
 
 const listRunsForUser = `-- name: ListRunsForUser :many
-SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, rp.path_with_namespace AS repo_path, w.name AS worker_name,
+       c.forge_type,
        ru.input_tokens          AS usage_input_tokens,
        ru.cache_read_tokens      AS usage_cache_read_tokens,
        ru.cache_creation_tokens  AS usage_cache_creation_tokens,
@@ -1825,6 +1854,7 @@ SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_descripti
        ru.cost_usd               AS usage_cost_usd
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
+JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_usage_totals ru ON ru.run_id = r.id
 WHERE r.user_id = $1
@@ -1849,6 +1879,7 @@ type ListRunsForUserRow struct {
 	Run                      Run            `json:"run"`
 	RepoPath                 string         `json:"repo_path"`
 	WorkerName               pgtype.Text    `json:"worker_name"`
+	ForgeType                string         `json:"forge_type"`
 	UsageInputTokens         pgtype.Int8    `json:"usage_input_tokens"`
 	UsageCacheReadTokens     pgtype.Int8    `json:"usage_cache_read_tokens"`
 	UsageCacheCreationTokens pgtype.Int8    `json:"usage_cache_creation_tokens"`
@@ -1919,8 +1950,10 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.Run.HealthSince,
 			&i.Run.HealthNotifiedAt,
 			&i.Run.TargetRunID,
+			&i.Run.MrWebUrl,
 			&i.RepoPath,
 			&i.WorkerName,
+			&i.ForgeType,
 			&i.UsageInputTokens,
 			&i.UsageCacheReadTokens,
 			&i.UsageCacheCreationTokens,
@@ -2461,23 +2494,33 @@ UPDATE runs SET
     status             = 'completed',
     branch             = $1,
     mr_iid             = $2,
-    session_id         = COALESCE($3, session_id),
+    -- The MR's web URL as the forge reported it (PRD #65 D8), written here because
+    -- the worker that opens the MR is the only thing holding the URL at the moment
+    -- it exists. Plain assignment, deliberately matching mr_iid rather than
+    -- session_id's COALESCE-narg: the iid and the URL are ONE fact reported by one
+    -- worker in one payload, so they must not persist under different conventions.
+    -- An old worker omits it (R8) and textParam(nil) lands NULL, which the web
+    -- renders via the legacy forgeUrls.ts reconstruction exactly as it did before
+    -- the column existed.
+    mr_web_url         = $3,
+    session_id         = COALESCE($4, session_id),
     -- fix_verdict carries a ci_fix run's outbound 'not_code' verdict on completion
     -- (PRD #6); NULL for every issue run and for a ci_fix that produced a fix (its
     -- verdict is stamped verified/fix_failed later by the pipeline sync).
-    fix_verdict        = COALESCE($4, fix_verdict),
+    fix_verdict        = COALESCE($5, fix_verdict),
     move_pending_since = now(),
     finished_at        = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
-WHERE id = $5 AND worker_id = $6
+WHERE id = $6 AND worker_id = $7
   AND status NOT IN ('completed', 'failed', 'cancelled')
 `
 
 type SetRunCompletedParams struct {
 	Branch     pgtype.Text `json:"branch"`
 	MrIid      pgtype.Int8 `json:"mr_iid"`
+	MrWebUrl   pgtype.Text `json:"mr_web_url"`
 	SessionID  pgtype.Text `json:"session_id"`
 	FixVerdict pgtype.Text `json:"fix_verdict"`
 	ID         uuid.UUID   `json:"id"`
@@ -2491,6 +2534,7 @@ func (q *Queries) SetRunCompleted(ctx context.Context, arg SetRunCompletedParams
 	result, err := q.db.Exec(ctx, setRunCompleted,
 		arg.Branch,
 		arg.MrIid,
+		arg.MrWebUrl,
 		arg.SessionID,
 		arg.FixVerdict,
 		arg.ID,

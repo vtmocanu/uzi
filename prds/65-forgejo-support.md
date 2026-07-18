@@ -3,14 +3,23 @@
 **GitLab Issue**: [#65](https://gitlab.example.com/vtmocanu/uzi/-/issues/65)
 **Status**: Draft (created 2026-07-17; designed by the architect agent, then revised twice the same day across two review waves — reviewer + security audit + fact-check, then a second wave on the revision. The security audit invalidated D6's original mapping; the fact-checks refuted 8 claims, two of which the PRD author had personally asserted as verified; the guardrail-enforcement work was split out to #66 mid-session.)
 **Priority**: Medium
-**Depends on**: no uzi PRD. **One external, human-owned dependency: the self-hosted validation instance must be upgraded to Forgejo ≥16.0.0** (currently 15.0.4) before M9 can validate live — see R2.
+**Depends on**: no uzi PRD, and — as of D10 (2026-07-17) — **no human-owned dependency either**. ~~One external, human-owned dependency: the self-hosted validation instance must be upgraded to Forgejo ≥16.0.0 (currently 15.0.4) before M9 can validate live — see R2.~~ M9 validates against a **pinned ephemeral `forgejo/forgejo:16.0.0` container**; the self-hosted upgrade is still wanted for dogfooding but gates nothing. See D10/R2.
 **Spawned**: [PRD #66](66-guardrail-enforcement.md) — refuse runs when the bot can push/merge to `main`. Discovered here (a Forgejo `write` bot can merge its own PR by default), split out because it is a **GitLab** behaviour change with no Forgejo content. **#65 lands the fields and findings; #66 consumes them.**
 **Touches the contracts of**: PRD #5 (privilege checks — this PRD adds fields + findings, changes no tiers), PRD #6 (CI status/fix), PRD #19 (autopilot attribution), PRD #24 (MR-close watcher), PRD #42 (worker claim wire contract).
 **Related**: PRD #2 (forge integration — established the seam this PRD tests).
 
-**This PRD changes no existing behaviour.** Every milestone lands dark: until M6b
-flips the handler gate, `forgejo` is unreachable, and nothing here alters a GitLab
-connection's verdicts, tiers, or runs.
+**This PRD adds no new refusal or block.** Every milestone lands dark: until M6b
+flips the handler gate, `forgejo` is unreachable, and **no run is refused and no save is
+rejected that would have succeeded before** — on either forge. *(Precision added 2026-07-17,
+D6a-1 tier ruling: "dark" is about **blocking** verdicts and runs, not the badge — the badge can
+still change. The earlier flat claim "alters no verdicts, **tiers**, or runs" was too strong:
+the D6a-1 merge check flips `privilege_status` **OK→Violations** for the narrow GitLab population
+whose *protected* `main` has `merge_access_levels` lowered to include the write role — a
+non-default, legal config. That is a tier change on the badge, but **nothing gates on
+`privilege_status`** — lead-verified: no run/claim/lifecycle/autopilot/poller path reads it, only
+the handler DTO, privcheck, and store. So the **blocking** invariant holds while the badge
+correctly reddens: uzi is surfacing a real primary-directive breach it was blind to, the same
+finding-class #5 already surfaces for the push sibling. #66 is what turns it into a refusal.)*
 
 ## Problem
 
@@ -93,11 +102,19 @@ mixed-forge**, so one board can say "Merge Request" on one card and "Pull Reques
 the next. Two consequences M8 owns:
 
 - **`forge_type` must reach the web, per card/run** — the architect's design concluded
-  the web needs no `forge_type` at all, and D2 makes that false. **But the cost is
-  lower than first estimated**: the queries **already** `SELECT c.forge_type`
-  (`runtime.sql:247`, `forge.sql:85,134`) and `api.ts:216` already carries
-  `ForgeConnection.forge_type` (Settings renders it as a badge today). So this is a
-  **DTO field addition, not a query change**.
+  the web needs no `forge_type` at all, and D2 makes that false. **The cost was lower than
+  first estimated for the board, but the "DTO field only, not a query change" claim was an
+  overgeneralization — corrected at M8 (2026-07-17, the ~8th team-corrected claim in this
+  PRD).** It held for the **board/repo path**: those queries already `SELECT c.forge_type`, so
+  cards got it as a pure DTO addition. It did **not** hold for the **standalone run surfaces**:
+  `ListRunsForUser` and `ListActiveRunsAll` (the Runs index + admin overview, which render the
+  MR/PR noun and chip) had **no** `forge_type` and needed a new `JOIN forge_connections c ON
+  c.id = rp.connection_id` + `c.forge_type` + sqlc regen; the run-**detail** path
+  (`GetRun`/`GetRunByID*`, bare `SELECT *` rows) got a new `GetForgeTypeForRepo :one`
+  resolved best-effort from `repo_id`, rather than widening those rows into joins (which would
+  ripple through every `GetRunByID` consumer at the service layer). **The insight stands (board
+  cards were free); the generalization to "no query change anywhere" was wrong** — run parity
+  cost three queries + a helper.
   - **One `forgeNoun(forgeType)` helper is the only mapping site.** Do not scatter
     ternaries across ~8 components. Acceptance: `grep -r '"Merge Request"' web/src`
     returns exactly one non-test hit.
@@ -199,8 +216,98 @@ floor with 404 → `ErrCIUnsupported` degradation.
   which runs 15.0.4**.
 - **Benefit**: D1 becomes a guarantee, not a per-instance maybe. No degradation
   branch to write, test, or explain.
-- **Consequence**: the self-hosted validation instance must be upgraded before uzi can connect to it at all.
-  On M9's critical path (R2).
+- **Consequence**: the self-hosted validation instance must be upgraded before uzi can connect
+  to it at all. ~~On M9's critical path (R2).~~ **Superseded by D10 (2026-07-17): M9 validates
+  against a pinned ephemeral `forgejo:16.0.0` container, so no human upgrade gates anything.**
+  The *connect* consequence stands; the *validation* consequence does not.
+
+#### D4a — The gate's comparison semantics: strict semver, and refusing a `-dev` build is **correct**
+
+D4 says "refuse < 16.0.0" and never defines what `16.0.0-dev-626-32363b81+gitea-1.22.0` is.
+It is a **prerelease**, so strict semver sorts it *below* `16.0.0` and refuses it — including
+codeberg.org, which runs exactly that string and demonstrably serves every route D4 requires.
+**That is not a bug to work around. Refusing it is the right answer, and semver's rule is
+right for precisely the reason semver has it: a prerelease of X promises nothing about X.**
+
+**The grammar, derived from the Makefile and 293 tags of release history** — not from two live
+samples (`Makefile@v16.0.0:87-101`):
+
+```makefile
+GITEA_COMPATIBILITY ?= gitea-1.22.0
+STORED_VERSION=$(shell cat VERSION 2>/dev/null)
+ifneq ($(STORED_VERSION),)
+  FORGEJO_VERSION ?= $(STORED_VERSION)      # release tarballs; free-form string
+else ifneq ($(GITEA_VERSION),)
+  FORGEJO_VERSION ?= $(GITEA_VERSION)       # packager override; free-form string
+else                                        # sed 's/-g/-/' strips describe's "g" sha prefix
+  FORGEJO_VERSION ?= $(shell git describe --exclude '*-test' --tags --always | sed 's/^v//' | sed 's/\-g/-/')
+endif
+FORGEJO_VERSION := $(FORGEJO_VERSION)+$(GITEA_COMPATIBILITY)   # unless already present
+```
+
+Of 293 tags, the **81 modern ones (major ≥ 7) are exactly two shapes**: 70 × `vN.N.N` and
+11 × `vN.0.0-dev`. **Modern Forgejo has no `-rc` tags at all** — the `-rcN` and `-N` shapes
+belong to the retired Gitea-derived 1.x scheme (all < v7, all refused by the floor anyway).
+`vN.0.0-dev` is a **real git tag opening a development cycle**, so every build in that cycle
+describes as `N.0.0-dev-<commits>-<sha>`.
+
+**Therefore `16.0.0-dev-N` is not "almost 16.0.0". It is a ~3-month *range*, and the string
+cannot tell you where in it you are:**
+
+| Build | Date | D4's gating route `/actions/jobs/{job_id}/logs` |
+|---|---|---|
+| `v16.0.0-dev` (the tag itself, N=0) | 2026-03-26 | **ABSENT** — `/actions` + `/runs` groups only (`api.go:1236-1238`): exactly v15.0.4's surface |
+| `16.0.0-dev-626-32363b81` (codeberg, live) | ~2026-07 | **PRESENT** (live swagger) |
+| `v17.0.0-dev` (main at the v16 branch cut) | 2026-06-25 | **PRESENT** (`api.go:891,897`) |
+| `v16.0.0` (release) | 2026-07-16 | **PRESENT** (`api.go:891,897`) |
+
+Rows 1 and 2 both report `16.0.0-dev-N`. **Accepting the `-dev` class would accept an instance
+that provably lacks the one route D4 exists to require.** Nor is the class orderable: semver
+parses `dev-626-32363b81` as a single alphanumeric identifier compared **lexically**, so
+`Compare(v16.0.0-dev-626, v16.0.0-dev-99) == -1` — `dev-626` sorts *below* `dev-99`. There is
+no "≥ dev-N" rule available even in principle.
+
+**Ruling: strict semver 2.0.0 against a floor of `v16.0.0`. Prerelease ordering intact
+(§11.3), build metadata ignored (§10), unparseable refuses.** Verified against every real
+string (2026-07-17):
+
+| Reported | Gate | Why it is right |
+|---|---|---|
+| `16.0.0+gitea-1.22.0` | **accept** | the release; **empirically what `forgejo:16.0.0` reports** |
+| `16.0.1` / `16.1.0` / `17.0.0` | **accept** | above the floor |
+| `17.0.0-dev-3-…` | **accept** | major 17 > 16 dominates. Sound: the v17 cycle opened *after* v16 branched, so it carries the v16 surface — **verified at the `v17.0.0-dev` tag** |
+| `16.0.0-dev-626-…` (codeberg) | **refuse** | prerelease < release. Correct: the `-dev` class spans builds with and without the route |
+| `15.0.4` / `15.0.5` | **refuse** | below the floor (the route is genuinely absent) |
+| `1.21.11-2`, `1.21.0-rc1` | **refuse** | legacy 1.x scheme |
+| `32363b81+gitea-1.22.0` | **refuse** | unparseable — see below |
+
+**Library: `golang.org/x/mod/semver`.** `api/go.mod` carries **no** semver library today
+(checked, not assumed); x/mod is the Go team's own, is a leaf dependency, and uzi already
+carries six `golang.org/x/*` modules — the boring, in-idiom choice. Two implementation notes:
+it **requires the leading `v` that Forgejo strips** (`"v" + strings.TrimPrefix(reported, "v")`),
+and `semver.IsValid` is the parse gate. Rejected: `Masterminds/semver` and
+`hashicorp/go-version` — new third-party trees for what x/mod does in two calls.
+
+**Parse failure refuses, and the input is real rather than hypothetical.**
+`git describe --always` falls back to a **bare commit sha** when a clone has no tags (a
+`--depth 1` clone, then `make`), yielding `32363b81+gitea-1.22.0`. The `VERSION` file and
+`GITEA_VERSION` env are free-form: the Makefile's own error text calls semver compatibility
+advisory ("This must be a semver compatible version", `:267`), not enforced.
+
+**Which way does failing closed cut? Both — and D4's own L2 sentence is why.** The gate is a
+**feature gate, never a security control**: `/api/v1/version` is public, unauthenticated and
+self-reported.
+
+- So failing closed **buys no security**. A hostile instance simply reports `16.0.0`. Refusing
+  an unparseable version stops no attacker, and **nothing may be hung on it** (L2 unchanged).
+- So failing closed also **costs no security**. The choice is therefore *purely* about failure
+  mode — and there, refusing wins: the alternative is uzi connecting to an unknown build and
+  dying at a bare 404 inside the CI-fix loop with no defined behaviour, which is exactly what
+  D4 deleted the degradation branch to avoid. **An unparseable version is an unsupported
+  version**: one clear error at connect beats a broken run later.
+
+**Consequence, stated plainly: uzi refuses codeberg.org.** Correct on the merits above, and
+moot in practice — D10 finds codeberg was never a usable validation target anyway.
 
 ### D5 — Client library: `code.gitea.io/sdk/gitea`, not `forgejo-sdk`
 
@@ -258,7 +365,7 @@ The corrected mapping is **better than GitLab's**, not a workaround:
 | Bot cannot push to it | inferred from push access levels | **`user_can_push == false`** |
 | Bot has no direct push grant | per-user allow-to-push entry | **subsumed by `user_can_push`** |
 | **Bot cannot merge to it** (new field, D6a-1) | `merge_access_levels` excludes Developer | **`user_can_merge == false`** |
-| No unprotected-file bypass (D6e) | n/a | `unprotected_file_patterns` is empty |
+| ~~No unprotected-file bypass (D6e)~~ | n/a | ~~`unprotected_file_patterns` is empty~~ **DROPPED — no write-role source (D6e). Manual-audit gap in the docs.** |
 
 `GET /repos/{o}/{r}/branches/{branch}` sits under `reqRepoReader(unit.TypeCode)`
 (`api.go:852-858`) — readable by a `write` bot — and returns `protected`,
@@ -298,8 +405,13 @@ protection to direct-push on Forgejo.
 
 #### D6a — Detect that the bot can merge. **Enforcement is PRD #66.**
 
-**This PRD reports; it does not refuse.** Findings stay at PRD #5's existing
-warn-don't-block tier, so #65 changes **no** GitLab behaviour and lands dark.
+**This PRD reports; it does not refuse.** The merge finding surfaces as a per-repo **Violation**
+(D6a-1's tier ruling) — the tier of its push sibling — which, like every per-repo finding,
+**blocks nothing** (`report.go:37-38`). So #65 adds **no new refusal or block** on either forge;
+the only new observable is a non-blocking `OK→Violations` badge flip on the narrow GitLab
+population whose protected `main` was configured to let the write role merge. #66 is what turns
+that finding into a refusal — reading the `BranchProtection` fields via a shared Protected-first
+predicate, not the badge tier.
 
 That was not the original plan, and the history is worth keeping. The security audit
 found that a Forgejo `write` bot can merge its own PR into protected `main` by
@@ -356,6 +468,76 @@ ever open an MR' guarantee"). That sentence is true on GitLab by luck of default
 `merge_access_levels` — which defaults to Maintainer, but **is configurable, and
 "safe by default" is not "safe"**. In #65 the finding is reported like any other;
 PRD #66 makes it block.
+
+**Tier (settling coder-m1's M3 question — the explicit sentence #66 must not have to guess):
+the merge finding surfaces as a per-repo *Violation*, not a *Warning*.** It goes in
+`RepoReport.Violations`, the **same tier as its push sibling** at `checker.go:178-182` ("the
+write role may push to protected `main`"). This flips `privilege_status` **OK→Violations** for
+the narrow GitLab population whose *protected* `main` has `merge_access_levels` lowered to
+include the write role (a legal, non-default config); default GitLab repos (merge at Maintainer)
+see no change, and Forgejo is gate-unreachable in #65. **The flip blocks nothing** — lead-verified
+2026-07-17 that no run/claim/lifecycle/autopilot/poller path reads `privilege_status` or the
+report; only the handler DTO, privcheck, and store do — so the **blocking** dark-landing
+invariant holds even as the badge correctly reddens.
+
+The severity is not a judgment call: a bot that can merge its own PR into protected `main`
+breaks the primary directive ("an agent can only ever open an MR") **exactly as** one that can
+push does, and `report.go:48-50` reserves the `Violations` array for precisely "role/branch
+problems that break the directive". Push and merge to `main` are the two halves of one
+guarantee; they must sit in the **same** tier.
+
+**History, kept because this PRD's value is recording what it got wrong (do not erase — the
+conclusion inverted, the deliberation stands):**
+
+- **M3 committed the merge finding as a *Warning*** (`checker.go:190-194`, `checker_test.go`'s
+  `TestMergeFindingsAreWarningsNotViolations`) — coder-m1's instinct that #65 must not change a
+  working GitLab connection's tier. **Reconsidered and overruled to *Violation* (user-confirmed
+  2026-07-17, architect-recommended).** The Warning tier located the right requirement
+  (non-blocking) on the wrong lever (severity): **non-blocking is already a property of per-repo
+  Violations** in PRD #5 (`report.go:37-38`: per-repo findings never block a save; enforcement
+  is #66), so preserving "reported, not blocking" does **not** require downgrading severity.
+  Downgrading would understate a real breach as advisory and split one guarantee across two badge
+  tiers — the exact "safe by default is not safe" error D6a-1 exists to correct.
+- **The "a Warning forces #66 to re-tier" argument the architect first offered for Violation is
+  a wash and is withdrawn** — it does **not** hold either way: #66 refuses by reading the
+  `BranchProtection` fields through a shared Protected-first predicate (see the #66 boundary
+  below), **never the #65 badge tier**, so the tier has no coupling to #66's enforcement. The
+  Violation ruling rests solely on **severity-correctness and push/merge symmetry**, which stand
+  on their own.
+- **The residual cost is real and accepted**: on a GitLab repo whose `merge_access_levels` was
+  widened to the write role *independently of push*, the badge flips `OK→Violations` at #65's
+  sweep — a new, non-blocking observable on a GitLab-only deployment. Accepted because it is the
+  **same finding-class #5 already reddens** for the push sibling (a branch-protection Violation
+  flipping a GitLab badge is *existing* #5 behaviour), and the D6a split defers the **refusal**,
+  never the **surfacing** ("should not find their working GitLab repos *refused*" — a badge is
+  not a refusal). Not separately user-gated: Success Criteria promise only "no new *blocking*
+  behaviour", which holds, and the user chose to check merge on both drivers (D6a-1) knowing uzi
+  would now see a breach it was blind to.
+
+**#66 boundary (carry into #66; recorded here because #65 shapes the fields — see R12).** M2's
+F1 fix scopes the driver comment but does **not** set `BotCanPush`/`BotCanMerge` to `true` on
+unprotected data — on an unprotected branch they are literally `false` because unevaluated, not
+because safe. **#66 must consume these through `evaluateRepo` / a shared `Protected`-first
+predicate, never a raw `if bp.BotCanMerge` struct read**, or R12's inversion reopens exactly
+where it does the most damage: a refusal guard reading `false,false` on an unprotected branch as
+"safe".
+
+**And the two drivers scope `WriteRoleCan*` differently, so the `Protected`-first guard is
+*load-bearing* on Forgejo, not merely belt-and-suspenders** (both M2 validators surfaced this;
+architect-verified live on `forgejo:16.0.0`, 2026-07-17). GitLab's `WriteRoleCanPush`/
+`WriteRoleCanMerge` mean "*any* principal at the write role" (from `push_/merge_access_levels`),
+and on an unprotected branch the driver **hardcodes them `true,true`**. Forgejo maps them from
+`user_can_push`/`user_can_merge`, which are **bot-scoped** — the *calling bot's* authoritative
+rights. On an unprotected branch these come back **`true,true` for a *write* bot** (uzi's
+supported config — matches GitLab) but **`false,false` for a *non-write* bot** (a misconfig,
+itself flagged by `ProjectRole`). Measured on a release: `{protected:false, user_can_push:true,
+user_can_merge:true}` for a write bot vs `{protected:false, false, false}` for a read bot, same
+unprotected repo. So GitLab's `true,true`-on-unprotected belt-and-suspenders is **not mirrored**
+on Forgejo, and a #66 predicate that leaned on `WriteRoleCan*` being `true` there (as it may for
+GitLab) would read `false,false` for a non-write bot and miss it — **except `Protected` is
+checked first.** No #65 impact (M3 already guards `Protected`-first, and `ProjectRole`
+independently flags the non-write bot); the point is that #66 must **not** remove the
+`Protected`-first check believing `WriteRoleCan*` alone suffices on both drivers.
 
 #### D6b — Per-forge required token scope set
 
@@ -448,13 +630,43 @@ Unlike GitLab, Forgejo has no `omitempty`, so `is_admin: false` is always emitte
 *means* non-admin. GitLab's absent-means-pass reasoning (PRD #5's risk section) does
 not transfer, but the conclusion does.
 
-#### D6e — `unprotected_file_patterns` bypass
+#### D6e — `unprotected_file_patterns` bypass: real, but **unimplementable at write role** — a documented manual-audit gap
 
-If any rule sets `unprotected_file_patterns` (e.g. `*.md`), the bot's PAT can push
-directly to `main` for commits touching only those files, despite `enable_push=false`
-(`hook_pre_receive.go:391-406`). No GitLab equivalent. `user_can_push` reflects the
-rule but not this per-commit override, so **check the pattern list is empty
-explicitly**; non-empty is a violation.
+The **risk is real**: if any rule sets `unprotected_file_patterns` (e.g. `*.md`), the bot's
+PAT can push directly to `main` for commits touching only those files, despite
+`enable_push=false` (`hook_pre_receive.go:391-406`). No GitLab equivalent.
+
+**But uzi cannot detect it.** ~~`user_can_push` reflects the rule but not this per-commit
+override, so check the pattern list is empty explicitly; non-empty is a violation.~~
+**Superseded (2026-07-17, architect, verified live on `forgejo:16.0.0`).** The check as specced
+was written against the pre-D6 mapping and never re-checked after D6 moved to
+`GET /branches/{branch}` — **the same methodological failure this PRD's risk section catalogs,
+caught here before it shipped** (credit: coder-m1). `unprotected_file_patterns` lives **only**
+on the `BranchProtection` definition (`GET .../branch_protections/{name}`), which is
+`reqAdmin()`. The write-bot-readable `GET /branches/{branch}` — D6's chosen, authoritative
+endpoint — **does not carry the field**, and `user_can_push` does not reflect the per-file
+override either. There is **no write-role source for it.**
+
+Reproduced on a released 16.0.0 (write bot, `main` protected with `unprotected_file_patterns: "*.md"`):
+
+| Read as the `write` bot | Result |
+|---|---|
+| `GET /branches/main` (D6's endpoint) | 200, fields `{name, commit, protected, required_approvals, enable_status_check, status_check_contexts, user_can_push, user_can_merge, effective_branch_protection_name}` — **no file-pattern field** |
+| `GET /branches/main`.`user_can_push` with the `*.md` rule active | **`false`** — the general rule, *not* the per-file override; the bypass is invisible here too |
+| `GET /branch_protections/main` | **403** (`reqAdmin()`) |
+| `GET /branch_protections` (list) | **403** |
+
+**Ruling: drop the D6e check. No `BranchProtection` field is added** (M1 correctly added none).
+`unprotected_file_patterns` becomes a **documented manual-audit gap** in
+`docs/forgejo-bot-setup.md`, exactly like the **team-whitelist gap D6 already documents** — a
+thing uzi tells the operator to verify because uzi's write-role bot provably cannot. Reading it
+would require handing the bot repo-admin, which D6 forbids and which is strictly worse (it also
+grants `DELETE` on the rule). **Nothing is blocked either way**: the gate is unflipped in #65,
+and even in #66 a check with no data source cannot fire.
+
+Rejected: (a) escalating the bot to admin to read it — D6 forbids it and it is strictly worse;
+(b) inferring it by attempting a `*.md` push to `main` — uzi never pushes to `main`, by the
+primary directive, so this is a non-starter.
 
 ### D7 — Interface: `Role` enum, and it is NOT contained in `api/`
 
@@ -517,6 +729,17 @@ querying **itself** is allowed (`collaborators.go:299`), and the endpoint delibe
 ignores fine-grained token scopes (`:303-306`), so `permission` is the *user's* role —
 what uzi wants. The bot cannot introspect *other* users' roles (D6 forbids admin);
 `privcheck` never needs to.
+
+**Known cross-driver divergence in what `member` *means* (both M2 validators; no guardrail
+impact — recorded so it is not a surprise).** For a bot demoted to **read** level, GitLab's
+membership lookup reports it as a genuine member (`member=true`), so privcheck raises the "role
+below write" finding. The Forgejo `member` derivation is the subtler one above — a `permission:"read"`
+payload (verified live for a read collaborator) is **not distinguishable from a removed bot on a
+public repo** — so the driver's `member` value for a read-level bot does not carry GitLab's "is a
+member" meaning. **The verdict is unchanged either way** — a read-level bot trips a violation on
+both drivers (role-below-write and/or not-a-member) — but a future consumer treating `member` as
+a portable "has any membership" flag would read the two drivers differently. Scoped to a
+non-write-bot misconfig `ProjectRole` already flags; noted, not fixed.
 
 ### D8 — Persist the MR web URL; stop guessing forge URL grammar
 
@@ -596,28 +819,120 @@ URL to slip past.
 
 **All four guardrail layers are untouched by this PRD.**
 
+### D10 — M9's live target is a pinned ephemeral `forgejo:16.0.0` container, not an upgraded instance
+
+R2 put M9's live validation behind a human upgrading the self-hosted instance (15.0.4) to a
+release days old, called it **High**, and asserted "**nothing has ever exercised gitea-sdk
+against a 16.0.0 server** — no reachable instance runs one". **That assertion is false, but
+codeberg.org is not what refutes it usefully. The released image is:**
+
+- `codeberg.org/forgejo/forgejo:16.0.0` **and** `data.forgejo.org/forgejo/forgejo:16.0.0` both
+  exist (published 2026-07-16, matching the tag; `linux/arm64` + `linux/amd64`).
+- It boots in **~4s** on sqlite (`FORGEJO__database__DB_TYPE=sqlite3`,
+  `FORGEJO__security__INSTALL_LOCK=true`), serves the API with no runner attached, and reports
+  **`16.0.0+gitea-1.22.0`** — a *release*, so it **passes the D4a gate**, which codeberg does not.
+
+**Everything R2 deferred was executed against it while this decision was written** (2026-07-17):
+
+| Claim | Was | Now |
+|---|---|---|
+| **R3 / D3 lost-update probe** | read from source, never executed; the architect's recorded *riskiest assumption* | **Executed. D3 confirmed exactly.** Issue at `['PRD']`; human adds `keep-me`; uzi PUTs its stale computed `[Doing]` → result **`['Doing']`**. The unrelated label is silently dropped |
+| D6a-1: a `write` bot can merge protected `main` | source inference | **Confirmed on a release.** Protected `main` + defaults → `protected=true, user_can_push=false, `**`user_can_merge=true`** for the write bot |
+| D6: `branch_protections` 403s a `write` bot | source (`reqAdmin()`) | **Confirmed.** write bot → **403**; owner → 200. `GET /branches/main` → **200** for the write bot, `effective_branch_protection_name` empty |
+| D6b: scopes re-emit reordered, never expand | source (`toScope()`) | **Confirmed.** Minted `[write:repository, write:issue, read:user]`; API returns `['write:issue','write:repository','read:user']` — a string compare **would** be a coin flip |
+| D7: no numeric levels | source | **Confirmed.** `collaborators/{bot}/permission` → `permission=write` |
+| D4: the gating route | route table at the tag | **Confirmed on a release.** swagger `16.0.0+gitea-1.22.0` serves `/actions/jobs/{job_id}/logs` (`produces: text/plain`) and `/actions/runs/{run_id}/jobs` |
+
+So M9's live lane needs **no human dependency and no external forge**. Pin the image **by
+digest**; keep `forge-fake` as the fast default lane (a real Forgejo in the default lane would
+slow every run for no gain) and add the live pass as an **opt-in**.
+
+**One [live] criterion keeps a real cost, and it is not hand-waved: the CI-fix loop.** The
+job-logs *route* is verified on a release, but *real job logs* need a registered
+`forgejo-runner` actually executing a workflow — a second container and real setup. **That was
+not verified.** It is where R2's residual severity now lives, and M9 should budget it.
+
+**Rejected: codeberg.org as the live target.** Three independent reasons, **any one sufficient**:
+
+1. **It is a public production forge run by volunteers.** The [live] criteria create issues,
+   move labels, push branches, open PRs and drive CI. Pointing an autonomous agent at donated
+   infrastructure, consuming their Actions runners, is not acceptable under any account or
+   repo. **This alone ends it**, independent of every technical fact.
+2. **D4a refuses it.** It reports `16.0.0-dev-626-…`; uzi cannot connect to it by its own rule.
+3. **It is a moving dev build.** It rebuilds continuously: green today proves nothing tomorrow.
+   It proves *routes exist on a dev build*, never *a released 16.0.0 behaves this way*.
+
+**Rejected: waiting on the self-hosted upgrade.** Not because the upgrade is unwanted — it
+remains the right real-world dogfooding target — but because it must not *gate* M9. It moves
+off the critical path and becomes optional.
+
+### D11 — Connect requires an explicit forge-type picker, not auto-detection (the gap M6b's "two-line flip" missed)
+
+**The headline `[live]` criterion — "a user connects a Forgejo ≥16.0.0 instance" — was unreachable
+through the product as the PRD stood** (found investigating M8's deferred connect copy, 2026-07-17;
+the **11th** team-caught claim). Verified: `handler.ForgeConfig` was built to feed the connect UI
+its valid choices and returns **both** `allowed_base_urls` **and** `forge_types` (the field, the
+`ForgeConfig` TS type at `api.ts:390`, and the mock all exist), but **the web connect form only ever
+consumed `allowed_base_urls`** — there is a base-URL `<Select>` and **no forge-type picker anywhere
+in `web/src`** (grep-confirmed), and `ForgeSettings.tsx:69` calls `api.createConnection(baseUrl,
+token)` dropping the third `forgeType` argument the function already accepts. So even after M6b flips
+the API to advertise+accept `forgejo`, the UI sends no `forge_type` → `CreateConnection` defaults it
+to `gitlab` → **every product-created connection is GitLab.** A `curl` could post `forge_type:forgejo`;
+no user can. **M6b as specced ("advertise + accept, two lines") cannot satisfy its own Success
+Criterion.**
+
+**Decision: an explicit picker, and auto-detection is rejected.** `CreateConnection` selects the
+driver — `ForgeForToken(forge.Type(forgeType), baseURL, token)` — **before** `VerifyToken` can talk to
+the instance, so `forge_type` must be known **up front**, and `ForgeConfig` already advertises
+`forge_types` precisely so a UI picker can offer them. That is the design intent; honor it.
+
+Rejected — **auto-detection** (probe `/api/v1/version` vs `/api/v4/version`, then pick the driver):
+1. **It leaks the forge boundary.** Discriminating forges by raw HTTP shape is a **driver-less
+   pre-probe in the handler** — "how to tell GitLab from Forgejo" logic living *outside* the `forge`
+   package, the exact leak the abstraction exists to prevent. The picker keeps all forge-type
+   knowledge in three honest places: the advertised list (config), the user's choice, and
+   `ForgeForToken`'s dispatch.
+2. **It solves a non-problem.** The user knows which forge they are connecting; a dropdown is not a
+   burden. Auto-detection is speculative generality.
+3. **It doubles the round-trips** (a detect probe *and* D4a's version gate) and adds new failure modes
+   (both/neither endpoint answers) for zero user benefit.
+
+The SSRF posture is unchanged either way (the base URL is allowlisted before any call), so this is a
+boundary/complexity decision, not a security one.
+
+### D11a — Known limitation, accepted: base-URL and forge-type are picked independently
+
+`ForgeConfig.allowed_base_urls` is a **flat list not associated with forge types**, so the form
+offers base URL and forge type as independent choices. A user can pick `gitlab` + a Forgejo URL (or
+the reverse); `VerifyToken` then fails against the wrong API shape and the save is rejected with an
+error — the safety net, not a silent miswrite. Associating URLs with forge types would be a
+`ForgeConfig` **contract change** (out of scope here, and it would need the lead/user); noted as a
+future refinement, not fixed in #65.
+
 ## Milestones
 
-Eleven milestones, six phases. **The gate flip is the last code change** (M6b), so
+Twelve milestones, six phases. **M6b (the go-live) is the last code change**, so
 everything before it lands dark on `main`: until `handler/forge.go` advertises
-`forgejo`, the type is unreachable from the API. (Guardrail *enforcement* was a
-twelfth milestone until it was split out to [PRD #66](66-guardrail-enforcement.md) —
+`forgejo`, the type is unreachable from the API — **including M11's connect-UI picker, which is
+itself dark** (hidden while `forge_types=[gitlab]`, D11). (Guardrail *enforcement* was another
+milestone until it was split out to [PRD #66](66-guardrail-enforcement.md) —
 it was the one milestone that would **not** have landed dark, refusing GitLab repos
 the moment it merged.)
 
 | M | Title | Files (collision-free within a phase) | Depends |
 |---|---|---|---|
 | **M1** | Interface: `TypeForgejo`, `Role` enum, `WriteRoleCanPush`, **`WriteRoleCanMerge` + `BotCanMerge`** (D6a-1); conform `gitlab.go` **and every implementer/call site**. **Not scoped to `forge/`** — `ProjectRole` has 5 fakes + a live consumer outside it, so "green `go test ./...`" is only achievable if M1 fixes them all | `forge/forge.go`, `forge/gitlab.go`, `forge/gitlab_test.go`, `privcheck/checker.go`, `privcheck/checker_test.go`, **`privcheck/service_test.go`** (`BranchProtection` literals at `:83,:111`), `handler/forge_test.go:55`, `seed/seed_test.go:57`, `poller/autopilot_test.go:171`, `forgesvc/sync_test.go:110` | — |
-| **M2** | Driver core + **compiling stubs for the whole interface** + `forge.New()` arm (`forge.go:302`) + **version gate in `VerifyToken`** (D4) + **D3 empirical probe**: `VerifyToken`, `ListProjects` (**client-side `permissions.push` filter**), `ListLabels`, `EnsureLabels`, `ListIssues` (**PR filter, R4**), `GetIssue`, `CreateIssue`, `UpdateIssueLabels` (D3), `UserExists`, `ProjectRole` (**`member` derivation, D7**), `DefaultBranchProtection` (**via `GET /branches/{branch}`, D6**) | `forge/forgejo.go`, `forge/forgejo_pipelines.go` (stubs), `forge/forgejo_test.go`, `forge/forge.go` (arm only) | M1 |
-| **M3** | privcheck: `Role` enum, **per-forge scope rule** (D6b), **merge + `unprotected_file_patterns` findings** (D6a-1, D6e — reported, not blocking), **one shared `evaluateRepo` with `Protected` checked first** (R12), **version re-check on sweep** (D4); drop `30`/`roleName()`; **log the ignored unmarshal error** (D7) | `privcheck/checker.go`, `privcheck/report.go`, `privcheck/checker_test.go`, `privcheck/service_test.go`, `handler/forge.go` (unmarshal logging only) | M1 |
+| **M2** | Driver core + **compiling stubs for the whole interface** + `forge.New()` arm (`forge.go:302`) + **version gate in `VerifyToken`** (D4, semantics fixed by **D4a**: strict semver ≥ `v16.0.0` via `golang.org/x/mod/semver`, prerelease refused, unparseable refused) + ~~**D3 empirical probe**~~ (**done — R3 closed 2026-07-17, D10**): `VerifyToken`, `ListProjects` (**client-side `permissions.push` filter**), `ListLabels`, `EnsureLabels`, `ListIssues` (**PR filter, R4**), `GetIssue`, `CreateIssue`, `UpdateIssueLabels` (D3), `UserExists`, `ProjectRole` (**`member` derivation, D7**), `DefaultBranchProtection` (**via `GET /branches/{branch}`, D6**) | `forge/forgejo.go`, `forge/forgejo_pipelines.go` (stubs), `forge/forgejo_test.go`, `forge/forge.go` (arm only) | M1 |
+| **M3** | privcheck: `Role` enum, **per-forge scope rule** (D6b), **merge finding as a per-repo Violation** — same tier as its push sibling, non-blocking, flips the badge OK→Violations for merge-permissive GitLab repos (D6a-1; ~~`unprotected_file_patterns`~~ **D6e dropped — no write-role source**), **one shared `evaluateRepo` with `Protected` checked first** (R12), **version re-check on sweep** (D4); drop `30`/`roleName()`; **log the ignored unmarshal error** (D7) | `privcheck/checker.go`, `privcheck/report.go`, `privcheck/checker_test.go`, `privcheck/service_test.go`, `handler/forge.go` (unmarshal logging only) | M1 |
 | **M4** | Driver: `GetMergeRequest` (state mapping), `ListIssueLabelEvents` (timeline), `CreateIssueNote`, `TokenInfo` (hand-rolled, D5) | `forge/forgejo.go`†, `forge/forgejo_test.go`† | M2 |
 | **M5** | Driver: `LatestPipeline`, `LatestMRPipeline`, `ListPipelineJobs`, `JobLogTail` (all ≥16; gitea-sdk has `GetRepoActionJobLogs`, no hand-roll) | `forge/forgejo_pipelines.go`†, `forgejo_pipelines_test.go` | M2 |
 | **M6a** | Migration: `forge_type` CHECK gains `'forgejo'`; `runs.mr_web_url`; **the extended completion query + regenerated sqlc** (D8 — without it M7 cannot add the param); **`seed.go:74,85,112` hardcodes** | `store/migrations/`, `store/queries/`, `seed/seed.go` | — |
 | **M7** | Worker: `gitlab.ts` → `forge.ts` + `ForgejoClient` (**+3 transport guards, D9**); `forge_type` on `ClaimRepo`; **`mr_web_url` on the completion payload** (D8); subpath base-URL fix; `claim.go` emits it | `agent/src/forge.ts`, `protocol.ts`, `runner.ts`, `agent/test/`, `workersvc/claim.go`, `workersvc/service.go`, `claim_wire_contract_test.go` | **M6a only** |
-| **M8** | **API + web** (not web-only): `forge_type` onto board cards + runs (**D2** — DTO field only, the queries already select it), `role` → string in the web (**D7**), merged pipeline map (**R5**), `mr_web_url` rendering **through `isHttpsUrl`** (D8), `forgeNoun()` as the single mapping site + `slacksvc/notifier.go` | `handler/board.go`, run handlers, `slacksvc/notifier.go`, `web/src/lib/*`, `web/src/components/*`, `mocks/` | M6a, M7 |
-| **M9** | e2e: `forge-fake` speaks `/api/v1`; `UZI_E2E_FORGE` lane; **live validation vs an upgraded validation instance** (R2) | `e2e/forge-fake/forge-fake.mjs`, `run-e2e.sh` | M4, M5, M7 |
+| **M8** | **API + web** (not web-only): `forge_type` onto board cards (**D2** — DTO field only, cards already select it) **and runs (query change: new `forge_connections` joins on `ListRunsForUser`/`ListActiveRunsAll` + a best-effort `GetForgeTypeForRepo` for the detail path + sqlc regen — corrected from the draft's "no query change", see D2)**, `role` → string in the web (**D7**), merged **forge-blind** pipeline map (**R5** — keyed on status only, never `forge_type`), `mr_web_url` rendering **through `isHttpsUrl`** (D8, Go twin `isHTTPSURL` in `notifier.go`), `forgeNoun()` as the single mapping site + its `slacksvc/notifier.go` Go twin | `handler/board.go`, run handlers, `slacksvc/notifier.go`, `web/src/lib/*`, `web/src/components/*`, `mocks/` | M6a, M7 |
+| **M9** | e2e (**Variant A**, user 2026-07-17): `forge-fake` speaks `/api/v1` incl. **canned Actions** (`runs`/`runs/{id}/jobs`/`jobs/{id}/logs` → fixture `text/plain`); `UZI_E2E_FORGE` lane; **live validation vs a pinned ephemeral `forgejo/forgejo:16.0.0`** (D10, **not** an upgraded instance — R2 superseded) for the **non-Actions** surface. Fake stays default; container is the opt-in pass. **CI-fix `[live]` is met by fixture logs** (exercises `ListPipelineJobs`/`JobLogTail` parse + loop deterministically). **Real `forgejo-runner` log emission is UNVERIFIED — no runner environment available; deferred as an open R2 residual, to be done when one exists.** | `e2e/forge-fake/forge-fake.mjs`, `run-e2e.sh` | M4, M5, M7 |
 | **M10** | Docs + ADR + `ARCHITECTURE.md:71`; **correct `specs/ai.md` §16 via spec-keeper** (R1); `specs/human.md:40,396` (user-approved 2026-07-17); `docs/forgejo-bot-setup.md` (**unique `order`** — `gitlab-bot-setup.md` is `order: 20`; a copied frontmatter fails `check-docs.mjs` inside `npm run build`) | `docs/`, `adr/0065-forgejo-driver.md`, `ARCHITECTURE.md`, `specs/` | M8, M9 |
-| **M6b** | **Gate flip — go-live**: `handler/forge.go:125` advertises `forgejo`; `:156,158` accept it | `handler/forge.go` | M8, M9, M10 |
+| **M11** | **Connect-UI forge-type picker (D11), lands DARK**: `ForgeSettings.tsx` consumes `cfg.forge_types`, renders a forge-type `<Select>` mirroring the base-URL one, **shown only when `forge_types.length > 1`** (hidden/defaulted to the single value otherwise — so **zero change while the advert is `[gitlab]`**), and threads `forgeType` through the existing `api.createConnection(baseUrl, token, forgeType)` call. **No copy change here** (that rides M6b, so nothing is user-visible pre-go-live). Update `mocks/` for a 2-type config | `web/src/pages/ForgeSettings.tsx`, `web/src/lib/api.ts` (call site only — the param exists), `web/src/mocks/` | — |
+| **M6b** | **Gate flip — go-live, now genuinely usable (D11)**: advertise `forgejo` (`ForgeConfig.forge_types`) + accept `forgejo` (drop the non-gitlab reject in `CreateConnection`) + **flip the forge-less connect lead-in copy neutral** now that both forges are selectable — `Dashboard.tsx:243` "Connect your GitLab bot"→"Connect your bot", `Repos.tsx:202` "uzi needs a GitLab bot"→"…a bot", `ForgeSettings.tsx:160` "the GitLab bot account"→"the bot account" (restructure past the noun, D2; `ForgeSettings.tsx:186,332` already say "bot account" — no change). **The picker (M11) is what makes this flip reach a user** | `handler/forge.go`, `web/src/pages/{Dashboard,Repos,ForgeSettings}.tsx` | M8, M9, M10, **M11** |
 
 † M4 and M5 are collision-free **only because M2 lands both files as stubs**. If M2
 ships one file, M4 → M5 must run sequentially.
@@ -630,10 +945,13 @@ ships one file, M4 → M5 must run sequentially.
 | **2** | **M2** ∥ **M3** ∥ **M7** | Driver core / privcheck / worker. Disjoint. |
 | **3** | **M4** ∥ **M5** ∥ **M8** | Driver MR / driver pipelines / api+web. Disjoint **given M2's stubs**. |
 | **4** | **M9** alone | e2e, green before the gate. |
-| **5** | **M10** alone | Docs once the as-built is known. |
-| **6** | **M6b** alone | The go-live. Two lines, deliberately last. |
+| **5** | **M10** ∥ **M11** | Docs (once the as-built is known) and the connect-UI picker (dark, web-only). Disjoint files. |
+| **6** | **M6b** alone | The go-live: API flip + forge-neutral connect copy. Deliberately last, and now **usable** because M11 shipped the picker (dark) first. |
 
-Peak parallelism 3.
+Peak parallelism 3. **The [live] connect criterion is reachable only once M11's picker + M6b's
+advert both land** (D11). Two distinct paths validate it: M9's e2e connects a Forgejo instance
+**via the API** (`forge_type` in the create-connection POST — the machine path, independent of the
+picker), while M11's web tests + **web-ux post-M6b** validate the human path through the picker.
 
 **Why M6 is split — this was a real bug, not a tidy-up.** An earlier draft put the
 whole of M6 (migration **and** gate flip) in Phase 2 while claiming "M1–M5 land dark".
@@ -649,7 +967,8 @@ is inert and wants to be early (M8 needs it); the gate flip is the go-live and m
 last. Split, the dark-landing property is finally **true**: M6a only *widens* a CHECK
 (no `forgejo` row can exist while the handler rejects the type), M6a/M7 emit
 `forge_type: "gitlab"` for existing connections, and the driver is unreachable.
-**M6b is the only milestone that changes observable behaviour.**
+**M6b is the only milestone that changes observable behaviour** — M11's picker lands dark
+(hidden until M6b's advert makes `forge_types` multi-valued), so it too is invisible until the flip.
 
 **One caveat, stated because "dark" invites carelessness: M3 is not inert.** It is a
 behaviour-preserving refactor of a **live GitLab path**. Verify it against the
@@ -692,13 +1011,23 @@ way. `forgejo_test.go` mirrors it with a `mockForgejo` recording `Authorization:
    the permission payload, not a 404** — assert a removed-bot-on-public-repo 200 with
    `permission:"read"` yields `member` correctly (D7). *An earlier draft's test #6
    asserted `404 → (_, false, nil)`, which pins the wrong convention.*
-8. **Version gate** (D4): a mock reporting 15.0.4 is **refused in `VerifyToken`** with
-   a version-naming error that survives to the user; 16.0.0 connects.
+8. **Version gate** (D4 + **D4a**): a mock reporting `15.0.4+gitea-1.22.0` is **refused in
+   `VerifyToken`** with a version-naming error that survives to the user;
+   **`16.0.0+gitea-1.22.0` connects** (the build-metadata suffix must not defeat the compare —
+   this is the real released string, verified). **Table-drive the D4a cases, they are the
+   decision**: `16.0.1`/`16.1.0`/`17.0.0` accept; **`17.0.0-dev-3-…` accepts** (major
+   dominates); **`16.0.0-dev-626-32363b81+gitea-1.22.0` REFUSES** — codeberg's live string, and
+   refusing it is the *correct* answer, not a false negative (D4a); `1.21.11-2` refuses;
+   **`32363b81+gitea-1.22.0` (bare sha from `git describe --always`) refuses as unparseable**;
+   `""` refuses. *A test asserting codeberg's string connects would be pinning the bug.*
 9. **Branch protection via `GET /branches/{branch}`** (D6): `user_can_push:false` +
-   `user_can_merge:false` → no finding; `user_can_push:true` → finding;
-   `user_can_merge:true` → finding (D6a-1); non-empty `unprotected_file_patterns` →
-   finding (D6e). Assert the driver **never calls `branch_protections/`** (it would
-   403).
+   `user_can_merge:false` → no finding; `user_can_push:true` → push **Violation**;
+   `user_can_merge:true` → merge **Violation** (D6a-1 — assert the finding lands in
+   `RepoReport.Violations`, same tier as the push sibling).
+   ~~non-empty `unprotected_file_patterns` → finding (D6e)~~ — **dropped: the field is not on this
+   endpoint (D6e), verified live.** Assert the driver **never calls `branch_protections/`** (it
+   403s a write bot — and it is the only place `unprotected_file_patterns` lives, which is why
+   D6e cannot be checked).
 9b. **Unprotected branch reports the strongest finding, on both drivers** (R12 — the
    inversion). Forgejo's unprotected early-return gives `protected:false` with
    `user_can_push`/`user_can_merge` **true**; the GitLab driver's 404 gives
@@ -723,10 +1052,14 @@ way. `forgejo_test.go` mirrors it with a `mockForgejo` recording `Authorization:
     puts it outside the SDK), and note `newRedactor` ignores secrets under 8 chars
     (`:26`) — fine for Forgejo's 40-char PATs.
 13. **Pagination**: two-page `ListProjects`.
-14. **D3 empirical probe** (M2, not a unit test): against a real ≥16 instance, create
-    an issue, add an unrelated label, PUT a computed set, assert what happens to the
-    unrelated label. The replace semantics are read-from-source and **never executed**
-    (R3).
+14. ~~**D3 empirical probe** (M2, not a unit test): against a real ≥16 instance, create an
+    issue, add an unrelated label, PUT a computed set, assert what happens to the unrelated
+    label. The replace semantics are read-from-source and **never executed** (R3).~~
+    **DONE — R3 closed 2026-07-17** (D10, released `forgejo:16.0.0`): `['PRD']` + `keep-me`
+    → PUT `[Doing]` → **`['Doing']`**. D3 confirmed; the unrelated label is dropped.
+    **This no longer gates `UpdateIssueLabels`.** Tests #3/#4 above still stand as fixtures —
+    they pin uzi's *client-side* behaviour (one PUT, correct set; zero PUTs on a no-op), which
+    the probe never covered.
 
 **Pipeline status: two enums, not one.** M8's merged map must know which it reads.
 Actions run status (`models/actions/status.go:28-37`) is
@@ -756,8 +1089,8 @@ admin/forge data.
 | # | Risk | Severity | Mitigation |
 |---|---|---|---|
 | **R1** | **`specs/ai.md:259-262` records a false blocker.** The first thing any future reader trusts, arguing against feasible work. | **High** | Correct in the same commit as the work disproving it (CLAUDE.md). spec-keeper owns the file. *(The redactor description there is **accurate** — an earlier draft wrongly listed it as needing correction. Nothing to fix.)* |
-| **R2** | **The self-hosted instance earmarked for validation runs 15.0.4; D4 requires ≥16.0.0**, so uzi will refuse it. M9's live validation is blocked on upgrading it to a release only days old. **Nothing has ever exercised gitea-sdk against a 16.0.0 server** — no reachable instance runs one. | **High** | Prerequisite, not a bug (D4). Upgrade before M9. Until then the ≥16 CI path and the D3 probe are **fixture-only**; if the upgrade slips, M9 ships with the lane green on the fake and a **stated** live gap. Success criteria are marked fixture-satisfiable or not. |
-| **R3** | **D3's replace semantics were never executed** — read from source only. The architect flagged this as its own riskiest assumption. | Medium | The M2 probe (test #14) settles it before `UpdateIssueLabels` is called done. |
+| **R2** | ~~**The self-hosted instance earmarked for validation runs 15.0.4**, so M9's live validation is blocked on a human upgrading it. **Nothing has ever exercised gitea-sdk against a 16.0.0 server** — no reachable instance runs one.~~ **SUPERSEDED by D10 (2026-07-17).** The second sentence was **false**, and the first no longer matters: M9's live lane runs against a **pinned ephemeral `forgejo/forgejo:16.0.0` container** (released, reports `16.0.0+gitea-1.22.0`, passes the D4a gate, boots ~4s on sqlite). **No human dependency is on the critical path.** *(Note codeberg.org does **not** refute R2 usefully — D10 rejects it on three counts, any one sufficient. The released **image** is what refutes it.)* **Residual — now an accepted, documented OPEN item (user 2026-07-17):** the CI-fix loop is proven against `forge-fake`'s **canned** job logs (Variant A), **never against live job-log retrieval.** Closing that gap needs a registered `forgejo-runner` executing a real workflow — **no such environment exists yet**, so the check is **deferred, not done.** M9 does **not** close it; the CI-fix loop ships fixture-verified with the real-runner path explicitly unverified. | ~~High~~ **Low** *(the open gap blocks nothing on the critical path)* | Pin the image **by digest**. `forge-fake` is the default lane; the ephemeral container validates the non-Actions live surface. **The real-runner job-log check is an open R2 residual** — recorded so a future reader knows the CI-fix loop was proven against fixtures, not a live Forgejo emitting logs; do it when a runner environment exists. The self-hosted upgrade is still wanted for dogfooding but gates nothing. |
+| **R3** | ~~**D3's replace semantics were never executed** — read from source only. The architect flagged this as its own riskiest assumption.~~ **CLOSED (2026-07-17)** — executed against a released `forgejo:16.0.0` (D10). Issue at `['PRD']` → human adds `keep-me` → uzi PUTs its stale computed `[Doing]` → result **`['Doing']`**. **The unrelated label is silently dropped, exactly as D3 predicted from source.** The architect's riskiest assumption is now executed rather than inferred, and D3's accepted lost-update window is real and correctly characterised. | ~~Medium~~ **Closed** | The probe **no longer gates** `UpdateIssueLabels`. M2 still owns tests #3/#4 (one PUT with the correct set; **zero** PUTs on a no-op) as **fixture** tests — they pin uzi's client-side behaviour, which the probe does not cover. |
 | **R4** | **PRs leak onto the board as cards** — Forgejo models a PR as an issue. Silent, visible, embarrassing. | Medium | Driver filters `pull_request == null`; test #1. |
 | **R5** | **A failed Forgejo build renders a benign badge.** `pipelineBadge.ts` is `PIPELINE_TONES[status] ?? "neutral"` with a `failed` key and no `failure`; `canceled` ≠ `cancelled`. | Medium | Merged map + test; both spellings. |
 | **R6** | **The label add/remove convention (`body == "1"`) is undocumented upstream.** | Low | Pin with test #5. Degrades to issue-author attribution, already handled. |
@@ -787,20 +1120,36 @@ unchallenged in `specs/ai.md` for months.
 
 ## Success Criteria
 
-Marked **[live]** where an upgraded validation instance is required (R2) and **[fixture]**
-where the httptest/e2e fake suffices.
+Marked **[live]** where a real Forgejo is required and **[fixture]** where the httptest/e2e
+fake suffices.
+
+**[live] no longer means "blocked on a human" (D10, 2026-07-17).** It means a **pinned
+ephemeral `forgejo/forgejo:16.0.0` container** — a released build that passes the D4a gate,
+boots in ~4s, and is already proven to answer these questions (R3 was settled on one). **One
+exception, and it is the only [live] criterion with real cost**: "a failed pipeline drives the
+CI-fix loop with real job logs" needs a registered `forgejo-runner` executing a workflow. The
+log *route* is verified on a release; a runner end-to-end is **not**. **M9 does not close this
+(Variant A, D10a): the CI-fix loop is proven against `forge-fake`'s canned logs, and the
+real-runner check is deferred — no runner environment exists (user 2026-07-17). Open R2
+residual, not claimed as done.**
 
 - **[fixture]** A Forgejo instance < 16.0.0 is **refused at connect**, with an error
   naming the required version reaching the user (D4).
-- **[live]** A user connects a Forgejo ≥16.0.0 instance, and the privilege checker
-  applies the **same PRD #5 verdicts** it applies to GitLab (D6) — including the
+- **[live]** A user connects a Forgejo ≥16.0.0 instance **through the connect form's
+  forge-type picker** (D11 — this criterion is only reachable once **M11** ships the picker and
+  **M6b** advertises `forgejo`; before both, the UI can only create GitLab connections), and the
+  privilege checker applies the **same PRD #5 verdicts** it applies to GitLab (D6) — including the
   per-forge scope rule (D6b), refusing rather than warning where a check cannot be
   satisfied.
 - **[live]** A Forgejo repo whose `main` is unprotected, **or** protected but
   mergeable by the bot, **reports** that finding on the Repos page — and still runs
   (D6c; PRD #66 turns this into a refusal).
 - **[fixture]** **Nothing in #65 refuses anything that ran before it.** An existing
-  GitLab connection sees no new blocking behaviour — the enforcement flip is #66.
+  GitLab connection sees no new *blocking* behaviour — no run refused, no save rejected — the
+  enforcement flip is #66. **Note the scope precisely (D6a-1 tier ruling): #65 *may* newly flip
+  the badge `OK→Violations` on a GitLab repo whose protected `main` lets the write role merge.**
+  That is the merge check landing as a non-blocking finding, the same class #5 already reddens
+  for push — "no new blocking" is not "no new badge".
 - **[fixture]** An **unprotected** branch reports the *strongest* finding, not a clean
   bill of health (R12 — the early-return inversion).
 - **[fixture]** A `PRD`-labelled Forgejo issue appears on the board as a card — and
@@ -809,11 +1158,22 @@ where the httptest/e2e fake suffices.
   (D3) — and an unrelated label added concurrently behaves as the M2 probe predicted.
 - **[live]** A run against a Forgejo repo clones, works, pushes a branch, and opens a
   **pull request** — never touching `main`, all four guardrail layers intact.
-- **[live]** The card shows the PR's CI status; a failed pipeline drives the CI-fix
-  loop with real job logs (D1, D4) — and a failed build renders **failed**, not
-  neutral (R5).
+- **[live]** The card shows the PR's CI status (D1, D4) — against the ephemeral 16.0.0
+  container's real `LatestPipeline`/`LatestMRPipeline`.
+- **[fixture]** A failed pipeline drives the CI-fix loop off `ListPipelineJobs`/`JobLogTail`
+  against the fake's **canned** job logs, and a failed build renders **failed**, not neutral
+  (R5). *(Variant A, user 2026-07-17: the loop is proven against fixtures, not live job-log
+  retrieval.)*
+- **[deferred]** A registered `forgejo-runner` emitting **real** logs that `JobLogTail`
+  truncates correctly — **NOT verified**; no runner environment available; open R2 residual, to
+  be done when one exists. Not claimed as done anywhere in this PRD.
 - **[fixture]** A Forgejo card says "Pull Request"; a GitLab card on the same board
-  says "Merge Request"; shared chrome says "merge request" (D2).
+  says "Merge Request"; **forge-less chrome (nav/app-shell, admin, docs) names both
+  ("merge/pull request") or restructures past the noun — never defaulting to one forge's
+  word** (D2). *(Corrected 2026-07-17, the ~10th team-corrected claim: an earlier draft's
+  "shared chrome says 'merge request'" survived into this criterion after D2's body killed it —
+  the exact "the story rots" pattern this PRD documents. coder-m8 followed the D2 decision, not
+  the stale criterion: Landing/AdminSettings render "merge/pull request".)*
 - **[fixture]** An old worker (no `forge_type`, no `mr_web_url`) still claims and
   completes a GitLab run (R8).
 - **[n/a]** `specs/ai.md` §16 no longer claims a blocker that does not exist (R1).
@@ -826,15 +1186,21 @@ where the httptest/e2e fake suffices.
 | D2 | `MergeRequest` internal; UI copy per-forge | 2026-07-17 | User, **overruling the architect** (mixed board mixes vocabulary). Trade-off recorded; costs M8 the `forge_type`-to-web plumbing the architect's design assumed away. Shared chrome stays neutral. |
 | D3 | Accept the lost-update window | 2026-07-17 | User + architect agreed. Narrow, rare, self-correcting. Exclusive scoped labels rejected — they fork the board contract per forge. Semantics still need the M2 probe (R3). |
 | D4 | Forgejo ≥16.0.0, refuse below; no degradation | 2026-07-17 | User, **overruling the architect** (15.x floor + `ErrCIUnsupported`). Guarantees parity, deletes the degradation branch; costs every pre-2026-07-16 instance, including the user's own. Gate lives in `VerifyToken`, re-checked on the sweep, and is **never a security control**. |
+| D4a | **Gate = strict semver ≥ `v16.0.0`**; build metadata ignored; **prerelease refused**; **unparseable refuses**; `golang.org/x/mod/semver` | 2026-07-17 | Architect. `16.0.0-dev-N` is a **~3-month range, not a version**: `v16.0.0-dev` (2026-03-26) **lacks** D4's gating route, codeberg's `dev-626` has it, and **both report `16.0.0-dev-N`** — so accepting the class accepts an instance without the route. Dev builds are not even orderable (semver compares `dev-626` **lexically below** `dev-99`). **Refusing codeberg.org is therefore correct, not a false negative.** `17.0.0-dev-N` accepts soundly (major dominates; the v17 cycle opened after v16 branched — verified at the tag). Grammar derived from `Makefile:87-101` + 293 tags (modern majors: **only** `vN.N.N` and `vN.0.0-dev`; **no `-rc`**), not from live samples. x/mod chosen: no semver lib in `go.mod` today, and it is the Go team's own leaf dep. Unparseable refuses because the gate is a **feature** gate (L2): failing closed **buys no security and costs none**, so it is purely a failure-mode call, and one clear error at connect beats a bare 404 mid-run. The bare-sha input is real (`git describe --always` on a tag-less clone). |
 | D5 | `code.gitea.io/sdk/gitea`, not forgejo-sdk | 2026-07-17 | Architect, verified. forgejo-sdk is 13 months stale, has no timeline, and only Actions *secrets*. gitea-sdk has both, incl. `GetRepoActionJobLogs`. |
 | D6 | Guardrails: full equivalent or refuse | 2026-07-17 | User. **Original mapping was unsafe** — three rows read an admin-gated endpoint a `write` bot 403s on, degrading to a warning. Corrected to `GET /branches/{branch}` + `user_can_push`, which is authoritative rather than inferred. |
 | D6a | **Detect can-merge here; enforce in [PRD #66](66-guardrail-enforcement.md)** | 2026-07-17 | User, after three moves: "add the merge check" → "block on push or merge" (once the D6c conflict surfaced) → **split enforcement out** (once the architect surfaced that blocking is a *GitLab* behaviour change with no Forgejo content, riding in a Forgejo PRD). #65 reports and stays dark; #66 owns the flip, its impact count, and its release note. |
 | D6a-1 | `WriteRoleCanMerge` + `BotCanMerge` on **both** drivers | 2026-07-17 | User. A Forgejo `write` bot can merge its own PR to protected `main` by default; GitLab's default forbids it — but `merge_access_levels` is configurable, and safe-by-default is not safe. uzi modelled merge on neither forge. |
+| D6a-1 (tier) | **The merge finding is a per-repo `Violation`, not a `Warning`** | 2026-07-17 | **User-confirmed, architect-recommended.** Same tier as its push sibling (`checker.go:178-182`, a Violation for the same breach-class); `report.go:48-50` reserves `Violations` for branch problems that break the directive. Non-blocking is already a property of per-repo Violations (`report.go:37-38`), so "reported, not blocking" does **not** require downgrading severity — which would understate a real breach and split one guarantee across two tiers. **History kept: M3 committed this as a `Warning`** (coder-m1's instinct to spare a working GitLab badge; `TestMergeFindingsAreWarningsNotViolations`), **reconsidered and inverted** — coder-m1 makes the code follow-up (Warning→Violation + tests). The architect's earlier "Warning forces #66 to re-tier" argument is **withdrawn as a wash** — #66 refuses off the `BranchProtection` fields via a shared Protected-first predicate, never the badge tier. Cost: badge flips `OK→Violations` for merge-permissive GitLab repos at #65's sweep — non-blocking (nothing gates on `privilege_status`, lead-verified), same class #5 already reddens for push; the D6a split defers the *refusal*, not the *surfacing*. |
+| D6e | **DROP the `unprotected_file_patterns` check — no write-role source** | 2026-07-17 | Architect, verified live on `forgejo:16.0.0` (caught by coder-m1). The field lives **only** on the `reqAdmin()`-gated `BranchProtection`; D6's write-readable `GET /branches/{branch}` does not carry it and `user_can_push` does not reflect the per-file override (both confirmed with a `*.md` rule active). Same methodological failure the risk section catalogs — a check specced against the pre-D6 endpoint, never re-checked after D6 moved. No `BranchProtection` field added (M1 added none). Becomes a **documented manual-audit gap** like the team-whitelist gap. Rejected: escalate the bot to admin (D6 forbids; grants `DELETE` on the rule too); infer by test-pushing `*.md` to `main` (the primary directive forbids uzi ever pushing to `main`). |
 | D6b | Per-forge required scope set, "exactly" kept | 2026-07-17 | User. Forgejo has no `api` scope; as specced every Forgejo connection was rejected at save. `all` rejected as god-mode; superset rejected as deleting PRD #5's only blocking token check. |
 | D6c | Unprotected default branch: **warn, don't block** (restored) | 2026-07-17 | User chose warn-not-block; it was briefly superseded by D6a's blocking rule (unprotected-main *is* can-merge, `convert.go:76-85`), then **restored when enforcement moved to #66**. The round trip is recorded, not erased — a future reader will otherwise re-derive the same conflict. The doc obligation is what #65 carries. |
 | D7 | `ProjectRole` → `Role` enum; `WriteRoleCanPush` | 2026-07-17 | Architect. Forgejo has no numeric levels; `write`→30 would be a driver lying. **Not contained in `api/`** — the role is persisted JSONB + typed in the web, and existing rows silently fail to unmarshal. `member` needs its own derivation (404 ≠ non-member). |
 | D8 | Persist `runs.mr_web_url`, written by the worker | 2026-07-17 | Architect. The driver has the URL and discards it. Worker path chosen over `mr_watch` (immediate + complete vs first-tick + Human-Review-only); `isHttpsUrl` guard survives. |
 | D9 | Minimal TS forge seam (`createMr` only) | 2026-07-17 | Architect. Worker needs ~2 endpoints, not 19. Three transport guards (https, `redirect:"error"`, 409-resume) are interface requirements. |
+| D10 | **M9's live target = pinned ephemeral `forgejo/forgejo:16.0.0`**, not an upgraded instance; **codeberg.org rejected** | 2026-07-17 | Architect. The released image exists on both registries, boots ~4s on sqlite, and reports `16.0.0+gitea-1.22.0` — a release, so it **passes D4a** where codeberg does not. **R3 was settled and D6a-1 / D6 / D6b / D7 / D4 were each confirmed on it while writing this** — the first time any of them ran against a released 16.0.0. codeberg rejected on three counts, **any one sufficient**: it is volunteer-run production infrastructure and the [live] criteria write to it (**decisive, and independent of every technical fact**); D4a refuses it; it is a moving dev build that can only ever prove *routes exist*, never *a release behaves this way*. Removes R2's human dependency from the critical path; the self-hosted upgrade stays wanted for dogfooding but gates nothing. **Residual: real job logs need a `forgejo-runner` (unverified) — see D10a.** |
+| D11 | **Connect needs an explicit forge-type picker (not auto-detection); M11 lands it dark, M6b flips advert+accept+copy** | 2026-07-17 | Architect, surfaced to user as a scope finding. The `[live]` connect criterion was **unreachable**: the web form never sent `forge_type`, so post-M6b it still created GitLab connections (11th team-caught claim). Picker chosen over auto-detection because the driver is selected **before** `VerifyToken` (forge_type must be known up front), `ForgeConfig` already advertises `forge_types` for exactly this, and auto-detection would leak forge-discrimination logic outside the `forge` package into a driver-less handler pre-probe. Picker hides while `forge_types=[gitlab]` → dark. **M6b's "two lines" was insufficient for its own Success Criterion.** Base-URL/forge-type picked independently (D11a): mismatch fails at `VerifyToken`, accepted limitation. |
+| D10a | **M9 CI-fix live coverage: fixtures only; real-runner verification deferred** | 2026-07-17 | User, choosing **Variant A**. The e2e lane proves `ListPipelineJobs`/`JobLogTail` + the CI-fix loop against `forge-fake`'s canned `text/plain` job logs; the non-Actions surface is validated live against the ephemeral `forgejo:16.0.0`. The one-time real-`forgejo-runner` job-log check is **deferred, not done** — the user has no runner environment. **Recorded as unverified, not claimed** (this PRD does not claim verification that did not happen). Acceptable because the log route is verified on a release and `JobLogTail` does near-zero forge-specific parsing (SDK call + tail-truncate), so the fixture lane's fidelity loss is narrow; the residual gap is the live *retrieval* path (auth/redirect/content-type on a real run), an open R2 item blocking nothing on the critical path. |
 
 ## Evidence Base
 
@@ -862,10 +1228,22 @@ Claims below were checked by at least two independent agents.
 | Exclusive scoped labels exist | `models/issues/label.go:89` |
 | `redact.go` is value-based | `redact.go:23-39`; `specs/ai.md:255-258` describes it accurately |
 | gitea-sdk v0.25.1, 2026-05-12; forgejo-sdk v2.2.0, 2025-06-17 | proxy.golang.org |
-| Live versions | validation instance → 15.0.4+gitea-1.22.0; codeberg.org → 15.0.0-209+gitea-1.22.0 |
+| Live versions | validation instance → `15.0.4+gitea-1.22.0`; codeberg.org → **`16.0.0-dev-626-32363b81+gitea-1.22.0`** (re-measured 2026-07-17). ~~codeberg.org → 15.0.0-209~~ — **that was stale within a day of being written; it is the tenth claim this PRD has had to retract, and it is why D4a derives the grammar from the Makefile rather than from live samples** |
+| **Forgejo's version grammar** (D4a) | `Makefile@v16.0.0:87-101` — `git describe --exclude '*-test' --tags --always \| sed 's/^v//' \| sed 's/\-g/-/'`, then `+$(GITEA_COMPATIBILITY)`; overridable by the `VERSION` file or `GITEA_VERSION` env, both free-form (`:265-267` calls semver "must" advisory). **293 tags enumerated**: modern majors (≥7) are 70 × `vN.N.N` + 11 × `vN.0.0-dev`, **zero `-rc`** |
+| **`v16.0.0-dev` LACKS D4's gating route** (D4a's load-bearing fact) | `routers/api/v1/api.go@v16.0.0-dev:1236-1238` — `/actions` + `/runs` groups, **no** `/jobs/{job_id}/logs`, **no** `ListActionRunJobs`: v15.0.4's surface exactly. Tagged 2026-03-26. Present at `v17.0.0-dev` (`:891,897`, tagged 2026-06-25) and `v16.0.0` (`:891,897`, 2026-07-16). **So `16.0.0-dev-N` spans builds with and without the route** |
+| **A released 16.0.0 reports `16.0.0+gitea-1.22.0`** | `docker run codeberg.org/forgejo/forgejo:16.0.0` → `GET /api/v1/version` (and `/api/forgejo/v1/version`, identical). **No prerelease component.** Verified 2026-07-17 |
+| **D3's lost update is real** (closes R3) | Executed on released 16.0.0: `['PRD']` + human `keep-me` → `PUT {labels:[3]}` → **`['Doing']`**. The unrelated label is dropped |
+| **D6a-1 confirmed live** | Released 16.0.0, protected `main` + defaults, bot at `write`: `protected=true, user_can_push=false, `**`user_can_merge=true`** |
+| **D6's authz gates confirmed live** | Released 16.0.0: write bot `GET branch_protections/main` → **403**; owner → 200; write bot `GET branches/main` → **200**, `effective_branch_protection_name` empty |
+| **D6e has no write-role source** (confirms the DROP) | Released 16.0.0, `main` protected with `unprotected_file_patterns: "*.md"`: write bot `GET branches/main` returns no file-pattern field and `user_can_push: false` (unchanged by the `*.md` rule); write bot `GET branch_protections/main` and `GET branch_protections` both **403**. `unprotected_file_patterns` is readable only on the admin-gated `BranchProtection` |
+| **D6b's reordering trap confirmed live** | Minted `[write:repository, write:issue, read:user]` → API returns `['write:issue','write:repository','read:user']`, un-expanded. **A string compare would be a coin flip**, as D6b said |
+| Released `forgejo:16.0.0` image exists | `codeberg.org/forgejo/forgejo:16.0.0` and `data.forgejo.org/forgejo/forgejo:16.0.0`, published 2026-07-16 (matching the tag); boots ~4s on sqlite |
 
 **Unverifiable and not relied upon**: the architect's live-instance anecdotes (SDK
 smoke test, `extraHeader` control test, admin-token 200). Each underlying fact was
 independently confirmed from source, which is stronger evidence than the anecdote.
-**Untestable today**: gitea-sdk against a 16.0.0 server — no reachable instance runs
-it (R2).
+~~**Untestable today**: gitea-sdk against a 16.0.0 server — no reachable instance runs it (R2).~~
+**Retracted 2026-07-17 (D10)**: a released 16.0.0 is one `docker run` away, and the rows above
+were produced on one. **Not yet verified, and now explicitly deferred (D10a, no runner
+environment)**: `forgejo-runner` executing a workflow end-to-end, i.e. *real* job-log retrieval
+rather than the log *route* (R2's residual). M9 covers the CI-fix loop with fixtures only.

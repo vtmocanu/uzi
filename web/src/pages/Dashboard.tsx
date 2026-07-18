@@ -10,6 +10,7 @@ import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, type AdminUsage, type RunListItem, type SelfUsage, type Worker } from "../lib/api";
 import { mrChipState } from "../lib/runBadge";
 import { MrChip } from "../components/MrChip";
+import { mrAbbrev } from "../lib/forgeNoun";
 import { YourUsageCard, FactoryTotalCard, PerUserUsageTable } from "../components/UsageCards";
 import { RunHealthBadge } from "../components/RunHealthBadge";
 import { WorkerStatLine, hasStats } from "../components/WorkerStats";
@@ -239,8 +240,8 @@ export function Dashboard() {
             <Step
               done={data.hasForge}
               index={2}
-              title="Connect your GitLab bot"
-              hint="A bot PAT with the api scope lets uzi see and move your issues."
+              title="Connect your bot"
+              hint="A bot PAT lets uzi see and move your issues."
               to="/settings/forge"
               cta="Forge"
             />
@@ -309,7 +310,15 @@ export function Dashboard() {
                     <p className="text-xs text-faint">
                       {r.repo_path} #{r.issue_iid}
                       {r.mr_iid != null && (
-                        <MrChip variant="inline" label="MR " mrIid={r.mr_iid} mrState={mrState} href={null} className="ml-2" />
+                        <MrChip
+                          variant="inline"
+                          label={`${mrAbbrev(r.forge_type)} `}
+                          forgeType={r.forge_type}
+                          mrIid={r.mr_iid}
+                          mrState={mrState}
+                          href={null}
+                          className="ml-2"
+                        />
                       )}
                     </p>
                   </div>

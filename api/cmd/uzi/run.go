@@ -407,7 +407,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		{"STATUS", r.Status},
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
-		{"MR", int64Or(r.MrIID, "-")},
+		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},
 		{"HEALTH", r.Health},
 	}
 	if r.HealthReason != nil && *r.HealthReason != "" {

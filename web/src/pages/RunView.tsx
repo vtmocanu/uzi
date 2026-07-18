@@ -12,6 +12,7 @@ import {
   api,
   ApiError,
   isHttpsUrl,
+  preferForgeUrl,
   isTerminalRun,
   type AgentSelectionInput,
   type Repo,
@@ -30,6 +31,7 @@ import {
   mrChipTitle,
   shouldShowHealthFlag,
 } from "../lib/runBadge";
+import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
@@ -170,10 +172,14 @@ export function RunView() {
   // MR state (PRD #33): a per-run frozen hint. It appends "merged"/"closed" to the
   // MR affordance and (for closed) drops the ok tone; open is unchanged.
   const mrState = mrChipState(run.mr_state);
-  const mrUrl =
-    run.mr_iid != null && isHttpsUrl(repoWebUrl)
-      ? `${repoWebUrl}/-/merge_requests/${run.mr_iid}`
-      : null;
+  // The MR/PR link (PRD #65 D8): prefer the forge-supplied URL the worker persisted
+  // (the only correct link on Forgejo), guarded through isHttpsUrl by preferForgeUrl
+  // before it becomes an anchor. A null (rows created before it landed — all GitLab)
+  // falls back to the legacy GitLab reconstruction from the repo web url.
+  const mrUrl = preferForgeUrl(
+    run.mr_web_url,
+    run.mr_iid != null && isHttpsUrl(repoWebUrl) ? `${repoWebUrl}/-/merge_requests/${run.mr_iid}` : null,
+  );
   const duration =
     run.started_at && run.finished_at
       ? formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime())
@@ -280,7 +286,7 @@ export function RunView() {
                   <>
                     Branch <code className="rounded bg-raised px-1 py-0.5 text-fg">{run.branch}</code>
                     {run.mr_iid != null &&
-                      ` — merge request ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
+                      ` — ${forgeNounLower(run.forge_type)} ${mrState === "merged" ? "merged" : mrState === "closed" ? "closed" : "opened"}.`}
                   </>
                 )}
               </p>
@@ -288,13 +294,19 @@ export function RunView() {
             {mrUrl ? (
               <a href={mrUrl} target="_blank" rel="noreferrer">
                 <Button>
-                  Open merge request !{run.mr_iid}{mrChipSuffix(mrState)} <ExternalLinkIcon />
+                  Open {forgeNounLower(run.forge_type)} {mrRefSymbol(run.forge_type)}
+                  {run.mr_iid}
+                  {mrChipSuffix(mrState)} <ExternalLinkIcon />
                 </Button>
               </a>
             ) : (
               run.mr_iid != null && (
-                <Badge tone={mrState === "closed" ? "neutral" : "ok"} title={mrChipTitle(mrState)}>
-                  MR <span className={mrState === "closed" ? "line-through" : undefined}>!{run.mr_iid}</span>
+                <Badge tone={mrState === "closed" ? "neutral" : "ok"} title={mrChipTitle(mrState, run.forge_type)}>
+                  {mrAbbrev(run.forge_type)}{" "}
+                  <span className={mrState === "closed" ? "line-through" : undefined}>
+                    {mrRefSymbol(run.forge_type)}
+                    {run.mr_iid}
+                  </span>
                   {mrChipSuffix(mrState)}
                 </Badge>
               )
@@ -327,13 +339,19 @@ export function RunView() {
             {mrUrl ? (
               <a href={mrUrl} target="_blank" rel="noreferrer">
                 <Button variant="secondary">
-                  Open merge request !{run.mr_iid}{mrChipSuffix(mrState)} <ExternalLinkIcon />
+                  Open {forgeNounLower(run.forge_type)} {mrRefSymbol(run.forge_type)}
+                  {run.mr_iid}
+                  {mrChipSuffix(mrState)} <ExternalLinkIcon />
                 </Button>
               </a>
             ) : (
               run.mr_iid != null && (
-                <Badge tone="neutral" title={mrChipTitle(mrState)}>
-                  MR <span className={mrState === "closed" ? "line-through" : undefined}>!{run.mr_iid}</span>
+                <Badge tone="neutral" title={mrChipTitle(mrState, run.forge_type)}>
+                  {mrAbbrev(run.forge_type)}{" "}
+                  <span className={mrState === "closed" ? "line-through" : undefined}>
+                    {mrRefSymbol(run.forge_type)}
+                    {run.mr_iid}
+                  </span>
                   {mrChipSuffix(mrState)}
                 </Badge>
               )

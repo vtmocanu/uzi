@@ -9,7 +9,11 @@
 // documented-and-hoped into continuously-checked.
 package privcheck
 
-import "time"
+import (
+	"time"
+
+	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
+)
 
 // Status is the denormalized worst-case tier of a report, stored on
 // forge_connections.privilege_status for cheap list queries and badges.
@@ -49,9 +53,12 @@ type RepoReport struct {
 	// Repos-page row.
 	RepoID string `json:"repo_id"`
 	Path   string `json:"path"`
-	// Role is the bot's effective access level (30 = Developer). Zero when the
-	// bot is not a member.
-	Role int `json:"role"`
+	// Role is the bot's effective forge-neutral role ("write" is the compliant
+	// one); RoleNone when the bot is not a member. This field was an int access
+	// level until PRD #65 (D7) — reports written before then hold a number here
+	// and no longer unmarshal, so they read blank until the next privilege sweep
+	// re-stamps them.
+	Role forge.Role `json:"role"`
 	// Member is false when the bot has no effective membership on the repo.
 	Member     bool     `json:"member"`
 	Violations []string `json:"violations"`

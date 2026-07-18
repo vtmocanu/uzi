@@ -16,6 +16,8 @@ function run(over: Partial<Run> = {}): Run {
     issue_description: "",
     title: null,
     resume_of_run_id: null,
+    forge_type: "gitlab",
+    mr_web_url: null,
     status: "completed",
     requeue_count: 0,
     iteration_count: 0,

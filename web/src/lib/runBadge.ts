@@ -4,6 +4,7 @@
 // (see runBadge.test.ts), the same split the run stream uses (runStream.ts).
 
 import { isTerminalRun, type LatestRun, type RunHealth, type StopKind } from "./api";
+import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
 
 // Tones mirror StatusPill's RUN_STATUS_TONES (ui.tsx) so one status renders one
 // color everywhere: queue (queued), neutral (stopped/idle), info
@@ -41,12 +42,17 @@ export function mrChipSuffix(state: MrChipState): string {
   return state === "open" ? "" : ` ${state}`;
 }
 
-// mrChipTitle is the chip's hover title. merged/closed scope the claim to "as of
-// last sync" (Decision 1: mr_state is frozen per run and only best-effort fresh).
-export function mrChipTitle(state: MrChipState): string {
-  if (state === "merged") return "Merge request merged (as of last sync)";
-  if (state === "closed") return "Merge request closed unmerged (as of last sync)";
-  return "Open the merge request on GitLab";
+// mrChipTitle is the chip's hover title. Both the noun and the destination platform
+// are per-forge (PRD #65 D2): "Merge request … on GitLab" vs "Pull request … on
+// Forgejo", so the open title keeps naming the platform (a GitLab card reads exactly
+// as it did pre-#65) without ever saying "GitLab" on a Forgejo card. merged/closed
+// scope the claim to "as of last sync" (Decision 1: mr_state is frozen per run and
+// only best-effort fresh).
+export function mrChipTitle(state: MrChipState, forgeType: string): string {
+  const noun = forgeNounSentence(forgeType);
+  if (state === "merged") return `${noun} merged (as of last sync)`;
+  if (state === "closed") return `${noun} closed unmerged (as of last sync)`;
+  return `Open the ${forgeNounLower(forgeType)} on ${forgePlatform(forgeType)}`;
 }
 
 // isStoppedRun folds the cancelled nuance (PRD §1): a deliberate human stop is not

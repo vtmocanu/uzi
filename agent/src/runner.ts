@@ -17,7 +17,7 @@ import {
 } from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
 import { SteeringChannel, type PlanVerdict } from "./steering.js";
-import { GitLabClient, gitlabBaseUrl, gitlabProjectPath } from "./gitlab.js";
+import { GitLabClient, ForgejoClient, type ForgeClient } from "./forge.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 import {
@@ -31,8 +31,8 @@ import {
   type CheckRunner,
 } from "./self-improve.js";
 
-/** Cap on a reported failure_reason, matching the GitLab error-body cap
- *  (gitlab.ts) so a runaway SDK error can't bloat the run row or the stream. */
+/** Cap on a reported failure_reason, matching the forge error-body cap
+ *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
 
 /**
@@ -60,8 +60,11 @@ export interface RunnerOptions {
   pollMs?: number;
   /** Plan-approval gate cap; 0 disables (default 24h). */
   planApprovalTimeoutMs?: number;
-  /** Injected for tests; default opens real GitLab MRs. */
-  gitlab?: GitLabClient;
+  /** Injected for tests; default opens real GitLab MRs. The worker picks between
+   *  this and `forgejo` per claim (`repo.forge_type`, D9). */
+  gitlab?: ForgeClient;
+  /** Injected for tests; default opens real Forgejo PRs (PRD #65 D9). */
+  forgejo?: ForgeClient;
   /** Injected for tests; default is the real `.claude/agents/` parser (PRD #37).
    *  A seam so a test can drive the detection-failure path deterministically. */
   detectRepoAgents?: (worktreePath: string) => Promise<DetectedRepoAgents>;
@@ -87,7 +90,8 @@ export interface RunnerOptions {
 export class RunRunner {
   private readonly pollMs: number;
   private readonly planApprovalTimeoutMs: number;
-  private readonly gitlab: GitLabClient;
+  private readonly gitlab: ForgeClient;
+  private readonly forgejo: ForgeClient;
   private readonly detect: (worktreePath: string) => Promise<DetectedRepoAgents>;
   // Optional test override; production builds it per-run with the scrubbed check env
   // (buildCheckEnv) once the executor's provisioned toolEnv is known (M9).
@@ -109,6 +113,7 @@ export class RunRunner {
     this.pollMs = opts.pollMs ?? 3_000;
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
+    this.forgejo = opts.forgejo ?? new ForgejoClient();
     this.detect = opts.detectRepoAgents ?? detectRepoAgents;
     this.checkRunner = opts.checkRunner;
   }
@@ -296,13 +301,16 @@ export class RunRunner {
       await this.git.pushBranch(barePath, result.branch, claim.secrets.forge_pat, claim.repo.clone_url, claim.secrets.forge_username);
       const targetBranch =
         claim.repo.default_branch?.trim() || (await this.git.defaultBranchName(barePath)) || "main";
-      // createMergeRequest is idempotent: for a ci_fix on an existing agent branch it
-      // returns the EXISTING MR (no second MR, PRD #6); for a fresh ci-fix/pipeline-N
-      // or agent/issue-N branch it opens one. Reporting its iid keeps the fix branch
-      // watched so the verification sync can stamp the verdict.
-      const mr = await this.gitlab.createMergeRequest({
-        baseUrl: gitlabBaseUrl(claim.repo.url),
-        projectPath: gitlabProjectPath(claim.repo.url),
+      // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
+      // the worker opens an MR on GitLab and a PR on Forgejo from the same code path;
+      // each client derives its own API base + project from repo.url (D9). createMergeRequest
+      // is idempotent: for a ci_fix on an existing agent branch it returns the EXISTING
+      // MR/PR (no second one, PRD #6); for a fresh ci-fix/pipeline-N or agent/issue-N
+      // branch it opens one. Reporting its iid keeps the fix branch watched so the
+      // verification sync can stamp the verdict.
+      const forge = claim.repo.forge_type === "forgejo" ? this.forgejo : this.gitlab;
+      const mr = await forge.createMergeRequest({
+        repoUrl: claim.repo.url,
         pat: claim.secrets.forge_pat,
         sourceBranch: result.branch,
         targetBranch,
@@ -312,7 +320,11 @@ export class RunRunner {
       batcher.emit({ kind: "status", agent: "worker", payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` } });
 
       await batcher.close();
-      await reportState({ status: "completed", branch: result.branch, mr_iid: mr.iid });
+      // Persist the MR/PR web URL the forge just handed us (PRD #65 D8), so the web
+      // links it directly instead of reconstructing the URL by string surgery. Omit
+      // it when the forge returned none (mr.webUrl empty) so the server lands NULL and
+      // the legacy forgeUrls.ts reconstruction still applies (R8, additive+optional).
+      await reportState({ status: "completed", branch: result.branch, mr_iid: mr.iid, mr_web_url: mr.webUrl || undefined });
       runLog.info("run completed", { branch: result.branch, mr_iid: mr.iid });
     } catch (err) {
       // failure_reason goes straight to reportState, bypassing the batcher's

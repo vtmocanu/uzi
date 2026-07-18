@@ -19,8 +19,8 @@ uzi only knows your bot account's identity from its PAT, not yours. Open
 **Settings → Forge → Your forge identity (for autopilot)** and enter your
 own GitLab username for that connection. uzi checks it against the forge on
 save; an unresolved username still saves, with a warning, since a forge
-blip shouldn't block the save. See [GitLab bot setup](./gitlab-bot-setup.md)
-for the rest of the Forge page.
+blip shouldn't block the save. See [GitLab bot setup](./gitlab-bot-setup.md) or
+[Forgejo bot setup](./forgejo-bot-setup.md) for the rest of the Forge page.
 
 Matching is exact and case-sensitive, per forge host: a case-variant of your
 username is a different identity for this purpose and isn't deduplicated

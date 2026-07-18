@@ -12,6 +12,11 @@ type RunDTO struct {
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
 	// issue/ci_fix runs.
 	RepoID *string `json:"repo_id"`
+	// ForgeType is the run's forge ("gitlab"|"forgejo"), so the web picks the
+	// per-run MR/PR noun and reference sigil (PRD #65 D2). "" on the worker/create
+	// DTO paths, which never render the MR affordance in a browser; set on the
+	// list/detail reads (ListRuns/AdminListRuns/GetRun) from the run's connection.
+	ForgeType string `json:"forge_type"`
 	// Kind is issue|ci_fix|chat. IssueIID is null for ci_fix (no issue) and chat
 	// runs; the ci_fix fields below carry pipeline context, chat carries Title.
 	Kind             string `json:"kind"`
@@ -30,6 +35,11 @@ type RunDTO struct {
 	WorkerID       *string `json:"worker_id"`
 	Branch         *string `json:"branch"`
 	MrIID          *int64  `json:"mr_iid"`
+	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
+	// creation (PRD #65 D8), null on runs created before it landed. The web renders
+	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL
+	// reconstruction for those null rows — it is the only correct link on Forgejo.
+	MrWebURL *string `json:"mr_web_url"`
 	// MrState is the last merge-request state the PRD #24 watcher observed for
 	// mr_iid (opened|closed|merged|locked), null when never observed. Display-only
 	// and best-effort (PRD #33 Decision 1): the chip treats merged/closed distinctly

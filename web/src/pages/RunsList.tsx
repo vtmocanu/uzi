@@ -13,6 +13,7 @@ import { api, ApiError, isTerminalRun, type AdminWorker, type RunListItem, type 
 import { Alert, Badge, Card, EmptyState, ListSkeleton, PageHeader, SectionTitle, StatusPill } from "../components/ui";
 import { ActivityIcon, ChevronDownIcon, ChevronRightIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
+import { mrAbbrev } from "../lib/forgeNoun";
 import { isStoppedRun, mrChipState } from "../lib/runBadge";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { hasTemplateDrift } from "../lib/workerTemplates";
@@ -68,7 +69,15 @@ function RunRow({
             {showOwner && run.owner_email && <span>· {run.owner_email}</span>}
             <span>· {new Date(run.updated_at).toLocaleString()}</span>
             {run.mr_iid != null && (
-              <MrChip variant="inline" label="· MR " mrIid={run.mr_iid} mrState={mrState} href={null} className="font-medium" />
+              <MrChip
+                variant="inline"
+                label={`· ${mrAbbrev(run.forge_type)} `}
+                forgeType={run.forge_type}
+                mrIid={run.mr_iid}
+                mrState={mrState}
+                href={null}
+                className="font-medium"
+              />
             )}
             {/* PRD #40: tokens + cost join the meta line; hidden for a run with no
                 usage rows (a pre-feature run) — never a fabricated 0. A running run
@@ -160,7 +169,7 @@ export function RunsList() {
             <EmptyState
               icon={<ActivityIcon />}
               title="No runs yet"
-              description="Open a board and press Start run on a PRD card — the agent plans, waits for your approval, then implements and opens an MR."
+              description="Open a board and press Start run on a PRD card — the agent plans, waits for your approval, then implements and opens a merge/pull request."
               action={
                 <Link to="/repos" className="text-sm font-medium text-brand hover:text-brand-hover">
                   Go to boards →

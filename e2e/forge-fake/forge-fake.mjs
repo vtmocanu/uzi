@@ -1,8 +1,14 @@
-// forge-fake — a tiny stand-in for a GitLab instance, used only by the M6 E2E
-// harness. It serves, over HTTPS on :443, the subset of the GitLab v4 REST API
-// that the uzi api (issue create/get, token verify, project + issue listing) and
-// the uzi worker (merge-request create/list) actually call, plus an
-// introspection endpoint the harness reads to assert what was recorded.
+// forge-fake — a tiny stand-in for a forge, used only by the E2E harness. It
+// serves, over HTTPS on :443, the subset of the forge REST API that the uzi api
+// (issue create/get, token verify, project + issue listing, privilege + branch
+// checks, CI) and the uzi worker (merge/pull-request create) actually call, plus
+// an introspection endpoint the harness reads to assert what was recorded.
+//
+// It speaks BOTH forge dialects over ONE shared in-memory state, selected by path
+// prefix: the GitLab v4 API (`/api/v4/*`) and — for PRD #65's Forgejo lane — the
+// Forgejo v1 API (`/api/v1/*`). The driver hits whichever matches the connection's
+// forge_type; the `/_e2e/*` mutators and the git smart-HTTP handler are
+// forge-agnostic and shared. UZI_E2E_FORGE selects the lane in run-e2e.sh.
 //
 // It is deliberately NOT a real forge: there is exactly one project, auth is not
 // checked (the harness uses dummy credentials per the testing-credentials
@@ -92,12 +98,28 @@ const state = {
   // these via the /_e2e/pipelines mutator to drive the CI-status + Fix CI +
   // verification flow. LatestMRPipeline resolves an MR to its source_branch's ref.
   pipelines: /** @type {Record<string, any>} */ ({}),
+  // Forgejo Actions workflow runs (PRD #65 M9). A flat list (NOT keyed by ref like
+  // GitLab's pipelines) so 2+ runs can exist on ONE branch/sha — the id-DESC
+  // ordering the driver's `[0]`-is-newest depends on. The /api/v1 readers return
+  // this sorted id DESC; the harness appends via /_e2e/actions-runs.
+  forgejoRuns: /** @type {any[]} */ ([]),
+  // Stable label name -> numeric id map for the Forgejo lane. Forgejo's label
+  // writes are keyed by id (ReplaceIssueLabels takes []int), so the fake must
+  // assign each label name a stable id and map ids back to names on a PUT.
+  forgejoLabelIds: /** @type {Record<string, number>} */ ({}),
   nextIssueIid: 1,
   nextMrIid: 1,
   nextNoteId: 5000,
   nextLabelEventId: 100,
   nextPipelineId: 900,
   nextJobId: 700,
+  nextForgejoRunId: 3000,
+  nextForgejoJobId: 3500,
+  nextForgejoLabelId: 200,
+  // The version /api/v1/version reports. Default is a D4a-passing release; the
+  // harness flips it (via /_e2e/forgejo-version) to a < 16.0.0 string for one
+  // assertion, to prove the privilege sweep raises the version-downgrade finding.
+  forgejoVersion: "16.0.0+gitea-1.22.0",
 };
 
 function persist() {
@@ -105,7 +127,7 @@ function persist() {
     fs.writeFileSync(
       STATE_FILE,
       JSON.stringify(
-        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, labelEvents: state.labelEvents, pipelines: state.pipelines },
+        { issues: Object.values(state.issues), mrs: state.mrs, notes: state.notes, labelEvents: state.labelEvents, pipelines: state.pipelines, forgejoRuns: state.forgejoRuns, forgejoLabelIds: state.forgejoLabelIds },
         null,
         2,
       ),
@@ -128,7 +150,12 @@ function load() {
     state.notes = Array.isArray(saved.notes) ? saved.notes : [];
     state.labelEvents = saved.labelEvents && typeof saved.labelEvents === "object" ? saved.labelEvents : {};
     state.pipelines = saved.pipelines && typeof saved.pipelines === "object" ? saved.pipelines : {};
+    state.forgejoRuns = Array.isArray(saved.forgejoRuns) ? saved.forgejoRuns : [];
+    state.forgejoLabelIds = saved.forgejoLabelIds && typeof saved.forgejoLabelIds === "object" ? saved.forgejoLabelIds : {};
     state.nextPipelineId = Math.max(899, ...Object.values(state.pipelines).map((p) => p.id)) + 1;
+    state.nextForgejoRunId = Math.max(2999, ...state.forgejoRuns.map((r) => r.id)) + 1;
+    state.nextForgejoJobId = Math.max(3499, ...state.forgejoRuns.flatMap((r) => (r.jobs || []).map((j) => j.id))) + 1;
+    state.nextForgejoLabelId = Math.max(199, ...Object.values(state.forgejoLabelIds)) + 1;
     state.nextIssueIid = Math.max(0, ...Object.keys(state.issues).map(Number)) + 1;
     state.nextMrIid = Math.max(0, ...state.mrs.map((m) => m.iid)) + 1;
     state.nextNoteId = Math.max(4999, ...state.notes.map((n) => n.id)) + 1;
@@ -207,6 +234,138 @@ function normLabels(v) {
   if (Array.isArray(v)) return v.map(String);
   if (typeof v === "string" && v.trim()) return v.split(",").map((s) => s.trim());
   return [];
+}
+
+// ============================================================================
+// Forgejo /api/v1 translation (PRD #65 M9). The Forgejo route table below shares
+// the SAME in-memory `state` as the GitLab /api/v4 table — the /_e2e mutators and
+// the git smart-HTTP handler are forge-agnostic — but the wire SHAPES differ, so
+// these helpers translate a GitLab-shaped state record into what the Forgejo
+// driver actually parses. Every shape here mirrors the driver as-built (verified
+// against a live 16.0.0 container while writing M2/M4/M5): a PR is an issue with a
+// non-null pull_request (R4); an issue's `label` in the timeline is a SINGLE
+// object; the token payload carries token_last_eight + scopes and no expiry;
+// Actions runs come back id-DESC as {total_count, workflow_runs}.
+// ============================================================================
+
+// flabelId assigns each label NAME a stable numeric id (Forgejo keys label writes
+// by id). Minted on first sight and persisted, so the catalog, an issue's labels,
+// and a ReplaceIssueLabels PUT all agree on the same id for a name.
+function flabelId(name) {
+  if (state.forgejoLabelIds[name] == null) state.forgejoLabelIds[name] = state.nextForgejoLabelId++;
+  return state.forgejoLabelIds[name];
+}
+// flabelName reverses flabelId (for a ReplaceIssueLabels PUT, which sends ids).
+function flabelName(id) {
+  for (const [name, n] of Object.entries(state.forgejoLabelIds)) if (n === id) return name;
+  return null;
+}
+// forgejoWebUrl rewrites a GitLab-style web_url into Forgejo's grammar so a card's
+// rendered link is forge-honest (/-/issues/N -> /issues/N, /-/merge_requests/N ->
+// /pulls/N). Correctness only; both are same-host https.
+function forgejoWebUrl(glUrl) {
+  return String(glUrl || "").replace("/-/issues/", "/issues/").replace("/-/merge_requests/", "/pulls/");
+}
+// forgejoIssueState maps the cache's "opened"/"closed" onto Forgejo's "open"/"closed".
+function forgejoIssueState(s) {
+  return s === "closed" ? "closed" : "open";
+}
+// toForgejoIssue maps a stored GitLab-shaped issue to a Forgejo issue: `number` for
+// the index, `body` for the description, a SINGLE-OBJECT labels array, and an
+// explicit null pull_request (this is a real issue, not a PR).
+function toForgejoIssue(issue) {
+  return {
+    id: issue.id,
+    number: issue.iid,
+    title: issue.title,
+    body: issue.description ?? "",
+    state: forgejoIssueState(issue.state),
+    labels: (issue.labels || []).map((n) => ({ id: flabelId(n), name: n })),
+    html_url: forgejoWebUrl(issue.web_url),
+    user: { id: issue.author?.id ?? 1, login: issue.author?.username || "uzi-bot" },
+    updated_at: issue.updated_at,
+    created_at: issue.created_at,
+    pull_request: null,
+  };
+}
+// forgejoPRState maps a stored MR's GitLab-style state (opened|closed|merged|locked)
+// onto Forgejo's {state, merged}: open -> {open,false}, merged -> {closed,true},
+// closed/locked -> {closed,false}. Verified live on 16.0.0.
+function forgejoPRState(mrState) {
+  if (mrState === "merged") return { state: "closed", merged: true };
+  if (mrState === "opened") return { state: "open", merged: false };
+  return { state: "closed", merged: false };
+}
+// mrHeadSha is the deterministic head commit the fake assigns a PR, so the harness
+// can drive Actions runs for the PR's head without reading it back. Real Forgejo
+// keys a PR's runs to its head SHA; LatestMRPipeline resolves the PR head then
+// filters runs by it, so the fake's PR head.sha and the run head_sha must agree.
+function mrHeadSha(sourceBranch) {
+  return `sha-${sourceBranch}`;
+}
+// toForgejoPR maps a stored MR to a Forgejo pull request. head.sha is deterministic
+// (see mrHeadSha) so LatestMRPipeline can find the run.
+function toForgejoPR(mr) {
+  const s = forgejoPRState(mr.state);
+  return {
+    id: mr.id,
+    number: mr.iid,
+    title: mr.title,
+    body: mr.description ?? "",
+    state: s.state,
+    merged: s.merged,
+    html_url: forgejoWebUrl(mr.web_url),
+    head: { ref: mr.source_branch, sha: mr.head_sha || mrHeadSha(mr.source_branch) },
+    base: { ref: mr.target_branch },
+  };
+}
+// mrToForgejoIssue models an MR as an issue with a non-null pull_request — exactly
+// how Forgejo returns PRs on the /issues route. The Forgejo /issues reader emits
+// these ALONGSIDE real issues so the driver's R4 filter (pull_request != null) is
+// exercised end-to-end: an MR must NEVER reach the board as a card.
+function mrToForgejoIssue(mr) {
+  const s = forgejoPRState(mr.state);
+  return {
+    id: mr.id,
+    // A distinct high number (NOT mr.iid) so a card leaking here is DETECTABLE: if
+    // the driver's R4 filter regressed, this PR would surface as card #(10000+iid),
+    // which no real issue ever has. The entry is always dropped (pull_request !=
+    // null) before the driver reads its number, so the offset is invisible in
+    // practice; it only makes a filter FAILURE visible.
+    number: 10000 + mr.iid,
+    title: mr.title || `PR ${mr.iid}`,
+    body: mr.description ?? "",
+    state: s.state,
+    labels: [],
+    html_url: forgejoWebUrl(mr.web_url),
+    user: { id: 1, login: "uzi-bot" },
+    updated_at: new Date().toISOString(),
+    created_at: new Date().toISOString(),
+    pull_request: { merged: s.merged, html_url: forgejoWebUrl(mr.web_url) },
+  };
+}
+// forgejoRunSummary is the {total_count, workflow_runs} shape ListRepoActionRuns
+// returns, sorted id DESC (newest first) — the ordering the driver's `[0]`-is-newest
+// depends on. Filters by branch and/or head_sha, and honours the driver's limit.
+function forgejoRunSummary({ branch, headSha, limit }) {
+  let runs = state.forgejoRuns.slice();
+  if (branch) runs = runs.filter((r) => r.head_branch === branch);
+  if (headSha) runs = runs.filter((r) => r.head_sha === headSha);
+  runs.sort((a, b) => b.id - a.id); // id DESC: newest first (models run_list.go ToOrders)
+  const total = runs.length;
+  if (limit && limit > 0) runs = runs.slice(0, limit);
+  return {
+    total_count: total,
+    workflow_runs: runs.map((r) => ({
+      id: r.id,
+      head_branch: r.head_branch,
+      head_sha: r.head_sha,
+      status: r.status,
+      html_url: r.html_url,
+      started_at: r.started_at,
+      completed_at: r.completed_at,
+    })),
+  };
 }
 
 // Bridge one request to `git http-backend` (CGI). Streams the request body to
@@ -408,6 +567,327 @@ const server = https.createServer(
       persist();
       log("pipeline set", ref, "->", state.pipelines[ref].status, "#" + id);
       return send(res, 200, state.pipelines[ref]);
+    }
+
+    // Append a Forgejo Actions workflow run (PRD #65 M9). Unlike /_e2e/pipelines
+    // (one pipeline per ref), this APPENDS, so 2+ runs can share a branch/sha — the
+    // id-DESC ordering the driver's [0]-is-newest relies on. Body:
+    // {branch?, sha?, status?, id?, jobs?:[{name,status,log}]}. A later append gets a
+    // higher auto-id (so a post-fix run outranks the failure), which is what the
+    // verification "observed id > snapshot id" guard needs.
+    if (method === "POST" && path === "/_e2e/actions-runs") {
+      const body = await readBody(req);
+      const id = Number.isFinite(body.id) ? body.id : state.nextForgejoRunId++;
+      const jobs = (body.jobs || []).map((j) => ({
+        id: state.nextForgejoJobId++,
+        name: j.name || "build",
+        status: j.status || "failure",
+        log: j.log ?? j.trace ?? "",
+        html_url: `${PROJECT.web_url}/actions/runs/${id}`,
+      }));
+      const run = {
+        id,
+        head_branch: String(body.branch || ""),
+        head_sha: String(body.sha || ""),
+        status: String(body.status || "failure"),
+        html_url: `${PROJECT.web_url}/actions/runs/${id}`,
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+        jobs,
+      };
+      state.forgejoRuns.push(run);
+      persist();
+      log("actions run set", run.head_branch || run.head_sha, "->", run.status, "#" + id);
+      return send(res, 201, { id, status: run.status });
+    }
+
+    // Set the version /api/v1/version reports (PRD #65 M9): the harness flips it
+    // below 16.0.0 to prove the privilege sweep raises the version-downgrade
+    // finding, then restores it. Body: {version}.
+    if (method === "POST" && path === "/_e2e/forgejo-version") {
+      const body = await readBody(req);
+      state.forgejoVersion = String(body.version || "16.0.0+gitea-1.22.0");
+      log("forgejo version ->", state.forgejoVersion);
+      return send(res, 200, { version: state.forgejoVersion });
+    }
+
+    // --- Forgejo /api/v1 subset (PRD #65 M9) ----------------------------------
+    // Selected by path prefix, over the SAME state as the GitLab table. The driver
+    // hits this table when the connection's forge_type is 'forgejo'; the GitLab
+    // lane never reaches it, so /api/v4 behaviour is byte-identical.
+    if (path === "/api/v1/version") {
+      // Default is a D4a-passing release; the harness can flip it below 16.0.0 to
+      // exercise the version gate on the sweep (/_e2e/forgejo-version).
+      return send(res, 200, { version: state.forgejoVersion });
+    }
+    if (method === "GET" && path === "/api/v1/user") {
+      // GetMyUserInfo (VerifyToken + TokenInfo bot-identify). is_admin is emitted
+      // (Forgejo has no omitempty) and false — a compliant non-admin bot.
+      return send(res, 200, { id: 1, login: "uzi-bot", is_admin: false });
+    }
+    if (method === "GET" && path === "/api/v1/users/search") {
+      // GetUserByID (ProjectRole resolves the numeric bot id -> login). Only the
+      // bot (uid=1) is known.
+      const uid = url.searchParams.get("uid");
+      return send(res, 200, { data: uid === "1" ? [{ id: 1, login: "uzi-bot" }] : [] });
+    }
+    const fjTokens = path.match(/^\/api\/v1\/users\/([^/]+)\/tokens$/);
+    if (method === "GET" && fjTokens) {
+      // TokenInfo (hand-rolled). token_last_eight identifies the authenticating PAT;
+      // read it straight off the Authorization header so it always matches whatever
+      // PAT the harness uses (M4's fail-safe fires on 0 or >1 matches). No expiry /
+      // active field (Forgejo has none) -> the driver sets Active=true, ExpiresAt=0.
+      // Scopes are REORDERED vs mint order to exercise D6b's set-compare.
+      const m = /^token\s+(.+)$/i.exec(req.headers["authorization"] || "");
+      const pat = m ? m[1] : "";
+      const last8 = pat.length >= 8 ? pat.slice(-8) : pat;
+      // Over-privileged iff the PAT itself signals it ("overpriv"), so the harness
+      // can drive both the compliant seed PAT and a rejected over-privileged one
+      // (the save-time scope block, D6b) against one fake — mirroring the GitLab
+      // /personal_access_tokens/self behaviour. Forgejo collapses a full write:* set
+      // to the single "all" token, which D6b rejects.
+      const scopes = pat.includes("overpriv")
+        ? ["all"]
+        : ["write:issue", "write:repository", "read:user"];
+      return send(res, 200, [{ id: 1, name: "uzi-bot", token_last_eight: last8, scopes }]);
+    }
+    const fjUser = path.match(/^\/api\/v1\/users\/([^/]+)$/);
+    if (method === "GET" && fjUser && fjUser[1] !== "search") {
+      // UserExists (human_username verify). The fake knows no human accounts, so
+      // 404 -> the driver returns (false, nil) -> saved WITH a warning, never a hard
+      // reject (the verified-or-warned path, mirroring the GitLab table's empty list).
+      return send(res, 404, { message: "user does not exist" });
+    }
+    const fjRepoById = path.match(/^\/api\/v1\/repositories\/(\d+)$/);
+    if (method === "GET" && fjRepoById) {
+      // GetRepoByID (the driver resolves a numeric project id -> owner/repo slug).
+      const project = resolveProject(fjRepoById[1]);
+      const [owner, ...rest] = project.path_with_namespace.split("/");
+      return send(res, 200, {
+        id: project.id,
+        name: rest.join("/") || project.path_with_namespace,
+        full_name: project.path_with_namespace,
+        owner: { id: 1, login: owner },
+        default_branch: project.default_branch,
+        html_url: project.web_url,
+        permissions: { admin: false, push: true, pull: true },
+      });
+    }
+    if (method === "GET" && path === "/api/v1/user/repos") {
+      // ListProjects. permissions.push=true so the driver's client-side push filter
+      // keeps them (a read-only repo would be dropped).
+      return send(
+        res,
+        200,
+        PROJECTS.map((p) => ({
+          id: p.id,
+          name: p.path_with_namespace.split("/").slice(1).join("/"),
+          full_name: p.path_with_namespace,
+          html_url: p.web_url,
+          default_branch: p.default_branch,
+          permissions: { admin: false, push: true, pull: true },
+        })),
+      );
+    }
+
+    // Repo-scoped: /api/v1/repos/{owner}/{repo}/<rest>.
+    const fjRepo = path.match(/^\/api\/v1\/repos\/([^/]+)\/([^/]+)(\/.*)?$/);
+    if (fjRepo) {
+      const project = resolveProject(`${fjRepo[1]}/${fjRepo[2]}`);
+      const rest = fjRepo[3] || "";
+
+      // Issues list. Emits real issues AND every MR as a pull_request issue, so the
+      // driver's R4 filter (pull_request != null) is exercised: an MR must never
+      // reach the board. The driver also asks type=issues; the client-side filter is
+      // the guarantee, so returning both here is the honest stress.
+      if (method === "GET" && rest === "/issues") {
+        const issues = Object.values(state.issues).map(toForgejoIssue);
+        const prs = state.mrs.map(mrToForgejoIssue);
+        return send(res, 200, [...issues, ...prs]);
+      }
+      const fjIssueGet = rest.match(/^\/issues\/(\d+)$/);
+      if (method === "GET" && fjIssueGet) {
+        const issue = state.issues[Number(fjIssueGet[1])];
+        return issue ? send(res, 200, toForgejoIssue(issue)) : send(res, 404, { message: "issue does not exist" });
+      }
+      if (method === "POST" && rest === "/issues") {
+        // CreateIssue: body {title, body, labels:[ids]}. Map ids -> names.
+        const body = await readBody(req);
+        const iid = state.nextIssueIid++;
+        const labels = (Array.isArray(body.labels) ? body.labels : []).map((id) => flabelName(Number(id))).filter(Boolean);
+        const issue = makeIssue({ iid, title: body.title || `issue ${iid}`, description: body.body, labels, project });
+        state.issues[iid] = issue;
+        persist();
+        log("fj issue created", iid, JSON.stringify(issue.title));
+        return send(res, 201, toForgejoIssue(issue));
+      }
+      // Issue labels: GET current [{id,name}]; PUT replaces the full set by ids
+      // (ReplaceIssueLabels). The full-set replace with id<->name mapping is the
+      // driver's D3 client-side computation landing here.
+      const fjIssueLabels = rest.match(/^\/issues\/(\d+)\/labels$/);
+      if (fjIssueLabels) {
+        const issue = state.issues[Number(fjIssueLabels[1])];
+        if (!issue) return send(res, 404, { message: "issue does not exist" });
+        if (method === "GET") {
+          return send(res, 200, (issue.labels || []).map((n) => ({ id: flabelId(n), name: n })));
+        }
+        if (method === "PUT") {
+          const body = await readBody(req);
+          const names = (Array.isArray(body.labels) ? body.labels : []).map((id) => flabelName(Number(id))).filter(Boolean);
+          issue.labels = names;
+          issue.updated_at = new Date().toISOString();
+          persist();
+          log("fj issue", issue.iid, "labels ->", JSON.stringify(issue.labels));
+          return send(res, 200, names.map((n) => ({ id: flabelId(n), name: n })));
+        }
+      }
+      // Issue comments (CreateIssueNote). Recorded in the shared notes list so the
+      // harness reads them back via /_e2e/state exactly like the GitLab lane.
+      const fjNotes = rest.match(/^\/issues\/(\d+)\/comments$/);
+      if (method === "POST" && fjNotes) {
+        const body = await readBody(req);
+        const iid = Number(fjNotes[1]);
+        const note = { id: state.nextNoteId++, issue_iid: iid, body: body.body || "", created_at: new Date().toISOString() };
+        state.notes.push(note);
+        persist();
+        log("fj note on issue", iid, JSON.stringify((body.body || "").slice(0, 72)));
+        return send(res, 201, { id: note.id, body: note.body });
+      }
+      // Issue timeline (ListIssueLabelEvents). Translate the shared labelEvents into
+      // Forgejo timeline entries: type "label", body "1"=add / ""=remove, and a
+      // SINGLE-OBJECT label (the shape the driver hand-parses — the SDK's []*Label
+      // cannot).
+      const fjTimeline = rest.match(/^\/issues\/(\d+)\/timeline$/);
+      if (method === "GET" && fjTimeline) {
+        const evts = state.labelEvents[Number(fjTimeline[1])] || [];
+        return send(
+          res,
+          200,
+          evts.map((e) => ({
+            id: e.id,
+            type: "label",
+            body: e.action === "remove" ? "" : "1",
+            user: { id: e.user?.id ?? 2, login: e.user?.username || "" },
+            label: { id: flabelId(e.label?.name || ""), name: e.label?.name || "" },
+            created_at: e.created_at,
+          })),
+        );
+      }
+      // Repo label catalog (ListRepoLabels / EnsureLabels). GET returns every known
+      // label; POST mints one. The driver resolves label names -> ids here.
+      if (rest === "/labels") {
+        if (method === "GET") {
+          return send(res, 200, Object.keys(state.forgejoLabelIds).map((n) => ({ id: state.forgejoLabelIds[n], name: n, color: "cccccc" })));
+        }
+        if (method === "POST") {
+          const body = await readBody(req);
+          const name = String(body.name || "label");
+          return send(res, 201, { id: flabelId(name), name, color: (body.color || "#cccccc").replace(/^#/, "") });
+        }
+      }
+      // Branch protection (DefaultBranchProtection, D6). Reader-gated and computed
+      // for the caller: compliant fixture = protected, bot cannot push or merge.
+      const fjBranch = rest.match(/^\/branches\/(.+)$/);
+      if (method === "GET" && fjBranch) {
+        return send(res, 200, {
+          name: decodeURIComponent(fjBranch[1]),
+          protected: true,
+          user_can_push: false,
+          user_can_merge: false,
+          effective_branch_protection_name: "",
+        });
+      }
+      // The admin-gated route the driver must NEVER call (a write bot 403s it). If it
+      // ever does, fail loudly rather than pretending it works.
+      if (rest.match(/^\/branch_protections\//)) {
+        return send(res, 403, { message: "must be repo admin" });
+      }
+      // Collaborator permission (ProjectRole, D7). The bot is a write collaborator ->
+      // RoleWrite, member=true (compliant, no finding).
+      const fjPerm = rest.match(/^\/collaborators\/([^/]+)\/permission$/);
+      if (method === "GET" && fjPerm) {
+        return send(res, 200, { permission: "write", role_name: "Write", user: { id: 1, login: "uzi-bot" } });
+      }
+
+      // Pull requests.
+      if (method === "POST" && rest === "/pulls") {
+        // CreatePullRequest (the worker opens the PR). 409 on an existing OPEN PR for
+        // the same head, so a resumed finish reuses it (matches Forgejo's
+        // ErrPullRequestAlreadyExists). head/base are branch names.
+        const body = await readBody(req);
+        const dup = state.mrs.find((m) => m.source_branch === body.head && m.target_branch === body.base && m.state === "opened");
+        if (dup) {
+          log("fj PR create 409 (open PR exists)", dup.iid, body.head);
+          return send(res, 409, { message: `pull request already exists for these targets: ${dup.iid}` });
+        }
+        const iid = state.nextMrIid++;
+        const mr = {
+          id: 5000 + iid,
+          iid,
+          project_id: project.id,
+          source_branch: body.head,
+          target_branch: body.base,
+          head_sha: mrHeadSha(body.head),
+          title: body.title,
+          description: body.body,
+          state: "opened",
+          web_url: `${project.web_url}/-/merge_requests/${iid}`,
+        };
+        state.mrs.push(mr);
+        persist();
+        log("fj PR created", iid, mr.source_branch, "->", mr.target_branch);
+        return send(res, 201, toForgejoPR(mr));
+      }
+      const fjPrByBaseHead = rest.match(/^\/pulls\/([^/]+)\/([^/]+)$/);
+      if (method === "GET" && fjPrByBaseHead && !/^\d+$/.test(fjPrByBaseHead[1])) {
+        // GetPullRequestByBaseHead (the worker's 409-resume fetch). base/head are
+        // branch names. Tolerates finding no open PR (Forgejo's 409 also covers other
+        // conflicts) with a 404.
+        const base = decodeURIComponent(fjPrByBaseHead[1]);
+        const head = decodeURIComponent(fjPrByBaseHead[2]);
+        const mr = state.mrs.find((m) => m.source_branch === head && m.target_branch === base && m.state === "opened");
+        return mr ? send(res, 200, toForgejoPR(mr)) : send(res, 404, { message: "pull request does not exist" });
+      }
+      const fjPrGet = rest.match(/^\/pulls\/(\d+)$/);
+      if (method === "GET" && fjPrGet) {
+        // GetMergeRequest / LatestMRPipeline head resolution.
+        const mr = state.mrs.find((m) => m.iid === Number(fjPrGet[1]));
+        return mr ? send(res, 200, toForgejoPR(mr)) : send(res, 404, { message: "pull request does not exist" });
+      }
+      const fjPrMerge = rest.match(/^\/pulls\/(\d+)\/merge$/);
+      if (method === "POST" && fjPrMerge) {
+        const mr = state.mrs.find((m) => m.iid === Number(fjPrMerge[1]));
+        if (!mr) return send(res, 404, { message: "pull request does not exist" });
+        mr.state = "merged";
+        persist();
+        log("fj PR merged", mr.iid);
+        return send(res, 200, {});
+      }
+
+      // Actions (CI-fix loop, canned — Variant A). Runs come back id-DESC.
+      if (method === "GET" && rest === "/actions/runs") {
+        const limit = Number(url.searchParams.get("limit")) || 0;
+        return send(res, 200, forgejoRunSummary({
+          branch: url.searchParams.get("branch") || "",
+          headSha: url.searchParams.get("head_sha") || "",
+          limit,
+        }));
+      }
+      const fjRunJobs = rest.match(/^\/actions\/runs\/(\d+)\/jobs$/);
+      if (method === "GET" && fjRunJobs) {
+        const run = state.forgejoRuns.find((r) => r.id === Number(fjRunJobs[1]));
+        const jobs = run ? run.jobs : [];
+        return send(res, 200, {
+          total_count: jobs.length,
+          jobs: jobs.map((j) => ({ id: j.id, run_id: run.id, name: j.name, status: j.status, html_url: j.html_url })),
+        });
+      }
+      const fjJobLogs = rest.match(/^\/actions\/jobs\/(\d+)\/logs$/);
+      if (method === "GET" && fjJobLogs) {
+        const job = state.forgejoRuns.flatMap((r) => r.jobs || []).find((j) => j.id === Number(fjJobLogs[1]));
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        return res.end(job ? job.log : "");
+      }
     }
 
     // --- GitLab v4 subset -----------------------------------------------------

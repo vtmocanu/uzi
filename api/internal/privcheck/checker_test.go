@@ -3,6 +3,7 @@ package privcheck
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 
 // roleResult / protResult script the per-project forge answers.
 type roleResult struct {
-	role   int
+	role   forge.Role
 	member bool
 	err    error
 }
@@ -38,7 +39,7 @@ func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
 func (f *fakeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 	return f.tokenInfo, f.tokenErr
 }
-func (f *fakeForge) ProjectRole(_ context.Context, projectID, _ int64) (int, bool, error) {
+func (f *fakeForge) ProjectRole(_ context.Context, projectID, _ int64) (forge.Role, bool, error) {
 	r := f.roles[projectID]
 	return r.role, r.member, r.err
 }
@@ -123,7 +124,7 @@ func TestEvaluateToken(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tr := evaluateToken(tc.info, tc.isAdmin, now, warnWindow, "")
+			tr := evaluateToken(forge.TypeGitLab, tc.info, tc.isAdmin, now, warnWindow, "")
 			if tc.wantViolation == "" && len(tr.Violations) > 0 {
 				t.Errorf("unexpected violations: %v", tr.Violations)
 			}
@@ -146,7 +147,7 @@ func TestCheckTokenIntrospectionUnsupported(t *testing.T) {
 	c := NewChecker()
 
 	f := &fakeForge{tokenErr: forge.ErrTokenIntrospectionUnsupported}
-	tr := c.CheckToken(context.Background(), f, false, now)
+	tr := c.CheckToken(context.Background(), f, forge.TypeGitLab, false, now)
 	if len(tr.Violations) != 0 {
 		t.Fatalf("unsupported introspection must not block; got violations %v", tr.Violations)
 	}
@@ -155,7 +156,7 @@ func TestCheckTokenIntrospectionUnsupported(t *testing.T) {
 	}
 
 	// Admin flag still turns into a violation even when scopes can't be read.
-	trAdmin := c.CheckToken(context.Background(), f, true, now)
+	trAdmin := c.CheckToken(context.Background(), f, forge.TypeGitLab, true, now)
 	if !hasFinding(trAdmin.Violations, "instance admin") {
 		t.Fatalf("admin check must apply without introspection; got %v", trAdmin.Violations)
 	}
@@ -167,15 +168,15 @@ func TestCheckFullReport(t *testing.T) {
 		identity:  forge.BotIdentity{ForgeUserID: 42, IsAdmin: false},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
 		roles: map[int64]roleResult{
-			1: {role: 30, member: true}, // compliant Developer
-			2: {role: 40, member: true}, // Maintainer → violation
-			3: {member: false},          // not a member → violation
-			4: {role: 30, member: true}, // Developer but branch problems below
+			1: {role: forge.RoleWrite, member: true}, // compliant write role
+			2: {role: forge.RoleAdmin, member: true}, // admin → violation
+			3: {member: false},                       // not a member → violation
+			4: {role: forge.RoleWrite, member: true}, // write role but branch problems below
 		},
 		prots: map[int64]protResult{
-			1: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false}},
-			2: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false}},
-			3: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false}},
+			1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false}},
+			2: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false}},
+			3: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false}},
 			4: {bp: forge.BranchProtection{Protected: false}}, // unprotected → violation
 		},
 	}
@@ -185,7 +186,7 @@ func TestCheckFullReport(t *testing.T) {
 		{ID: "r3", Path: "g/three", ForgeProjectID: 3, DefaultBranch: "main"},
 		{ID: "r4", Path: "g/four", ForgeProjectID: 4, DefaultBranch: "main"},
 	}
-	rep := NewChecker().Check(context.Background(), f, repos, now)
+	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, repos, now)
 
 	if rep.Status != StatusViolations {
 		t.Fatalf("status = %q, want violations", rep.Status)
@@ -200,10 +201,10 @@ func TestCheckFullReport(t *testing.T) {
 	if len(byID["r1"].Violations) != 0 {
 		t.Errorf("r1 should be clean, got %v", byID["r1"].Violations)
 	}
-	if !hasFinding(byID["r2"].Violations, "Maintainer (40)") {
-		t.Errorf("r2 want Maintainer violation, got %v", byID["r2"].Violations)
+	if !hasFinding(byID["r2"].Violations, "role is admin, above") {
+		t.Errorf("r2 want above-write violation, got %v", byID["r2"].Violations)
 	}
-	if !hasFinding(byID["r3"].Violations, "no longer a Developer member") {
+	if !hasFinding(byID["r3"].Violations, "no longer a member") {
 		t.Errorf("r3 want not-a-member violation, got %v", byID["r3"].Violations)
 	}
 	if !hasFinding(byID["r4"].Violations, "not protected") {
@@ -211,30 +212,30 @@ func TestCheckFullReport(t *testing.T) {
 	}
 }
 
-func TestCheckDevelopersCanPushIsViolation(t *testing.T) {
+func TestCheckWriteRoleCanPushIsViolation(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
-		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: true}}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: true}}},
 	}
-	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
-	if !hasFinding(rep.Repos[0].Violations, "Developers may push") {
-		t.Fatalf("want developers-can-push violation, got %v", rep.Repos[0].Violations)
+	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
+	if !hasFinding(rep.Repos[0].Violations, "the write role may push") {
+		t.Fatalf("want write-role-can-push violation, got %v", rep.Repos[0].Violations)
 	}
 }
 
-// TestCheckBotDirectPushGrantIsViolation: a protected branch that Developers
+// TestCheckBotDirectPushGrantIsViolation: a protected branch the write role
 // cannot push, but which grants the bot a direct per-user push, is still a
 // violation (the false negative the role check alone would miss).
 func TestCheckBotDirectPushGrantIsViolation(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
-		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, DevelopersCanPush: false, BotCanPush: true}}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true, WriteRoleCanPush: false, BotCanPush: true}}},
 	}
-	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
+	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
 	if !hasFinding(rep.Repos[0].Violations, "direct push grant") {
 		t.Fatalf("want bot direct-push-grant violation, got %v", rep.Repos[0].Violations)
 	}
@@ -244,9 +245,9 @@ func TestCheckEmptyDefaultBranchWarns(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
 	}
-	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: ""}}, now)
+	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: ""}}, now)
 	if len(rep.Repos[0].Violations) != 0 {
 		t.Fatalf("empty-default-branch repo should not violate, got %v", rep.Repos[0].Violations)
 	}
@@ -264,18 +265,18 @@ func TestCheckDrift(t *testing.T) {
 	f := &fakeForge{
 		identity:  forge.BotIdentity{ForgeUserID: 42},
 		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
-		roles:     map[int64]roleResult{1: {role: 30, member: true}},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
 		prots:     map[int64]protResult{1: {bp: forge.BranchProtection{Protected: true}}},
 	}
 	repos := []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}
 	c := NewChecker()
 
-	if rep := c.Check(context.Background(), f, repos, now); rep.Status != StatusOK {
+	if rep := c.Check(context.Background(), f, forge.TypeGitLab, repos, now); rep.Status != StatusOK {
 		t.Fatalf("initial status = %q, want ok", rep.Status)
 	}
 	// A teammate promotes the bot to Maintainer.
-	f.roles[1] = roleResult{role: 40, member: true}
-	if rep := c.Check(context.Background(), f, repos, now); rep.Status != StatusViolations {
+	f.roles[1] = roleResult{role: forge.RoleAdmin, member: true}
+	if rep := c.Check(context.Background(), f, forge.TypeGitLab, repos, now); rep.Status != StatusViolations {
 		t.Fatalf("post-drift status = %q, want violations", rep.Status)
 	}
 }
@@ -284,7 +285,7 @@ func TestCheckDrift(t *testing.T) {
 // down) yields StatusError with the finding recorded, never a returned error.
 func TestCheckErrorReport(t *testing.T) {
 	f := &fakeForge{verifyErr: errors.New("401 unauthorized")}
-	rep := NewChecker().Check(context.Background(), f, []Repo{{ID: "r1", ForgeProjectID: 1}}, now)
+	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1}}, now)
 	if rep.Status != StatusError {
 		t.Fatalf("status = %q, want error", rep.Status)
 	}
@@ -294,5 +295,151 @@ func TestCheckErrorReport(t *testing.T) {
 	// The redacted error must not embed the raw forge message.
 	if hasFinding(rep.Token.Warnings, "401 unauthorized") {
 		t.Fatalf("report leaked the raw forge error: %v", rep.Token.Warnings)
+	}
+}
+
+// TestCheckVersionDowngradeDistinctFinding: when VerifyToken refuses because the
+// forge downgraded below the driver minimum (Forgejo <16, D4/D4a), the sweep
+// surfaces a distinct upgrade-the-server finding via errors.Is on
+// forge.ErrForgeVersionUnsupported — NOT the generic revoked/unreachable message
+// that would send the user to re-mint a working token. Still StatusError.
+func TestCheckVersionDowngradeDistinctFinding(t *testing.T) {
+	// Wrap the sentinel the way the driver does (%w through a redacted message),
+	// so errors.Is reaches it through the wrapper.
+	f := &fakeForge{verifyErr: fmt.Errorf("forgejo: server version %q is below the required Forgejo %s: %w", "15.0.4", "16.0.0", forge.ErrForgeVersionUnsupported)}
+	rep := NewChecker().Check(context.Background(), f, forge.TypeForgejo, []Repo{{ID: "r1", ForgeProjectID: 1}}, now)
+	if rep.Status != StatusError {
+		t.Fatalf("status = %q, want error", rep.Status)
+	}
+	if !hasFinding(rep.Token.Warnings, "older than the minimum version uzi requires") {
+		t.Fatalf("want the distinct version-downgrade finding, got %v", rep.Token.Warnings)
+	}
+	// It must NOT collapse to the generic token-failure message.
+	if hasFinding(rep.Token.Warnings, "could not verify the bot token") {
+		t.Fatalf("a version downgrade must not read as a token failure: %v", rep.Token.Warnings)
+	}
+	// And it must not leak the raw driver error (version string / wrapper text).
+	if hasFinding(rep.Token.Warnings, "15.0.4") || hasFinding(rep.Token.Warnings, "forgejo:") {
+		t.Fatalf("report leaked the raw forge error: %v", rep.Token.Warnings)
+	}
+}
+
+// TestScopesPerForge pins D6b: the required scope set is per-forge and compared
+// as an unordered set, keeping the "exactly" semantics. GitLab is unchanged
+// (exactly {api}); Forgejo is exactly {write:repository, write:issue, read:user}.
+// The two traps the PRD calls out are the load-bearing cases here: order must not
+// matter, and the god-mode ["all"] literal must be rejected as a plain non-match,
+// never expanded.
+func TestScopesPerForge(t *testing.T) {
+	warnWindow := 14 * 24 * time.Hour
+	forgejoOK := []string{"write:repository", "write:issue", "read:user"}
+	cases := []struct {
+		name          string
+		forgeType     forge.Type
+		scopes        []string
+		wantViolation bool
+	}{
+		{"gitlab exactly api is clean", forge.TypeGitLab, []string{"api"}, false},
+		{"gitlab extra scope violates", forge.TypeGitLab, []string{"api", "sudo"}, true},
+		{"gitlab forgejo-scopes violate", forge.TypeGitLab, forgejoOK, true},
+		{"forgejo exact set is clean", forge.TypeForgejo, forgejoOK, false},
+		// Forgejo re-emits scopes in its own canonical order, not mint order, so a
+		// string compare would be a coin flip. Every permutation must pass.
+		{"forgejo reordered is clean", forge.TypeForgejo, []string{"read:user", "write:repository", "write:issue"}, false},
+		{"forgejo superset violates", forge.TypeForgejo, append(append([]string{}, forgejoOK...), "write:organization"), true},
+		{"forgejo missing one violates", forge.TypeForgejo, []string{"write:repository", "write:issue"}, true},
+		// The god-mode token arrives as the single literal "all" (Forgejo collapses
+		// every write:* into it); it is rejected because it is not the three-scope
+		// set, with no attempt to expand it.
+		{"forgejo all literal violates", forge.TypeForgejo, []string{"all"}, true},
+		{"forgejo gitlab-api violates", forge.TypeForgejo, []string{"api"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := evaluateToken(tc.forgeType, forge.TokenInfo{Scopes: tc.scopes, Active: true}, false, now, warnWindow, "")
+			got := hasFinding(tr.Violations, "are not exactly")
+			if got != tc.wantViolation {
+				t.Errorf("scopes %v on %s: scope violation = %v, want %v (violations=%v)",
+					tc.scopes, tc.forgeType, got, tc.wantViolation, tr.Violations)
+			}
+		})
+	}
+}
+
+// TestMergeFindingsAreViolations pins D6a-1's tier: a bot that can merge its own
+// PR into protected main breaks the primary directive exactly as one that can
+// push does, so the merge findings are Violations, the same tier as the push
+// sibling. This is non-blocking in #65 in the sense that matters — a per-repo
+// Violation never blocks a save (only token violations do) and nothing gates a
+// run on privilege_status — so the badge going ok->violations for the
+// merge-lowered GitLab population is the intended, user-confirmed behaviour, not
+// a refusal. #66 promotes these fields to run-refusals, not the badge tier.
+func TestMergeFindingsAreViolations(t *testing.T) {
+	f := &fakeForge{
+		identity:  forge.BotIdentity{ForgeUserID: 42},
+		tokenInfo: forge.TokenInfo{Scopes: []string{"api"}, Active: true},
+		roles:     map[int64]roleResult{1: {role: forge.RoleWrite, member: true}},
+		prots: map[int64]protResult{1: {bp: forge.BranchProtection{
+			Protected:         true,
+			WriteRoleCanPush:  false,
+			BotCanPush:        false,
+			WriteRoleCanMerge: true,
+			BotCanMerge:       true,
+		}}},
+	}
+	rep := NewChecker().Check(context.Background(), f, forge.TypeGitLab, []Repo{{ID: "r1", ForgeProjectID: 1, DefaultBranch: "main"}}, now)
+	rr := rep.Repos[0]
+	if len(rr.Warnings) != 0 {
+		t.Fatalf("merge findings must be violations, not warnings, got warnings %v", rr.Warnings)
+	}
+	if !hasFinding(rr.Violations, "the write role may merge into protected") {
+		t.Fatalf("want a write-role merge violation, got %v", rr.Violations)
+	}
+	if !hasFinding(rr.Violations, "the bot has a direct merge grant on protected") {
+		t.Fatalf("want a bot merge-grant violation, got %v", rr.Violations)
+	}
+	// A merge finding drives the connection status to violations (the badge), but
+	// this blocks nothing: no save is rejected and no run is refused on it in #65.
+	if rep.Status != StatusViolations {
+		t.Fatalf("a merge finding must drive status to violations, got %q", rep.Status)
+	}
+}
+
+// TestEvaluateRepoProtectedFirst pins R12 directly on the pure evaluator. An
+// unprotected branch — the case where the fields say the bot CAN push and merge
+// — must yield exactly the "not protected" finding and short-circuit: it must NOT
+// additionally emit a per-field push/merge finding, and it must NOT be readable
+// as clean. Checking Protected first is what makes that true regardless of what
+// the push/merge fields hold.
+func TestEvaluateRepoProtectedFirst(t *testing.T) {
+	repo := Repo{ID: "r1", Path: "g/one", ForgeProjectID: 1, DefaultBranch: "main"}
+
+	// Unprotected, with the fields truthfully reporting the bot can push and merge
+	// (as both drivers now do). The strongest finding wins and nothing else fires.
+	// Push and merge findings are both Violations now, so a leaked per-field
+	// finding would show up as an EXTRA violation — the exact-count assertion
+	// below is what catches it, on whichever array it would land.
+	var unprot RepoReport
+	unprot.Violations, unprot.Warnings = []string{}, []string{}
+	evaluateRepo(&unprot, repo, forge.RoleWrite, true, nil, true,
+		forge.BranchProtection{Protected: false, WriteRoleCanPush: true, BotCanPush: true, WriteRoleCanMerge: true, BotCanMerge: true}, nil)
+	if !hasFinding(unprot.Violations, "is not protected") {
+		t.Fatalf("unprotected must yield the not-protected violation, got %v", unprot.Violations)
+	}
+	if len(unprot.Violations) != 1 {
+		t.Fatalf("unprotected must short-circuit to the single strongest finding, got %v", unprot.Violations)
+	}
+	if len(unprot.Warnings) != 0 {
+		t.Fatalf("unprotected must not emit any secondary finding, got %v", unprot.Warnings)
+	}
+
+	// A fully clean protected branch produces nothing — the negative control that
+	// proves the short-circuit is not just swallowing everything.
+	var clean RepoReport
+	clean.Violations, clean.Warnings = []string{}, []string{}
+	evaluateRepo(&clean, repo, forge.RoleWrite, true, nil, true,
+		forge.BranchProtection{Protected: true}, nil)
+	if len(clean.Violations) != 0 || len(clean.Warnings) != 0 {
+		t.Fatalf("a clean protected branch must be finding-free, got v=%v w=%v", clean.Violations, clean.Warnings)
 	}
 }

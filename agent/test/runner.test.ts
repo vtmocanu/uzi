@@ -14,7 +14,7 @@ import { GitCache } from "../src/git.js";
 import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, type Executor, type RunContext, type ExecutorResult } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
-import { GitLabClient, type FetchFn } from "../src/gitlab.js";
+import { GitLabClient, ForgejoClient, type FetchFn } from "../src/forge.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import type { Logger } from "../src/log.js";
 import type { UserInput } from "../src/protocol.js";
@@ -87,6 +87,19 @@ function fakeGitlab(): { gitlab: GitLabClient; calls: MrCall[] } {
   return { gitlab: new GitLabClient({ fetchFn }), calls };
 }
 
+/** A Forgejo client whose transport is captured; opens PR #42 with no network. */
+function fakeForgejo(): { forgejo: ForgejoClient; calls: MrCall[] } {
+  const calls: MrCall[] = [];
+  const fetchFn: FetchFn = async (url, init) => {
+    calls.push({ url, method: init.method, headers: init.headers, body: init.body });
+    return {
+      status: 201,
+      text: async () => JSON.stringify({ number: 42, html_url: "https://forgejo.example.test/org/repo/pulls/42" }),
+    };
+  };
+  return { forgejo: new ForgejoClient({ fetchFn }), calls };
+}
+
 function runner(executor: Executor, gitlab: GitLabClient, joinToken?: string): RunRunner {
   // Wrap the single executor as a factory (PRD #42): each execute() gets it back.
   // The per-run-executor tests below inject a real per-run factory instead.
@@ -124,6 +137,9 @@ describe("RunRunner — worker-performed push + MR", () => {
     const completed = api.states.find((s) => s.body.status === "completed")!.body;
     assert.strictEqual(completed.branch, "agent/issue-7");
     assert.strictEqual(completed.mr_iid, 42);
+    // The forge-reported MR web URL is persisted on completion (PRD #65 D8), so the
+    // web links it directly instead of reconstructing it.
+    assert.strictEqual(completed.mr_web_url, "https://gitlab.example.test/org/repo/-/merge_requests/42");
 
     // The MR was opened with the PAT in the PRIVATE-TOKEN header — never the URL
     // or the body (primary directive: the credential stays off argv/URL/logs).
@@ -144,6 +160,39 @@ describe("RunRunner — worker-performed push + MR", () => {
     const log = execFileSync("git", ["-C", fx.originPath, "log", "--oneline", "agent/issue-7"], { encoding: "utf8" });
     assert.ok(log.includes("uzi stub: work on issue #7"));
     assert.strictEqual(fs.existsSync(worktreeDirFor(7)), false);
+  });
+
+  it("routes a forgejo claim to the Forgejo client and persists the PR web url (PRD #65 D9/D8)", async () => {
+    const { forgejo, calls } = fakeForgejo();
+    // A Forgejo run: same local clone_url (git is forge-agnostic), a Forgejo web url,
+    // and forge_type=forgejo on the wire so the worker picks the Forgejo client.
+    const claim = gitlabClaim(15, {
+      repo: { id: "r1", url: "https://forgejo.example.test/org/repo", clone_url: fx.originPath, forge_type: "forgejo" },
+    });
+    const r = new RunRunner(client, git, () => ({ executor: new StubExecutor(nullLogger()) }), nullLogger(), 20, undefined, {
+      pollMs: 5,
+      planApprovalTimeoutMs: 0,
+      forgejo,
+    });
+    await r.execute(claim);
+
+    const completed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "completed")!.body;
+    assert.strictEqual(completed.branch, "agent/issue-15");
+    assert.strictEqual(completed.mr_iid, 42);
+    assert.strictEqual(completed.mr_web_url, "https://forgejo.example.test/org/repo/pulls/42");
+
+    // The PR was opened against Forgejo's /api/v1 pulls endpoint with the token header
+    // — never the URL/body (primary directive).
+    assert.strictEqual(calls.length, 1);
+    const call = calls[0]!;
+    assert.strictEqual(call.method, "POST");
+    assert.match(call.url, /\/api\/v1\/repos\/org\/repo\/pulls$/);
+    assert.strictEqual(call.headers["Authorization"], "token fixture-forge-pat-000000");
+    assert.ok(!call.url.includes("fixture-forge-pat"), "PAT must not be in the URL");
+    assert.ok(!(call.body ?? "").includes("fixture-forge-pat"), "PAT must not be in the body");
+    const body = JSON.parse(call.body ?? "{}");
+    assert.strictEqual(body.head, "agent/issue-15");
+    assert.strictEqual(body.base, "main");
   });
 
   it("tears down the sibling skills plugin dir with the worktree (PRD #16 M6 follow-up)", async () => {

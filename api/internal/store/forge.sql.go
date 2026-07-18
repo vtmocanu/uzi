@@ -128,7 +128,7 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 }
 
 const getLatestRunForIssue = `-- name: GetLatestRunForIssue :one
-SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop_kind,
+SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind,
        r.health, r.health_reason, r.health_since, r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
        COUNT(*) OVER () AS run_count
@@ -150,6 +150,7 @@ type GetLatestRunForIssueRow struct {
 	UserID        uuid.UUID          `json:"user_id"`
 	Status        string             `json:"status"`
 	MrIid         pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl      pgtype.Text        `json:"mr_web_url"`
 	MrState       pgtype.Text        `json:"mr_state"`
 	FailureReason pgtype.Text        `json:"failure_reason"`
 	StopKind      pgtype.Text        `json:"stop_kind"`
@@ -178,6 +179,7 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.UserID,
 		&i.Status,
 		&i.MrIid,
+		&i.MrWebUrl,
 		&i.MrState,
 		&i.FailureReason,
 		&i.StopKind,
@@ -542,7 +544,7 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 
 const listLatestRunsForRepo = `-- name: ListLatestRunsForRepo :many
 SELECT DISTINCT ON (r.issue_iid)
-       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_state, r.failure_reason, r.stop_kind,
+       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind,
        r.health, r.health_reason, r.health_since,
        r.created_at, r.updated_at,
        ru.display_name AS owner_name, rw.name AS worker_name,
@@ -560,6 +562,7 @@ type ListLatestRunsForRepoRow struct {
 	UserID        uuid.UUID          `json:"user_id"`
 	Status        string             `json:"status"`
 	MrIid         pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl      pgtype.Text        `json:"mr_web_url"`
 	MrState       pgtype.Text        `json:"mr_state"`
 	FailureReason pgtype.Text        `json:"failure_reason"`
 	StopKind      pgtype.Text        `json:"stop_kind"`
@@ -605,6 +608,7 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.UserID,
 			&i.Status,
 			&i.MrIid,
+			&i.MrWebUrl,
 			&i.MrState,
 			&i.FailureReason,
 			&i.StopKind,

@@ -676,6 +676,7 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 			CloneURL:      rc.RepoWebUrl + ".git",
 			DefaultBranch: textPtr(rc.DefaultBranch),
 			SkillsEnabled: rc.RepoSkillsEnabled,
+			ForgeType:     rc.ForgeType,
 		},
 		Secrets: ClaimSecrets{
 			ForgeUsername:       rc.BotUsername,
@@ -952,10 +953,15 @@ func nonNegTokens(n int64) int64 {
 // column, the M2 worker client, and multica's protocol); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
-	State          string  `json:"status"` // running|awaiting_approval|completed|failed
-	PlanMd         *string `json:"plan_md"`
-	Branch         *string `json:"branch"`
-	MrIID          *int64  `json:"mr_iid"`
+	State  string  `json:"status"` // running|awaiting_approval|completed|failed
+	PlanMd *string `json:"plan_md"`
+	Branch *string `json:"branch"`
+	MrIID  *int64  `json:"mr_iid"`
+	// MrWebURL is the MR/PR web URL as the forge reported it (PRD #65 D8), reported
+	// on completion alongside MrIID. Additive + optional (R8): an OLD worker omits it
+	// and textParam(nil) lands NULL, which the web renders via the legacy forgeUrls.ts
+	// reconstruction exactly as before the column existed.
+	MrWebURL       *string `json:"mr_web_url"`
 	FailureReason  *string `json:"failure_reason"`
 	IterationCount int32   `json:"iteration_count"`
 	// SessionID pins the worker's SDK session for resume. Empty means "no change"
@@ -1017,7 +1023,7 @@ func (s *Service) SetState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		})
 	case "completed":
 		rows, err = s.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
-			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), SessionID: sessionID,
+			Branch: textParam(req.Branch), MrIid: int8Param(req.MrIID), MrWebUrl: textParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict: clampWireFixVerdict(req.FixVerdict), ID: runID, WorkerID: pgUUID(wkr.ID),
 		})
 	case "failed":

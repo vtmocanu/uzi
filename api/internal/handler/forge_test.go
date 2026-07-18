@@ -13,7 +13,9 @@ import (
 // fakeUserForge is a forge.Forge whose only meaningful method is UserExists; the
 // rest are unused by the save-path helper under test. It lets humanUsernameWarning
 // be exercised without a live forge (the handler's DB-touching wrapper is covered
-// by the M6 e2e stack — there is no live-Postgres handler harness in this repo).
+// by the e2e stack; a live-Postgres handler harness does exist — hostedLiveDB in
+// hosted_provision_livedb_test.go, opt-in via UZI_TEST_DATABASE_URL / run-store-it.sh —
+// but this save-path helper does not need one).
 type fakeUserForge struct {
 	exists bool
 	err    error
@@ -52,8 +54,8 @@ func (f *fakeUserForge) GetMergeRequest(context.Context, int64, int64) (forge.Me
 func (f *fakeUserForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
 	return forge.TokenInfo{}, nil
 }
-func (f *fakeUserForge) ProjectRole(context.Context, int64, int64) (int, bool, error) {
-	return 0, false, nil
+func (f *fakeUserForge) ProjectRole(context.Context, int64, int64) (forge.Role, bool, error) {
+	return forge.RoleNone, false, nil
 }
 func (f *fakeUserForge) DefaultBranchProtection(context.Context, int64, string, int64) (forge.BranchProtection, error) {
 	return forge.BranchProtection{}, nil

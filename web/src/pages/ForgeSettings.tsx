@@ -7,16 +7,68 @@ import { Fragment, useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, type ForgeConnection, type PrivilegeReport } from "../lib/api";
 import { privilegeBadge } from "../lib/privilege";
+import { forgePlatform } from "../lib/forgeNoun";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select, Skeleton } from "../components/ui";
 import { SettingsShell } from "../components/SettingsShell";
 import { BranchIcon } from "../components/icons";
 
-const BOT_SETUP_DOC = "/docs/gitlab-bot-setup";
+// botSetupDoc is the in-app bot-setup guide for a forge (PRD #65 M6b). Each forge
+// has its own guide (both audience: user); the over-privilege violation card links
+// to the one for the forge the user is connecting, not always GitLab's. gitlab (and
+// any unknown/absent type — the only kind pre-M6b) keeps the exact GitLab path.
+function botSetupDoc(forgeType: string): string {
+  return forgeType === "forgejo" ? "/docs/forgejo-bot-setup" : "/docs/gitlab-bot-setup";
+}
+
+// ConnectHints is the connect form's inline token guidance for one forge. On a
+// full-parity feature (D1) the form must not instruct the wrong forge's scopes — a
+// Forgejo user told to mint an `api`-scoped Developer token gets rejected by
+// VerifyToken and cannot connect without leaving the form.
+type ConnectHints = {
+  scopeLabel: string; // token Field label suffix: "scope: api" / "scopes: …"
+  scopeCode: string; // the scope string rendered in <code> in the help + violation card
+  scopeWord: string; // "scope" (one) vs "scopes" (several) for the help sentence
+  roleClause: string; // "as Developer" (GitLab) vs "at the write role" (Forgejo)
+  placeholder: string; // token input placeholder
+};
+
+// connectHints is the per-forge twin of privcheck's D6b required-scope set and
+// docs/{gitlab,forgejo}-bot-setup.md — the scopes shown here MUST match what
+// VerifyToken accepts (D6b: GitLab exactly `api`; Forgejo exactly `write:repository,
+// write:issue, read:user`) and the role the guide tells the user to grant, or the
+// form instructs a token the server will reject. Keep the three in sync. This is the
+// accepted 2-forge twin pattern (like forgeNoun/forgePlatform), NOT plumbed through
+// ForgeConfig (a contract change, out of scope — same call as D11a). gitlab (and any
+// unknown/absent type — the only kind pre-M6b) keeps the exact GitLab strings.
+function connectHints(forgeType: string): ConnectHints {
+  if (forgeType === "forgejo") {
+    return {
+      scopeLabel: "scopes: write:repository, write:issue, read:user",
+      scopeCode: "write:repository, write:issue, read:user",
+      scopeWord: "scopes",
+      roleClause: "at the write role",
+      placeholder: "your Forgejo token",
+    };
+  }
+  return {
+    scopeLabel: "scope: api",
+    scopeCode: "api",
+    scopeWord: "scope",
+    roleClause: "as Developer",
+    placeholder: "glpat-…",
+  };
+}
 
 export function ForgeSettings() {
   const [connections, setConnections] = useState<ForgeConnection[]>([]);
   const [allowedUrls, setAllowedUrls] = useState<string[]>([]);
   const [baseUrl, setBaseUrl] = useState("");
+  // The advertised forge types (PRD #65 D11). The picker below is shown only when
+  // more than one is advertised; while the API advertises just ["gitlab"] (today,
+  // until M6b), it stays hidden and forgeType defaults to that single value, so the
+  // connect form behaves exactly as before — the milestone lands dark.
+  const [forgeTypes, setForgeTypes] = useState<string[]>([]);
+  const [forgeType, setForgeType] = useState("gitlab");
   const [token, setToken] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -39,6 +91,11 @@ export function ForgeSettings() {
       const [cfg, conns] = await Promise.all([api.forgeConfig(), api.listConnections()]);
       setAllowedUrls(cfg.allowed_base_urls);
       setBaseUrl((prev) => prev || cfg.allowed_base_urls[0] || "");
+      setForgeTypes(cfg.forge_types);
+      // The selection defaults to gitlab (the useState seed above), so a single-type
+      // config sends forge_type: "gitlab" exactly as the form does now. Once the user
+      // opens the picker (only shown when >1 type is advertised) their choice wins.
+      setForgeType((prev) => prev || cfg.forge_types[0] || "gitlab");
       setConnections(conns.connections);
       setUsernameDrafts(
         Object.fromEntries(conns.connections.map((c) => [c.id, c.human_username ?? ""])),
@@ -66,7 +123,7 @@ export function ForgeSettings() {
     resetMessages();
     setConnecting(true);
     try {
-      const { connection } = await api.createConnection(baseUrl, token);
+      const { connection } = await api.createConnection(baseUrl, token, forgeType);
       setToken("");
       setNotice(`Connected as ${connection.bot_username}.`);
       await load();
@@ -156,8 +213,12 @@ export function ForgeSettings() {
     }
   };
 
+  // The connect form's token hints follow the selected forge (M6b): pre-M6b the
+  // picker is hidden and forgeType is "gitlab", so these are the exact GitLab strings.
+  const hints = connectHints(forgeType);
+
   return (
-    <SettingsShell description="Connect the GitLab bot account uzi acts through.">
+    <SettingsShell description="Connect the bot account uzi acts through.">
       {error && <Alert message={error} />}
       {connectViolations && (
         <Card className="border-danger/40 bg-danger/5">
@@ -168,9 +229,10 @@ export function ForgeSettings() {
             ))}
           </ul>
           <p className="mt-3 text-sm text-muted">
-            Mint a least-privilege token (scope <code className="rounded bg-raised px-1 py-0.5 text-fg">api</code> only,
+            Mint a least-privilege token ({hints.scopeWord}{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> only,
             non-admin bot) — see the{" "}
-            <Link to={BOT_SETUP_DOC} className="text-brand hover:underline">
+            <Link to={botSetupDoc(forgeType)} className="text-brand hover:underline">
               bot setup guide
             </Link>
             .
@@ -184,9 +246,9 @@ export function ForgeSettings() {
         <SectionTitle>Connect a bot PAT</SectionTitle>
         <p className="mt-2 text-sm text-muted">
           Create a bot account, give it a personal access token with the{" "}
-          <code className="rounded bg-raised px-1 py-0.5 text-fg">api</code> scope, and add it as
-          Developer to the projects uzi should see. The token is stored encrypted and never shown
-          again.
+          <code className="rounded bg-raised px-1 py-0.5 text-fg">{hints.scopeCode}</code> {hints.scopeWord}, and add
+          it {hints.roleClause} to the projects uzi should see. The token is stored encrypted and never
+          shown again.
         </p>
         <form className="mt-4 space-y-4" onSubmit={connect}>
           <Field label="Forge base URL">
@@ -198,16 +260,31 @@ export function ForgeSettings() {
               ))}
             </Select>
           </Field>
-          <Field label="Bot personal access token (scope: api)">
+          {/* Forge-type picker (PRD #65 D11): shown only when the API advertises more
+              than one type. While it advertises just ["gitlab"] the picker is hidden
+              and forgeType stays "gitlab", so the form is unchanged. Base URL and type
+              are independent choices (D11a): a mismatch is caught by VerifyToken. */}
+          {forgeTypes.length > 1 && (
+            <Field label="Forge type">
+              <Select value={forgeType} onChange={(e) => setForgeType(e.target.value)}>
+                {forgeTypes.map((t) => (
+                  <option key={t} value={t}>
+                    {forgePlatform(t)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          )}
+          <Field label={`Bot personal access token (${hints.scopeLabel})`}>
             <Input
               type="password"
               autoComplete="off"
-              placeholder="glpat-…"
+              placeholder={hints.placeholder}
               value={token}
               onChange={(e) => setToken(e.target.value)}
             />
           </Field>
-          <Button type="submit" disabled={connecting || !baseUrl || !token}>
+          <Button type="submit" disabled={connecting || !baseUrl || !forgeType || !token}>
             {connecting ? "Verifying…" : "Connect"}
           </Button>
         </form>

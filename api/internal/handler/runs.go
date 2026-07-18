@@ -55,6 +55,7 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 		}
+		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
 		item.Usage = usageFromListRow(row) // nil when the run has no usage rows (PRD #40)
 		out = append(out, item)
 	}
@@ -73,12 +74,14 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
 		email := row.OwnerEmail
-		out = append(out, apitypes.RunListItemDTO{
+		item := apitypes.RunListItemDTO{
 			RunDTO:     runToDTO(row.Run),
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 			OwnerEmail: &email,
-		})
+		}
+		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
+		out = append(out, item)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"runs": out})
 }
