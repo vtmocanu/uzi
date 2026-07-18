@@ -483,6 +483,57 @@ export interface AuthConfig {
   password_login_enabled?: boolean;
 }
 
+// ── CLI tokens (PRD #64) ──────────────────────────────────────────────────
+// A Bearer credential the `uzi` CLI presents (sha256 at rest). scope is a
+// ceiling: 'user' is the owner's own authority, 'admin_ro' reads the whole
+// factory (mintable only by an admin). The token VALUE is never a field — it is
+// shown once at mint (CliTokenMint below) and never returned again.
+export type CliTokenScope = "user" | "admin_ro";
+
+// CliToken is the metadata-only view of a stored CLI token. token_prefix,
+// last_used_at and last_used_ip are the ENTIRE forensic surface (Risk 8): there
+// is no per-request audit log and a password change does not revoke these, so
+// "which token is this, and was it used by someone who isn't me?" is answerable
+// only from those three. They are not optional columns. All three of
+// last_used_at/last_used_ip/expires_at are null until set (a never-used or
+// never-expiring token). This mirrors the server's cliTokenDTO, which lives in
+// handler/cli_tokens.go (not apitypes) — no CLI verb decodes it, the SPA does.
+export interface CliToken {
+  id: string;
+  name: string;
+  token_prefix: string;
+  scope: CliTokenScope;
+  revoked: boolean;
+  created_at: string;
+  last_used_at: string | null;
+  last_used_ip: string | null;
+  expires_at: string | null;
+}
+
+// CliTokenMint is the POST /me/cli-tokens response: the plaintext token shown
+// exactly once (only its hash is stored) plus the row's metadata, mirroring
+// CreateWorker's {worker, token}. `token` is the only place the value ever
+// appears — copy it now or lose it.
+export interface CliTokenMint {
+  token: string;
+  cli_token: CliToken;
+}
+
+// ── CLI browser-login consent flow (PRD #64 M5/M6) ────────────────────────────
+// The `/cli-auth` consent page reads a pending request and approves/denies it.
+// status mirrors the server enum; a stale-but-pending row reports "expired".
+export type CliAuthStatus = "pending" | "approved" | "denied" | "consumed" | "expired";
+
+// CliAuthRequestMeta is GET /api/auth/cli/request/{id}. It carries client_desc +
+// status + expiry and DELIBERATELY NOT the user_code: the human must type the
+// code shown in their terminal, which is the anti-async-phishing property. The
+// consent page therefore renders a code input, never a pre-filled value.
+export interface CliAuthRequestMeta {
+  client_desc: string;
+  status: CliAuthStatus;
+  expires_at: string;
+}
+
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
 
 export interface Worker {
@@ -1374,6 +1425,32 @@ const realApi = {
   unreadNotificationCount: () => request<{ unread: number }>("GET", "/notifications/unread_count"),
   markNotificationRead: (id: string) =>
     request<{ notification: Notification }>("POST", `/notifications/${id}/read`),
+
+  // ── CLI tokens (PRD #64) — cookie-only CRUD ────────────────────────────────
+  // A CLI token can never reach these endpoints (deliberate: a stolen token would
+  // mint replacements, making revocation whack-a-mole) — they are the webui's own.
+  // The mint returns the plaintext once; the list never carries a value.
+  listCliTokens: () => request<{ tokens: CliToken[] }>("GET", "/me/cli-tokens"),
+  createCliToken: (name: string, scope: CliTokenScope) =>
+    request<CliTokenMint>("POST", "/me/cli-tokens", { name, scope }),
+  revokeCliToken: (id: string) => request<null>("DELETE", `/me/cli-tokens/${id}`),
+  // The panic button for a lost laptop: one query revokes every un-revoked token
+  // of the caller. Idempotent (a second call is a no-op 204).
+  revokeAllCliTokens: () => request<null>("POST", "/me/cli-tokens/revoke-all"),
+
+  // ── CLI browser-login consent flow (PRD #64) ───────────────────────────────
+  // The `/cli-auth` page's three calls. getCliAuthRequest is a cookie-only read
+  // (the human's login happens on the way to it); approve/deny are CSRF writes.
+  getCliAuthRequest: (id: string) =>
+    request<CliAuthRequestMeta>("GET", `/auth/cli/request/${id}`),
+  approveCliAuth: (requestId: string, userCode: string, scope: CliTokenScope) =>
+    request<{ status: string }>("POST", "/auth/cli/approve", {
+      request_id: requestId,
+      user_code: userCode,
+      scope,
+    }),
+  denyCliAuth: (requestId: string) =>
+    request<{ status: string }>("POST", "/auth/cli/deny", { request_id: requestId }),
 };
 
 // The one client the app talks to. `mockApi` implements the identical surface

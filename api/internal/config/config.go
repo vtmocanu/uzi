@@ -158,6 +158,16 @@ type Config struct {
 	// per-user burst cap.
 	SlackDMRateLimitMax    int
 	SlackDMRateLimitWindow time.Duration
+	// CLIPollRateLimitMax/Window is the dedicated budget for POST /api/auth/cli/poll
+	// (PRD #64 M5). It MUST comfortably exceed the poll cadence the server itself
+	// returns: an RFC 8628 poll at the 5s interval is 12/min, so the shared authLimiter
+	// (10/min) would trip `uzi login` at poll #11 — a broken login, not tidiness. This
+	// budget and the returned interval are one decision; the default (60/min) leaves
+	// ~5x headroom over 12/min so several concurrent logins behind one NAT still fit.
+	// Unauthenticated + per-(path,IP) keyed like authLimiter, so it stays a DoS cap on
+	// a cheap indexed endpoint.
+	CLIPollRateLimitMax    int
+	CLIPollRateLimitWindow time.Duration
 	// PrivilegeCheckInterval is the cadence of the background PAT least-privilege
 	// re-check sweep (PRD #5). Default 24h; 0 disables the sweep entirely (no boot
 	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
@@ -483,6 +493,11 @@ func Load() (Config, error) {
 	// abuse control.
 	cfg.SlackDMRateLimitMax = parseInt("SLACK_DM_RATE_LIMIT_MAX", 6)
 	cfg.SlackDMRateLimitWindow = parseDuration("SLACK_DM_RATE_LIMIT_WINDOW", time.Minute)
+	// 60/min: ~5x the 12/min a 5s poll costs, so uzi login never trips its own limit
+	// (authLimiter's 10/min would). See the field doc for why this and the returned
+	// interval are one decision.
+	cfg.CLIPollRateLimitMax = parseInt("CLI_POLL_RATE_LIMIT_MAX", 60)
+	cfg.CLIPollRateLimitWindow = parseDuration("CLI_POLL_RATE_LIMIT_WINDOW", time.Minute)
 	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)

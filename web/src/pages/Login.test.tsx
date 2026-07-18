@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { Login } from "./Login";
+import { Login, safeNextPath } from "./Login";
 import { api, type AuthConfig } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
@@ -84,5 +84,27 @@ describe("Login SSO + gating", () => {
     renderLogin("/login?error=totally-made-up-code");
     await screen.findByText(/Sign-in failed\. Please try again\./i);
     expect(screen.queryByText(/totally-made-up-code/)).toBeNull();
+  });
+});
+
+describe("safeNextPath open-redirect guard", () => {
+  it("keeps a same-origin internal path (query preserved)", () => {
+    expect(safeNextPath("/cli-auth?request=abc")).toBe("/cli-auth?request=abc");
+  });
+
+  it("rejects a protocol-relative //host", () => {
+    expect(safeNextPath("//evil.com")).toBe("/dashboard");
+  });
+
+  it("rejects an absolute URL", () => {
+    expect(safeNextPath("https://evil.com")).toBe("/dashboard");
+  });
+
+  it("rejects the backslash vector /\\evil.com (window.location normalizes \\ to /)", () => {
+    expect(safeNextPath("/\\evil.com")).toBe("/dashboard");
+  });
+
+  it("defaults to /dashboard for a null/absent next", () => {
+    expect(safeNextPath(null)).toBe("/dashboard");
   });
 });

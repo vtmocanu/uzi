@@ -4,12 +4,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -83,37 +83,12 @@ func (h *Handler) SetUserJudgeEnabled(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"user": toDTO(updated)})
 }
 
-// recommendationDTO is one structured judge recommendation for the run-page panel
-// (PRD #46 M4). category is the taxonomy enum; target/rationale are the scrubbed
-// free-text fields (validated + capped + secret-scrubbed at the review POST), which
-// the SPA renders as escaped text (never markdown/HTML).
-type recommendationDTO struct {
-	ID          string    `json:"id"`
-	Category    string    `json:"category"`
-	Target      string    `json:"target"`
-	RationaleMd string    `json:"rationale_md"`
-	Confidence  string    `json:"confidence"`
-	CreatedAt   time.Time `json:"created_at"`
-}
-
-// reviewDTO is the run's judge verdict + recommendations for the run page. summary_md
-// and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
-type reviewDTO struct {
-	ID              string              `json:"id"`
-	TargetRunID     string              `json:"target_run_id"`
-	Verdict         string              `json:"verdict"`
-	SummaryMd       string              `json:"summary_md"`
-	JudgeModel      string              `json:"judge_model"`
-	Status          string              `json:"status"`
-	CreatedAt       time.Time           `json:"created_at"`
-	UpdatedAt       time.Time           `json:"updated_at"`
-	Recommendations []recommendationDTO `json:"recommendations"`
-}
-
-func reviewToDTO(rw workersvc.ReviewWithRecommendations) reviewDTO {
-	recs := make([]recommendationDTO, 0, len(rw.Recommendations))
+// reviewDTO (apitypes.ReviewDTO) and recommendationDTO (apitypes.RecommendationDTO)
+// moved to the stdlib-only apitypes leaf (PRD #64 M1); reviewToDTO stays here.
+func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
+	recs := make([]apitypes.RecommendationDTO, 0, len(rw.Recommendations))
 	for _, rc := range rw.Recommendations {
-		recs = append(recs, recommendationDTO{
+		recs = append(recs, apitypes.RecommendationDTO{
 			ID:          rc.ID.String(),
 			Category:    rc.Category,
 			Target:      rc.Target,
@@ -122,7 +97,7 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) reviewDTO {
 			CreatedAt:   rc.CreatedAt.Time,
 		})
 	}
-	return reviewDTO{
+	return apitypes.ReviewDTO{
 		ID:              rw.Review.ID.String(),
 		TargetRunID:     rw.Review.TargetRunID.String(),
 		Verdict:         rw.Review.Verdict,
