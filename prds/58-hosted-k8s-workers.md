@@ -1,7 +1,7 @@
 # PRD #58: Hosted k8s workers — self-service worker provisioning
 
 **GitLab Issue**: [#58](https://gitlab.example.com/vtmocanu/uzi/-/issues/58)
-**Status**: Draft (created 2026-07-16; revised same day after parallel design review / security audit / fact-check — mechanism changed from api-managed Deployments to a dedicated controller, TLS on the worker hop pulled into scope, v1 admin surface trimmed)
+**Status**: Complete — **released in v0.3.0**, hosted workers live on dev-cluster (feature merge `6098104`, release `3da61c3`). M1–M7 all landed. Two open residuals keep this in `prds/` (not yet moved to `done/`): one M7 operator item is only PARTLY delivered (commit `8190069`), and issue #82 tracks a live hosted-provisioning bug (tool provisioning hangs on non-seeded packages). (Status corrected 2026-07-18 — the header still read "Draft" long after v0.3.0 shipped; see git history. Created 2026-07-16; revised same day after parallel design review / security audit / fact-check — mechanism changed from api-managed Deployments to a dedicated controller, TLS on the worker hop pulled into scope, v1 admin surface trimmed.)
 **Priority**: Medium
 **Depends on**: PRD #18 (worker templates), PRD #52 (k8s deploy via Helm/ArgoCD), PRD #42 (concurrency semantics reused for sizing).
 **Related**: PRD #51 (uid-split; its k8s remote-worker phase and this PRD's pod spec must be one design when both land). PRD #32/#45 (vault — H1 below is why join tokens get delivered-once semantics).
@@ -780,7 +780,7 @@ Non-goals (v1):
       quantities**, sourced from the controller's preset table via a golden, so the
       architect's objection is answered rather than merely outlived. The **incentive**
       half it did not cover stays open by user decision — see M6.
-- [ ] **M6 — CI + chart + rollout**: publish per-template agent images
+- [x] **M6 — CI + chart + rollout** (landed; released v0.3.0, hosting turned on for dev-cluster): publish per-template agent images
   (`agent-base`, `agent-jvm`; templates listed in a CI variable to bound build
   cost) and the controller image on `v*` tags; chart adds controller
   Deployment, worker namespace + RBAC + quotas + policies, hosting values;
@@ -1094,7 +1094,7 @@ Non-goals (v1):
       cover deployment skew (a released bundle showing last release's numbers) —
       the same limit the name golden carries, and strictly less harmful here: a
       stale label misinforms, a stale name strands a worker.
-- [ ] **M7 — Docs + specs**: new `docs/hosted-workers.md` (audience: user);
+- [x] **M7 — Docs + specs** (landed; the `specs/human.md` operator item is only PARTLY delivered — commit `8190069`): new `docs/hosted-workers.md` (audience: user);
   updates to `worker-setup.md`, `configuration.md`, `admin-settings.md`,
   `vault-threat-model.md` (join-token-in-etcd residual), `ARCHITECTURE.md`
   (controller trust boundary); `specs/ai.md` updated; `specs/human.md` marks
