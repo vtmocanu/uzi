@@ -199,7 +199,7 @@ export function Repos() {
         <EmptyState
           icon={<BoardIcon />}
           title="No forge connection yet"
-          description="uzi needs a GitLab bot before it can see any projects."
+          description="uzi needs a bot before it can see any projects."
           action={
             <Link to="/settings/forge">
               <Button size="sm">Connect the forge</Button>
