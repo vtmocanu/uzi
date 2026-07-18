@@ -36,10 +36,11 @@ to soften:
    (`:293`) feeds it the header, steering log, a deterministic command-not-found
    pre-scan, and a sampled trace — but **no environment ground truth**. Real case
    (issue #78): a hosted run failed in tool provisioning because `api.github.com`
-   was egress-denied on dev-cluster — at the time its worker allowlist was the
-   original three FQDNs (`deploy/values/dev-cluster.yaml`; github has since been
-   added as an interim unblock, with the durable fix being to pin nixpkgs so the
-   github dependency disappears — see issue #78). Given only "connection timed out,"
+   is egress-denied on dev-cluster (its worker allowlist is three FQDNs,
+   `deploy/values/dev-cluster.yaml`). The durable fix — pin nixpkgs so the github
+   dependency disappears, or pre-seed the package into the image — is tracked in
+   **issue #82** (a github-egress stopgap was tried and reverted to keep the
+   minimal-egress guardrail). Given only "connection timed out,"
    the judge called it a **transient infrastructure failure** and its
    **high-confidence** recommendation was **retry with exponential backoff** — which
    cannot work against a policy block. It also spent an opus retrospective on a run
@@ -95,9 +96,9 @@ visibility, and accuracy build on the enqueue gate and judge paths the first add
    - **M7b (deferred, low marginal value):** enriching the signal to name the specific
      unreachable host and cross-check it against the deployment's egress allowlist. As
      Decision 11 records, the API holds neither the allowlist nor the host today, so
-     this needs new config plumbing and a host source; and since github is now
-     allowlisted and pinning nixpkgs is #78's durable fix, its value is small.
-     Documented, not built.
+     this needs new config plumbing and a host source; and the durable fix (pin
+     nixpkgs / pre-seed, issue #82) removes the github dependency entirely, so its
+     marginal value is small. Documented, not built.
    Detailed in Decisions 11–12 and M7.
 
 ### Consent surface (enforced mode)
@@ -354,9 +355,10 @@ What does **not** change:
       nothing under `api/` reads it, and `failure_reason` carries no hostname
       (`provision.ts:184` is a generic message). M7b would need (a) the allowlist fed to
       the API (e.g. a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env, empty = no policy)
-      and (b) a host source (worker-side enrichment or a run-stream scan). Given github
-      is now allowlisted and pinning nixpkgs is the durable fix, M7a's class-only signal
-      plus the prompt rule is the justified scope.
+      and (b) a host source (worker-side enrichment or a run-stream scan). Given the
+      durable fix (pin nixpkgs / pre-seed, issue #82) removes the github dependency
+      entirely and M7b is infeasible today, M7a's class-only signal plus the prompt
+      rule is the justified scope.
 
 12. **Don't judge a run that never started; route pre-start infra failures to a
     deterministic notification.** A run that failed before the agent began
@@ -534,7 +536,7 @@ issue #81; touches the enqueue gate + the judge prompt assembly):
 unreachable host and cross-check it against the deployment's `allowFQDNs`. Blocked on
 config plumbing (a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env — the API reads no Helm
 value today) + a host source (worker-side enrichment or a run-stream scan). Low marginal
-value now that github is allowlisted and pinning nixpkgs (issue #78) removes the github
+value: the durable fix (pin nixpkgs / pre-seed, issue #82) removes the github
 dependency; the design is recorded here so a future need has it, but it is not built in
 this PRD.
 
@@ -599,8 +601,8 @@ then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
   #78-class failure yields a non-"transient", non-retry recommendation, a 0-iteration
   infra failure is notified not judged, and an agent-crash-at-iteration-0 is still judged.
 - [ ] **M7b — Egress-allowlist enrichment (DEFERRED)**: not built in this PRD. Requires
-  a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env + a host source; low value while github
-  is allowlisted and nixpkgs pinning (issue #78) is the durable fix.
+  a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env + a host source; low value because the
+  durable fix (pin nixpkgs / pre-seed, issue #82) removes the underlying failure mode.
 - [ ] **M4 — Consent surface + web + docs + specs**: `/me` effective fields,
   admin enforce toggle (with cost copy + greying) + the two spend-guard inputs,
   user judge card (enforced banner + per-user model input), stale-comment fix,
