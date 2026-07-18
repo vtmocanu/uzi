@@ -241,7 +241,7 @@ export function Dashboard() {
               done={data.hasForge}
               index={2}
               title="Connect your bot"
-              hint="A bot PAT with the api scope lets uzi see and move your issues."
+              hint="A bot PAT lets uzi see and move your issues."
               to="/settings/forge"
               cta="Forge"
             />
