@@ -45,3 +45,5 @@ Register a worker and start a run from a board card: see
   reconfigure instance-wide.
 - [Autopilot](./autopilot.md): skip the plan-approval step and let a labeled
   issue run end to end unattended, on your own opt-in.
+- [uzi CLI](./cli.md): drive uzi from the terminal or from an agent/CI job
+  instead of the browser.

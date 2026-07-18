@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/config"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
@@ -87,27 +88,10 @@ func connToDTO(c store.ForgeConnection) connectionDTO {
 	return dto
 }
 
-type repoDTO struct {
-	ID                string  `json:"id"`
-	ConnectionID      string  `json:"connection_id"`
-	ForgeProjectID    int64   `json:"forge_project_id"`
-	PathWithNamespace string  `json:"path_with_namespace"`
-	WebURL            string  `json:"web_url"`
-	DefaultBranch     *string `json:"default_branch"`
-	Enabled           bool    `json:"enabled"`
-	RepoSkillsEnabled bool    `json:"repo_skills_enabled"`
-	// RepoDevboxOptIn is the tier-2 opt-in (PRD #18 M5): when true, a run on this
-	// repo also unions the packages from the repo's own devbox.json (packages-only,
-	// never its hooks/scripts). Default false.
-	RepoDevboxOptIn bool `json:"repo_devbox_opt_in"`
-	// Pipeline is the repo's default-branch CI status (PRD #6), null when there is
-	// no cached default-branch pipeline (no CI configured, MR-only pipelines, or not
-	// yet synced). Set by the list handlers, which enrich from the pipeline cache.
-	Pipeline *pipelineDTO `json:"pipeline"`
-}
-
-func repoToDTO(r store.Repo) repoDTO {
-	dto := repoDTO{
+// repoDTO (apitypes.RepoDTO) moved to the stdlib-only apitypes leaf (PRD #64 M1);
+// repoToDTO stays here as the store→DTO mapper.
+func repoToDTO(r store.Repo) apitypes.RepoDTO {
+	dto := apitypes.RepoDTO{
 		ID:                r.ID.String(),
 		ConnectionID:      r.ConnectionID.String(),
 		ForgeProjectID:    r.ForgeProjectID,
@@ -501,7 +485,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]repoDTO, 0, len(repos))
+	out := make([]apitypes.RepoDTO, 0, len(repos))
 	repoIDs := make([]uuid.UUID, len(repos))
 	for i, rp := range repos {
 		repoIDs[i] = rp.ID
@@ -534,7 +518,7 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]repoDTO, 0, len(repos))
+	out := make([]apitypes.RepoDTO, 0, len(repos))
 	repoIDs := make([]uuid.UUID, len(repos))
 	for i, rp := range repos {
 		repoIDs[i] = rp.ID

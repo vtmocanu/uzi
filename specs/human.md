@@ -393,6 +393,16 @@ Tracked as GitLab issue vtmocanu/uzi#58; PRD at `prds/58-hosted-k8s-workers.md`.
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
 
+## Feature #64 — uzi CLI: terminal control for humans and agents
+
+Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/64-uzi-cli.md`.
+
+- A `uzi` CLI shipped in this repo, installed via the existing `vtmocanu/homebrew-tap`.
+- Driven identically by humans (tables on a TTY) and agents/CI (`--json`, documented exit codes).
+- Headless requirement: an agent drives uzi with a Bearer token in `UZI_TOKEN` — no browser, no cookie, no `$HOME`. [Success Criterion 1]
+- `uzi login` works on a password-only stack AND an OIDC-backed instance with no IdP configuration change. [Success Criterion 2]
+- Admin gets read-only verbs over the CLI; every admin write stays a webui action. [user override, PRD #64 Decision 5]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

@@ -9,42 +9,14 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 )
 
-// rateLimitWindow is one window of the frozen DTO (PRD #53): a 0..100 percent plus
-// the reset as epoch seconds, or null when Anthropic reported none. resets_at has
-// no omitempty — the contract keeps it PRESENT as `null` inside every window.
-type rateLimitWindow struct {
-	Pct      int    `json:"pct"`
-	ResetsAt *int64 `json:"resets_at"`
-}
-
-// rateLimitDTO is the frozen union discriminated on status. Only the "ok" branch
-// carries the windows/source/synced_at/stale; "no_token" and "unavailable" are
-// status-only — omitempty drops the ok-only fields so they serialize to exactly
-// {"status": "..."}. Exposes ONLY pct/resets_at/status/source/synced_at/stale, per
-// the frozen contract (no is_admin, no internal fields).
-type rateLimitDTO struct {
-	Status   string           `json:"status"` // ok | no_token | unavailable
-	FiveHour *rateLimitWindow `json:"five_hour,omitempty"`
-	SevenDay *rateLimitWindow `json:"seven_day,omitempty"`
-	Source   string           `json:"source,omitempty"`
-	SyncedAt string           `json:"synced_at,omitempty"`
-	Stale    *bool            `json:"stale,omitempty"`
-}
-
-// adminRateLimitRowDTO is one user's row on the admin view: identity + the live
-// vault lock state + the same union as /me. Every user appears, including
-// no_token ones.
-type adminRateLimitRowDTO struct {
-	ID          string       `json:"id"`
-	Email       string       `json:"email"`
-	Name        string       `json:"name"`
-	VaultLocked bool         `json:"vault_locked"`
-	Limits      rateLimitDTO `json:"limits"`
-}
+// rateLimitWindow (apitypes.RateLimitWindow), rateLimitDTO (apitypes.RateLimitDTO)
+// and adminRateLimitRowDTO (apitypes.AdminRateLimitRowDTO) moved to the stdlib-only
+// apitypes leaf (PRD #64 M1); the builders below stay here.
 
 const (
 	rateLimitStatusOK          = "ok"
@@ -70,12 +42,12 @@ func (h *Handler) SelfRateLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !hasToken {
-		httpx.JSON(w, http.StatusOK, rateLimitDTO{Status: rateLimitStatusNoToken})
+		httpx.JSON(w, http.StatusOK, apitypes.RateLimitDTO{Status: rateLimitStatusNoToken})
 		return
 	}
 	row, err := h.q.GetRateLimits(r.Context(), user.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		httpx.JSON(w, http.StatusOK, rateLimitDTO{Status: rateLimitStatusUnavailable})
+		httpx.JSON(w, http.StatusOK, apitypes.RateLimitDTO{Status: rateLimitStatusUnavailable})
 		return
 	}
 	if err != nil {
@@ -101,15 +73,15 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	users := make([]adminRateLimitRowDTO, 0, len(rows))
+	users := make([]apitypes.AdminRateLimitRowDTO, 0, len(rows))
 	for _, u := range rows {
-		var limits rateLimitDTO
+		var limits apitypes.RateLimitDTO
 		switch {
 		case !u.HasToken:
-			limits = rateLimitDTO{Status: rateLimitStatusNoToken}
+			limits = apitypes.RateLimitDTO{Status: rateLimitStatusNoToken}
 		case !u.SyncedAt.Valid:
 			// Token held but no gauge row yet (LEFT JOIN miss): no reading.
-			limits = rateLimitDTO{Status: rateLimitStatusUnavailable}
+			limits = apitypes.RateLimitDTO{Status: rateLimitStatusUnavailable}
 		default:
 			limits = h.okRateLimitDTO(
 				u.FiveHourPct, u.FiveHourResetsAt,
@@ -117,7 +89,7 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 				u.Source, u.SyncedAt,
 			)
 		}
-		users = append(users, adminRateLimitRowDTO{
+		users = append(users, apitypes.AdminRateLimitRowDTO{
 			ID:          u.UserID.String(),
 			Email:       u.Email,
 			Name:        u.DisplayName.String, // "" when the user has no display name
@@ -130,12 +102,12 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 
 // okRateLimitDTO builds the "ok" union branch from the stored gauge columns. stale
 // is computed server-side (D3); resets are rendered as epoch seconds (D7).
-func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamptz, sevenPct pgtype.Int2, sevenReset pgtype.Timestamptz, source pgtype.Text, syncedAt pgtype.Timestamptz) rateLimitDTO {
+func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamptz, sevenPct pgtype.Int2, sevenReset pgtype.Timestamptz, source pgtype.Text, syncedAt pgtype.Timestamptz) apitypes.RateLimitDTO {
 	stale := h.rateLimitStale(syncedAt)
-	return rateLimitDTO{
+	return apitypes.RateLimitDTO{
 		Status:   rateLimitStatusOK,
-		FiveHour: &rateLimitWindow{Pct: int(fivePct.Int16), ResetsAt: epochPtr(fiveReset)},
-		SevenDay: &rateLimitWindow{Pct: int(sevenPct.Int16), ResetsAt: epochPtr(sevenReset)},
+		FiveHour: &apitypes.RateLimitWindow{Pct: int(fivePct.Int16), ResetsAt: epochPtr(fiveReset)},
+		SevenDay: &apitypes.RateLimitWindow{Pct: int(sevenPct.Int16), ResetsAt: epochPtr(sevenReset)},
 		Source:   source.String,
 		SyncedAt: syncedAt.Time.UTC().Format(time.RFC3339),
 		Stale:    &stale,

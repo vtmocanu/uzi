@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/board"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forge"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/forgesvc"
@@ -66,7 +67,7 @@ type cardDTO struct {
 	// Pipeline is the CI status of the card's MOST RECENT run's branch (PRD #6),
 	// null when that run has no branch, no CI, or the card has never run. It is what
 	// renders the per-card badge and gates the "Fix CI" affordance.
-	Pipeline *pipelineDTO `json:"pipeline"`
+	Pipeline *apitypes.PipelineDTO `json:"pipeline"`
 }
 
 // latestRunDTO is the run summary a card carries (PRD #12 M2), so the board needs
@@ -174,7 +175,7 @@ type boardDTO struct {
 	Cards     []cardDTO   `json:"cards"`
 	// Pipeline is the repo's default-branch CI status (PRD #6, the board header
 	// badge), null when there is no cached default-branch pipeline.
-	Pipeline *pipelineDTO `json:"pipeline"`
+	Pipeline *apitypes.PipelineDTO `json:"pipeline"`
 }
 
 // ── Board ───────────────────────────────────────────────────────────────────
@@ -377,7 +378,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 // defaultBranchPipeline reads the repo's default-branch CI status from the cache
 // for the board header (PRD #6). Returns nil when the repo has no default branch,
 // no cached pipeline for it, or on a read error (logged) — the badge is enrichment.
-func (h *Handler) defaultBranchPipeline(r *http.Request, repo store.GetRepoForUserRow) *pipelineDTO {
+func (h *Handler) defaultBranchPipeline(r *http.Request, repo store.GetRepoForUserRow) *apitypes.PipelineDTO {
 	if !repo.DefaultBranch.Valid || repo.DefaultBranch.String == "" {
 		return nil
 	}
@@ -396,8 +397,8 @@ func (h *Handler) defaultBranchPipeline(r *http.Request, repo store.GetRepoForUs
 // cardPipelines reads the per-card CI statuses (each issue's most-recent run's
 // branch pipeline) keyed by issue iid (PRD #6). A read error logs and yields an
 // empty map so cards render without badges.
-func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*pipelineDTO {
-	out := map[int64]*pipelineDTO{}
+func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*apitypes.PipelineDTO {
+	out := map[int64]*apitypes.PipelineDTO{}
 	rows, err := h.q.ListRunPipelineStatusesForRepo(r.Context(), repoID)
 	if err != nil {
 		slog.Warn("board card pipelines", "repo", repoID, "error", err)
@@ -414,7 +415,7 @@ func (h *Handler) cardPipelines(r *http.Request, repoID uuid.UUID) map[int64]*pi
 // and the board viewer. It is the pure, DB-free core of the board payload: it
 // keys each issue's latest_run by issue_iid (issues with no run get null), and
 // resolves each card's column. viewerID drives IsMine.
-func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*pipelineDTO, position map[string]int, viewerID uuid.UUID, forgeType string) []cardDTO {
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, position map[string]int, viewerID uuid.UUID, forgeType string) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		latestByIID[rr.IssueIid.Int64] = mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.MrIid, rr.MrWebUrl,

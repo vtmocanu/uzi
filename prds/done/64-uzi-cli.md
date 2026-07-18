@@ -1,7 +1,7 @@
 # PRD #64: uzi CLI — terminal control of the factory for humans and agents
 
 **GitLab Issue**: [#64](https://gitlab.example.com/vtmocanu/uzi/-/issues/64)
-**Status**: Draft (created 2026-07-17; revised same day after review / fact-check / security audit — the token `scope` ceiling was found to be unenforced outside `/api/admin/*` and the route swap was narrowed from groups to an enumerated per-route list)
+**Status**: Complete (implemented 2026-07-17, merged to main 2026-07-18 via MR !67; all 11 milestones landed, reviewed, and live-validated)
 **Priority**: Medium
 **Created**: 2026-07-17
 **Depends on**: PRD #1 (auth/session — the chokepoint this brokers off), PRD #4 (workers/runs), PRD #45 (OIDC — the *other* login that converges on the same chokepoint), PRD #52 (CI shape + `v*` tag releases, which the CLI now rides).
@@ -130,6 +130,13 @@ Every owner-or-admin handler then degrades to owner-only **for free, with zero h
 `RequireAdminRO` reduces to an `IsAdmin` check on the context user. Sessions are untouched. This
 is what makes `scope` a real ceiling rather than a label.
 
+*(This block measured the consumers as of the group-swap design: two run reads + `PatchRepo`.
+Decision 21 later swapped `GET /api/runs/{id}/review`, adding **`GetReviewForTarget`** as a third
+owner-or-admin **read**, and `PatchRepo` became cookie-only — so the live run-read set the ceiling
+test enumerates is now the **trio** `GetRunForViewer` / `ListRunMessagesForViewer` /
+`GetReviewForTarget`. The count differs from this paragraph on purpose; the "degrades for free"
+property is exactly why the third consumer needed no new fix, only one more line in the test.)*
+
 **Deliberate, ruled consequence**: `GET /api/auth/me` over a `uzc_` token reports
 `is_admin:false`. That is correct — it reports *this credential's* effective authority, not the
 human's résumé — and `uzi whoami` therefore shows admin only for a `uza_` token. Documented, not
@@ -151,7 +158,8 @@ and M2 is scoped accordingly.
 | `GET /api/auth/me` | **`RequireUser`** | `uzi whoami` |
 | `POST /api/auth/logout` | **cookie-only** | shares a group with `/auth/me` (`handler.go:271-275`) but must **split**: logout bumps `token_version`, which would kill the user's **browser** sessions from a CLI call |
 | `GET /api/runs`, `GET /api/runs/{id}`, `GET /api/runs/{id}/messages`, `POST /api/runs/{id}/inputs` | **`RequireUser`** | the core loop: list/get/logs/approve/reject/cancel/follow-up |
-| `GET /api/runs/{id}/review`, `POST /api/runs/{id}/rejudge` | cookie-only | no v1 verb |
+| `GET /api/runs/{id}/review` | **`RequireUser`** | `uzi run review` (Decision 21). A pure read whose payload — verdict + a fixed-taxonomy recommendation list — is *more* machine-actionable than human-readable; the agent path is the point. **Adds a third admin-widening consumer to the swapped set** (`GetReviewForTarget`, `handler/judge.go:154`), so the ceiling test below is a trio, not a pair |
+| `POST /api/runs/{id}/rejudge` | cookie-only | no v1 verb — it **mints a token-spending run**. Excluded on the read-vs-spend distinction (Decision 21), not by inheritance from the row above. **M2 must pin this with a Bearer-reject test** — after the `/review` swap it is the only cookie-only route left in the `/runs` group |
 | `GET /api/repos`, `POST /api/repos/{id}/runs` | **`RequireUser`** | `uzi repo list`, `uzi run create` |
 | `PATCH /api/repos/{id}`, `PUT /api/repos/{id}`, tool-profile, board, issues, sync, ci-fix-runs | cookie-only | no v1 verb; `PATCH` is also the F1 admin-write path |
 | `GET /api/workers`, `DELETE /api/workers/{id}` | **`RequireUser`** | `uzi worker list` / `uzi worker rm`. **`DELETE` stays swapped deliberately**: destroying a worker cannot exfiltrate anything, and the loss is the owner's own (their worker stops; runs requeue) — the asymmetry with `POST` is *mint vs unmint*, not *read vs write*. Stated rather than inherited, per Decision 15(d) |
@@ -493,7 +501,9 @@ must contain no `pgx` and no `chi`.
 
 ```
 uzi login | logout | auth token [--with-token] | auth status | whoami
-uzi run list|get|logs [--follow]|create|approve|reject|cancel|follow-up
+uzi run list|get|logs [--follow]|review|create|approve|reject|cancel|follow-up
+                                   # `review` is READ-ONLY: no `rejudge` verb, it spends
+                                   # the owner's Anthropic token (webui action)
 uzi worker list|rm                 # NO `create`: minting a join token is a webui action (it
                                    # returns a credential that reads decrypted secrets)
 uzi repo list
@@ -614,7 +624,7 @@ browser.
 
 Phase 1 (parallel — disjoint files):
 
-- [ ] **M1: `apitypes` leaf extraction** — `api/internal/apitypes/` (stdlib-only); handlers
+- [x] **M1: `apitypes` leaf extraction** — `api/internal/apitypes/` (stdlib-only); handlers
   re-pointed. Pure refactor, no behaviour change. **The set is exactly the DTOs behind the
   `RequireUser` routes** (so an M1 agent running beside M3 need not guess it):
 
@@ -623,6 +633,7 @@ Phase 1 (parallel — disjoint files):
   | `GET /api/auth/me` | `userDTO` (`handler/handler.go:199`) |
   | `GET /api/runs`, `GET /api/runs/{id}` | the run DTO + its health/reason fields (**`handler/workers.go:164-200`**) and the `runListItemDTO` wrapper (`handler/runs.go`) — the set spans **both** files |
   | `GET /api/runs/{id}/messages` | the run-message DTO (incl. `seq`) |
+  | `GET /api/runs/{id}/review` | `reviewDTO` **+ `recommendationDTO`** (`handler/judge.go:90-111`) — both, and note the envelope: the endpoint returns `{"review": …\|null}`, and **`null` is a valid 200** (visible-but-unjudged run), not an error. The CLI and any `--json` consumer must model it as nullable |
   | `POST /api/runs/{id}/inputs` | request `{kind, body, selection}` + `{server_side}` (`handler/workers.go:637-670`) |
   | `GET /api/repos` | the repo DTO (`handler/forge.go`) |
   | `POST /api/repos/{id}/runs` | the create-run request + run DTO |
@@ -634,7 +645,7 @@ Phase 1 (parallel — disjoint files):
   payloads still pass unmodified, proving byte-identical JSON. If a DTO has no such test, add the
   assertion **before** moving the type — an extraction without a pinning test is a silent
   contract change.
-- [ ] **M2: CLI token credential + admin split + the group split** — `clitoken` pkg
+- [x] **M2: CLI token credential + admin split + the group split** — `clitoken` pkg
   (`uzc_`/`uza_`), `cli_tokens` (draft `00067`, incl. `last_used_ip`), `RequireUser` (**including
   the `IsAdmin=false` context copy for non-`admin_ro` tokens**), `RequireAdminRO`,
   `/api/me/cli-tokens` CRUD **+ `revoke-all`** (all cookie-only), the `/api/admin` 9-read/4-write
@@ -650,9 +661,23 @@ Phase 1 (parallel — disjoint files):
   **Ceiling criteria — these test the *property*, not the route prefix (a suite passing only the
   `/api/admin/*` checks above would go green with the hole wide open):**
   - **(load-bearing)** an **admin's** `uzc_` gets **404** on another user's
-    `GET /api/runs/{id}` and `GET /api/runs/{id}/messages`. After the route narrowing, the
-    `GetRunForViewer` pair is the **only** admin-widening path left in the swapped set, so this is
-    the ceiling test that actually exercises the masking;
+    `GET /api/runs/{id}`, `GET /api/runs/{id}/messages` **and `GET /api/runs/{id}/review`**. After
+    the route narrowing, these three are the **only** admin-widening paths left in the swapped set
+    (`GetRunForViewer`, `ListRunMessagesForViewer`, `GetReviewForTarget` — the last reads
+    `IsAdmin` live at `handler/judge.go:154`, exactly like the other two), so this is the ceiling
+    test that actually exercises the masking. **`/review` is not a freebie on the back of the other
+    two.** Precisely why *(both reviewers sharpened this)*: at the **service** layer it is not
+    independent — `GetReviewForTarget` delegates its visibility check to `GetRunForViewer` as its
+    first line (`workersvc/judge_read.go:52`), so a masking bug *there* fails all three identically.
+    The divergence the trio test guards is one layer up: the **handler** passes `user.IsAdmin` into
+    its own call (`judge.go:154`), and the M2 **route surgery** could land `/review` under different
+    middleware than `/{id}` and `/{id}/messages`, or a handler edit could pass the wrong arg — either
+    would spare `/review` while both existing tests stayed green, leaking another user's verdict.
+    The test earns its place against *routing/handler* drift, not against a service-layer bug.
+    **The foreign run in the fixture must be a *judged* one** *(security audit, F-D)*: an unjudged
+    foreign run still distinguishes 404 from 200 `{"review":null}`, so the test passes either way,
+    but only a judged fixture proves **verdict content** never crosses — the leak it exists to
+    prevent;
   - **(load-bearing)** `GET /api/auth/me` over a `uzc_` reports `is_admin:false`; over a `uza_`,
     `true`;
   - *(pins the **routing**, not the ceiling — **not** coverage)* an admin's `uzc_` cannot flip
@@ -664,9 +689,20 @@ Phase 1 (parallel — disjoint files):
     become live again and this test is what catches it. But do not file it under "what F1 would
     have slipped past": a test that cannot fail today is not evidence today;
   - `POST /api/workers` (**D1**), `POST /api/forge/connections`,
-    `DELETE /api/me/secrets/anthropic_token`, `POST /api/chats` and `POST /api/auth/logout` all
-    reject a Bearer credential. The `POST /api/workers` case is the one that matters most: it is
-    the boundary between a revocable uzi credential and a plaintext forge PAT.
+    `DELETE /api/me/secrets/anthropic_token`, `POST /api/chats`, `POST /api/auth/logout` **and
+    `POST /api/runs/{id}/rejudge`** all reject a Bearer credential. The `POST /api/workers` case is
+    the one that matters most: it is the boundary between a revocable uzi credential and a
+    plaintext forge PAT.
+    **`rejudge` is on this list because Decision 21 made it the PRD's highest ride-along risk, and
+    it had no mechanical pin** *(architect review of the D21 amendment)*. After the `/review` swap
+    the `/runs` sub-router (`handler.go:539-552`) is **5 swapped, 1 cookie-only** — rejudge alone —
+    and "wrap the whole `r.Route("/runs")` group in `RequireUser`" is the single most tempting
+    shortcut in M2. **Every other criterion stays green when a coder takes it**: the trio 404
+    ceiling test passes, the admin checks pass, and rejudge appeared in no reject list. The result
+    is a stolen `uzc_` minting judge runs against the owner's Anthropic budget, with Decision 21's
+    exclusion silently void and **no red test anywhere**. This is Decision 15(g) in its purest
+    form — a rule recorded and then not re-run against the row it governs — and it was found in an
+    amendment that *quotes* 15(g) while committing it.
   **Limiter ordering (easy to break silently while re-parenting routes):** `POST /api/repos/{id}/runs`
   is wrapped in `forgeLimiter.PerUserMiddleware` (`handler.go:501`), which carries an explicit
   contract — *"It MUST run after RequireAuth (which sets the user in context)"*
@@ -678,14 +714,14 @@ Phase 1 (parallel — disjoint files):
   first, limiter second.
   *Shares `handler.go` with M1 (different hunks) and with **PRD #58's unmerged `/api/workers`
   edits** — rebase onto post-#58 `main`.*
-- [ ] **M3: CLI skeleton** — `api/cmd/uzi/` (cobra root, noun stubs) + `api/internal/uzicli/`
+- [x] **M3: CLI skeleton** — `api/cmd/uzi/` (cobra root, noun stubs) + `api/internal/uzicli/`
   (output: tables/`--json`/exit codes; config: files, perms, env override). Client is an interface
   with a fake; no live calls. Includes the `go list -deps ./cmd/uzi` layering assertion. Success:
   the existing `validate:api`/`test:api` go green with **zero CI edits**; `uzi --help` renders the
   tree; the layering assertion fails when someone imports `internal/handler`.
 Phase 1b (**M4 — starts the moment M3's binary compiles; it is not parallel with M3**):
 
-- [ ] **M4: brew spike** (still the earliest possible slot — it settles the riskiest assumption
+- [x] **M4: brew spike** (still the earliest possible slot — it settles the riskiest assumption
   before any release plumbing exists) — `Formula/uzi-cli.rb` + `scripts/brew-local-test.sh`.
   **Depends on M3**: a from-source formula needs a compilable `api/cmd/uzi` to build at all, and
   the spike tests against M3's binary. It needs only *a binary that builds*, not the real command
@@ -700,11 +736,18 @@ Phase 1b (**M4 — starts the moment M3's binary compiles; it is not parallel wi
 
 Phase 2 (sequential, except M6 ∥ M7):
 
-- [ ] **M5: browser-brokered auth** — `cli_auth_requests` (draft `00068`) +
+- [x] **M5: browser-brokered auth** — `cli_auth_requests` (draft `00068`) +
   `/api/auth/cli/{start,poll,request,approve,deny}`; the server applies the expiry matrix at mint.
   Success: the flow mints exactly one token; a replayed poll 410s; a wrong verifier never mints;
   expiry enforced server-side.
-- [ ] **M6: SPA surfaces** — CLI-tokens section in Settings (create/list/revoke, show-once,
+  **Also — teach the redactors the new credential family (Risk 14, security audit F-B).** M5 mints
+  `uzc_`/`uza_`, so M5 owns it: add the final token shape (`uz[caw]_[A-Za-z0-9_-]{16,}`, covering
+  the pre-existing `uzw_`) to **both** `slacksvc.ScrubSecrets` (`slacksvc/redact.go:45-50`) and
+  `snapshotSecretPatterns` (`handler/ci_fix.go:34-41`), with a test sealing a literal `uzc_` through
+  the review ingest and the Slack path. **Non-optional and non-deferrable**: this PRD tells users to
+  put `UZI_TOKEN` in GitLab CI, so it *creates* the echo-into-a-trace path, and shipping the mint
+  without the scrub means the leak exists for however long the gap lasts.
+- [x] **M6: SPA surfaces** — CLI-tokens section in Settings (create/list/revoke, show-once,
   **scope picker offered only to admins**) + the `/cli-auth` consent page (names the requesting
   host and the scope; **the user types the `user_code`, not merely compares it**).
   The token list **must render `token_prefix`, `last_used_at` and `last_used_ip`** — they are the
@@ -716,15 +759,31 @@ Phase 2 (sequential, except M6 ∥ M7):
   "enumerate each one" degrades exactly as it matters most. It is one comparison against a column
   already on screen. Anything more — auto-revoking stale tokens — is a policy change and would need
   its own ruling.)* *Runs parallel with M7 — `web/` vs `api/cmd/uzi/`.*
-- [ ] **M7: real client + read commands** — `internal/uzicli/client.go` importing `apitypes`
+- [x] **M7: real client + read commands** — `internal/uzicli/client.go` importing `apitypes`
   directly, `uzi auth token` (stdin), `whoami`, `run list/get/logs` (polling `?after=<seq>`),
-  `worker list`, `repo list`, plus a **malformed-response test**.
-- [ ] **M7b: admin read verbs** — `uzi admin users|runs|workers|usage|rate-limits`, `--json`-first.
+  `run review`, `worker list`, `repo list`, plus a **malformed-response test**.
+  **`run review` specifics** (Decision 21): human output is the verdict line + one row per
+  recommendation (category, target, confidence) with the rationale beneath; `--json` passes the
+  envelope through. **An unjudged run is exit 0 with "not judged", not exit 4** — the endpoint
+  returns 200 `{"review":null}`, and mapping that to not-found would be the CLI inventing an error
+  the API deliberately does not raise. Reserve exit 4 for a 404 (run absent or not visible).
+  A **`status:"failed"`** review renders the same "judge incomplete" caveat the run page shows — a
+  `--json` agent must not read a fallback-only recommendation set as a complete retrospective.
+  **The wire value is `failed`, not `incomplete`**: the enum is `{"complete","failed"}`
+  (`workersvc/judge_review.go:22`), and *"judge incomplete"* is only the **badge wording** in
+  `docs/judge.md:48`. An earlier draft of this milestone said `status:"incomplete"` — a value that
+  does not exist, read off a doc's UI copy rather than the enum. Recorded per Decision 15: the CLI
+  must branch on `failed`, and a `--json` consumer keying on `"incomplete"` matches nothing,
+  silently treating every fallback review as complete.
+
+  **`target`, `rationale_md` and `summary_md` are UNTRUSTED DATA, and the SKILL.md must say so.**
+  *(Security audit, 2026-07-17 — F-A, a risk this amendment **creates**.)* See Decision 21.
+- [x] **M7b: admin read verbs** — `uzi admin users|runs|workers|usage|rate-limits`, `--json`-first.
   Exits **3** with an actionable message when the token lacks `admin_ro` ("mint an admin-scoped
   token"), not a bare 403. Fold into M7 if preferred.
-- [ ] **M8: `uzi login` + write commands** — browser flow; `run create/approve/reject/cancel/
+- [x] **M8: `uzi login` + write commands** — browser flow; `run create/approve/reject/cancel/
   follow-up`; surface the locked-vault health reason.
-- [ ] **M9: bundled skill + self-upgrade** — `go:embed`, content-hash staleness, `.bak` rescue,
+- [x] **M9: bundled skill + self-upgrade** — `go:embed`, content-hash staleness, `.bak` rescue,
   atomic rename, never-fatal, plus the **skill↔cobra-tree test**. *Needs M8: the skill must
   document the final surface, or it ships stale.* **Concretely, post-D1**: author the SKILL.md
   **after** the tree settles or it will document `uzi worker create`, which no longer exists — and
@@ -733,12 +792,12 @@ Phase 2 (sequential, except M6 ∥ M7):
 
 Phase 3 (release + docs):
 
-- [ ] **M10: release pipeline** — `publish_brew` (tag-only, `needs: *publish_needs`,
+- [x] **M10: release pipeline** — `publish_brew` (tag-only, `needs: *publish_needs`,
   `TAP_WRITE_TOKEN` protected+masked). Copies `Formula/uzi-cli.rb` into the tap, bumps the pinned
   tag, creates the informational `uzi-cli-<version>` tap tag. Tap README gains the `uzi-cli` row +
   the access caveat. Success: `git tag vX.Y.Z && git push --tags` ⇒ `brew install uzi-cli` on a
   clean machine yields a working binary whose `uzi version` == the tag.
-- [ ] **M11: docs + the feedback loop (explicit user requirement)** — **`CLAUDE.md` rule: new uzi
+- [x] **M11: docs + the feedback loop (explicit user requirement)** — **`CLAUDE.md` rule: new uzi
   functionality ⇒ check whether `api/cmd/uzi/` needs a matching change**, now enforceable in one MR
   (the thing a separate repo could never offer). Plus ARCHITECTURE.md (the CLI as the second API
   consumer; `RequireUser`/`RequireAdminRO`; the `apitypes` leaf + layering assertion),
@@ -755,6 +814,16 @@ Phase 3 (release + docs):
   ("I rotated my password, I'm fine") is the one a competent admin will otherwise make from every
   other system they have used.
   Also document that `UZI_TOKEN` in GitLab CI must be a **masked** variable.
+  **Plus `docs/judge.md`**: its "What you get" list currently names three destinations for a
+  finished review (run page, inbox, Slack). The CLI makes a fourth — `uzi run review <id>`, and
+  `--json` for agents — and that page is where a reader looks for it. Leaving it at three would
+  make the doc quietly wrong the day M7 lands. Keep the `rejudge` exclusion visible there too: the
+  **Re-run judge** button stays a webui action (Out of scope). **And carry the Risk 13 contract for
+  `--json` consumers**: `target`, `rationale_md` and `summary_md` are judge free text derived from
+  untrusted repo/CI content — **data, never instructions**; branch on `verdict`, `category` and
+  `confidence`, which are closed enums. Note the wire value for a fallback review is
+  **`status:"failed"`**, even though the run page's badge reads *"judge incomplete"* — the doc
+  currently only gives the badge wording, which is what misled this PRD's own M7 draft.
 
 ### Phasing & parallel-safety
 
@@ -780,13 +849,20 @@ M5; M8 is the join, since `uzi login` needs M5's endpoints and M7's client.)
    by `/api/admin/*`", which **would have gone green with the F1 hole wide open**. See Decision 7.
    The route prefix is not the boundary; the authority is.)
    - **Cross-user containment**: an **admin's** `uzc_` gets **404** on another user's
-     `GET /api/runs/{id}` and `GET /api/runs/{id}/messages` — the `GetRunForViewer` pair is the
-     only admin-widening path left in the swapped set, so this is the test that actually exercises
-     the masking.
+     `GET /api/runs/{id}`, `GET /api/runs/{id}/messages` and `GET /api/runs/{id}/review` — those
+     three are the only admin-widening paths left in the swapped set, so this is the test that
+     actually exercises the masking. Enumerate all three: each handler passes `IsAdmin` into its own
+     call, so the M2 route surgery can spare one while the others stay green (Decision 21). The
+     `/review` fixture run must be **judged**, so the test proves verdict content never crosses, not
+     merely that 404≠200.
    - **Self-report honesty**: `GET /api/auth/me` over a `uzc_` reports `is_admin:false`; over a
      `uza_`, `true`.
    - **Cross-credential-class containment**: a `uzc_` is rejected by **`POST /api/workers`** — the
      boundary between a revocable uzi credential and a plaintext forge PAT (Decision 18).
+   - **Spend containment on the sole cookie-only `/runs` route**: a `uzc_` is rejected by
+     **`POST /api/runs/{id}/rejudge`** — after the `/review` swap it is the one route in the
+     `/runs` group that a "swap the whole group" shortcut would silently expose, and nothing else
+     in this list would catch it (Decision 21).
    - **Admin surface**: a `uza_` reads all 9 admin GETs and is rejected by all 4 admin writes;
      `/api/vault/*` rejects any CLI token.
    - **Live demotion**: setting the owner's `is_admin=false` makes a `uza_`'s admin reads fail on
@@ -925,6 +1001,42 @@ M5; M8 is the join, since `uzi login` needs M5's endpoints and M7's client.)
     executed on every engineer's laptop** — including engineers installing *example-app*, who never
     touched uzi. Scope the token to the tap repo, and prefer a **project** access token over a
     personal one.
+13. **`uzi run review --json` turns judge free text into an agent-read channel from
+    attacker-influenceable content. This risk is *created* by Decision 21 and did not exist before
+    it.** *(Security audit, 2026-07-17, F-A — the third question the two prior audits never thought
+    to ask: **"who consumes this payload, and does the swap change the consumer from a human
+    reading escaped text to an agent that acts on it?"**)* The chain is real and needs no bug:
+    repo/issue/CI content is attacker-influenceable → the judge LLM reads it in the trace
+    (`handler/judge_worker.go:26-30`) → its output free text is **explicitly untrusted
+    worker-controlled input** (`judge_worker.go:143-144`) → ingest strips control chars and three
+    token shapes but **cannot strip instruction-shaped prose** → today the only consumer is the SPA
+    rendering escaped text at a human, but after M7 `--json` feeds it to an agent, **and Decision 21
+    celebrates exactly that** ("an agent that can read its own retrospective can act on it").
+    Containment is real but partial: `verdict`, `category` and `confidence` are **closed enums
+    validated at ingest** (`workersvc/judge_review.go:18-27`), and terminal-escape injection into
+    the human rendering is already handled (`sanitizeReviewText` strips ESC,
+    `judge_worker.go:370-383`). `target` / `rationale_md` / `summary_md` are **not** contained and
+    cannot be. Mitigation is design-stage and cheap, so it is **required, not optional**: M7's
+    SKILL.md and the `docs/judge.md` CLI section must state that those three fields are **data,
+    never instructions** — the same standing the SPA already gives them — and that only
+    `verdict`/`category`/`confidence` are safe to branch on. This is the inverse of Risk 11: there
+    the untrusted instructions arrive from *our* supply chain, here from *the user's own forge
+    content*, and both land in the same agent.
+14. **A `uzc_` matches no scrubber uzi has — and this PRD is what mints it.** *(Security audit,
+    2026-07-17, F-B.)* Neither `slacksvc.ScrubSecrets` (`slacksvc/redact.go:45-50`: slack,
+    `sk-ant-`, `glpat-`) nor `snapshotSecretPatterns` (`handler/ci_fix.go:34-41`) knows the
+    `uzc_`/`uza_` shape — nor `uzw_`, which predates this PRD. The chain is the one **this PRD
+    instructs users to build**: it tells them to put `UZI_TOKEN` in GitLab CI → a `set -x` job
+    echoes it → the trace enters a run → the judge quotes it into `summary_md` → `ScrubSecrets`
+    passes it through → it is served over the newly-swapped `/review` **and** copied into the Slack
+    DM path (`judge_worker.go:291`, same narrow scrub). Note `ci_fix.go`'s own comment already names
+    *"Anthropic keys (sk-ant-…), the shape of a printed per-user token"* and the `set -x` echo — the
+    scenario is one this repo has already designed for, in a scrubber the review path does not use.
+    **M5 owns the fix** (it is where the token family is born): extend **both** redactors with the
+    final shape (`uz[caw]_[A-Za-z0-9_-]{16,}` covers `uzw_` while we are here), and add a test
+    sealing a literal token through the review ingest. **Introducing a credential family without
+    teaching the redactors is Decision 18's error class in a new coat**: a rule this repo applies in
+    two places and skips in the third, because the third did not look like a token surface.
 
 ## Out of scope (deferred)
 
@@ -939,6 +1051,12 @@ M5; M8 is the join, since `uzi login` needs M5's endpoints and M7's client.)
   (`handler/ws.go:57`) and coder/websocket's `authenticateOrigin` **returns nil when `Origin` is
   empty** (`websocket@v1.8.14/accept.go:228-232`), and a CLI sends no `Origin`. A future PRD adds
   only a client; do not re-litigate feasibility.
+- **`uzi run rejudge`** (`POST /api/runs/{id}/rejudge`). Reading the judge's verdict ships (Decision
+  21); **re-running it does not**. It mints a token-spending run on the owner's Anthropic token, and
+  the read verb is what both audiences asked for. Defensible later — it is owner-only and already
+  behind a dedicated per-user spend limiter (`handler.go:551`), so the swap is one row plus a
+  limiter-ordering check — but it is a **spend** decision, and spend is not read. Additive when
+  wanted; the noun-verb tree is for exactly this.
 - **Admin writes over the CLI** (cookie-only by routing), **vault access over the CLI**, `uzi context
   use` (the config file is already a context map), a `uzi update` command (brew is the only channel),
   and per-request admin audit logging (see Risk 8).
@@ -1001,9 +1119,13 @@ M5; M8 is the join, since `uzi login` needs M5's endpoints and M7's client.)
    over-claim:* the audit found F1 against the **group-swap** design, where `PATCH /api/repos/{id}`
    (`PatchRepo`'s two unscoped admin branches, `handler/forge.go:620-631`) was a **live** second
    consumer — an admin **write** on any user's repo. Against the design **as it now stands** that
-   route is cookie-only, so it is double-covered and only the `GetRunForViewer` pair remains a live
-   consumer of the masking. Both statements are true of their own design; conflating them would
-   overstate the residual surface.
+   route is cookie-only, so it is double-covered and only the run-read consumers remain live. Both
+   statements are true of their own design; conflating them would overstate the residual surface.
+   **Amended by Decision 21:** swapping `GET /api/runs/{id}/review` makes `GetReviewForTarget` a
+   **third** live consumer of the masking. This is the mechanism working as designed, not a
+   regression — but it is precisely why the masking is a **copy of the user row** rather than a
+   per-route check: each new swapped read inherits the ceiling for free, and the only cost is one
+   more line in the ceiling test.
    Recorded because the M2 criteria as first written **would have gone green with the hole open** —
    the lesson is that the criteria must test the property, not the route prefix. Success Criteria 4
    was rewritten for the same reason (it had inherited the pre-F1 shape).
@@ -1140,3 +1262,91 @@ M5; M8 is the join, since `uzi login` needs M5's endpoints and M7's client.)
     that co-location is not a cure*: their CLAUDE.md warns *"installed desktop clients can talk to
     newer backends"* and mandates schema-validated parsing plus a malformed-response test — with a
     same-repo CLI. — architect.
+21. **`uzi run review` ships in v1: judge recommendations reach both audiences, `rejudge` does not.**
+    *(**User ruling**, 2026-07-17, amending the route table's original "no v1 verb" on both judge
+    routes.)* The requirement is that humans *and* agents can read the judge's output from the
+    terminal. The read earns the swap on this PRD's own stated tests, and the split falls out of
+    them:
+    - **Least privilege** (the table's governing rule — "the surface widens when a verb needs it,
+      not before") is a test of *whether a verb needs it*, not a presumption against widening. A
+      verb now needs it.
+    - **"Does it return a credential?"** (Decision 18's second question, the one that actually
+      catches things) — no. Verdict, category, target, rationale, confidence. The fields are
+      scrubbed at ingest by `validateAndScrubReview` (**`handler/judge_worker.go:329-364`** — the
+      *mechanism*; an earlier draft cited `handler/judge.go:88-99`, which is a **DTO comment
+      restating the claim**, not the code enforcing it. Citing the assertion instead of the
+      enforcement is how an overstated guarantee survives review).
+      **Stated at its true strength**: that gate runs `slacksvc.ScrubSecrets`, which covers
+      **three** families (`slack`, `sk-ant-`, `glpat-` — `slacksvc/redact.go:45-50`), *not* the
+      nine-GitLab-family + header-line + bare-`Bearer` set the repo's snapshot scrubber uses
+      (`handler/ci_fix.go:34-41`). So the payload is scrubbed, not sterile.
+      The **relative** claim still holds and is what licenses the swap: `run logs`
+      (`/api/runs/{id}/messages`) has **no ingest scrubbing at all** and is already swapped, so
+      this route's *marginal* exposure is ~zero. The absolute guarantee is weaker than "scrubbed"
+      implies — see Risks 13 and 14.
+    - **Does it widen authority?** No: `GetReviewForTarget` takes the same `(userID, isAdmin)` and
+      is capped by the same `RequireUser` masking as `GetRunForViewer`. It adds a consumer, not a
+      hole (Decision 7, amended).
+    - **Is the payload agent-shaped?** More than most — and this one is **enforced, not just
+      documented**: `RecommendationCategories` is a closed six-value map checked at ingest
+      (`workersvc/judge_review.go:23-26`: `enable_tool`, `install_worker_tool`, `adjust_template`,
+      `improve_agent`, `add_agent`, `improve_uzi`), as are `ReviewVerdicts`, `ReviewStatuses` and
+      `RecommendationConfidences` (`:18-27`). A bad category is a rejected POST, not a stored
+      surprise. So `--json`'s consumer gets a real enum + a target, not prose it must parse. An
+      agent that can read its own retrospective can act on it; one that cannot must be told by a
+      human reading a web page. That is the thin end of the self-improvement loop this factory is
+      for. *(Cite the enum, not `docs/judge.md`: the doc **describes** the taxonomy, the map
+      **is** it — and this PRD has already been bitten once by reading a value off that doc's UI
+      copy, see M7's `failed`-not-`incomplete` note.)*
+    - **What it costs, stated in the same breath as the benefit** *(security audit F-A, Risk 13)*:
+      the very property that makes the payload agent-shaped makes it an **injection conduit** —
+      `target`/`rationale_md`/`summary_md` are untrusted, instruction-shaped-capable text that
+      after M7 flows to an agent instead of to an escaping human renderer. The enums are contained;
+      the free text is not. **The ruling stands with that cost named**: the fix is a documentation
+      contract (those fields are data, never instructions — M7 + `docs/judge.md`), not a reason to
+      withhold the verb, because the alternative is an agent that cannot see its own retrospective
+      at all. But an amendment that argued only the upside would have been the same failure as
+      citing a comment instead of the mechanism.
+
+    **`rejudge` fails a different test, which is why the two rows split.** It is not a read: it
+    mints a run that spends the owner's Anthropic token. The route table already draws a
+    *mint-vs-unmint* line one row up (the `DELETE /api/workers` row: destroying a worker exfiltrates
+    nothing, minting one does), and the honest framing here is its sibling — *read vs spend*. `POST
+    /api/repos/{id}/runs` is swapped and also spends — so this is a judgment call, not a rule — and
+    the judgment is that the read is what was asked for and the spend can be added the day someone
+    wants it. Recorded so a future reader does not "fix" the inconsistency by reflex in either
+    direction.
+    **And do not mistake it for a security boundary** *(security audit, 2026-07-17, answering
+    "what does withholding rejudge buy?" with: **~nothing**)*. A stolen `uzc_` **already** spends
+    the owner's Anthropic token at will via the swapped `POST /api/repos/{id}/runs` (behind only
+    `forgeLimiter`, `handler.go:503`); rejudge is owner-only even for admins
+    (`ErrNotRunOwner`, `workersvc/judge_review.go:87-88`) and carries a dedicated per-user spend
+    limiter (`handler.go:551`), so it adds **no authority and marginal spend**. Withholding it is
+    **API-surface discipline — product scope, not a control**. Anyone arguing later that "rejudge
+    is excluded for security" is inventing a rationale this decision never claimed.
+
+    **The near-miss worth recording**: the original table put both judge routes on one row under one
+    justification ("no v1 verb"). That was true when written, but the row's *shape* — two verbs, one
+    verdict — is what made it cheap to leave both out and easy to wave both in. **A route table row
+    that bundles a read with a spend has already lost the distinction it exists to make.** The rows
+    are split now. Same error class as Decision 18's: a rule applied three times and skipped on the
+    fourth row, because the rows looked alike.
+
+    **The audit of this amendment found the better lesson, and it is about the audits themselves.**
+    Decision 18 recorded that the catching question is *"does this return a credential?"* — so this
+    amendment asked it, and answered "no", correctly. The audit's F-A asked a **third** question
+    nobody had asked in three rounds: ***"who consumes this payload, and does the swap change the
+    consumer?"*** `/review`'s bytes are unchanged by the swap; **its reader is not** — SPA-escaping-
+    text becomes an agent-that-acts. That is a real risk (Risk 13) invisible to both prior
+    questions, because both interrogate the *payload* and this one interrogates the *consumer*.
+    **The question list grows by one per audit, and that is the artifact worth keeping**: (1) does
+    it widen admin authority? (2) does it return a credential? (3) does it change who consumes the
+    payload, and what they do with it?
+    The amendment also shipped two flaws of exactly the kind this PRD keeps a Decision 15 for: it
+    cited a **DTO comment restating the scrubbing** instead of the function performing it, and it
+    named a status value (`incomplete`) that **exists only as badge copy in a doc**, not in the
+    enum. Both are the same mistake in different clothes — **trusting a description of the code
+    instead of the code** — committed while amending a PRD whose Decision 15 is titled for that
+    failure. Fixed in M7 and above.
+    — user (ruling), reviewer (route-table + ceiling-test consequences), auditor (F-A/F-B, and the
+    third question).

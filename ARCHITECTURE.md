@@ -582,6 +582,67 @@ uzi's fifth surface is a conversational one: a **Chat** page where a user talks 
 - **Issue creation is structurally human-gated.** `propose_issue` persists a `pending` `issue_proposals` row and emits a `proposal`-kind run_message the browser renders as a card; only the browser's session+CSRF `POST /api/chats/:id/proposals/:pid/confirm` executes `Forge.CreateIssue` via the user's own connection (forge-first, PAT-redacted, per-user forge-rate-limited). Confirm is **claim-first** (atomic `pending → confirming` before the forge call, revert on failure) so a double-confirm creates exactly one issue; a stuck-`confirming` row is swept back to `pending`, and a boot-time clamp keeps the sweep timeout safely above the forge HTTP timeout so a slow-but-alive confirm is never reaped into a duplicate. The proposal write path simply does not exist without the human click.
 - **The primary directive is unaffected.** Chat holds no forge credential and has no git access; the worst it can do is draft an issue the user must click to file. Every guardrail layer is intact — `settingSources` stays `[]`, the deny-hooks still fire, and no PAT is ever in reach of the chat agent. Named residual (unchanged from the run surface): `CLAUDE_CODE_OAUTH_TOKEN` is in the agent's env, but chat's no-Bash/no-network/no-`/proc` surface is strictly stronger than a run's, so a prompt-injected chat has no egress channel for it.
 
+## The uzi CLI: a second API consumer
+
+Until PRD #64, `web` (browser + session cookie) was the API's only caller.
+The `uzi` CLI (`api/cmd/uzi/`, same module as `api`) is a second one, driven
+identically by humans and agents — it talks to the same JSON API `web` does,
+over a different credential. It adds **no new service and no new inbound
+port**: the CLI is an outbound-only client of the existing `api`, the same
+way a browser is. User-facing usage is [docs/cli.md](docs/cli.md); full
+design rationale — including the security audit that found and closed the
+scope-ceiling gap below — is in the PRD (`prds/64-uzi-cli.md`, especially its
+Decision Log).
+
+- **One new credential, one new middleware.** A `cli_tokens` row (`uzc_`
+  user-scoped / `uza_` admin-scoped, sha256 at rest, mirroring the worker
+  join-token posture) is presented as `Authorization: Bearer …`.
+  `mw.RequireUser` dispatches on whether that header **parses** as
+  `Bearer <non-empty>` — never on bare presence, and never "try cookie, fall
+  back to Bearer" — so a request takes exactly one path: a parsing Bearer
+  header goes CLI-token-only (no CSRF), anything else goes through the
+  existing `RequireAuth` cookie path, CSRF-enforced, byte-identical to
+  before. Both populate the same `userKey` every handler already reads, so
+  no handler needed to change to gain a CLI-reachable route.
+- **The route swap is enumerated per route, not per group.** Only the routes
+  a v1 CLI verb needs were moved onto `RequireUser` (`GET /api/auth/me`,
+  the `/api/runs` read+input routes including `/review`, `GET /api/repos` +
+  `POST /api/repos/{id}/runs`, `GET/DELETE /api/workers`, the 9 admin GETs).
+  Everything else — `POST /api/workers` (mints a plaintext join token that
+  can read decrypted secrets), `/api/me/cli-tokens` itself, `/api/vault/*`,
+  `/api/forge/*`, `/api/me/secrets/*`, and every admin write — stayed
+  cookie-only. Swapping whole route groups would have hit endpoints no v1
+  command needs and materially widened what a stolen CLI token could do; see
+  the PRD's route-disposition table for the full per-route reasoning.
+- **`scope` is a ceiling, enforced in the middleware, not just at
+  `/api/admin/*`.** `RequireAdminRO` is a plain `user.IsAdmin` check — the
+  real control is upstream, in `RequireUser`: a CLI token whose `scope !=
+  'admin_ro'` gets a **copy** of the user row with `IsAdmin=false` installed
+  in the request context. Every owner-or-admin handler outside
+  `/api/admin/*` that reads admin-ness live (`GetRunForViewer`,
+  `ListRunMessagesForViewer`, `GetReviewForTarget` — three run-visibility
+  checks an admin's default `uzc_` would otherwise widen to "any user's
+  run") degrades to owner-only **for free**, with no handler change. This is
+  the fix a security audit added mid-design: an earlier draft checked scope
+  only under `/api/admin/*` and would have shipped an admin's everyday
+  token able to read every user's run transcripts.
+- **`apitypes` (`api/internal/apitypes/`) is a stdlib-only leaf.** The CLI
+  imports handler DTOs through it rather than `internal/handler` directly,
+  so the binary never drags in `chi`/`pgx`. Enforced mechanically, not by
+  convention: a test runs `go list -deps ./cmd/uzi` and fails if `pgx` or
+  `chi` appears in the dependency graph.
+- **Browser login is poll-based, not a loopback listener.** `uzi login`
+  generates a PKCE verifier locally, sends only its challenge to
+  `POST /api/auth/cli/start`, prints a `user_code` plus a `/cli-auth?request=`
+  URL, and polls `POST /api/auth/cli/poll` until a human — in an
+  already-authenticated browser tab, via whatever this instance's login
+  method is (password or OIDC) — types the code and approves. No token is
+  minted at approve; the poll mints it, claim-first (`UPDATE … WHERE
+  status='approved' … RETURNING`) so two racing polls can't both mint from
+  one approval. This is deliberately unlike `multica`'s loopback-listener
+  design (a session JWT in a URL, SSH-hostile, LAN-exposed binding
+  heuristics) — see the PRD's inspiration-check table.
+
 ## Docs
 
 The `/docs` section (`web/src/pages/Docs.tsx`, `web/src/pages/DocPage.tsx`)

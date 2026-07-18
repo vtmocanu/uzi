@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -82,57 +83,16 @@ var runInputKinds = map[string]bool{
 // DTOs
 // -------------------------------------------------------------------------
 
-type workerDTO struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
-	// controller runs in the cluster, PRD #58). HostedSize is the S/M/L preset name,
-	// null for an external worker. Together they are what lets the UI mark hosted
-	// rows (Decision 10: status stays heartbeat-driven for both kinds).
-	//
-	// hosted_generation is deliberately absent: it is controller-internal reconcile
-	// state, not browser state — the same rule that keeps session_id/last_seq off
-	// runDTO below.
-	Kind       string  `json:"kind"`
-	HostedSize *string `json:"hosted_size"`
-	// Busy is the any-kind non-terminal signal (PRD #42 Decision 10): true whenever
-	// the worker holds ANY active run, chat included — so a lone active chat still
-	// reads as busy even though active_runs (run-lane only) is 0.
-	Busy bool `json:"busy"`
-	// ActiveRuns is the worker's live count of active RUN-lane runs (chat excluded —
-	// chat has its own session budget); MaxConcurrentRuns is its advertised slot cap
-	// (null when unadvertised). Together they drive the "N/M runs" saturation badge
-	// (PRD #42).
-	ActiveRuns        int  `json:"active_runs"`
-	MaxConcurrentRuns *int `json:"max_concurrent_runs"`
-	// Worker template (PRD #18): the UI-declared choice and the worker's
-	// self-reported value. Either may be null (no choice / older image); the UI
-	// badges drift when both are set and differ.
-	TemplateDeclared *string    `json:"template_declared"`
-	TemplateReported *string    `json:"template_reported"`
-	Version          *string    `json:"version"`
-	LastHeartbeatAt  *time.Time `json:"last_heartbeat_at"`
-	CreatedAt        time.Time  `json:"created_at"`
-	// Latest container resource sample (PRD #49), all null until the worker reports
-	// one (and re-nulled if it stops). StatsMemLimitBytes is null when the container
-	// is unlimited or the sample came from the process fallback; StatsCPUPct is null
-	// on the worker's first tick. StatsSource is "cgroup" or "process" (the UI labels
-	// a process-source sample "worker process only"). Freshness is LastHeartbeatAt —
-	// an offline worker's stats are last-known, dimmed by the client.
-	StatsCPUPct        *float64 `json:"stats_cpu_pct"`
-	StatsMemBytes      *int64   `json:"stats_mem_bytes"`
-	StatsMemLimitBytes *int64   `json:"stats_mem_limit_bytes"`
-	StatsSource        *string  `json:"stats_source"`
-}
+// workerDTO/runDTO/messageDTO moved to the stdlib-only apitypes leaf (PRD #64 M1);
+// the mappers below stay here as the store→DTO builders.
 
 // workerDTOFromWorker builds the DTO from a bare worker row plus its active (non-chat)
 // run count and its any-kind busy flag — both computed by the list queries, never
 // derivable from a bare Worker row. The register/heartbeat/create paths hold neither
 // (a just-registered worker has requeued its orphans and holds nothing), so they pass
 // 0/false, exactly as they previously passed busy=false.
-func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) workerDTO {
-	return workerDTO{
+func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) apitypes.WorkerDTO {
+	return apitypes.WorkerDTO{
 		ID:                 w.ID.String(),
 		Name:               w.Name,
 		Status:             w.Status,
@@ -153,8 +113,8 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool) workerDTO {
 	}
 }
 
-func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
-	return workerDTO{
+func workerDTOFromRow(w store.ListWorkersByUserRow) apitypes.WorkerDTO {
+	return apitypes.WorkerDTO{
 		ID:                 w.ID.String(),
 		Name:               w.Name,
 		Status:             w.Status,
@@ -175,102 +135,8 @@ func workerDTOFromRow(w store.ListWorkersByUserRow) workerDTO {
 	}
 }
 
-// runDTO is the web view of a run. session_id and last_seq are intentionally
-// omitted — they are worker-internal (resume plumbing), not browser state.
-type runDTO struct {
-	ID string `json:"id"`
-	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
-	// issue/ci_fix runs.
-	RepoID *string `json:"repo_id"`
-	// ForgeType is the run's forge ("gitlab"|"forgejo"), so the web picks the
-	// per-run MR/PR noun and reference sigil (PRD #65 D2). "" on the worker/create
-	// DTO paths, which never render the MR affordance in a browser; set on the
-	// list/detail reads (ListRuns/AdminListRuns/GetRun) from the run's connection.
-	ForgeType string `json:"forge_type"`
-	// Kind is issue|ci_fix|chat. IssueIID is null for ci_fix (no issue) and chat
-	// runs; the ci_fix fields below carry pipeline context, chat carries Title.
-	Kind             string `json:"kind"`
-	IssueIID         *int64 `json:"issue_iid"`
-	IssueTitle       string `json:"issue_title"`
-	IssueDescription string `json:"issue_description"`
-	// Title is the chat conversation's display title (PRD #39), null for
-	// issue/ci_fix runs. ResumeOfRunID points a Continue chat at the ended chat it
-	// resumes (Decision 11), null otherwise.
-	Title          *string `json:"title"`
-	ResumeOfRunID  *string `json:"resume_of_run_id"`
-	Status         string  `json:"status"`
-	RequeueCount   int32   `json:"requeue_count"`
-	IterationCount int32   `json:"iteration_count"`
-	AutoApprove    bool    `json:"auto_approve"`
-	WorkerID       *string `json:"worker_id"`
-	Branch         *string `json:"branch"`
-	MrIID          *int64  `json:"mr_iid"`
-	// MrWebURL is the forge-supplied MR/PR web URL persisted by the worker at MR
-	// creation (PRD #65 D8), null on runs created before it landed. The web renders
-	// it directly through isHttpsUrl and only falls back to the legacy GitLab URL
-	// reconstruction for those null rows — it is the only correct link on Forgejo.
-	MrWebURL *string `json:"mr_web_url"`
-	// MrState is the last merge-request state the PRD #24 watcher observed for
-	// mr_iid (opened|closed|merged|locked), null when never observed. Display-only
-	// and best-effort (PRD #33 Decision 1): the chip treats merged/closed distinctly
-	// and everything else as the plain open chip. Frozen per run — a superseded
-	// run's value can be stale, so freshness is scoped to the board card in the UI.
-	MrState       *string `json:"mr_state"`
-	FailureReason *string `json:"failure_reason"`
-	// StopKind is the server-stamped deliberate-stop signal (PRD #33): "cancelled"
-	// or "plan_rejected", null for every other run. It — not the failure_reason
-	// text — is what the client's isStoppedRun reads to style a stop as calm/neutral.
-	StopKind *string `json:"stop_kind"`
-	// Run health (PRD #47). This DTO is owner-scoped (ListRuns owner-only,
-	// AdminListRuns admin-only, GetRun owner/admin), so health_reason rides
-	// unconditionally here, matching failure_reason — the owner-gating that the shared
-	// board applies is unnecessary. Health is the flag enum; HealthSince (when it was
-	// raised) drives the run-view "stuck for Xm".
-	Health       string     `json:"health"`
-	HealthReason *string    `json:"health_reason"`
-	HealthSince  *time.Time `json:"health_since"`
-	PlanMd       *string    `json:"plan_md"`
-	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
-	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
-	// (verified|fix_failed|not_code|null-while-unverified).
-	PipelineRef    *string    `json:"pipeline_ref"`
-	PipelineWebURL *string    `json:"pipeline_web_url"`
-	FixVerdict     *string    `json:"fix_verdict"`
-	ClaimedAt      *time.Time `json:"claimed_at"`
-	StartedAt      *time.Time `json:"started_at"`
-	FinishedAt     *time.Time `json:"finished_at"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	// Per-run agent selection (PRD #37). RepoAgents is the roster the worker
-	// detected in the clone's .claude/agents/: null when no worker ever reported
-	// (a pre-feature run), `[]` when detection ran and found none. The plan gate
-	// distinguishes those two — an inert repo card vs. a live one — so do not
-	// collapse them. AgentSource/AgentExclusions stay null until a selection is
-	// made, at the gate or by an autopilot run's self-resolved default.
-	//
-	// The names and descriptions here are REPO-SUPPLIED text. The gate panel
-	// renders them as plain JSX, never through <Markdown>: an attacker-authored
-	// description must not put a clickable link inside an approval dialog.
-	RepoAgents      []workersvc.RepoAgent `json:"repo_agents"`
-	AgentSource     *string               `json:"agent_source"`
-	AgentExclusions []string              `json:"agent_exclusions"`
-	// OwnAgents is the OWN-source subagent roster (name + description) the run's
-	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
-	// minus the lead. It is the single source of truth the plan-gate "My agent
-	// templates" picker reads, so an excludable chip always matches what the
-	// approve validator accepts and the count is exact (PRD #37 M4-fix). Populated
-	// only on the run-detail read (GetRun), where the store is in reach; null (a Go
-	// nil slice) on the list/create/worker DTOs, which never drive the picker.
-	OwnAgents []workersvc.RepoAgent `json:"own_agents"`
-	// Usage is the run's rolled-up token/cost totals (PRD #40), present only when the
-	// run has usage rows — null for a pre-feature run so the UI shows nothing rather
-	// than a fabricated 0. Populated on the list (ListRuns) and detail (GetRun) reads;
-	// nil on the create/worker DTO paths, which never render usage.
-	Usage *usageDTO `json:"usage,omitempty"`
-}
-
-func runToDTO(r store.Run) runDTO {
-	dto := runDTO{
+func runToDTO(r store.Run) apitypes.RunDTO {
+	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
 		Kind:             r.Kind,
 		IssueTitle:       r.IssueTitle,
@@ -356,16 +222,8 @@ func failureSnapshotWebURL(raw []byte) string {
 	return snap.WebURL
 }
 
-type messageDTO struct {
-	Seq       int32           `json:"seq"`
-	Kind      string          `json:"kind"`
-	Agent     *string         `json:"agent"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
-}
-
-func messageToDTO(m store.RunMessage) messageDTO {
-	return messageDTO{
+func messageToDTO(m store.RunMessage) apitypes.MessageDTO {
+	return apitypes.MessageDTO{
 		Seq:       m.Seq,
 		Kind:      m.Kind,
 		Agent:     textPtrValue(m.Agent.Valid, m.Agent.String),
@@ -435,7 +293,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]workerDTO, 0, len(rows))
+	out := make([]apitypes.WorkerDTO, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, workerDTOFromRow(row))
 	}
@@ -603,7 +461,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// (a pre-feature run shows nothing). Best-effort like OwnAgents above: a lookup
 	// error must not fail the read of an otherwise-fine run.
 	if u, err := h.wsvc.RunUsageTotal(r.Context(), run.ID); err == nil {
-		dto.Usage = &usageDTO{
+		dto.Usage = &apitypes.UsageDTO{
 			InputTokens:         u.InputTokens,
 			CacheReadTokens:     u.CacheReadTokens,
 			CacheCreationTokens: u.CacheCreationTokens,
@@ -649,7 +507,7 @@ func (h *Handler) ListRunMessages(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]messageDTO, 0, len(msgs))
+	out := make([]apitypes.MessageDTO, 0, len(msgs))
 	for _, m := range msgs {
 		out = append(out, messageToDTO(m))
 	}
@@ -670,15 +528,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid run id")
 		return
 	}
-	var req struct {
-		Kind string `json:"kind"`
-		Body string `json:"body"`
-		// Selection is the PRD #37 agent choice, sent STRUCTURED and legal only with
-		// approve_plan. The client never composes the worker-bound input body itself:
-		// the server validates this against the run's real roster and writes its own
-		// canonical JSON encoding into that body.
-		Selection *workersvc.AgentSelection `json:"selection"`
-	}
+	var req apitypes.RunInputRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -703,5 +553,5 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusAccepted, map[string]any{"server_side": res.ServerSide})
+	httpx.JSON(w, http.StatusAccepted, apitypes.RunInputResponse{ServerSide: res.ServerSide})
 }

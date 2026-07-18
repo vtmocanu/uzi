@@ -25,6 +25,7 @@ entries=(
   "anthropic-token-settings.png|Anthropic token settings|Settings > Anthropic token: paste field and Set status"
   "agent-templates-editor.png|Agent template editor|prompt body with a live Markdown preview"
   "worker-setup-join-token.png|Worker join token|Settings > Workers: generated token, shown once"
+  "cli-access-settings.png|Settings > Access|CLI token list: prefix, last used, last IP, Revoke all"
 )
 
 for e in "${entries[@]}"; do

@@ -28,6 +28,13 @@ var (
 	slackTokenPattern = regexp.MustCompile(`x(?:ox[bpoas]|app)-[A-Za-z0-9-]+`)
 	anthropicPattern  = regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]+`)
 	gitlabPATPattern  = regexp.MustCompile(`glpat-[A-Za-z0-9_-]+`)
+	// uziTokenPattern covers uzi's own Bearer credentials — uzw_ (worker join token),
+	// uzc_ (user CLI token) and uza_ (admin_ro CLI token) (PRD #64 Risk 14). The CLI
+	// PRD tells users to put UZI_TOKEN in a GitLab CI variable, which creates the
+	// echo-into-a-trace path this scrub defends: a uzc_/uza_ minted here must never
+	// survive into an outbound Slack message. The {16,} body avoids matching the short
+	// "uzc_a1b2" display prefix (only 4 body chars), which is not a secret.
+	uziTokenPattern = regexp.MustCompile(`uz[caw]_[A-Za-z0-9_-]{16,}`)
 )
 
 // ScrubTokens replaces any Slack token substring with a placeholder. slack-go's
@@ -38,14 +45,16 @@ func ScrubTokens(s string) string {
 	return slackTokenPattern.ReplaceAllString(s, "[redacted]")
 }
 
-// ScrubSecrets is the widened outbound scrub (PRD #25 M2): every secret family
-// uzi handles — Slack tokens, the per-user Anthropic key, and a GitLab PAT.
-// Everything sent to Slack passes through it as a last line of defense so a
-// credential that somehow reached a status/title string never leaves the box.
+// ScrubSecrets is the widened outbound scrub (PRD #25 M2, extended PRD #64 M5):
+// every secret family uzi handles — Slack tokens, the per-user Anthropic key, a
+// GitLab PAT, and uzi's own uzw_/uzc_/uza_ Bearer credentials. Everything sent to
+// Slack passes through it as a last line of defense so a credential that somehow
+// reached a status/title string never leaves the box.
 func ScrubSecrets(s string) string {
 	s = slackTokenPattern.ReplaceAllString(s, "[redacted]")
 	s = anthropicPattern.ReplaceAllString(s, "[redacted]")
 	s = gitlabPATPattern.ReplaceAllString(s, "[redacted]")
+	s = uziTokenPattern.ReplaceAllString(s, "[redacted]")
 	return s
 }
 

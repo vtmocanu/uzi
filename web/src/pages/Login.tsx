@@ -20,6 +20,20 @@ function oidcErrorMessage(code: string | null): string | null {
   return OIDC_ERROR_MESSAGES[code] ?? "Sign-in failed. Please try again.";
 }
 
+// safeNextPath returns a same-origin internal path to return to after login, or
+// "/dashboard" for anything unsafe. It admits only a rooted path ("/…") that is
+// NOT protocol-relative ("//host") and contains NO backslash: this feeds
+// react-router navigate() today (client-side, so "/\evil.com" is inert), but
+// window.location normalizes "\"→"/", so the day a refactor points it at
+// window.location.assign, "/\evil.com" would become a live open redirect. Reject
+// the backslash here so that refactor can't silently reopen the hole.
+export function safeNextPath(next: string | null): string {
+  if (next && next.startsWith("/") && !next.startsWith("//") && !next.includes("\\")) {
+    return next;
+  }
+  return "/dashboard";
+}
+
 // ssoButtonClass matches the secondary Button variant, but as an anchor: the SSO
 // button is a full-page navigation to the API redirect endpoint (a server 302 to the
 // IdP), NOT a fetch, so it must be a real link.
@@ -52,13 +66,20 @@ export function Login() {
 
   const oidcError = oidcErrorMessage(searchParams.get("error"));
 
+  // Where to land after login. Defaults to /dashboard; a ?next= (set by the CLI
+  // consent page so it is returned to after logging in) overrides it, but only for
+  // a same-origin internal path — see safeNextPath (rejects absolute,
+  // protocol-relative, and backslash vectors) so it can never become an open
+  // redirect.
+  const returnTo = safeNextPath(searchParams.get("next"));
+
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
     setSubmitting(true);
     try {
       await login(email, password);
-      navigate("/dashboard");
+      navigate(returnTo);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong");
     } finally {

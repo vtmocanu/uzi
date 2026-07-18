@@ -6,26 +6,14 @@ import (
 
 	"github.com/google/uuid"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 )
 
-// runListItemDTO is a run row for the Runs index and the admin Agents-status
-// overview: the run plus display context (repo path, worker name) and, for the
-// admin view, the owning user's email.
-type runListItemDTO struct {
-	runDTO
-	RepoPath   string  `json:"repo_path"`
-	WorkerName *string `json:"worker_name"`
-	OwnerEmail *string `json:"owner_email,omitempty"`
-}
-
-// adminWorkerDTO is a worker plus its owner email for the admin Agents-status
-// page.
-type adminWorkerDTO struct {
-	workerDTO
-	OwnerEmail string `json:"owner_email"`
-}
+// runListItemDTO (apitypes.RunListItemDTO) and adminWorkerDTO
+// (apitypes.AdminWorkerDTO) moved to the stdlib-only apitypes leaf (PRD #64 M1);
+// the mappers below stay here.
 
 // ListRuns returns the current user's runs, newest first. Optional ?repo_id= and
 // ?issue_iid= narrow the list (repo scope for the board attention strip, repo +
@@ -60,10 +48,10 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]runListItemDTO, 0, len(rows))
+	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
-		item := runListItemDTO{
-			runDTO:     runToDTO(row.Run),
+		item := apitypes.RunListItemDTO{
+			RunDTO:     runToDTO(row.Run),
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 		}
@@ -83,11 +71,11 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]runListItemDTO, 0, len(rows))
+	out := make([]apitypes.RunListItemDTO, 0, len(rows))
 	for _, row := range rows {
 		email := row.OwnerEmail
-		item := runListItemDTO{
-			runDTO:     runToDTO(row.Run),
+		item := apitypes.RunListItemDTO{
+			RunDTO:     runToDTO(row.Run),
 			RepoPath:   row.RepoPath,
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 			OwnerEmail: &email,
@@ -107,10 +95,10 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := make([]adminWorkerDTO, 0, len(rows))
+	out := make([]apitypes.AdminWorkerDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, adminWorkerDTO{
-			workerDTO:  workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy),
+		out = append(out, apitypes.AdminWorkerDTO{
+			WorkerDTO:  workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy),
 			OwnerEmail: row.OwnerEmail,
 		})
 	}

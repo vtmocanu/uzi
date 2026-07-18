@@ -5,6 +5,8 @@
 package store
 
 import (
+	"net/netip"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -67,6 +69,32 @@ type BoardColumn struct {
 	RepoID    uuid.UUID `json:"repo_id"`
 	LabelName string    `json:"label_name"`
 	Position  int32     `json:"position"`
+}
+
+type CliAuthRequest struct {
+	ID            uuid.UUID          `json:"id"`
+	CodeChallenge string             `json:"code_challenge"`
+	ClientDesc    string             `json:"client_desc"`
+	UserCode      string             `json:"user_code"`
+	Status        string             `json:"status"`
+	UserID        pgtype.UUID        `json:"user_id"`
+	Scope         string             `json:"scope"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+}
+
+type CliToken struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	Name        string             `json:"name"`
+	TokenHash   []byte             `json:"token_hash"`
+	TokenPrefix string             `json:"token_prefix"`
+	Scope       string             `json:"scope"`
+	Revoked     bool               `json:"revoked"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
 type ForgeConnection struct {

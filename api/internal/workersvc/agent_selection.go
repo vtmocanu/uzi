@@ -7,6 +7,7 @@ import (
 	"unicode"
 
 	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // Per-run agent selection (PRD #37).
@@ -50,22 +51,16 @@ const (
 	AgentSourceOwn  = "own"
 )
 
-// RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/.
-// Names and descriptions only: the prompt bodies stay worker-side, so nothing this
-// struct carries is ever executed — it is what the approval gate renders and what
-// the run view shows afterwards.
-type RepoAgent struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-}
+// RepoAgent and AgentSelection are defined in apitypes (the stdlib-only leaf the
+// uzi CLI links, PRD #64 M1) and re-exported here as type ALIASES. Aliases, not new
+// types, so every existing workersvc.RepoAgent / workersvc.AgentSelection reference,
+// the validate* free functions below, and DecodeRepoAgents/DecodeExclusions keep
+// compiling unchanged. The Max* caps and all validation logic stay in this package;
+// apitypes owns only the wire shape. See apitypes/agent.go for the field docs.
+type RepoAgent = apitypes.RepoAgent
 
-// AgentSelection is which roster a run's subagents come from, minus the agents the
-// user excluded. Either/or, no mixing (Decision 4). The lead is always uzi's
-// builtin and is never selectable or excludable (Decision 3).
-type AgentSelection struct {
-	Source     string   `json:"source"`
-	Exclusions []string `json:"exclusions"`
-}
+// AgentSelection — see RepoAgent.
+type AgentSelection = apitypes.AgentSelection
 
 // validateRepoAgents enforces every bound on a worker-reported roster: length,
 // per-item name shape and length, description length, and the absence of control
