@@ -48,6 +48,18 @@ Every poll tick, uzi caches each watched ref's latest CI pipeline and renders a 
 
 See [ARCHITECTURE.md](ARCHITECTURE.md#ci-status--fix-agent-prd-6) and [configuration](docs/configuration.md#ci-status-integration-prd-6) for the pipeline-sync + verification design and its knobs.
 
+### Drive it from the terminal
+
+`uzi`, a CLI installed via Homebrew, gives humans and agents the same control without a browser tab: list, inspect, approve, and steer runs, read the judge's review, and manage workers and repos — human-readable tables on a TTY, `--json` plus documented exit codes for scripts and agents.
+
+```sh
+brew install vtmocanu/tap/uzi-cli   # vtmocanu group access; builds from source
+uzi login                          # humans; or set UZI_TOKEN from Settings -> Access
+uzi run list
+```
+
+An agent drives it fully headless with a Bearer token in `UZI_TOKEN` — no browser, no cookie, no `$HOME` — and the CLI even installs its own skill so an agent knows the command surface. See [docs/cli.md](docs/cli.md).
+
 ## Documentation
 
 Full docs live in [docs/](docs/), and the same golden-path pages are
@@ -60,6 +72,7 @@ browsable in-app under **Docs**:
 - [Anthropic token](docs/anthropic-token.md)
 - [Agent templates](docs/agent-templates.md)
 - [Worker setup](docs/worker-setup.md)
+- [CLI](docs/cli.md)
 - [Installation](docs/installation.md)
 - [Configuration](docs/configuration.md)
 - [Auth design](docs/auth-design.md)
