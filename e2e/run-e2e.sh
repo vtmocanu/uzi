@@ -614,6 +614,46 @@ if [ "$FORGE" = forgejo ]; then
   pass "< 16.0.0 forge refused with the version-downgrade finding (ErrForgeVersionUnsupported) ✓"
   fake_post /_e2e/forgejo-version '{"version":"16.0.0+gitea-1.22.0"}' >/dev/null  # restore
 
+  # 2b) Connect-POST validation (M6b go-live). The db-flip above tests the RUNTIME
+  #     against a forgejo connection, but not the SAVE-TIME connect flow — the one
+  #     path structurally unreachable in M9 (the gate rejected forge_type:forgejo
+  #     until M6b). Now that the gate is open, a fresh user connects forgejo via the
+  #     REAL POST /api/forge/connections, exercising the save-time gates:
+  #       good >=16 + correct scopes -> created; <16 -> refused (VerifyToken version
+  #       gate); over-privileged -> 422 (CheckToken scope block, D6b).
+  say "forgejo connect POST (M6b go-live): good >=16 connects; <16 refused; over-privileged 422"
+  FJCJAR="$RUNROOT/fj-connect.jar"
+  curl -fsS -c "$FJCJAR" -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' \
+    -d '{"email":"fj-connect@uzi.e2e","password":"e2e-fj-connect-pass-0000"}' >/dev/null \
+    || fail "fresh forgejo-connect user could not register"
+  fj_conn_post() {  # BODY OUTFILE -> prints HTTP status
+    curl -sS -b "$FJCJAR" -o "$2" -w '%{http_code}' -X POST "$BASE/api/forge/connections" \
+      -H 'Content-Type: application/json' -H "X-CSRF-Token: $(awk '$6=="uzi_csrf"{print $7}' "$FJCJAR")" -d "$1"
+  }
+  # The advert now lists forgejo (the picker's source of truth).
+  apiget /api/forge/config | jq -e '.forge_types | index("forgejo")' >/dev/null \
+    || fail "ForgeConfig must advertise forgejo after the M6b flip"
+  # a) good >=16 + correct scopes -> 201 created (the real connect path).
+  FJGOOD="$RUNROOT/fj-good.json"
+  GC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-good-pat-000000"}' "$FJGOOD")"
+  [ "$GC" = 201 ] || fail "forgejo connect (good >=16) expected 201, got $GC ($(cat "$FJGOOD"))"
+  [ "$(jq -r '.connection.forge_type // empty' "$FJGOOD")" = forgejo ] || fail "created connection is not forge_type=forgejo: $(cat "$FJGOOD")"
+  pass "forgejo connect POST created a connection against a good >=16 instance (VerifyToken + scope gate pass) ✓"
+  # b) < 16.0.0 -> refused at VerifyToken's version gate (not created).
+  fake_post /_e2e/forgejo-version '{"version":"15.0.4+gitea-1.22.0"}' >/dev/null
+  FJLOW="$RUNROOT/fj-low.json"
+  LC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-good-pat-000000"}' "$FJLOW")"
+  case "$LC" in 2*) fail "forgejo connect against a <16 instance must be refused, got $LC ($(cat "$FJLOW"))";; esac
+  grep -qi "16.0.0\|older than the minimum\|version" "$FJLOW" || fail "the <16 refusal must name the version, got $(cat "$FJLOW")"
+  pass "forgejo connect POST refused against a < 16.0.0 instance, naming the required version (save-time gate) ✓"
+  fake_post /_e2e/forgejo-version '{"version":"16.0.0+gitea-1.22.0"}' >/dev/null  # restore
+  # c) over-privileged token -> 422 + violations (D6b save-time scope block).
+  FJOVER="$RUNROOT/fj-over.json"
+  OC="$(fj_conn_post '{"forge_type":"forgejo","base_url":"https://forge-fake.e2e","token":"e2e-forgejo-overpriv-pat-0000"}' "$FJOVER")"
+  [ "$OC" = 422 ] || fail "forgejo connect (over-privileged) expected 422, got $OC ($(cat "$FJOVER"))"
+  jq -e '.violations | length > 0' "$FJOVER" >/dev/null 2>&1 || fail "422 body missing violations: $(cat "$FJOVER")"
+  pass "forgejo connect POST 422s an over-privileged token with violations (D6b scope block) ✓"
+
   # 3) Bring the worker online (same path as the GitLab lane).
   say "issue a worker join token and bring the worker online"
   WTOKEN="$(apipost /api/workers '{"name":"e2e-worker-fj"}' | jq -r '.token')"

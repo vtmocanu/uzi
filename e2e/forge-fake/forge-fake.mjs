@@ -641,9 +641,15 @@ const server = https.createServer(
       const m = /^token\s+(.+)$/i.exec(req.headers["authorization"] || "");
       const pat = m ? m[1] : "";
       const last8 = pat.length >= 8 ? pat.slice(-8) : pat;
-      return send(res, 200, [
-        { id: 1, name: "uzi-bot", token_last_eight: last8, scopes: ["write:issue", "write:repository", "read:user"] },
-      ]);
+      // Over-privileged iff the PAT itself signals it ("overpriv"), so the harness
+      // can drive both the compliant seed PAT and a rejected over-privileged one
+      // (the save-time scope block, D6b) against one fake — mirroring the GitLab
+      // /personal_access_tokens/self behaviour. Forgejo collapses a full write:* set
+      // to the single "all" token, which D6b rejects.
+      const scopes = pat.includes("overpriv")
+        ? ["all"]
+        : ["write:issue", "write:repository", "read:user"];
+      return send(res, 200, [{ id: 1, name: "uzi-bot", token_last_eight: last8, scopes }]);
     }
     const fjUser = path.match(/^\/api\/v1\/users\/([^/]+)$/);
     if (method === "GET" && fjUser && fjUser[1] !== "search") {
