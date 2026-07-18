@@ -1,7 +1,7 @@
 # PRD #64: uzi CLI — terminal control of the factory for humans and agents
 
 **GitLab Issue**: [#64](https://gitlab.example.com/vtmocanu/uzi/-/issues/64)
-**Status**: Draft (created 2026-07-17; revised same day after review / fact-check / security audit — the token `scope` ceiling was found to be unenforced outside `/api/admin/*` and the route swap was narrowed from groups to an enumerated per-route list)
+**Status**: Complete (implemented 2026-07-17, merged to main 2026-07-18 via MR !67; all 11 milestones landed, reviewed, and live-validated)
 **Priority**: Medium
 **Created**: 2026-07-17
 **Depends on**: PRD #1 (auth/session — the chokepoint this brokers off), PRD #4 (workers/runs), PRD #45 (OIDC — the *other* login that converges on the same chokepoint), PRD #52 (CI shape + `v*` tag releases, which the CLI now rides).
@@ -624,7 +624,7 @@ browser.
 
 Phase 1 (parallel — disjoint files):
 
-- [ ] **M1: `apitypes` leaf extraction** — `api/internal/apitypes/` (stdlib-only); handlers
+- [x] **M1: `apitypes` leaf extraction** — `api/internal/apitypes/` (stdlib-only); handlers
   re-pointed. Pure refactor, no behaviour change. **The set is exactly the DTOs behind the
   `RequireUser` routes** (so an M1 agent running beside M3 need not guess it):
 
@@ -645,7 +645,7 @@ Phase 1 (parallel — disjoint files):
   payloads still pass unmodified, proving byte-identical JSON. If a DTO has no such test, add the
   assertion **before** moving the type — an extraction without a pinning test is a silent
   contract change.
-- [ ] **M2: CLI token credential + admin split + the group split** — `clitoken` pkg
+- [x] **M2: CLI token credential + admin split + the group split** — `clitoken` pkg
   (`uzc_`/`uza_`), `cli_tokens` (draft `00067`, incl. `last_used_ip`), `RequireUser` (**including
   the `IsAdmin=false` context copy for non-`admin_ro` tokens**), `RequireAdminRO`,
   `/api/me/cli-tokens` CRUD **+ `revoke-all`** (all cookie-only), the `/api/admin` 9-read/4-write
@@ -714,14 +714,14 @@ Phase 1 (parallel — disjoint files):
   first, limiter second.
   *Shares `handler.go` with M1 (different hunks) and with **PRD #58's unmerged `/api/workers`
   edits** — rebase onto post-#58 `main`.*
-- [ ] **M3: CLI skeleton** — `api/cmd/uzi/` (cobra root, noun stubs) + `api/internal/uzicli/`
+- [x] **M3: CLI skeleton** — `api/cmd/uzi/` (cobra root, noun stubs) + `api/internal/uzicli/`
   (output: tables/`--json`/exit codes; config: files, perms, env override). Client is an interface
   with a fake; no live calls. Includes the `go list -deps ./cmd/uzi` layering assertion. Success:
   the existing `validate:api`/`test:api` go green with **zero CI edits**; `uzi --help` renders the
   tree; the layering assertion fails when someone imports `internal/handler`.
 Phase 1b (**M4 — starts the moment M3's binary compiles; it is not parallel with M3**):
 
-- [ ] **M4: brew spike** (still the earliest possible slot — it settles the riskiest assumption
+- [x] **M4: brew spike** (still the earliest possible slot — it settles the riskiest assumption
   before any release plumbing exists) — `Formula/uzi-cli.rb` + `scripts/brew-local-test.sh`.
   **Depends on M3**: a from-source formula needs a compilable `api/cmd/uzi` to build at all, and
   the spike tests against M3's binary. It needs only *a binary that builds*, not the real command
@@ -736,7 +736,7 @@ Phase 1b (**M4 — starts the moment M3's binary compiles; it is not parallel wi
 
 Phase 2 (sequential, except M6 ∥ M7):
 
-- [ ] **M5: browser-brokered auth** — `cli_auth_requests` (draft `00068`) +
+- [x] **M5: browser-brokered auth** — `cli_auth_requests` (draft `00068`) +
   `/api/auth/cli/{start,poll,request,approve,deny}`; the server applies the expiry matrix at mint.
   Success: the flow mints exactly one token; a replayed poll 410s; a wrong verifier never mints;
   expiry enforced server-side.
@@ -747,7 +747,7 @@ Phase 2 (sequential, except M6 ∥ M7):
   the review ingest and the Slack path. **Non-optional and non-deferrable**: this PRD tells users to
   put `UZI_TOKEN` in GitLab CI, so it *creates* the echo-into-a-trace path, and shipping the mint
   without the scrub means the leak exists for however long the gap lasts.
-- [ ] **M6: SPA surfaces** — CLI-tokens section in Settings (create/list/revoke, show-once,
+- [x] **M6: SPA surfaces** — CLI-tokens section in Settings (create/list/revoke, show-once,
   **scope picker offered only to admins**) + the `/cli-auth` consent page (names the requesting
   host and the scope; **the user types the `user_code`, not merely compares it**).
   The token list **must render `token_prefix`, `last_used_at` and `last_used_ip`** — they are the
@@ -759,7 +759,7 @@ Phase 2 (sequential, except M6 ∥ M7):
   "enumerate each one" degrades exactly as it matters most. It is one comparison against a column
   already on screen. Anything more — auto-revoking stale tokens — is a policy change and would need
   its own ruling.)* *Runs parallel with M7 — `web/` vs `api/cmd/uzi/`.*
-- [ ] **M7: real client + read commands** — `internal/uzicli/client.go` importing `apitypes`
+- [x] **M7: real client + read commands** — `internal/uzicli/client.go` importing `apitypes`
   directly, `uzi auth token` (stdin), `whoami`, `run list/get/logs` (polling `?after=<seq>`),
   `run review`, `worker list`, `repo list`, plus a **malformed-response test**.
   **`run review` specifics** (Decision 21): human output is the verdict line + one row per
@@ -778,12 +778,12 @@ Phase 2 (sequential, except M6 ∥ M7):
 
   **`target`, `rationale_md` and `summary_md` are UNTRUSTED DATA, and the SKILL.md must say so.**
   *(Security audit, 2026-07-17 — F-A, a risk this amendment **creates**.)* See Decision 21.
-- [ ] **M7b: admin read verbs** — `uzi admin users|runs|workers|usage|rate-limits`, `--json`-first.
+- [x] **M7b: admin read verbs** — `uzi admin users|runs|workers|usage|rate-limits`, `--json`-first.
   Exits **3** with an actionable message when the token lacks `admin_ro` ("mint an admin-scoped
   token"), not a bare 403. Fold into M7 if preferred.
-- [ ] **M8: `uzi login` + write commands** — browser flow; `run create/approve/reject/cancel/
+- [x] **M8: `uzi login` + write commands** — browser flow; `run create/approve/reject/cancel/
   follow-up`; surface the locked-vault health reason.
-- [ ] **M9: bundled skill + self-upgrade** — `go:embed`, content-hash staleness, `.bak` rescue,
+- [x] **M9: bundled skill + self-upgrade** — `go:embed`, content-hash staleness, `.bak` rescue,
   atomic rename, never-fatal, plus the **skill↔cobra-tree test**. *Needs M8: the skill must
   document the final surface, or it ships stale.* **Concretely, post-D1**: author the SKILL.md
   **after** the tree settles or it will document `uzi worker create`, which no longer exists — and
@@ -792,12 +792,12 @@ Phase 2 (sequential, except M6 ∥ M7):
 
 Phase 3 (release + docs):
 
-- [ ] **M10: release pipeline** — `publish_brew` (tag-only, `needs: *publish_needs`,
+- [x] **M10: release pipeline** — `publish_brew` (tag-only, `needs: *publish_needs`,
   `TAP_WRITE_TOKEN` protected+masked). Copies `Formula/uzi-cli.rb` into the tap, bumps the pinned
   tag, creates the informational `uzi-cli-<version>` tap tag. Tap README gains the `uzi-cli` row +
   the access caveat. Success: `git tag vX.Y.Z && git push --tags` ⇒ `brew install uzi-cli` on a
   clean machine yields a working binary whose `uzi version` == the tag.
-- [ ] **M11: docs + the feedback loop (explicit user requirement)** — **`CLAUDE.md` rule: new uzi
+- [x] **M11: docs + the feedback loop (explicit user requirement)** — **`CLAUDE.md` rule: new uzi
   functionality ⇒ check whether `api/cmd/uzi/` needs a matching change**, now enforceable in one MR
   (the thing a separate repo could never offer). Plus ARCHITECTURE.md (the CLI as the second API
   consumer; `RequireUser`/`RequireAdminRO`; the `apitypes` leaf + layering assertion),
