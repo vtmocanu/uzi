@@ -1,7 +1,7 @@
-# PRD #69: Judge mode (off / optional / enforced) + per-user judge model + opus default + spend guards + judge run cost/time visibility
+# PRD #69: Judge mode (off / optional / enforced) + per-user judge model + opus default + spend guards + judge run cost/time visibility + judge accuracy (deterministic signals + pre-start gating)
 
 **GitLab Issue**: [#69](https://gitlab.example.com/vtmocanu/uzi/-/issues/69)
-**Status**: Draft (created 2026-07-17; revised 2026-07-17 after fact-check + architecture + risk review, then spend guards folded in per user request, then judge run cost/time visibility (M6) folded in per user request)
+**Status**: Draft (created 2026-07-17; revised 2026-07-17 after fact-check + architecture + risk review, then spend guards folded in per user request, then judge run cost/time visibility (M6) folded in per user request; then judge-accuracy work (M7: deterministic env/failure-class signals + gate off pre-start infra failures) folded in 2026-07-18 per user request — from issue #81, surfaced by the #78 provisioning misjudgment)
 **Priority**: Medium
 **Supersedes**: PRD #59 (default judge model → sonnet). #59's single change (flip the compiled-in default) is folded in here, but the value is **opus**, not sonnet — see Decision 1, which reverses #59's Decision 1. #59 is closed as superseded.
 **Related**: PRD #46 (run judge + self-improvement — introduced `judge_enabled`, `judge_model`, and the per-user `users.judge_enabled` opt-in this PRD extends). PRD #17 (per-user `default_model` — the layering pattern this PRD mirrors for the judge model).
@@ -30,10 +30,27 @@ to soften:
    produces shallow self-improvement work. #59 proposed sonnet; the decision
    here (Decision 1) is opus, with the new per-user override as the cost lever.
 
+4. **The judge misclassifies failures it has no ground truth for.** It reasons
+   only from the run transcript (`JUDGE_SYSTEM_PROMPT` — "reason only from the
+   trace text; you have NO tools", `agent/src/judge-runner.ts:71`); `buildJudgePrompt`
+   (`:293`) feeds it the header, steering log, a deterministic command-not-found
+   pre-scan, and a sampled trace — but **no environment ground truth**. Real case
+   (issue #78): a hosted run failed in tool provisioning because `api.github.com`
+   was egress-denied on dev-cluster — at the time its worker allowlist was the
+   original three FQDNs (`deploy/values/dev-cluster.yaml`; github has since been
+   added as an interim unblock, with the durable fix being to pin nixpkgs so the
+   github dependency disappears — see issue #78). Given only "connection timed out,"
+   the judge called it a **transient infrastructure failure** and its
+   **high-confidence** recommendation was **retry with exponential backoff** — which
+   cannot work against a policy block. It also spent an opus retrospective on a run
+   that failed at 0 iterations, before the agent ever started. The judge failed from
+   missing inputs, not weak reasoning — and the input it needed (which failures are
+   permanent) is only partly derivable from data the API holds today (see Decision 11).
+
 ## Solution Overview
 
-Four changes (the first three are independently shippable; the fourth builds on
-the enqueue gate the first adds):
+The changes (mode / model / opus are independently shippable; spend guards, cost
+visibility, and accuracy build on the enqueue gate and judge paths the first adds):
 
 1. **Instance judge mode.** Keep `judge_enabled` as the master kill-switch and
    add an admin `judge_enforce_all` boolean. The enqueue gate resolves to three
@@ -59,6 +76,29 @@ the enqueue gate the first adds):
    `DefaultJudgeModel` from `haiku` to `opus` and align every surface that
    states or displays it. Admin-set values still win; the default only applies
    where the key is unset/blank.
+
+4. **Judge accuracy (deterministic signals + pre-start gating).** Changes so the
+   judge stops confidently misclassifying failures whose cause it cannot see
+   (Problem 4), split by what the API can already do:
+   - **M7a (the shippable core):** (a) the API computes a trusted, **closed-enum**
+     failure-class signal — extending the existing command-not-found pre-scan — from
+     data it already holds (the target run's `status`, `failure_reason`,
+     `iteration_count`), naming causes like `provisioning_failed` /
+     `provisioning_timeout` / `plan_approval_timeout` / `rate_limited`, fed into the
+     judge prompt as data the judge trusts over its own inference; plus one targeted
+     `JUDGE_SYSTEM_PROMPT` addition (transient≠permanent; no retry for a
+     policy/config-denied failure). (b) a **pre-start gate**: a run that failed before
+     the agent started (0 iterations AND an infra-class `failure_reason`) is routed to
+     a deterministic infra notification instead of an opus retrospective — cheaper and
+     more correct. M7a alone prevents both #78 failure modes (the run would not have
+     been judged at all).
+   - **M7b (deferred, low marginal value):** enriching the signal to name the specific
+     unreachable host and cross-check it against the deployment's egress allowlist. As
+     Decision 11 records, the API holds neither the allowlist nor the host today, so
+     this needs new config plumbing and a host source; and since github is now
+     allowlisted and pinning nixpkgs is #78's durable fix, its value is small.
+     Documented, not built.
+   Detailed in Decisions 11–12 and M7.
 
 ### Consent surface (enforced mode)
 
@@ -284,6 +324,60 @@ What does **not** change:
       figures; a judge run predating the feature (no `run_usage` row) renders no
       strip, never a fabricated 0 (the pre-feature-run rule PRD #40 already uses).
 
+11. **Feed the judge a deterministic, closed-enum failure-class signal; it trusts
+    it over its own inference.** Extends an existing pattern: the API already hands
+    the judge a trusted command-not-found pre-scan (`signalBlock`, `judge-runner.ts:310`,
+    assembled API-side). Add a **failure-class signal** over the *target* run,
+    computed from data the API already holds — `status`, `failure_reason`,
+    `iteration_count` (`store.Run`, `store/models.go`) — as a **closed enum**
+    (`provisioning_failed`, `provisioning_timeout`, `plan_approval_timeout`,
+    `rate_limited`, `agent_failure`, …). The `JUDGE_SYSTEM_PROMPT` gains ONE targeted
+    addition (the only prompt change this PRD makes — see the Out-of-Scope carve-out):
+    a network timeout is not automatically transient, and retry/backoff must not be
+    recommended for a policy- or config-denied failure. **Why signals over "make the
+    model smarter":** the judge failed here from missing inputs, not weak reasoning —
+    given the ground truth, "transient → retry" is not a reachable conclusion.
+    - **Trust boundary:** the signal is trusted API-computed data (like the
+      command-not-found scan), so it sits OUTSIDE the untrusted-trace fence. Because of
+      that it MUST be the enum value plus, at most, a **syntax-validated FQDN token** —
+      never interpolated raw `failure_reason` text (worker-reported and untrusted;
+      interpolating it would write attacker-controlled text into the judge's trusted
+      zone).
+    - **Cross-language coupling:** the infra classes are matched from `failure_reason`
+      prefixes authored in TypeScript (e.g. `REASON_PROVISION_FAILED`,
+      `agent/src/provision-run.ts:17`) plus API-side sweeper reasons. Enumerate the
+      recognized prefixes in one place; a reworded agent constant silently un-classes.
+    - **Egress-allowlist cross-check is M7b, and infeasible today (deferred).** Naming
+      the specific unreachable host and checking it against `workers.fqdnEgress.allowFQDNs`
+      is NOT buildable from what the API holds: the allowlist exists only as a Helm value
+      rendered into an Antrea CRD (`deploy/chart/templates/worker-fqdn-egress.yaml`),
+      nothing under `api/` reads it, and `failure_reason` carries no hostname
+      (`provision.ts:184` is a generic message). M7b would need (a) the allowlist fed to
+      the API (e.g. a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env, empty = no policy)
+      and (b) a host source (worker-side enrichment or a run-stream scan). Given github
+      is now allowlisted and pinning nixpkgs is the durable fix, M7a's class-only signal
+      plus the prompt rule is the justified scope.
+
+12. **Don't judge a run that never started; route pre-start infra failures to a
+    deterministic notification.** A run that failed before the agent began
+    (`iteration_count=0` **AND** an infra-class `failure_reason` — the conjunction
+    matters: 0 iterations alone also matches an agent that started and crashed before
+    its first iteration report, which is judgeable) has no agent behavior to
+    retrospect — the judge's actual strength. Gate it in `maybeEnqueueJudge` (a sibling
+    of the M5 spend-guard Gate 5, after Gates 2–4, so a judge-disabled or token-less
+    user gets nothing — this is a judge *replacement*, not a general failure notifier).
+    This is both an **accuracy** fix (no hallucinated agent-quality verdict on an infra
+    failure) and a **spend** fix (the single most expensive per-run call — Decision 1 —
+    is not fired on a run that did nothing), so it composes with the M5 guards.
+    - **Notifier dependency:** `workersvc` has no user-notification capability today
+      (`notifysvc.Notify` is called from the handler layer; `selfimprove/engine.go` is
+      the in-package precedent), so the gate needs a notifier **injected into the
+      service** (copy the selfimprove wiring). Unlike the enqueue path, which is
+      idempotent via the one-active-judge unique index (`judge_enqueue.go:94`), the
+      notification has no such final guard — add its own idempotency (a per-run
+      notification key or a stamped column, à la `health_notified_at`).
+    - Judged-worthy failures — the agent ran and then failed — are unaffected.
+
 ## Data model
 
 - **New column** `users.judge_model text` (nullable, no default) — migration
@@ -411,6 +505,39 @@ independent of M1/M2/M3/M5 — touches disjoint files):
 - `docs/judge.md`: judge spend is the owner's own token spend and now appears in
   their usage totals and on the run's review panel.
 
+**M7a — Judge accuracy (class signal + prompt rule + pre-start gate)** (folded from
+issue #81; touches the enqueue gate + the judge prompt assembly):
+- `api/internal/workersvc/judge*.go`: compute a closed-enum `failure_class` over the
+  **target** run (in the `judgeSignal`-style path, `judge.go:196` — note that in
+  `assembleJudgeClaim` the `run` var is the *judge* run, so read the target run's
+  `status`/`failure_reason`/`iteration_count`), carried on the judge claim alongside the
+  existing command-not-found `judge_signal`. Enumerate the recognized infra
+  `failure_reason` prefixes in one place (coupled to the TS constants, e.g.
+  `provision-run.ts:17`). New gate (sibling to M5's Gate 5, after Gates 2–4) in
+  `maybeEnqueueJudge`: `iteration_count=0` AND infra-class reason → skip the judge and
+  fire a deterministic infra notification via a notifier **newly injected into
+  `workersvc`** (selfimprove engine is the precedent), with its own idempotency
+  (per-run key / stamped column).
+- `agent/src/judge-runner.ts`: `buildJudgePrompt` (`:293`) renders the enum
+  `failure_class` in the trusted (pre-fence) signal block next to `signalBlock` (`:310`)
+  — enum value + at most a syntax-validated FQDN token, never raw `failure_reason`;
+  amend `JUDGE_SYSTEM_PROMPT` (`:65`) with the transient≠permanent /
+  no-retry-for-policy rule. The trace fence and no-tools discipline are unchanged.
+- Tests: `workersvc/judge_*_test.go` (class derivation incl. the provisioning-timeout
+  case; a 0-iteration infra run is notified not enqueued; an agent-crash-at-iteration-0
+  run is still judged) and `agent/test/judge-runner.test.ts` (the class reaches the
+  prompt in the trusted block; the prompt carries the rule).
+- `docs/judge.md`: the failure-class signal + the pre-start-skip behavior. `specs/ai.md`:
+  the accuracy decision.
+
+**M7b — Egress-allowlist enrichment (DEFERRED, not built):** name the specific
+unreachable host and cross-check it against the deployment's `allowFQDNs`. Blocked on
+config plumbing (a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env — the API reads no Helm
+value today) + a host source (worker-side enrichment or a run-stream scan). Low marginal
+value now that github is allowlisted and pinning nixpkgs (issue #78) removes the github
+dependency; the design is recorded here so a future need has it, but it is not built in
+this PRD.
+
 ## Milestones
 
 Dependency notes (corrected after arch review finding 3):
@@ -432,10 +559,14 @@ Dependency notes (corrected after arch review finding 3):
   runner, the review read path, and the `JudgePanel` — none of the mode/model/
   spend-guard files — so it can land in parallel with M2/M3 (or any time), and
   needs `sqlc generate` for its one read query like M2 does.
+- **M7a (judge accuracy) shares M1/M5's `judge_enqueue.go`/`maybeEnqueueJudge`** (its
+  pre-start gate is a sibling of Gate 5), so it must land **after M5** (serialized on
+  that function, not parallel with it), and it edits `judge-runner.ts` like M6.
+  Independent of M2/M3/M4. M7b is deferred (not scheduled).
 
 So the safe fan-out is M1 first, then M2 and M3 (and M6) in parallel on top of it,
-then M5 after M2 (shared enqueue/sqlc surface), then M4 last — not all-wide from a
-cold start.
+then M5 after M2 (shared enqueue/sqlc surface), then M7a after M5 (same
+`maybeEnqueueJudge`), then M4 last — not all-wide from a cold start. M7b is deferred.
 
 - [ ] **M1 — Judge mode (enforce-all)**: `judge_enforce_all` setting +
   default-false-on-junk accessor + `SettingsReader` widening (+ all fakes) +
@@ -458,6 +589,18 @@ cold start.
   Verify a completed judge writes a `run_usage` row and its cost appears in
   `SelfUsage`/`AdminUsage`. `go test ./internal/workersvc ./internal/handler`,
   `cd agent && npm test`, `cd web && npm run build` green.
+- [ ] **M7a — Judge accuracy (class signal + prompt rule + pre-start gate)**:
+  closed-enum `failure_class` over the target run (status + reason + iteration_count) on
+  the judge claim + rendered in the trusted signal block (enum + validated FQDN only);
+  `JUDGE_SYSTEM_PROMPT` transient≠permanent / no-retry-for-policy rule; pre-start-infra
+  gate in `maybeEnqueueJudge` (0 iterations AND infra reason → skip judge →
+  deterministic notification via an injected notifier, idempotent); docs + specs. `go
+  test ./internal/workersvc`, `cd agent && npm test` green, with a test proving a
+  #78-class failure yields a non-"transient", non-retry recommendation, a 0-iteration
+  infra failure is notified not judged, and an agent-crash-at-iteration-0 is still judged.
+- [ ] **M7b — Egress-allowlist enrichment (DEFERRED)**: not built in this PRD. Requires
+  a chart-derived `WORKER_EGRESS_ALLOW_FQDNS` env + a host source; low value while github
+  is allowlisted and nixpkgs pinning (issue #78) is the durable fix.
 - [ ] **M4 — Consent surface + web + docs + specs**: `/me` effective fields,
   admin enforce toggle (with cost copy + greying) + the two spend-guard inputs,
   user judge card (enforced banner + per-user model input), stale-comment fix,
@@ -494,6 +637,13 @@ cold start.
   cost render on the reviewed run's review panel as the 4-tile strip; a judge run
   predating the feature shows no strip (never a fabricated 0); the judge run
   itself remains hidden from every run list.
+- **Judge accuracy (M7a)**: a provisioning-timeout failure is presented to the judge
+  as a `provisioning_timeout` class (in the trusted block, no raw reason text) and,
+  with the prompt rule, does not yield a "transient / retry-with-backoff"
+  recommendation; a run that failed at 0 iterations AND with an infra-class reason is
+  not judged (no opus call) but produces a deterministic infra notification; an agent
+  that started and crashed at iteration 0 is still judged. (M7b — the host/allowlist
+  cross-check — is deferred and has no criterion here.)
 
 ## Out of Scope
 
@@ -510,9 +660,11 @@ cold start.
   makes each judge's actual cost available *after* the fact, so a cost-denominated
   budget becomes a smaller follow-up, but it stays out of scope here — the gate
   still runs at enqueue, before the about-to-run judge's cost is known.)
-- Changing the judge prompt/compaction or the self-improvement engine.
-  `self_improve` runs stay un-judged (allowlist, `judge_enqueue.go:19`)
-  regardless of `enforce_all`.
+- Changing the judge **compaction** or the self-improvement engine.
+  `self_improve` runs stay un-judged (allowlist, `judge_enqueue.go:19`) regardless
+  of `enforce_all`. (M7 makes ONE targeted `JUDGE_SYSTEM_PROMPT` addition — the
+  transient≠permanent / no-retry-for-policy rule — and adds a trusted failure-class
+  signal; the broader prompt/compaction rework stays out.)
 - Per-user override of the *agent-run* `default_model` (already exists, PRD #17)
   or making the agent default opus (the `lead` builtin is already `opus` —
   `api/internal/agenttmpl/builtins/lead.md:4`).
