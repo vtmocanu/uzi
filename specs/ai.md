@@ -7912,3 +7912,230 @@ Serves human Feature #2 (connect a forge) and the testing-credentials policy.
   assumed-covered. Runs are enqueue-able without a runner (a push to a repo with a
   `.forgejo/workflows/` file enqueues a queued run), so this is verifiable at rollout despite
   the deferred runner.
+
+## 297. Filing a forge issue from a judge recommendation is deterministic templating — no second LLM call (D1, D11)
+
+Serves human: the judge's recommendations must be **fileable as forge issues, the human choosing
+which to file** (GitLab issue #68). *(The user-stated requirement line is proposed for human.md's
+"Run retrospective (LLM judge)" feature and is pending approval; this section records the mechanism
+the AI chose to satisfy it.)* Design record: `prds/68-judge-file-issue.md`.
+
+- **The issue body is templated server-side from rows already stored; the click spends no Anthropic
+  token.** Everything a useful issue needs is on hand: `category`, `target`, `rationale_md`,
+  `confidence` (recommendation), `verdict`, `summary_md`, `judge_model` (review), and kind/repo/
+  issue-iid/status (the judged run). A pure renderer (`api/internal/issuedraft/`, `Render(Input)
+  Draft`) composes them into title + body + provenance.
+  - Why: the two token-spending alternatives were rejected. A fresh LLM call at click time adds a
+    worker round-trip and a failure mode behind a button that should feel instant; judge-authored
+    `issue_title`/`issue_body` at review time makes **every** judged run pay for bodies that are
+    mostly never filed (PRD #46's caps exist to keep those rows small). The judge prompt, worker,
+    and claim protocol are untouched.
+- **Works on every recommendation ever judged, with no backfill or re-judge (D11, user question).**
+  Because the draft is templated at click time and the link table starts empty (which reads as
+  "nothing filed yet"), the button appears idle on every pre-existing recommendation; filing spends
+  no token on old runs any more than new. The category→repo default (§300) reads *current* settings
+  and the run's repo, both independent of the run's age. *(The "no backfill" acceptance is a user
+  decision; that templating-at-click-time satisfies it for free is the AI consequence.)*
+
+## 298. Two endpoints, split by CSRF/CLI posture; owner-or-admin read, caller-owns-repo write (D2, D8)
+
+Serves human: the fileable-recommendation requirement (§297) plus the user decision to **keep
+admin-can-file** (not restrict to the owner), conditioned on prominent provenance.
+
+- **Draft and file are separate endpoints.** `GET /api/runs/{id}/review/recommendations/{recID}/
+  issue-draft` returns `{default_repo_id, title, description, labels, provenance, …}`
+  (`apitypes.IssueDraftDTO`, `handler/review_issue_draft.go`); the user edits; `POST .../issue`
+  with `{repo_id, title, description}` writes to the forge and persists the link
+  (`handler/review_issue_file.go`). Each endpoint gets its own handler file so M2 and M3 shared
+  only a trivial one-line edit each to the `handler.go` route block.
+  - Why a **server** GET rather than rendering the draft in the browser from review data the panel
+    already holds: three things must be a single Go source of truth — the draft-time secret-shape
+    scan (§303), the category→repo resolution (§300, reads settings + the caller's repos), and the
+    fence/`/`-strip templating. Payload size is secondary: a body is up to ~13 KB and up to 50
+    recommendations exist per review, so it is deliberately **not** folded into `GET .../review`
+    (that would inflate every run-page load to serve a draft usually never opened).
+- **Routing is split, not uniform, because of the CLI (Interactions).** The judge-review *read* is
+  already CLI-reachable, so the draft **GET mounts on `RequireUser`** (session **or** admin-scoped
+  CLI Bearer, CSRF-safe, mirroring the review read). Filing is **browser-only in this PRD** (no CLI
+  verb), so the **POST mounts on the cookie+CSRF `RequireAuth` path behind
+  `forgeLimiter.PerUserMiddleware`**, mirroring `ConfirmProposal` — never on the cookie-only
+  `RequireAdmin` write group. Pinned so a future reader does not mistake the CLI omission for an
+  oversight.
+- **Authorization: owner-or-admin to read, caller-owns-repo to write (D8).** The draft is
+  owner-or-admin scoped via `GetRunForViewer` (non-owner → not-found), exactly like `GetRunReview`.
+  The write additionally requires the *caller* to own the target repo via `GetRepoForUser`
+  (session-user-scoped, the join `repos → forge_connections WHERE r.id=$1 AND c.user_id=$2`), so a
+  plain user cannot file against a repo they do not own.
+  - **Accepted residual — confused-deputy on the admin path (user decision).** Recommendation text
+    is worker-forged (PRD #46 threat model); an admin browsing another user's review can file that
+    text as the **admin's** bot into the **admin's** repo. The user chose to keep admin filing
+    rather than restrict to owner, **conditioned on provenance being prominent**: the draft carries
+    a "from user X's worker, run <id>" line (`produced_by_user_id`/`produced_by_run_id`, PRD #46) so
+    the admin sees whose text they are publishing. There is no cross-user *write* and no per-user
+    forge identity anywhere in uzi — a repo has one connection, one PAT, one bot author.
+
+## 299. Labels `PRD` + `PRDLESS` assembled server-side; the omitted `autopilot` is the real guard (D3)
+
+Serves human: "nothing auto-starts" — filing an issue and spending tokens on a run stay separate
+human decisions.
+
+- **The three labels do three jobs; only two are attached.** `PRD` (`settings.KeyPRDLabel`) is
+  *visibility* — the sync filters on it, so an unlabelled issue is invisible to uzi. `PRDLESS`
+  (`settings.KeyPrdlessLabel`, PRD #22) is the *PRD-link bypass* — without it `createRun` rejects a
+  recommendation (no `prds/*.md` file) with `ErrNoPRDLink`. `autopilot`
+  (`settings.KeyAutopilotLabel`) is the *trigger*, deliberately omitted.
+- **The labels are `[]string{PRD, PRDLESS}` built server-side from settings, never from the request
+  body.** The uzi API surface gives the client no way to attach `autopilot`.
+  - Why the omission is the *primary* guard, not belt-and-braces: autopilot attribution
+    (`poller/autopilot.go`) matches the label-event actor against the connection's declared
+    `human_username`, and that guard is **unenforced when the connection PAT's own account equals
+    `human_username`** — a fully supported personal-PAT setup uzi nowhere forbids. In that case a
+    bot-filed autopilot-labelled issue *would* self-trigger. Safety therefore comes from not
+    attaching the label, not from an attribution invariant that may not hold.
+- **`EnsureLabels` is intentionally not called** (matching `issues.go`'s create path): if a project
+  lacks a `PRDLESS` label GitLab auto-creates it on `CreateIssue` with a random colour. Harmless —
+  the Start gate re-reads *live* forge labels and keys the bypass on the label *name*, so the card
+  still starts on the first click regardless of colour.
+- **Residual, out of uzi's hands:** the human-edited *description* can carry GitLab quick-action
+  `/`-commands (`/label`, `/relabel`, `/assign`, `/close`, …), which a `/label`-only strip would
+  miss. This is handled at the write boundary by the breakout-proof fence + full `/`-line strip
+  (§303), not by a keyword blocklist. The `prdless_enabled` instance setting (default on) is a
+  documented precondition for the "starts on first click" success criterion; an admin who turned it
+  off makes even a PRDLESS issue fail `ErrNoPRDLink` on Start.
+
+## 300. The target repo is category-derived and always overridable (D4)
+
+Serves human: the fileable-recommendation requirement — a filed issue lands in the right repo
+without the human re-deriving it.
+
+- **A category→repo default map, resolved server-side.** `improve_agent`/`add_agent` → the judged
+  run's repo (repo agents live in that repo's `.claude/agents/`); `improve_uzi`/
+  `install_worker_tool`/`adjust_template` → `selfimprove_repo` (uzi's own code / the worker image /
+  `go:embed`-shipped builtins); `enable_tool` → `selfimprove_repo` (weakest fit, accepted).
+- **The default is a pre-selection, not a constraint.** The picker lists every repo the *caller* has
+  connected; Create enables once any is chosen.
+  - **Honest framing:** `selfimprove_repo` is a doubly weak default — usually unset, and even when
+    set it is one admin's connected repo (per D8's caller-scoping it resolves only for that admin).
+    So for a non-admin, 4 of 6 categories are expected to open with an **empty picker**; the map's
+    real payload is the `improve_agent`/`add_agent` → judged-run's-repo default, which is cheap and
+    usually resolvable. When the default cannot be resolved, the draft opens with the picker empty
+    and says why rather than guessing (mock state D). There is no "judged run's repo is gone" case:
+    judge-eligible kinds (`issue`/`ci_fix`) are `repo_id NOT NULL` and cascade-tied to a live repo.
+- **Every category gets the button, including the two that fit badly (D5).** `enable_tool` (usually
+  an admin toggle) and `adjust_template` (splits builtins-vs-DB-rows) can be a category error, but
+  the user's ask is a button on *each* improvement and the human reads the draft first;
+  special-casing two of six buys a rule to learn against a mis-click already visible and cancelable.
+  Revisit if the filed-issue mix shows these two dominating and closed-invalid.
+
+## 301. `recommendation_filed_issues` — a coordinate-keyed table that survives a re-judge, and the self-improve exclusion it feeds (D6, D12)
+
+Serves human: the fileable-recommendation requirement, durably (a re-judge must not re-arm a
+duplicate file), and Feature #46's self-improvement job (a hand-filed `improve_uzi` must not double
+up with the engine's tracking issue).
+
+- **The link lives in its own table, not on the recommendation row.** Migration `00070`
+  (`recommendation_filed_issues`) keyed **`(review_id, category, target)`** holds `filed_repo_id`,
+  `filed_issue_iid`, `filed_issue_url`, `filed_by_user_id`, `filed_at`, `filing_since`.
+  - Why not `filed_*` columns on `review_recommendations`: that row is deleted-and-reinserted on
+    every re-judge (`UpsertRunReviewWithRecommendations`), so a column-based link would need
+    carrying forward — and `(category, target)` is **not unique** per row (the judge can emit two
+    `improve_agent` rows for one agent, cap 50), so a carry `LEFT JOIN` fans out. The review row is
+    stable across a re-judge (upserted, same `target_run_id`), so keying the link table on the
+    review's coordinate makes the fan-out impossible by construction and enforces **one issue per
+    coordinate per review**.
+  - **FK delete rules:** `review_id` `ON DELETE CASCADE` (the link dies with the review); `filed_repo_id`
+    and `filed_by_user_id` `ON DELETE SET NULL` (disconnecting an *unrelated* repo/user must never
+    delete another run's link; `filed_issue_url` stays as the durable pointer, matching
+    `produced_by_user_id`'s SET-NULL shape).
+- **Accepted inherent limitation — the `target=''` collapse.** `target` is `NOT NULL DEFAULT ''` and
+  ingest does not force it non-empty, so several `improve_uzi`/`enable_tool` recommendations with
+  empty target **collapse to one coordinate**: only the first is fileable. This is inherent to the
+  survive-re-judge key, **not a fixable defect** — folding a row-id or rationale-hash into the key
+  would reintroduce the carry-forward problem the table exists to avoid (and break the "keep the
+  link when rationale changes" semantics). Accepted: the panel says "this category/target already
+  has an issue" on blocked siblings, and for `improve_uzi` the collapse is *benign* (the
+  self-improvement engine already aggregates all `improve_uzi` rows into one tracking issue). A
+  judge that populates distinct `target` values (which the prompt asks for) avoids it entirely.
+- **Stale-link semantics.** On a re-judge that re-emits the coordinate with a different rationale the
+  link is kept (a second issue would be a forge-side duplicate), but the UI flags staleness by
+  comparing `filed_at` against the review's `updated_at` ("filed for an earlier version").
+- **Self-improve backlog exclusion (D12).** `ListOpenImproveUziRecommendations`
+  (`queries/selfimprove.sql`) gains a **claimed-or-filed `NOT EXISTS`** against
+  `recommendation_filed_issues` on the coordinate — keyed on the row **existing at all** (not
+  `filed_at IS NOT NULL`), so an in-flight claim (`filing_since` set, `filed_at` NULL) also excludes
+  the coordinate, closing the same check-then-act race the claim-first design avoids elsewhere; a
+  reverted (deleted) claim re-includes it next cycle. `NOT EXISTS` is the only viable mechanism (a
+  partial index cannot reference another table; the filed table's own UNIQUE `(review_id, category,
+  target)` index serves the subquery). Folded into the M1 migration to avoid a second migration on
+  the same path. A recommendation can be both filed and engine-addressed; display precedence is
+  addressed-then-filed.
+
+## 302. Claim-first concurrency, forge-first tx, created-with-warning, and a clamped stranded-claim sweeper (D7, D9)
+
+Serves human: "two concurrent file attempts create exactly one issue," and the forge-is-source-of-
+truth invariant (CLAUDE.md).
+
+- **Claim-first, not read-then-write.** A naïve "check unfiled → `CreateIssue`" is check-then-act
+  (two concurrent POSTs both pass and file two issues). Mirroring `ConfirmProposal`'s
+  `pending→confirming` claim, a `recommendation_filed_issues` row is claimed with a transient
+  `filing_since` via an atomic `INSERT … ON CONFLICT DO NOTHING` on the coordinate **before**
+  `CreateIssue` (`ClaimRecommendationFiledIssue`); the loser 409s. On forge failure the claim
+  reverts (row deleted, `RevertRecommendationFiledIssue`, logged-not-fatal); on success it settles
+  by row-id with the issue iid.
+- **Forge-first, then link + cache in one tx (D9).** Order is claim → `CreateIssue` → in one tx,
+  `SettleRecommendationFiledIssue` (`:execrows`) **and** upsert the issue into the `issues` cache so
+  the board card appears without a poll (the same write `handler/issues.go` performs). The route
+  mounts in the shared `forgeLimiter.PerUserMiddleware` bucket (competing with move/sync/create-run/
+  create-issue, acceptable).
+- **Settle-failure reports, never reverts.** A tx failure after a successful `CreateIssue` reports
+  **created-with-warning** and does not revert (reverting would orphan or invite a duplicate of the
+  real issue) — the exact stance `issues.go` takes. A **swept-out claim** (settle updates 0 rows
+  because the `filing_since` was reaped mid-flight) is treated the same: created-with-warning, never
+  a retry of the forge write. A crash after `CreateIssue` before the tx leaves the issue on the
+  forge (PRD+PRDLESS), which the next poll syncs regardless; only the local link is missing.
+- **The sweep timeout is clamped `≥ 2×ForgeHTTPTimeout` at boot** (`config.IssueFilingStuckTimeout`,
+  env `ISSUE_FILING_STUCK_TIMEOUT`, default 2m, clamp at `config.go`), mirroring the
+  `PROPOSAL_CONFIRM_STUCK_TIMEOUT` precedent but needing it **more**: the proposal revert is a state
+  flip, whereas this revert is a **DELETE**, so a premature sweep during a live `CreateIssue`
+  deletes the claim, a retry re-INSERTs, and **two forge issues** result — the exact duplicate the
+  design prevents. `SweepStrandedRecommendationClaims` reaps `filing_since`-only rows past the floor.
+- Deleting the filed issue on the forge does not un-file the coordinate (uzi does not poll for it) —
+  accepted: the link points at a deleted issue, honest and one re-judge from resetting.
+
+## 303. Write-boundary sanitizer, re-run server-side on the POST body — breakout-proof fence, CRLF-aware `/`-strip, best-effort secret scan (D10)
+
+Serves human: "untrusted recommendation text in a filed body renders inert for a human GitLab
+viewer" — the first path that writes judge text to a forge issue.
+
+- **The controls are a server-side invariant at the POST handler, over the body being filed — not
+  only in the GET draft.** The load-bearing correction: the draft renderer produces a UX
+  convenience, but the bytes that reach the forge are the client's POST `description`, which the
+  client may have edited or replaced. Idempotent controls (`/`-strip, secret-scan) re-run at POST
+  (`SanitizeFiledBody`, `SanitizeTitle`); the fence is render-only (re-fencing arbitrary human edits
+  would mangle them), so the write-boundary guarantee rests on strip + scan over the exposed text.
+- **Breakout-proof fence (render time).** Every untrusted field (`summary_md`, `rationale_md`,
+  `target`) is fenced with a backtick delimiter **strictly longer than the longest backtick run in
+  the content** (`FenceBlock` / `longestBacktickRun`), because ingest (`sanitizeReviewText`)
+  preserves backticks — a naïve ``` fence is defeated by hostile content closing it early and
+  re-exposing trailing lines as live markdown / column-0 `/`-command text. GitLab's Banzai
+  `quick_action` pipeline also excludes fenced blocks, so a correct fence neutralizes quick-actions
+  in the same stroke.
+- **`/`-strip, fence-aware and CRLF-normalized.** `StripUnfencedSlashLines` removes every line whose
+  first non-fenced character is `/` (the full quick-action family, not just `/label`), tracking
+  fence state so it never touches legitimately-fenced content. **Both sanitizer entry points
+  normalize `\r\n`/`\r` first** (`normalizeNewlines`) — a review found a CRLF-blind strip could be
+  bypassed by a `\r`-terminated `/`-line, fixed explicitly.
+- **Best-effort secret-shape scan behind the human gate.** `ScrubSecretShapes` matches a broader
+  set than the 4-family ingest scrub (AWS `AKIA…`, `ghp_…`, PEM private keys, bearer JWTs, …) and
+  redacts hits, because this flow can egress a foreign secret into an issue on a **different**
+  project than the run's repo. Ordered honestly: the **human gate is the primary control**, the
+  scan is defense-in-depth (large false-negative surface on dictionary/low-entropy secrets,
+  false-positives on SHAs/UUIDs — not a credible standalone control), and a judge-prompt
+  "never quote verbatim" instruction is the upstream backstop. Documented as a known-limited control
+  (auditor LOW-1), not sold as airtight.
+- **Title caveat and provenance footer.** The title is derived from worker-controlled `target` and
+  cannot hold a fence; on GitLab it is low-risk (titles are not markdown-rendered, no quick-actions,
+  newlines stripped) but is still run through `/`-strip + secret-scan (noted for a future Forgejo
+  driver). The body carries a footer naming uzi, the requesting user, and the producing run/user, so
+  neither a human nor a later reader mistakes bot-authorship for uzi vouching for the content
+  (provenance prominence, review-reinforced).
