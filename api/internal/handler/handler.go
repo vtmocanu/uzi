@@ -613,6 +613,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (owner-or-admin, GetReviewForTarget → GetRunForViewer-scoped, capped by
 				// the same RequireUser masking as GetRun).
 				r.Get("/{id}/review", h.GetRunReview)
+				// Issue-draft (PRD #68 M2): the templated, human-editable draft for
+				// filing a forge issue from one recommendation. A READ (owner-or-admin,
+				// same scoping as the review read); no forge write, no token spend. The
+				// file POST (M3) mounts separately on the cookie+CSRF RequireAuth path.
+				r.Get("/{id}/review/recommendations/{recID}/issue-draft", h.GetIssueDraft)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
