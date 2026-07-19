@@ -271,6 +271,31 @@ describe("worker templates pin the same devbox version", () => {
   });
 });
 
+// The rootless-DinD sidecar image pin (PRD #83) is a literal in TWO places: the
+// compose track (docker-compose.yml `dind`, M2) and the k8s track
+// (deploy/chart/values.yaml workers.docker.image, M3). Both tracks must run the
+// IDENTICAL daemon — the compose Decision-3 efficacy result is only evidence for k8s
+// if the image is the same — so pin them byte-equal here, mirroring the
+// DEVBOX_VERSION lockstep above, so a bump to one that misses the other is a red
+// build rather than a silent divergence.
+describe("the DinD sidecar image is pinned identically on the compose and k8s tracks", () => {
+  const repoRoot = path.resolve(templatesDir, "../..");
+  const dindPin = /docker:[\w.-]+-dind-rootless@sha256:[0-9a-f]{64}/;
+  const pinIn = (rel: string): string => {
+    const text = fs.readFileSync(path.resolve(repoRoot, rel), "utf8");
+    const m = dindPin.exec(text);
+    assert.ok(m, `${rel} must carry a pinned docker:<tag>-dind-rootless@sha256 image`);
+    return m![0];
+  };
+  it("docker-compose.yml == deploy/chart/values.yaml", () => {
+    assert.strictEqual(
+      pinIn("docker-compose.yml"),
+      pinIn("deploy/chart/values.yaml"),
+      "the compose and chart DinD image pins have drifted — bump both together (arch §Q6: one pin, two tracks)",
+    );
+  });
+});
+
 // The template name set lives in THREE places (PRD #18): the agent/templates/<name>/
 // dirs (the images), api/internal/workertmpl.Names (server registry, validates the
 // declared choice), and web/src/lib/workerTemplates.ts (the issuance dropdown). This

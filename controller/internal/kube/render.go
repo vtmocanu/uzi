@@ -481,12 +481,15 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 	if w.Docker {
 		// The k8s branch of the keystone resolver (agent/src/docker-wiring.ts): set
-		// DOCKER_HOST EXPLICITLY, never probe. This is BOTH the socket target and the
-		// resolver's "sidecar expected" signal, so the worker waits for the DinD
-		// sidecar rather than concluding docker unwired if it starts first. The value
-		// carries no secret (a socket path), and it is only present when the sidecar
-		// is rendered. Only ever set here for a docker worker — a provisioned toolEnv
-		// cannot overwrite it (the SDK env fold writes only allowlisted nix keys).
+		// DOCKER_HOST EXPLICITLY, never probe. It is BOTH the socket target AND the
+		// resolver's "sidecar expected" signal — which turns on the bounded readiness
+		// RETRY, so a daemon that is briefly slow or a socket briefly at 0660 does not
+		// cost the capability. It does NOT itself hold the worker: what gates the worker
+		// container's start on dockerd actually listening is the dind native-sidecar
+		// startupProbe (pod ordering), and a probe that never succeeds degrades to
+		// unwired regardless of this env. The value carries no secret (a socket path),
+		// is present only when the sidecar is rendered, and cannot be overwritten by a
+		// provisioned toolEnv (the SDK env fold writes only allowlisted nix keys).
 		env = append(env, corev1.EnvVar{Name: "DOCKER_HOST", Value: dockerHostValue})
 	}
 
@@ -733,11 +736,18 @@ done
 		RestartPolicy: &always,
 		Command:       []string{"/bin/sh", "-c", script},
 		SecurityContext: &corev1.SecurityContext{
-			// Root, for chown/chmod — nothing more. Not privileged; it needs only the
-			// default root caps (CHOWN/FOWNER), so it does not widen the pod.
+			// Root, for chown/chmod — nothing more. Drop ALL and add back ONLY the two
+			// caps it actually uses: CHOWN (chown the socket dir to the rootless uid) and
+			// FOWNER (chmod a dir/socket it does not own once the daemon owns it). Not
+			// privileged, and not the full root cap set — so a compromise of this tiny
+			// helper widens the pod by exactly those two caps, nothing more.
 			RunAsNonRoot: &runAsNonRoot,
 			RunAsUser:    &root,
 			RunAsGroup:   &root,
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN", "FOWNER"},
+			},
 		},
 		Resources: dindInitResources,
 		StartupProbe: &corev1.Probe{

@@ -154,4 +154,30 @@ describe("resolveDockerWiring readiness wait (PRD #83 M2)", () => {
     assert.deepStrictEqual(w, {}, "timeout ⇒ degrade to unwired");
     assert.ok(calls >= 2, `expected multiple probe attempts before the timeout, got ${calls}`);
   });
+
+  it("RETRIES through a probe EACCES (the 0660→0666 socket-perm handoff window) until wired", async () => {
+    // The k8s socket-perm race (reviewer #2): dind's `docker info` startupProbe passes
+    // at socket mode 0660 (dind runs as its OWNER uid 1000) BEFORE dind-init's loop
+    // relaxes the socket to 0666. The worker (uid 10001, NOT the owner) then gets EACCES
+    // connecting until that chmod lands — a sub-second window with a PERMANENT
+    // consequence if it were fatal (unwired for the worker's whole lifetime). The real
+    // defaultProbe turns a connect EACCES into `false`; an injected probe that THROWS
+    // EACCES exercises the loop's catch path. Either way it must be RETRYABLE, not fatal.
+    let calls = 0;
+    const eaccesThenUp = async (): Promise<boolean> => {
+      calls++;
+      if (calls < 3) {
+        const err = new Error("connect EACCES /run/dind/docker.sock") as NodeJS.ErrnoException;
+        err.code = "EACCES";
+        throw err;
+      }
+      return true; // dind-init has relaxed the socket to 0666
+    };
+    const w = await resolveDockerWiring(
+      { DOCKER_HOST: "unix:///run/dind/docker.sock" }, // expected ⇒ the readiness wait applies
+      { probe: eaccesThenUp, sleep: async () => {}, readyIntervalMs: 1, readyTimeoutMs: 10_000 },
+    );
+    assert.strictEqual(w.dockerHost, "unix:///run/dind/docker.sock");
+    assert.ok(calls >= 3, `EACCES must be retried, not fatal; probe called ${calls}×`);
+  });
 });

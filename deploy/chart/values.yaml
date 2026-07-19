@@ -420,6 +420,31 @@ workers:
     # (docker-compose.yml `dind`) so both tracks run the identical daemon. One image
     # ref serves both the sidecar and the tiny root socket-prep helper.
     image: docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431
+    # The docker tier's OWN NetworkPolicy (auditor MUST, blocking for LIVE enablement).
+    # The restricted ns's worker-networkpolicy.yaml + worker-fqdn-egress.yaml hardcode
+    # workers.namespace, so this namespace would otherwise be default-ALLOW — and a
+    # privileged DinD worker could `docker run --network=host` to reach CNPG / other
+    # ClusterIPs / the apiserver, and expose the dind daemon port cluster-wide. This
+    # vanilla networking.k8s.io/v1 policy closes IN-CLUSTER lateral egress + ALL ingress
+    # (Half A). EXTERNAL egress filtering — the Anthropic-token / repo-exfil residual —
+    # stays PRD #50's job (Half B), NOT closed here.
+    #
+    # Default enabled:false so it renders nothing when the docker tier is off. It MUST
+    # be set true, with the cluster's REAL CIDRs, BEFORE enabling docker workers live —
+    # deploy/values/dev-cluster.yaml pre-stages dev-cluster's CIDRs + enables it.
+    networkPolicy:
+      enabled: false
+      # The in-cluster ranges EXCLUDED from the 0.0.0.0/0 egress allow, so a docker
+      # worker can pull images from the internet but cannot reach in-cluster ClusterIPs,
+      # pod IPs, the apiserver, or the metadata/link-local IP. CLUSTER-SPECIFIC — the
+      # defaults below are common guesses; set the real values per cluster.
+      podCIDR: 10.244.0.0/16
+      serviceCIDR: 10.96.0.0/12
+      linkLocalCIDR: 169.254.0.0/16
+      # Extra CIDRs to also exclude from the internet allow (appended to the three
+      # above). The node CIDR belongs here — reaching a node IP is reaching the kubelet,
+      # which the restricted tier's Antrea policy already drops. Per-cluster.
+      extraExcept: []
     # Namespace ResourceQuota for the docker tier (Decision 8's floor, per-tier).
     # Docker workers cost MORE than a plain one: the worker preset PLUS the DinD
     # sidecar (~1-2 GiB / ~1 CPU, arch §Q4) PLUS the daemon's emptyDir image/build

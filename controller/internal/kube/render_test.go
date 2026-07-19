@@ -526,6 +526,25 @@ func TestDockerWorkerKeepsWorkerPostureAndPrivilegesOnlyTheSidecar(t *testing.T)
 	if dind.SecurityContext.SeccompProfile == nil || dind.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined {
 		t.Error("the dind sidecar needs seccomp Unconfined so the nested daemon can profile its children")
 	}
+
+	// dind-init runs as root but with a TIGHT cap set: drop ALL, add back only CHOWN +
+	// FOWNER (the two it uses to chown/chmod the socket dir). Not the full root cap set,
+	// so a compromise of this tiny helper widens the pod by exactly those two.
+	dindInit := containerByName(t, pod.InitContainers, dindInitContainerName)
+	if dindInit.SecurityContext == nil || dindInit.SecurityContext.RunAsUser == nil || *dindInit.SecurityContext.RunAsUser != 0 {
+		t.Fatal("dind-init must run as root (uid 0) to chown/chmod the socket dir")
+	}
+	caps := dindInit.SecurityContext.Capabilities
+	if caps == nil || len(caps.Drop) != 1 || caps.Drop[0] != "ALL" {
+		t.Error("dind-init must drop ALL capabilities")
+	}
+	gotAdd := map[corev1.Capability]bool{}
+	for _, c := range caps.Add {
+		gotAdd[c] = true
+	}
+	if caps == nil || len(caps.Add) != 2 || !gotAdd["CHOWN"] || !gotAdd["FOWNER"] {
+		t.Errorf("dind-init must add exactly [CHOWN, FOWNER] and nothing else, got %v", caps.Add)
+	}
 }
 
 // The k8s branch of the keystone resolver: DOCKER_HOST is set EXPLICITLY on the
