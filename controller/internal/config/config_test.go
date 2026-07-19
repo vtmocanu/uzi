@@ -375,3 +375,74 @@ func TestLoadKeepsTheCAPEMForRelayToWorkers(t *testing.T) {
 		t.Error("APICAPEM must carry the raw bundle for relay to the worker Secrets")
 	}
 }
+
+// --- docker tier (PRD #83 M3) ----------------------------------------------
+
+// setDockerBaseEnv supplies everything Load needs to reach the docker-tier
+// validation successfully.
+func setDockerBaseEnv(t *testing.T) {
+	t.Helper()
+	setWorkerEnv(t)
+	t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+	t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+}
+
+// The docker tier is OPT-IN: neither knob set means a controller that renders no
+// docker workers, and Load must succeed with the fields empty (the kind smoke, any
+// instance with docker off).
+func TestLoadDockerTierOffLeavesTheFieldsEmpty(t *testing.T) {
+	setDockerBaseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDockerNamespace != "" || cfg.WorkerDinDImage != "" {
+		t.Fatalf("docker fields = %q / %q, want empty when the tier is off", cfg.WorkerDockerNamespace, cfg.WorkerDinDImage)
+	}
+}
+
+// Both knobs travel together: a namespace without the sidecar image (or vice versa)
+// is a half-configured docker tier that would strand every docker worker, so Load
+// refuses it at boot rather than at the far end.
+func TestLoadDockerNamespaceWithoutImageIsRejected(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	// UZI_WORKER_DIND_IMAGE deliberately unset.
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DIND_IMAGE") {
+		t.Fatalf("err = %v, want a both-or-neither failure naming the image", err)
+	}
+}
+
+func TestLoadDockerImageWithoutNamespaceIsRejected(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind-rootless@sha256:deadbeef")
+	// UZI_WORKER_DOCKER_NAMESPACE deliberately unset.
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DOCKER_NAMESPACE") {
+		t.Fatalf("err = %v, want a both-or-neither failure naming the namespace", err)
+	}
+}
+
+// The docker namespace MUST differ from the restricted default: equal namespaces
+// would run privileged DinD sidecars in uzi-workers, dissolving the blast-radius
+// separation that is the tier's entire reason to exist (Decision 7 / Q-B).
+func TestLoadDockerNamespaceMustDifferFromTheRestrictedDefault(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers") // == UZI_WORKER_NAMESPACE
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind-rootless@sha256:deadbeef")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("err = %v, want a refusal that the docker namespace must differ from the restricted default", err)
+	}
+}
+
+func TestLoadDockerTierOnPopulatesBothFields(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind-rootless@sha256:deadbeef")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDockerNamespace != "uzi-workers-docker" || cfg.WorkerDinDImage != "docker:28-dind-rootless@sha256:deadbeef" {
+		t.Fatalf("docker fields = %q / %q", cfg.WorkerDockerNamespace, cfg.WorkerDinDImage)
+	}
+}

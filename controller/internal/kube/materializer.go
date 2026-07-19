@@ -65,24 +65,51 @@ func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver
 //   - anything else          -> not our business at all
 func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker, error) {
 	byID := map[string]*reconcile.ObservedWorker{}
+
+	// BOTH worker namespaces (PRD #83 M3): the restricted default and, when this
+	// controller is configured for the docker tier, the privileged docker namespace.
+	// The whole hosted fleet is desired state, so an object in EITHER namespace that
+	// answers to no desired worker is an orphan (flag) or a dropped worker (teardown)
+	// — a scan of one namespace could never see the other's, so both are listed and
+	// the per-namespace provenance model holds independently in each.
+	namespaces := []string{m.cfg.Namespace}
+	if m.cfg.DockerNamespace != "" {
+		namespaces = append(namespaces, m.cfg.DockerNamespace)
+	}
+	for _, ns := range namespaces {
+		if err := m.observeNamespace(ctx, ns, byID); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]reconcile.ObservedWorker, 0, len(byID))
+	for _, o := range byID {
+		out = append(out, *o)
+	}
+	return out, nil
+}
+
+// observeNamespace folds one namespace's stamped Deployments and PVCs into byID,
+// recording the namespace each worker was seen in so teardown can target it.
+func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map[string]*reconcile.ObservedWorker) error {
 	get := func(id string) *reconcile.ObservedWorker {
 		if o, ok := byID[id]; ok {
 			return o
 		}
-		o := &reconcile.ObservedWorker{ID: id}
+		o := &reconcile.ObservedWorker{ID: id, Namespace: ns}
 		byID[id] = o
 		return o
 	}
 
-	deployments, err := m.client.AppsV1().Deployments(m.cfg.Namespace).List(ctx, metav1.ListOptions{})
+	deployments, err := m.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("list deployments in %s: %w", m.cfg.Namespace, err)
+		return fmt.Errorf("list deployments in %s: %w", ns, err)
 	}
 	for i := range deployments.Items {
 		d := &deployments.Items[i]
 		id, ours := IsOurs(d.Labels)
 		if !ours {
-			m.flagOrphan("deployment", d.Name)
+			m.flagOrphan("deployment", d.Name, ns)
 			continue
 		}
 		o := get(id)
@@ -105,15 +132,15 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 		}
 	}
 
-	pvcs, err := m.client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).List(ctx, metav1.ListOptions{})
+	pvcs, err := m.client.CoreV1().PersistentVolumeClaims(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("list persistentvolumeclaims in %s: %w", m.cfg.Namespace, err)
+		return fmt.Errorf("list persistentvolumeclaims in %s: %w", ns, err)
 	}
 	for i := range pvcs.Items {
 		p := &pvcs.Items[i]
 		id, ours := IsOurs(p.Labels)
 		if !ours {
-			m.flagOrphan("persistentvolumeclaim", p.Name)
+			m.flagOrphan("persistentvolumeclaim", p.Name, ns)
 			continue
 		}
 		o := get(id)
@@ -124,12 +151,7 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 			o.HasNixPVC = true
 		}
 	}
-
-	out := make([]reconcile.ObservedWorker, 0, len(byID))
-	for _, o := range byID {
-		out = append(out, *o)
-	}
-	return out, nil
+	return nil
 }
 
 // flagOrphan logs a uzi-hw-*-named object we did not create. Never adopted, never
@@ -143,12 +165,12 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 // Decision 1 refuses. That is the accepted trade, and it is no wider than accepted:
 // a DELETED worker's Secret is still cleaned up, because its name is reachable from
 // the worker id we recover off the observed Deployment/PVC labels.
-func (m *Materializer) flagOrphan(kind, name string) {
+func (m *Materializer) flagOrphan(kind, name, ns string) {
 	if !strings.HasPrefix(name, NamePrefix) {
 		return // not ours, not named like ours: none of our business.
 	}
 	m.log.Warn("orphan hosted-worker object: named like ours but not stamped by this controller; flagging only, never adopting or deleting",
-		"kind", kind, "name", name, "namespace", m.cfg.Namespace,
+		"kind", kind, "name", name, "namespace", ns,
 		"expected_stamp", LabelManagedBy+"="+ValueManagedBy)
 }
 
@@ -192,12 +214,20 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 		}
 	}
 
-	// Pass 3: teardown, against the set built in pass 1.
+	// Pass 3: teardown, against the set built in pass 1. Each dropped worker is torn
+	// down in the namespace it was OBSERVED in (a docker worker lives in the docker
+	// namespace) — its Docker flag is no longer in the desired set to derive it from.
 	for _, o := range observed {
 		if desiredIDs[o.ID] {
 			continue
 		}
-		if err := m.teardown(ctx, o.ID); err != nil {
+		ns := o.Namespace
+		if ns == "" {
+			// A pre-#83 observation, or a fake in a test, carried no namespace: the
+			// restricted default is where single-namespace workers always lived.
+			ns = m.cfg.Namespace
+		}
+		if err := m.teardown(ctx, o.ID, ns); err != nil {
 			errs = append(errs, fmt.Errorf("teardown %s: %w", o.ID, err))
 		}
 	}
@@ -206,6 +236,20 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 
 // reconcileWorker converges one desired worker.
 func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) error {
+	// A docker worker needs the privileged docker namespace, and this controller is
+	// not always configured for it (the kind smoke, any instance with the docker tier
+	// off). Skip RENDERING with a loud error rather than default the namespace —
+	// exactly the unknown-preset posture below: the worker stays desired (never torn
+	// down), and materializes the moment the controller is configured. This is the
+	// "no silent default" rule from config.go carried to the reconcile: never render a
+	// privileged pod into the restricted default because a namespace was unset.
+	if w.Docker && m.cfg.DockerNamespace == "" {
+		m.log.Error("desired worker requests docker but this controller has no docker namespace configured; skipping its RENDER only (set UZI_WORKER_DOCKER_NAMESPACE + UZI_WORKER_DIND_IMAGE)",
+			"worker_id", w.ID)
+		return nil
+	}
+	ns := m.cfg.namespaceFor(w)
+
 	spec, err := m.resolver.Resolve(w.Template, w.Size)
 	if err != nil {
 		if preset.IsUnknown(err) {
@@ -232,7 +276,7 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 		// There is no get on Secrets, so "create if absent" is not available to us — and
 		// does not need to be. Issue the create and treat AlreadyExists as success. That
 		// is the WHOLE of Secret idempotence, and it needs no read.
-		_, err := m.client.CoreV1().Secrets(m.cfg.Namespace).Create(ctx, RenderSecret(m.cfg, w, *w.JoinToken), metav1.CreateOptions{})
+		_, err := m.client.CoreV1().Secrets(ns).Create(ctx, RenderSecret(m.cfg, w, *w.JoinToken), metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			// The error is from the apiserver about an object it rejected; it does not carry
 			// the Secret's data. Still, nothing here interpolates the token.
@@ -243,7 +287,7 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	// The PVCs. Same create/AlreadyExists shape, and never patched: PVC specs are
 	// near-immutable, so a size change is delete + reprovision, not a live edit.
 	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
-		_, err := m.client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
+		_, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create pvc %s: %w", pvc.Name, err)
 		}
@@ -252,7 +296,7 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	// The Deployment.
 	dep := RenderDeployment(m.cfg, w, spec)
 	if !obs.HasDeployment {
-		_, err := m.client.AppsV1().Deployments(m.cfg.Namespace).Create(ctx, dep, metav1.CreateOptions{})
+		_, err := m.client.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("create deployment: %w", err)
 		}
@@ -275,7 +319,7 @@ func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWo
 	if err != nil {
 		return err
 	}
-	if _, err := m.client.AppsV1().Deployments(m.cfg.Namespace).Patch(ctx, dep.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+	if _, err := m.client.AppsV1().Deployments(ns).Patch(ctx, dep.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("patch deployment: %w", err)
 	}
 	return nil
@@ -323,18 +367,18 @@ func patchFor(dep *appsv1.Deployment) ([]byte, error) {
 // per-run workspaces (the forge holds the durable output — branch and MR — and runs
 // are tracked in the DB and requeued), and a worker whose row is gone has no
 // workers.token_hash, so its pod cannot authenticate and is already dead weight.
-func (m *Materializer) teardown(ctx context.Context, id string) error {
-	m.log.Info("tearing down a hosted worker the api no longer wants", "worker_id", id)
+func (m *Materializer) teardown(ctx context.Context, id, ns string) error {
+	m.log.Info("tearing down a hosted worker the api no longer wants", "worker_id", id, "namespace", ns)
 	var errs []error
 
-	if err := m.client.AppsV1().Deployments(m.cfg.Namespace).Delete(ctx, deploymentName(id), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+	if err := m.client.AppsV1().Deployments(ns).Delete(ctx, deploymentName(id), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		errs = append(errs, fmt.Errorf("delete deployment: %w", err))
 	}
-	if err := m.client.CoreV1().Secrets(m.cfg.Namespace).Delete(ctx, secretName(id), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+	if err := m.client.CoreV1().Secrets(ns).Delete(ctx, secretName(id), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		errs = append(errs, fmt.Errorf("delete secret: %w", err))
 	}
 	for _, name := range []string{dataPVCName(id), nixPVCName(id)} {
-		if err := m.client.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		if err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("delete pvc %s: %w", name, err))
 		}
 	}

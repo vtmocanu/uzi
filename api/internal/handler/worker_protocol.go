@@ -81,6 +81,15 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 		// every M3a worker, before the M2 agent starts sending it) omits it and the
 		// column stays NULL. A pointer so absent (NULL) is distinct from a sent 0.
 		MaxConcurrentRuns *int `json:"max_concurrent_runs"`
+		// Capabilities is the worker's self-reported REACHABLE capability set (PRD #83
+		// Q1: today only ["docker"], meaning a daemon sidecar is reachable). Declared
+		// ONLY so DecodeJSON's DisallowUnknownFields does not 400 a register that
+		// carries it — the SAME accept-and-ignore reason as Name. In M1 nothing reads
+		// or stores it (accept-and-ignore, no column, no migration); #84 owns the
+		// capability vocabulary + the claim-time match predicate. The compat rule (the
+		// api must tolerate this field in the same release the worker starts sending it)
+		// is satisfied by declaring it here — do NOT thread it into wsvc.Register.
+		Capabilities []string `json:"capabilities"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")

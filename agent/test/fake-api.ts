@@ -17,6 +17,9 @@ interface RecordedRegister {
   /** The self-reported worker template (PRD #18), or undefined when the worker
    *  sends no `template` field (older image). */
   template?: string;
+  /** The self-reported capability set (PRD #83 Q1), or undefined when the worker
+   *  sends no `capabilities` field (no daemon wired / older image). */
+  capabilities?: string[];
   authorized: boolean;
 }
 
@@ -131,6 +134,9 @@ export class FakeApi {
       // Only record the key when the worker actually sent one, so an old-style
       // {name,version} register stays byte-for-byte that shape (PRD #18).
       if (json.template !== undefined) rec.template = String(json.template);
+      // Capabilities (PRD #83 Q1): recorded only when present, so a daemon-less worker's
+      // register wire stays byte-identical. Mirrors the api's accept-and-ignore.
+      if (json.capabilities !== undefined) rec.capabilities = (json.capabilities as unknown[]).map(String);
       this.registers.push(rec);
       return send(res, 200, { worker_id: randomUUID() });
     }

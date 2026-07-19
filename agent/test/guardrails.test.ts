@@ -150,6 +150,143 @@ describe("CI-fix guardrail parity (PRD #6)", () => {
   }
 });
 
+// PRD #83 M1 (Q3 + auditor B1-B5): the docker CLI now ships in `base` and is inert
+// without a daemon. The guardrail's ONLY docker containment role is "deny when no daemon
+// is wired"; on a WIRED worker it allows docker (minus daemon-redirect flags). The
+// LIVE Decision-3 efficacy test (a container-via-sidecar cannot read the token) is
+// structurally impossible in M1 — there is no daemon — and lands in M2 (compose) / M3
+// (k8s); these are the PURE, no-daemon guardrail-composition tests only. `dockerWired`
+// is a PURE PARAMETER (B2): the screener never reads env; mount-ns (Decision 3), NOT this
+// screener, is the real containment against `docker run -v` secret theft (B4).
+describe("docker guardrail (PRD #83)", () => {
+  // Every wrapping/quoting form must reduce to the docker simple command (B1), exactly
+  // like the git suite — proven by peeling sh -c / env / sudo / timeout / eval / absolute
+  // path / bare VAR= assignment.
+  const DOCKER_CMDS: Array<[string, string]> = [
+    ["docker run --rm alpine echo hi", "plain docker run"],
+    ["docker compose up -d", "docker compose (v2 subcommand)"],
+    ["docker-compose up", "legacy docker-compose"],
+    ["docker build -t x .", "docker build"],
+    ["docker ps", "docker ps"],
+    ["sh -c 'docker run --rm alpine true'", "sh -c wrapper"],
+    ["bash -lc \"docker compose up\"", "bash -lc wrapper"],
+    ["env FOO=bar docker run --rm alpine true", "env-prefixed"],
+    ["sudo docker ps", "sudo-prefixed"],
+    ["timeout 30 docker build -t x .", "timeout-wrapped"],
+    ["eval \"docker ps\"", "eval wrapper"],
+    ["/usr/bin/docker ps", "absolute path"],
+    ["FOO=bar docker ps", "bare leading assignment"],
+  ];
+
+  it("denies docker on a worker with NO daemon wired (dockerWired=false)", () => {
+    for (const [cmd, label] of DOCKER_CMDS) {
+      const r = screenBashCommand(cmd, [], false);
+      assert.strictEqual(r.denied, true, `expected denied (no daemon) for ${label}: ${cmd}`);
+      // Content-free reason — never echo the command / an image name.
+      assert.ok(r.reason && !r.reason.includes("alpine"), "reason must be content-free");
+    }
+  });
+
+  it("allows docker on a WIRED worker (dockerWired=true), through every wrapper/quoting form", () => {
+    for (const [cmd, label] of DOCKER_CMDS) {
+      assert.strictEqual(screenBashCommand(cmd, [], true).denied, false, `expected allowed (wired) for ${label}: ${cmd}`);
+    }
+  });
+
+  it("defaults to deny when dockerWired is omitted (safe default — no daemon assumed)", () => {
+    assert.strictEqual(screenBashCommand("docker ps").denied, true);
+  });
+
+  // Defense-in-depth composition (B4): a docker command referencing a secret-mount path
+  // is denied EVEN on a wired worker, because the secret-path / /proc checks run BEFORE
+  // the docker allow rule. NOT relied on as containment — `-v /run:/x` / `-v /:/x` evade
+  // any substring match; mount-ns (Decision 3) is the containment.
+  it("denies a docker command touching a secret path or /proc EVEN when wired", () => {
+    assert.strictEqual(
+      screenBashCommand("docker run -v /run/secrets/worker_token:/x alpine cat /x", [], true).denied,
+      true,
+      "literal /run/secrets/ mount denied when wired",
+    );
+    const tokenPath = "/worker-secret/token";
+    assert.strictEqual(
+      screenBashCommand(`docker run -v ${tokenPath}:/x alpine cat /x`, [tokenPath], true).denied,
+      true,
+      "configured token-file path denied when wired",
+    );
+    assert.strictEqual(
+      screenBashCommand("docker run -v /proc/1/environ:/x alpine cat /x", [], true).denied,
+      true,
+      "/proc mount denied when wired",
+    );
+  });
+
+  // B5: even a wired worker must reach only ITS OWN sidecar — deny inline daemon/context
+  // redirection so it cannot be pointed at another daemon.
+  const REDIRECTS: Array<[string, string]> = [
+    ["docker -H tcp://evil:2375 ps", "-H host"],
+    ["docker --host tcp://evil:2375 ps", "--host host"],
+    ["docker --host=unix:///tmp/evil.sock ps", "--host="],
+    ["docker -Htcp://evil:2375 ps", "-H glued"],
+    ["DOCKER_HOST=tcp://evil:2375 docker ps", "DOCKER_HOST= prefix"],
+    ["docker --context prod ps", "--context"],
+    ["docker -c prod ps", "-c context"],
+    ["docker context use prod", "context use"],
+    ["docker context create evil --docker host=tcp://evil:2375", "context create"],
+    ["docker context update evil --docker host=tcp://evil:2375", "context update"],
+    ["DOCKER_CONTEXT=evil docker ps", "DOCKER_CONTEXT= prefix"],
+    ["sh -c 'DOCKER_HOST=tcp://evil docker ps'", "DOCKER_HOST= inside sh -c"],
+    ["DOCKER_HOST=tcp://evil sh -c 'docker ps'", "DOCKER_HOST= prefix BEFORE sh -c (exported to subshell)"],
+    ["env DOCKER_HOST=tcp://evil docker ps", "DOCKER_HOST= via env wrapper"],
+    // Compound export form: the export itself is denied on a wired worker (segment-local).
+    ["export DOCKER_HOST=tcp://evil:2375", "bare export DOCKER_HOST"],
+    ["export DOCKER_HOST=tcp://evil:2375; docker ps", "export DOCKER_HOST then docker (compound)"],
+    ["export DOCKER_CONTEXT=evil", "export DOCKER_CONTEXT"],
+    ["declare -x DOCKER_HOST=tcp://evil:2375", "declare -x DOCKER_HOST"],
+  ];
+  it("denies inline docker daemon/context redirection on a wired worker (B5)", () => {
+    for (const [cmd, label] of REDIRECTS) {
+      assert.strictEqual(screenBashCommand(cmd, [], true).denied, true, `expected redirect denied for ${label}: ${cmd}`);
+    }
+  });
+
+  it("does not false-positive benign docker flags that merely share a prefix", () => {
+    // --hostname is NOT --host; a post-subcommand -c is --cpu-shares, not the global
+    // --context; context ls / --log-level are read-only/benign globals.
+    assert.strictEqual(screenBashCommand("docker run --hostname myhost alpine true", [], true).denied, false);
+    assert.strictEqual(screenBashCommand("docker run -c 512 alpine true", [], true).denied, false);
+    assert.strictEqual(screenBashCommand("docker context ls", [], true).denied, false);
+    assert.strictEqual(screenBashCommand("docker --log-level debug ps", [], true).denied, false);
+    // A benign export of an unrelated var is NOT a docker redirect.
+    assert.strictEqual(screenBashCommand("export FOO=bar", [], true).denied, false);
+    assert.strictEqual(screenBashCommand("export PATH=/opt/bin:/usr/bin", [], true).denied, false);
+    // The export-redirect rule is gated on `dockerWired`: on a worker with no daemon,
+    // docker is already denied outright, so an export of DOCKER_HOST is inert (not denied
+    // by THIS rule — the compound `docker …` that follows is the one that gets denied).
+    assert.strictEqual(screenBashCommand("export DOCKER_HOST=tcp://evil:2375", [], false).denied, false);
+  });
+});
+
+// B3: EVERY existing deny must STILL fire on a docker (wired) worker — the docker allow
+// rule must not loosen any prior deny. Re-run the whole DENIED matrix with dockerWired=true.
+describe("existing denies still fire on a wired docker worker (PRD #83 B3)", () => {
+  for (const [cmd, label] of DENIED) {
+    it(`still denies with dockerWired=true: ${label}`, () => {
+      assert.strictEqual(screenBashCommand(cmd, [], true).denied, true, `must stay denied when wired: ${cmd}`);
+    });
+  }
+  // The leading-assignment peel that makes `DOCKER_HOST=… docker` detectable also closes
+  // the pre-existing `VAR=v git push` / `VAR=v env` bypass — INCLUDING when a wrapper
+  // sits between the assignment and the command (a TIGHTENING, never a loosening). Pin
+  // every form so a future refactor can't silently reopen it.
+  it("denies an assignment-prefixed git push / env, composing with wrappers (no weakening)", () => {
+    assert.strictEqual(screenBashCommand("FOO=bar git push origin main").denied, true, "bare assignment + git push");
+    assert.strictEqual(screenBashCommand("FOO=bar env").denied, true, "bare assignment + env");
+    assert.strictEqual(screenBashCommand("FOO=bar sudo git push").denied, true, "assignment + generic wrapper + git push");
+    assert.strictEqual(screenBashCommand("FOO=bar sh -c 'git push'").denied, true, "assignment + sh -c wrapper + git push");
+    assert.strictEqual(screenBashCommand("FOO=1 sudo BAR=2 git push").denied, true, "assignment + wrapper + assignment + git push");
+  });
+});
+
 function baseInput(): Omit<HookInput, "hook_event_name" | "tool_name" | "tool_input" | "tool_use_id"> {
   return { session_id: "s", transcript_path: "/t", cwd: "/w" };
 }
@@ -201,6 +338,30 @@ describe("buildPreToolUseHook", () => {
 
   it("exports the nested-agent tool name it blocks on subagents", () => {
     assert.strictEqual(NESTED_AGENT_TOOL, "Agent");
+  });
+
+  it("denies docker when the worker has no daemon wired (dockerWired=false, default)", async () => {
+    const hook = buildPreToolUseHook(nullLogger()); // dockerWired defaults false
+    const out = await hook({
+      ...baseInput(),
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "docker compose up" },
+      tool_use_id: "tu-d1",
+    } as HookInput);
+    assert.strictEqual((out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision, "deny");
+  });
+
+  it("allows docker when a daemon is wired (dockerWired=true → no decision)", async () => {
+    const hook = buildPreToolUseHook(nullLogger(), [], true);
+    const out = await hook({
+      ...baseInput(),
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "docker compose up" },
+      tool_use_id: "tu-d2",
+    } as HookInput);
+    assert.deepStrictEqual(out, {});
   });
 });
 

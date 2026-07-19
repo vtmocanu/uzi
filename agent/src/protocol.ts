@@ -80,6 +80,14 @@ export interface RegisterRequest {
    *  pre-#42 worker omits it and the column stays NULL. Distinct from the chat
    *  lane's own concurrency (WORKER_CHAT_SESSIONS). */
   max_concurrent_runs?: number;
+  /** The capabilities this worker self-reports as REACHABLE realities (PRD #83 Q1).
+   *  An ARRAY (not a `docker` bool) so #84 can grow the capability vocabulary without
+   *  another wire change; #83 only ever puts `["docker"]` here (a daemon is reachable,
+   *  resolved by docker-wiring.ts) or omits it. In M1 the api declares-and-ignores this
+   *  field (accept-and-ignore, no storage) — #84 owns the vocabulary + the consuming
+   *  query. Sent only when non-empty (same "only send when known" shape as `template`);
+   *  compat rule: the api MUST tolerate it in the same release the worker sends it. */
+  capabilities?: string[];
 }
 
 export interface RegisterResponse {

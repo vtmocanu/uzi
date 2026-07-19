@@ -46,8 +46,10 @@ A worker image is built from a **template**: a curated, code-reviewed Dockerfile
 
 | Template | What it adds | Use it when |
 |---|---|---|
-| `base` (default) | Node 22 + git + bash — the minimal worker | Most repos |
+| `base` (default) | Node 22 + git + bash + the `docker` CLI + go + python3 — the minimal worker | Most repos |
 | `jvm` | `base` plus a JDK (`java`/`javac`) | Repos that build or test Java |
+
+Every worker also ships the `docker` CLI and a default go/python3/pip toolchain, baked at build time onto both templates' `PATH` — no per-repo provisioning needed for either. The `docker` CLI alone can't run anything until a daemon is wired up: see [Docker inside a worker](./worker-docker.md). go/python3/pip share the nix store's first-run-only warm cache described under [Tool provisioning](#tool-provisioning) below: they refresh only when `/nix` is deleted and the worker reprovisions, not on every worker image upgrade.
 
 Pick a template at build time with the `WORKER_TEMPLATE` variable, which selects `agent/templates/<name>/Dockerfile`:
 
@@ -59,6 +61,16 @@ WORKER_TEMPLATE=jvm docker compose --profile agent up
 With `WORKER_TEMPLATE` unset, compose builds `base`. Set it to a **bare template name** only (one of the names above): it is interpolated into the Dockerfile path, so a value with `/`, `..`, or an absolute path is unsupported and would resolve outside `agent/templates/`. Standalone, point `docker build -f` at the template's Dockerfile (e.g. `-f agent/templates/jvm/Dockerfile agent`).
 
 Each template's Dockerfile bakes its own name into the image as `UZI_WORKER_TEMPLATE` (a fixed literal, independent of the `WORKER_TEMPLATE` build variable), and the worker **reports** that at register, so **Settings → Workers** shows each worker's template. Because the reported value is the image's own baked-in identity, it flags a genuine mismatch when you build with one `WORKER_TEMPLATE` but declared another at issuance. This is observability only: the join token is still the sole trust anchor, so a worker's reported template is never used to accept or reject it.
+
+## Docker sidecar
+
+A worker's `docker` CLI (above) is inert without a daemon: bring up a **docker-capable worker** to actually run containers.
+
+```sh
+UZI_DIND_SOCKET=/run/dind/docker.sock docker compose --profile agent --profile agent-docker up
+```
+
+This adds a rootless Docker-in-Docker sidecar alongside the ordinary `agent` service; leave `UZI_DIND_SOCKET` unset (plain `--profile agent`) and nothing changes from today. See [Docker inside a worker](./worker-docker.md) for the trust model, the hosted (k8s) path, and sizing.
 
 ## Tool provisioning
 
@@ -101,6 +113,8 @@ resources:
     memory: "4Gi"
     cpu: "2"
 ```
+
+**A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. `dinddata` only grows; reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
 
 What the gauges mean:
 

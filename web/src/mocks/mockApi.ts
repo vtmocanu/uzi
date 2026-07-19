@@ -1195,7 +1195,7 @@ export const mockApi = {
   // journey three clicks away: provision → 2 of 2 → the button disables → delete →
   // it enables again.
   hostedConfig: async () => delay({ enabled: true, quota: 2 }),
-  provisionHostedWorker: async (template: string, size: string, name?: string) => {
+  provisionHostedWorker: async (template: string, size: string, _docker = false, name?: string) => {
     const w = {
       id: `w-hosted-${++workerCounter}`,
       // Empty name → the server derives one from template + size (handler's

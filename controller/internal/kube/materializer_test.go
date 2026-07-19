@@ -370,6 +370,156 @@ func TestNoSecretReadAcrossAFullFleetReconcile(t *testing.T) {
 	}
 }
 
+// --- two-namespace / docker tier (PRD #83 M3) ------------------------------
+
+func newDockerMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
+	t.Helper()
+	client := fake.NewSimpleClientset(objs...)
+	m := New(client, dockerTestConfig(), testResolver(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return m, client
+}
+
+func deployedWorkerNS(id, ns string, generation int64, hash string) *appsv1.Deployment {
+	d := deployedWorker(id, generation, hash)
+	d.Namespace = ns
+	return d
+}
+
+func pvcForNS(id, kind, ns string) *corev1.PersistentVolumeClaim {
+	p := pvcFor(id, kind)
+	p.Namespace = ns
+	return p
+}
+
+// A docker worker and a plain one reconcile into SEPARATE namespaces — the whole
+// point of the docker tier (Decision 7 / Q-B): the privileged namespace's blast
+// radius never touches the restricted default. If they landed together the isolation
+// would be a comment, not a fact.
+func TestReconcilePlacesDockerAndPlainWorkersInSeparateNamespaces(t *testing.T) {
+	m, client := newDockerMat(t)
+	ctx := context.Background()
+	plain := protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")}
+	dock := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")}
+
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{plain, dock}, nil); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// Plain worker: restricted default.
+	if _, err := client.AppsV1().Deployments("uzi-workers").Get(ctx, "uzi-hw-p1", metav1.GetOptions{}); err != nil {
+		t.Errorf("plain worker deployment not in the restricted namespace: %v", err)
+	}
+	// Docker worker: privileged namespace — deployment, secret, both PVCs.
+	if _, err := client.AppsV1().Deployments("uzi-workers-docker").Get(ctx, "uzi-hw-d1", metav1.GetOptions{}); err != nil {
+		t.Errorf("docker worker deployment not in the docker namespace: %v", err)
+	}
+	for _, name := range []string{"uzi-hw-d1-data", "uzi-hw-d1-nix"} {
+		if _, err := client.CoreV1().PersistentVolumeClaims("uzi-workers-docker").Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Errorf("docker worker pvc %s not in the docker namespace: %v", name, err)
+		}
+	}
+	// And the docker worker must NOT have leaked into the restricted namespace.
+	if _, err := client.AppsV1().Deployments("uzi-workers").Get(ctx, "uzi-hw-d1", metav1.GetOptions{}); err == nil {
+		t.Error("the docker worker's deployment leaked into the restricted namespace — the tiers are not isolated")
+	}
+	assertNoSecretReads(t, client)
+}
+
+// Teardown of a dropped worker targets the namespace it was OBSERVED in — a docker
+// worker's objects live in the docker namespace, and its Docker flag is gone from the
+// desired set, so the observation's namespace is the only handle on where to delete.
+func TestObserveStampsNamespaceAndTeardownTargetsIt(t *testing.T) {
+	m, client := newDockerMat(t,
+		deployedWorkerNS("d1", "uzi-workers-docker", 0, "h"),
+		pvcForNS("d1", "data", "uzi-workers-docker"),
+		pvcForNS("d1", "nix", "uzi-workers-docker"),
+	)
+	ctx := context.Background()
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 1 || observed[0].Namespace != "uzi-workers-docker" {
+		t.Fatalf("observed = %+v, want one worker stamped with the docker namespace", observed)
+	}
+
+	// The api no longer wants it: tear down, in the docker namespace.
+	if err := m.Reconcile(ctx, nil, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	var deletedNS []string
+	for _, a := range client.Actions() {
+		if d, ok := a.(k8stesting.DeleteAction); ok {
+			deletedNS = append(deletedNS, d.GetNamespace())
+		}
+	}
+	if len(deletedNS) == 0 {
+		t.Fatal("nothing was torn down for a dropped docker worker")
+	}
+	for _, ns := range deletedNS {
+		if ns != "uzi-workers-docker" {
+			t.Errorf("a delete targeted namespace %q, want uzi-workers-docker — teardown hit the wrong namespace", ns)
+		}
+	}
+	assertNoSecretReads(t, client)
+}
+
+// An orphan in the DOCKER namespace is flagged there and never touched — the
+// provenance model holds per-namespace, so the privileged tier gets the same
+// "flag, never adopt or delete" treatment as the restricted default.
+func TestOrphanInDockerNamespaceIsFlaggedNotDeleted(t *testing.T) {
+	orphan := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name:      "uzi-hw-handmade",
+		Namespace: "uzi-workers-docker",
+		Labels:    map[string]string{"app": "someone-elses"},
+	}}
+	var logs strings.Builder
+	client := fake.NewSimpleClientset(orphan)
+	m := New(client, dockerTestConfig(), testResolver(t), slog.New(slog.NewTextHandler(&logs, nil)))
+	ctx := context.Background()
+
+	observed, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if len(observed) != 0 {
+		t.Fatalf("observed = %+v; an orphan must never be returned as one of ours", observed)
+	}
+	if !strings.Contains(logs.String(), "orphan") || !strings.Contains(logs.String(), "uzi-workers-docker") {
+		t.Errorf("an orphan in the docker namespace must be logged with that namespace; got:\n%s", logs.String())
+	}
+	if err := m.Reconcile(ctx, nil, observed); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, a := range client.Actions() {
+		if a.GetVerb() == "delete" {
+			t.Fatal("an orphan must NEVER be deleted — flagged only")
+		}
+	}
+}
+
+// A docker worker on a controller with NO docker namespace configured is SKIPPED with
+// a loud error, never rendered into the restricted default. This is the reconcile
+// half of config.go's "no silent default": a privileged pod must never land in the
+// restricted namespace because a knob was unset. The worker stays desired (never torn
+// down), so it materializes the moment the controller is configured.
+func TestDockerWorkerSkippedWhenDockerNamespaceUnconfigured(t *testing.T) {
+	m, client := newMat(t) // testConfig has NO docker namespace
+	ctx := context.Background()
+	dock := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")}
+
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{dock}, nil); err != nil {
+		t.Fatalf("Reconcile must tolerate an unconfigured docker worker, got: %v", err)
+	}
+	for _, a := range client.Actions() {
+		if v := a.GetVerb(); v == "create" || v == "delete" || v == "patch" {
+			t.Fatalf("a %q on %s reached the apiserver for a docker worker with no docker namespace configured — "+
+				"it must be skipped, never rendered into the restricted default", v, a.GetResource().Resource)
+		}
+	}
+}
+
 // --- helpers ---------------------------------------------------------------
 
 func findPatch(t *testing.T, client *fake.Clientset) string {

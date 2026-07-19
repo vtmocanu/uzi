@@ -67,7 +67,12 @@ export class WorkerClient {
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
   }
 
-  async register(name: string, template?: string, maxConcurrentRuns?: number): Promise<RegisterResponse> {
+  async register(
+    name: string,
+    template?: string,
+    maxConcurrentRuns?: number,
+    capabilities?: string[],
+  ): Promise<RegisterResponse> {
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
     // no template, and the server stores NULL (PRD #18). The server's decoder
@@ -79,6 +84,11 @@ export class WorkerClient {
     // 1); M3a's register handler accepts it and a pre-#42 server ignores it. Distinct
     // from the chat lane's WORKER_CHAT_SESSIONS — this bounds issue/ci_fix runs only.
     if (typeof maxConcurrentRuns === "number") body.max_concurrent_runs = maxConcurrentRuns;
+    // Self-reported REACHABLE capabilities (PRD #83 Q1). Only send when non-empty
+    // (mirrors `template`): a worker with no daemon wired omits it entirely, so the
+    // register wire stays byte-identical to today. The api declares-and-ignores it in
+    // M1 (accept-and-ignore); #84 owns storage + the claim-time match predicate.
+    if (capabilities?.length) body.capabilities = capabilities;
     return (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
   }
 

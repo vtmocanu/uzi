@@ -44,6 +44,19 @@ func desired(id string) protocol.DesiredWorker {
 	return protocol.DesiredWorker{ID: id, Template: "base", Size: "m", Generation: 0}
 }
 
+// dockerTestConfig is testConfig plus a configured docker tier (PRD #83 M3): the
+// separate privileged namespace and the pinned DinD sidecar image.
+func dockerTestConfig() RenderConfig {
+	cfg := testConfig()
+	cfg.DockerNamespace = "uzi-workers-docker"
+	cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
+	return cfg
+}
+
+func desiredDocker(id string) protocol.DesiredWorker {
+	return protocol.DesiredWorker{ID: id, Template: "base", Size: "m", Generation: 0, Docker: true}
+}
+
 // The pod posture, asserted field by field. Every line here is a decision that
 // fails in a specific, mostly-silent way if it drifts.
 func TestRenderedPodPosture(t *testing.T) {
@@ -405,6 +418,228 @@ func TestGenerationIsStampedOnThePodTemplate(t *testing.T) {
 	if got := rolled.Spec.Template.Annotations[AnnotationGeneration]; got != "3" {
 		t.Errorf("generation annotation = %q, want \"3\"", got)
 	}
+}
+
+// --- docker-capable workers (PRD #83 M3) -----------------------------------
+
+// THE ONE SECURITY INVARIANT on a wired worker (Decision 3): the DinD containers
+// mount NONE of the worker's token/`/data`/`/nix` volumes, so a `docker run -v
+// <anything>:/x` binds a filesystem that holds none of them. This is what closes the
+// docker `-v` vector on k8s; the in-container guardrail only denies "no daemon", it
+// is NOT containment. A failing assertion here is a real security regression, not a
+// style nit — do not "fix" it by loosening the check.
+func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
+	dep := RenderDeployment(dockerTestConfig(), desiredDocker("abc"), testSpec(t, "base", "m"))
+	pod := dep.Spec.Template.Spec
+
+	// The volumes (by name) and paths that carry the worker's secrets/state. The dind
+	// side must touch none of them, by EITHER name or mount path.
+	forbiddenNames := map[string]bool{"token": true, "data": true, "nix": true}
+	forbiddenPaths := map[string]bool{secretMountPath: true, dataMountPath: true, nixMountPath: true, nixSeedMountPath: true}
+
+	var checked int
+	for _, c := range pod.InitContainers {
+		if c.Name != dindContainerName && c.Name != dindInitContainerName {
+			continue
+		}
+		checked++
+		for _, vm := range c.VolumeMounts {
+			if forbiddenNames[vm.Name] {
+				t.Errorf("dind container %q mounts the worker volume %q — this reopens the docker -v vector "+
+					"(a `docker run -v` into this container would expose the worker's secret/data/nix). Decision 3: "+
+					"the dind side mounts ONLY the shared socket dir and its own data root.", c.Name, vm.Name)
+			}
+			if forbiddenPaths[vm.MountPath] {
+				t.Errorf("dind container %q mounts a worker path %q — Decision 3 forbids the dind side seeing "+
+					"token/data/nix at all.", c.Name, vm.MountPath)
+			}
+		}
+	}
+	if checked != 2 {
+		t.Fatalf("expected to check exactly the dind + dind-init containers, checked %d", checked)
+	}
+}
+
+// The docker sidecars are NATIVE SIDECARS (initContainers with restartPolicy: Always
+// + a startupProbe), ordered [seed-nix → dind-init → dind]. This is what makes k8s
+// start the daemon before the worker and hold the worker until dockerd is listening
+// (the k8s half of the keystone readiness race). Order is load-bearing: dind-init
+// (the socket-dir chown) MUST precede dind, because rootless dockerd refuses to start
+// without a writable runtime dir.
+func TestDockerWorkerRendersNativeSidecarsInOrder(t *testing.T) {
+	dep := RenderDeployment(dockerTestConfig(), desiredDocker("abc"), testSpec(t, "base", "m"))
+	inits := dep.Spec.Template.Spec.InitContainers
+
+	if len(inits) != 3 {
+		t.Fatalf("%d init containers, want 3 (seed-nix, dind-init, dind)", len(inits))
+	}
+	if inits[0].Name != seedContainerName || inits[1].Name != dindInitContainerName || inits[2].Name != dindContainerName {
+		t.Fatalf("init order = [%s %s %s], want [%s %s %s]",
+			inits[0].Name, inits[1].Name, inits[2].Name, seedContainerName, dindInitContainerName, dindContainerName)
+	}
+	for _, c := range []corev1.Container{inits[1], inits[2]} {
+		if c.RestartPolicy == nil || *c.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			t.Errorf("%q must be a native sidecar (restartPolicy: Always); a plain wait-initContainer would "+
+				"deadlock before the sidecar ever starts", c.Name)
+		}
+		if c.StartupProbe == nil || c.StartupProbe.Exec == nil {
+			t.Errorf("%q must carry an exec startupProbe so k8s gates the worker on real readiness", c.Name)
+		}
+	}
+	// The dind gate is the DAEMON being up (`docker info`), not the socket existing.
+	if probe := inits[2].StartupProbe; probe == nil || probe.Exec == nil ||
+		!strings.Contains(strings.Join(probe.Exec.Command, " "), "info") {
+		t.Error("the dind startupProbe must run `docker info` — the socket existing is not the daemon being ready")
+	}
+}
+
+// The worker container keeps #58's posture VERBATIM even on a docker pod — only the
+// sidecar is privileged. And the dind sidecar is privileged + runs as the rootless
+// uid 1000 (not the pod's 10001), which is the actual security property (a breakout
+// lands as a userns-mapped unprivileged host uid).
+func TestDockerWorkerKeepsWorkerPostureAndPrivilegesOnlyTheSidecar(t *testing.T) {
+	dep := RenderDeployment(dockerTestConfig(), desiredDocker("abc"), testSpec(t, "base", "m"))
+	pod := dep.Spec.Template.Spec
+
+	// Pod-level posture unchanged: the worker still runs as 10001 non-root.
+	if *pod.SecurityContext.RunAsUser != 10001 || !*pod.SecurityContext.RunAsNonRoot {
+		t.Errorf("pod runAsUser/nonRoot = %d/%v, want the #58 posture 10001/true", *pod.SecurityContext.RunAsUser, *pod.SecurityContext.RunAsNonRoot)
+	}
+	worker := containerByName(t, pod.Containers, workerContainerName)
+	if worker.SecurityContext == nil || *worker.SecurityContext.AllowPrivilegeEscalation {
+		t.Error("the worker container must keep allowPrivilegeEscalation:false — only the sidecar is privileged")
+	}
+	if worker.SecurityContext.Privileged != nil && *worker.SecurityContext.Privileged {
+		t.Error("the WORKER container must never be privileged")
+	}
+	if len(worker.SecurityContext.Capabilities.Drop) != 1 || worker.SecurityContext.Capabilities.Drop[0] != "ALL" {
+		t.Error("the worker container must keep drop ALL")
+	}
+
+	dind := containerByName(t, pod.InitContainers, dindContainerName)
+	if dind.SecurityContext == nil || dind.SecurityContext.Privileged == nil || !*dind.SecurityContext.Privileged {
+		t.Fatal("the dind sidecar must be privileged:true in the privileged-tier namespace")
+	}
+	if dind.SecurityContext.RunAsUser == nil || *dind.SecurityContext.RunAsUser != 1000 {
+		t.Error("the dind sidecar must run as the rootless uid 1000 (its subuid/subgid ranges), overriding the pod's 10001")
+	}
+	if dind.SecurityContext.SeccompProfile == nil || dind.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined {
+		t.Error("the dind sidecar needs seccomp Unconfined so the nested daemon can profile its children")
+	}
+
+	// dind-init runs as root but with a TIGHT cap set: drop ALL, add back only CHOWN +
+	// FOWNER (the two it uses to chown/chmod the socket dir). Not the full root cap set,
+	// so a compromise of this tiny helper widens the pod by exactly those two.
+	dindInit := containerByName(t, pod.InitContainers, dindInitContainerName)
+	if dindInit.SecurityContext == nil || dindInit.SecurityContext.RunAsUser == nil || *dindInit.SecurityContext.RunAsUser != 0 {
+		t.Fatal("dind-init must run as root (uid 0) to chown/chmod the socket dir")
+	}
+	caps := dindInit.SecurityContext.Capabilities
+	if caps == nil || len(caps.Drop) != 1 || caps.Drop[0] != "ALL" {
+		t.Error("dind-init must drop ALL capabilities")
+	}
+	gotAdd := map[corev1.Capability]bool{}
+	for _, c := range caps.Add {
+		gotAdd[c] = true
+	}
+	if caps == nil || len(caps.Add) != 2 || !gotAdd["CHOWN"] || !gotAdd["FOWNER"] {
+		t.Errorf("dind-init must add exactly [CHOWN, FOWNER] and nothing else, got %v", caps.Add)
+	}
+}
+
+// The k8s branch of the keystone resolver: DOCKER_HOST is set EXPLICITLY on the
+// worker (never probed), pointing at the shared socket. A non-docker worker gets no
+// DOCKER_HOST at all.
+func TestDockerWorkerSetsExplicitDockerHostAndSharesOnlyTheSocket(t *testing.T) {
+	dep := RenderDeployment(dockerTestConfig(), desiredDocker("abc"), testSpec(t, "base", "m"))
+	worker := containerByName(t, dep.Spec.Template.Spec.Containers, workerContainerName)
+
+	var dockerHost string
+	socketMounted := false
+	for _, e := range worker.Env {
+		if e.Name == "DOCKER_HOST" {
+			dockerHost = e.Value
+		}
+	}
+	for _, vm := range worker.VolumeMounts {
+		if vm.Name == dindSocketVolume {
+			socketMounted = true
+			if vm.MountPath != dindSocketDir {
+				t.Errorf("worker mounts the socket dir at %q, want %q", vm.MountPath, dindSocketDir)
+			}
+		}
+	}
+	if dockerHost != "unix:///run/dind/docker.sock" {
+		t.Errorf("DOCKER_HOST = %q, want the explicit shared-socket path", dockerHost)
+	}
+	if !socketMounted {
+		t.Error("the worker must mount the shared socket dir to reach the daemon")
+	}
+
+	// A plain worker gets neither — the docker path is fully gated on w.Docker.
+	plain := RenderDeployment(dockerTestConfig(), desired("abc"), testSpec(t, "base", "m"))
+	pw := containerByName(t, plain.Spec.Template.Spec.Containers, workerContainerName)
+	for _, e := range pw.Env {
+		if e.Name == "DOCKER_HOST" {
+			t.Error("a non-docker worker must not carry DOCKER_HOST")
+		}
+	}
+	if len(plain.Spec.Template.Spec.InitContainers) != 1 {
+		t.Errorf("a non-docker worker must render exactly the seed init container, got %d", len(plain.Spec.Template.Spec.InitContainers))
+	}
+}
+
+// A docker worker renders into the SEPARATE privileged namespace; a plain worker
+// stays in the restricted default. The blast-radius separation (Decision 7 / Q-B) is
+// only real if the objects actually land in different namespaces.
+func TestDockerWorkerObjectsGoToTheDockerNamespace(t *testing.T) {
+	cfg := dockerTestConfig()
+	dw := desiredDocker("abc")
+
+	if got := RenderDeployment(cfg, dw, testSpec(t, "base", "m")).Namespace; got != "uzi-workers-docker" {
+		t.Errorf("docker deployment namespace = %q, want uzi-workers-docker", got)
+	}
+	if got := RenderSecret(cfg, dw, "uzw_t").Namespace; got != "uzi-workers-docker" {
+		t.Errorf("docker secret namespace = %q, want uzi-workers-docker", got)
+	}
+	for _, p := range RenderPVCs(cfg, dw, testSpec(t, "base", "m")) {
+		if p.Namespace != "uzi-workers-docker" {
+			t.Errorf("docker pvc %q namespace = %q, want uzi-workers-docker", p.Name, p.Namespace)
+		}
+	}
+	// The plain worker is untouched: restricted default.
+	if got := RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m")).Namespace; got != "uzi-workers" {
+		t.Errorf("plain deployment namespace = %q, want the restricted uzi-workers", got)
+	}
+}
+
+// The docker toggle rolls the pod (specHash covers the new containers), so flipping
+// it is a real re-render — but a plain worker's hash is UNCHANGED from the pre-#83
+// render (the docker path is fully gated), so shipping docker never rolls the
+// existing fleet.
+func TestDockerFlagRollsThePodButAbsentDockerIsInert(t *testing.T) {
+	cfg := dockerTestConfig()
+	plain := SpecHashOf(cfg, desired("abc"), testSpec(t, "base", "m"))
+	dockerHash := SpecHashOf(cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+	if plain == dockerHash {
+		t.Error("a docker worker must hash differently from a plain one, or enabling docker would never roll the pod")
+	}
+	// With docker off, the docker namespace/image config must not bleed into the hash:
+	// a controller that merely CAN render docker must not roll every plain worker.
+	if noCfg := SpecHashOf(testConfig(), desired("abc"), testSpec(t, "base", "m")); noCfg != plain {
+		t.Error("a plain worker's spec hash must not depend on whether the docker tier is configured")
+	}
+}
+
+func containerByName(t *testing.T, cs []corev1.Container, name string) corev1.Container {
+	t.Helper()
+	for _, c := range cs {
+		if c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("no container named %q", name)
+	return corev1.Container{}
 }
 
 // --- the seed script -------------------------------------------------------

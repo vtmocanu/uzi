@@ -22,6 +22,7 @@ SELECT w.id,
        w.template_declared,
        w.hosted_size,
        w.hosted_generation,
+       w.docker_enabled,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
@@ -72,8 +73,13 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND kind = 'hosted';
 -- a hazard the count and the insert being separate statements makes MORE reachable,
 -- not less, since nothing but this hardcoding ties the two to the same kind.
 -- hosted_generation takes its column default (0); nothing in M2 bumps it.
-INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size)
-VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size)
+--
+-- docker_enabled (PRD #83 M3) is the opt-in for the rootless-DinD sidecar. It is a
+-- plain parameter here, not defaulted, because the provision handler decides it from
+-- the request and passes an explicit true/false — a false is a real "no sidecar",
+-- distinct from an external worker's NULL.
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled)
+VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size, @docker_enabled)
 RETURNING *;
 
 -- name: UpsertHostedWorkerToken :exec

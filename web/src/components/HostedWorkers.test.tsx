@@ -130,8 +130,22 @@ describe("HostedWorkers provisioning", () => {
 
     // "M" is what the user reads; "m" is the only thing the api accepts
     // (workersize.Valid("M") is false), so the label must never become the value.
-    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("jvm", "m"));
+    // docker defaults false (the box is unchecked) and is sent explicitly.
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("jvm", "m", false));
     expect(onProvisioned).toHaveBeenCalled();
+  });
+
+  it("sends docker=true when the Docker-capable box is ticked (PRD #83 M3)", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2 });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+
+    fireEvent.change(await screen.findByLabelText("Hosted worker template"), { target: { value: "jvm" } });
+    fireEvent.change(screen.getByLabelText("Hosted worker size"), { target: { value: "m" } });
+    fireEvent.click(screen.getByLabelText("Docker-capable worker"));
+    fireEvent.click(await provisionButton());
+
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("jvm", "m", true));
   });
 
   it("renders NO token after a successful provision", async () => {
@@ -181,7 +195,7 @@ describe("HostedWorkers provisioning", () => {
     mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
     renderCard(0);
     fireEvent.click(await provisionButton());
-    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "m"));
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "m", false));
   });
 
   it("shows the 409 quota refusal verbatim (the server's words, not ours)", async () => {

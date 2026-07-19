@@ -51,6 +51,23 @@ describe("register / heartbeat / claim", () => {
     assert.ok(!("template" in rec));
   });
 
+  it("sends capabilities when the worker has a daemon wired (PRD #83 Q1)", async () => {
+    await newClient().register("vlad-laptop", "base", 1, ["docker"]);
+    const rec = api.registers[0];
+    assert.ok(rec);
+    assert.deepStrictEqual(rec.capabilities, ["docker"]);
+  });
+
+  it("omits the capabilities field when none are reported (empty or undefined)", async () => {
+    // Both an empty array and undefined must produce the SAME byte-identical wire as a
+    // pre-#83 worker: no `capabilities` key at all (only send when non-empty).
+    await newClient().register("vlad-laptop", "base", 1, []);
+    await newClient().register("vlad-laptop", "base", 1, undefined);
+    for (const rec of api.registers) {
+      assert.strictEqual(rec.capabilities, undefined);
+    }
+  });
+
   it("rejects a wrong token with 401", async () => {
     const bad = new WorkerClient(baseUrl, "nope", "0.1.0-test", nullLogger());
     await assert.rejects(bad.heartbeat(), RequestError);

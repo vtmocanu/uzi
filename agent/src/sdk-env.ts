@@ -56,8 +56,21 @@ export interface SdkEnv {
  *                   so widening the agent env stays deliberate. PATH here REPLACES
  *                   the inherited PATH (devbox's PATH already prepends tool bins to
  *                   it). Empty ⇒ today's behavior exactly.
+ * @param dockerHost PRD #83 Q3/Q4: the resolved DOCKER_HOST for a WIRED worker (the
+ *                   keystone resolver's output). When set, the agent's docker CLI
+ *                   reaches the sidecar daemon through it. Undefined ⇒ the key is
+ *                   omitted entirely, so a sidecar-less worker's docker fails loudly
+ *                   ("cannot connect to the Docker daemon") rather than reaching for a
+ *                   host socket. Widening the deliberately-minimal agent env is safe:
+ *                   it is a socket path/URL, NOT a secret, and is present only when a
+ *                   sidecar is wired.
  */
-export function buildSdkEnv(oauthToken: string, homeDir: string, toolEnv: Record<string, string> = {}): SdkEnv {
+export function buildSdkEnv(
+  oauthToken: string,
+  homeDir: string,
+  toolEnv: Record<string, string> = {},
+  dockerHost?: string,
+): SdkEnv {
   const env: SdkEnv = {
     CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
     HOME: homeDir,
@@ -82,5 +95,9 @@ export function buildSdkEnv(oauthToken: string, homeDir: string, toolEnv: Record
     if (PROTECTED_ENV_KEYS.has(k)) continue;
     env[k] = v;
   }
+  // DOCKER_HOST is worker-set (not agent-set) and NOT in PROTECTED_ENV_KEYS: the
+  // provision allowlist never emits it, so the fold above cannot carry it. Set it AFTER
+  // the fold so a provisioned var can never clobber the worker's wired endpoint.
+  if (dockerHost) env.DOCKER_HOST = dockerHost;
   return env;
 }

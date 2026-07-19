@@ -52,6 +52,15 @@ type DesiredWorker struct {
 	// sides, and shipping resolved values would make the api the authority on a
 	// pod spec it is not allowed to know anything about.
 	Size string `json:"size"`
+	// Docker is the rootless-DinD sidecar opt-in (PRD #83 M3): true → the controller
+	// renders the worker with a privileged DinD native sidecar in the dedicated
+	// privileged-tier namespace, false → #58's plain single-container worker in the
+	// restricted namespace. A pod-shape DIMENSION orthogonal to Template (Decision 1:
+	// docker is not a template), so it rides its own bool. Always present on the wire
+	// (no omitempty) so a drop is a visible contract change, not a silent false.
+	// COALESCEd from the nullable docker_enabled column, so a NULL (external rows
+	// never reach this poll) and an explicit false both mean "no sidecar".
+	Docker bool `json:"docker"`
 	// Generation is bumped whenever the desired spec changes; the controller
 	// compares it against what it observes to decide whether to roll (Decision 9).
 	Generation int64 `json:"generation"`

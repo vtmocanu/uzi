@@ -32,13 +32,20 @@ func samplePollResponse() PollResponse {
 			Template:   "base",
 			Size:       "s",
 			Generation: 1,
-			JoinToken:  &token,
+			// A docker-capable worker: the controller renders it with the privileged
+			// DinD native sidecar in the docker namespace (PRD #83 M3).
+			Docker:    true,
+			JoinToken: &token,
 		},
 		{
 			ID:         "22222222-2222-2222-2222-222222222222",
 			Template:   "jvm",
 			Size:       "l",
 			Generation: 4,
+			// docker false: #58's plain single-container worker in the restricted
+			// namespace — both docker states on one wire so a drop of the field is a
+			// red build on both sides.
+			Docker: false,
 			// No token to write: a pod already proved it holds one (its plaintext
 			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,

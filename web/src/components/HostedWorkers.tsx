@@ -31,6 +31,9 @@ export function HostedWorkers({
   const [config, setConfig] = useState<HostedConfig | null>(null);
   const [template, setTemplate] = useState<string>(DEFAULT_WORKER_TEMPLATE);
   const [size, setSize] = useState<string>(DEFAULT_WORKER_SIZE);
+  // Opt into a rootless Docker-in-Docker sidecar (PRD #83 M3). Off by default: the
+  // plain worker is the common case, docker is the extra one you ask for.
+  const [docker, setDocker] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -63,9 +66,10 @@ export function HostedWorkers({
       // No token comes back and none is rendered — unlike createWorker on this page.
       // The controller collects a hosted worker's token from its poll; the user is
       // never in that path (Decision 3). Success is: the row shows up in the list.
-      const { worker } = await api.provisionHostedWorker(template, size);
+      const { worker } = await api.provisionHostedWorker(template, size, docker);
       setTemplate(DEFAULT_WORKER_TEMPLATE);
       setSize(DEFAULT_WORKER_SIZE);
+      setDocker(false);
       // The page announces it, naming the worker the SERVER created (it derives a name
       // from template + size when the form sends none, and naming the row is how the
       // user finds it below).
@@ -138,6 +142,19 @@ export function HostedWorkers({
             </Select>
           </Field>
         </div>
+        {/* A plain labeled checkbox, not a new ui primitive: this repo has no toggle
+            primitive and a single opt-in is not the place to invent one (same reason
+            this card is not a modal). The label wraps the input so the whole thing is
+            one click target with no htmlFor to keep in sync. */}
+        <label className="flex items-center gap-2 pb-2 text-sm">
+          <input
+            type="checkbox"
+            aria-label="Docker-capable worker"
+            checked={docker}
+            onChange={(e) => setDocker(e.target.checked)}
+          />
+          Docker-capable
+        </label>
         <Button type="submit" disabled={busy || atQuota}>
           {busy ? "Provisioning…" : "Provision"}
         </Button>
@@ -149,7 +166,9 @@ export function HostedWorkers({
       <p className="text-xs text-muted">
         A hosted worker runs in the cluster, not on your machine: there is no join token to
         copy and no container to start. It appears below and comes online on its own, and you
-        delete it there like any other worker.
+        delete it there like any other worker. Tick <em>Docker-capable</em> to give its agent
+        a rootless, isolated Docker daemon (for docker and docker&nbsp;compose); it costs extra
+        CPU and storage and needs an instance that offers the docker tier.
       </p>
     </Card>
   );
