@@ -1,6 +1,7 @@
 package uzicli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -38,10 +39,6 @@ const (
 	hookMatcher = "startup"
 	// hookCommand is the canonical command we write.
 	hookCommand = "uzi skill install"
-	// hookCommandPrefix is the tolerant match: any SessionStart command that
-	// starts with this prefix is treated as ours, so a user who appended flags
-	// or tweaked the string is still recognised (PRD R5) — no orphan duplicate.
-	hookCommandPrefix = "uzi skill install"
 	// hookTimeout is the per-hook timeout, in seconds.
 	hookTimeout = 15
 )
@@ -116,6 +113,43 @@ func (hm *HookManager) readRaw() (data []byte, existed bool, err error) {
 	return b, true, nil
 }
 
+// decodeSettings parses settings.json into a top-level object. It uses
+// UseNumber() so large-integer siblings survive verbatim (json.Unmarshal would
+// coerce them to float64 and lose precision on re-marshal). A decode error or a
+// non-object top-level (array, string, number, bool) is errSettingsMalformed —
+// we never overwrite a shape we do not understand. A literal JSON `null`
+// decodes to a nil map, which callers treat as an empty object.
+func decodeSettings(raw []byte) (map[string]any, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, errSettingsMalformed
+	}
+	if v == nil {
+		return nil, nil // JSON null
+	}
+	root, ok := v.(map[string]any)
+	if !ok {
+		return nil, errSettingsMalformed
+	}
+	return root, nil
+}
+
+// encodeSettings marshals a settings document with HTML escaping OFF (so `&&`,
+// `>`, `<` in foreign commands are preserved verbatim, not turned into &
+// etc.) and 2-space indent. The encoder appends a trailing newline.
+func encodeSettings(root map[string]any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(root); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // canonicalMatcherObject builds the SessionStart matcher-object we manage.
 func canonicalMatcherObject() map[string]any {
 	return map[string]any{
@@ -130,9 +164,18 @@ func canonicalMatcherObject() map[string]any {
 	}
 }
 
+// isOurCommand reports whether a SessionStart command string is one we manage.
+// The match is WORD-BOUNDARY aware: the exact canonical string, or the canonical
+// string followed by a space (so appended flags like `uzi skill install --force`
+// still count, PRD R5) — but NOT a longer word like the real sibling subcommand
+// `uzi skill install-hook`, which a bare prefix match would destroy.
+func isOurCommand(cmd string) bool {
+	return cmd == hookCommand || strings.HasPrefix(cmd, hookCommand+" ")
+}
+
 // commandHasOurPrefix reports whether an untrusted hook element is a
-// command-object whose "command" starts with our prefix. It type-asserts every
-// hop with the ,ok form so a malformed shape is skipped, never a panic.
+// command-object whose "command" is one of ours. It type-asserts every hop with
+// the ,ok form so a malformed shape is skipped, never a panic.
 func commandHasOurPrefix(h any) bool {
 	m, ok := h.(map[string]any)
 	if !ok {
@@ -142,7 +185,7 @@ func commandHasOurPrefix(h any) bool {
 	if !ok {
 		return false
 	}
-	return strings.HasPrefix(cmd, hookCommandPrefix)
+	return isOurCommand(cmd)
 }
 
 // sessionStartArray returns the (possibly nil) SessionStart array from a parsed
@@ -188,11 +231,12 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 
 	root := map[string]any{}
 	if existed {
-		if err := json.Unmarshal(raw, &root); err != nil {
-			return res, errSettingsMalformed
+		decoded, err := decodeSettings(raw)
+		if err != nil {
+			return res, err
 		}
-		if root == nil { // literal JSON null
-			root = map[string]any{}
+		if decoded != nil { // nil ⇒ literal JSON null ⇒ treat as empty object
+			root = decoded
 		}
 	}
 
@@ -205,16 +249,29 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 	}
 
 	// Navigate/create hooks (object) → SessionStart (array), preserving siblings.
-	hooks, ok := root["hooks"].(map[string]any)
-	if !ok {
-		hooks = map[string]any{}
+	// A present-but-wrong-typed `hooks` or `SessionStart` is treated like a
+	// malformed file: abort rather than clobber a shape we do not understand.
+	hooks := map[string]any{}
+	if v, present := root["hooks"]; present {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return res, errSettingsMalformed
+		}
+		hooks = m
 	}
-	sessionStart, _ := hooks["SessionStart"].([]any)
+	var sessionStart []any
+	if v, present := hooks["SessionStart"]; present {
+		arr, ok := v.([]any)
+		if !ok {
+			return res, errSettingsMalformed
+		}
+		sessionStart = arr
+	}
 	sessionStart = append(sessionStart, canonicalMatcherObject())
 	hooks["SessionStart"] = sessionStart
 	root["hooks"] = hooks
 
-	out, err := json.MarshalIndent(root, "", "  ")
+	out, err := encodeSettings(root)
 	if err != nil {
 		return res, err
 	}
@@ -222,14 +279,15 @@ func (hm *HookManager) InstallHook() (HookInstallResult, error) {
 	if err := os.MkdirAll(hm.dir(), 0o755); err != nil {
 		return res, err
 	}
-	// Back up the prior file before the first mutating write.
+	// Back up the prior file before the first mutating write. settings.json can
+	// hold secrets (env block, apiKeyHelper), so both files are 0o600.
 	if existed {
-		if err := writeFileAtomic(hm.backupPath(), raw, 0o644); err != nil {
+		if err := writeFileAtomic(hm.backupPath(), raw, 0o600); err != nil {
 			return res, err
 		}
 		res.BackedUp = true
 	}
-	if err := writeFileAtomic(hm.settingsPath(), out, 0o644); err != nil {
+	if err := writeFileAtomic(hm.settingsPath(), out, 0o600); err != nil {
 		return res, err
 	}
 	res.Changed = true
@@ -250,9 +308,9 @@ func (hm *HookManager) UninstallHook() (HookUninstallResult, error) {
 		return res, nil
 	}
 
-	var root map[string]any
-	if err := json.Unmarshal(raw, &root); err != nil {
-		return res, errSettingsMalformed
+	root, err := decodeSettings(raw)
+	if err != nil {
+		return res, err
 	}
 	if root == nil {
 		return res, nil
@@ -310,18 +368,18 @@ func (hm *HookManager) UninstallHook() (HookUninstallResult, error) {
 		root["hooks"] = hooks
 	}
 
-	out, err := json.MarshalIndent(root, "", "  ")
+	out, err := encodeSettings(root)
 	if err != nil {
 		return res, err
 	}
 	if err := os.MkdirAll(hm.dir(), 0o755); err != nil {
 		return res, err
 	}
-	if err := writeFileAtomic(hm.backupPath(), raw, 0o644); err != nil {
+	if err := writeFileAtomic(hm.backupPath(), raw, 0o600); err != nil {
 		return res, err
 	}
 	res.BackedUp = true
-	if err := writeFileAtomic(hm.settingsPath(), out, 0o644); err != nil {
+	if err := writeFileAtomic(hm.settingsPath(), out, 0o600); err != nil {
 		return res, err
 	}
 	res.Changed = true
@@ -339,10 +397,13 @@ func (hm *HookManager) HookStatus() HookStatusResult {
 	if err != nil || !existed {
 		return res
 	}
-	var root map[string]any
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeSettings(raw)
+	if err != nil {
 		res.Malformed = true
 		return res
+	}
+	if root == nil {
+		return res // literal JSON null ⇒ nothing installed
 	}
 
 	matches := 0
@@ -364,7 +425,7 @@ func (hm *HookManager) HookStatus() HookStatusResult {
 			if !ok {
 				continue
 			}
-			if strings.HasPrefix(cmd, hookCommandPrefix) {
+			if isOurCommand(cmd) {
 				matches++
 				if cmd == hookCommand {
 					res.Current = true

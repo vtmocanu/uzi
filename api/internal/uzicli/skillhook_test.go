@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -349,4 +350,133 @@ func TestHookStatus(t *testing.T) {
 			t.Fatalf("prefix match: %+v, want Installed and not Current", st)
 		}
 	})
+
+	// Word-boundary: the REAL sibling subcommand `uzi skill install-hook` must
+	// NOT be mistaken for ours (a bare prefix match would); appended flags do.
+	t.Run("word-boundary excludes install-hook, includes flags", func(t *testing.T) {
+		home := t.TempDir()
+		writeSettings(t, home, `{"hooks":{"SessionStart":[
+		  {"matcher":"startup","hooks":[{"type":"command","command":"uzi skill install-hook"}]}
+		]}}`)
+		if st := NewHookManagerAt(home).HookStatus(); st.Installed {
+			t.Fatalf("`uzi skill install-hook` must NOT count as ours: %+v", st)
+		}
+
+		home2 := t.TempDir()
+		writeSettings(t, home2, `{"hooks":{"SessionStart":[
+		  {"matcher":"startup","hooks":[{"type":"command","command":"uzi skill install --force"}]}
+		]}}`)
+		if st := NewHookManagerAt(home2).HookStatus(); !st.Installed {
+			t.Fatalf("`uzi skill install --force` must count as ours: %+v", st)
+		}
+	})
+}
+
+// UninstallHook must not destroy the real sibling subcommand `uzi skill
+// install-hook` if a user ever wired it as a SessionStart command — a bare
+// prefix match would have deleted it (the destructive direction of the bug).
+func TestUninstallHookLeavesInstallHookSibling(t *testing.T) {
+	home := t.TempDir()
+	writeSettings(t, home, `{"hooks":{"SessionStart":[
+	  {"matcher":"startup","hooks":[{"type":"command","command":"uzi skill install-hook"}]}
+	]}}`)
+	hm := NewHookManagerAt(home)
+	res, err := hm.UninstallHook()
+	if err != nil {
+		t.Fatalf("UninstallHook: %v", err)
+	}
+	if res.Changed || res.Removed != 0 {
+		t.Fatalf("uninstall must be a no-op over install-hook: %+v", res)
+	}
+	cmds := sessionStartCommands(t, parseSettings(t, home))
+	var saw bool
+	for _, c := range cmds {
+		if c == "uzi skill install-hook" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("`uzi skill install-hook` was destroyed by uninstall; commands=%v", cmds)
+	}
+}
+
+// Byte-faithful round-trip: a large-integer sibling must NOT be coerced to
+// float64 (which would corrupt it), and `&&`/`>`/`<` in a foreign command must
+// be preserved verbatim (no HTML escaping).
+func TestInstallHookByteFaithfulSiblings(t *testing.T) {
+	home := t.TempDir()
+	writeSettings(t, home, `{
+	  "big": 123456789012345678,
+	  "hooks": {"SessionStart": [
+	    {"matcher":"startup","hooks":[{"type":"command","command":"echo a && b > c < d"}]}
+	  ]}
+	}`)
+	if _, err := NewHookManagerAt(home).InstallHook(); err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	raw, err := os.ReadFile(settingsPathIn(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(raw)
+	if !strings.Contains(s, "123456789012345678") {
+		t.Errorf("large integer corrupted on round-trip:\n%s", s)
+	}
+	if !strings.Contains(s, "echo a && b > c < d") {
+		t.Errorf("foreign command was HTML-escaped or altered:\n%s", s)
+	}
+}
+
+// A present-but-wrong-typed `hooks` or `SessionStart` is treated like a
+// malformed file: InstallHook aborts without writing or backing up.
+func TestInstallHookWrongTypedContainersAbort(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"hooks is a string", `{"hooks":"x"}`},
+		{"SessionStart is a string", `{"hooks":{"SessionStart":"x"}}`},
+		{"SessionStart is an object", `{"hooks":{"SessionStart":{"a":1}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			writeSettings(t, home, tc.raw)
+			if _, err := NewHookManagerAt(home).InstallHook(); err == nil {
+				t.Fatal("InstallHook must abort on a wrong-typed container")
+			}
+			if got, err := os.ReadFile(settingsPathIn(home)); err != nil || string(got) != tc.raw {
+				t.Fatalf("file was modified: got %q err %v", got, err)
+			}
+			if _, err := os.Stat(backupPathIn(home)); !os.IsNotExist(err) {
+				t.Fatalf("no .bak may be written on the abort path (err=%v)", err)
+			}
+		})
+	}
+}
+
+// settings.json can hold secrets (env block, apiKeyHelper), so both the file we
+// write and its .bak must be 0o600, never world-readable.
+func TestInstallHookWritesMode0600(t *testing.T) {
+	// Fresh file.
+	home := t.TempDir()
+	if _, err := NewHookManagerAt(home).InstallHook(); err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	if info, err := os.Stat(settingsPathIn(home)); err != nil {
+		t.Fatal(err)
+	} else if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("settings.json mode = %o, want 600", perm)
+	}
+
+	// Over an existing file: the .bak must also be 0o600.
+	home2 := t.TempDir()
+	writeSettings(t, home2, "{}\n")
+	if _, err := NewHookManagerAt(home2).InstallHook(); err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	if info, err := os.Stat(backupPathIn(home2)); err != nil {
+		t.Fatal(err)
+	} else if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("settings.json.bak mode = %o, want 600", perm)
+	}
 }
