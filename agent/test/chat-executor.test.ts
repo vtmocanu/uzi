@@ -181,7 +181,11 @@ describe("buildChatSdkOptions confinement (PRD #39 Decision 6)", () => {
     const o = opts();
     assert.deepStrictEqual(o.tools, [...CHAT_BASE_TOOLS]); // Read/Grep/Glob only
     assert.strictEqual(o.allowedTools, undefined, "must not use allowedTools — it does not confine");
-    // No Bash/Write/Edit/WebFetch/WebSearch/Agent in the base set.
+    // No Bash/Write/Edit/WebFetch/WebSearch/Agent in the base set. Load-bearing for
+    // PRD #89 M-allow (auditor Medium): the docker claim-gate exempts repo-less runs,
+    // and chat rides its own ungated lane, so a docker worker CAN run a chat with
+    // DOCKER_HOST set. That is safe only because none of these reach the daemon; the
+    // judge's mirror of this invariant is judge-runner.test.ts.
     for (const forbidden of ["Bash", "Write", "Edit", "WebFetch", "WebSearch", "Agent"]) {
       assert.ok(!(o.tools as string[]).includes(forbidden), `${forbidden} must not be available`);
     }

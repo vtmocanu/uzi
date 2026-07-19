@@ -202,6 +202,9 @@ WHERE id = (
       AND (r.worker_id IS NULL
            OR r.worker_id = $1
            OR r.updated_at < $3)
+      AND (NOT $4::boolean
+           OR (r.repo_id IS NULL AND r.kind = 'judge')
+           OR r.repo_id = ANY($5::uuid[]))
     ORDER BY COALESCE(r.worker_id = $1, false) DESC, r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -210,9 +213,11 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type ClaimRunParams struct {
-	WorkerID       pgtype.UUID        `json:"worker_id"`
-	UserID         uuid.UUID          `json:"user_id"`
-	AffinityCutoff pgtype.Timestamptz `json:"affinity_cutoff"`
+	WorkerID            pgtype.UUID        `json:"worker_id"`
+	UserID              uuid.UUID          `json:"user_id"`
+	AffinityCutoff      pgtype.Timestamptz `json:"affinity_cutoff"`
+	IsDockerWorker      bool               `json:"is_docker_worker"`
+	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 }
 
 // The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
@@ -223,8 +228,43 @@ type ClaimRunParams struct {
 // FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
 // blocking (multica's queue semantics). The kind<>'chat' predicate is what keeps
 // the run lane and the concurrent chat lane from stealing each other's work.
+//
+// Docker-worker repo allowlist (PRD #89 M-allow): a DOCKER-enabled worker
+// (@is_docker_worker) may claim ONLY runs whose repo is on the trusted allowlist
+// (@docker_repo_allowlist). This is the accepted-risk LIKELIHOOD control for the
+// non-rootless DinD tier — the trigger is repo content, so the gate MUST bind here
+// at claim, not at provisioning (a provision-time user allowlist can't gate the
+// repo-content trigger the acceptance rests on). Non-docker workers pass
+// @is_docker_worker=false and the predicate short-circuits (NOT false = true),
+// leaving them wholly unaffected. An EMPTY allowlist for a docker worker is
+// FAIL-CLOSED: = ANY('{}') is false for every repo, so it claims only repo-less
+// runs — never an unvetted repo's run.
+//
+// The exemption is scoped to kind='judge' EXPLICITLY (r.repo_id IS NULL AND
+// r.kind = 'judge'), not to every repo-less run. judge is the only repo-less kind
+// ClaimRun can reach today (chat rides the separate ClaimChatRun lane; the
+// runs_kind_shape CHECK forbids repo_id NULL for issue/ci_fix/self_improve), so this
+// is behavior-identical now — but the `kind = 'judge'` clause makes a FUTURE repo-less
+// kind FAIL-CLOSED (a docker worker won't claim it) until it is deliberately added
+// here alongside its own executor-confinement test (auditor Low, PRD #89 M-allow).
+//
+// Why judge is safe to exempt: NOT "repo-less = content-free" (a judge still reasons
+// over an untrusted, prompt-injectable trace) — it is that the repo-less EXECUTOR
+// carries no daemon-reaching tool. agent/src/judge-runner.ts runs with a deny-ALL
+// PreToolUse hook (no Bash/HTTP/shell), so even with DOCKER_HOST set it cannot invoke
+// docker. The separate chat lane (ClaimChatRun, ungated) rests on the same property:
+// agent/src/chat-executor.ts is Read/Grep/Glob + read-only uzi MCP, with no
+// Bash/Write/Edit/WebFetch/WebSearch/Agent. An agent/ regression test pins BOTH so a
+// future tool addition trips CI (auditor Medium, PRD #89 M-allow). If that invariant
+// ever changes, this exemption must be revisited before it does.
 func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error) {
-	row := q.db.QueryRow(ctx, claimRun, arg.WorkerID, arg.UserID, arg.AffinityCutoff)
+	row := q.db.QueryRow(ctx, claimRun,
+		arg.WorkerID,
+		arg.UserID,
+		arg.AffinityCutoff,
+		arg.IsDockerWorker,
+		arg.DockerRepoAllowlist,
+	)
 	var i Run
 	err := row.Scan(
 		&i.ID,

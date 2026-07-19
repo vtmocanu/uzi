@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import type { Options as SdkOptions, HookInput } from "@anthropic-ai/claude-agent-sdk";
 
 import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview } from "../src/judge-runner.js";
 import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
@@ -234,5 +235,91 @@ describe("buildJudgePrompt", () => {
     const a = buildJudgePrompt(emptyTrace, null).match(/<untrusted_trace_([0-9a-f]{16})>/)?.[1];
     const b = buildJudgePrompt(emptyTrace, null).match(/<untrusted_trace_([0-9a-f]{16})>/)?.[1];
     assert.ok(a && b && a !== b, "each prompt must mint a fresh nonce");
+  });
+});
+
+// PRD #89 M-allow / auditor Medium. ClaimRun's `repo_id IS NULL` exemption lets a
+// docker-enabled worker claim repo-less judge runs (and the chat lane is ungated).
+// That is safe ONLY because these repo-less executors reach no daemon-capable tool —
+// a property that lives here in agent/, not at the claim gate. This pins it so a
+// future tool addition to the judge trips CI. The chat side is pinned by
+// chat-executor.test.ts ("restricts the tool set … no Bash/Write/Edit/WebFetch/
+// WebSearch/Agent"); this covers the judge, whose confinement is a deny-ALL
+// PreToolUse hook (it grants no `tools` allowlist at all).
+describe("judge tool confinement (PRD #89 M-allow / auditor Medium)", () => {
+  // Every tool a hijacked judge could use to reach dockerd (or otherwise execute /
+  // exfiltrate). The judge must deny all of them even under bypassPermissions.
+  const DAEMON_REACHING = [
+    "Bash",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "Agent",
+    "Task",
+  ];
+
+  // A queryFn that captures the SdkOptions the judge hands the model, then emits a
+  // valid terminal result so execute() completes.
+  function capturingQueryFn(text: string): { queryFn: SdkQueryFn; captured: { options?: SdkOptions } } {
+    const captured: { options?: SdkOptions } = {};
+    const queryFn: SdkQueryFn = (params) => {
+      captured.options = params.options;
+      return (async function* () {
+        yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+        yield { type: "result", subtype: "success", is_error: false };
+      })() as never;
+    };
+    return { queryFn, captured };
+  }
+
+  // Run every PreToolUse hook group that applies to toolName and return the last
+  // permissionDecision (a group with no matcher applies to all tools).
+  async function preToolUseDecision(options: SdkOptions, toolName: string): Promise<string | undefined> {
+    const groups = (options.hooks?.PreToolUse ?? []) as Array<{
+      matcher?: string;
+      hooks: Array<(input: HookInput) => Promise<unknown>>;
+    }>;
+    let decision: string | undefined;
+    for (const g of groups) {
+      if (g.matcher && !new RegExp(g.matcher).test(toolName)) continue;
+      for (const h of g.hooks) {
+        const out = (await h({
+          hook_event_name: "PreToolUse",
+          tool_name: toolName,
+          tool_input: {},
+          tool_use_id: "t",
+        } as unknown as HookInput)) as { hookSpecificOutput?: { permissionDecision?: string } };
+        if (out?.hookSpecificOutput?.permissionDecision) decision = out.hookSpecificOutput.permissionDecision;
+      }
+    }
+    return decision;
+  }
+
+  it("wires a PreToolUse hook that DENIES every daemon-reaching tool, and grants no tools allowlist", async () => {
+    const { client } = fakeClient(emptyTrace);
+    const { queryFn, captured } = capturingQueryFn(
+      JSON.stringify({ verdict: "ok", summary: "", recommendations: [] }),
+    );
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn });
+    await runner.execute(judgeClaim());
+
+    const options = captured.options;
+    assert.ok(options, "the judge must have called the model (so options were captured)");
+    // Repo-borne .claude/ can't grant permissions, and there is NO `tools` allowlist
+    // that could widen the surface — confinement is the deny-all hook below.
+    assert.deepStrictEqual(options!.settingSources, []);
+    assert.equal(
+      options!.tools,
+      undefined,
+      "the judge must grant no tools allowlist (its confinement is the deny-all hook)",
+    );
+    // The load-bearing invariant: every daemon-reaching tool is denied, so even with
+    // DOCKER_HOST set a hijacked judge cannot invoke docker.
+    for (const t of DAEMON_REACHING) {
+      assert.equal(await preToolUseDecision(options!, t), "deny", `${t} must be denied for the judge`);
+    }
   });
 });
