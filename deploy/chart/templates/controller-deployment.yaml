@@ -111,6 +111,19 @@ spec:
             - name: UZI_WORKER_STORAGE_CLASS
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.workers.docker.enabled }}
+            # The docker tier (PRD #83 M3). Both are required together — the controller
+            # refuses to boot with one set and not the other — and the namespace must
+            # differ from UZI_WORKER_NAMESPACE (the privileged tier is a SEPARATE
+            # namespace, which is the whole point). With docker off, neither is set and
+            # the controller renders no docker workers (a docker worker in the poll is
+            # skipped, never rendered into the restricted default).
+            - name: UZI_WORKER_DOCKER_NAMESPACE
+              value: {{ .Values.workers.docker.namespace | quote }}
+            # The pinned rootless-DinD sidecar image, shared with the compose track.
+            - name: UZI_WORKER_DIND_IMAGE
+              value: {{ .Values.workers.docker.image | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.workers.controller.resources | nindent 12 }}
           volumeMounts:

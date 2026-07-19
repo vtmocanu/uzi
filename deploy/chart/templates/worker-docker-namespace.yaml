@@ -1,0 +1,145 @@
+{{- if and .Values.workers.enabled .Values.workers.docker.enabled }}
+{{- /*
+  The DOCKER-capable worker tier's namespace and admission envelope (PRD #83 M3).
+
+  This is a SECOND, dedicated namespace, running `pod-security.kubernetes.io/enforce:
+  privileged`, that exists so workers with a rootless Docker-in-Docker sidecar have
+  somewhere admissible to run. It mirrors worker-namespace.yaml in every way EXCEPT
+  the PodSecurity tier — and that one difference is the whole reason it is a separate
+  namespace rather than a relaxation of the restricted default.
+
+  WHY PRIVILEGED, AND WHY IT IS STILL BOUNDED (Q-B). dev-cluster is k8s 1.29.4 +
+  containerd 1.6.31, below the k8s >=1.30 / containerd >=2.0.5 that pod user
+  namespaces (`hostUsers: false`) need — so the flagless-rootless design is infeasible
+  here and the tier is `privileged: true` rootless-DinD, the same posture the compose
+  track uses. The security property is the USERNS REMAP inside the docker:dind-rootless
+  image (a breakout lands as an unprivileged, userns-mapped host uid), NOT the flag's
+  absence. sysbox (runtimeClassName: sysbox-runc) is the documented path to a
+  non-privileged tier once the cluster is upgraded; it is not installed here.
+
+  WHY A SEPARATE NAMESPACE, still (Decision 7's real goal, preserved). A Role that can
+  create pods in a namespace can mount any Secret and impersonate any ServiceAccount
+  in it — RBAC cannot scope `create` by label — so the blast radius of a compromised
+  controller is exactly "whatever else lives in this namespace". Keeping the privileged
+  tier in its OWN namespace is what stops that blast radius from ever reaching the
+  restricted default (uzi-workers), which is UNTOUCHED by this file. Do not park
+  anything else here either.
+
+  WHAT LIVES HERE, stated exactly (the argument is only as good as its inventory):
+  docker-capable hosted workers, their per-worker token Secrets, their PVCs, the
+  docker tier's own zero-permission ServiceAccount, and the Harbor pull secret. No
+  CNPG, no app secrets, no privileged ServiceAccounts.
+*/ -}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.workers.docker.namespace }}
+  annotations:
+    # Same wave as the restricted namespace: the pull secret materialized into it must
+    # exist first.
+    argocd.argoproj.io/sync-wave: "-20"
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-docker
+    # PodSecurity `privileged`, ENFORCED. This is the ONE line that differs from
+    # worker-namespace.yaml's `restricted`, and it is what admits the privileged DinD
+    # sidecar. The worker container itself still runs the #58 restricted posture
+    # (runAsUser 10001, drop ALL, no privilege escalation) — the controller renders
+    # that verbatim; only the sidecar is privileged. The namespace tier is privileged
+    # because k8s admission is per-pod, and the pod as a whole contains a privileged
+    # container.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    # audit/warn stay at `restricted` so any NON-sidecar container that drifts from the
+    # hardened posture still shows up in audit logs and warnings — privileged enforce
+    # admits everything, so these are the only signal left that the worker container
+    # itself has not quietly relaxed.
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+{{- if .Values.workers.docker.quota.enabled }}
+{{- /*
+  The docker tier's own ResourceQuota (Decision 8's k8s floor, per-tier). Docker
+  workers cost more than a plain one — the worker preset PLUS the DinD sidecar PLUS the
+  daemon's emptyDir image/build cache — so this tier is budgeted separately from the
+  restricted default's.
+
+  Same load-bearing side effect: a quota on requests.* makes admission REJECT any pod
+  with a container declaring no requests — initContainers and native sidecars
+  included. The controller renders explicit requests on the seed, dind-init and dind
+  containers for exactly this reason.
+*/}}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "uzi.fullname" . }}-hosted-workers-docker
+  namespace: {{ .Values.workers.docker.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-docker
+spec:
+  hard:
+    requests.cpu: {{ .Values.workers.docker.quota.requestsCPU | quote }}
+    requests.memory: {{ .Values.workers.docker.quota.requestsMemory | quote }}
+    requests.storage: {{ .Values.workers.docker.quota.requestsStorage | quote }}
+    {{- with .Values.workers.docker.quota.ephemeralStorage }}
+    # The DinD daemon's data root is an emptyDir on node ephemeral storage; bound it so
+    # a runaway image pull cannot fill a node.
+    requests.ephemeral-storage: {{ . | quote }}
+    {{- end }}
+    persistentvolumeclaims: {{ .Values.workers.docker.quota.persistentVolumeClaims | quote }}
+    count/deployments.apps: {{ .Values.workers.docker.quota.deployments | quote }}
+{{- end }}
+{{- if .Values.workers.docker.limitRange.enabled }}
+{{- /*
+  The backstop, never the source: every docker worker pod arrives from the controller
+  with explicit requests + limits on every container. `max` must stay >= the largest
+  worker preset's limits (l = 4 CPU / 8Gi) or that preset stops being admissible here.
+*/}}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "uzi.fullname" . }}-hosted-workers-docker
+  namespace: {{ .Values.workers.docker.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-docker
+spec:
+  limits:
+    - type: Container
+      default:
+        {{- toYaml .Values.workers.docker.limitRange.default | nindent 8 }}
+      defaultRequest:
+        {{- toYaml .Values.workers.docker.limitRange.defaultRequest | nindent 8 }}
+      max:
+        {{- toYaml .Values.workers.docker.limitRange.max | nindent 8 }}
+    - type: PersistentVolumeClaim
+      max:
+        storage: {{ .Values.workers.docker.limitRange.maxPVCStorage | quote }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  # The docker tier's own zero-permission ServiceAccount. A pod's serviceAccountName
+  # must name a SA in the pod's OWN namespace, and docker workers live here, so this
+  # is a separate object from the restricted namespace's SA of the same name — same
+  # name, same zero permissions, different namespace. Bound to no Role anywhere; a
+  # worker's trust anchor is its join token and nothing else.
+  name: {{ .Values.workers.serviceAccountName }}
+  namespace: {{ .Values.workers.docker.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-docker
+# Belt to the pod spec's own automountServiceAccountToken: false: a worker that mounts
+# no kube token cannot reach the apiserver even if this namespace's RBAC were widened
+# by mistake.
+automountServiceAccountToken: false
+{{- if .Values.workers.imagePullSecretName }}
+imagePullSecrets:
+  - name: {{ .Values.workers.imagePullSecretName }}
+{{- end }}
+{{- end }}

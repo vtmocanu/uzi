@@ -45,6 +45,13 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if pending.Template != "base" || pending.Size != "s" || pending.Generation != 1 {
 		t.Fatalf("desired = %+v, want the golden's first worker", pending)
 	}
+	// The docker opt-in must survive the round trip: this worker gets the privileged
+	// DinD sidecar, and a dropped/renamed field would silently render it as a plain
+	// #58 worker. DisallowUnknownFields above already fails if the api adds a field
+	// this side has not modelled; this pins the value.
+	if !pending.Docker {
+		t.Fatal("docker must parse as true for the golden's first worker (the sidecar-enabled one)")
+	}
 	if pending.JoinToken == nil {
 		t.Fatal("join_token must parse into a non-nil pointer when the api delivers one")
 	}
@@ -61,6 +68,9 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	}
 	if noToken.Template != "jvm" || noToken.Size != "l" || noToken.Generation != 4 {
 		t.Fatalf("desired = %+v, want the golden's second worker", noToken)
+	}
+	if noToken.Docker {
+		t.Fatal("docker must parse as false for the golden's second worker (the plain one)")
 	}
 }
 

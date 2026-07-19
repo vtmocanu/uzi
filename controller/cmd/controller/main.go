@@ -69,6 +69,8 @@ func main() {
 
 	materializer := kube.New(kubeClient, kube.RenderConfig{
 		Namespace:          cfg.WorkerNamespace,
+		DockerNamespace:    cfg.WorkerDockerNamespace,
+		DinDImage:          cfg.WorkerDinDImage,
 		ServiceAccountName: cfg.WorkerServiceAccount,
 		APIURL:             cfg.WorkerAPIURL,
 		StorageClass:       cfg.WorkerStorageClass,
@@ -88,7 +90,12 @@ func main() {
 		// The image tag is the thing that rolls the fleet on a release, so it belongs in
 		// the line you read first when a worker is running the wrong code.
 		"worker_image", cfg.WorkerImageRepo+"/agent-<template>:"+cfg.WorkerImageTag,
-		"worker_ca_relayed", len(cfg.APICAPEM) > 0)
+		"worker_ca_relayed", len(cfg.APICAPEM) > 0,
+		// The docker tier's posture at a glance: whether this controller will render
+		// docker workers at all, and into which privileged namespace (empty = off, and
+		// docker workers in the poll are then skipped, not rendered into the default).
+		"docker_workers", cfg.WorkerDockerNamespace != "",
+		"docker_namespace", cfg.WorkerDockerNamespace)
 	loop.Run(ctx)
 	log.Info("controller stopped")
 }

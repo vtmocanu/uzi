@@ -89,6 +89,27 @@ type Config struct {
 	WorkerAPIURL string
 	// WorkerStorageClass is optional; empty means the cluster default.
 	WorkerStorageClass string
+
+	// --- docker-capable workers (PRD #83 M3) ----------------------------------
+	// Both empty unless this instance offers docker workers. They travel TOGETHER:
+	// a docker worker is rendered into WorkerDockerNamespace with a DinD sidecar from
+	// WorkerDinDImage, so one without the other is a half-configured docker tier and
+	// Load rejects it (the same "fail at boot, not at the far end" rule the CA/https
+	// coupling above follows).
+
+	// WorkerDockerNamespace is the DEDICATED `enforce: privileged` namespace docker
+	// workers render into (e.g. uzi-workers-docker). Separate from WorkerNamespace
+	// (#58's restricted `uzi-workers`) precisely so the privileged tier's blast radius
+	// never touches the restricted default — Decision 7's real goal, preserved even
+	// though the tier is privileged not baseline (Q-B). Empty means this controller
+	// renders no docker workers; a docker worker in the poll is then skipped with a
+	// loud error rather than rendered into the wrong (restricted) namespace.
+	WorkerDockerNamespace string
+	// WorkerDinDImage is the fully-pinned rootless-DinD sidecar image
+	// (docker:<tag>-dind-rootless@sha256:...). It is operator config, not wire data —
+	// the api never names an image — and shared with the compose track's pin (arch
+	// §Q6). Required exactly when WorkerDockerNamespace is set.
+	WorkerDinDImage string
 }
 
 // Load reads and validates the configuration.
@@ -172,6 +193,40 @@ func loadWorkerSettings(cfg *Config) error {
 		return fmt.Errorf("UZI_API_CA_FILE is set but UZI_WORKER_API_URL is not https; the workers would carry a CA they never consult and their claim traffic — which carries the user's decrypted forge PAT and Anthropic token — would cross the pod network in the clear")
 	}
 	cfg.WorkerStorageClass = strings.TrimSpace(os.Getenv("UZI_WORKER_STORAGE_CLASS"))
+
+	// The docker tier (PRD #83 M3): namespace + sidecar image, both or neither. No
+	// silent default for the namespace — guessing it means rendering privileged pods
+	// somewhere this controller may have no RBAC, or worse, into the restricted
+	// default. So it is opt-in and, once opted into, the image must accompany it.
+	cfg.WorkerDockerNamespace = strings.TrimSpace(os.Getenv("UZI_WORKER_DOCKER_NAMESPACE"))
+	cfg.WorkerDinDImage = strings.TrimSpace(os.Getenv("UZI_WORKER_DIND_IMAGE"))
+	if err := validateDockerTier(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateDockerTier enforces the both-or-neither coupling of the docker knobs and
+// the blast-radius separation of the two namespaces.
+func validateDockerTier(cfg *Config) error {
+	ns, img := cfg.WorkerDockerNamespace, cfg.WorkerDinDImage
+	if ns == "" && img == "" {
+		return nil // docker tier off; docker workers are skipped in the reconcile.
+	}
+	if ns == "" || img == "" {
+		return fmt.Errorf("UZI_WORKER_DOCKER_NAMESPACE and UZI_WORKER_DIND_IMAGE must be set together " +
+			"(a docker worker renders a DinD sidecar into the docker namespace; one without the other is a " +
+			"half-configured docker tier that would strand every docker worker)")
+	}
+	if ns == cfg.WorkerNamespace {
+		// The whole point of the dedicated namespace is that the privileged tier's
+		// blast radius never overlaps the restricted default (Decision 7 / Q-B). Equal
+		// namespaces would run privileged DinD sidecars in `uzi-workers`, dissolving
+		// exactly that boundary — refuse at boot rather than admit it.
+		return fmt.Errorf("UZI_WORKER_DOCKER_NAMESPACE (%q) must differ from UZI_WORKER_NAMESPACE (%q): "+
+			"the docker tier is a SEPARATE privileged namespace so its blast radius never touches the "+
+			"restricted worker namespace", ns, cfg.WorkerNamespace)
+	}
 	return nil
 }
 

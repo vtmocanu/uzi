@@ -74,6 +74,13 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 		// (Decision 7 makes the type a deliberate choice).
 		Template string `json:"template"`
 		Size     string `json:"size"`
+		// Docker opts the worker into a rootless-DinD sidecar (PRD #83 M3), so its
+		// agent can run docker/docker compose. A pod-shape DIMENSION orthogonal to
+		// template (Decision 1: docker is not a template), which is why it is a bool
+		// here and not another template name. Absent → false → no sidecar; the k8s
+		// controller renders the privileged DinD sidecar only when it is true, in the
+		// dedicated privileged-tier namespace.
+		Docker bool `json:"docker"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -121,7 +128,7 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	wkr, err := h.provisionHostedWorker(r.Context(), user.ID, name, template, size, quota)
+	wkr, err := h.provisionHostedWorker(r.Context(), user.ID, name, template, size, req.Docker, quota)
 	if err != nil {
 		if errors.Is(err, errHostedQuotaExceeded) {
 			// State, not policy: the user can delete a hosted worker and retry. Mirrors
@@ -180,7 +187,7 @@ func derivedHostedWorkerName(template, size string) string {
 // same statement only because token_hash and the ciphertext are written together
 // here. Split them and nothing fails loudly: a worker ends up holding a token whose
 // plaintext was never queued for anyone, or a buffer outlives the hash it belongs to.
-func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, name, template, size string, quota int) (store.Worker, error) {
+func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, name, template, size string, docker bool, quota int) (store.Worker, error) {
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		return store.Worker{}, err
@@ -222,6 +229,10 @@ func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, n
 		TokenHash:        hash,
 		TemplateDeclared: pgtype.Text{String: template, Valid: true},
 		HostedSize:       pgtype.Text{String: size, Valid: true},
+		// Explicit true/false (Valid always), never NULL: on a hosted row a false is a
+		// real "no sidecar", and the controller renders exactly what this says. Only
+		// external rows (created via CreateWorker) leave the column NULL.
+		DockerEnabled: pgtype.Bool{Bool: docker, Valid: true},
 	})
 	if err != nil {
 		return store.Worker{}, err

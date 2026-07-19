@@ -391,6 +391,66 @@ workers:
       cpu: "4"
       memory: 8Gi
     maxPVCStorage: 20Gi
+  # --- the docker-capable worker tier (PRD #83 M3) ------------------------------
+  #
+  # A SECOND, DEDICATED namespace running `pod-security.kubernetes.io/enforce:
+  # privileged`, for workers that opted into a rootless Docker-in-Docker sidecar so
+  # their agent can run `docker`/`docker compose`. It is a SEPARATE namespace on
+  # purpose: the privileged tier's blast radius must never touch the restricted
+  # default above (Decision 7 / Q-B). The restricted `namespace` stays exactly as it
+  # is — nothing here weakens it.
+  #
+  # OFF by default. dev-cluster's k8s 1.29.4 + containerd 1.6.31 cannot do flagless
+  # rootless (pod userns needs k8s >=1.30 / containerd >=2.0.5), so this tier is
+  # privileged rootless-DinD in a privileged namespace — the same posture the compose
+  # track uses and the owner accepted. sysbox (runtimeClassName: sysbox-runc) is the
+  # documented path to a non-privileged tier once the cluster is upgraded; it is NOT
+  # installed and NOT required.
+  docker:
+    # Turning this on creates the privileged namespace, its quota/limits, the worker
+    # SA + pull secret in it, and the controller's Role there. It also makes the
+    # controller render docker workers (UZI_WORKER_DOCKER_NAMESPACE + the sidecar
+    # image). With it off, a worker provisioned with docker=true is SKIPPED by the
+    # controller (a loud error, never rendered into the restricted default).
+    enabled: false
+    # The dedicated privileged namespace. MUST differ from workers.namespace — the
+    # controller refuses to boot if they are equal (the separation is the point).
+    namespace: uzi-workers-docker
+    # The pinned rootless-DinD sidecar image, SHARED with the compose track's pin
+    # (docker-compose.yml `dind`) so both tracks run the identical daemon. One image
+    # ref serves both the sidecar and the tiny root socket-prep helper.
+    image: docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431
+    # Namespace ResourceQuota for the docker tier (Decision 8's floor, per-tier).
+    # Docker workers cost MORE than a plain one: the worker preset PLUS the DinD
+    # sidecar (~1-2 GiB / ~1 CPU, arch §Q4) PLUS the daemon's emptyDir image/build
+    # cache (~5-20 GiB, arch §Q4). Sized smaller than the default tier because the
+    # docker tier is opt-in and expected to hold few workers; tune at rollout.
+    quota:
+      enabled: true
+      requestsCPU: "8"
+      requestsMemory: 32Gi
+      requestsStorage: 140Gi
+      # emptyDir dind data roots land on node ephemeral storage; bound it so a runaway
+      # image pull cannot fill a node.
+      ephemeralStorage: 200Gi
+      persistentVolumeClaims: "20"
+      deployments: "10"
+    # The backstop, never the source (the controller renders explicit requests+limits
+    # on every container, sidecars included). `max` must stay >= the largest worker
+    # preset's limits PLUS the sidecar's, or the biggest docker worker stops being
+    # admissible.
+    limitRange:
+      enabled: true
+      default:
+        cpu: "2"
+        memory: 4Gi
+      defaultRequest:
+        cpu: 500m
+        memory: 2Gi
+      max:
+        cpu: "4"
+        memory: 8Gi
+      maxPVCStorage: 20Gi
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
   # ClusterIP before policy enforcement, so FQDN cannot match a Service).
