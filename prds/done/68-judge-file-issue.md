@@ -1,7 +1,7 @@
 # PRD #68: File a forge issue from a judge recommendation
 
 **GitLab Issue**: [#68](https://gitlab.example.com/vtmocanu/uzi/-/issues/68)
-**Status**: Draft (created 2026-07-17)
+**Status**: Complete (2026-07-19) — merged to main via MR !71. Migration landed as `00071` (`00070` was taken by PRD #83's `worker_docker_enabled` on the landing rebase).
 **Priority**: Medium
 **Mockup**: [`prds/mockups/68-judge-file-issue-mock.html`](mockups/68-judge-file-issue-mock.html) (5 states)
 **Depends on**: PRD #46 (the judge, `run_reviews` + `review_recommendations`). Related: PRD #39 (`ProposalCard`, the human-gated issue-draft shape this reuses), PRD #22 (the `PRDLESS` bypass this relies on), PRD #19 (`app_settings`, `selfimprove_repo`).
