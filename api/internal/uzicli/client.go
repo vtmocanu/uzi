@@ -65,6 +65,13 @@ type Client interface {
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
 	// there is no create counterpart here.
 	DeleteWorker(ctx context.Context, id string) error
+	// ListMemory returns the caller's agent memory across all repos (PRD #90):
+	// GET /api/me/memory. Each entry carries its repo + provenance so the owner can
+	// see what a future run would read back.
+	ListMemory(ctx context.Context) ([]apitypes.AgentMemoryDTO, error)
+	// DeleteMemory purges one of the caller's memory entries: DELETE
+	// /api/me/memory/{id} (204 on success). An unknown/foreign id is a 404 (exit 4).
+	DeleteMemory(ctx context.Context, id string) error
 }
 
 // maxRespBytes caps how much of a response body the client reads, so a broken or
@@ -369,6 +376,20 @@ func (c *HTTPClient) ListWorkers(ctx context.Context) ([]apitypes.WorkerDTO, err
 
 func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	return c.del(ctx, "/api/workers/"+url.PathEscape(id))
+}
+
+func (c *HTTPClient) ListMemory(ctx context.Context) ([]apitypes.AgentMemoryDTO, error) {
+	var env struct {
+		Memories []apitypes.AgentMemoryDTO `json:"memories"`
+	}
+	if err := c.get(ctx, "/api/me/memory", &env); err != nil {
+		return nil, err
+	}
+	return env.Memories, nil
+}
+
+func (c *HTTPClient) DeleteMemory(ctx context.Context, id string) error {
+	return c.del(ctx, "/api/me/memory/"+url.PathEscape(id))
 }
 
 func (c *HTTPClient) ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error) {

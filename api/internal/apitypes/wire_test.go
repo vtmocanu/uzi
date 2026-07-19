@@ -215,6 +215,24 @@ func TestAdminRateLimitRowDTOTags(t *testing.T) {
 		"id", "email", "name", "vault_locked", "limits")
 }
 
+// TestAgentMemoryWriteRequestTags pins the worker save body: exactly {title, body}
+// — no identity fields exist on the wire, so (user_id, repo_id) can only be derived
+// server-side from the run claim (PRD #90 B3).
+func TestAgentMemoryWriteRequestTags(t *testing.T) {
+	assertTags(t, "AgentMemoryWriteRequest", AgentMemoryWriteRequest{}, "title", "body")
+}
+
+// TestAgentMemoryDTOTags pins the read shape. repo_id/repo_name/run_id are
+// omitempty: the worker per-(user,repo) read omits the redundant repo fields, and
+// run_id drops when the writing run is pruned (FK SET NULL). The user-facing
+// cross-repo list sets all of them.
+func TestAgentMemoryDTOTags(t *testing.T) {
+	assertTags(t, "AgentMemoryDTO(worker)", AgentMemoryDTO{}, "id", "title", "body", "created_at")
+	full := AgentMemoryDTO{ID: "m1", RepoID: "r1", RepoName: "org/repo", Title: "t", Body: "b", RunID: "run1"}
+	assertTags(t, "AgentMemoryDTO(user list)", full,
+		"id", "repo_id", "repo_name", "title", "body", "run_id", "created_at")
+}
+
 func contains(ss []string, s string) bool {
 	for _, x := range ss {
 		if x == s {

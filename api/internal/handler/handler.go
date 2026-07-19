@@ -337,6 +337,17 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 			r.Delete("/{id}", h.RevokeCLIToken)
 		})
 
+		// Agent memory (PRD #90 M6): the owner's view + purge of their cross-run
+		// memory. RequireUser (session OR a user-scoped CLI token), so `uzi memory
+		// list/rm` works headlessly — the read/delete are the owner's own authority,
+		// not a secret-minting surface like cli-tokens. Scoped to the caller: the list
+		// is user_id-filtered and the delete is owner-scoped (a foreign id 404s).
+		r.Route("/me/memory", func(r chi.Router) {
+			r.Use(mw.RequireUser(h.q, h.cfg))
+			r.Get("/", h.ListMyMemory)
+			r.Delete("/{id}", h.DeleteMyMemory)
+		})
+
 		// Per-user vault (PRD #32): unlock/lock/status for the password-wrapped
 		// secret DEK. All authenticated (CSRF applies to the POSTs). Unlock is a
 		// password-guessing surface, so it rides the auth limiter keyed PER USER
@@ -747,6 +758,13 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
+
+		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
+		// entry; the read half lists the run's (user, repo) memory the worker fences
+		// into the lead's prompt at claim time. Both derive (user_id, repo_id) from
+		// the run claim inside the service — never from the request body.
+		r.Post("/runs/{id}/memory", h.WorkerSaveMemory)
+		r.Get("/runs/{id}/memory", h.WorkerListMemory)
 
 		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
 		// verdict. Both are judge-run-scoped (the worker must own the active judge

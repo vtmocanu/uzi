@@ -11,6 +11,16 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AgentMemory struct {
+	ID        uuid.UUID          `json:"id"`
+	UserID    uuid.UUID          `json:"user_id"`
+	RepoID    uuid.UUID          `json:"repo_id"`
+	RunID     pgtype.UUID        `json:"run_id"`
+	Title     string             `json:"title"`
+	Body      string             `json:"body"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type AgentSkillAllocation struct {
 	TemplateID uuid.UUID          `json:"template_id"`
 	SkillID    uuid.UUID          `json:"skill_id"`

@@ -52,6 +52,11 @@ type FakeClient struct {
 	// DeleteWorker capture: records the id it was asked to delete.
 	LastDeletedWorkerID string
 
+	// Agent memory (PRD #90): ListMemory returns Memories; DeleteMemory records the
+	// id it was asked to purge.
+	Memories            []apitypes.AgentMemoryDTO
+	LastDeletedMemoryID string
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }
@@ -115,6 +120,18 @@ func (f *FakeClient) ListWorkers(context.Context) ([]apitypes.WorkerDTO, error) 
 
 func (f *FakeClient) DeleteWorker(_ context.Context, id string) error {
 	f.LastDeletedWorkerID = id
+	return f.Err
+}
+
+func (f *FakeClient) ListMemory(context.Context) ([]apitypes.AgentMemoryDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.Memories, nil
+}
+
+func (f *FakeClient) DeleteMemory(_ context.Context, id string) error {
+	f.LastDeletedMemoryID = id
 	return f.Err
 }
 
