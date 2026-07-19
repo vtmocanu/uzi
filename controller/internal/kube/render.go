@@ -738,10 +738,12 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 //     userns (dev-cluster/Linux). RunAsNonRoot MUST be false at CONTAINER scope: the
 //     pod is RunAsNonRoot:true, so a uid-0 container is rejected at admission without
 //     this override (the same override dindInitContainer uses). The dockerd command is
-//     OVERRIDDEN to bind loopback-only (the unix socket + dindLoopbackTCP, `--tls=false`)
-//     — THE control that suppresses docker:dind's automatic 0.0.0.0:2375 listener, so
-//     the unauthenticated root daemon is never on the pod IP. No dind-init, no shared
-//     socket volume: the worker reaches the daemon over the pod's loopback netns.
+//     OVERRIDDEN to bind ONLY dindLoopbackTCP (`--tls=false`) — THE control that
+//     suppresses docker:dind's automatic 0.0.0.0:2375 listener, so the unauthenticated
+//     root daemon is never on the pod IP. It binds NO unix socket: this posture drops
+//     dind-init AND the shared socket volume, so /run/dind does not exist and a unix
+//     --host would make dockerd exit 1 (live-proven, fixed in 0.8.1). The worker reaches
+//     the daemon over the pod's loopback netns.
 //
 // Both keep seccomp Unconfined (the nested daemon profiles its children) and mount the
 // shared run workdir (M-workdir).
@@ -777,11 +779,18 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 			RunAsGroup:     &root,
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined},
 		}
-		// THE loopback-bind control (PRD #89 M1): bind the unix socket + pod-loopback TCP
-		// EXPLICITLY and nothing else, which suppresses docker:dind's automatic
-		// 0.0.0.0:2375 listener. --tls=false because the loopback endpoint is plain (the
-		// trust boundary is the pod netns, same as a same-pod unix socket).
-		command = []string{"dockerd", "--host=unix://" + dindSocketPath, "--host=" + dindLoopbackTCP, "--tls=false"}
+		// THE loopback-bind control (PRD #89 M1): bind ONLY the pod-loopback TCP endpoint
+		// and nothing else, which suppresses docker:dind's automatic 0.0.0.0:2375
+		// listener. --tls=false because the loopback endpoint is plain (the trust boundary
+		// is the pod netns, same as a same-pod unix socket).
+		//
+		// It must NOT also bind the unix socket: the non-rootless posture drops dind-init
+		// AND the shared dind-sock volume, so /run/dind does not exist and a
+		// `--host=unix:///run/dind/docker.sock` makes dockerd exit 1 ("can't create unix
+		// socket ...: bind: no such file or directory") — live-proven on dev-cluster in
+		// 0.8.0 and fixed here (0.8.1). Nothing needs the socket: the worker's DOCKER_HOST
+		// is dindLoopbackTCP and the probe is `docker -H tcp://127.0.0.1:2375 info`.
+		command = []string{"dockerd", "--host=" + dindLoopbackTCP, "--tls=false"}
 		// `docker info` over the loopback endpoint: the daemon answering there is the real
 		// readiness signal (the socket existing is not the daemon being up).
 		probeCmd = "docker -H " + dindLoopbackTCP + " info >/dev/null 2>&1"

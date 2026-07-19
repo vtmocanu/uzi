@@ -765,10 +765,15 @@ func TestDockerFlagRollsThePodButAbsentDockerIsInert(t *testing.T) {
 // assertion, NOT a "no 0.0.0.0 string" negative: dropping the command override
 // entirely would pass a negative test while docker:dind's image entrypoint restores
 // the 0.0.0.0:2375 listener, putting the unauthenticated ROOT daemon on the pod IP.
-// So we assert the command is PRESENT and its ONLY --host values are the pod-loopback
-// TCP endpoint + the unix socket. A failing assertion here is a real security
-// regression (node-root daemon reachable off-pod), not a style nit.
-func TestNonRootlessDindBindsOnlyLoopbackAndUnixViaExplicitCommand(t *testing.T) {
+// So we assert the command is PRESENT and its ONLY --host value is the pod-loopback
+// TCP endpoint. A failing assertion here is a real security regression (node-root
+// daemon reachable off-pod), not a style nit.
+//
+// It binds NO unix socket (0.8.1 fix): the non-rootless posture drops dind-init and the
+// shared dind-sock volume, so /run/dind does not exist and a `--host=unix://...` makes
+// dockerd exit 1 (live-proven on dev-cluster). The worker uses the loopback TCP endpoint
+// only.
+func TestNonRootlessDindBindsOnlyLoopbackTCPViaExplicitCommand(t *testing.T) {
 	dep := RenderDeployment(dockerTestConfigNonRootless(), desiredDocker("abc"), testSpec(t, "base", "m"))
 	dind := containerByName(t, dep.Spec.Template.Spec.InitContainers, dindContainerName)
 
@@ -790,14 +795,16 @@ func TestNonRootlessDindBindsOnlyLoopbackAndUnixViaExplicitCommand(t *testing.T)
 			tlsOff = true
 		}
 	}
-	want := map[string]bool{dindLoopbackTCP: true, "unix://" + dindSocketPath: true}
+	want := map[string]bool{dindLoopbackTCP: true}
 	if len(hosts) != len(want) {
-		t.Fatalf("dind --host args = %v, want exactly the loopback TCP + the unix socket (%v)", hosts, want)
+		t.Fatalf("dind --host args = %v, want EXACTLY the loopback TCP endpoint (%v) and nothing else — "+
+			"binding the unix socket crashes dockerd (the socket dir is dropped in this posture), and any "+
+			"other bind (esp. 0.0.0.0) exposes the unauthenticated root daemon on the pod network", hosts, want)
 	}
 	for _, h := range hosts {
 		if !want[h] {
-			t.Errorf("dind binds --host=%q, which is neither the loopback TCP nor the unix socket — any other "+
-				"bind (esp. 0.0.0.0) exposes the unauthenticated root daemon on the pod network", h)
+			t.Errorf("dind binds --host=%q, which is not the loopback TCP endpoint — the unix socket crashes "+
+				"dockerd here, and any other bind (esp. 0.0.0.0) exposes the unauthenticated root daemon on the pod network", h)
 		}
 	}
 	if !tlsOff {
