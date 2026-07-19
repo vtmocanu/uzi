@@ -7912,3 +7912,312 @@ Serves human Feature #2 (connect a forge) and the testing-credentials policy.
   assumed-covered. Runs are enqueue-able without a runner (a push to a repo with a
   `.forgejo/workflows/` file enqueues a queued run), so this is verifiable at rollout despite
   the deferred runner.
+
+# PRD #83 — Docker-capable worker (docker/compose in the agent's toolchain)
+
+Serves human Feature #4 (the worker runs the agent) + the user requirement that workers be
+able to run Docker/Compose projects — uzi's own `./e2e/run-e2e.sh` / `./scripts/smoke.sh`
+need `docker compose up`, so a worker that cannot run containers cannot dogfood uzi. PRD at
+`prds/83-docker-capable-worker.md` (Decision Log D1–D9 + resolved questions Q-A…Q-D). Design
+grounding: `.claude/agent-team-tasks/prd-83-architecture.md`. Trust model (user): trust the
+USER who owns the worker, not the repo code the agent runs (prompt-injectable); the ONE
+agent-facing defense that stays load-bearing is that a container the agent starts cannot reach
+the worker's secrets. Built on #58's hosted-worker machinery (§264–275) and #51's uid split
+(§ the runner-uid work); reuses, does not fork, both. Milestones: M1 = the wiring foundation
+(no daemon), M2 = compose sidecar, M3 = k8s privileged tier, M4 = docs/specs/CLI/web surface.
+
+## 297. Decision 1 — docker CLI baked into every base image; the daemon is an opt-in sidecar
+
+Serves human: "the default worker has docker + python + go available."
+
+- **The docker CLI (`docker-cli`, `docker-cli-compose`, `docker-cli-buildx`, Alpine community)
+  is on PATH in EVERY worker image**, added to the `apk add` in `agent/templates/base/Dockerfile`
+  and mirrored in `jvm/Dockerfile` (jvm is NOT `FROM base` — every layer is duplicated in
+  lockstep, the same rule the docker/nix/entrypoint layers already follow). "docker-capable"
+  is therefore not an image variant: a plain worker has the client, it just has no daemon to
+  talk to. Rejected the alternative of a dedicated `docker` image template (the review deleted
+  that template before it was built): a capability orthogonal to the image (base/jvm) must not
+  be modelled as one of them.
+- **NO `dockerd` in any image and `DOCKER_HOST` is NOT baked.** The daemon is always a separate
+  opt-in sidecar (compose §302 / k8s §303); `DOCKER_HOST` is set at RUNTIME only, by the
+  keystone resolver (§298). A sidecar-less worker's `docker …` fails loudly ("cannot connect to
+  the Docker daemon") and never reaches for a host socket — pinned by a structural test that the
+  built image bakes no `/var/run/docker.sock` or `/run/docker.sock` and leaves `DOCKER_HOST`
+  unset.
+- **Default toolchain go + python3 + pip, via the ONE nix/devbox path (Q2/Q-C).** They ride
+  PRD #18's provisioning path, NOT a second `apk` path (no version drift): a committed pinned
+  global manifest `agent/devbox-global/devbox.json` (`packages: ["go","python3","python3Packages.pip"]`)
+  + its `devbox.lock` (nixpkgs revision pinned to an exact store path). Each template Dockerfile
+  COPYs both in and runs `devbox global install` at BUILD time, realizing the closures into the
+  baked image `/nix` and putting the global profile bin on `ENV PATH`, so every run has go/python
+  with zero per-run provisioning and no cold-start closure fetch. "Add to the default tier" could
+  NOT mean "add to `tool_packages`" — that list is per-owner/per-repo (`resolveTooling`) and would
+  force every profile to list them; it means bake onto the image PATH. Bump manifest + lock
+  together on a toolchain upgrade. The exact go/python/pip versions are whatever the pinned nixpkgs
+  revision resolves; the tester confirms all three resolve on the built image's agent PATH (arm64
+  live build, per the Dockerfile's build-not-in-workspace convention).
+- **#51 premise re-verified against the new packages (auditor input 5).** The #51 runner
+  cap-clear rests on the image shipping no setuid/setgid/file-capability binary; `docker-cli`+buildx
+  must not reintroduce one. `find / -perm -4000 -o -perm -2000` and `getcap -r /` on the built
+  image must stay empty — a base bump or new package makes this a conscious re-check.
+
+## 298. The keystone `resolveDockerWiring` resolver + bounded readiness wait (M1, one primitive for both tracks)
+
+Serves human Feature #4; the decoupling that lets M2 (compose) ∥ M3 (k8s) not coordinate.
+
+- **`resolveDockerWiring(env)` → `{ dockerHost? }`** (`agent/src/docker-wiring.ts`), computed ONCE
+  at worker startup (before register) and cached on `Config`, so the capability report (§299), the
+  guardrail (§300), and the SDK env (§301) all read the same resolved value — never re-probed
+  per run. Resolution order: (1) `DOCKER_HOST` set non-empty → use verbatim (the k8s path — the
+  controller renders it explicitly); (2) else a well-known sidecar socket (`UZI_DIND_SOCKET`,
+  default probe target `/run/dind/docker.sock`) stats+connects → `dockerHost = unix://<path>`
+  (the compose path); (3) else `{}` (docker inert). This lets k8s be **explicit** and compose
+  **implicit** without the two tracks agreeing on anything but a socket path constant.
+- **"Reachable" (for the capability report) is stricter than "resolved":** a bounded
+  `docker version` (or raw socket connect), ~2s timeout, against the resolved host. Resolution or
+  probe failure → capability absent, guardrail denies, `DOCKER_HOST` not injected. The capability
+  stays honest ("a daemon is reachable"), not "a path is configured."
+- **Bounded readiness wait folded INTO resolve-once (the cross-track race fix).** Rootless dockerd
+  takes several seconds (userns setup) and pod/compose containers start unordered, so a naive
+  resolve-once could conclude UNWIRED for the worker's whole lifetime while the sidecar comes up
+  moments later. Fix: a `sidecarExpected` gate — **expected iff `DOCKER_HOST` OR `UZI_DIND_SOCKET`
+  is set non-empty.** When expected, the resolver retries the probe every `UZI_DOCKER_READY_INTERVAL`
+  (~1s) up to `UZI_DOCKER_READY_TIMEOUT` (~30s) before concluding; when NOT expected it stays
+  fast-fail (single probe, no wait) so an ordinary non-docker worker never blocks startup. The
+  gate keys on the EXPLICIT env signal, not on "the socket's parent dir exists" — the compose
+  `agent` mounts the shared socket dir unconditionally, so `/run/dind` exists even for a daemonless
+  worker; a dir signal would make every ordinary worker eat the wait. On timeout: degrade to unwired
+  + a LOUD warn (distinct from an ordinary worker's silent unwired), not fatal, so a flaky dind
+  never wedges the worker's non-docker lane (config knob if a fleet prefers fail-fast-restart).
+
+## 299. Capability self-report — the worker sends `capabilities:["docker"]`; the api accepts-and-ignores (Q-A)
+
+Serves human Feature #4; scoped so #83 does not pre-empt #84's capability vocabulary.
+
+- **`RegisterRequest.capabilities?: string[]`** (`agent/src/protocol.ts`) — an array, not a `docker`
+  bool, so #84 can grow the vocabulary without a wire change; #83 only ever puts `["docker"]` in it
+  (when wired) or omits it (`client.register` sends it only when non-empty, mirroring `template`).
+- **The api declares-and-ignores it.** `WorkerRegister`'s decode struct gains
+  `Capabilities []string` **only** so `httpx.DecodeJSON`'s DisallowUnknownFields does not 400 the
+  register (the same reason `Name` is declared-but-ignored); it is NOT threaded into `wsvc.Register`.
+  **No column, no DTO, no sqlc/migration in #83** (Q-A: no-persist). Nothing in #83 reads it — the
+  guardrail keys on `DOCKER_HOST` (§300), not the registered capability, and a homogeneous dogfood
+  fleet needs no claim-time filter. Storage + the claim-time match predicate are **PRD #84's** to
+  own (it owns the vocabulary + the consuming query); persisting now would bake a shape #84 should
+  define.
+- **Compat rule (load-bearing):** the api MUST declare `capabilities` in the SAME release the worker
+  starts sending it — an older DisallowUnknownFields api would 400 the register and wedge the fleet's
+  retry loop. Both land in M1, same MR; never split across releases.
+- This is also the executor-independent probe the M2 e2e uses to prove the REAL resolver wired the
+  socket (register payload / startup log shows `capabilities:["docker"]`), rather than the
+  `-e DOCKER_HOST` bypass — works even under the stub executor since register + wiring are
+  worker-level, not executor-level.
+
+## 300. Guardrail — docker allowed ONLY when a daemon is wired, denied otherwise; the guardrail is not the containment
+
+Serves human Feature #4 + the primary directive; the agent-facing defense the trust model keeps.
+
+- **New rule in `analyzeSimple` (`agent/src/guardrails.ts`):** after the existing `/proc/` and
+  secret-path checks, `if (base === "docker" || base === "docker-compose") return dockerWired ? ALLOW
+  : deny(REASON_DOCKER_NO_DAEMON)`. "Wired" = the resolved `dockerHost !== undefined` from §298,
+  threaded as a `dockerWired: boolean` alongside `secretPaths` through
+  `screenBashCommand → screenWithDepth/analyzeSegment/analyzeSimple` and into
+  `buildPreToolUseHook`; `sdk-executor.ts` computes it once from the worker's wiring. There was NO
+  pre-existing "deny docker unless docker template" gate — M1 ADDS this rule fresh (the docker
+  template was deleted before it was built).
+- **Evasion resistance is free from the tokenizer:** `analyzeSimple` runs AFTER wrapper peeling
+  (`sh -c`, `env VAR=v`, `eval`, `timeout`, quoting all reduce to the `docker` simple command),
+  so `sh -c 'docker run …'` and `env FOO=bar docker …` hit the rule — the same property that
+  catches `sh -c 'git push'`. **#83 also closed a pre-existing bypass discovered here:** a
+  bare leading assignment (`FOO=bar git push`, `DOCKER_HOST=… docker`) that previously slipped the
+  screen is now peeled and screened. `REASON_DOCKER_NO_DAEMON` is a static, content-free reason —
+  never echoes the command.
+- **The guardrail is NOT docker containment (auditor input 3).** A literal
+  `docker run -v /run/secrets/worker_token:/x` is caught by the incidental secret-path substring
+  check, but that is worthless as containment — `-v /run:/s` (mount a parent) or `-v /:/x` evades
+  any substring check. Partial `-v` parsing is unwinnable and MUST NOT be attempted as a defense.
+  The guardrail's docker role is EXACTLY ONE thing: deny when no daemon is wired. On a WIRED worker
+  the sole load-bearing containment is Decision 3's separate mount namespace (§301). All other
+  denies (`git push`, force/history rewrite, secret-path, `/proc`) stay intact on docker workers.
+- **SDK env:** `buildSdkEnv` is a full-replacement env (the agent sees only what it builds); a new
+  optional `dockerHost` param sets `env.DOCKER_HOST` when a sidecar is wired, else the agent's docker
+  CLI cannot find the daemon. It carries no secret (a socket path/URL), is present only when wired,
+  and a provisioned `toolEnv` cannot overwrite it (the fold only writes allowlisted nix keys).
+- **M1 CANNOT host the Decision-3 EFFICACY test (sequencing correction).** M1 has no daemon, so a
+  real "container-via-sidecar cannot read the token" test is structurally unachievable; a green M1
+  config-lint MUST NEVER be read as satisfying Decision 3. M1 ships the guardrail unit tests
+  (allow/deny through `sh -c`/`env`/quoting; secret-path arg denied even when wired — proving the
+  allow rule does not loosen existing denies) + the structural no-baked-socket test; the efficacy
+  test lives where a sidecar first exists (§302 compose e2e, §303 k8s live).
+
+## 301. Decision 3 — the universal separate-mount-namespace secret invariant; `no docker.sock` preserved
+
+Serves human trust model (a container the agent starts cannot reach the worker's secrets) + the
+primary directive. THE one non-negotiable of #83.
+
+- **The DinD daemon always runs in a SEPARATE container/pod with its own mount namespace that
+  mounts NONE of the worker's join token, `/data`, or `/nix`.** So `docker run -v <anypath>:/x`
+  binds the DinD container's filesystem — which holds none of the worker's secret/state — no matter
+  how the path is spelled (`/run/secrets/worker_token`, `/run`, `/`, `/data`, `/nix`). This, not
+  the guardrail, is the sole containment on a wired worker. It is a UNIVERSAL invariant: it holds on
+  every worker that ever wires a sidecar, on both tracks.
+- **It is TEST-PINNED, not a comment, on both tracks.** Compose: a live e2e efficacy attack (§302).
+  k8s: a `render_test.go` assertion that the rendered `dind` container's `VolumeMounts` contain none
+  of the `token`/`data`/`nix` volumes and no `/data`/`/nix`/`/run/secrets` paths — a failing build if
+  violated (`controller/internal/kube/render_test.go`, the "dind mounts none of the worker volumes"
+  test), plus the M3 live attack matrix.
+- **The `no docker.sock into the api` invariant (§168 / #58 Decision) is explicitly PRESERVED.** The
+  api still holds ZERO container-runtime credential and mounts no `docker.sock`; #83 puts the runtime
+  socket only between the worker's agent and its OWN sidecar, never near the api.
+- **Namespace isolation is part of the invariant:** the sidecar must NOT share the worker's
+  pid/net/ipc namespaces on compose (no `network_mode/pid/ipc: service:agent`), and on k8s
+  `shareProcessNamespace` stays false. Pod containers do share the k8s network namespace (daemon
+  socket on the pod loopback), acceptable ONLY because the worker is outbound-only and never listens
+  (per ARCHITECTURE.md's worker trust boundary); if that ever changes the socket must move to a
+  path-isolated transport.
+
+## 302. Compose track (M2) — profile `agent-docker`, rootless-DinD sidecar, socket-share
+
+Serves human: workers run docker/compose on the laptop dev loop + the e2e/smoke harness.
+
+- **Opt-in via `profiles: ["agent-docker"]`** — the plain `--profile agent` path is UNCHANGED
+  (`dind`/`dind-init` are out of scope, `UZI_DIND_SOCKET` empty, docker inert + guardrail-denied).
+  The compose docker opt-in = `--profile agent-docker` PLUS `UZI_DIND_SOCKET=/run/dind/docker.sock`
+  in `.env` (one line): that explicit value is BOTH the socket target AND the §298 "expected"
+  readiness signal. A non-empty `UZI_DIND_SOCKET` is deliberately NOT baked into the agent env
+  (that would make every ordinary worker eat the readiness wait).
+- **`dind` service: `docker:28-dind-rootless` (digest-pinned), `privileged: true` (Decision 2).**
+  Rootless DinD's userns remap is the security property — a breakout lands as an unprivileged,
+  userns-mapped host uid — NOT the absence of the privileged flag (the rootless image still needs
+  it on the outer container for mount/userns setup). Recorded, not hidden. Task #9 tracks trying to
+  drop `privileged` for `security_opt:[seccomp/apparmor=unconfined] + devices:[/dev/fuse]`; the set
+  compose records carries to k8s (§303) since both tracks now share the privileged posture.
+- **Socket-share topology (default; TCP is a documented fallback only).** A named volume `dindsock`
+  mounted at `/run/dind` in both; rootless dockerd (`XDG_RUNTIME_DIR=/run/dind`) writes its socket
+  to `/run/dind/docker.sock` — exactly the path §298 probes. The volume carries ONLY the socket. No
+  TCP surface: `tcp://dind:2375` is documented as a compose-internal fallback only, with the warning
+  that an always-on unauthenticated daemon TCP port is a standing takeover surface.
+- **Cross-uid socket access is a real day-1 item (solved, recorded).** The rootless socket is
+  `0660` owned by the sidecar's rootless uid; the agent connects as the `runner` uid (10002) — a
+  different uid, and the worker's `setpriv --init-groups` strips `group_add` so group alignment is
+  unreliable. Solution: a `dind-init` helper (root) chowns `/run/dind` → `1000:1000` + `chmod 0711`
+  (traversable-by-others, deliberately not lax) BEFORE the daemon starts, then loops re-applying
+  `chmod 0666` to the socket so a `dind` restart (new inode) stays reachable. `dind` gates on
+  `dind-init` via `depends_on: service_healthy`.
+- **Storage isolation (Decision 3, §301):** `dind` mounts NONE of `agentdata`/`/data` /
+  `agentnix`/`/nix` / the `worker_token` secret. Its only writable volume besides `dindsock` is its
+  own `dinddata` (rootless data root `/home/rootless/.local/share/docker`).
+- **Readiness:** `dind` healthcheck gates on the DAEMON (`docker info`, `start_period ~15s`), so
+  `docker compose up --wait dind` waits for the daemon not just the container. The `agent` does NOT
+  `depends_on: dind` — on the pinned engine an out-of-scope profiled dependency ERRORS the whole
+  project under plain `--profile agent`; the §298 bounded wait is the version-independent primary,
+  the healthcheck the belt (the e2e names `dind` in its `up`).
+- **e2e (isolated stack, `e2e/`):** (a) a run can `docker compose up` a toy project through the
+  sidecar; (b) the LIVE Decision-3 efficacy test — canary at the real token path + `docker info`
+  liveness/positive-control + the attack matrix `-v {/run/secrets/worker_token,/run,/,/data,/nix}`
+  each asserting ENOENT (path absent in the DinD fs), NOT a guardrail-deny, run OUTSIDE the guardrail
+  so it proves mount-ns not the hook; (c) the resolver-coverage assertion — bring docker up via
+  `UZI_DIND_SOCKET` only (no `-e DOCKER_HOST` bypass) and assert the worker registered
+  `capabilities:["docker"]` (§299).
+
+## 303. k8s track (M3) — a dedicated PRIVILEGED-tier namespace (Q-B); native sidecar; two-namespace controller
+
+Serves human: k8s is the first-class test/runtime environment + the OWNER's Q-B decision on the k8s
+docker posture. Extends #58's controller (§264–275), does not fork it.
+
+- **Q-B RESOLVED (owner decision, recorded as a deviation from PRD Decision 7).** Original intent was
+  a `baseline` namespace + a flagless rootless sidecar (no `privileged`, `/dev/fuse` device plugin,
+  `hostUsers:false`). Live dev-cluster evidence killed it: **k8s 1.29.4 + containerd 1.6.31**
+  (Linux OS kernel 6.1.83, FIPS platform), both BELOW the k8s ≥1.30 / containerd ≥2.0.5 that pod user
+  namespaces (`hostUsers:false`) need — so baseline+flagless is INFEASIBLE on this cluster. Owner's
+  choice (Option 1): a **privileged rootless-DinD sidecar in a dedicated `enforce: privileged`
+  namespace `uzi-workers-docker`**, same posture as compose. Decision 7's REAL goal — a separate,
+  blast-radius-isolated namespace so #58's `restricted` default (`uzi-workers`) stays UNTOUCHED — is
+  preserved; only the tier is privileged, not baseline. `/dev/fuse` DaemonSet and `hostUsers:false`
+  are DROPPED (a privileged sidecar needs neither). Sysbox (`runtimeClassName: sysbox-runc`) stays
+  the documented path to a non-privileged tier once the cluster reaches ≥1.30/≥2.0.5 — not installed.
+- **"docker" is a pod-shape DIMENSION, not a template** (faithful to Decision 1). `template` stays
+  `base`/`jvm` for image selection; docker is a boolean on the worker. Plumbing end-to-end: api
+  `workers.docker_enabled` (new nullable column, draft migration renumbered above the live head at
+  landing, strict goose) → `ProvisionHostedWorker` accepts `docker bool` → poll producer
+  `DesiredWorker.Docker` → controller `protocol.DesiredWorker.Docker` (the contract golden +
+  `*_contract_test.go` carry the field so drift stays a red build). Preset `Resolve` still keys on
+  `(template, size)` for the image — unchanged.
+- **Render (`controller/internal/kube/render.go`), gated on `w.Docker`:** a second container `dind`
+  (`docker:28-dind-rootless`, same pin as compose) with `securityContext.privileged: true`; a shared
+  `emptyDir` socket volume at the §298 socket path (socket only); the worker container's
+  `DOCKER_HOST` set EXPLICITLY (the k8s branch of the resolver — no probe); a `dinddata` volume
+  mounted into `dind` ONLY. The worker container keeps #58 posture VERBATIM (`runAsUser:10001`, drop
+  ALL, `automountServiceAccountToken:false`) — only the sidecar is privileged; `specHash` covers the
+  new container so a change rolls the pod. **The `dind` container mounts NONE of the worker's
+  token/`/data`/`/nix` — the test-pinned Decision-3 render invariant (§301), the sole containment on
+  the wired worker.**
+- **`dind` rendered as a NATIVE SIDECAR, not a plain container** (native sidecars are GA on 1.29.4):
+  an `initContainers` entry with `restartPolicy: Always` + a `startupProbe` running `docker info`, so
+  k8s holds the worker container until the daemon is actually listening — more robust than a plain
+  sidecar + resolver wait, and it avoids the deadlock a regular wait-for-dind initContainer would hit.
+  Init order: `seed-nix` → `dind` (native sidecar, `docker info` startupProbe) → optional
+  socket-chmod init → worker container. The §298 bounded wait stays the cross-track belt.
+- **Two-namespace controller (`materializer.go`):** `RenderConfig.DockerNamespace` alongside #58's
+  `Namespace`; `reconcileWorker` picks the ns per `w.Docker`; **`Observe` lists BOTH namespaces** and
+  `teardown` targets the right one — every hardcoded `m.cfg.Namespace` becomes ns-per-worker. The
+  provenance/orphan model stays per-namespace (an orphan in the docker ns is still flag-only, not
+  deleted). Config: `UZI_WORKER_DOCKER_NAMESPACE` + `UZI_WORKER_DIND_IMAGE`, required together (one
+  without the other is a half-configured tier — a privileged pod must never land unconfigured), same
+  "required, no silent default" discipline as #58.
+- **Chart (`deploy/chart`):** `worker-docker-namespace.yaml` (`pod-security.kubernetes.io/enforce:
+  privileged`, NOT baseline) + its own ResourceQuota/LimitRange; controller Role EXTENDED to the
+  docker ns with #58's same minimal verbs (Secrets create/delete only, no get/list; Deployment/PVC
+  verbs) as a second Role+RoleBinding; the Harbor pull Secret materialized a third time into the
+  docker ns. **A Helm fail-guard** (`worker-invariants.yaml`): `workers.docker.enabled` requires
+  `workers.docker.networkPolicy.enabled` with real CIDRs, else the render FAILS — the privileged
+  tier cannot render unfenced unless an operator sets `acknowledgeUnfenced=true` deliberately (e.g. a
+  throwaway CNI-less cluster). Capacity reuses #58's per-user `HostedWorkerQuota` as-is (no new api
+  quota logic — not a security gate). #58's `uzi-workers` stays untouched.
+- **PR-deliverable vs LIVE split (flagged to the user):** the wire/column/render/chart are PR
+  artifacts, testable by `go test ./...` + `helm lint/template` + goldens. NOT PR artifacts: the
+  ArgoCD sync to dev-cluster and the DoD — a docker hosted worker there running `./e2e/run-e2e.sh`
+  green incl. the live Decision-3 attack matrix (needs cluster creds the coder cannot exercise from
+  the repo). Q-B removed the last node precondition, so only the sync + e2e run remain.
+
+## 304. The docker-ns NetworkPolicy (Half A closed) and the named external-egress residual (Half B → PRD #50)
+
+Serves human trust model; states honestly what #83 does and does not close.
+
+- **Half A — in-cluster lateral movement + ingress — is CLOSED by `worker-docker-networkpolicy.yaml`.**
+  #58's policies select `.Values.workers.namespace`, so the docker ns would have NO policy from them;
+  this file adds a default-deny (empty `podSelector` = every pod in the docker ns, incl. the
+  privileged `dind`) that denies all ingress and all in-cluster egress except DNS + the api, fencing
+  the privileged tier off from cluster-internal lateral movement. This floor is CNI-independent
+  vanilla `networking.k8s.io/v1` NetworkPolicy (a green kind run with no CNI enforcement proves
+  nothing — dev-cluster's Antrea enforces it; enforcement is verified at rollout).
+- **Half B — filtered EXTERNAL egress — is NOT #83's job (the named residual).** A docker worker
+  pulls images from registries, a NEW outbound set. Filtering external egress (and thus closing
+  **Anthropic-token / repo exfil via prompt injection over unfiltered egress** — the token is already
+  in the agent env; `docker push`/`curl` could exfil it) is **PRD #50's** (egress proxy). #83 NAMES
+  this residual and does not pretend to close it; `worker-fqdn-egress.yaml` (Antrea FQDN egress) is
+  where #50's allowlist lands. ARCHITECTURE.md points image pulls → #50.
+- **Inherited #58 residual, unchanged and explicitly NOT introduced by #83:** on the k8s single-uid
+  path the agent runs as the SAME uid (10001) as the token-holding worker (no `runner` uid split —
+  #51's uid split runs only on the root-started compose path), and the join token is a Secret volume
+  mounted `0440 root:10001`, DIRECTLY readable by the agent's uid. So "the agent cannot read the
+  join token" is NOT a uid boundary on k8s — it is carried by the in-container guardrail (secret-path
+  deny), exactly as #58 already accepts. What #83 newly opens is the docker `-v` vector, closed by
+  Decision 3 (§301). Fencing the direct read = bringing #51's deferred k8s uid-split forward, OUT of
+  #83 scope (Q-D) and inside the owner's "we trust our users" envelope. Docker adds no new reach to
+  the direct read — verified.
+
+## 305. Sizing and the inherited warm-volume caveats (M4 docs)
+
+Serves human Feature #49-adjacent (worker sizing) + the docs requirement.
+
+- **A docker worker budgets ~1–2 GiB RAM / ~1 CPU extra** (the sidecar) on top of the agent's own,
+  plus a `dinddata` volume. `dinddata` for uzi-e2e-in-dind ≈ **5–20 GiB steady-state** (pulls
+  postgres:17, builds api/web/agent). Document `dinddata` GC/retention guidance.
+- **`/nix` headroom regression (needs a live measurement, not a guess):** baking go+python+pip grows
+  the baked `/nix` store; `preset.nixSize` (a flat 4 GiB) and the compose `agentnix` guidance may
+  need a bump. M2/M3 re-measure on a real build.
+- **Inherited #58 `/nix` warm-volume staleness caveat:** the `/nix` named volume (compose `agentnix`;
+  k8s the seeded PVC) seeds from the image on FIRST use only and never refreshes from a newer image,
+  so the baked go/python set updates only on `/nix` volume delete + reprovision (or a fresh worker).
+  Document, do not fight it — the same caveat the tier-1 warm set already carries.
