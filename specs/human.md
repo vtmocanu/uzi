@@ -317,6 +317,17 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/46-run-judge-self-improvem
   implemented (plan.md:69). [user 2026-07-12]
 - Judge recommends; only the job acts. Judge never auto-creates MRs.
   [user 2026-07-12]
+- **File a recommendation as a forge issue** (vtmocanu/uzi#68): each recommendation
+  gets a File-issue button; the human picks which one to file, reviews an
+  API-templated editable draft (no extra LLM call, no Anthropic token), and files
+  it. The issue is labelled to land on the board (`PRD`+`PRDLESS`) but **never
+  auto-starts** (no `autopilot`) — filing an issue and spending tokens on a run
+  stay separate human decisions. [user 2026-07-17]
+- **Admin may file** another user's recommendation (kept, not restricted to the
+  owner), conditioned on **prominent provenance** showing whose worker produced
+  the (attacker-influencable) text. [user 2026-07-17]
+- Works on **every existing recommendation**, with no backfill and no re-judge.
+  [user 2026-07-17]
 
 ## Feature #45 — OIDC SSO login (Keycloak / Pocket ID)
 
