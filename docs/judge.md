@@ -106,13 +106,18 @@ If an admin files a recommendation from *your* review, the draft shows
 "from user X's worker, run \<id\>" so they can see whose text they're about
 to publish before they click Create.
 
-**The recommendation text is untrusted.** It's LLM output derived from your
-run's trace, which can itself be shaped by whatever the run touched. Before
-filing, uzi fences the untrusted text, strips anything that looks like a
-GitLab quick-action, and scans for secret-shaped strings — but that scan is
-best-effort, not a guarantee, and the repo you're filing into may not be the
-one the text came from. Read the draft before you click Create; don't file
-text you haven't looked at.
+**The recommendation text is untrusted, and it can cross projects.** It's LLM
+output derived from your run's trace, which can itself be shaped by whatever
+the run touched — and the repo you're filing into may not be the one the text
+came from. Before filing, uzi fences the untrusted text, strips anything that
+looks like a GitLab quick-action, and scans for known secret shapes (GitLab
+tokens, AWS keys, PEM private keys, and more). That scan is best-effort
+defense-in-depth, not a guarantee: reading the draft is still the real
+control. Known gaps that survive the scan un-redacted today include npm
+tokens (`npm_…`), Stripe-style secret keys (`sk_live_…`), GCP service-account
+JSON, SSH public keys, userinfo-style basic-auth in a URL, and a bare
+40-character AWS secret key. Read the draft before you click Create; don't
+file text you haven't looked at.
 
 Re-running the judge on an already-filed recommendation doesn't refile it —
 the existing link is kept, and if the new verdict changed the recommendation,
