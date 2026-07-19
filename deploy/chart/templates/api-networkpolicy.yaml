@@ -82,5 +82,25 @@ spec:
       ports:
         - protocol: TCP
           port: {{ include "uzi.workerAPIPort" . }}
+
+    {{- if .Values.workers.docker.enabled }}
+    # 3. Docker-tier hosted worker pods (the SEPARATE docker worker namespace) -> api.
+    #    Same AND-scoping as rule 2 (namespace + pod label in ONE `from`). PRD #83 gave
+    #    the docker tier its own namespace but never extended this ingress, so a docker
+    #    worker's register/claim/heartbeat was silently dropped by the api's default-deny
+    #    — surfaced only once 0.8.1 fixed the dind crash that had kept workers from ever
+    #    reaching the register step. The pod label (uzi-hosted-worker) is identical across
+    #    tiers; only the namespace differs.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.docker.namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: uzi-hosted-worker
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+    {{- end }}
     {{- end }}
 {{- end }}
