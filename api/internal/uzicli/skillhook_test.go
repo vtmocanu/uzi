@@ -198,21 +198,32 @@ func TestInstallHookIdempotent(t *testing.T) {
 	}
 }
 
-// A malformed settings.json aborts: error, file unchanged, no .bak.
+// A malformed settings.json aborts: error, file unchanged, no .bak. This covers
+// both syntactically-broken input and VALID-first-value-plus-trailing-garbage
+// (which json.Decoder alone would silently accept, dropping the trailing bytes).
 func TestInstallHookMalformedAborts(t *testing.T) {
-	home := t.TempDir()
-	const bad = "{not json"
-	writeSettings(t, home, bad)
-	hm := NewHookManagerAt(home)
+	for _, bad := range []string{
+		"{not json",          // broken
+		`{"a":1}` + "\nJUNK", // valid object then trailing garbage
+		"{}{}",               // two concatenated objects
+		`[1,2,3]`,            // valid JSON, but not an object
+		`"a string"`,         // valid JSON scalar, not an object
+	} {
+		t.Run(bad, func(t *testing.T) {
+			home := t.TempDir()
+			writeSettings(t, home, bad)
+			hm := NewHookManagerAt(home)
 
-	if _, err := hm.InstallHook(); err == nil {
-		t.Fatal("InstallHook must error on malformed settings.json")
-	}
-	if got, err := os.ReadFile(settingsPathIn(home)); err != nil || string(got) != bad {
-		t.Fatalf("settings.json was modified: got %q err %v", got, err)
-	}
-	if _, err := os.Stat(backupPathIn(home)); !os.IsNotExist(err) {
-		t.Fatalf("no .bak may be created on the abort path (err=%v)", err)
+			if _, err := hm.InstallHook(); err == nil {
+				t.Fatalf("InstallHook must error on malformed input %q", bad)
+			}
+			if got, err := os.ReadFile(settingsPathIn(home)); err != nil || string(got) != bad {
+				t.Fatalf("settings.json was modified: got %q err %v", got, err)
+			}
+			if _, err := os.Stat(backupPathIn(home)); !os.IsNotExist(err) {
+				t.Fatalf("no .bak may be created on the abort path (err=%v)", err)
+			}
+		})
 	}
 }
 
@@ -335,6 +346,24 @@ func TestHookStatus(t *testing.T) {
 		st := NewHookManagerAt(home).HookStatus()
 		if !st.Malformed || st.Installed {
 			t.Fatalf("malformed: %+v, want Malformed and not Installed", st)
+		}
+	})
+
+	t.Run("trailing garbage is malformed", func(t *testing.T) {
+		home := t.TempDir()
+		writeSettings(t, home, `{"hooks":{}}`+"\nJUNK")
+		st := NewHookManagerAt(home).HookStatus()
+		if !st.Malformed || st.Installed {
+			t.Fatalf("trailing garbage: %+v, want Malformed and not Installed", st)
+		}
+	})
+
+	t.Run("literal null is not installed, not malformed", func(t *testing.T) {
+		home := t.TempDir()
+		writeSettings(t, home, "null\n")
+		st := NewHookManagerAt(home).HookStatus()
+		if st.Installed || st.Malformed {
+			t.Fatalf("null root: %+v, want not Installed and not Malformed", st)
 		}
 	})
 
@@ -478,5 +507,24 @@ func TestInstallHookWritesMode0600(t *testing.T) {
 		t.Fatal(err)
 	} else if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("settings.json.bak mode = %o, want 600", perm)
+	}
+
+	// UninstallHook's writes (settings + .bak) must also be 0o600. Install over a
+	// pre-existing file with a foreign sibling so uninstall actually rewrites.
+	home3 := t.TempDir()
+	writeSettings(t, home3, `{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"dot-ai refresh"}]}]}}`)
+	hm3 := NewHookManagerAt(home3)
+	if _, err := hm3.InstallHook(); err != nil {
+		t.Fatalf("InstallHook: %v", err)
+	}
+	if _, err := hm3.UninstallHook(); err != nil {
+		t.Fatalf("UninstallHook: %v", err)
+	}
+	for _, p := range []string{settingsPathIn(home3), backupPathIn(home3)} {
+		if info, err := os.Stat(p); err != nil {
+			t.Fatal(err)
+		} else if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("%s mode = %o, want 600", p, perm)
+		}
 	}
 }

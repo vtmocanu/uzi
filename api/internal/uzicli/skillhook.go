@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,7 +95,7 @@ type HookUninstallResult struct {
 // HookStatusResult is what `uzi skill status` reports for the hook.
 type HookStatusResult struct {
 	Path       string `json:"path"`
-	Installed  bool   `json:"installed"`  // at least one SessionStart command has our prefix
+	Installed  bool   `json:"installed"`  // at least one SessionStart command is one we manage
 	Current    bool   `json:"current"`    // an entry's command == the canonical string
 	Command    string `json:"command"`    // the canonical command we manage
 	Duplicates int    `json:"duplicates"` // matching entries beyond the first (R5 orphans)
@@ -119,11 +120,21 @@ func (hm *HookManager) readRaw() (data []byte, existed bool, err error) {
 // non-object top-level (array, string, number, bool) is errSettingsMalformed —
 // we never overwrite a shape we do not understand. A literal JSON `null`
 // decodes to a nil map, which callers treat as an empty object.
+//
+// Unlike a bare json.Decoder.Decode (which stops after the first value and
+// silently ignores trailing bytes), this REQUIRES the input to be a single JSON
+// document: any trailing content after the first value — e.g. `{}{}` or
+// `{"a":1}\ngarbage` — is malformed, matching json.Unmarshal's strictness so the
+// "refuse to write over invalid JSON" guarantee holds. Trailing whitespace is fine.
 func decodeSettings(raw []byte) (map[string]any, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
+		return nil, errSettingsMalformed
+	}
+	// Reject trailing data: a second decode must hit EOF (whitespace is skipped).
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, errSettingsMalformed
 	}
 	if v == nil {
@@ -173,10 +184,10 @@ func isOurCommand(cmd string) bool {
 	return cmd == hookCommand || strings.HasPrefix(cmd, hookCommand+" ")
 }
 
-// commandHasOurPrefix reports whether an untrusted hook element is a
-// command-object whose "command" is one of ours. It type-asserts every hop with
-// the ,ok form so a malformed shape is skipped, never a panic.
-func commandHasOurPrefix(h any) bool {
+// commandIsOurs reports whether an untrusted hook element is a command-object
+// whose "command" is one we manage. It type-asserts every hop with the ,ok form
+// so a malformed shape is skipped, never a panic.
+func commandIsOurs(h any) bool {
 	m, ok := h.(map[string]any)
 	if !ok {
 		return false
@@ -211,7 +222,7 @@ func matcherObjectHasOurHook(mo any) bool {
 		return false
 	}
 	for _, h := range inner {
-		if commandHasOurPrefix(h) {
+		if commandIsOurs(h) {
 			return true
 		}
 	}
@@ -339,7 +350,7 @@ func (hm *HookManager) UninstallHook() (HookUninstallResult, error) {
 		}
 		keptInner := make([]any, 0, len(inner))
 		for _, h := range inner {
-			if commandHasOurPrefix(h) {
+			if commandIsOurs(h) {
 				removed++
 				continue
 			}
