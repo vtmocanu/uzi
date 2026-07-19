@@ -268,6 +268,11 @@ export interface SelfImprovePlanPromptInput {
   /** The accumulated improve_uzi backlog (untrusted), carried as issue_description. */
   recommendations: string;
   subagentNames: string[];
+  /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
+   *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. A
+   *  self_improve run can WRITE memory, so it must also READ it back (write/read
+   *  symmetry). */
+  memory?: readonly MemoryEntryView[];
 }
 
 /**
@@ -286,6 +291,9 @@ export function buildSelfImprovePlanPrompt(input: SelfImprovePlanPromptInput): s
   const nonce = fenceNonce();
   const openTag = `<untrusted_recommendations_${nonce}>`;
   const closeTag = `</untrusted_recommendations_${nonce}>`;
+  // PRD #90: inert, nonce-fenced cross-run memory (its own fence, distinct from the
+  // recommendations fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
+  const memoryBlock = buildMemoryContext(input.memory ?? []);
   return [
     "You are running an AUTONOMOUS self-improvement task on uzi's own repository.",
     `You are on the fixed branch \`${input.branch}\`, which may already carry an open`,
@@ -309,6 +317,7 @@ export function buildSelfImprovePlanPrompt(input: SelfImprovePlanPromptInput): s
     openTag,
     input.recommendations,
     closeTag,
+    ...(memoryBlock ? ["", memoryBlock] : []),
     "",
     delegatesLine(input.subagentNames),
     "Produce a concrete implementation plan for the ONE improvement you chose, then call",
@@ -356,6 +365,10 @@ export interface CIFixPlanPromptInput {
   /** The failed jobs' names/stages + log tails (UNTRUSTED evidence). */
   failedJobs: { name: string; stage: string; logTail: string }[];
   subagentNames: string[];
+  /** PRD #90: the run's (user, repo) cross-run memory, rendered as inert nonce-
+   *  fenced untrusted-advisory context. Absent/empty ⇒ no block is injected. A
+   *  ci_fix run can WRITE memory, so it must also READ it back (write/read symmetry). */
+  memory?: readonly MemoryEntryView[];
 }
 
 // CI job logs are the most attacker-influenceable text uzi ever feeds an agent:
@@ -407,6 +420,10 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
       "",
     );
   }
+  // PRD #90: inert, nonce-fenced cross-run memory (its own fence, distinct from the
+  // job-log fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
+  const memoryBlock = buildMemoryContext(input.memory ?? []);
+  if (memoryBlock) lines.push(memoryBlock, "");
   lines.push(
     delegatesLine(input.subagentNames),
     "Diagnose the failure. You may re-run the failing commands locally (tests,",

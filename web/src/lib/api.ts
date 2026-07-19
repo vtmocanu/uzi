@@ -569,14 +569,15 @@ export interface CliAuthRequestMeta {
 // that planted it. The server derives (user_id, repo_id) from the run claim on
 // write and owner-scopes every read/delete — the client never sends identity.
 // repo_name is the human path (e.g. "vtmocanu/uzi") the list groups by; run_id is
-// the provenance run that wrote the entry.
+// the provenance run that wrote the entry — OPTIONAL: it is `omitempty` in Go and
+// set NULL when its run is pruned (FK ON DELETE SET NULL), so it can be absent.
 export interface Memory {
   id: string;
   repo_id: string;
   repo_name: string;
   title: string;
   body: string;
-  run_id: string;
+  run_id?: string;
   created_at: string;
 }
 

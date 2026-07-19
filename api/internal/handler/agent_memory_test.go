@@ -121,6 +121,30 @@ func TestWorkerSaveMemoryDerivesIdentityFromRunClaim(t *testing.T) {
 	}
 }
 
+func TestWorkerSaveMemoryStripsControlChars(t *testing.T) {
+	// A prompt-injected ANSI escape (ESC 0x1b, e.g. 0x1b then [31m) or a bare
+	// control char (BEL 0x07) in the title/body must be stripped server-side BEFORE
+	// storage, so it can never render raw when the owner runs `uzi memory list` (the CLI table
+	// printer writes cell values verbatim). The body preserves its real \n and \t; the
+	// single-line title keeps neither. Control bytes ride the wire JSON-escaped (a
+	// strict decoder rejects raw C0 bytes in a string), as a hostile worker must encode
+	// them.
+	st := &memoryStore{ownedRun: runWithRepo(uuid.New(), uuid.New())}
+	h := newProtocolHandler(t, st)
+	rec := httptest.NewRecorder()
+	body := `{"title":"\u001b[31mred\u0007","body":"line1\nline2\t\u001b[0mtail\u0007"}`
+	h.WorkerSaveMemory(rec, workerReq(http.MethodPost, body, uuid.New()))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body %q", rec.Code, rec.Body.String())
+	}
+	if got, want := st.insertParams.Title, "[31mred"; got != want {
+		t.Errorf("stored title = %q, want %q (ANSI escape + BEL stripped)", got, want)
+	}
+	if got, want := st.insertParams.Body, "line1\nline2\t[0mtail"; got != want {
+		t.Errorf("stored body = %q, want %q (real newline + tab kept, ANSI escape + BEL stripped)", got, want)
+	}
+}
+
 func TestWorkerSaveMemoryRejectsIdentityInBody(t *testing.T) {
 	// A body that tries to smuggle a user_id/repo_id must be rejected outright (the
 	// decoder forbids unknown fields), so identity can never be body-driven.

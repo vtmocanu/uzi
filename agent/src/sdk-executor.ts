@@ -368,6 +368,9 @@ export class SdkExecutor implements Executor {
           pipelineWebURL: ctx.pipeline!.web_url,
           failedJobs: ctx.pipeline!.failed_jobs.map((j) => ({ name: j.name, stage: j.stage, logTail: j.log_tail })),
           subagentNames: ownSubagentNames,
+          // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
+          // nonce-fenced cross-run memory back (empty/absent injects nothing).
+          memory: ctx.memory,
         });
       } else if (isSelfImprove) {
         // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -377,6 +380,9 @@ export class SdkExecutor implements Executor {
           branch: ctx.branch,
           recommendations: ctx.issueDescription,
           subagentNames: ownSubagentNames,
+          // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
+          // nonce-fenced cross-run memory back (empty/absent injects nothing).
+          memory: ctx.memory,
         });
       } else {
         planPrompt = buildPlanPrompt({

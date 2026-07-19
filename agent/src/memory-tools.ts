@@ -15,7 +15,7 @@
 //      NEVER accepts them as parameters, so a compromised worker cannot write
 //      arbitrary users' memory. The tool targets deps.runId (closure), never an
 //      arbitrary run.
-//   2. Bounded + capped. title ≤200 chars, body ≤2048 bytes, ≤5 writes/run — all
+//   2. Bounded + capped. title ≤200 bytes, body ≤2048 bytes, ≤5 writes/run — all
 //      enforced server-side; this tool mirrors the size caps client-side (a clear
 //      tool error, never a throw) so an over-cap call is rejected before the POST,
 //      and surfaces a 429/409/400 from the server as a concise, NON-FATAL message.
@@ -37,9 +37,11 @@ import { errMessage } from "./util.js";
 export const MEMORY_SERVER_NAME = "memory";
 export const SAVE_MEMORY_TOOL = "save_memory";
 
-/** Client-side mirror of the server-enforced entry caps (PRD #90 M4). Title is
- *  bounded in CHARACTERS; body in BYTES (utf-8), matching the server's byte cap. */
-export const MEMORY_TITLE_MAX_CHARS = 200;
+/** Client-side mirror of the server-enforced entry caps (PRD #90 M4). BOTH title
+ *  and body are bounded in BYTES (utf-8), matching the server's byte caps exactly —
+ *  a multibyte title ≤200 chars but >200 bytes would otherwise pass here and 400
+ *  server-side. */
+export const MEMORY_TITLE_MAX_BYTES = 200;
 export const MEMORY_BODY_MAX_BYTES = 2048;
 
 /** The qualified tool name to allow/deny by (extraTools / subagent deny). */
@@ -110,8 +112,9 @@ export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandler
       const title = (args.title ?? "").trim();
       const body = args.body ?? "";
       if (title.length === 0) return asText("save_memory needs a non-empty title.", true);
-      if (title.length > MEMORY_TITLE_MAX_CHARS) {
-        return asText(`save_memory title is too long (max ${MEMORY_TITLE_MAX_CHARS} characters; got ${title.length}).`, true);
+      const titleBytes = Buffer.byteLength(title, "utf8");
+      if (titleBytes > MEMORY_TITLE_MAX_BYTES) {
+        return asText(`save_memory title is too long (max ${MEMORY_TITLE_MAX_BYTES} bytes; got ${titleBytes}). Shorten it and try again.`, true);
       }
       if (body.trim().length === 0) return asText("save_memory needs a non-empty body.", true);
       const bytes = Buffer.byteLength(body, "utf8");
@@ -159,7 +162,13 @@ export function buildMemoryServer(deps: MemoryToolsDeps): {
           "persist a note. Keep the title short and the body a couple of sentences.",
         ].join(" "),
         {
-          title: z.string().min(1).max(MEMORY_TITLE_MAX_CHARS).describe(`A short label for the note (≤${MEMORY_TITLE_MAX_CHARS} characters).`),
+          title: z
+            .string()
+            .min(1)
+            .refine((s) => Buffer.byteLength(s, "utf8") <= MEMORY_TITLE_MAX_BYTES, {
+              message: `title must be at most ${MEMORY_TITLE_MAX_BYTES} bytes`,
+            })
+            .describe(`A short label for the note (≤${MEMORY_TITLE_MAX_BYTES} bytes).`),
           body: z
             .string()
             .min(1)

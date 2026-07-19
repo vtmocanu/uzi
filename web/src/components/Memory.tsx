@@ -133,9 +133,11 @@ function MemoryRow({ memory, onDelete }: { memory: Memory; onDelete: () => void 
           </pre>
           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-faint">
             <span>saved {new Date(memory.created_at).toLocaleString()}</span>
-            <span>
-              · from run <code className="font-mono text-fg">{memory.run_id}</code>
-            </span>
+            {memory.run_id ? (
+              <span>
+                · from run <code className="font-mono text-fg">{memory.run_id}</code>
+              </span>
+            ) : null}
           </div>
         </div>
         {confirming ? (

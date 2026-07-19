@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -1279,7 +1280,14 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 	if !run.RepoID.Valid {
 		return store.AgentMemory{}, ErrMemoryNoRepo
 	}
-	title = strings.TrimSpace(title)
+	// Strip control characters from the untrusted title/body BEFORE the size cap so
+	// the stored byte count reflects the stored value. A prompt-injected ANSI escape
+	// or bare control char would otherwise render raw when the owner runs `uzi memory
+	// list` (the CLI table printer writes cell values verbatim). Mirrors the
+	// handler's sanitizeSelfReported: a title is single-line (no whitespace kept), a
+	// body keeps \n and \t but drops every other C0/C1 control char and ANSI escape.
+	title = sanitizeMemoryField(strings.TrimSpace(title), false)
+	body = sanitizeMemoryField(body, true)
 	if title == "" || strings.TrimSpace(body) == "" {
 		return store.AgentMemory{}, ErrMemoryEmpty
 	}
@@ -1318,6 +1326,31 @@ func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.U
 		return store.AgentMemory{}, err
 	}
 	return mem, nil
+}
+
+// sanitizeMemoryField strips control characters from an untrusted memory field
+// before it is stored, so a prompt-injected ANSI escape (\x1b[…) or bare control
+// char (e.g. \x07) can never render raw when the owner reads it back with `uzi
+// memory list` (the CLI table printer writes cell values verbatim). It mirrors
+// sanitizeSelfReported in the handler package, minus the byte truncation (SaveMemory
+// applies the size cap AFTER this, on the sanitized value). keepWhitespace preserves
+// \n and \t for the multi-line body while still dropping every other C0/C1 control
+// char; a single-line title keeps neither. unicode.IsControl catches C0 (incl. ESC
+// 0x1b and BEL 0x07), DEL, and C1 — the whole ANSI-escape lead-in class.
+func sanitizeMemoryField(s string, keepWhitespace bool) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if (r == '\n' || r == '\t') && keepWhitespace {
+			b.WriteRune(r)
+			continue
+		}
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // ListMemoryForRun returns the (user, repo) memory for a run the worker owns,

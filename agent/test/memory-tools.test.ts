@@ -5,7 +5,7 @@ import {
   buildMemoryServer,
   memoryToolNames,
   MEMORY_SERVER_NAME,
-  MEMORY_TITLE_MAX_CHARS,
+  MEMORY_TITLE_MAX_BYTES,
   MEMORY_BODY_MAX_BYTES,
 } from "../src/memory-tools.js";
 import { RequestError, type WorkerClient } from "../src/client.js";
@@ -73,9 +73,14 @@ describe("save_memory handler (PRD #90 M2)", () => {
     assert.strictEqual(calls.saveMemory.length, 0, "no POST on a client-side rejection");
   });
 
-  it("rejects an over-cap title client-side (mirror of the server cap) with NO network call", async () => {
+  it("rejects an over-cap title by BYTES, not chars (multi-byte counts), with NO network call", async () => {
     const { client, calls } = fakeClient();
-    const res = await handlers(client).saveMemory({ title: "T".repeat(MEMORY_TITLE_MAX_CHARS + 1), body: "b" });
+    // A 101-char string of a 2-byte code point = 202 bytes > 200, but only 101 chars —
+    // proves the title cap is byte-measured (matching the server), not char-measured.
+    const title = "é".repeat(101);
+    assert.ok(title.length <= MEMORY_TITLE_MAX_BYTES, "under the byte cap by char count");
+    assert.ok(Buffer.byteLength(title, "utf8") > MEMORY_TITLE_MAX_BYTES, "over the byte cap by byte count");
+    const res = await handlers(client).saveMemory({ title, body: "b" });
     assert.strictEqual(res.isError, true);
     assert.match(bodyText(res), /title is too long/);
     assert.strictEqual(calls.saveMemory.length, 0);
