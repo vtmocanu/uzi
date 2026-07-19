@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   resolveDockerWiring,
+  dockerSidecarExpected,
   DEFAULT_DIND_SOCKET,
   type ResolveDockerWiringOptions,
 } from "../src/docker-wiring.js";
@@ -15,9 +16,11 @@ import {
 const okProbe = async (): Promise<boolean> => true;
 const failProbe = async (): Promise<boolean> => false;
 
-/** No DOCKER_HOST, no default socket present, unless the case overrides. */
+/** No DOCKER_HOST, no default socket present, unless the case overrides. `readyTimeoutMs: 0`
+ *  + a no-op sleep keep these single-probe (the readiness WAIT has its own tests below), so
+ *  a failing-probe case returns immediately instead of blocking the real 30s budget. */
 function opts(over: Partial<ResolveDockerWiringOptions> = {}): ResolveDockerWiringOptions {
-  return { probe: okProbe, socketExists: () => false, ...over };
+  return { probe: okProbe, socketExists: () => false, readyTimeoutMs: 0, sleep: async () => {}, ...over };
 }
 
 describe("resolveDockerWiring", () => {
@@ -87,5 +90,68 @@ describe("resolveDockerWiring", () => {
   it("ignores a blank/whitespace DOCKER_HOST and falls through to the socket probe", async () => {
     const w = await resolveDockerWiring({ DOCKER_HOST: "   " }, opts({ socketExists: () => true }));
     assert.strictEqual(w.dockerHost, `unix://${DEFAULT_DIND_SOCKET}`);
+  });
+});
+
+// M2 follow-up: the bounded readiness wait. Only an EXPECTED sidecar (DOCKER_HOST or
+// UZI_DIND_SOCKET set) is waited for; a non-docker worker never blocks. Timeout ⇒ unwired.
+describe("resolveDockerWiring readiness wait (PRD #83 M2)", () => {
+  it("dockerSidecarExpected keys on DOCKER_HOST / UZI_DIND_SOCKET only", () => {
+    assert.strictEqual(dockerSidecarExpected({ DOCKER_HOST: "tcp://dind:2375" }), true);
+    assert.strictEqual(dockerSidecarExpected({ UZI_DIND_SOCKET: "/run/dind/docker.sock" }), true);
+    assert.strictEqual(dockerSidecarExpected({}), false);
+    assert.strictEqual(dockerSidecarExpected({ DOCKER_HOST: "  " }), false); // blank ⇒ not expected
+  });
+
+  it("RETRIES an expected sidecar's probe until the daemon comes up (compose/k8s start race)", async () => {
+    let calls = 0;
+    const flaky = async (): Promise<boolean> => { calls++; return calls >= 3; }; // up on the 3rd probe
+    const w = await resolveDockerWiring(
+      { UZI_DIND_SOCKET: "/run/dind/docker.sock" },
+      { probe: flaky, sleep: async () => {}, readyIntervalMs: 1, readyTimeoutMs: 10_000 },
+    );
+    assert.strictEqual(w.dockerHost, "unix:///run/dind/docker.sock");
+    assert.strictEqual(calls, 3, "should have retried until reachable");
+  });
+
+  it("forms the candidate from UZI_DIND_SOCKET even before the socket file exists (wait bridges it)", async () => {
+    // socketExists is NEVER consulted for an explicit UZI_DIND_SOCKET — the probe/retry owns
+    // liveness, so the wait can span the window before the daemon writes the socket.
+    let statted = false;
+    let calls = 0;
+    const w = await resolveDockerWiring(
+      { UZI_DIND_SOCKET: "/run/dind/docker.sock" },
+      {
+        socketExists: () => { statted = true; return false; },
+        probe: async () => { calls++; return calls >= 2; },
+        sleep: async () => {}, readyIntervalMs: 1, readyTimeoutMs: 10_000,
+      },
+    );
+    assert.strictEqual(w.dockerHost, "unix:///run/dind/docker.sock");
+    assert.strictEqual(statted, false, "an explicit UZI_DIND_SOCKET must not gate on socket existence");
+  });
+
+  it("does NOT wait when no sidecar is expected — exactly ONE probe even with a generous budget", async () => {
+    let calls = 0;
+    const w = await resolveDockerWiring(
+      {}, // neither DOCKER_HOST nor UZI_DIND_SOCKET → not expected
+      {
+        socketExists: () => true, // default socket present ⇒ a candidate forms…
+        probe: async () => { calls++; return false; }, // …but the probe fails
+        readyIntervalMs: 1, readyTimeoutMs: 30_000, sleep: async () => {},
+      },
+    );
+    assert.deepStrictEqual(w, {}, "a failed single probe on a non-expected worker yields unwired");
+    assert.strictEqual(calls, 1, "a non-docker worker must NEVER block: exactly one probe");
+  });
+
+  it("degrades to unwired after the readiness timeout when an expected daemon never comes up", async () => {
+    let calls = 0;
+    const w = await resolveDockerWiring(
+      { DOCKER_HOST: "tcp://dind:2375" },
+      { probe: async () => { calls++; return false; }, readyIntervalMs: 5, readyTimeoutMs: 30 },
+    );
+    assert.deepStrictEqual(w, {}, "timeout ⇒ degrade to unwired");
+    assert.ok(calls >= 2, `expected multiple probe attempts before the timeout, got ${calls}`);
   });
 });

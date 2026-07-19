@@ -298,6 +298,14 @@ services:
       # it but warns at boot). Raising it multiplies memory/CPU/token pressure — size
       # cpus/mem_limit above and RUN_MAX_REQUEUES with it. See docs/worker-setup.md.
       WORKER_MAX_CONCURRENT_RUNS: ${WORKER_MAX_CONCURRENT_RUNS:-1}
+      # PRD #83 M2: the DinD sidecar socket the worker probes. Unset by DEFAULT (empty):
+      # a plain `--profile agent` worker then does ONE fast probe of the default path and
+      # NEVER blocks. When you run `--profile agent-docker`, SET this (to
+      # /run/dind/docker.sock) so the worker EXPECTS the sidecar and its keystone bounded-
+      # wait bridges the daemon-vs-worker start race (else a slow dind can cost the docker
+      # capability). See docs/worker-docker.md (M4). The agent always mounts the socket
+      # volume; this only controls the readiness WAIT + capability self-report.
+      UZI_DIND_SOCKET: ${UZI_DIND_SOCKET:-}
       UZI_LOG_LEVEL: ${UZI_LOG_LEVEL:-info}
     volumes:
       - agentdata:/data
@@ -319,6 +327,15 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    # NOTE (M2 follow-up): the agent does NOT `depends_on: dind`. On the pinned engine
+    # (Docker Compose 5.1.2) a `depends_on` whose target is disabled by the active profiles
+    # ERRORS the whole project ("service agent depends on undefined service dind: invalid
+    # compose project") rather than being skipped — so a plain `--profile agent` (non-docker)
+    # run would fail to start. Instead the readiness is handled WORKER-SIDE by the keystone
+    # bounded-wait (agent/src/docker-wiring.ts): when a sidecar is expected (UZI_DIND_SOCKET
+    # / DOCKER_HOST set) the worker retries the probe until the daemon is up. The e2e names
+    # `dind` in its `up` so the daemon starts; the `dind` healthcheck makes `up --wait dind`
+    # meaningful.
 
   # PRD #83 M2: socket-permission helper for the rootless DinD sidecar. Two problems the
   # rootless daemon cannot solve for itself, both established live (see the M2 commit /
@@ -342,6 +359,11 @@ services:
     image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
     profiles: ["agent-docker"]
     # Runs as root (default) — the chown/chmod of a root-owned volume needs it.
+    # SECURITY (auditor LOW): `0711` on /run/dind is deliberate, not lax — others get
+    # traverse-ONLY (x), never write (w), so a non-owner (the runner uid) can reach the
+    # daemon socket the rootless uid owns but CANNOT create/replace/squat a file in the dir
+    # (e.g. plant a rogue docker.sock). Do NOT loosen it to 0777. Only the socket itself is
+    # 0666, and only because both the probe uid and the split runner uid must connect.
     command:
       - "sh"
       - "-c"
@@ -418,17 +440,28 @@ services:
       # docs): ~5-20 GiB for uzi-e2e-in-dind (pulls postgres:17, builds api/web/agent);
       # budget the sidecar ~1-2 GiB / ~1 CPU on top of the agent. Needs a GC/retention story.
       - dinddata:/home/rootless/.local/share/docker
+    # Daemon-readiness healthcheck (M2 follow-up): the daemon answers `docker info` over its
+    # own socket. This makes `dind` a real readiness gate so `docker compose up --wait dind`
+    # waits for the DAEMON (not just the container) — the e2e names `dind` in its `up` and the
+    # worker's keystone bounded-wait handles the residual start race worker-side. `-H` is
+    # explicit because the dind image's client defaults to /var/run/docker.sock, not our
+    # /run/dind. start_period covers the rootless userns bring-up (~5-15s).
+    healthcheck:
+      test: ["CMD-SHELL", "docker -H unix:///run/dind/docker.sock info >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
     # Namespace isolation (auditor E1/E2 — MUST): an ORDINARY sibling service. NO
     # `network_mode: "service:agent"`, no `pid:`/`ipc:` sharing. The worker reaches the
     # daemon ONLY through the shared socket volume. A shared netns would put the daemon's
     # socket on the worker's own loopback and defeat the separate-mount-ns isolation's intent.
     #
-    # DAY-1 open item the tester must establish (arch §Q4): CROSS-UID socket access. The
-    # rootless daemon's socket is owned by the sidecar's rootless uid (0660); the worker
-    # probes as uid 10001 and the agent's docker runs as uid 10002 — different uids. Getting
-    # the socket readable/writable across containers/uids (a shared gid via `group_add`, a
-    # 0777 socket dir, or a socket mode) is a real day-1 item, NOT a given. Encoded here is
-    # the topology; the exact permission wiring is what the tester's live run pins down.
+    # CROSS-UID socket access (arch §Q4) is SOLVED by dind-init above (chown /run/dind →
+    # 1000:1000 0711 so the rootless daemon starts, then hold the socket at 0666 so both the
+    # worker probe uid 10001 and the runner-uid 10002 agent reach it — validated live). The
+    # remaining tester day-1 item is the minimal privileged/security set (Decision 2), NOT the
+    # socket wiring.
 
 volumes:
   pgdata:

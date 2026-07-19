@@ -14,7 +14,7 @@ import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
-import { resolveDockerWiring } from "./docker-wiring.js";
+import { resolveDockerWiring, dockerSidecarExpected } from "./docker-wiring.js";
 
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
@@ -38,10 +38,23 @@ async function main(): Promise<void> {
 
   // Docker wiring keystone (PRD #83 M1): resolve ONCE at startup with a bounded liveness
   // probe (loadConfig can't — it's sync). The single result feeds the register capability
-  // report, the guardrail's allow-when-wired decision, and the SDK's DOCKER_HOST. In M1
-  // there is no daemon, so this resolves to `{}` (docker inert + denied, capability
-  // absent); M2 (compose socket) / M3 (k8s DOCKER_HOST) supply a real sidecar to it.
-  config.dockerWiring = await resolveDockerWiring(process.env);
+  // report, the guardrail's allow-when-wired decision, and the SDK's DOCKER_HOST. M2
+  // (compose socket) / M3 (k8s DOCKER_HOST) supply a real sidecar to it. M2 follow-up: when
+  // a sidecar is EXPECTED (DOCKER_HOST/UZI_DIND_SOCKET set) the probe is RETRIED up to the
+  // readiness budget so a daemon container slightly slower than the worker does not cost the
+  // capability; a non-docker worker (neither set) does one fast probe and never blocks.
+  config.dockerWiring = await resolveDockerWiring(process.env, {
+    readyIntervalMs: config.dockerReadyIntervalMs,
+    readyTimeoutMs: config.dockerReadyTimeoutMs,
+  });
+  // Degrade-to-unwired is silent for a normal non-docker worker, but LOUD when a sidecar was
+  // expected and never came up — that is a misconfig/timing bug an operator must see.
+  if (dockerSidecarExpected(process.env) && config.dockerWiring.dockerHost === undefined) {
+    log.warn(
+      "docker sidecar EXPECTED (DOCKER_HOST/UZI_DIND_SOCKET set) but no daemon became reachable within the readiness timeout; continuing WITHOUT docker (capability unreported, guardrail denies docker, DOCKER_HOST not injected)",
+      { docker_ready_timeout_ms: config.dockerReadyTimeoutMs },
+    );
+  }
 
   log.info("uzi-agent starting", {
     version: config.version,

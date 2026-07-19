@@ -203,8 +203,9 @@ cleanup() {
     printf '  project:  %s\n  web:      %s\n  rundir:   %s\n' "$PROJECT" "$BASE" "$RUNROOT"
     printf '  logs:     docker compose -p %s logs\n' "$PROJECT"
     printf '  worker:   docker compose -p %s exec agent sh\n' "$PROJECT"
-    printf '  teardown: docker compose -p %s --env-file %s -f %s -f %s --profile agent down -v\n' \
-      "$PROJECT" "$ENVFILE" "$ROOT/docker-compose.yml" "$ROOT/e2e/docker-compose.e2e.yml"
+    printf '  teardown: docker compose -p %s --env-file %s -f %s -f %s --profile agent%s down -v\n' \
+      "$PROJECT" "$ENVFILE" "$ROOT/docker-compose.yml" "$ROOT/e2e/docker-compose.e2e.yml" \
+      "${DOCKER_PROFILE:+ --profile agent-docker}"
     exit $code
   fi
   say "tearing down (down -v)"
@@ -2635,6 +2636,12 @@ if [ -n "$DOCKER_PROFILE" ]; then
   DH="unix:///run/dind/docker.sock"            # the path M1's resolveDockerWiring probes
   DTOK=/run/secrets/worker_token               # the worker join-token file (the canary)
   DIMG=alpine:3.22                             # the sidecar pulls this to run the attacks
+  # Start the sidecar EXPLICITLY. The `agent` deliberately does NOT `depends_on: dind`
+  # (that errors under the plain `--profile agent` path on the pinned engine — see the
+  # compose comment), and the harness brings the stack up naming only `agent`, so `dind`
+  # would otherwise never be created. `--wait` blocks on dind's `docker info` healthcheck,
+  # so the daemon (not just the container) is ready before the assertions.
+  "${COMPOSE[@]}" up -d --wait dind >/dev/null 2>&1 || fail "the DinD sidecar did not become healthy (up --wait dind)"
   # Root-client exec (bypasses socket perms) — proves the DAEMON's mount ns regardless of
   # client uid. `docker`/DOCKER_HOST is not in the agent's login env (only injected into the
   # SDK subprocess), so set it explicitly here.
@@ -2679,6 +2686,28 @@ if [ -n "$DOCKER_PROFILE" ]; then
       && fail "Decision-3 VIOLATED: the join token leaked through 'docker run -v $src' (the DinD daemon mounted a worker path)"
   done
   pass "Decision-3: a sidecar container cannot read the join token via -v {token,/run,/,/data,/nix} — mount-ns isolation holds"
+
+  # (3) The WORKER'S OWN path (the product path M2 exists to enable), NOT the -e DOCKER_HOST
+  # exec bypass above: set UZI_DIND_SOCKET, recreate the agent, and assert the worker's
+  # resolveDockerWiring auto-detects the live socket and its register reports
+  # capabilities:["docker"]. Executor-independent (register+wiring are worker-level), so it
+  # proves the real path under the stub. UZI_DIND_SOCKET marks the sidecar "expected", so the
+  # keystone bounded-wait bridges any residual daemon-vs-worker start race.
+  say "PRD #83 M2 (3): the worker self-detects the sidecar and reports the capability"
+  printf 'UZI_DIND_SOCKET=/run/dind/docker.sock\n' >> "$ENVFILE"
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null 2>&1 \
+    || fail "could not recreate the agent with UZI_DIND_SOCKET set"
+  # Wait for the recreated worker to boot, probe (with the readiness wait), and log its wiring.
+  det_end=$((SECONDS + 45))
+  while [ $SECONDS -lt $det_end ]; do
+    "${COMPOSE[@]}" logs agent 2>&1 | grep -q '"docker_wired":true' && break
+    sleep 1
+  done
+  "${COMPOSE[@]}" logs agent 2>&1 | grep -q '"docker_wired":true' \
+    || fail "the worker did not self-detect the sidecar (no docker_wired:true) via UZI_DIND_SOCKET"
+  "${COMPOSE[@]}" logs agent 2>&1 | grep -qE '"capabilities":\["docker"\]' \
+    || fail 'the worker did not report capabilities:["docker"] at register'
+  pass 'the worker self-detects the sidecar and registers capabilities:["docker"] (real product path, no DOCKER_HOST bypass)'
 fi
 
 printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #47 run-health + PRD #53 rate-limits%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"

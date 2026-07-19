@@ -42,53 +42,107 @@ export const DEFAULT_DIND_SOCKET = "/run/dind/docker.sock";
  *  within this, and an absent/stale endpoint must not stall worker startup. */
 export const DEFAULT_PROBE_TIMEOUT_MS = 2_000;
 
+/** Readiness-wait cadence + budget (M2 follow-up). Used ONLY when a sidecar is EXPECTED
+ *  (DOCKER_HOST or UZI_DIND_SOCKET set) — the worker retries the probe up to the timeout so
+ *  it does not lose the capability just because the daemon container is a few seconds slower
+ *  to come up than the worker (the compose start race, and the k8s pod-sidecar race). */
+export const DEFAULT_READY_INTERVAL_MS = 1_000;
+export const DEFAULT_READY_TIMEOUT_MS = 30_000;
+
+const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 export interface ResolveDockerWiringOptions {
   /** Reachability probe; injected in tests so the resolver is provable with no daemon.
    *  Resolves true iff a daemon answers on `dockerHost` within the timeout. Default =
    *  a bounded raw socket connect (unix:// or tcp://). */
   probe?: (dockerHost: string, timeoutMs: number) => Promise<boolean>;
   /** Existence check for the sidecar socket path (default = a stat that also verifies
-   *  the entry is a socket). Injected in tests. */
+   *  the entry is a socket). Injected in tests. Consulted ONLY for the default-path
+   *  auto-detect (a non-expected worker) — an explicit UZI_DIND_SOCKET forms the candidate
+   *  regardless, so the readiness wait can span the window before the socket file appears. */
   socketExists?: (socketPath: string) => boolean;
   /** Probe timeout override (ms). */
   probeTimeoutMs?: number;
+  /** Readiness-wait cadence (ms) between probes; only used when a sidecar is expected. */
+  readyIntervalMs?: number;
+  /** Readiness-wait budget (ms) before degrading to unwired; only used when expected. 0 ⇒
+   *  exactly one probe, no wait (the non-expected path). */
+  readyTimeoutMs?: number;
+  /** Injectable sleep (tests drive the wait with no real delay). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** True when the operator EXPECTS a sidecar: DOCKER_HOST (k8s) or UZI_DIND_SOCKET (compose
+ *  opt-in) set non-empty. Only then does the worker WAIT for the daemon; an ordinary
+ *  non-docker worker (neither set) never blocks. Exported so main.ts warns on the same
+ *  signal it degraded on. */
+export function dockerSidecarExpected(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !!(env.DOCKER_HOST?.trim() || env.UZI_DIND_SOCKET?.trim());
 }
 
 /**
- * Resolve this worker's docker wiring ONCE at startup (arch doc §Keystone):
- *   1. DOCKER_HOST set + non-empty → that endpoint verbatim (the k8s path).
- *   2. else the sidecar socket (UZI_DIND_SOCKET, default /run/dind/docker.sock) if it
- *      exists → unix://<path> (the compose auto-detect path).
- *   3. else no candidate → {}.
- * A candidate is then PROBED for liveness; `dockerHost` is returned only when the probe
- * succeeds, so "reachable" (not merely "configured") is what every consumer keys on.
+ * Resolve this worker's docker wiring ONCE at startup (arch doc §Keystone; M2 follow-up
+ * adds the bounded readiness wait):
+ *   1. DOCKER_HOST set + non-empty → that endpoint verbatim (the k8s path); EXPECTED.
+ *   2. else UZI_DIND_SOCKET set → unix://<path> regardless of whether the file exists yet
+ *      (compose opt-in); EXPECTED — the wait spans the window before the socket appears.
+ *   3. else the DEFAULT socket if it already exists → unix://<default>; NOT expected.
+ *   4. else no candidate → {}.
+ * The candidate is PROBED for liveness. When EXPECTED, the probe is retried every
+ * `readyIntervalMs` up to `readyTimeoutMs` before concluding unwired, so a slow-to-start
+ * daemon does not cost the capability. When NOT expected, exactly ONE fast probe runs and
+ * the worker NEVER blocks. `dockerHost` is returned only when a probe succeeds, so
+ * "reachable" (not merely "configured") is what every consumer keys on. Timeout ⇒ {}
+ * (degrade-to-unwired); main.ts emits the loud warn.
  */
 export async function resolveDockerWiring(
   env: NodeJS.ProcessEnv = process.env,
   opts: ResolveDockerWiringOptions = {},
 ): Promise<DockerWiring> {
-  const candidate = resolveCandidate(env, opts);
-  if (!candidate) return {};
+  const resolved = resolveCandidate(env, opts);
+  if (!resolved) return {};
   const probe = opts.probe ?? defaultProbe;
-  const timeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  let reachable = false;
-  try {
-    reachable = await probe(candidate, timeoutMs);
-  } catch {
-    // A probe that throws is treated as unreachable — never let it fail worker
-    // startup, and never report a capability we could not confirm.
-    reachable = false;
+  const probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+  const sleep = opts.sleep ?? realSleep;
+  const readyIntervalMs = opts.readyIntervalMs ?? DEFAULT_READY_INTERVAL_MS;
+  // Only an EXPECTED sidecar gets a wait budget; otherwise the deadline is now (one probe).
+  const readyTimeoutMs = resolved.expected ? (opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS) : 0;
+  const deadline = Date.now() + readyTimeoutMs;
+  for (;;) {
+    let reachable = false;
+    try {
+      reachable = await probe(resolved.host, probeTimeoutMs);
+    } catch {
+      // A probe that throws is treated as unreachable — never let it fail worker startup,
+      // and never report a capability we could not confirm.
+      reachable = false;
+    }
+    if (reachable) return { dockerHost: resolved.host };
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return {}; // not expected ⇒ deadline≈now ⇒ exactly one probe, no wait
+    await sleep(Math.min(readyIntervalMs, remaining));
   }
-  return reachable ? { dockerHost: candidate } : {};
+}
+
+/** The resolved candidate endpoint + whether a sidecar was EXPECTED (drives the wait). */
+interface ResolvedCandidate {
+  host: string;
+  expected: boolean;
 }
 
 /** Resolve the candidate endpoint (before the liveness probe), or undefined. */
-function resolveCandidate(env: NodeJS.ProcessEnv, opts: ResolveDockerWiringOptions): string | undefined {
+function resolveCandidate(env: NodeJS.ProcessEnv, opts: ResolveDockerWiringOptions): ResolvedCandidate | undefined {
   const explicit = env.DOCKER_HOST?.trim();
-  if (explicit) return explicit; // k8s: the controller sets it explicitly.
-  const socketPath = env.UZI_DIND_SOCKET?.trim() || DEFAULT_DIND_SOCKET;
+  if (explicit) return { host: explicit, expected: true }; // k8s: the controller sets it.
+  const configured = env.UZI_DIND_SOCKET?.trim();
+  // An explicitly-configured socket path forms the candidate REGARDLESS of current
+  // existence, so the readiness wait can bridge the gap until the daemon writes the socket.
+  if (configured) return { host: `unix://${configured}`, expected: true };
+  // Default path, NOT explicitly configured: only a candidate if the socket is ALREADY
+  // present, and never expected — a non-docker worker must not block on a path that may
+  // never appear (the socket-share volume always exists; the SOCKET is what matters).
   const exists = opts.socketExists ?? defaultSocketExists;
-  if (exists(socketPath)) return `unix://${socketPath}`; // compose: auto-detected.
+  if (exists(DEFAULT_DIND_SOCKET)) return { host: `unix://${DEFAULT_DIND_SOCKET}`, expected: false };
   return undefined;
 }
 
