@@ -133,6 +133,27 @@ spec:
             # image/posture mismatch, so this value is always coherent with the flag above.
             - name: UZI_WORKER_DIND_IMAGE
               value: {{ include "uzi.workerDinDImage" . | quote }}
+            # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). Optional: the
+            # controller validates each as a k8s quantity at boot and falls back to its
+            # built-in default (250m/256Mi req, 2/2Gi lim) for any left unset. A cluster
+            # raises them (request in lockstep with the limit) because in-daemon image
+            # builds OOM the 2Gi default.
+            {{- with .Values.workers.docker.dindResources.requests.cpu }}
+            - name: UZI_WORKER_DIND_REQUEST_CPU
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.docker.dindResources.requests.memory }}
+            - name: UZI_WORKER_DIND_REQUEST_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.docker.dindResources.limits.cpu }}
+            - name: UZI_WORKER_DIND_LIMIT_CPU
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.docker.dindResources.limits.memory }}
+            - name: UZI_WORKER_DIND_LIMIT_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
           resources:
             {{- toYaml .Values.workers.controller.resources | nindent 12 }}

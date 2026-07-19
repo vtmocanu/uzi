@@ -74,7 +74,13 @@ func main() {
 		// Config carries the POSITIVE `rootless` bool (matching the chart value); the
 		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
 		// rootless posture. Invert here, at the one wiring point.
-		DinDNonRootless:    !cfg.WorkerDinDRootless,
+		DinDNonRootless: !cfg.WorkerDinDRootless,
+		// DinD resource overrides (PRD #89 0.8.1), requests + limits; empty leaves the
+		// render default.
+		DinDRequestCPU:     cfg.WorkerDinDRequestCPU,
+		DinDRequestMemory:  cfg.WorkerDinDRequestMemory,
+		DinDLimitCPU:       cfg.WorkerDinDLimitCPU,
+		DinDLimitMemory:    cfg.WorkerDinDLimitMemory,
 		ServiceAccountName: cfg.WorkerServiceAccount,
 		APIURL:             cfg.WorkerAPIURL,
 		StorageClass:       cfg.WorkerStorageClass,

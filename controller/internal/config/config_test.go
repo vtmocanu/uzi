@@ -503,3 +503,57 @@ func TestLoadDockerTierOffDefaultsRootless(t *testing.T) {
 		t.Error("with the docker tier off, WorkerDinDRootless must keep its safe default (true)")
 	}
 }
+
+// The DinD resource overrides (PRD #89 0.8.1) are optional; when set they are read verbatim
+// and (below) validated as k8s quantities. Requests + limits both. Empty leaves them empty
+// (the render default).
+func TestLoadDockerDinDResourceOverrides(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	t.Setenv("UZI_WORKER_DIND_REQUEST_CPU", "500m")
+	t.Setenv("UZI_WORKER_DIND_REQUEST_MEMORY", "2Gi")
+	t.Setenv("UZI_WORKER_DIND_LIMIT_CPU", "4")
+	t.Setenv("UZI_WORKER_DIND_LIMIT_MEMORY", "6Gi")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDinDRequestCPU != "500m" || cfg.WorkerDinDRequestMemory != "2Gi" {
+		t.Fatalf("dind requests = %q / %q, want 500m / 2Gi", cfg.WorkerDinDRequestCPU, cfg.WorkerDinDRequestMemory)
+	}
+	if cfg.WorkerDinDLimitCPU != "4" || cfg.WorkerDinDLimitMemory != "6Gi" {
+		t.Fatalf("dind limits = %q / %q, want 4 / 6Gi", cfg.WorkerDinDLimitCPU, cfg.WorkerDinDLimitMemory)
+	}
+}
+
+// A typo'd override fails at BOOT (validated as a k8s Quantity), not at the far end when
+// the apiserver rejects the rendered pod — for a REQUEST var as well as a limit var.
+func TestLoadDockerDinDResourceRejectsABadQuantity(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	t.Setenv("UZI_WORKER_DIND_REQUEST_MEMORY", "2GB") // not a k8s quantity (want Gi/Mi/G/M)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DIND_REQUEST_MEMORY") {
+		t.Fatalf("err = %v, want a boot refusal naming the bad request var", err)
+	}
+}
+
+// Unset overrides leave the fields empty (the render side supplies its default).
+func TestLoadDockerDinDResourceDefaultsEmpty(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDinDRequestCPU != "" || cfg.WorkerDinDRequestMemory != "" ||
+		cfg.WorkerDinDLimitCPU != "" || cfg.WorkerDinDLimitMemory != "" {
+		t.Errorf("unset dind resources must stay empty, got req %q/%q lim %q/%q",
+			cfg.WorkerDinDRequestCPU, cfg.WorkerDinDRequestMemory, cfg.WorkerDinDLimitCPU, cfg.WorkerDinDLimitMemory)
+	}
+}

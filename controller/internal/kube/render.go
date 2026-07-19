@@ -194,17 +194,43 @@ const (
 // a ResourceQuota on requests.* rejects any pod with a container declaring none, and
 // native sidecars count toward the pod's request (they run alongside the worker).
 // The sidecar budget follows arch §Q4 (~1-2 GiB / ~1 CPU on top of the agent).
-var (
-	dindResources = corev1.ResourceRequirements{
+//
+// The dind requests+limits are the DEFAULT; a cluster overrides them per-cluster (PRD #89
+// 0.8.1, RenderConfig.DinDRequest*/DinDLimit*) because in-daemon image builds OOM the 2Gi
+// default — uzi's own e2e builds 5 images inside the daemon. BOTH the requests and the
+// limits are overridable: raising only the limit lets the scheduler place the pod on a
+// node without the memory and OOM it under contention, so a cluster that raises the memory
+// limit raises the request in lockstep. See dindResources() below.
+const (
+	dindDefaultRequestCPU    = "250m"
+	dindDefaultRequestMemory = "256Mi"
+	dindDefaultLimitCPU      = "2"
+	dindDefaultLimitMemory   = "2Gi"
+)
+
+// dindResources builds the DinD sidecar's requests+limits from cfg, falling back to the
+// dindDefault* constants for any field a cluster did not override (config validated every
+// override string as a k8s quantity at boot, so MustParse here is safe).
+func (cfg RenderConfig) dindResources() corev1.ResourceRequirements {
+	pick := func(override, def string) string {
+		if override != "" {
+			return override
+		}
+		return def
+	}
+	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("250m"),
-			corev1.ResourceMemory: resource.MustParse("256Mi"),
+			corev1.ResourceCPU:    resource.MustParse(pick(cfg.DinDRequestCPU, dindDefaultRequestCPU)),
+			corev1.ResourceMemory: resource.MustParse(pick(cfg.DinDRequestMemory, dindDefaultRequestMemory)),
 		},
 		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("2"),
-			corev1.ResourceMemory: resource.MustParse("2Gi"),
+			corev1.ResourceCPU:    resource.MustParse(pick(cfg.DinDLimitCPU, dindDefaultLimitCPU)),
+			corev1.ResourceMemory: resource.MustParse(pick(cfg.DinDLimitMemory, dindDefaultLimitMemory)),
 		},
 	}
+}
+
+var (
 	dindInitResources = corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("50m"),
@@ -286,6 +312,18 @@ type RenderConfig struct {
 	// acknowledgeNonRootlessNodeRoot fail-guard (M2); it never comes off the wire and is
 	// kept out of a plain worker's rendered spec/hash.
 	DinDNonRootless bool
+	// DinDRequest*/DinDLimit* override the DinD sidecar's resource requests+limits (PRD #89
+	// 0.8.1). Empty ⇒ dindDefault* ("250m"/"256Mi" requests, "2"/"2Gi" limits). A cluster
+	// raises them because in-daemon image builds OOM the 2Gi default (uzi's own e2e builds
+	// 5 images inside the daemon); the REQUEST is raised alongside the limit so the
+	// scheduler reserves the memory rather than placing the pod on a node that OOMs it under
+	// contention. Quantity strings (e.g. "4" / "6Gi"), validated at the controller's boot so
+	// the render side can MustParse them. Docker-only, so they never touch a plain worker's
+	// spec/hash.
+	DinDRequestCPU    string
+	DinDRequestMemory string
+	DinDLimitCPU      string
+	DinDLimitMemory   string
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.
@@ -545,6 +583,34 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			host = dindLoopbackTCP
 		}
 		env = append(env, corev1.EnvVar{Name: "DOCKER_HOST", Value: host})
+
+		// TMPDIR into the shared run workdir (M-workdir), docker workers ONLY. A tool that
+		// stages a `docker run -v <src>:/x` / compose bind source under $TMPDIR (uzi's own
+		// e2e defaults its run dir to ${TMPDIR:-/tmp}/uzi-e2e-$$) needs <src> to resolve in
+		// the DAEMON's filesystem, not the worker's — otherwise the bind source is an empty
+		// dir in the daemon and the run silently sees nothing. The daemon shares only
+		// dindWorkdirDir with the worker, so tmp MUST live under it. Point it at the mount
+		// root directly: the emptyDir mount point always exists and is writable by fsGroup
+		// 10001 (no subdir to create, no agent/entrypoint change).
+		//
+		// NO secret transits here (Decision 3 holds): the PAT is env-scoped not on disk,
+		// per-run secrets have their own volume, and the join token is its own mount — none
+		// of them route through $TMPDIR. The daemon can already read this dir (it is shared
+		// by design), so tmp being dind-visible adds no exposure beyond the checkout that
+		// M-workdir already shares.
+		//
+		// The agent honours this: on the current non-root k8s start entrypoint.sh takes the
+		// single-uid branch (it unsets UZI_RUNNER_TMPDIR and does NOT set its own TMPDIR), so
+		// this pod-spec TMPDIR survives and runnerTmpdir() (= UZI_RUNNER_TMPDIR || TMPDIR)
+		// returns it — reaching both the worker and the repo's docker/compose. Render-only,
+		// verified against agent/templates/entrypoint.sh + agent/src/runner-uid.ts.
+		// FUTURE COUPLING: PRD #51 M4's runner-uid split (root-started A1 path, not yet on
+		// k8s) makes the entrypoint export its OWN tmpdirs UNDER /tmp — worker TMPDIR
+		// /tmp/uzi-worker (overriding this value) and UZI_RUNNER_TMPDIR /tmp/uzi-runner — both
+		// OUTSIDE /data/runner, so repo bind sources would land back outside the dind-shared
+		// workdir. When that split lands on k8s, both tmpdirs must be relocated under
+		// dindWorkdirDir. Not a 0.8.1 concern (the split does not run on the non-root start).
+		env = append(env, corev1.EnvVar{Name: "TMPDIR", Value: dindWorkdirDir})
 	}
 
 	containerSecurity := &corev1.SecurityContext{
@@ -738,10 +804,12 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 //     userns (dev-cluster/Linux). RunAsNonRoot MUST be false at CONTAINER scope: the
 //     pod is RunAsNonRoot:true, so a uid-0 container is rejected at admission without
 //     this override (the same override dindInitContainer uses). The dockerd command is
-//     OVERRIDDEN to bind loopback-only (the unix socket + dindLoopbackTCP, `--tls=false`)
-//     — THE control that suppresses docker:dind's automatic 0.0.0.0:2375 listener, so
-//     the unauthenticated root daemon is never on the pod IP. No dind-init, no shared
-//     socket volume: the worker reaches the daemon over the pod's loopback netns.
+//     OVERRIDDEN to bind ONLY dindLoopbackTCP (`--tls=false`) — THE control that
+//     suppresses docker:dind's automatic 0.0.0.0:2375 listener, so the unauthenticated
+//     root daemon is never on the pod IP. It binds NO unix socket: this posture drops
+//     dind-init AND the shared socket volume, so /run/dind does not exist and a unix
+//     --host would make dockerd exit 1 (live-proven, fixed in 0.8.1). The worker reaches
+//     the daemon over the pod's loopback netns.
 //
 // Both keep seccomp Unconfined (the nested daemon profiles its children) and mount the
 // shared run workdir (M-workdir).
@@ -777,11 +845,18 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 			RunAsGroup:     &root,
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined},
 		}
-		// THE loopback-bind control (PRD #89 M1): bind the unix socket + pod-loopback TCP
-		// EXPLICITLY and nothing else, which suppresses docker:dind's automatic
-		// 0.0.0.0:2375 listener. --tls=false because the loopback endpoint is plain (the
-		// trust boundary is the pod netns, same as a same-pod unix socket).
-		command = []string{"dockerd", "--host=unix://" + dindSocketPath, "--host=" + dindLoopbackTCP, "--tls=false"}
+		// THE loopback-bind control (PRD #89 M1): bind ONLY the pod-loopback TCP endpoint
+		// and nothing else, which suppresses docker:dind's automatic 0.0.0.0:2375
+		// listener. --tls=false because the loopback endpoint is plain (the trust boundary
+		// is the pod netns, same as a same-pod unix socket).
+		//
+		// It must NOT also bind the unix socket: the non-rootless posture drops dind-init
+		// AND the shared dind-sock volume, so /run/dind does not exist and a
+		// `--host=unix:///run/dind/docker.sock` makes dockerd exit 1 ("can't create unix
+		// socket ...: bind: no such file or directory") — live-proven on dev-cluster in
+		// 0.8.0 and fixed here (0.8.1). Nothing needs the socket: the worker's DOCKER_HOST
+		// is dindLoopbackTCP and the probe is `docker -H tcp://127.0.0.1:2375 info`.
+		command = []string{"dockerd", "--host=" + dindLoopbackTCP, "--tls=false"}
 		// `docker info` over the loopback endpoint: the daemon answering there is the real
 		// readiness signal (the socket existing is not the daemon being up).
 		probeCmd = "docker -H " + dindLoopbackTCP + " info >/dev/null 2>&1"
@@ -814,7 +889,7 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 		Command:         command, // nil for rootless (image entrypoint), set for non-rootless
 		Env:             env,
 		SecurityContext: sc,
-		Resources:       dindResources,
+		Resources:       cfg.dindResources(),
 		StartupProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", probeCmd}},

@@ -516,6 +516,23 @@ workers:
         cpu: "4"
         memory: 8Gi
       maxPVCStorage: 20Gi
+    # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). The controller renders
+    # the sidecar with these (flattened to UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}).
+    # The default (250m/256Mi req, 2/2Gi lim) is enough for `docker`/compose that pulls
+    # prebuilt images, but IN-DAEMON image BUILDS OOM it (uzi's own e2e builds 5 images
+    # inside the daemon), so a cluster that runs real docker work raises them per-cluster
+    # (dev-cluster sets 500m/2Gi req, 4/6Gi lim). RAISE THE REQUEST alongside the limit:
+    # a large limit with a tiny request lets the scheduler place the pod on a node without
+    # the memory and OOM it under contention. Limits must stay within limitRange.max above
+    # (per-container ceiling: 4 CPU / 8Gi). Any field left empty falls back to the
+    # controller's built-in default.
+    dindResources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
   # ClusterIP before policy enforcement, so FQDN cannot match a Service).

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
@@ -765,10 +766,15 @@ func TestDockerFlagRollsThePodButAbsentDockerIsInert(t *testing.T) {
 // assertion, NOT a "no 0.0.0.0 string" negative: dropping the command override
 // entirely would pass a negative test while docker:dind's image entrypoint restores
 // the 0.0.0.0:2375 listener, putting the unauthenticated ROOT daemon on the pod IP.
-// So we assert the command is PRESENT and its ONLY --host values are the pod-loopback
-// TCP endpoint + the unix socket. A failing assertion here is a real security
-// regression (node-root daemon reachable off-pod), not a style nit.
-func TestNonRootlessDindBindsOnlyLoopbackAndUnixViaExplicitCommand(t *testing.T) {
+// So we assert the command is PRESENT and its ONLY --host value is the pod-loopback
+// TCP endpoint. A failing assertion here is a real security regression (node-root
+// daemon reachable off-pod), not a style nit.
+//
+// It binds NO unix socket (0.8.1 fix): the non-rootless posture drops dind-init and the
+// shared dind-sock volume, so /run/dind does not exist and a `--host=unix://...` makes
+// dockerd exit 1 (live-proven on dev-cluster). The worker uses the loopback TCP endpoint
+// only.
+func TestNonRootlessDindBindsOnlyLoopbackTCPViaExplicitCommand(t *testing.T) {
 	dep := RenderDeployment(dockerTestConfigNonRootless(), desiredDocker("abc"), testSpec(t, "base", "m"))
 	dind := containerByName(t, dep.Spec.Template.Spec.InitContainers, dindContainerName)
 
@@ -790,14 +796,16 @@ func TestNonRootlessDindBindsOnlyLoopbackAndUnixViaExplicitCommand(t *testing.T)
 			tlsOff = true
 		}
 	}
-	want := map[string]bool{dindLoopbackTCP: true, "unix://" + dindSocketPath: true}
+	want := map[string]bool{dindLoopbackTCP: true}
 	if len(hosts) != len(want) {
-		t.Fatalf("dind --host args = %v, want exactly the loopback TCP + the unix socket (%v)", hosts, want)
+		t.Fatalf("dind --host args = %v, want EXACTLY the loopback TCP endpoint (%v) and nothing else — "+
+			"binding the unix socket crashes dockerd (the socket dir is dropped in this posture), and any "+
+			"other bind (esp. 0.0.0.0) exposes the unauthenticated root daemon on the pod network", hosts, want)
 	}
 	for _, h := range hosts {
 		if !want[h] {
-			t.Errorf("dind binds --host=%q, which is neither the loopback TCP nor the unix socket — any other "+
-				"bind (esp. 0.0.0.0) exposes the unauthenticated root daemon on the pod network", h)
+			t.Errorf("dind binds --host=%q, which is not the loopback TCP endpoint — the unix socket crashes "+
+				"dockerd here, and any other bind (esp. 0.0.0.0) exposes the unauthenticated root daemon on the pod network", h)
 		}
 	}
 	if !tlsOff {
@@ -865,6 +873,98 @@ func TestDockerWorkerSharesTheRunWorkdirWithDindButNotSecrets(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TMPDIR under the shared run workdir (PRD #89 0.8.1), docker workers ONLY. A tool that
+// stages a `docker run -v <src>` bind source under $TMPDIR (uzi's own e2e defaults its
+// run dir to ${TMPDIR:-/tmp}) needs <src> to resolve in the DAEMON's filesystem; the
+// daemon shares only dindWorkdirDir with the worker, so tmp must live under it. A plain
+// worker gets no TMPDIR (docker-only, so its spec/hash is untouched).
+func TestDockerWorkerTMPDIRUnderSharedWorkdirAndPlainHasNone(t *testing.T) {
+	envValue := func(c corev1.Container, name string) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == name {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	for _, p := range dindPostures() {
+		t.Run(p.name, func(t *testing.T) {
+			dep := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+			worker := containerByName(t, dep.Spec.Template.Spec.Containers, workerContainerName)
+
+			tmp, ok := envValue(worker, "TMPDIR")
+			if !ok {
+				t.Fatal("a docker worker must set TMPDIR so tmp-staged bind sources land in the dind-visible shared workdir")
+			}
+			if tmp != dindWorkdirDir {
+				t.Errorf("TMPDIR = %q, want %q (the shared run workdir the dind sidecar also mounts)", tmp, dindWorkdirDir)
+			}
+			// TMPDIR must resolve inside the shared workdir mount, or a bind source under it
+			// is invisible to the daemon.
+			if mountPath(worker, dindWorkdirVolume) != dindWorkdirDir {
+				t.Errorf("TMPDIR %q is not covered by the shared workdir mount %q", tmp, dindWorkdirDir)
+			}
+		})
+	}
+
+	// A PLAIN worker never gets TMPDIR (docker-only; keeps its hash stable).
+	plain := RenderDeployment(dockerTestConfig(), desired("abc"), testSpec(t, "base", "m"))
+	pw := containerByName(t, plain.Spec.Template.Spec.Containers, workerContainerName)
+	if _, ok := envValue(pw, "TMPDIR"); ok {
+		t.Error("a plain worker must not set TMPDIR (docker-only env; setting it would change the plain worker's spec hash)")
+	}
+}
+
+// dind sidecar resources (PRD #89 0.8.1): BOTH requests and limits are configurable per
+// cluster (in-daemon image builds OOM the 2Gi default, and the request must rise with the
+// limit or the scheduler under-reserves). Empty overrides keep the built-in default; set
+// overrides win; a partial override leaves the untouched field at its default.
+func TestDindResourceRequestsAndLimitsDefaultAndOverride(t *testing.T) {
+	dindOf := func(cfg RenderConfig) corev1.Container {
+		dep := RenderDeployment(cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+		return containerByName(t, dep.Spec.Template.Spec.InitContainers, dindContainerName)
+	}
+	eq := func(t *testing.T, got resource.Quantity, want string, what string) {
+		t.Helper()
+		if w := resource.MustParse(want); got.Cmp(w) != 0 {
+			t.Errorf("dind %s = %s, want %s", what, got.String(), want)
+		}
+	}
+
+	// Default: requests 250m / 256Mi, limits 2 / 2Gi.
+	def := dindOf(dockerTestConfigNonRootless())
+	eq(t, def.Resources.Requests[corev1.ResourceCPU], "250m", "default CPU request")
+	eq(t, def.Resources.Requests[corev1.ResourceMemory], "256Mi", "default memory request")
+	eq(t, def.Resources.Limits[corev1.ResourceCPU], "2", "default CPU limit")
+	eq(t, def.Resources.Limits[corev1.ResourceMemory], "2Gi", "default memory limit")
+
+	// Full override raises requests AND limits (dev-cluster's shape).
+	cfg := dockerTestConfigNonRootless()
+	cfg.DinDRequestCPU = "500m"
+	cfg.DinDRequestMemory = "2Gi"
+	cfg.DinDLimitCPU = "4"
+	cfg.DinDLimitMemory = "6Gi"
+	ov := dindOf(cfg)
+	eq(t, ov.Resources.Requests[corev1.ResourceCPU], "500m", "overridden CPU request")
+	eq(t, ov.Resources.Requests[corev1.ResourceMemory], "2Gi", "overridden memory request")
+	eq(t, ov.Resources.Limits[corev1.ResourceCPU], "4", "overridden CPU limit")
+	eq(t, ov.Resources.Limits[corev1.ResourceMemory], "6Gi", "overridden memory limit")
+
+	// A PARTIAL override leaves the untouched fields at their default (per-field fallback).
+	part := dockerTestConfigNonRootless()
+	part.DinDLimitMemory = "6Gi" // only the memory limit
+	pc := dindOf(part)
+	eq(t, pc.Resources.Limits[corev1.ResourceMemory], "6Gi", "partial: overridden memory limit")
+	eq(t, pc.Resources.Limits[corev1.ResourceCPU], "2", "partial: CPU limit stays default")
+	eq(t, pc.Resources.Requests[corev1.ResourceMemory], "256Mi", "partial: memory request stays default")
+
+	// The override rolls the docker worker's spec hash (it changes the rendered pod).
+	if SpecHashOf(dockerTestConfigNonRootless(), desiredDocker("abc"), testSpec(t, "base", "m")) ==
+		SpecHashOf(cfg, desiredDocker("abc"), testSpec(t, "base", "m")) {
+		t.Error("raising the dind resources must change the docker worker's spec hash (else a bump never rolls the pod)")
 	}
 }
 
