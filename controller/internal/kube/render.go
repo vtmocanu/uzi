@@ -139,15 +139,45 @@ const (
 const (
 	dindSocketDir  = "/run/dind"
 	dindSocketPath = dindSocketDir + "/docker.sock"
-	// dockerHostValue is what the worker's DOCKER_HOST is set to — the k8s branch of
-	// the keystone resolver (agent/src/docker-wiring.ts): explicit, never probed.
+	// dockerHostValue is what the ROOTLESS worker's DOCKER_HOST is set to — the k8s
+	// branch of the keystone resolver (agent/src/docker-wiring.ts): explicit, never
+	// probed. The NON-ROOTLESS posture uses dindLoopbackTCP instead (no shared socket).
 	dockerHostValue = "unix://" + dindSocketPath
+	// dindLoopbackTCP is the pod-loopback endpoint the NON-ROOTLESS worker reaches the
+	// daemon on (PRD #89). Client transport is pod-local loopback TCP, matching coder:
+	// loopback ONLY (never the pod IP), so the trust boundary is same-pod containers,
+	// identical to the rootless shared unix socket. The dockerd command binds this
+	// EXPLICITLY, which SUPPRESSES docker:dind's automatic 0.0.0.0:2375 listener — the
+	// primary control keeping the unauthenticated root daemon off the pod IP.
+	dindLoopbackTCP = "tcp://127.0.0.1:2375"
 	// The rootless daemon's data root. docker:*-dind-rootless runs as the `rootless`
 	// user (uid 1000) and stores its data under this HOME path.
 	dindDataDir = "/home/rootless/.local/share/docker"
+	// dindDataDirRoot is the NON-ROOTLESS daemon's data root (PRD #89): a root dockerd
+	// stores images + build cache under /var/lib/docker, not the rootless HOME path.
+	dindDataDirRoot = "/var/lib/docker"
 
 	dindSocketVolume = "dind-sock"
 	dindDataVolume   = "dind-data"
+)
+
+// The shared run workdir (PRD #89 M-workdir — a Decision-3 amendment). A no-secrets
+// emptyDir mounted into BOTH the worker and the dind sidecar at the SAME path, so a
+// `docker run -v <src>:/x` / compose bind whose source is the run's checkout resolves
+// in the daemon's own filesystem. Without it the daemon mounts none of the worker fs,
+// so every bind source is an EMPTY dir — which breaks uzi's own e2e and most real
+// docker repos on ANY posture (the daemon never saw the worker's files). It bites
+// rootless and non-rootless equally, so it is rendered for both.
+//
+// The path is the agent's runner-clone root: git.ts sets runnerRoot =
+// <UZI_DATA_DIR>/runner and the run's SDK cwd is a clone under it, so the docker bind
+// source is /data/runner/... — COUPLED to agent/src/git.ts; if that root moves, this
+// must move with it. It is a SEPARATE emptyDir nested under /data (the cache PVC's
+// mountpoint), so the clone cache at /data/repos, /nix, and the token/secret mounts
+// stay UNSHARED with dind — Decision 3's crown-jewel isolation is preserved.
+const (
+	dindWorkdirVolume = "run-workdir"
+	dindWorkdirDir    = dataMountPath + "/runner"
 )
 
 // The rootless dind uid/gid baked into docker:*-dind-rootless. The sidecar MUST run
@@ -240,6 +270,17 @@ type RenderConfig struct {
 	// (that image ships /bin/sh + chown/chmod), so there is no second image to
 	// configure. Empty exactly when DockerNamespace is (config validates the pair).
 	DinDImage string
+	// DinDNonRootless selects the NON-ROOTLESS privileged DinD posture (PRD #89). Its
+	// ZERO VALUE (false) is ROOTLESS — the safe default — so an unset posture renders
+	// exactly PRD #83's rootless sidecar and no caller that omits it can accidentally
+	// get node root. Set true ONLY for clusters whose nodes cannot run rootless dockerd
+	// (no unprivileged userns — dev-cluster/Linux): the daemon then runs as real root
+	// (uid 0) in the already-privileged, already-fenced docker namespace and the worker
+	// reaches it over pod-loopback TCP (dindLoopbackTCP) instead of a shared unix
+	// socket. Pure operator config gated by workers.docker.rootless + the
+	// acknowledgeNonRootlessNodeRoot fail-guard (M2); it never comes off the wire and is
+	// kept out of a plain worker's rendered spec/hash.
+	DinDNonRootless bool
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.
@@ -490,7 +531,15 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// unwired regardless of this env. The value carries no secret (a socket path),
 		// is present only when the sidecar is rendered, and cannot be overwritten by a
 		// provisioned toolEnv (the SDK env fold writes only allowlisted nix keys).
-		env = append(env, corev1.EnvVar{Name: "DOCKER_HOST", Value: dockerHostValue})
+		//
+		// Rootless: the shared unix socket. Non-rootless (PRD #89): pod-loopback TCP,
+		// since there is no shared socket volume — the worker reaches the root daemon over
+		// the pod's loopback netns. parseDockerTarget already handles tcp:// unchanged.
+		host := dockerHostValue
+		if cfg.DinDNonRootless {
+			host = dindLoopbackTCP
+		}
+		env = append(env, corev1.EnvVar{Name: "DOCKER_HOST", Value: host})
 	}
 
 	containerSecurity := &corev1.SecurityContext{
@@ -553,33 +602,52 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		},
 	}
 	if w.Docker {
-		// Native-sidecar ordering (reviewer race, k8s half): the DinD helper + daemon
-		// are initContainers with restartPolicy: Always, so k8s starts them BEFORE the
-		// worker and — via the dind startupProbe — holds the worker until dockerd is
-		// actually listening. A plain wait-for-dind initContainer would DEADLOCK (it
-		// runs before regular-container sidecars ever start); native sidecars are the
-		// clean fix and are GA on k8s 1.29 (dev-cluster).
+		// Native-sidecar ordering (reviewer race, k8s half): the DinD daemon is an
+		// initContainer with restartPolicy: Always, so k8s starts it BEFORE the worker
+		// and — via the dind startupProbe — holds the worker until dockerd is actually
+		// listening. A plain wait-for-dind initContainer would DEADLOCK (it runs before
+		// regular-container sidecars ever start); native sidecars are the clean fix and
+		// are GA on k8s 1.29 (dev-cluster).
 		//
-		// Order is load-bearing: [seed-nix] → [dind-init: chown the socket dir to the
-		// rootless uid so dockerd can start] → [dind: the daemon]. dind-init MUST
-		// precede dind because rootless dockerd REFUSES to start without a writable
-		// XDG_RUNTIME_DIR (M2 established this live), and dind-init also holds the
-		// socket at 0666 for the agent's own uid after the daemon creates it.
-		initContainers = append(initContainers, dindInitContainer(cfg), dindContainer(cfg))
-		// The worker reaches the daemon through the shared socket dir — and NOTHING
-		// else transits it (Decision 3).
-		workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindSocketVolume, MountPath: dindSocketDir})
+		// Rootless (PRD #83): [seed-nix] → [dind-init: chown the socket dir to the
+		// rootless uid so dockerd can start] → [dind]. dind-init MUST precede dind
+		// because rootless dockerd REFUSES to start without a writable XDG_RUNTIME_DIR,
+		// and it also holds the socket at 0666 for the agent's own uid after the daemon
+		// creates it.
+		//
+		// Non-rootless (PRD #89): [seed-nix] → [dind]. There is NO shared socket dir to
+		// prepare — the worker reaches the root daemon over pod-loopback TCP, not a
+		// shared volume — so dind-init and the dind-sock socket volume+mounts are dropped
+		// entirely.
+		if cfg.DinDNonRootless {
+			initContainers = append(initContainers, dindContainer(cfg))
+		} else {
+			initContainers = append(initContainers, dindInitContainer(cfg), dindContainer(cfg))
+			// Rootless only: the worker reaches the daemon through the shared socket dir —
+			// and NOTHING else transits it (Decision 3).
+			workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindSocketVolume, MountPath: dindSocketDir})
+		}
+		// The shared no-secrets run workdir (M-workdir), BOTH postures: mounted into the
+		// worker AND the dind sidecar at the SAME path so a `docker run -v` bind source
+		// under the run's checkout resolves in the daemon. Secrets + the /data cache +
+		// /nix stay UNSHARED (Decision 3): the invariant test pins that dind mounts none
+		// of token/data/nix.
+		workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindWorkdirVolume, MountPath: dindWorkdirDir})
 		volumes = append(volumes,
-			// Socket-only shared dir. emptyDir, so it is torn down with the pod and is
-			// never a persistence surface. Carries ONLY the socket (Decision 3): the
-			// render invariant test asserts the dind containers mount none of
-			// token/data/nix, which is what actually closes the docker `-v` vector.
-			corev1.Volume{Name: dindSocketVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-			// The rootless daemon's data root, mounted into `dind` ALONE. emptyDir in
-			// v1 (a PVC is the durable/size alternative, arch §Q4); this is the images +
-			// build cache the daemon writes, none of it worker state.
+			// The daemon's data root, mounted into `dind` ALONE (rootless HOME path or
+			// /var/lib/docker per posture). emptyDir in v1 (a PVC is the durable/size
+			// alternative, arch §Q4); this is the images + build cache the daemon writes,
+			// none of it worker state.
 			corev1.Volume{Name: dindDataVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			// The shared run workdir (M-workdir). emptyDir, so it is torn down with the pod
+			// and is never a persistence surface; carries the run's checkout, NO secrets.
+			corev1.Volume{Name: dindWorkdirVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 		)
+		if !cfg.DinDNonRootless {
+			// Rootless only: the socket-only shared dir. emptyDir, torn down with the pod;
+			// carries ONLY the socket (Decision 3).
+			volumes = append(volumes, corev1.Volume{Name: dindSocketVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+		}
 	}
 
 	return corev1.PodTemplateSpec{
@@ -592,6 +660,10 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		Spec: corev1.PodSpec{
 			ServiceAccountName:           cfg.ServiceAccountName,
 			AutomountServiceAccountToken: &automount,
+			// Soft anti-affinity for docker workers ONLY (nil for a plain worker, so its
+			// spec/hash is untouched). Keeps the pod off nodes running the crown-jewel
+			// pods — see dockerNodeAntiAffinity.
+			Affinity: dockerNodeAntiAffinity(w),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: &runAsNonRoot,
 				RunAsUser:    &uid,
@@ -630,72 +702,163 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 					},
 				},
 				SecurityContext: containerSecurity,
-				// Built above: [token, data, nix] plus the shared socket dir for a
-				// docker worker. The socket dir is the ONLY thing the worker and the
-				// DinD sidecar share.
+				// Built above: [token, data, nix] plus, for a docker worker, the shared
+				// run workdir (M-workdir) and — rootless only — the shared socket dir.
 				VolumeMounts: workerMounts,
 			}},
-			// Built above: [token, data, nix] plus the two docker emptyDirs (the shared
-			// socket dir and the daemon's private data root) for a docker worker.
+			// Built above: [token, data, nix] plus, for a docker worker, the daemon's
+			// private data root + the shared run workdir emptyDirs (and, rootless only,
+			// the shared socket-dir emptyDir).
 			Volumes: volumes,
 		},
 	}
 }
 
-// dindContainer is the rootless Docker-in-Docker daemon, modelled as a NATIVE
-// SIDECAR (an initContainer with restartPolicy: Always) so k8s starts it before the
-// worker and holds the worker container until its startupProbe (`docker info`)
-// passes — the k8s half of the keystone readiness race fix.
+// dindContainer is the Docker-in-Docker daemon, modelled as a NATIVE SIDECAR (an
+// initContainer with restartPolicy: Always) so k8s starts it before the worker and
+// holds the worker container until its startupProbe (`docker info`) passes — the k8s
+// half of the keystone readiness race fix. It is `privileged: true` in the dedicated
+// `enforce: privileged` namespace (Q-B) in BOTH postures.
 //
-// It is `privileged: true` in the dedicated `enforce: privileged` namespace (Q-B):
-// the security property is the USERNS REMAP inside the rootless image (a breakout
-// lands as an unprivileged, userns-mapped host uid), exactly as on the compose
-// track, not the flag's absence. It runs as the image's rootless uid 1000
-// (overriding the pod's 10001, whose subuid/subgid ranges the rootless setup needs)
-// and seccomp Unconfined so the nested daemon can configure its children's profiles.
+// The posture (cfg.DinDNonRootless) picks the daemon's identity and transport:
 //
-// DECISION 3 — the one security invariant on a wired worker: it mounts ONLY the
-// shared socket dir and its OWN data root, and NONE of the worker's
-// token/`/data`/`/nix`. A `docker run -v <anything>:/x` then binds this container's
-// fs, which holds none of it. render_test.go pins this as a failing test.
+//   - ROOTLESS (PRD #83, the default): runs as the image's rootless uid 1000
+//     (overriding the pod's 10001, whose subuid/subgid ranges the rootless setup
+//     needs). The security property is the USERNS REMAP inside the rootless image — a
+//     breakout lands as an unprivileged, userns-mapped host uid. The socket lands on
+//     the shared dind-sock volume ($XDG_RUNTIME_DIR); the worker reaches it there.
+//
+//   - NON-ROOTLESS (PRD #89): runs as REAL ROOT (uid 0), no userns, so a breakout
+//     lands as node root — the owner-accepted residual on nodes without unprivileged
+//     userns (dev-cluster/Linux). RunAsNonRoot MUST be false at CONTAINER scope: the
+//     pod is RunAsNonRoot:true, so a uid-0 container is rejected at admission without
+//     this override (the same override dindInitContainer uses). The dockerd command is
+//     OVERRIDDEN to bind loopback-only (the unix socket + dindLoopbackTCP, `--tls=false`)
+//     — THE control that suppresses docker:dind's automatic 0.0.0.0:2375 listener, so
+//     the unauthenticated root daemon is never on the pod IP. No dind-init, no shared
+//     socket volume: the worker reaches the daemon over the pod's loopback netns.
+//
+// Both keep seccomp Unconfined (the nested daemon profiles its children) and mount the
+// shared run workdir (M-workdir).
+//
+// DECISION 3 — the one security invariant on a wired worker: it mounts ONLY its OWN
+// data root, the shared run workdir (M-workdir, no secrets) and — rootless only — the
+// shared socket dir; NONE of the worker's token/`/data`(cache)/`/nix`. A `docker run -v
+// <anything>:/x` then binds this container's fs, which holds none of them. render_test.go
+// pins this.
 func dindContainer(cfg RenderConfig) corev1.Container {
 	always := corev1.ContainerRestartPolicyAlways
 	privileged := true
-	runAsNonRoot := true // uid 1000 is non-root
-	uid, gid := dindUID, dindGID
-	return corev1.Container{
-		Name:          dindContainerName,
-		Image:         cfg.DinDImage,
-		RestartPolicy: &always,
-		// rootless dockerd writes its API socket to $XDG_RUNTIME_DIR/docker.sock;
-		// point it at the shared volume so the socket lands at the path the worker's
-		// DOCKER_HOST names (exactly the compose track's wiring).
-		Env: []corev1.EnvVar{{Name: "XDG_RUNTIME_DIR", Value: dindSocketDir}},
-		SecurityContext: &corev1.SecurityContext{
-			// allowPrivilegeEscalation is left nil on purpose: the apiserver rejects
-			// privileged:true alongside allowPrivilegeEscalation:false, and privileged
-			// already grants everything.
+
+	// The shared run workdir is mounted in BOTH postures (M-workdir).
+	mounts := []corev1.VolumeMount{{Name: dindWorkdirVolume, MountPath: dindWorkdirDir}}
+
+	var sc *corev1.SecurityContext
+	var env []corev1.EnvVar
+	var command []string
+	var probeCmd string
+	var dataDir string
+
+	if cfg.DinDNonRootless {
+		root := int64(0)
+		runAsNonRoot := false // real root: the pod's RunAsNonRoot:true rejects it without this
+		dataDir = dindDataDirRoot
+		sc = &corev1.SecurityContext{
+			// allowPrivilegeEscalation left nil: the apiserver rejects privileged:true
+			// alongside allowPrivilegeEscalation:false, and privileged already grants all.
+			Privileged:     &privileged,
+			RunAsNonRoot:   &runAsNonRoot,
+			RunAsUser:      &root,
+			RunAsGroup:     &root,
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined},
+		}
+		// THE loopback-bind control (PRD #89 M1): bind the unix socket + pod-loopback TCP
+		// EXPLICITLY and nothing else, which suppresses docker:dind's automatic
+		// 0.0.0.0:2375 listener. --tls=false because the loopback endpoint is plain (the
+		// trust boundary is the pod netns, same as a same-pod unix socket).
+		command = []string{"dockerd", "--host=unix://" + dindSocketPath, "--host=" + dindLoopbackTCP, "--tls=false"}
+		// `docker info` over the loopback endpoint: the daemon answering there is the real
+		// readiness signal (the socket existing is not the daemon being up).
+		probeCmd = "docker -H " + dindLoopbackTCP + " info >/dev/null 2>&1"
+	} else {
+		uid, gid := dindUID, dindGID
+		runAsNonRoot := true // uid 1000 is non-root
+		dataDir = dindDataDir
+		// rootless dockerd writes its API socket to $XDG_RUNTIME_DIR/docker.sock; point it
+		// at the shared volume so the socket lands at the path DOCKER_HOST names.
+		env = []corev1.EnvVar{{Name: "XDG_RUNTIME_DIR", Value: dindSocketDir}}
+		sc = &corev1.SecurityContext{
 			Privileged:     &privileged,
 			RunAsNonRoot:   &runAsNonRoot,
 			RunAsUser:      &uid,
 			RunAsGroup:     &gid,
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined},
-		},
-		Resources: dindResources,
+		}
+		// `docker info` connects as uid 1000 (the socket's owner), so it succeeds even
+		// before dind-init has relaxed the socket to 0666.
+		probeCmd = "docker -H unix://" + dindSocketPath + " info >/dev/null 2>&1"
+		// Rootless only: the worker reaches the daemon through the shared socket dir.
+		mounts = append(mounts, corev1.VolumeMount{Name: dindSocketVolume, MountPath: dindSocketDir})
+	}
+	mounts = append(mounts, corev1.VolumeMount{Name: dindDataVolume, MountPath: dataDir})
+
+	return corev1.Container{
+		Name:            dindContainerName,
+		Image:           cfg.DinDImage,
+		RestartPolicy:   &always,
+		Command:         command, // nil for rootless (image entrypoint), set for non-rootless
+		Env:             env,
+		SecurityContext: sc,
+		Resources:       dindResources,
 		StartupProbe: &corev1.Probe{
-			// The daemon-ready gate: the socket EXISTING is not the daemon being up
-			// (rootless userns setup takes seconds). k8s holds the worker until this
-			// passes. `docker info` connects as uid 1000 (the socket's owner), so it
-			// succeeds even before dind-init has relaxed the socket to 0666.
 			ProbeHandler: corev1.ProbeHandler{
-				Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "docker -H unix://" + dindSocketPath + " info >/dev/null 2>&1"}},
+				Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", probeCmd}},
 			},
 			PeriodSeconds:    2,
-			FailureThreshold: 30, // ~60s for the rootless bring-up worst case
+			FailureThreshold: 30, // ~60s bring-up worst case
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: dindSocketVolume, MountPath: dindSocketDir},
-			{Name: dindDataVolume, MountPath: dindDataDir},
+		VolumeMounts: mounts,
+	}
+}
+
+// dockerNodeAntiAffinity keeps a docker worker's pod OFF nodes running the crown-jewel
+// pods — the api (which holds UZI_SECRET_KEY, the master key that decrypts every user's
+// forge PAT + Anthropic token) and CNPG. It is a cheap mitigation for the non-rootless
+// node-root residual (PRD #89 mitigation #3): with kubelet NodeRestriction, node root
+// reads only the secrets of pods bound to THAT node, so keeping the crown jewels off
+// docker-worker nodes directly shrinks the worst outcome.
+//
+// PREFERRED (soft) on purpose — it must never wedge scheduling — and best-effort, not a
+// full fix. It is CROSS-NAMESPACE (the crown jewels are in the release namespace, the
+// worker in the docker namespace), so it uses an empty namespaceSelector (all
+// namespaces) plus a label match: the api pod (app.kubernetes.io/component=api) and any
+// CNPG instance pod (the cnpg.io/cluster label). Rendered for docker workers only; a
+// plain worker gets nil, so its spec/hash is untouched.
+func dockerNodeAntiAffinity(w protocol.DesiredWorker) *corev1.Affinity {
+	if !w.Docker {
+		return nil
+	}
+	const hostnameTopology = "kubernetes.io/hostname"
+	term := func(sel *metav1.LabelSelector) corev1.WeightedPodAffinityTerm {
+		return corev1.WeightedPodAffinityTerm{
+			Weight: 100,
+			PodAffinityTerm: corev1.PodAffinityTerm{
+				TopologyKey:       hostnameTopology,
+				NamespaceSelector: &metav1.LabelSelector{}, // empty => all namespaces
+				LabelSelector:     sel,
+			},
+		}
+	}
+	return &corev1.Affinity{
+		PodAntiAffinity: &corev1.PodAntiAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
+				// The uzi api pod.
+				term(&metav1.LabelSelector{MatchLabels: map[string]string{LabelComponent: "api"}}),
+				// Any CNPG instance pod (the operator stamps cnpg.io/cluster on each).
+				term(&metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "cnpg.io/cluster", Operator: metav1.LabelSelectorOpExists},
+				}}),
+			},
 		},
 	}
 }
