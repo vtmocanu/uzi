@@ -8075,6 +8075,16 @@ primary directive. THE one non-negotiable of #83.
   socket on the pod loopback), acceptable ONLY because the worker is outbound-only and never listens
   (per ARCHITECTURE.md's worker trust boundary); if that ever changes the socket must move to a
   path-isolated transport.
+  - **Amended by §314 (PRD #89):** under the non-rootless posture (`rootless:false`) the daemon now
+    listens on a pod-local `tcp://127.0.0.1:2375`. "The worker never listens" narrows to "never on the
+    pod IP": the daemon's loopback listener is same-pod-only, so the trust boundary is identical to the
+    shared unix socket. The loopback-bind (suppressing `docker:dind`'s auto `0.0.0.0:2375`) IS the
+    "path-isolated transport" that clause demanded — see §314.
+- **Amended by §315 (PRD #89, M-workdir):** the "mounts NONE of `/data`" absolute is relaxed to "mounts
+  none of the worker's SECRETS" — a no-secrets `emptyDir` at `/data/runner` is now shared into both the
+  worker and the dind daemon at the same path so bind sources under the run checkout resolve in the
+  daemon. The join token, env-scoped PAT, and per-run secret volume stay UNSHARED; the test-pinned
+  invariant becomes "dind mounts none of the token/nix/secret volumes," not "no `/data` path at all."
 
 ## 302. Compose track (M2) — profile `agent-docker`, rootless-DinD sidecar, socket-share
 
@@ -8447,3 +8457,145 @@ viewer" — the first path that writes judge text to a forge issue.
   driver). The body carries a footer naming uzi, the requesting user, and the producing run/user, so
   neither a human nor a later reader mistakes bot-authorship for uzi vouching for the content
   (provenance prominence, review-reinforced).
+
+# PRD #89 — Optional non-rootless Docker-in-Docker tier for hosted workers (per-cluster toggle)
+
+A scoped fallback on PRD #83's rootless docker-worker tier (§297–305), added because the live
+dev-cluster nodes (vendor Linux OS, kernel 6.1.83) ship unprivileged user namespaces DISABLED, so
+rootless dockerd crash-loops there and #83's k8s definition of done is unreachable on this cluster.
+Owner decisions are recorded in `prds/89-optional-nonrootless-dind.md`'s Decision Log and are NOT
+duplicated into `specs/human.md` (they are #83 owner overrides, not new user-binding requirements);
+what follows is the AI/implementation record for rebuild-from-specs. The owner-stated frame (reference
+only): docker workers run on dev-cluster; the owner accepts the node-root residual on the mitigation
+terms (loopback-bind + M-allow allowlist + `acknowledgeNonRootlessNodeRoot` ack + honest docs);
+reduced-cap was tested live and REJECTED (cgroup-v2 makes `/sys/fs/cgroup` read-only without
+`privileged`); rootless stays the default where nodes allow it.
+
+## 313. Per-cluster non-rootless DinD posture — a controller-owned toggle, no schema/wire/api/web/agent change
+
+Serves human Feature #4 (workers run docker) on a cluster that cannot do rootless. PRD #89 M1/M2/M3.
+
+- **`workers.docker.rootless` (chart default `true`)** is the whole posture surface. `true` = the
+  unchanged PRD #83 rootless sidecar (§302/§303). `false` = the controller renders a NON-rootless
+  privileged DinD: `dockerd` as root (uid 0) inside the already-privileged, already-fenced
+  `uzi-workers-docker` namespace (§303), for nodes lacking unprivileged userns. dev-cluster sets
+  `false`; every other cluster keeps the default.
+- **The toggle selects CONTROLLER-RENDERED behavior, not Helm-templated YAML.** The dind sidecar is
+  emitted by `controller/internal/kube/render.go`, so the chart only plumbs the flag to a controller
+  env var (`UZI_WORKER_DIND_ROOTLESS`), read + validated in `controller/internal/config/config.go`,
+  and `render.go` branches on it. Deliberately NO DB schema/migration, NO wire change, NO api/web/CLI
+  change, NO agent change: `docker_enabled` stays the per-worker "wants a daemon" bool (§303), and
+  posture is pure OPERATOR config the controller owns (#83 Decision 1 — docker is a pod-shape
+  dimension, not a template; posture is one more render input, not a per-worker attribute). This
+  tight bound is the load-bearing feasibility argument.
+- **The render-config seam is a NEGATIVE flag whose ZERO value is the safe posture.** `RenderConfig`
+  gains a `DinDNonRootless bool` (not `Rootless`), so an un-set/default RenderConfig renders the
+  rootless-safe pod; the value is inverted once, at `main.go`, from the positive `rootless` chart
+  value. Rationale: a zero-value struct (tests, a forgotten field) must never silently produce the
+  privileged-root posture. Keep the flag OUT of a plain (non-docker) worker's rendered spec + specHash
+  so a posture flip never rolls non-docker pods.
+- **Config fails LOUD on an ambiguous posture** (`config.go`): a docker tier that leaves posture
+  unresolved must refuse to start rather than default, mirroring #58's "required, no silent default"
+  discipline. Image selection is HYBRID (OQ-A): the chart carries BOTH pinned digests
+  (`docker:*-dind-rootless` and `docker:*-dind`) and picks by the `rootless` flag, with
+  `workers.docker.image` still overriding — so dev-cluster sets only `rootless:false`, no second image
+  line, and digest pinning is preserved. Two chart fail-guards (`worker-invariants.yaml`): (a) a
+  coherence guard refuses a `-dind-rootless` image under `rootless:false` (or vice-versa); (b) an
+  acknowledgement guard refuses `rootless:false` without `workers.docker.acknowledgeNonRootlessNodeRoot:
+  true` (OQ-B: a SECOND ack flag beyond #58's namespace ack, because the residual is node root reachable
+  by untrusted repo content — it overrides #83 Decision 4's "drop ceremony" default for this one case).
+- **The five rootless-pinned render tests are PARAMETERIZED by posture, not duplicated.** The security
+  invariant (dind mounts none of token/data-secrets/nix — §301/§315) is posture-INDEPENDENT and still
+  asserted on both; only the shape assertions (uid 0 vs 1000, `runAsNonRoot:false`, data root
+  `/var/lib/docker` vs the rootless path, no `dind-init`/socket-volume, loopback `--host`) branch.
+- **Soft anti-affinity** (a cheap owner-accepted mitigation, not a containment): preferred pod
+  anti-affinity keeps the api pod (holder of `UZI_SECRET_KEY`) and CNPG off docker-worker nodes, so a
+  node-root escape lands where no crown-jewel secret is co-scheduled. Best-effort only; it does not
+  bound the residual and is recorded as such.
+
+## 314. Pod-local `127.0.0.1:2375` loopback LISTENER under `rootless:false` — amends §301's "worker never listens"
+
+Serves human Feature #4; the client transport for the non-rootless daemon. PRD #89 M1. AMENDS §301.
+
+- **Under `rootless:false` a pod-local loopback TCP listener now exists.** The non-root worker (uid
+  10001) reaches the root daemon over `DOCKER_HOST=tcp://127.0.0.1:2375` (matching the coder prior art
+  on the same cluster infra). This is why the non-rootless posture needs NO agent change: the resolver
+  §298 takes branch 1 (explicit `DOCKER_HOST` → use verbatim; `agent/src/docker-wiring.ts` already
+  parses `tcp://` targets) and the guardrail §300 keys only on `DOCKER_HOST` being set — the tcp host
+  flows through unchanged. The non-rootless render drops `dind-init` and the shared socket VOLUME
+  entirely (the worker reaches the daemon over the pod loopback netns, not a shared unix socket).
+- **The trust boundary is IDENTICAL to the rootless shared unix socket:** loopback is same-pod-only, so
+  only the worker's own sidecar containers can reach `127.0.0.1:2375`. This is the §301 clause "if the
+  worker ever listens the socket must move to a path-isolated transport" being exercised — the loopback
+  bind IS that isolation.
+- **The loopback-bind is THE primary control keeping the unauthenticated root daemon off the pod IP.**
+  `docker:dind` auto-listens on `0.0.0.0:2375`; the render OVERRIDES the dockerd command to
+  `--host=unix:///run/dind/docker.sock --host=tcp://127.0.0.1:2375 --tls=false`, which SUPPRESSES the
+  `0.0.0.0` listener. A render-invariant test asserts the POSITIVE (the dind Command is present and its
+  only `--host` args are the loopback tcp + the unix socket) — a "no `0.0.0.0`" NEGATIVE test is
+  defeatable, because dropping the override entirely passes it while the dind entrypoint restores the
+  wide listener. Live M5 verification: `ss`/`netstat` in the dind container shows LISTEN on
+  `127.0.0.1:2375` ONLY, and a connect from another pod to `<workerPodIP>:2375` is refused.
+- **This does NOT close the node-root residual and must not be read as doing so.** Loopback-bind keeps
+  the daemon off the pod network; it does nothing about a hijacked agent that legitimately reaches the
+  daemon over loopback, does `docker run --privileged`, and (no userns on the non-rootless sidecar)
+  obtains node root. That residual is the owner's accepted risk; the likelihood control is M-allow
+  (§316), not this listener.
+
+## 315. M-workdir — a shared no-secrets `/data/runner` emptyDir (Decision-3 amendment); the runner-clone durability + bind-scope consequences
+
+Serves human Feature #4 + the DoD (`./e2e/run-e2e.sh` green): a docker worker cannot bind-mount any
+repo without this. PRD #89 M-workdir. A GENERAL Decision-3 amendment — applies to BOTH postures and to
+compose. AMENDS §301 and #51/§267.
+
+- **The problem:** the dind daemon runs in its own mount namespace and cannot see the worker's
+  filesystem, so `docker run -v <src>:<dst>` / compose bind sources under the run checkout resolve
+  EMPTY in the daemon — uzi's own e2e (and most real docker repos) fail on first contact, on every
+  posture. Decision 3 (§301) forbade sharing the worker fs precisely to keep secrets out of the daemon,
+  so the fix must share the WORKDIR without sharing the secrets.
+- **Fix: a no-secrets `emptyDir` at `/data/runner`, mounted into BOTH the worker and the dind sidecar
+  at the SAME path**, so a bind source spelled `/data/runner/...` resolves identically in both mount
+  namespaces. Secrets stay UNSHARED — the join token, the env-scoped PAT, and the per-run secret volume
+  keep their own mounts that dind never sees. Decision 3's crown-jewel isolation is therefore preserved;
+  the test-pinned render invariant is REWORDED from "dind mounts none of `/data`" to "dind mounts none of
+  the token/nix/SECRET volumes" (§301 amendment). The shared workdir carries no secret by construction.
+- **Consequence A — runner-clone durability (amends #51/§267):** the runner clone (the run's working
+  tree) MOVES from the persistent `/data` PVC to the ephemeral `/data/runner` emptyDir, so a run's
+  working tree NO LONGER survives a pod restart. This is acceptable because committed work is durable
+  elsewhere: it lands in the worker-private persistent BARE repo, and a resume re-clones LOCAL from that
+  bare (`file://`, the CVE-2022-39253-safe path — §267). Uncommitted in-flight edits are the only loss,
+  and only across a pod restart. This narrows #51/§267's "runner clone on the shared `/data` PVC" to
+  "runner clone on a shared emptyDir"; §267's rule that the WORKER'S BARE repo must never live on the
+  shared/`fsGroup` volume and must never be mounted into the runner still holds unchanged.
+- **Consequence B — bind sources OUTSIDE `/data/runner` do not resolve (an M4/M5 wiring item, recorded
+  as a known limitation).** Only paths under the shared `/data/runner` resolve in the daemon; a bind
+  source elsewhere (e.g. uzi's e2e default scratch `${TMPDIR:-/tmp}/uzi-e2e-$$`) is invisible to dind.
+  The M4/M5 fix is to point the worker's `TMPDIR` (and any run scratch root) UNDER `/data/runner` so
+  e2e's own temp trees land inside the shared volume. Deferred to M4 by design; without it a green M4 is
+  unreachable regardless of posture.
+
+## 316. M-allow — a claim-time repo allowlist, and the CORRECTED repo-less exemption invariant
+
+Serves human Feature #4 + the owner's accepted-risk likelihood control; non-rootless must NOT go live on
+dev-cluster (M5) until this ships. PRD #89 M-allow. Gates at CLAIM/DISPATCH, not provisioning.
+
+- **The control binds at the CLAIM layer, because provisioning cannot gate the repo-content trigger.**
+  `ClaimRun` (`api/internal/store/queries/runtime.sql`) filtered only on `user_id` + `kind<>'chat'`
+  with NO repo predicate, so a provision-time PER-USER allowlist would never gate WHICH repo's content a
+  docker worker runs — and repo content is exactly the prompt-injection trigger the accepted risk rests
+  on. The predicate therefore lives INSIDE `ClaimRun`'s `FOR UPDATE SKIP LOCKED` subquery: a
+  docker-capable worker only claims a run whose `repo_id` is in the allowlist.
+- **`docker_repo_allowlist` — an admin `app_settings` string** (comma-separated repo UUIDs), synthesized
+  default `""`, FAIL-CLOSED (empty ⇒ a docker worker claims no repo-bound run), NO migration. Chosen as a
+  settings string over a dedicated FK/junction table (architect ruling): it is operator config with a
+  handful of trusted repos, not a modeled relation; a UUID-string setting needs no schema and matches the
+  existing admin-settings surface. The web admin exposes it as a repo multiselect picker (resolving UUIDs
+  ⇄ repo names), not a raw UUID text box.
+- **CORRECTED exemption invariant for repo-less kinds (judge, chat).** They are exempt from the
+  allowlist NOT because "no repo checkout means no untrusted content" (the earlier, wrong rationale — a
+  judge reads run output, chat reads user text; both are content) but because their EXECUTORS CARRY NO
+  DAEMON-REACHING TOOL: `judge-runner.ts` installs a deny-ALL `PreToolUse` hook, and `chat-executor.ts`
+  exposes only Read/Grep/Glob + a read-only uzi MCP — neither can invoke `docker`, so neither can reach
+  the root daemon even on a docker-capable worker. This is pinned by an `agent/` regression test asserting
+  the tool surface, so a future loosening of either executor cannot silently re-open the exemption. The
+  exemption is HARDENED (reword + guard), never dropped.
