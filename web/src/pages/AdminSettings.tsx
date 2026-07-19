@@ -792,10 +792,12 @@ function normalizeAllowlist(ids: string[]): string {
 // then claims no repo-bearing run), and non-docker workers are entirely unaffected.
 //
 // The stored value is a comma-separated list of repo UUIDs, but admins pick repos by
-// path — the card resolves paths from the repos API and writes the ids. Repo ids in
-// the stored list that no longer match a connected repo (a deleted repo) are shown as
-// a count and dropped on the next save (a stale id can never match a live run, so
-// this is safe cleanup, not a policy change).
+// path — the card resolves paths from the repos API and writes the ids. The repos API
+// (`listRepos`) is scoped to the CALLING admin's own repos, and docker_repo_allowlist
+// is a GLOBAL setting that can hold repo ids from OTHER admins. So stored ids that do
+// not resolve to a repo this admin can see are PRESERVED verbatim on save (surfaced as
+// a labeled count), never dropped — otherwise admin A saving would silently clobber
+// admin B's allowlisted repo just because A can't see it (auditor Low, PRD #89).
 function DockerAllowlistCard({
   settings,
   sources,
@@ -830,11 +832,12 @@ function DockerAllowlistCard({
       return next;
     });
 
-  // Stored ids that resolve to no connected repo (a deleted repo). They are kept in
-  // `selected` so nothing is silently dropped mid-edit, but surfaced as a count and
-  // removed on save.
+  // Selected ids that resolve to no repo THIS admin can see (listRepos is per-user):
+  // another admin's allowlisted repo, or a deleted one. Kept in `selected` and written
+  // back untouched on save so a global setting is never clobbered by an admin who
+  // simply can't see the entry.
   const knownIds = new Set(repos.map((r) => r.id));
-  const staleCount = [...selected].filter((id) => !knownIds.has(id)).length;
+  const outsideVisibilityCount = [...selected].filter((id) => !knownIds.has(id)).length;
 
   const dirty =
     normalizeAllowlist([...selected]) !== normalizeAllowlist(parseAllowlist(settings.docker_repo_allowlist));
@@ -844,9 +847,10 @@ function DockerAllowlistCard({
     setError("");
     setNotice("");
     if (isEnv) return;
-    // Persist only ids that still resolve to a connected repo — this drops stale ids
-    // (harmless, they never match a live run) and keeps the stored value clean.
-    const value = normalizeAllowlist([...selected].filter((id) => knownIds.has(id)));
+    // Persist EVERY selected id, including ones outside this admin's visibility — a
+    // global setting must not be clobbered by an admin who cannot see another admin's
+    // repos. Only the checkboxes this admin can see change; the rest ride through.
+    const value = normalizeAllowlist([...selected]);
     setBusy(true);
     try {
       const resp = await api.updateSettings({ docker_repo_allowlist: value });
@@ -908,10 +912,11 @@ function DockerAllowlistCard({
           )}
         </Field>
 
-        {staleCount > 0 && (
+        {outsideVisibilityCount > 0 && (
           <p className="text-xs text-faint">
-            {staleCount} allowlisted repo id{staleCount === 1 ? "" : "s"} no longer match a connected
-            repository; they will be removed when you save.
+            {outsideVisibilityCount} allowlisted repo{outsideVisibilityCount === 1 ? "" : "s"} outside your
+            visibility (preserved) — repos on other admins&rsquo; connections, or since removed. They stay in
+            the allowlist when you save.
           </p>
         )}
 

@@ -506,12 +506,13 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 	}
 
 	// Docker-worker repo allowlist (PRD #89 M-allow): a docker-enabled worker may
-	// claim ONLY runs whose repo is on the trusted allowlist. Repo-less runs (judge)
-	// are exempt (repo_id IS NULL) — safe NOT because "repo-less = content-free" (a
-	// judge reasons over an untrusted trace) but because the repo-less executor
-	// (agent/src/judge-runner.ts, and the chat lane's chat-executor.ts) carries no
-	// daemon-reaching tool, so DOCKER_HOST is inert for it; an agent/ regression test
-	// pins that. This is the accepted-risk likelihood control for the non-rootless
+	// claim ONLY runs whose repo is on the trusted allowlist. Repo-less JUDGE runs are
+	// exempt (the SQL narrows the exemption to kind='judge', so a future repo-less kind
+	// fail-closes until deliberately exempted) — safe NOT because "repo-less =
+	// content-free" (a judge reasons over an untrusted trace) but because the repo-less
+	// executor (agent/src/judge-runner.ts, and the chat lane's chat-executor.ts)
+	// carries no daemon-reaching tool, so DOCKER_HOST is inert for it; an agent/
+	// regression test pins that. This is the accepted-risk likelihood control for the non-rootless
 	// DinD tier: the trigger is repo content, so the gate binds at claim, not at
 	// provisioning. Non-docker workers skip it entirely (isDocker=false → the SQL
 	// predicate short-circuits), so their behavior is unchanged. Fail-closed: a docker

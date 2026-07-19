@@ -239,16 +239,23 @@ SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id;
 -- FAIL-CLOSED: = ANY('{}') is false for every repo, so it claims only repo-less
 -- runs — never an unvetted repo's run.
 --
--- Repo-less runs (kind='judge') are EXEMPT: r.repo_id IS NULL passes. The true
--- invariant that makes this safe is NOT "repo-less = content-free" (a judge still
--- reasons over an untrusted, prompt-injectable trace) — it is that the repo-less
--- EXECUTOR carries no daemon-reaching tool. agent/src/judge-runner.ts runs with a
--- deny-ALL PreToolUse hook (no Bash/HTTP/shell), so even with DOCKER_HOST set it
--- cannot invoke docker. The separate chat lane (ClaimChatRun, ungated) rests on the
--- same property: agent/src/chat-executor.ts is Read/Grep/Glob + read-only uzi MCP,
--- with no Bash/Write/Edit/WebFetch/WebSearch/Agent. An agent/ regression test pins
--- BOTH so a future tool addition trips CI (auditor Medium, PRD #89 M-allow). If that
--- invariant ever changes, this exemption must be revisited before it does.
+-- The exemption is scoped to kind='judge' EXPLICITLY (r.repo_id IS NULL AND
+-- r.kind = 'judge'), not to every repo-less run. judge is the only repo-less kind
+-- ClaimRun can reach today (chat rides the separate ClaimChatRun lane; the
+-- runs_kind_shape CHECK forbids repo_id NULL for issue/ci_fix/self_improve), so this
+-- is behavior-identical now — but the `kind = 'judge'` clause makes a FUTURE repo-less
+-- kind FAIL-CLOSED (a docker worker won't claim it) until it is deliberately added
+-- here alongside its own executor-confinement test (auditor Low, PRD #89 M-allow).
+--
+-- Why judge is safe to exempt: NOT "repo-less = content-free" (a judge still reasons
+-- over an untrusted, prompt-injectable trace) — it is that the repo-less EXECUTOR
+-- carries no daemon-reaching tool. agent/src/judge-runner.ts runs with a deny-ALL
+-- PreToolUse hook (no Bash/HTTP/shell), so even with DOCKER_HOST set it cannot invoke
+-- docker. The separate chat lane (ClaimChatRun, ungated) rests on the same property:
+-- agent/src/chat-executor.ts is Read/Grep/Glob + read-only uzi MCP, with no
+-- Bash/Write/Edit/WebFetch/WebSearch/Agent. An agent/ regression test pins BOTH so a
+-- future tool addition trips CI (auditor Medium, PRD #89 M-allow). If that invariant
+-- ever changes, this exemption must be revisited before it does.
 UPDATE runs SET
     status     = 'claimed',
     worker_id  = @worker_id,
@@ -266,7 +273,7 @@ WHERE id = (
            OR r.worker_id = @worker_id
            OR r.updated_at < @affinity_cutoff)
       AND (NOT @is_docker_worker::boolean
-           OR r.repo_id IS NULL
+           OR (r.repo_id IS NULL AND r.kind = 'judge')
            OR r.repo_id = ANY(@docker_repo_allowlist::uuid[]))
     ORDER BY COALESCE(r.worker_id = @worker_id, false) DESC, r.created_at ASC
     FOR UPDATE SKIP LOCKED

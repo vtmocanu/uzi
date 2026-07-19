@@ -416,3 +416,38 @@ describe("AdminSettings — self-improvement (PRD #46 M5)", () => {
     expect(mockApi.updateSelfimprove).not.toHaveBeenCalled();
   });
 });
+
+describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
+  // Auditor Low: docker_repo_allowlist is a GLOBAL setting but listRepos is per-user,
+  // so an admin editing it sees only their own repos. Ids for repos they can't see
+  // (another admin's repo) must be PRESERVED on save, never silently clobbered.
+  it("preserves allowlisted repo ids outside the editing admin's visibility on save", async () => {
+    // Stored allowlist: repo-uzi (visible to this admin) + repo-other (NOT in this
+    // admin's listRepos — another admin's connection).
+    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
+    mockApi.listRepos.mockResolvedValue({
+      repos: [
+        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
+        { id: "repo-two", path_with_namespace: "vtmocanu/two" },
+      ] as unknown as import("../lib/api").Repo[],
+    });
+    mockApi.updateSettings.mockResolvedValue(
+      response({ docker_repo_allowlist: "repo-other,repo-two,repo-uzi" }),
+    );
+    renderPage();
+
+    // The invisible id is surfaced as a preserved count, not dropped.
+    expect(await screen.findByText(/outside your visibility \(preserved\)/i)).toBeTruthy();
+
+    // Tick a visible repo and save. The write must still carry repo-other — the entry
+    // this admin cannot see rides through untouched.
+    fireEvent.click(await screen.findByLabelText("vtmocanu/two"));
+    fireEvent.click(screen.getByRole("button", { name: /save repo allowlist/i }));
+
+    await waitFor(() => {
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({
+        docker_repo_allowlist: "repo-other,repo-two,repo-uzi",
+      });
+    });
+  });
+});

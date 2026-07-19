@@ -17,16 +17,24 @@ import (
 // TestClaimRunDockerRepoAllowlistLiveDB exercises the PRD #89 M-allow claim-gate
 // predicate against a REAL Postgres — the security invariant the fake-store unit
 // tests (which only pin the params the service passes) cannot cover: that
-// ClaimRun's `NOT is_docker_worker OR repo_id IS NULL OR repo_id = ANY(allowlist)`
-// actually FENCES a docker worker to the allowlisted repos at the DB level.
+// ClaimRun's `NOT is_docker_worker OR (repo_id IS NULL AND kind='judge') OR
+// repo_id = ANY(allowlist)` actually FENCES a docker worker to the allowlisted repos
+// at the DB level.
 //
 // It proves, with a single worker whose claims mutate queue state:
 //   - EMPTY allowlist is fail-closed: a docker worker claims only the repo-less
-//     (judge) run, never either repo's run;
+//     JUDGE run, never either repo's run;
 //   - a docker worker claims an ALLOWLISTED repo's run;
 //   - a docker worker is idle when the only queued run is a NON-allowlisted repo
 //     (the fence), rather than claiming it;
 //   - a NON-docker worker is unaffected and claims that same non-allowlisted run.
+//
+// The repo-less exemption is scoped to kind='judge' (auditor Low): a future repo-less
+// kind would fail-closed. That path is not exercisable here — the runs_kind_shape
+// CHECK forbids repo_id NULL for every non-chat, non-judge kind, so no "future
+// repo-less kind" run can be inserted to claim; the guard is the narrowed predicate
+// plus this note. The judge case below still proves the judge exemption survives the
+// narrowing.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (the store
 // e2e runner, e2e/run-store-it.sh, provides one).
