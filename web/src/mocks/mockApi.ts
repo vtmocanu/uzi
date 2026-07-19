@@ -111,6 +111,7 @@ const SEED_APP_SETTINGS: AppSettings = {
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
+  docker_repo_allowlist: "",
 };
 
 interface PersistedSettings {
@@ -149,7 +150,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.health_slow_seconds === "string" &&
     typeof a.health_queued_seconds === "string" &&
     typeof a.health_approval_seconds === "string" &&
-    typeof a.health_nudge_cooldown_seconds === "string";
+    typeof a.health_nudge_cooldown_seconds === "string" &&
+    typeof a.docker_repo_allowlist === "string";
   return okUser && okApp;
 }
 

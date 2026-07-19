@@ -43,6 +43,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
+  docker_repo_allowlist: "",
   ...over,
 });
 

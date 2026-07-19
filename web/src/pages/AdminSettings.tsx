@@ -381,6 +381,10 @@ export function AdminSettings() {
       {!loading && saved && (
         <HealthSettingsCard settings={saved} sources={sources} onSaved={applyResponse} />
       )}
+
+      {!loading && saved && (
+        <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
+      )}
     </div>
   );
 }
@@ -762,6 +766,157 @@ function HealthSettingsCard({
 
         <Button type="submit" disabled={!dirty || busy || fieldError != null}>
           {busy ? "Saving…" : "Save run health"}
+        </Button>
+      </form>
+    </Card>
+  );
+}
+
+// parseAllowlist splits the comma-separated repo-id allowlist into a deduped id
+// list, dropping empty tokens. normalizeAllowlist canonicalizes for comparison
+// (deduped + sorted) so dirty-checking is order/dup-insensitive.
+function parseAllowlist(value: string): string[] {
+  return value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+function normalizeAllowlist(ids: string[]): string {
+  return [...new Set(ids)].sort().join(",");
+}
+
+// DockerAllowlistCard is the admin surface for the docker-worker repo allowlist
+// (PRD #89 M-allow). A docker-capable worker reaches a root Docker daemon, so it may
+// only claim runs for repos an admin has explicitly trusted; the gate binds at claim
+// time. This is a security control: an EMPTY list is fail-closed (a docker worker
+// then claims no repo-bearing run), and non-docker workers are entirely unaffected.
+//
+// The stored value is a comma-separated list of repo UUIDs, but admins pick repos by
+// path — the card resolves paths from the repos API and writes the ids. Repo ids in
+// the stored list that no longer match a connected repo (a deleted repo) are shown as
+// a count and dropped on the next save (a stale id can never match a live run, so
+// this is safe cleanup, not a policy change).
+function DockerAllowlistCard({
+  settings,
+  sources,
+  onSaved,
+}: {
+  settings: AppSettings;
+  sources: Record<string, SettingSource>;
+  onSaved: (resp: SettingsResponse) => void;
+}) {
+  const [repos, setRepos] = useState<Repo[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(
+    () => new Set(parseAllowlist(settings.docker_repo_allowlist)),
+  );
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const isEnv = sources["docker_repo_allowlist"] === "env";
+
+  useEffect(() => {
+    api
+      .listRepos()
+      .then(({ repos }) => setRepos(repos))
+      .catch(() => setRepos([]));
+  }, []);
+
+  const toggle = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // Stored ids that resolve to no connected repo (a deleted repo). They are kept in
+  // `selected` so nothing is silently dropped mid-edit, but surfaced as a count and
+  // removed on save.
+  const knownIds = new Set(repos.map((r) => r.id));
+  const staleCount = [...selected].filter((id) => !knownIds.has(id)).length;
+
+  const dirty =
+    normalizeAllowlist([...selected]) !== normalizeAllowlist(parseAllowlist(settings.docker_repo_allowlist));
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    if (isEnv) return;
+    // Persist only ids that still resolve to a connected repo — this drops stale ids
+    // (harmless, they never match a live run) and keeps the stored value clean.
+    const value = normalizeAllowlist([...selected].filter((id) => knownIds.has(id)));
+    setBusy(true);
+    try {
+      const resp = await api.updateSettings({ docker_repo_allowlist: value });
+      onSaved(resp);
+      setSelected(new Set(parseAllowlist(resp.settings.docker_repo_allowlist)));
+      setNotice("Docker worker repo allowlist saved.");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to save the docker repo allowlist");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const selectedKnown = [...selected].filter((id) => knownIds.has(id)).length;
+
+  return (
+    <Card className="space-y-5">
+      <div>
+        <SectionTitle>Docker worker repo allowlist</SectionTitle>
+        <p className="mt-2 text-sm text-muted">
+          Docker-capable workers reach a root Docker daemon, so they may only run repos you
+          explicitly trust here. Only the repos ticked below can be claimed by a docker worker;
+          every other repo waits for a non-docker worker.
+        </p>
+        <p className="mt-2 text-sm text-warn">
+          An <strong className="text-fg">empty list is fail-closed</strong> — a docker worker then
+          claims no repo-bearing run. Non-docker workers are unaffected by this list.
+        </p>
+      </div>
+
+      {error && <Alert message={error} />}
+      {notice && <Alert tone="success" message={notice} />}
+      {isEnv && (
+        <Alert tone="info" message="This setting is fixed by an environment variable and cannot be changed here." />
+      )}
+
+      <form onSubmit={save} className="space-y-4">
+        <Field label={`Trusted repositories (${selectedKnown} selected)`}>
+          {repos.length === 0 ? (
+            <p className="text-sm text-faint">No connected repositories.</p>
+          ) : (
+            <div className="max-h-64 space-y-1 overflow-y-auto rounded border border-edge p-2">
+              {repos.map((r) => (
+                <label
+                  key={r.id}
+                  className="flex cursor-pointer select-none items-center gap-2 rounded px-1 py-1 text-sm hover:bg-raised"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(r.id)}
+                    disabled={isEnv}
+                    onChange={() => toggle(r.id)}
+                    className="h-4 w-4 rounded border-edge accent-brand"
+                  />
+                  <span className="truncate text-fg">{r.path_with_namespace}</span>
+                </label>
+              ))}
+            </div>
+          )}
+        </Field>
+
+        {staleCount > 0 && (
+          <p className="text-xs text-faint">
+            {staleCount} allowlisted repo id{staleCount === 1 ? "" : "s"} no longer match a connected
+            repository; they will be removed when you save.
+          </p>
+        )}
+
+        <Button type="submit" disabled={!dirty || busy || isEnv}>
+          {busy ? "Saving…" : "Save repo allowlist"}
         </Button>
       </form>
     </Card>
