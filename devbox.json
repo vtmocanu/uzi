@@ -1,0 +1,14 @@
+{
+  // Repo tier-2 devbox packages (PRD #18 M5). ONLY the `packages` field is read by
+  // the worker (agent/src/repo-tools.ts extractRepoDevboxPackages) — and ONLY when the
+  // repo owner has enabled `repo_devbox_opt_in` AND each package is on the admin
+  // tool_allowlist. init_hook/scripts/env/flakes here are NEVER executed by a run.
+  //
+  // ruby: this repo ships a Homebrew formula (Formula/uzi-cli.rb); without ruby a run
+  // editing it can't even `ruby -c` syntax-check it before shipping (judge rec, run
+  // e2d7427b). ruby is genuinely repo-specific (only formula-shipping repos need it),
+  // so it lives here as tier-2 rather than in the baked worker image.
+  "packages": [
+    "ruby@3.3"
+  ]
+}

@@ -21,8 +21,15 @@
   //
   // `pip` is nixpkgs `python3Packages.pip` (there is no top-level `pip` attr); the tester
   // confirms `pip`/`python3`/`go` all resolve on the agent PATH of the built image (Q-C).
+  //
+  // `gcc` completes the go/python3 toolchains rather than being a repo-specific extra:
+  // `go test -race` and cgo need a C compiler/linker (this repo's own store integration
+  // tests run `-race`), and python C-extension wheels need one too. Delivered through the
+  // SAME nix/devbox path as go so cgo links against the matching toolchain (an apk/musl
+  // gcc would mismatch nix-glibc go). Validate `cgo`/`-race` in the built image.
   "packages": [
     "go",
+    "gcc",
     "python3",
     "python3Packages.pip"
   ]
