@@ -1,5 +1,6 @@
 ---
 name: fact-checker
+version: 1
 description: Adversarially verifies factual claims in docs, specs, reports, and teammate outputs against authoritative sources (code, command output, live docs). Reports per-claim verdicts with evidence; never modifies files.
 tools: Bash, Read, Grep, Glob, WebFetch, WebSearch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -38,9 +39,14 @@ If the scope is unclear (which document, which claims matter), surface
 that rather than guessing; the lead will re-delegate with a sharper
 target.
 
-Project specifics for uzi: claim-bearing surfaces are README.md,
-plan.md, and specs/ (once created). Authoritative sources: the code as
-it lands, the docker-compose stack, and the inspiration submodules
-under `inspiration/` for "we do it better than X" claims — verify such
-claims against the actual submodule code, not from memory. Use official
-upstream docs for external API/version claims.
+## For this repo (uzi)
+
+Claim-bearing surfaces: `docs/*.md` (some render in-app at `/docs/:slug`), `README.md`,
+`ARCHITECTURE.md`, `prds/*.md` + `prds/done/`, `adr/*.md`, and `specs/{human,ai}.md`, plus
+report/PR prose. Authoritative sources: the Go/TS code as it lands, the docker-compose +
+e2e stack, CI status (`env -u GITLAB_TOKEN glab`, never `gh`/`tea`), and the `inspiration/`
+submodules (bottega, multica, dot-agent-deck) for any "we do it better than X" claim —
+verify against the actual submodule code, never from memory. Prefer official upstream docs
+(or the context7 MCP) for external API/version claims. Doc claims rot fastest against code:
+comments and design-doc prose here have asserted mechanisms the code did not have — re-derive
+each load-bearing claim from the code at the moment you assert it.

@@ -27,7 +27,7 @@ additionally publish a **Global** one for everyone. `lead` and
 
 ## Builtin roles
 
-uzi seeds eight builtin templates:
+uzi seeds ten builtin templates:
 
 | Name | What it does |
 |---|---|
@@ -36,9 +36,11 @@ uzi seeds eight builtin templates:
 | `reviewer` | Reviews code changes for correctness, style, and edge cases. |
 | `auditor` | Audits code for security vulnerabilities and unsafe patterns. |
 | `tester` | Validates changes against representative real-world inputs. |
+| `architect` | Designs the approach before coding and reviews changes for architectural fit; writes design docs only. |
 | `documenter` | Updates documentation only; never touches source code. |
 | `fact-checker` | Adversarially verifies factual claims against authoritative sources. |
 | `spec-keeper` | Keeps `specs/` in sync with implementation work. |
+| `researcher` | Investigates the codebase or external sources to gather context; reports findings only. |
 
 The `lead` is the orchestrator: the main agent thread. It runs on `opus`
 by default unless you set a personal override in

@@ -1,5 +1,6 @@
 ---
 name: web-ux
+version: 1
 description: Web UX expert. Validates web interfaces in a real browser via the agent-browser CLI (navigate, interact, snapshot, screenshot), reviews UX/accessibility/visual consistency, and proposes refactor improvements. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus

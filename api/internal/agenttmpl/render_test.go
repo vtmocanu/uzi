@@ -6,15 +6,18 @@ import (
 )
 
 // builtinNames is the exact set of roles the product ships and PRD #4 depends on
-// existing. The lead orchestrator template (PRD #17) is the eighth. This is the
+// existing. The lead orchestrator template (PRD #17) is one of them; architect and
+// researcher were added from the agent-team role library (design-before-code and
+// read-only context-gathering roles the product previously lacked). This is the
 // single source of truth: builtins are the embedded builtins/*.md files, no
-// longer mirrored from .claude/agents/.
+// longer mirrored from .claude/agents/. Keep this list sorted — Builtins() returns
+// its slice sorted by name and TestBuiltinsSetIsExactlyTen compares index-for-index.
 var builtinNames = []string{
-	"auditor", "coder", "documenter", "fact-checker",
-	"lead", "reviewer", "spec-keeper", "tester",
+	"architect", "auditor", "coder", "documenter", "fact-checker",
+	"lead", "researcher", "reviewer", "spec-keeper", "tester",
 }
 
-func TestBuiltinsSetIsExactlyEight(t *testing.T) {
+func TestBuiltinsSetIsExactlyTen(t *testing.T) {
 	got := Builtins()
 	if len(got) != len(builtinNames) {
 		t.Fatalf("got %d builtins, want %d", len(got), len(builtinNames))

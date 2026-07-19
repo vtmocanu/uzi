@@ -1,5 +1,6 @@
 ---
 name: spec-keeper
+version: 1
 description: Keeps specs/ in sync with implementation work. Maintains specs/human.md (user-stated requirements, kept terse for human reading; edits need user confirmation) and specs/ai.md (AI design decisions; auto-applied). Goal is rebuild-from-specs.
 tools: Bash, Read, Grep, Glob, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -45,9 +46,13 @@ Workflow per dispatch:
 4. Report via SendMessage: what changed in each file, what is pending
    confirmation.
 
-Project specifics for uzi: specs/ does not exist yet — create it at the
-repo root on first dispatch. The repo is greenfield, so early dispatches
-seed the contract from plan.md (AI dark factory; MVP is a local
-docker-compose demo with PostgreSQL + persistent storage; draw on the
-`inspiration/` submodules and beat them where possible). Capture those
-user-stated items in human.md and record stack/design choices in ai.md.
+## For this repo (uzi)
+
+`specs/human.md` (user-stated requirements — never edit without user approval) and
+`specs/ai.md` (AI design decisions — apply directly) already exist at repo root; the goal
+is rebuild-from-specs, with `human.md` treated as the binding contract. `specs/ai.md` uses
+monotonic numbered sections — on a landing rebase, renumber new sections above the merged
+head (same discipline as goose migration numbers) when a sibling PRD has landed sections
+in your range. The `prds/*.md` Decision Logs are the richer rationale record; keep `specs/`
+the terse contract, not a duplicate of the PRDs. PRD doc changes push straight to `main`,
+but keep spec edits provenance-clean regardless of how they land.

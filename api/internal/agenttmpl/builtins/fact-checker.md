@@ -37,10 +37,3 @@ claim, verdict, evidence. Lead with refuted claims.
 If the scope is unclear (which document, which claims matter), surface
 that rather than guessing; the lead will re-delegate with a sharper
 target.
-
-Project specifics for uzi: claim-bearing surfaces are README.md,
-plan.md, and specs/ (once created). Authoritative sources: the code as
-it lands, the docker-compose stack, and the inspiration submodules
-under `inspiration/` for "we do it better than X" claims — verify such
-claims against the actual submodule code, not from memory. Use official
-upstream docs for external API/version claims.

@@ -124,10 +124,10 @@ agent can play: name, description, an optional model override, an optional
 tools allowlist, and a prompt body. It is not itself an agent; it is the
 recipe a later release renders into a running one.
 
-- **`builtins/` is the single source of truth.** Eight builtin roles — the
-  `lead` orchestrator (`model: opus`) plus seven subagents (`coder`,
-  `reviewer`, `auditor`, `tester`, `documenter`, `fact-checker`,
-  `spec-keeper`) — are Go-embedded from `api/internal/agenttmpl/builtins/*.md`,
+- **`builtins/` is the single source of truth.** Ten builtin roles — the
+  `lead` orchestrator (`model: opus`) plus nine subagents (`coder`,
+  `reviewer`, `auditor`, `tester`, `architect`, `documenter`, `fact-checker`,
+  `spec-keeper`, `researcher`) — are Go-embedded from `api/internal/agenttmpl/builtins/*.md`,
   parsed at package `init()`. This directory is independent of this repo's own
   `.claude/agents/*.md` dev-team roster (PRD #17): that roster is free to
   drift and product changes never touch it. At every boot,

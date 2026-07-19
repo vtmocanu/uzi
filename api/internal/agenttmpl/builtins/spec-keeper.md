@@ -44,10 +44,3 @@ Workflow per dispatch:
    and apply only after user approval.
 4. Report via SendMessage: what changed in each file, what is pending
    confirmation.
-
-Project specifics for uzi: specs/ does not exist yet — create it at the
-repo root on first dispatch. The repo is greenfield, so early dispatches
-seed the contract from plan.md (AI dark factory; MVP is a local
-docker-compose demo with PostgreSQL + persistent storage; draw on the
-`inspiration/` submodules and beat them where possible). Capture those
-user-stated items in human.md and record stack/design choices in ai.md.

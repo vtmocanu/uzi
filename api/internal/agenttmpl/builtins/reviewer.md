@@ -22,9 +22,3 @@ Report via SendMessage to the team lead.
 
 If the diff to review or the spec is missing, surface that in your report
 rather than guessing; the lead will re-delegate with the missing context.
-
-Project specifics for uzi: greenfield repo, no CONTRIBUTING.md or
-CLAUDE.md yet — the bar is the emerging code style plus plan.md. When
-reviewing, cross-check against the inspiration submodules under
-`inspiration/` (bottega, multica, dot-agent-deck): if one of them does
-the same thing more cleanly, flag ours as a candidate to match or beat.
