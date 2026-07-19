@@ -27,8 +27,8 @@ On first run the CLI also drops a Claude Code skill at
 `~/.claude/skills/uzi-cli/SKILL.md` (generated from the binary's own command
 tree, so it never drifts). No manual step is needed, but you can force a
 refresh — e.g. right after upgrading — with `uzi skill install --force`, and
-check it with `uzi skill status` (details under **Agents get a bundled skill
-for free**, below).
+check it with `uzi skill status` (details under **Bundled skill and
+session-start hook**, below).
 
 ## 2. Point it at your instance
 
@@ -78,7 +78,7 @@ uzi run follow-up <id> [--message <text>]
 uzi worker list | rm <id>
 uzi repo list
 uzi admin users | runs | workers | usage | rate-limits
-uzi skill status | install [--force]
+uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi version
 ```
 
@@ -129,9 +129,47 @@ can change. There's also no `--token` flag: a credential must never land on
 `argv`, readable via `ps`/`/proc`. Use `$UZI_TOKEN`, or `uzi auth token`,
 which reads a token from stdin.
 
-**Agents get a bundled skill for free.** The CLI installs (and self-upgrades)
+## Bundled skill and session-start hook
+
+**The skill itself.** The CLI installs (and self-upgrades)
 `~/.claude/skills/uzi-cli/SKILL.md` on first run, generated from the binary's
 own command tree — it never drifts from the CLI you actually have installed.
+Every `uzi` command refreshes it best-effort before it runs (set
+`UZI_SKILL_AUTO_UPGRADE=0` to disable that). `uzi skill install [--force]`
+refreshes it explicitly — `--force` overwrites even a file you edited (your
+edit is preserved to `SKILL.md.bak` first) — and `uzi skill status` reports
+its path and whether it's installed and current.
+
+**The session-start hook, opt-in.** The per-command refresh above only helps
+once a `uzi` command has run — right after `brew upgrade uzi-cli`, a fresh
+Claude Code session can still read the OLD skill before that happens. Run
+`uzi skill install-hook` to narrow that window: it wires a Claude Code
+`SessionStart` hook into `~/.claude/settings.json` whose command is
+`uzi skill install`, so the skill is refreshed at session start rather than
+waiting for your next `uzi` command.
+
+The write is surgical and non-destructive:
+
+- **Opt-in.** Nothing installs this for you; you run it yourself, once.
+- **Merged, not clobbered.** It adds just our one hook entry to
+  `~/.claude/settings.json`, alongside any hooks other tools already put
+  there — those are left untouched.
+- **Backed up first.** The prior file is copied to `settings.json.bak` before
+  the first write.
+- **Abort on malformed JSON.** If `settings.json` exists but doesn't parse,
+  `install-hook`/`uninstall-hook` refuse to touch it rather than risk
+  clobbering a hand-maintained file.
+- **Idempotent.** Running `uzi skill install-hook` again is a no-op — it
+  detects the hook is already present.
+- **Visible in status.** `uzi skill status` (and `--json`) reports whether
+  the hook is installed and current, alongside the skill's own state.
+- **Reversible.** `uzi skill uninstall-hook` removes it, leaving every
+  sibling hook intact.
+
+The hook is best-effort and near-free to run: a failed refresh never blocks
+session start, and `uzi skill install` is a version-gated no-op once the
+skill is already current, so the hook costs almost nothing on a normal
+session start.
 
 ## Config and credentials
 

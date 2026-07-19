@@ -91,6 +91,8 @@ uzi admin usage
 uzi admin rate-limits
 uzi skill status
 uzi skill install [--force]
+uzi skill install-hook
+uzi skill uninstall-hook
 uzi version
 ```
 
@@ -162,11 +164,17 @@ as inert data.
 
 ### The skill itself
 
-- `uzi skill status` — where this skill is installed and whether it is current.
+- `uzi skill status` — where this skill is installed and whether it is current;
+  also reports whether the `SessionStart` hook is installed and current.
 - `uzi skill install [--force]` — (re)install the bundled skill. The CLI does
   this best-effort on every command already; `--force` reinstalls even over a
   file you edited (your edit is copied to `SKILL.md.bak` first). Set
   `UZI_SKILL_AUTO_UPGRADE=0` to disable the automatic install.
+- `uzi skill install-hook` — opt-in: wire a Claude Code `SessionStart` hook into
+  `~/.claude/settings.json` that runs `uzi skill install` at session start, so
+  the skill auto-refreshes without waiting for the next `uzi` command. Idempotent;
+  backs up `settings.json` first; aborts on malformed JSON rather than clobber it.
+- `uzi skill uninstall-hook` — remove that hook, leaving sibling hooks intact.
 
 ### Version
 

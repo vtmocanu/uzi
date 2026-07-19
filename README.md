@@ -58,7 +58,7 @@ uzi login                          # humans; or set UZI_TOKEN from Settings -> A
 uzi run list
 ```
 
-An agent drives it fully headless with a Bearer token in `UZI_TOKEN` — no browser, no cookie, no `$HOME` — and the CLI even installs its own skill so an agent knows the command surface. See [docs/cli.md](docs/cli.md).
+An agent drives it fully headless with a Bearer token in `UZI_TOKEN` — no browser, no cookie, no `$HOME` — and the CLI even installs its own skill so an agent knows the command surface. Claude Code users can opt in further with `uzi skill install-hook`, so the skill refreshes at the start of every session, not just after the next `uzi` command. See [docs/cli.md](docs/cli.md).
 
 ## Documentation
 
