@@ -350,6 +350,16 @@ flip_mr() { fake_post "/_e2e/mrs/$1/state" "$(jq -nc --arg s "$2" '{state:$s}')"
 # fake_state — the fake's recorded state (issues, MRs, notes, label events).
 fake_state() { curl -fsSk "$FAKE_BASE/_e2e/state"; }
 
+# fake_has_label IID LABEL — "yes" if the fake forge currently shows LABEL on issue
+# IID, else "no". Use with wait_eq to POLL rather than read once: a label toggle is
+# forge-first and the fake forge applies it synchronously, but under heavy concurrent-
+# e2e host contention the /_e2e/state read can momentarily race the write, so a one-shot
+# check flakes. Polling matches how every other forge-state assertion here waits.
+fake_has_label() {
+  fake_state | jq -r --argjson iid "$1" --arg lbl "$2" \
+    'if any(.issues[]?; .iid==$iid and ((.labels // []) | index($lbl))) then "yes" else "no" end'
+}
+
 # note_count IID / notes_text IID — issue-comment introspection.
 note_count() { fake_state | jq --argjson iid "$1" '[.notes[]? | select(.issue_iid==$iid)] | length'; }
 notes_text() { fake_state | jq -r --argjson iid "$1" '.notes[]? | select(.issue_iid==$iid) | .body'; }
@@ -1760,18 +1770,16 @@ pass "PRDLESS run completed the normal lifecycle (branch agent/issue-$IID_PL, MR
 CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":true}')"
 echo "$CARD" | jq -e '.card.labels | index("PRDLESS") != null' >/dev/null \
   || fail "apply: returned card labels missing PRDLESS: $(echo "$CARD" | jq -c '.card.labels')"
-fake_state | jq -e --argjson iid "$IID_TG" \
-  '.issues[] | select(.iid==$iid) | .labels | index("PRDLESS") != null' >/dev/null \
-  || fail "apply: PRDLESS label not written to the fake forge issue #$IID_TG"
+wait_eq yes 20 "apply: PRDLESS written to the fake forge issue #$IID_TG" \
+  fake_has_label "$IID_TG" PRDLESS
 pass "toggle apply: PRDLESS on the fake forge + reflected in the card"
 
 # UI toggle remove: the label is gone from the fake forge and the card.
 CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":false}')"
 echo "$CARD" | jq -e '.card.labels | index("PRDLESS") == null' >/dev/null \
   || fail "remove: returned card still carries PRDLESS"
-fake_state | jq -e --argjson iid "$IID_TG" \
-  '.issues[] | select(.iid==$iid) | .labels | index("PRDLESS") == null' >/dev/null \
-  || fail "remove: PRDLESS label still on the fake forge issue #$IID_TG"
+wait_eq no 20 "remove: PRDLESS gone from the fake forge issue #$IID_TG" \
+  fake_has_label "$IID_TG" PRDLESS
 pass "toggle remove: PRDLESS gone from the fake forge + the card"
 
 # =============================================================================
