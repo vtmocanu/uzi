@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,171 @@ func skillEnv(fc uzicli.Client, home string) Env {
 
 func installedSkillPath(home string) string {
 	return filepath.Join(home, ".claude", "skills", "uzi-cli", "SKILL.md")
+}
+
+func settingsFilePath(home string) string {
+	return filepath.Join(home, ".claude", "settings.json")
+}
+
+// hookCommandCount reads settings.json and counts SessionStart hook commands
+// equal to the canonical `uzi skill install`.
+func hookCommandCount(t *testing.T, home string) int {
+	t.Helper()
+	b, err := os.ReadFile(settingsFilePath(home))
+	if err != nil {
+		t.Fatalf("read settings.json: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("settings.json not valid JSON: %v", err)
+	}
+	hooks, _ := m["hooks"].(map[string]any)
+	arr, _ := hooks["SessionStart"].([]any)
+	n := 0
+	for _, mo := range arr {
+		mm, ok := mo.(map[string]any)
+		if !ok {
+			continue
+		}
+		inner, _ := mm["hooks"].([]any)
+		for _, h := range inner {
+			hm, ok := h.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cmd, _ := hm["command"].(string); cmd == "uzi skill install" {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// `uzi skill install-hook` writes the SessionStart hook and exits 0.
+func TestSkillInstallHookCommand(t *testing.T) {
+	home := t.TempDir()
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.SkillHome = home
+	out, _, code := runCLI(t, env, "skill", "install-hook")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if got := hookCommandCount(t, home); got != 1 {
+		t.Fatalf("want 1 hook command, got %d", got)
+	}
+	if !strings.Contains(out, "hook") {
+		t.Errorf("install-hook output = %q, want mention of the hook", out)
+	}
+}
+
+// `uzi skill install-hook` twice is idempotent — still exactly one entry.
+func TestSkillInstallHookIdempotent(t *testing.T) {
+	home := t.TempDir()
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.SkillHome = home
+	if _, _, code := runCLI(t, env, "skill", "install-hook"); code != uzicli.ExitOK {
+		t.Fatal("first install-hook failed")
+	}
+	out, _, code := runCLI(t, env, "skill", "install-hook")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if got := hookCommandCount(t, home); got != 1 {
+		t.Fatalf("re-run created a duplicate: %d hook commands", got)
+	}
+	if !strings.Contains(out, "already present") {
+		t.Errorf("second install-hook = %q, want 'already present'", out)
+	}
+}
+
+// `uzi skill status --json` carries the hook fields, before and after install.
+func TestSkillStatusJSONIncludesHook(t *testing.T) {
+	home := t.TempDir()
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.SkillHome = home
+
+	out, _, code := runCLI(t, env, "skill", "status", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("status exit = %d, want 0", code)
+	}
+	var before struct {
+		Skill map[string]any `json:"skill"`
+		Hook  struct {
+			Installed bool `json:"installed"`
+		} `json:"hook"`
+	}
+	if err := json.Unmarshal([]byte(out), &before); err != nil {
+		t.Fatalf("status --json not decodable: %v\n%s", err, out)
+	}
+	if before.Skill == nil {
+		t.Errorf("status --json missing the skill object:\n%s", out)
+	}
+	if before.Hook.Installed {
+		t.Errorf("hook should not be installed yet:\n%s", out)
+	}
+
+	if _, _, code := runCLI(t, env, "skill", "install-hook"); code != uzicli.ExitOK {
+		t.Fatal("install-hook failed")
+	}
+	out, _, code = runCLI(t, env, "skill", "status", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("status exit = %d, want 0", code)
+	}
+	var after struct {
+		Hook struct {
+			Installed bool `json:"installed"`
+			Current   bool `json:"current"`
+		} `json:"hook"`
+	}
+	if err := json.Unmarshal([]byte(out), &after); err != nil {
+		t.Fatalf("status --json not decodable: %v\n%s", err, out)
+	}
+	if !after.Hook.Installed || !after.Hook.Current {
+		t.Errorf("hook status after install-hook = %+v, want installed+current\n%s", after.Hook, out)
+	}
+}
+
+// `uzi skill uninstall-hook` removes the hook and exits 0.
+func TestSkillUninstallHookCommand(t *testing.T) {
+	home := t.TempDir()
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.SkillHome = home
+	if _, _, code := runCLI(t, env, "skill", "install-hook"); code != uzicli.ExitOK {
+		t.Fatal("install-hook failed")
+	}
+	out, _, code := runCLI(t, env, "skill", "uninstall-hook")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if got := hookCommandCount(t, home); got != 0 {
+		t.Fatalf("uninstall-hook left %d hook commands", got)
+	}
+	if !strings.Contains(out, "removed") {
+		t.Errorf("uninstall-hook output = %q, want 'removed'", out)
+	}
+}
+
+// `uzi skill install-hook` against a malformed settings.json fails non-zero and
+// leaves the file unchanged.
+func TestSkillInstallHookMalformedFails(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const bad = "{not json"
+	if err := os.WriteFile(settingsFilePath(home), []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := fakeEnv(&uzicli.FakeClient{})
+	env.SkillHome = home
+	_, _, code := runCLI(t, env, "skill", "install-hook")
+	if code == uzicli.ExitOK {
+		t.Fatalf("exit = %d, want non-zero on malformed settings.json", code)
+	}
+	if got, _ := os.ReadFile(settingsFilePath(home)); string(got) != bad {
+		t.Fatalf("settings.json changed on the abort path: %q", got)
+	}
 }
 
 // Explicit `uzi skill install` writes the bundled skill and exits 0.

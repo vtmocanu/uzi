@@ -55,4 +55,22 @@ class UziCli < Formula
     # version and exits 0.
     assert_match "v#{version}", shell_output("#{bin}/uzi version")
   end
+
+  # Print-only: `caveats` returns a string brew prints after install/upgrade; it
+  # touches nothing. We must NOT wire the Claude Code hook from the formula — a
+  # `post_install` runs sandboxed with an ephemeral `$HOME` and cannot reach the
+  # real `~/.claude` (disproven in PRD #86 review), so we only nudge the user.
+  def caveats
+    <<~EOS
+      uzi ships a self-updating Claude Code skill at
+      ~/.claude/skills/uzi-cli/SKILL.md.
+
+      If you use Claude Code, run `uzi skill install-hook` once to wire a
+      SessionStart hook so the skill refreshes at session start (otherwise it
+      only refreshes on your next `uzi` command).
+
+      `uzi skill uninstall-hook` removes the hook; `uzi skill status` shows
+      whether it is wired.
+    EOS
+  end
 end
