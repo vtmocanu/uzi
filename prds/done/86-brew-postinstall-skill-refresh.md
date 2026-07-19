@@ -1,7 +1,7 @@
 # PRD #86: keep the uzi-cli Claude Code skill fresh via an opt-in SessionStart hook
 
 **GitLab Issue**: [#86](https://gitlab.example.com/vtmocanu/uzi/-/issues/86)
-**Status**: Draft (created 2026-07-19; scope pivoted 2026-07-19 — see Change History)
+**Status**: Complete (implemented via MR !76, merged to `main` 2026-07-19 as `85b6895`; all 6 milestones landed; the M1/M6 empirical gate was validated 2026-07-19 — see Validation Results). Scope pivoted 2026-07-19 — see Change History.
 **Priority**: Medium
 **Created**: 2026-07-19
 **Depends on**: PRD #64 (the `uzi` CLI, the bundled self-upgrading skill `uzi skill install/status`, and `Formula/uzi-cli.rb`).
@@ -96,7 +96,7 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
 
 ## Milestones
 
-- [ ] **M1 — Empirical go/no-go on same-session hot-load (hard gate).** Confirmed from docs (guide
+- [x] **M1 — Empirical go/no-go on same-session hot-load (hard gate). → GO (validated 2026-07-19).** Confirmed from docs (guide
   review, Claude Code hooks-guide + settings docs): the `settings.json` `SessionStart` schema
   (`matcher` + `hooks[].{type,command,timeout}`), strict-JSON-only, user-scope `~/.claude/settings.json`,
   4 matchers (`startup`/`resume`/`clear`/`compact`), 10-min default timeout, and non-zero-exit is
@@ -109,21 +109,21 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
   freshness for the *next* session without requiring a `uzi` run (weaker than advertised, marginally
   better than today's self-heal); **stop and re-decide with the user** whether that residual value is
   worth the settings.json-editing surface, rather than shipping on a false premise like v1.
-- [ ] **M2 — `uzi skill install-hook` / `uninstall-hook` (CLI, Go).** Idempotent, non-clobbering
+- [x] **M2 — `uzi skill install-hook` / `uninstall-hook` (CLI, Go).** Idempotent, non-clobbering
   `settings.json` merge with backup and malformed-JSON abort. Unit tests over fixtures: missing
   file, empty file, file with unrelated hooks incl. an existing `SessionStart` array, re-run
   idempotency, our-entry removal leaves siblings intact, malformed input aborts without writing.
-- [ ] **M3 — `uzi skill status` reports hook state.** Extend status + its `--json` output with
+- [x] **M3 — `uzi skill status` reports hook state.** Extend status + its `--json` output with
   hook-installed / hook-current fields; tests.
-- [ ] **M4 — Formula `caveats` nudge.** Add a `caveats` block to `Formula/uzi-cli.rb` (source of
+- [x] **M4 — Formula `caveats` nudge.** Add a `caveats` block to `Formula/uzi-cli.rb` (source of
   truth) pointing at `uzi skill install-hook`.
-- [ ] **M5 — Docs (README + cli.md + tap README).** `README.md`: extend the existing skill mention
+- [x] **M5 — Docs (README + cli.md + tap README).** `README.md`: extend the existing skill mention
   (line ~61) to tell users to run `uzi skill install-hook` so the skill auto-refreshes. `docs/cli.md`:
   document **both** surfaces together — the bundled **skill** (what it is, `uzi skill install/status`)
   **and** the **hook** (`uzi skill install-hook`/`uninstall-hook`: what it wires into
   `~/.claude/settings.json`, why, how to check with `uzi skill status`, how to remove). Tap README:
   the same enable-auto-refresh pointer.
-- [ ] **M6 — Live validation.** Install the hook, `brew upgrade` (or bump the local binary), open a
+- [x] **M6 — Live validation. → PASS (validated 2026-07-19).** Install the hook, `brew upgrade` (or bump the local binary), open a
   fresh session, confirm `SKILL.md` was refreshed before first use AND that the user's other
   SessionStart hooks still fire. Flip Status to Implemented with the date.
 
@@ -147,6 +147,7 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
   today's self-heal. The docs do not state the ordering, and the `dot-ai` precedent is a *different*
   surface (`commands/` vs `skills/`). Mitigation: **M1 is an empirical hard gate with an explicit
   no-go path back to the user** — we do not build on this assumption, we test it first.
+  **RESOLVED 2026-07-19** — the M1 spike confirmed same-session hot-load works (see Validation Results).
 - **R3 — Session-start latency.** Every session pays the hook. Mitigation: `uzi skill install` is a
   version-gated local no-op when current; measure in M6.
 - **R4 — Stale hook after uninstall.** If the user removes the `uzi` binary but leaves the hook, it
@@ -161,3 +162,24 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
 Go unit tests drive M2/M3 over `settings.json` fixtures (the risky surface). M1 settles the
 Claude Code semantics from docs before any code. M6 is the end-to-end proof: a real fresh session
 after an upgrade shows the skill refreshed ahead of first use with all sibling hooks intact.
+
+## Validation Results (2026-07-19)
+
+Both the M1 hard gate and the M6 live check were run, not assumed:
+
+**M1 — same-session hot-load: GO.** In a throwaway *project* scope (`.claude/settings.json` +
+`.claude/skills/magicword/SKILL.md`; the real `~/.claude` was never touched), a
+`SessionStart`/`startup` hook overwrote a skill whose on-disk body read `OLD-TOKEN-11111` with
+`NEW-TOKEN-22222`, then a headless `claude -p` session started from that same directory answered
+`NEW-TOKEN-22222`. So the hook runs **before** the model reads the skill and the refreshed body is
+hot-loaded **in the same session** — the window is genuinely closed, not merely narrowed. (Exercised
+via `claude -p` v2.1.215 with a project-scope skill; the interactive + user-scope path is expected
+to behave identically, since it is the same SessionStart→skill-load ordering.)
+
+**M6 — live merge against a real `settings.json`: PASS.** `uzi skill install-hook` (built from
+`85b6895`, `HOME` pointed at a *copy* of the real 15-event / 4-`SessionStart`-entry `settings.json`)
+added our entry (SessionStart 4→5), preserved every dot-ai / zellaude / clawd / dot-agent-deck hook
+and every other event, kept the file valid JSON, and wrote a byte-identical `.bak`. `uzi skill status`
+reported `HOOK_INSTALLED true / HOOK_CURRENT true`; a re-run was idempotent ("already present"); and
+`uzi skill uninstall-hook` removed exactly our entry, leaving the document **semantically identical**
+to the original.
