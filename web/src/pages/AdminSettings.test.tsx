@@ -418,36 +418,85 @@ describe("AdminSettings — self-improvement (PRD #46 M5)", () => {
 });
 
 describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
-  // Auditor Low: docker_repo_allowlist is a GLOBAL setting but listRepos is per-user,
-  // so an admin editing it sees only their own repos. Ids for repos they can't see
-  // (another admin's repo) must be PRESERVED on save, never silently clobbered.
-  it("preserves allowlisted repo ids outside the editing admin's visibility on save", async () => {
-    // Stored allowlist: repo-uzi (visible to this admin) + repo-other (NOT in this
-    // admin's listRepos — another admin's connection).
-    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
+  // The card edits a security control (which repos a docker worker may claim), so its
+  // save logic is behaviorally pinned here, not just its rendering. Auditor Low: the
+  // setting is GLOBAL but listRepos is per-user, so ids the editing admin cannot see
+  // must be PRESERVED on save, never silently clobbered.
+  const twoRepos = () =>
     mockApi.listRepos.mockResolvedValue({
       repos: [
         { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
         { id: "repo-two", path_with_namespace: "vtmocanu/two" },
       ] as unknown as import("../lib/api").Repo[],
     });
+  const saveBtn = () =>
+    screen.getByRole("button", { name: /save repo allowlist/i }) as HTMLButtonElement;
+
+  it("keeps Save disabled until the selection changes (dirty-check)", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi" }));
+    twoRepos();
+    renderPage();
+
+    // Selection equals the stored value → nothing to save.
+    await screen.findByLabelText("vtmocanu/two");
+    expect(saveBtn().disabled).toBe(true);
+
+    fireEvent.click(screen.getByLabelText("vtmocanu/two"));
+    expect(saveBtn().disabled).toBe(false);
+  });
+
+  it("saves the ticked repos as comma-separated ids and PRESERVES ids outside the admin's visibility", async () => {
+    // repo-other is not in this admin's listRepos (another admin's connection).
+    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
+    twoRepos();
     mockApi.updateSettings.mockResolvedValue(
       response({ docker_repo_allowlist: "repo-other,repo-two,repo-uzi" }),
     );
     renderPage();
 
-    // The invisible id is surfaced as a preserved count, not dropped.
+    // The invisible id is surfaced as preserved, not dropped.
     expect(await screen.findByText(/outside your visibility \(preserved\)/i)).toBeTruthy();
 
     // Tick a visible repo and save. The write must still carry repo-other — the entry
     // this admin cannot see rides through untouched.
     fireEvent.click(await screen.findByLabelText("vtmocanu/two"));
-    fireEvent.click(screen.getByRole("button", { name: /save repo allowlist/i }));
+    fireEvent.click(saveBtn());
 
     await waitFor(() => {
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         docker_repo_allowlist: "repo-other,repo-two,repo-uzi",
       });
     });
+  });
+
+  it("removing the only visible repo writes an empty (fail-closed) allowlist", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi" }));
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" }] as unknown as import("../lib/api").Repo[],
+    });
+    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: "" }));
+    renderPage();
+
+    // The stored repo is ticked; untick it and save → empty string (fail-closed).
+    const box = (await screen.findByLabelText("vtmocanu/uzi")) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    fireEvent.click(saveBtn());
+
+    await waitFor(() => {
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: "" });
+    });
+  });
+
+  it("does not show the out-of-visibility indicator when the repos list fails to load", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
+    mockApi.listRepos.mockRejectedValue(new Error("network"));
+    renderPage();
+
+    // The card reports the load failure but never the spurious "N outside your
+    // visibility" count — repos never loaded, so it cannot be known, and it must not
+    // promise a removal the admin can't perform.
+    expect(await screen.findByText(/could not load repositories/i)).toBeTruthy();
+    expect(screen.queryByText(/outside your visibility/i)).toBeNull();
   });
 });

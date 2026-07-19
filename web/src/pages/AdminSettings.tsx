@@ -808,6 +808,13 @@ function DockerAllowlistCard({
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const [repos, setRepos] = useState<Repo[]>([]);
+  // reposLoaded gates the out-of-visibility indicator: until listRepos succeeds we
+  // cannot know which stored ids are genuinely outside this admin's visibility vs
+  // simply not fetched yet, so the count would be spurious (every id looks "unknown"
+  // while repos is empty). reposError distinguishes a failed fetch from a genuinely
+  // empty repo list so the copy can differ.
+  const [reposLoaded, setReposLoaded] = useState(false);
+  const [reposError, setReposError] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(
     () => new Set(parseAllowlist(settings.docker_repo_allowlist)),
   );
@@ -820,8 +827,11 @@ function DockerAllowlistCard({
   useEffect(() => {
     api
       .listRepos()
-      .then(({ repos }) => setRepos(repos))
-      .catch(() => setRepos([]));
+      .then(({ repos }) => {
+        setRepos(repos);
+        setReposLoaded(true);
+      })
+      .catch(() => setReposError(true));
   }, []);
 
   const toggle = (id: string) =>
@@ -889,7 +899,13 @@ function DockerAllowlistCard({
 
       <form onSubmit={save} className="space-y-4">
         <Field label={`Trusted repositories (${selectedKnown} selected)`}>
-          {repos.length === 0 ? (
+          {reposError ? (
+            <p className="text-sm text-warn">
+              Could not load repositories. The stored allowlist is preserved unchanged; reload to edit it.
+            </p>
+          ) : !reposLoaded ? (
+            <p className="text-sm text-faint">Loading repositories…</p>
+          ) : repos.length === 0 ? (
             <p className="text-sm text-faint">No connected repositories.</p>
           ) : (
             <div className="max-h-64 space-y-1 overflow-y-auto rounded border border-edge p-2">
@@ -912,7 +928,12 @@ function DockerAllowlistCard({
           )}
         </Field>
 
-        {outsideVisibilityCount > 0 && (
+        {/* Gated on reposLoaded: an unresolved id is only meaningfully "outside your
+            visibility" once the repo list actually loaded — during loading or after a
+            fetch failure every id looks unknown, which would be a false alarm. Purely
+            informational (these ids are preserved on save), so it renders regardless of
+            the dirty state without promising any removal. */}
+        {reposLoaded && outsideVisibilityCount > 0 && (
           <p className="text-xs text-faint">
             {outsideVisibilityCount} allowlisted repo{outsideVisibilityCount === 1 ? "" : "s"} outside your
             visibility (preserved) — repos on other admins&rsquo; connections, or since removed. They stay in
