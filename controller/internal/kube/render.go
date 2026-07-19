@@ -194,17 +194,39 @@ const (
 // a ResourceQuota on requests.* rejects any pod with a container declaring none, and
 // native sidecars count toward the pod's request (they run alongside the worker).
 // The sidecar budget follows arch §Q4 (~1-2 GiB / ~1 CPU on top of the agent).
-var (
-	dindResources = corev1.ResourceRequirements{
+//
+// The dind LIMITS are the DEFAULT; a cluster raises them per-cluster (PRD #89 0.8.1,
+// RenderConfig.DinDLimitCPU/Memory) because in-daemon image builds OOM the 2Gi default —
+// uzi's own e2e builds 5 images inside the daemon. See dindResources() below.
+const (
+	dindDefaultLimitCPU    = "2"
+	dindDefaultLimitMemory = "2Gi"
+)
+
+// dindResources builds the DinD sidecar's requests+limits. Requests are fixed and small
+// (the daemon idles most of a run); the LIMITS default to dindDefaultLimit* but a cluster
+// can raise them via cfg (config validated the strings at boot, so MustParse is safe).
+func (cfg RenderConfig) dindResources() corev1.ResourceRequirements {
+	limitCPU, limitMem := dindDefaultLimitCPU, dindDefaultLimitMemory
+	if cfg.DinDLimitCPU != "" {
+		limitCPU = cfg.DinDLimitCPU
+	}
+	if cfg.DinDLimitMemory != "" {
+		limitMem = cfg.DinDLimitMemory
+	}
+	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("250m"),
 			corev1.ResourceMemory: resource.MustParse("256Mi"),
 		},
 		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("2"),
-			corev1.ResourceMemory: resource.MustParse("2Gi"),
+			corev1.ResourceCPU:    resource.MustParse(limitCPU),
+			corev1.ResourceMemory: resource.MustParse(limitMem),
 		},
 	}
+}
+
+var (
 	dindInitResources = corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("50m"),
@@ -286,6 +308,14 @@ type RenderConfig struct {
 	// acknowledgeNonRootlessNodeRoot fail-guard (M2); it never comes off the wire and is
 	// kept out of a plain worker's rendered spec/hash.
 	DinDNonRootless bool
+	// DinDLimitCPU / DinDLimitMemory override the DinD sidecar's resource LIMITS (PRD #89
+	// 0.8.1). Empty ⇒ dindDefaultLimitCPU/Memory ("2" / "2Gi"). A cluster raises them
+	// because in-daemon image builds OOM the 2Gi default (uzi's own e2e builds 5 images
+	// inside the daemon). Quantity strings (e.g. "4" / "6Gi"), validated at the
+	// controller's boot so the render side can MustParse them. Requests stay fixed.
+	// Docker-only, so they never touch a plain worker's spec/hash.
+	DinDLimitCPU    string
+	DinDLimitMemory string
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.
@@ -839,7 +869,7 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 		Command:         command, // nil for rootless (image entrypoint), set for non-rootless
 		Env:             env,
 		SecurityContext: sc,
-		Resources:       dindResources,
+		Resources:       cfg.dindResources(),
 		StartupProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", probeCmd}},

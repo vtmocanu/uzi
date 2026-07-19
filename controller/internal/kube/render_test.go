@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/preset"
 	"gitlab.example.com/vtmocanu/uzi/controller/internal/protocol"
@@ -914,6 +915,46 @@ func TestDockerWorkerTMPDIRUnderSharedWorkdirAndPlainHasNone(t *testing.T) {
 	pw := containerByName(t, plain.Spec.Template.Spec.Containers, workerContainerName)
 	if _, ok := envValue(pw, "TMPDIR"); ok {
 		t.Error("a plain worker must not set TMPDIR (docker-only env; setting it would change the plain worker's spec hash)")
+	}
+}
+
+// dind sidecar resource limits (PRD #89 0.8.1): the LIMITS are configurable per cluster
+// (in-daemon image builds OOM the 2Gi default), the requests stay fixed. Empty overrides
+// keep the built-in default; set overrides win.
+func TestDindResourceLimitsDefaultAndOverride(t *testing.T) {
+	dindOf := func(cfg RenderConfig) corev1.Container {
+		dep := RenderDeployment(cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+		return containerByName(t, dep.Spec.Template.Spec.InitContainers, dindContainerName)
+	}
+	eq := func(t *testing.T, got resource.Quantity, want string, what string) {
+		t.Helper()
+		if w := resource.MustParse(want); got.Cmp(w) != 0 {
+			t.Errorf("dind %s = %s, want %s", what, got.String(), want)
+		}
+	}
+
+	// Default: limits 2 / 2Gi, requests 250m / 256Mi.
+	def := dindOf(dockerTestConfigNonRootless())
+	eq(t, def.Resources.Limits[corev1.ResourceCPU], "2", "default CPU limit")
+	eq(t, def.Resources.Limits[corev1.ResourceMemory], "2Gi", "default memory limit")
+	eq(t, def.Resources.Requests[corev1.ResourceCPU], "250m", "CPU request")
+	eq(t, def.Resources.Requests[corev1.ResourceMemory], "256Mi", "memory request")
+
+	// Override raises the limits; requests are untouched.
+	cfg := dockerTestConfigNonRootless()
+	cfg.DinDLimitCPU = "4"
+	cfg.DinDLimitMemory = "6Gi"
+	ov := dindOf(cfg)
+	eq(t, ov.Resources.Limits[corev1.ResourceCPU], "4", "overridden CPU limit")
+	eq(t, ov.Resources.Limits[corev1.ResourceMemory], "6Gi", "overridden memory limit")
+	eq(t, ov.Resources.Requests[corev1.ResourceCPU], "250m", "CPU request (unchanged by a limit override)")
+	eq(t, ov.Resources.Requests[corev1.ResourceMemory], "256Mi", "memory request (unchanged by a limit override)")
+
+	// The override rolls the docker worker's spec hash (it changes the rendered pod), and
+	// a rootless posture honours it too (the limits are posture-independent).
+	if SpecHashOf(dockerTestConfigNonRootless(), desiredDocker("abc"), testSpec(t, "base", "m")) ==
+		SpecHashOf(cfg, desiredDocker("abc"), testSpec(t, "base", "m")) {
+		t.Error("raising the dind limits must change the docker worker's spec hash (else a bump never rolls the pod)")
 	}
 }
 

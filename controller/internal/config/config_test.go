@@ -503,3 +503,49 @@ func TestLoadDockerTierOffDefaultsRootless(t *testing.T) {
 		t.Error("with the docker tier off, WorkerDinDRootless must keep its safe default (true)")
 	}
 }
+
+// The DinD limit overrides (PRD #89 0.8.1) are optional; when set they are read verbatim
+// and (below) validated as k8s quantities. Empty leaves them empty (the render default).
+func TestLoadDockerDinDLimitOverrides(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	t.Setenv("UZI_WORKER_DIND_LIMIT_CPU", "4")
+	t.Setenv("UZI_WORKER_DIND_LIMIT_MEMORY", "6Gi")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDinDLimitCPU != "4" || cfg.WorkerDinDLimitMemory != "6Gi" {
+		t.Fatalf("dind limits = %q / %q, want 4 / 6Gi", cfg.WorkerDinDLimitCPU, cfg.WorkerDinDLimitMemory)
+	}
+}
+
+// A typo'd override fails at BOOT (validated as a k8s Quantity), not at the far end when
+// the apiserver rejects the rendered pod.
+func TestLoadDockerDinDLimitRejectsABadQuantity(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	t.Setenv("UZI_WORKER_DIND_LIMIT_MEMORY", "6GB") // not a k8s quantity (want Gi/Mi/G/M)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DIND_LIMIT_MEMORY") {
+		t.Fatalf("err = %v, want a boot refusal naming the bad limit var", err)
+	}
+}
+
+// Unset overrides leave the fields empty (the render side supplies its 2 / 2Gi default).
+func TestLoadDockerDinDLimitDefaultsEmpty(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDinDLimitCPU != "" || cfg.WorkerDinDLimitMemory != "" {
+		t.Errorf("unset dind limits must stay empty, got %q / %q", cfg.WorkerDinDLimitCPU, cfg.WorkerDinDLimitMemory)
+	}
+}

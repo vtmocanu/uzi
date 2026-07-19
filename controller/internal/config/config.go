@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // Config holds the controller's runtime settings.
@@ -123,6 +125,13 @@ type Config struct {
 	// tier off ⇒ irrelevant, but the safe value). Threaded to RenderConfig.DinDNonRootless
 	// (inverted) so the render side's zero value stays the safe rootless posture.
 	WorkerDinDRootless bool
+	// WorkerDinDLimitCPU / WorkerDinDLimitMemory override the DinD sidecar's resource
+	// LIMITS (PRD #89 0.8.1). Empty ⇒ the render side's built-in default ("2" / "2Gi").
+	// A cluster raises them because in-daemon image builds OOM the 2Gi default (uzi's own
+	// e2e builds 5 images inside the daemon). Optional even when the docker tier is on —
+	// validated as k8s Quantity strings when set, so a typo fails at boot, not at admission.
+	WorkerDinDLimitCPU    string
+	WorkerDinDLimitMemory string
 }
 
 // Load reads and validates the configuration.
@@ -263,6 +272,27 @@ func validateDockerTier(cfg *Config) error {
 		return fmt.Errorf("UZI_WORKER_DIND_ROOTLESS=%q is not a boolean (want true or false): %w", rootlessRaw, err)
 	}
 	cfg.WorkerDinDRootless = rootless
+
+	// Optional DinD limit overrides (PRD #89 0.8.1). Validated as k8s Quantity strings
+	// when set so a typo fails at boot, not at the far end when the apiserver rejects the
+	// rendered pod. Empty leaves the render side's built-in default.
+	limits := []struct {
+		key string
+		dst *string
+	}{
+		{"UZI_WORKER_DIND_LIMIT_CPU", &cfg.WorkerDinDLimitCPU},
+		{"UZI_WORKER_DIND_LIMIT_MEMORY", &cfg.WorkerDinDLimitMemory},
+	}
+	for _, l := range limits {
+		v := strings.TrimSpace(os.Getenv(l.key))
+		if v == "" {
+			continue
+		}
+		if _, err := resource.ParseQuantity(v); err != nil {
+			return fmt.Errorf("%s=%q is not a valid resource quantity (e.g. \"4\" or \"6Gi\"): %w", l.key, v, err)
+		}
+		*l.dst = v
+	}
 	return nil
 }
 
