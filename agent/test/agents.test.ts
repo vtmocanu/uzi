@@ -38,17 +38,18 @@ describe("assembleAgents", () => {
     assert.strictEqual(subagents.reviewer?.model, "opus");
   });
 
-  it("blocks nested Agent spawning and the workflow-signal MCP server on every subagent", () => {
-    // PRD #43 M2: disallowedTools denies nested Agent spawning AND the run's
-    // signal server (mcp__uzi → both submit_plan and signal_done) for every
-    // subagent, builtin or custom. `mcp__uzi` is a server-level MCP spec that
-    // removes every tool the `uzi` in-process server exposes (sdk.d.ts:48).
+  it("blocks nested Agent spawning, the workflow-signal MCP server, and the memory MCP server on every subagent", () => {
+    // PRD #43 M2 + PRD #90: disallowedTools denies nested Agent spawning, the run's
+    // signal server (mcp__uzi → submit_plan/signal_done), AND the memory server
+    // (mcp__memory → save_memory, lead-only) for every subagent, builtin or custom.
+    // Each `mcp__<server>` is a server-level MCP spec removing every tool that
+    // in-process server exposes (sdk.d.ts:48).
     const { subagents } = assembleAgents([coder, reviewer]);
     for (const name of Object.keys(subagents)) {
       assert.deepStrictEqual(
         subagents[name]?.disallowedTools,
-        ["Agent", "mcp__uzi"],
-        `${name} must disallow Agent and the uzi signal server`,
+        ["Agent", "mcp__uzi", "mcp__memory"],
+        `${name} must disallow Agent, the uzi signal server, and the memory server`,
       );
     }
   });
@@ -68,10 +69,10 @@ describe("assembleAgents", () => {
     for (const tools of [null, [] as string[], undefined]) {
       const { subagents } = assembleAgents([{ ...coder, tools }]);
       assert.strictEqual(subagents.coder?.tools, undefined);
-      // Nested spawning AND the signal server stay blocked even when the subagent
-      // inherits all tools (the coder path) — the denial is not a function of the
-      // allowlist (PRD #43 M2).
-      assert.deepStrictEqual(subagents.coder?.disallowedTools, ["Agent", "mcp__uzi"]);
+      // Nested spawning, the signal server, AND the memory server stay blocked even
+      // when the subagent inherits all tools (the coder path) — the denial is not a
+      // function of the allowlist (PRD #43 M2 + PRD #90).
+      assert.deepStrictEqual(subagents.coder?.disallowedTools, ["Agent", "mcp__uzi", "mcp__memory"]);
     }
   });
 
@@ -137,9 +138,9 @@ describe("subagentsFromTemplates (PRD #37 repo source)", () => {
     // hoisted to a main-thread system prompt (that is assembleAgents' job for own).
     assert.strictEqual(subagents.lead!.prompt, "REPO LEAD BODY");
     // Structural denial still applies via toDefinition — including for
-    // repo-sourced (custom) subagents: no nested Agent, no uzi signal server.
+    // repo-sourced (custom) subagents: no nested Agent, no uzi signal server, no memory server.
     for (const name of ["lead", "auditor"]) {
-      assert.deepStrictEqual(subagents[name]!.disallowedTools, ["Agent", "mcp__uzi"]);
+      assert.deepStrictEqual(subagents[name]!.disallowedTools, ["Agent", "mcp__uzi", "mcp__memory"]);
     }
   });
 

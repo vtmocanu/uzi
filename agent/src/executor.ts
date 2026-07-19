@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MessageKind, RunKind } from "./protocol.js";
+import type { AgentSource, AgentTemplate, ClaimConfig, ClaimPipeline, ClaimSkill, ClaimSkillDrop, FixVerdict, MemoryEntry, MessageKind, RunKind } from "./protocol.js";
 import type { PlanVerdict } from "./steering.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { provisionRunTools } from "./provision-run.js";
@@ -64,6 +64,10 @@ export interface RunContext {
    *  .claude/skills. Only then does the worker enumerate them (skills only, lowest
    *  precedence); default off. */
   repoSkillsEnabled?: boolean;
+  /** PRD #90: the run's (user, repo) cross-run memory, fetched at claim time. The
+   *  executor composes it into the lead's plan prompt as inert, nonce-fenced,
+   *  UNTRUSTED-advisory context. Absent/empty ⇒ no memory block is injected. */
+  memory?: MemoryEntry[];
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** SDK session to resume; null/absent for a fresh run. */

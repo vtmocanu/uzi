@@ -114,6 +114,9 @@ async function main(): Promise<void> {
       // Docker wiring (PRD #83 M1): the same startup-resolved wiring for every run —
       // gates the Bash guardrail's docker rule and supplies DOCKER_HOST to the SDK env.
       dockerWiring: config.dockerWiring,
+      // PRD #90: the worker→API client, so the lead's save_memory MCP tool can POST a
+      // cross-run learning (the server derives (user, repo) from the run claim).
+      client,
     });
     return { executor, homeDir: runHome };
   };

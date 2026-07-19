@@ -8606,3 +8606,157 @@ dev-cluster (M5) until this ships. PRD #89 M-allow. Gates at CLAIM/DISPATCH, not
   repo-less kind FAIL-CLOSED: a docker worker will NOT claim it until that kind is DELIBERATELY added to
   the exempt set alongside its own executor-confinement (no-daemon-tool) regression test. The exemption
   is thus opt-in per kind, never a standing hole for any repo-less run.
+
+# PRD #90 — Cross-run agent memory
+
+A durable, per-(user, repo) store the lead writes a bounded learning into and a
+FUTURE run on the same repo reads back — sanctioned, structured, and user-visible,
+where prior runs had no such mechanism (a stray cross-run Bash write, the accepted
+PRD #42 residual, was never re-read into context). Owner decisions are recorded in
+`prds/90-agent-memory-persistence.md`'s Decision Log and are NOT duplicated into
+`specs/human.md` (an implementation/design record, not a new user-binding
+requirement, per the PRD #89 precedent). The independent fable-model review that
+shaped this PRD is summarized there too; what follows is the AI/implementation
+record for rebuild-from-specs.
+
+## 317. Memory model — a DB-backed `agent_memory` store, written through a custom tool, never a file
+
+Serves human Feature #4 (agent runtime) on the lead's plan-time context. PRD #90 M1/M2.
+
+- **`agent_memory` is a DB table, not a file/volume**, keyed `(user_id, repo_id)`,
+  FK `user_id`/`repo_id` → `users`/`repos` `ON DELETE CASCADE` (a poisoned entry
+  must not outlive the account or the disconnected repo), `run_id` →
+  `runs ON DELETE SET NULL` (provenance only — the entry belongs to the
+  `(user, repo)`, not the one run that wrote it, so run pruning keeps it), plus
+  `created_at`. A composite `(user_id, repo_id, created_at DESC)` index serves the
+  claim-time read, the user list, and the oldest-eviction scan in one shape
+  (`api/internal/store/migrations/00072_agent_memory.sql`). DB-backed also means the
+  store rides the existing CNPG backup set for free.
+- **Write path is a `save_memory` SDK custom tool, NOT the Write/Edit file tools.**
+  `agent/src/memory-tools.ts` exposes it as an in-process custom tool (the same
+  MCP/custom-tool seam the chat executor already uses); the worker validates shape +
+  caps and POSTs to the API, which persists via `Service.SaveMemory`
+  (`api/internal/workersvc/service.go`). Because the write never touches a
+  `PATH_TOOLS` file tool, no guard carve-out is needed — see §320.
+- **Read path composes memory into the lead's plan prompt at claim time**, not via a
+  file read: `agent/src/client.ts` fetches the run's `(user, repo)` memory and
+  `agent/src/prompt.ts` renders it as inert, nonce-fenced text (§318) folded into the
+  same prompt assembly that already frames CI logs and judge recommendations with
+  per-prompt nonce fences.
+
+## 318. The READ path is the genuinely new trust surface — inert, nonce-fenced, advisory
+
+Serves human Feature #4; the crux the PRD centers on. PRD #90 M3, Decision Log
+"Trust model = INERT/ADVISORY" + Security framing.
+
+- **Durable cross-run writes already existed via Bash** (the Bash screener is a
+  deny-LIST with no path containment, and only `agent-home/<runId>` is torn down on
+  terminal — `git.ts`'s documented PRD #42 residual); what never existed is
+  deliberate **read-back** of persisted content into a future run's context. PRD #90
+  builds that loop on purpose, so the read path — not persistence itself — is the
+  only genuinely new trust surface, and the design is centered there rather than on
+  gating the write.
+- **Memory is rendered inert/advisory, prefaced as untrusted, and wrapped in a
+  per-prompt nonce fence** (`<untrusted_memory_${nonce}>…</untrusted_memory_${nonce}>`,
+  `agent/src/prompt.ts`) — the same unforgeable-delimiter pattern `judge-runner.ts`
+  uses for job logs and judge recommendations: the nonce is minted per-prompt, so a
+  memory entry authored before the nonce existed cannot predict and forge the closing
+  tag to break out of the fence.
+- **Stated honestly: "inert/advisory" is a prompt-level label for a tool-bearing
+  lead, not a structural containment.** The judge's "data-not-commands" framing is
+  structural because its executor is tool-less (`judge-runner.ts` installs a
+  deny-ALL `PreToolUse` hook); the lead has full tools, so a poisoned memory entry
+  CAN still injection-shape it, same as any other repo content the lead reads. The
+  real backstop stack is therefore NOT the label — it is (a) the deny-layer
+  guardrails bounding what any shaped lead can do regardless of what shaped it
+  (no push, no secret read, no outside-worktree file write, docker-redirect denied…);
+  (b) the per-(user,repo) scope (§319); (c) server-enforced caps + structure (§321);
+  (d) the nonce fence; (e) user-visible purge (§322). With that stack, the residual
+  narrows to roughly the injection risk a lead already carries just by reading the
+  repo it runs on.
+
+## 319. Server-side identity derivation is mandatory — never from the request body
+
+Serves human Feature #4; the write-path integrity control. PRD #90 M1, Decision Log
+"Server-side identity derivation is mandatory (fable B3)".
+
+- **The API derives `(user_id, repo_id)` from the run claim, never from caller
+  parameters.** `Service.SaveMemory`/`ListMemoryForRun` (`api/internal/workersvc/
+  service.go`) resolve the run through `runOwnedByWorker` (`GetRunOwnedByWorker`,
+  scoped to the calling worker) and take `user_id`/`repo_id` off that row — the
+  worker's join token is not user-scoped, so a compromised worker must not be able
+  to write another user's memory by simply naming a different `(user_id, repo_id)`
+  in the request.
+- **Repo-less runs are handled asymmetrically, by design.** `SaveMemory` rejects a
+  write on a repo-less run outright (`ErrMemoryNoRepo` — a save needs a repo scope
+  to key on); `ListMemoryForRun` instead returns an empty list for a repo-less run
+  rather than erroring, so the worker simply composes nothing into that lead's
+  prompt. A repo-less run (judge/chat) has no memory scope to read.
+
+## 320. The PRD #51 file-tool path guard is UNCHANGED — no carve-out
+
+Serves human Feature #4 + the primary-directive worktree containment (PRD #51).
+PRD #90 M2, Decision Log "OQ-A resolved: DB store + `save_memory` custom tool, NOT
+a file + guard carve-out (fable B2)".
+
+- **Memory bypasses the guard by being a custom tool, not by weakening the guard.**
+  `agent/src/guardrails.ts`'s path guard on `PATH_TOOLS`
+  (Read/Edit/Write/MultiEdit/NotebookEdit/Glob/Grep) — deny anything resolving
+  outside the run worktree, authoritative under `bypassPermissions` — is untouched
+  by this PRD. A file-based memory store was rejected specifically because it would
+  have needed a carve-out (and would carry a TOCTOU on the runner-group-writable
+  `agent-home` parent); the DB + custom-tool design deletes that guard change
+  entirely rather than amending it.
+- **Pinned by a regression test naming PRD #90 explicitly.** `agent/test/
+  guardrails.test.ts` ("file-tool path guard is UNCHANGED by agent memory
+  (PRD #90 M2)") asserts the guard still denies plausible out-of-worktree
+  "memory" targets a shaped lead might try (`/data/agent-home/memory.md`,
+  `../agent-home/memory.md`, `/tmp/agent-memory.json`, …) — so a future change
+  that loosened the guard to admit an out-of-worktree memory file fails CI, not
+  just review.
+
+## 321. Caps and write policy — server-enforced, auto-write, lead-only
+
+Serves human Feature #4; the spam/size bound on the new store. PRD #90 M4, Open
+questions OQ-B/OQ-C resolved.
+
+- **Caps chosen (OQ-C), enforced in `api/internal/workersvc/service.go`, not
+  client-trusted:** `MemoryMaxTitleBytes = 200`, `MemoryMaxBodyBytes = 2048`,
+  `MemoryMaxPerUserRepo = 20` (oldest-eviction — `EvictAgentMemoryOverCap` trims
+  the `(user,repo)` set right after every insert, so it can never be observed over
+  cap by a subsequent read), `MemoryMaxPerRun = 5` (counted on `run_id`, so it
+  survives even after older entries have been evicted from the `(user,repo)` set).
+  These mirror, deliberately, the numbers the PRD suggested up front (~20 × ~2KB,
+  ~5/run) — chosen small on purpose, a learning is a note, not a document.
+- **Caps are DDL-free by design.** The migration (§317) enforces none of this as a
+  CHECK constraint: the count cap is an oldest-eviction (a CHECK cannot evict) and
+  the size caps are validated at the handler alongside the same limits the SDK tool
+  schema (`agent/src/memory-tools.ts`) advertises to the model, so a single Go
+  source of truth owns the numbers rather than splitting them across a constraint
+  and application code.
+- **Write policy (OQ-B): auto-write, lead-only.** The lead decides what's worth
+  saving with no human-curation step — acceptable specifically because memory is
+  inert (§318): a saved entry cannot auto-execute later, only bias a future read.
+  Lead-only (the only writer touching `save_memory`) keeps provenance clean; the
+  count-check → insert → evict sequence in `SaveMemory` is safe as sequential store
+  calls (mirroring `AppendMessages`) because a single lead is the only writer per
+  run, so no cross-write race is in play.
+
+## 322. User-visible and per-entry deletable — a v1 security control, not a nicety
+
+Serves human Feature #4 + Feature #64 (uzi CLI). PRD #90 M6, Decision Log
+"User-visible + deletable is v1, not conditional (fable S1)".
+
+- **Both surfaces ship in v1, not as a follow-up.** Web: Settings → Memory
+  (`web/src/components/Memory.tsx`) lists every cross-run memory entry the signed-in
+  user's agents have saved, grouped by repo (newest-written repo floats to the top,
+  newest-first within each bucket) with a per-entry delete. CLI: `uzi memory list`
+  / `uzi memory rm <memory-id>` (`api/cmd/uzi/memory.go`) give the same surface
+  headlessly, per the repo's "new API ⇒ check the CLI" rule (Feature #64).
+  Delete is intentionally framed as a "danger" action in the UI copy.
+- **This is a security control, not a convenience.** The distinctive risk memory
+  introduces is a poisoned entry outliving the repo injection that planted it (an
+  attacker's payload lands in a saved memory, the attacker's repo content is later
+  cleaned up, but the memory persists) — the owner's ability to see and purge a
+  bad-looking or planted entry is the backstop that bounds that residual, which is
+  why v1 shipped it unconditionally rather than deferring to a later milestone.

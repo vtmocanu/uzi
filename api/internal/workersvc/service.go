@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -67,6 +68,28 @@ var (
 	// non-terminal run: the FK is ON DELETE SET NULL, so deleting would orphan the
 	// run past every sweep (and the one-active-run index would then block re-runs).
 	ErrWorkerHasActiveRuns = errors.New("worker has active runs")
+
+	// Agent-memory sentinels (PRD #90), mapped to HTTP by the worker handlers.
+	// ErrMemoryNoRepo rejects a save/read on a repo-less run (runs.repo_id is
+	// nullable — a chat/self-improve run has no repo, so it has no (user,repo)
+	// memory scope) → 409. ErrMemoryTooLarge is an oversize title/body → 400.
+	// ErrMemoryWriteCap is the per-run write cap tripped → 429.
+	ErrMemoryNoRepo   = errors.New("run has no repo for agent memory")
+	ErrMemoryTooLarge = errors.New("agent memory title or body too large")
+	ErrMemoryWriteCap = errors.New("per-run agent memory write cap reached")
+	ErrMemoryEmpty    = errors.New("agent memory title and body must be non-empty")
+)
+
+// Agent-memory caps (PRD #90, OQ-C). Server-enforced (not client-trusted) and the
+// single Go source of truth the SDK tool schema mirrors: at most
+// MemoryMaxTitleBytes/MemoryMaxBodyBytes per entry, MemoryMaxPerRun writes per run
+// (spam bound), and MemoryMaxPerUserRepo entries per (user,repo) with the oldest
+// evicted on insert.
+const (
+	MemoryMaxTitleBytes  = 200
+	MemoryMaxBodyBytes   = 2048
+	MemoryMaxPerRun      = 5
+	MemoryMaxPerUserRepo = 20
 )
 
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
@@ -156,6 +179,15 @@ type Store interface {
 	// selection atomically (PRD #37).
 	CreateApprovePlanInput(ctx context.Context, arg store.CreateApprovePlanInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
+
+	// Agent memory (PRD #90): the worker-facing write/read of the per-(user,repo)
+	// cross-run store. Identity is derived from the run claim, never the body; the
+	// per-run write cap and the oldest-eviction that keep the set bounded are
+	// enforced in the store service around these calls.
+	InsertAgentMemory(ctx context.Context, arg store.InsertAgentMemoryParams) (store.AgentMemory, error)
+	ListAgentMemoryForUserRepo(ctx context.Context, arg store.ListAgentMemoryForUserRepoParams) ([]store.AgentMemory, error)
+	CountAgentMemoryForRun(ctx context.Context, runID pgtype.UUID) (int64, error)
+	EvictAgentMemoryOverCap(ctx context.Context, arg store.EvictAgentMemoryOverCapParams) error
 
 	// Chat runs (PRD #39): a third run kind riding the run machinery. The chat
 	// claim lane (ClaimChatRun) is disjoint from ClaimRun (which now excludes chat);
@@ -1228,6 +1260,115 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		out = append(out, InputDTO{ID: row.ID, Kind: row.Kind, Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
 	}
 	return out, nil
+}
+
+// SaveMemory persists one cross-run memory entry for the run's (user, repo), the
+// worker's save_memory tool landing here (PRD #90). CRITICAL: the (user_id,
+// repo_id) are read off the OWNED run — never from the request — so a worker whose
+// join token is not user-scoped cannot write another user's memory. A repo-less run
+// (chat/self-improve) has no memory scope → ErrMemoryNoRepo. Caps are enforced
+// server-side: oversize title/body → ErrMemoryTooLarge; the per-run write count at
+// the cap → ErrMemoryWriteCap; and after the insert the (user,repo) set is trimmed
+// to the newest MemoryMaxPerUserRepo (oldest-eviction). The count-check → insert →
+// evict are sequential store calls (mirroring AppendMessages) — a single lead is
+// the only writer per run, so no cross-write race is in play.
+func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.UUID, title, body string) (store.AgentMemory, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return store.AgentMemory{}, err
+	}
+	if !run.RepoID.Valid {
+		return store.AgentMemory{}, ErrMemoryNoRepo
+	}
+	// Strip control characters from the untrusted title/body BEFORE the size cap so
+	// the stored byte count reflects the stored value. A prompt-injected ANSI escape
+	// or bare control char would otherwise render raw when the owner runs `uzi memory
+	// list` (the CLI table printer writes cell values verbatim). Mirrors the
+	// handler's sanitizeSelfReported: a title is single-line (no whitespace kept), a
+	// body keeps \n and \t but drops every other C0/C1 control char and ANSI escape.
+	title = sanitizeMemoryField(strings.TrimSpace(title), false)
+	body = sanitizeMemoryField(body, true)
+	if title == "" || strings.TrimSpace(body) == "" {
+		return store.AgentMemory{}, ErrMemoryEmpty
+	}
+	if len(title) > MemoryMaxTitleBytes || len(body) > MemoryMaxBodyBytes {
+		return store.AgentMemory{}, ErrMemoryTooLarge
+	}
+	// Per-run write cap: the spam bound within one run (Decision M4). Counted on
+	// run_id, so it survives even when older entries have been evicted from the
+	// (user,repo) set.
+	n, err := s.q.CountAgentMemoryForRun(ctx, pgUUID(runID))
+	if err != nil {
+		return store.AgentMemory{}, err
+	}
+	if n >= MemoryMaxPerRun {
+		return store.AgentMemory{}, ErrMemoryWriteCap
+	}
+	repoID := uuid.UUID(run.RepoID.Bytes)
+	mem, err := s.q.InsertAgentMemory(ctx, store.InsertAgentMemoryParams{
+		UserID: run.UserID,
+		RepoID: repoID,
+		RunID:  pgUUID(runID),
+		Title:  title,
+		Body:   body,
+	})
+	if err != nil {
+		return store.AgentMemory{}, err
+	}
+	// Trim to the newest MemoryMaxPerUserRepo for this (user,repo) — the count cap
+	// via oldest-eviction, right after the insert so the set can never be observed
+	// over cap by a subsequent read.
+	if err := s.q.EvictAgentMemoryOverCap(ctx, store.EvictAgentMemoryOverCapParams{
+		UserID:    run.UserID,
+		RepoID:    repoID,
+		KeepCount: MemoryMaxPerUserRepo,
+	}); err != nil {
+		return store.AgentMemory{}, err
+	}
+	return mem, nil
+}
+
+// sanitizeMemoryField strips control characters from an untrusted memory field
+// before it is stored, so a prompt-injected ANSI escape (\x1b[…) or bare control
+// char (e.g. \x07) can never render raw when the owner reads it back with `uzi
+// memory list` (the CLI table printer writes cell values verbatim). It mirrors
+// sanitizeSelfReported in the handler package, minus the byte truncation (SaveMemory
+// applies the size cap AFTER this, on the sanitized value). keepWhitespace preserves
+// \n and \t for the multi-line body while still dropping every other C0/C1 control
+// char; a single-line title keeps neither. unicode.IsControl catches C0 (incl. ESC
+// 0x1b and BEL 0x07), DEL, and C1 — the whole ANSI-escape lead-in class.
+func sanitizeMemoryField(s string, keepWhitespace bool) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if (r == '\n' || r == '\t') && keepWhitespace {
+			b.WriteRune(r)
+			continue
+		}
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// ListMemoryForRun returns the (user, repo) memory for a run the worker owns,
+// newest first (PRD #90 read path). A repo-less run has no memory scope, so it
+// returns an empty list rather than an error — the worker composes nothing into the
+// lead's prompt for such a run.
+func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID uuid.UUID) ([]store.AgentMemory, error) {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return nil, err
+	}
+	if !run.RepoID.Valid {
+		return []store.AgentMemory{}, nil
+	}
+	return s.q.ListAgentMemoryForUserRepo(ctx, store.ListAgentMemoryForUserRepoParams{
+		UserID: run.UserID,
+		RepoID: uuid.UUID(run.RepoID.Bytes),
+	})
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {

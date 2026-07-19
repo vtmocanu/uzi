@@ -195,6 +195,18 @@ export class RunRunner {
         );
       }
 
+      // Cross-run memory (PRD #90): fetch this run's (user, repo) memory so the
+      // executor can compose it into the lead's plan prompt as inert, nonce-fenced,
+      // untrusted-advisory context. Guarded HARD — a fetch failure (older API, repo-
+      // less run 404/409, transport error) or an empty store injects NOTHING and
+      // never fails the run: memory is advisory, never load-bearing.
+      let memory: Awaited<ReturnType<WorkerClient["getMemory"]>> = [];
+      try {
+        memory = await this.client.getMemory(runId);
+      } catch (err) {
+        runLog.warn("could not fetch cross-run memory; continuing without it", { error: errMessage(err) });
+      }
+
       const ctx: RunContext = {
         runId,
         kind: claim.kind ?? "issue",
@@ -211,6 +223,7 @@ export class RunRunner {
         skills: claim.skills,
         skillsDropped: claim.skills_dropped,
         repoSkillsEnabled: claim.repo.skills_enabled ?? false,
+        memory,
         config: claim.config,
         sessionId: claim.session_id,
         signal: cancel.signal,

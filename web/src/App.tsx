@@ -10,6 +10,7 @@ import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
 import { Settings } from "./pages/Settings";
 import { AccessSettings } from "./pages/AccessSettings";
+import { MemorySettings } from "./pages/MemorySettings";
 import { CliAuth } from "./pages/CliAuth";
 import { Agents } from "./pages/Agents";
 import { AgentNew } from "./pages/AgentNew";
@@ -98,6 +99,14 @@ export default function App() {
           element={
             <ProtectedRoute>
               <AccessSettings />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/settings/memory"
+          element={
+            <ProtectedRoute>
+              <MemorySettings />
             </ProtectedRoute>
           }
         />

@@ -38,6 +38,7 @@ import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentSource, AgentTemplate } from "./protocol.js";
 import { NESTED_AGENT_TOOL } from "./guardrails.js";
 import { SIGNAL_SERVER_NAME } from "./signals.js";
+import { MEMORY_SERVER_NAME } from "./memory-tools.js";
 import { qualifiedSkillName } from "./skills-plugin.js";
 
 // Server-level MCP denial (PRD #43 M2 / Decision 3). A `mcp__<server>` entry in
@@ -53,6 +54,13 @@ import { qualifiedSkillName } from "./skills-plugin.js";
 // (scanSignals ignores a subagent-borne signal even if the SDK let the call
 // through). Keep both.
 const SIGNAL_SERVER_DENY = `mcp__${SIGNAL_SERVER_NAME}`;
+
+// PRD #90: save_memory is the LEAD's alone (OQ-B — one writer, clean provenance).
+// Denying the whole `mcp__memory` server to every subagent (same mechanism as
+// SIGNAL_SERVER_DENY) keeps a coder/reviewer — buggy or prompt-injected — from
+// writing cross-run memory. Defense-in-depth: the entry is still per-(user,repo)
+// scoped and server-capped, but provenance stays "the lead saved this".
+const MEMORY_SERVER_DENY = `mcp__${MEMORY_SERVER_NAME}`;
 
 /**
  * A template is the lead orchestrator (routed to the main thread, not registered
@@ -84,10 +92,11 @@ function toDefinition(
     description: t.description,
     prompt: t.prompt_body,
     // No subagent may spawn nested agents (defense-in-depth over the fact that
-    // `agents` + settingSources:[] already limit spawnable agents to these), and
-    // no subagent may reach the run's workflow-signal MCP tools (SIGNAL_SERVER_DENY
-    // above — the plan gate and done→MR handoff are the lead's alone).
-    disallowedTools: [NESTED_AGENT_TOOL, SIGNAL_SERVER_DENY],
+    // `agents` + settingSources:[] already limit spawnable agents to these), reach
+    // the run's workflow-signal MCP tools (SIGNAL_SERVER_DENY — the plan gate and
+    // done→MR handoff are the lead's alone), or write cross-run memory
+    // (MEMORY_SERVER_DENY — save_memory is lead-only, PRD #90 OQ-B).
+    disallowedTools: [NESTED_AGENT_TOOL, SIGNAL_SERVER_DENY, MEMORY_SERVER_DENY],
   };
   // A non-empty template list is an explicit allowlist honored verbatim (and is
   // what makes reviewer/tester read-only). null/absent/empty ⇒ leave `tools`

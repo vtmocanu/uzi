@@ -14,8 +14,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"gitlab.example.com/vtmocanu/uzi/api/internal/apitypes"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/httpx"
 	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
+	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workertmpl"
 )
@@ -412,4 +414,102 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": inputs})
+}
+
+// workerMemoryToDTO maps a stored entry to the worker-facing DTO. It carries run_id
+// (provenance) but OMITS repo_id/repo_name — the worker already knows the run's repo
+// and the write derives it server-side, so echoing it would be redundant surface.
+func workerMemoryToDTO(m store.AgentMemory) apitypes.AgentMemoryDTO {
+	dto := apitypes.AgentMemoryDTO{
+		ID:        m.ID.String(),
+		Title:     m.Title,
+		Body:      m.Body,
+		CreatedAt: m.CreatedAt.Time,
+	}
+	if m.RunID.Valid {
+		dto.RunID = uuid.UUID(m.RunID.Bytes).String()
+	}
+	return dto
+}
+
+// WorkerSaveMemory persists one cross-run memory entry for the run's (user, repo)
+// — the worker's save_memory tool (PRD #90). The identity is derived from the run
+// claim inside the service, NEVER from the body: the body carries only {title,
+// body}. A repo-less run is a 409, oversize/empty content a 400, the per-run write
+// cap a 429.
+func (h *Handler) WorkerSaveMemory(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	var req apitypes.AgentMemoryWriteRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	mem, err := h.wsvc.SaveMemory(r.Context(), wkr, runID, req.Title, req.Body)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrMemoryNoRepo):
+			httpx.Error(w, http.StatusConflict, "this run has no repo, so it has no memory to write")
+		case errors.Is(err, workersvc.ErrMemoryEmpty):
+			httpx.Error(w, http.StatusBadRequest, "memory title and body must be non-empty")
+		case errors.Is(err, workersvc.ErrMemoryTooLarge):
+			httpx.Error(w, http.StatusBadRequest, "memory title must be at most 200 bytes and body at most 2048 bytes")
+		case errors.Is(err, workersvc.ErrMemoryWriteCap):
+			httpx.Error(w, http.StatusTooManyRequests, "this run has reached its memory write limit")
+		default:
+			slog.Error("worker save memory", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	// The write echo is the bare entry {id,title,body,created_at} (run_id is present
+	// on the read path, not the write echo).
+	httpx.JSON(w, http.StatusCreated, apitypes.AgentMemoryDTO{
+		ID:        mem.ID.String(),
+		Title:     mem.Title,
+		Body:      mem.Body,
+		CreatedAt: mem.CreatedAt.Time,
+	})
+}
+
+// WorkerListMemory returns the run's (user, repo) memory, newest first — the read
+// half of the loop the worker composes (nonce-fenced, inert) into the lead's prompt
+// at claim time (PRD #90). Scoped to the OWNED run's (user, repo); a repo-less run
+// yields an empty list.
+func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	rows, err := h.wsvc.ListMemoryForRun(r.Context(), wkr, runID)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker list memory", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	out := make([]apitypes.AgentMemoryDTO, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, workerMemoryToDTO(m))
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"memories": out})
 }

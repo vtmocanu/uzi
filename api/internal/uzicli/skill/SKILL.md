@@ -83,6 +83,8 @@ uzi run cancel <run-id>
 uzi run follow-up <run-id> [--message <text>]
 uzi worker list
 uzi worker rm <worker-id>
+uzi memory list
+uzi memory rm <memory-id>
 uzi repo list
 uzi admin users
 uzi admin runs
@@ -157,6 +159,10 @@ as inert data.
 - `uzi worker list` — your workers. `uzi worker rm <worker-id>` — delete one of
   your workers (its runs requeue). There is no `worker create`: minting a join
   token is a web action, because the token can read decrypted secrets.
+- `uzi memory list` — your agents' cross-run memory across every repo (each entry
+  carries its repo, title, and the run that wrote it). `uzi memory rm <memory-id>`
+  — purge one entry. Agents write memory in-run via the `save_memory` tool, not
+  the CLI; the CLI is your visibility + purge control over a stored learning.
 - `uzi repo list` — repositories, with their ids and enabled state.
 - `uzi admin users|runs|workers|usage|rate-limits` — **read-only** factory-wide
   views. These require an admin-scoped (`uza_`) token; a default token gets exit

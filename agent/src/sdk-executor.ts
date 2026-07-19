@@ -37,6 +37,9 @@ import { resolveAgentSelection } from "./protocol.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
+import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
+import type { WorkerClient } from "./client.js";
+import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
@@ -102,6 +105,10 @@ export interface SdkExecutorOptions {
    *  the Bash guardrail denies docker and no DOCKER_HOST reaches the SDK env. Present
    *  ⇒ docker is allowed and DOCKER_HOST is injected. */
   dockerWiring?: DockerWiring;
+  /** The worker→API client (PRD #90): threaded so the lead's `save_memory` MCP tool
+   *  can POST a cross-run learning. Absent ⇒ no memory server is registered (tests/
+   *  stubs that never call it), so the tool wiring is additive and back-compatible. */
+  client?: WorkerClient;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -134,6 +141,9 @@ export class SdkExecutor implements Executor {
    *  the Bash guardrail; `dockerHost` is injected into the SDK env when present. */
   private readonly dockerWired: boolean;
   private readonly dockerHost?: string;
+  /** The worker→API client for the lead's save_memory tool (PRD #90); undefined in
+   *  tests/stubs that never register it. */
+  private readonly client?: WorkerClient;
   /** Every pid spawned across the current run's turns, for the done-path reap.
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. */
@@ -168,6 +178,7 @@ export class SdkExecutor implements Executor {
     // injected into the SDK env; absent ⇒ docker is denied and never injected.
     this.dockerHost = opts.dockerWiring?.dockerHost;
     this.dockerWired = this.dockerHost !== undefined;
+    this.client = opts.client;
   }
 
   /**
@@ -263,6 +274,19 @@ export class SdkExecutor implements Executor {
       { matcher: NESTED_AGENT_TOOL, hooks: [buildAgentGuardHook(allowedSubagents, this.log)] },
     ];
 
+    // In-process MCP servers the LEAD (full toolset) reaches. The dep-free signal
+    // server (plan gate + done) is always present; the memory server (PRD #90) is
+    // added ONLY when a client was threaded (main.ts), surfacing save_memory as
+    // `mcp__memory__save_memory`. Registered under a DISTINCT key from the signal
+    // server so neither disturbs the other; the lead sets no `tools` allowlist, so a
+    // registered MCP tool is callable, and save_memory is not in disallowedTools.
+    const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
+      [SIGNAL_SERVER_NAME]: buildSignalMcpServer(),
+    };
+    if (this.client) {
+      mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({ client: this.client, runId: ctx.runId, log: this.log }).server;
+    }
+
     const baseOptions: SdkOptions = {
       cwd: ctx.worktreePath,
       // Full replacement — only these keys reach the agent subprocess.
@@ -282,9 +306,10 @@ export class SdkExecutor implements Executor {
       skills: runSkills.map((s) => qualifiedSkillName(s.name)),
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt),
       agents: assembled.subagents,
-      // In-process signalling tools the lead calls to gate the plan and mark done
-      // (see signals.ts). Only the lead (full toolset) can reach them.
-      mcpServers: { [SIGNAL_SERVER_NAME]: buildSignalMcpServer() },
+      // In-process tools the lead calls: the signal server (gate the plan / mark
+      // done, see signals.ts) plus, when a client is threaded, the memory server
+      // (save_memory, PRD #90). Only the lead (full toolset) reaches them.
+      mcpServers,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       // Block the deferral tools so the lead can't background work to a future
@@ -343,6 +368,9 @@ export class SdkExecutor implements Executor {
           pipelineWebURL: ctx.pipeline!.web_url,
           failedJobs: ctx.pipeline!.failed_jobs.map((j) => ({ name: j.name, stage: j.stage, logTail: j.log_tail })),
           subagentNames: ownSubagentNames,
+          // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
+          // nonce-fenced cross-run memory back (empty/absent injects nothing).
+          memory: ctx.memory,
         });
       } else if (isSelfImprove) {
         // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -352,6 +380,9 @@ export class SdkExecutor implements Executor {
           branch: ctx.branch,
           recommendations: ctx.issueDescription,
           subagentNames: ownSubagentNames,
+          // PRD #90: a self_improve run can WRITE memory, so it reads the same inert,
+          // nonce-fenced cross-run memory back (empty/absent injects nothing).
+          memory: ctx.memory,
         });
       } else {
         planPrompt = buildPlanPrompt({
@@ -360,6 +391,9 @@ export class SdkExecutor implements Executor {
           issueDescription: ctx.issueDescription,
           branch: ctx.branch,
           subagentNames: ownSubagentNames,
+          // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
+          // runner fetched it at claim time; empty/absent injects nothing).
+          memory: ctx.memory,
         });
       }
       const planningLabel = isCIFix ? "diagnosing CI failure" : isSelfImprove ? "planning self-improvement" : "planning";
