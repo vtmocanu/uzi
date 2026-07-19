@@ -7,6 +7,7 @@ import type { Config } from "./config.js";
 import type { WorkerStats } from "./protocol.js";
 import { StatsCollector } from "./stats.js";
 import { errMessage, sleep } from "./util.js";
+import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 
 /**
  * Outbound-only worker loop (multica's daemon model): register once, heartbeat on
@@ -29,9 +30,30 @@ export class Worker {
     private readonly chatRunner: ChatRunner,
     private readonly judgeRunner: JudgeRunner,
     private readonly log: Logger,
+    // PRD #92 M3: the boot toolchain preflight, injectable so the concurrency/semaphore
+    // unit tests (which run on a non-image host with no `/opt/uzi-toolchain`) can pass a
+    // stub; production uses the real check against the runner PATH.
+    private readonly preflight: () => PreflightResult = () => toolchainPreflight(process.env),
   ) {}
 
   async run(signal: AbortSignal): Promise<void> {
+    // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
+    // A worker whose `/nix` store is missing the baked go/python3/gcc/pip (a stale seed
+    // after an image roll — see PRD #92 root cause) must FAIL REGISTRATION visibly, not
+    // retry forever (the toolchain won't appear by retrying) or emit silent 127s to
+    // subagents mid-run. THROW so it propagates to main.ts's fatal handler (exit 1) and
+    // the pod surfaces the error to an operator — do NOT swallow it into registerWithRetry.
+    const pf = this.preflight();
+    if (!pf.ok) {
+      this.log.error("toolchain preflight FAILED — refusing to register", {
+        missing: pf.missing,
+        likely_cause:
+          "the baked worker toolchain is missing from the runner PATH — most likely a stale /nix seed after an image roll (PRD #92): the seed init container tars /nix into the PVC once, so a rolled image does not re-seed an existing worker",
+      });
+      throw new Error(
+        `toolchain preflight failed: missing ${pf.missing.join(", ")} — baked worker toolchain not on the runner PATH (likely a stale /nix seed after an image roll; see PRD #92)`,
+      );
+    }
     await this.registerWithRetry(signal);
     if (signal.aborted) return;
     // Heartbeat, the run lane, and the chat lane run concurrently until abort.

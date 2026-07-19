@@ -13,6 +13,11 @@ import { recordingLogger } from "./helpers.js";
 // stub satisfies the Worker constructor (the judge lane has its own test file).
 const noJudge = { execute: async () => {} } as unknown as JudgeRunner;
 
+// PRD #92 M3: the real boot toolchain preflight would fail on this (non-image) test host
+// (no /opt/uzi-toolchain, no baked go/gcc on PATH), so the concurrency/semaphore tests
+// inject a passing preflight; the dedicated preflight-gate test below drives a failing one.
+const okPreflight = () => ({ ok: true, missing: [] as string[] });
+
 // The worker runs the RUN lane and the CHAT lane as two independent, concurrent
 // claim loops (PRD #39 Decision 4). This proves they actually run at the same time
 // (not one-after-the-other) while sharing the Logger and WorkerClient — the
@@ -126,7 +131,7 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
       },
     } as unknown as ChatRunner;
 
-    const worker = new Worker(fakeConfig(), client, runRunner, chatRunner, noJudge, logger);
+    const worker = new Worker(fakeConfig(), client, runRunner, chatRunner, noJudge, logger, okPreflight);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 500 && !(ranRun && ranChat); i++) await tick();
     controller.abort();
@@ -170,7 +175,7 @@ describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
     } as unknown as ChatRunner;
     const runRunner = { execute: async () => {} } as unknown as RunRunner;
 
-    const worker = new Worker(fakeConfig({ chatSessions: 2 }), client, runRunner, chatRunner, noJudge, recordingLogger().logger);
+    const worker = new Worker(fakeConfig({ chatSessions: 2 }), client, runRunner, chatRunner, noJudge, recordingLogger().logger, okPreflight);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 300 && active < 2; i++) await tick();
     // Give the loop extra ticks to (wrongly) over-fill if the ceiling were not honored.
@@ -198,7 +203,7 @@ describe("Worker — heartbeat carries a resource sample (PRD #49 M1)", () => {
       claimChat: async (): Promise<ChatClaimResponse | null> => null,
     } as unknown as WorkerClient;
 
-    const worker = new Worker(fakeConfig(), client, { execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner, noJudge, recordingLogger().logger);
+    const worker = new Worker(fakeConfig(), client, { execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner, noJudge, recordingLogger().logger, okPreflight);
     const done = worker.run(controller.signal);
     for (let i = 0; i < 500 && seen.length === 0; i++) await tick();
     controller.abort();
@@ -225,7 +230,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     const { logger, lines } = recordingLogger();
 
     // chatRunner unused: the chat lane always claims null here, so execute is never called.
-    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 2 }), client, runner, {} as unknown as ChatRunner, noJudge, logger);
+    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 2 }), client, runner, {} as unknown as ChatRunner, noJudge, logger, okPreflight);
     const done = worker.run(controller.signal);
 
     for (let i = 0; i < 500 && active() < 2; i++) await tick();
@@ -266,7 +271,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     });
     const { logger, lines } = recordingLogger();
 
-    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 1 }), client, runner, {} as unknown as ChatRunner, noJudge, logger);
+    const worker = new Worker(fakeConfig({ maxConcurrentRuns: 1 }), client, runner, {} as unknown as ChatRunner, noJudge, logger, okPreflight);
     const done = worker.run(controller.signal);
 
     // run-1 parks holding the only slot; run-2 must NOT start until run-1 frees it.
@@ -325,6 +330,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       {} as unknown as ChatRunner,
       noJudge,
       recordingLogger().logger,
+      okPreflight,
     );
     const done = worker.run(controller.signal);
     for (let n = 0; n < 300 && !executed.includes("ok"); n++) await tick();
@@ -378,6 +384,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       {} as unknown as ChatRunner,
       noJudge,
       recordingLogger().logger,
+      okPreflight,
     );
     const done = worker.run(controller.signal);
 
@@ -407,6 +414,7 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
       {} as unknown as ChatRunner,
       noJudge,
       recordingLogger().logger,
+      okPreflight,
     );
     const done = worker.run(controller.signal);
     let resolved = false;
@@ -426,5 +434,72 @@ describe("Worker — RUN lane slot semaphore (PRD #42 M2)", () => {
     assert.strictEqual(resolved, true);
     assert.strictEqual(ended.length, 3, "every in-flight run drained");
     assert.strictEqual(active(), 0);
+  });
+});
+
+// PRD #92 M3: the boot toolchain preflight is a fail-loud REGISTRATION gate. A worker
+// whose /nix store is missing the baked toolchain (a stale seed after an image roll)
+// must THROW at run() start — before it ever calls client.register — so the pod surfaces
+// the error to an operator instead of retrying forever or emitting silent 127s mid-run.
+describe("Worker — boot toolchain preflight gate (PRD #92 M3)", () => {
+  it("throws before register when the preflight fails, naming the missing tools", async () => {
+    const controller = new AbortController();
+    let registered = false;
+    const client = {
+      register: async () => {
+        registered = true;
+        return {};
+      },
+      heartbeat: async () => {},
+      claimRun: async () => null,
+      claimChat: async () => null,
+    } as unknown as WorkerClient;
+
+    const failing = () => ({ ok: false, missing: ["go", "gcc", "/opt/uzi-toolchain"] });
+    const worker = new Worker(
+      fakeConfig(),
+      client,
+      { execute: async () => {} } as unknown as RunRunner,
+      {} as unknown as ChatRunner,
+      noJudge,
+      recordingLogger().logger,
+      failing,
+    );
+
+    await assert.rejects(
+      () => worker.run(controller.signal),
+      /toolchain preflight failed: missing go, gcc, \/opt\/uzi-toolchain/,
+      "run() rejects with a message naming the missing tools",
+    );
+    assert.strictEqual(registered, false, "register is NEVER called when the preflight fails");
+  });
+
+  it("registers normally when the preflight passes", async () => {
+    const controller = new AbortController();
+    let registered = false;
+    const client = {
+      register: async () => {
+        registered = true;
+        return {};
+      },
+      heartbeat: async () => {},
+      claimRun: async (): Promise<ClaimResponse | null> => null,
+      claimChat: async (): Promise<ChatClaimResponse | null> => null,
+    } as unknown as WorkerClient;
+
+    const worker = new Worker(
+      fakeConfig(),
+      client,
+      { execute: async () => {} } as unknown as RunRunner,
+      {} as unknown as ChatRunner,
+      noJudge,
+      recordingLogger().logger,
+      okPreflight,
+    );
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 300 && !registered; i++) await tick();
+    assert.strictEqual(registered, true, "a passing preflight lets registration proceed");
+    controller.abort();
+    await done;
   });
 });

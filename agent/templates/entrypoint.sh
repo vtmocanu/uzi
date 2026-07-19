@@ -79,6 +79,13 @@ echo "uzi-entrypoint: A1 uid-split active (root-started) — dropping to worker 
 # the dropped WORKER keeps only the stripped root-owned PATH (below), and the full image
 # PATH is handed to the runner via UZI_RUNNER_PATH at the drop. The root window itself
 # runs on the same stripped PATH.
+#
+# PROHIBITION (PRD #92): `/opt/uzi-toolchain/bin` (the M1 stable toolchain handle) must
+# NEVER be added to the worker's stripped PATH below — it dereferences into the now
+# runner-writable `/nix` store, so putting it on the worker PATH would let a runner plant
+# a binary the PAT-holding worker resolves, piercing the PRD #51 M2-audit invariant. The
+# baked toolchain belongs ONLY on the image PATH that becomes UZI_RUNNER_PATH (handed to
+# the runner). The M3 boot preflight resolves it against UZI_RUNNER_PATH, never here.
 IMAGE_PATH="${PATH}"
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH

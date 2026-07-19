@@ -145,11 +145,30 @@ COPY agent/devbox-global/devbox.json /home/worker/.local/share/devbox/global/def
 COPY agent/devbox-global/devbox.lock /home/worker/.local/share/devbox/global/default/devbox.lock
 RUN devbox global install \
     && chown -R worker:runner /home/worker/.local/share/devbox /nix
-# Put the devbox global profile bin on the image PATH so go/python3/pip resolve for BOTH
-# the worker's provision subprocess and the agent (whose SDK PATH = runnerPath() = the
-# image PATH). A per-run `devbox shellenv` still PREPENDS run tools, so the baked set stays
-# reachable underneath. The tester confirms this dir equals `devbox global path`/.devbox/…
-ENV PATH="/home/worker/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:${PATH}"
+# PRD #92 M1: expose the realized toolchain at a STABLE, immutable path independent of
+# devbox's mutable `default` profile symlink (which advances with every image roll and
+# strands stale-seeded /nix volumes). `/opt/uzi-toolchain` is the stable, PATH-facing handle
+# (root-owned image path — deliberately NOT runner-writable); an INDIRECT nix GC root keeps
+# the seed tar carrying the profile and stops a runner-triggered `nix-collect-garbage`
+# (issue #91) from reaping it; `/etc/uzi-toolchain-profile` is the store-hash marker the
+# version-aware seed (M2) keys on to decide reseed — the STORE HASH, NOT appVersion.
+RUN PROFILE="$(readlink -f /home/worker/.local/share/devbox/global/default/.devbox/nix/profile/default)" \
+    && ln -sfn "$PROFILE" /opt/uzi-toolchain \
+    && mkdir -p /nix/var/nix/gcroots \
+    && ln -sfn /opt/uzi-toolchain /nix/var/nix/gcroots/uzi-toolchain \
+    && readlink -f /opt/uzi-toolchain > /etc/uzi-toolchain-profile \
+    && chown -R worker:runner /nix/var/nix/gcroots \
+    && chown -h worker:runner /nix/var/nix/gcroots/uzi-toolchain
+# Put the STABLE toolchain bin on the image PATH so go/python3/gcc/pip resolve for BOTH the
+# worker's provision subprocess and the agent (whose SDK PATH = runnerPath() = the image
+# PATH). Points at /opt/uzi-toolchain/bin — the immutable handle above — NOT the mutable
+# `.devbox/.../default/bin` symlink. A per-run `devbox shellenv` still PREPENDS run tools,
+# so the baked set stays reachable underneath as a durable floor.
+ENV PATH="/opt/uzi-toolchain/bin:${PATH}"
+# PRD #92 M1 fail-closed guard (the "UNVERIFIED" stanza never had one): a broken toolchain
+# fails the BUILD here (resolving against /opt/uzi-toolchain/bin) instead of shipping a
+# silent 127 to every subagent at run time.
+RUN command -v python3 go gcc pip && go version && python3 --version && gcc --version && pip --version
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.

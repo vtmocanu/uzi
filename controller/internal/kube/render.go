@@ -96,6 +96,19 @@ const (
 	// NOT /nix. Mounting it at /nix would mask the very image content the init
 	// container exists to copy: the same masking bug, one level down.
 	nixSeedMountPath = "/nix-seed"
+	// dataSeedMountPath is where the seed init container mounts the DATA PVC —
+	// deliberately NOT /data, for the same masking rationale as nixSeedMountPath:
+	// mounting at /data would mask the image path and, more to the point, the seed
+	// only needs to REACH the persisted devbox/nix provisioning state to clear it on
+	// a reseed, not to run as /data.
+	dataSeedMountPath = "/data-seed"
+
+	// toolchainProfileMarker is the image-baked toolchain-identity file (PRD #92 M1):
+	// `readlink -f /opt/uzi-toolchain`, the realized nix store profile path — the
+	// "store hash". Keying the reseed on this (NOT the image appVersion) fires a
+	// reseed only when the toolchain actually changed, preserving the warm-start cache
+	// of per-run provisioned packages the volume exists to hold.
+	toolchainProfileMarker = "/etc/uzi-toolchain-profile"
 )
 
 // The uid/gid pinning. 10001 is PRD #51 M2's `worker` uid; v1 is single-container
@@ -122,6 +135,15 @@ const (
 // into a half-seeded store, which mirrors migrate_tree's sentinel idiom already in
 // agent/templates/entrypoint.sh.
 const nixSentinel = ".uzi-nix-seeded"
+
+// nixToolchainMarker records, alongside the sentinel, the toolchain identity
+// (toolchainProfileMarker's value = the store-hash profile path) the seeded store
+// was built from. The reseed is version-aware: it skips ONLY when the sentinel AND
+// this recorded marker both exist AND match the image's current marker. A legacy
+// sentinel with NO recorded marker is therefore a MISMATCH and reseeds — which is
+// exactly how the currently-broken live worker heals on its next roll (PRD #92). An
+// "absent marker = skip" reading would silently fail that primary DoD.
+const nixToolchainMarker = ".uzi-nix-toolchain"
 
 // Container names.
 const (
@@ -486,21 +508,53 @@ func renderPVC(cfg RenderConfig, ns, id, name string, size resource.Quantity) *c
 // because unlike the two CrashLoops above it is SILENT. Verified that /bin/sh here
 // (busybox ash) both accepts pipefail and propagates it; a shell that lacked it
 // would abort under `set -e`, which fails loudly and in the safe direction.
-func nixSeedScript(src, dst string) string {
+//
+// VERSION-AWARE SKIP (PRD #92 M2). The once-only sentinel stranded every worker
+// rolled onto a toolchain-changing image: the seeded PVC kept the OLD store while
+// PATH pointed at the new profile hash, so go/python3/gcc/pip became 127. The skip
+// is now keyed on the image's baked toolchain-identity marker (markerFile =
+// /etc/uzi-toolchain-profile, the store-hash profile path): we skip ONLY when the
+// sentinel exists AND a recorded marker exists AND the image marker is non-empty AND
+// it equals the recorded one. Fresh (no sentinel) seeds; a changed marker reseeds;
+// and a LEGACY sentinel with no recorded marker reseeds — that last case is how the
+// live broken worker heals on its next roll, so "absent marker = skip" is forbidden.
+//
+// A reseed WIPES the store, so any store paths per-run provisioning realized at
+// runtime vanish — while the devbox/nix state under the data volume (profiles, GC
+// roots, generation links, HOME-derived under /data/agent-home; the E2E stub's
+// /data/provision root) survives and would dangle into the wiped store, so the next
+// `devbox install` can fail to re-realize. On the reseed body ONLY (never the skip
+// path) we therefore best-effort clear that SHARED provisioning state under dataDir
+// — never the whole data volume, never per-run SDK homes. Best-effort (|| true) so a
+// /data permission hiccup cannot strand the worker behind a failed seed; the M3 boot
+// preflight and per-run re-install are the backstop.
+func nixSeedScript(src, dst, markerFile, dataDir string) string {
+	// dataDir is compile-time in production and empty in the seed tests that don't
+	// exercise it; emit the clear only when it's set, so an empty dataDir never
+	// produces bogus /agent-home paths.
+	dataClear := ""
+	if dataDir != "" {
+		dataClear = fmt.Sprintf(`echo "uzi-seed-nix: clearing dangling shared devbox/nix provisioning state under %[1]s (reseed)"
+rm -rf %[1]s/agent-home/.local/share/devbox %[1]s/agent-home/.local/state/nix %[1]s/agent-home/.local/share/nix %[1]s/provision 2>/dev/null || true
+`, dataDir)
+	}
 	return fmt.Sprintf(`set -eu
 set -o pipefail
-if [ -f %[2]s/%[3]s ]; then
-  echo "uzi-seed-nix: store already seeded; nothing to do"
+WANT="$(cat %[3]s 2>/dev/null || true)"
+HAVE="$(cat %[2]s/%[5]s 2>/dev/null || true)"
+if [ -f %[2]s/%[4]s ] && [ -f %[2]s/%[5]s ] && [ -n "$WANT" ] && [ "$WANT" = "$HAVE" ]; then
+  echo "uzi-seed-nix: store already seeded (toolchain $WANT matches); nothing to do"
   exit 0
 fi
-echo "uzi-seed-nix: seeding the nix store from the image"
+echo "uzi-seed-nix: seeding the nix store from the image (want=$WANT have=$HAVE)"
 find %[2]s -mindepth 1 -type d -exec chmod u+w {} + 2>/dev/null || true
 find %[2]s -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-cd %[1]s
+%[6]scd %[1]s
 tar -cf - -- $(ls -A) | tar -xpf - -C %[2]s
-: > %[2]s/%[3]s
+printf '%%s' "$WANT" > %[2]s/%[5]s
+: > %[2]s/%[4]s
 echo "uzi-seed-nix: seeded"
-`, src, dst, nixSentinel)
+`, src, dst, markerFile, nixSentinel, nixToolchainMarker, dataClear)
 }
 
 // RenderDeployment builds a worker's Deployment, with the spec hash stamped in.
@@ -627,11 +681,16 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// The SAME per-template agent image as the worker, so the store it copies is
 		// the one that image was built with.
 		Image:           spec.Image,
-		Command:         []string{"/bin/sh", "-c", nixSeedScript(nixMountPath, nixSeedMountPath)},
+		Command:         []string{"/bin/sh", "-c", nixSeedScript(nixMountPath, nixSeedMountPath, toolchainProfileMarker, dataSeedMountPath)},
 		Resources:       seedResources,
 		SecurityContext: containerSecurity,
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "nix", MountPath: nixSeedMountPath},
+			// The DATA PVC too, at a NON-/data path: a reseed must clear the shared
+			// devbox/nix provisioning state persisted here or it dangles into the wiped
+			// store (PRD #92 M2). Mounted at dataSeedMountPath for the same masking
+			// rationale as the nix mount above.
+			{Name: "data", MountPath: dataSeedMountPath},
 		},
 	}}
 	workerMounts := []corev1.VolumeMount{

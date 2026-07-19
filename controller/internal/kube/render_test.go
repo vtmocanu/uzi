@@ -212,7 +212,8 @@ func TestTokenVolumeIs0440NotThe0400ThatWouldBeUnreadable(t *testing.T) {
 
 // The init container must mount the nix PVC at /nix-seed, NOT /nix — mounting it at
 // /nix masks the very image content it exists to copy. The worker mounts the same
-// PVC at /nix.
+// PVC at /nix. PRD #92 M2: it ALSO mounts the data PVC at /data-seed (NOT /data, same
+// masking rationale) so a reseed can clear the dangling shared provisioning state.
 func TestNixSeedMountsAtNixSeedNotNix(t *testing.T) {
 	dep := RenderDeployment(testConfig(), desired("abc"), testSpec(t, "base", "m"))
 	pod := dep.Spec.Template.Spec
@@ -221,11 +222,21 @@ func TestNixSeedMountsAtNixSeedNotNix(t *testing.T) {
 		t.Fatalf("%d init containers, want 1", len(pod.InitContainers))
 	}
 	init := pod.InitContainers[0]
-	if len(init.VolumeMounts) != 1 || init.VolumeMounts[0].Name != "nix" {
-		t.Fatalf("init mounts = %v, want the nix volume alone", init.VolumeMounts)
+	initMounts := map[string]string{}
+	for _, m := range init.VolumeMounts {
+		initMounts[m.Name] = m.MountPath
 	}
-	if got := init.VolumeMounts[0].MountPath; got != "/nix-seed" {
+	if got := initMounts["nix"]; got != "/nix-seed" {
 		t.Fatalf("init nix mountPath = %q, want /nix-seed (mounting at /nix masks the store being copied)", got)
+	}
+	// The data PVC at a NON-/data path: needed to clear the dangling devbox/nix
+	// provisioning state on a reseed, and at /data-seed (not /data) for the same
+	// masking reason as the nix mount.
+	if got := initMounts["data"]; got != "/data-seed" {
+		t.Fatalf("init data mountPath = %q, want /data-seed (the reseed clears dangling /data provisioning state)", got)
+	}
+	if len(init.VolumeMounts) != 2 {
+		t.Fatalf("init mounts = %v, want exactly the nix (/nix-seed) and data (/data-seed) volumes", init.VolumeMounts)
 	}
 	// The SAME per-template image as the worker, so the store it copies is the one
 	// that image was built with.
@@ -1018,11 +1029,34 @@ func containerByName(t *testing.T, cs []corev1.Container, name string) corev1.Co
 // property of the check, so it needs no kubelet.
 
 // runSeed executes the REAL script (same text, different paths) against temp dirs.
-func runSeed(t *testing.T, src, dst string) (string, error) {
+// markerFile is the image toolchain-identity marker (the /etc/uzi-toolchain-profile
+// analogue); dataDir is the reseed's data-clear target ("" to not exercise it).
+func runSeed(t *testing.T, src, dst, markerFile, dataDir string) (string, error) {
 	t.Helper()
-	cmd := exec.Command("/bin/sh", "-c", nixSeedScript(src, dst))
+	cmd := exec.Command("/bin/sh", "-c", nixSeedScript(src, dst, markerFile, dataDir))
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// markerFileWith writes an image toolchain-identity marker file holding value (the
+// store-hash profile path in production) and returns its path.
+func markerFileWith(t *testing.T, value string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "uzi-toolchain-profile")
+	if err := os.WriteFile(p, []byte(value), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// recordedMarker reads the toolchain identity the seed recorded in the PVC.
+func recordedMarker(t *testing.T, dst string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dst, nixToolchainMarker))
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func seedSource(t *testing.T) string {
@@ -1045,7 +1079,7 @@ func seeded(t *testing.T, dst string) bool {
 
 func TestSeedScriptSeedsAnEmptyVolume(t *testing.T) {
 	dst := t.TempDir()
-	if out, err := runSeed(t, seedSource(t), dst); err != nil {
+	if out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-A"), ""); err != nil {
 		t.Fatalf("seed failed: %v\n%s", err, out)
 	}
 	if !seeded(t, dst) {
@@ -1053,6 +1087,11 @@ func TestSeedScriptSeedsAnEmptyVolume(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dst, nixSentinel)); err != nil {
 		t.Fatal("the sentinel must be written after a successful copy")
+	}
+	// A fresh seed must ALSO record the image's toolchain identity, or the very next
+	// boot would read an absent marker as a mismatch and reseed on every start.
+	if got := recordedMarker(t, dst); got != "store-hash-A" {
+		t.Fatalf("the recorded toolchain marker must be written on a fresh seed, got %q", got)
 	}
 }
 
@@ -1066,7 +1105,7 @@ func TestSeedScriptStillSeedsAVolumeThatCameWithLostAndFound(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dst, "lost+found"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	out, err := runSeed(t, seedSource(t), dst)
+	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-A"), "")
 	if err != nil {
 		t.Fatalf("seed failed: %v\n%s", err, out)
 	}
@@ -1077,21 +1116,150 @@ func TestSeedScriptStillSeedsAVolumeThatCameWithLostAndFound(t *testing.T) {
 	}
 }
 
-func TestSeedScriptSkipsOnTheSentinel(t *testing.T) {
+// The skip is version-aware now: a bare sentinel is NO LONGER enough. Skip fires only
+// when the sentinel AND the recorded toolchain marker both exist AND match the image
+// marker — that is the store the running image expects, so it is never overwritten.
+func TestSeedScriptSkipsWhenTheRecordedMarkerMatches(t *testing.T) {
 	dst := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, err := runSeed(t, seedSource(t), dst)
+	if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-A"), "")
 	if err != nil {
 		t.Fatalf("seed failed: %v\n%s", err, out)
 	}
 	if seeded(t, dst) {
-		t.Fatal("a seeded volume must never be overwritten: it holds a provisioned store")
+		t.Fatal("a matching-marker volume must never be overwritten: it holds a provisioned store the image expects")
 	}
 	if !strings.Contains(out, "already seeded") {
 		t.Errorf("expected a skip, got:\n%s", out)
 	}
+}
+
+// A toolchain-changing image roll: the recorded marker no longer matches the image's
+// baked identity, so the stale store MUST be reseeded (this is the #92 bug fix). The
+// recorded marker is advanced to the new value so the next boot skips.
+func TestSeedScriptReseedsWhenTheMarkerMismatches(t *testing.T) {
+	dst := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A stale store path from the OLD image, plus the OLD recorded marker.
+	if err := os.MkdirAll(filepath.Join(dst, "store", "stale-pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-OLD"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-NEW"), "")
+	if err != nil {
+		t.Fatalf("reseed failed: %v\n%s", err, out)
+	}
+	if !seeded(t, dst) {
+		t.Fatal("a changed toolchain marker must reseed the store from the new image")
+	}
+	if _, err := os.Stat(filepath.Join(dst, "store", "stale-pkg")); err == nil {
+		t.Fatal("the stale store payload must be wiped on a reseed, not merged around")
+	}
+	if got := recordedMarker(t, dst); got != "store-hash-NEW" {
+		t.Fatalf("the recorded marker must advance to the new toolchain identity, got %q", got)
+	}
+}
+
+// THE #92 HEAL. The live broken worker was seeded by a pre-M2 image: it has a
+// sentinel but NO recorded marker. That MUST count as a mismatch and reseed — an
+// "absent marker = skip" reading would leave it stranded with a dead PATH forever.
+func TestSeedScriptReseedsALegacySentinelWithoutAMarker(t *testing.T) {
+	dst := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dst, "store", "stale-pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-NEW"), "")
+	if err != nil {
+		t.Fatalf("reseed failed: %v\n%s", err, out)
+	}
+	if !seeded(t, dst) {
+		t.Fatal("a legacy sentinel with no recorded marker must reseed — that is how the live broken worker heals")
+	}
+	if got := recordedMarker(t, dst); got != "store-hash-NEW" {
+		t.Fatalf("the reseed must record the image's toolchain identity, got %q", got)
+	}
+}
+
+// A reseed wipes the store, so the SHARED devbox/nix provisioning state persisted
+// under the data volume (HOME-derived under agent-home; the E2E stub's provision
+// root) would dangle into the wiped store and break the next `devbox install`. The
+// reseed clears exactly that state — and the SKIP path leaves it untouched.
+func TestSeedScriptClearsDanglingDataStateOnReseedOnly(t *testing.T) {
+	// The subpaths verified from agent/src (sdkHomeRoot=/data/agent-home,
+	// buildProvisionEnv HOME=that; executor.ts provisionRoot=/data/provision).
+	danglers := []string{
+		"agent-home/.local/share/devbox",
+		"agent-home/.local/state/nix",
+		"agent-home/.local/share/nix",
+		"provision",
+	}
+	seedDangling := func(dataDir string) {
+		for _, d := range danglers {
+			if err := os.MkdirAll(filepath.Join(dataDir, d, "child"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// RESEED (legacy sentinel, no marker): the dangling state is cleared.
+	t.Run("reseed clears", func(t *testing.T) {
+		dst := t.TempDir()
+		dataDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		seedDangling(dataDir)
+		// A sibling under agent-home that is NOT provisioning state must SURVIVE.
+		if err := os.MkdirAll(filepath.Join(dataDir, "agent-home", "some-run-id"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-NEW"), dataDir)
+		if err != nil {
+			t.Fatalf("reseed failed: %v\n%s", err, out)
+		}
+		for _, d := range danglers {
+			if _, err := os.Stat(filepath.Join(dataDir, d)); !os.IsNotExist(err) {
+				t.Fatalf("reseed must clear dangling provisioning state %q (err=%v)", d, err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(dataDir, "agent-home", "some-run-id")); err != nil {
+			t.Fatal("the reseed must NOT wipe per-run SDK homes, only the shared provisioning state")
+		}
+	})
+
+	// SKIP (marker matches): the data state is left entirely alone.
+	t.Run("skip leaves data untouched", func(t *testing.T) {
+		dst := t.TempDir()
+		dataDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dst, nixSentinel), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dst, nixToolchainMarker), []byte("store-hash-A"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		seedDangling(dataDir)
+		out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-A"), dataDir)
+		if err != nil {
+			t.Fatalf("seed failed: %v\n%s", err, out)
+		}
+		for _, d := range danglers {
+			if _, err := os.Stat(filepath.Join(dataDir, d)); err != nil {
+				t.Fatalf("the SKIP path must NOT touch data state, but %q is gone (err=%v)", d, err)
+			}
+		}
+	})
 }
 
 // The sentinel is written LAST, so an interrupted copy re-runs IN FULL rather than
@@ -1117,7 +1285,7 @@ func TestSeedScriptReRunsInFullOverAnInterruptedCopysReadOnlyDirs(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = os.Chmod(sealed, 0o755) }) // so t.TempDir can clean up
 
-	out, err := runSeed(t, seedSource(t), dst)
+	out, err := runSeed(t, seedSource(t), dst, markerFileWith(t, "store-hash-A"), "")
 	if err != nil {
 		t.Fatalf("an interrupted seed must re-run in full over its own read-only dirs: %v\n%s", err, out)
 	}
@@ -1143,7 +1311,7 @@ func TestSeedScriptReRunsInFullOverAnInterruptedCopysReadOnlyDirs(t *testing.T) 
 //
 // This is the failure the kind run actually produced, and no fake client could have.
 func TestSeedScriptNeverRestoresMetadataOntoTheMountRoot(t *testing.T) {
-	script := nixSeedScript("/nix", "/nix-seed")
+	script := nixSeedScript("/nix", "/nix-seed", toolchainProfileMarker, dataSeedMountPath)
 	if strings.Contains(script, "tar -cf - -C /nix .") {
 		t.Error("archiving `.` puts a `./` member in the archive, so extraction ends by chmod/utime-ing " +
 			"the destination ROOT — the kubelet's mount point, which uid 10001 does not own. It EPERMs, " +
@@ -1169,7 +1337,7 @@ func TestSeedScriptNeverRestoresMetadataOntoTheMountRoot(t *testing.T) {
 // skips seeding forever, on a store missing paths. Verified in the real image: a
 // failing producer piped to a succeeding consumer exits 0.
 func TestSeedScriptNeverWritesTheSentinelOnAProducerFailure(t *testing.T) {
-	if !strings.Contains(nixSeedScript("/nix", "/nix-seed"), "set -o pipefail") {
+	if !strings.Contains(nixSeedScript("/nix", "/nix-seed", toolchainProfileMarker, dataSeedMountPath), "set -o pipefail") {
 		t.Fatal("the seed pipeline must set pipefail: without it a producer failure that still yields a " +
 			"well-formed short archive writes the 'seeded' sentinel over a partial store, and every later " +
 			"boot skips seeding forever")
@@ -1177,7 +1345,7 @@ func TestSeedScriptNeverWritesTheSentinelOnAProducerFailure(t *testing.T) {
 
 	// Behavioural half: a source that cannot be read must NOT leave a sentinel behind.
 	dst := t.TempDir()
-	out, err := runSeed(t, filepath.Join(t.TempDir(), "does-not-exist"), dst)
+	out, err := runSeed(t, filepath.Join(t.TempDir(), "does-not-exist"), dst, markerFileWith(t, "store-hash-A"), "")
 	if err == nil {
 		t.Fatalf("seeding from a missing source must fail loudly, got success:\n%s", out)
 	}
@@ -1190,7 +1358,7 @@ func TestSeedScriptNeverWritesTheSentinelOnAProducerFailure(t *testing.T) {
 // BUSYBOX (the image installs no coreutils), so its -a behaviour on read-only dirs
 // and hardlinks is exactly what must not be assumed.
 func TestSeedScriptUsesTarNotCp(t *testing.T) {
-	script := nixSeedScript("/nix", "/nix-seed")
+	script := nixSeedScript("/nix", "/nix-seed", toolchainProfileMarker, dataSeedMountPath)
 	if !strings.Contains(script, "tar -cf -") {
 		t.Error("the seed must stream through tar")
 	}
@@ -1206,7 +1374,13 @@ func TestSeedScriptUsesTarNotCp(t *testing.T) {
 		t.Error("idempotence must be a POSITIVE sentinel, never an emptiness check: a fresh ext4 PVC carries lost+found, " +
 			"so an emptiness check passes on kind's local-path provisioner and strands every worker on dev-cluster")
 	}
-	if !strings.Contains(script, "if [ -f /nix-seed/"+nixSentinel+" ]") {
-		t.Error("the skip must be decided by the sentinel file")
+	// The skip gate is version-aware now (PRD #92 M2): it is decided by the sentinel
+	// AND a recorded toolchain marker that MATCHES the image marker — never a bare
+	// sentinel and never an emptiness check. Assert the new gate shape.
+	if !strings.Contains(script, "if [ -f /nix-seed/"+nixSentinel+" ] && [ -f /nix-seed/"+nixToolchainMarker+" ]") {
+		t.Error("the skip must require BOTH the sentinel and the recorded toolchain marker")
+	}
+	if !strings.Contains(script, `[ "$WANT" = "$HAVE" ]`) {
+		t.Error("the skip must additionally require the recorded marker to MATCH the image marker, or a stale store is never reseeded")
 	}
 }
