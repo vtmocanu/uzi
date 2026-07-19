@@ -68,7 +68,9 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
     expect((await api.provisionHostedWorker("base", "s")).worker.name).toBe("base (S)");
-    expect((await api.provisionHostedWorker("jvm", "m", "  ")).worker.name).toBe("jvm (M)");
+    // docker=false, then a WHITESPACE name (4th arg) → still derived. The name arg
+    // moved behind docker (PRD #83 M3), so it is passed positionally here.
+    expect((await api.provisionHostedWorker("jvm", "m", false, "  ")).worker.name).toBe("jvm (M)");
   });
 
   it("marks every seeded hand-run worker external, so the badge means something", async () => {
