@@ -476,6 +476,33 @@ export interface CreateProposalRequest {
   labels: string[];
 }
 
+/** Request body for POST /api/worker/runs/:id/memory (PRD #90). The server derives
+ *  (user_id, repo_id) from the run claim — the worker NEVER sends them (its join
+ *  token is not user-scoped). Caps (title ≤200 chars, body ≤2048 bytes, ≤5 writes/
+ *  run) are enforced server-side; the tool schema mirrors them client-side. */
+export interface SaveMemoryRequest {
+  title: string;
+  body: string;
+}
+
+/** One cross-run memory entry (PRD #90). The write endpoint returns id/title/body/
+ *  created_at; the read endpoint also carries run_id provenance. */
+export interface MemoryEntry {
+  id: string;
+  title: string;
+  body: string;
+  /** Provenance: the run that saved it. Present on the read surface, absent on the
+   *  write response. */
+  run_id?: string;
+  created_at: string;
+}
+
+/** Response for GET /api/worker/runs/:id/memory (PRD #90): the run's (user, repo)
+ *  memory, newest first. UNTRUSTED — composed into the lead prompt nonce-fenced. */
+export interface MemoryListResponse {
+  memories?: MemoryEntry[];
+}
+
 /** One appended message; the server is idempotent on (run_id, seq). */
 export interface OutgoingMessage {
   seq: number;

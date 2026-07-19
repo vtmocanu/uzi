@@ -13,6 +13,7 @@ import type {
   ForgeConnection,
   IssueProposal,
   LatestRun,
+  Memory,
   MyRateLimits,
   RateLimitSource,
   RecommendationCategory,
@@ -1697,6 +1698,45 @@ export const mockCliTokens: (CliToken & { user_id: string })[] = [
     last_used_at: daysAgo(58),
     last_used_ip: "198.51.100.3",
     expires_at: null,
+  },
+];
+
+// ── Agent memory (PRD #90) ────────────────────────────────────────────────
+// Seed cross-run learnings across TWO repos so the Settings → Memory tab shows
+// its group-by-repo layout, plus a second repo with one entry. Each row carries a
+// user_id so the mock filters by session user (the wire Memory type has none — the
+// server owner-scopes it — so it lives only on the fixture and mockApi strips it).
+// Attributed to the admin persona so logging in as the demo admin shows them.
+export const mockMemories: (Memory & { user_id: string })[] = [
+  {
+    id: "mem-1",
+    user_id: mockAdmin.id,
+    repo_id: "repo-uzi",
+    repo_name: "vtmocanu/uzi",
+    title: "Worker image bakes the gcc toolchain since 0.8.3",
+    body: "Building the api no longer needs an apt-get for build-essential — the worker chart 0.8.3 bakes gcc/g++/make. Skip the toolchain-install step; it just wastes a couple of minutes.",
+    run_id: "e2d7427b",
+    created_at: minsAgo(30),
+  },
+  {
+    id: "mem-2",
+    user_id: mockAdmin.id,
+    repo_id: "repo-uzi",
+    repo_name: "vtmocanu/uzi",
+    title: "sqlc must be regenerated after touching queries/",
+    body: "After editing internal/store/migrations or queries/, run the pinned `sqlc generate` before `go build` — otherwise the generated code and the schema drift and the build fails on a missing method.",
+    run_id: "a1f09c34",
+    created_at: daysAgo(2),
+  },
+  {
+    id: "mem-3",
+    user_id: mockAdmin.id,
+    repo_id: "repo-atlas",
+    repo_name: "vtmocanu/atlas-api",
+    title: "Integration tests need POSTGRES_DSN pointed at the throwaway db",
+    body: "The atlas integration suite reads POSTGRES_DSN; without it the tests silently skip. Point it at the ephemeral compose db, not the dev one, or you'll clobber local fixtures.",
+    run_id: "b7734de1",
+    created_at: daysAgo(5),
   },
 ];
 

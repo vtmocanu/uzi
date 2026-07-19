@@ -561,6 +561,25 @@ export interface CliAuthRequestMeta {
   expires_at: string;
 }
 
+// ── Agent memory (PRD #90) ────────────────────────────────────────────────
+// A durable per-(user, repo) learning an agent saved on a prior run, read back
+// into a future run as inert, nonce-fenced, advisory context. The webui surfaces
+// it because the owner's ability to SEE and PURGE a (possibly poisoned) entry is
+// a security control, not a nicety: a bad entry can outlive the repo injection
+// that planted it. The server derives (user_id, repo_id) from the run claim on
+// write and owner-scopes every read/delete — the client never sends identity.
+// repo_name is the human path (e.g. "vtmocanu/uzi") the list groups by; run_id is
+// the provenance run that wrote the entry.
+export interface Memory {
+  id: string;
+  repo_id: string;
+  repo_name: string;
+  title: string;
+  body: string;
+  run_id: string;
+  created_at: string;
+}
+
 // ── Agent runtime (PRD #4) ────────────────────────────────────────────────
 
 export interface Worker {
@@ -1551,6 +1570,13 @@ const realApi = {
     }),
   denyCliAuth: (requestId: string) =>
     request<{ status: string }>("POST", "/auth/cli/deny", { request_id: requestId }),
+
+  // ── Agent memory (PRD #90 M6) — cookie-only, owner-scoped ──────────────────
+  // list is newest-first across all the caller's repos (the component groups by
+  // repo_name); delete is a single owner-scoped purge. The server derives the
+  // owner from the session, so neither call carries a user_id.
+  listMemory: () => request<{ memories: Memory[] }>("GET", "/me/memory"),
+  deleteMemory: (id: string) => request<null>("DELETE", `/me/memory/${id}`),
 };
 
 // The one client the app talks to. `mockApi` implements the identical surface

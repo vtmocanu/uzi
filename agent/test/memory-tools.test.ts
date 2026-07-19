@@ -1,0 +1,140 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
+  makeMemoryToolHandlers,
+  buildMemoryServer,
+  memoryToolNames,
+  MEMORY_SERVER_NAME,
+  MEMORY_TITLE_MAX_CHARS,
+  MEMORY_BODY_MAX_BYTES,
+} from "../src/memory-tools.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
+import type { MemoryEntry, SaveMemoryRequest } from "../src/protocol.js";
+import { nullLogger } from "./helpers.js";
+
+// save_memory is exercised through its raw handler (makeMemoryToolHandlers) with a
+// fake WorkerClient — no live SDK, no HTTP. Proves: a valid call POSTs the trimmed
+// {title, body} for the CURRENT run id; the size caps are enforced CLIENT-side (a
+// clear tool error, never a throw, and no network call); and a 429/409/400 from the
+// server is surfaced as a concise NON-FATAL tool message (PRD #90 M2).
+
+interface Calls {
+  saveMemory: Array<{ runId: string; body: SaveMemoryRequest }>;
+}
+function fakeClient(over: { entry?: MemoryEntry; throws?: unknown } = {}): { client: WorkerClient; calls: Calls } {
+  const calls: Calls = { saveMemory: [] };
+  const client = {
+    async saveMemory(runId: string, body: SaveMemoryRequest): Promise<MemoryEntry> {
+      calls.saveMemory.push({ runId, body });
+      if (over.throws) throw over.throws;
+      return (
+        over.entry ?? {
+          id: "mem-1",
+          title: body.title,
+          body: body.body,
+          created_at: "2026-07-19T00:00:00Z",
+        }
+      );
+    },
+  } as unknown as WorkerClient;
+  return { client, calls };
+}
+
+function handlers(client: WorkerClient, runId = "run-current") {
+  return makeMemoryToolHandlers({ client, runId, log: nullLogger() });
+}
+const bodyText = (r: { content: { text: string }[] }): string => r.content[0]!.text;
+
+describe("save_memory handler (PRD #90 M2)", () => {
+  it("POSTs the trimmed {title, body} for the CURRENT run id and confirms", async () => {
+    const { client, calls } = fakeClient({
+      entry: { id: "mem-9", title: "gcc baked in", body: "no build-essential needed", created_at: "2026-07-19T00:00:00Z" },
+    });
+    const res = await handlers(client, "run-current").saveMemory({ title: "  gcc baked in  ", body: "no build-essential needed" });
+    assert.strictEqual(calls.saveMemory.length, 1);
+    assert.deepStrictEqual(calls.saveMemory[0], {
+      runId: "run-current",
+      body: { title: "gcc baked in", body: "no build-essential needed" },
+    });
+    assert.notStrictEqual(res.isError, true);
+    assert.match(bodyText(res), /Saved cross-run memory "gcc baked in"/);
+    assert.match(bodyText(res), /mem-9/);
+    assert.match(bodyText(res), /advisory/i);
+  });
+
+  it("rejects an empty title/body client-side with a tool error and NO network call", async () => {
+    const { client, calls } = fakeClient();
+    const noTitle = await handlers(client).saveMemory({ title: "   ", body: "x" });
+    assert.strictEqual(noTitle.isError, true);
+    assert.match(bodyText(noTitle), /non-empty title/);
+    const noBody = await handlers(client).saveMemory({ title: "t", body: "   " });
+    assert.strictEqual(noBody.isError, true);
+    assert.match(bodyText(noBody), /non-empty body/);
+    assert.strictEqual(calls.saveMemory.length, 0, "no POST on a client-side rejection");
+  });
+
+  it("rejects an over-cap title client-side (mirror of the server cap) with NO network call", async () => {
+    const { client, calls } = fakeClient();
+    const res = await handlers(client).saveMemory({ title: "T".repeat(MEMORY_TITLE_MAX_CHARS + 1), body: "b" });
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /title is too long/);
+    assert.strictEqual(calls.saveMemory.length, 0);
+  });
+
+  it("rejects an over-cap body by BYTES, not chars (multi-byte counts), with NO network call", async () => {
+    const { client, calls } = fakeClient();
+    // A 1025-char string of a 2-byte code point = 2050 bytes > 2048, but only 1025
+    // chars — proves the cap is byte-measured, not char-measured.
+    const body = "é".repeat(1025);
+    assert.ok(body.length <= MEMORY_BODY_MAX_BYTES, "under the byte cap by char count");
+    assert.ok(Buffer.byteLength(body, "utf8") > MEMORY_BODY_MAX_BYTES, "over the byte cap by byte count");
+    const res = await handlers(client).saveMemory({ title: "t", body });
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /body is too long/);
+    assert.strictEqual(calls.saveMemory.length, 0);
+  });
+
+  it("surfaces the per-run write cap (429) as a concise, non-fatal tool message", async () => {
+    const { client } = fakeClient({ throws: new RequestError("POST", "/x", 429, "write cap reached") });
+    const res = await handlers(client).saveMemory({ title: "t", body: "b" });
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /reached its save_memory limit/);
+    assert.match(bodyText(res), /Do not retry/i);
+  });
+
+  it("surfaces a repo-less run (409) as a non-fatal tool message", async () => {
+    const { client } = fakeClient({ throws: new RequestError("POST", "/x", 409, "run has no repo") });
+    const res = await handlers(client).saveMemory({ title: "t", body: "b" });
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /not associated with a repository/);
+  });
+
+  it("surfaces a server 400 (empty/oversize) as a non-fatal tool message carrying the server body", async () => {
+    const { client } = fakeClient({ throws: new RequestError("POST", "/x", 400, "title too long") });
+    const res = await handlers(client).saveMemory({ title: "t", body: "b" });
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /Memory not saved: title too long/);
+  });
+
+  it("never throws on a transport error — returns a non-fatal message so the run continues", async () => {
+    const { client } = fakeClient({ throws: new Error("network down") });
+    const res = await handlers(client).saveMemory({ title: "t", body: "b" });
+    assert.strictEqual(res.isError, true);
+    assert.match(bodyText(res), /network down/);
+  });
+});
+
+describe("save_memory wiring", () => {
+  it("exposes the qualified tool name under the `memory` server (mcp__memory__save_memory)", () => {
+    assert.strictEqual(MEMORY_SERVER_NAME, "memory");
+    assert.deepStrictEqual(memoryToolNames(), ["mcp__memory__save_memory"]);
+  });
+
+  it("buildMemoryServer returns the server, tool names, and handlers over the same deps", () => {
+    const { client } = fakeClient();
+    const built = buildMemoryServer({ client, runId: "run-current", log: nullLogger() });
+    assert.ok(built.server, "an MCP server config is returned");
+    assert.deepStrictEqual(built.toolNames, ["mcp__memory__save_memory"]);
+    assert.strictEqual(typeof built.handlers.saveMemory, "function");
+  });
+});

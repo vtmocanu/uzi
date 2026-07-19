@@ -548,3 +548,46 @@ describe("buildPathGuardHook", () => {
     assert.deepStrictEqual(await hook(pathInput("Bash", { command: "cat /proc/1/environ" })), {});
   });
 });
+
+// PRD #90 M2 (the load-bearing regression): agent memory is now written via the
+// save_memory MCP tool (a network custom tool, NOT a file write), so the file-tool
+// path guard needed NO carve-out and MUST remain a hard "deny everything outside the
+// worktree". This asserts that guarantee directly — a Write AND an Edit to a path
+// OUTSIDE the worktree is still denied with the outside-worktree reason. If a future
+// change ever loosened the guard to admit an out-of-worktree memory file, this fails.
+describe("file-tool path guard is UNCHANGED by agent memory (PRD #90 M2)", () => {
+  const hook = buildPathGuardHook(WT, nullLogger());
+  const OUTSIDE = /outside the run worktree/;
+  // Plausible out-of-worktree "memory" targets a shaped lead might try (the
+  // ephemeral per-run agent-home + a data-volume sibling that would survive).
+  const outsideTargets = [
+    "/data/agent-home/memory.md",
+    "/data/agent-home/run-1/memory/notes.txt",
+    "../agent-home/memory.md",
+    "/tmp/agent-memory.json",
+  ];
+
+  it("screenToolPath still denies out-of-worktree Write/Edit targets with the outside-worktree reason", () => {
+    for (const p of outsideTargets) {
+      const r = screenToolPath(p, WT, WT);
+      assert.strictEqual(r.denied, true, `expected deny for ${p}`);
+      assert.match(r.reason ?? "", OUTSIDE, `expected the outside-worktree reason for ${p}`);
+    }
+  });
+
+  for (const tool of ["Write", "Edit"] as const) {
+    it(`the path-guard hook denies a ${tool} outside the worktree with the outside-worktree reason`, async () => {
+      for (const p of outsideTargets) {
+        const out = await hook(pathInput(tool, { file_path: p }));
+        const hso = (out as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } }).hookSpecificOutput;
+        assert.strictEqual(hso?.permissionDecision, "deny", `expected ${tool} deny for ${p}`);
+        assert.match(hso?.permissionDecisionReason ?? "", OUTSIDE, `expected the outside-worktree reason for ${tool} ${p}`);
+      }
+    });
+  }
+
+  it("still allows an in-worktree Write/Edit (the guard did not over-tighten either)", async () => {
+    assert.deepStrictEqual(await hook(pathInput("Write", { file_path: "src/notes.ts" })), {});
+    assert.deepStrictEqual(await hook(pathInput("Edit", { file_path: "/work/wt/src/notes.ts" })), {});
+  });
+});

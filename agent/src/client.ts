@@ -19,6 +19,9 @@ import {
   type JudgeTraceResponse,
   type ReviewRequest,
   type WorkerStats,
+  type SaveMemoryRequest,
+  type MemoryEntry,
+  type MemoryListResponse,
 } from "./protocol.js";
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
@@ -216,6 +219,28 @@ export class WorkerClient {
       proposal: WorkerProposal;
     };
     return res.proposal;
+  }
+
+  // ── Cross-run agent memory (PRD #90) ───────────────────────────────────────
+  // Per-(user, repo), server-derived from the run claim. The worker NEVER sends
+  // user/repo ids (its join token is not user-scoped). save_memory is the WRITE
+  // seam the lead's in-process MCP tool calls; getMemory is the READ seam the
+  // runner composes into the lead's plan prompt as inert, nonce-fenced context.
+
+  /** Persist a cross-run learning for this run's (user, repo) (POST /worker/runs/:id/
+   *  memory). Returns the stored entry. Errors are meaningful: 409 (repo-less run),
+   *  400 (empty/oversize), 429 (per-run write cap) — the caller surfaces each as a
+   *  non-fatal tool message. */
+  async saveMemory(runId: string, body: SaveMemoryRequest): Promise<MemoryEntry> {
+    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/memory`, body)) as MemoryEntry;
+  }
+
+  /** Fetch this run's (user, repo) memory, newest first (GET /worker/runs/:id/
+   *  memory). Returned entries are UNTRUSTED — the runner wraps them in a nonce
+   *  fence before they reach the lead. */
+  async getMemory(runId: string): Promise<MemoryEntry[]> {
+    const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/memory`)) as MemoryListResponse;
+    return res.memories ?? [];
   }
 
   /** A 409, or a 4xx body mentioning "terminal", means the server already
