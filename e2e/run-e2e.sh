@@ -2660,8 +2660,26 @@ if [ -n "$DOCKER_PROFILE" ]; then
   runnerdk docker run --rm "$DIMG" echo dind-run-ok 2>/dev/null | grep -q dind-run-ok \
     || fail "the runner uid (10002) could not run a container via the sidecar"
   pass "the runner uid runs a container through the sidecar (the agent's real docker path)"
-  rootdk sh -c 'set -e; d=$(mktemp -d); printf "services:\n  toy:\n    image: '"$DIMG"'\n    command: [\"echo\",\"compose-ok\"]\n" > "$d/compose.yaml"; docker compose -f "$d/compose.yaml" up --abort-on-container-exit --exit-code-from toy' 2>/dev/null | grep -q compose-ok \
-    || fail "a toy 'docker compose up' did not run through the sidecar (compose v2 client-side)"
+  # Warm-up: pay the compose PLUGIN's cold-start (plugin load) before the timed
+  # assertion. Cheap and client-side; orthogonal to the DAEMON's own cold path (first
+  # network-create), which the retry below absorbs.
+  rootdk docker compose version >/dev/null 2>&1 || true
+  # The toy `docker compose up`, with a BOUNDED RETRY. On a cold rootless daemon the
+  # FIRST compose invocation is transiently flaky (network create / compose-plugin
+  # cold-start) — diagnosed live: the exact command passes once the daemon is warm, and
+  # the full Decision-3 attack matrix below is clean. The old single attempt buried its
+  # stderr under `2>/dev/null`, so a failure was a black box. Capture COMBINED output,
+  # retry up to 3x (~2s apart), and on the FINAL failure surface a tail so the next real
+  # breakage is diagnosable instead of silent.
+  toy_compose='set -e; d=$(mktemp -d); printf "services:\n  toy:\n    image: '"$DIMG"'\n    command: [\"echo\",\"compose-ok\"]\n" > "$d/compose.yaml"; docker compose -f "$d/compose.yaml" up --abort-on-container-exit --exit-code-from toy'
+  tc_ok=""; tc_out=""
+  for tc_try in 1 2 3; do
+    tc_out="$(rootdk sh -c "$toy_compose" 2>&1 || true)"
+    if printf '%s' "$tc_out" | grep -q compose-ok; then tc_ok=1; break; fi
+    if [ "$tc_try" -lt 3 ]; then sleep 2; fi
+  done
+  [ -n "$tc_ok" ] || fail "a toy 'docker compose up' did not run through the sidecar (compose v2 client-side) after 3 attempts. Last output tail:
+$(printf '%s' "$tc_out" | tail -n 15)"
   pass "a toy 'docker compose up' runs through the sidecar (docker compose v2)"
 
   # (b) LIVE Decision-3 efficacy (deferred from M1, no daemon existed there).
