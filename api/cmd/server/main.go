@@ -47,6 +47,12 @@ import (
 	"gitlab.example.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=vX.Y.Z" (the api
+// Dockerfile does this from the release git tag; Model B == chart appVersion ==
+// image tag). Unset on a plain local `go build`, so it defaults to "dev" and is
+// served that way at GET /api/version.
+var version = "dev"
+
 func main() {
 	// -health is a shell-free container healthcheck: the distroless runtime
 	// image has no wget/curl, so the binary probes itself.
@@ -488,6 +494,7 @@ func run() error {
 	// uzi login never trips its own limit — which the shared 10/min authLimiter would.
 	cliPollLimiter := mw.NewLimiter(cfg.CLIPollRateLimitMax, cfg.CLIPollRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	h.SetVersion(version)
 	// The settings PUT handler asks the poller to full-sync every repo when a label
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
 	// the signal target is the handler.

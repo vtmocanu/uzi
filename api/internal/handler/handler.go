@@ -93,6 +93,11 @@ type Handler struct {
 	// disabled, or a test handler) — the token still lands, just polled on the next
 	// tick.
 	usagePoker UsagePoker
+	// version is the server build version, stamped into cmd/server via ldflags
+	// (Model B: == the release git tag) and served unauthenticated at GET
+	// /api/version so the SPA footer and the uzi CLI report one coordinate. Defaults
+	// to "dev" on an un-stamped local/compose build. Set via SetVersion.
+	version string
 }
 
 // UsagePoker is the slice of the rate-limit poller the token-save handler needs
@@ -175,7 +180,16 @@ type Reconciler interface {
 
 // New constructs a Handler.
 func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox.Box, svc *forgesvc.Service, wsvc *workersvc.Service, pcheck *privcheck.Service, h *hub.Hub, set *settings.Cache) *Handler {
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set}
+	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, version: "dev"}
+}
+
+// SetVersion stamps the server build version served at GET /api/version. Called
+// once in main with the ldflags-injected value; an empty value leaves the "dev"
+// default untouched (a local/compose build).
+func (h *Handler) SetVersion(v string) {
+	if v != "" {
+		h.version = v
+	}
 }
 
 // SetReconciler wires the poller's force-reconcile signal in after construction,
@@ -226,6 +240,13 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// Version reports the server build version (Model B: the release git tag),
+// stamped via ldflags and defaulting to "dev" on a local build. Unauthenticated
+// like Health — the SPA footer reads it, and it carries no secret.
+func (h *Handler) Version(w http.ResponseWriter, r *http.Request) {
+	httpx.JSON(w, http.StatusOK, map[string]string{"version": h.version})
+}
+
 // Routes builds the API router. authLimiter is applied per-route to the
 // register and login endpoints; forgeLimiter is a per-user budget on the
 // forge-proxying endpoints (verify/projects/sync/move) so one user cannot
@@ -243,6 +264,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", h.Health)
+		r.Get("/version", h.Version)
 
 		r.Route("/auth", func(r chi.Router) {
 			r.With(authLimiter.Middleware).Post("/register", h.Register)

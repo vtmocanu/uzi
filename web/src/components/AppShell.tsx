@@ -42,6 +42,31 @@ import {
 // localStorage key for the desktop sidebar's collapsed state (per browser).
 const SIDEBAR_COLLAPSED_KEY = "uzi.sidebar.collapsed";
 
+// The server build version, fetched once and shared. Memoised at module scope so
+// the two SidebarContent mounts (desktop rail + mobile drawer) and any remount
+// reuse a single unauthenticated GET /api/version. A failed fetch resolves to ""
+// (rendered as nothing), never a thrown error in the shell.
+let versionPromise: Promise<string> | null = null;
+function useAppVersion(): string | null {
+  const [version, setVersion] = useState<string | null>(null);
+  useEffect(() => {
+    if (!versionPromise) {
+      versionPromise = api
+        .version()
+        .then((r) => r.version)
+        .catch(() => "");
+    }
+    let live = true;
+    versionPromise.then((v) => {
+      if (live) setVersion(v || null);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return version;
+}
+
 function isNavActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(href + "/");
 }
@@ -167,6 +192,7 @@ function SidebarContent({
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const version = useAppVersion();
   const [repos, setRepos] = useState<Repo[]>([]);
   // connection_id → forge_type, joined web-side so board entries can show a forge
   // glyph (the Repo DTO has no forge_type). Kept separate from repos so a failed
@@ -399,6 +425,29 @@ function SidebarContent({
               <SidebarRateLimits />
             </div>
           ))}
+
+        {/* Server build version (GET /api/version). The API returns the bare
+            Model-B coordinate (e.g. "0.6.0", == image tag / chart appVersion) or
+            "dev"/"demo"; we prefix a display "v" only for a numeric version so it
+            reads "v0.6.0" while "dev"/"demo" stay as-is (never "vdev"). aria-label
+            makes it self-describing for AT; title carries the full string when the
+            collapsed rail truncates it. */}
+        {version &&
+          (() => {
+            const label = /^\d/.test(version) ? `v${version}` : version;
+            return (
+              <div
+                title={`uzi ${label}`}
+                aria-label={`uzi version ${label}`}
+                className={cx(
+                  "border-t border-edge text-faint",
+                  collapsed ? "px-1 py-1.5 text-center text-[9px]" : "px-3 py-1.5 text-[10px]",
+                )}
+              >
+                <span className="block truncate">{label}</span>
+              </div>
+            );
+          })()}
       </div>
     </div>
   );

@@ -24,6 +24,11 @@ vi.mock("../lib/api", () => ({
     // The sidebar-footer rate-limit micro-meters (PRD #53) self-gate: default to
     // no_token so they render nothing in these nav/collapse assertions.
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
+    // The sidebar-footer version line fetches GET /api/version on mount; resolve it
+    // so the shared module-level promise settles instead of throwing on an undefined
+    // mock. Bare (no leading v) so the "renders" test below can assert the UI adds
+    // the display "v" prefix.
+    version: vi.fn().mockResolvedValue({ version: "9.9.9-test" }),
   },
 }));
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
@@ -160,6 +165,15 @@ describe("AppShell navigation", () => {
 
     // Decision 3: Forge is reachable only under Settings, never as its own entry.
     expect(screen.queryByRole("link", { name: "Forge" })).toBeNull();
+  });
+
+  it("shows the server build version (GET /api/version) in the sidebar footer", async () => {
+    renderShell("/dashboard");
+    // Rendered verbatim from the endpoint; desktop shell is expanded by default.
+    // (version() is memoised at module scope, so we assert the rendered text rather
+    // than the call count, which is order-dependent across tests in this file.)
+    // Mock returns bare "9.9.9-test"; the footer prefixes a display "v".
+    expect(await screen.findByText("v9.9.9-test")).toBeTruthy();
   });
 
   it("still renders board children (with the fallback icon) when the connections join fails", async () => {
