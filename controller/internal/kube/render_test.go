@@ -875,6 +875,48 @@ func TestDockerWorkerSharesTheRunWorkdirWithDindButNotSecrets(t *testing.T) {
 	}
 }
 
+// TMPDIR under the shared run workdir (PRD #89 0.8.1), docker workers ONLY. A tool that
+// stages a `docker run -v <src>` bind source under $TMPDIR (uzi's own e2e defaults its
+// run dir to ${TMPDIR:-/tmp}) needs <src> to resolve in the DAEMON's filesystem; the
+// daemon shares only dindWorkdirDir with the worker, so tmp must live under it. A plain
+// worker gets no TMPDIR (docker-only, so its spec/hash is untouched).
+func TestDockerWorkerTMPDIRUnderSharedWorkdirAndPlainHasNone(t *testing.T) {
+	envValue := func(c corev1.Container, name string) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == name {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	for _, p := range dindPostures() {
+		t.Run(p.name, func(t *testing.T) {
+			dep := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
+			worker := containerByName(t, dep.Spec.Template.Spec.Containers, workerContainerName)
+
+			tmp, ok := envValue(worker, "TMPDIR")
+			if !ok {
+				t.Fatal("a docker worker must set TMPDIR so tmp-staged bind sources land in the dind-visible shared workdir")
+			}
+			if tmp != dindWorkdirDir {
+				t.Errorf("TMPDIR = %q, want %q (the shared run workdir the dind sidecar also mounts)", tmp, dindWorkdirDir)
+			}
+			// TMPDIR must resolve inside the shared workdir mount, or a bind source under it
+			// is invisible to the daemon.
+			if mountPath(worker, dindWorkdirVolume) != dindWorkdirDir {
+				t.Errorf("TMPDIR %q is not covered by the shared workdir mount %q", tmp, dindWorkdirDir)
+			}
+		})
+	}
+
+	// A PLAIN worker never gets TMPDIR (docker-only; keeps its hash stable).
+	plain := RenderDeployment(dockerTestConfig(), desired("abc"), testSpec(t, "base", "m"))
+	pw := containerByName(t, plain.Spec.Template.Spec.Containers, workerContainerName)
+	if _, ok := envValue(pw, "TMPDIR"); ok {
+		t.Error("a plain worker must not set TMPDIR (docker-only env; setting it would change the plain worker's spec hash)")
+	}
+}
+
 // Soft anti-affinity (PRD #89 mitigation #3): a docker worker prefers to avoid nodes
 // running the crown-jewel pods (the api holding UZI_SECRET_KEY + CNPG). PREFERRED, not
 // required (it must never wedge scheduling), node-scoped, cross-namespace. A plain

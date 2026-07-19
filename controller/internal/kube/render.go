@@ -545,6 +545,22 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			host = dindLoopbackTCP
 		}
 		env = append(env, corev1.EnvVar{Name: "DOCKER_HOST", Value: host})
+
+		// TMPDIR into the shared run workdir (M-workdir), docker workers ONLY. A tool that
+		// stages a `docker run -v <src>:/x` / compose bind source under $TMPDIR (uzi's own
+		// e2e defaults its run dir to ${TMPDIR:-/tmp}/uzi-e2e-$$) needs <src> to resolve in
+		// the DAEMON's filesystem, not the worker's — otherwise the bind source is an empty
+		// dir in the daemon and the run silently sees nothing. The daemon shares only
+		// dindWorkdirDir with the worker, so tmp MUST live under it. Point it at the mount
+		// root directly: the emptyDir mount point always exists and is writable by fsGroup
+		// 10001 (no subdir to create, no agent/entrypoint change).
+		//
+		// NO secret transits here (Decision 3 holds): the PAT is env-scoped not on disk,
+		// per-run secrets have their own volume, and the join token is its own mount — none
+		// of them route through $TMPDIR. The daemon can already read this dir (it is shared
+		// by design), so tmp being dind-visible adds no exposure beyond the checkout that
+		// M-workdir already shares.
+		env = append(env, corev1.EnvVar{Name: "TMPDIR", Value: dindWorkdirDir})
 	}
 
 	containerSecurity := &corev1.SecurityContext{
