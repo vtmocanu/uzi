@@ -317,16 +317,35 @@ export const mockReviews: MockReview[] = [
         confidence: "low",
         created_at: minsAgo(6),
       },
+      {
+        // Already filed with a RECENT link — the non-stale state C variant on load.
+        id: "rec-4",
+        category: "add_agent",
+        target: "deploy-agent",
+        rationale_md:
+          "No agent owns the deploy step, so the run hand-rolled it; a dedicated deploy-agent would standardize it.",
+        confidence: "medium",
+        created_at: minsAgo(6),
+      },
     ],
-    // rec-1's coordinate is already filed, so the demo shows the filed row (mock state C)
-    // on that recommendation and the idle File-issue button (mock A) on the other two.
+    // Two seeded links so both state-C variants render on load: rec-1's filed_at is OLDER
+    // than the review's updated_at (minsAgo(6)) → the STALE variant ("filed for an earlier
+    // version"); rec-4's is NEWER → the plain filed row. The idle button (mock A) shows on
+    // rec-2/rec-3.
     filed_issues: [
       {
         category: "install_worker_tool",
         target: "shellcheck",
         issue_iid: 71,
         issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/71",
-        filed_at: minsAgo(3),
+        filed_at: minsAgo(20),
+      },
+      {
+        category: "add_agent",
+        target: "deploy-agent",
+        issue_iid: 72,
+        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/72",
+        filed_at: minsAgo(2),
       },
     ],
   },

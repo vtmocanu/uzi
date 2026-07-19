@@ -589,6 +589,16 @@ function FollowUpComposer({
 // self_improve run never has a review, so the panel is hidden for those kinds.
 const JUDGE_ELIGIBLE_KINDS = new Set(["issue", "ci_fix"]);
 
+// coordKey is the SINGLE source of truth for the (category, target) key that matches a
+// recommendation to its filed link (PRD #68). It MUST be used at both the build and the
+// lookup site — a separator mismatch silently drops a persisted filed link back to the
+// idle "File issue" button (the row 409s on Create, the stale flag never fires). category
+// is a fixed enum with no spaces, so a single space cleanly separates it from the
+// arbitrary target.
+function coordKey(category: string, target: string): string {
+  return `${category} ${target}`;
+}
+
 // JudgePanel is the run retrospective (PRD #46 M4): the LLM judge's verdict +
 // structured recommendations, plus the "re-run judge" action. It fetches its own
 // review (owner-or-admin scoped server-side) and, after a re-run, polls a bounded
@@ -654,7 +664,7 @@ export function JudgePanel({ run }: { run: Run }) {
   // link table uses — so re-judged siblings that collapse to one coordinate all resolve.
   const filedByCoord = useMemo(() => {
     const m = new Map<string, FiledIssue>();
-    for (const f of review?.filed_issues ?? []) m.set(`${f.category} ${f.target}`, f);
+    for (const f of review?.filed_issues ?? []) m.set(coordKey(f.category, f.target), f);
     return m;
   }, [review]);
 
@@ -761,7 +771,7 @@ export function JudgePanel({ run }: { run: Run }) {
                   <RecommendationFiler
                     runId={run.id}
                     rec={rec}
-                    filed={filedByCoord.get(`${rec.category} ${rec.target}`)}
+                    filed={filedByCoord.get(coordKey(rec.category, rec.target))}
                     reviewUpdatedAt={review.updated_at}
                     repos={repos}
                   />
@@ -901,13 +911,35 @@ function RecommendationFiler({
       </div>
 
       <div className="space-y-3 px-3 py-3">
-        {loadingDraft && <p className="text-sm text-faint">Loading draft…</p>}
+        {loadingDraft && (
+          <p role="status" className="text-sm text-faint">
+            Loading draft…
+          </p>
+        )}
         {draftErr && <Alert message={draftErr} />}
+        {/* A draft-load failure must not trap the card: with no draft there is neither the
+            Cancel below (inside the draft guard) nor the File-issue button (open===true),
+            so offer Retry + Cancel here. */}
+        {draftErr && !draft && (
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" onClick={openDraft}>
+              Retry
+            </Button>
+            <Button size="sm" variant="secondary" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+          </div>
+        )}
         {draft && (
           <>
             {/* Provenance (Decision 8): whose worker produced this (attacker-influencable)
-                text, shown prominently so an admin filing another user's review sees it. */}
-            {draft.provenance && <p className="text-xs text-faint">{draft.provenance}</p>}
+                text — prominent (boxed + labeled) so an admin filing another user's review
+                notices whose text they are about to publish. */}
+            {draft.provenance && (
+              <div className="rounded-md border border-edge bg-raised/50 px-2.5 py-1.5 text-xs text-muted">
+                <span className="font-semibold text-fg">Source:</span> {draft.provenance}
+              </div>
+            )}
             {fileErr && <Alert message={fileErr} />}
 
             <div className="space-y-1">
@@ -921,7 +953,17 @@ function RecommendationFiler({
                 ))}
               </Select>
               {draft.default_note && (
-                <p className={cx("text-xs", repoId ? "text-faint" : "text-info")}>{draft.default_note}</p>
+                <p
+                  role="status"
+                  className={cx(
+                    "text-xs",
+                    repoId
+                      ? "text-faint"
+                      : "rounded-md border border-info/40 bg-info/10 px-2.5 py-1.5 text-info",
+                  )}
+                >
+                  {draft.default_note}
+                </p>
               )}
             </div>
 

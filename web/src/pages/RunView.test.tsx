@@ -287,4 +287,30 @@ describe("JudgePanel (PRD #46 M4)", () => {
     expect(container.textContent).toBe("");
     expect(mockApi.getRunReview).not.toHaveBeenCalled();
   });
+
+  // Regression for the coordinate-key mismatch (web-ux blocking): a recommendation with a
+  // PERSISTED filed link (from ReviewDTO.filed_issues on reload) must render the filed ROW
+  // with the issue link, NOT the idle "File issue" button. Same-session smoke missed this
+  // because the just-filed LOCAL state masked it; only a persisted link exercises coordKey.
+  it("renders a persisted filed link as the filed row, not the idle button", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        filed_issues: [
+          {
+            category: "install_worker_tool",
+            target: "shellcheck",
+            issue_iid: 71,
+            issue_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+            filed_at: "2026-01-02T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const link = await screen.findByRole("link", { name: /#71/ });
+    expect(link.getAttribute("href")).toBe("https://gitlab.example/vtmocanu/uzi/-/issues/71");
+    // The idle affordance for this (now-filed) recommendation is gone.
+    expect(screen.queryByText("File issue")).toBeNull();
+  });
 });
