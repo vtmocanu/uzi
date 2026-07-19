@@ -306,11 +306,129 @@ services:
       # path (relocating it forfeits cache.nixos.org substitution); Docker seeds
       # this named volume from the image's build-time /nix on first use.
       - agentnix:/nix
+      # PRD #83 M2: mount the shared DinD socket volume UNCONDITIONALLY (even on the
+      # plain `--profile agent` path). Empty when the `dind` sidecar is down = harmless:
+      # M1's resolveDockerWiring probes /run/dind/docker.sock, finds nothing, and docker
+      # stays inert + guardrail-denied. Bring the sidecar up (`--profile agent-docker`)
+      # and the socket appears at exactly that path, so the worker auto-detects it — no
+      # per-profile conditional DOCKER_HOST env is needed. The volume carries ONLY the
+      # socket (Decision 3). rw (not :ro): the docker CLIENT connect(2)s the socket.
+      - dindsock:/run/dind
     secrets:
       - worker_token
     depends_on:
       api:
         condition: service_healthy
+
+  # PRD #83 M2: socket-permission helper for the rootless DinD sidecar. Two problems the
+  # rootless daemon cannot solve for itself, both established live (see the M2 commit /
+  # PRD Decision Log — this is the recorded day-1 set, tester validates + reduces):
+  #   1. The shared `dindsock` named volume mounts root-owned 0755, but rootless dockerd
+  #      runs as uid 1000 and REFUSES to start without a WRITABLE XDG_RUNTIME_DIR
+  #      ("need writable ... XDG_RUNTIME_DIR (/run/dind) for user 1000"). Only root can
+  #      chown it, and the sidecar has no root window (image USER=rootless), so this
+  #      helper (root) chowns /run/dind → 1000:1000 + 0711 (traversable by others) BEFORE
+  #      the daemon starts. `dind` gates on this via depends_on: service_healthy.
+  #   2. The daemon creates docker.sock 0660 owned by uid 1000 + a userns-REMAPPED gid.
+  #      The worker probes as uid 10001 and the agent runs docker as the `runner` uid
+  #      10002; a `group_add` would reach the worker but the #51 uid split spawns runner
+  #      children with setpriv `--init-groups`, which DROPS supplementary groups — so the
+  #      agent's own `docker` would still be denied. Making the socket 0666 lets BOTH uids
+  #      connect with no group dependency (validated: uid 10002 ran a container via the
+  #      sidecar). The socket is on a volume only this trio mounts, and mount-ns
+  #      (Decision 3) — not the socket mode — is the containment, so 0666 is acceptable.
+  #   The loop re-applies 0666 so a `dind` restart (new socket inode) stays reachable.
+  dind-init:
+    image: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+    profiles: ["agent-docker"]
+    # Runs as root (default) — the chown/chmod of a root-owned volume needs it.
+    command:
+      - "sh"
+      - "-c"
+      - "chown 1000:1000 /run/dind && chmod 0711 /run/dind && touch /tmp/dir-ready
+         && while :; do [ -S /run/dind/docker.sock ] && chmod 0666 /run/dind/docker.sock; sleep 2; done"
+    volumes:
+      - dindsock:/run/dind
+    healthcheck:
+      # Healthy once the socket dir is prepared, so `dind` waits for a writable runtime dir.
+      test: ["CMD-SHELL", "[ -f /tmp/dir-ready ]"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  # PRD #83 M2: opt-in rootless Docker-in-Docker SIDECAR (the laptop dev loop). It
+  # supplies the actual daemon for a worker whose repo tests need docker/`docker
+  # compose` — uzi's own e2e/smoke do `docker compose up`. The docker CLIENT already
+  # lives in `base` (M1, inert without a daemon); this is the daemon, in its OWN
+  # container with its OWN mount namespace (Decision 3), so a hijacked agent doing
+  # `docker run -v /run/secrets/worker_token:/x` binds THIS container's fs — which holds
+  # none of the worker's secret/`/data`/`/nix`. Profile-gated: the plain `--profile
+  # agent` path is UNCHANGED; bring the daemon up with `--profile agent-docker`.
+  dind:
+    # Rootless DinD (Decision 2): a breakout lands as an unprivileged, userns-mapped host
+    # uid — the same rootless stance as our nix/devbox engine, never host root, never a
+    # host docker.sock. Pinned by digest (multi-arch: amd64 + Apple-Silicon). The
+    # `docker compose` v2 subcommand runs CLIENT-side in the `agent` (M1's
+    # docker-cli-compose) against this daemon, so the daemon image needs only to be a
+    # working rootless dockerd. TESTER confirms the tag/digest boots rootless on the live
+    # host and that `docker compose up` works end-to-end.
+    image: docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431
+    profiles: ["agent-docker"]
+    # Wait for the socket dir to be chowned writable-by-1000 (else rootless dockerd
+    # refuses to start). dind-init keeps running (it also holds the socket 0666 open), so
+    # gate on service_healthy, not completed.
+    depends_on:
+      dind-init:
+        condition: service_healthy
+    # Decision 2 (RECORDED, not hidden): `docker:dind-rootless` normally still needs
+    # `privileged: true` on the OUTER container even in the rootless variant (mount/userns/
+    # sysfs ops the default seccomp/AppArmor profile blocks). The userns REMAP inside the
+    # rootless image is the security property, not the flag's absence. Accepted for a
+    # private factory. DAY-1 (tester): try to REDUCE to `security_opt: [seccomp=unconfined,
+    # apparmor=unconfined]` + `devices: [/dev/fuse]` WITHOUT privileged and record the exact
+    # minimal set that actually brings the daemon up. This informs but does NOT bind k8s
+    # (M3 cannot use privileged under PodSecurity baseline — see PRD Decision 7).
+    privileged: true
+    environment:
+      # rootless dockerd writes its API socket to $XDG_RUNTIME_DIR/docker.sock. Point it at
+      # the shared volume so the socket lands at /run/dind/docker.sock — EXACTLY the path
+      # M1's keystone resolver probes (UZI_DIND_SOCKET default). The socket is the
+      # transport; DOCKER_TLS_CERTDIR is left at the image default (/certs) ON PURPOSE.
+      # The rootless entrypoint force-adds an internal daemon listener regardless of a
+      # dockerd --host override (verified live): with the default it is TLS 2376
+      # (mutual-auth, client certs in the sidecar's own /certs the agent never mounts);
+      # setting DOCKER_TLS_CERTDIR="" only DOWNGRADES it to PLAIN 2375. So the default is
+      # the safest achievable posture. That 2376 listener is UNPUBLISHED (no `ports:`) and
+      # NOT on the agent's netns (no network_mode: service:agent), so it is not the
+      # "always-on UNAUTHENTICATED daemon port" the review warns against — it is a benign
+      # cert-gated residual. Tester day-1: try to fully suppress it via the entrypoint if
+      # cheap; low priority given it is TLS + unpublished + off the agent netns.
+      XDG_RUNTIME_DIR: /run/dind
+    volumes:
+      # Socket-share (the DEFAULT; TCP is a documented fallback only — an always-on
+      # unauthenticated `tcp://dind:2375` is a standing daemon-takeover surface, so we do
+      # NOT expose one). The rootless daemon writes docker.sock here; the `agent` mounts the
+      # SAME volume and auto-detects it. Carries ONLY the socket.
+      - dindsock:/run/dind
+      # The daemon's OWN data root (pulled images, layers, build cache) — the ONLY
+      # worker-adjacent state it holds, in its own mount namespace. Decision 3: `dind` mounts
+      # NONE of agentdata/`/data`, agentnix/`/nix`, or the worker_token secret, so a
+      # container it launches can bind-mount nothing of the worker's. Sizing (PRD #42, → M4
+      # docs): ~5-20 GiB for uzi-e2e-in-dind (pulls postgres:17, builds api/web/agent);
+      # budget the sidecar ~1-2 GiB / ~1 CPU on top of the agent. Needs a GC/retention story.
+      - dinddata:/home/rootless/.local/share/docker
+    # Namespace isolation (auditor E1/E2 — MUST): an ORDINARY sibling service. NO
+    # `network_mode: "service:agent"`, no `pid:`/`ipc:` sharing. The worker reaches the
+    # daemon ONLY through the shared socket volume. A shared netns would put the daemon's
+    # socket on the worker's own loopback and defeat the separate-mount-ns isolation's intent.
+    #
+    # DAY-1 open item the tester must establish (arch §Q4): CROSS-UID socket access. The
+    # rootless daemon's socket is owned by the sidecar's rootless uid (0660); the worker
+    # probes as uid 10001 and the agent's docker runs as uid 10002 — different uids. Getting
+    # the socket readable/writable across containers/uids (a shared gid via `group_add`, a
+    # 0777 socket dir, or a socket mode) is a real day-1 item, NOT a given. Encoded here is
+    # the topology; the exact permission wiring is what the tester's live run pins down.
 
 volumes:
   pgdata:
@@ -318,6 +436,11 @@ volumes:
   # The worker's nix store (PRD #18): seeded from the image on first use, then
   # persisted so provisioning is a first-run-only fetch.
   agentnix:
+  # PRD #83 M2: the DinD socket-share (carries ONLY the daemon socket) and the DinD data
+  # root (images/layers/build cache — its own isolated store, Decision 3). Both are
+  # sidecar-scoped; neither is ever mounted into a container the agent launches.
+  dindsock:
+  dinddata:
 
 secrets:
   # The worker join token, delivered to the agent as a FILE (mounted at

@@ -112,6 +112,24 @@ if [ "${1:-}" != "--e2e-sanitized" ]; then
 fi
 shift  # drop --e2e-sanitized; safe — this line is reached only when $1 held it
 
+# --- optional args -----------------------------------------------------------
+# The ONE supported positional flag: `--profile agent-docker` (PRD #83 M2). It brings up
+# the rootless DinD sidecar (dind + dind-init) alongside the worker and runs the
+# docker-capable PHASE at the end: sidecar reachability + a toy `docker compose up` + the
+# LIVE Decision-3 efficacy test (a sidecar container cannot read the worker's join token).
+# The default (no args) is BYTE-IDENTICAL to before. Args survive the env -i re-exec above
+# (they ride after --e2e-sanitized). No env knob is used, so nothing new enters the
+# compose-read env — the sidecar is opt-in purely by this flag + the compose profile.
+DOCKER_PROFILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --profile)
+      [ "${2:-}" = "agent-docker" ] || { echo "error: only '--profile agent-docker' is supported (got '${2:-}')" >&2; exit 2; }
+      DOCKER_PROFILE="agent-docker"; shift 2 ;;
+    *) echo "error: unknown argument '$1' (only '--profile agent-docker' is supported)" >&2; exit 2 ;;
+  esac
+done
+
 # --- layout ------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXECUTOR="${UZI_E2E_EXECUTOR:-stub}"
@@ -165,6 +183,10 @@ FAKE_BASE="https://127.0.0.1:${FAKE_PORT}"
 
 COMPOSE=(docker compose -p "$PROJECT" --project-directory "$ROOT" --env-file "$ENVFILE"
   -f "$ROOT/docker-compose.yml" -f "$ROOT/e2e/docker-compose.e2e.yml" --profile agent)
+# PRD #83 M2: also activate the DinD sidecar profile when `--profile agent-docker` was
+# passed, so `dind` + `dind-init` come up for the docker-capable phase. `down` ignores
+# profiles, so the teardown hint below still removes everything.
+[ -n "$DOCKER_PROFILE" ] && COMPOSE+=(--profile "$DOCKER_PROFILE")
 
 # --- output helpers ----------------------------------------------------------
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
@@ -2600,4 +2622,63 @@ curl -fsS -c "$FRESHJAR" -X POST "$BASE/api/auth/login" -H 'Content-Type: applic
   || fail "a non-admin member must get 403 on /api/admin/rate-limits"
 pass "member gets 403 on /api/admin/rate-limits"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #47 run-health + PRD #53 rate-limits; executor=%s)\n' "$EXECUTOR"
+# ── PRD #83 M2: docker-capable worker (rootless DinD sidecar) ────────────────────────
+# Runs ONLY under `--profile agent-docker` (so the default suite is untouched). Two
+# assertions justify M2: (a) a run's docker path reaches the sidecar and `docker compose
+# up` works; (b) the LIVE Decision-3 efficacy test — a container started via the sidecar
+# CANNOT read the worker's join-token path. (b) is driven OUTSIDE the guardrail (docker
+# invoked directly, not through the SDK's guarded Bash) so it proves MOUNT-NAMESPACE
+# isolation (the DinD daemon's fs holds none of the worker's secret/`/data`/`/nix`), NOT
+# the guardrail substring check.
+if [ -n "$DOCKER_PROFILE" ]; then
+  say "PRD #83 M2: rootless DinD sidecar + Decision-3 efficacy"
+  DH="unix:///run/dind/docker.sock"            # the path M1's resolveDockerWiring probes
+  DTOK=/run/secrets/worker_token               # the worker join-token file (the canary)
+  DIMG=alpine:3.22                             # the sidecar pulls this to run the attacks
+  # Root-client exec (bypasses socket perms) — proves the DAEMON's mount ns regardless of
+  # client uid. `docker`/DOCKER_HOST is not in the agent's login env (only injected into the
+  # SDK subprocess), so set it explicitly here.
+  rootdk() { "${COMPOSE[@]}" exec -T -e DOCKER_HOST="$DH" agent "$@"; }
+  # Runner-uid exec (uid 10002, via the SAME setpriv path the runtime uses) — proves the
+  # split-uid agent's OWN docker reaches the daemon (needs the dind-init 0666 socket).
+  runnerdk() { "${COMPOSE[@]}" exec -T -e DOCKER_HOST="$DH" agent \
+    /bin/setpriv --reuid runner --regid runner --init-groups -- "$@"; }
+
+  # 0) Liveness FIRST — else every negative below is vacuous (a down daemon also yields
+  #    "no such file"). `docker info` must succeed against the sidecar.
+  rootdk docker info >/dev/null 2>&1 || fail "DinD daemon not reachable (docker info failed) — the Decision-3 negatives would be vacuous"
+  pass "DinD daemon reachable via the shared socket ($DH)"
+
+  # (a) the split-uid agent path reaches the daemon AND runs a container; then compose v2.
+  runnerdk docker run --rm "$DIMG" echo dind-run-ok 2>/dev/null | grep -q dind-run-ok \
+    || fail "the runner uid (10002) could not run a container via the sidecar"
+  pass "the runner uid runs a container through the sidecar (the agent's real docker path)"
+  rootdk sh -c 'set -e; d=$(mktemp -d); printf "services:\n  toy:\n    image: '"$DIMG"'\n    command: [\"echo\",\"compose-ok\"]\n" > "$d/compose.yaml"; docker compose -f "$d/compose.yaml" up --abort-on-container-exit --exit-code-from toy' 2>/dev/null | grep -q compose-ok \
+    || fail "a toy 'docker compose up' did not run through the sidecar (compose v2 client-side)"
+  pass "a toy 'docker compose up' runs through the sidecar (docker compose v2)"
+
+  # (b) LIVE Decision-3 efficacy (deferred from M1, no daemon existed there).
+  CANARY="$(rootdk cat "$DTOK" 2>/dev/null | tr -d '\r\n' || true)"
+  [ -n "$CANARY" ] || fail "could not read the join-token canary from the agent — the Decision-3 assertion would be vacuous"
+  # positive control: a sidecar container CAN read a file that IS in the DinD fs, so an
+  # absent canary below reads as "not mounted", never "the exec path is broken".
+  rootdk docker run --rm "$DIMG" cat /etc/hostname >/dev/null 2>&1 \
+    || fail "positive control failed (a sidecar container could not read its OWN /etc/hostname)"
+  pass "positive control: a sidecar container runs and reads its own fs"
+  # attack matrix: bind-mount worker paths. Each `-v <src>` resolves <src> in the DinD
+  # DAEMON's mount ns (which mounts NONE of them — Decision 3), so the token is absent.
+  # Assert the canary value never appears (the mount is empty / the path is ENOENT there),
+  # NOT a guardrail deny (we drive docker directly). A leak here = Decision 3 VIOLATED.
+  for src in "$DTOK" /run / /data /nix; do
+    OUT="$(rootdk docker run --rm -v "$src":/x "$DIMG" sh -c '
+      cat /x 2>/dev/null
+      cat /x/secrets/worker_token 2>/dev/null
+      cat /x/run/secrets/worker_token 2>/dev/null
+      cat /x/worker_token 2>/dev/null' 2>/dev/null || true)"
+    printf '%s' "$OUT" | grep -qF "$CANARY" \
+      && fail "Decision-3 VIOLATED: the join token leaked through 'docker run -v $src' (the DinD daemon mounted a worker path)"
+  done
+  pass "Decision-3: a sidecar container cannot read the join token via -v {token,/run,/,/data,/nix} — mount-ns isolation holds"
+fi
+
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #47 run-health + PRD #53 rate-limits%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
