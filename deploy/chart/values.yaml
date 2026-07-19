@@ -434,6 +434,14 @@ workers:
     # deploy/values/dev-cluster.yaml pre-stages dev-cluster's CIDRs + enables it.
     networkPolicy:
       enabled: false
+      # The escape hatch for the fail-guard (worker-invariants.yaml): with docker on and
+      # this NetworkPolicy off, the chart REFUSES TO RENDER, because a privileged docker
+      # tier with no in-cluster egress fence is the "on by accident, unfenced" posture.
+      # Set this true ONLY to deliberately run unfenced — a throwaway cluster whose CNI
+      # enforces no NetworkPolicy (kind), where the policy would be created and silently
+      # ignored anyway. NEVER on a real deployment: enable networkPolicy with real CIDRs
+      # instead. Visible in the values file that chose it, not an inherited default.
+      acknowledgeUnfenced: false
       # The in-cluster ranges EXCLUDED from the 0.0.0.0/0 egress allow, so a docker
       # worker can pull images from the internet but cannot reach in-cluster ClusterIPs,
       # pod IPs, the apiserver, or the metadata/link-local IP. CLUSTER-SPECIFIC — the

@@ -45,4 +45,25 @@
   off. This closes the seam because an invariant should hold because of what it is.
 */ -}}
 {{- $_ := include "uzi.workerAPIPort" . -}}
+{{- /*
+  DOCKER TIER FAIL-GUARD (PRD #83 M3, auditor LOW). The docker tier is a PRIVILEGED
+  namespace; its worker-docker-networkpolicy.yaml is what fences it off from in-cluster
+  lateral movement, and that policy is DEFAULT-OFF (it needs the cluster's real CIDRs,
+  which the chart cannot guess). So a stack that turns docker workers on but forgets the
+  NetworkPolicy would run privileged DinD workers with NO in-cluster egress fence — the
+  exact "on by accident, unfenced" posture the auditor flagged.
+
+  This refuses to render that combination. It lives HERE, in the always-evaluated
+  invariants template (gated on workers.enabled, which every real docker deploy has),
+  for the same reason the plaintext guard above does: an invariant must hold because of
+  the CONFIGURATION, not because some sub-toggled template happened to render.
+
+  The escape hatch is EXPLICIT and VISIBLE: acknowledgeUnfenced=true opts out in the
+  values file that chose it (a throwaway cluster with no CNI NetworkPolicy support, say
+  kind), rather than an unfenced tier being an inherited default. dev-cluster sets
+  networkPolicy.enabled=true with real CIDRs, so it never trips this.
+*/ -}}
+{{- if and .Values.workers.docker.enabled (not .Values.workers.docker.networkPolicy.enabled) (not .Values.workers.docker.networkPolicy.acknowledgeUnfenced) }}
+{{- fail "workers.docker.enabled requires workers.docker.networkPolicy.enabled (with real cluster CIDRs in workers.docker.networkPolicy.{podCIDR,serviceCIDR,linkLocalCIDR}) — the docker tier is privileged and must be fenced from in-cluster lateral movement. To deliberately run it UNFENCED (e.g. a throwaway cluster with no NetworkPolicy support), set workers.docker.networkPolicy.acknowledgeUnfenced=true." }}
+{{- end }}
 {{- end }}
