@@ -52,9 +52,9 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 }
 
 const createHostedWorker = `-- name: CreateHostedWorker :one
-INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size)
-VALUES ($1, $2, $3, $4, 'hosted', $5)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled)
+VALUES ($1, $2, $3, $4, 'hosted', $5, $6)
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled
 `
 
 type CreateHostedWorkerParams struct {
@@ -63,6 +63,7 @@ type CreateHostedWorkerParams struct {
 	TokenHash        []byte      `json:"token_hash"`
 	TemplateDeclared pgtype.Text `json:"template_declared"`
 	HostedSize       pgtype.Text `json:"hosted_size"`
+	DockerEnabled    pgtype.Bool `json:"docker_enabled"`
 }
 
 // Insert a hosted worker. Deliberately UNGUARDED: the quota decision belongs to the
@@ -77,6 +78,11 @@ type CreateHostedWorkerParams struct {
 // a hazard the count and the insert being separate statements makes MORE reachable,
 // not less, since nothing but this hardcoding ties the two to the same kind.
 // hosted_generation takes its column default (0); nothing in M2 bumps it.
+//
+// docker_enabled (PRD #83 M3) is the opt-in for the rootless-DinD sidecar. It is a
+// plain parameter here, not defaulted, because the provision handler decides it from
+// the request and passes an explicit true/false — a false is a real "no sidecar",
+// distinct from an external worker's NULL.
 func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorkerParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, createHostedWorker,
 		arg.UserID,
@@ -84,6 +90,7 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		arg.TokenHash,
 		arg.TemplateDeclared,
 		arg.HostedSize,
+		arg.DockerEnabled,
 	)
 	var i Worker
 	err := row.Scan(
@@ -106,6 +113,7 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.Kind,
 		&i.HostedSize,
 		&i.HostedGeneration,
+		&i.DockerEnabled,
 	)
 	return i, err
 }
@@ -156,6 +164,7 @@ SELECT w.id,
        w.template_declared,
        w.hosted_size,
        w.hosted_generation,
+       w.docker_enabled,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
@@ -168,6 +177,7 @@ type ListHostedWorkersForControllerRow struct {
 	TemplateDeclared pgtype.Text `json:"template_declared"`
 	HostedSize       pgtype.Text `json:"hosted_size"`
 	HostedGeneration int64       `json:"hosted_generation"`
+	DockerEnabled    pgtype.Bool `json:"docker_enabled"`
 	TokenCiphertext  []byte      `json:"token_ciphertext"`
 }
 
@@ -203,6 +213,7 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context) ([]ListHos
 			&i.TemplateDeclared,
 			&i.HostedSize,
 			&i.HostedGeneration,
+			&i.DockerEnabled,
 			&i.TokenCiphertext,
 		); err != nil {
 			return nil, err

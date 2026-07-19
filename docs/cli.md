@@ -23,6 +23,13 @@ The formula builds from source (`vtmocanu/uzi` is a private repo), so you need
 **group-read on `vtmocanu/uzi`** — unlike a public tap, `brew install` clones
 the product repo over git-over-SSH using your own key.
 
+On first run the CLI also drops a Claude Code skill at
+`~/.claude/skills/uzi-cli/SKILL.md` (generated from the binary's own command
+tree, so it never drifts). No manual step is needed, but you can force a
+refresh — e.g. right after upgrading — with `uzi skill install --force`, and
+check it with `uzi skill status` (details under **Agents get a bundled skill
+for free**, below).
+
 ## 2. Point it at your instance
 
 Every command needs a base URL: pass `--url`, set `$UZI_URL`, or run

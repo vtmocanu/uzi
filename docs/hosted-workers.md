@@ -16,7 +16,9 @@ available if your admin has turned hosting on for this instance.
 
 1. Open **Settings → Workers**. If hosting is available, a **Provision a
    hosted worker** card appears above your worker list.
-2. Pick a **type** and a **size** (below), then **Provision**.
+2. Pick a **type** and a **size** (below), optionally tick **Docker-capable**
+   (see [Docker inside a worker](./worker-docker.md) — needs an instance
+   whose admin has turned the docker tier on), then **Provision**.
 3. The new worker appears in your list right away and comes online on its
    own, usually within a few seconds — nothing to run, nothing to copy.
 

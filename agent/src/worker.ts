@@ -42,14 +42,22 @@ export class Worker {
     let attempt = 0;
     while (!signal.aborted) {
       try {
+        // Self-report the `docker` capability ONLY when a daemon sidecar is reachable
+        // (PRD #83 Q1) — the wiring was resolved once at startup (main.ts). An array so
+        // #84 can grow the vocabulary; #83 only ever sends `["docker"]` or omits it. The
+        // `?.` degrades safe to "no capability" if wiring is somehow unset: registration
+        // is a load-bearing loop that must never throw on a config quirk.
+        const capabilities = this.config.dockerWiring?.dockerHost ? ["docker"] : undefined;
         const res = await this.client.register(
           this.config.workerName,
           this.config.workerTemplate,
           this.config.maxConcurrentRuns,
+          capabilities,
         );
         this.log.info("registered", {
           name: this.config.workerName,
           template: this.config.workerTemplate,
+          capabilities: capabilities ?? [],
           worker_id: res.worker_id ?? null,
         });
         return;

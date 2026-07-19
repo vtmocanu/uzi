@@ -1,0 +1,12 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-07-18T08:47:58Z",
+      "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957?lastModified=1784364478"
+    },
+    "go": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#go", "source": "nixpkg" },
+    "python3": { "plugin_version": "0.0.5", "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#python3", "source": "nixpkg" },
+    "python3Packages.pip": { "resolved": "github:NixOS/nixpkgs/20535e48e12c86043b577b8518234ff5dbb26957#python3Packages.pip", "source": "nixpkg" }
+  }
+}

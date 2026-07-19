@@ -135,4 +135,65 @@ automountServiceAccountToken: false
 imagePullSecrets:
   - name: {{ .Values.workers.imagePullSecretName }}
 {{- end }}
+{{- if .Values.workers.docker.enabled }}
+{{- /*
+  The controller's reach into the DOCKER tier's namespace (PRD #83 M3).
+
+  A Role is namespace-scoped, so the controller needs a SECOND Role + RoleBinding to
+  create/roll/tear-down docker workers in workers.docker.namespace — with the EXACT
+  SAME minimal verbs as the restricted-namespace Role above. The Secrets line is
+  identical and identically load-bearing: create/delete ONLY, never get/list. Read the
+  restricted Role's Secrets comment before touching this; the reasoning is verbatim,
+  and the docker namespace holding privileged pods makes fleet-wide token disclosure
+  from a widened verb no less catastrophic here than there.
+
+  The controller's ServiceAccount is unchanged — one identity, now bound into two
+  namespaces. That is exactly the reach we intend: the controller creates workers in
+  the restricted default AND the privileged docker tier, and nowhere else.
+*/ -}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller-docker
+  namespace: {{ .Values.workers.docker.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # ================= DO NOT ADD `get` OR `list` HERE. EVER. =================
+    # Same rule, same reason as the restricted Role: k8s has no existence-only verb,
+    # so get/list would let a controller compromise harvest every docker worker's join
+    # token in one call — worker impersonation into that owner's decrypted forge PAT
+    # and Anthropic token. The controller issues `create` and treats AlreadyExists as
+    # success, deletes by name, and never reads a Secret back.
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller-docker
+  namespace: {{ .Values.workers.docker.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "uzi.fullname" . }}-controller-docker
+subjects:
+  # The SAME controller ServiceAccount (release namespace), now reaching into the
+  # docker namespace too.
+  - kind: ServiceAccount
+    name: {{ .Values.workers.controllerServiceAccountName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

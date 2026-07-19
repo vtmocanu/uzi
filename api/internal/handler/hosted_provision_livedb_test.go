@@ -124,7 +124,7 @@ func TestProvisionHostedWorkerLockIsHeldLiveDB(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := h.provisionHostedWorker(ctx, userID, "blocked", "base", "m", quota)
+		_, err := h.provisionHostedWorker(ctx, userID, "blocked", "base", "m", false, quota)
 		done <- err
 	}()
 
@@ -215,7 +215,7 @@ func TestProvisionHostedWorkerQuotaRaceLiveDB(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start // release them together, to actually overlap the transactions
-			_, err := h.provisionHostedWorker(ctx, userID, fmt.Sprintf("racer-%d", i), "base", "m", quota)
+			_, err := h.provisionHostedWorker(ctx, userID, fmt.Sprintf("racer-%d", i), "base", "m", false, quota)
 			results[i] = err
 		}(i)
 	}
@@ -262,15 +262,15 @@ func TestProvisionHostedWorkerQuotaIsPerUserLiveDB(t *testing.T) {
 
 	// A fills their quota.
 	for i := 0; i < 2; i++ {
-		if _, err := h.provisionHostedWorker(ctx, userA, fmt.Sprintf("a-%d", i), "base", "m", 2); err != nil {
+		if _, err := h.provisionHostedWorker(ctx, userA, fmt.Sprintf("a-%d", i), "base", "m", false, 2); err != nil {
 			t.Fatalf("provision for user A: %v", err)
 		}
 	}
-	if _, err := h.provisionHostedWorker(ctx, userA, "a-over", "base", "m", 2); !errors.Is(err, errHostedQuotaExceeded) {
+	if _, err := h.provisionHostedWorker(ctx, userA, "a-over", "base", "m", false, 2); !errors.Is(err, errHostedQuotaExceeded) {
 		t.Fatalf("user A over quota: err = %v, want errHostedQuotaExceeded", err)
 	}
 	// B is unaffected: the quota is per user.
-	if _, err := h.provisionHostedWorker(ctx, userB, "b-0", "base", "m", 2); err != nil {
+	if _, err := h.provisionHostedWorker(ctx, userB, "b-0", "base", "m", false, 2); err != nil {
 		t.Fatalf("provision for user B must be unaffected by user A's quota: %v", err)
 	}
 	if n := countHostedWorkers(ctx, t, pool, userB); n != 1 {
@@ -293,9 +293,15 @@ func TestProvisionHostedWorkerCoWriteLiveDB(t *testing.T) {
 	h, _, q, box, userID := hostedLiveDB(t, "2")
 	ctx := context.Background()
 
-	wkr, err := h.provisionHostedWorker(ctx, userID, "co-write", "base", "l", 2)
+	// docker=true here, so this test doubles as the end-to-end docker-flag proof
+	// (PRD #83 M3): the boolean must survive provision -> row -> Poll -> wire, which
+	// is the whole of what the api owes the controller for docker.
+	wkr, err := h.provisionHostedWorker(ctx, userID, "co-write", "base", "l", true, 2)
 	if err != nil {
 		t.Fatalf("provision: %v", err)
+	}
+	if !wkr.DockerEnabled.Valid || !wkr.DockerEnabled.Bool {
+		t.Fatalf("docker_enabled = %+v on the provisioned row, want an explicit true", wkr.DockerEnabled)
 	}
 
 	resp, err := hostedsvc.New(q, box).Poll(ctx)
@@ -326,6 +332,13 @@ func TestProvisionHostedWorkerCoWriteLiveDB(t *testing.T) {
 	if found.Template != "base" || found.Size != "l" {
 		t.Errorf("desired state = template %q size %q, want base/l", found.Template, found.Size)
 	}
+	// The docker flag reached the wire: a controller polling this sees Docker=true and
+	// renders the privileged DinD sidecar. If this drops to false the sidecar silently
+	// never renders and the worker's `docker` is inert.
+	if !found.Docker {
+		t.Error("desired state Docker=false for a worker provisioned with docker=true — " +
+			"the flag did not survive to the controller poll, so the sidecar never renders")
+	}
 }
 
 // Nothing is sealed when the quota refuses: no worker, no parked ciphertext.
@@ -347,7 +360,7 @@ func TestProvisionHostedWorkerRefusalSealsNothingLiveDB(t *testing.T) {
 	h, pool, _, _, userID := hostedLiveDB(t, "0")
 	ctx := context.Background()
 
-	if _, err := h.provisionHostedWorker(ctx, userID, "refused", "base", "m", 0); !errors.Is(err, errHostedQuotaExceeded) {
+	if _, err := h.provisionHostedWorker(ctx, userID, "refused", "base", "m", false, 0); !errors.Is(err, errHostedQuotaExceeded) {
 		t.Fatalf("err = %v, want errHostedQuotaExceeded", err)
 	}
 	if n := countHostedWorkers(ctx, t, pool, userID); n != 0 {
@@ -373,7 +386,7 @@ func TestDeleteHostedWorkerCascadesPendingTokenLiveDB(t *testing.T) {
 	h, pool, q, box, userID := hostedLiveDB(t, "2")
 	ctx := context.Background()
 
-	wkr, err := h.provisionHostedWorker(ctx, userID, "doomed", "base", "m", 2)
+	wkr, err := h.provisionHostedWorker(ctx, userID, "doomed", "base", "m", false, 2)
 	if err != nil {
 		t.Fatalf("provision: %v", err)
 	}
@@ -412,7 +425,7 @@ func TestDeleteHostedWorkerCascadesPendingTokenLiveDB(t *testing.T) {
 	}
 	// And it frees quota: delete + reprovision is v1's recovery for a stranded
 	// worker (there is no rotation endpoint), so it has to actually work.
-	if _, err := h.provisionHostedWorker(ctx, userID, "replacement", "base", "m", 2); err != nil {
+	if _, err := h.provisionHostedWorker(ctx, userID, "replacement", "base", "m", false, 2); err != nil {
 		t.Fatalf("reprovision after delete: %v", err)
 	}
 }
@@ -425,7 +438,7 @@ func TestDeleteHostedWorkerRefusedWhileBusyLiveDB(t *testing.T) {
 	h, pool, q, box, userID := hostedLiveDB(t, "2")
 	ctx := context.Background()
 
-	wkr, err := h.provisionHostedWorker(ctx, userID, "busy", "base", "m", 2)
+	wkr, err := h.provisionHostedWorker(ctx, userID, "busy", "base", "m", false, 2)
 	if err != nil {
 		t.Fatalf("provision: %v", err)
 	}

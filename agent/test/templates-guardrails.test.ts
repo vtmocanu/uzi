@@ -73,6 +73,45 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       // verification silently (audit L2).
       assert.match(text, /set -o pipefail/, `${name}/Dockerfile must guard the checksum pipe with 'set -o pipefail'`);
     });
+
+    it(`${name}: ships the docker CLI (client only) with NO daemon and NO baked socket (PRD #83 M1)`, () => {
+      // Decision 1: docker-cli + compose + buildx go into `base` (both templates); the
+      // CLIENT only — there is NO `dockerd` in any image, the daemon is the sidecar.
+      assert.match(text, /apk add[^\n]*\bdocker-cli\b/, `${name}/Dockerfile must apk add docker-cli`);
+      assert.match(text, /apk add[^\n]*\bdocker-cli-compose\b/, `${name}/Dockerfile must apk add docker-cli-compose (compose v2)`);
+      assert.match(text, /apk add[^\n]*\bdocker-cli-buildx\b/, `${name}/Dockerfile must apk add docker-cli-buildx`);
+      assert.doesNotMatch(text, /\bapk add[^\n]*\bdockerd\b/, `${name}/Dockerfile must NOT install dockerd (the daemon is the sidecar)`);
+      // C1: base must bake NO docker socket (the CLI defaults to /var/run/docker.sock when
+      // DOCKER_HOST is unset), and DOCKER_HOST must NOT be baked — set at run time only by
+      // the keystone resolver when a sidecar is wired, so a sidecar-less docker fails loudly.
+      assert.doesNotMatch(text, /docker\.sock/, `${name}/Dockerfile must bake no docker.sock (C1)`);
+      assert.doesNotMatch(text, /^\s*ENV\s+DOCKER_HOST\b/m, `${name}/Dockerfile must NOT bake ENV DOCKER_HOST (set at run time only)`);
+    });
+
+    it(`${name}: bakes the go/python default toolchain via devbox-global at build time (PRD #83 Q2)`, () => {
+      // The owner's default worker toolchain (go + python + pip) goes through the ONE
+      // nix/devbox path (no second apk package path), realized into the baked /nix at build
+      // time from the committed pinned manifest, and its profile bin added to ENV PATH.
+      // Mirrored across both templates (jvm is NOT `FROM base`).
+      assert.match(text, /COPY\s+agent\/devbox-global\/devbox\.json\b/, `${name}/Dockerfile must COPY the committed global manifest`);
+      // The committed lock PINS the nixpkgs revision; without this COPY the image never
+      // sees it and go/python/pip float per rebuild (violating the "everything PINNED"
+      // rule). It must precede `devbox global install`.
+      assert.match(text, /COPY\s+agent\/devbox-global\/devbox\.lock\b/, `${name}/Dockerfile must COPY the committed global lock (pins nixpkgs)`);
+      // Anchor on the concrete COPY/RUN lines (not the prose, which also names
+      // "devbox global install") so the ordering check is real: the lock COPY must precede
+      // the install RUN, else the image never sees the lock.
+      assert.ok(
+        text.indexOf("COPY agent/devbox-global/devbox.lock") < text.indexOf("RUN devbox global install"),
+        `${name}/Dockerfile must COPY the lock BEFORE 'RUN devbox global install'`,
+      );
+      assert.match(text, /devbox global install/, `${name}/Dockerfile must realize the global manifest at build time`);
+      assert.match(
+        text,
+        /ENV PATH="[^"]*devbox\/global\/default\/\.devbox\/nix\/profile\/default\/bin/,
+        `${name}/Dockerfile must add the devbox global profile bin to PATH`,
+      );
+    });
   }
 });
 
@@ -232,6 +271,31 @@ describe("worker templates pin the same devbox version", () => {
   });
 });
 
+// The rootless-DinD sidecar image pin (PRD #83) is a literal in TWO places: the
+// compose track (docker-compose.yml `dind`, M2) and the k8s track
+// (deploy/chart/values.yaml workers.docker.image, M3). Both tracks must run the
+// IDENTICAL daemon — the compose Decision-3 efficacy result is only evidence for k8s
+// if the image is the same — so pin them byte-equal here, mirroring the
+// DEVBOX_VERSION lockstep above, so a bump to one that misses the other is a red
+// build rather than a silent divergence.
+describe("the DinD sidecar image is pinned identically on the compose and k8s tracks", () => {
+  const repoRoot = path.resolve(templatesDir, "../..");
+  const dindPin = /docker:[\w.-]+-dind-rootless@sha256:[0-9a-f]{64}/;
+  const pinIn = (rel: string): string => {
+    const text = fs.readFileSync(path.resolve(repoRoot, rel), "utf8");
+    const m = dindPin.exec(text);
+    assert.ok(m, `${rel} must carry a pinned docker:<tag>-dind-rootless@sha256 image`);
+    return m![0];
+  };
+  it("docker-compose.yml == deploy/chart/values.yaml", () => {
+    assert.strictEqual(
+      pinIn("docker-compose.yml"),
+      pinIn("deploy/chart/values.yaml"),
+      "the compose and chart DinD image pins have drifted — bump both together (arch §Q6: one pin, two tracks)",
+    );
+  });
+});
+
 // The template name set lives in THREE places (PRD #18): the agent/templates/<name>/
 // dirs (the images), api/internal/workertmpl.Names (server registry, validates the
 // declared choice), and web/src/lib/workerTemplates.ts (the issuance dropdown). This
@@ -242,6 +306,19 @@ function parseStringList(text: string, anchor: RegExp): string[] {
   if (!m || m[1] === undefined) return [];
   return [...m[1].matchAll(/["']([^"']+)["']/g)].map((x) => x[1]!).sort();
 }
+
+// The committed devbox GLOBAL manifest (PRD #83 M1 Q2) is the single source of truth for
+// the default worker toolchain both templates bake. Pin that it lists go + python + pip so
+// a drop can't silently ship a worker without them. Read as text (devbox.json is HuJSON —
+// it carries `//` comments — so JSON.parse would reject it).
+describe("devbox-global default toolchain manifest", () => {
+  const manifest = fs.readFileSync(path.resolve(templatesDir, "../devbox-global/devbox.json"), "utf8");
+  it("lists go + python3 + pip", () => {
+    assert.match(manifest, /"go"/, "manifest must list go");
+    assert.match(manifest, /"python3"/, "manifest must list python3");
+    assert.match(manifest, /python3Packages\.pip|"pip"/, "manifest must list pip");
+  });
+});
 
 describe("worker template registry stays in sync (three sources)", () => {
   const dirNames = templateDockerfiles()

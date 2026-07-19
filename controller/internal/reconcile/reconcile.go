@@ -65,6 +65,14 @@ type ObservedWorker struct {
 	// between calls) converge without a read of anything sensitive.
 	HasDataPVC bool
 	HasNixPVC  bool
+	// Namespace is the namespace the object(s) for this worker were OBSERVED in
+	// (PRD #83 M3). With two worker namespaces — the restricted default and the
+	// privileged docker tier — teardown of a worker the api no longer wants must
+	// target the namespace its objects actually live in, and that is knowable only
+	// from where they were seen (a dropped worker's Docker flag is no longer in the
+	// desired set). Empty falls back to the restricted default, which is what a
+	// single-namespace (pre-#83) observation carried implicitly.
+	Namespace string
 }
 
 // Materializer is the cluster side of the loop — the seam M3 implements with the

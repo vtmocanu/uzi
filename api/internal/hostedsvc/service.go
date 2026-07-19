@@ -172,6 +172,10 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			Template:   row.TemplateDeclared.String,
 			Size:       row.HostedSize.String,
 			Generation: row.HostedGeneration,
+			// pgtype.Bool zero-value is {Bool:false, Valid:false}, so a NULL column
+			// reads as false here — exactly the "no sidecar" the controller wants. No
+			// need to branch on Valid.
+			Docker: row.DockerEnabled.Bool,
 		}
 		if len(row.TokenCiphertext) > 0 {
 			plain, err := s.box.OpenWithAAD(row.TokenCiphertext, tokenAAD(row.ID))

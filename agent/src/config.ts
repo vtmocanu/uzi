@@ -1,6 +1,7 @@
 import os from "node:os";
 import fs from "node:fs";
 import type { LogLevel } from "./log.js";
+import type { DockerWiring } from "./docker-wiring.js";
 import { errMessage } from "./util.js";
 
 // Worker configuration, parsed from env (PRD #4 §Configuration).
@@ -86,6 +87,26 @@ export interface Config {
    * only — the chat lane has its own, distinct ceiling (chatSessions above).
    */
   maxConcurrentRuns: number;
+  /**
+   * The worker's resolved docker wiring (PRD #83 M1 keystone). `loadConfig` leaves it
+   * `{}` — resolution runs a bounded liveness PROBE (async), so it cannot happen in the
+   * sync env parse; main.ts calls `resolveDockerWiring` ONCE at startup and populates
+   * this before the worker registers. `dockerHost` present ⇒ a daemon sidecar is
+   * reachable, so the worker reports the `docker` capability, the guardrail allows
+   * docker, and DOCKER_HOST reaches the SDK env; `{}` ⇒ none of that. In M1 there is no
+   * daemon, so this stays `{}` in practice.
+   */
+  dockerWiring: DockerWiring;
+  /**
+   * Readiness-wait knobs for the docker-wiring probe (PRD #83 M2 follow-up,
+   * UZI_DOCKER_READY_INTERVAL / UZI_DOCKER_READY_TIMEOUT). When a sidecar is EXPECTED
+   * (DOCKER_HOST or UZI_DIND_SOCKET set), the startup probe is retried every
+   * `dockerReadyIntervalMs` up to `dockerReadyTimeoutMs` before degrading to unwired — so a
+   * daemon container a few seconds slower than the worker does not cost the capability. A
+   * worker with NO sidecar expected ignores these (one fast probe, never blocks).
+   */
+  dockerReadyIntervalMs: number;
+  dockerReadyTimeoutMs: number;
   logLevel: LogLevel;
 }
 
@@ -213,6 +234,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // the safe default. The soft-ceiling warn lives in main.ts (needs the logger,
     // built after this parse) — see MAX_CONCURRENT_RUNS_SOFT_CEILING.
     maxConcurrentRuns: positiveInt(env, "WORKER_MAX_CONCURRENT_RUNS", 1),
+    // Populated by main.ts after an async liveness probe (see the field doc); the sync
+    // parse cannot probe, so the default is "no daemon wired".
+    dockerWiring: {},
+    // Readiness wait for an EXPECTED docker sidecar (M2 follow-up). ~1s poll, ~30s budget.
+    dockerReadyIntervalMs: duration(env, "UZI_DOCKER_READY_INTERVAL", "1s"),
+    dockerReadyTimeoutMs: duration(env, "UZI_DOCKER_READY_TIMEOUT", "30s"),
     logLevel: isLogLevel(rawLevel) ? rawLevel : "info",
   };
 }

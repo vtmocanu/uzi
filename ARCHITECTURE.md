@@ -33,7 +33,7 @@ uzi's current MVP is a docker-compose stack of three always-on services (`web`, 
 - **`web`** (`web/Dockerfile`) — a Vite/React SPA built at image build time and served by `nginxinc/nginx-unprivileged`. Its `nginx.conf` does two jobs: serve the built static assets, and reverse-proxy `/api/*` to `api:8080`. The SPA and API therefore share one origin (`http://127.0.0.1:8080`) — no CORS configuration exists anywhere in the stack.
 - **`api`** (`api/Dockerfile`) — a statically linked Go binary (`chi` router) on `gcr.io/distroless/static-debian12`, running as `nonroot`. Serves `/api/auth/*`, `/api/admin/*`, `/api/agent-templates/*`, `/api/me/secrets/*`, `/api/worker/*` (the worker protocol, PRD #4), `/api/ws`, `/api/health`, among others. Runs its own DB migrations and builtin-template reconciliation at startup before it starts accepting traffic (see below).
 - **`db`** — stock `postgres:17`, digest-pinned in `docker-compose.yml`. Data lives in the named volume `pgdata`; it is not a bind mount, so it survives container recreation but is bound to the Docker volume store on this host.
-- **`agent`** (`agent/templates/<name>/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 22 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* and executes runs. The image is built from a curated **template** selected by `WORKER_TEMPLATE` (PRD #18: `base`, or heavy-dep variants like `jvm`). Its outbound reach is `api`, the forge (git clone/fetch/push over HTTPS, the PAT injected as a Basic-auth header, not a session), **plus**, when a run has tier-1 tool packages to provision, the **nix substituters** the devbox engine fetches from (`cache.nixos.org` and any configured extras) — provisioning runs before the SDK in a secret-scrubbed subprocess (PRD #18 M3, [docs/worker-setup.md](docs/worker-setup.md#tool-provisioning)). The substituters are the one NEW egress PRD #18 adds to that set; the nix store lives on its own `agentnix` volume (at `/nix`) so it is a first-run-only fetch. See [Agent runtime](#agent-runtime-workers-runs-live-view) below and [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure.
+- **`agent`** (`agent/templates/<name>/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 22 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* and executes runs. The image is built from a curated **template** selected by `WORKER_TEMPLATE` (PRD #18: `base`, or heavy-dep variants like `jvm`). Its outbound reach is `api`, the forge (git clone/fetch/push over HTTPS, the PAT injected as a Basic-auth header, not a session), **plus**, when a run has tier-1 tool packages to provision, the **nix substituters** the devbox engine fetches from (`cache.nixos.org` and any configured extras) — provisioning runs before the SDK in a secret-scrubbed subprocess (PRD #18 M3, [docs/worker-setup.md](docs/worker-setup.md#tool-provisioning)). The substituters are the one NEW egress PRD #18 adds to that set; the nix store lives on its own `agentnix` volume (at `/nix`) so it is a first-run-only fetch. Every worker also ships the `docker` CLI on `PATH` (PRD #83: `docker-cli`/`-compose`/`-buildx` baked into every template; no `dockerd`, no host `docker.sock`, anywhere in the image) — inert until an optional **docker-capable** worker adds a rootless Docker-in-Docker sidecar: its own container (compose) or pod sidecar (k8s), sharing only the daemon socket. The sidecar mounts none of the worker's join token, `/data`, or `/nix`, so a container the agent launches (`docker run -v ...`) can bind-mount none of them — the universal separate-mount-namespace invariant that holds on every track. Standing the sidecar up opens one genuinely new outbound set, pulled container images from a registry, which this PRD does not filter — that is [PRD #50](prds/50-llm-egress-proxy.md)'s job. See [Agent runtime](#agent-runtime-workers-runs-live-view) below, [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure, and [docs/worker-docker.md](docs/worker-docker.md) for the docker sidecar.
 
 All images are pulled/built by digest or pinned tag in `docker-compose.yml`, not floating `latest`.
 
@@ -768,17 +768,30 @@ Shipped in the chart but **off by default** (`workers.enabled: false`); see
 and [deploy/README.md](deploy/README.md#hosted-workers-prd-58) for turning it
 on.
 
-- **Scoped to one empty namespace.** Its ServiceAccount carries a `Role`
-  bound to a dedicated `uzi-workers` namespace containing nothing but hosted
-  worker objects — no CNPG, no other app's Secrets, no privileged
-  ServiceAccounts. A `Role` that can create pods in a namespace can mount any
-  Secret and impersonate any ServiceAccount already there, so the emptiness
-  is what actually bounds a compromised controller, not the RBAC verbs alone.
-  Those verbs are pinned minimal on top: Deployments/PVCs
+- **Scoped to two empty namespaces, one of them privileged.** Its
+  ServiceAccount carries a `Role` bound to the dedicated `uzi-workers`
+  (**restricted**-tier) namespace containing nothing but hosted worker
+  objects — no CNPG, no other app's Secrets, no privileged ServiceAccounts —
+  plus, when the docker tier is enabled, a second `Role`+`RoleBinding` into a
+  dedicated `uzi-workers-docker` namespace running
+  `pod-security.kubernetes.io/enforce: privileged` (PRD #83 M3). The
+  privileged tier is a recorded deviation from the PRD's original
+  `baseline`-namespace intent: dev-cluster's k8s 1.29.4 + containerd 1.6.31
+  are below what pod user namespaces need, so a flagless-rootless DinD
+  sidecar is infeasible there, and the userns remap inside the
+  `docker:dind-rootless` image is the security property instead. Isolating
+  that privileged tier in its own namespace is what still bounds a
+  compromised controller — a `Role` that can create pods in a namespace can
+  mount any Secret and impersonate any ServiceAccount already there, so the
+  emptiness (not the RBAC verbs alone) is the real fence, exactly as the
+  restricted namespace already relied on — plus its own default-deny
+  `NetworkPolicy` (in-cluster lateral egress denied; external egress is the
+  named [PRD #50](prds/50-llm-egress-proxy.md) residual, not closed here).
+  Both namespaces' Roles carry the same pinned-minimal verbs: Deployments/PVCs
   create/list/patch(Deployments only)/delete; Secrets **create/delete
   only** — no `get`/`list`, so the controller writes each worker's join
   token once and can never read any token back, including one it didn't
-  create. No pod access at all.
+  create. No pod access at all, in either namespace.
 - **Outbound-only, like a worker.** The controller authenticates to `api`
   with its own bearer credential and polls a controller-facing endpoint for
   desired state; there is no inbound port on the controller and `api` never
@@ -808,7 +821,10 @@ on.
 
 Full design rationale — why a dedicated controller rather than the api, the
 RBAC verb-by-verb reasoning, the namespace/NetworkPolicy split, and the sizing
-presets — is `prds/58-hosted-k8s-workers.md` (its Decision Log especially).
+presets — is `prds/58-hosted-k8s-workers.md` (its Decision Log especially). The
+docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
+separate-mount-namespace invariant are recorded in
+`prds/83-docker-capable-worker.md`.
 
 ## Not yet in scope
 

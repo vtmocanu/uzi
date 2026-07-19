@@ -1405,9 +1405,14 @@ const realApi = {
    * template and size are mandatory (400 otherwise), unlike createWorker's optional
    * template: we run the image, so a silent default would pick it for the user.
    * name is optional — empty means the server derives one from template + size.
+   *
+   * docker (PRD #83 M3) opts the worker into a rootless Docker-in-Docker sidecar so its
+   * agent can run docker/docker compose. It rides ahead of the rarely-used name (the
+   * form sets docker, never name) and is always sent as an explicit bool: absent reads
+   * as false server-side, but sending it keeps the request self-describing.
    */
-  provisionHostedWorker: (template: string, size: string, name?: string) =>
-    request<{ worker: Worker }>("POST", "/workers/hosted", { template, size, name }),
+  provisionHostedWorker: (template: string, size: string, docker = false, name?: string) =>
+    request<{ worker: Worker }>("POST", "/workers/hosted", { template, size, name, docker }),
 
   createRun: (repoId: string, issueIid: number) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/runs`, { issue_iid: issueIid }),

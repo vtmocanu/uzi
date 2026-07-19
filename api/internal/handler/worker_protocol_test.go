@@ -198,6 +198,29 @@ func TestWorkerRegisterAcceptsCeilingMaxConcurrentRuns(t *testing.T) {
 	}
 }
 
+func TestWorkerRegisterToleratesCapabilities(t *testing.T) {
+	// PRD #83 Q1: an M1 worker with a daemon wired sends {"capabilities":["docker"]}.
+	// DecodeJSON rejects unknown fields, so register MUST declare the field or the
+	// worker 400s on register and wedges its retry loop — the compat rule (the api
+	// tolerates `capabilities` in the SAME release the worker starts sending it). M1 is
+	// accept-and-ignore: no column, no DTO surface, just no 400. An empty array and an
+	// absent field must both be tolerated too.
+	for _, body := range []string{
+		`{"name":"laptop","version":"1.2.3","capabilities":["docker"]}`,
+		`{"name":"laptop","version":"1.2.3","capabilities":[]}`,
+		`{"name":"laptop","version":"1.2.3"}`,
+		// Alongside the other optional self-reported fields.
+		`{"name":"laptop","version":"1.2.3","template":"base","max_concurrent_runs":2,"capabilities":["docker"]}`,
+	} {
+		h := newProtocolHandler(t, &protocolStore{})
+		rec := httptest.NewRecorder()
+		h.WorkerRegister(rec, workerReq(http.MethodPost, body, uuid.Nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (capabilities must not 400 register) for %s, body %q", rec.Code, body, rec.Body.String())
+		}
+	}
+}
+
 func TestSanitizeSelfReported(t *testing.T) {
 	// Trims, strips control chars, caps length.
 	if got := sanitizeSelfReported("  1.2.3\x07-m4 \n ", maxSelfReportedBytes); got != "1.2.3-m4" {

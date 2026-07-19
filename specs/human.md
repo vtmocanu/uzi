@@ -403,6 +403,16 @@ Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/64-uzi-cli.md`.
 - `uzi login` works on a password-only stack AND an OIDC-backed instance with no IdP configuration change. [Success Criterion 2]
 - Admin gets read-only verbs over the CLI; every admin write stays a webui action. [user override, PRD #64 Decision 5]
 
+## Feature #83 — Docker-capable worker
+
+Tracked as GitLab issue vtmocanu/uzi#83; PRD at `prds/83-docker-capable-worker.md`.
+
+- Workers must be able to run Docker/Compose projects (uzi's own e2e/smoke need `docker compose up`). [user]
+- The default worker has docker + python + go available. [user]
+- Trust model: trust the USER who owns the worker, not the repo code the agent runs (prompt-injectable). Security compromises allowed to cut complexity; agent-facing defenses stay load-bearing. [user]
+- k8s is the first-class test/runtime environment (not the deferred track). [user]
+- k8s docker posture: a dedicated privileged-tier namespace running the rootless-DinD sidecar. [user, Q-B owner decision]
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

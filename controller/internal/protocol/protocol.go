@@ -41,8 +41,16 @@ type DesiredWorker struct {
 	Template string `json:"template"`
 	// Size is the preset NAME (S/M/L). Resolving it to cpu/memory/PVC quantities is
 	// this side's job: the api is not allowed to know what a pod spec looks like.
-	Size       string `json:"size"`
-	Generation int64  `json:"generation"`
+	Size string `json:"size"`
+	// Docker is the rootless-DinD sidecar opt-in (PRD #83 M3). true → render this
+	// worker with a privileged DinD native sidecar in the dedicated
+	// `enforce: privileged` namespace (UZI_WORKER_DOCKER_NAMESPACE); false → #58's
+	// plain single-container worker in the restricted namespace. It is a pod-shape
+	// DIMENSION orthogonal to Template (Decision 1: docker is not a template), which
+	// is why it rides its own bool rather than a template name. Mirrors the api's
+	// hostedsvc.DesiredWorker.Docker; the shared golden pins the two in lockstep.
+	Docker     bool  `json:"docker"`
+	Generation int64 `json:"generation"`
 	// JoinToken is the plaintext, present only until a pod proves it holds it (by
 	// registering) or the api's buffer expires unread.
 	//
