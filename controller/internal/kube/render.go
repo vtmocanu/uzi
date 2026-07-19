@@ -690,6 +690,14 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			// devbox/nix provisioning state persisted here or it dangles into the wiped
 			// store (PRD #92 M2). Mounted at dataSeedMountPath for the same masking
 			// rationale as the nix mount above.
+			// FUTURE COUPLING: PRD #51 M4's runner-uid split (root-started A1 path, not yet
+			// on k8s) makes /data shared across the worker and a distinct `runner` uid. This
+			// init runs as the pod runAsUser; today (single-uid) that IS the uid that owns the
+			// devbox/nix state, so the best-effort `rm -rf` succeeds. Once the split lands on
+			// k8s, this container's uid + the cleared paths' ownership must be re-derived —
+			// otherwise the clear EACCESes and, being best-effort (`|| true`), silently
+			// no-ops, regressing the dangling-store heal onto M4's "devbox install re-realizes"
+			// fallback. Re-derive alongside the TMPDIR relocation noted above.
 			{Name: "data", MountPath: dataSeedMountPath},
 		},
 	}}

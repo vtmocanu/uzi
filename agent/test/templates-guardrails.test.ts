@@ -138,12 +138,16 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         /ln -sfn \/opt\/uzi-toolchain \/nix\/var\/nix\/gcroots\/uzi-toolchain/,
         `${name}/Dockerfile must register the /nix/var/nix/gcroots/uzi-toolchain GC root`,
       );
-      // The fail-closed build assertion: a broken toolchain fails the BUILD, not a silent 127 at run time.
-      assert.match(
-        text,
-        /command -v python3 go gcc pip/,
-        `${name}/Dockerfile must carry the fail-closed 'command -v python3 go gcc pip' build assertion`,
-      );
+      // The fail-closed build assertion: a broken toolchain fails the BUILD, not a silent 127 at
+      // run time. `command -v` checks each tool SEPARATELY (multi-operand `command -v` validates
+      // only the first), so all four must be present as their own `command -v` clause.
+      for (const tool of ["python3", "go", "gcc", "pip"]) {
+        assert.match(
+          text,
+          new RegExp(`command -v ${tool}\\b`),
+          `${name}/Dockerfile must carry a fail-closed 'command -v ${tool}' build assertion`,
+        );
+      }
     });
   }
 });
