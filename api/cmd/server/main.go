@@ -359,6 +359,22 @@ func run() error {
 				return q.DeleteExpiredCLIAuthRequests(ctx)
 			},
 		},
+		// Stranded issue-filing claims (PRD #68 M3): a file handler killed after the
+		// claim (filing_since set) but before it settled leaves a row that blocks the
+		// coordinate forever. This DELETEs claims older than the clamped cutoff (>= 2x
+		// ForgeHTTPTimeout, config.go) so a slow-but-alive CreateIssue is never reaped
+		// mid-flight. 0 disables the sweep. Rides this ticker rather than its own
+		// goroutine, like the passes above.
+		sweeper.Pass{
+			Name: "issue_filing_claims_stranded",
+			Run: func(ctx context.Context) (int64, error) {
+				if cfg.IssueFilingStuckTimeout <= 0 {
+					return 0, nil
+				}
+				cutoff := time.Now().Add(-cfg.IssueFilingStuckTimeout)
+				return q.SweepStrandedRecommendationClaims(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
+			},
+		},
 	)
 	sweep.Boot(ctx)
 

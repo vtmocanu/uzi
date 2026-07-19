@@ -329,6 +329,15 @@ type Config struct {
 	// Above the forge HTTP timeout so an in-flight confirm is never reaped. 0 disables it.
 	ProposalConfirmStuckTimeout time.Duration
 
+	// IssueFilingStuckTimeout is how long a recommendation_filed_issues claim may sit
+	// with filing_since set but filed_at NULL before the sweeper DELETEs it (PRD #68 M3):
+	// recovery for a file handler killed after the claim but before it settled. This
+	// path is HARSHER than the proposal precedent — the revert is a DELETE of the claim,
+	// so a premature sweep during a live CreateIssue lets a retry re-INSERT and file a
+	// SECOND forge issue — so it is clamped >= 2x ForgeHTTPTimeout exactly like
+	// ProposalConfirmStuckTimeout. 0 disables it.
+	IssueFilingStuckTimeout time.Duration
+
 	// Hosted k8s workers (PRD #58 Decision 12). WorkerHostingEnabled gates the whole
 	// feature; it is false by default and on compose, where there is no controller and
 	// no cluster to host anything in — so a compose stack is zero-diff. Off, the
@@ -564,6 +573,22 @@ func Load() (Config, error) {
 			"forge_http_timeout", cfg.ForgeHTTPTimeout.String(),
 			"clamped_to", floor.String())
 		cfg.ProposalConfirmStuckTimeout = floor
+	}
+
+	cfg.IssueFilingStuckTimeout = parseDuration("ISSUE_FILING_STUCK_TIMEOUT", 2*time.Minute)
+	// Same LOAD-BEARING clamp as PROPOSAL_CONFIRM_STUCK_TIMEOUT above, and it matters
+	// MORE here (PRD #68 Decision 7): the filing revert is a DELETE of the claim row, so
+	// if the sweep reaped a claim while its CreateIssue was still legitimately in flight,
+	// a retry or a concurrent POST would re-INSERT the coordinate and file a SECOND forge
+	// issue — the exact duplicate claim-first exists to prevent. The in-flight window is
+	// bounded by ForgeHTTPTimeout, so the sweep floor MUST sit safely above it. Clamp up
+	// (never trust a low operator value); 0 disables the sweep and is left alone.
+	if floor := 2 * cfg.ForgeHTTPTimeout; cfg.IssueFilingStuckTimeout > 0 && cfg.IssueFilingStuckTimeout < floor {
+		slog.Warn("ISSUE_FILING_STUCK_TIMEOUT is not safely above FORGE_HTTP_TIMEOUT; clamping up (else a slow forge write could be swept mid-flight and re-filed into a duplicate issue)",
+			"configured", cfg.IssueFilingStuckTimeout.String(),
+			"forge_http_timeout", cfg.ForgeHTTPTimeout.String(),
+			"clamped_to", floor.String())
+		cfg.IssueFilingStuckTimeout = floor
 	}
 
 	cfg.CIWatchRunWindow = parseDuration("CI_WATCH_RUN_WINDOW", 14*24*time.Hour)

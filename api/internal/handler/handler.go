@@ -626,6 +626,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (service-enforced, audit H3); behind a DEDICATED per-user judge spend
 				// limiter (separate budget from chat).
 				r.With(judgeLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
+				// File a forge issue from a recommendation (PRD #68 M3): a forge WRITE, so
+				// cookie+CSRF (this RequireAuth group) behind the per-user forge limiter,
+				// mirroring ConfirmProposal — not the RequireUser read group the draft GET
+				// sits in. Owner-or-admin to see the recommendation, caller-owns-repo to write.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/review/recommendations/{recID}/issue", h.FileIssue)
 			})
 		})
 
