@@ -384,18 +384,40 @@ full reasoning.
 - Soft anti-affinity — keeps the api pod (holding `UZI_SECRET_KEY`) and CNPG off
   docker-worker nodes, so wherever node root lands it reads no crown-jewel secret.
 
-**Two open items, tracked but not blocking.** Both concern the shared no-secrets
-run workdir (`/data/runner`, the M-workdir Decision-3 amendment): an `emptyDir`
-mounted into both the worker and the dind sidecar at the same path, so bind
-mounts (uzi's own e2e included) resolve in the daemon instead of hitting an empty
-dir. It applies to both postures.
+**Shared run workdir.** Both postures mount a no-secrets `emptyDir` (`/data/runner`,
+the M-workdir Decision-3 amendment) into both the worker and the dind sidecar at
+the same path, so `docker run -v`/compose bind mounts under the run's checkout
+(uzi's own e2e included) resolve in the daemon instead of hitting an empty dir.
+The path mirrors `agent/src/git.ts`'s `runnerRoot` — if that root ever moves,
+`controller/internal/kube/render.go`'s render must move with it.
 
-1. **Rootless cross-uid workdir permissions.** The workdir is `fsGroup: 10001`; a
-   future *rootless* cluster's uid-1000 dind sidecar may need a permissions fix
-   to write it. Non-rootless (uid 0) is unaffected.
-2. **The workdir path is coupled to the agent.** It mirrors `agent/src/git.ts`'s
-   `runnerRoot` — if that root ever moves, `controller/internal/kube/render.go`'s
-   render must move with it.
+### M4/M5 runbook: known items before go-live
+
+Not blockers to M1–M3 landing, but gate the live rollout. Full detail on 2–4 is
+recorded in `specs/ai.md`; this stays a pointer, not a duplicate.
+
+1. **Enable ordering.** Nothing in the chart couples the
+   `acknowledgeNonRootlessNodeRoot` ack to the api build actually carrying
+   M-allow. Do **not** set `rootless: false` live until the api deploy with the
+   M-allow claim gate (repo allowlist) is out — M-allow is the acceptance's
+   likelihood control, not an optional follow-up.
+2. **M-workdir bind-source scope.** The shared workdir only resolves bind
+   sources located *under* the run's checkout; sources outside it don't. Concretely,
+   `./e2e/run-e2e.sh` defaults its run dir to `${TMPDIR:-/tmp}/uzi-e2e-$$` —
+   outside `/data/runner` — so its own compose binds won't resolve in dind as
+   shipped. Fix: point the worker's `TMPDIR` at a subdir under `/data/runner`
+   (`run-e2e.sh`'s sanitized-env allowlist already passes `TMPDIR`/
+   `E2E_RUN_DIR` through). The concrete M4/M5 gate: e2e green **and** no secret
+   transits the now-dind-visible tmp.
+3. **Runner-clone durability.** M-workdir moves the runner clone from the
+   persistent `/data` PVC to an ephemeral `emptyDir`, so a run's working tree no
+   longer survives a pod restart. Expected, not a regression: committed work is
+   safe (the persistent bare repo at `/data/repos` re-clones on resume);
+   uncommitted-across-a-crash was never durable either way.
+4. **Rootless fsGroup workdir read (M4 runtime check).** The workdir is
+   `fsGroup: 10001`; whether a future *rootless* cluster's uid-1000 dind sidecar
+   can read worker-written bind sources via the fsGroup supplemental group is
+   unproven by unit tests. Non-rootless (dev-cluster) is root, unaffected.
 
 ## The api TLS listener (`api.tls.*`, PRD #58)
 
