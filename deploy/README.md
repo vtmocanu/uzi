@@ -326,6 +326,99 @@ each was checked rather than assumed:
   start is the rollout: watch that it reads its token, verifies the api's cert against
   the projected CA, and that its polls are not dropped by the api's default-deny.
 
+## Docker-capable workers: rootless vs non-rootless DinD (PRD #83 / #89)
+
+PRD #83 shipped an opt-in docker-capable hosted-worker tier: a Docker-in-Docker
+(DinD) sidecar in its own privileged, fenced `uzi-workers-docker` namespace, so a
+worker can run `docker`/`docker compose` for repos whose own tests need it
+(including uzi's own e2e). PRD #89 makes the DinD **posture** a per-cluster
+toggle, because the safer posture has a node prerequisite not every cluster meets.
+
+`workers.docker.rootless` (chart default `true`) selects it:
+
+| Value | Posture | Daemon runs as | Node needs |
+|---|---|---|---|
+| `true` (default) | Rootless DinD — PRD #83, unchanged | userns-mapped, unprivileged | `kernel.unprivileged_userns_clone=1` |
+| `false` | Non-rootless privileged DinD — PRD #89 | real root, no userns | nothing beyond `--privileged` |
+
+Nothing changes on a cluster that keeps `rootless: true`. `false` is a documented
+escape hatch, not a new default.
+
+**Node prerequisite.** Rootless dockerd needs unprivileged user namespaces enabled
+on the node kernel (`kernel.unprivileged_userns_clone=1`) — a **node-scoped**
+sysctl, not settable per-pod. dev-cluster's nodes are vendor Linux OS (kernel
+6.1.83), which ships this **off** as a hardening default, so the rootless sidecar
+crash-loops there (`need 'kernel.unprivileged_userns_clone' … set to 1`).
+`deploy/values/dev-cluster.yaml` therefore sets `rootless: false`.
+
+**Reduced-capability dead end.** Before accepting non-rootless, a `privileged:
+false` variant with a curated capability set (`SYS_ADMIN`, `NET_ADMIN`, `MKNOD`, …)
+was tried live on these nodes: dockerd started, but could not create containers —
+`mkdir /sys/fs/cgroup/docker: read-only file system`. On cgroup v2, k8s mounts
+`/sys/fs/cgroup` read-only for non-privileged containers, and a writable cgroup
+needs either `privileged: true` or a host cgroup bind-mount (a node change, out of
+scope). So full `--privileged` is required on these nodes — there is no
+lesser-privilege middle ground.
+
+**The trade-off, stated plainly.** Non-rootless dockerd is real root with no user
+namespace: a hijacked agent that reaches `tcp://127.0.0.1:2375` can `docker run
+--privileged` straight to node root, and node root reads every co-scheduled pod's
+secrets from the kubelet — including the api pod's `UZI_SECRET_KEY`, the master
+key that decrypts every user's forge PAT and Anthropic token. This is an
+owner-accepted risk on the mitigation terms below, for dev-cluster specifically —
+not a claim that non-rootless is safe by default. See
+`prds/89-optional-nonrootless-dind.md` (Security framing, Decision Log) for the
+full reasoning.
+
+**The mitigations (required together, not a menu):**
+- `workers.docker.acknowledgeNonRootlessNodeRoot: true` — the chart **refuses to
+  render** `rootless: false` without it, so the node-root acceptance is a loud,
+  visible operator choice, never an inherited default.
+- Loopback-bind — dockerd listens on `tcp://127.0.0.1:2375` only (the
+  `docker:dind` image's automatic `0.0.0.0:2375` listener is suppressed), so the
+  unauthenticated root daemon is never reachable off-pod.
+- Claim-time repo allowlist — the **Admin Settings** `docker_repo_allowlist`
+  setting: a docker-capable worker only claims runs whose repo is on it. This is
+  the acceptance's likelihood control and **must be populated before any real
+  work runs on a non-rootless cluster**, not an optional follow-up.
+- Soft anti-affinity — keeps the api pod (holding `UZI_SECRET_KEY`) and CNPG off
+  docker-worker nodes, so wherever node root lands it reads no crown-jewel secret.
+
+**Shared run workdir.** Both postures mount a no-secrets `emptyDir` (`/data/runner`,
+the M-workdir Decision-3 amendment) into both the worker and the dind sidecar at
+the same path, so `docker run -v`/compose bind mounts under the run's checkout
+(uzi's own e2e included) resolve in the daemon instead of hitting an empty dir.
+The path mirrors `agent/src/git.ts`'s `runnerRoot` — if that root ever moves,
+`controller/internal/kube/render.go`'s render must move with it.
+
+### M4/M5 runbook: known items before go-live
+
+Not blockers to M1–M3 landing, but gate the live rollout. Full detail on 2–4 is
+recorded in `specs/ai.md`; this stays a pointer, not a duplicate.
+
+1. **Enable ordering.** Nothing in the chart couples the
+   `acknowledgeNonRootlessNodeRoot` ack to the api build actually carrying
+   M-allow. Do **not** set `rootless: false` live until the api deploy with the
+   M-allow claim gate (repo allowlist) is out — M-allow is the acceptance's
+   likelihood control, not an optional follow-up.
+2. **M-workdir bind-source scope.** The shared workdir only resolves bind
+   sources located *under* the run's checkout; sources outside it don't. Concretely,
+   `./e2e/run-e2e.sh` defaults its run dir to `${TMPDIR:-/tmp}/uzi-e2e-$$` —
+   outside `/data/runner` — so its own compose binds won't resolve in dind as
+   shipped. Fix: point the worker's `TMPDIR` at a subdir under `/data/runner`
+   (`run-e2e.sh`'s sanitized-env allowlist already passes `TMPDIR`/
+   `E2E_RUN_DIR` through). The concrete M4/M5 gate: e2e green **and** no secret
+   transits the now-dind-visible tmp.
+3. **Runner-clone durability.** M-workdir moves the runner clone from the
+   persistent `/data` PVC to an ephemeral `emptyDir`, so a run's working tree no
+   longer survives a pod restart. Expected, not a regression: committed work is
+   safe (the persistent bare repo at `/data/repos` re-clones on resume);
+   uncommitted-across-a-crash was never durable either way.
+4. **Rootless fsGroup workdir read (M4 runtime check).** The workdir is
+   `fsGroup: 10001`; whether a future *rootless* cluster's uid-1000 dind sidecar
+   can read worker-written bind sources via the fsGroup supplemental group is
+   unproven by unit tests. Non-rootless (dev-cluster) is root, unaffected.
+
 ## The api TLS listener (`api.tls.*`, PRD #58)
 
 **Off by default, and off is a no-op**: with `api.tls.enabled: false` the chart

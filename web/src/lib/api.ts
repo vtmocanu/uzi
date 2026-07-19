@@ -422,6 +422,12 @@ export interface AppSettings {
   health_queued_seconds: string;
   health_approval_seconds: string;
   health_nudge_cooldown_seconds: string;
+  // Docker-worker repo allowlist (PRD #89 M-allow): a comma-separated list of repo
+  // ids (UUIDs). A docker-capable worker may only claim runs for repos on this list;
+  // empty is fail-closed (a docker worker then claims no repo-bearing run). Non-docker
+  // workers are unaffected. The admin UI edits it as a repo multiselect writing the
+  // ids — admins pick paths, never paste UUIDs.
+  docker_repo_allowlist: string;
 }
 
 // SettingSource reports where a setting's effective value comes from (PRD #25):

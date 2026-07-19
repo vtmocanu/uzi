@@ -298,6 +298,16 @@ type SettingsReader interface {
 	JudgeModel(ctx context.Context) (string, error)
 }
 
+// DockerAllowlistReader is the narrow settings view the claim gate reads for the
+// docker-worker repo allowlist (PRD #89 M-allow). *settings.Cache satisfies it.
+// Kept its own interface (interface segregation, like SettingsReader/Settings) so a
+// test exercises only what it uses. Optional (nil-safe): a nil reader means the
+// allowlist is UNAVAILABLE, which the claim gate treats as fail-closed for a docker
+// worker — it then claims no repo-bearing run. A non-docker worker never consults it.
+type DockerAllowlistReader interface {
+	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
+}
+
 // Service holds the store, the secret cipher, and the runtime params.
 type Service struct {
 	q   Store
@@ -332,6 +342,12 @@ type Service struct {
 	// the whole health detector, so tests that do not exercise it — and any
 	// deployment without a settings cache — behave exactly as before.
 	healthSettings Settings
+	// dockerAllowlist reads the docker-worker repo allowlist the claim gate enforces
+	// (PRD #89 M-allow). Optional (nil-safe); set via SetDockerAllowlist with the same
+	// settings cache the HTTP handlers hold. Nil ⇒ a docker worker is fail-closed (it
+	// claims no repo-bearing run); a non-docker worker never consults it, so tests and
+	// deployments without a settings cache are unaffected.
+	dockerAllowlist DockerAllowlistReader
 	// lastSlowClampWarn is the last health_slow_seconds value the read-time clamp
 	// warned about (PRD #47), so the warning logs once per distinct misconfigured
 	// value instead of on every 15s sweep. Touched only by the sweeper goroutine
@@ -364,6 +380,13 @@ func (s *Service) SetVault(v *vault.Vault) { s.vlt = v }
 // startup, before the sweeper runs, with the same settings cache the HTTP handlers
 // hold. A nil healthSettings (the default) disables the health detector entirely.
 func (s *Service) SetHealthSettings(cfg Settings) { s.healthSettings = cfg }
+
+// SetDockerAllowlist wires the docker-worker repo-allowlist reader the claim gate
+// enforces (PRD #89 M-allow). Call once at startup, before serving, with the same
+// settings cache the HTTP handlers hold. Nil (the default in tests) makes a docker
+// worker fail-closed — it claims no repo-bearing run — while leaving non-docker
+// workers wholly unaffected.
+func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlist = r }
 
 // notify fires the lifecycle hook if one is wired. It is a no-op otherwise, so
 // every call site stays unconditional.
@@ -482,10 +505,36 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker) (*ClaimPayload, e
 		return nil, nil // idle: owner locked
 	}
 
+	// Docker-worker repo allowlist (PRD #89 M-allow): a docker-enabled worker may
+	// claim ONLY runs whose repo is on the trusted allowlist. Repo-less JUDGE runs are
+	// exempt (the SQL narrows the exemption to kind='judge', so a future repo-less kind
+	// fail-closes until deliberately exempted) — safe NOT because "repo-less =
+	// content-free" (a judge reasons over an untrusted trace) but because the repo-less
+	// executor (agent/src/judge-runner.ts, and the chat lane's chat-executor.ts)
+	// carries no daemon-reaching tool, so DOCKER_HOST is inert for it; an agent/
+	// regression test pins that. This is the accepted-risk likelihood control for the non-rootless
+	// DinD tier: the trigger is repo content, so the gate binds at claim, not at
+	// provisioning. Non-docker workers skip it entirely (isDocker=false → the SQL
+	// predicate short-circuits), so their behavior is unchanged. Fail-closed: a docker
+	// worker with no allowlist reader wired, or an empty allowlist, claims no
+	// repo-bearing run. Read STRICTLY — a settings read error leaves the run unclaimed
+	// (never claim a repo run when the allowlist can't be confirmed).
+	isDocker := wkr.DockerEnabled.Valid && wkr.DockerEnabled.Bool
+	allowlist := []uuid.UUID{}
+	if isDocker && s.dockerAllowlist != nil {
+		al, aerr := s.dockerAllowlist.DockerRepoAllowlist(ctx)
+		if aerr != nil {
+			return nil, aerr
+		}
+		allowlist = al
+	}
+
 	run, err := s.q.ClaimRun(ctx, store.ClaimRunParams{
-		WorkerID:       pgUUID(wkr.ID),
-		UserID:         wkr.UserID,
-		AffinityCutoff: pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
+		WorkerID:            pgUUID(wkr.ID),
+		UserID:              wkr.UserID,
+		AffinityCutoff:      pgTime(s.now().Add(-s.p.WorkerAffinityGrace)),
+		IsDockerWorker:      isDocker,
+		DockerRepoAllowlist: allowlist,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

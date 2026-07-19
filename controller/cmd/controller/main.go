@@ -68,9 +68,13 @@ func main() {
 	}
 
 	materializer := kube.New(kubeClient, kube.RenderConfig{
-		Namespace:          cfg.WorkerNamespace,
-		DockerNamespace:    cfg.WorkerDockerNamespace,
-		DinDImage:          cfg.WorkerDinDImage,
+		Namespace:       cfg.WorkerNamespace,
+		DockerNamespace: cfg.WorkerDockerNamespace,
+		DinDImage:       cfg.WorkerDinDImage,
+		// Config carries the POSITIVE `rootless` bool (matching the chart value); the
+		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
+		// rootless posture. Invert here, at the one wiring point.
+		DinDNonRootless:    !cfg.WorkerDinDRootless,
 		ServiceAccountName: cfg.WorkerServiceAccount,
 		APIURL:             cfg.WorkerAPIURL,
 		StorageClass:       cfg.WorkerStorageClass,
@@ -95,7 +99,11 @@ func main() {
 		// docker workers at all, and into which privileged namespace (empty = off, and
 		// docker workers in the poll are then skipped, not rendered into the default).
 		"docker_workers", cfg.WorkerDockerNamespace != "",
-		"docker_namespace", cfg.WorkerDockerNamespace)
+		"docker_namespace", cfg.WorkerDockerNamespace,
+		// The DinD posture at a glance (PRD #89): false here means dockerd runs as real
+		// root and a breakout is node root — worth seeing in the first log line on a
+		// cluster that opted into it.
+		"docker_rootless", cfg.WorkerDinDRootless)
 	loop.Run(ctx)
 	log.Info("controller stopped")
 }

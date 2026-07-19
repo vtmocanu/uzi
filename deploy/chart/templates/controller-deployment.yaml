@@ -112,17 +112,27 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- if .Values.workers.docker.enabled }}
-            # The docker tier (PRD #83 M3). Both are required together — the controller
-            # refuses to boot with one set and not the other — and the namespace must
-            # differ from UZI_WORKER_NAMESPACE (the privileged tier is a SEPARATE
-            # namespace, which is the whole point). With docker off, neither is set and
-            # the controller renders no docker workers (a docker worker in the poll is
-            # skipped, never rendered into the restricted default).
+            # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
+            # together — the controller refuses to boot with one set and not the other —
+            # and the namespace must differ from UZI_WORKER_NAMESPACE (the privileged tier
+            # is a SEPARATE namespace, which is the whole point). The posture var below is
+            # also required when the tier is on. With docker off, none are set and the
+            # controller renders no docker workers (a docker worker in the poll is skipped,
+            # never rendered into the restricted default).
             - name: UZI_WORKER_DOCKER_NAMESPACE
               value: {{ .Values.workers.docker.namespace | quote }}
-            # The pinned rootless-DinD sidecar image, shared with the compose track.
+            # The DinD posture (PRD #89): true (default) = rootless; false = non-rootless
+            # privileged (dockerd as real root, the node-root residual gated by
+            # acknowledgeNonRootlessNodeRoot in worker-invariants.yaml). The controller's
+            # config reads + validates it and threads it to the render branch.
+            - name: UZI_WORKER_DIND_ROOTLESS
+              value: {{ .Values.workers.docker.rootless | quote }}
+            # The pinned DinD sidecar image, SELECTED by posture (OQ-A hybrid): the
+            # explicit `image` override wins, else rootlessImage/nonRootlessImage by
+            # `rootless`. worker-invariants.yaml's coherence fail-guard rejects an
+            # image/posture mismatch, so this value is always coherent with the flag above.
             - name: UZI_WORKER_DIND_IMAGE
-              value: {{ .Values.workers.docker.image | quote }}
+              value: {{ include "uzi.workerDinDImage" . | quote }}
             {{- end }}
           resources:
             {{- toYaml .Values.workers.controller.resources | nindent 12 }}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -105,11 +106,23 @@ type Config struct {
 	// renders no docker workers; a docker worker in the poll is then skipped with a
 	// loud error rather than rendered into the wrong (restricted) namespace.
 	WorkerDockerNamespace string
-	// WorkerDinDImage is the fully-pinned rootless-DinD sidecar image
-	// (docker:<tag>-dind-rootless@sha256:...). It is operator config, not wire data —
-	// the api never names an image — and shared with the compose track's pin (arch
-	// §Q6). Required exactly when WorkerDockerNamespace is set.
+	// WorkerDinDImage is the fully-pinned DinD sidecar image
+	// (docker:<tag>-dind-rootless@sha256:... or, non-rootless, docker:<tag>-dind@...).
+	// It is operator config, not wire data — the api never names an image — and shared
+	// with the compose track's / CI's pins. Required exactly when WorkerDockerNamespace
+	// is set. The chart selects it by posture (uzi.workerDinDImage) and a chart
+	// fail-guard rejects an image/posture mismatch, so it always agrees with
+	// WorkerDinDRootless below.
 	WorkerDinDImage string
+	// WorkerDinDRootless is the DinD posture (PRD #89). true = rootless (PRD #83, the
+	// safe default and the recommended stance everywhere it is possible); false =
+	// non-rootless privileged (dockerd as REAL ROOT, the node-root residual owner-accepts
+	// on nodes without unprivileged userns). It is REQUIRED and must be an unambiguous
+	// bool WHEN the docker tier is configured — a docker tier that leaves the posture
+	// unset refuses to boot rather than guess node-root-vs-userns. Defaults true (docker
+	// tier off ⇒ irrelevant, but the safe value). Threaded to RenderConfig.DinDNonRootless
+	// (inverted) so the render side's zero value stays the safe rootless posture.
+	WorkerDinDRootless bool
 }
 
 // Load reads and validates the configuration.
@@ -117,6 +130,9 @@ func Load() (Config, error) {
 	cfg := Config{
 		PollInterval: parseDuration("CONTROLLER_POLL_INTERVAL", 10*time.Second),
 		HTTPTimeout:  parseDuration("CONTROLLER_HTTP_TIMEOUT", 15*time.Second),
+		// Safe default: rootless. Overridden (and REQUIRED explicit) when the docker tier
+		// is configured — see validateDockerTier.
+		WorkerDinDRootless: true,
 	}
 
 	base := strings.TrimSpace(os.Getenv("UZI_API_URL"))
@@ -206,12 +222,17 @@ func loadWorkerSettings(cfg *Config) error {
 	return nil
 }
 
-// validateDockerTier enforces the both-or-neither coupling of the docker knobs and
-// the blast-radius separation of the two namespaces.
+// validateDockerTier enforces the both-or-neither coupling of the docker knobs, the
+// blast-radius separation of the two namespaces, and (PRD #89) an unambiguous DinD
+// posture whenever the tier is on.
 func validateDockerTier(cfg *Config) error {
 	ns, img := cfg.WorkerDockerNamespace, cfg.WorkerDinDImage
+	rootlessRaw := strings.TrimSpace(os.Getenv("UZI_WORKER_DIND_ROOTLESS"))
 	if ns == "" && img == "" {
-		return nil // docker tier off; docker workers are skipped in the reconcile.
+		// Docker tier off; docker workers are skipped in the reconcile. A stray posture
+		// value with no tier is ignored (there is nothing for it to configure), and
+		// WorkerDinDRootless keeps its safe default (true).
+		return nil
 	}
 	if ns == "" || img == "" {
 		return fmt.Errorf("UZI_WORKER_DOCKER_NAMESPACE and UZI_WORKER_DIND_IMAGE must be set together " +
@@ -227,6 +248,21 @@ func validateDockerTier(cfg *Config) error {
 			"the docker tier is a SEPARATE privileged namespace so its blast radius never touches the "+
 			"restricted worker namespace", ns, cfg.WorkerNamespace)
 	}
+	// The DinD posture (PRD #89). When the tier is on it MUST be present and an
+	// unambiguous bool: it selects node-root (non-rootless) vs a userns-mapped uid
+	// (rootless), so a docker tier that leaves it unset refuses to boot rather than
+	// default a security posture. The chart always sets it under workers.docker.enabled,
+	// so this only bites a hand-rolled controller env that half-configured the tier.
+	if rootlessRaw == "" {
+		return fmt.Errorf("UZI_WORKER_DIND_ROOTLESS is required when the docker tier is configured " +
+			"(it selects the DinD posture: true=rootless, false=non-rootless privileged/node-root); " +
+			"refusing to guess a security posture")
+	}
+	rootless, err := strconv.ParseBool(rootlessRaw)
+	if err != nil {
+		return fmt.Errorf("UZI_WORKER_DIND_ROOTLESS=%q is not a boolean (want true or false): %w", rootlessRaw, err)
+	}
+	cfg.WorkerDinDRootless = rootless
 	return nil
 }
 
