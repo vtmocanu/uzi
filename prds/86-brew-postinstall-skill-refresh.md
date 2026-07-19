@@ -75,21 +75,40 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
    overwriting. Re-run = no-op.
 4. **Hook command = `uzi skill install`.** Reuses the existing, tested writer; version-gated no-op
    keeps session-start cost near zero.
-5. **Matcher = whatever fires on a new interactive session** (`startup`, plus `resume`/`clear` if
-   needed to cover reopened sessions). Confirmed in M1 before coding — this is the load-bearing
-   assumption, and v1 died on an unverified one, so it is a gate, not a footnote.
-6. **`caveats` is print-only and safe.** Unlike `post_install`, `caveats` merely prints text for the
+5. **Matcher = `startup`** (a new interactive session), likely **+ `resume`** to cover reopened
+   sessions — `startup`/`resume`/`clear`/`compact` are the four `SessionStart` matchers, but the docs
+   do **not** state which fires on a fresh session, so M1 confirms empirically.
+6. **`timeout` set low + rely on best-effort exit.** Command hooks default to a **10-minute** timeout;
+   we pin a short one (~15s) so a hung `uzi` cannot stall session start, and lean on the documented
+   "non-zero exit ≠ blocking" behaviour so a failed refresh never breaks the session. Hook command is
+   `uzi skill install`.
+7. **Identity = full command string (settings.json has no hook `id`).** There is no upstream
+   uniqueness/collision mechanism for the `SessionStart` array; the merge dedupes by exact command
+   string and must not disturb sibling hooks. `~/.claude/settings.json` is user-scope; a project
+   `.claude/settings.json` can override it, which is fine for a global default.
+8. **`caveats` is print-only and safe.** Unlike `post_install`, `caveats` merely prints text for the
    real user; it runs for from-source formulae and cannot fail the install.
-7. **Reuse the SKILL.md backup/USER_EDITED posture.** The settings.json edit mirrors the existing
+9. **Reuse the SKILL.md backup/USER_EDITED posture.** The settings.json edit mirrors the existing
    `.bak` safety valve so the two skill-management surfaces behave consistently.
+10. **Docs advertise both surfaces (skill + hook).** `README.md` points users at
+   `uzi skill install-hook`; `docs/cli.md` documents skill and hook side by side (see M5). An
+   unadvertised opt-in closes nothing.
 
 ## Milestones
 
-- [ ] **M1 — Verify SessionStart semantics (gate).** Confirm from Claude Code docs: (a) SessionStart
-  hooks run before the model reads skills and a hook-refreshed `SKILL.md` is picked up in the SAME
-  session; (b) the correct matcher(s) for a new interactive session; (c) the exact
-  `settings.json` hook schema and that it is strict JSON; (d) failure/timeout/async behavior.
-  Record the confirmed facts here. **Do not start M2 until this is settled.**
+- [ ] **M1 — Empirical go/no-go on same-session hot-load (hard gate).** Confirmed from docs (guide
+  review, Claude Code hooks-guide + settings docs): the `settings.json` `SessionStart` schema
+  (`matcher` + `hooks[].{type,command,timeout}`), strict-JSON-only, user-scope `~/.claude/settings.json`,
+  4 matchers (`startup`/`resume`/`clear`/`compact`), 10-min default timeout, and non-zero-exit is
+  non-blocking. **Undocumented and load-bearing:** whether a `SessionStart` hook that rewrites
+  `~/.claude/skills/uzi-cli/SKILL.md` is picked up **in the same session** before the model reads it.
+  The `dot-ai` precedent generates `~/.claude/commands/*` (slash commands), a *different* surface from
+  a Skill-tool `SKILL.md`, so it is suggestive, not proof. **Spike:** wire the hook, bump the skill
+  version, open a fresh session, observe whether the model sees the new skill. **Go** → build M2–M6 as
+  the same-session window-closer. **No-go** (hot-load is next-session-only) → the hook still guarantees
+  freshness for the *next* session without requiring a `uzi` run (weaker than advertised, marginally
+  better than today's self-heal); **stop and re-decide with the user** whether that residual value is
+  worth the settings.json-editing surface, rather than shipping on a false premise like v1.
 - [ ] **M2 — `uzi skill install-hook` / `uninstall-hook` (CLI, Go).** Idempotent, non-clobbering
   `settings.json` merge with backup and malformed-JSON abort. Unit tests over fixtures: missing
   file, empty file, file with unrelated hooks incl. an existing `SessionStart` array, re-run
@@ -122,9 +141,12 @@ v1 — nothing in the brew lifecycle can reach the real `~/.claude` to do it any
 - **R1 — Corrupting a user's `settings.json`.** The file is shared with many hooks; a bad merge
   breaks Claude Code globally. Mitigation: parse-validate → back up → abort-on-malformed → write;
   idempotent stable-string identity; tests over realistic multi-hook fixtures (M2).
-- **R2 — SessionStart may not run before skills are read.** If it doesn't, this is as useless as
-  v1. Mitigation: M1 is a hard gate; the in-environment `dot-ai` SessionStart precedent is strong
-  but must be confirmed against docs, not assumed.
+- **R2 — Same-session hot-load is undocumented (the v1-shaped risk).** If a hook-refreshed
+  `SKILL.md` is only visible next session, the feature does not close the same-session window it
+  exists for — it degrades to "guarantees next-session freshness without a `uzi` run," barely above
+  today's self-heal. The docs do not state the ordering, and the `dot-ai` precedent is a *different*
+  surface (`commands/` vs `skills/`). Mitigation: **M1 is an empirical hard gate with an explicit
+  no-go path back to the user** — we do not build on this assumption, we test it first.
 - **R3 — Session-start latency.** Every session pays the hook. Mitigation: `uzi skill install` is a
   version-gated local no-op when current; measure in M6.
 - **R4 — Stale hook after uninstall.** If the user removes the `uzi` binary but leaves the hook, it
