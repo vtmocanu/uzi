@@ -27,8 +27,8 @@ On first run the CLI also drops a Claude Code skill at
 `~/.claude/skills/uzi-cli/SKILL.md` (generated from the binary's own command
 tree, so it never drifts). No manual step is needed, but you can force a
 refresh — e.g. right after upgrading — with `uzi skill install --force`, and
-check it with `uzi skill status` (details under **Agents get a bundled skill
-for free**, below).
+check it with `uzi skill status` (details under **Bundled skill and
+session-start hook**, below).
 
 ## 2. Point it at your instance
 
@@ -143,10 +143,10 @@ its path and whether it's installed and current.
 **The session-start hook, opt-in.** The per-command refresh above only helps
 once a `uzi` command has run — right after `brew upgrade uzi-cli`, a fresh
 Claude Code session can still read the OLD skill before that happens. Run
-`uzi skill install-hook` to close that window: it wires a Claude Code
+`uzi skill install-hook` to narrow that window: it wires a Claude Code
 `SessionStart` hook into `~/.claude/settings.json` whose command is
-`uzi skill install`, so the skill is refreshed at the start of every session,
-before the model ever reads it.
+`uzi skill install`, so the skill is refreshed at session start rather than
+waiting for your next `uzi` command.
 
 The write is surgical and non-destructive:
 
