@@ -132,16 +132,27 @@ func TestStripUnfencedSlashLinesCRLF(t *testing.T) {
 	// trailing \r (or a bare-\r body) must be treated as CLOSED here and the following
 	// column-0 /label line stripped (audit Medium-1 — the CRLF-blind bypass).
 	cases := map[string]string{
-		"crlf":   "```\r\ncode\r\n```\r\n/label ~autopilot\r\n",
-		"bareCR": "```\rcode\r```\r/label ~autopilot\r",
+		"crlf":   "```\r\ncode\r\n```\r\n/label ~autopilot\r\n/close\r\n",
+		"bareCR": "```\rcode\r```\r/label ~autopilot\r/close\r",
 	}
 	for name, body := range cases {
 		got := StripUnfencedSlashLines(body)
-		if strings.Contains(got, "/label") {
+		if strings.Contains(got, "/label") || strings.Contains(got, "/close") {
 			t.Fatalf("%s: CRLF-blind strip left a quick-action line: %q", name, got)
 		}
 		if !strings.Contains(got, "code") {
 			t.Fatalf("%s: fenced code was lost: %q", name, got)
+		}
+	}
+}
+
+func TestSanitizeTitleCRLF(t *testing.T) {
+	// A CRLF/­bare-CR title with a leading quick-action must collapse to one line and lose
+	// its leading "/" (never open with a quick-action character).
+	for _, in := range []string{"/label ~x\r\nmake the fix", "/label ~x\rmake the fix"} {
+		got := SanitizeTitle(in)
+		if strings.HasPrefix(got, "/") || strings.ContainsAny(got, "\r\n") {
+			t.Fatalf("SanitizeTitle(%q) = %q; want single line, no leading slash", in, got)
 		}
 	}
 }

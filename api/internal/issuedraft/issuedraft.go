@@ -242,13 +242,24 @@ func provenance(in Input) string {
 
 // ── Write-boundary sanitizers (Decision 10) — the single source of truth M3 re-runs ──
 
-// SanitizeFiledBody is the idempotent write-boundary pass over an issue body: strip
-// unfenced "/"-lines, then scrub secret shapes. Render applies it to the templated
-// draft; the M3 POST handler re-applies it to the CLIENT-supplied body, which may have
-// been edited or replaced (the "the draft was inert" invariant does not survive the
-// round-trip, so it must be re-established server-side).
+// normalizeNewlines folds "\r\n" and bare "\r" to "\n" (audit Medium-1). GitLab
+// CRLF-normalizes before its markdown/quick-action processing, so every write-boundary
+// control here must see the same line breaks it will — otherwise a fence closed with a
+// trailing "\r" reads as unclosed here (and a following column-0 "/label" survives the
+// strip) while GitLab executes it. Applied at BOTH public entry points below, so the
+// whole downstream fence/strip/scan chain is CRLF-safe by construction.
+func normalizeNewlines(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
+// SanitizeFiledBody is the idempotent write-boundary pass over an issue body: normalize
+// line endings (CRLF-safe), strip unfenced "/"-lines, then scrub secret shapes. Render
+// applies it to the templated draft; the M3 POST handler re-applies it to the
+// CLIENT-supplied body, which may have been edited or replaced (the "the draft was inert"
+// invariant does not survive the round-trip, so it must be re-established server-side).
 func SanitizeFiledBody(body string) string {
-	return ScrubSecretShapes(StripUnfencedSlashLines(body))
+	return ScrubSecretShapes(StripUnfencedSlashLines(normalizeNewlines(body)))
 }
 
 // SanitizeTitle collapses a title to a single line, removes any leading whitespace/"/"
@@ -257,7 +268,7 @@ func SanitizeFiledBody(body string) string {
 // secret shapes. It never deletes the title (unlike the line-strip), only neutralizes
 // its head, so a hostile leading "/" yields a defanged title rather than an empty one.
 func SanitizeTitle(s string) string {
-	s = collapseWS(s)
+	s = collapseWS(normalizeNewlines(s))
 	s = strings.TrimLeft(s, " /")
 	s = ScrubSecretShapes(s)
 	if len(s) > titleMax {
@@ -326,14 +337,11 @@ var wsRun = regexp.MustCompile(`\s+`)
 // identical fence chars (` or ~), up to 3 leading spaces, opens/closes a block; a closing
 // fence must be the same char and at least as long as the opener.
 func StripUnfencedSlashLines(body string) string {
-	// Normalize line endings FIRST (audit Medium-1). GitLab CRLF-normalizes before its
-	// markdown/quick-action processing, so a closing fence written "```\r" — or any bare
-	// "\r" line break — must be seen as a line ending here too; otherwise the fence
-	// tracker treats "```\r" as an unclosed fence (info="\r") and stops stripping, while
-	// GitLab sees the fence CLOSED and executes a following column-0 "/label" line. Fold
-	// "\r\n" and bare "\r" to "\n" so every downstream check is CRLF-safe.
-	body = strings.ReplaceAll(body, "\r\n", "\n")
-	body = strings.ReplaceAll(body, "\r", "\n")
+	// Normalize line endings FIRST (audit Medium-1) so the fence tracker sees the same
+	// line breaks GitLab does — a closing fence "```\r" must read as CLOSED, not as an
+	// unclosed fence with info="\r" that keeps a following "/label" line unstripped. Also
+	// applied at the SanitizeFiledBody entry; kept here too so a direct caller is safe.
+	body = normalizeNewlines(body)
 	lines := strings.Split(body, "\n")
 	out := make([]string, 0, len(lines))
 	var fenceChar byte // 0 = not in a fence
