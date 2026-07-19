@@ -598,6 +598,18 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// of them route through $TMPDIR. The daemon can already read this dir (it is shared
 		// by design), so tmp being dind-visible adds no exposure beyond the checkout that
 		// M-workdir already shares.
+		//
+		// The agent honours this: on the current non-root k8s start entrypoint.sh takes the
+		// single-uid branch (it unsets UZI_RUNNER_TMPDIR and does NOT set its own TMPDIR), so
+		// this pod-spec TMPDIR survives and runnerTmpdir() (= UZI_RUNNER_TMPDIR || TMPDIR)
+		// returns it — reaching both the worker and the repo's docker/compose. Render-only,
+		// verified against agent/templates/entrypoint.sh + agent/src/runner-uid.ts.
+		// FUTURE COUPLING: PRD #51 M4's runner-uid split (root-started A1 path, not yet on
+		// k8s) makes the entrypoint export its OWN tmpdirs UNDER /tmp — worker TMPDIR
+		// /tmp/uzi-worker (overriding this value) and UZI_RUNNER_TMPDIR /tmp/uzi-runner — both
+		// OUTSIDE /data/runner, so repo bind sources would land back outside the dind-shared
+		// workdir. When that split lands on k8s, both tmpdirs must be relocated under
+		// dindWorkdirDir. Not a 0.8.1 concern (the split does not run on the non-root start).
 		env = append(env, corev1.EnvVar{Name: "TMPDIR", Value: dindWorkdirDir})
 	}
 
