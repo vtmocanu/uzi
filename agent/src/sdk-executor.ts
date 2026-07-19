@@ -29,6 +29,7 @@ import type { Options as SdkOptions, SDKMessage, SpawnOptions, SpawnedProcess } 
 import type { Executor, ExecutorResult, RunContext } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
+import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
@@ -96,6 +97,11 @@ export interface SdkExecutorOptions {
   /** Devbox provisioning fn (PRD #18 M3). Injected in tests so no real nix egress
    *  happens; default = provisionTools. */
   provision?: typeof provisionTools;
+  /** The worker's resolved docker wiring (PRD #83 M1 keystone), computed ONCE at
+   *  startup (docker-wiring.ts) and the same for every run. Absent/`{}` ⇒ no daemon:
+   *  the Bash guardrail denies docker and no DOCKER_HOST reaches the SDK env. Present
+   *  ⇒ docker is allowed and DOCKER_HOST is injected. */
+  dockerWiring?: DockerWiring;
 }
 
 /** What one turn observed: the session id, and any workflow signals. */
@@ -124,6 +130,10 @@ export class SdkExecutor implements Executor {
   private readonly provisionRoot: string;
   private readonly provisionHomeDir: string;
   private readonly provision: typeof provisionTools;
+  /** Resolved once from the worker's docker wiring (PRD #83 M1). `dockerWired` gates
+   *  the Bash guardrail; `dockerHost` is injected into the SDK env when present. */
+  private readonly dockerWired: boolean;
+  private readonly dockerHost?: string;
   /** Every pid spawned across the current run's turns, for the done-path reap.
    *  Private to THIS instance — one SdkExecutor is built per run (PRD #42 Decision
    *  4), so two concurrent runs can never wipe/kill each other's set. */
@@ -153,6 +163,11 @@ export class SdkExecutor implements Executor {
     this.provisionHomeDir = opts.provisionHomeDir ?? this.homeDir;
     this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.provisionHomeDir), "provision");
     this.provision = opts.provision ?? provisionTools;
+    // Docker wiring (PRD #83 M1): derive the two consumer facts ONCE. `dockerHost` set
+    // ⇒ a sidecar daemon is reachable, so the guardrail allows docker and DOCKER_HOST is
+    // injected into the SDK env; absent ⇒ docker is denied and never injected.
+    this.dockerHost = opts.dockerWiring?.dockerHost;
+    this.dockerWired = this.dockerHost !== undefined;
   }
 
   /**
@@ -214,7 +229,7 @@ export class SdkExecutor implements Executor {
       provision: this.provision,
     });
 
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv);
+    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
 
     // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
@@ -240,7 +255,7 @@ export class SdkExecutor implements Executor {
     // reuse; only the Agent-guard hook's allowSet is frozen at construction and so
     // must be REBUILT when the implement roster differs from the plan roster (PRD
     // #37 — an excluded or repo-sourced subagent must be denied by the guard).
-    const bashHook = buildPreToolUseHook(this.log, this.secretPaths);
+    const bashHook = buildPreToolUseHook(this.log, this.secretPaths, this.dockerWired);
     const pathHook = buildPathGuardHook(ctx.worktreePath, this.log);
     const preToolUse = (allowedSubagents: string[]): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [
       { matcher: "Bash", hooks: [bashHook] },

@@ -15,9 +15,11 @@ WORKDIR /app
 # xz + tar for the pinned nix/devbox downloads. openjdk17 is this template's reason
 # to exist — a full JDK (java + javac) from Alpine's community repo. setpriv
 # (util-linux) is the PRD #51 A1 drop wrapper (busybox setpriv cannot `--reuid`);
-# the grep fails the build if /bin/setpriv is not the util-linux binary. MIRRORED
-# from templates/base.
-RUN apk add --no-cache git bash tini curl xz tar openjdk17 setpriv \
+# the grep fails the build if /bin/setpriv is not the util-linux binary. docker-cli +
+# docker-cli-compose + docker-cli-buildx (PRD #83 Decision 1): the docker CLIENT only,
+# NO dockerd, inert without a wired daemon (DOCKER_HOST not baked). MIRRORED from
+# templates/base (jvm is NOT `FROM base`; keep in lockstep).
+RUN apk add --no-cache git bash tini curl xz tar openjdk17 setpriv docker-cli docker-cli-compose docker-cli-buildx \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid
 
 # JAVA_HOME + PATH so `java`/`javac` and Maven/Gradle wrappers resolve for the
@@ -77,6 +79,19 @@ RUN set -o pipefail \
     && tar -xzf "${TARBALL}" -C devbox-extract \
     && install -m 0755 "$(find devbox-extract -type f -name devbox | head -n1)" /usr/local/bin/devbox \
     && rm -rf "${TARBALL}" checksums.txt devbox-extract
+
+# --- PRD #83 M1 (Q2): go + python default toolchain via devbox-global — MIRRORED FROM base
+# The same committed pinned global manifest (agent/devbox-global/devbox.json:
+# go + python3 + pip) realized into the baked /nix at build time via `devbox global
+# install`, so every run has go/python/pip instantly. jvm is NOT `FROM base`, so it carries
+# its own copy of this stanza + the ENV PATH addition — keep in LOCKSTEP with base. Exact
+# `devbox global` invocation + resulting PATH/devbox.lock are tester-confirmed on the live
+# build (Dockerfile header convention). See templates/base for the full rationale.
+RUN mkdir -p /home/worker/.local/share/devbox/global/default
+COPY agent/devbox-global/devbox.json /home/worker/.local/share/devbox/global/default/devbox.json
+RUN devbox global install \
+    && chown -R worker:runner /home/worker/.local/share/devbox /nix
+ENV PATH="/home/worker/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:${PATH}"
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.

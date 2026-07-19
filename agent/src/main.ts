@@ -14,6 +14,7 @@ import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
+import { resolveDockerWiring } from "./docker-wiring.js";
 
 // Set once the logger exists so the last-resort fatal handler can scrub through
 // the SecretRegistry instead of writing a raw (unredacted) line.
@@ -35,6 +36,13 @@ async function main(): Promise<void> {
   log.addSecret(config.workerToken);
   fatalLog = log;
 
+  // Docker wiring keystone (PRD #83 M1): resolve ONCE at startup with a bounded liveness
+  // probe (loadConfig can't — it's sync). The single result feeds the register capability
+  // report, the guardrail's allow-when-wired decision, and the SDK's DOCKER_HOST. In M1
+  // there is no daemon, so this resolves to `{}` (docker inert + denied, capability
+  // absent); M2 (compose socket) / M3 (k8s DOCKER_HOST) supply a real sidecar to it.
+  config.dockerWiring = await resolveDockerWiring(process.env);
+
   log.info("uzi-agent starting", {
     version: config.version,
     api_url: config.apiUrl,
@@ -42,6 +50,7 @@ async function main(): Promise<void> {
     worker_name: config.workerName,
     executor: config.executor,
     max_concurrent_runs: config.maxConcurrentRuns,
+    docker_wired: config.dockerWiring.dockerHost !== undefined,
   });
   // Soft-ceiling warn (PRD #42 Decision 3): the cap is honored as configured, but a
   // value above the documented ceiling is almost certainly a fat-finger — each slot
@@ -89,6 +98,9 @@ async function main(): Promise<void> {
       // doesn't fragment per run. The per-run provision DIR still isolates the
       // synthesized devbox.json.
       provisionHomeDir: sdkHomeRoot,
+      // Docker wiring (PRD #83 M1): the same startup-resolved wiring for every run —
+      // gates the Bash guardrail's docker rule and supplies DOCKER_HOST to the SDK env.
+      dockerWiring: config.dockerWiring,
     });
     return { executor, homeDir: runHome };
   };

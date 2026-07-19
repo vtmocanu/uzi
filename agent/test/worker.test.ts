@@ -30,6 +30,7 @@ function fakeConfig(over: Partial<Config> = {}): Config {
     chatPollMs: 1,
     chatSessions: 1,
     maxConcurrentRuns: 1,
+    dockerWiring: {},
     ...over,
   } as unknown as Config;
 }

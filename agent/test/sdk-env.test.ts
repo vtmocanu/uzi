@@ -82,6 +82,26 @@ describe("buildSdkEnv", () => {
     assert.strictEqual(env.HOME, HOME_DIR);
   });
 
+  it("omits DOCKER_HOST when no sidecar is wired (PRD #83 Q4)", () => {
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    assert.ok(!("DOCKER_HOST" in env), "no DOCKER_HOST key when the worker has no daemon wired");
+    const withTools = buildSdkEnv(FAKE_OAUTH, HOME_DIR, { PATH: "/nix/bin" });
+    assert.ok(!("DOCKER_HOST" in withTools));
+  });
+
+  it("injects DOCKER_HOST when a sidecar is wired, and a provisioned var cannot clobber it", () => {
+    const DIND = "unix:///run/dind/docker.sock";
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, DIND);
+    assert.strictEqual(env.DOCKER_HOST, DIND);
+    // Set AFTER the tool-env fold: even if a provisioned var carried a DOCKER_HOST (it
+    // never does — not on the allowlist), the wired endpoint wins.
+    const folded = buildSdkEnv(FAKE_OAUTH, HOME_DIR, { DOCKER_HOST: "tcp://evil:2375" } as Record<string, string>, DIND);
+    assert.strictEqual(folded.DOCKER_HOST, DIND);
+    // The credential + HOME are untouched by the new param.
+    assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+    assert.strictEqual(env.HOME, HOME_DIR);
+  });
+
   it("never lets tool env overwrite a protected key (credential, HOME, ANTHROPIC_*)", () => {
     // filterShellenv already drops these, but buildSdkEnv is defensive too — the
     // ANTHROPIC_* keys must stay undefined so nothing outranks the OAuth token.

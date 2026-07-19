@@ -1,0 +1,29 @@
+{
+  // Pinned devbox GLOBAL manifest for the default worker toolchain (PRD #83 M1, Q2).
+  //
+  // go + python3 + pip are the owner's "the default worker should have docker/python/go
+  // available" set. They are delivered through the ONE nix/devbox provisioning path
+  // (PRD #18 — no second apk package path, no version drift), realized into the baked
+  // image /nix at BUILD time via `devbox global install` so first use is instant instead
+  // of paying the cold-start closure fetch. Each template Dockerfile copies this file
+  // (agent/devbox-global/devbox.json) into devbox's global config dir and installs it
+  // (base + jvm, in lockstep — jvm is NOT `FROM base`). It lives OUTSIDE agent/templates/
+  // because that dir is one-directory-per-worker-image; this is shared build config, not
+  // a template.
+  //
+  // devbox.json is parsed as HuJSON, so these `//` comments are valid.
+  //
+  // NOTE (pinning): like #18's per-run synthesized manifests, the nixpkgs revision is
+  // pinned by the DEVBOX_VERSION binary the Dockerfile installs (0.17.5) — deterministic
+  // per image build. The tester's live worker-user build (Dockerfile header convention,
+  // lines 57-59) generates the resolved `devbox.lock` here; committing that lock is the
+  // follow-up that upgrades the pin from "per devbox binary" to "per resolved store path".
+  //
+  // `pip` is nixpkgs `python3Packages.pip` (there is no top-level `pip` attr); the tester
+  // confirms `pip`/`python3`/`go` all resolve on the agent PATH of the built image (Q-C).
+  "packages": [
+    "go",
+    "python3",
+    "python3Packages.pip"
+  ]
+}

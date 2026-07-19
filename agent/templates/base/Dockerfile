@@ -21,7 +21,15 @@ WORKDIR /app
 # CAP_SETUID/SETGID ambient; the busybox setpriv applet CANNOT `--reuid`, so the
 # grep asserts the util-linux binary is the one on /bin/setpriv (fails the build
 # otherwise).
-RUN apk add --no-cache git bash tini curl xz tar setpriv \
+#
+# docker-cli + docker-cli-compose + docker-cli-buildx (Alpine community, PRD #83
+# Decision 1): the docker CLIENT only — there is NO `dockerd` in any image. It is
+# INERT without a daemon: DOCKER_HOST is NOT baked (Q3/keystone set it at run time
+# only when a sidecar is wired), so `docker …` on a sidecar-less worker fails loudly
+# ("cannot connect to the Docker daemon") rather than reaching for a host socket, and
+# the Bash guardrail denies docker outright until a daemon is wired. compose ships the
+# v2 subcommand plugin (`docker compose`), buildx the build plugin.
+RUN apk add --no-cache git bash tini curl xz tar setpriv docker-cli docker-cli-compose docker-cli-buildx \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid
 
 # Two runtime uids (PRD #51 A1). `worker` (uid 10001) holds the run credentials
@@ -113,6 +121,32 @@ RUN set -o pipefail \
     && tar -xzf "${TARBALL}" -C devbox-extract \
     && install -m 0755 "$(find devbox-extract -type f -name devbox | head -n1)" /usr/local/bin/devbox \
     && rm -rf "${TARBALL}" checksums.txt devbox-extract
+
+# --- PRD #83 M1 (Q2): go + python default toolchain via devbox-global (build-time) ------
+# The owner's "the default worker should have docker/python/go available" set, delivered
+# through the ONE nix/devbox path (PRD #18 — no second apk package path, no version drift)
+# and PRE-WARMED into the baked /nix so first use is instant instead of paying the cold
+# closure fetch. The committed pinned manifest (agent/devbox-global/devbox.json)
+# lists go + python3 + pip; `devbox global install` realizes their closures into the
+# DEFAULT /nix (baked into this image layer) and builds the global profile. Runs AFTER the
+# nix chown (line ~88) and the devbox binary install above, per the M1 spec.
+#
+# UNVERIFIED in this workspace (the Dockerfile-header convention, lines 57-59): the tester
+# re-runs the live worker-user build and confirms the EXACT `devbox global` invocation
+# (`devbox global install` from the copied manifest, or the equivalent
+# `devbox global add go python3 python3Packages.pip`), the resulting `devbox.lock`, and
+# that go/python3/pip land on the AGENT PATH. HOME=/home/worker (set above), so devbox's
+# global config resolves under $HOME/.local/share/devbox/global/default; ENV PATH below
+# adds that profile's bin dir. jvm mirrors this stanza (it is NOT `FROM base`).
+RUN mkdir -p /home/worker/.local/share/devbox/global/default
+COPY agent/devbox-global/devbox.json /home/worker/.local/share/devbox/global/default/devbox.json
+RUN devbox global install \
+    && chown -R worker:runner /home/worker/.local/share/devbox /nix
+# Put the devbox global profile bin on the image PATH so go/python3/pip resolve for BOTH
+# the worker's provision subprocess and the agent (whose SDK PATH = runnerPath() = the
+# image PATH). A per-run `devbox shellenv` still PREPENDS run tools, so the baked set stays
+# reachable underneath. The tester confirms this dir equals `devbox global path`/.devbox/…
+ENV PATH="/home/worker/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:${PATH}"
 
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.

@@ -34,6 +34,17 @@
 //  - Heredoc bodies are tokenized as if they were commands, so a benign
 //    `cat <<EOF … git push … EOF` may be over-denied. That degrades SAFE (a
 //    denied benign heredoc) and the agent can use Write/Edit instead.
+//  - Docker secret theft via bind-mount remap is NOT contained by this screener
+//    (PRD #83 auditor B4). The docker rule below denies docker ENTIRELY when no
+//    daemon is wired; on a WIRED worker it allows docker, and a literal
+//    `docker run -v /run/secrets/worker_token:/x` is still caught by the secret-path
+//    check — but that is incidental and must NEVER be leaned on: `-v /run:/x` or
+//    `-v /:/x` (mount a parent) evade any substring match. Do NOT try to parse `-v`
+//    partially — it is unwinnable. The SOLE containment on a wired worker is
+//    Decision 3 (the DinD daemon runs in a SEPARATE container whose own mount
+//    namespace mounts none of the worker's secret/`/data`/`/nix`, so `-v <anything>:/x`
+//    binds the DinD fs, which holds none of it). The guardrail's only docker job is
+//    "deny when no daemon is wired".
 
 import fs from "node:fs";
 import path from "node:path";
@@ -76,6 +87,13 @@ const REASON_ENV = "denied by guardrail: reading the process environment is not 
 const REASON_PS = "denied by guardrail: inspecting the process table is not permitted";
 const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
 const REASON_SECRET_FILE = "denied by guardrail: reading the worker credential file is not permitted";
+// PRD #83 M1 (Q3): docker is inert without a daemon sidecar wired (DOCKER_HOST/keystone
+// resolver). Content-free — never echo the command.
+const REASON_DOCKER_NO_DAEMON = "denied by guardrail: docker requires a daemon sidecar, which this worker has none wired";
+// PRD #83 M1 (auditor B5): even a WIRED worker may reach only ITS own sidecar — an
+// inline -H/--host, a DOCKER_HOST=… prefix, or `docker context use/create` redirects
+// the client to a different daemon and is denied. Defense-in-depth, NOT containment.
+const REASON_DOCKER_REDIRECT = "denied by guardrail: redirecting the docker client to a different daemon is not permitted";
 const REASON_DEPTH = "denied by guardrail: command wrapping is nested too deeply to screen safely";
 const REASON_OUTSIDE_WORKTREE = "denied by guardrail: file access outside the run worktree is not permitted";
 const REASON_DOTGIT = "denied by guardrail: accessing the .git directory is not permitted";
@@ -107,6 +125,15 @@ const REMOTE_MUTATORS = new Set([
 // work; local file ops (git clean -f, git add -f, …) are allowed. Force-push is
 // denied unconditionally by the `push` rule above, not here.
 const FORCE_DENY_SUBCOMMANDS = new Set(["checkout", "switch", "restore"]);
+// docker CLI basenames the wired/deny rule keys on (PRD #83 Q3). `docker compose …`
+// reduces to the `docker` base; `docker-compose …` (the legacy v1 wrapper) is its own
+// basename, so both are listed.
+const DOCKER_BASES = new Set(["docker", "docker-compose"]);
+// docker GLOBAL flags (before the subcommand) that CONSUME a following value token, so
+// the value is never mistaken for the subcommand while scanning for `context` (B5). The
+// endpoint-redirecting globals (-H/--host/-c/--context) are denied outright below, so
+// they are deliberately NOT here.
+const DOCKER_GLOBAL_VALUE_FLAGS = new Set(["-l", "--log-level", "--config", "--tlscacert", "--tlscert", "--tlskey"]);
 // File tools that carry a path and so get the worktree/`/proc`/`.git` guard.
 const PATH_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Glob", "Grep"]);
 // git global options that consume the following token as their value.
@@ -281,22 +308,85 @@ function analyzeGit(args: string[]): BashScreenResult {
   return ALLOW;
 }
 
-/** Analyze one simple command (operator-free word list) after wrapper peeling. */
-function analyzeSimple(cmd: string[], secretPaths: readonly string[]): BashScreenResult {
-  if (cmd.length === 0) return ALLOW;
+/** An inline `-H`/`--host` endpoint override (B5). Precise so `docker run --hostname foo`
+ *  (a benign flag that shares the `--host` prefix) is NOT caught. */
+function isDockerHostFlag(a: string): boolean {
+  return a === "-H" || a === "--host" || a.startsWith("--host=") || (a.startsWith("-H") && a.length > 2);
+}
+
+/** An inline `-c`/`--context` context override (B5). `--config`/`--configFoo` don't
+ *  match the `-c` glued form (they start with `--`), and `docker run -c 512` is safe
+ *  because `-c` after the subcommand is never scanned here (see analyzeDocker). */
+function isDockerContextFlag(a: string): boolean {
+  return a === "-c" || a === "--context" || a.startsWith("--context=") || (a.startsWith("-c") && a.length > 2 && !a.startsWith("--"));
+}
+
+/** A leading shell `VAR=value` env-assignment word. */
+function isAssignment(word: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word);
+}
+
+/**
+ * Screen a `docker`/`docker-compose` simple command (PRD #83 Q3 + auditor B5).
+ * `assignments` are the `VAR=value` env prefixes peeled by analyzeSegment (bare and
+ * `env`-wrapper forms, incl. those inherited through an `sh -c`/`eval` wrapper).
+ *
+ *  - No daemon wired ⇒ deny outright (the guardrail's ONLY docker containment role).
+ *  - Wired ⇒ allow, EXCEPT an inline daemon redirect (a `DOCKER_HOST=…` prefix, an
+ *    `-H`/`--host` GLOBAL flag, an `-c`/`--context` GLOBAL flag, or `context use/create`)
+ *    so a wired worker reaches only ITS OWN sidecar. This is defense-in-depth, never the
+ *    containment — mount-ns (Decision 3) is (see the file header, B4).
+ */
+function analyzeDocker(cmd: string[], assignments: readonly string[], dockerWired: boolean): BashScreenResult {
+  if (!dockerWired) return deny(REASON_DOCKER_NO_DAEMON);
+  if (assignments.some((a) => a.startsWith("DOCKER_HOST="))) return deny(REASON_DOCKER_REDIRECT);
+  const args = cmd.slice(1);
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i]!;
+    if (isDockerHostFlag(a) || isDockerContextFlag(a)) return deny(REASON_DOCKER_REDIRECT);
+    if (!a.startsWith("-")) break; // reached the subcommand
+    if (DOCKER_GLOBAL_VALUE_FLAGS.has(a)) { i += 2; continue; } // benign global; skip its value
+    i++;
+  }
+  if (args[i]?.toLowerCase() === "context") {
+    const op = args.slice(i + 1).find((x) => !x.startsWith("-"))?.toLowerCase();
+    if (op === "use" || op === "create") return deny(REASON_DOCKER_REDIRECT);
+  }
+  return ALLOW;
+}
+
+/** Analyze one simple command (operator-free word list) after wrapper + leading-
+ *  assignment peeling. `assignments` are the peeled `VAR=value` prefixes (from
+ *  analyzeSegment), inspected only for a DOCKER_HOST= daemon redirect (B5). */
+function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWired: boolean, assignments: readonly string[]): BashScreenResult {
+  if (cmd.length === 0) return ALLOW; // only env assignments, no command word — runs nothing
   if (cmd.some((w) => w.includes("/proc/"))) return deny(REASON_PROC);
   if (cmd.some((w) => hitsSecret(w, secretPaths))) return deny(REASON_SECRET_FILE);
   const base = basename(cmd[0]!).toLowerCase();
   if (base === "printenv" || base === "env") return deny(REASON_ENV);
   if (base === "ps" || base === "pgrep") return deny(REASON_PS);
   if (base === "git") return analyzeGit(cmd.slice(1));
+  if (DOCKER_BASES.has(base)) return analyzeDocker(cmd, assignments, dockerWired);
   return ALLOW;
 }
 
-/** Peel `env`/shell/`eval`/generic wrappers, then screen the real command. */
-function analyzeSegment(words: string[], depth: number, secretPaths: readonly string[]): BashScreenResult {
+/**
+ * Peel leading `VAR=value` env-assignments + `env`/shell/`eval`/generic wrappers, then
+ * screen the real command. Assignments are peeled at EACH leading position (before AND
+ * after a generic wrapper), so they compose with the wrapper peel: `FOO=bar sh -c 'git
+ * push'`, `DOCKER_HOST=x sudo docker …`, and `env DOCKER_HOST=x docker …` all reduce
+ * correctly. This also closes the pre-existing `FOO=bar git push` evasion (a bare
+ * assignment used to leave the base as `foo=bar`, an unknown command that slipped every
+ * deny) — a strict tightening, never a loosening. Captured assignments ride down to the
+ * docker analyzer for the B5 DOCKER_HOST= redirect check, INCLUDING across an `sh -c`/
+ * `eval` wrapper (a prefix assignment is exported to that subshell).
+ */
+function analyzeSegment(words: string[], depth: number, secretPaths: readonly string[], dockerWired: boolean, inherited: readonly string[]): BashScreenResult {
+  const assignments: string[] = [...inherited];
   let i = 0;
   while (i < words.length) {
+    if (isAssignment(words[i]!)) { assignments.push(words[i]!); i++; continue; }
     const base = basename(words[i]!).toLowerCase();
 
     if (base === "env") {
@@ -306,7 +396,7 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
         if (a === "-u") { i += 2; continue; }
         if (a === "-i" || a === "-" || a === "--" || a === "-0") { i++; continue; }
         if (a.startsWith("-")) { i++; continue; }
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) { i++; continue; } // VAR=value assignment
+        if (isAssignment(a)) { assignments.push(a); i++; continue; } // `env DOCKER_HOST=x …` counts for B5
         break;
       }
       if (i >= words.length) return deny(REASON_ENV); // bare `env` dumps the environment
@@ -315,12 +405,14 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
 
     if (SHELLS.has(base)) {
       const inner = shellDashCArg(words, i + 1);
-      if (inner !== undefined) return screenWithDepth(inner, depth + 1, secretPaths);
+      // A prefix env-assignment is exported to the subshell, so carry it into the inner
+      // screen (`DOCKER_HOST=x sh -c 'docker ps'` must still see the redirect).
+      if (inner !== undefined) return screenWithDepth(inner, depth + 1, secretPaths, dockerWired, assignments);
       return ALLOW; // `bash script.sh` — the script file cannot be inspected statically
     }
 
     if (base === "eval") {
-      return screenWithDepth(words.slice(i + 1).join(" "), depth + 1, secretPaths);
+      return screenWithDepth(words.slice(i + 1).join(" "), depth + 1, secretPaths, dockerWired, assignments);
     }
 
     if (GENERIC_WRAPPERS.has(base)) {
@@ -331,15 +423,21 @@ function analyzeSegment(words: string[], depth: number, secretPaths: readonly st
     }
     break;
   }
-  return analyzeSimple(words.slice(i), secretPaths);
+  return analyzeSimple(words.slice(i), secretPaths, dockerWired, assignments);
 }
 
-function screenWithDepth(command: string, depth: number, secretPaths: readonly string[]): BashScreenResult {
+function screenWithDepth(
+  command: string,
+  depth: number,
+  secretPaths: readonly string[],
+  dockerWired: boolean,
+  assignments: readonly string[] = [],
+): BashScreenResult {
   if (depth > MAX_DEPTH) return deny(REASON_DEPTH);
   if (command.includes("/proc/")) return deny(REASON_PROC);
   if (hitsSecret(command, secretPaths)) return deny(REASON_SECRET_FILE);
   for (const seg of splitSegments(tokenize(command))) {
-    const r = analyzeSegment(seg, depth, secretPaths);
+    const r = analyzeSegment(seg, depth, secretPaths, dockerWired, assignments);
     if (r.denied) return r;
   }
   return ALLOW;
@@ -351,9 +449,18 @@ function screenWithDepth(command: string, depth: number, secretPaths: readonly s
  * Anthropic session. `extraSecretPaths` are additional worker-credential file
  * paths to deny (the configured UZI_WORKER_TOKEN_FILE), on top of the built-in
  * `/run/secrets/` secret-mount prefix.
+ *
+ * `dockerWired` (PRD #83 Q3) is a PARAMETER, never read from `process.env` inside
+ * this analyzer (auditor B2 — the screener stays pure): the worker resolves docker
+ * wiring ONCE at startup (docker-wiring.ts) and passes the resolved boolean here.
+ * false (the default) DENIES docker entirely; true allows it (minus daemon redirects).
  */
-export function screenBashCommand(command: string, extraSecretPaths: readonly string[] = []): BashScreenResult {
-  return screenWithDepth(command, 0, [...SECRET_PATH_PREFIXES, ...extraSecretPaths]);
+export function screenBashCommand(
+  command: string,
+  extraSecretPaths: readonly string[] = [],
+  dockerWired = false,
+): BashScreenResult {
+  return screenWithDepth(command, 0, [...SECRET_PATH_PREFIXES, ...extraSecretPaths], dockerWired);
 }
 
 /** Extract the `command` field from a Bash tool_input, if present. */
@@ -374,10 +481,15 @@ function bashCommandOf(toolInput: unknown): string | undefined {
  * `extraSecretPaths` are worker-credential file paths (the configured
  * UZI_WORKER_TOKEN_FILE) to deny a Bash read of, on top of the built-in
  * `/run/secrets/` prefix.
+ *
+ * `dockerWired` (PRD #83 Q3) is resolved ONCE at worker startup (docker-wiring.ts) and
+ * frozen into the hook here — the screener never reads env (auditor B2). false ⇒ docker
+ * is denied; true ⇒ allowed (minus daemon redirects).
  */
 export function buildPreToolUseHook(
   log: Logger,
   extraSecretPaths: readonly string[] = [],
+  dockerWired = false,
 ): (input: HookInput) => Promise<HookJSONOutput> {
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Bash") {
@@ -386,7 +498,7 @@ export function buildPreToolUseHook(
     const command = bashCommandOf(input.tool_input);
     if (command === undefined) return {};
 
-    const screen = screenBashCommand(command, extraSecretPaths);
+    const screen = screenBashCommand(command, extraSecretPaths, dockerWired);
     if (!screen.denied) return {};
 
     // Log the denial (reason only — never the command) so an operator can see
