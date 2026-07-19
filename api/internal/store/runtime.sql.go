@@ -234,12 +234,22 @@ type ClaimRunParams struct {
 // (@docker_repo_allowlist). This is the accepted-risk LIKELIHOOD control for the
 // non-rootless DinD tier — the trigger is repo content, so the gate MUST bind here
 // at claim, not at provisioning (a provision-time user allowlist can't gate the
-// repo-content trigger the acceptance rests on). Repo-less runs (judge) are exempt:
-// with no repo checkout there is no repo content to reach the root daemon, so
-// r.repo_id IS NULL passes. Non-docker workers pass @is_docker_worker=false and the
-// predicate short-circuits (NOT false = true), leaving them wholly unaffected. An
-// EMPTY allowlist for a docker worker is FAIL-CLOSED: = ANY('{}') is false for every
-// repo, so it claims only repo-less runs — never an unvetted repo's run.
+// repo-content trigger the acceptance rests on). Non-docker workers pass
+// @is_docker_worker=false and the predicate short-circuits (NOT false = true),
+// leaving them wholly unaffected. An EMPTY allowlist for a docker worker is
+// FAIL-CLOSED: = ANY('{}') is false for every repo, so it claims only repo-less
+// runs — never an unvetted repo's run.
+//
+// Repo-less runs (kind='judge') are EXEMPT: r.repo_id IS NULL passes. The true
+// invariant that makes this safe is NOT "repo-less = content-free" (a judge still
+// reasons over an untrusted, prompt-injectable trace) — it is that the repo-less
+// EXECUTOR carries no daemon-reaching tool. agent/src/judge-runner.ts runs with a
+// deny-ALL PreToolUse hook (no Bash/HTTP/shell), so even with DOCKER_HOST set it
+// cannot invoke docker. The separate chat lane (ClaimChatRun, ungated) rests on the
+// same property: agent/src/chat-executor.ts is Read/Grep/Glob + read-only uzi MCP,
+// with no Bash/Write/Edit/WebFetch/WebSearch/Agent. An agent/ regression test pins
+// BOTH so a future tool addition trips CI (auditor Medium, PRD #89 M-allow). If that
+// invariant ever changes, this exemption must be revisited before it does.
 func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, claimRun,
 		arg.WorkerID,
