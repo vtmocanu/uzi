@@ -36,10 +36,14 @@ var (
 )
 
 // ReviewWithRecommendations is the run-page review payload: the verdict row plus its
-// structured recommendations, all already scrubbed + capped at ingest (M3).
+// structured recommendations, all already scrubbed + capped at ingest (M3), and the
+// settled recommendation→forge-issue links for the review (PRD #68) so the panel renders
+// a filed row (and a stale-filed flag) instead of the File-issue button without a second
+// fetch.
 type ReviewWithRecommendations struct {
 	Review          store.RunReview
 	Recommendations []store.ReviewRecommendation
+	FiledIssues     []store.RecommendationFiledIssue
 }
 
 // GetReviewForTarget returns the judge's review of a run for the run-page panel
@@ -63,7 +67,14 @@ func (s *Service) GetReviewForTarget(ctx context.Context, userID uuid.UUID, isAd
 	if err != nil {
 		return nil, err
 	}
-	return &ReviewWithRecommendations{Review: review, Recommendations: recs}, nil
+	// The filed-issue links (PRD #68): keyed by the review, they survive a re-judge's
+	// recommendation delete-reinsert, so the panel matches them to recommendations by
+	// (category, target) and renders the filed state.
+	filed, err := s.q.ListFiledIssuesForReview(ctx, review.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &ReviewWithRecommendations{Review: review, Recommendations: recs, FiledIssues: filed}, nil
 }
 
 // RerunJudge enqueues a fresh judge run for a terminal run at the OWNER's explicit

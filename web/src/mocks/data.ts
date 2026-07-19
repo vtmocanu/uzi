@@ -265,6 +265,15 @@ export interface MockReview {
     confidence: "" | "low" | "medium" | "high";
     created_at: string;
   }[];
+  // Settled recommendation→issue links (PRD #68), keyed by (category, target). The panel
+  // renders a filed row for a matching recommendation instead of the File-issue button.
+  filed_issues: {
+    category: RecommendationCategory;
+    target: string;
+    issue_iid: number;
+    issue_url: string;
+    filed_at: string;
+  }[];
 }
 
 export const mockReviews: MockReview[] = [
@@ -296,6 +305,28 @@ export const mockReviews: MockReview[] = [
           "The repo reviewer agent approved on the first pass without checking the migration ordering; tightening its checklist would catch this class of issue.",
         confidence: "medium",
         created_at: minsAgo(6),
+      },
+      {
+        // No category default resolves (selfimprove_repo unset by default), so the draft
+        // opens with an empty picker + a reason — exercises mock state D in the demo.
+        id: "rec-3",
+        category: "improve_uzi",
+        target: "api/internal/poller",
+        rationale_md:
+          "The run waited ~4m for the first poll tick after the label was applied; a webhook path would cut queue-to-claim latency.",
+        confidence: "low",
+        created_at: minsAgo(6),
+      },
+    ],
+    // rec-1's coordinate is already filed, so the demo shows the filed row (mock state C)
+    // on that recommendation and the idle File-issue button (mock A) on the other two.
+    filed_issues: [
+      {
+        category: "install_worker_tool",
+        target: "shellcheck",
+        issue_iid: 71,
+        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/71",
+        filed_at: minsAgo(3),
       },
     ],
   },

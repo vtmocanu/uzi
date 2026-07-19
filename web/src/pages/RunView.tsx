@@ -15,7 +15,10 @@ import {
   preferForgeUrl,
   isTerminalRun,
   type AgentSelectionInput,
+  type FiledIssue,
+  type IssueDraft,
   type Repo,
+  type ReviewRecommendation,
   type Run,
   type RunMessage,
   type RunReview,
@@ -39,8 +42,8 @@ import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { Markdown } from "../components/Markdown";
-import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, Textarea, cx } from "../components/ui";
-import { ExternalLinkIcon } from "../components/icons";
+import { Alert, Badge, Button, Card, Input, PageHeader, Select, Spinner, StatusPill, Textarea, cx } from "../components/ui";
+import { ExternalLinkIcon, FileTextIcon } from "../components/icons";
 
 // stageForMessages: latest-message → human stage label (multica's
 // TOOL_KEY_BY_SLUG, adapted to uzi's message kinds).
@@ -599,6 +602,9 @@ export function JudgePanel({ run }: { run: Run }) {
   const [actionErr, setActionErr] = useState("");
   const [rerunning, setRerunning] = useState(false);
   const [queued, setQueued] = useState(false);
+  // The caller's connected repos back the file-issue draft picker (PRD #68 M4). Fetched
+  // once for the panel; a failure just leaves the picker empty (the draft still opens).
+  const [repos, setRepos] = useState<Repo[]>([]);
   // The verdict's updated_at at the moment a re-run was fired; the poll below stops
   // once the review's updated_at moves past it (or a first-ever review lands).
   const baselineUpdatedAt = useRef<string | null>(null);
@@ -624,6 +630,33 @@ export function JudgePanel({ run }: { run: Run }) {
     }
     fetchReview();
   }, [eligible, fetchReview]);
+
+  // The file-issue picker lists every repo the caller has connected (PRD #68 Decision 4).
+  // Best-effort: a failure (or a bare test double) just leaves the picker empty.
+  useEffect(() => {
+    if (!eligible) return;
+    let alive = true;
+    (async () => {
+      try {
+        const { repos } = await api.listRepos();
+        if (alive) setRepos(repos);
+      } catch {
+        /* picker stays empty; the draft still opens */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [eligible]);
+
+  // Filed links keyed by coordinate so a recommendation renders its filed row instead of
+  // the File-issue button (PRD #68). Keyed (category, target) — the same coordinate the
+  // link table uses — so re-judged siblings that collapse to one coordinate all resolve.
+  const filedByCoord = useMemo(() => {
+    const m = new Map<string, FiledIssue>();
+    for (const f of review?.filed_issues ?? []) m.set(`${f.category} ${f.target}`, f);
+    return m;
+  }, [review]);
 
   // Bounded background poll after a re-run: the fresh verdict arrives when the new
   // judge run finishes, so check every few seconds for a changed updated_at, giving
@@ -725,6 +758,13 @@ export function JudgePanel({ run }: { run: Run }) {
                   {rec.rationale_md.trim() !== "" && (
                     <p className="mt-1.5 whitespace-pre-wrap text-sm text-muted">{rec.rationale_md}</p>
                   )}
+                  <RecommendationFiler
+                    runId={run.id}
+                    rec={rec}
+                    filed={filedByCoord.get(`${rec.category} ${rec.target}`)}
+                    reviewUpdatedAt={review.updated_at}
+                    repos={repos}
+                  />
                 </li>
               ))}
             </ul>
@@ -734,5 +774,200 @@ export function JudgePanel({ run }: { run: Run }) {
         </>
       )}
     </Card>
+  );
+}
+
+// JustFiled is the local filed state after a successful Create click (mock C), so the row
+// flips without re-fetching the review. warning carries a created-with-warning message
+// (the issue exists on the forge but its local link/cache could not be settled).
+type JustFiled = { iid: number; web_url: string; warning?: string };
+
+// RecommendationFiler is the per-recommendation File-issue affordance (PRD #68 M4): the
+// idle button (mock A), the ProposalCard-shaped inline draft (mock B / no-default D /
+// forge-error E), and the filed row (mock C, from a server link OR a just-filed local
+// one). Every draft field is INERT text like ProposalCard — title/description render in an
+// editable control, never through Markdown, and the load-bearing sanitizer re-runs
+// server-side at the POST. The draft shows RAW markdown (no rendered preview) by design.
+function RecommendationFiler({
+  runId,
+  rec,
+  filed,
+  reviewUpdatedAt,
+  repos,
+}: {
+  runId: string;
+  rec: ReviewRecommendation;
+  filed?: FiledIssue;
+  reviewUpdatedAt: string;
+  repos: Repo[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState<IssueDraft | null>(null);
+  const [loadingDraft, setLoadingDraft] = useState(false);
+  const [draftErr, setDraftErr] = useState("");
+  const [repoId, setRepoId] = useState("");
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [fileErr, setFileErr] = useState("");
+  const [local, setLocal] = useState<JustFiled | null>(null);
+
+  // Filed already (server link) or just now (local) → the filed row (mock C). A server
+  // link is stale when it predates the current review revision (filed_at < updated_at:
+  // "filed for an earlier version"); a just-filed local link is by definition current.
+  if (filed || local) {
+    const iid = local ? local.iid : filed!.issue_iid;
+    const url = local ? local.web_url : filed!.issue_url;
+    const stale = !local && filed ? new Date(filed.filed_at) < new Date(reviewUpdatedAt) : false;
+    return (
+      <div className="mt-2.5 rounded-lg border border-ok/40 bg-ok/10 px-3 py-2 text-sm text-ok">
+        <span className="font-medium">Issue created.</span>{" "}
+        {isHttpsUrl(url) ? (
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 font-medium underline underline-offset-2 hover:text-ok"
+          >
+            #{iid} <ExternalLinkIcon />
+          </a>
+        ) : (
+          <span className="font-medium">#{iid}</span>
+        )}
+        {local?.warning ? (
+          <p className="mt-1 text-xs text-warn">{local.warning}</p>
+        ) : stale ? (
+          <p className="mt-1 text-xs text-faint">
+            Filed for an earlier version of this recommendation — re-running the judge changed it since.
+          </p>
+        ) : (
+          <span className="text-ok/80"> — open it on the board to start a run.</span>
+        )}
+      </div>
+    );
+  }
+
+  const openDraft = async () => {
+    setOpen(true);
+    setLoadingDraft(true);
+    setDraftErr("");
+    try {
+      const { draft } = await api.getIssueDraft(runId, rec.id);
+      setDraft(draft);
+      setRepoId(draft.default_repo_id);
+      setTitle(draft.title);
+      setDescription(draft.description);
+    } catch (e) {
+      setDraftErr(e instanceof ApiError ? e.message : "Could not load the draft");
+    } finally {
+      setLoadingDraft(false);
+    }
+  };
+
+  const create = async () => {
+    setFileErr("");
+    setBusy(true);
+    try {
+      const { issue, warning } = await api.fileIssue(runId, rec.id, { repo_id: repoId, title, description });
+      setLocal({ iid: issue.iid, web_url: issue.web_url, warning });
+    } catch (e) {
+      // Forge rejected the write (mock E): the draft stays open with its edits intact.
+      setFileErr(e instanceof ApiError ? e.message : "Could not file the issue");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <div className="mt-2.5">
+        <Button size="sm" onClick={openDraft}>
+          File issue
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2.5 overflow-hidden rounded-xl border border-brand/40 bg-brand/[0.06]">
+      <div className="flex items-center justify-between gap-2 border-b border-brand/20 bg-brand/10 px-3 py-2">
+        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-brand">
+          <span aria-hidden="true">
+            <FileTextIcon />
+          </span>
+          Draft issue
+        </span>
+        <Badge tone="brand">needs your review</Badge>
+      </div>
+
+      <div className="space-y-3 px-3 py-3">
+        {loadingDraft && <p className="text-sm text-faint">Loading draft…</p>}
+        {draftErr && <Alert message={draftErr} />}
+        {draft && (
+          <>
+            {/* Provenance (Decision 8): whose worker produced this (attacker-influencable)
+                text, shown prominently so an admin filing another user's review sees it. */}
+            {draft.provenance && <p className="text-xs text-faint">{draft.provenance}</p>}
+            {fileErr && <Alert message={fileErr} />}
+
+            <div className="space-y-1">
+              <label className="block text-xs text-muted">Repo</label>
+              <Select value={repoId} onChange={(e) => setRepoId(e.target.value)}>
+                <option value="">Select a repo…</option>
+                {repos.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.path_with_namespace}
+                  </option>
+                ))}
+              </Select>
+              {draft.default_note && (
+                <p className={cx("text-xs", repoId ? "text-faint" : "text-info")}>{draft.default_note}</p>
+              )}
+            </div>
+
+            {/* Every field below is inert text (never Markdown): the title/description are
+                edited raw, and the server re-sanitizes at the POST boundary. */}
+            <div className="space-y-1">
+              <label className="block text-xs text-muted">Title</label>
+              <Input value={title} onChange={(e) => setTitle(e.target.value)} />
+            </div>
+
+            <div className="space-y-1">
+              <label className="block text-xs text-muted">Description</label>
+              <Textarea
+                rows={10}
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                className="max-h-72 font-mono text-xs"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="block text-xs text-muted">Labels</label>
+              <div className="flex flex-wrap gap-1">
+                {draft.labels.map((l) => (
+                  <Badge key={l} tone="neutral">
+                    {l}
+                  </Badge>
+                ))}
+              </div>
+              <p className="text-xs text-faint">
+                Lands on the board and is startable without a PRD file. No autopilot label — nothing runs until you click
+                Start.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-2 pt-0.5">
+              <Button size="sm" disabled={busy || !repoId || title.trim() === ""} onClick={create}>
+                Create issue
+              </Button>
+              <Button size="sm" variant="secondary" disabled={busy} onClick={() => setOpen(false)}>
+                Cancel
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   );
 }

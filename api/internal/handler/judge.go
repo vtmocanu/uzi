@@ -97,6 +97,21 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 			CreatedAt:   rc.CreatedAt.Time,
 		})
 	}
+	// Only SETTLED links (filed_at valid) surface to the panel; an in-flight claim is
+	// transient. The panel matches them to recommendations by (category, target).
+	filed := make([]apitypes.FiledIssueDTO, 0, len(rw.FiledIssues))
+	for _, f := range rw.FiledIssues {
+		if !f.FiledAt.Valid {
+			continue
+		}
+		filed = append(filed, apitypes.FiledIssueDTO{
+			Category: f.Category,
+			Target:   f.Target,
+			IssueIID: f.FiledIssueIid.Int64,
+			IssueURL: f.FiledIssueUrl,
+			FiledAt:  f.FiledAt.Time,
+		})
+	}
 	return apitypes.ReviewDTO{
 		ID:              rw.Review.ID.String(),
 		TargetRunID:     rw.Review.TargetRunID.String(),
@@ -107,6 +122,7 @@ func reviewToDTO(rw workersvc.ReviewWithRecommendations) apitypes.ReviewDTO {
 		CreatedAt:       rw.Review.CreatedAt.Time,
 		UpdatedAt:       rw.Review.UpdatedAt.Time,
 		Recommendations: recs,
+		FiledIssues:     filed,
 	}
 }
 

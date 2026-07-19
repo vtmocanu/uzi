@@ -34,6 +34,19 @@ type IssueDraftDTO struct {
 	DefaultNote string `json:"default_note"`
 }
 
+// FiledIssueDTO is a SETTLED recommendation→forge-issue link for the run-page panel
+// (PRD #68 M4): the coordinate it covers, the created issue, and when it was filed so the
+// panel can render a filed row (with an issue link) instead of the File-issue button and
+// flag a stale link (filed_at < review.updated_at → "filed for an earlier version"). Only
+// settled links appear; an in-flight claim is transient and omitted.
+type FiledIssueDTO struct {
+	Category string    `json:"category"`
+	Target   string    `json:"target"`
+	IssueIID int64     `json:"issue_iid"`
+	IssueURL string    `json:"issue_url"`
+	FiledAt  time.Time `json:"filed_at"`
+}
+
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md
 // and each rationale_md were scrubbed at ingest; the SPA renders them as escaped text.
 type ReviewDTO struct {
@@ -46,4 +59,6 @@ type ReviewDTO struct {
 	CreatedAt       time.Time           `json:"created_at"`
 	UpdatedAt       time.Time           `json:"updated_at"`
 	Recommendations []RecommendationDTO `json:"recommendations"`
+	// FiledIssues are the settled recommendation→issue links for this review (PRD #68).
+	FiledIssues []FiledIssueDTO `json:"filed_issues"`
 }

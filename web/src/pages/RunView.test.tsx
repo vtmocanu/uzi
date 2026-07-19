@@ -11,7 +11,16 @@ vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { listAgentTemplates: vi.fn(), getRunReview: vi.fn(), rerunJudge: vi.fn() },
+    api: {
+      listAgentTemplates: vi.fn(),
+      getRunReview: vi.fn(),
+      rerunJudge: vi.fn(),
+      // PRD #68 M4: the file-issue draft/write + the picker's repo list. Defaulted to an
+      // empty picker so the panel's best-effort repos fetch resolves cleanly.
+      listRepos: vi.fn().mockResolvedValue({ repos: [] }),
+      getIssueDraft: vi.fn(),
+      fileIssue: vi.fn(),
+    },
   };
 });
 const mockApi = vi.mocked(api);
@@ -218,6 +227,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
           created_at: "2026-01-01T00:00:00Z",
         },
       ],
+      filed_issues: [],
       ...over,
     };
   }
