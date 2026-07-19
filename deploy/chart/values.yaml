@@ -391,21 +391,25 @@ workers:
       cpu: "4"
       memory: 8Gi
     maxPVCStorage: 20Gi
-  # --- the docker-capable worker tier (PRD #83 M3) ------------------------------
+  # --- the docker-capable worker tier (PRD #83 M3, PRD #89) ---------------------
   #
   # A SECOND, DEDICATED namespace running `pod-security.kubernetes.io/enforce:
-  # privileged`, for workers that opted into a rootless Docker-in-Docker sidecar so
-  # their agent can run `docker`/`docker compose`. It is a SEPARATE namespace on
-  # purpose: the privileged tier's blast radius must never touch the restricted
-  # default above (Decision 7 / Q-B). The restricted `namespace` stays exactly as it
-  # is — nothing here weakens it.
+  # privileged`, for workers that opted into a Docker-in-Docker sidecar so their agent
+  # can run `docker`/`docker compose`. It is a SEPARATE namespace on purpose: the
+  # privileged tier's blast radius must never touch the restricted default above
+  # (Decision 7 / Q-B). The restricted `namespace` stays exactly as it is — nothing
+  # here weakens it.
   #
-  # OFF by default. dev-cluster's k8s 1.29.4 + containerd 1.6.31 cannot do flagless
-  # rootless (pod userns needs k8s >=1.30 / containerd >=2.0.5), so this tier is
-  # privileged rootless-DinD in a privileged namespace — the same posture the compose
-  # track uses and the owner accepted. sysbox (runtimeClassName: sysbox-runc) is the
-  # documented path to a non-privileged tier once the cluster is upgraded; it is NOT
-  # installed and NOT required.
+  # OFF by default. The DinD posture is a PER-CLUSTER toggle (PRD #89, `rootless` below):
+  #   - rootless:true (default) — the PRD #83 rootless-DinD sidecar (unprivileged uid
+  #     inside a privileged, fenced namespace); the recommended stance, and it needs
+  #     nodes with unprivileged userns (kernel.unprivileged_userns_clone=1).
+  #   - rootless:false — a NON-ROOTLESS privileged sidecar (dockerd as REAL ROOT on
+  #     pod-loopback TCP), for clusters whose nodes cannot do rootless. dev-cluster
+  #     (vendor Linux, userns off) is one, so it sets rootless:false. Its residual is
+  #     node root, gated behind acknowledgeNonRootlessNodeRoot (see below).
+  # sysbox (runtimeClassName: sysbox-runc) remains the documented path to a
+  # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
   docker:
     # Turning this on creates the privileged namespace, its quota/limits, the worker
     # SA + pull secret in it, and the controller's Role there. It also makes the

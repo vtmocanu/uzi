@@ -150,8 +150,9 @@ const (
 	// EXPLICITLY, which SUPPRESSES docker:dind's automatic 0.0.0.0:2375 listener — the
 	// primary control keeping the unauthenticated root daemon off the pod IP.
 	dindLoopbackTCP = "tcp://127.0.0.1:2375"
-	// The rootless daemon's data root. docker:*-dind-rootless runs as the `rootless`
-	// user (uid 1000) and stores its data under this HOME path.
+	// The ROOTLESS daemon's data root. docker:*-dind-rootless runs as the `rootless`
+	// user (uid 1000) and stores its data under this HOME path. The non-rootless posture
+	// (PRD #89) uses dindDataDirRoot below; dindContainer picks per posture.
 	dindDataDir = "/home/rootless/.local/share/docker"
 	// dindDataDirRoot is the NON-ROOTLESS daemon's data root (PRD #89): a root dockerd
 	// stores images + build cache under /var/lib/docker, not the rootless HOME path.
@@ -264,11 +265,15 @@ type RenderConfig struct {
 	// baseline (Q-B). Empty means this controller renders no docker workers; a docker
 	// worker in the poll is then SKIPPED (never rendered into the restricted default).
 	DockerNamespace string
-	// DinDImage is the fully-pinned rootless-DinD sidecar image
-	// (docker:<tag>-dind-rootless@sha256:...), shared with the compose track's pin.
-	// One image ref serves both the DinD sidecar AND the tiny root socket-prep helper
-	// (that image ships /bin/sh + chown/chmod), so there is no second image to
-	// configure. Empty exactly when DockerNamespace is (config validates the pair).
+	// DinDImage is the fully-pinned DinD sidecar image, of the posture DinDNonRootless
+	// selects: rootless (docker:<tag>-dind-rootless@sha256:...) or non-rootless
+	// (docker:<tag>-dind@sha256:...). The chart picks the matching pinned digest
+	// (uzi.workerDinDImage) and a chart fail-guard rejects an image/posture mismatch, so
+	// it always agrees with DinDNonRootless. Shared with the compose track's / CI's pins.
+	// In the ROOTLESS posture this one ref also serves the tiny root socket-prep helper
+	// (dindInitContainer — that image ships /bin/sh + chown/chmod); the non-rootless
+	// posture renders no such helper (loopback transport, no shared socket dir). Empty
+	// exactly when DockerNamespace is (config validates the pair).
 	DinDImage string
 	// DinDNonRootless selects the NON-ROOTLESS privileged DinD posture (PRD #89). Its
 	// ZERO VALUE (false) is ROOTLESS — the safe default — so an unset posture renders

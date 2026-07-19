@@ -112,12 +112,13 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- if .Values.workers.docker.enabled }}
-            # The docker tier (PRD #83 M3). Both are required together — the controller
-            # refuses to boot with one set and not the other — and the namespace must
-            # differ from UZI_WORKER_NAMESPACE (the privileged tier is a SEPARATE
-            # namespace, which is the whole point). With docker off, neither is set and
-            # the controller renders no docker workers (a docker worker in the poll is
-            # skipped, never rendered into the restricted default).
+            # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
+            # together — the controller refuses to boot with one set and not the other —
+            # and the namespace must differ from UZI_WORKER_NAMESPACE (the privileged tier
+            # is a SEPARATE namespace, which is the whole point). The posture var below is
+            # also required when the tier is on. With docker off, none are set and the
+            # controller renders no docker workers (a docker worker in the poll is skipped,
+            # never rendered into the restricted default).
             - name: UZI_WORKER_DOCKER_NAMESPACE
               value: {{ .Values.workers.docker.namespace | quote }}
             # The DinD posture (PRD #89): true (default) = rootless; false = non-rootless
