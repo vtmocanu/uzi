@@ -285,6 +285,13 @@ func run() error {
 	// admin change takes effect within the cache TTL. Nil would disable detection;
 	// wiring it here turns it on with the compiled-in defaults.
 	wsvc.SetHealthSettings(settingsCache)
+	// Docker-worker repo allowlist (PRD #89 M-allow): the claim gate reads which repos
+	// a docker-enabled worker may claim runs for from the same settings cache, so an
+	// admin change takes effect within the cache TTL. This is the accepted-risk
+	// likelihood control for the non-rootless DinD tier — a docker worker fail-closes
+	// (claims no repo-bearing run) for any repo not on the list. Non-docker workers are
+	// unaffected.
+	wsvc.SetDockerAllowlist(settingsCache)
 
 	// Browser live-event hub (M5): workersvc broadcasts persisted run events to
 	// it, and the WS handler fans them out to subscribed browsers. In-process and

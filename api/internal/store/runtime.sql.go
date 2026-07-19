@@ -202,6 +202,9 @@ WHERE id = (
       AND (r.worker_id IS NULL
            OR r.worker_id = $1
            OR r.updated_at < $3)
+      AND (NOT $4::boolean
+           OR r.repo_id IS NULL
+           OR r.repo_id = ANY($5::uuid[]))
     ORDER BY COALESCE(r.worker_id = $1, false) DESC, r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -210,9 +213,11 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type ClaimRunParams struct {
-	WorkerID       pgtype.UUID        `json:"worker_id"`
-	UserID         uuid.UUID          `json:"user_id"`
-	AffinityCutoff pgtype.Timestamptz `json:"affinity_cutoff"`
+	WorkerID            pgtype.UUID        `json:"worker_id"`
+	UserID              uuid.UUID          `json:"user_id"`
+	AffinityCutoff      pgtype.Timestamptz `json:"affinity_cutoff"`
+	IsDockerWorker      bool               `json:"is_docker_worker"`
+	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 }
 
 // The RUN claim lane (Decision 4): atomic claim of the oldest claimable queued run
@@ -223,8 +228,26 @@ type ClaimRunParams struct {
 // FOR UPDATE SKIP LOCKED lets concurrent workers claim disjoint runs without
 // blocking (multica's queue semantics). The kind<>'chat' predicate is what keeps
 // the run lane and the concurrent chat lane from stealing each other's work.
+//
+// Docker-worker repo allowlist (PRD #89 M-allow): a DOCKER-enabled worker
+// (@is_docker_worker) may claim ONLY runs whose repo is on the trusted allowlist
+// (@docker_repo_allowlist). This is the accepted-risk LIKELIHOOD control for the
+// non-rootless DinD tier — the trigger is repo content, so the gate MUST bind here
+// at claim, not at provisioning (a provision-time user allowlist can't gate the
+// repo-content trigger the acceptance rests on). Repo-less runs (judge) are exempt:
+// with no repo checkout there is no repo content to reach the root daemon, so
+// r.repo_id IS NULL passes. Non-docker workers pass @is_docker_worker=false and the
+// predicate short-circuits (NOT false = true), leaving them wholly unaffected. An
+// EMPTY allowlist for a docker worker is FAIL-CLOSED: = ANY('{}') is false for every
+// repo, so it claims only repo-less runs — never an unvetted repo's run.
 func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error) {
-	row := q.db.QueryRow(ctx, claimRun, arg.WorkerID, arg.UserID, arg.AffinityCutoff)
+	row := q.db.QueryRow(ctx, claimRun,
+		arg.WorkerID,
+		arg.UserID,
+		arg.AffinityCutoff,
+		arg.IsDockerWorker,
+		arg.DockerRepoAllowlist,
+	)
 	var i Run
 	err := row.Scan(
 		&i.ID,

@@ -23,6 +23,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"gitlab.example.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/secretbox"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
@@ -83,6 +85,13 @@ const (
 	// where 0 disables self-service entirely (the API then 403s a provision).
 	// Runtime-tunable from the Admin Settings page; no env var.
 	KeyHostedWorkerQuota = "hosted_worker_quota"
+	// Docker-worker repo allowlist (PRD #89 M-allow): the set of repos a
+	// docker-enabled worker is permitted to CLAIM runs for. Stored as a
+	// comma-separated list of repo UUIDs. This is the accepted-risk likelihood
+	// control for the non-rootless DinD tier — the trigger is repo content, so the
+	// gate binds at claim, and an empty value is FAIL-CLOSED (a docker worker then
+	// claims no repo-bearing run). Non-docker workers never consult it.
+	KeyDockerRepoAllowlist = "docker_repo_allowlist"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -126,6 +135,12 @@ const (
 	// which is why a permissive-ish default is safe here and the flag, not this
 	// number, is the real "is this feature on" switch.
 	DefaultHostedWorkerQuota = "2"
+	// PRD #89 M-allow: the docker repo allowlist is EMPTY by default, which the claim
+	// gate reads as fail-closed — a docker worker claims no repo-bearing run until an
+	// admin lists the trusted repos. Empty is the safe default precisely because this
+	// is a security control: an unconfigured instance never lets a docker worker pick
+	// up an unvetted repo's run.
+	DefaultDockerRepoAllowlist = ""
 )
 
 // healthSecondsMin / healthSecondsMax bound the integer health settings (Decision
@@ -195,6 +210,10 @@ var Defaults = map[string]string{
 	// an inert knob is cheaper than a settings surface that changes shape with the
 	// deployment.
 	KeyHostedWorkerQuota: DefaultHostedWorkerQuota,
+	// PRD #89 M-allow docker repo allowlist. Same no-seeded-row pattern: an absent
+	// row synthesizes to the empty (fail-closed) default, so All/AdminView surface it
+	// to the settings page on every instance and no migration seeds it.
+	KeyDockerRepoAllowlist: DefaultDockerRepoAllowlist,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
@@ -582,6 +601,41 @@ func (c *Cache) HostedWorkerQuota(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyHostedWorkerQuota)
 }
 
+// DockerRepoAllowlist returns the set of repo ids a docker-enabled worker may claim
+// runs for (PRD #89 M-allow). Stored as a comma-separated list of repo UUIDs; an
+// absent/empty value yields an EMPTY slice, which the claim gate treats as
+// fail-closed (a docker worker then claims no repo-bearing run). Unparseable tokens
+// in a hand-edited row are skipped rather than erroring — the same junk-tolerance as
+// the bool/int accessors, since write-time validation is the real gate. The slice is
+// always non-nil so the claim param encodes as a Postgres array, never NULL.
+//
+// The claim path (workersvc) reads this STRICTLY — a non-nil error is surfaced and
+// the run is left unclaimed — because this is a security control: never claim a repo
+// run when the allowlist cannot be read (mirrors HostedWorkerQuota's strict caller).
+func (c *Cache) DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error) {
+	v, err := c.get(ctx, KeyDockerRepoAllowlist)
+	return parseRepoAllowlist(v), err
+}
+
+// parseRepoAllowlist splits a comma-separated repo-id list into canonical UUIDs,
+// skipping empty and unparseable tokens. Always returns a non-nil slice (possibly
+// empty). Shared by the accessor and reused as the parse half of validation's intent.
+func parseRepoAllowlist(v string) []uuid.UUID {
+	out := []uuid.UUID{}
+	for _, tok := range strings.Split(v, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		id, err := uuid.Parse(tok)
+		if err != nil {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
 // intSetting resolves an integer setting to its parsed value, falling back to the
 // compiled-in default when the effective value is absent or unparseable. Stored
 // values pass validateHealthSeconds at write time, so an unparseable value here is
@@ -756,6 +810,8 @@ func Validate(key, value string) error {
 		return validateHealthSeconds(value)
 	case KeyHostedWorkerQuota:
 		return validateHostedWorkerQuota(value)
+	case KeyDockerRepoAllowlist:
+		return validateRepoAllowlist(value)
 	case KeyPublicBaseURL:
 		return ValidatePublicBaseURL(value)
 	case KeySlackBotToken:
@@ -881,6 +937,29 @@ func validateHostedWorkerQuota(value string) error {
 	}
 	if n < 0 || n > maxHostedWorkerQuota {
 		return fmt.Errorf("must be 0 (self-service disabled) or between 1 and %d workers", maxHostedWorkerQuota)
+	}
+	return nil
+}
+
+// validateRepoAllowlist is the write-time gate for the docker repo allowlist (PRD
+// #89 M-allow): a comma-separated list of repo UUIDs. Empty is allowed — it is the
+// fail-closed "no repos trusted" value, not a rejection. Each non-empty entry must
+// be a valid UUID; a malformed entry fails the WRITE, the only moment a human is
+// present to be told, so a typo can never silently widen or void the gate.
+//
+// Like validateHostedWorkerQuota, this MUST have an explicit Validate case: the
+// default branch falls through to ValidateLabel, which REJECTS the comma that an
+// allowlist of two or more repos requires — so without this case a valid multi-repo
+// allowlist could never be saved at all.
+func validateRepoAllowlist(value string) error {
+	for _, tok := range strings.Split(value, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		if _, err := uuid.Parse(tok); err != nil {
+			return errors.New("must be a comma-separated list of repo ids (UUIDs)")
+		}
 	}
 	return nil
 }
