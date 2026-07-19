@@ -232,9 +232,16 @@ describe("docker guardrail (PRD #83)", () => {
     ["docker -c prod ps", "-c context"],
     ["docker context use prod", "context use"],
     ["docker context create evil --docker host=tcp://evil:2375", "context create"],
+    ["docker context update evil --docker host=tcp://evil:2375", "context update"],
+    ["DOCKER_CONTEXT=evil docker ps", "DOCKER_CONTEXT= prefix"],
     ["sh -c 'DOCKER_HOST=tcp://evil docker ps'", "DOCKER_HOST= inside sh -c"],
     ["DOCKER_HOST=tcp://evil sh -c 'docker ps'", "DOCKER_HOST= prefix BEFORE sh -c (exported to subshell)"],
     ["env DOCKER_HOST=tcp://evil docker ps", "DOCKER_HOST= via env wrapper"],
+    // Compound export form: the export itself is denied on a wired worker (segment-local).
+    ["export DOCKER_HOST=tcp://evil:2375", "bare export DOCKER_HOST"],
+    ["export DOCKER_HOST=tcp://evil:2375; docker ps", "export DOCKER_HOST then docker (compound)"],
+    ["export DOCKER_CONTEXT=evil", "export DOCKER_CONTEXT"],
+    ["declare -x DOCKER_HOST=tcp://evil:2375", "declare -x DOCKER_HOST"],
   ];
   it("denies inline docker daemon/context redirection on a wired worker (B5)", () => {
     for (const [cmd, label] of REDIRECTS) {
@@ -249,6 +256,13 @@ describe("docker guardrail (PRD #83)", () => {
     assert.strictEqual(screenBashCommand("docker run -c 512 alpine true", [], true).denied, false);
     assert.strictEqual(screenBashCommand("docker context ls", [], true).denied, false);
     assert.strictEqual(screenBashCommand("docker --log-level debug ps", [], true).denied, false);
+    // A benign export of an unrelated var is NOT a docker redirect.
+    assert.strictEqual(screenBashCommand("export FOO=bar", [], true).denied, false);
+    assert.strictEqual(screenBashCommand("export PATH=/opt/bin:/usr/bin", [], true).denied, false);
+    // The export-redirect rule is gated on `dockerWired`: on a worker with no daemon,
+    // docker is already denied outright, so an export of DOCKER_HOST is inert (not denied
+    // by THIS rule — the compound `docker …` that follows is the one that gets denied).
+    assert.strictEqual(screenBashCommand("export DOCKER_HOST=tcp://evil:2375", [], false).denied, false);
   });
 });
 

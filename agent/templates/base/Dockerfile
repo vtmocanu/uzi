@@ -140,6 +140,9 @@ RUN set -o pipefail \
 # adds that profile's bin dir. jvm mirrors this stanza (it is NOT `FROM base`).
 RUN mkdir -p /home/worker/.local/share/devbox/global/default
 COPY agent/devbox-global/devbox.json /home/worker/.local/share/devbox/global/default/devbox.json
+# The committed lock PINS the nixpkgs revision (go/python/pip). Without this COPY the
+# image never sees it and the pin FLOATS per rebuild — it must sit BEFORE the install.
+COPY agent/devbox-global/devbox.lock /home/worker/.local/share/devbox/global/default/devbox.lock
 RUN devbox global install \
     && chown -R worker:runner /home/worker/.local/share/devbox /nix
 # Put the devbox global profile bin on the image PATH so go/python3/pip resolve for BOTH

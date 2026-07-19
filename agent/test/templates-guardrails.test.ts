@@ -94,6 +94,17 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       // time from the committed pinned manifest, and its profile bin added to ENV PATH.
       // Mirrored across both templates (jvm is NOT `FROM base`).
       assert.match(text, /COPY\s+agent\/devbox-global\/devbox\.json\b/, `${name}/Dockerfile must COPY the committed global manifest`);
+      // The committed lock PINS the nixpkgs revision; without this COPY the image never
+      // sees it and go/python/pip float per rebuild (violating the "everything PINNED"
+      // rule). It must precede `devbox global install`.
+      assert.match(text, /COPY\s+agent\/devbox-global\/devbox\.lock\b/, `${name}/Dockerfile must COPY the committed global lock (pins nixpkgs)`);
+      // Anchor on the concrete COPY/RUN lines (not the prose, which also names
+      // "devbox global install") so the ordering check is real: the lock COPY must precede
+      // the install RUN, else the image never sees the lock.
+      assert.ok(
+        text.indexOf("COPY agent/devbox-global/devbox.lock") < text.indexOf("RUN devbox global install"),
+        `${name}/Dockerfile must COPY the lock BEFORE 'RUN devbox global install'`,
+      );
       assert.match(text, /devbox global install/, `${name}/Dockerfile must realize the global manifest at build time`);
       assert.match(
         text,

@@ -89,6 +89,9 @@ RUN set -o pipefail \
 # build (Dockerfile header convention). See templates/base for the full rationale.
 RUN mkdir -p /home/worker/.local/share/devbox/global/default
 COPY agent/devbox-global/devbox.json /home/worker/.local/share/devbox/global/default/devbox.json
+# The committed lock PINS the nixpkgs revision — must sit BEFORE the install or the image
+# never sees it and the pin floats. MIRRORED from base (jvm is NOT `FROM base`).
+COPY agent/devbox-global/devbox.lock /home/worker/.local/share/devbox/global/default/devbox.lock
 RUN devbox global install \
     && chown -R worker:runner /home/worker/.local/share/devbox /nix
 ENV PATH="/home/worker/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:${PATH}"

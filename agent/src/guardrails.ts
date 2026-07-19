@@ -45,6 +45,17 @@
 //    namespace mounts none of the worker's secret/`/data`/`/nix`, so `-v <anything>:/x`
 //    binds the DinD fs, which holds none of it). The guardrail's only docker job is
 //    "deny when no daemon is wired".
+//  - Docker daemon-redirect (B5) is caught for the INLINE + segment-LOCAL forms only
+//    (`DOCKER_HOST=`/`DOCKER_CONTEXT=` prefix, `-H`/`--host`/`-c`/`--context` flags,
+//    `docker context use|create|update`, and an `export`/`declare` of DOCKER_HOST/
+//    DOCKER_CONTEXT). NOT caught: STATEFUL propagation across statements — `set -a` +
+//    a later bare `DOCKER_HOST=…`, or `export DOCKER_HOST=…` in one `;`-segment affecting
+//    a `docker` in a later segment of the SAME shell (the analyzer screens each segment
+//    independently and does not model exported-var state). This is an intentional residual
+//    (both reviewer + auditor rated LOW, no exploit path on the real topology): B5 is
+//    defense-in-depth to keep a wired worker on ITS OWN sidecar, and mount-ns (Decision 3)
+//    — not this redirect check — is the containment. A modelling of shell env state is out
+//    of scope and would risk the tokenizer.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -134,6 +145,9 @@ const DOCKER_BASES = new Set(["docker", "docker-compose"]);
 // endpoint-redirecting globals (-H/--host/-c/--context) are denied outright below, so
 // they are deliberately NOT here.
 const DOCKER_GLOBAL_VALUE_FLAGS = new Set(["-l", "--log-level", "--config", "--tlscacert", "--tlscert", "--tlskey"]);
+// Shell builtins that EXPORT a variable into the environment of LATER commands in the same
+// shell — the B5 compound redirect form `export DOCKER_HOST=…; docker …`.
+const EXPORT_BUILTINS = new Set(["export", "declare", "typeset", "local"]);
 // File tools that carry a path and so get the worktree/`/proc`/`.git` guard.
 const PATH_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Glob", "Grep"]);
 // git global options that consume the following token as their value.
@@ -326,20 +340,26 @@ function isAssignment(word: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(word);
 }
 
+/** A `DOCKER_HOST=…`/`DOCKER_CONTEXT=…` assignment — either points the docker client at a
+ *  different daemon endpoint (B5). */
+function redirectsDockerEnv(word: string): boolean {
+  return /^(DOCKER_HOST|DOCKER_CONTEXT)=/.test(word);
+}
+
 /**
  * Screen a `docker`/`docker-compose` simple command (PRD #83 Q3 + auditor B5).
  * `assignments` are the `VAR=value` env prefixes peeled by analyzeSegment (bare and
  * `env`-wrapper forms, incl. those inherited through an `sh -c`/`eval` wrapper).
  *
  *  - No daemon wired ⇒ deny outright (the guardrail's ONLY docker containment role).
- *  - Wired ⇒ allow, EXCEPT an inline daemon redirect (a `DOCKER_HOST=…` prefix, an
- *    `-H`/`--host` GLOBAL flag, an `-c`/`--context` GLOBAL flag, or `context use/create`)
- *    so a wired worker reaches only ITS OWN sidecar. This is defense-in-depth, never the
- *    containment — mount-ns (Decision 3) is (see the file header, B4).
+ *  - Wired ⇒ allow, EXCEPT an inline daemon redirect (a `DOCKER_HOST=`/`DOCKER_CONTEXT=`
+ *    prefix, an `-H`/`--host` GLOBAL flag, an `-c`/`--context` GLOBAL flag, or
+ *    `context use/create/update`) so a wired worker reaches only ITS OWN sidecar. This is
+ *    defense-in-depth, never the containment — mount-ns (Decision 3) is (see header, B4).
  */
 function analyzeDocker(cmd: string[], assignments: readonly string[], dockerWired: boolean): BashScreenResult {
   if (!dockerWired) return deny(REASON_DOCKER_NO_DAEMON);
-  if (assignments.some((a) => a.startsWith("DOCKER_HOST="))) return deny(REASON_DOCKER_REDIRECT);
+  if (assignments.some(redirectsDockerEnv)) return deny(REASON_DOCKER_REDIRECT);
   const args = cmd.slice(1);
   let i = 0;
   while (i < args.length) {
@@ -351,7 +371,7 @@ function analyzeDocker(cmd: string[], assignments: readonly string[], dockerWire
   }
   if (args[i]?.toLowerCase() === "context") {
     const op = args.slice(i + 1).find((x) => !x.startsWith("-"))?.toLowerCase();
-    if (op === "use" || op === "create") return deny(REASON_DOCKER_REDIRECT);
+    if (op === "use" || op === "create" || op === "update") return deny(REASON_DOCKER_REDIRECT);
   }
   return ALLOW;
 }
@@ -368,6 +388,14 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
   if (base === "ps" || base === "pgrep") return deny(REASON_PS);
   if (base === "git") return analyzeGit(cmd.slice(1));
   if (DOCKER_BASES.has(base)) return analyzeDocker(cmd, assignments, dockerWired);
+  // B5 compound form: `export DOCKER_HOST=…; docker …` / `declare -x DOCKER_CONTEXT=…`
+  // marks a daemon/context redirect for a later docker in the SAME shell. Deny the export
+  // itself, but only on a WIRED worker (unwired, docker is already denied outright, so the
+  // export is inert). Segment-local: `set -a` + cross-`;` assignment PROPAGATION is a
+  // documented residual (see file header), not caught — mount-ns is the containment.
+  if (dockerWired && EXPORT_BUILTINS.has(base) && cmd.slice(1).some(redirectsDockerEnv)) {
+    return deny(REASON_DOCKER_REDIRECT);
+  }
   return ALLOW;
 }
 
