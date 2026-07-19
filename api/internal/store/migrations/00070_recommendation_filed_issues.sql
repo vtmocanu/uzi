@@ -28,6 +28,11 @@
 -- filed_repo_id and filed_by_user_id SET NULL, so disconnecting an unrelated repo or
 -- removing a user never destroys another run's filed link — filed_issue_url stays as
 -- the durable pointer (matches produced_by_user_id's existing SET-NULL shape).
+-- category has NO CHECK constraint here ON PURPOSE: the (category, target) coordinate is
+-- always copied from an already-validated review_recommendations row (whose category IS
+-- CHECK-constrained to the six-enum set, 00059), so a redundant CHECK would only couple
+-- this table to that enum for no added safety. The handler never accepts a category from
+-- the request body — it reads it off the resolved recommendation.
 CREATE TABLE recommendation_filed_issues (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     review_id        uuid NOT NULL REFERENCES run_reviews ON DELETE CASCADE,

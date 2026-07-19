@@ -335,7 +335,10 @@ type Config struct {
 	// path is HARSHER than the proposal precedent — the revert is a DELETE of the claim,
 	// so a premature sweep during a live CreateIssue lets a retry re-INSERT and file a
 	// SECOND forge issue — so it is clamped >= 2x ForgeHTTPTimeout exactly like
-	// ProposalConfirmStuckTimeout. 0 disables it.
+	// ProposalConfirmStuckTimeout. An unset/zero/invalid env value falls back to the 2m
+	// default (parseDuration keeps only a positive duration), so the sweep is effectively
+	// always on; the clamp only raises a too-low positive value. The sweeper's own
+	// non-positive guard is defensive for a direct code-set 0, not an env-reachable path.
 	IssueFilingStuckTimeout time.Duration
 
 	// Hosted k8s workers (PRD #58 Decision 12). WorkerHostingEnabled gates the whole

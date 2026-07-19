@@ -202,6 +202,100 @@ func TestRecommendationFiledIssuesLiveDB(t *testing.T) {
 	}
 }
 
+// TestRecommendationFiledIssueSetNullLiveDB proves the FK delete rules (PRD #68 Decision
+// 6): disconnecting the filed repo or removing the filing user must NOT destroy another
+// run's filed link — filed_repo_id / filed_by_user_id go NULL and filed_issue_url stays as
+// the durable pointer. It uses a DISTINCT filer (an admin, userB) filing against a DISTINCT
+// repo (repoB) than the review owner (userA)'s run repo, so deleting them exercises SET
+// NULL without cascading the review away (the review's own user_id is CASCADE, the run's
+// repo is CASCADE — those would take the link with them, which is the correct, different
+// behavior asserted by the re-judge/run-deletion paths).
+func TestRecommendationFiledIssueSetNullLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	q := store.New(pool)
+
+	userA, connA, repoA, targetID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	userB, connB, repoB := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userA, fmt.Sprintf("owner-%s@e2e", userA))
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash, is_admin) VALUES ($1, $2, 'x', true)`, userB, fmt.Sprintf("admin-%s@e2e", userB))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bota', 1, $3)`, connA, userA, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'botb', 2, $3)`, connB, userB, []byte{0x2})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/ra', 'https://forge.e2e/g/ra', 'main', true)`, repoA, connA)
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 2, 'g/rb', 'https://forge.e2e/g/rb', 'main', true)`, repoB, connB)
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind)
+		 VALUES ($1, $2, $3, 7, 'Do X', 'd', 'completed', 'issue')`, targetID, userA, repoA)
+
+	recs, _ := json.Marshal([]map[string]string{{"category": "improve_uzi", "target": "", "rationale_md": "r", "confidence": "low"}})
+	reviewID, err := q.UpsertRunReviewWithRecommendations(ctx, store.UpsertRunReviewWithRecommendationsParams{
+		TargetRunID: targetID, UserID: userA, Verdict: "issues", SummaryMd: "s", JudgeModel: "haiku", Status: "complete", Recommendations: recs,
+	})
+	if err != nil {
+		t.Fatalf("upsert review: %v", err)
+	}
+
+	// userB (admin) files against repoB (their own repo), NOT userA's run repo.
+	claimID, err := q.ClaimRecommendationFiledIssue(ctx, store.ClaimRecommendationFiledIssueParams{
+		ReviewID: reviewID, Category: "improve_uzi", Target: "", FiledByUserID: pgtype.UUID{Bytes: userB, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	const filedURL = "https://forge.e2e/g/rb/-/issues/101"
+	if n, err := q.SettleRecommendationFiledIssue(ctx, store.SettleRecommendationFiledIssueParams{
+		FiledRepoID: pgtype.UUID{Bytes: repoB, Valid: true}, FiledIssueIid: pgtype.Int8{Int64: 101, Valid: true},
+		FiledIssueUrl: filedURL, ID: claimID,
+	}); err != nil || n != 1 {
+		t.Fatalf("settle: n=%d err=%v", n, err)
+	}
+
+	// Disconnect the filed repo, then remove the filing user. Neither owns the review, so
+	// the link must SURVIVE with the two FKs nulled and the durable URL intact.
+	mustExec(ctx, t, pool, `DELETE FROM repos WHERE id = $1`, repoB)
+	mustExec(ctx, t, pool, `DELETE FROM users WHERE id = $1`, userB)
+
+	var repoNull, userNull bool
+	var url string
+	var filedAtValid bool
+	if err := pool.QueryRow(ctx,
+		`SELECT filed_repo_id IS NULL, filed_by_user_id IS NULL, filed_issue_url, filed_at IS NOT NULL
+		   FROM recommendation_filed_issues WHERE id = $1`, claimID).Scan(&repoNull, &userNull, &url, &filedAtValid); err != nil {
+		t.Fatalf("the filed link must survive the repo+user deletion (SET NULL, not CASCADE): %v", err)
+	}
+	if !repoNull {
+		t.Error("filed_repo_id must be NULL after the filed repo was deleted (ON DELETE SET NULL)")
+	}
+	if !userNull {
+		t.Error("filed_by_user_id must be NULL after the filing user was deleted (ON DELETE SET NULL)")
+	}
+	if url != filedURL {
+		t.Errorf("filed_issue_url = %q, want the durable pointer %q (must outlive the repo/user)", url, filedURL)
+	}
+	if !filedAtValid {
+		t.Error("filed_at must remain set — only the disconnected FKs go NULL")
+	}
+}
+
 func openImproveUziTargets(ctx context.Context, t *testing.T, q *store.Queries) []string {
 	t.Helper()
 	rows, err := q.ListOpenImproveUziRecommendations(ctx, 100)

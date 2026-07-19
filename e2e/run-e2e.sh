@@ -1961,6 +1961,56 @@ apiget "/api/runs/$J_RUN/review" \
   || fail "PRD #46: re-judge must UPSERT a single review row, not stack a second"
 pass "deterministic fallback: re-run judge named install_worker_tool 'jq'; the review UPSERTed to one row"
 
+# --- PRD #68: file a forge issue from a judge recommendation -------------------
+# The review on $J_RUN carries an install_worker_tool/jq recommendation. Filing it
+# templates + sanitizes a draft server-side, creates a REAL issue on the fake forge
+# labelled exactly PRD+PRDLESS (never autopilot), persists the link, and enqueues NO
+# run — filing an issue and spending tokens on a run stay separate human decisions.
+say "PRD #68: file a forge issue from a judge recommendation"
+F_REC="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.recommendations[] | select(.category=="install_worker_tool" and .target=="jq") | .id')"
+{ [ -n "$F_REC" ] && [ "$F_REC" != null ]; } || fail "PRD #68: no install_worker_tool/jq recommendation to file"
+
+# The draft GET is owner-scoped, templates the body, and carries the server-assembled
+# PRD+PRDLESS labels (never autopilot, never from the request body).
+F_DRAFT="$(apiget "/api/runs/$J_RUN/review/recommendations/$F_REC/issue-draft")"
+echo "$F_DRAFT" | jq -e '.draft.labels == ["PRD","PRDLESS"]' >/dev/null \
+  || fail "PRD #68: the issue-draft must carry server-side labels [PRD, PRDLESS] (got $(echo "$F_DRAFT" | jq -c '.draft.labels'))"
+echo "$F_DRAFT" | jq -e '.draft.labels | index("autopilot") | not' >/dev/null \
+  || fail "PRD #68: the draft must NEVER carry the autopilot label"
+pass "issue-draft templated with server-side labels PRD+PRDLESS (no autopilot)"
+
+F_RUNS_BEFORE="$(db_psql "SELECT count(*) FROM runs")"
+
+# File it against the caller's connected repo → 201 with the real created issue.
+F_RESP="$(apipost "/api/runs/$J_RUN/review/recommendations/$F_REC/issue" \
+  "{\"repo_id\":\"$REPO_ID\",\"title\":\"Install jq in the worker image\",\"description\":\"The reviewer hit jq command-not-found in two iterations.\"}")"
+F_IID="$(echo "$F_RESP" | jq -r '.issue.iid')"
+{ [ -n "$F_IID" ] && [ "$F_IID" != null ]; } || fail "PRD #68: filing did not return a created issue iid ($F_RESP)"
+pass "filed issue #$F_IID on the forge from the recommendation"
+
+# The FORGE truth: the bot-created issue carries exactly PRD+PRDLESS, never autopilot.
+fake_state | jq -e --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | (.labels | sort) == ["PRD","PRDLESS"]' >/dev/null \
+  || fail "PRD #68: the filed forge issue #$F_IID must be labelled exactly PRD+PRDLESS (got $(fake_state | jq -c --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | .labels'))"
+fake_state | jq -e --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | (.labels | index("autopilot") | not)' >/dev/null \
+  || fail "PRD #68: the filed forge issue #$F_IID must NOT carry autopilot"
+pass "the filed forge issue #$F_IID is labelled exactly PRD+PRDLESS (no autopilot)"
+
+# Nothing auto-starts: filing enqueues NO run. No run row was added, and none exists for
+# the filed issue — it is startable on the board, but only a human Start spends tokens.
+F_RUNS_AFTER="$(db_psql "SELECT count(*) FROM runs")"
+[ "$F_RUNS_BEFORE" = "$F_RUNS_AFTER" ] \
+  || fail "PRD #68: filing enqueued a run ($F_RUNS_BEFORE -> $F_RUNS_AFTER) — filing must never start a run"
+[ "$(db_psql "SELECT count(*) FROM runs WHERE repo_id='$REPO_ID' AND issue_iid=$F_IID")" = 0 ] \
+  || fail "PRD #68: a run was enqueued for the filed issue #$F_IID — nothing must auto-start"
+pass "filing enqueued NO run — the filed issue is startable, but nothing auto-started"
+
+# The persisted link enforces one issue per coordinate: re-filing the same recommendation
+# is a 409 (claim-first), and no second forge issue is created.
+F_DUP_CODE="$(apipost_code "/api/runs/$J_RUN/review/recommendations/$F_REC/issue" \
+  "{\"repo_id\":\"$REPO_ID\",\"title\":\"dup\",\"description\":\"dup\"}")"
+[ "$F_DUP_CODE" = 409 ] || fail "PRD #68: re-filing the same coordinate must 409 (got $F_DUP_CODE)"
+pass "re-filing the same recommendation is a 409 — one issue per coordinate (persisted link)"
+
 # Restore the default (judge OFF) so later sections' runs are not auto-judged and the
 # PRD #42 concurrency capacity math (judge runs count toward worker capacity) is clean.
 apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null
@@ -2600,4 +2650,4 @@ curl -fsS -c "$FRESHJAR" -X POST "$BASE/api/auth/login" -H 'Content-Type: applic
   || fail "a non-admin member must get 403 on /api/admin/rate-limits"
 pass "member gets 403 on /api/admin/rate-limits"
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #47 run-health + PRD #53 rate-limits; executor=%s)\n' "$EXECUTOR"
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #47 run-health + PRD #53 rate-limits; executor=%s)\n' "$EXECUTOR"
