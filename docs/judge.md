@@ -82,6 +82,48 @@ clicking it is your consent to spend your own token, no separate opt-in
 required — and rate-limited per user so it can't be hammered. A re-run
 replaces the previous verdict rather than appending a second one.
 
+## Filing an issue from a recommendation
+
+Each recommendation on the run page has a **File issue** button. Click it and
+uzi templates an editable draft — title, description, and a repo picker —
+from the recommendation, the review, and the judged run, entirely from data
+already stored. Nothing new is sent to the judge model and no token is spent.
+Edit the draft if you like, pick a repo, and click **Create**: uzi files the
+issue on GitLab as your connection's bot (uzi has no per-user forge identity,
+so every issue, note, and label it creates is authored by the same bot as
+everything else) and remembers the link so the same recommendation can't be
+filed twice.
+
+The filed issue carries the `PRD` and `PRDLESS` labels — it shows up on the
+board and can start a run in one click, with no separate PRD file — but
+**never** the autopilot label, so filing never starts a run by itself.
+Filing an issue and spending tokens on a run stay two separate decisions you
+make. Note the [PRDLESS bypass](./prdless.md) also needs the instance-wide
+PRDLESS toggle to be on; if your admin has turned it off, even a
+PRDLESS-labelled filed issue still can't start without a `prds/*.md` link.
+
+If an admin files a recommendation from *your* review, the draft shows
+"from user X's worker, run \<id\>" so they can see whose text they're about
+to publish before they click Create.
+
+**The recommendation text is untrusted, and it can cross projects.** It's LLM
+output derived from your run's trace, which can itself be shaped by whatever
+the run touched — and the repo you're filing into may not be the one the text
+came from. Before filing, uzi fences the untrusted text, strips anything that
+looks like a GitLab quick-action, and scans for known secret shapes (GitLab
+tokens, AWS keys, PEM private keys, and more). That scan is best-effort
+defense-in-depth, not a guarantee: reading the draft is still the real
+control. Known gaps that survive the scan un-redacted today include npm
+tokens (`npm_…`), Stripe-style secret keys (`sk_live_…`), GCP service-account
+JSON, SSH public keys, userinfo-style basic-auth in a URL, and a bare
+40-character AWS secret key. Read the draft before you click Create; don't
+file text you haven't looked at.
+
+Re-running the judge on an already-filed recommendation doesn't refile it —
+the existing link is kept, and if the new verdict changed the recommendation,
+the filed row is flagged "filed for an earlier version" so you know to check
+whether the issue still matches.
+
 ## Which runs are judged
 
 Only finished **issue** and **CI-fix** runs are eligible. Chat runs, judge

@@ -171,6 +171,19 @@ type PipelineStatus struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 }
 
+type RecommendationFiledIssue struct {
+	ID            uuid.UUID          `json:"id"`
+	ReviewID      uuid.UUID          `json:"review_id"`
+	Category      string             `json:"category"`
+	Target        string             `json:"target"`
+	FiledRepoID   pgtype.UUID        `json:"filed_repo_id"`
+	FiledIssueIid pgtype.Int8        `json:"filed_issue_iid"`
+	FiledIssueUrl string             `json:"filed_issue_url"`
+	FiledByUserID pgtype.UUID        `json:"filed_by_user_id"`
+	FiledAt       pgtype.Timestamptz `json:"filed_at"`
+	FilingSince   pgtype.Timestamptz `json:"filing_since"`
+}
+
 type Repo struct {
 	ID                uuid.UUID   `json:"id"`
 	ConnectionID      uuid.UUID   `json:"connection_id"`

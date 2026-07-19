@@ -613,6 +613,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (owner-or-admin, GetReviewForTarget → GetRunForViewer-scoped, capped by
 				// the same RequireUser masking as GetRun).
 				r.Get("/{id}/review", h.GetRunReview)
+				// Issue-draft (PRD #68 M2): the templated, human-editable draft for
+				// filing a forge issue from one recommendation. A READ (owner-or-admin,
+				// same scoping as the review read); no forge write, no token spend. The
+				// file POST (M3) mounts separately on the cookie+CSRF RequireAuth path.
+				r.Get("/{id}/review/recommendations/{recID}/issue-draft", h.GetIssueDraft)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -621,6 +626,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// (service-enforced, audit H3); behind a DEDICATED per-user judge spend
 				// limiter (separate budget from chat).
 				r.With(judgeLimiter.PerUserMiddleware).Post("/{id}/rejudge", h.RerunJudge)
+				// File a forge issue from a recommendation (PRD #68 M3): a forge WRITE, so
+				// cookie+CSRF (this RequireAuth group) behind the per-user forge limiter,
+				// mirroring ConfirmProposal — not the RequireUser read group the draft GET
+				// sits in. Owner-or-admin to see the recommendation, caller-owns-repo to write.
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/review/recommendations/{recID}/issue", h.FileIssue)
 			})
 		})
 

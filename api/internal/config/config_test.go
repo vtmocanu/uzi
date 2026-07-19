@@ -170,6 +170,56 @@ func TestProposalConfirmStuckTimeoutClamped(t *testing.T) {
 	}
 }
 
+// TestIssueFilingStuckTimeoutClamped pins the same load-bearing floor for the PRD #68
+// file-issue claim sweep, which matters MORE than the proposal one: the filing revert is
+// a DELETE of the claim row, so a premature sweep during a slow-but-alive CreateIssue lets
+// a retry re-INSERT and file a SECOND forge issue. A too-low value is clamped up to 2x the
+// forge timeout; a comfortably-large value is left untouched; 0 disables the sweep.
+func TestIssueFilingStuckTimeoutClamped(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	// Below 2x the (raised) forge timeout → clamped up.
+	t.Setenv("FORGE_HTTP_TIMEOUT", "90s")
+	t.Setenv("ISSUE_FILING_STUCK_TIMEOUT", "30s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.IssueFilingStuckTimeout != 180*time.Second {
+		t.Errorf("clamped filing timeout = %v, want 180s (2x the 90s forge timeout)", cfg.IssueFilingStuckTimeout)
+	}
+
+	// Comfortably above the floor → unchanged.
+	t.Setenv("ISSUE_FILING_STUCK_TIMEOUT", "10m")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.IssueFilingStuckTimeout != 10*time.Minute {
+		t.Errorf("filing timeout = %v, want 10m (above the floor, unchanged)", cfg.IssueFilingStuckTimeout)
+	}
+
+	// A zero/invalid env value is treated as UNSET by parseDuration (it keeps only a
+	// positive duration), so it falls back to the 2m default and is then clamped up like
+	// any too-low value — "0 disables" is NOT reachable through the env (same as the
+	// proposal precedent). This pins that behavior so a future reader does not assume
+	// ISSUE_FILING_STUCK_TIMEOUT=0 turns the sweep off.
+	t.Setenv("ISSUE_FILING_STUCK_TIMEOUT", "0")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.IssueFilingStuckTimeout != 180*time.Second {
+		t.Errorf("filing timeout = %v, want 180s (env 0 → 2m default → clamped, NOT disabled)", cfg.IssueFilingStuckTimeout)
+	}
+}
+
 func TestOriginIsHTTPS(t *testing.T) {
 	cases := map[string]bool{
 		"https://uzi.example.com": true,

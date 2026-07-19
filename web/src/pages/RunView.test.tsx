@@ -2,7 +2,7 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { PlanPanel, AgentRosterSummary, JudgePanel } from "./RunView";
-import { api, type RepoAgent, type Run, type RunReview } from "../lib/api";
+import { api, type IssueDraft, type Repo, type RepoAgent, type Run, type RunReview } from "../lib/api";
 
 // The picker no longer fetches the template list (PRD #37 M4-fix — it reads the
 // run's own_agents instead). listAgentTemplates is mocked only so a test can assert
@@ -11,7 +11,16 @@ vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { listAgentTemplates: vi.fn(), getRunReview: vi.fn(), rerunJudge: vi.fn() },
+    api: {
+      listAgentTemplates: vi.fn(),
+      getRunReview: vi.fn(),
+      rerunJudge: vi.fn(),
+      // PRD #68 M4: the file-issue draft/write + the picker's repo list. Defaulted to an
+      // empty picker so the panel's best-effort repos fetch resolves cleanly.
+      listRepos: vi.fn().mockResolvedValue({ repos: [] }),
+      getIssueDraft: vi.fn(),
+      fileIssue: vi.fn(),
+    },
   };
 });
 const mockApi = vi.mocked(api);
@@ -218,6 +227,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
           created_at: "2026-01-01T00:00:00Z",
         },
       ],
+      filed_issues: [],
       ...over,
     };
   }
@@ -276,5 +286,160 @@ describe("JudgePanel (PRD #46 M4)", () => {
     const { container } = render(<JudgePanel run={run({ kind: "chat", status: "completed" })} />);
     expect(container.textContent).toBe("");
     expect(mockApi.getRunReview).not.toHaveBeenCalled();
+  });
+
+  // Regression for the coordinate-key mismatch (web-ux blocking): a recommendation with a
+  // PERSISTED filed link (from ReviewDTO.filed_issues on reload) must render the filed ROW
+  // with the issue link, NOT the idle "File issue" button. Same-session smoke missed this
+  // because the just-filed LOCAL state masked it; only a persisted link exercises coordKey.
+  it("renders a persisted filed link as the filed row, not the idle button", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        filed_issues: [
+          {
+            category: "install_worker_tool",
+            target: "shellcheck",
+            issue_iid: 71,
+            issue_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+            filed_at: "2026-01-02T00:00:00Z",
+          },
+        ],
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    const link = await screen.findByRole("link", { name: /#71/ });
+    expect(link.getAttribute("href")).toBe("https://gitlab.example/vtmocanu/uzi/-/issues/71");
+    // The idle affordance for this (now-filed) recommendation is gone.
+    expect(screen.queryByText("File issue")).toBeNull();
+  });
+
+  // ── File-issue draft flow (PRD #68 M4 states A–E) ──────────────────────────────────────
+  function repoOpt(id: string, path: string): Repo {
+    return {
+      id,
+      connection_id: "c1",
+      forge_project_id: 1,
+      path_with_namespace: path,
+      web_url: `https://gitlab.example/${path}`,
+      default_branch: "main",
+      enabled: true,
+      repo_skills_enabled: false,
+      repo_devbox_opt_in: false,
+      pipeline: null,
+    };
+  }
+  function draftFixture(over: Partial<IssueDraft> = {}): IssueDraft {
+    return {
+      default_repo_id: "repo1",
+      title: "Improve the reviewer: reviewer",
+      description: "## What the judge found\n\n````\nrationale\n````",
+      labels: ["PRD", "PRDLESS"],
+      provenance: "from vlad's worker, run 8f2c1d04",
+      default_note: "Defaulted to the judged run's repo.",
+      ...over,
+    };
+  }
+
+  it("opens the draft with templated fields on File issue click (state B)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("File issue"));
+    expect(mockApi.getIssueDraft).toHaveBeenCalledWith("r1", "rc1");
+    expect(await screen.findByText("Draft issue")).toBeTruthy();
+    // Provenance is prominent (Decision 8), labels are the server-assembled pair, and the
+    // title is an editable field seeded from the draft.
+    expect(screen.getByText(/from vlad's worker, run 8f2c1d04/)).toBeTruthy();
+    expect(screen.getByText("PRD")).toBeTruthy();
+    expect(screen.getByText("PRDLESS")).toBeTruthy();
+    expect((screen.getByDisplayValue("Improve the reviewer: reviewer") as HTMLInputElement).tagName).toBe("INPUT");
+  });
+
+  it("files the issue and shows the created link (state C)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    mockApi.fileIssue.mockResolvedValue({
+      issue: { iid: 71, web_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71", title: "t" },
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("File issue"));
+    fireEvent.click(await screen.findByText("Create issue"));
+    expect(mockApi.fileIssue).toHaveBeenCalledWith("r1", "rc1", {
+      repo_id: "repo1",
+      title: "Improve the reviewer: reviewer",
+      description: draftFixture().description,
+    });
+    const link = await screen.findByRole("link", { name: /#71/ });
+    expect(link.getAttribute("href")).toBe("https://gitlab.example/vtmocanu/uzi/-/issues/71");
+  });
+
+  it("disables Create until a repo is picked when no default resolves (state D)", async () => {
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.getIssueDraft.mockResolvedValue({
+      draft: draftFixture({ default_repo_id: "", default_note: "No uzi repo is configured." }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("File issue"));
+    const create = (await screen.findByText("Create issue")) as HTMLButtonElement;
+    expect(create.disabled).toBe(true);
+    expect(screen.getByText("No uzi repo is configured.")).toBeTruthy();
+    // Picking a repo enables Create.
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "repo1" } });
+    expect((screen.getByText("Create issue") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("keeps the draft open and shows the error when the forge rejects (state E)", async () => {
+    const { ApiError } = await import("../lib/api");
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.listRepos.mockResolvedValue({ repos: [repoOpt("repo1", "vtmocanu/uzi")] });
+    mockApi.getIssueDraft.mockResolvedValue({ draft: draftFixture() });
+    mockApi.fileIssue.mockRejectedValue(new ApiError(502, "the forge rejected the request (403)"));
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("File issue"));
+    fireEvent.click(await screen.findByText("Create issue"));
+    expect(await screen.findByText(/forge rejected the request/i)).toBeTruthy();
+    // The draft stays open with its fields intact (not collapsed to the filed row).
+    expect(screen.getByDisplayValue("Improve the reviewer: reviewer")).toBeTruthy();
+  });
+
+  it("flags a stale filed link (filed before the current review revision)", async () => {
+    mockApi.getRunReview.mockResolvedValue({
+      review: review({
+        updated_at: "2026-02-01T00:00:00Z",
+        filed_issues: [
+          {
+            category: "install_worker_tool",
+            target: "shellcheck",
+            issue_iid: 71,
+            issue_url: "https://gitlab.example/vtmocanu/uzi/-/issues/71",
+            filed_at: "2026-01-01T00:00:00Z", // older than updated_at → stale
+          },
+        ],
+      }),
+    });
+    render(<JudgePanel run={run({ status: "completed" })} />);
+    expect(await screen.findByText(/filed for an earlier version/i)).toBeTruthy();
+  });
+
+  it("recovers from a draft-load failure with Retry and Cancel (no dead end)", async () => {
+    const { ApiError } = await import("../lib/api");
+    mockApi.getRunReview.mockResolvedValue({ review: review() });
+    mockApi.listRepos.mockResolvedValue({ repos: [] });
+    mockApi.getIssueDraft.mockRejectedValue(new ApiError(500, "boom"));
+    render(<JudgePanel run={run({ status: "completed" })} />);
+
+    fireEvent.click(await screen.findByText("File issue"));
+    expect(await screen.findByText("Retry")).toBeTruthy();
+    // Cancel dismisses the failed card, restoring the File-issue button.
+    fireEvent.click(screen.getByText("Cancel"));
+    expect(await screen.findByText("File issue")).toBeTruthy();
   });
 });

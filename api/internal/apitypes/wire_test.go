@@ -108,7 +108,17 @@ func TestRecommendationDTOTags(t *testing.T) {
 func TestReviewDTOTags(t *testing.T) {
 	assertTags(t, "ReviewDTO", ReviewDTO{},
 		"id", "target_run_id", "verdict", "summary_md", "judge_model", "status",
-		"created_at", "updated_at", "recommendations")
+		"created_at", "updated_at", "recommendations", "filed_issues")
+}
+
+func TestFiledIssueDTOTags(t *testing.T) {
+	assertTags(t, "FiledIssueDTO", FiledIssueDTO{},
+		"category", "target", "issue_iid", "issue_url", "filed_at")
+}
+
+func TestIssueDraftDTOTags(t *testing.T) {
+	assertTags(t, "IssueDraftDTO", IssueDraftDTO{},
+		"default_repo_id", "title", "description", "labels", "provenance", "default_note")
 }
 
 // TestReviewNullEnvelope pins the GET /api/runs/{id}/review contract that a

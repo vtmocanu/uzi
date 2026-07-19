@@ -16,6 +16,7 @@ import {
   type CliToken,
   type CliTokenScope,
   type CreatedIssue,
+  type IssueDraft,
   type Notification,
   type NotificationList,
   type PrivilegeReport,
@@ -41,6 +42,7 @@ import {
   type UserSettingsPatch,
 } from "../lib/api";
 import { isTheme, resolveTheme } from "../lib/theme";
+import { recommendationLabel, verdictLabel } from "../lib/judge";
 import { bodyError, descriptionError, SKILL_NAME_RE } from "../lib/skills";
 import {
   LIVE_RUN_ID,
@@ -186,7 +188,80 @@ const loadedSettings = loadSettings();
 let templates: AgentTemplate[] = mockTemplates.map((t) => ({ ...t }));
 let users: User[] = mockUsers.map((u) => ({ ...u }));
 let notifications: MockNotification[] = mockNotifications.map((n) => ({ ...n }));
-const reviews: MockReview[] = mockReviews.map((r) => ({ ...r, recommendations: r.recommendations.map((x) => ({ ...x })) }));
+const reviews: MockReview[] = mockReviews.map((r) => ({
+  ...r,
+  recommendations: r.recommendations.map((x) => ({ ...x })),
+  filed_issues: r.filed_issues.map((x) => ({ ...x })),
+}));
+
+// Monotonic iid for issues the preview files (PRD #68), above the seeded #71.
+let nextFiledIssueIid = 90;
+
+// mockIssueDraft mirrors the server's deterministic templating (PRD #68 M2): the
+// category→repo default resolved against the connected repos + selfimprove config (an
+// empty default → mock state D), the fenced body, server-side PRD+PRDLESS labels, and a
+// provenance line. Faithful enough for the preview to render every state, not a
+// byte-for-byte copy of the Go renderer (its fence/strip/scan is unit-tested there).
+function mockIssueDraft(
+  runId: string,
+  rec: MockReview["recommendations"][number],
+  review: MockReview,
+): IssueDraft {
+  const label = recommendationLabel(rec.category);
+  const enabledRepoIds = new Set(repos.filter((r) => r.enabled).map((r) => r.id));
+  let default_repo_id = "";
+  let default_note = "";
+  if (rec.category === "improve_agent" || rec.category === "add_agent") {
+    const rid = getRun(runId)?.repo_id ?? "";
+    if (enabledRepoIds.has(rid)) {
+      default_repo_id = rid;
+      default_note =
+        "Defaulted to the judged run's repo — repo agents live in its .claude/agents/. Pick any repo you have connected.";
+    } else {
+      default_note = "The judged run's repo isn't one you've connected. Pick the repo to file this against.";
+    }
+  } else {
+    const rid = selfimprove.repo_id ?? "";
+    if (rid && enabledRepoIds.has(rid)) {
+      default_repo_id = rid;
+      default_note = "Defaulted from the category to uzi's own repo. Pick any repo you have connected.";
+    } else {
+      default_note =
+        "No uzi repo is configured on this instance (or it isn't one you've connected), so there's no default. Pick the repo to file this against.";
+    }
+  }
+  const description = [
+    "## What the judge found",
+    "",
+    "````",
+    rec.rationale_md,
+    "````",
+    "",
+    "## Context",
+    "",
+    `- Recommendation: **${label}**${rec.target ? " — `" + rec.target + "`" : ""}${
+      rec.confidence ? ` (${rec.confidence} confidence)` : ""
+    }`,
+    `- Verdict on the judged run: **${verdictLabel(review.verdict)}**`,
+    "",
+    "## Judge's summary of the run",
+    "",
+    "````",
+    review.summary_md,
+    "````",
+    "",
+    "---",
+    "Opened by uzi on behalf of @vlad, from a run retrospective. The quoted text above is LLM-authored and unverified.",
+  ].join("\n");
+  return {
+    default_repo_id,
+    title: rec.target ? `${label}: ${rec.target}` : label,
+    description,
+    labels: ["PRD", "PRDLESS"],
+    provenance: `from vlad's worker, run ${runId.slice(0, 8)}`,
+    default_note,
+  };
+}
 let selfimprove: SelfimproveConfig = {
   enabled: false,
   interval: "48h",
@@ -1387,9 +1462,60 @@ export const mockApi = {
     if (!getRun(id)) throw new ApiError(404, "run not found");
     const review = reviews.find((r) => r.target_run_id === id);
     return delay(
-      { review: review ? { ...review, recommendations: review.recommendations.map((x) => ({ ...x })) } : null },
+      {
+        review: review
+          ? {
+              ...review,
+              recommendations: review.recommendations.map((x) => ({ ...x })),
+              filed_issues: review.filed_issues.map((x) => ({ ...x })),
+            }
+          : null,
+      },
       60,
     );
+  },
+
+  // ── File a forge issue from a recommendation (PRD #68 M4 preview) ────────────
+  getIssueDraft: async (runId: string, recId: string) => {
+    const run = getRun(runId);
+    if (!run) throw new ApiError(404, "run not found");
+    const review = reviews.find((r) => r.target_run_id === runId);
+    const rec = review?.recommendations.find((x) => x.id === recId);
+    if (!review || !rec) throw new ApiError(404, "recommendation not found");
+    return delay({ draft: mockIssueDraft(runId, rec, review) }, 80);
+  },
+  fileIssue: async (
+    runId: string,
+    recId: string,
+    body: { repo_id: string; title: string; description: string },
+  ) => {
+    const run = getRun(runId);
+    if (!run) throw new ApiError(404, "run not found");
+    const review = reviews.find((r) => r.target_run_id === runId);
+    const rec = review?.recommendations.find((x) => x.id === recId);
+    if (!review || !rec) throw new ApiError(404, "recommendation not found");
+    if (review.filed_issues.some((f) => f.category === rec.category && f.target === rec.target)) {
+      throw new ApiError(409, "this recommendation already has an issue, or one is being filed");
+    }
+    const repo = repos.find((r) => r.id === body.repo_id);
+    if (!repo) throw new ApiError(404, "repo not found");
+    // Demo hook for mock state E (forge rejected): filing against the atlas repo, which
+    // the demo treats as write-protected, surfaces the draft-stays-open error path.
+    if (repo.path_with_namespace.includes("atlas")) {
+      throw new ApiError(502, "could not create the issue on the forge: the forge rejected the request (403)");
+    }
+    const iid = nextFiledIssueIid++;
+    const web_url = `${repo.web_url}/-/issues/${iid}`;
+    // Persist the link so a reload shows the filed row (mock C), just like the real API.
+    review.filed_issues.push({
+      category: rec.category,
+      target: rec.target,
+      issue_iid: iid,
+      issue_url: web_url,
+      filed_at: new Date().toISOString(),
+    });
+    const issue: CreatedIssue = { iid, web_url, title: body.title };
+    return delay({ issue }, 200);
   },
   rerunJudge: async (id: string) => {
     const run = getRun(id);

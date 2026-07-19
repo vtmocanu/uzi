@@ -265,6 +265,15 @@ export interface MockReview {
     confidence: "" | "low" | "medium" | "high";
     created_at: string;
   }[];
+  // Settled recommendation→issue links (PRD #68), keyed by (category, target). The panel
+  // renders a filed row for a matching recommendation instead of the File-issue button.
+  filed_issues: {
+    category: RecommendationCategory;
+    target: string;
+    issue_iid: number;
+    issue_url: string;
+    filed_at: string;
+  }[];
 }
 
 export const mockReviews: MockReview[] = [
@@ -296,6 +305,47 @@ export const mockReviews: MockReview[] = [
           "The repo reviewer agent approved on the first pass without checking the migration ordering; tightening its checklist would catch this class of issue.",
         confidence: "medium",
         created_at: minsAgo(6),
+      },
+      {
+        // No category default resolves (selfimprove_repo unset by default), so the draft
+        // opens with an empty picker + a reason — exercises mock state D in the demo.
+        id: "rec-3",
+        category: "improve_uzi",
+        target: "api/internal/poller",
+        rationale_md:
+          "The run waited ~4m for the first poll tick after the label was applied; a webhook path would cut queue-to-claim latency.",
+        confidence: "low",
+        created_at: minsAgo(6),
+      },
+      {
+        // Already filed with a RECENT link — the non-stale state C variant on load.
+        id: "rec-4",
+        category: "add_agent",
+        target: "deploy-agent",
+        rationale_md:
+          "No agent owns the deploy step, so the run hand-rolled it; a dedicated deploy-agent would standardize it.",
+        confidence: "medium",
+        created_at: minsAgo(6),
+      },
+    ],
+    // Two seeded links so both state-C variants render on load: rec-1's filed_at is OLDER
+    // than the review's updated_at (minsAgo(6)) → the STALE variant ("filed for an earlier
+    // version"); rec-4's is NEWER → the plain filed row. The idle button (mock A) shows on
+    // rec-2/rec-3.
+    filed_issues: [
+      {
+        category: "install_worker_tool",
+        target: "shellcheck",
+        issue_iid: 71,
+        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/71",
+        filed_at: minsAgo(20),
+      },
+      {
+        category: "add_agent",
+        target: "deploy-agent",
+        issue_iid: 72,
+        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/72",
+        filed_at: minsAgo(2),
       },
     ],
   },

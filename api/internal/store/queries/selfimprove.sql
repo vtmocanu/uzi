@@ -33,10 +33,24 @@ WHERE kind = 'self_improve' AND status NOT IN ('completed', 'failed', 'cancelled
 -- category='improve_uzi' AND addressed_by_run_id IS NULL). Oldest first so the
 -- longest-waiting items lead; @lim caps the block the prompt carries so a large
 -- backlog can't blow the prompt budget.
-SELECT id, target, rationale_md, confidence, created_at
-FROM review_recommendations
-WHERE category = 'improve_uzi' AND addressed_by_run_id IS NULL
-ORDER BY created_at ASC
+--
+-- PRD #68 Decision 12: also exclude any coordinate that has a row in
+-- recommendation_filed_issues — a CLAIMED-OR-FILED NOT EXISTS (the row EXISTING is the
+-- exclusion, NOT filed_at IS NOT NULL), so a hand-filed OR mid-filing improve_uzi issue
+-- and this backlog never cover the same coordinate twice; a reverted (deleted) claim
+-- re-includes it next cycle. This is the only mechanism — a partial index cannot cross
+-- tables; the filed table's UNIQUE (review_id, category, target) index serves the
+-- correlated lookup.
+SELECT rr.id, rr.target, rr.rationale_md, rr.confidence, rr.created_at
+FROM review_recommendations rr
+WHERE rr.category = 'improve_uzi' AND rr.addressed_by_run_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM recommendation_filed_issues f
+      WHERE f.review_id = rr.review_id
+        AND f.category  = rr.category
+        AND f.target    = rr.target
+  )
+ORDER BY rr.created_at ASC
 LIMIT @lim;
 
 -- name: MarkImproveUziRecommendationsAddressed :execrows

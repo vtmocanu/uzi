@@ -893,6 +893,18 @@ export interface ReviewRecommendation {
   created_at: string;
 }
 
+// FiledIssue is a SETTLED recommendation→forge-issue link (PRD #68 M4). The panel
+// matches it to a recommendation by (category, target) and renders the filed row (issue
+// link) instead of the File-issue button; filed_at < review.updated_at flags a stale link
+// ("filed for an earlier version"). Only settled links appear.
+export interface FiledIssue {
+  category: RecommendationCategory;
+  target: string;
+  issue_iid: number;
+  issue_url: string;
+  filed_at: string;
+}
+
 export interface RunReview {
   id: string;
   target_run_id: string;
@@ -903,6 +915,22 @@ export interface RunReview {
   created_at: string;
   updated_at: string;
   recommendations: ReviewRecommendation[];
+  filed_issues: FiledIssue[];
+}
+
+// IssueDraft is the templated, human-editable draft for filing a forge issue from a
+// recommendation (PRD #68 M2/M4). The body is server-rendered + sanitized (fenced/
+// stripped/scanned), but the panel treats title/description as INERT text (never Markdown)
+// like ProposalCard — the load-bearing controls re-run server-side at the POST. A blank
+// default_repo_id means no default resolved (empty picker, mock state D); default_note is
+// the picker hint / no-default reason; provenance names whose worker produced the text.
+export interface IssueDraft {
+  default_repo_id: string;
+  title: string;
+  description: string;
+  labels: string[];
+  provenance: string;
+  default_note: string;
 }
 
 // ── Self-improvement config (PRD #46 M5) ─────────────────────────────────────
@@ -1431,6 +1459,23 @@ const realApi = {
   // judge run finishes, so callers re-fetch getRunReview.
   getRunReview: (id: string) => request<{ review: RunReview | null }>("GET", `/runs/${id}/review`),
   rerunJudge: (id: string) => request<{ run: Run }>("POST", `/runs/${id}/rejudge`),
+
+  // ── File a forge issue from a recommendation (PRD #68) ──────────────────────
+  // getIssueDraft reads the server-templated draft (owner-or-admin, no write, no token
+  // spend). fileIssue is the forge write (cookie+CSRF, per-user forge limiter): 201
+  // {issue, warning?} — warning is set when the issue was created but its local link/
+  // cache could not be settled (created-with-warning), a success, never a retry signal.
+  getIssueDraft: (runId: string, recId: string) =>
+    request<{ draft: IssueDraft }>(
+      "GET",
+      `/runs/${runId}/review/recommendations/${recId}/issue-draft`,
+    ),
+  fileIssue: (runId: string, recId: string, body: { repo_id: string; title: string; description: string }) =>
+    request<{ issue: CreatedIssue; warning?: string }>(
+      "POST",
+      `/runs/${runId}/review/recommendations/${recId}/issue`,
+      body,
+    ),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/

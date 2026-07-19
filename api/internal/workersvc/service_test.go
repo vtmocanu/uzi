@@ -109,6 +109,8 @@ type fakeStore struct {
 	reviewByTargetErr     error
 	recsByReview          []store.ReviewRecommendation
 	recsByReviewErr       error
+	filedByReview         []store.RecommendationFiledIssue
+	filedByReviewErr      error
 
 	// Submit input.
 	runByID            store.Run
@@ -383,6 +385,9 @@ func (f *fakeStore) GetRunReviewForTarget(context.Context, uuid.UUID) (store.Run
 }
 func (f *fakeStore) ListRecommendationsForReview(context.Context, uuid.UUID) ([]store.ReviewRecommendation, error) {
 	return f.recsByReview, f.recsByReviewErr
+}
+func (f *fakeStore) ListFiledIssuesForReview(context.Context, uuid.UUID) ([]store.RecommendationFiledIssue, error) {
+	return f.filedByReview, f.filedByReviewErr
 }
 func (f *fakeStore) GetWorkerByID(context.Context, uuid.UUID) (store.Worker, error) {
 	return f.workerByID, f.workerByIDErr

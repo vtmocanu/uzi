@@ -373,6 +373,16 @@ flip_mr() { fake_post "/_e2e/mrs/$1/state" "$(jq -nc --arg s "$2" '{state:$s}')"
 # fake_state — the fake's recorded state (issues, MRs, notes, label events).
 fake_state() { curl -fsSk "$FAKE_BASE/_e2e/state"; }
 
+# fake_has_label IID LABEL — "yes" if the fake forge currently shows LABEL on issue
+# IID, else "no". Use with wait_eq to POLL rather than read once: a label toggle is
+# forge-first and the fake forge applies it synchronously, but under heavy concurrent-
+# e2e host contention the /_e2e/state read can momentarily race the write, so a one-shot
+# check flakes. Polling matches how every other forge-state assertion here waits.
+fake_has_label() {
+  fake_state | jq -r --argjson iid "$1" --arg lbl "$2" \
+    'if any(.issues[]?; .iid==$iid and ((.labels // []) | index($lbl))) then "yes" else "no" end'
+}
+
 # note_count IID / notes_text IID — issue-comment introspection.
 note_count() { fake_state | jq --argjson iid "$1" '[.notes[]? | select(.issue_iid==$iid)] | length'; }
 notes_text() { fake_state | jq -r --argjson iid "$1" '.notes[]? | select(.issue_iid==$iid) | .body'; }
@@ -1783,18 +1793,16 @@ pass "PRDLESS run completed the normal lifecycle (branch agent/issue-$IID_PL, MR
 CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":true}')"
 echo "$CARD" | jq -e '.card.labels | index("PRDLESS") != null' >/dev/null \
   || fail "apply: returned card labels missing PRDLESS: $(echo "$CARD" | jq -c '.card.labels')"
-fake_state | jq -e --argjson iid "$IID_TG" \
-  '.issues[] | select(.iid==$iid) | .labels | index("PRDLESS") != null' >/dev/null \
-  || fail "apply: PRDLESS label not written to the fake forge issue #$IID_TG"
+wait_eq yes 20 "apply: PRDLESS written to the fake forge issue #$IID_TG" \
+  fake_has_label "$IID_TG" PRDLESS
 pass "toggle apply: PRDLESS on the fake forge + reflected in the card"
 
 # UI toggle remove: the label is gone from the fake forge and the card.
 CARD="$(apipost "/api/repos/$REPO_ID/issues/$IID_TG/prdless" '{"apply":false}')"
 echo "$CARD" | jq -e '.card.labels | index("PRDLESS") == null' >/dev/null \
   || fail "remove: returned card still carries PRDLESS"
-fake_state | jq -e --argjson iid "$IID_TG" \
-  '.issues[] | select(.iid==$iid) | .labels | index("PRDLESS") == null' >/dev/null \
-  || fail "remove: PRDLESS label still on the fake forge issue #$IID_TG"
+wait_eq no 20 "remove: PRDLESS gone from the fake forge issue #$IID_TG" \
+  fake_has_label "$IID_TG" PRDLESS
 pass "toggle remove: PRDLESS gone from the fake forge + the card"
 
 # =============================================================================
@@ -1983,6 +1991,77 @@ apiget "/api/runs/$J_RUN/review" \
 [ "$(db_psql "SELECT count(*) FROM run_reviews WHERE target_run_id='$J_RUN'")" = 1 ] \
   || fail "PRD #46: re-judge must UPSERT a single review row, not stack a second"
 pass "deterministic fallback: re-run judge named install_worker_tool 'jq'; the review UPSERTed to one row"
+
+# --- PRD #68: file a forge issue from a judge recommendation -------------------
+# The review on $J_RUN carries an install_worker_tool/jq recommendation. Filing it
+# templates + sanitizes a draft server-side, creates a REAL issue on the fake forge
+# labelled exactly PRD+PRDLESS (never autopilot), persists the link, and enqueues NO
+# run — filing an issue and spending tokens on a run stay separate human decisions.
+say "PRD #68: file a forge issue from a judge recommendation"
+F_REC="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.recommendations[] | select(.category=="install_worker_tool" and .target=="jq") | .id')"
+{ [ -n "$F_REC" ] && [ "$F_REC" != null ]; } || fail "PRD #68: no install_worker_tool/jq recommendation to file"
+
+# The draft GET is owner-scoped, templates the body, and carries the server-assembled
+# PRD+PRDLESS labels (never autopilot, never from the request body).
+F_DRAFT="$(apiget "/api/runs/$J_RUN/review/recommendations/$F_REC/issue-draft")"
+echo "$F_DRAFT" | jq -e '.draft.labels == ["PRD","PRDLESS"]' >/dev/null \
+  || fail "PRD #68: the issue-draft must carry server-side labels [PRD, PRDLESS] (got $(echo "$F_DRAFT" | jq -c '.draft.labels'))"
+echo "$F_DRAFT" | jq -e '.draft.labels | index("autopilot") | not' >/dev/null \
+  || fail "PRD #68: the draft must NEVER carry the autopilot label"
+pass "issue-draft templated with server-side labels PRD+PRDLESS (no autopilot)"
+
+F_RUNS_BEFORE="$(db_psql "SELECT count(*) FROM runs")"
+
+# File it against the caller's connected repo → 201 with the real created issue.
+F_RESP="$(apipost "/api/runs/$J_RUN/review/recommendations/$F_REC/issue" \
+  "{\"repo_id\":\"$REPO_ID\",\"title\":\"Install jq in the worker image\",\"description\":\"The reviewer hit jq command-not-found in two iterations.\"}")"
+F_IID="$(echo "$F_RESP" | jq -r '.issue.iid')"
+{ [ -n "$F_IID" ] && [ "$F_IID" != null ]; } || fail "PRD #68: filing did not return a created issue iid ($F_RESP)"
+pass "filed issue #$F_IID on the forge from the recommendation"
+
+# The FORGE truth: the bot-created issue carries exactly PRD+PRDLESS, never autopilot.
+fake_state | jq -e --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | (.labels | sort) == ["PRD","PRDLESS"]' >/dev/null \
+  || fail "PRD #68: the filed forge issue #$F_IID must be labelled exactly PRD+PRDLESS (got $(fake_state | jq -c --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | .labels'))"
+fake_state | jq -e --argjson iid "$F_IID" '.issues[] | select(.iid==$iid) | (.labels | index("autopilot") | not)' >/dev/null \
+  || fail "PRD #68: the filed forge issue #$F_IID must NOT carry autopilot"
+pass "the filed forge issue #$F_IID is labelled exactly PRD+PRDLESS (no autopilot)"
+
+# Nothing auto-starts: filing enqueues NO run. No run row was added, and none exists for
+# the filed issue — it is startable on the board, but only a human Start spends tokens.
+F_RUNS_AFTER="$(db_psql "SELECT count(*) FROM runs")"
+[ "$F_RUNS_BEFORE" = "$F_RUNS_AFTER" ] \
+  || fail "PRD #68: filing enqueued a run ($F_RUNS_BEFORE -> $F_RUNS_AFTER) — filing must never start a run"
+[ "$(db_psql "SELECT count(*) FROM runs WHERE repo_id='$REPO_ID' AND issue_iid=$F_IID")" = 0 ] \
+  || fail "PRD #68: a run was enqueued for the filed issue #$F_IID — nothing must auto-start"
+pass "filing enqueued NO run — the filed issue is startable, but nothing auto-started"
+
+# The persisted link enforces one issue per coordinate: re-filing the same recommendation
+# is a 409 (claim-first), and no second forge issue is created.
+F_DUP_CODE="$(apipost_code "/api/runs/$J_RUN/review/recommendations/$F_REC/issue" \
+  "{\"repo_id\":\"$REPO_ID\",\"title\":\"dup\",\"description\":\"dup\"}")"
+[ "$F_DUP_CODE" = 409 ] || fail "PRD #68: re-filing the same coordinate must 409 (got $F_DUP_CODE)"
+pass "re-filing the same recommendation is a 409 — one issue per coordinate (persisted link)"
+
+# Headline success criterion: on an instance with prdless_enabled ON (the shipped
+# default, as the PRD #22 leg established), the filed PRD+PRDLESS issue is STARTABLE on
+# the FIRST Start click — the PRDLESS label bypasses the PRD-file-link requirement, so
+# createRun does NOT reject with ErrNoPRDLink (a 422 would make create_run return non-zero).
+F_START_RUN="$(create_run "$REPO_ID" "$F_IID")" \
+  || fail "PRD #68: the filed issue #$F_IID was NOT startable — createRun rejected it (ErrNoPRDLink?); a PRD+PRDLESS issue must start on the first click"
+{ [ -n "$F_START_RUN" ] && [ "$F_START_RUN" != null ]; } || fail "PRD #68: no run id returned for the filed issue #$F_IID"
+pass "the filed PRD+PRDLESS issue #$F_IID started a run ($F_START_RUN) on the first Start — no PRD-file link needed (no ErrNoPRDLink)"
+
+# Clean up: cancel this run so it does not hold worker capacity in the later PRD #42
+# concurrency section (a normal issue run parks at the plan gate). Best-effort cancel +
+# a soft wait for a terminal state (never hard-fail on the cleanup).
+apipost "/api/runs/$F_START_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+for _ in $(seq 1 60); do
+  case "$(apiget "/api/runs/$F_START_RUN" | jq -r '.run.status // empty')" in
+    cancelled|completed|failed) break ;;
+  esac
+  sleep 0.3
+done
+pass "cleaned up the filed-issue run (cancelled) so it frees worker capacity for later sections"
 
 # Restore the default (judge OFF) so later sections' runs are not auto-judged and the
 # PRD #42 concurrency capacity math (judge runs count toward worker capacity) is clean.
@@ -2728,4 +2807,4 @@ $(printf '%s' "$tc_out" | tail -n 15)"
   pass 'the worker self-detects the sidecar and registers capabilities:["docker"] (real product path, no DOCKER_HOST bypass)'
 fi
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #47 run-health + PRD #53 rate-limits%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #47 run-health + PRD #53 rate-limits%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
