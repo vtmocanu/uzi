@@ -54,6 +54,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md#ci-status--fix-agent-prd-6) and [configura
 
 ```sh
 brew install vtmocanu/tap/uzi-cli   # vtmocanu group access; builds from source
+uzi skill install-hook             # Claude Code users: refresh the skill at each session start
 uzi login                          # humans; or set UZI_TOKEN from Settings -> Access
 uzi run list
 ```
