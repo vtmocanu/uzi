@@ -32,7 +32,7 @@ type ClaimRecommendationFiledIssueParams struct {
 // coordinate. The filing flow is claim-first (Decision 7, mirror ConfirmProposal +
 // 00054): Claim BEFORE the forge write, then Settle on success / Revert on failure,
 // with Sweep reaping claims stranded by a crash between the two. See
-// 00070_recommendation_filed_issues.sql for the table rationale.
+// 00071_recommendation_filed_issues.sql for the table rationale.
 // Atomic claim-first (Decision 7). INSERT the claim row stamping filing_since; ON
 // CONFLICT on the coordinate DO NOTHING, so a second concurrent POST — or a coordinate
 // that is already filed OR mid-filing — returns NO row (pgx.ErrNoRows), which the
