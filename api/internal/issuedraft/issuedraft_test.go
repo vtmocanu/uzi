@@ -40,7 +40,7 @@ func TestRenderBasicShape(t *testing.T) {
 		"- Judged run: [issue run on vtmocanu/uzi#58](https://uzi.example/runs/8f2c1d04) (completed)",
 		"- Retrospective by ` sonnet `, 2026-07-17",
 		"## Judge's summary of the run",
-		"Opened by uzi on behalf of @vmocanu, from a retrospective of vmocanu's run 8f2c1d04",
+		"Opened by uzi on behalf of @` vmocanu `, from a retrospective of ` vmocanu `'s run 8f2c1d04",
 		"quick-actions render inert.",
 	} {
 		if !strings.Contains(d.Description, want) {
@@ -124,6 +124,57 @@ func TestStripUnfencedSlashLines(t *testing.T) {
 		if !strings.Contains(got, keep) {
 			t.Fatalf("dropped a legitimate line %q:\n%s", keep, got)
 		}
+	}
+}
+
+func TestStripUnfencedSlashLinesCRLF(t *testing.T) {
+	// GitLab CRLF-normalizes before quick-action processing, so a fence closed with a
+	// trailing \r (or a bare-\r body) must be treated as CLOSED here and the following
+	// column-0 /label line stripped (audit Medium-1 — the CRLF-blind bypass).
+	cases := map[string]string{
+		"crlf":   "```\r\ncode\r\n```\r\n/label ~autopilot\r\n",
+		"bareCR": "```\rcode\r```\r/label ~autopilot\r",
+	}
+	for name, body := range cases {
+		got := StripUnfencedSlashLines(body)
+		if strings.Contains(got, "/label") {
+			t.Fatalf("%s: CRLF-blind strip left a quick-action line: %q", name, got)
+		}
+		if !strings.Contains(got, "code") {
+			t.Fatalf("%s: fenced code was lost: %q", name, got)
+		}
+	}
+}
+
+func TestSanitizeFiledBodyCRLFAttack(t *testing.T) {
+	body := "intro\r\n```\r\nx\r\n```\r\n/label ~autopilot\r\n"
+	got := SanitizeFiledBody(body)
+	if strings.Contains(got, "/label") {
+		t.Fatalf("SanitizeFiledBody did not strip a CRLF-hidden quick-action:\n%q", got)
+	}
+}
+
+func TestFooterNeutralizesHostileUsername(t *testing.T) {
+	in := baseInput()
+	in.RequestingUser = "[x](https://evil.example)"
+	in.ProducingUser = "@everyone"
+	d := Render(in)
+	// A hostile display name is wrapped in inline code, so the "](url)" is inert and the
+	// "@everyone" cannot fire a real GitLab mention.
+	if !strings.Contains(d.Description, "` [x](https://evil.example) `") {
+		t.Fatalf("hostile requesting-user name was not fenced in inline code:\n%s", d.Description)
+	}
+	if !strings.Contains(d.Description, "` @everyone `'s run") {
+		t.Fatalf("producing-user name was not fenced (would render as a live mention):\n%s", d.Description)
+	}
+}
+
+func TestRunReferenceRepoPathBreakout(t *testing.T) {
+	in := baseInput()
+	in.RepoPath = "evil](https://evil.example) ["
+	d := Render(in)
+	if strings.Contains(d.Description, "](https://evil.example)") {
+		t.Fatalf("repo path broke out of the markdown link label:\n%s", d.Description)
 	}
 }
 

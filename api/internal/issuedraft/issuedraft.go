@@ -182,7 +182,11 @@ func runReference(in Input) string {
 	if kind == "" {
 		kind = "run"
 	}
-	where := kind + " run on " + in.RepoPath
+	// RepoPath is forge-controlled and sits in a markdown link LABEL, outside any fence
+	// (audit Low-2). GitLab project paths exclude the label/destination metacharacters
+	// today, but strip them anyway so a breakout never rests solely on that external
+	// constraint. kind/status are trusted enums; IssueIID an integer.
+	where := kind + " run on " + linkLabelSafe(in.RepoPath)
 	if in.IssueIID > 0 {
 		where += "#" + strconv.FormatInt(in.IssueIID, 10)
 	}
@@ -197,22 +201,33 @@ func runReference(in Input) string {
 }
 
 func footer(in Input) string {
-	who := in.RequestingUser
-	if who == "" {
-		who = "a user"
+	// RequestingUser/ProducingUser are user-controlled display handles interpolated into
+	// markdown PROSE outside any fence (audit Low-2): a hostile display name could inject
+	// a live link, or an "@name" that fires a real GitLab mention/ping. Fence each in
+	// breakout-proof inline code so it renders as inert text and no mention resolves.
+	who := "a user"
+	if in.RequestingUser != "" {
+		who = SafeInlineCode(in.RequestingUser)
 	}
 	src := "a run retrospective"
 	if in.ProducingUser != "" {
-		src = in.ProducingUser + "'s run"
+		src = "a retrospective of " + SafeInlineCode(in.ProducingUser) + "'s run"
 		if in.ProducingRunShortID != "" {
 			src += " " + in.ProducingRunShortID
 		}
-		src = "a retrospective of " + src
 	}
 	return "Opened by uzi on behalf of @" + who + ", from " + src +
 		". The quoted text above is LLM-authored and unverified, and is fenced " +
 		"(not blockquoted) so links, image beacons and quick-actions render inert."
 }
+
+// linkLabelSafe strips the markdown link-label/destination metacharacters and collapses
+// whitespace so an untrusted value cannot break out of a `[label](url)` construct.
+func linkLabelSafe(s string) string {
+	return collapseWS(linkUnsafe.ReplaceAllString(s, ""))
+}
+
+var linkUnsafe = regexp.MustCompile("[\\[\\]()`]")
 
 func provenance(in Input) string {
 	if in.ProducingUser == "" {
@@ -311,6 +326,14 @@ var wsRun = regexp.MustCompile(`\s+`)
 // identical fence chars (` or ~), up to 3 leading spaces, opens/closes a block; a closing
 // fence must be the same char and at least as long as the opener.
 func StripUnfencedSlashLines(body string) string {
+	// Normalize line endings FIRST (audit Medium-1). GitLab CRLF-normalizes before its
+	// markdown/quick-action processing, so a closing fence written "```\r" — or any bare
+	// "\r" line break — must be seen as a line ending here too; otherwise the fence
+	// tracker treats "```\r" as an unclosed fence (info="\r") and stops stripping, while
+	// GitLab sees the fence CLOSED and executes a following column-0 "/label" line. Fold
+	// "\r\n" and bare "\r" to "\n" so every downstream check is CRLF-safe.
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	body = strings.ReplaceAll(body, "\r", "\n")
 	lines := strings.Split(body, "\n")
 	out := make([]string, 0, len(lines))
 	var fenceChar byte // 0 = not in a fence
