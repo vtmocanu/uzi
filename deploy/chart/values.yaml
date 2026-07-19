@@ -516,15 +516,20 @@ workers:
         cpu: "4"
         memory: 8Gi
       maxPVCStorage: 20Gi
-    # The DinD sidecar's resource LIMITS (PRD #89 0.8.1). The controller renders the
-    # sidecar with these limits (passed as UZI_WORKER_DIND_LIMIT_CPU/MEMORY); its requests
-    # stay fixed and small (250m / 256Mi — the daemon idles most of a run). The default
-    # (2 / 2Gi) is enough for `docker`/compose that pulls prebuilt images, but IN-DAEMON
-    # image BUILDS OOM it (uzi's own e2e builds 5 images inside the daemon), so a cluster
-    # that runs real docker work raises them per-cluster (dev-cluster sets 4 / 6Gi). Must
-    # stay within limitRange.max above (per-container ceiling). Empty ⇒ the controller's
-    # built-in default; set both or the unset one falls back to that default.
+    # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). The controller renders
+    # the sidecar with these (flattened to UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}).
+    # The default (250m/256Mi req, 2/2Gi lim) is enough for `docker`/compose that pulls
+    # prebuilt images, but IN-DAEMON image BUILDS OOM it (uzi's own e2e builds 5 images
+    # inside the daemon), so a cluster that runs real docker work raises them per-cluster
+    # (dev-cluster sets 500m/2Gi req, 4/6Gi lim). RAISE THE REQUEST alongside the limit:
+    # a large limit with a tiny request lets the scheduler place the pod on a node without
+    # the memory and OOM it under contention. Limits must stay within limitRange.max above
+    # (per-container ceiling: 4 CPU / 8Gi). Any field left empty falls back to the
+    # controller's built-in default.
     dindResources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
       limits:
         cpu: "2"
         memory: 2Gi

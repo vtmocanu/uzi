@@ -125,13 +125,17 @@ type Config struct {
 	// tier off ⇒ irrelevant, but the safe value). Threaded to RenderConfig.DinDNonRootless
 	// (inverted) so the render side's zero value stays the safe rootless posture.
 	WorkerDinDRootless bool
-	// WorkerDinDLimitCPU / WorkerDinDLimitMemory override the DinD sidecar's resource
-	// LIMITS (PRD #89 0.8.1). Empty ⇒ the render side's built-in default ("2" / "2Gi").
-	// A cluster raises them because in-daemon image builds OOM the 2Gi default (uzi's own
-	// e2e builds 5 images inside the daemon). Optional even when the docker tier is on —
-	// validated as k8s Quantity strings when set, so a typo fails at boot, not at admission.
-	WorkerDinDLimitCPU    string
-	WorkerDinDLimitMemory string
+	// WorkerDinDRequest*/WorkerDinDLimit* override the DinD sidecar's resource requests+
+	// limits (PRD #89 0.8.1). Empty ⇒ the render side's built-in default ("250m"/"256Mi"
+	// requests, "2"/"2Gi" limits). A cluster raises them because in-daemon image builds OOM
+	// the 2Gi default (uzi's own e2e builds 5 images inside the daemon); the request is
+	// raised alongside the limit so the scheduler reserves the memory. Optional even when
+	// the docker tier is on — each is validated as a k8s Quantity when set, so a typo fails
+	// at boot, not at admission.
+	WorkerDinDRequestCPU    string
+	WorkerDinDRequestMemory string
+	WorkerDinDLimitCPU      string
+	WorkerDinDLimitMemory   string
 }
 
 // Load reads and validates the configuration.
@@ -273,25 +277,27 @@ func validateDockerTier(cfg *Config) error {
 	}
 	cfg.WorkerDinDRootless = rootless
 
-	// Optional DinD limit overrides (PRD #89 0.8.1). Validated as k8s Quantity strings
-	// when set so a typo fails at boot, not at the far end when the apiserver rejects the
-	// rendered pod. Empty leaves the render side's built-in default.
-	limits := []struct {
+	// Optional DinD resource overrides (PRD #89 0.8.1), requests + limits both. Validated as
+	// k8s Quantity strings when set so a typo fails at boot, not at the far end when the
+	// apiserver rejects the rendered pod. Empty leaves the render side's built-in default.
+	quantities := []struct {
 		key string
 		dst *string
 	}{
+		{"UZI_WORKER_DIND_REQUEST_CPU", &cfg.WorkerDinDRequestCPU},
+		{"UZI_WORKER_DIND_REQUEST_MEMORY", &cfg.WorkerDinDRequestMemory},
 		{"UZI_WORKER_DIND_LIMIT_CPU", &cfg.WorkerDinDLimitCPU},
 		{"UZI_WORKER_DIND_LIMIT_MEMORY", &cfg.WorkerDinDLimitMemory},
 	}
-	for _, l := range limits {
-		v := strings.TrimSpace(os.Getenv(l.key))
+	for _, q := range quantities {
+		v := strings.TrimSpace(os.Getenv(q.key))
 		if v == "" {
 			continue
 		}
 		if _, err := resource.ParseQuantity(v); err != nil {
-			return fmt.Errorf("%s=%q is not a valid resource quantity (e.g. \"4\" or \"6Gi\"): %w", l.key, v, err)
+			return fmt.Errorf("%s=%q is not a valid resource quantity (e.g. \"4\" or \"6Gi\"): %w", q.key, v, err)
 		}
-		*l.dst = v
+		*q.dst = v
 	}
 	return nil
 }

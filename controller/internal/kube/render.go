@@ -195,33 +195,37 @@ const (
 // native sidecars count toward the pod's request (they run alongside the worker).
 // The sidecar budget follows arch §Q4 (~1-2 GiB / ~1 CPU on top of the agent).
 //
-// The dind LIMITS are the DEFAULT; a cluster raises them per-cluster (PRD #89 0.8.1,
-// RenderConfig.DinDLimitCPU/Memory) because in-daemon image builds OOM the 2Gi default —
-// uzi's own e2e builds 5 images inside the daemon. See dindResources() below.
+// The dind requests+limits are the DEFAULT; a cluster overrides them per-cluster (PRD #89
+// 0.8.1, RenderConfig.DinDRequest*/DinDLimit*) because in-daemon image builds OOM the 2Gi
+// default — uzi's own e2e builds 5 images inside the daemon. BOTH the requests and the
+// limits are overridable: raising only the limit lets the scheduler place the pod on a
+// node without the memory and OOM it under contention, so a cluster that raises the memory
+// limit raises the request in lockstep. See dindResources() below.
 const (
-	dindDefaultLimitCPU    = "2"
-	dindDefaultLimitMemory = "2Gi"
+	dindDefaultRequestCPU    = "250m"
+	dindDefaultRequestMemory = "256Mi"
+	dindDefaultLimitCPU      = "2"
+	dindDefaultLimitMemory   = "2Gi"
 )
 
-// dindResources builds the DinD sidecar's requests+limits. Requests are fixed and small
-// (the daemon idles most of a run); the LIMITS default to dindDefaultLimit* but a cluster
-// can raise them via cfg (config validated the strings at boot, so MustParse is safe).
+// dindResources builds the DinD sidecar's requests+limits from cfg, falling back to the
+// dindDefault* constants for any field a cluster did not override (config validated every
+// override string as a k8s quantity at boot, so MustParse here is safe).
 func (cfg RenderConfig) dindResources() corev1.ResourceRequirements {
-	limitCPU, limitMem := dindDefaultLimitCPU, dindDefaultLimitMemory
-	if cfg.DinDLimitCPU != "" {
-		limitCPU = cfg.DinDLimitCPU
-	}
-	if cfg.DinDLimitMemory != "" {
-		limitMem = cfg.DinDLimitMemory
+	pick := func(override, def string) string {
+		if override != "" {
+			return override
+		}
+		return def
 	}
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("250m"),
-			corev1.ResourceMemory: resource.MustParse("256Mi"),
+			corev1.ResourceCPU:    resource.MustParse(pick(cfg.DinDRequestCPU, dindDefaultRequestCPU)),
+			corev1.ResourceMemory: resource.MustParse(pick(cfg.DinDRequestMemory, dindDefaultRequestMemory)),
 		},
 		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(limitCPU),
-			corev1.ResourceMemory: resource.MustParse(limitMem),
+			corev1.ResourceCPU:    resource.MustParse(pick(cfg.DinDLimitCPU, dindDefaultLimitCPU)),
+			corev1.ResourceMemory: resource.MustParse(pick(cfg.DinDLimitMemory, dindDefaultLimitMemory)),
 		},
 	}
 }
@@ -308,14 +312,18 @@ type RenderConfig struct {
 	// acknowledgeNonRootlessNodeRoot fail-guard (M2); it never comes off the wire and is
 	// kept out of a plain worker's rendered spec/hash.
 	DinDNonRootless bool
-	// DinDLimitCPU / DinDLimitMemory override the DinD sidecar's resource LIMITS (PRD #89
-	// 0.8.1). Empty ⇒ dindDefaultLimitCPU/Memory ("2" / "2Gi"). A cluster raises them
-	// because in-daemon image builds OOM the 2Gi default (uzi's own e2e builds 5 images
-	// inside the daemon). Quantity strings (e.g. "4" / "6Gi"), validated at the
-	// controller's boot so the render side can MustParse them. Requests stay fixed.
-	// Docker-only, so they never touch a plain worker's spec/hash.
-	DinDLimitCPU    string
-	DinDLimitMemory string
+	// DinDRequest*/DinDLimit* override the DinD sidecar's resource requests+limits (PRD #89
+	// 0.8.1). Empty ⇒ dindDefault* ("250m"/"256Mi" requests, "2"/"2Gi" limits). A cluster
+	// raises them because in-daemon image builds OOM the 2Gi default (uzi's own e2e builds
+	// 5 images inside the daemon); the REQUEST is raised alongside the limit so the
+	// scheduler reserves the memory rather than placing the pod on a node that OOMs it under
+	// contention. Quantity strings (e.g. "4" / "6Gi"), validated at the controller's boot so
+	// the render side can MustParse them. Docker-only, so they never touch a plain worker's
+	// spec/hash.
+	DinDRequestCPU    string
+	DinDRequestMemory string
+	DinDLimitCPU      string
+	DinDLimitMemory   string
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.

@@ -75,7 +75,10 @@ func main() {
 		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
 		// rootless posture. Invert here, at the one wiring point.
 		DinDNonRootless: !cfg.WorkerDinDRootless,
-		// DinD limit overrides (PRD #89 0.8.1); empty leaves the render default.
+		// DinD resource overrides (PRD #89 0.8.1), requests + limits; empty leaves the
+		// render default.
+		DinDRequestCPU:     cfg.WorkerDinDRequestCPU,
+		DinDRequestMemory:  cfg.WorkerDinDRequestMemory,
 		DinDLimitCPU:       cfg.WorkerDinDLimitCPU,
 		DinDLimitMemory:    cfg.WorkerDinDLimitMemory,
 		ServiceAccountName: cfg.WorkerServiceAccount,
