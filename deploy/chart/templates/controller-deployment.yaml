@@ -120,9 +120,18 @@ spec:
             # skipped, never rendered into the restricted default).
             - name: UZI_WORKER_DOCKER_NAMESPACE
               value: {{ .Values.workers.docker.namespace | quote }}
-            # The pinned rootless-DinD sidecar image, shared with the compose track.
+            # The DinD posture (PRD #89): true (default) = rootless; false = non-rootless
+            # privileged (dockerd as real root, the node-root residual gated by
+            # acknowledgeNonRootlessNodeRoot in worker-invariants.yaml). The controller's
+            # config reads + validates it and threads it to the render branch.
+            - name: UZI_WORKER_DIND_ROOTLESS
+              value: {{ .Values.workers.docker.rootless | quote }}
+            # The pinned DinD sidecar image, SELECTED by posture (OQ-A hybrid): the
+            # explicit `image` override wins, else rootlessImage/nonRootlessImage by
+            # `rootless`. worker-invariants.yaml's coherence fail-guard rejects an
+            # image/posture mismatch, so this value is always coherent with the flag above.
             - name: UZI_WORKER_DIND_IMAGE
-              value: {{ .Values.workers.docker.image | quote }}
+              value: {{ include "uzi.workerDinDImage" . | quote }}
             {{- end }}
           resources:
             {{- toYaml .Values.workers.controller.resources | nindent 12 }}

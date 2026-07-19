@@ -416,10 +416,38 @@ workers:
     # The dedicated privileged namespace. MUST differ from workers.namespace — the
     # controller refuses to boot if they are equal (the separation is the point).
     namespace: uzi-workers-docker
-    # The pinned rootless-DinD sidecar image, SHARED with the compose track's pin
-    # (docker-compose.yml `dind`) so both tracks run the identical daemon. One image
-    # ref serves both the sidecar and the tiny root socket-prep helper.
-    image: docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431
+    # --- DinD posture (PRD #89): the per-cluster rootless toggle -------------------
+    #
+    # Default ROOTLESS (the safe, recommended stance — PRD #83). Set false ONLY on
+    # clusters whose nodes cannot run rootless dockerd (no unprivileged userns, e.g.
+    # dev-cluster / vendor Linux, kernel default off): the controller then renders a
+    # NON-ROOTLESS privileged DinD sidecar — dockerd as REAL ROOT bound to pod-loopback
+    # TCP (127.0.0.1:2375). Nothing changes on any cluster that keeps rootless.
+    #
+    # The residual under rootless:false is NODE ROOT reachable by untrusted repo
+    # content (a prompt-injectable agent reaches the root daemon and can `docker run
+    # --privileged` out to the node) — the owner-accepted risk. So it is refused unless
+    # acknowledgeNonRootlessNodeRoot is ALSO true (worker-invariants.yaml), mirroring
+    # the networkPolicy.acknowledgeUnfenced idiom: a loud, visible operator choice.
+    rootless: true
+    # The acknowledgement of the node-root residual, REQUIRED to render rootless:false.
+    # An opt-in in the values file that chose it, never an inherited default. Ignored
+    # while rootless:true.
+    acknowledgeNonRootlessNodeRoot: false
+    # The pinned DinD sidecar images, ONE PER POSTURE (OQ-A resolved: hybrid). The chart
+    # SELECTS by `rootless` (uzi.workerDinDImage) and passes the winner to the controller
+    # as UZI_WORKER_DIND_IMAGE, so a cluster flips posture with a bare `rootless:false`
+    # and no second image line — while digest pinning is preserved. Both are
+    # digest-pinned and share the other tracks' pins: rootlessImage == docker-compose.yml
+    # `dind`; nonRootlessImage == .gitlab-ci.yml's `docker:28-dind` service (same major).
+    # One image ref serves both the sidecar and the tiny root socket-prep helper.
+    rootlessImage: docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431
+    nonRootlessImage: docker:28-dind@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac
+    # Explicit image override: non-empty is used VERBATIM instead of the posture
+    # selection above (still subject to the coherence fail-guard, which rejects a
+    # -dind-rootless image with rootless:false, or a plain -dind image with
+    # rootless:true). Empty selects rootlessImage/nonRootlessImage by `rootless`.
+    image: ""
     # The docker tier's OWN NetworkPolicy (auditor MUST, blocking for LIVE enablement).
     # The restricted ns's worker-networkpolicy.yaml + worker-fqdn-egress.yaml hardcode
     # workers.namespace, so this namespace would otherwise be default-ALLOW — and a

@@ -167,3 +167,24 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 true
 {{- end -}}
 {{- end -}}
+
+{{- /*
+  uzi.workerDinDImage: the pinned DinD sidecar image, SELECTED by posture (PRD #89
+  OQ-A hybrid). workers.docker.image (an explicit override) wins; otherwise
+  rootlessImage when workers.docker.rootless, else nonRootlessImage. The coherence
+  fail-guard in worker-invariants.yaml rejects a posture/image mismatch, so every
+  caller can treat the result as coherent with workers.docker.rootless.
+
+  This is the single definition of the selection; controller-deployment.yaml passes it
+  as UZI_WORKER_DIND_IMAGE and worker-invariants.yaml validates it, so the two never drift.
+*/ -}}
+{{- define "uzi.workerDinDImage" -}}
+{{- $d := .Values.workers.docker -}}
+{{- if $d.image -}}
+{{- $d.image -}}
+{{- else if $d.rootless -}}
+{{- $d.rootlessImage -}}
+{{- else -}}
+{{- $d.nonRootlessImage -}}
+{{- end -}}
+{{- end -}}

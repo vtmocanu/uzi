@@ -66,4 +66,37 @@
 {{- if and .Values.workers.docker.enabled (not .Values.workers.docker.networkPolicy.enabled) (not .Values.workers.docker.networkPolicy.acknowledgeUnfenced) }}
 {{- fail "workers.docker.enabled requires workers.docker.networkPolicy.enabled (with real cluster CIDRs in workers.docker.networkPolicy.{podCIDR,serviceCIDR,linkLocalCIDR}) — the docker tier is privileged and must be fenced from in-cluster lateral movement. To deliberately run it UNFENCED (e.g. a throwaway cluster with no NetworkPolicy support), set workers.docker.networkPolicy.acknowledgeUnfenced=true." }}
 {{- end }}
+{{- /*
+  DinD POSTURE FAIL-GUARDS (PRD #89 M2). Two invariants that must hold BY CONSTRUCTION,
+  in the always-evaluated template, for the same reason as the guards above.
+
+  (1) NODE-ROOT ACKNOWLEDGEMENT (auditor MUST; OQ-B resolved YES). rootless:false renders
+      a non-rootless privileged DinD daemon — dockerd as REAL ROOT — whose residual is
+      NODE ROOT reachable by untrusted repo content (the api pod's UZI_SECRET_KEY decrypts
+      every user's forge PAT + Anthropic token). Default-off + a decision-log line is
+      insufficient for a residual this reachable, so rootless:false is refused unless
+      acknowledgeNonRootlessNodeRoot=true — a loud, visible operator choice, mirroring
+      networkPolicy.acknowledgeUnfenced.
+
+  (2) IMAGE/POSTURE COHERENCE (OQ-A). The chart selects the DinD image by posture
+      (uzi.workerDinDImage), but workers.docker.image can override it — and a rootless
+      (-dind-rootless) image under rootless:false (or a plain -dind image under
+      rootless:true) is a silent posture mismatch that would crash-loop or, worse, run
+      the wrong daemon. Reject the mismatched pair here, checking the SELECTED image so
+      the override is covered too.
+*/ -}}
+{{- if .Values.workers.docker.enabled }}
+{{- $rootless := .Values.workers.docker.rootless }}
+{{- if and (not $rootless) (not .Values.workers.docker.acknowledgeNonRootlessNodeRoot) }}
+{{- fail "workers.docker.rootless=false renders a NON-ROOTLESS privileged DinD daemon (dockerd as real root on the node): a prompt-injectable agent reaching it can obtain NODE ROOT and read every co-scheduled pod's secrets, including the api's UZI_SECRET_KEY (which decrypts all users' forge PATs + Anthropic tokens). This is the owner-accepted residual on nodes without unprivileged userns (dev-cluster/Linux), but it must be an explicit choice: set workers.docker.acknowledgeNonRootlessNodeRoot=true to accept it, or keep workers.docker.rootless=true (the default, safe posture)." }}
+{{- end }}
+{{- $img := include "uzi.workerDinDImage" . }}
+{{- $imgIsRootless := contains "-dind-rootless" $img }}
+{{- if and $rootless (not $imgIsRootless) }}
+{{- fail (printf "workers.docker.rootless=true but the selected DinD image %q is not a rootless (-dind-rootless) image — running a non-rootless image under the rootless posture is a silent mismatch. Use a -dind-rootless image (or unset workers.docker.image to take the pinned rootlessImage), or set workers.docker.rootless=false with acknowledgeNonRootlessNodeRoot=true." $img) }}
+{{- end }}
+{{- if and (not $rootless) $imgIsRootless }}
+{{- fail (printf "workers.docker.rootless=false but the selected DinD image %q is a rootless (-dind-rootless) image — a rootless image cannot run under the non-rootless posture (it crash-loops needing unprivileged userns, the exact node prerequisite rootless:false exists to avoid). Use a non-rootless -dind image (or unset workers.docker.image to take the pinned nonRootlessImage)." $img) }}
+{{- end }}
+{{- end }}
 {{- end }}

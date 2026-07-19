@@ -438,11 +438,68 @@ func TestLoadDockerTierOnPopulatesBothFields(t *testing.T) {
 	setDockerBaseEnv(t)
 	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
 	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind-rootless@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "true")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.WorkerDockerNamespace != "uzi-workers-docker" || cfg.WorkerDinDImage != "docker:28-dind-rootless@sha256:deadbeef" {
 		t.Fatalf("docker fields = %q / %q", cfg.WorkerDockerNamespace, cfg.WorkerDinDImage)
+	}
+	if !cfg.WorkerDinDRootless {
+		t.Error("UZI_WORKER_DIND_ROOTLESS=true must set WorkerDinDRootless")
+	}
+}
+
+// The DinD posture (PRD #89) is REQUIRED and unambiguous when the tier is on: it selects
+// node-root (non-rootless) vs a userns-mapped uid (rootless), so a docker tier that
+// leaves it unset refuses to boot rather than default a security posture.
+func TestLoadDockerTierRequiresAnExplicitPosture(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind-rootless@sha256:deadbeef")
+	// UZI_WORKER_DIND_ROOTLESS deliberately unset.
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DIND_ROOTLESS") {
+		t.Fatalf("err = %v, want a refusal naming the required posture var", err)
+	}
+}
+
+func TestLoadDockerTierRejectsANonBooleanPosture(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "maybe")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "not a boolean") {
+		t.Fatalf("err = %v, want a refusal that the posture is not a boolean", err)
+	}
+}
+
+// rootless:false is a valid, explicit choice (dev-cluster): it threads through to
+// WorkerDinDRootless=false, which main.go inverts into RenderConfig.DinDNonRootless.
+func TestLoadDockerNonRootlessPostureThreadsThrough(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "uzi-workers-docker")
+	t.Setenv("UZI_WORKER_DIND_IMAGE", "docker:28-dind@sha256:deadbeef")
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WorkerDinDRootless {
+		t.Error("UZI_WORKER_DIND_ROOTLESS=false must clear WorkerDinDRootless")
+	}
+}
+
+// With the tier off, the posture defaults to the SAFE value (rootless) and a stray
+// UZI_WORKER_DIND_ROOTLESS with no tier is ignored (nothing for it to configure).
+func TestLoadDockerTierOffDefaultsRootless(t *testing.T) {
+	setDockerBaseEnv(t)
+	t.Setenv("UZI_WORKER_DIND_ROOTLESS", "false") // stray value, no tier
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.WorkerDinDRootless {
+		t.Error("with the docker tier off, WorkerDinDRootless must keep its safe default (true)")
 	}
 }
