@@ -8584,18 +8584,25 @@ dev-cluster (M5) until this ships. PRD #89 M-allow. Gates at CLAIM/DISPATCH, not
   with NO repo predicate, so a provision-time PER-USER allowlist would never gate WHICH repo's content a
   docker worker runs — and repo content is exactly the prompt-injection trigger the accepted risk rests
   on. The predicate therefore lives INSIDE `ClaimRun`'s `FOR UPDATE SKIP LOCKED` subquery: a
-  docker-capable worker only claims a run whose `repo_id` is in the allowlist.
+  docker-capable worker only claims a run whose `repo_id` is in the allowlist, OR whose `repo_id IS NULL
+  AND kind = 'judge'` (the narrowed repo-less exemption — see below).
 - **`docker_repo_allowlist` — an admin `app_settings` string** (comma-separated repo UUIDs), synthesized
   default `""`, FAIL-CLOSED (empty ⇒ a docker worker claims no repo-bound run), NO migration. Chosen as a
   settings string over a dedicated FK/junction table (architect ruling): it is operator config with a
   handful of trusted repos, not a modeled relation; a UUID-string setting needs no schema and matches the
   existing admin-settings surface. The web admin exposes it as a repo multiselect picker (resolving UUIDs
   ⇄ repo names), not a raw UUID text box.
-- **CORRECTED exemption invariant for repo-less kinds (judge, chat).** They are exempt from the
-  allowlist NOT because "no repo checkout means no untrusted content" (the earlier, wrong rationale — a
-  judge reads run output, chat reads user text; both are content) but because their EXECUTORS CARRY NO
-  DAEMON-REACHING TOOL: `judge-runner.ts` installs a deny-ALL `PreToolUse` hook, and `chat-executor.ts`
-  exposes only Read/Grep/Glob + a read-only uzi MCP — neither can invoke `docker`, so neither can reach
-  the root daemon even on a docker-capable worker. This is pinned by an `agent/` regression test asserting
-  the tool surface, so a future loosening of either executor cannot silently re-open the exemption. The
-  exemption is HARDENED (reword + guard), never dropped.
+- **CORRECTED exemption invariant for repo-less kinds.** Repo-less kinds are exempt from the allowlist
+  NOT because "no repo checkout means no untrusted content" (the earlier, wrong rationale — a judge reads
+  run output, chat reads user text; both are content) but because their EXECUTORS CARRY NO DAEMON-REACHING
+  TOOL: `judge-runner.ts` installs a deny-ALL `PreToolUse` hook, and `chat-executor.ts` exposes only
+  Read/Grep/Glob + a read-only uzi MCP — neither can invoke `docker`, so neither can reach the root daemon
+  even on a docker-capable worker. This is pinned by an `agent/` regression test asserting the tool
+  surface, so a future loosening of either executor cannot silently re-open the exemption. The exemption
+  is HARDENED (reword + guard), never dropped.
+- **The claim predicate names the exempt kind EXPLICITLY — `r.repo_id IS NULL AND r.kind = 'judge'`, not
+  bare `r.repo_id IS NULL`.** Behavior-identical today (judge is the only repo-less kind `ClaimRun`
+  reaches — chat is already excluded by the pre-existing `kind <> 'chat'` filter), but it makes a FUTURE
+  repo-less kind FAIL-CLOSED: a docker worker will NOT claim it until that kind is DELIBERATELY added to
+  the exempt set alongside its own executor-confinement (no-daemon-tool) regression test. The exemption
+  is thus opt-in per kind, never a standing hole for any repo-less run.
