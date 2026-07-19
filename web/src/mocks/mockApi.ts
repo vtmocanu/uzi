@@ -523,6 +523,8 @@ export const mockApi = {
       password_login_enabled: d.passwordLoginEnabled,
     });
   },
+  // The in-browser demo build has no server; report "demo" to match the header pill.
+  version: async () => delay({ version: "demo" }),
   logout: async () => {
     state.session = null;
     return delay({ status: "ok" });

@@ -1229,6 +1229,9 @@ const realApi = {
   login: (email: string, password: string) =>
     request<SessionResponse>("POST", "/auth/login", { email, password }),
   authConfig: () => request<AuthConfig>("GET", "/auth/config"),
+  // Server build version (Model B: the release git tag; "dev" on a local build).
+  // Unauthenticated, like /health — the shell footer reads it.
+  version: () => request<{ version: string }>("GET", "/version"),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
   me: () => request<SessionResponse>("GET", "/auth/me"),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),

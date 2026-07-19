@@ -68,6 +68,7 @@ func TestTLSListenerServesOnlyTheWorkerAndControllerSurface(t *testing.T) {
 		{http.MethodGet, "/api/runs"},
 		{http.MethodGet, "/api/ws"}, // the agent never opens one; verified by grep
 		{http.MethodGet, "/api/health"},
+		{http.MethodGet, "/api/version"}, // public info route, plain listener only — like /api/health
 	} {
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
