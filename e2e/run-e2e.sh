@@ -2011,6 +2011,27 @@ F_DUP_CODE="$(apipost_code "/api/runs/$J_RUN/review/recommendations/$F_REC/issue
 [ "$F_DUP_CODE" = 409 ] || fail "PRD #68: re-filing the same coordinate must 409 (got $F_DUP_CODE)"
 pass "re-filing the same recommendation is a 409 — one issue per coordinate (persisted link)"
 
+# Headline success criterion: on an instance with prdless_enabled ON (the shipped
+# default, as the PRD #22 leg established), the filed PRD+PRDLESS issue is STARTABLE on
+# the FIRST Start click — the PRDLESS label bypasses the PRD-file-link requirement, so
+# createRun does NOT reject with ErrNoPRDLink (a 422 would make create_run return non-zero).
+F_START_RUN="$(create_run "$REPO_ID" "$F_IID")" \
+  || fail "PRD #68: the filed issue #$F_IID was NOT startable — createRun rejected it (ErrNoPRDLink?); a PRD+PRDLESS issue must start on the first click"
+{ [ -n "$F_START_RUN" ] && [ "$F_START_RUN" != null ]; } || fail "PRD #68: no run id returned for the filed issue #$F_IID"
+pass "the filed PRD+PRDLESS issue #$F_IID started a run ($F_START_RUN) on the first Start — no PRD-file link needed (no ErrNoPRDLink)"
+
+# Clean up: cancel this run so it does not hold worker capacity in the later PRD #42
+# concurrency section (a normal issue run parks at the plan gate). Best-effort cancel +
+# a soft wait for a terminal state (never hard-fail on the cleanup).
+apipost "/api/runs/$F_START_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+for _ in $(seq 1 60); do
+  case "$(apiget "/api/runs/$F_START_RUN" | jq -r '.run.status // empty')" in
+    cancelled|completed|failed) break ;;
+  esac
+  sleep 0.3
+done
+pass "cleaned up the filed-issue run (cancelled) so it frees worker capacity for later sections"
+
 # Restore the default (judge OFF) so later sections' runs are not auto-judged and the
 # PRD #42 concurrency capacity math (judge runs count toward worker capacity) is clean.
 apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null

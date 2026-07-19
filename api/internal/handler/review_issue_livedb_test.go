@@ -497,7 +497,9 @@ func TestFileIssueWriteBoundarySanitizesClientBodyLiveDB(t *testing.T) {
 		"/confidential",
 		"a leaked key " + awsKey,
 		"trailing text",
-	}, "\n") + "\r\n/label ~crlf-sneaky\r\n" // a CRLF-hidden quick-action → stripped
+	}, "\n") +
+		"\r\n/label ~crlf-sneaky\r\n" + // a CRLF (\r\n) -hidden quick-action → stripped
+		"\r/label ~bare-cr\r" // a BARE-\r-hidden quick-action → stripped (MEDIUM-1 PoC parity)
 
 	rr := httptest.NewRecorder()
 	// The client may attach anything in the body; labels are NEVER taken from it.
@@ -519,7 +521,7 @@ func TestFileIssueWriteBoundarySanitizesClientBodyLiveDB(t *testing.T) {
 		}
 	}
 	// Every unfenced quick-action family — and the CRLF-hidden one — is stripped.
-	for _, gone := range []string{"~unfenced-autopilot", "/relabel", "@adminuser", "/close", "/move other/project", "/confidential", "~crlf-sneaky"} {
+	for _, gone := range []string{"~unfenced-autopilot", "/relabel", "@adminuser", "/close", "/move other/project", "/confidential", "~crlf-sneaky", "~bare-cr"} {
 		if strings.Contains(got, gone) {
 			t.Errorf("unfenced quick-action %q survived the write-boundary strip:\n%s", gone, got)
 		}
@@ -531,6 +533,50 @@ func TestFileIssueWriteBoundarySanitizesClientBodyLiveDB(t *testing.T) {
 	// Labels are assembled server-side regardless of the body.
 	if l := fs.creates[0].Labels; len(l) != 2 || l[0] != "PRD" || l[1] != "PRDLESS" {
 		t.Errorf("labels to forge = %v, want [PRD PRDLESS]", l)
+	}
+}
+
+// ── The TITLE is defanged at the POST handler too (SanitizeTitle, not only the body) ─────
+func TestFileIssueTitleSanitizedAtPostLiveDB(t *testing.T) {
+	h, pool, _, box, fs := fileIssueLiveDB(t)
+	ctx := context.Background()
+	f := seedFileFixture(ctx, t, pool, store.New(pool), box, fs.server.URL)
+
+	// A hostile title carrying a leading quick-action and a CRLF line-split must be
+	// neutralized server-side: the forge-received title has NO leading "/" (the
+	// quick-action cannot take effect) and NO CR/LF (it cannot split into a second line).
+	// A regression that dropped SanitizeTitle(req.Title) at the handler fails HERE.
+	rr := httptest.NewRecorder()
+	h.FileIssue(rr, fileIssueReq(f.owner, f.runID, f.recID, f.ownerRepo, "/label ~x\r\nreal title", "d"))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+	}
+	if fs.count() != 1 {
+		t.Fatalf("forge creates = %d, want 1", fs.count())
+	}
+	got := fs.creates[0].Title
+	if strings.HasPrefix(got, "/") {
+		t.Errorf("filed title must not open with a quick-action slash: %q", got)
+	}
+	if strings.ContainsAny(got, "\r\n") {
+		t.Errorf("filed title must be a single line (no CR/LF): %q", got)
+	}
+}
+
+func TestFileIssueEmptyTitleRejectedLiveDB(t *testing.T) {
+	h, pool, _, box, fs := fileIssueLiveDB(t)
+	ctx := context.Background()
+	f := seedFileFixture(ctx, t, pool, store.New(pool), box, fs.server.URL)
+
+	// A title that sanitizes to empty (only slashes/whitespace) cannot file → 400, before
+	// any repo lookup, claim, or forge call.
+	rr := httptest.NewRecorder()
+	h.FileIssue(rr, fileIssueReq(f.owner, f.runID, f.recID, f.ownerRepo, "/////", "d"))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("empty-after-sanitize title: status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+	if fs.count() != 0 || filedRowCount(ctx, t, pool, f.reviewID) != 0 {
+		t.Errorf("a rejected title must touch neither forge (%d) nor claim table (%d)", fs.count(), filedRowCount(ctx, t, pool, f.reviewID))
 	}
 }
 
