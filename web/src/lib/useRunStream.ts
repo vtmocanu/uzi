@@ -34,6 +34,13 @@ export function useRunStream(runId: string) {
   // — run finished". M1 fetches it once on mount; the live refetch triggers (onopen /
   // state / health / the data-less `input` frame) and optimistic send land in M3.
   const [inputs, setInputs] = useState<SteerInput[]>([]);
+  // canSteer distinguishes an OWNER (GET /inputs 200, even when the queue is empty)
+  // from a NON-OWNER viewer (a non-owner admin can open the owner-or-admin run view,
+  // but the owner-only /inputs 404s). Decision 8/N2: the steer surface (queue card +
+  // composer) must render empty/hidden and silent for a non-owner — never a broken
+  // Send that 404s, never a banner. Defaults true so an owner never flashes hidden;
+  // a 404 flips it off. A 200-empty owner is unaffected.
+  const [canSteer, setCanSteer] = useState(true);
 
   const streamRef = useRef<StreamState>(emptyStream());
   const statusRef = useRef<string>("");
@@ -72,8 +79,14 @@ export function useRunStream(runId: string) {
     try {
       const { inputs } = await api.getRunInputs(runId);
       setInputs(inputs);
-    } catch {
-      // 404 (non-owner) or transient: leave the queue as-is; never surface an error.
+      // A 200 (even empty) proves this viewer owns the run → allow steering.
+      setCanSteer(true);
+    } catch (e) {
+      // A 404 on the owner-only endpoint means this viewer is NOT the owner (the run
+      // view itself is owner-or-admin, so it can still be open): hide the steer surface
+      // silently (Decision 8/N2). Any other error is transient — leave the queue and the
+      // last-known canSteer untouched. Never surface a banner either way.
+      if (e instanceof ApiError && e.status === 404) setCanSteer(false);
     }
   }, [runId]);
 
@@ -89,6 +102,7 @@ export function useRunStream(runId: string) {
     setRun(null);
     setError("");
     setInputs([]);
+    setCanSteer(true);
     // Load the run and its message history on MOUNT, independent of the socket.
     // The persisted log is authoritative and a page load must show existing
     // history (and current status) immediately — even if the WS is slow to
@@ -213,6 +227,7 @@ export function useRunStream(runId: string) {
   );
 
   // inputs + refreshInputs are the PRD #95 steer queue: M3 wires refreshInputs into the
-  // live triggers and the queue card reads `inputs`.
-  return { run, messages, connected, error, submit, refreshRun, inputs, refreshInputs };
+  // live triggers and the queue card reads `inputs`. canSteer gates the steer surface
+  // for a non-owner viewer (Decision 8/N2).
+  return { run, messages, connected, error, submit, refreshRun, inputs, refreshInputs, canSteer };
 }

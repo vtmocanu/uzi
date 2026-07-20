@@ -13,7 +13,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { api, type Run, type RunMessage, type SteerInput } from "./api";
+import { api, ApiError, type Run, type RunMessage, type SteerInput } from "./api";
 import { useRunStream } from "./useRunStream";
 
 // DeadSocket looks like a WebSocket to the hook but never fires onopen (or any
@@ -209,5 +209,38 @@ describe("useRunStream steer queue (PRD #95 M3)", () => {
       LiveSocket.last!.deliver({ type: "input" });
     });
     await waitFor(() => expect(getInputs.mock.calls.length).toBeGreaterThan(afterOpen));
+  });
+
+  it("a 404 on /inputs marks the viewer a non-owner (canSteer false) — Decision 8/N2", async () => {
+    vi.spyOn(api, "getRunInputs").mockRejectedValue(new ApiError(404, "run not found"));
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.canSteer).toBe(false));
+    // Silent: no run-level error banner from the 404.
+    expect(result.current.error).toBe("");
+    expect(result.current.inputs).toHaveLength(0);
+  });
+
+  it("a 200-empty response keeps the owner steering (canSteer stays true)", async () => {
+    vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.id).toBe("run-1"));
+    // An empty queue is NOT a non-owner signal; the owner still steers.
+    expect(result.current.canSteer).toBe(true);
+  });
+
+  it("a transient (non-404) inputs error does not flip an owner to non-owner", async () => {
+    // First mount refetch 200s (owner confirmed), a later refetch 500s (transient).
+    vi.spyOn(api, "getRunInputs")
+      .mockResolvedValueOnce({ inputs: [] })
+      .mockRejectedValue(new ApiError(500, "boom"));
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.id).toBe("run-1"));
+    expect(result.current.canSteer).toBe(true);
+    // The socket opens → a second refetch fires and 500s; canSteer must NOT flip.
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+    await waitFor(() => expect(result.current.connected).toBe(true));
+    expect(result.current.canSteer).toBe(true);
   });
 });

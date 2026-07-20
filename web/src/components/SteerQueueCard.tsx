@@ -58,6 +58,7 @@ export function SteerQueueCard({
   inputs,
   terminal,
   status,
+  canSteer = true,
   busy,
   onStop,
   onSend,
@@ -67,15 +68,22 @@ export function SteerQueueCard({
   // The run status, used only to render the gate copy ("Delivered — applies after
   // approval") when awaiting_approval. Optional: absent degrades that case to "Delivered".
   status?: string;
+  // canSteer is false for a NON-OWNER viewer (a non-owner admin can open the owner-or-
+  // admin run view, but the owner-only /inputs 404s — useRunStream reports that here).
+  // Decision 8/N2: hide the composer + Stop so there is no Send affordance that 404s.
+  // Defaults true (owner) so a legit owner is never hidden. A non-owner's queue is also
+  // empty (the 404 leaves it []), so the whole card collapses to nothing below.
+  canSteer?: boolean;
   busy: boolean;
   onStop: () => void;
   onSend: (text: string) => void;
 }) {
-  // Nothing to steer and nothing to show: on a finished run with an empty queue, render
-  // no card at all (matching the pre-v2 "no composer once terminal" behavior). A live run
-  // always shows the card (it carries the composer); a finished run shows it only to
-  // display a non-empty queue read-only.
-  if (terminal && inputs.length === 0) return null;
+  // Render nothing when there is no queue to show AND no composer to offer: a finished
+  // run with an empty queue (matching the pre-v2 "no composer once terminal" behavior),
+  // OR a non-owner viewer (canSteer false, queue always empty → empty/hidden and silent,
+  // never a bare "Steer this run" heading with a broken Send). An owner's live run with
+  // an empty queue still renders — it carries the composer.
+  if (inputs.length === 0 && (terminal || !canSteer)) return null;
 
   const atGate = status === "awaiting_approval";
 
@@ -102,8 +110,10 @@ export function SteerQueueCard({
         </ul>
       )}
 
-      {/* Composer + Stop are live-run-only steering; the queue above persists past terminal. */}
-      {!terminal && (
+      {/* Composer + Stop are live-run-only, owner-only steering; the queue above persists
+          past terminal and is shown read-only to a non-owner only if it is non-empty
+          (which it never is — a non-owner's /inputs 404s, leaving the queue empty). */}
+      {!terminal && canSteer && (
         <>
           <FollowUpComposer busy={busy} onSend={onSend} />
           <Button variant="danger" disabled={busy} onClick={onStop}>

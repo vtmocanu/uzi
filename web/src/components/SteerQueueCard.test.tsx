@@ -163,6 +163,47 @@ describe("SteerQueueCard survives the terminal transition (B1)", () => {
   });
 });
 
+describe("SteerQueueCard non-owner hiding (Decision 8/N2)", () => {
+  it("a non-owner viewer (canSteer=false, empty queue) renders NOTHING — no heading, no broken Send", () => {
+    const { container } = render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        canSteer={false}
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByText("Steer this run")).toBeNull();
+    expect(screen.queryByText("Send follow-up")).toBeNull();
+    expect(screen.queryByText("Stop run")).toBeNull();
+  });
+
+  it("an OWNER with an empty live queue (canSteer=true) still sees the composer", () => {
+    render(
+      <SteerQueueCard
+        inputs={[]}
+        terminal={false}
+        status="running"
+        canSteer={true}
+        busy={false}
+        onStop={noop}
+        onSend={noop}
+      />,
+    );
+    expect(screen.getByText("Steer this run")).toBeTruthy();
+    expect(screen.getByText("Send follow-up")).toBeTruthy();
+  });
+
+  it("canSteer defaults to owner (true) when the prop is omitted", () => {
+    render(<SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />);
+    expect(screen.getByText("Send follow-up")).toBeTruthy();
+  });
+});
+
 // A silent-onSend guard: the card must not throw when send/stop are wired to noops
 // (RunView routes them through act()); this is a smoke assertion, not a behavior test.
 describe("SteerQueueCard smoke", () => {
