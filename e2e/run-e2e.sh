@@ -345,27 +345,49 @@ wait_http() {
 # 20s chat-phase ceilings — the tightest in the suite, and blind until M9b.
 #
 # Deliberately NOT instrumented, named individually so this claim is checkable rather
-# than asserted (M9b exists because M9's coverage claim was not):
-#   * five INLINE `while [ $SECONDS -lt … ]` loops that are not helpers — second
-#     proposal card (:2971, 20s), plan-revision v2 pickup (:3149, 60s), worker cap
-#     re-advertise (:3229, 40s), docker self-detect (:3602, 45s). All four `break` on
+# than asserted (M9b exists because M9's coverage claim was not). Each is cited by a
+# UNIQUE CONTENT ANCHOR — grep the quoted string — never by line number: this file's
+# refs have already gone stale by ~400 lines once, and the first draft of this very
+# block cited six line numbers that its own 11 added lines invalidated as it was
+# written. One of them then resolved to `wait_run_for_issue()`, an INSTRUMENTED helper,
+# inside the bullet claiming it was uninstrumented. A ref that resolves to something
+# plausible and wrong costs more than no ref at all. Anchors cannot drift.
+#   * four INLINE `while [ $SECONDS -lt … ]` loops that are not helpers, each named by
+#     the variable holding its deadline: `deadline=$((SECONDS + 20))` (second proposal
+#     card, 20s), `rv_deadline` (plan-revision v2 pickup, 60s), `cap_deadline` (worker
+#     cap re-advertise, 40s), `det_end` (docker self-detect, 45s). All four `break` on
 #     success and leave the verdict to an assertion AFTER the loop, so the loop has no
 #     success return to hang a record on, and the deadline is a give-up point rather
 #     than a ceiling anything is asserted against.
-#   * the fifth, PRD #47 (c)'s in-flight/health loop (:3463, 90s), is INVERTED: it polls
-#     for a condition that must NEVER become true (health flipping to `stalled`), so
-#     running the full 90s IS the success. A record there would print
-#     "waited 90s of 90s, headroom 0s" on every green run — the single most alarming row
-#     in the report, for a loop behaving exactly as designed.
-#   * `assert_no_run_for_issue` (:522) is a fixed `sleep`, not a wait: it settles for a
-#     few detector ticks and then reads once. There is no polling, no success event to
-#     time, and no ceiling — elapsed is the sleep argument by construction, so a record
-#     would carry zero information. Out of scope.
-# Give any of these a real ceiling contract of its own before instrumenting it.
+#   * a fifth inline loop, `if_end` (PRD #47 (c), 90s), is INVERTED: it polls for a
+#     condition that must NEVER become true (health flipping to `stalled`), so running
+#     the full 90s IS the success. A record there would print "waited 90s of 90s,
+#     headroom 0s" on every green run — the single most alarming row in the report, for
+#     a loop behaving exactly as designed.
+#   * `assert_no_run_for_issue()` is a fixed `sleep`, not a wait: it settles for a few
+#     detector ticks and then reads once. There is no polling, no success event to time,
+#     and no ceiling — elapsed is the sleep argument by construction, so a record would
+#     carry zero information. Out of scope.
+# Five inline loops in total, plus the one fixed sleep. Give any of them a real ceiling
+# contract of its own before instrumenting it.
 #
 # Every helper binds its ceiling into a LOCAL and uses that local for both the deadline
-# and the record, so the reported ceiling can never drift from the enforced one (a
-# `local a=… b=$((a+1))` on ONE line does not sequence in bash — hence two statements).
+# and the record, so the reported ceiling can never drift from the enforced one. The
+# two-statement shape below is LOAD-BEARING, not style:
+#
+#     local run="$1" timeout="${3:-90}"            # statement 1: bind the ceiling
+#     local start=$SECONDS deadline=$((SECONDS + timeout))   # statement 2: use it
+#
+# bash expands a `local`'s arguments BEFORE executing it, so assignments within ONE
+# `local` do not sequence — `timeout` is still unset while `$((SECONDS + timeout))` is
+# expanded. Under this script's `set -euo pipefail`, that is not a wrong number, it is a
+# HARD ABORT: `bash: timeout: unbound variable`, exit 1, on the very first wait the
+# suite reaches. Collapsing these two statements into one therefore takes the whole run
+# down, and the failure names the loop variable rather than the edit that caused it.
+# (Verified: the collapsed form aborts under `set -u`; without `set -u` it silently
+# yields a garbage ceiling instead, which is how it reads as harmless when tried in a
+# bare shell.) The code as written is correct and always has been — this note exists to
+# stop a future tidy-up, not to flag a live defect.
 #
 # Diagnostic ONLY: record_margin never asserts and never fails a run — a broken
 # diagnostic must not be able to turn a good run red. It is called on the SUCCESS path
