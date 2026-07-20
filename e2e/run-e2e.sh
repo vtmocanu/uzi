@@ -344,13 +344,24 @@ wait_http() {
 # wait_review, wait_msg_kind, wait_msg_text, wait_tool_result. The last three are the
 # 20s chat-phase ceilings — the tightest in the suite, and blind until M9b.
 #
-# Deliberately NOT instrumented: the handful of INLINE `while [ $SECONDS -lt … ]`
-# loops that are not helpers (second proposal card, plan-revision v2 pickup, worker cap
-# re-advertise, docker self-detect, and the inverted in-flight/health loop). They
-# `break` on success and leave the verdict to an assertion AFTER the loop, so the loop
-# has no success return to hang a record on; the inverted one waits for a condition
-# that must NEVER become true, where "how long it waited" has no meaning. Give one a
-# ceiling contract of its own before instrumenting it.
+# Deliberately NOT instrumented, named individually so this claim is checkable rather
+# than asserted (M9b exists because M9's coverage claim was not):
+#   * five INLINE `while [ $SECONDS -lt … ]` loops that are not helpers — second
+#     proposal card (:2971, 20s), plan-revision v2 pickup (:3149, 60s), worker cap
+#     re-advertise (:3229, 40s), docker self-detect (:3602, 45s). All four `break` on
+#     success and leave the verdict to an assertion AFTER the loop, so the loop has no
+#     success return to hang a record on, and the deadline is a give-up point rather
+#     than a ceiling anything is asserted against.
+#   * the fifth, PRD #47 (c)'s in-flight/health loop (:3463, 90s), is INVERTED: it polls
+#     for a condition that must NEVER become true (health flipping to `stalled`), so
+#     running the full 90s IS the success. A record there would print
+#     "waited 90s of 90s, headroom 0s" on every green run — the single most alarming row
+#     in the report, for a loop behaving exactly as designed.
+#   * `assert_no_run_for_issue` (:522) is a fixed `sleep`, not a wait: it settles for a
+#     few detector ticks and then reads once. There is no polling, no success event to
+#     time, and no ceiling — elapsed is the sleep argument by construction, so a record
+#     would carry zero information. Out of scope.
+# Give any of these a real ceiling contract of its own before instrumenting it.
 #
 # Every helper binds its ceiling into a LOCAL and uses that local for both the deadline
 # and the record, so the reported ceiling can never drift from the enforced one (a
