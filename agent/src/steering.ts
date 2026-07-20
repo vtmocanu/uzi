@@ -58,6 +58,7 @@ export interface SteeringOptions {
 /** Feed notices for events discarded because they were written against a plan version
  *  that has since been revised (PRD #41 Decision 3). */
 const STALE_APPROVE_NOTICE = "Approval ignored — the plan changed; re-send if you still want it.";
+const STALE_REJECT_NOTICE = "Rejection ignored — the plan changed; re-send if you still want it.";
 const STALE_REVISE_NOTICE = "Feedback ignored — it was written against an older plan version; re-send it.";
 
 export class SteeringChannel {
@@ -183,7 +184,8 @@ export class SteeringChannel {
       const { verdict, epoch: e } = this.bufferedVerdict;
       this.bufferedVerdict = undefined;
       if (e === epoch) return verdict;
-      this.notify?.(STALE_APPROVE_NOTICE);
+      // Verdict-specific notice so the feed reads correctly for either kind.
+      this.notify?.(verdict.kind === "reject" ? STALE_REJECT_NOTICE : STALE_APPROVE_NOTICE);
     }
     return undefined;
   }

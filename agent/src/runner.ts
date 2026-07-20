@@ -101,6 +101,13 @@ export class RunRunner {
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
    *  timeout) and, defensively, when the run reaches a terminal state. */
   private readonly gateDeadlines = new Map<string, number>();
+  /** PRD #41 (Decision 3): the set of runs that have opened a plan gate at least once.
+   *  It distinguishes the FIRST gate (epoch 0 — a verdict already queued when the gate
+   *  opens still applies) from a RE-gate after a revision turn (where the epoch must be
+   *  advanced so a mid-revision approve of the superseded plan goes stale). Works
+   *  regardless of planApprovalTimeoutMs (unlike keying off gateDeadlines). Cleared on a
+   *  terminal verdict and, defensively, when the run reaches a terminal state. */
+  private readonly gatedRuns = new Set<string>();
 
   constructor(
     private readonly client: WorkerClient,
@@ -365,9 +372,11 @@ export class RunRunner {
       );
     } finally {
       await steering.stop().catch(() => undefined);
-      // PRD #41: drop this run's plan-approval deadline (normally cleared when the gate
-      // resolves terminally, but a run that ends by any other path must not leak it).
+      // PRD #41: drop this run's plan-approval deadline + gate-tracking (normally cleared
+      // when the gate resolves terminally, but a run that ends by any other path must not
+      // leak either).
       this.gateDeadlines.delete(runId);
+      this.gatedRuns.delete(runId);
       // Evict this run's secrets from the logger now the run is terminal (Decision
       // 7). Reaching this finally means execute() ran to a terminal report; a
       // requeue (worker death) never returns here, so the evict/HOME-cleanup below
@@ -523,20 +532,28 @@ export class RunRunner {
       return { kind: "approve", selection: { status: "ok", selection } };
     }
 
-    // Await this plan version's event at the CURRENT epoch (PRD #41). The first round is
-    // epoch 0, so a verdict already queued when the gate opens still applies; the epoch is
-    // advanced only when a revision is TAKEN (settle below), which retires this version.
-    const epoch = steering.currentEpoch();
+    // PRD #41 round-awareness (Decision 3): the gate epoch is advanced at the
+    // awaiting_approval RE-report — the last step before awaiting a new round — NOT
+    // when a revise is taken. A revision planning turn runs BETWEEN rounds; bumping
+    // early would leave that whole window at the new epoch, so an approve clicked
+    // mid-revision would be accepted at the v2 gate (a plan no human saw). Bumping
+    // here, after v2 is reported, stamps such a mid-revision approve at the PRIOR
+    // epoch, so it is discarded with a feed notice. The FIRST gate for a run does
+    // NOT bump: epoch 0 lets a verdict already queued when the gate opens apply.
     await reportState({ status: "awaiting_approval", plan_md: planMd });
+    if (this.gatedRuns.has(runId)) steering.bumpEpoch();
+    else this.gatedRuns.add(runId);
+    const epoch = steering.currentEpoch();
     runLog.info("plan gate: awaiting approval", { run_id: runId, gate_epoch: epoch });
 
-    // On a revise, advance the epoch (so a verdict written against THIS version, e.g. an
-    // approve batched with the revise, goes stale next round) and KEEP the shared budget
-    // running. Any terminal verdict ends the gate → clear the shared budget.
+    // A terminal verdict ends the gate → clear the shared per-run gate state. A revise
+    // keeps the shared budget/epoch state running; the re-report above does the bump.
     const settle = (v: PlanVerdict): PlanVerdict => {
-      if (v.kind === "revise") steering.bumpEpoch();
-      else this.gateDeadlines.delete(runId);
-      return v;
+      if (v.kind !== "revise") {
+        this.gateDeadlines.delete(runId);
+        this.gatedRuns.delete(runId);
+      }
+      return v; // NOTE: no bump here — the awaiting_approval re-report bumps.
     };
 
     if (this.planApprovalTimeoutMs <= 0) return settle(await steering.awaitGateEvent(epoch));

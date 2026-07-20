@@ -143,6 +143,25 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     await ch.stop();
   });
 
+  it("discards a PRIOR-epoch reject with a verdict-specific feed notice (not 'Approval ignored')", async () => {
+    // PRD #41 Decision 3: a stale REJECT is discarded exactly like a stale approve (only
+    // cancel is epoch-exempt), but the feed wording must read correctly for a rejection.
+    const notices: string[] = [];
+    const { client, push } = pushableClient();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    ch.bumpEpoch(); // epoch 1
+    ch.start();
+    push([inp("reject_plan", "no thanks")]); // consumed + buffered at epoch 1
+    await tick();
+    const e2 = ch.bumpEpoch(); // the plan was revised; the epoch-1 reject is now stale
+    const p = ch.awaitGateEvent(e2);
+    push([inp("approve_plan")]); // a fresh approve at epoch 2 resolves the gate
+    assert.deepStrictEqual(await p, { kind: "approve", selection: { status: "absent" } });
+    assert.ok(notices.some((n) => n.includes("Rejection ignored")), notices.join("\n"));
+    assert.ok(!notices.some((n) => n.includes("Approval ignored")), "reject must not read as an approval notice");
+    await ch.stop();
+  });
+
   it("discards a stale (prior-epoch) queued revise with a feed notice", async () => {
     const notices: string[] = [];
     const { client, push } = pushableClient();

@@ -33,7 +33,7 @@ import type { DockerWiring } from "./docker-wiring.js";
 import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
-import { resolveAgentSelection } from "./protocol.js";
+import { resolveAgentSelection, type ClaimConfig } from "./protocol.js";
 import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildRevisePlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
@@ -246,7 +246,7 @@ export class SdkExecutor implements Executor {
 
     const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
-    const maxRevisions = positive(planMaxRevisionsOf(ctx.config), DEFAULT_MAX_REVISIONS);
+    const maxRevisions = planMaxRevisionsOf(ctx.config);
 
     // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
     // local plugin dir OUTSIDE the clone (loads under `settingSources: []`, so the
@@ -712,14 +712,15 @@ function positive(value: number | undefined, fallback: number): number {
  * PRD #41: the worker-side plan-revision cap from the claim config. The server sends
  * `plan_max_revisions` in the claim config (workersvc claim.go) and ALSO enforces it
  * at submit time (rejects the 4th revise), so this worker counter is a belt-and-
- * suspenders guard. Read defensively: the field is not (yet) declared on the TS
- * ClaimConfig type (protocol.ts is owned by the steering/runner unit), so this reads
- * it off the config object without widening that interface. Returns undefined when
- * absent so the caller applies DEFAULT_MAX_REVISIONS.
+ * suspenders guard. An explicit 0 (operator DISABLING revisions) is respected as 0 —
+ * only an absent/undefined or negative/garbage value falls back to DEFAULT_MAX_REVISIONS,
+ * so the worker counter mirrors operator intent (the server gates first, so this is
+ * harmless today, but must not silently re-enable revisions a config disabled).
  */
-function planMaxRevisionsOf(config: unknown): number | undefined {
-  const v = (config as { plan_max_revisions?: unknown } | null | undefined)?.plan_max_revisions;
-  return typeof v === "number" ? v : undefined;
+function planMaxRevisionsOf(config: ClaimConfig | null | undefined): number {
+  const v = config?.plan_max_revisions;
+  if (typeof v === "number" && Number.isFinite(v) && v >= 0) return Math.floor(v);
+  return DEFAULT_MAX_REVISIONS;
 }
 
 /** Human-readable run-message text for a dropped skill, by reason code. Unknown

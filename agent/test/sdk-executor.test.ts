@@ -325,6 +325,36 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
     const probe = makeCtx({ config: { idle_timeout_seconds: 100, run_timeout_seconds: 0.03 } }, [revise("keep going"), approve]);
     await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /wall-clock timeout/);
   });
+
+  it("hits the worker-side revision cap: re-gates the current plan without another turn (fail-closed)", async () => {
+    // Belt-and-suspenders (Decision 3c + Success Criterion 5): the SERVER caps revises,
+    // but if a revise arrives past plan_max_revisions the worker must NOT run another
+    // planning turn — it emits a "revision budget exhausted" feed notice and re-gates the
+    // CURRENT plan. With plan_max_revisions=1, the 2nd revise trips the cap: only ONE
+    // revision turn runs, and the same v2 plan is re-gated (then approved).
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan v1"), resultSuccess()], // planning turn
+      [submitPlan("# Plan v2"), resultSuccess()], // the single allowed revision turn
+      [signalDone(), resultSuccess()], // loop turn 1 (after the re-gate approve)
+    ]);
+    // [revise, revise, approve]: the 2nd revise is over-cap → re-gate-without-turn → approve.
+    const probe = makeCtx({ config: { plan_max_revisions: 1 } }, [revise("first fix"), revise("over-cap fix"), approve]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+    // Exactly ONE revision turn ran (planning + 1 revision + 1 implement = 3 turns); the
+    // over-cap revise did NOT drive a 4th turn.
+    assert.strictEqual(turns.length, 3, "the over-cap revise ran no planning turn");
+    // The current (v2) plan was re-gated after the cap, not a fresh v3.
+    assert.deepStrictEqual(probe.gated, ["# Plan v1", "# Plan v2", "# Plan v2"]);
+    // The fail-closed feed notice was emitted.
+    const statuses = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload["text"]));
+    assert.ok(statuses.some((t) => t.includes("revision budget exhausted")), statuses.join("\n"));
+    // Only ONE revision round was announced (plan_revising round=1), never a round 2.
+    const rounds = probe.emits.filter((m) => m.kind === "plan_revising").map((m) => m.payload["round"]);
+    assert.deepStrictEqual(rounds, [1]);
+    // The run still proceeded to implement on the re-gate approval.
+    assert.strictEqual(result.branch, "agent/issue-5");
+  });
 });
 
 describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
