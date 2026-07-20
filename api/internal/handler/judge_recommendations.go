@@ -40,7 +40,10 @@ func (h *Handler) JudgeRecommendations(w http.ResponseWriter, r *http.Request) {
 	}
 	bucket := r.URL.Query().Get("bucket")
 	if bucket == "" {
-		bucket = "todo" // the backlog's reason to exist: what still needs triage
+		// The backlog's reason to exist: what still needs triage. Referenced, not spelled —
+		// the structural twin of the scope default below it, and drifting BucketTodo would
+		// otherwise 400 every default-bucket request.
+		bucket = workersvc.BucketTodo
 	}
 	if !workersvc.ValidJudgeBacklogBucket(bucket) {
 		httpx.Error(w, http.StatusBadRequest, "invalid bucket")

@@ -530,3 +530,69 @@ func TestJudgeRecommendationBacklogTriageIgnoresFilters(t *testing.T) {
 		})
 	}
 }
+
+// TestBucketConstantsMatchTheLadder pins the one coupling AK leaves behind.
+//
+// BucketOf (#94's shared ladder, triage.go) spells its rung names as literals — that is the
+// ladder's own DEFINITION, not a consumer spelling a value, so it is deliberately not
+// changed. But everything on this PRD's paths now REFERENCES the Bucket* constants, and the
+// two vocabularies must agree: the handler validates a request bucket against a map built
+// from the constants, while filterGroups compares it to a group rollup derived from
+// BucketOf's output. Drift between them accepts a value that then matches no group.
+//
+// A constant nothing asserts is a constant anyone can edit, so this asserts it.
+func TestBucketConstantsMatchTheLadder(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   string
+		filed    bool
+		constant string
+	}{
+		{"open", "", false, BucketTodo},
+		{"settled filed link", "", true, BucketFiled},
+		{"done", "done", false, BucketDone},
+		{"dismissed", "dismissed", false, BucketDismissed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := BucketOf(tc.status, tc.filed); got != tc.constant {
+				t.Fatalf("BucketOf(%q, %v) = %q, but the constant says %q — the ladder's rung "+
+					"names and the Bucket* constants have drifted apart", tc.status, tc.filed, got, tc.constant)
+			}
+		})
+	}
+	// BucketAll is not a ladder rung — it is the unfiltered view — so it must NOT collide
+	// with one, or filterGroups' "show everything" branch would also match a real rollup.
+	for _, rung := range []string{BucketTodo, BucketFiled, BucketDone, BucketDismissed} {
+		if BucketAll == rung {
+			t.Fatalf("BucketAll (%q) collides with the ladder rung %q", BucketAll, rung)
+		}
+	}
+}
+
+// TestFilterGroupsAllUsesTheConstant is the test the AK review asked for, because the
+// failure it guards is SILENT: if filterGroups spelled "all" as a literal and BucketAll
+// drifted, the handler would still accept the new value (its validator is built from the
+// constants) and this filter would treat it as a rollup name matching nothing — HTTP 200
+// with an empty list, or `updated=1 groups=0` through the disposition re-read, which reads
+// to a consumer as "settled and gone".
+//
+// Driving it through the CONSTANT rather than the string is what makes it catch the drift.
+func TestFilterGroupsAllUsesTheConstant(t *testing.T) {
+	groups := GroupJudgeRecommendations(rowsOf(
+		backlogRow{runID: uuid.New(), reviewID: uuid.New(), recID: uuid.New(), category: "improve_uzi", target: "open"},
+		backlogRow{runID: uuid.New(), reviewID: uuid.New(), recID: uuid.New(), category: "add_agent", target: "done", disposition: "done"},
+	))
+	if len(groups) != 2 {
+		t.Fatalf("fixture: want 2 groups, got %d", len(groups))
+	}
+	if got := filterGroups(groups, BucketAll); len(got) != 2 {
+		t.Fatalf("filterGroups(BucketAll) returned %d groups, want all %d — the unfiltered "+
+			"view must key off the constant, not a spelled literal", len(got), len(groups))
+	}
+	// Positive control: a real rung still filters, so the assertion above is not just
+	// "filterGroups never filters".
+	if got := filterGroups(groups, BucketDone); len(got) != 1 {
+		t.Fatalf("filterGroups(BucketDone) returned %d groups, want 1", len(got))
+	}
+}

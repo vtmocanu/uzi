@@ -228,7 +228,7 @@ func GroupJudgeRecommendations(rows []store.ListJudgeRecommendationRowsForUserRo
 			Bucket:     b,
 			FiledIssue: filedIssueRef(r),
 		})
-		if b == "todo" {
+		if b == BucketTodo {
 			g.OpenCount++
 		}
 		if !runsSeen[key][r.RunID] {
@@ -246,7 +246,7 @@ func GroupJudgeRecommendations(rows []store.ListJudgeRecommendationRowsForUserRo
 	for i := range groups {
 		key := coord{category: groups[i].Category, target: groups[i].Target}
 		if groups[i].OpenCount > 0 {
-			groups[i].Bucket = "todo"
+			groups[i].Bucket = BucketTodo
 			continue
 		}
 		groups[i].Bucket = bucketName(topRung[key])
@@ -299,7 +299,14 @@ func filedIssueRef(r store.ListJudgeRecommendationRowsForUserRow) *apitypes.Judg
 func filterGroups(groups []apitypes.JudgeRecommendationGroupDTO, bucket string) []apitypes.JudgeRecommendationGroupDTO {
 	out := make([]apitypes.JudgeRecommendationGroupDTO, 0, len(groups))
 	for _, g := range groups {
-		if bucket != "all" && bucket != "" && g.Bucket != bucket {
+		// BucketAll referenced, not spelled. This is the quietest of the literal-drift
+		// failures on this path: if BucketAll's wire value drifted, the handler would still
+		// ACCEPT the new value (judgeBacklogBuckets is built from the constants) and this
+		// line would then treat it as a rollup name matching no group — HTTP 200 with an
+		// empty list, or, through the disposition re-read, `updated=1 groups=0`: the write
+		// lands and the acted-on group silently vanishes. That is exactly the "row vanished
+		// mid-interaction" state the bucket=all re-read exists to prevent.
+		if bucket != BucketAll && bucket != "" && g.Bucket != bucket {
 			continue
 		}
 		out = append(out, g)
