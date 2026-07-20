@@ -25,6 +25,11 @@ const (
 	ActionGateApproveOwn     = "slack_gate_approve_own"  // picker → "own"
 	ActionGateReject         = "slack_gate_reject"
 	ActionGateRejectNoReason = "slack_gate_reject_noreason"
+	// ActionGateRequestChanges opens the plan-revision path (PRD #41): it parks the
+	// run in revise_pending, and the presser's threaded reply becomes the revise_plan
+	// feedback the worker runs a fresh plan turn on. Sibling of Reject, but the run
+	// stays awaiting_approval and re-gates with the next plan version.
+	ActionGateRequestChanges = "slack_gate_request_changes"
 	// ActionGateOpen is the Open-in-uzi URL button. It carries a url (Slack opens
 	// it) and is a no-op for the inbound handler.
 	ActionGateOpen = "slack_gate_open"
@@ -38,6 +43,13 @@ const (
 // adapter in main translates it, keeping slacksvc free of a workersvc import.
 var ErrSelectionRejected = errors.New("slack: agent selection rejected by the server")
 
+// ErrReviseCapReached is the replier-facing translation of workersvc's
+// ErrReviseCapReached (PRD #41): the run already hit PLAN_MAX_REVISIONS persisted
+// revisions, so a further revise_plan is refused server-side. Surfaced to the user
+// as an ephemeral (the gate stays parked, no ack) rather than a silent drop. The
+// adapter in main translates it, keeping slacksvc free of a workersvc import.
+var ErrReviseCapReached = errors.New("slack: plan revision limit reached")
+
 // maxGateAgentNames bounds how many repo agent names the gate lists (Slack's
 // section text caps at 3000 chars; the roster caps at 16). Extra names collapse to
 // "+N more" so the message stays scannable.
@@ -47,7 +59,17 @@ const maxGateAgentNames = 10
 const (
 	gateStateOpen          = "open"
 	gateStateRejectPending = "reject_pending"
+	// gateStateRevisePending parks the gate after Request-changes is pressed: the run
+	// stays awaiting_approval and the presser's threaded reply becomes the revise_plan
+	// feedback (PRD #41 Decision 10). The replier's compare-and-swap clears it so
+	// exactly one concurrent reply is accepted as the revision.
+	gateStateRevisePending = "revise_pending"
 )
+
+// maxSlackSectionRunes bounds a Block Kit section's text to Slack's 3000-char limit
+// (with headroom for the truncation ellipsis and any partial-entity slack). Applied
+// to the plan-in-thread render (PRD #41 Decision 10); slicing is on a rune boundary.
+const maxSlackSectionRunes = 2900
 
 // pgText wraps a non-empty string as a valid pgtype.Text (an empty string still
 // yields Valid=true; callers pass "" only where they mean a present empty value).
@@ -111,11 +133,17 @@ func gateBlocks(runID uuid.UUID, base string, repoAgentNames []string) []slack.B
 		approveElems = []slack.BlockElement{approve}
 	}
 
+	// Request changes (PRD #41): the default-styled sibling of Reject — parks the run
+	// for a revision instead of ending it. No confirm dialog: the threaded reply IS
+	// the deliberate step, and the revision is capped server-side.
+	requestChanges := slack.NewButtonBlockElement(ActionGateRequestChanges, runID.String(),
+		slack.NewTextBlockObject(slack.PlainTextType, "Request changes", false, false))
+
 	reject := slack.NewButtonBlockElement(ActionGateReject, runID.String(),
 		slack.NewTextBlockObject(slack.PlainTextType, "Reject", false, false))
 	reject.Style = slack.StyleDanger
 
-	elements := append(approveElems, reject)
+	elements := append(approveElems, requestChanges, reject)
 	if link := runURL(base, runID); link != "" {
 		open := slack.NewButtonBlockElement(ActionGateOpen, runID.String(),
 			slack.NewTextBlockObject(slack.PlainTextType, "Open in uzi", false, false))
@@ -180,6 +208,57 @@ func rejectPendingBlocks(runID uuid.UUID) []slack.Block {
 	return []slack.Block{section, slack.NewActionBlock("slack_gate_reject_pending", btn)}
 }
 
+// revisePendingBlocks replaces the gate buttons after Request-changes is pressed
+// (PRD #41 Decision 10): a prompt to reply in-thread with what should change. Mirrors
+// rejectPendingBlocks, but there is no escape-hatch button — a revision needs the
+// feedback text, so the only affordance is the threaded reply. The prompt is fixed
+// text; posting it is best-effort (the server-side supersede + CAS are the real
+// guarantees, not this edit).
+func revisePendingBlocks(_ uuid.UUID) []slack.Block {
+	return []slack.Block{slack.NewSectionBlock(
+		slack.NewTextBlockObject(slack.MarkdownType,
+			"Reply in this thread with what should change — the plan will be revised and re-posted for approval.",
+			false, false),
+		nil, nil)}
+}
+
+// truncateForSlackSection bounds text to Slack's 3000-char section-block limit on a
+// RUNE boundary (PRD #41 Decision 10) — a multi-byte rune is never split. Applied to
+// the already-escaped plan blob before it becomes a section; the deep link is a
+// SEPARATE block outside this bound, so it can never be truncated away.
+func truncateForSlackSection(s string) string {
+	r := []rune(s)
+	if len(r) <= maxSlackSectionRunes {
+		return s
+	}
+	return string(r[:maxSlackSectionRunes]) + "\n…"
+}
+
+// planThreadBlocks renders the plan into the run's DM thread at the approval gate
+// (PRD #41 Decision 10 — Slack gate parity). Pipeline: ScrubSecrets (credential
+// defense in depth) → EscapeMrkdwn of the WHOLE blob → truncate → deep link appended
+// as a SEPARATE trusted block.
+//
+// The whole-blob EscapeMrkdwn is the DOCUMENTED EXCEPTION to EscapeMrkdwn's per-field
+// rule (see redact.go): that rule exists so escaping never breaks trusted <url|label>
+// markup interpolated beside an untrusted field — but the plan blob carries NO trusted
+// markup of its own, so escaping it wholesale is exactly right and neutralizes any
+// <, >, &, <@Uxxx> mention, or spoofed <https://evil|Open> link a hostile plan embeds.
+// The one trusted element, the "full plan in uzi" deep link, is added in its own block
+// OUTSIDE the truncated region so it is never split or displaced by an over-long plan.
+func planThreadBlocks(runID uuid.UUID, planMD, base string) []slack.Block {
+	body := truncateForSlackSection(EscapeMrkdwn(ScrubSecrets(planMD)))
+	blocks := []slack.Block{
+		slack.NewSectionBlock(
+			slack.NewTextBlockObject(slack.MarkdownType, body, false, false), nil, nil),
+	}
+	if u := runURL(base, runID); u != "" {
+		blocks = append(blocks, slack.NewContextBlock("slack_gate_plan_link",
+			slack.NewTextBlockObject(slack.MarkdownType, fmt.Sprintf("<%s|Open the full plan in uzi>", u), false, false)))
+	}
+	return blocks
+}
+
 // gateResolvedBlocks renders a resolved gate as a single section with no action
 // block, so editing the gate message with it removes the Approve/Reject buttons.
 // text is a fixed caller-built template; it is mrkdwn-escaped as defense in depth.
@@ -193,7 +272,8 @@ func gateResolvedBlocks(text string) []slack.Block {
 // server action.
 func isGateAction(actionID string) bool {
 	switch actionID {
-	case ActionGateApprove, ActionGateApproveRepo, ActionGateApproveOwn, ActionGateReject, ActionGateRejectNoReason:
+	case ActionGateApprove, ActionGateApproveRepo, ActionGateApproveOwn,
+		ActionGateReject, ActionGateRejectNoReason, ActionGateRequestChanges:
 		return true
 	default:
 		return false

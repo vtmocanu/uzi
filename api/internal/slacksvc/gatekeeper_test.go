@@ -14,17 +14,44 @@ import (
 
 // fakeGateStore records the gatekeeper's confirmed-user lookups and gate writes.
 type fakeGateStore struct {
-	user    store.User
-	userErr error
-	gateSet []store.SetSlackRunGateParams
+	user      store.User
+	userErr   error
+	anchor    store.SlackRunMessage
+	anchorErr error
+	gateSet   []store.SetSlackRunGateParams
+	gateSetIf []store.SetSlackRunGateIfParams
+	// casFail simulates a concurrent cross-surface re-gate advancing the anchor between
+	// the supersede read and the CAS write (PRD #41 Decision 10d), so SetSlackRunGateIf
+	// finds no matching row and the stale click loses instead of reverting the anchor.
+	casFail bool
 }
 
 func (f *fakeGateStore) GetConfirmedUserBySlackID(context.Context, pgtype.Text) (store.User, error) {
 	return f.user, f.userErr
 }
+func (f *fakeGateStore) GetSlackRunMessage(context.Context, uuid.UUID) (store.SlackRunMessage, error) {
+	return f.anchor, f.anchorErr
+}
 func (f *fakeGateStore) SetSlackRunGate(_ context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error) {
 	f.gateSet = append(f.gateSet, arg)
 	return store.SlackRunMessage{}, nil
+}
+func (f *fakeGateStore) SetSlackRunGateIf(_ context.Context, arg store.SetSlackRunGateIfParams) (store.SlackRunMessage, error) {
+	f.gateSetIf = append(f.gateSetIf, arg)
+	if f.casFail {
+		return store.SlackRunMessage{}, pgx.ErrNoRows
+	}
+	return store.SlackRunMessage{}, nil
+}
+
+// openGateAnchor is the live anchor for a run whose gate message ts matches the
+// gateAction default MessageTS ("gts"), so the server-enforced supersede check (PRD
+// #41 Decision 10b) passes for a click on the current gate.
+func openGateAnchor(runID uuid.UUID) store.SlackRunMessage {
+	return store.SlackRunMessage{
+		RunID: runID, ChannelID: "D1", RootTs: "root1",
+		GateTs: pgtype.Text{String: "gts", Valid: true}, GateState: pgtype.Text{String: gateStateOpen, Valid: true},
+	}
 }
 
 type submittedInput struct {
@@ -83,7 +110,7 @@ func TestGatekeeperApproveRoutesSourceAndResolves(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			runID, user := uuid.New(), store.User{ID: uuid.New()}
-			gs := &fakeGateStore{user: user}
+			gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
 			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
 			fp := &fakePoster{}
 			g := NewGatekeeper(gs, sub, fp, nil)
@@ -113,7 +140,7 @@ func TestGatekeeperApproveRoutesSourceAndResolves(t *testing.T) {
 // ephemeral: no clear, no resolve edit, and the presser can retry from uzi.
 func TestGatekeeperApproveRejectedLeavesGateOpen(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	gs := &fakeGateStore{user: user}
+	gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
 	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), approveErr: ErrSelectionRejected}
 	fp := &fakePoster{}
 	g := NewGatekeeper(gs, sub, fp, nil)
@@ -133,7 +160,7 @@ func TestGatekeeperApproveRejectedLeavesGateOpen(t *testing.T) {
 
 func TestGatekeeperRejectEntersRejectPending(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	gs := &fakeGateStore{user: user}
+	gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
 	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
 	fp := &fakePoster{}
 	g := NewGatekeeper(gs, sub, fp, nil)
@@ -143,8 +170,14 @@ func TestGatekeeperRejectEntersRejectPending(t *testing.T) {
 	if len(sub.submitted) != 0 {
 		t.Fatalf("plain Reject must NOT submit yet (it awaits a reason): %+v", sub.submitted)
 	}
-	if len(gs.gateSet) != 1 || gs.gateSet[0].GateState.String != gateStateRejectPending || !gs.gateSet[0].GateTs.Valid {
-		t.Fatalf("Reject must record reject_pending keeping gate_ts: %+v", gs.gateSet)
+	// The transition is a generation-guarded compare-and-swap (PRD #41 Decision 10d),
+	// expecting the anchor to still show THIS open gate.
+	if len(gs.gateSetIf) != 1 || gs.gateSetIf[0].GateState.String != gateStateRejectPending ||
+		gs.gateSetIf[0].ExpectedGateTs.String != "gts" || gs.gateSetIf[0].ExpectedGateState.String != gateStateOpen {
+		t.Fatalf("Reject must CAS to reject_pending expecting the open gate: %+v", gs.gateSetIf)
+	}
+	if len(gs.gateSet) != 0 {
+		t.Fatalf("Reject transition must not use the unconditional SetSlackRunGate: %+v", gs.gateSet)
 	}
 	if len(fp.updateBlocks) != 1 || !containsID(fp.updateBlocks[0].actionIDs, ActionGateRejectNoReason) {
 		t.Fatalf("Reject must edit the gate to offer 'Reject without reason': %+v", fp.updateBlocks)
@@ -153,7 +186,7 @@ func TestGatekeeperRejectEntersRejectPending(t *testing.T) {
 
 func TestGatekeeperRejectNoReasonSubmitsAndResolves(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	gs := &fakeGateStore{user: user}
+	gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
 	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
 	fp := &fakePoster{}
 	g := NewGatekeeper(gs, sub, fp, nil)
@@ -169,6 +202,95 @@ func TestGatekeeperRejectNoReasonSubmitsAndResolves(t *testing.T) {
 	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 ||
 		!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "rejected") {
 		t.Fatalf("gate message must be edited button-free to a rejected state: %+v", fp.updateBlocks)
+	}
+}
+
+// Request changes parks the run in revise_pending (keeping gate_ts) and swaps the
+// gate buttons for the "reply with what should change" affordance; nothing is
+// submitted yet — the threaded reply carries the feedback (PRD #41 Decision 10).
+func TestGatekeeperRequestChangesEntersRevisePending(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+	fp := &fakePoster{}
+	g := NewGatekeeper(gs, sub, fp, nil)
+
+	g.HandleBlockAction(context.Background(), gateAction(ActionGateRequestChanges, runID))
+
+	if len(sub.submitted) != 0 {
+		t.Fatalf("Request changes must NOT submit yet (it awaits the feedback reply): %+v", sub.submitted)
+	}
+	if len(gs.gateSetIf) != 1 || gs.gateSetIf[0].GateState.String != gateStateRevisePending ||
+		gs.gateSetIf[0].ExpectedGateTs.String != "gts" || gs.gateSetIf[0].ExpectedGateState.String != gateStateOpen {
+		t.Fatalf("Request changes must CAS to revise_pending expecting the open gate: %+v", gs.gateSetIf)
+	}
+	if len(gs.gateSet) != 0 {
+		t.Fatalf("Request changes transition must not use the unconditional SetSlackRunGate: %+v", gs.gateSet)
+	}
+	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 ||
+		!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "what should change") {
+		t.Fatalf("Request changes must edit the gate to the revise-pending prompt: %+v", fp.updateBlocks)
+	}
+}
+
+// The re-gate race (PRD #41 Decision 10d): a concurrent cross-surface re-gate advances
+// the anchor between the supersede read and the transition write. The compare-and-swap
+// then finds no matching row, so a stale Request-changes/Reject click LOSES — it must not
+// edit the gate to a pending affordance (which would orphan the live gate) and instead
+// tells the presser the gate was superseded. Without the CAS, the unconditional write
+// reverted gate_ts to the stale message and bricked the Slack surface.
+func TestGatekeeperTransitionLosesCASWhenSuperseded(t *testing.T) {
+	for _, actionID := range []string{ActionGateReject, ActionGateRequestChanges} {
+		t.Run(actionID, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			// Read still shows the clicked gate (supersede read passes), but the CAS loses.
+			gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID), casFail: true}
+			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+			fp := &fakePoster{}
+			g := NewGatekeeper(gs, sub, fp, nil)
+
+			g.HandleBlockAction(context.Background(), gateAction(actionID, runID))
+
+			if len(gs.gateSetIf) != 1 {
+				t.Fatalf("the transition must attempt exactly one CAS: %+v", gs.gateSetIf)
+			}
+			if len(sub.submitted) != 0 || len(gs.gateSet) != 0 {
+				t.Fatalf("a lost CAS must not submit or clobber the anchor: submitted=%+v gateSet=%+v", sub.submitted, gs.gateSet)
+			}
+			if len(fp.updateBlocks) != 0 {
+				t.Fatalf("a lost CAS must not edit the gate to a pending affordance: %+v", fp.updateBlocks)
+			}
+			if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "superseded") {
+				t.Fatalf("a lost CAS must tell the presser the gate was superseded: %+v", fp.ephemerals)
+			}
+		})
+	}
+}
+
+// Server-enforced supersede (PRD #41 Decision 10b): a click on a message whose ts no
+// longer matches the anchor's live gate_ts (the plan it showed was re-parked to a
+// newer version) is refused server-side — nothing submitted, no gate write — even
+// though the run is still awaiting_approval. This is independent of the best-effort
+// button edit, so a stale card's Reject/Request-changes can't overwrite the live gate.
+func TestGatekeeperSupersededClickRefused(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	// The live anchor now points at a NEWER gate (gate-v2); the click carries "gts".
+	anchor := openGateAnchor(runID)
+	anchor.GateTs = pgtype.Text{String: "gate-v2", Valid: true}
+	gs := &fakeGateStore{user: user, anchor: anchor}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+	fp := &fakePoster{}
+	g := NewGatekeeper(gs, sub, fp, nil)
+
+	// Reject on the stale (superseded) card.
+	g.HandleBlockAction(context.Background(), gateAction(ActionGateReject, runID))
+
+	if len(sub.submitted) != 0 || len(gs.gateSet) != 0 || len(fp.updateBlocks) != 0 {
+		t.Fatalf("a superseded click must not submit, edit, or write the gate: submitted=%v gate=%v edits=%v",
+			sub.submitted, gs.gateSet, fp.updateBlocks)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "superseded") {
+		t.Fatalf("a superseded click must get a 'superseded' ephemeral: %+v", fp.ephemerals)
 	}
 }
 

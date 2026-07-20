@@ -134,6 +134,10 @@ function agentOneLiner(latest: RunMessage | undefined): string {
       return `Error: ${describeError(latest.payload)}`;
     case "plan":
       return "Submitted a plan";
+    case "plan_revising":
+      return "Revising the plan";
+    case "plan_feedback":
+      return "Sent revision feedback";
     default:
       return "";
   }
@@ -313,7 +317,14 @@ export function ActivityFeed({
 
     let meaningful: RunMessage | undefined;
     for (const mm of messages) {
-      if (mm.kind === "status" || mm.kind === "error" || mm.kind === "plan") meaningful = mm;
+      if (
+        mm.kind === "status" ||
+        mm.kind === "error" ||
+        mm.kind === "plan" ||
+        mm.kind === "plan_revising" ||
+        mm.kind === "plan_feedback"
+      )
+        meaningful = mm;
     }
     if (meaningful && meaningful.seq !== seen.seq) {
       seen.seq = meaningful.seq;
@@ -322,7 +333,11 @@ export function ActivityFeed({
           ? `Error: ${describeError(meaningful.payload)}`
           : meaningful.kind === "plan"
             ? "Plan submitted, awaiting approval"
-            : describeStatus(meaningful.payload);
+            : meaningful.kind === "plan_revising"
+              ? "Revising the plan"
+              : meaningful.kind === "plan_feedback"
+                ? "Revision feedback sent"
+                : describeStatus(meaningful.payload);
     }
 
     if (terminal && !seen.terminal) next = "Run finished";

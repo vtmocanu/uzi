@@ -87,7 +87,7 @@ const maxWorkerNameBytes = 200
 
 // runInputKinds is the accepted steering-input set (mirrors the DB CHECK).
 var runInputKinds = map[string]bool{
-	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true,
+	"follow_up": true, "approve_plan": true, "reject_plan": true, "cancel": true, "revise_plan": true,
 }
 
 // -------------------------------------------------------------------------
@@ -547,7 +547,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !runInputKinds[req.Kind] {
-		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel")
+		httpx.Error(w, http.StatusBadRequest, "kind must be one of follow_up, approve_plan, reject_plan, cancel, revise_plan")
 		return
 	}
 
@@ -558,6 +558,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrReviseCapReached):
+			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
 		case errors.Is(err, workersvc.ErrInvalidSelection):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		default:

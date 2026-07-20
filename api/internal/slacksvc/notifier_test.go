@@ -17,14 +17,17 @@ import (
 )
 
 type fakeNotifStore struct {
-	rc          store.GetSlackRunContextRow
-	rcErr       error
-	delivery    pgtype.Text
-	deliveryErr error
-	msg         store.SlackRunMessage
-	msgErr      error
-	upserted    []store.UpsertSlackRunMessageParams
-	gateSet     []store.SetSlackRunGateParams
+	rc           store.GetSlackRunContextRow
+	rcErr        error
+	delivery     pgtype.Text
+	deliveryErr  error
+	msg          store.SlackRunMessage
+	msgErr       error
+	upserted     []store.UpsertSlackRunMessageParams
+	gateSet      []store.SetSlackRunGateParams
+	gateSetGen   []store.SetSlackRunGateGenParams
+	planCount    int64
+	planCountErr error
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {
@@ -43,6 +46,13 @@ func (f *fakeNotifStore) UpsertSlackRunMessage(_ context.Context, arg store.Upse
 func (f *fakeNotifStore) SetSlackRunGate(_ context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error) {
 	f.gateSet = append(f.gateSet, arg)
 	return store.SlackRunMessage{RunID: arg.RunID, GateTs: arg.GateTs, GateState: arg.GateState}, nil
+}
+func (f *fakeNotifStore) SetSlackRunGateGen(_ context.Context, arg store.SetSlackRunGateGenParams) (store.SlackRunMessage, error) {
+	f.gateSetGen = append(f.gateSetGen, arg)
+	return store.SlackRunMessage{RunID: arg.RunID, GateTs: arg.GateTs, GateState: arg.GateState, GateGeneration: arg.GateGeneration}, nil
+}
+func (f *fakeNotifStore) CountRunPlanMessages(context.Context, uuid.UUID) (int64, error) {
+	return f.planCount, f.planCountErr
 }
 
 type postCall struct{ channel, thread, text string }
@@ -370,23 +380,106 @@ func TestNotifierEscapesAndBoundsFailureReason(t *testing.T) {
 func TestNotifierPostsGateOnAwaitingApproval(t *testing.T) {
 	rc := baseRun("awaiting_approval")
 	fs := &fakeNotifStore{
-		rc:       rc,
-		delivery: txt("U1"),
-		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+		planCount: 1, // one plan version so far → generation 1
 	}
 	fp := &fakePoster{dmChannel: "D1"}
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
 
+	// No plan_md on the row → no plan-in-thread post, just the gate.
 	if len(fp.blocks) != 1 || fp.blocks[0].thread != "ts1" {
 		t.Fatalf("gate must post one Block Kit message in-thread under the root: %+v", fp.blocks)
 	}
 	ids := fp.blocks[0].actionIDs
-	if len(ids) != 3 || ids[0] != ActionGateApprove || ids[1] != ActionGateReject || ids[2] != ActionGateOpen {
-		t.Fatalf("gate buttons = %v, want [approve reject open]", ids)
+	if len(ids) != 4 || ids[0] != ActionGateApprove || ids[1] != ActionGateRequestChanges || ids[2] != ActionGateReject || ids[3] != ActionGateOpen {
+		t.Fatalf("gate buttons = %v, want [approve request_changes reject open]", ids)
 	}
-	if len(fs.gateSet) != 1 || fs.gateSet[0].GateState.String != gateStateOpen || !fs.gateSet[0].GateTs.Valid {
-		t.Fatalf("gate anchor not recorded open: %+v", fs.gateSet)
+	if len(fs.gateSetGen) != 1 || fs.gateSetGen[0].GateState.String != gateStateOpen ||
+		!fs.gateSetGen[0].GateTs.Valid || fs.gateSetGen[0].GateGeneration.Int32 != 1 {
+		t.Fatalf("gate anchor not recorded open at generation 1: %+v", fs.gateSetGen)
+	}
+}
+
+// A transient plan-count error must NOT fabricate a generation (PRD #41): the old
+// storedGen+1 fallback would post the current (possibly pre-revision) plan and record a
+// generation that later SWALLOWS the genuine re-gate. Skip this event instead — post
+// nothing, advance nothing — and let a subsequent state event re-drive with a working
+// count. The run is unaffected (Slack is best-effort; the web gate is canonical).
+func TestNotifierSkipsGateOnCountError(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	rc.PlanMd = txt("## Plan\n1. do a thing")
+	fs := &fakeNotifStore{
+		rc:           rc,
+		delivery:     txt("U1"),
+		msg:          store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}, // gate closed
+		planCountErr: fmt.Errorf("db hiccup"),
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	if len(fp.blocks) != 0 {
+		t.Fatalf("a count error must post no gate/plan Block Kit message: %+v", fp.blocks)
+	}
+	if len(fs.gateSetGen) != 0 {
+		t.Fatalf("a count error must NOT advance/record a generation (no burn): %+v", fs.gateSetGen)
+	}
+}
+
+// The gate depends on the worker flushing the `plan` run_message BEFORE it re-reports
+// awaiting_approval (§343): a correctly-ordered gate always has currentGen>=1. A
+// currentGen of 0 means the plan isn't flushed yet, so the notifier waits (posts no gate)
+// rather than posting a gate with no plan — a no-op, not a drop.
+func TestNotifierWaitsForPlanFlushWhenCountZero(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	fs := &fakeNotifStore{
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}, // fresh anchor, gen 0
+		planCount: 0,                                                                   // plan run_message not flushed yet → currentGen 0
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	if len(fp.blocks) != 0 {
+		t.Fatalf("currentGen==0 must not post a gate (wait for the plan flush): %+v", fp.blocks)
+	}
+	if len(fs.gateSetGen) != 0 {
+		t.Fatalf("currentGen==0 must not record a generation: %+v", fs.gateSetGen)
+	}
+}
+
+// The plan itself is posted into the thread at the gate (PRD #41 Decision 10 — Slack
+// gate parity), keyed to the fresh-gate post, alongside the gate buttons.
+func TestNotifierPostsPlanInThreadAtGate(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	rc.PlanMd = txt("## Plan\n1. do a thing\n2. do another")
+	fs := &fakeNotifStore{
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+		planCount: 1,
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	// Two block posts under the root: the plan render + the gate.
+	if len(fp.blocks) != 2 {
+		t.Fatalf("want a plan-in-thread post AND a gate post: %+v", fp.blocks)
+	}
+	if !strings.Contains(fp.blocks[0].sectionText, "do a thing") {
+		t.Fatalf("plan-in-thread must carry the plan body: %q", fp.blocks[0].sectionText)
+	}
+	if len(fp.blocks[0].actionIDs) != 0 {
+		t.Fatalf("the plan post carries no buttons: %+v", fp.blocks[0].actionIDs)
+	}
+	if len(fp.blocks[1].actionIDs) == 0 {
+		t.Fatalf("the second post must be the gate (with buttons): %+v", fp.blocks[1])
 	}
 }
 
@@ -397,9 +490,10 @@ func TestNotifierGateOffersRepoAndOwnWhenRosterDetected(t *testing.T) {
 	rc := baseRun("awaiting_approval")
 	rc.RepoAgentNames = []string{"coder", "reviewer", "tester"}
 	fs := &fakeNotifStore{
-		rc:       rc,
-		delivery: txt("U1"),
-		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+		planCount: 1,
 	}
 	fp := &fakePoster{dmChannel: "D1"}
 	n := NewNotifier(fs, fp, fixedBase, nil)
@@ -409,7 +503,7 @@ func TestNotifierGateOffersRepoAndOwnWhenRosterDetected(t *testing.T) {
 		t.Fatalf("gate must post one Block Kit message: %+v", fp.blocks)
 	}
 	ids := fp.blocks[0].actionIDs
-	want := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateReject, ActionGateOpen}
+	want := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
 	if len(ids) != len(want) {
 		t.Fatalf("gate buttons = %v, want %v", ids, want)
 	}
@@ -424,23 +518,58 @@ func TestNotifierGateOffersRepoAndOwnWhenRosterDetected(t *testing.T) {
 	}
 }
 
-// A run already carrying an open gate must not get a second gate message.
+// A redundant awaiting_approval re-broadcast of the SAME plan generation must not get
+// a second gate message or re-post the plan (PRD #41 Decision 10e).
 func TestNotifierDoesNotDoublePostGate(t *testing.T) {
 	rc := baseRun("awaiting_approval")
+	rc.PlanMd = txt("## Plan\ndo the thing")
 	fs := &fakeNotifStore{
-		rc:       rc,
-		delivery: txt("U1"),
-		msg:      store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1", GateTs: txt("gate-ts"), GateState: txt(gateStateOpen)},
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1", GateTs: txt("gate-ts"), GateState: txt(gateStateOpen), GateGeneration: pgtype.Int4{Int32: 1, Valid: true}},
+		planCount: 1, // same generation as the stored anchor → redundant
 	}
 	fp := &fakePoster{dmChannel: "D1"}
 	n := NewNotifier(fs, fp, fixedBase, nil)
 	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
 
 	if len(fp.blocks) != 0 {
-		t.Fatalf("an already-open gate must not be re-posted: %+v", fp.blocks)
+		t.Fatalf("a same-generation re-broadcast must not re-post the gate or plan: %+v", fp.blocks)
 	}
-	if len(fs.gateSet) != 0 {
-		t.Fatalf("no gate write expected when the gate is already open: %+v", fs.gateSet)
+	if len(fs.gateSet) != 0 || len(fs.gateSetGen) != 0 {
+		t.Fatalf("no gate write expected on a redundant broadcast: gate=%+v gen=%+v", fs.gateSet, fs.gateSetGen)
+	}
+}
+
+// A NEW plan version (higher generation) while a gate is still open re-parks: it
+// supersedes the prior gate button-free, posts a FRESH gate + the new plan, and a
+// click on the SUPERSEDED message is refused server-side (see gatekeeper test). PRD
+// #41 Decision 10a.
+func TestNotifierRepostsGateOnNewPlanGeneration(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	rc.PlanMd = txt("## Plan v2\nthe revised approach")
+	fs := &fakeNotifStore{
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1", GateTs: txt("gate-v1"), GateState: txt(gateStateOpen), GateGeneration: pgtype.Int4{Int32: 1, Valid: true}},
+		planCount: 2, // a second plan version arrived → generation 2 > stored 1
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	// The prior gate (gate-v1) is edited button-free to a superseded state.
+	if len(fp.updateBlocks) != 1 || fp.updateBlocks[0].ts != "gate-v1" || len(fp.updateBlocks[0].actionIDs) != 0 ||
+		!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "superseded") {
+		t.Fatalf("prior gate must be edited button-free to 'superseded': %+v", fp.updateBlocks)
+	}
+	// A fresh plan-in-thread + a fresh gate are posted.
+	if len(fp.blocks) != 2 || !strings.Contains(fp.blocks[0].sectionText, "revised approach") || len(fp.blocks[1].actionIDs) == 0 {
+		t.Fatalf("want a fresh plan post + fresh gate for the new version: %+v", fp.blocks)
+	}
+	// The anchor advances to generation 2 at the new gate ts.
+	if len(fs.gateSetGen) != 1 || fs.gateSetGen[0].GateGeneration.Int32 != 2 || !fs.gateSetGen[0].GateTs.Valid {
+		t.Fatalf("anchor must advance to generation 2 at the fresh gate: %+v", fs.gateSetGen)
 	}
 }
 

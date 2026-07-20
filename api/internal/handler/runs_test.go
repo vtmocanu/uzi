@@ -49,6 +49,8 @@ type runsStore struct {
 	// assertable).
 	followUpInputs []store.RunUserInput
 	createInputRow store.RunUserInput
+	// reviseCount is what CountRunReviseInputs returns (PRD #41 plan-revision cap).
+	reviseCount int64
 }
 
 func (s *runsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -80,6 +82,16 @@ func (s *runsStore) ListActiveRunsAll(context.Context) ([]store.ListActiveRunsAl
 	return s.activeRuns, nil
 }
 func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) (store.RunUserInput, error) {
+	return s.createInputRow, nil
+}
+func (s *runsStore) CountRunReviseInputs(context.Context, uuid.UUID) (int64, error) {
+	return s.reviseCount, nil
+}
+func (s *runsStore) CreateRunReviseInputIfUnderCap(_ context.Context, arg store.CreateRunReviseInputIfUnderCapParams) (store.RunUserInput, error) {
+	// Emulate the atomic cap: insert only while the persisted count is under the cap.
+	if s.reviseCount >= int64(arg.MaxRevisions) {
+		return store.RunUserInput{}, pgx.ErrNoRows
+	}
 	return s.createInputRow, nil
 }
 func (s *runsStore) ListFollowUpInputsForRun(_ context.Context, runID uuid.UUID) ([]store.RunUserInput, error) {
@@ -396,6 +408,37 @@ func TestCreateRunInputFollowUpReturnsCreatedRow(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), `"id"`) || strings.Contains(rec.Body.String(), `"created_at"`) {
 		t.Fatalf("approve_plan response must omit id/created_at, got %s", rec.Body.String())
+	}
+}
+
+// TestCreateRunInputRevisePlanCap pins the PRD #41 wiring end-to-end at the handler:
+// revise_plan is an accepted kind (not a 400), an accepted revision returns 202, and
+// a revision over PLAN_MAX_REVISIONS maps ErrReviseCapReached → 409.
+func TestCreateRunInputRevisePlanCap(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	newH := func(st workersvc.Store) *Handler {
+		box, err := secretbox.New(make([]byte, secretbox.KeySize))
+		if err != nil {
+			t.Fatalf("new box: %v", err)
+		}
+		return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{PlanMaxRevisions: 3}), hub: hub.New()}
+	}
+
+	// Under the cap (2 persisted, cap 3 → 3rd revise accepted) → 202.
+	stOK := &runsStore{ownerID: owner.ID, run: store.Run{ID: runID, UserID: owner.ID, Status: "awaiting_approval"}, reviseCount: 2}
+	rec := httptest.NewRecorder()
+	newH(stOK).CreateRunInput(rec, inputReq(owner, runID, `{"kind":"revise_plan","body":"use pgx"}`))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("under-cap revise = %d, want 202", rec.Code)
+	}
+
+	// At the cap (3 persisted, cap 3 → 4th revise rejected) → 409.
+	stCapped := &runsStore{ownerID: owner.ID, run: store.Run{ID: runID, UserID: owner.ID, Status: "awaiting_approval"}, reviseCount: 3}
+	rec = httptest.NewRecorder()
+	newH(stCapped).CreateRunInput(rec, inputReq(owner, runID, `{"kind":"revise_plan","body":"again"}`))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("over-cap revise = %d, want 409", rec.Code)
 	}
 }
 

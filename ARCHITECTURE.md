@@ -396,8 +396,8 @@ life (a DB partial unique index enforces at most one non-terminal run per
 issue). Status is a linear state machine:
 
 ```
-queued → claimed → running → awaiting_approval → running → completed
-                                                           → failed
+queued → claimed → running → awaiting_approval ⟲ (revise, PRD #41) → running → completed
+                                                                             → failed
    ↳ (worker dies) → re-queued, up to RUN_MAX_REQUEUES → failed
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
@@ -410,10 +410,26 @@ queued → claimed → running → awaiting_approval → running → completed
   git worktree. After the grace window any of the user's workers may claim it.
 - **running → awaiting_approval → running** — the lead agent produces a plan;
   the worker reports it (`POST /api/worker/runs/:id/state`) and the run parks
-  until the user approves or rejects it in the run view, or
-  `WORKER_PLAN_APPROVAL_TIMEOUT` (worker-side, default 24h) elapses. Approval
-  resumes the same SDK session into the implement ⇄ review loop
-  (`RUN_MAX_ITERATIONS`, default 5).
+  at the gate until the user approves or rejects it in the run view, or
+  `WORKER_PLAN_APPROVAL_TIMEOUT` (worker-side, default 24h) elapses. **The
+  gate is a round-aware loop, not a single step (PRD #41).** Alongside
+  approve/reject the user can **request changes**: the worker resumes the
+  *same* SDK session with the feedback, the lead revises the plan, and the
+  run re-parks at `awaiting_approval` with plan v2 — no new status, since the
+  loop is entirely worker-internal (`plan → gate → (revise → resume → new
+  plan → re-gate)* → approve/reject/cancel`, fail-closed on any other exit).
+  Rounds are bounded by `PLAN_MAX_REVISIONS` (default 3, enforced both
+  server- and worker-side), and the whole loop shares **one absolute
+  `WORKER_PLAN_APPROVAL_TIMEOUT` deadline** computed at first gate entry, not
+  a fresh one per round. A monotonic **gate epoch**, bumped at each
+  `awaiting_approval` re-report, ties every verdict to the plan version the
+  user actually saw — an approve or reject arriving mid-revision is
+  discarded rather than silently applied to a plan no human reviewed. Once
+  approved, the run resumes the same SDK session into the implement ⇄ review
+  loop (`RUN_MAX_ITERATIONS`, default 5). See [PRD #41](prds/41-plan-revision-gate.md)
+  for the epoch mechanism (Decisions 2/3) and
+  [docs/run-activity.md](docs/run-activity.md#plan-approval-gate) for the
+  user-facing actions.
 - **→ completed / failed** — the **worker**, not the agent, pushes the branch
   (`agent/issue-{iid}`) and opens the MR on completion (see Secrets, below);
   failure carries a `failure_reason`.
@@ -569,12 +585,12 @@ re-read-on-signal shape — no new server-pushed state. See
 
 uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slacksvc`, PRD #25): per-user run DMs, plan-approval buttons, and reply-from-Slack steering. It adds no new service and no new inbound port — the trust posture below is why. Full design rationale lives in the PRD (`prds/25-slack-integration.md`, especially its Security posture and Decision Log); user-facing setup is [docs/slack.md](docs/slack.md).
 
-- **Outbound-only, no inbound surface.** The manager (`slacksvc.Manager`) opens a Socket Mode WebSocket *out* to Slack and polls it live; there is no public URL, no signing-secret HTTP endpoint, and no new port on `api`. This holds the same "only `web` publishes a port" boundary above unchanged — Slack is a second *outbound* relationship, the same shape as the forge integration, not a new inbound one. The honest caveat: enabling Slack does export run *status metadata* off-box to Slack's cloud (see Content minimization, below).
+- **Outbound-only, no inbound surface.** The manager (`slacksvc.Manager`) opens a Socket Mode WebSocket *out* to Slack and polls it live; there is no public URL, no signing-secret HTTP endpoint, and no new port on `api`. This holds the same "only `web` publishes a port" boundary above unchanged — Slack is a second *outbound* relationship, the same shape as the forge integration, not a new inbound one. The honest caveat: enabling Slack does export run *status metadata* off-box to Slack's cloud — and, since PRD #41, gated plan bodies too (see Content minimization, below).
 - **`api` is the sole custodian of both Slack tokens.** The bot (`xoxb-`) and app-level (`xapp-`) tokens are settings values, sealed with the same `secretbox` key as every other secret at rest, and structurally excluded from every value-producing settings read (`settings.SecretKeys`, kept out of `Defaults` so `All()`/`Effective()` cannot emit them by construction — the same "cannot forget to redact" pattern used for the Anthropic token above). They are readable only through slacksvc's own decrypt accessors. A dedicated `slacksvc.Redact` additionally scrubs `xoxb-`/`xapp-` patterns *and* the Socket Mode connection URL's `?ticket=` query — a live-session credential the token-shape redaction alone would miss — from every log line. Neither token, nor the ticket URL, is ever sent to a worker or agent.
 - **Identity mapping is the authz primitive for every inbound action.** `users.slack_resolved_id` (the manual override, or a cached `users.lookupByEmail` match) has a partial unique index (`users_slack_resolved_id_key`, `WHERE slack_resolved_id IS NOT NULL`), so at most one uzi user can ever resolve from a given Slack id. Every inbound handler (the Gatekeeper's Approve/Reject, the Replier's thread replies) re-resolves the Slack-authenticated envelope actor through `GetConfirmedUserBySlackID`, which additionally requires `slack_link_confirmed_at IS NOT NULL` and `is_active = true` — an unconfirmed link or a deactivated account resolves to no row and the action is refused with an ephemeral notice, never guessed at. Content flows only after the user completes a link-confirmation DM round-trip; since uzi emails are unverified at registration, that confirmation click — not the email match itself — is what makes the mapping trustworthy against account-squatting. Approve/Reject and follow-up submissions then ride `workersvc.SubmitInput`'s own ownership check (`GetRunByIDForUser`) as a second, independent gate.
-- **Content minimization.** Slack messages carry status, repository path, issue number and title, MR link, and failure reason only — plan and diff content never leaves `api`; the plan is one click away behind the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`). Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup. A separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth, on top of the mrkdwn escaping.
+- **Content minimization — with one deliberate exception for the plan gate.** Slack messages otherwise carry status, repository path, issue number and title, MR link, and failure reason only — diff content never leaves `api`. Every dynamic field that could carry forge- or worker-controlled text (issue title, repo path, failure reason, a linked account's label) is mrkdwn-escaped (`EscapeMrkdwn`) before interpolation, so it can't smuggle a clickable link or an `@mention` into a message that also carries trusted deep-link markup, and a separate outbound scrub (`ScrubSecrets`) strips `sk-ant-`/`glpat-`/`xoxb-`/`xapp-` patterns from every outbound string as defense in depth. **The plan body is the one exception** (user-approved 2026-07-10, reversing this minimization for `plan_md` only — [PRD #41](prds/41-plan-revision-gate.md) Decision 10): every gated plan, and each revision a Request-changes round produces, is posted into the run's Slack thread — `ScrubSecrets`, then a **whole-blob** mrkdwn escape (not the per-field rule above, since the blob carries no trusted markup of its own to preserve), then a rune-safe truncate to Slack's 3000-char block limit, with the deep link appended as trusted markup outside the truncated region. This genuinely widens what leaves the box: plan bodies quote source/issue content, and no layer here catches a secret a model happens to quote verbatim into a plan — only the four known token *patterns* above are stripped. Gate posts still land only in the owner's own 1:1 DM, so the added exposure is Slack's cloud (retention, admin export, e-discovery) plus that workspace's own admin boundary, not other members; the deep link (`UZI_PUBLIC_BASE_URL`/`public_base_url`) stays the canonical, untruncated rendering.
 - **Inbound rate limits, at two layers.** The Socket Mode receive loop ACKs every envelope before processing (Slack retries an un-ACKed one in ~3s), and a per-Slack-user flood window bounds thread-reply volume. Separately, the two `/me/slack` endpoints that trigger an outbound DM to a caller-supplied Slack id (`PUT .../override`, `POST .../test-dm`) sit behind a dedicated, tighter per-user `mw.Limiter` (`SLACK_DM_RATE_LIMIT_MAX`/`_WINDOW`, distinct from the forge limiter above) plus a 30-second per-target DM cooldown in `slacksvc.Linker` — together bounding both an arbitrary-member DM-spam primitive and a member-id enumeration oracle.
-- **The primary directive is unaffected.** Slack can only approve, reject, or steer a plan gate — a latency/authorization control, not a `main`-write capability. A wrongful approval can at worst produce a branch + MR, same as an approval from the web UI, and every one of the [four guardrail layers](#guardrail-layers-the-primary-directive) is untouched by this integration: Slack never holds a forge credential, never talks to a worker, and never reaches the agent's own context.
+- **The primary directive is unaffected.** Slack can only approve, reject, request changes to (feeding text back into the same planning session), or otherwise thread-steer a plan gate — a latency/authorization control, not a `main`-write capability. A wrongful approval can at worst produce a branch + MR, same as an approval from the web UI, and every one of the [four guardrail layers](#guardrail-layers-the-primary-directive) is untouched by this integration: Slack never holds a forge credential, never talks to a worker, and never reaches the agent's own context.
 - **Fails safe when unconfigured.** With Slack disabled (the default) or either token absent, the manager idles and every other surface behaves exactly as before — nothing here is a hard dependency of the run lifecycle.
 
 ## Chat with uzi (the fifth surface)

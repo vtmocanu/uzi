@@ -414,6 +414,21 @@ func (q *Queries) CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUI
 	return count, err
 }
 
+const countRunReviseInputs = `-- name: CountRunReviseInputs :one
+SELECT count(*) FROM run_user_inputs WHERE run_id = $1 AND kind = 'revise_plan'
+`
+
+// Plan-revision cap (PRD #41): every persisted revise_plan row for the run counts
+// toward PLAN_MAX_REVISIONS, with NO consumed_at filter — a consumed revise still
+// counts, so the cap is the lifetime number of revisions, not the pending backlog.
+// Read-only reporting view of the same count CreateRunReviseInputIfUnderCap enforces.
+func (q *Queries) CountRunReviseInputs(ctx context.Context, runID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countRunReviseInputs, runID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countWorkerNonTerminalRuns = `-- name: CountWorkerNonTerminalRuns :one
 SELECT count(*) FROM runs
 WHERE worker_id = $1
@@ -599,6 +614,50 @@ type CreateRunInputParams struct {
 // CreateStopVerdictInput instead (they must stamp runs.stop_kind atomically).
 func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) (RunUserInput, error) {
 	row := q.db.QueryRow(ctx, createRunInput, arg.RunID, arg.Kind, arg.Body)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createRunReviseInputIfUnderCap = `-- name: CreateRunReviseInputIfUnderCap :one
+WITH locked AS (
+    SELECT r.id AS run_id FROM runs r WHERE r.id = $3 FOR UPDATE
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+SELECT locked.run_id, 'revise_plan', $1
+FROM locked
+WHERE (
+    SELECT count(*) FROM run_user_inputs rui
+    WHERE rui.run_id = locked.run_id AND rui.kind = 'revise_plan'
+) < $2::int
+RETURNING id, run_id, kind, body, consumed_at, created_at
+`
+
+type CreateRunReviseInputIfUnderCapParams struct {
+	Body         pgtype.Text `json:"body"`
+	MaxRevisions int32       `json:"max_revisions"`
+	RunID        uuid.UUID   `json:"run_id"`
+}
+
+// Atomic capped enqueue of a revise_plan (PRD #41): insert ONLY while the run is still
+// under its lifetime revision cap, collapsing the count and the insert into ONE
+// statement so two concurrent submits (e.g. web + Slack on the same single-owner gate)
+// cannot both read N-1 and both insert an N+1th row (a count-then-insert TOCTOU). The
+// run row is taken FOR UPDATE in a leading CTE and the cap count reads through it (the
+// count filters on the locked id), so callers serialize on the run: a second caller
+// blocks until the first commits, then counts including the first's row. NO consumed_at
+// filter — a consumed revise still counts (same lifetime semantics as
+// CountRunReviseInputs). No row returned = the cap is already reached (or the run row is
+// gone); the caller maps that to ErrReviseCapReached.
+func (q *Queries) CreateRunReviseInputIfUnderCap(ctx context.Context, arg CreateRunReviseInputIfUnderCapParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, createRunReviseInputIfUnderCap, arg.Body, arg.MaxRevisions, arg.RunID)
 	var i RunUserInput
 	err := row.Scan(
 		&i.ID,

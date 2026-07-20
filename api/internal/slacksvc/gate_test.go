@@ -19,7 +19,7 @@ func gateSummary(blocks []slack.Block) ([]string, string) {
 func TestGateBlocksNoRosterSingleApprove(t *testing.T) {
 	for _, names := range [][]string{nil, {}} {
 		ids, section := gateSummary(gateBlocks(uuid.New(), "https://uzi.example", names))
-		want := []string{ActionGateApprove, ActionGateReject, ActionGateOpen}
+		want := []string{ActionGateApprove, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
 		if len(ids) != len(want) {
 			t.Fatalf("names=%v: buttons = %v, want %v", names, ids, want)
 		}
@@ -41,7 +41,7 @@ func TestGateBlocksRosterTwoApproves(t *testing.T) {
 	blocks := gateBlocks(uuid.New(), "https://uzi.example", names)
 	ids, section := gateSummary(blocks)
 
-	want := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateReject, ActionGateOpen}
+	want := []string{ActionGateApproveRepo, ActionGateApproveOwn, ActionGateRequestChanges, ActionGateReject, ActionGateOpen}
 	if len(ids) != len(want) {
 		t.Fatalf("buttons = %v, want %v", ids, want)
 	}
@@ -83,6 +83,110 @@ func TestGateBlocksRosterTruncates(t *testing.T) {
 	// The 11th name (index 10) is past the cap and must not appear.
 	if strings.Contains(section, names[10]) {
 		t.Fatalf("a name past the cap leaked into the body: %q", section)
+	}
+}
+
+// revisePendingBlocks prompts for a threaded "what should change" reply and carries
+// NO buttons (unlike reject-pending's escape hatch) — the feedback text is required.
+func TestRevisePendingBlocksPromptNoButtons(t *testing.T) {
+	ids, section := gateSummary(revisePendingBlocks(uuid.New()))
+	if len(ids) != 0 {
+		t.Fatalf("revise-pending must carry no buttons: %v", ids)
+	}
+	if !strings.Contains(strings.ToLower(section), "what should change") {
+		t.Fatalf("revise-pending must prompt for the change: %q", section)
+	}
+}
+
+// The plan-in-thread render escapes the WHOLE plan blob (the documented EscapeMrkdwn
+// exception — the blob carries no trusted markup): any <, >, <@Uxxx> mention, or
+// spoofed <https://evil|Open> link a hostile plan embeds is rendered INERT, while the
+// genuine "full plan in uzi" deep link stays raw and clickable in its own block.
+func TestPlanThreadBlocksEscapesHostilePlan(t *testing.T) {
+	runID := uuid.New()
+	plan := "Do <b> a thing & ping <@U123> then click <https://evil.example|Open in uzi>"
+	blocks := planThreadBlocks(runID, plan, "https://uzi.example")
+	_, section := gateSummary(blocks)
+
+	if strings.Contains(section, "<@U123>") || strings.Contains(section, "<https://evil.example|Open in uzi>") {
+		t.Fatalf("hostile plan markup survived un-escaped: %q", section)
+	}
+	if !strings.Contains(section, "&lt;@U123&gt;") || !strings.Contains(section, "&amp;") {
+		t.Fatalf("plan blob was not mrkdwn-escaped: %q", section)
+	}
+	// The genuine deep link (trusted base + uuid) stays raw and clickable in its own
+	// context block, OUTSIDE the escaped plan blob.
+	if link := contextText(blocks); !strings.Contains(link, "<https://uzi.example/runs/"+runID.String()+"|Open the full plan in uzi>") {
+		t.Fatalf("the trusted plan deep link must survive raw outside the escaped blob: %q", link)
+	}
+}
+
+// contextText concatenates the mrkdwn of every context block (blockSummary only
+// captures section + action blocks).
+func contextText(blocks []slack.Block) string {
+	out := ""
+	for _, b := range blocks {
+		if cb, ok := b.(*slack.ContextBlock); ok && cb.ContextElements.Elements != nil {
+			for _, el := range cb.ContextElements.Elements {
+				if txt, ok := el.(*slack.TextBlockObject); ok {
+					out += txt.Text
+				}
+			}
+		}
+	}
+	return out
+}
+
+// A plan over the 3000-char section cap is truncated on a RUNE boundary (multi-byte
+// runes never split), and the deep link — a separate block outside the truncated
+// region — always survives (PRD #41 Decision 10).
+func TestPlanThreadBlocksTruncatesOnRuneBoundary(t *testing.T) {
+	runID := uuid.New()
+	// A long run of a 3-byte rune ('世'), well past the section cap.
+	plan := strings.Repeat("世", maxSlackSectionRunes+500)
+	blocks := planThreadBlocks(runID, plan, "https://uzi.example")
+	_, section := gateSummary(blocks)
+
+	if len([]rune(section)) > maxSlackSectionRunes+2 { // +2 for the "\n…" tail
+		t.Fatalf("section not bounded to the cap: %d runes", len([]rune(section)))
+	}
+	if !strings.Contains(section, "…") {
+		t.Fatalf("an over-long plan must be visibly truncated: %q", section[:60])
+	}
+	// Every rune in the truncated section must be intact (no split multi-byte rune →
+	// no U+FFFD replacement char).
+	if strings.ContainsRune(section, '�') {
+		t.Fatalf("truncation split a multi-byte rune (found U+FFFD)")
+	}
+	// The deep link lives in its own block and survives regardless of plan length.
+	link := ""
+	for _, b := range blocks {
+		if cb, ok := b.(*slack.ContextBlock); ok && cb.ContextElements.Elements != nil {
+			for _, el := range cb.ContextElements.Elements {
+				if txt, ok := el.(*slack.TextBlockObject); ok {
+					link += txt.Text
+				}
+			}
+		}
+	}
+	if !strings.Contains(link, "/runs/"+runID.String()) {
+		t.Fatalf("the deep link must survive outside the truncated region: %q", link)
+	}
+}
+
+// truncateForSlackSection is a no-op under the cap and rune-safe over it.
+func TestTruncateForSlackSection(t *testing.T) {
+	short := "just a short plan"
+	if got := truncateForSlackSection(short); got != short {
+		t.Fatalf("under-cap text must pass through unchanged: %q", got)
+	}
+	long := strings.Repeat("é", maxSlackSectionRunes+100) // 2-byte rune
+	got := truncateForSlackSection(long)
+	if strings.ContainsRune(got, '�') {
+		t.Fatalf("truncation split a multi-byte rune")
+	}
+	if len([]rune(got)) > maxSlackSectionRunes+2 {
+		t.Fatalf("truncated text exceeds the cap: %d runes", len([]rune(got)))
 	}
 }
 

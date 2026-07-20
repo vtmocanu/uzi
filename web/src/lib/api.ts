@@ -1028,7 +1028,7 @@ export interface RunMessage {
   created_at: string;
 }
 
-export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
+export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "revise_plan" | "cancel";
 
 // SteerInput is one follow_up steer-queue entry (PRD #95), from GET /api/runs/{id}/
 // inputs. Delivery status is derived client-side: consumed_at null ⇒ Queued (the worker

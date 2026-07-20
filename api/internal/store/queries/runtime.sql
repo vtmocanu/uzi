@@ -761,6 +761,36 @@ INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES (@run_id, @kind, @body)
 RETURNING *;
 
+-- name: CountRunReviseInputs :one
+-- Plan-revision cap (PRD #41): every persisted revise_plan row for the run counts
+-- toward PLAN_MAX_REVISIONS, with NO consumed_at filter — a consumed revise still
+-- counts, so the cap is the lifetime number of revisions, not the pending backlog.
+-- Read-only reporting view of the same count CreateRunReviseInputIfUnderCap enforces.
+SELECT count(*) FROM run_user_inputs WHERE run_id = @run_id AND kind = 'revise_plan';
+
+-- name: CreateRunReviseInputIfUnderCap :one
+-- Atomic capped enqueue of a revise_plan (PRD #41): insert ONLY while the run is still
+-- under its lifetime revision cap, collapsing the count and the insert into ONE
+-- statement so two concurrent submits (e.g. web + Slack on the same single-owner gate)
+-- cannot both read N-1 and both insert an N+1th row (a count-then-insert TOCTOU). The
+-- run row is taken FOR UPDATE in a leading CTE and the cap count reads through it (the
+-- count filters on the locked id), so callers serialize on the run: a second caller
+-- blocks until the first commits, then counts including the first's row. NO consumed_at
+-- filter — a consumed revise still counts (same lifetime semantics as
+-- CountRunReviseInputs). No row returned = the cap is already reached (or the run row is
+-- gone); the caller maps that to ErrReviseCapReached.
+WITH locked AS (
+    SELECT r.id AS run_id FROM runs r WHERE r.id = @run_id FOR UPDATE
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+SELECT locked.run_id, 'revise_plan', @body
+FROM locked
+WHERE (
+    SELECT count(*) FROM run_user_inputs rui
+    WHERE rui.run_id = locked.run_id AND rui.kind = 'revise_plan'
+) < @max_revisions::int
+RETURNING *;
+
 -- name: CreateApprovePlanInput :one
 -- Enqueue an approve_plan verdict for the live worker AND record the agent
 -- selection it carries, in ONE statement (PRD #37, mirroring CreateStopVerdictInput

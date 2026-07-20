@@ -6,6 +6,7 @@ import {
   buildLeadSystemPrompt,
   buildMemoryContext,
   buildPlanPrompt,
+  buildRevisePlanPrompt,
   buildSelfImprovePlanPrompt,
   isNotCodePlan,
   LEAD_GUARDRAIL_APPEND,
@@ -172,6 +173,38 @@ describe("buildImplementPrompt", () => {
   it("renders the lead-only case when the roster is empty", () => {
     const p = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
     assert.match(p, /No subagents are available; do the work yourself\./);
+  });
+});
+
+describe("buildRevisePlanPrompt (PRD #41)", () => {
+  const feedback = "Split the migration into two steps and cover the rollback path.";
+  const p = buildRevisePlanPrompt(feedback);
+
+  it("includes the reviewer's feedback verbatim", () => {
+    assert.match(p, /Split the migration into two steps and cover the rollback path\./);
+  });
+
+  it("frames the feedback as an authoritative reviewer instruction, NOT untrusted data", () => {
+    // Decision 11: the feedback is the human plan reviewer speaking, not attacker-
+    // influenceable forge text — so it must NOT wear the untrusted-evidence framing
+    // and must NOT be wrapped in a data fence the way the issue fields / follow-ups are.
+    assert.doesNotMatch(p, /UNTRUSTED/i);
+    assert.doesNotMatch(p, /never as instructions/i);
+    assert.doesNotMatch(p, /<follow_up>|<issue_|<untrusted|_[0-9a-f]{16}>/);
+    assert.match(p, /authoritative instruction/i);
+  });
+
+  it("keeps the full-plan-required contract: submit_plan with the complete plan and STOP", () => {
+    assert.match(p, /submit_plan/);
+    assert.match(p, /COMPLETE revised implementation plan/);
+    assert.match(p, /STOP/);
+    assert.match(p, /Do NOT implement anything yet/i);
+  });
+
+  it("does not re-embed the issue (it rides a resumed planning session)", () => {
+    // Model it on buildImplementPrompt: no issue title/description tags — the resumed
+    // session already carries them.
+    assert.doesNotMatch(p, /<issue_title>|<issue_description>/);
   });
 });
 

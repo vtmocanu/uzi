@@ -3,6 +3,7 @@ package slacksvc
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -20,6 +21,15 @@ type fakeReplierStore struct {
 	anchor    store.SlackRunMessage
 	anchorErr error
 	gateSet   []store.SetSlackRunGateParams
+
+	// CAS state (PRD #41 Decision 10c): SetSlackRunGateIf models an atomic
+	// compare-and-swap — the FIRST caller finding the expected state wins (returns a
+	// row); every later caller sees the state changed and gets pgx.ErrNoRows. casErr,
+	// when set, is returned to every caller (a DB error path).
+	mu        sync.Mutex
+	gateSetIf []store.SetSlackRunGateIfParams
+	casWon    int
+	casErr    error
 }
 
 func (f *fakeReplierStore) GetConfirmedUserBySlackID(context.Context, pgtype.Text) (store.User, error) {
@@ -31,6 +41,19 @@ func (f *fakeReplierStore) GetSlackRunMessageByRoot(context.Context, store.GetSl
 func (f *fakeReplierStore) SetSlackRunGate(_ context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error) {
 	f.gateSet = append(f.gateSet, arg)
 	return store.SlackRunMessage{}, nil
+}
+func (f *fakeReplierStore) SetSlackRunGateIf(_ context.Context, arg store.SetSlackRunGateIfParams) (store.SlackRunMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gateSetIf = append(f.gateSetIf, arg)
+	if f.casErr != nil {
+		return store.SlackRunMessage{}, f.casErr
+	}
+	if f.casWon > 0 {
+		return store.SlackRunMessage{}, pgx.ErrNoRows // already taken → loser
+	}
+	f.casWon++
+	return store.SlackRunMessage{RunID: arg.RunID}, nil // winner
 }
 
 func reply(text string) MessageReply {
@@ -159,8 +182,94 @@ func TestReplierOpenGateNudges(t *testing.T) {
 	if len(sub.submitted) != 0 || len(fp.reactions) != 0 {
 		t.Fatalf("a bare reply during an open gate must not submit or ack: submitted=%v acks=%v", sub.submitted, fp.reactions)
 	}
-	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "approve or reject") {
-		t.Fatalf("an open-gate reply must be nudged: %+v", fp.ephemerals)
+	nudge := strings.ToLower(fp.ephemerals[0].text)
+	if len(fp.ephemerals) != 1 || !strings.Contains(nudge, "request changes") || !strings.Contains(nudge, "reject") || !strings.Contains(nudge, "approve") {
+		t.Fatalf("an open-gate reply must be nudged naming all three actions: %+v", fp.ephemerals)
+	}
+}
+
+// A reply while the gate is revise-pending IS the revision feedback: it submits
+// revise_plan with the reply text, acks, and edits the message to a neutral
+// "Revising…" — but does NOT resolve the gate (the run stays parked for the next plan
+// version). The accept rides a compare-and-swap so exactly one reply wins.
+func TestReplierRevisePendingSubmitsRevise(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, gateStateRevisePending)}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("use a worker pool instead"))
+
+	if len(sub.submitted) != 1 || sub.submitted[0].kind != "revise_plan" ||
+		sub.submitted[0].body != "use a worker pool instead" ||
+		sub.submitted[0].userID != user.ID || sub.submitted[0].runID != runID {
+		t.Fatalf("revise-pending reply must submit revise_plan with the feedback: %+v", sub.submitted)
+	}
+	if len(fs.gateSetIf) != 1 || fs.gateSetIf[0].ExpectedGateState.String != gateStateRevisePending ||
+		fs.gateSetIf[0].GateState.Valid {
+		t.Fatalf("revise accept must CAS-clear revise_pending: %+v", fs.gateSetIf)
+	}
+	if len(fs.gateSet) != 0 {
+		t.Fatalf("revise accept must NOT unconditionally clear the gate (no resolveGate): %+v", fs.gateSet)
+	}
+	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 ||
+		!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "revising") {
+		t.Fatalf("gate message must be edited to a neutral 'Revising…' state: %+v", fp.updateBlocks)
+	}
+	if strings.Contains(fp.updateBlocks[0].sectionText, "worker pool") {
+		t.Fatalf("the feedback must NOT be echoed back to Slack: %q", fp.updateBlocks[0].sectionText)
+	}
+	if len(fp.reactions) != 1 {
+		t.Fatalf("an accepted revise reply must get a ✅ ack: %+v", fp.reactions)
+	}
+}
+
+// Two revise-pending replies (modelled as concurrent via the CAS fake) → exactly ONE
+// revise_plan submitted; the loser is nudged, never a second submit (PRD #41 Decision
+// 10c single-winner).
+func TestReplierRevisePendingSingleWinner(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, gateStateRevisePending)}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("first feedback"))
+	r.HandleMessage(context.Background(), reply("second feedback"))
+
+	if len(sub.submitted) != 1 || sub.submitted[0].body != "first feedback" {
+		t.Fatalf("exactly one revise must be submitted (the CAS winner): %+v", sub.submitted)
+	}
+	if len(fs.gateSetIf) != 2 {
+		t.Fatalf("both replies must attempt the CAS: %+v", fs.gateSetIf)
+	}
+	if len(fp.reactions) != 1 {
+		t.Fatalf("only the winning reply is acked: %+v", fp.reactions)
+	}
+	// The loser falls through to the open-gate nudge.
+	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "request changes") {
+		t.Fatalf("the CAS loser must be nudged, not submitted: %+v", fp.ephemerals)
+	}
+}
+
+// Hitting the server-side revision cap: the CAS wins but SubmitInput returns
+// ErrReviseCapReached — the reply is NOT acked, and the user is told the limit was
+// reached (PRD #41).
+func TestReplierRevisePendingCapReached(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: anchorRow(runID, gateStateRevisePending)}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), submitErr: ErrReviseCapReached}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("one more change please"))
+
+	if len(fp.reactions) != 0 {
+		t.Fatalf("a cap-refused revise must NOT be acked: %+v", fp.reactions)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "limit") {
+		t.Fatalf("a cap-refused revise must tell the user the limit was reached: %+v", fp.ephemerals)
 	}
 }
 

@@ -27,6 +27,14 @@ type NotifierStore interface {
 	// sets it when a run enters awaiting_approval and clears it when the run is
 	// resolved from EITHER surface (cross-surface idempotency).
 	SetSlackRunGate(ctx context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error)
+	// SetSlackRunGateGen records a FRESH gate anchor together with its plan generation
+	// (PRD #41 Decision 10d), generation-guarded so a slow drain can't clobber a newer
+	// gate. No row = the write was refused (a newer generation already posted).
+	SetSlackRunGateGen(ctx context.Context, arg store.SetSlackRunGateGenParams) (store.SlackRunMessage, error)
+	// CountRunPlanMessages returns the number of kind='plan' run_messages for a run —
+	// the monotonic plan generation the notifier uses to tell a new plan version from a
+	// redundant awaiting_approval re-broadcast (PRD #41 Decision 10a/e).
+	CountRunPlanMessages(ctx context.Context, runID uuid.UUID) (int64, error)
 }
 
 // Poster is the outbound Slack surface the notifier drives: open a DM channel and
@@ -331,28 +339,80 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 }
 
 // handleGate manages the approval-gate message's lifecycle on the notifier's
-// (state-transition) side. On entry to awaiting_approval it posts the Approve /
-// Reject gate under the run's root and records gate_ts/gate_state='open' (unless a
-// gate is already open — never double-post). On any transition OUT of
-// awaiting_approval while a gate is still open, the gate was resolved from another
-// surface (the web UI, a timeout, the sweeper) or the Slack handler has not
-// cleared it yet, so it edits the gate message to a closed state and clears the
-// anchor — the cross-surface idempotency hook. All best-effort: a failure is
-// logged (redacted) and never affects the run.
+// (state-transition) side, now generation-aware for plan revision (PRD #41 Decision
+// 10a/e). The run can sit at awaiting_approval across MULTIPLE plan generations (a
+// revision re-gates without leaving the status), so "a gate is already open" is NOT a
+// safe dedupe key — a redundant re-broadcast and a genuinely new plan version look
+// identical by status alone. The authority is the plan generation: the count of
+// kind='plan' run_messages, compared against the anchor's stored gate_generation.
+//
+//   - awaiting_approval, currentGen > storedGen → a NEW plan version: supersede the
+//     prior gate (button-free edit) if one is open, post a FRESH gate + the plan into
+//     the thread, and record gate_ts + gate_generation (generation-guarded).
+//   - awaiting_approval, currentGen <= storedGen → a redundant re-broadcast of the
+//     same version: return without posting (never spam, never re-post the plan).
+//   - left awaiting_approval while a gate is open → resolved from another surface (web
+//     UI, timeout, sweeper): close the gate message and clear the anchor
+//     (cross-surface idempotency).
+//
+// All best-effort: a failure is logged (redacted) and never affects the run.
 func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRow, anchor store.SlackRunMessage, base string) {
 	gateOpen := anchor.GateTs.Valid && anchor.GateTs.String != ""
 
 	if rc.Status == "awaiting_approval" {
+		storedGen := int64(0)
+		if anchor.GateGeneration.Valid {
+			storedGen = int64(anchor.GateGeneration.Int32)
+		}
+		currentGen, err := n.store.CountRunPlanMessages(ctx, rc.ID)
+		if err != nil {
+			// Without a reliable plan-generation count we cannot tell a genuinely new plan
+			// version from a redundant re-broadcast. The old fallback guessed storedGen+1 on
+			// a closed gate, but that BURNS the next generation: it posts the current
+			// (possibly still pre-revision) plan and records the guessed generation, so the
+			// genuine v2 re-gate later reads currentGen == storedGen and is silently swallowed
+			// — a gate showing the wrong plan version. Skip this event instead; the run is
+			// unaffected (Slack is best-effort, the web gate is canonical) and a subsequent
+			// state event re-drives handleGate with a working count.
+			n.logf("count plan messages", err)
+			return
+		}
+		if currentGen <= storedGen {
+			// Redundant re-broadcast of a plan version already gated — never spam. This also
+			// covers currentGen==0: the worker flushes the `plan` run_message BEFORE it
+			// re-reports awaiting_approval (§343), so a correctly-ordered gate always has
+			// currentGen>=1; a 0 means the plan isn't flushed yet, so waiting (no gate with no
+			// plan) is correct, not a drop.
+			return
+		}
+
+		// A genuinely new plan version. Supersede a still-open prior gate button-free so
+		// no stale card lingers (the pure-Slack revise flow already cleared gate_ts, so
+		// this fires mainly for a web-UI-driven or timed-out revise).
 		if gateOpen {
-			return // gate already posted for this run
+			if err := n.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.GateTs.String, "Plan superseded by a newer version",
+				gateResolvedBlocks("Superseded by a newer plan version below.")); err != nil {
+				n.logf("supersede prior gate", err)
+			}
+		}
+
+		// Slack gate parity (Decision 10): the plan itself now rides the thread, posted
+		// FIRST so it reads above the gate buttons. Bound to THIS fresh-gate branch and
+		// keyed by the same generation, so it is never posted on a redundant broadcast.
+		// Skipped when the plan is empty (nothing to show).
+		if plan := strings.TrimSpace(rc.PlanMd.String); rc.PlanMd.Valid && plan != "" {
+			if _, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review", planThreadBlocks(rc.ID, plan, base)); err != nil {
+				n.logf("post plan in thread", err)
+			}
 		}
 		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames))
 		if err != nil {
 			n.logf("post gate", err)
 			return
 		}
-		if _, err := n.store.SetSlackRunGate(ctx, store.SetSlackRunGateParams{
+		if _, err := n.store.SetSlackRunGateGen(ctx, store.SetSlackRunGateGenParams{
 			RunID: rc.ID, GateTs: pgText(ts), GateState: pgText(gateStateOpen),
+			GateGeneration: pgtype.Int4{Int32: int32(currentGen), Valid: true},
 		}); err != nil {
 			n.logf("record gate", err)
 		}
