@@ -272,6 +272,29 @@ one action.
      signal so the client repeats (mirroring M1), **never** a rejection. The
      operation is own-data, idempotent and authenticated; the honest
      characterisation lives in the query comment where the next reader will find it.
+     Two arguments settled it, both stronger than "the heaviest user is
+     inconvenienced". **A single group can exceed any cap on its own** — members
+     expand per coordinate, so one coordinate recurring across a long history blows
+     the cap by itself, and there is nothing smaller for the user to select. The
+     action becomes permanently impossible for *precisely* the recommendation this
+     feature exists to surface, since frequency is the priority signal and the
+     most-recurring group is both the most valuable and the first to exceed. And
+     **members are invisible to the client** — the UI shows groups and `run_count`,
+     and nothing anywhere tells a user that three selected groups expand to 4,000
+     members — so "select fewer" is guess-and-check against a quantity they cannot
+     observe. An unactionable error is bad; one that is unactionable *in principle*
+     is a dead end.
+     **If protection is ever wanted, the instrument is a per-user rate limiter on
+     the `/me/judge` group, not a member cap.** Re-derived at `415d08bb`: that group
+     mounts `RequireUser` and nothing else — no limiter — and carries all three
+     routes. The real exposure there is **repetition, not any single request's
+     size**: `GET /me/judge/stats` is completely unbounded and, per the measured
+     plan above, seq-scans `review_recommendations` in full on every call. A member
+     cap would harden the one route that is already atomic and self-limiting while
+     leaving the two cheaper-to-abuse reads open. The codebase already has the
+     pattern (`judgeLimiter`, `forgeLimiter`, `hostedLimiter` are per-user
+     middleware). Deliberately **not** done here: it should be triggered by an
+     observation rather than a theory.
      The per-member loop was immune only because each upsert was its own
      statement, which is a reason nobody had written down until changing the shape
      removed it. **This was missed on the first attempt and shipped a hard 500** —
@@ -307,7 +330,34 @@ one action.
      would have caught it; the coder self-caught it earlier, which is better, but the
      safety net was real. The claim was the implementer's, relayed by the lead
      without checking — the same inherited-assertion failure this PRD keeps finding,
-     this time in the PRD's own prose.)*
+     this time in the PRD's own prose. The audit added the symmetry that explains
+     it: those pre-existing multi-member fixtures build members with `memberRow`,
+     which mints a **fresh `ReviewID` per member**, so every one of them is
+     implicitly a *cross-review* fixture — exactly what a pair-keyed dedup destroys.
+     **The same fixture limitation that made the same-review duplicate
+     unconstructible, and so hid the 21000 crash, is what would have exposed the
+     pair-key mistake.** One property, two opposite effects, depending on which bug
+     you are hunting.)*
+   - **The Go dedup layer is deliberate defence-in-depth, and adding it was not
+     free — state both halves.** On the live path it is **dead code by
+     construction**: the resolve is `SELECT DISTINCT ON (…)`, so it cannot return a
+     duplicate triple and `seen[key]` can never fire against a real database. It is
+     exercised only by fake-backed tests — which is the point, since a fake cannot
+     model SQL and a fake-backed duplicate test would otherwise be theatre. It earns
+     its place the day someone relaxes the `DISTINCT ON` or adds a second caller of
+     the write. **But divergence between the two layers is asymmetric, and the
+     dangerous direction is the new one:** a wrong *SQL* key is masked by the Go
+     layer (which still keys on the conflict key, so the statement stays legal —
+     degraded, not broken), while a wrong *Go* key is **not** masked by SQL, because
+     the Go pass runs downstream and can *remove* members the SQL correctly kept —
+     silently under-disposing. So the second layer added a way to be wrong that did
+     not exist before it, which is why the Go layer is the one that must carry the
+     test. "Add a second layer" is not automatically free. (Implementation detail
+     that is safe *for a reason* rather than by luck: `seen[key]` is marked **before**
+     the scope switch, so a member excluded by scope still consumes its key — fine
+     only because duplicates of one triple always carry identical
+     `disposition_status`/`filed_settled`, since those joins are on the coordinate
+     and not on `rr.id`, so both copies take the same scope branch anyway.)
    - **Why "write the resolved row, never the body" is defence-in-depth rather than
      the mechanism** (recorded so a future refactor does not undo it): the resolve
      matches by *equality* (`want.category = rr.category AND want.target =

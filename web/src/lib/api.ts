@@ -783,6 +783,15 @@ export interface RunUsage {
 
 // RunListItem is a run row for the index + admin overview: the run plus display
 // context. owner_email is present only on the admin (all-users) list.
+// RunListItem is the LIST row — GET /api/runs. It extends Run, and that inheritance is a
+// trap worth naming: on the Go side RunDTO and RunListItemDTO are SEPARATE structs, so a
+// field added to one is simply absent from the other. Here, a field added to `Run` is
+// silently inherited by RunListItem, so putting a list-only field at the wrong level
+// compiles fine and quietly claims that GET /runs/{id} returns something the API never
+// sends. Nothing fails at runtime until a caller reads the missing field.
+//
+// So: a field the API puts on RunListItemDTO belongs HERE, not on Run. (PRD #98 M4's judge
+// badge fields were caught doing exactly this, by tsc via the run-view fixtures.)
 export interface RunListItem extends Run {
   /** Judge badge (PRD #98 M4). judge_verdict is the run's review verdict, null when
    *  the run was never judged — rendered as NO badge, never a neutral one, since

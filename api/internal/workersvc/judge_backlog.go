@@ -22,8 +22,22 @@ import (
 // the handler is not a validator. A function gives M3/M7 the same ergonomics with none of
 // the reach.
 var judgeBacklogBuckets = map[string]bool{
-	"todo": true, "filed": true, "done": true, "dismissed": true, "all": true,
+	BucketTodo: true, BucketFiled: true, BucketDone: true, BucketDismissed: true, BucketAll: true,
 }
+
+// Bucket values. Named for the same reason the scope values are (PRD #98 review AC): a
+// literal spelled at a call site would silently become invalid if the wire value ever
+// changed, and the failure would surface as an empty view rather than an error.
+const (
+	BucketTodo      = "todo"
+	BucketFiled     = "filed"
+	BucketDone      = "done"
+	BucketDismissed = "dismissed"
+	// BucketAll is the unfiltered view — the only one referenced from Go today (the
+	// post-write re-read in BulkSetDispositions, which must return a group even after it
+	// has left To triage).
+	BucketAll = "all"
+)
 
 // ValidJudgeBacklogBucket reports whether s is an accepted ?bucket= value. The handler
 // rejects anything else with a 400 rather than silently ignoring the filter.

@@ -62,7 +62,10 @@ func (h *Handler) BulkSetDispositions(w http.ResponseWriter, r *http.Request) {
 	}
 	scope := req.Scope
 	if scope == "" {
-		scope = "open" // the default: settle what is open, never re-assert a settled member
+		// The default: settle what is open, never re-assert a settled member. Referenced,
+		// not spelled — if ScopeOpen's wire value ever changed, a literal here would
+		// silently become an invalid scope and every default-scope request would 400.
+		scope = workersvc.ScopeOpen
 	}
 	if !workersvc.ValidJudgeDispositionScope(scope) {
 		httpx.Error(w, http.StatusBadRequest, "invalid scope")

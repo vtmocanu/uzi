@@ -71,7 +71,12 @@ ORDER BY f.id ASC
 -- the third enumeration in this PRD to need a bound (M1's rows, M2's fan-out, now this) —
 -- bound them where they are written.
 --
--- The bound is FIFO by id, and a FAILING edge is not consumed — so a persistent poison edge
+-- Note what the ORDER BY does and does not give. f.id is a random uuid (gen_random_uuid),
+-- so this is stable and arbitrary — NOT oldest-close-first. There is no ordering by close
+-- time here, and none is needed: every pending edge is applied eventually, and the order
+-- among them carries no meaning. Do not read "FIFO" as "the earliest close wins".
+--
+-- The bound is FIFO by that arbitrary id, and a FAILING edge is not consumed — so a persistent poison edge
 -- HOLDS ITS SLOT in every subsequent batch. The usual drain argument ("applied edges leave
 -- the working set permanently, so the set strictly shrinks") is true and has exactly this
 -- exception: if a full batch of low-id edges failed on every tick, newer edges would never
