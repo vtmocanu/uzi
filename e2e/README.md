@@ -13,8 +13,12 @@ side; this exercises the real wire).
 ```
 
 Requirements: Docker + Compose v2, and `openssl`, `jq`, `git`, `curl` on the
-host. First run builds the `api`/`web`/`agent` images plus the tiny `forge-fake`
-image (a few minutes); later runs reuse the layer cache. On success it prints
+host. **Docker Engine >= 25** is recommended: the overlay's healthchecks set
+`start_interval: 1s` (probe every second during `start_period`), which trims the
+first-probe floor off the full-stack `--wait` boots. Older engines silently ignore
+the field, so the suite still runs correctly — just a few seconds slower per boot.
+First run builds the `api`/`web`/`agent` images plus the tiny `forge-fake` image
+(a few minutes); later runs reuse the layer cache. On success it prints
 `All E2E checks passed.` and tears everything down.
 
 Knobs (env vars):

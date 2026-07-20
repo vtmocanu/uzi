@@ -1661,8 +1661,9 @@ pass "poller sped to ~2s; card #$IID in Human Review with open MR !$MR_IID"
 
 # NULL-bootstrap (Decision 9): the first tick records the MR's CURRENT state
 # ('opened') WITHOUT moving, so a pre-existing state never triggers a spurious
-# move. Give it a few ticks (2s each); the card must stay put.
-sleep 6
+# move. Give it 2 poll ticks (2s each) to act + confirm-stable; the card must stay
+# put (Decision 5 floors a 2s-poll negative window at 2 ticks = 4s, PRD #97 M5).
+sleep 4
 [ "$(card_column "$IID")" = "Human Review" ] \
   || fail "NULL-bootstrap must record MR state without moving the card (Decision 9)"
 pass "NULL-bootstrap recorded MR state without moving the card"
@@ -1692,9 +1693,9 @@ wait_card_column "$IID" "In Progress" 40
 apipost "/api/repos/$REPO_ID/issues/$IID/move" '{"to_column":"Later"}' >/dev/null
 wait_card_column "$IID" "Later" 10   # the move is forge-first; let any in-flight reconcile settle
 flip_mr "$MR_IID" opened
-# Several ticks (2s each) must pass with the card LEFT in Later (a fight would
-# yank it to Human Review within one tick).
-sleep 6
+# Two ticks (2s each) must pass with the card LEFT in Later (a fight would yank it
+# to Human Review within one tick; Decision 5 floors this at 2 ticks = 4s, PRD #97 M5).
+sleep 4
 [ "$(card_column "$IID")" = "Later" ] \
   || fail "watcher fought a manual drag: card #$IID left Later after the MR reopened"
 pass "manual drag wins: card #$IID stayed in Later despite the MR reopening"
@@ -1884,7 +1885,7 @@ IID_NC="$(create_autopilot_issue "E2E autopilot no-consent" \
   "Implements prds/4-agent-runtime-workers.md" someone-else someone-else)"
 wait_notes "$IID_NC" 1 40
 notes_text "$IID_NC" | grep -qF "did not start a run" || fail "expected the no-eligible-user comment"
-assert_no_run_for_issue "$IID_NC" 6
+assert_no_run_for_issue "$IID_NC" 4  # 2 poll ticks (2s each): act + confirm-stable (Decision 5, PRD #97 M5)
 pass "one 'no eligible user' comment, no run"
 
 # Retry gesture: remove + re-add mints a larger event id → re-evaluated exactly once.
@@ -1911,7 +1912,7 @@ wait_status "$RUN_FL" failed 120
 wait_notes "$IID_FL" 1 40
 notes_text "$IID_FL" | grep -qF "could not complete" || fail "expected the failure comment"
 notes_text "$IID_FL" | grep -qF "/runs/$RUN_FL" || fail "failure comment is missing the run link"
-sleep 5   # a duplicate would appear within a couple of (2s) ticks
+sleep 4   # 2 poll ticks (2s each): a duplicate would appear within a couple of ticks (Decision 5, PRD #97 M5)
 [ "$(note_count "$IID_FL")" = 1 ] || fail "failure path posted more than one comment"
 pass "exactly one failure comment (fixed template + run link), no failure_reason echoed"
 
@@ -1921,7 +1922,7 @@ IID_NP="$(create_autopilot_issue "E2E autopilot no-prd" \
   "This issue points at no plan file whatsoever." owner-alice owner-alice)"
 wait_notes "$IID_NP" 1 40
 notes_text "$IID_NP" | grep -qF "no PRD link" || fail "expected the no-PRD-link comment"
-assert_no_run_for_issue "$IID_NP" 6
+assert_no_run_for_issue "$IID_NP" 4  # 2 poll ticks (2s each): act + confirm-stable (Decision 5, PRD #97 M5)
 pass "one 'no PRD link' comment, no run"
 
 # --- autopilot #4: carry-item e2e (settings race + username collision) -------
@@ -2183,7 +2184,7 @@ apipost /api/vault/lock '' >/dev/null
 IID_V="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E vault gated","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
 RUN_V="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_V}" | jq -r '.run.id')"
-sleep 3   # several worker poll cycles (500ms each) must pass with the run LEFT queued
+sleep 1.5   # ~3 worker poll cycles (500ms each) must pass with the run LEFT queued (PRD #97 M5)
 [ "$(apiget "/api/runs/$RUN_V" | jq -r '.run.status')" = queued ] \
   || fail "a locked owner's run must stay queued (never claimed, never failed)"
 pass "vault locked: run $RUN_V stayed queued across several poll cycles"
