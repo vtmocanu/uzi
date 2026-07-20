@@ -75,6 +75,7 @@ uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
+uzi run inputs <id> [--json]
 uzi worker list | rm <id>
 uzi repo list
 uzi admin users | runs | workers | usage | rate-limits
@@ -99,6 +100,13 @@ A few worth knowing:
   for the full `--json` contract. It's read-only: there's no `rejudge` verb,
   since re-running the judge spends the owner's Anthropic budget and stays a
   web action.
+- **`run inputs <id>`** lists the steer queue — a table of `body` / `state`
+  / `age`, newest first — same delivery states as the web pane, see
+  [Run activity pane](./run-activity.md#steer-queue). `--json` prints the raw
+  DTO instead. **Chat caveat**: a chat run seeds every turn as a follow-up
+  row, so `run inputs` against a chat run lists the whole conversation, not
+  just steering messages; an issue or CI-fix run's queue starts empty and
+  only ever holds what you actually sent mid-run.
 - **`admin` needs an admin-scoped token.** A default (`uzc_`) token gets
   exit 3 with an actionable message; mint an `admin_ro` (`uza_`) token in
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports

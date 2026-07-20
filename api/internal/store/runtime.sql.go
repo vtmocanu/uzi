@@ -1663,6 +1663,45 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 	return items, nil
 }
 
+const listFollowUpInputsForRun = `-- name: ListFollowUpInputsForRun :many
+SELECT id, run_id, kind, body, consumed_at, created_at FROM run_user_inputs
+WHERE run_id = $1 AND kind = 'follow_up'
+ORDER BY id DESC
+`
+
+// The follow-up steer queue for a run, NEWEST FIRST and UNCAPPED (PRD #95 Decision 4):
+// the web + CLI steer queue reads exactly kind='follow_up', with delivery status derived
+// client-side from consumed_at (NULL → Queued, set → Delivered). Deliberately NOT the
+// judge's ListRunInputsForRun (oldest-first, @lim-capped, all kinds) — that would drop
+// the newest follow-ups behind its cap on a busy/chat run. Owner-scoping is enforced at
+// the run resolve (GetRunByIDForUser), not here.
+func (q *Queries) ListFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]RunUserInput, error) {
+	rows, err := q.db.Query(ctx, listFollowUpInputsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunUserInput{}
+	for rows.Next() {
+		var i RunUserInput
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Kind,
+			&i.Body,
+			&i.ConsumedAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listGaveUpColumnMoves = `-- name: ListGaveUpColumnMoves :many
 SELECT r.id, r.repo_id, r.issue_iid, r.status, r.move_pending_since
 FROM runs r

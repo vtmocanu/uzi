@@ -993,6 +993,17 @@ export interface RunMessage {
 
 export type RunInputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
 
+// SteerInput is one follow_up steer-queue entry (PRD #95), from GET /api/runs/{id}/
+// inputs. Delivery status is derived client-side: consumed_at null ⇒ Queued (the worker
+// has not drained it), set ⇒ Delivered (handed to the worker for its next turn). body is
+// nullable to match the wire, though a follow_up always carries one.
+export interface SteerInput {
+  id: number;
+  body: string | null;
+  created_at: string;
+  consumed_at: string | null;
+}
+
 // AgentSource is which roster a run's subagents come from (PRD #37): the repo's
 // own .claude/agents/, or the user's uzi templates. The lead orchestrator is
 // always uzi's builtin and is never selectable.
@@ -1017,12 +1028,15 @@ export interface AgentSelectionInput {
 }
 
 // WsEvent is a live frame from /api/ws. A "message" carries a persisted message
-// (rendered directly, deduped by seq); "state" signals a status change and "health"
-// a run-health flag change (PRD #47). For both "state" and "health" the client
-// re-reads the run over REST — WS is never the source of truth, so the flag reason
-// (owner-gated) never rides the socket.
+// (rendered directly, deduped by seq); "state" signals a status change, "health" a
+// run-health flag change (PRD #47), and "input" a steer-queue change (PRD #95). For
+// "state", "health", and "input" the client re-reads over REST — WS is never the
+// source of truth, so the (owner-gated) flag reason / steer text never rides the
+// socket. The "input" frame is data-less and a FAST-PATH only: the queue also
+// reconciles by REST refetch (mount/reconnect/state/health), so a dropped frame
+// self-heals — its handling lands in M3.
 export interface WsEvent {
-  type: "message" | "state" | "health";
+  type: "message" | "state" | "health" | "input";
   seq?: number;
   kind?: string;
   agent?: string | null;
@@ -1470,8 +1484,14 @@ const realApi = {
       "GET",
       afterSeq > 0 ? `/runs/${id}/messages?after=${afterSeq}` : `/runs/${id}/messages`,
     ),
+  // The run's follow_up steer queue with delivery status (PRD #95). Owner-only: a
+  // non-owner (incl. admin_ro) gets 404, which the caller treats as "no queue".
+  getRunInputs: (id: string) => request<{ inputs: SteerInput[] }>("GET", `/runs/${id}/inputs`),
+  // A follow_up write returns the created row's id + created_at (PRD #95 S2) so the
+  // web's optimistic queue entry adopts the real id and reconciles; other kinds omit
+  // them (they are server-side or own their own UI). Both fields optional on the wire.
   submitRunInput: (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) =>
-    request<{ server_side: boolean }>("POST", `/runs/${id}/inputs`, {
+    request<{ server_side: boolean; id?: number; created_at?: string }>("POST", `/runs/${id}/inputs`, {
       kind,
       body,
       // PRD #37: the structured agent selection is legal only on approve_plan; the

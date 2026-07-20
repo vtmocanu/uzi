@@ -97,7 +97,18 @@ func TestMessageDTOTags(t *testing.T) {
 
 func TestRunInputTags(t *testing.T) {
 	assertTags(t, "RunInputRequest", RunInputRequest{}, "kind", "body", "selection")
+	// id + created_at are omitempty (nil on approve/cancel/reject): the zero value is
+	// still just server_side (PRD #95 S2).
 	assertTags(t, "RunInputResponse", RunInputResponse{}, "server_side")
+	// A follow_up write returns the created row: id + created_at appear when set.
+	id := int64(7)
+	now := time.Unix(0, 0)
+	assertTags(t, "RunInputResponse(with row)", RunInputResponse{ID: &id, CreatedAt: &now},
+		"server_side", "id", "created_at")
+}
+
+func TestSteerInputDTOTags(t *testing.T) {
+	assertTags(t, "SteerInputDTO", SteerInputDTO{}, "id", "body", "created_at", "consumed_at")
 }
 
 func TestRecommendationDTOTags(t *testing.T) {

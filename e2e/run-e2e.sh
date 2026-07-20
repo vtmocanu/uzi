@@ -320,6 +320,11 @@ run_mr_state()          { apiget "/api/runs/$1" | jq -r '.run.mr_state // empty'
 run_health()            { apiget "/api/runs/$1" | jq -r '.run.health'; }
 # card_column IID — the board's resolved column for one issue (empty = Open).
 card_column()           { apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" '.board.cards[] | select(.iid==$iid) | .column'; }
+# run_input_delivery RUN — the delivery state of the run's newest follow_up in its
+# owner-scoped steer queue (PRD #95), derived from consumed_at EXACTLY as the web/CLI
+# derive it: "delivered" once consumed_at is set, "queued" while null, "none" when the
+# queue is empty. The read endpoint returns newest-first, so .[0] is the latest.
+run_input_delivery()    { apiget "/api/runs/$1/inputs" | jq -r '(.inputs // []) | if length == 0 then "none" elif (.[0].consumed_at != null) then "delivered" else "queued" end'; }
 
 wait_worker_online()  { wait_eq online 40 "worker status" worker_status; }
 # Poller-driven waits: PRD #6 CI badges + verification stamp, PRD #24 card moves
@@ -1068,6 +1073,100 @@ else
     || fail "no per-agent (coder) usage-bearing message in the run-view data"
   pass "PRD #40: per-agent coder usage message present in the run stream (12000 in)"
 fi
+
+# =============================================================================
+# PRD #95 — steer-queue delivery (Problem 3): a follow-up shows as Queued on submit,
+# flips to Delivered when the worker consumes it, is NEVER mirrored into run_messages
+# (Decision 4 — the headline invariant), and spends no token / writes no forge (the
+# whole reason the queue is a DTO over run_user_inputs, not a run_message).
+#
+# The stub DOES consume inputs naturally — no /_e2e mutator or hand-driven worker call
+# is needed: the runner's SteeringChannel polls GET /api/worker/runs/{id}/inputs
+# (→ ConsumeInputs) every WORKER_POLL_INTERVAL (3s), consuming EVERY pending input and
+# buffering a follow_up for the agent's next turn. To observe Queued DETERMINISTICALLY
+# we submit the follow-up in the queued/claiming window BEFORE the run is owned and its
+# steering poll has run (clone+plan take seconds, so consumed_at is still NULL at the
+# immediate read); the gate's poll then flips it to Delivered while the run sits at
+# awaiting_approval — the S3 "Delivered — applies after approval" case, driven end to
+# end by the real worker poll. (The dropped-frame reconnect self-heal, S1, is proven in
+# web/src/lib/useRunStream.test.tsx — e2e has no browser WS, so it is not re-tested here.)
+say "PRD #95: steer-queue delivery — Queued → Delivered on consume, no run_message, no forge/token"
+STEER_MRS_BEFORE="$(fake_state | jq '.mrs | length')"
+IID_S="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E steer","description":"steer me — see prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
+RUN_S="$(apipost "/api/repos/$REPO_ID/runs" "{\"issue_iid\":$IID_S}" | jq -r '.run.id')"
+{ [ -n "$RUN_S" ] && [ "$RUN_S" != null ]; } || fail "steer-path run was not created"
+
+# Submit the follow-up immediately (the run is still queued/claiming — its worker has
+# not cloned or started steering yet), then read the owner queue: the write returns the
+# created row (S2) and the queue shows it Queued (consumed_at null).
+STEER_BODY="please also update the changelog"
+SUB="$(apipost "/api/runs/$RUN_S/inputs" "$(jq -cn --arg b "$STEER_BODY" '{kind:"follow_up",body:$b}')")"
+[ "$(echo "$SUB" | jq -r '.server_side')" = false ] \
+  || fail "a follow_up must never be server-side (got server_side=$(echo "$SUB" | jq -r '.server_side'))"
+STEER_ID="$(echo "$SUB" | jq -r '.id')"
+{ [ "$STEER_ID" != null ] && [ "$STEER_ID" -gt 0 ]; } || fail "follow_up write did not return the created row id (S2), got '$STEER_ID'"
+[ "$(echo "$SUB" | jq -r '.created_at // empty')" != "" ] || fail "follow_up write did not return created_at (S2)"
+Q="$(apiget "/api/runs/$RUN_S/inputs")"
+[ "$(echo "$Q" | jq '.inputs | length')" = 1 ] || fail "steer queue should list exactly the one follow_up (got $(echo "$Q" | jq -c '.inputs'))"
+[ "$(echo "$Q" | jq -r '.inputs[0].body')" = "$STEER_BODY" ] || fail "queued follow_up body mismatch"
+[ "$(echo "$Q" | jq -r '.inputs[0].consumed_at')" = null ] \
+  || fail "a freshly-submitted follow_up must be Queued (consumed_at null), got $(echo "$Q" | jq -c '.inputs[0]')"
+pass "follow_up submitted: write returned the row (id=$STEER_ID), queue shows it Queued (consumed_at null)"
+
+# The run reaches the gate; the steering poll there consumes the follow_up (stamping
+# consumed_at) while the run stays awaiting_approval — Delivered, S3 flavor.
+wait_status "$RUN_S" awaiting_approval
+wait_eq delivered 30 "run $RUN_S follow-up delivery" run_input_delivery "$RUN_S"
+DLV="$(apiget "/api/runs/$RUN_S/inputs")"
+[ "$(echo "$DLV" | jq -r '.inputs[0].consumed_at')" != null ] || fail "consumed follow_up must show Delivered (consumed_at set)"
+[ "$(echo "$DLV" | jq -r '.inputs[0].id')" = "$STEER_ID" ] || fail "delivered row id drifted from the submitted id"
+[ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')" = awaiting_approval ] \
+  || fail "the run should still be at the gate when the follow_up is consumed (S3 delivered-applies-after-approval)"
+pass "worker consumed the follow_up at the gate: queue Queued → Delivered, run still awaiting_approval (S3)"
+
+# Decision 4 — the headline invariant: the follow_up is a DTO over run_user_inputs,
+# NEVER a run_message. Its body appears in NO message payload, and the gapless per-run
+# seq is intact (no server-injected message racing the worker's local seq allocator).
+SMSGS="$(apiget "/api/runs/$RUN_S/messages")"
+echo "$SMSGS" | jq -e --arg b "$STEER_BODY" '[.messages[] | select((.payload | tostring) | contains($b))] | length == 0' >/dev/null \
+  || fail "the follow_up body leaked into run_messages — Decision 4 says a follow_up is NEVER a run_message"
+echo "$SMSGS" | jq -e '(.messages | length) as $n | [.messages[].seq] == [range(1; $n+1)]' >/dev/null \
+  || fail "run_messages seq is not gapless 1..N after the follow_up round-trip (a follow_up must not perturb the seq stream)"
+pass "Decision 4: no run_message written for the follow_up; run_messages seq still gapless 1..$(echo "$SMSGS" | jq '.messages | length')"
+
+# No forge write, no token spend attributable to the steer round-trip: the fake forge
+# recorded no new MR, no branch was pushed for this issue, and the parked run banked no
+# usage (a steer neither runs the agent nor writes the forge).
+[ "$(fake_state | jq '.mrs | length')" = "$STEER_MRS_BEFORE" ] \
+  || fail "the follow_up path created a forge MR (before=$STEER_MRS_BEFORE, after=$(fake_state | jq '.mrs | length')) — a steer must never write the forge"
+if git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_S"; then
+  fail "a branch was pushed for the steer run while it was still at the gate — no forge write may attribute to the follow_up"
+fi
+apiget "/api/runs/$RUN_S" | jq -e '((.run.usage.input_tokens // 0) == 0) and ((.run.usage.output_tokens // 0) == 0)' >/dev/null \
+  || fail "the steer run banked token usage while parked at the gate — a follow_up spends no tokens (got: $(apiget "/api/runs/$RUN_S" | jq -c '.run.usage'))"
+pass "no forge write + no token spend for the follow_up path (MR count unchanged, no branch, run.usage zero)"
+
+# The queue survives the run going terminal (B1): cancel to clean up, then the same
+# Delivered follow_up is still readable on the now-terminal run (it lives in
+# run_user_inputs, not the composer's unmounted component state).
+#
+# Terminal status is `failed`, NOT `cancelled`: a cancel consumed by a LIVE worker
+# aborts the executor's AbortController with reason "run cancelled", and the runner
+# reports every aborted run as failed (runner.ts:348-353 — its terminal ladder is
+# completed|failed only). `cancelled` is exclusively the server-side no-poller path
+# (SubmitInput's hasLivePoller=false branch, used by the queued-run cancel phase
+# above). This run is at the gate with a live worker, so the cancel is enqueued and
+# worker-consumed → failed(run cancelled), deterministically. The failure_reason
+# assertion keeps this non-vacuous: it proves the run ended because of THIS cancel,
+# not a coincidental failure.
+apipost "/api/runs/$RUN_S/inputs" '{"kind":"cancel","body":""}' >/dev/null
+wait_status "$RUN_S" failed
+[ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.failure_reason // empty')" = "run cancelled" ] \
+  || fail "a live-worker cancel must terminate the run as failed(reason=run cancelled), got reason='$(apiget "/api/runs/$RUN_S" | jq -r '.run.failure_reason // empty')'"
+[ "$(apiget "/api/runs/$RUN_S/inputs" | jq -r '.inputs[0].consumed_at')" != null ] \
+  || fail "the delivered follow_up must remain readable (and Delivered) after the run goes terminal (B1 survive-terminal)"
+pass "steer queue survives terminal: the Delivered follow_up is still listed on the now-terminal (failed: run cancelled) run (B1)"
 
 say "secret-hygiene assertions"
 LOGS="$("${COMPOSE[@]}" logs --no-color 2>&1 || true)"
@@ -2807,4 +2906,4 @@ $(printf '%s' "$tc_out" | tail -n 15)"
   pass 'the worker self-detects the sidecar and registers capabilities:["docker"] (real product path, no DOCKER_HOST bypass)'
 fi
 
-printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #47 run-health + PRD #53 rate-limits%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"
+printf '\n\033[32mAll E2E checks passed.\033[0m (M6 runtime + PRD #24 MR-close + PRD #16 skills + PRD #18 templates/tools + PRD #19 autopilot + PRD #6 CI-fix + PRD #22 PRDLESS + PRD #32 vault + PRD #39 chat + PRD #42 bounded concurrency + PRD #68 file-issue + PRD #47 run-health + PRD #53 rate-limits + PRD #95 steer-queue%s; executor=%s)\n' "${DOCKER_PROFILE:+ + PRD #83 docker sidecar}" "$EXECUTOR"

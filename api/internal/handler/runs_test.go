@@ -44,6 +44,11 @@ type runsStore struct {
 	selfUsage     store.SelfUsageRow
 	adminTotals   store.AdminUsageTotalsRow
 	adminPerUser  []store.AdminUsagePerUserRow
+	// PRD #95 steer queue: the follow_up rows ListFollowUpInputsForRun returns, and the
+	// row CreateRunInput echoes (so the richer follow-up write's id/created_at are
+	// assertable).
+	followUpInputs []store.RunUserInput
+	createInputRow store.RunUserInput
 }
 
 func (s *runsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -75,7 +80,13 @@ func (s *runsStore) ListActiveRunsAll(context.Context) ([]store.ListActiveRunsAl
 	return s.activeRuns, nil
 }
 func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) (store.RunUserInput, error) {
-	return store.RunUserInput{}, nil
+	return s.createInputRow, nil
+}
+func (s *runsStore) ListFollowUpInputsForRun(_ context.Context, runID uuid.UUID) ([]store.RunUserInput, error) {
+	if runID != s.run.ID {
+		return nil, nil
+	}
+	return s.followUpInputs, nil
 }
 func (s *runsStore) CreateStopVerdictInput(context.Context, store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
 	return store.RunUserInput{}, nil
@@ -267,6 +278,124 @@ func TestCreateRunInputIsOwnerOnly(t *testing.T) {
 	h.CreateRunInput(rec, inputReq(store.User{ID: uuid.New(), IsAdmin: true}, runID, `{"kind":"cancel"}`))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("non-owner admin steering = %d, want 404 (steering is owner-only)", rec.Code)
+	}
+}
+
+// TestListRunInputsOwnerOnly is the PRD #95 M1 authz matrix for the steer-queue read:
+// the owner sees their follow_up queue; a non-owner AND a non-owner admin (admin_ro)
+// both get 404 — GET /inputs is strict owner-only (GetRunByIDForUser), not owner-or-
+// admin, because follow-ups are never in run_messages and would otherwise leak. The
+// DTO carries body + consumed_at so the client derives Queued/Delivered; the handler
+// preserves the query's newest-first order (no re-sort, no truncation).
+func TestListRunInputsOwnerOnly(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	newer := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	older := newer.Add(-time.Hour)
+	consumed := newer.Add(30 * time.Minute)
+	st := &runsStore{
+		ownerID: owner.ID,
+		run:     store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		// Newest-first, as the query returns them: a Delivered (consumed_at set) then a
+		// Queued (consumed_at NULL). The handler must not reorder or drop either.
+		followUpInputs: []store.RunUserInput{
+			{ID: 2, RunID: runID, Kind: "follow_up", Body: pgtype.Text{String: "and the changelog", Valid: true},
+				ConsumedAt: pgtype.Timestamptz{Time: consumed, Valid: true}, CreatedAt: pgtype.Timestamptz{Time: newer, Valid: true}},
+			{ID: 1, RunID: runID, Kind: "follow_up", Body: pgtype.Text{String: "focus on the api", Valid: true},
+				CreatedAt: pgtype.Timestamptz{Time: older, Valid: true}},
+		},
+	}
+	h := newRunsHandler(t, st)
+
+	// Owner sees the queue, in the returned order, with delivery status derivable.
+	rec := httptest.NewRecorder()
+	h.ListRunInputs(rec, runReq(owner, runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner ListRunInputs = %d, want 200", rec.Code)
+	}
+	var body struct {
+		Inputs []struct {
+			ID         int64      `json:"id"`
+			Body       *string    `json:"body"`
+			ConsumedAt *time.Time `json:"consumed_at"`
+			CreatedAt  time.Time  `json:"created_at"`
+		} `json:"inputs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(body.Inputs) != 2 {
+		t.Fatalf("inputs len = %d, want 2 (no truncation): %s", len(body.Inputs), rec.Body.String())
+	}
+	// Order preserved (newest id first); the first is Delivered, the second Queued.
+	if body.Inputs[0].ID != 2 || body.Inputs[0].ConsumedAt == nil {
+		t.Errorf("inputs[0] = %+v, want id 2 delivered (consumed_at set)", body.Inputs[0])
+	}
+	if body.Inputs[1].ID != 1 || body.Inputs[1].ConsumedAt != nil {
+		t.Errorf("inputs[1] = %+v, want id 1 queued (consumed_at nil)", body.Inputs[1])
+	}
+	if body.Inputs[1].Body == nil || *body.Inputs[1].Body != "focus on the api" {
+		t.Errorf("inputs[1].body = %v, want the message text", body.Inputs[1].Body)
+	}
+
+	// A non-owner is denied (404, indistinguishable from an unknown run).
+	rec = httptest.NewRecorder()
+	h.ListRunInputs(rec, runReq(store.User{ID: uuid.New()}, runID))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("non-owner ListRunInputs = %d, want 404", rec.Code)
+	}
+
+	// A non-owner ADMIN (admin_ro) is ALSO denied: the steer read is owner-only, so an
+	// admin cannot read another user's follow-up text even though they can view the run.
+	rec = httptest.NewRecorder()
+	h.ListRunInputs(rec, runReq(store.User{ID: uuid.New(), IsAdmin: true}, runID))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("non-owner admin ListRunInputs = %d, want 404 (steer read is owner-only)", rec.Code)
+	}
+}
+
+// TestCreateRunInputFollowUpReturnsCreatedRow pins the richer follow-up write (PRD #95
+// S2): a follow_up POST returns the created row's id + created_at so the web's
+// optimistic queue entry adopts the real id; a non-follow_up input omits them.
+func TestCreateRunInputFollowUpReturnsCreatedRow(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID := uuid.New()
+	created := time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC)
+	st := &runsStore{
+		ownerID:        owner.ID,
+		run:            store.Run{ID: runID, UserID: owner.ID, Status: "running"},
+		createInputRow: store.RunUserInput{ID: 42, RunID: runID, Kind: "follow_up", CreatedAt: pgtype.Timestamptz{Time: created, Valid: true}},
+	}
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.CreateRunInput(rec, inputReq(owner, runID, `{"kind":"follow_up","body":"keep going"}`))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("follow_up = %d, want 202", rec.Code)
+	}
+	var resp struct {
+		ServerSide bool       `json:"server_side"`
+		ID         *int64     `json:"id"`
+		CreatedAt  *time.Time `json:"created_at"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp.ID == nil || *resp.ID != 42 {
+		t.Fatalf("follow_up response id = %v, want 42 (the created row)", resp.ID)
+	}
+	if resp.CreatedAt == nil || !resp.CreatedAt.Equal(created) {
+		t.Fatalf("follow_up response created_at = %v, want %v", resp.CreatedAt, created)
+	}
+
+	// An approve_plan (no selection) reports no queue row: id/created_at omitted.
+	rec = httptest.NewRecorder()
+	h.CreateRunInput(rec, inputReq(owner, runID, `{"kind":"approve_plan"}`))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("approve_plan = %d, want 202", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), `"id"`) || strings.Contains(rec.Body.String(), `"created_at"`) {
+		t.Fatalf("approve_plan response must omit id/created_at, got %s", rec.Body.String())
 	}
 }
 

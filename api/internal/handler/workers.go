@@ -553,5 +553,60 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusAccepted, apitypes.RunInputResponse{ServerSide: res.ServerSide})
+	resp := apitypes.RunInputResponse{ServerSide: res.ServerSide}
+	// A follow_up write returns the created row (PRD #95 S2) so the web's optimistic
+	// queue entry adopts the real id + timestamp. follow_up is never server-side (only
+	// cancel/reject are), so res.ID/CreatedAt are the freshly-inserted row here.
+	if req.Kind == "follow_up" {
+		id := res.ID
+		createdAt := res.CreatedAt
+		resp.ID = &id
+		resp.CreatedAt = &createdAt
+	}
+	httpx.JSON(w, http.StatusAccepted, resp)
+}
+
+// steerInputToDTO maps a follow_up run_user_inputs row to the web/CLI steer-queue DTO
+// (PRD #95). Delivery status is derived client-side from consumed_at.
+func steerInputToDTO(i store.RunUserInput) apitypes.SteerInputDTO {
+	return apitypes.SteerInputDTO{
+		ID:         i.ID,
+		Body:       textPtrValue(i.Body.Valid, i.Body.String),
+		CreatedAt:  i.CreatedAt.Time,
+		ConsumedAt: timePtr(i.ConsumedAt.Valid, i.ConsumedAt.Time),
+	}
+}
+
+// ListRunInputs returns a run's follow_up steer queue (newest-first) with delivery
+// status (PRD #95). RequireUser (so a CLI token works — Decision 8) and OWNER-ONLY:
+// the run is resolved via GetRunByIDForUser, so a non-owner — including an admin_ro
+// token on another user's run — gets 404, never an error banner. This closes a real
+// read leak (follow-ups are never mirrored into run_messages). A non-owner viewer's
+// queue card therefore renders empty/silent.
+func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid run id")
+		return
+	}
+	rows, err := h.wsvc.ListFollowUpInputs(r.Context(), user.ID, id)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrRunNotFound) {
+			httpx.Error(w, http.StatusNotFound, "run not found")
+			return
+		}
+		slog.Error("list run inputs", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	out := make([]apitypes.SteerInputDTO, 0, len(rows))
+	for _, i := range rows {
+		out = append(out, steerInputToDTO(i))
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": out})
 }
