@@ -28,7 +28,7 @@ You may be dispatched as one of several coders working in parallel in the
 same worktree. When your delegation prompt assigns you a file scope, treat it
 as a hard boundary: create and edit files only within it, and if the task
 genuinely requires touching anything outside it — including shared files like
-go.mod, lockfiles, generated code, or wiring and registration files — stop and
+lockfiles, generated code, or wiring and registration files — stop and
 report that instead of editing it. In parallel mode do not run `git commit`,
 and do not run build or test commands unless they cover only code you
 exclusively own; otherwise just report your edits — the lead integrates,
@@ -56,4 +56,6 @@ worker/runtime feature is not done just because compose works. Remote is GitLab
 `gitlab.example.com:vtmocanu/uzi` (`env -u GITLAB_TOKEN glab`, never `gh`/`tea`).
 Goose migration numbers are draft until merge — renumber above the live head on landing.
 In linked worktrees a bare `go build` can fail on VCS stamping; use `-buildvcs=false`
-locally, never commit it.
+locally, never commit it. In parallel mode, the shared files to stop-and-report on here
+(rather than edit) are `api/go.mod`/`go.sum`, sqlc-generated code, `docker-compose.yml`,
+and `.env.example` — the lead does one consolidated edit after the parallel units land.
