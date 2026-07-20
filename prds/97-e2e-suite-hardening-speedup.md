@@ -139,7 +139,15 @@ carry explicit author sign-off:
 
 ## Milestones
 
-- [ ] **M1 — git Basic-auth default + `main`-push backstop** (highest value):
+- [x] **M1 — git Basic-auth default + `main`-push backstop** (highest value)
+      — DONE `1e4d88cf`; reviewer APPROVE + auditor PASS; both full harness lanes
+      green (default 171/0, `E2E_GIT_SMART_HTTP=1` 172/0, previously red at #42).
+      Recommend a human re-run of both lanes on the target host before merge (neither
+      validator re-ran the ~20-min stack). Impl notes: single-repo M1 phase drops
+      insteadOf mode-aware (restored byte-identically), worker push traverses
+      forge-fake's Basic gate, non-vacuous receive-pack counter positive control;
+      pre-receive `refs/heads/main`-reject hook in both bares (explicit `chmod 0755`,
+      installed after the seed push, force/delete/alt-refspec bypasses all closed):
       make the worker's git-over-HTTPS Basic-auth push run on **every** default run
       via a **second push pass** against the smart-HTTP remote, scoped to a
       single-repo phase (Decision 1 — a happy-path flip is NOT viable; forge-fake's
