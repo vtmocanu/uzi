@@ -201,7 +201,17 @@ carry explicit author sign-off:
       `:2843`), and a blanket retry could double-execute a write after an ambiguous
       failure. Tighten the weak Forgejo `<16` secondary grep (`:689`, the `version`
       alternative matches almost anything).
-- [ ] **M4 — drop / downgrade verified-redundant phases**: with each redundancy
+- [ ] **M4 — drop / downgrade verified-redundant phases**:
+      > ⚠️ **The `run-e2e.sh` line numbers below are as-of-drafting and are now STALE** —
+      > the file grew ~400 lines across M1/M2/M3/M5/M8 and will shift again as M4 drops
+      > phases. **Navigate by CONTENT** (the phase's `say "…"` header), never by these
+      > refs. Concretely dangerous example: `:2182` was cited for #94 triage, but at the
+      > post-M8 tip `:2182` is the PRD #6 cross-kind **409 race** line — an
+      > `apipost_code` site that must NOT be touched. Verified stale as of 2026-07-20:
+      > #16 `:870`→`:941-966` (leg 4 = `:966`), #46 Phase B `:2085`→`:2445`,
+      > #53 `:2832`→~`:3284-3331`, #33 `:1392` and #40 `:1023` likewise moved.
+
+      With each redundancy
       confirmed against the named lower-layer test —
       - PRD #94 triage (`:2182`) → **drop** (covered by
         `store/recommendation_dispositions_integration_test.go` +
