@@ -115,9 +115,12 @@ export class SteeringChannel {
 
   /**
    * Advance to a new revision round (PRD #41): increment the epoch and return it. The
-   * runner's gatePlan calls this WHEN A REVISE IS TAKEN — i.e. right before it re-reports
-   * awaiting_approval for the next plan version — so that any verdict written against the
-   * plan version just superseded (e.g. an approve batched with the revise) goes stale.
+   * runner's gatePlan calls this AT THE awaiting_approval RE-report — immediately AFTER
+   * reporting the next plan version and before it awaits the new round — NOT when the
+   * revise is dequeued. The revision planning turn runs BETWEEN rounds; bumping when the
+   * revise is taken would leave that whole window at the new epoch, so an approve clicked
+   * mid-revision would be accepted at the v2 gate (a plan no human saw). Bumping at the
+   * re-report stamps such a mid-revision approve at the PRIOR epoch, so it goes stale.
    * The FIRST round is not bumped (epoch 0), so a verdict already sitting in the consume-
    * on-read /inputs queue when the gate opens still applies to the initial plan. The
    * executor drives the revision loop through ctx.gatePlan:
@@ -125,7 +128,7 @@ export class SteeringChannel {
    *   let v = await gatePlan(planMd);          // runner: awaitGateEvent at current epoch
    *   while (v.kind === "revise") {            // feedback → run a fresh plan turn
    *     const newPlan = await revise(v.feedback);
-   *     v = await gatePlan(newPlan);           // runner bumped the epoch on the revise
+   *     v = await gatePlan(newPlan);           // runner bumps the epoch at the v2 re-report
    *   }
    */
   bumpEpoch(): number {

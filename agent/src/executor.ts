@@ -365,6 +365,10 @@ export class StubExecutor implements Executor {
       }
       if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
       if (verdict.kind === "cancel") throw new Error("run cancelled");
+      // Fail closed: only an approve may proceed to implement. revise exits the loop
+      // above; reject/cancel throw here. `verdict` is now narrowed to `approve` — if a
+      // future PlanVerdict variant is added, this line stops type-checking, forcing it to
+      // be handled rather than silently falling through to implementing an unapproved plan.
       if (notCode) {
         ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub diagnosis: not a code problem" } });
         return { branch: ctx.branch, fixVerdict: "not_code" };

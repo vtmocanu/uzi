@@ -484,8 +484,10 @@ export class RunRunner {
    *  since a self-approved run never receives an approve_plan input to carry one.
    *
    *  PRD #41 plan revision: this is called ONCE PER ROUND by the executor's gate loop.
-   *  Each call bumps the steering epoch (so a verdict written against the previous plan
-   *  version goes stale) and awaits the epoch-aware event. A `revise` verdict is RETURNED
+   *  A RE-gate (every round after the first) bumps the steering epoch at the re-report,
+   *  so a verdict written against the previous plan version goes stale; the first gate
+   *  does not bump (epoch 0). Each call then awaits the epoch-aware event. A `revise`
+   *  verdict is RETURNED
    *  to the caller — the executor runs a fresh plan turn with the feedback and calls
    *  gatePlan again; approve/reject/cancel are terminal. The 24h approval budget is an
    *  ABSOLUTE deadline computed on the first entry and threaded across rounds, so N
