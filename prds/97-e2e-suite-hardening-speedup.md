@@ -211,6 +211,28 @@ carry explicit author sign-off:
       > #16 `:870`→`:941-966` (leg 4 = `:966`), #46 Phase B `:2085`→`:2445`,
       > #53 `:2832`→~`:3284-3331`, #33 `:1392` and #40 `:1023` likewise moved.
 
+      > ⚠️ **CITATION CORRECTIONS (2026-07-20) — several drop justifications below are
+      > WRONG or INCOMPLETE. Verify against the code, not against this list.** Found by
+      > applying a reverse audit (enumerate what each phase *actually* asserts, then check
+      > each leg has a home) rather than only checking that the cited tests cover the
+      > listed properties. The latter passes even when the listed properties don't
+      > *exhaust* the phase — which is exactly how a coverage-removing change leaks.
+      > - **#94**: the cited tests do NOT cover the per-review `.review.triage.false_positives`
+      >   counter (`reviewToDTO` builds its own triage rows; `TestJudgeStatsAggregateLadder`
+      >   covers only the GLOBAL strip). Closed by a new `TestGetRunReviewPerReviewTriage`.
+      > - **#16 leg 3** (non-admin `PUT /api/agent-templates/{id}/skills`→403): `TestAllocatableRules`
+      >   tests *which skills may be allocated*, NOT the admin gate (`skill_allocations.go:105-107`).
+      >   `SetTemplateSkills` has **no test at all**. This e2e leg is RESTORED, not dropped —
+      >   so #16 keeps **two** legs (repos-PATCH + template-skills-403).
+      > - **#33**: the cited IT covers the SQL stamping but NOT that `runToDTO`
+      >   (`workers.go:166`) surfaces `stop_kind` on `GET /api/runs/{id}`. Closed by a new
+      >   `TestRunToDTOStopKind`.
+      > - **#16 leg 1** (other user's private skill→404): covered, but NOT by the cited
+      >   helper — `GetSkill` never calls `authorizeSkillWrite`; the real home is
+      >   `TestSkillsVisibilityLiveDB` (SQL visibility filter → ErrNoRows → 404).
+      >
+      > Net effect: the drop is **182 → 173** (−9), not the −10 first scoped.
+
       With each redundancy
       confirmed against the named lower-layer test —
       - PRD #94 triage (`:2182`) → **drop** (covered by
