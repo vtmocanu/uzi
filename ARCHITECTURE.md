@@ -558,6 +558,13 @@ that are load-bearing, not incidental: **Origin validation** on the upgrade
 REST enforces, checked again here since a WS subscription is a second entry
 point into the same data.
 
+The run view's activity pane (crew roster, collapsed-by-default logs, the
+steer queue) is a pure client derivation over this stream plus `run.health`
+(PRD #47) and a data-less `input` frame that mirrors `health`'s
+re-read-on-signal shape — no new server-pushed state. See
+[docs/run-activity.md](docs/run-activity.md) and
+[docs/run-health.md](docs/run-health.md).
+
 ## Slack integration (outbound-only)
 
 uzi's fourth surface is a Slack bot, owned entirely by `api` (`api/internal/slacksvc`, PRD #25): per-user run DMs, plan-approval buttons, and reply-from-Slack steering. It adds no new service and no new inbound port — the trust posture below is why. Full design rationale lives in the PRD (`prds/25-slack-integration.md`, especially its Security posture and Decision Log); user-facing setup is [docs/slack.md](docs/slack.md).
