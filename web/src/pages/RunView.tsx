@@ -409,6 +409,7 @@ export function RunView() {
       <SteerQueueCard
         inputs={inputs}
         terminal={terminal}
+        status={run.status}
         busy={busy}
         onStop={() => act(() => submit("cancel"))}
         onSend={(text) => act(() => submit("follow_up", text))}
