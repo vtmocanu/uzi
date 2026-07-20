@@ -281,3 +281,13 @@ export const KeyIcon = (p: SVGProps<SVGSVGElement>) => (
     <path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4" />
   </Icon>
 );
+
+// ScaleIcon: a lucide "scale" glyph — the ⚖ balance the judge grammar already uses on
+// the /runs badge (PRD #98). Used for the Judge nav entry and page header.
+export const ScaleIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z" />
+    <path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z" />
+    <path d="M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" />
+  </Icon>
+);

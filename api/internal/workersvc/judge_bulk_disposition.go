@@ -169,12 +169,18 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 	// the day someone relaxes the DISTINCT ON or adds a second caller of the write.
 	//
 	// AND IT ADDED A NEW WAY TO BE WRONG, which is the honest price of the layering rule.
-	// Divergence between the two layers is ASYMMETRIC:
-	//   * a wrong SQL key is MASKED here — this still keys on the conflict key, so the
-	//     statement stays legal. Degraded, not broken.
-	//   * a wrong key HERE is NOT masked by SQL. This pass runs downstream and can REMOVE
-	//     members the query correctly kept — silently under-disposing, with no error and no
-	//     crash, just some runs left unsettled.
+	// Divergence between the two layers is ASYMMETRIC, and the SQL side splits in two —
+	// "a wrong SQL key" is not one outcome (measured, PRD #98 review AL, not reasoned):
+	//   * a REMOVED SQL guard (delete the DISTINCT ON entirely) is fully MASKED here: this
+	//     pass still dedupes on the conflict key, so the write is CORRECT, not merely legal —
+	//     the whole live-DB suite stays green and the Go layer is silently doing the work.
+	//   * a NARROWED SQL key (DISTINCT ON (rr.category, rr.target), dropping rv.id) is NOT
+	//     masked at all: SQL drops rows this pass never sees, and Go cannot restore what SQL
+	//     already discarded, so three live-DB tests fail loudly (updated = 1 want 3; scope;
+	//     idempotency). Only "the statement stays legal" is true of BOTH.
+	//   * a wrong key HERE is NOT masked by SQL either. This pass runs downstream and can
+	//     REMOVE members the query correctly kept — silently under-disposing, with no error
+	//     and no crash, just some runs left unsettled.
 	// So this is the layer that must carry the test, and it does
 	// (TestBulkDispositionDedupesMembersWithinAReview, including the negative control that
 	// a pair-shaped key would collapse the cross-run fan-out). "Add a second layer" is not

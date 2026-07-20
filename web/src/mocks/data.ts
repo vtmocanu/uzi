@@ -384,6 +384,110 @@ export const mockReviews: MockReview[] = [
     // rec-5), of which 1 is a false positive (rec-5). Recomputed by mockApi on mutation.
     triage: { total: 5, todo: 1, filed: 1, done: 1, dismissed: 2, false_positives: 1 },
   },
+  // ── Two more reviews so the Judge menu (PRD #98 M3) demos dedup across runs ──────
+  // These share coordinates with rev-done so the by-target grouping has something to
+  // dedup: `improve_uzi / api/internal/poller` recurs in all three runs (the frequency
+  // signal, top of To triage), `install_worker_tool / shellcheck` is DONE in run-done
+  // but TODO here (a PARTIALLY-SETTLED group — some occurrences settled, some open, the
+  // shape the rollup and the scope=open fan-out hinge on), and `add_agent / deploy-agent`
+  // is filed in two runs (a Filed-tab group seen in 2 runs).
+  {
+    id: "rev-closed",
+    target_run_id: "run-closed",
+    verdict: "issues",
+    summary_md:
+      "The retry landed, but the worker was still missing shellcheck and the first poll tick lagged — both recurring across recent runs.",
+    judge_model: "haiku",
+    status: "complete",
+    created_at: minsAgo(120),
+    updated_at: minsAgo(120),
+    recommendations: [
+      {
+        id: "rc-1",
+        category: "install_worker_tool",
+        // Same coordinate as rev-done's rec-1 (done there) → this group is partially
+        // settled: rolls up To triage because THIS occurrence is open.
+        target: "shellcheck",
+        rationale_md: "`shellcheck` was missing again on this run's worker image — the second run to hit it.",
+        confidence: "high",
+        created_at: minsAgo(120),
+      },
+      {
+        id: "rc-2",
+        category: "improve_uzi",
+        target: "api/internal/poller",
+        rationale_md: "Queue-to-claim latency again dominated the run's wall time; a webhook path keeps coming up.",
+        confidence: "medium",
+        created_at: minsAgo(120),
+      },
+      {
+        id: "rc-3",
+        category: "enable_tool",
+        target: "ripgrep",
+        rationale_md: "The agent shelled out to `grep -r` repeatedly; enabling ripgrep would speed the search phase.",
+        confidence: "low",
+        created_at: minsAgo(120),
+      },
+    ],
+    filed_issues: [],
+    dispositions: [],
+    // All three open → todo 3.
+    triage: { total: 3, todo: 3, filed: 0, done: 0, dismissed: 0, false_positives: 0 },
+  },
+  {
+    id: "rev-cancelled",
+    target_run_id: "run-cancelled",
+    verdict: "ok",
+    summary_md: "A short run; the healthcheck landed cleanly. The poller latency note recurs, and a template tweak is worth doing.",
+    judge_model: "haiku",
+    status: "complete",
+    created_at: daysAgo(3),
+    updated_at: daysAgo(3),
+    recommendations: [
+      {
+        id: "rx-1",
+        category: "improve_uzi",
+        // Third occurrence of the poller coordinate → "seen in 3 runs", the top group.
+        target: "api/internal/poller",
+        rationale_md: "Same first-poll latency as the other runs — this is the most-recurring recommendation in your backlog.",
+        confidence: "medium",
+        created_at: daysAgo(3),
+      },
+      {
+        id: "rx-2",
+        category: "add_agent",
+        // Same coordinate as rev-done's rec-4 (also filed) → a Filed-tab group seen in 2.
+        target: "deploy-agent",
+        rationale_md: "The deploy step was hand-rolled here too; a dedicated deploy-agent would standardize it.",
+        confidence: "medium",
+        created_at: daysAgo(3),
+      },
+      {
+        id: "rx-3",
+        category: "adjust_template",
+        target: "coder",
+        rationale_md: "The coder re-ran a failing test without reading the error; a template line to read the error first would help.",
+        confidence: "low",
+        created_at: daysAgo(3),
+      },
+    ],
+    // deploy-agent filed here → a Filed-tab group seen in 2 runs.
+    filed_issues: [
+      {
+        category: "add_agent",
+        target: "deploy-agent",
+        issue_iid: 88,
+        issue_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/88",
+        filed_at: daysAgo(3),
+      },
+    ],
+    // coder marked done → a Done-tab group.
+    dispositions: [
+      { category: "adjust_template", target: "coder", status: "done", reason: "", set_at: daysAgo(2), stale: false },
+    ],
+    // total 3: todo 1 (rx-1), filed 1 (rx-2), done 1 (rx-3), dismissed 0.
+    triage: { total: 3, todo: 1, filed: 1, done: 1, dismissed: 0, false_positives: 0 },
+  },
 ];
 
 // ── Secrets ──────────────────────────────────────────────────────────────────

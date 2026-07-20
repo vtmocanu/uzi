@@ -2,6 +2,14 @@
 
 **GitLab Issue**: [#98](https://gitlab.example.com/vtmocanu/uzi/-/issues/98)
 **Status**: In progress (2026-07-20) — branch `feature/prd-98-judge-menu`. **M8's e2e leg is deferred** until PRD #97 (e2e suite hardening) merges: it rewrites ~450 lines of `e2e/run-e2e.sh` and this PRD's e2e leg must be written against its `create_run` / `retry_read` / positive-control conventions, not the pre-#97 ones.
+
+**Progress (2026-07-20, end of day)** — 4 of 8 milestones landed on `feature/prd-98-judge-menu`, no MR yet:
+- **Done**: M1 (`0874d3f6`), M2 (`30204a61`, rewritten to one atomic statement in `082d8651`/`c962435d`), M6 (`d6a8545c`), M4 (`1da5ac32`). All reviewed **and** audited; the full Go + web + live-DB gates pass at the tip.
+- **In progress**: M3 (Judge page + nav) — the largest remaining milestone, first substantial `web/` surface. Handoff notes for it live in `.claude/agent-team-tasks/prd-98-m3-checkpoint.md`.
+- **Not started**: M7 (CLI), M5 (notification retarget — depends on M3's route), M8a (vitest + docs + specs). **M8b (e2e) stays blocked** on #97.
+- **One Blocking bug** found and fixed before merge: a duplicate-coordinate `SQLSTATE 21000` crash on legal judge output, invisible to fakes (the M2 fan-out collapse; fixed with `DISTINCT ON` on the resolved member set, `c962435d`).
+- **Open follow-ups**: **AK** — a bucket-literal→constant sweep is partial; the producer side (`BucketOf` in `triage.go`, #94's shared helper) is deliberately left as a cross-PRD change, with `TestBucketConstantsMatchTheLadder` pinning the coupling meanwhile. **AL** — a comment-precision split in `judge_bulk_disposition.go`. Both tracked in the M3 checkpoint.
+- The Design Decisions and Risks below were **corrected repeatedly against the code during implementation** and are current; several load-bearing claims (the `?run=` semi-join, the `EXPLAIN`-measured backlog cost, the `set_via` provenance mirror, the two-layer dedup asymmetry) were rewritten after being disproved by execution rather than review.
 **Priority**: Medium
 **Mockup**: static concept mock (ember shell + buckets + worklist + the three deltas) at the design artifact; **note** it renders the worklist grouped *by run* — a precursor. This PRD supersedes that with **group-by-target + dedup** (Decision 2); a revised in-repo mock lands with M3 as `prds/mockups/98-judge-menu-mock.html`.
 **Depends on**: PRD #46 (the judge: `run_reviews` + `review_recommendations`, `users.judge_enabled`), PRD #68 (`recommendation_filed_issues`, the coordinate-keyed claim-first file flow), PRD #94 (`recommendation_dispositions`, the `bucketOf` ladder, `GET /me/judge/stats`, the global RunsList strip this promotes). Related: PRD #64 (the `uzi` CLI, second consumer), PRD #69 (the judge **control plane** — mode/model/spend/accuracy/consent; this PRD is the complementary output workbench, cleanly separable — see Decision 5's digest-scope note), PRD #47 (RunHealth badge — the per-row badge grammar this mirrors).
@@ -576,7 +584,13 @@ exactly as #68 already does.
       test asserts at the **DB level** (their row unchanged), not on HTTP status:
       with coordinates there is no id to 404 on, so a status-only assertion is
       vacuous.
-- [ ] **M3 — Judge page + nav (web)**: route `/judge` (with the `?run=` filter for
+- [x] **M3 — Judge page + nav (web)** — DONE; review pending. Web gates green
+      (`typecheck` + 837 vitest). **One interpretation to confirm:** an anchored
+      deep-link (`/judge?run={id}`) with no explicit `?bucket=` defaults to the `all`
+      bucket, not `todo`, so a notification reliably shows that run's recs even when its
+      coordinates rolled up settled elsewhere (dedup); un-anchored still defaults `todo`.
+      The AL comment-precision fix in `judge_bulk_disposition.go` is folded into this
+      commit.: route `/judge` (with the `?run=` filter for
       the notification deep-link); `<NavItem>` in the Factory group with the
       `triage.todo` badge poll (Decisions 8/9); bucket tabs from `triage`; the
       deduped worklist (group rows + "seen in N runs" + occurrence expander +

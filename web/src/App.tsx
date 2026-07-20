@@ -23,6 +23,7 @@ import { Board } from "./pages/Board";
 import { IssueView } from "./pages/IssueView";
 import { RunsList } from "./pages/RunsList";
 import { RunView } from "./pages/RunView";
+import { Judge } from "./pages/Judge";
 import { Notifications } from "./pages/Notifications";
 import { ChatList, ChatConversation } from "./pages/Chat";
 import { WorkersSettings } from "./pages/WorkersSettings";
@@ -127,6 +128,16 @@ export default function App() {
           element={
             <ProtectedRoute>
               <RunView />
+            </ProtectedRoute>
+          }
+        />
+        {/* PRD #98: the cross-run recommendation workbench. ?run= is the judge
+            notification deep-link anchor. */}
+        <Route
+          path="/judge"
+          element={
+            <ProtectedRoute>
+              <Judge />
             </ProtectedRoute>
           }
         />

@@ -154,3 +154,81 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     await expect(api.rerunJudge("run-queued")).rejects.toMatchObject({ status: 422 });
   });
 });
+
+describe("mockApi judge backlog (PRD #98 M3)", () => {
+  it("dedups by (category, target) across runs, ranks by frequency, and can express a PARTIALLY-settled group", async () => {
+    installStorage();
+    const api = await reload();
+
+    const all = await api.getJudgeBacklog("all");
+    const byCoord = (c: string, t: string) => all.groups.find((g) => g.category === c && g.target === t);
+
+    // poller recurs in all three seeded runs → the top group by frequency.
+    const poller = byCoord("improve_uzi", "api/internal/poller")!;
+    expect(poller.run_count).toBe(3);
+    expect(poller.open_count).toBe(3);
+    expect(poller.bucket).toBe("todo");
+    expect(all.groups[0]).toBe(poller); // ranked first (run_count desc)
+
+    // shellcheck is the PARTIALLY-settled group: DONE in run-done, TODO in run-closed. The
+    // fixture must be able to construct this before any test leans on it (checkpoint).
+    const shellcheck = byCoord("install_worker_tool", "shellcheck")!;
+    expect(shellcheck.run_count).toBe(2);
+    expect(shellcheck.open_count).toBe(1); // one open member among two
+    expect(shellcheck.bucket).toBe("todo"); // any open member → the group rolls up To triage
+    const buckets = shellcheck.occurrences.map((o) => o.bucket).sort();
+    expect(buckets).toEqual(["done", "todo"]);
+
+    // The canonical triage is the SAME query getJudgeStats serves — the two cannot drift.
+    const stats = await api.getJudgeStats();
+    expect(all.triage).toEqual(stats);
+    expect(stats.todo).toBe(5); // per-recommendation, > the 3 open group rows
+  });
+
+  it("the ?run= anchor keeps only groups recurring in that run but preserves their other-run occurrences", async () => {
+    installStorage();
+    const api = await reload();
+
+    const anchored = await api.getJudgeBacklog("all", "run-closed");
+    const coords = anchored.groups.map((g) => `${g.category}/${g.target}`).sort();
+    // run-closed's review carries poller, shellcheck, ripgrep — and nothing else survives.
+    expect(coords).toEqual([
+      "enable_tool/ripgrep",
+      "improve_uzi/api/internal/poller",
+      "install_worker_tool/shellcheck",
+    ]);
+    // poller still shows ALL three of its occurrences (the recurrence is the whole point).
+    const poller = anchored.groups.find((g) => g.target === "api/internal/poller")!;
+    expect(poller.run_count).toBe(3);
+
+    // A foreign / unknown run matches nothing (no existence oracle) — never a 404.
+    const foreign = await api.getJudgeBacklog("all", "does-not-exist");
+    expect(foreign.groups).toEqual([]);
+  });
+
+  it("scope=open dispositions ONLY the open members; `updated` counts triples, lower than the visible span", async () => {
+    installStorage();
+    const api = await reload();
+
+    // shellcheck spans 2 occurrences (done + todo). scope=open touches only the open one,
+    // so `updated` is 1 — deliberately lower than the 2 the group visibly spans.
+    const res = await api.bulkSetJudgeDisposition(
+      [{ category: "install_worker_tool", target: "shellcheck" }],
+      "dismissed",
+      "wont_do",
+      "open",
+    );
+    expect(res.updated).toBe(1);
+    // The group is RE-READ at bucket=all and comes back with its new rollup: the done member
+    // remains, the once-open member is now dismissed → highest rung (dismissed) wins.
+    const g = res.groups.find((x) => x.target === "shellcheck")!;
+    expect(g.bucket).toBe("dismissed");
+    expect(g.open_count).toBe(0);
+    // The done member was NOT overwritten (scope=open left it).
+    expect(g.occurrences.map((o) => o.bucket).sort()).toEqual(["dismissed", "done"]);
+
+    // Canonical counts moved: one left To triage, one joined Dismissed.
+    expect(res.triage.todo).toBe(4);
+    expect(res.triage.dismissed).toBe(3);
+  });
+});

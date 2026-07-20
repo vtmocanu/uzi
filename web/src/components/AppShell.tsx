@@ -33,6 +33,7 @@ import {
   HomeIcon,
   LogOutIcon,
   MenuIcon,
+  ScaleIcon,
   ServerIcon,
   SkillIcon,
   UsersIcon,
@@ -178,12 +179,17 @@ function SidebarContent({
   collapsed = false,
   onToggleCollapse,
   unread = 0,
+  judgeTodo = 0,
 }: {
   onNavigate?: () => void;
   // Desktop-only icon-rail mode. The mobile sheet always renders expanded (it is
   // already a full-width overlay) and passes neither prop.
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  // Judge to-triage count for the Judge nav badge (PRD #98). Owned by AppShell alongside
+  // `unread`, sourced from /me/judge/stats.todo — the ONE canonical number, so the badge
+  // agrees with the Judge page's To-triage tab and the judge notification to the digit.
+  judgeTodo?: number;
   // Notifications unread count for the bell badge (PRD #46 M2). Owned by the
   // parent AppShell so the single poll feeds both this badge and the status
   // favicon (PRD #70), and both sidebar instances (desktop + mobile) share it.
@@ -305,6 +311,9 @@ function SidebarContent({
           <NavItem to="/agents" icon={<BotIcon />} label="Agents" onNavigate={onNavigate} collapsed={collapsed} />
           <NavItem to="/skills" icon={<SkillIcon />} label="Skills" onNavigate={onNavigate} collapsed={collapsed} />
           <NavItem to="/settings/workers" icon={<ServerIcon />} label="Workers" onNavigate={onNavigate} collapsed={collapsed} />
+          {/* Judge (PRD #98): the cross-run recommendation workbench. Badge is the
+              to-triage backlog count — the same number the page's To-triage tab shows. */}
+          <NavItem to="/judge" icon={<ScaleIcon />} label="Judge" badge={judgeTodo} onNavigate={onNavigate} collapsed={collapsed} />
         </NavGroup>
 
         <NavGroup label="Configure" collapsed={collapsed}>
@@ -495,6 +504,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   // return — so a single poll feeds both the bell badge (passed to each
   // SidebarContent) and the status favicon, and it survives across routes.
   const [unread, setUnread] = useState(0);
+  // Judge to-triage badge (PRD #98). Owned here alongside `unread`, from
+  // /me/judge/stats.todo — the ONE canonical to-triage number, so the nav badge agrees
+  // with the Judge page's To-triage tab and the judge notification.
+  const [judgeTodo, setJudgeTodo] = useState(0);
   // Desktop sidebar collapse, persisted per browser. Initialised lazily from
   // localStorage so the first paint already matches the stored state — a
   // post-mount effect would flash the sidebar expanded then snap it collapsed.
@@ -524,6 +537,26 @@ export function AppShell({ children }: { children: ReactNode }) {
     return () => {
       alive = false;
       off();
+    };
+  }, [user, location.pathname]);
+
+  // Judge to-triage poll (PRD #98): the same on-navigation cadence as the unread poll
+  // above, reading the canonical /me/judge/stats.todo. A failed fetch keeps the last
+  // known count rather than blanking the badge.
+  useEffect(() => {
+    if (!user) {
+      setJudgeTodo(0);
+      return;
+    }
+    let alive = true;
+    api
+      .getJudgeStats()
+      .then((stats) => {
+        if (alive) setJudgeTodo(stats.todo);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
     };
   }, [user, location.pathname]);
 
@@ -560,6 +593,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           collapsed={collapsed}
           onToggleCollapse={() => setCollapsed((c) => !c)}
           unread={unread}
+          judgeTodo={judgeTodo}
         />
       </aside>
 
@@ -591,7 +625,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <XIcon />
             </button>
-            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} />
+            <SidebarContent onNavigate={() => setMobileOpen(false)} unread={unread} judgeTodo={judgeTodo} />
           </div>
         </div>
       )}

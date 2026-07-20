@@ -1018,6 +1018,99 @@ export interface IssueDraft {
   default_note: string;
 }
 
+// ── Judge menu — cross-run recommendation backlog (PRD #98) ──────────────────
+// The Judge page reads the caller's recommendations deduped by (category, target)
+// across all their runs, and disposes a whole group in one call. Every free-text
+// field below (rationale_preview, run_title, target) is UNTRUSTED judge/worker
+// output, shipped as PLAIN TEXT and rendered as escaped React text (never Markdown /
+// dangerouslySetInnerHTML) — the no-raw-render guarantee is CLIENT-side, matching
+// RunView's handling of the same fields.
+
+// The ?bucket= filter matches the GROUP rollup, not a member. "all" is unfiltered;
+// the other four are the #94 ladder's rungs. Default is "todo".
+export type JudgeBacklogBucket = "todo" | "filed" | "done" | "dismissed" | "all";
+
+// Disposition scope for the bulk fan-out (PRD #98 Decision 3). "open" (default) only
+// touches members the ladder buckets as todo — a filed/settled member is left alone;
+// "all" re-asserts across every member.
+export type JudgeDispositionScope = "open" | "all";
+
+// JudgeFiledIssueRef is the settled forge issue a single occurrence was filed as
+// (PRD #98 M1). Present only on a settled link; absent for a never-filed or in-flight
+// coordinate. Coordinate-free — the enclosing group carries (category, target).
+export interface JudgeFiledIssueRef {
+  issue_iid: number;
+  issue_url: string;
+  filed_at: string;
+}
+
+// JudgeOccurrence is one run's instance of a deduped recommendation (PRD #98
+// Decision 2). Triage state stays PER-COORDINATE, so each occurrence carries its own
+// bucket and its own filed link. rec_id + run_id are what the per-recommendation
+// File-issue draft (#68) needs from the occurrence expander.
+export interface JudgeOccurrence {
+  run_id: string;
+  run_title: string;
+  review_id: string;
+  rec_id: string;
+  verdict: ReviewVerdict;
+  confidence: "" | "low" | "medium" | "high";
+  bucket: JudgeBacklogBucket;
+  filed_issue?: JudgeFiledIssueRef;
+}
+
+// JudgeRecommendationGroup is one (category, target) coordinate deduped across every
+// run it recurs in (PRD #98 Decisions 1/2) — the Judge menu's row. open_count is the
+// number of members whose bucket is todo; run_count is the DISTINCT run count ("seen
+// in N runs", the frequency signal the backlog ranks by); bucket is the group rollup
+// (todo whenever open_count >= 1, else the highest member rung).
+export interface JudgeRecommendationGroup {
+  category: RecommendationCategory;
+  target: string;
+  bucket: JudgeBacklogBucket;
+  open_count: number;
+  run_count: number;
+  rationale_preview: string;
+  occurrences: JudgeOccurrence[];
+}
+
+// JudgeBacklog is GET /api/me/judge/recommendations (PRD #98 M1). `bucket` echoes the
+// applied filter and `run` the ?run= anchor (""" when absent). `triage` is the
+// canonical GET /me/judge/stats aggregate — NEVER tallied from `groups` — so the page
+// tabs, the nav badge and the notification cannot drift; it survives both filters and
+// truncation. `truncated` says the hard row cap bit: when true a SURVIVING group's
+// counts/rollup may be understated, so a truncated page is never authoritative.
+export interface JudgeBacklog {
+  bucket: JudgeBacklogBucket;
+  run: string;
+  groups: JudgeRecommendationGroup[];
+  truncated: boolean;
+  triage: TriageCounts;
+}
+
+// JudgeDispositionCoord is one requested (category, target) coordinate for the bulk
+// fan-out. It is the caller's REQUEST — nothing here is written; the server writes off
+// the resolved rows.
+export interface JudgeDispositionCoord {
+  category: RecommendationCategory;
+  target: string;
+}
+
+// JudgeDispositionResult is the response to the bulk group disposition (PRD #98 M2).
+// `updated` counts member (review_id, category, target) TRIPLES, so it can be LOWER
+// than the recommendations a group visibly spans — "dismissed a group of 5, said 4"
+// is correct, not a bug. `groups` are the acted-on coordinates RE-READ at bucket=all,
+// so a group that just left To triage still returns with its new rollup and the row
+// re-renders rather than vanishing. `truncated`: past the cap a settled coordinate can
+// fall outside the read window and have NO group here — treat a missing group as
+// UNKNOWN, not settled.
+export interface JudgeDispositionResult {
+  updated: number;
+  groups: JudgeRecommendationGroup[];
+  truncated: boolean;
+  triage: TriageCounts;
+}
+
 // ── Self-improvement config (PRD #46 M5) ─────────────────────────────────────
 // The admin-facing view of the autonomous self-improvement job. repo_path /
 // user_email are display-only resolutions of the ids; last_run_at is the durable
@@ -1618,7 +1711,40 @@ const realApi = {
   // getJudgeStats is the global "across all your runs" backlog tally (RequireUser,
   // owner-scoped, all-time). It DELIBERATELY ignores any list filter — it is a global
   // backlog, not the filtered view — and is bucketed by the same Go ladder as `triage`.
+  // Feeds the Judge nav badge (via .todo) and the /runs list strip's successor.
   getJudgeStats: () => request<TriageCounts>("GET", "/me/judge/stats"),
+
+  // ── Judge menu — cross-run backlog + bulk disposition (PRD #98) ─────────────
+  // getJudgeBacklog reads the deduped, grouped backlog (RequireUser, owner-scoped, no
+  // token spend). bucket filters the group ROLLUP (default todo server-side); run is
+  // the notification deep-link anchor (/judge?run={id}) — it keeps groups recurring in
+  // that run while preserving their other-run occurrences. `triage` in the response is
+  // the canonical count; render it, never re-derive from `groups`.
+  getJudgeBacklog: (bucket?: JudgeBacklogBucket, run?: string) => {
+    const qs = new URLSearchParams();
+    if (bucket) qs.set("bucket", bucket);
+    if (run) qs.set("run", run);
+    const suffix = qs.toString();
+    return request<JudgeBacklog>("GET", `/me/judge/recommendations${suffix ? `?${suffix}` : ""}`);
+  },
+  // bulkSetJudgeDisposition fans one verdict out to every member coordinate of the
+  // given groups (RequireUser, owner-only, idempotent, no token spend, no forge write).
+  // reason is REQUIRED iff dismissed and MUST be omitted for done (mirrors the per-rec
+  // route). scope defaults to "open" (settle only todo members; leave settled ones).
+  // Returns updated count + the acted-on groups re-read at bucket=all + the recomputed
+  // triage — enough to update rows AND the badge from one round-trip.
+  bulkSetJudgeDisposition: (
+    items: JudgeDispositionCoord[],
+    status: "done" | "dismissed",
+    reason?: "wont_do" | "not_an_issue",
+    scope: JudgeDispositionScope = "open",
+  ) =>
+    request<JudgeDispositionResult>("PUT", "/me/judge/recommendations/disposition", {
+      items,
+      status,
+      scope,
+      ...(status === "dismissed" ? { reason } : {}),
+    }),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/
