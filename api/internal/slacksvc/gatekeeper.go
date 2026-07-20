@@ -21,7 +21,12 @@ type GateStore interface {
 	// the confirmed filter is what makes it an authz join). pgx.ErrNoRows = the
 	// account is not linked, and the action is refused rather than guessed.
 	GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID pgtype.Text) (store.User, error)
-	// SetSlackRunGate records the reject-pending state or clears the gate anchor.
+	// GetSlackRunMessage reads the run's DM anchor so a gate click can be verified
+	// against the LIVE gate_ts (PRD #41 Decision 10b): a click whose message ts no
+	// longer matches the anchor is superseded and refused server-side, independent of
+	// the best-effort message edit.
+	GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (store.SlackRunMessage, error)
+	// SetSlackRunGate records the reject/revise-pending state or clears the gate anchor.
 	SetSlackRunGate(ctx context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error)
 }
 
@@ -109,6 +114,19 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 		return
 	}
 
+	// Server-enforced supersede (PRD #41 Decision 10b): the run can be parked at
+	// awaiting_approval across MULTIPLE plan generations (a revision re-gates without
+	// leaving the status), so the status guard alone can't tell a live gate from a
+	// stale one. Refuse any click whose message ts no longer matches the anchor's
+	// live gate_ts — the plan it was showing has been superseded by a newer one. This
+	// makes the no-unseen-plan guarantee independent of the best-effort message edit
+	// and stops a stale Reject/Request-changes from overwriting the live anchor.
+	anchor, err := g.store.GetSlackRunMessage(ctx, runID)
+	if err != nil || !anchor.GateTs.Valid || anchor.GateTs.String != a.MessageTS {
+		g.ephemeral(ctx, a, "This gate was superseded — scroll down to the latest plan message.")
+		return
+	}
+
 	switch a.ActionID {
 	// The approve id encodes the agent source (PRD #37 M7), from a CLOSED set — the
 	// server never receives a client-supplied source string. The legacy/no-roster
@@ -131,6 +149,23 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 		if err := g.poster.UpdateBlocks(ctx, a.ChannelID, a.MessageTS,
 			"Reply with a rejection reason", rejectPendingBlocks(runID)); err != nil {
 			g.logf("edit gate to reject-pending", err)
+		}
+
+	case ActionGateRequestChanges:
+		// Enter revise-pending (PRD #41): the run stays parked (still
+		// awaiting_approval); swap the buttons for the "reply with what should change"
+		// affordance. gate_ts is kept (== a.MessageTS, verified live above) and
+		// gate_generation is preserved by SetSlackRunGate, so the notifier still sees
+		// the current generation and re-gates the NEXT plan version. The threaded reply
+		// that carries the feedback is accepted by the replier's compare-and-swap.
+		if _, err := g.store.SetSlackRunGate(ctx, store.SetSlackRunGateParams{
+			RunID: runID, GateTs: pgText(a.MessageTS), GateState: pgText(gateStateRevisePending),
+		}); err != nil {
+			g.logf("set revise-pending", err)
+		}
+		if err := g.poster.UpdateBlocks(ctx, a.ChannelID, a.MessageTS,
+			"Reply with what should change", revisePendingBlocks(runID)); err != nil {
+			g.logf("edit gate to revise-pending", err)
 		}
 
 	case ActionGateRejectNoReason:

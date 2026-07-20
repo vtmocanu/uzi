@@ -225,6 +225,27 @@ describe("RunEventRow rendering", () => {
     expect(container.textContent).not.toContain("huge plan body");
   });
 
+  it("renders a plan_revising event as a terse one-liner with the round (PRD #41)", () => {
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 1, kind: "plan_revising", payload: { round: 2 } })} live={false} />,
+    );
+    expect(container.textContent).toContain("revising plan");
+    expect(container.textContent).toContain("round 2");
+  });
+
+  it("renders plan_feedback text ESCAPED, never as a live element (PRD #41)", () => {
+    // The steering text is untrusted, so a <script>/<img onerror> payload must render
+    // as inert text through the hardened <Markdown> — never injected as a real node.
+    const feedback = "drop step 1 <script>alert(1)</script> <img src=x onerror=alert(2)>";
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 1, kind: "plan_feedback", payload: { feedback } })} live={false} />,
+    );
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.querySelector("img")).toBeNull();
+    // The safe portion of the feedback still renders as text.
+    expect(container.textContent).toContain("drop step 1");
+  });
+
   it("falls back for an unknown kind, surfacing any extractable text", () => {
     const { container } = render(
       <RunEventRow msg={msg({ seq: 1, kind: "mystery", payload: { text: "some detail" } })} live={false} />,

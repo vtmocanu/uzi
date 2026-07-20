@@ -109,7 +109,7 @@ RETURNING *;
 -- Names ride in roster order (WITH ORDINALITY).
 SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.kind,
-       r.health,
+       r.health, r.plan_md,
        rp.path_with_namespace, rp.web_url, c.forge_type,
        COALESCE(
            (SELECT array_agg(elem->>'name' ORDER BY ord)
@@ -134,8 +134,43 @@ SELECT * FROM slack_run_messages WHERE channel_id = $1 AND root_ts = $2;
 
 -- name: SetSlackRunGate :one
 -- Set/clear the open-gate anchor (M4 approval flow): gate_ts + gate_state. NULLs
--- clear it. Kept here so the anchor table has one owner.
+-- clear it. Deliberately does NOT touch gate_generation, so a reject/revise-pending
+-- transition (or a clear during the revise round) preserves the plan generation the
+-- notifier compares against — only a fresh-gate post (SetSlackRunGateGen) advances it
+-- (PRD #41 Decision 10). Kept here so the anchor table has one owner.
 UPDATE slack_run_messages
 SET gate_ts = @gate_ts, gate_state = @gate_state, updated_at = now()
 WHERE run_id = @run_id
 RETURNING *;
+
+-- name: SetSlackRunGateGen :one
+-- Generation-guarded fresh-gate anchor write (PRD #41 Decision 10d): stamp gate_ts +
+-- gate_state AND the plan generation, but ONLY when this generation is newer than
+-- what is stored — a slow notifier drain writing generation N can never clobber an
+-- anchor another drain already advanced to N+1. No row returned = the write was
+-- refused (a newer gate already exists), and the caller backs off.
+UPDATE slack_run_messages
+SET gate_ts = @gate_ts, gate_state = @gate_state, gate_generation = @gate_generation, updated_at = now()
+WHERE run_id = @run_id AND (gate_generation IS NULL OR gate_generation < @gate_generation)
+RETURNING *;
+
+-- name: SetSlackRunGateIf :one
+-- Compare-and-swap gate-anchor write (PRD #41 Decision 10c): update ONLY when the
+-- anchor still shows the expected gate_ts + gate_state the caller read. Exactly one
+-- concurrent caller wins (RETURNING a row); losers match nothing and get no row, so
+-- they back off. gate_generation is preserved (see SetSlackRunGate). Used by the
+-- replier to make a revise-feedback reply a single-winner accept even though the run
+-- stays awaiting_approval (so a plain status guard cannot dedupe two replies).
+UPDATE slack_run_messages
+SET gate_ts = @gate_ts, gate_state = @gate_state, updated_at = now()
+WHERE run_id = @run_id AND gate_ts = @expected_gate_ts AND gate_state = @expected_gate_state
+RETURNING *;
+
+-- name: CountRunPlanMessages :one
+-- Plan-generation signal for the Slack notifier (PRD #41 Decision 10a/e). Each plan
+-- version the lead produces appends exactly ONE kind='plan' run_message, flushed
+-- before the awaiting_approval state report, so this monotonic count IS the gate
+-- generation: the notifier compares it to slack_run_messages.gate_generation to tell
+-- a genuinely new plan version (post a fresh gate + plan-in-thread) from a redundant
+-- re-broadcast of the same version (no-op, never spam).
+SELECT count(*) FROM run_messages WHERE run_id = @run_id AND kind = 'plan';

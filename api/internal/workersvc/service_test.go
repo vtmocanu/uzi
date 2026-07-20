@@ -129,6 +129,10 @@ type fakeStore struct {
 	workerByID         store.Worker
 	workerByIDErr      error
 	createdInput       *store.CreateRunInputParams
+	// reviseCount is what CountRunReviseInputs returns (PRD #41 plan-revision cap);
+	// reviseCountRunID captures the run id the cap query was asked about.
+	reviseCount        int64
+	reviseCountRunID   *uuid.UUID
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
 	cancelled          *store.CancelRunServerSideParams
@@ -426,6 +430,10 @@ func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputPa
 	f.createdInput = &arg
 	return store.RunUserInput{}, nil
 }
+func (f *fakeStore) CountRunReviseInputs(_ context.Context, runID uuid.UUID) (int64, error) {
+	f.reviseCountRunID = &runID
+	return f.reviseCount, nil
+}
 func (f *fakeStore) CreateStopVerdictInput(_ context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
 	f.createdStopVerdict = &arg
 	return store.RunUserInput{}, nil
@@ -490,6 +498,7 @@ func testParams() Params {
 		RunTimeout:            2 * time.Hour,
 		RunIdleTimeout:        10 * time.Minute,
 		RunMaxIterations:      5,
+		PlanMaxRevisions:      3,
 		RunMaxRequeues:        1,
 		WorkerHeartbeatStale:  45 * time.Second,
 		WorkerAffinityGrace:   2 * time.Minute,
@@ -1476,6 +1485,105 @@ func TestSubmitInputRejectsTerminalRun(t *testing.T) {
 	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "completed"}}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.SubmitInput(context.Background(), user, runID, "cancel", "", nil); err != ErrRunTerminal {
+		t.Fatalf("err = %v, want ErrRunTerminal", err)
+	}
+}
+
+// A revise_plan is a plain enqueue (PRD #41): it goes through CreateRunInput with
+// the feedback body and never stamps a stop signal, so it is NOT a deliberate-stop
+// verdict like cancel/reject_plan.
+func TestSubmitInputRevisePlanEnqueuesPlain(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{
+		runByID:     store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},
+		reviseCount: 0,
+	}
+	svc := New(fs, newBox(t), testParams())
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "revise_plan", "use pgx not gorm", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if res.ServerSide {
+		t.Fatal("revise_plan is never a server-side transition")
+	}
+	if fs.createdInput == nil || fs.createdInput.Kind != "revise_plan" {
+		t.Fatalf("revise_plan not enqueued: %+v", fs.createdInput)
+	}
+	if fs.createdInput.Body.String != "use pgx not gorm" {
+		t.Fatalf("revise body = %q, want feedback text", fs.createdInput.Body.String)
+	}
+	if fs.createdStopVerdict != nil {
+		t.Fatalf("revise_plan must not use the stop-verdict path, got %+v", fs.createdStopVerdict)
+	}
+}
+
+// The cap counts ALL revise_plan rows (no consumed_at filter): the cap query is
+// asked about the run, and a count already at the limit rejects with
+// ErrReviseCapReached before any enqueue.
+func TestSubmitInputRevisePlanCapReached(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	// PlanMaxRevisions is 3; a run already at 3 persisted revisions (consumed or not)
+	// is at the cap, so the next revise is rejected.
+	fs := &fakeStore{
+		runByID:     store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},
+		reviseCount: 3,
+	}
+	svc := New(fs, newBox(t), testParams())
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "revise_plan", "again", nil); err != ErrReviseCapReached {
+		t.Fatalf("err = %v, want ErrReviseCapReached", err)
+	}
+	if fs.reviseCountRunID == nil || *fs.reviseCountRunID != runID {
+		t.Fatalf("cap query not scoped to run %s, got %v", runID, fs.reviseCountRunID)
+	}
+	if fs.createdInput != nil {
+		t.Fatalf("no enqueue expected once capped, got %+v", fs.createdInput)
+	}
+}
+
+// Off-by-one at the cap boundary: with PlanMaxRevisions=3, an existing count of 2
+// (the 3rd revise) is accepted, but a count of 3 (the 4th) is rejected.
+func TestSubmitInputRevisePlanCapBoundary(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	svc := func(count int64) (*fakeStore, *Service) {
+		fs := &fakeStore{
+			runByID:     store.Run{ID: runID, UserID: user, Status: "awaiting_approval"},
+			reviseCount: count,
+		}
+		return fs, New(fs, newBox(t), testParams())
+	}
+
+	// 3rd revise (2 already persisted) → accepted.
+	fs3, s3 := svc(2)
+	if _, err := s3.SubmitInput(context.Background(), user, runID, "revise_plan", "third", nil); err != nil {
+		t.Fatalf("3rd revise should be accepted: %v", err)
+	}
+	if fs3.createdInput == nil {
+		t.Fatal("3rd revise should have enqueued")
+	}
+
+	// 4th revise (3 already persisted) → rejected.
+	fs4, s4 := svc(3)
+	if _, err := s4.SubmitInput(context.Background(), user, runID, "revise_plan", "fourth", nil); err != ErrReviseCapReached {
+		t.Fatalf("4th revise err = %v, want ErrReviseCapReached", err)
+	}
+	if fs4.createdInput != nil {
+		t.Fatalf("4th revise must not enqueue, got %+v", fs4.createdInput)
+	}
+}
+
+// A revise on a terminal run is blocked by the existing terminal guard (before the
+// cap query runs).
+func TestSubmitInputRevisePlanRejectsTerminalRun(t *testing.T) {
+	user := uuid.New()
+	runID := uuid.New()
+	fs := &fakeStore{runByID: store.Run{ID: runID, UserID: user, Status: "failed"}}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "revise_plan", "x", nil); err != ErrRunTerminal {
 		t.Fatalf("err = %v, want ErrRunTerminal", err)
 	}
 }

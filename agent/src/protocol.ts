@@ -23,8 +23,9 @@ export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
   "failed",
 ]);
 
-/** run_messages.kind (PRD #4 §Schema; PRD #39 adds user_message + proposal — the
- *  DB column carries no CHECK, so these need no migration, Decision 8/D12). */
+/** run_messages.kind (PRD #4 §Schema; PRD #39 adds user_message + proposal; PRD #41
+ *  adds plan_feedback + plan_revising — the DB column carries no CHECK, so these need
+ *  no migration, Decision 8/D12). */
 export type MessageKind =
   | "text"
   | "thinking"
@@ -34,10 +35,17 @@ export type MessageKind =
   | "error"
   | "user_message"
   | "plan"
-  | "proposal";
+  | "proposal"
+  /** PRD #41: the user's revision feedback at the approval gate (payload
+   *  `{ feedback: string }`), echoed to the feed so the revision is auditable. */
+  | "plan_feedback"
+  /** PRD #41: the lead is revising the plan for round N (payload `{ round: number }`);
+   *  the UI derives its "revising" gate state from this. */
+  | "plan_revising";
 
-/** run_user_inputs.kind (PRD #4 §Schema). */
-export type InputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel";
+/** run_user_inputs.kind (PRD #4 §Schema; PRD #41 adds `revise_plan` — the user asks
+ *  for a new plan version at the gate, body = their feedback text). */
+export type InputKind = "follow_up" | "approve_plan" | "reject_plan" | "cancel" | "revise_plan";
 
 /** runs.kind (PRD #6; PRD #46 adds "judge" and "self_improve"). self_improve is
  *  issue-shaped and runs the ordinary run lane (RunRunner), with a fixed branch and
@@ -216,6 +224,9 @@ export interface ClaimConfig {
   run_timeout_seconds?: number;
   idle_timeout_seconds?: number;
   max_iterations?: number;
+  /** Bound on plan-revision rounds at the approval gate (PRD #41, env
+   *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */
+  plan_max_revisions?: number;
   /** The run owner's per-user default model (PRD #17). When present it overrides
    *  the lead template's model for the main thread; absent when the owner set no
    *  default, so the worker falls back to the lead template's model. */

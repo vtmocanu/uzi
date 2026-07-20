@@ -16,6 +16,7 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { GitLabClient, ForgejoClient, type FetchFn } from "../src/forge.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
+import type { PlanVerdict } from "../src/steering.js";
 import type { Logger } from "../src/log.js";
 import type { UserInput } from "../src/protocol.js";
 
@@ -514,6 +515,114 @@ describe("RunRunner — plan gate + steering end to end", () => {
     assert.strictEqual(calls.length, 0, "no MR on cancel");
   });
 });
+
+// --- PRD #41: plan revision at the approval gate -------------------------------
+// The runner's gatePlan is called once per round; a `revise` verdict is returned to the
+// executor (which runs a fresh plan turn), and the gate re-reports awaiting_approval,
+// bumping the steering epoch so a verdict written against the previous plan version goes
+// stale. All rounds share ONE approval budget.
+describe("RunRunner — plan revision at the gate (PRD #41)", () => {
+  const pollTick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+  /** Once the run has posted `n` awaiting_approval reports, submit `inputs`. Because the
+   *  epoch is bumped BEFORE each awaiting_approval report, observing the report proves the
+   *  epoch has advanced, so inputs set here are stamped at the new (current) epoch. */
+  function onGateRound(runId: string, n: number, inputs: UserInput[]): Promise<void> {
+    return (async () => {
+      while (api.states.filter((s) => s.runId === runId && s.body.status === "awaiting_approval").length < n) {
+        await pollTick();
+      }
+      api.setInputs(runId, inputs);
+    })();
+  }
+
+  it("returns a revise verdict for a fresh round, then completes on the round-2 approve", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(80);
+    const seen: PlanVerdictKind[] = [];
+    const reviseExec: Executor = {
+      run: async (ctx) => {
+        const v1 = await ctx.gatePlan!("# PLAN v1");
+        seen.push(v1.kind);
+        assert.strictEqual(v1.kind, "revise");
+        assert.strictEqual(v1.kind === "revise" ? v1.feedback : "", "tighten the scope");
+        const v2 = await ctx.gatePlan!("# PLAN v2");
+        seen.push(v2.kind);
+        if (v2.kind !== "approve") throw new Error(`expected approve, got ${v2.kind}`);
+        return { branch: ctx.branch };
+      },
+    };
+    api.setInputs(claim.run_id, [input("revise_plan", "tighten the scope")]);
+    const round2 = onGateRound(claim.run_id, 2, [input("approve_plan")]);
+    await runner(reviseExec, gitlab).execute(claim);
+    await round2;
+
+    assert.deepStrictEqual(seen, ["revise", "approve"]);
+    // The gate parked at awaiting_approval TWICE — once per plan version.
+    const gates = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval").map((s) => s.body);
+    assert.strictEqual(gates.length, 2);
+    assert.match(gates[0]!.plan_md ?? "", /PLAN v1/);
+    assert.match(gates[1]!.plan_md ?? "", /PLAN v2/);
+    // The run completed with an MR after the round-2 approval.
+    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+    assert.strictEqual(calls.length, 1);
+  });
+
+  it("discards an approve batched with a revise (written against the pre-feedback plan) and notes it on the feed", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(81);
+    const reviseExec: Executor = {
+      run: async (ctx) => {
+        const v1 = await ctx.gatePlan!("# PLAN v1");
+        assert.strictEqual(v1.kind, "revise");
+        const v2 = await ctx.gatePlan!("# PLAN v2");
+        if (v2.kind !== "approve") throw new Error(`expected approve, got ${v2.kind}`);
+        return { branch: ctx.branch };
+      },
+    };
+    // The user's approve rides the SAME batch as the revise, so it is stamped against the
+    // pre-feedback plan (epoch 1). Round 2 must NOT approve on it.
+    api.setInputs(claim.run_id, [input("revise_plan", "rethink it"), input("approve_plan")]);
+    const round2 = onGateRound(claim.run_id, 2, [input("approve_plan")]); // a fresh, round-2 approve
+    await runner(reviseExec, gitlab).execute(claim);
+    await round2;
+
+    const texts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+    assert.ok(texts.some((t) => t.includes("Approval ignored")), texts.join("\n"));
+    assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
+  });
+
+  it("shares ONE approval budget across rounds: a revise does not reset the deadline", async () => {
+    // With a tiny budget and a revision round that never approves, the run times out on
+    // the SHARED deadline and fails with the timeout reason — the revise kept the clock
+    // running rather than granting a fresh full budget.
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(82);
+    const reviseExec: Executor = {
+      run: async (ctx) => {
+        const v1 = await ctx.gatePlan!("# PLAN v1");
+        assert.strictEqual(v1.kind, "revise");
+        const v2 = await ctx.gatePlan!("# PLAN v2"); // no approve ever comes → times out
+        if (v2.kind === "reject") throw new PlanRejectedError(v2.reason);
+        return { branch: ctx.branch };
+      },
+    };
+    const r = new RunRunner(client, git, () => ({ executor: reviseExec }), nullLogger(), 20, undefined, {
+      pollMs: 5,
+      planApprovalTimeoutMs: 60, // small, shared across both rounds
+      gitlab,
+    });
+    api.setInputs(claim.run_id, [input("revise_plan", "one more pass")]);
+    await r.execute(claim);
+
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failed, "run should fail on the shared-budget timeout");
+    assert.match(failed!.body.failure_reason ?? "", /plan approval timed out/);
+    assert.strictEqual(calls.length, 0, "no MR when the gate times out");
+  });
+});
+
+type PlanVerdictKind = PlanVerdict["kind"];
 
 // --- PRD #42 M1: per-run executor + HOME isolation + secret eviction ----------
 

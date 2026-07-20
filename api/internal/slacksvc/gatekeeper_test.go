@@ -14,17 +14,32 @@ import (
 
 // fakeGateStore records the gatekeeper's confirmed-user lookups and gate writes.
 type fakeGateStore struct {
-	user    store.User
-	userErr error
-	gateSet []store.SetSlackRunGateParams
+	user      store.User
+	userErr   error
+	anchor    store.SlackRunMessage
+	anchorErr error
+	gateSet   []store.SetSlackRunGateParams
 }
 
 func (f *fakeGateStore) GetConfirmedUserBySlackID(context.Context, pgtype.Text) (store.User, error) {
 	return f.user, f.userErr
 }
+func (f *fakeGateStore) GetSlackRunMessage(context.Context, uuid.UUID) (store.SlackRunMessage, error) {
+	return f.anchor, f.anchorErr
+}
 func (f *fakeGateStore) SetSlackRunGate(_ context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error) {
 	f.gateSet = append(f.gateSet, arg)
 	return store.SlackRunMessage{}, nil
+}
+
+// openGateAnchor is the live anchor for a run whose gate message ts matches the
+// gateAction default MessageTS ("gts"), so the server-enforced supersede check (PRD
+// #41 Decision 10b) passes for a click on the current gate.
+func openGateAnchor(runID uuid.UUID) store.SlackRunMessage {
+	return store.SlackRunMessage{
+		RunID: runID, ChannelID: "D1", RootTs: "root1",
+		GateTs: pgtype.Text{String: "gts", Valid: true}, GateState: pgtype.Text{String: gateStateOpen, Valid: true},
+	}
 }
 
 type submittedInput struct {
@@ -83,7 +98,7 @@ func TestGatekeeperApproveRoutesSourceAndResolves(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			runID, user := uuid.New(), store.User{ID: uuid.New()}
-			gs := &fakeGateStore{user: user}
+			gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
 			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
 			fp := &fakePoster{}
 			g := NewGatekeeper(gs, sub, fp, nil)
@@ -113,7 +128,7 @@ func TestGatekeeperApproveRoutesSourceAndResolves(t *testing.T) {
 // ephemeral: no clear, no resolve edit, and the presser can retry from uzi.
 func TestGatekeeperApproveRejectedLeavesGateOpen(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	gs := &fakeGateStore{user: user}
+	gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
 	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), approveErr: ErrSelectionRejected}
 	fp := &fakePoster{}
 	g := NewGatekeeper(gs, sub, fp, nil)
@@ -133,7 +148,7 @@ func TestGatekeeperApproveRejectedLeavesGateOpen(t *testing.T) {
 
 func TestGatekeeperRejectEntersRejectPending(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	gs := &fakeGateStore{user: user}
+	gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
 	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
 	fp := &fakePoster{}
 	g := NewGatekeeper(gs, sub, fp, nil)
@@ -153,7 +168,7 @@ func TestGatekeeperRejectEntersRejectPending(t *testing.T) {
 
 func TestGatekeeperRejectNoReasonSubmitsAndResolves(t *testing.T) {
 	runID, user := uuid.New(), store.User{ID: uuid.New()}
-	gs := &fakeGateStore{user: user}
+	gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
 	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
 	fp := &fakePoster{}
 	g := NewGatekeeper(gs, sub, fp, nil)
@@ -169,6 +184,57 @@ func TestGatekeeperRejectNoReasonSubmitsAndResolves(t *testing.T) {
 	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 ||
 		!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "rejected") {
 		t.Fatalf("gate message must be edited button-free to a rejected state: %+v", fp.updateBlocks)
+	}
+}
+
+// Request changes parks the run in revise_pending (keeping gate_ts) and swaps the
+// gate buttons for the "reply with what should change" affordance; nothing is
+// submitted yet — the threaded reply carries the feedback (PRD #41 Decision 10).
+func TestGatekeeperRequestChangesEntersRevisePending(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+	fp := &fakePoster{}
+	g := NewGatekeeper(gs, sub, fp, nil)
+
+	g.HandleBlockAction(context.Background(), gateAction(ActionGateRequestChanges, runID))
+
+	if len(sub.submitted) != 0 {
+		t.Fatalf("Request changes must NOT submit yet (it awaits the feedback reply): %+v", sub.submitted)
+	}
+	if len(gs.gateSet) != 1 || gs.gateSet[0].GateState.String != gateStateRevisePending || !gs.gateSet[0].GateTs.Valid {
+		t.Fatalf("Request changes must record revise_pending keeping gate_ts: %+v", gs.gateSet)
+	}
+	if len(fp.updateBlocks) != 1 || len(fp.updateBlocks[0].actionIDs) != 0 ||
+		!strings.Contains(strings.ToLower(fp.updateBlocks[0].sectionText), "what should change") {
+		t.Fatalf("Request changes must edit the gate to the revise-pending prompt: %+v", fp.updateBlocks)
+	}
+}
+
+// Server-enforced supersede (PRD #41 Decision 10b): a click on a message whose ts no
+// longer matches the anchor's live gate_ts (the plan it showed was re-parked to a
+// newer version) is refused server-side — nothing submitted, no gate write — even
+// though the run is still awaiting_approval. This is independent of the best-effort
+// button edit, so a stale card's Reject/Request-changes can't overwrite the live gate.
+func TestGatekeeperSupersededClickRefused(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	// The live anchor now points at a NEWER gate (gate-v2); the click carries "gts".
+	anchor := openGateAnchor(runID)
+	anchor.GateTs = pgtype.Text{String: "gate-v2", Valid: true}
+	gs := &fakeGateStore{user: user, anchor: anchor}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+	fp := &fakePoster{}
+	g := NewGatekeeper(gs, sub, fp, nil)
+
+	// Reject on the stale (superseded) card.
+	g.HandleBlockAction(context.Background(), gateAction(ActionGateReject, runID))
+
+	if len(sub.submitted) != 0 || len(gs.gateSet) != 0 || len(fp.updateBlocks) != 0 {
+		t.Fatalf("a superseded click must not submit, edit, or write the gate: submitted=%v gate=%v edits=%v",
+			sub.submitted, gs.gateSet, fp.updateBlocks)
+	}
+	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "superseded") {
+		t.Fatalf("a superseded click must get a 'superseded' ephemeral: %+v", fp.ephemerals)
 	}
 }
 

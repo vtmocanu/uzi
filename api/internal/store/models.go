@@ -355,12 +355,13 @@ type Skill struct {
 }
 
 type SlackRunMessage struct {
-	RunID     uuid.UUID          `json:"run_id"`
-	ChannelID string             `json:"channel_id"`
-	RootTs    string             `json:"root_ts"`
-	GateTs    pgtype.Text        `json:"gate_ts"`
-	GateState pgtype.Text        `json:"gate_state"`
-	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	RunID          uuid.UUID          `json:"run_id"`
+	ChannelID      string             `json:"channel_id"`
+	RootTs         string             `json:"root_ts"`
+	GateTs         pgtype.Text        `json:"gate_ts"`
+	GateState      pgtype.Text        `json:"gate_state"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	GateGeneration pgtype.Int4        `json:"gate_generation"`
 }
 
 type ToolAllowlist struct {

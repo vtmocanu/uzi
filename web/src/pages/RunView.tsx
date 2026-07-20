@@ -374,9 +374,12 @@ export function RunView() {
       {run.status === "awaiting_approval" && (
         <PlanPanel
           run={run}
+          messages={messages}
           busy={busy}
           onApprove={(selection) => act(() => submit("approve_plan", "", selection))}
           onReject={(reason) => act(() => submit("reject_plan", reason))}
+          onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
+          onCancel={() => act(() => submit("cancel"))}
         />
       )}
 
@@ -421,23 +424,137 @@ export function RunView() {
   );
 }
 
+// The server enforces the real revision cap; 3 is only the display default for the
+// "revision N of MAX" counter (PRD #41 Decision 9).
+const MAX_REVISION_ROUNDS = 3;
+
+// PlanRevision is the panel's derived view of the revision history (PRD #41 Decision
+// 9): all of it comes from the run's feed messages, never a separate fetch.
+export interface PlanRevision {
+  // versions = number of `plan` messages so far (v1, v2, …).
+  versions: number;
+  // rounds = number of `plan_feedback` rounds — the "revision N of MAX" counter.
+  rounds: number;
+  // revising = the LATEST of {`plan`, `plan_revising`} by seq is a `plan_revising`
+  // frame, i.e. the planner is reworking and the gate is parked (not open).
+  revising: boolean;
+  // latestFeedback = the newest `plan_feedback` steering text (the user's bubble).
+  latestFeedback: string | null;
+  // priorPlans = the plan_md of every SUPERSEDED plan version (all but the latest),
+  // oldest-first — the collapsed history accordion once a v2+ is re-gated.
+  priorPlans: string[];
+}
+
+// derivePlanRevision folds the feed into the panel's revision state. Exported for a
+// direct unit test of the derivation (the component test drives the UI on top of it).
+export function derivePlanRevision(messages: RunMessage[]): PlanRevision {
+  const plans = messages.filter((m) => m.kind === "plan");
+  const feedbacks = messages.filter((m) => m.kind === "plan_feedback");
+
+  // The gate's live state is the latest of {plan, plan_revising} BY SEQ — a newer
+  // `plan` (re-gated) beats an earlier `plan_revising`, and vice-versa.
+  let latestGating: RunMessage | undefined;
+  for (const m of messages) {
+    if (m.kind !== "plan" && m.kind !== "plan_revising") continue;
+    if (!latestGating || m.seq > latestGating.seq) latestGating = m;
+  }
+
+  let latestFeedback: string | null = null;
+  let latestFeedbackSeq = -Infinity;
+  for (const m of feedbacks) {
+    const fb = (m.payload as { feedback?: string } | null)?.feedback;
+    if (typeof fb === "string" && m.seq > latestFeedbackSeq) {
+      latestFeedback = fb;
+      latestFeedbackSeq = m.seq;
+    }
+  }
+
+  const priorPlans = plans
+    .slice(0, Math.max(0, plans.length - 1))
+    .map((m) => (m.payload as { plan_md?: string } | null)?.plan_md ?? "")
+    .filter((s) => s.trim() !== "");
+
+  return {
+    versions: plans.length,
+    rounds: feedbacks.length,
+    revising: latestGating?.kind === "plan_revising",
+    latestFeedback,
+    priorPlans,
+  };
+}
+
+// VersionChip is the mono v1/v2 badge in the panel head. Info-toned in the revising
+// (parked) state, warn-toned at an open gate — matching the panel's own tone.
+function VersionChip({ label, parked }: { label: string; parked?: boolean }) {
+  return (
+    <span
+      className={cx(
+        "inline-flex items-center rounded-md border px-1.5 py-px font-mono text-[11px] font-semibold",
+        parked ? "border-info/40 bg-info/[0.12] text-info" : "border-warn/40 bg-warn/[0.12] text-warn",
+      )}
+    >
+      {label}
+    </span>
+  );
+}
+
+// RevisionThread renders the user's steering bubble (PRD #41). The feedback is
+// UNTRUSTED, so it goes through the hardened <Markdown> — never a raw sink. `working`
+// appends the info-toned "planner is reworking" spinner line (the parked state).
+function RevisionThread({ feedback, working = false }: { feedback: string | null; working?: boolean }) {
+  if (!feedback && !working) return null;
+  return (
+    <div className="space-y-2.5">
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-faint">Revision thread</span>
+      {feedback && (
+        <div className="ml-auto max-w-[85%] rounded-lg border border-brand/30 bg-brand/[0.12] px-3 py-2 text-sm">
+          <span className="mb-1 block text-[11px] font-semibold text-brand">You requested</span>
+          <Markdown content={feedback} />
+        </div>
+      )}
+      {working && (
+        <div className="flex items-center gap-2 text-sm italic text-muted">
+          <Spinner /> planner is reworking the plan…
+        </div>
+      )}
+    </div>
+  );
+}
+
 // PlanPanel: the run's one human decision point — visually the loudest thing on
 // the page while it is pending. Grows the PRD #37 agent picker: the user chooses
 // the subagent roster (repo agents when detected, else their templates) with the
 // approve verdict; the choice is submitted as a structured selection on approve.
+// PRD #41 adds the third gate action (Request changes → revise_plan), the revising
+// parked state, the version chip, and the collapsed history of superseded plans.
 export function PlanPanel({
   run,
+  messages = [],
   busy,
   onApprove,
   onReject,
+  onRequestChanges,
+  onCancel,
 }: {
   run: Run;
+  // The run's feed, used to derive the version chip / round counter / revising state
+  // (PRD #41 Decision 9). Optional so a caller/test that only exercises the base gate
+  // can omit it — the derivation degrades to v1 / revision 0 of 3.
+  messages?: RunMessage[];
   busy: boolean;
   onApprove: (selection: AgentSelectionInput) => void;
   onReject: (reason: string) => void;
+  // Request-changes (PRD #41) and the revising-state Cancel-run affordance. Optional
+  // with a no-op default so a base-gate-only caller need not wire them.
+  onRequestChanges?: (feedback: string) => void;
+  onCancel?: () => void;
 }) {
   const [rejecting, setRejecting] = useState(false);
+  const [requesting, setRequesting] = useState(false);
   const [reason, setReason] = useState("");
+  const [feedback, setFeedback] = useState("");
+
+  const rev = useMemo(() => derivePlanRevision(messages), [messages]);
 
   const repoAgents = useMemo(() => run.repo_agents ?? [], [run.repo_agents]);
   const repoDetected = repoAgents.length > 0;
@@ -468,23 +585,75 @@ export function PlanPanel({
   const approveLabel =
     activeRoster.length > 0 ? `Approve plan · ${selectionLabel(selection.source, activeCount)}` : "Approve plan";
 
+  // The rounds counter is always shown at the head; MAX is the display default (the
+  // server owns the real cap).
+  const roundsLabel = `revision ${rev.rounds} of ${MAX_REVISION_ROUNDS}`;
+
+  // Revising (parked) state: the planner is reworking after a request-changes. The
+  // panel goes info-toned, swaps the gate for the revision thread + a Cancel-run
+  // affordance, and shows a v(N)→v(N+1) chip (the next version has not landed yet).
+  if (rev.revising) {
+    return (
+      <div className="overflow-hidden rounded-xl border border-info/40 bg-info/5">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-info/25 bg-info/[0.08] px-4 py-3">
+          <div>
+            <h2 className="flex items-center gap-2 text-sm font-semibold text-info">
+              Revising the plan
+              <VersionChip parked label={`v${rev.versions} → v${rev.versions + 1}`} />
+            </h2>
+            <p className="text-xs text-muted">
+              Your feedback was sent to the planning session. The updated plan will return here for approval.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-faint">{roundsLabel}</span>
+            <Button variant="danger" disabled={busy} onClick={() => onCancel?.()}>
+              Cancel run
+            </Button>
+          </div>
+        </div>
+        <div className="p-4">
+          <RevisionThread feedback={rev.latestFeedback} working />
+        </div>
+      </div>
+    );
+  }
+
+  // Open gate. A v2+ re-gate reads "Updated plan…" and shows the superseded history.
+  const revised = rev.versions > 1;
+  const currentVersion = Math.max(rev.versions, 1);
+  const disclosing = rejecting || requesting;
+
   return (
     <div className="overflow-hidden rounded-xl border border-warn/50 bg-warn/5">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-warn/30 bg-warn/10 px-4 py-3">
         <div>
-          <h2 className="text-sm font-semibold text-warn">Plan awaiting your approval</h2>
-          <p className="text-xs text-muted">The run is parked until you decide. Agent choice locks in on approval.</p>
+          <h2 className="flex items-center gap-2 text-sm font-semibold text-warn">
+            {revised ? "Updated plan awaiting your approval" : "Plan awaiting your approval"}
+            <VersionChip label={`v${currentVersion}`} />
+          </h2>
+          <p className="text-xs text-muted">
+            {requesting
+              ? "Describe what should change; the other actions return if you cancel."
+              : "The run is parked until you decide. Agent choice locks in on approval."}
+          </p>
         </div>
-        {!rejecting && (
-          <div className="flex gap-2">
-            <Button disabled={busy} onClick={() => onApprove(selection)}>
-              {approveLabel}
-            </Button>
-            <Button variant="secondary" disabled={busy} onClick={() => setRejecting(true)}>
-              Reject with reason
-            </Button>
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-faint">{roundsLabel}</span>
+          {!disclosing && (
+            <div className="flex gap-2">
+              <Button disabled={busy} onClick={() => onApprove(selection)}>
+                {approveLabel}
+              </Button>
+              <Button variant="secondary" disabled={busy} onClick={() => setRequesting(true)}>
+                Request changes
+              </Button>
+              <Button variant="danger" disabled={busy} onClick={() => setRejecting(true)}>
+                Reject
+              </Button>
+            </div>
+          )}
+        </div>
       </div>
       <div className="space-y-4 p-4">
         <AgentPicker repoAgents={repoAgents} ownTemplates={ownTemplates} onChange={onSelectionChange} />
@@ -496,6 +665,36 @@ export function PlanPanel({
         ) : (
           <p className="text-sm text-faint">The agent has not attached a plan body.</p>
         )}
+
+        {/* Request-changes composer: disclosed only after selecting the action, the
+            same pattern as the reject-with-reason disclosure. "Send & revise" submits
+            revise_plan; Cancel restores the header actions. */}
+        {requesting && (
+          <div className="space-y-2">
+            <Textarea
+              rows={3}
+              placeholder="What should change? (sent to the planning session; the plan returns here for approval)"
+              value={feedback}
+              onChange={(e) => setFeedback(e.target.value)}
+            />
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[11px] text-faint">
+                Feedback goes to the planning session; the agent revises and the plan returns here for approval.{" "}
+                {MAX_REVISION_ROUNDS} revision rounds max.
+              </span>
+              <div className="flex gap-2">
+                <Button variant="ghost" disabled={busy} onClick={() => setRequesting(false)}>
+                  Cancel
+                </Button>
+                <Button disabled={busy || feedback.trim() === ""} onClick={() => onRequestChanges?.(feedback)}>
+                  Send &amp; revise
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Reject-with-reason disclosure (unchanged semantics). */}
         {rejecting && (
           <div className="space-y-2">
             <Textarea
@@ -513,6 +712,28 @@ export function PlanPanel({
               </Button>
             </div>
           </div>
+        )}
+
+        {/* After a revision the user's steering bubble stays visible above the gate. */}
+        {revised && !disclosing && <RevisionThread feedback={rev.latestFeedback} />}
+
+        {/* Collapsed history of superseded plan versions (v1, …) once a v2+ is gated. */}
+        {rev.priorPlans.length > 0 && !disclosing && (
+          <details className="rounded-lg border border-edge bg-surface/50">
+            <summary className="cursor-pointer px-3 py-2 text-xs text-muted">
+              {rev.priorPlans.length === 1
+                ? "Plan v1 · superseded"
+                : `${rev.priorPlans.length} superseded plan versions`}
+            </summary>
+            <div className="space-y-3 border-t border-edge p-3">
+              {rev.priorPlans.map((md, i) => (
+                <div key={i} className="border-l-2 border-edge-strong pl-3 text-xs text-muted">
+                  <div className="mb-1 font-semibold text-faint">Plan v{i + 1}</div>
+                  <Markdown content={md} />
+                </div>
+              ))}
+            </div>
+          </details>
         )}
       </div>
     </div>

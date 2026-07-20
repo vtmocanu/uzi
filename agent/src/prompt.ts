@@ -237,6 +237,33 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   return lines.join("\n");
 }
 
+/**
+ * PRD #41 Decision 11: the plan revision turn. Unlike the issue fields or a
+ * follow_up, the revision feedback is the plan REVIEWER's own instruction — the
+ * human owner who is approving/rejecting the plan is speaking, NOT attacker-
+ * influenceable forge text — so it is framed as an AUTHORITATIVE instruction to
+ * revise, NOT wrapped in an untrusted-evidence fence. This rides a RESUMED session
+ * (the planning context, incl. the fenced untrusted issue fields, is retained), so
+ * it does NOT re-embed the issue; like buildImplementPrompt it injects a short
+ * directive + the feedback + the "submit the full updated plan and STOP"
+ * instruction. The full-plan-required contract matches buildPlanPrompt: the lead
+ * must call `submit_plan` with the COMPLETE revised plan and stop for the gate.
+ */
+export function buildRevisePlanPrompt(feedback: string): string {
+  return [
+    "The plan reviewer read your proposed plan and wants changes before approving it.",
+    "The text below is their revision instruction — it comes from the human reviewing",
+    "your plan, so treat it as an authoritative instruction to act on, and revise the",
+    "plan accordingly:",
+    "",
+    feedback,
+    "",
+    "Produce the COMPLETE revised implementation plan (the full plan, not just the",
+    "changes), then call the `submit_plan` tool with the plan as Markdown and STOP.",
+    "Do NOT implement anything yet — a human must approve the revised plan first.",
+  ].join("\n");
+}
+
 function delegatesLine(subagentNames: string[]): string {
   return subagentNames.length > 0
     ? `Available subagents to delegate to: ${subagentNames.join(", ")}.`

@@ -96,6 +96,11 @@ export class RunRunner {
   // Optional test override; production builds it per-run with the scrubbed check env
   // (buildCheckEnv) once the executor's provisioned toolEnv is known (M9).
   private readonly checkRunner?: CheckRunner;
+  /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
+   *  gate entry and reused across every revision round so N rounds share ONE budget (not
+   *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
+   *  timeout) and, defensively, when the run reaches a terminal state. */
+  private readonly gateDeadlines = new Map<string, number>();
 
   constructor(
     private readonly client: WorkerClient,
@@ -155,7 +160,12 @@ export class RunRunner {
     // Cancel/shutdown spans the whole run; a `cancel` input aborts it via the
     // steering channel, which the executor's ctx.signal watches.
     const cancel = new AbortController();
-    const steering = new SteeringChannel(this.client, runId, this.pollMs, runLog, cancel);
+    // PRD #41: `notify` lets the steering channel post a feed notice when it discards a
+    // verdict/revision written against a stale plan version — wired to the batcher here
+    // so the channel never reaches into runner internals.
+    const steering = new SteeringChannel(this.client, runId, this.pollMs, runLog, cancel, {
+      notify: (text) => batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+    });
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
@@ -355,6 +365,9 @@ export class RunRunner {
       );
     } finally {
       await steering.stop().catch(() => undefined);
+      // PRD #41: drop this run's plan-approval deadline (normally cleared when the gate
+      // resolves terminally, but a run that ends by any other path must not leak it).
+      this.gateDeadlines.delete(runId);
       // Evict this run's secrets from the logger now the run is terminal (Decision
       // 7). Reaching this finally means execute() ran to a terminal report; a
       // requeue (worker death) never returns here, so the evict/HOME-cleanup below
@@ -459,7 +472,16 @@ export class RunRunner {
    *  For an autopilot run, the plan is still recorded but the gate resolves with an
    *  approve verdict immediately — no awaiting_approval report, no /inputs wait. It
    *  also resolves + records the run's DEFAULT agent selection (PRD #37 Decision 6),
-   *  since a self-approved run never receives an approve_plan input to carry one. */
+   *  since a self-approved run never receives an approve_plan input to carry one.
+   *
+   *  PRD #41 plan revision: this is called ONCE PER ROUND by the executor's gate loop.
+   *  Each call bumps the steering epoch (so a verdict written against the previous plan
+   *  version goes stale) and awaits the epoch-aware event. A `revise` verdict is RETURNED
+   *  to the caller — the executor runs a fresh plan turn with the feedback and calls
+   *  gatePlan again; approve/reject/cancel are terminal. The 24h approval budget is an
+   *  ABSOLUTE deadline computed on the first entry and threaded across rounds, so N
+   *  revision rounds share ONE budget rather than resetting the clock each round. The
+   *  autopilot short-circuit is unchanged and never returns a revise. */
   private async gatePlan(
     runId: string,
     planMd: string,
@@ -501,17 +523,39 @@ export class RunRunner {
       return { kind: "approve", selection: { status: "ok", selection } };
     }
 
+    // Await this plan version's event at the CURRENT epoch (PRD #41). The first round is
+    // epoch 0, so a verdict already queued when the gate opens still applies; the epoch is
+    // advanced only when a revision is TAKEN (settle below), which retires this version.
+    const epoch = steering.currentEpoch();
     await reportState({ status: "awaiting_approval", plan_md: planMd });
-    runLog.info("plan gate: awaiting approval", { run_id: runId });
+    runLog.info("plan gate: awaiting approval", { run_id: runId, gate_epoch: epoch });
 
-    if (this.planApprovalTimeoutMs <= 0) return steering.awaitVerdict();
+    // On a revise, advance the epoch (so a verdict written against THIS version, e.g. an
+    // approve batched with the revise, goes stale next round) and KEEP the shared budget
+    // running. Any terminal verdict ends the gate → clear the shared budget.
+    const settle = (v: PlanVerdict): PlanVerdict => {
+      if (v.kind === "revise") steering.bumpEpoch();
+      else this.gateDeadlines.delete(runId);
+      return v;
+    };
+
+    if (this.planApprovalTimeoutMs <= 0) return settle(await steering.awaitGateEvent(epoch));
+
+    // One absolute deadline across all revision rounds: set it on the first entry and
+    // reuse it, so the per-round timer counts down the REMAINING budget (not a fresh 24h).
+    let deadlineAt = this.gateDeadlines.get(runId);
+    if (deadlineAt === undefined) {
+      deadlineAt = Date.now() + this.planApprovalTimeoutMs;
+      this.gateDeadlines.set(runId, deadlineAt);
+    }
+    const remaining = Math.max(0, deadlineAt - Date.now());
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<PlanVerdict>((resolve) => {
-      timer = setTimeout(() => resolve({ kind: "reject", reason: "plan approval timed out" }), this.planApprovalTimeoutMs);
+      timer = setTimeout(() => resolve({ kind: "reject", reason: "plan approval timed out" }), remaining);
       timer.unref?.();
     });
     try {
-      return await Promise.race([steering.awaitVerdict(), timeout]);
+      return settle(await Promise.race([steering.awaitGateEvent(epoch), timeout]));
     } finally {
       if (timer) clearTimeout(timer);
     }

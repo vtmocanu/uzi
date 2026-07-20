@@ -44,6 +44,7 @@
     "run_timeout_seconds": 7200,
     "idle_timeout_seconds": 600,
     "max_iterations": 5,
+    "plan_max_revisions": 3,
     "skill_max_bytes": 65536,
     "skills_max_per_run": 32,
     "tool_packages": [],

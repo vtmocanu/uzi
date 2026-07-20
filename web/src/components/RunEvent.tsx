@@ -32,6 +32,9 @@ function asRecord(v: unknown): Record<string, unknown> | undefined {
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
+function asNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
 function firstLine(s: string): string {
   const i = s.indexOf("\n");
   return i === -1 ? s : s.slice(0, i);
@@ -758,6 +761,32 @@ export const RunEventRow = memo(function RunEventRow({
           plan submitted (awaiting approval)
         </div>
       );
+    // PRD #41: the planner is reworking the plan after the user requested changes.
+    // A terse, info-toned one-liner — the plan body itself re-arrives as a `plan`
+    // event, so this row only marks the round transition.
+    case "plan_revising": {
+      const round = asNumber(rec?.["round"]);
+      return (
+        <div className="inline-flex items-center gap-1.5 rounded-md border border-info/40 bg-info/10 px-2 py-1 text-xs text-info">
+          <span aria-hidden="true">
+            <FileTextIcon />
+          </span>
+          revising plan{round != null ? ` (round ${round})` : ""}
+        </div>
+      );
+    }
+    // PRD #41: the user's steering text for a revision. UNTRUSTED, so it is rendered
+    // through the hardened <Markdown> (react-markdown, no raw-HTML sink) — never a
+    // raw injection point.
+    case "plan_feedback": {
+      const feedback = asString(rec?.["feedback"]) ?? "";
+      return (
+        <div className="rounded-md border border-brand/30 bg-brand/[0.08] px-2.5 py-1.5 text-sm">
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-brand">requested changes</div>
+          {feedback ? <Markdown content={feedback} /> : <span className="text-xs text-faint">(no feedback text)</span>}
+        </div>
+      );
+    }
     default: {
       const extract = asString(rec?.["text"]) ?? asString(rec?.["message"]) ?? "";
       return (

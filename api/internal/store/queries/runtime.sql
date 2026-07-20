@@ -761,6 +761,12 @@ INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES (@run_id, @kind, @body)
 RETURNING *;
 
+-- name: CountRunReviseInputs :one
+-- Plan-revision cap (PRD #41): every persisted revise_plan row for the run counts
+-- toward PLAN_MAX_REVISIONS, with NO consumed_at filter — a consumed revise still
+-- counts, so the cap is the lifetime number of revisions, not the pending backlog.
+SELECT count(*) FROM run_user_inputs WHERE run_id = @run_id AND kind = 'revise_plan';
+
 -- name: CreateApprovePlanInput :one
 -- Enqueue an approve_plan verdict for the live worker AND record the agent
 -- selection it carries, in ONE statement (PRD #37, mirroring CreateStopVerdictInput

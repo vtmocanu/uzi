@@ -34,7 +34,7 @@ import { provisionTools } from "./provision.js";
 import { provisionRunTools } from "./provision-run.js";
 import { assembleAgents, selectSubagents } from "./agents.js";
 import { resolveAgentSelection } from "./protocol.js";
-import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
+import { buildCIFixPlanPrompt, buildImplementPrompt, buildLeadSystemPrompt, buildPlanPrompt, buildRevisePlanPrompt, buildSelfImprovePlanPrompt, isNotCodePlan } from "./prompt.js";
 import { buildPreToolUseHook, buildPathGuardHook, buildAgentGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { buildSignalMcpServer, isSignalToolName, scanSignals, SIGNAL_SERVER_NAME } from "./signals.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
@@ -52,6 +52,10 @@ import { errMessage } from "./util.js";
 const DEFAULT_RUN_TIMEOUT_SECONDS = 2 * 60 * 60; // 2h
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60; // 10m
 const DEFAULT_MAX_ITERATIONS = 5; // PRD: RUN_MAX_ITERATIONS default 5
+// PRD #41: the plan-revision cap (PLAN_MAX_REVISIONS, default 3). The server also
+// enforces it at submit time (rejects the 4th revise), so the worker counter is a
+// belt-and-suspenders guard that rarely trips.
+const DEFAULT_MAX_REVISIONS = 3;
 
 // Static (content-free) failure reasons — safe to persist as failure_reason.
 const REASON_WALL = "run exceeded its wall-clock timeout";
@@ -242,6 +246,7 @@ export class SdkExecutor implements Executor {
 
     const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
     const maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
+    const maxRevisions = positive(planMaxRevisionsOf(ctx.config), DEFAULT_MAX_REVISIONS);
 
     // Skills (PRD #16 M4 + M6). Assemble the run's skill set and materialize a
     // local plugin dir OUTSIDE the clone (loads under `settingSources: []`, so the
@@ -404,16 +409,56 @@ export class SdkExecutor implements Executor {
       // un-gated work, even if the lead prematurely signalled done.
       if (plan.plan === undefined) throw new Error(REASON_NO_PLAN);
 
-      // --- Plan gate --------------------------------------------------------
+      // --- Plan gate (+ revision loop, PRD #41) -----------------------------
+      // The gate can be re-entered N times under ONE approval budget: a `revise`
+      // verdict carries the reviewer's feedback, and the worker runs a fresh planning
+      // turn (resumed, so the planning context is retained) and re-gates the new plan.
+      // approve/reject/cancel are terminal; the runner advances the steering epoch each
+      // time a revise is taken. FAIL-CLOSED: the while-condition + the post-loop guards
+      // guarantee the only way past this block is an `approve` (see the explicit guard).
       if (!ctx.gatePlan) throw new Error("plan gate is not wired for this run");
-      const verdict = await ctx.gatePlan(plan.plan);
+      let approvedPlan = plan.plan;
+      let verdict = await ctx.gatePlan(approvedPlan);
+      let revisions = 0;
+      while (verdict.kind === "revise") {
+        const feedback = verdict.feedback;
+        // Record the reviewer's feedback on the feed. Ordered BEFORE the revision turn
+        // (and thus before the next gatePlan flushes the new plan), so the feed never
+        // lags the awaiting_approval re-report.
+        ctx.emit({ kind: "plan_feedback", agent: "worker", payload: { feedback } });
+        // Belt-and-suspenders (PRD #41 Decision 3c): the SERVER enforces the same cap at
+        // submit time and won't enqueue a revise past it, so this should never trip. If it
+        // does, DO NOT run another planning turn — record it and re-gate the current plan so
+        // the run stays fail-closed rather than revising unbounded.
+        if (revisions >= maxRevisions) {
+          this.log.warn("plan revision budget exhausted; re-gating without a turn", { run_id: ctx.runId, max_revisions: maxRevisions });
+          ctx.emit({ kind: "status", agent: "worker", payload: { text: "revision budget exhausted — not revising the plan further" } });
+          verdict = await ctx.gatePlan(approvedPlan);
+          continue;
+        }
+        revisions++;
+        ctx.emit({ kind: "plan_revising", agent: "worker", payload: { round: revisions } });
+        // A revision turn is a PLANNING turn (pre-approval), so it runs with the OWN
+        // subagents (baseOptions), exactly like the first plan turn — the roster
+        // selection only takes effect once a plan is APPROVED (PRD #37 Decision 5).
+        const turn = await this.driveTurn(ctx, baseOptions, resumeId, buildRevisePlanPrompt(feedback), state, idleMs);
+        resumeId = turn.sessionId ?? resumeId;
+        // A revision turn that submits no plan fails, same as the first planning turn —
+        // never push un-gated work.
+        if (turn.plan === undefined) throw new Error(REASON_NO_PLAN);
+        approvedPlan = turn.plan;
+        verdict = await ctx.gatePlan(approvedPlan);
+      }
       if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
       if (verdict.kind === "cancel") throw new Error(REASON_CANCELLED);
+      // FAIL-CLOSED: the loop + guards above leave only `approve`; any other kind is a
+      // bug (e.g. a future verdict variant) and must never fall through into implement.
+      if (verdict.kind !== "approve") throw new Error(`unexpected plan verdict: ${(verdict as { kind: string }).kind}`);
 
       // A ci_fix run whose approved plan is a not_code verdict is done: no code to
       // implement, no branch to push. The run completes with the diagnosis as its
       // value (PRD #6). Detected AFTER approval so a human confirmed the verdict.
-      if (isCIFix && isNotCodePlan(plan.plan)) {
+      if (isCIFix && isNotCodePlan(approvedPlan)) {
         ctx.emit({ kind: "status", agent: "worker", payload: { text: "diagnosis: not a code problem — completing with no fix" } });
         this.log.info("ci_fix run: not_code verdict", { run_id: ctx.runId });
         return { branch: ctx.branch, fixVerdict: "not_code" };
@@ -661,6 +706,20 @@ function seconds(value: number | undefined, fallback: number): number {
 /** A positive integer override, else the fallback. */
 function positive(value: number | undefined, fallback: number): number {
   return typeof value === "number" && value > 0 ? Math.floor(value) : fallback;
+}
+
+/**
+ * PRD #41: the worker-side plan-revision cap from the claim config. The server sends
+ * `plan_max_revisions` in the claim config (workersvc claim.go) and ALSO enforces it
+ * at submit time (rejects the 4th revise), so this worker counter is a belt-and-
+ * suspenders guard. Read defensively: the field is not (yet) declared on the TS
+ * ClaimConfig type (protocol.ts is owned by the steering/runner unit), so this reads
+ * it off the config object without widening that interface. Returns undefined when
+ * absent so the caller applies DEFAULT_MAX_REVISIONS.
+ */
+function planMaxRevisionsOf(config: unknown): number | undefined {
+  const v = (config as { plan_max_revisions?: unknown } | null | undefined)?.plan_max_revisions;
+  return typeof v === "number" ? v : undefined;
 }
 
 /** Human-readable run-message text for a dropped skill, by reason code. Unknown

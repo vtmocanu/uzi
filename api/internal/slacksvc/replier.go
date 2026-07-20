@@ -38,7 +38,17 @@ type ReplierStore interface {
 	GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID pgtype.Text) (store.User, error)
 	GetSlackRunMessageByRoot(ctx context.Context, arg store.GetSlackRunMessageByRootParams) (store.SlackRunMessage, error)
 	SetSlackRunGate(ctx context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error)
+	// SetSlackRunGateIf is the compare-and-swap accept for a revise-feedback reply
+	// (PRD #41 Decision 10c): a revision keeps the run awaiting_approval, so two
+	// replies both pass the status guard — the CAS clears revise_pending only if the
+	// anchor still shows it at the same gate_ts, so exactly one reply wins.
+	SetSlackRunGateIf(ctx context.Context, arg store.SetSlackRunGateIfParams) (store.SlackRunMessage, error)
 }
+
+// gateNudgeText is the bare-reply nudge shown while the gate is open but takes no
+// threaded verdict directly — it names all THREE actions (PRD #41 Decision 10).
+const gateNudgeText = "The plan gate takes Approve, Request changes, or Reject — a bare reply isn't a verdict. " +
+	"Press Request changes then reply with what to change, or Reject then reply with the reason, or open the run in uzi."
 
 const (
 	// maxReplyRunes bounds an accepted reply before it becomes a reject_plan reason
@@ -146,6 +156,39 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 	text := boundReply(m.Text)
 
 	switch {
+	case run.Status == "awaiting_approval" && anchor.GateState.Valid && anchor.GateState.String == gateStateRevisePending:
+		// Revise-pending AND the run is still parked: the reply IS the revision feedback
+		// (PRD #41 Decision 10c). Because a revision KEEPS the run awaiting_approval,
+		// two replies would both reach here — so accept via compare-and-swap: atomically
+		// clear revise_pending only if the anchor still shows it at the same gate_ts.
+		// Exactly one reply wins; the loser (no row) falls through to the nudge. On a win
+		// we do NOT resolveGate — the run stays parked and the gate re-opens with the
+		// next plan version (a higher generation); the gate_ts is cleared so the
+		// notifier's cross-surface close can't fire during the revise turn.
+		if _, err := r.store.SetSlackRunGateIf(ctx, store.SetSlackRunGateIfParams{
+			RunID: anchor.RunID, GateTs: pgtype.Text{}, GateState: pgtype.Text{},
+			ExpectedGateTs: anchor.GateTs, ExpectedGateState: anchor.GateState,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Lost the CAS — another reply already took the revision; nudge, don't submit.
+				r.coalescedEphemeral(ctx, m, "gate-open", gateNudgeText)
+				return
+			}
+			r.logf("cas revise accept", err)
+			return
+		}
+		if err := r.svc.SubmitInput(ctx, user.ID, anchor.RunID, "revise_plan", text); err != nil {
+			if errors.Is(err, ErrReviseCapReached) {
+				r.editGateMessage(ctx, anchor, "🔁 Revision limit reached — approve or reject this plan in uzi.")
+				r.ephemeral(ctx, m, "You've hit the plan-revision limit for this run — approve or reject the current plan instead.")
+				return
+			}
+			r.logf("submit revise", err)
+			return
+		}
+		r.editGateMessage(ctx, anchor, "🔁 Revising the plan with your feedback…")
+		r.ack(ctx, m)
+
 	case run.Status == "awaiting_approval" && anchor.GateState.Valid && anchor.GateState.String == gateStateRejectPending:
 		// Reject-pending AND the run is still parked: the reply IS the reasoned
 		// rejection. Submit it, resolve the gate, ack; the reason goes only to the
@@ -166,8 +209,7 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 		// worker queues a follow_up submitted during a gate rather than consuming it
 		// as feedback (verified in agent/src/steering.ts), so nudge, don't submit.
 		// Coalesced like the other notices so a burst is nudged once.
-		r.coalescedEphemeral(ctx, m, "gate-open",
-			"The plan gate takes Approve or Reject. Press Reject to use a reply as the reason, or open the run in uzi.")
+		r.coalescedEphemeral(ctx, m, "gate-open", gateNudgeText)
 
 	case isTerminalStatus(run.Status):
 		r.coalescedEphemeral(ctx, m, "finished", "That run has already finished.")
@@ -192,6 +234,18 @@ func (r *Replier) resolveGate(ctx context.Context, anchor store.SlackRunMessage,
 	}
 	if _, err := r.store.SetSlackRunGate(ctx, store.SetSlackRunGateParams{RunID: anchor.RunID}); err != nil {
 		r.logf("clear gate", err)
+	}
+}
+
+// editGateMessage edits the gate message to a neutral, button-free state WITHOUT
+// clearing the anchor — used by the revise-accept path, where the CAS already
+// transitioned the anchor and the run stays parked for the next plan version (PRD
+// #41). Best-effort; a NULL gate_ts is a no-op.
+func (r *Replier) editGateMessage(ctx context.Context, anchor store.SlackRunMessage, text string) {
+	if anchor.GateTs.Valid && anchor.GateTs.String != "" {
+		if err := r.poster.UpdateBlocks(ctx, anchor.ChannelID, anchor.GateTs.String, text, gateResolvedBlocks(text)); err != nil {
+			r.logf("edit gate message", err)
+		}
 	}
 }
 

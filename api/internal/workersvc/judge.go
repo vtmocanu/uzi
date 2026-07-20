@@ -183,6 +183,7 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, run store.Run) (*Claim
 			RunTimeoutSeconds:  int(s.p.RunTimeout.Seconds()),
 			IdleTimeoutSeconds: int(s.p.RunIdleTimeout.Seconds()),
 			MaxIterations:      s.p.RunMaxIterations,
+			PlanMaxRevisions:   s.p.PlanMaxRevisions,
 			ToolPackages:       []string{},
 		},
 	}, nil

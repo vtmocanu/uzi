@@ -239,6 +239,7 @@ type Config struct {
 	RunTimeout              time.Duration // wall clock before a running run is failed
 	RunIdleTimeout          time.Duration // worker-side no-message idle cap
 	RunMaxIterations        int           // implement⇄review loop cap (worker-side)
+	PlanMaxRevisions        int           // PRD #41 plan-revision cap at the approval gate (server + worker)
 	RunMaxRequeues          int           // worker-death re-queues allowed before a run is failed
 	WorkerHeartbeatInterval time.Duration // how often a worker heartbeats
 	WorkerHeartbeatStale    time.Duration // no heartbeat past this ⇒ worker offline + runs re-queued
@@ -536,6 +537,7 @@ func Load() (Config, error) {
 	cfg.RunTimeout = parseDuration("RUN_TIMEOUT", 2*time.Hour)
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
 	cfg.RunMaxIterations = parseInt("RUN_MAX_ITERATIONS", 5)
+	cfg.PlanMaxRevisions = parseInt("PLAN_MAX_REVISIONS", 3)
 	cfg.RunMaxRequeues = parseNonNegInt("RUN_MAX_REQUEUES", 1)
 	cfg.WorkerHeartbeatInterval = parseDuration("WORKER_HEARTBEAT_INTERVAL", 15*time.Second)
 	cfg.WorkerHeartbeatStale = parseDuration("WORKER_HEARTBEAT_STALE", 45*time.Second)

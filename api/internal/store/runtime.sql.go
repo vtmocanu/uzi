@@ -414,6 +414,20 @@ func (q *Queries) CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUI
 	return count, err
 }
 
+const countRunReviseInputs = `-- name: CountRunReviseInputs :one
+SELECT count(*) FROM run_user_inputs WHERE run_id = $1 AND kind = 'revise_plan'
+`
+
+// Plan-revision cap (PRD #41): every persisted revise_plan row for the run counts
+// toward PLAN_MAX_REVISIONS, with NO consumed_at filter — a consumed revise still
+// counts, so the cap is the lifetime number of revisions, not the pending backlog.
+func (q *Queries) CountRunReviseInputs(ctx context.Context, runID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countRunReviseInputs, runID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countWorkerNonTerminalRuns = `-- name: CountWorkerNonTerminalRuns :one
 SELECT count(*) FROM runs
 WHERE worker_id = $1

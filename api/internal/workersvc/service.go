@@ -57,6 +57,11 @@ var (
 	ErrDescriptionTooLarge = errors.New("issue description is too large to run")
 	ErrActiveRunExists     = errors.New("a non-terminal run already exists for this issue")
 	ErrRunTerminal         = errors.New("run has already finished")
+	// ErrReviseCapReached rejects a revise_plan once the run has hit
+	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
+	// revise_plan rows for the run (a consumed revise still counts), so the cap is
+	// the lifetime number of revisions requested, not the pending backlog. → 409.
+	ErrReviseCapReached = errors.New("plan revision limit reached")
 	ErrInvalidState        = errors.New("invalid run state")
 	ErrInvalidMessage      = errors.New("invalid run message")
 	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
@@ -180,6 +185,9 @@ type Store interface {
 	AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error)
 	AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error)
 	CreateRunInput(ctx context.Context, arg store.CreateRunInputParams) (store.RunUserInput, error)
+	// CountRunReviseInputs backs the PRD #41 plan-revision cap: all revise_plan rows
+	// for the run (no consumed_at filter), so a consumed revise still counts.
+	CountRunReviseInputs(ctx context.Context, runID uuid.UUID) (int64, error)
 	// ListFollowUpInputsForRun backs the web/CLI steer queue (PRD #95): kind='follow_up'
 	// only, newest-first, uncapped. Owner-scoped by the run resolve, not the query.
 	ListFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]store.RunUserInput, error)
@@ -245,7 +253,11 @@ type Params struct {
 	RunTimeout           time.Duration
 	RunIdleTimeout       time.Duration
 	RunMaxIterations     int
-	RunMaxRequeues       int
+	// PlanMaxRevisions caps how many times a run's plan may be revised at the
+	// approval gate (PRD #41, PLAN_MAX_REVISIONS). Enforced server-side in
+	// SubmitInput and shipped in the claim so the worker enforces the same limit.
+	PlanMaxRevisions int
+	RunMaxRequeues   int
 	WorkerHeartbeatStale time.Duration
 	WorkerAffinityGrace  time.Duration
 	// ClaimGrace is the claimed-but-never-started reclaim window. It is not a
@@ -792,6 +804,7 @@ func (s *Service) assembleClaim(ctx context.Context, run store.Run) (*ClaimPaylo
 			RunTimeoutSeconds:  int(s.p.RunTimeout.Seconds()),
 			IdleTimeoutSeconds: int(s.p.RunIdleTimeout.Seconds()),
 			MaxIterations:      s.p.RunMaxIterations,
+			PlanMaxRevisions:   s.p.PlanMaxRevisions,
 			DefaultModel:       textPtr(defaultModel),
 			SkillMaxBytes:      s.p.SkillMaxBytes,
 			SkillsMaxPerRun:    s.p.SkillsMaxPerRun,
@@ -1778,9 +1791,24 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		return SubmitInputResult{ServerSide: false}, nil
 	}
 
-	// A plain steering input (approve_plan / follow_up): enqueue for the worker with
-	// no stop signal and no runs-row touch. Return the created row (PRD #95 S2) so the
-	// handler can surface id + created_at for a follow_up's optimistic reconcile.
+	// A revise_plan (PRD #41) is a plain enqueue like follow_up/approve_plan — no
+	// stop signal, no server-side transition — but it is capped: at most
+	// PlanMaxRevisions persisted revisions per run. The count spans ALL revise_plan
+	// rows (no consumed_at filter), so a consumed revision still counts toward the
+	// cap. The terminal-run guard above already blocks a revise on a finished run.
+	if kind == "revise_plan" {
+		n, err := s.q.CountRunReviseInputs(ctx, runID)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		if int(n) >= s.p.PlanMaxRevisions {
+			return SubmitInputResult{}, ErrReviseCapReached
+		}
+	}
+
+	// A plain steering input (approve_plan / follow_up / revise_plan): enqueue for the
+	// worker with no stop signal and no runs-row touch. Return the created row (PRD #95
+	// S2) so the handler can surface id + created_at for a follow_up's optimistic reconcile.
 	row, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
 		RunID: runID, Kind: kind, Body: pgText(body),
 	})
