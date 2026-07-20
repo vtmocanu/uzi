@@ -396,7 +396,7 @@ export function ActivityFeed({
                       )}
                     />
                     <span className="font-medium text-fg">{a}</span>
-                    <span className="text-[10px] uppercase tracking-wide opacity-80">{state}</span>
+                    <span className="text-[11px] uppercase tracking-wide opacity-80">{state}</span>
                   </button>
                 );
               })}
