@@ -175,19 +175,19 @@ type ListFiledIssueCloseEdgesRow struct {
 // the third enumeration in this PRD to need a bound (M1's rows, M2's fan-out, now this) —
 // bound them where they are written.
 //
-// Note what the ORDER BY does and does not give. f.id is a random uuid (gen_random_uuid),
-// so this is stable and arbitrary — NOT oldest-close-first. There is no ordering by close
-// time here, and none is needed: every pending edge is applied eventually, and the order
-// among them carries no meaning. Do not read "FIFO" as "the earliest close wins".
+// The batch order is STABLE but ARBITRARY: f.id is a random uuid (gen_random_uuid), so this
+// is neither FIFO nor oldest-close-first. Nothing here orders by close time, and nothing
+// needs to — every pending edge is applied eventually and the order among them carries no
+// meaning.
 //
-// The bound is FIFO by that arbitrary id, and a FAILING edge is not consumed — so a persistent poison edge
-// HOLDS ITS SLOT in every subsequent batch. The usual drain argument ("applied edges leave
-// the working set permanently, so the set strictly shrinks") is true and has exactly this
-// exception: if a full batch of low-id edges failed on every tick, newer edges would never
-// enter the window. Left as-is deliberately — it needs @lim edges failing simultaneously and
-// indefinitely, which the CTE”'s realistic failure modes (a dead DB, which stops the whole
-// tick anyway) do not produce. Written down so the exception is known rather than
-// rediscovered.
+// Stability is all the starvation argument needs. A FAILING edge is not consumed, so a
+// persistent poison edge keeps its slot in every batch. The usual drain argument ("applied
+// edges leave the working set permanently, so the set strictly shrinks") is true and has
+// exactly this exception: if a full batch of edges failed on every tick, newer edges would
+// never enter the window. Left as-is deliberately — it needs @lim edges failing
+// simultaneously and indefinitely, which the realistic failure modes (a dead database,
+// which stops the whole tick anyway) do not produce. Written down so the exception is known
+// rather than rediscovered.
 func (q *Queries) ListFiledIssueCloseEdges(ctx context.Context, arg ListFiledIssueCloseEdgesParams) ([]ListFiledIssueCloseEdgesRow, error) {
 	rows, err := q.db.Query(ctx, listFiledIssueCloseEdges, arg.RepoID, arg.Lim)
 	if err != nil {
