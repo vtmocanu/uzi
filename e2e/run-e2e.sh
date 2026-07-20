@@ -307,10 +307,17 @@ apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$
 apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
 
+# wait_http — poll /api/health until the stack answers. Instrumented (PRD #97 M9b)
+# even though it is defined ABOVE record_margin: bash resolves function names at call
+# time, and the first wait_http call (~:700) is far below the MARGINS_FILE arming
+# (~:535), so this is correct as written — do not "fix" the ordering.
 wait_http() {
-  local deadline=$((SECONDS + 90))
+  local timeout=90
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    curl -fsS "$BASE/api/health" >/dev/null 2>&1 && return 0
+    if curl -fsS "$BASE/api/health" >/dev/null 2>&1; then
+      record_margin "api health" "$((SECONDS - start))" "$timeout"; return 0
+    fi
     sleep 0.3
   done
   fail "api health never came up at $BASE"
@@ -318,23 +325,46 @@ wait_http() {
 
 # wait_eq WANT TIMEOUT DESC GETTER [ARGS...] — the generic "reaches state X" wait:
 # poll GETTER until its output equals WANT. Every simple equality wait shares this
-# skeleton; only the waits with extra early-fail conditions (wait_status,
-# wait_autopilot_done, wait_notes) keep bespoke loops.
-# ── margin instrumentation (PRD #97 M9) ───────────────────────────────────────
-# Every wait_* below records how long it ACTUALLY waited against the ceiling it was
+# skeleton. Bespoke loops remain where the wait is not a plain equality: extra
+# early-fail conditions (wait_status, wait_autopilot_done, wait_notes), a non-equality
+# predicate (wait_http, wait_review, wait_msg_kind, wait_msg_text, wait_tool_result),
+# or a value to echo back on success (wait_run_for_issue).
+# ── margin instrumentation (PRD #97 M9, completed in M9b) ─────────────────────
+# Every wait_* helper records how long it ACTUALLY waited against the ceiling it was
 # given; the tightest are printed at the end of the run. A bare PASS cannot distinguish
 # "settled instantly" from "made it with 200ms to spare on a 20s ceiling", and that
 # difference is the whole question when deciding whether a phase is safe to speed up or
-# is quietly one slow host away from red. Instrumenting the SHARED helper (rather than
-# per site) covers every wait_eq wrapper — wait_worker_online / wait_board_pipeline /
+# is quietly one slow host away from red.
+#
+# Coverage is now EVERY wait_* helper in this file. Instrumenting the shared wait_eq
+# covers its seven wrappers in one place (wait_worker_online / wait_board_pipeline /
 # wait_card_pipeline / wait_verdict / wait_card_column / wait_run_mr_state /
-# wait_health — plus wait_status, in one place.
+# wait_health); the nine helpers with bespoke loops each record at their own success
+# return: wait_status, wait_http, wait_run_for_issue, wait_autopilot_done, wait_notes,
+# wait_review, wait_msg_kind, wait_msg_text, wait_tool_result. The last three are the
+# 20s chat-phase ceilings — the tightest in the suite, and blind until M9b.
+#
+# Deliberately NOT instrumented: the handful of INLINE `while [ $SECONDS -lt … ]`
+# loops that are not helpers (second proposal card, plan-revision v2 pickup, worker cap
+# re-advertise, docker self-detect, and the inverted in-flight/health loop). They
+# `break` on success and leave the verdict to an assertion AFTER the loop, so the loop
+# has no success return to hang a record on; the inverted one waits for a condition
+# that must NEVER become true, where "how long it waited" has no meaning. Give one a
+# ceiling contract of its own before instrumenting it.
+#
+# Every helper binds its ceiling into a LOCAL and uses that local for both the deadline
+# and the record, so the reported ceiling can never drift from the enforced one (a
+# `local a=… b=$((a+1))` on ONE line does not sequence in bash — hence two statements).
 #
 # Diagnostic ONLY: record_margin never asserts and never fails a run — a broken
-# diagnostic must not be able to turn a good run red. Resolution is whole seconds
-# ($SECONDS, portable everywhere); that cannot resolve sub-second waits, but the
-# question it answers is "which ceilings are we approaching", where 1s granularity is
-# ample. Sub-second precision where it matters is done per site (see PRD #95).
+# diagnostic must not be able to turn a good run red. It is called on the SUCCESS path
+# only, never on a fail/early-exit path, and never in a position that could change a
+# helper's exit status or pollute its stdout (wait_run_for_issue echoes a run id).
+# Resolution is whole seconds ($SECONDS, portable everywhere); that cannot resolve
+# sub-second waits, but the question it answers is "which ceilings are we approaching",
+# where 1s granularity is ample. Sub-second precision where it matters is done per site
+# (see PRD #95). Descriptions carry run ids / issue iids / status+kind literals only —
+# never bodies, tokens, or vault material.
 MARGINS_FILE=""   # assigned once RUNROOT exists (see the mkdir below)
 record_margin() { # record_margin DESC WAITED_S TIMEOUT_S
   [ -n "$MARGINS_FILE" ] || return 0
@@ -342,14 +372,17 @@ record_margin() { # record_margin DESC WAITED_S TIMEOUT_S
 }
 
 # report_margins — print the waits that came closest to their ceiling. Sorted by
-# headroom (timeout - waited) ascending, so the most fragile are first.
+# headroom (timeout - waited) ascending, so the most fragile are first. The cut-off is
+# 20 (was 12): M9b roughly doubled the number of instrumented sites, and a top-12 taken
+# over twice the population hides exactly the newly-visible tight waits it was added
+# to expose.
 report_margins() {
   [ -n "$MARGINS_FILE" ] && [ -s "$MARGINS_FILE" ] || return 0
   say "PRD #97 M9 — wait_* margin report (tightest first; headroom = ceiling - actual)"
   # Emit "<headroom>\t<line>", numeric-sort on the leading key, then strip it — sorting
   # the rendered text directly does not work (the number is not at a field boundary).
   awk -F'\t' '{ printf "%d\t  %-46s waited %3ss of %3ss ceiling (headroom %3ss)\n", $2-$1, substr($3,1,46), $1, $2, $2-$1 }' \
-    "$MARGINS_FILE" | sort -n -k1,1 | cut -f2- | head -12
+    "$MARGINS_FILE" | sort -n -k1,1 | cut -f2- | head -20
   printf '  (%s instrumented waits this run; whole-second resolution)\n' "$(wc -l < "$MARGINS_FILE" | tr -d ' ')"
 }
 
@@ -399,8 +432,8 @@ wait_health()         { wait_eq "$2" "${3:-120}" "run $1 health" run_health "$1"
 # wait_status RUN WANT [TIMEOUT] — poll a run until it reaches WANT; abort early
 # if it lands in an unexpected terminal state.
 wait_status() {
-  local run="$1" want="$2" timeout="${3:-90}" deadline=$((SECONDS + ${3:-90})) s
-  local start=$SECONDS
+  local run="$1" want="$2" timeout="${3:-90}" s
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
     s="$(apiget "/api/runs/$run" | jq -r '.run.status')"
     if [ "$s" = "$want" ]; then record_margin "run status -> $want" "$((SECONDS - start))" "$timeout"; return 0; fi
@@ -476,10 +509,16 @@ create_autopilot_issue() {
 # wait_run_for_issue IID [TIMEOUT] — poll until an autopilot run exists for IID
 # (the poller creates it unattended); echoes the run id.
 wait_run_for_issue() {
-  local iid="$1" deadline=$((SECONDS + ${2:-40})) rid
+  local iid="$1" timeout="${2:-40}" rid
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
     rid="$(apiget "/api/runs?issue_iid=$iid" | jq -r '.runs[0].id // empty')"
-    [ -n "$rid" ] && { printf '%s' "$rid"; return 0; }
+    if [ -n "$rid" ]; then
+      # record_margin writes only to MARGINS_FILE — it must not touch the stdout this
+      # helper uses to hand the run id back to the caller.
+      record_margin "autopilot run for issue #$iid" "$((SECONDS - start))" "$timeout"
+      printf '%s' "$rid"; return 0
+    fi
     sleep 0.3
   done
   fail "timeout: no autopilot run appeared for issue #$iid"
@@ -497,10 +536,11 @@ assert_no_run_for_issue() {
 # awaiting_approval as a hard failure: an autopilot run that parks at the plan
 # gate means auto-approve is broken (the run would hang there forever).
 wait_autopilot_done() {
-  local run="$1" want="$2" deadline=$((SECONDS + ${3:-120})) s
+  local run="$1" want="$2" timeout="${3:-120}" s
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
     s="$(apiget "/api/runs/$run" | jq -r '.run.status')"
-    [ "$s" = "$want" ] && return 0
+    if [ "$s" = "$want" ]; then record_margin "autopilot run status -> $want" "$((SECONDS - start))" "$timeout"; return 0; fi
     [ "$s" = awaiting_approval ] && fail "autopilot run $run parked at awaiting_approval — auto-approve did not fire"
     case "$s" in
       failed|cancelled) [ "$s" = "$want" ] || fail "autopilot run $run entered '$s' while waiting for '$want'";;
@@ -513,10 +553,11 @@ wait_autopilot_done() {
 # wait_notes IID WANT [TIMEOUT] — poll until IID has exactly WANT comments; fail
 # fast if it ever exceeds WANT (the exactly-once guarantee is the whole point).
 wait_notes() {
-  local iid="$1" want="$2" deadline=$((SECONDS + ${3:-40})) n
+  local iid="$1" want="$2" timeout="${3:-40}" n
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
     n="$(note_count "$iid")"
-    [ "$n" = "$want" ] && return 0
+    if [ "$n" = "$want" ]; then record_margin "issue #$iid notes -> $want" "$((SECONDS - start))" "$timeout"; return 0; fi
     { [ -n "$n" ] && [ "$n" -gt "$want" ] 2>/dev/null; } && fail "issue #$iid has $n comments, expected $want (over-commented)"
     sleep 0.3
   done
@@ -2592,9 +2633,12 @@ pass "target issue run $J_RUN completed (the run the judge reviews)"
 
 # wait_review RUN [TIMEOUT] — poll the M4 owner-scoped review endpoint until a review lands.
 wait_review() {
-  local run="$1" deadline=$((SECONDS + ${2:-120}))
+  local run="$1" timeout="${2:-120}"
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    [ -n "$(apiget "/api/runs/$run/review" | jq -r '.review.id // empty')" ] && return 0
+    if [ -n "$(apiget "/api/runs/$run/review" | jq -r '.review.id // empty')" ]; then
+      record_margin "judge review landed" "$((SECONDS - start))" "$timeout"; return 0
+    fi
     sleep 0.3
   done
   fail "PRD #46: no judge review ever landed for run $run"
@@ -2633,16 +2677,28 @@ pass "persist-first: a judge_review inbox notification landed for the reviewed r
 say "PRD #68: file a forge issue from a judge recommendation"
 F_REVIEW="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.id')"
 { [ -n "$F_REVIEW" ] && [ "$F_REVIEW" != null ]; } || fail "PRD #68: no review on $J_RUN to seed a recommendation on"
-# Pre-generate the id in SQL rather than INSERT ... RETURNING, whose psql command tag
-# ("INSERT 0 1") would contaminate the captured id once db_psql strips the newline.
-F_REC="$(db_psql "SELECT gen_random_uuid()")"
-[ -n "$F_REC" ] || fail "PRD #68: could not generate a recommendation id"
-db_psql "INSERT INTO review_recommendations (id, review_id, category, target, rationale_md, confidence)
-         VALUES ('$F_REC','$F_REVIEW','install_worker_tool','jq','the reviewer hit jq: command not found in two iterations','high')" >/dev/null
-# Read it back THROUGH the API (not the id we generated) so the seed only counts if the
+# The id is never captured here — the row's `id uuid PRIMARY KEY DEFAULT
+# gen_random_uuid()` (migration 00059) assigns it, and the read-back below takes the id
+# from the API, which is the only one that proves anything.
+db_psql "INSERT INTO review_recommendations (review_id, category, target, rationale_md, confidence)
+         VALUES ('$F_REVIEW','install_worker_tool','jq','the reviewer hit jq: command not found in two iterations','high')" >/dev/null
+# Read it back THROUGH the API (not from the INSERT) so the seed only counts if the
 # review DTO actually surfaces the recommendation the filing routes will resolve.
-F_REC="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.recommendations[] | select(.category=="install_worker_tool" and .target=="jq") | .id')"
-{ [ -n "$F_REC" ] && [ "$F_REC" != null ]; } || fail "PRD #68: no install_worker_tool/jq recommendation to file"
+#
+# Assert EXACTLY ONE match. review_recommendations has no UNIQUE on
+# (review_id, category, target) — only idx_review_recommendations_review (00059) — so
+# nothing at the schema level stops a second row on this coordinate. Today that cannot
+# happen (fallbackReview only emits install_worker_tool from signal.missing_tools, and
+# nothing upstream plants one), but if it ever did, jq would emit two newline-joined
+# uuids, the -n/!=null guard would pass, and the damage would surface far downstream as
+# a malformed recommendation URL. Count first, then take the id — never `head -1`,
+# which would hide the duplicate this check exists to name.
+F_REC_IDS="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.recommendations[] | select(.category=="install_worker_tool" and .target=="jq") | .id')"
+F_REC_N="$(printf '%s' "$F_REC_IDS" | grep -c . || true)"
+[ "$F_REC_N" = 1 ] \
+  || fail "PRD #68: expected exactly 1 install_worker_tool/jq recommendation on review $F_REVIEW, got $F_REC_N (0 = the seed never surfaced on the review DTO; >1 = the funnel's review already carried this coordinate and the seed duplicated it — the phase must file against an unambiguous row)"
+F_REC="$F_REC_IDS"
+[ "$F_REC" != null ] || fail "PRD #68: the install_worker_tool/jq recommendation has a null id"
 
 # The draft GET is owner-scoped, templates the body, and carries the server-assembled
 # PRD+PRDLESS labels (never autopilot, never from the request body).
@@ -2755,30 +2811,40 @@ pass "judge disabled again (global + opt-in) — later sections run unjudged"
 # --- chat helpers (PRD #39) --------------------------------------------------
 # wait_msg_kind RUN KIND [TIMEOUT] — poll a run's messages until >=1 of KIND appears.
 wait_msg_kind() {
-  local run="$1" kind="$2" deadline=$((SECONDS + ${3:-20}))
+  local run="$1" kind="$2" timeout="${3:-20}"
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    apiget "/api/runs/$run/messages" \
-      | jq -e --arg k "$kind" '[.messages[] | select(.kind==$k)] | length >= 1' >/dev/null 2>&1 && return 0
+    if apiget "/api/runs/$run/messages" \
+      | jq -e --arg k "$kind" '[.messages[] | select(.kind==$k)] | length >= 1' >/dev/null 2>&1; then
+      record_margin "chat msg kind -> $kind" "$((SECONDS - start))" "$timeout"; return 0
+    fi
     sleep 0.3
   done
   fail "timeout: run $run never emitted a '$2' message"
 }
 # wait_msg_text RUN SUBSTR [TIMEOUT] — poll until a message payload.text contains SUBSTR.
 wait_msg_text() {
-  local run="$1" sub="$2" deadline=$((SECONDS + ${3:-20}))
+  local run="$1" sub="$2" timeout="${3:-20}"
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    apiget "/api/runs/$run/messages" \
-      | jq -e --arg s "$sub" '[.messages[] | select((.payload.text // "") | contains($s))] | length >= 1' >/dev/null 2>&1 && return 0
+    if apiget "/api/runs/$run/messages" \
+      | jq -e --arg s "$sub" '[.messages[] | select((.payload.text // "") | contains($s))] | length >= 1' >/dev/null 2>&1; then
+      # The needle is a message BODY — deliberately not in the description.
+      record_margin "chat msg text match" "$((SECONDS - start))" "$timeout"; return 0
+    fi
     sleep 0.3
   done
   fail "timeout: run $run never emitted a message containing '$2'"
 }
 # wait_tool_result RUN TOOL_USE_ID [TIMEOUT] — poll until a tool_result with that id lands.
 wait_tool_result() {
-  local run="$1" tuid="$2" deadline=$((SECONDS + ${3:-20}))
+  local run="$1" tuid="$2" timeout="${3:-20}"
+  local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ $SECONDS -lt $deadline ]; do
-    apiget "/api/runs/$run/messages" \
-      | jq -e --arg t "$tuid" '[.messages[] | select(.kind=="tool_result" and .payload.tool_use_id==$t)] | length >= 1' >/dev/null 2>&1 && return 0
+    if apiget "/api/runs/$run/messages" \
+      | jq -e --arg t "$tuid" '[.messages[] | select(.kind=="tool_result" and .payload.tool_use_id==$t)] | length >= 1' >/dev/null 2>&1; then
+      record_margin "chat tool_result -> $tuid" "$((SECONDS - start))" "$timeout"; return 0
+    fi
     sleep 0.3
   done
   fail "timeout: run $run never emitted a tool_result '$2'"
