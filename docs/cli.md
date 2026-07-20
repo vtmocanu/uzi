@@ -69,12 +69,14 @@ headless path. **In GitLab CI, `UZI_TOKEN` must be a masked variable.**
 
 ```
 uzi login | logout | auth token [--with-token] | auth status | whoami
-uzi run list | get <id> | logs <id> [--follow] [--after <seq>] | review <id>
+uzi run list | get <id> | logs <id> [--follow] [--after <seq>]
 uzi run create --repo <id> --issue <iid>
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
 uzi run reject <id> [--message <text>]
 uzi run cancel <id>
 uzi run follow-up <id> [--message <text>]
+uzi review show <id> | resolve <id> <rec> | dismiss <id> <rec> --reason wont-do|not-an-issue
+uzi review undo <id> <rec> | stats [--json]
 uzi worker list | rm <id>
 uzi repo list
 uzi admin users | runs | workers | usage | rate-limits
@@ -94,11 +96,15 @@ A few worth knowing:
   (`own` = your template roster, `repo` = the agents the worker detected in
   the clone's `.claude/agents/`), and `--exclude-agents a,b` drops individual
   subagents from that source. `--exclude-agents` requires `--agent-source`.
-- **`run review <id>`** prints the judge's verdict, summary, and
-  recommendations for a run — see [Run judge](./judge.md#reading-a-review-from-the-cli)
-  for the full `--json` contract. It's read-only: there's no `rejudge` verb,
-  since re-running the judge spends the owner's Anthropic budget and stays a
-  web action.
+- **`review show <id>`** (formerly `run review <id>`, still around as a
+  hidden, deprecated alias) prints the judge's verdict, summary,
+  recommendations, and triage tally for a run — see
+  [Run judge](./judge.md#reading-a-review-from-the-cli) for the full `--json`
+  contract. The rest of the `review` group (`resolve`/`dismiss`/`undo`/
+  `stats`) triages recommendations — see
+  [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)
+  below. There's still no `rejudge` verb: re-running the judge spends the
+  owner's Anthropic budget and stays a web action.
 - **`admin` needs an admin-scoped token.** A default (`uzc_`) token gets
   exit 3 with an actionable message; mint an `admin_ro` (`uza_`) token in
   Settings → Access to use it. `uzi whoami` over a `uzc_` token reports
@@ -107,6 +113,46 @@ A few worth knowing:
 - **`uzi logout` is local-only.** It removes the stored credential; it does
   **not** revoke it server-side (see [Managing tokens](#managing-tokens)
   below).
+
+## Reviewing and triaging from the CLI
+
+`uzi review` reads a run's judge output and sets the same **Mark done** /
+**Dismiss** triage the [run judge](./judge.md#triage-resolve-dismiss-and-count)
+page does, from the terminal:
+
+```sh
+uzi review show <run-id>                                    # verdict + recommendations + triage
+uzi review resolve <run-id> <rec-id>                         # mark a recommendation done
+uzi review dismiss <run-id> <rec-id> --reason wont-do        # valid, not worth doing
+uzi review dismiss <run-id> <rec-id> --reason not-an-issue   # false positive
+uzi review undo <run-id> <rec-id>                            # clear a disposition
+uzi review stats [--json]                                    # your triage tally, across all runs
+```
+
+`<rec-id>` is the short, git-style id `show` prints as the first column of
+each recommendation (or the full UUID from `--json`); an unambiguous prefix
+resolves against the run's **current** review, so you can paste straight out
+of `show`'s output. An ambiguous prefix is a usage error (exit 2, "use a
+longer id"); an id that matches nothing is a not-found (exit 4) with a
+refresh hint — the review may have changed under a re-judge.
+`dismiss` requires `--reason wont-do` or `--reason not-an-issue`; anything
+else is a usage error (exit 2), raised before any request is sent. `undo` on
+a recommendation with no disposition is treated as already-undone (a
+friendly line, exit 0), not a failure.
+
+`uzi run review <id>` still works — it's a hidden, deprecated alias for
+`uzi review show <id>`.
+
+**The mutation verbs are owner-only, whatever the token.** A `uzc_` token
+drives `resolve`/`dismiss`/`undo`/`stats` on its own runs, same as clicking
+the buttons yourself. A read-only `uza_` token can `show` anyone's review
+(the same admin reach other judge reads get) and `stats` always reports the
+token owner's *own* tally, but the read-only ceiling still holds for writes:
+`resolve`/`dismiss`/`undo` against **another** user's review is refused
+(exit 4, not found), exactly as for a non-admin `uzc_` token. On its
+**own** runs, though, a `uza_` token can triage same as any owner — the
+ceiling blocks reaching into someone else's review, not every write
+everywhere.
 
 ## Agents: `--json` and exit codes
 
