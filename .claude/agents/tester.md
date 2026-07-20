@@ -1,8 +1,8 @@
 ---
 name: tester
-version: 1
+version: 2
 description: "Validates changes by exercising them against representative real-world inputs and verifying observable behavior. Adapts to whatever testing surface the repo actually has: unit-test framework (jest, pytest, go test, cargo test), scenario simulation for repos without one (CI workflows, infra, KCL/IaC libs), live-API dry-runs, or end-to-end runs with a consumer."
-tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
+tools: Bash, Read, Grep, Glob, WebFetch, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
 ---
 
@@ -63,3 +63,10 @@ that allowlist re-opens a real hazard, so don't without saying why. Never a bare
 hosted k8s deploy (dev-cluster, ArgoCD) — validate worker/runtime features there, not
 only under compose. CI (`.gitlab-ci.yml`) runs the per-toolchain gates but NOT e2e
 (it needs docker compose on the runner), so e2e + smoke stay the local pre-merge gate.
+
+**Long-gate exception to the generic `<5min` live-wait bound:** `./e2e/run-e2e.sh` runs
+~30 minutes end to end (it cycles the whole stack and drives real stub-agent scenarios),
+far past the `<5min` bound in the generic body above. For a full e2e run, coordinate with
+the lead and let it finish (the lead watches the process to completion) — do NOT abandon it
+at 5 minutes. The `<5min` bound still governs individual polls against a live run/API, not
+the e2e gate itself.
