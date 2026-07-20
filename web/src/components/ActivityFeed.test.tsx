@@ -1,13 +1,43 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect, vi } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import type { Run, RunHealth, RunMessage, RunStatus } from "../lib/api";
 import { ActivityFeed } from "./ActivityFeed";
+
+// This jsdom build does not expose window.localStorage (see prefs.test.ts), so the view
+// preference has to be backed by a Map-based Storage stub — without one `prefs` silently
+// falls back and selectTimelineView() would be a no-op that still passes.
+function makeStorage(): Storage {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => (m.has(k) ? (m.get(k) as string) : null),
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+    clear: () => m.clear(),
+    key: (i: number) => [...m.keys()][i] ?? null,
+    get length() {
+      return m.size;
+    },
+  } as Storage;
+}
+
+beforeEach(() => {
+  // Fresh per test: the view toggle persists GLOBALLY (PRD #99 Decision 2), so a test
+  // that selects Timeline would otherwise leak that choice into every later test.
+  Object.defineProperty(window, "localStorage", { configurable: true, value: makeStorage() });
+});
 
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
 });
+
+// The pane defaults to By-agent instance lanes (PRD #99). Two behaviours below are the
+// pre-#99 chronological rendering, which is RETAINED but now lives only behind the
+// Timeline toggle — seed the persisted preference before rendering to reach it.
+function selectTimelineView() {
+  window.localStorage.setItem("uzi.activity.view", JSON.stringify("timeline"));
+}
 
 function m(
   seq: number,
@@ -213,7 +243,10 @@ describe("ActivityFeed crew roster", () => {
     expect(queryByRole("button", { name: /^Jump to/ })).toBeNull();
   });
 
-  it("clicking a crew chip expands that agent", () => {
+  it("clicking a crew chip expands that agent (Timeline — the strip's home)", () => {
+    // The jump strip is Timeline-only now: under By-agent the collapsed lanes ARE the
+    // roster, so a small crew renders no strip at all (PRD #99 Decision 5).
+    selectTimelineView();
     // Newest message is lead (seq 9) → lead is the active speaker; worker is non-active.
     const { getByRole } = renderFeed(leadWorkerLead(), { status: "running", health: "ok" });
     // Multi-agent live run → collapsed by default.
@@ -242,7 +275,10 @@ describe("ActivityFeed collapse-by-default", () => {
     expect(getByRole("button", { name: /lead activity$/ }).getAttribute("aria-expanded")).toBe("true");
   });
 
-  it("collapsing lead reduces BOTH lead blocks, worker untouched (keyed by agent name)", () => {
+  it("collapsing lead reduces BOTH lead blocks, worker untouched (Timeline, keyed by agent name)", () => {
+    // Two non-contiguous lead blocks only exist in Timeline: By-agent coalesces them
+    // into one lane, which is the whole point of PRD #99's Problem 1.
+    selectTimelineView();
     const { getAllByRole, getByRole } = renderFeed(leadWorkerLead(), { status: "completed" });
     // Terminal → all expanded; collapse lead via its first block's chevron.
     const leadToggles = getAllByRole("button", { name: /lead activity$/ });
