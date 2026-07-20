@@ -1487,8 +1487,11 @@ const realApi = {
   // The run's follow_up steer queue with delivery status (PRD #95). Owner-only: a
   // non-owner (incl. admin_ro) gets 404, which the caller treats as "no queue".
   getRunInputs: (id: string) => request<{ inputs: SteerInput[] }>("GET", `/runs/${id}/inputs`),
+  // A follow_up write returns the created row's id + created_at (PRD #95 S2) so the
+  // web's optimistic queue entry adopts the real id and reconciles; other kinds omit
+  // them (they are server-side or own their own UI). Both fields optional on the wire.
   submitRunInput: (id: string, kind: RunInputKind, body = "", selection?: AgentSelectionInput) =>
-    request<{ server_side: boolean }>("POST", `/runs/${id}/inputs`, {
+    request<{ server_side: boolean; id?: number; created_at?: string }>("POST", `/runs/${id}/inputs`, {
       kind,
       body,
       // PRD #37: the structured agent selection is legal only on approve_plan; the

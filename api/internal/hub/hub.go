@@ -25,11 +25,12 @@ import (
 const subBuffer = 256
 
 // Event is one WS frame. "message" carries a persisted run message (the client
-// renders it directly, deduped by seq); "state" signals a run state change and
-// "health" a run-health flag change (PRD #47) — for both the client re-reads the run
-// over REST, since WS never carries authoritative run state.
+// renders it directly, deduped by seq); "state" signals a run state change,
+// "health" a run-health flag change (PRD #47), and "input" a steer-queue change
+// (PRD #95) — for all three the client re-reads over REST, since WS never carries
+// authoritative run state.
 type Event struct {
-	Type      string          `json:"type"` // "message" | "state" | "health"
+	Type      string          `json:"type"` // "message" | "state" | "health" | "input"
 	Seq       int32           `json:"seq,omitempty"`
 	Kind      string          `json:"kind,omitempty"`
 	Agent     *string         `json:"agent,omitempty"`
@@ -117,6 +118,16 @@ func (h *Hub) PublishState(runID uuid.UUID, status string) {
 // prompt the repaint, so it ignores them.
 func (h *Hub) PublishHealth(runID uuid.UUID, health, reason string, nudge bool) {
 	h.broadcast(runID, Event{Type: "health"})
+}
+
+// PublishInput signals that a run's steer queue changed (PRD #95) — a follow-up was
+// consumed, stamping consumed_at. Like a "state" or "health" frame it carries NO
+// authoritative data: the browser re-reads GET /runs/{id}/inputs, which owner-gates
+// the steer text, so it never rides the socket. This frame is a fast-path only — the
+// client also refetches inputs on mount/reconnect/state/health, so a hub-dropped
+// frame self-heals (Decision 5).
+func (h *Hub) PublishInput(runID uuid.UUID) {
+	h.broadcast(runID, Event{Type: "input"})
 }
 
 // broadcast marshals ev once and sends it to every subscriber of runID,

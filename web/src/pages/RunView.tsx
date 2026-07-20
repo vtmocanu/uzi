@@ -119,7 +119,7 @@ function HealthFlag({ run }: { run: Run }) {
 
 export function RunView() {
   const { id = "" } = useParams();
-  const { run, messages, connected, error, submit, inputs } = useRunStream(id);
+  const { run, messages, connected, error, submit, inputs, canSteer } = useRunStream(id);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [actionErr, setActionErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -409,6 +409,8 @@ export function RunView() {
       <SteerQueueCard
         inputs={inputs}
         terminal={terminal}
+        status={run.status}
+        canSteer={canSteer}
         busy={busy}
         onStop={() => act(() => submit("cancel"))}
         onSend={(text) => act(() => submit("follow_up", text))}
