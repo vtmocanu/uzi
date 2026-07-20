@@ -106,11 +106,48 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must COPY the lock BEFORE 'RUN devbox global install'`,
       );
       assert.match(text, /devbox global install/, `${name}/Dockerfile must realize the global manifest at build time`);
+      // PRD #92 M1: PATH points at the STABLE, immutable /opt/uzi-toolchain/bin handle
+      // (readlink -f of the realized profile), NOT the mutable devbox `default` profile
+      // symlink that advances every image roll and strands stale-seeded /nix volumes.
       assert.match(
         text,
-        /ENV PATH="[^"]*devbox\/global\/default\/\.devbox\/nix\/profile\/default\/bin/,
-        `${name}/Dockerfile must add the devbox global profile bin to PATH`,
+        /ENV PATH="\/opt\/uzi-toolchain\/bin/,
+        `${name}/Dockerfile must put /opt/uzi-toolchain/bin on PATH (the stable, immutable toolchain handle)`,
       );
+      assert.doesNotMatch(
+        text,
+        /ENV PATH="[^"]*devbox\/global\/default\/\.devbox\/nix\/profile\/default\/bin/,
+        `${name}/Dockerfile must NOT point PATH at the mutable devbox global profile symlink (PRD #92 M1)`,
+      );
+      // The stable symlink is created from the readlink -f'd realized profile.
+      assert.match(
+        text,
+        /ln -sfn "\$PROFILE" \/opt\/uzi-toolchain/,
+        `${name}/Dockerfile must create the stable /opt/uzi-toolchain symlink to the realized profile`,
+      );
+      // The store-hash marker M2's version-aware seed keys on (the contract this milestone freezes).
+      assert.match(
+        text,
+        /readlink -f \/opt\/uzi-toolchain > \/etc\/uzi-toolchain-profile/,
+        `${name}/Dockerfile must bake the /etc/uzi-toolchain-profile store-hash marker (M2 contract)`,
+      );
+      // The INDIRECT nix GC root so the seed tar carries the profile and a runner
+      // nix-collect-garbage (issue #91) can't reap it.
+      assert.match(
+        text,
+        /ln -sfn \/opt\/uzi-toolchain \/nix\/var\/nix\/gcroots\/uzi-toolchain/,
+        `${name}/Dockerfile must register the /nix/var/nix/gcroots/uzi-toolchain GC root`,
+      );
+      // The fail-closed build assertion: a broken toolchain fails the BUILD, not a silent 127 at
+      // run time. `command -v` checks each tool SEPARATELY (multi-operand `command -v` validates
+      // only the first), so all four must be present as their own `command -v` clause.
+      for (const tool of ["python3", "go", "gcc", "pip"]) {
+        assert.match(
+          text,
+          new RegExp(`command -v ${tool}\\b`),
+          `${name}/Dockerfile must carry a fail-closed 'command -v ${tool}' build assertion`,
+        );
+      }
     });
   }
 });
@@ -142,6 +179,14 @@ describe("the shared root-entry drop wrapper", () => {
     // PATH excludes /nix and /data so root never resolves a binary from a volume.
     assert.match(entrypoint, /PATH=\/usr\/local\/sbin:\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/sbin:\/bin/);
     assert.doesNotMatch(entrypoint, /PATH=[^\n]*\/nix/, "the root-window PATH must not contain /nix");
+    // PRD #92 M3 prohibition: /opt/uzi-toolchain/bin dereferences into runner-writable
+    // /nix, so it must NEVER be on any worker PATH= line (it belongs only on the image
+    // PATH that becomes UZI_RUNNER_PATH). This pins the guardrail comment as an invariant.
+    assert.doesNotMatch(
+      entrypoint,
+      /PATH=[^\n]*\/opt\/uzi-toolchain/,
+      "no PATH= line may carry /opt/uzi-toolchain (PRD #92: it dereferences into runner-writable /nix)",
+    );
   });
 
   it("tolerates a non-root start (PRD #58): single-uid exec precedes the setpriv drop", () => {
