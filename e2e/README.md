@@ -13,8 +13,13 @@ side; this exercises the real wire).
 ```
 
 Requirements: Docker + Compose v2, and `openssl`, `jq`, `git`, `curl` on the
-host. First run builds the `api`/`web`/`agent` images plus the tiny `forge-fake`
-image (a few minutes); later runs reuse the layer cache. On success it prints
+host — plus **`go`** (the PRD #97 M2 CLI leg builds `api/cmd/uzi` on the host and
+drives the running api with it). **Docker Engine >= 25** is recommended: the overlay's healthchecks set
+`start_interval: 1s` (probe every second during `start_period`), which trims the
+first-probe floor off the full-stack `--wait` boots. Older engines silently ignore
+the field, so the suite still runs correctly — just a few seconds slower per boot.
+First run builds the `api`/`web`/`agent` images plus the tiny `forge-fake` image
+(a few minutes); later runs reuse the layer cache. On success it prints
 `All E2E checks passed.` and tears everything down.
 
 Knobs (env vars):
@@ -109,6 +114,20 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
    already concurrency-safe, so this exercises the worker-loop + server + API path,
    **not** the M1 per-run executor kill/reap isolation fix (guarded by an `agent/`
    unit test).
+10. **Live `/api/ws` + `uzi` CLI (PRD #97 M2)** — two full-wire-only consumers no
+    lower layer reaches. **WS**: the agent's Node 22 global `WebSocket` subscribes to
+    `/api/ws?run=<id>` (the browser's primary real-time transport; every *other*
+    stream assertion here uses the REST `?after=<seq>` replay), authenticating with
+    the admin **session cookie** plumbed into the upgrade — a GET upgrade behind
+    `RequireAuth`, with a same-origin (CSWSH) check and per-run authz. It subscribes
+    **first**, then approves the parked plan on socket open, and asserts it receives a
+    live `run_message` frame (hub-broadcast → client wire, not REST replay); a
+    **no-cookie** upgrade is separately asserted to be **rejected**, so the gate is
+    non-vacuous. **CLI**: `api/cmd/uzi` is built on the host and pointed at the live
+    api, authed headless via a minted `uzc_` `$UZI_TOKEN` (from `POST
+    /api/me/cli-tokens`); `uzi run list --json` must parse and its run-id set must
+    equal `GET /api/runs`'s, then `uzi run approve` drives a parked run to
+    `completed` — so DTO/route drift in either consumer turns the run red.
 
 ## How the fakes are wired (no real GitLab, no live session)
 
@@ -127,14 +146,28 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
   worker reaches it because a `url.<local>.insteadOf` gitconfig rewrites the
   https clone/push URL the api hands out. The worker's clone → worktree → commit
   → **push** path runs for real against it; the branch-pushed assertion reads the
-  bare repo directly. **Fidelity caveat:** because the rewritten remote is a
-  *local path*, git ignores all `http.*` config on it, so the worker's
-  **git-over-HTTPS Basic auth header is NOT exercised** by the default harness —
-  which is exactly why this harness (like every prior test) would not have caught
-  the `PRIVATE-TOKEN`-vs-Basic auth bug; the live run did. (The
-  `E2E_GIT_SMART_HTTP=1` variant, when available, points `clone_url` at a real
-  git-smart-HTTP endpoint on `forge-fake` that 401s without a valid `Authorization:
-  Basic` header, closing this gap and guarding against a git-auth regression.)
+  bare repo directly. This local-path leg stays the fast, hermetic default for
+  every phase (and is the only transport that keeps `repo.git`/`repo2.git` as two
+  independent bares, which the PRD #42 two-repo concurrency phase requires).
+- **git-over-HTTPS Basic auth is exercised on EVERY default run** (PRD #97 M1). A
+  local-path push ignores all `http.*` config, so it never sends the worker's
+  `Authorization: Basic` header — the exact blind spot the shipped
+  `PRIVATE-TOKEN`-vs-Basic auth bug slipped through. So one dedicated leg drops the
+  `insteadOf` rewrite for a single `group/repo` run and lets the worker fetch+push
+  against `forge-fake`'s real git-smart-HTTP endpoint, which **401s any git op
+  lacking a valid `Authorization: Basic` (`uzi-bot:PAT`)**. A run that reaches
+  `completed` with its branch on the bare therefore proves the worker sent Basic; a
+  credential-injection regression turns the run red. (The opt-in
+  `E2E_GIT_SMART_HTTP=1` variant routes the *whole* suite over smart-HTTP; because
+  `forge-fake` collapses every repo path to one bare, that variant's #42 phase
+  asserts against the one shared bare — the default run keeps the full independent-
+  bare check.)
+- **`main` is never touched — and the fake remote enforces it** (PRD #97 M1). Each
+  seeded bare carries a `pre-receive` hook that refuses `refs/heads/main`, so the
+  "push to main is refused" assertion is real, not vacuous. The backstop is
+  self-tested under **both** transports (the hook fires in the agent image for a
+  local-path push and in `forge-fake` for smart-HTTP, since the bare is one shared
+  host dir): a `main` push is refused, a non-`main` branch push is accepted.
 - **The executor** is the M2 stub with `UZI_STUB_PLAN_GATE=1`, so it drives the
   full M4 plan gate (emit plan → `awaiting_approval` → await verdict → implement)
   with no SDK.

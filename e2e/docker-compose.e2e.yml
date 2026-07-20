@@ -53,6 +53,12 @@ services:
       timeout: 5s
       retries: 10
       start_period: 3s
+      # PRD #97 M5: probe every 1s DURING start_period (Docker Engine >=25), so a
+      # container that is ready in ~1s is marked healthy at the next second instead of
+      # waiting for the first `interval` probe. Trims the first-probe floor off the two
+      # full-stack `up -d --wait db api web forge-fake` boots (overlay-only; base
+      # healthcheck cadence is untouched). See e2e/README.md.
+      start_interval: 1s
 
   # Publish the SPA/nginx origin on a per-run high port so the harness never
   # collides with the user's own `uzi` stack on 8080. `!override` replaces the
@@ -61,7 +67,20 @@ services:
     ports: !override
       - "127.0.0.1:${E2E_WEB_PORT}:8080"
 
+  db:
+    # PRD #97 M5: merge start_interval into the base db healthcheck (pg_isready test etc.
+    # stay in docker-compose.yml). db is first in the `--wait` chain, so a 1s start probe
+    # shortens the whole boot (api depends_on db: service_healthy). Needs Engine >=25.
+    healthcheck:
+      start_interval: 1s
+
   api:
+    # PRD #97 M5: merge start_interval into the base api healthcheck (test/interval/etc.
+    # come from docker-compose.yml). Probing every 1s during start_period lets api go
+    # healthy as soon as the db→api chain is up, cutting the first-probe floor off the two
+    # `up -d --wait db api web forge-fake` boots. Needs Docker Engine >=25. Overlay-only.
+    healthcheck:
+      start_interval: 1s
     environment:
       # Hermetic master key (a fixed dummy, base64 of "e2e-dummy-secret-key-not-real!!!").
       # A literal here overrides the base's ${UZI_SECRET_KEY} for THIS container, so the
