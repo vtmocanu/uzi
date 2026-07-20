@@ -208,10 +208,16 @@ one action.
      **not wrapped in a transaction**. Each is local, side-effect-free and
      last-writer-wins, with no forge write and no spend to make exactly-once — #94
      Decision 6's own reasoning — so a partial failure is safely retried and
-     converges. Two properties keep that honest and must not be dropped: `updated`
-     reflects what actually landed, and the re-read `groups` show the true
-     post-state, so a partial apply is **visible** rather than silently assumed
-     complete. The response is `{updated, groups, triage}` with **`groups` re-read at
+     converges. **A mid-fan-out failure surfaces as a plain 500 and the partial
+     apply is NOT reported** (measured, not reasoned, in the M2 review: with the
+     2nd of 3 upserts failing, one upsert had landed, the service discarded the
+     `updated` counter and returned a generic 500, and the re-read never ran).
+     That is accepted: a 500 makes no false claim of success, the landed subset is
+     visible on the next read, and a retry converges because every upsert is
+     idempotent. What is NOT accepted is describing it otherwise — the requirement
+     is that the endpoint never *claims* completeness it does not have. Moving to a
+     partial-success report (207, or 200 with a `partial` flag) would be a design
+     change, deliberately not taken in v1. The response is `{updated, groups, triage}` with **`groups` re-read at
      `bucket=all`** — the subtle part: a just-dismissed group has left To triage but
      must still come back so M3 can re-render the row instead of having it vanish
      mid-interaction. **M3 must not "optimize" that re-read down to the active

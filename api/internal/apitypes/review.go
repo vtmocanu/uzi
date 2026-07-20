@@ -138,10 +138,24 @@ type JudgeRecommendationGroupDTO struct {
 // BucketTriage ladder, so the page's bucket tabs, the nav badge and the strip cannot drift
 // no matter which filter is applied or whether the page was truncated.
 //
-// Truncated says the backlog hit its hard row cap (workersvc.JudgeBacklogMaxRows) and the
-// Groups below are therefore a partial view — the OLDEST occurrences are the ones missing,
-// since the read is most-recent-first. Triage stays whole regardless, so the canonical
-// counts are still correct when this is true.
+// Truncated says the backlog hit its hard row cap (workersvc.JudgeBacklogMaxRows). Read
+// this carefully before rendering a truncated page, because the cut is NOT simply "the
+// tail of the list is missing":
+//
+// The cap bounds ROWS and it applies BEFORE grouping, so a group that SURVIVES the cut can
+// still have lost occurrences. When Truncated is true, a surviving group's RunCount and
+// OpenCount may be UNDERSTATED and its Bucket rollup may be WRONG — a group whose only
+// open occurrence fell outside the cut rolls up done/dismissed instead of todo, and is
+// then filtered out of the default ?bucket=todo view entirely. So a truncated page must
+// never be presented as authoritative.
+//
+// What is missing is the LEAST-RECENTLY-JUDGED occurrences: the read is ordered by
+// run_reviews.updated_at DESC, so "oldest" means oldest by last judging, and a run
+// re-judged today counts as recent no matter when it first ran.
+//
+// Triage is unaffected — it comes from the #94 stats query over the caller's whole row
+// set, so the canonical counts remain correct even here. That asymmetry is deliberate: the
+// numbers stay right while the list goes partial.
 type JudgeBacklogDTO struct {
 	Bucket    string                        `json:"bucket"`
 	Run       string                        `json:"run"`

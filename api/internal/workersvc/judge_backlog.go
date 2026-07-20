@@ -95,6 +95,18 @@ type coord struct {
 // response, and a group is at most one row per run it recurs in. At ≤50 recommendations per
 // review (ReviewMaxRecommendations) this is ≥40 fully-loaded reviews, and typically many
 // hundreds. When the cap bites, JudgeBacklogDTO.Truncated says so.
+//
+// Note what the cap does NOT bound. It applies BEFORE grouping, so a surviving group can
+// lose occurrences and under-report RunCount/OpenCount — and can therefore roll up to the
+// wrong bucket (see JudgeBacklogDTO.Truncated for the consequence). And it bounds the
+// CLIENT side of the read only: the ORDER BY spans run_reviews and review_recommendations,
+// so no index supplies that ordering and Postgres still materializes the caller's full
+// join result and top-N sorts it before LIMIT applies. It is bounded to the caller's own
+// rows by idx_run_reviews_user, never a full-table scan, but "bounded pull" means the wire
+// and this process, not the server's work. (Structural argument from the query text and
+// the index list; not measured with EXPLAIN.) The companion stats read is not capped at
+// all — 3 narrow columns, and it is the same unbounded query /me/judge/stats already
+// serves on this mount — so a request is half-capped, not capped.
 const JudgeBacklogMaxRows = 2000
 
 // JudgeRecommendationBacklog is the Judge menu's grouped read (PRD #98 M1, Decision 1):

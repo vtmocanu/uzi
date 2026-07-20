@@ -2102,6 +2102,22 @@ func pgFloat4Ptr(v *float64) pgtype.Float4 {
 	return pgtype.Float4{Float32: float32(*v), Valid: true}
 }
 
+// pgUUID wraps a uuid you KNOW IS PRESENT as a valid pgtype.UUID. It sets Valid=true
+// unconditionally — including for uuid.Nil, which it turns into the REAL all-zero uuid,
+// not SQL NULL.
+//
+// That is correct for its contract and must not be "fixed" to auto-NULL uuid.Nil: at the
+// ~45 call sites that legitimately assume presence, auto-NULLing would convert a loud FK
+// violation into a silent NULL write.
+//
+// The trap is passing uuid.Nil as an "absent" sentinel to a sqlc.narg parameter. The
+// query's `IS NULL` escape hatch then never fires and the filter matches nothing, so the
+// endpoint SILENTLY RETURNS NOTHING rather than erroring (PRD #98 M1 hit exactly this; it
+// took a live-DB test to surface, since a fake store cannot show it). For a genuinely
+// optional id use the house idiom instead: *uuid.UUID with an explicit nil guard
+// (ListRunsForUser, above), or leave the zero pgtype.UUID (Valid:false → NULL) and call
+// this only on the present branch. workersvc.nullableUUID does the latter for the judge
+// backlog's ?run= anchor.
 func pgUUID(id uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: id, Valid: true}
 }

@@ -612,7 +612,19 @@ func hasControlChar(s string) bool {
 	return false
 }
 
-// pgUUID wraps a google/uuid value as a valid pgtype.UUID.
+// pgUUID wraps a uuid you KNOW IS PRESENT as a valid pgtype.UUID. It sets Valid=true
+// unconditionally — including for uuid.Nil, which becomes the REAL all-zero uuid, not SQL
+// NULL. Do not "fix" that: at call sites that legitimately assume presence, auto-NULLing
+// would turn a loud FK violation into a silent NULL write.
+//
+// The trap is passing uuid.Nil as an "absent" sentinel to a sqlc.narg parameter — the
+// query's `IS NULL` branch never fires, so the filter matches nothing and the endpoint
+// SILENTLY RETURNS NOTHING instead of erroring. For a genuinely optional id, leave the
+// zero pgtype.UUID (Valid:false → NULL) and call this only on the present branch, as the
+// optional-parent paths in this file already do.
+//
+// Two sibling copies exist (workersvc/service.go, selfimprove/engine.go) with the same
+// contract; keep these comments in step.
 func pgUUID(id uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: id, Valid: true}
 }

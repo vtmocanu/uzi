@@ -43,15 +43,23 @@ WHERE rv.user_id = $1
   -- return. It is a SEMI-join, not an equality: keep every occurrence of a coordinate that
   -- ALSO occurs in the anchor run, so a group arrived at from a notification still shows
   -- the other runs it recurs in — the whole point of the dedup. The subquery is scoped
-  -- rv2.user_id = rv.user_id, so it can only ever see the CALLER's own reviews: an anchor
+  -- rv2.user_id = @user_id, so it can only ever see the CALLER's own reviews: an anchor
   -- naming another user's (or a nonexistent) run matches nothing, with no existence oracle.
+  --
+  -- The subquery pins @user_id DIRECTLY rather than correlating ` + "`" + `rv2.user_id = rv.user_id` + "`" + `.
+  -- The correlated form is also correct today — the outer WHERE pins rv.user_id to the
+  -- caller, so it can only ever bind to the caller — but it is correct only BECAUSE that
+  -- outer filter holds. This repo's guardrail rule is not to lean one layer on another
+  -- layer holding, and the outer filter is exactly the kind of thing a future admin or
+  -- cross-user view would relax. Pinning directly costs nothing and keeps the anchor
+  -- owner-scoped on its own.
   AND (
       $2::uuid IS NULL
       OR EXISTS (
           SELECT 1
           FROM run_reviews rv2
           JOIN review_recommendations rr2 ON rr2.review_id = rv2.id
-          WHERE rv2.user_id = rv.user_id
+          WHERE rv2.user_id = $1
             AND rv2.target_run_id = $2::uuid
             AND rr2.category = rr.category
             AND rr2.target = rr.target
