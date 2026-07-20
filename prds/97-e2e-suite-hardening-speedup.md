@@ -379,9 +379,22 @@ carry explicit author sign-off:
         fine, accepting the opposite is not); no substituting the write-response for
         `GET /inputs` (distinct surfaces — assert both or neither); and no merely
         making the read earlier, which shortens the window without closing it.
-      - **`#22` propagation timeout** (`wait_eq no 20` at `:2293` ≈ 6s) → widen to
-        **≥2 reconcile periods**. At `FORGE_POLL_INTERVAL=2s` + `FORGE_RECONCILE_EVERY=2`
-        the reconcile period is 4s, so ~6s is barely 1.5 periods.
+      - **`#22` PRDLESS-remove → DIAGNOSE. Do NOT widen the window.**
+        ⚠️ **Correction (2026-07-20):** an earlier draft of this milestone called `#22`
+        a too-tight window — "`wait_eq no 20` ≈ 6s, ~1.5 reconcile periods". **That was
+        wrong.** `wait_eq`'s second argument is **SECONDS, not tries**
+        (`local deadline=$((SECONDS + timeout))`), so it waited a **full 20s across ~66
+        polls** = **5 reconcile periods**, comfortably ABOVE the Decision-5 floor.
+        The label was still on the fake forge after all 66 reads, on a **forge-first**
+        write whose response card had already come back *without* PRDLESS. So this is
+        **a state that never converged, not a window that closed early** — and it fits
+        neither M8 class (a) (run-create reconcile 404) nor (b) (api-routing transient).
+        **Raising the timeout here would convert a real unexplained defect into a slower
+        green** — precisely the false-green pattern this PRD exists to kill. M9's action
+        is therefore to **diagnose** (run with `KEEP_STACK=1` so a recurrence can be
+        interrogated against forge-fake + api logs instead of being torn down), and to
+        fix only once the mechanism is known. If it proves environmental, say so with
+        evidence; do not reclassify it as a flake to make the suite green.
       - **FullSync-eviction `sleep 6`** → **8s**, the 2-reconcile-period floor the fable
         review identified. M5 correctly declined to *lower* it; M9 raises it to the floor.
       - **Margin diagnostics** — the durable part. Timing-sensitive assertions must emit
