@@ -366,18 +366,24 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		}
 		currentGen, err := n.store.CountRunPlanMessages(ctx, rc.ID)
 		if err != nil {
-			// Best-effort fallback to the legacy "post once" behavior so a count failure
-			// neither spams nor silently drops: treat a closed gate as a new generation
-			// and an open gate as the same one.
+			// Without a reliable plan-generation count we cannot tell a genuinely new plan
+			// version from a redundant re-broadcast. The old fallback guessed storedGen+1 on
+			// a closed gate, but that BURNS the next generation: it posts the current
+			// (possibly still pre-revision) plan and records the guessed generation, so the
+			// genuine v2 re-gate later reads currentGen == storedGen and is silently swallowed
+			// — a gate showing the wrong plan version. Skip this event instead; the run is
+			// unaffected (Slack is best-effort, the web gate is canonical) and a subsequent
+			// state event re-drives handleGate with a working count.
 			n.logf("count plan messages", err)
-			if gateOpen {
-				currentGen = storedGen
-			} else {
-				currentGen = storedGen + 1
-			}
+			return
 		}
 		if currentGen <= storedGen {
-			return // redundant re-broadcast of a plan version already gated — never spam
+			// Redundant re-broadcast of a plan version already gated — never spam. This also
+			// covers currentGen==0: the worker flushes the `plan` run_message BEFORE it
+			// re-reports awaiting_approval (§343), so a correctly-ordered gate always has
+			// currentGen>=1; a 0 means the plan isn't flushed yet, so waiting (no gate with no
+			// plan) is correct, not a drop.
+			return
 		}
 
 		// A genuinely new plan version. Supersede a still-open prior gate button-free so

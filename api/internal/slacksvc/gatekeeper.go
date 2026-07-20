@@ -26,8 +26,17 @@ type GateStore interface {
 	// longer matches the anchor is superseded and refused server-side, independent of
 	// the best-effort message edit.
 	GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (store.SlackRunMessage, error)
-	// SetSlackRunGate records the reject/revise-pending state or clears the gate anchor.
+	// SetSlackRunGate clears the gate anchor (a terminal resolve). The reject/revise-pending
+	// TRANSITION writes use the compare-and-swap SetSlackRunGateIf instead.
 	SetSlackRunGate(ctx context.Context, arg store.SetSlackRunGateParams) (store.SlackRunMessage, error)
+	// SetSlackRunGateIf is the compare-and-swap transition write (PRD #41 Decision 10d):
+	// enter reject/revise-pending ONLY if the anchor still shows the gate the click acted
+	// on (gate_ts == the clicked message, still open). A concurrent cross-surface re-gate
+	// (a web-driven or timed-out revise) can advance the anchor to a newer plan generation
+	// between the supersede read below and this write; the CAS makes such a stale click
+	// LOSE (no row) rather than revert gate_ts to the superseded message and orphan the
+	// live gate — so every gate-anchor write is generation-guarded, not just the read.
+	SetSlackRunGateIf(ctx context.Context, arg store.SetSlackRunGateIfParams) (store.SlackRunMessage, error)
 }
 
 // PlanGateSubmitter is the slice of the run service the gatekeeper drives: read a
@@ -138,13 +147,24 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 		g.approve(ctx, a, user.ID, runID, "repo")
 
 	case ActionGateReject:
-		// Enter reject-pending: the run stays parked (still awaiting_approval); swap
-		// the buttons for the reasoned-reject affordance. The threaded reply that
-		// carries the reason is wired in M5; the escape-hatch button rejects now.
-		if _, err := g.store.SetSlackRunGate(ctx, store.SetSlackRunGateParams{
+		// Enter reject-pending via compare-and-swap: keep the run parked (still
+		// awaiting_approval) and swap the buttons for the reasoned-reject affordance, but
+		// ONLY if the anchor still points at THIS open gate. The supersede read above is at
+		// read time; a concurrent cross-surface re-gate can advance the anchor in the window
+		// before this write, so the CAS (expected gate_ts == the clicked message, state
+		// still open) makes a stale click LOSE rather than revert gate_ts to a superseded
+		// message and orphan the live gate (PRD #41 Decision 10d). The threaded reply that
+		// carries the reason is handled by the replier.
+		if _, err := g.store.SetSlackRunGateIf(ctx, store.SetSlackRunGateIfParams{
 			RunID: runID, GateTs: pgText(a.MessageTS), GateState: pgText(gateStateRejectPending),
+			ExpectedGateTs: pgText(a.MessageTS), ExpectedGateState: pgText(gateStateOpen),
 		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				g.ephemeral(ctx, a, "This gate was superseded — scroll down to the latest plan message.")
+				return
+			}
 			g.logf("set reject-pending", err)
+			return
 		}
 		if err := g.poster.UpdateBlocks(ctx, a.ChannelID, a.MessageTS,
 			"Reply with a rejection reason", rejectPendingBlocks(runID)); err != nil {
@@ -152,16 +172,24 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 		}
 
 	case ActionGateRequestChanges:
-		// Enter revise-pending (PRD #41): the run stays parked (still
-		// awaiting_approval); swap the buttons for the "reply with what should change"
-		// affordance. gate_ts is kept (== a.MessageTS, verified live above) and
-		// gate_generation is preserved by SetSlackRunGate, so the notifier still sees
-		// the current generation and re-gates the NEXT plan version. The threaded reply
-		// that carries the feedback is accepted by the replier's compare-and-swap.
-		if _, err := g.store.SetSlackRunGate(ctx, store.SetSlackRunGateParams{
+		// Enter revise-pending (PRD #41) via the same compare-and-swap as reject-pending:
+		// keep the run parked (still awaiting_approval) and swap the buttons for the "reply
+		// with what should change" affordance, ONLY if the anchor still shows this open gate.
+		// gate_ts is kept (== a.MessageTS) and gate_generation is preserved by the CAS, so
+		// the notifier still sees the current generation and re-gates the NEXT plan version;
+		// a stale click that races a cross-surface re-gate loses the CAS instead of orphaning
+		// the live gate (PRD #41 Decision 10d). The threaded feedback reply is accepted by
+		// the replier's own compare-and-swap.
+		if _, err := g.store.SetSlackRunGateIf(ctx, store.SetSlackRunGateIfParams{
 			RunID: runID, GateTs: pgText(a.MessageTS), GateState: pgText(gateStateRevisePending),
+			ExpectedGateTs: pgText(a.MessageTS), ExpectedGateState: pgText(gateStateOpen),
 		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				g.ephemeral(ctx, a, "This gate was superseded — scroll down to the latest plan message.")
+				return
+			}
 			g.logf("set revise-pending", err)
+			return
 		}
 		if err := g.poster.UpdateBlocks(ctx, a.ChannelID, a.MessageTS,
 			"Reply with what should change", revisePendingBlocks(runID)); err != nil {

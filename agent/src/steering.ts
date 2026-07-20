@@ -215,8 +215,11 @@ export class SteeringChannel {
         this.bufferedVerdict = { verdict: { kind: "reject", reason: body?.trim() || "plan rejected" }, epoch: this.gateEpoch };
         break;
       case "revise_plan":
-        // PRD #41: enqueue the feedback for a revision round AND wake the gate — a lone
-        // revise must not just buffer silently. Empty feedback is ignored (like follow_up).
+        // PRD #41: enqueue the feedback for a revision round. Empty feedback is ignored
+        // (like follow_up). The gate is serviced once per poll batch (pollLoop), AFTER all
+        // inputs route, so precedence (a current-epoch revise beats a buffered approve) is
+        // applied across the WHOLE batch — a [approve, revise] batch yields the revision
+        // round, not a silent drop of the trailing revise.
         if (body && body.trim()) this.reviseQueue.push({ feedback: body.trim(), epoch: this.gateEpoch });
         break;
       case "cancel":
@@ -229,8 +232,6 @@ export class SteeringChannel {
       default:
         this.log.warn("steering: ignoring unknown input kind", { kind });
     }
-    // Route THEN service: whatever landed this input may now satisfy a parked gate.
-    this.serviceGate();
   }
 
   private async pollLoop(): Promise<void> {
@@ -238,6 +239,12 @@ export class SteeringChannel {
       try {
         const inputs = await this.client.getInputs(this.runId);
         for (const inp of inputs) this.route(inp.kind, inp.body ?? undefined);
+        // Route the WHOLE batch, THEN service once: whatever landed may now satisfy a
+        // parked gate. Servicing per-input would let an approve at the head of a
+        // [approve, revise] batch resolve the gate before the revise routes — the revise
+        // would then sit un-consumed (a silent drop that still burned a server cap slot).
+        // One service call per batch evaluates full precedence (revise beats approve) once.
+        this.serviceGate();
       } catch (err) {
         this.log.warn("steering: input poll failed", { run_id: this.runId, error: errMessage(err) });
       }

@@ -87,6 +87,13 @@ func (s *runsStore) CreateRunInput(context.Context, store.CreateRunInputParams) 
 func (s *runsStore) CountRunReviseInputs(context.Context, uuid.UUID) (int64, error) {
 	return s.reviseCount, nil
 }
+func (s *runsStore) CreateRunReviseInputIfUnderCap(_ context.Context, arg store.CreateRunReviseInputIfUnderCapParams) (store.RunUserInput, error) {
+	// Emulate the atomic cap: insert only while the persisted count is under the cap.
+	if s.reviseCount >= int64(arg.MaxRevisions) {
+		return store.RunUserInput{}, pgx.ErrNoRows
+	}
+	return s.createInputRow, nil
+}
 func (s *runsStore) ListFollowUpInputsForRun(_ context.Context, runID uuid.UUID) ([]store.RunUserInput, error) {
 	if runID != s.run.ID {
 		return nil, nil

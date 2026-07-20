@@ -129,10 +129,13 @@ type fakeStore struct {
 	workerByID         store.Worker
 	workerByIDErr      error
 	createdInput       *store.CreateRunInputParams
-	// reviseCount is what CountRunReviseInputs returns (PRD #41 plan-revision cap);
-	// reviseCountRunID captures the run id the cap query was asked about.
+	// reviseCount is the number of persisted revise_plan rows the fake pretends the run
+	// already has (PRD #41 plan-revision cap); reviseCountRunID captures the run id the
+	// read-only cap query was asked about. reviseCapArg captures the atomic capped-enqueue
+	// call, which enforces the cap against reviseCount vs arg.MaxRevisions.
 	reviseCount        int64
 	reviseCountRunID   *uuid.UUID
+	reviseCapArg       *store.CreateRunReviseInputIfUnderCapParams
 	createdStopVerdict *store.CreateStopVerdictInputParams
 	createdApproval    *store.CreateApprovePlanInputParams
 	cancelled          *store.CancelRunServerSideParams
@@ -433,6 +436,15 @@ func (f *fakeStore) CreateRunInput(_ context.Context, arg store.CreateRunInputPa
 func (f *fakeStore) CountRunReviseInputs(_ context.Context, runID uuid.UUID) (int64, error) {
 	f.reviseCountRunID = &runID
 	return f.reviseCount, nil
+}
+func (f *fakeStore) CreateRunReviseInputIfUnderCap(_ context.Context, arg store.CreateRunReviseInputIfUnderCapParams) (store.RunUserInput, error) {
+	f.reviseCapArg = &arg
+	// Emulate the atomic cap: the insert happens only while the already-persisted count
+	// is strictly under the cap, else no row (pgx.ErrNoRows) — same as the real query.
+	if f.reviseCount >= int64(arg.MaxRevisions) {
+		return store.RunUserInput{}, pgx.ErrNoRows
+	}
+	return store.RunUserInput{ID: 1, RunID: arg.RunID, Kind: "revise_plan", Body: arg.Body}, nil
 }
 func (f *fakeStore) CreateStopVerdictInput(_ context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
 	f.createdStopVerdict = &arg
@@ -1489,9 +1501,10 @@ func TestSubmitInputRejectsTerminalRun(t *testing.T) {
 	}
 }
 
-// A revise_plan is a plain enqueue (PRD #41): it goes through CreateRunInput with
-// the feedback body and never stamps a stop signal, so it is NOT a deliberate-stop
-// verdict like cancel/reject_plan.
+// A revise_plan is a plain enqueue (PRD #41): it goes through the atomic capped-enqueue
+// query with the feedback body and never stamps a stop signal, so it is NOT a
+// deliberate-stop verdict like cancel/reject_plan, and it never takes the plain
+// CreateRunInput path (which has no cap).
 func TestSubmitInputRevisePlanEnqueuesPlain(t *testing.T) {
 	user := uuid.New()
 	runID := uuid.New()
@@ -1508,11 +1521,14 @@ func TestSubmitInputRevisePlanEnqueuesPlain(t *testing.T) {
 	if res.ServerSide {
 		t.Fatal("revise_plan is never a server-side transition")
 	}
-	if fs.createdInput == nil || fs.createdInput.Kind != "revise_plan" {
-		t.Fatalf("revise_plan not enqueued: %+v", fs.createdInput)
+	if fs.reviseCapArg == nil || fs.reviseCapArg.RunID != runID {
+		t.Fatalf("revise_plan not enqueued via the capped path: %+v", fs.reviseCapArg)
 	}
-	if fs.createdInput.Body.String != "use pgx not gorm" {
-		t.Fatalf("revise body = %q, want feedback text", fs.createdInput.Body.String)
+	if fs.reviseCapArg.Body.String != "use pgx not gorm" {
+		t.Fatalf("revise body = %q, want feedback text", fs.reviseCapArg.Body.String)
+	}
+	if fs.createdInput != nil {
+		t.Fatalf("revise_plan must not use the uncapped CreateRunInput path, got %+v", fs.createdInput)
 	}
 	if fs.createdStopVerdict != nil {
 		t.Fatalf("revise_plan must not use the stop-verdict path, got %+v", fs.createdStopVerdict)
@@ -1536,11 +1552,14 @@ func TestSubmitInputRevisePlanCapReached(t *testing.T) {
 	if _, err := svc.SubmitInput(context.Background(), user, runID, "revise_plan", "again", nil); err != ErrReviseCapReached {
 		t.Fatalf("err = %v, want ErrReviseCapReached", err)
 	}
-	if fs.reviseCountRunID == nil || *fs.reviseCountRunID != runID {
-		t.Fatalf("cap query not scoped to run %s, got %v", runID, fs.reviseCountRunID)
+	if fs.reviseCapArg == nil || fs.reviseCapArg.RunID != runID {
+		t.Fatalf("capped enqueue not scoped to run %s, got %v", runID, fs.reviseCapArg)
+	}
+	if fs.reviseCapArg.MaxRevisions != 3 {
+		t.Fatalf("cap passed to the query = %d, want PlanMaxRevisions 3", fs.reviseCapArg.MaxRevisions)
 	}
 	if fs.createdInput != nil {
-		t.Fatalf("no enqueue expected once capped, got %+v", fs.createdInput)
+		t.Fatalf("no plain enqueue expected once capped, got %+v", fs.createdInput)
 	}
 }
 
@@ -1562,17 +1581,14 @@ func TestSubmitInputRevisePlanCapBoundary(t *testing.T) {
 	if _, err := s3.SubmitInput(context.Background(), user, runID, "revise_plan", "third", nil); err != nil {
 		t.Fatalf("3rd revise should be accepted: %v", err)
 	}
-	if fs3.createdInput == nil {
-		t.Fatal("3rd revise should have enqueued")
+	if fs3.reviseCapArg == nil {
+		t.Fatal("3rd revise should have enqueued via the capped path")
 	}
 
 	// 4th revise (3 already persisted) → rejected.
-	fs4, s4 := svc(3)
+	_, s4 := svc(3)
 	if _, err := s4.SubmitInput(context.Background(), user, runID, "revise_plan", "fourth", nil); err != ErrReviseCapReached {
 		t.Fatalf("4th revise err = %v, want ErrReviseCapReached", err)
-	}
-	if fs4.createdInput != nil {
-		t.Fatalf("4th revise must not enqueue, got %+v", fs4.createdInput)
 	}
 }
 

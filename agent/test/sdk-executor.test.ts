@@ -253,6 +253,9 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
     assert.doesNotMatch(turns[1]!.promptText ?? "", /UNTRUSTED/i);
     // The revision turn is a PLANNING turn ⇒ runs with the OWN roster (Decision 5).
     assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    // It RESUMES the v1 planning session (§340/§344: full planning context, no transcript
+    // replay) — the revision continues the same session that produced v1 ("sess-1").
+    assert.strictEqual(turns[1]!.options.resume, "sess-1");
     // The run proceeded to implement (plan + revision + one loop turn) and reported the branch.
     assert.strictEqual(turns.length, 3);
     assert.deepStrictEqual(probe.iterations, [1]);

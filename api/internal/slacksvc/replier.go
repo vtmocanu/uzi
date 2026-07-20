@@ -183,7 +183,12 @@ func (r *Replier) HandleMessage(ctx context.Context, m MessageReply) {
 				r.ephemeral(ctx, m, "You've hit the plan-revision limit for this run — approve or reject the current plan instead.")
 				return
 			}
+			// A transient submit failure AFTER the CAS already cleared revise_pending: the
+			// feedback did not persist and the anchor is no longer revise-pending, so a
+			// re-reply would only hit the open-gate nudge. Surface the failure instead of
+			// dropping it silently — the user can press Request changes again or use uzi.
 			r.logf("submit revise", err)
+			r.ephemeral(ctx, m, "Couldn't record your feedback — press Request changes again, or open the run in uzi.")
 			return
 		}
 		r.editGateMessage(ctx, anchor, "🔁 Revising the plan with your feedback…")

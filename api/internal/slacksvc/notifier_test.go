@@ -403,6 +403,56 @@ func TestNotifierPostsGateOnAwaitingApproval(t *testing.T) {
 	}
 }
 
+// A transient plan-count error must NOT fabricate a generation (PRD #41): the old
+// storedGen+1 fallback would post the current (possibly pre-revision) plan and record a
+// generation that later SWALLOWS the genuine re-gate. Skip this event instead — post
+// nothing, advance nothing — and let a subsequent state event re-drive with a working
+// count. The run is unaffected (Slack is best-effort; the web gate is canonical).
+func TestNotifierSkipsGateOnCountError(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	rc.PlanMd = txt("## Plan\n1. do a thing")
+	fs := &fakeNotifStore{
+		rc:           rc,
+		delivery:     txt("U1"),
+		msg:          store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}, // gate closed
+		planCountErr: fmt.Errorf("db hiccup"),
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	if len(fp.blocks) != 0 {
+		t.Fatalf("a count error must post no gate/plan Block Kit message: %+v", fp.blocks)
+	}
+	if len(fs.gateSetGen) != 0 {
+		t.Fatalf("a count error must NOT advance/record a generation (no burn): %+v", fs.gateSetGen)
+	}
+}
+
+// The gate depends on the worker flushing the `plan` run_message BEFORE it re-reports
+// awaiting_approval (§343): a correctly-ordered gate always has currentGen>=1. A
+// currentGen of 0 means the plan isn't flushed yet, so the notifier waits (posts no gate)
+// rather than posting a gate with no plan — a no-op, not a drop.
+func TestNotifierWaitsForPlanFlushWhenCountZero(t *testing.T) {
+	rc := baseRun("awaiting_approval")
+	fs := &fakeNotifStore{
+		rc:        rc,
+		delivery:  txt("U1"),
+		msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}, // fresh anchor, gen 0
+		planCount: 0,                                                                   // plan run_message not flushed yet → currentGen 0
+	}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil)
+	n.handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+
+	if len(fp.blocks) != 0 {
+		t.Fatalf("currentGen==0 must not post a gate (wait for the plan flush): %+v", fp.blocks)
+	}
+	if len(fs.gateSetGen) != 0 {
+		t.Fatalf("currentGen==0 must not record a generation: %+v", fs.gateSetGen)
+	}
+}
+
 // The plan itself is posted into the thread at the gate (PRD #41 Decision 10 — Slack
 // gate parity), keyed to the fresh-gate post, alongside the gate buttons.
 func TestNotifierPostsPlanInThreadAtGate(t *testing.T) {

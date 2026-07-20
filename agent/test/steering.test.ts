@@ -126,6 +126,28 @@ describe("SteeringChannel — plan revision (PRD #41)", () => {
     await ch.stop();
   });
 
+  it("order within the batch does not matter: [approve, revise] still takes the revise, not the approve", async () => {
+    // The gate is serviced once per poll batch (not per input), so an approve at the HEAD
+    // of the batch can't resolve the gate before the trailing revise routes. Servicing
+    // per-input would silently drop the revise (and still burn a server cap slot). The
+    // approve is left buffered — proven stale at the next epoch — not consumed.
+    const notices: string[] = [];
+    const { client, push } = pushableClient();
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { notify: (t) => notices.push(t) });
+    const e = ch.bumpEpoch();
+    ch.start();
+    push([inp("approve_plan"), inp("revise_plan", "tweak it")]); // approve FIRST in the batch
+    assert.deepStrictEqual(await ch.awaitGateEvent(e), { kind: "revise", feedback: "tweak it" });
+    // The batched approve was buffered, not dropped: at the next epoch it is the stale
+    // pre-feedback version and is discarded with a notice, and a fresh approve then lands.
+    const e2 = ch.bumpEpoch();
+    const p = ch.awaitGateEvent(e2);
+    push([inp("approve_plan")]);
+    assert.deepStrictEqual(await p, { kind: "approve", selection: { status: "absent" } });
+    assert.ok(notices.some((n) => n.includes("Approval ignored")), notices.join("\n"));
+    await ch.stop();
+  });
+
   it("discards a PRIOR-epoch approve with a feed notice; a current-epoch approve lands", async () => {
     const notices: string[] = [];
     const { client, push } = pushableClient();
