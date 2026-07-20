@@ -7,6 +7,52 @@
 **Review**: fable adversarial pass folded in (2026-07-20). Load-bearing corrections: M1's "flip the happy-path leg to smart-HTTP" is **not** viable (forge-fake routes every repo path to one bare, breaking the PRD #42 two-repo phase) — only the second-push-pass option survives, and the existing `E2E_GIT_SMART_HTTP=1` full run is likely already broken at #42; dropping #46 Phase B (M4) **breaks the downstream #68 phase** that reads the planted `jq` rec; the #16 collapse must **keep** the non-owner repo-PATCH→404 leg (no handler test covers it); M5's healthcheck saving is ~30-40s (not 55-80s — `start_interval` helps only the two `--wait` boots, not the `--force-recreate` api recreates) and its `assert_no_run_for_issue` default change is a no-op (all call sites pass explicit args). The #94/#53/#33/#40/#46-fallback drops were independently re-verified safe.
 **Scope note**: All work is on the test harness and its compose overlay, with two small exceptions that touch product code (a `SWEEP_INTERVAL` config knob in M6, called out explicitly). No product behaviour changes; no e2e assertion is weakened — every "drop" is verified redundant against a cheaper layer, every "faster" preserves the assertion.
 
+## ▶ RESUME HERE (session paused 2026-07-20)
+
+**State: 5 of 9 milestones DONE and green; M4+M9 code-complete but NOT gated; M6/M7 deferred.**
+
+| milestone | state |
+|---|---|
+| **M1, M2, M3, M5, M8** | ✅ DONE — committed, reviewer APPROVE + auditor PASS, full-suite green |
+| **M4** (drops) | 🟢 **GATE PASSED** — 173 PASS / 0 FAIL; review/audit wave still owed |
+| **M9** (timing hardening) | 🟢 **GATE PASSED** — same run; review/audit wave still owed |
+| **M6** (speedups) | ⏸ DEFERRED → [issue #100](https://gitlab.example.com/vtmocanu/uzi/-/issues/100) |
+| **M7** (refactor) | ⏸ optional, never started |
+
+**Next actions, in order:**
+1. ✅ **Both landed and the tree is clean**: **M4 = `aad3c201`** (11 pass legs dropped, 2 new tests,
+   `specs/ai.md` corrected) and **M9 = `859a8066`** (vault lock, `:2108` 6→8s, `wait_card_column`
+   10→20s, central margin instrumentation). Nothing further to secure.
+2. ✅ **GATE ALREADY PASSED — do not re-run to "confirm".** The final run was **fully green:
+   `All E2E checks passed`, 173 PASS / 0 FAIL** — matching the predicted `182 → 173` exactly,
+   with `#22`, `#41`, `#68` and `#95` all passing. **And the margins are comfortable**, which is
+   the half of the gate that matters: M9's report showed the **tightest headroom in the whole
+   suite at 10s** (`card #2 column → Later`, waited 0s of a 10s ceiling), across **92 instrumented
+   waits**. No thin margins ⇒ a genuine green, not a lucky one. Notably `#22`
+   (`remove: PRDLESS gone…`) completed in **0s of its 20s ceiling** — instantaneous when it works,
+   which corroborates the never-converged diagnosis: no timeout value was ever going to help it.
+3. **Dispatch the review/audit wave** on the M4 and M9 SHAs. Two items are pre-agreed and owed:
+   - The auditor has **two mutation tests queued** — `TestGetRunReviewPerReviewTriage` and
+     `TestRunToDTOStopKind`. Both are the *sole* justification for a dropped assertion, so if
+     either cannot be made to go RED, that drop is unjustified and blocking.
+   - The reviewer must decompose the delta as **11 removed − 2 added = −9** against its
+     line-numbered baseline, every vanished leg named.
+4. **`#22` is RED and UNEXPLAINED — do not "fix" it by widening a timeout.** Mechanism narrowed:
+   `SetIssuePrdless` is forge-first and synchronous, so a 200 whose card lacks PRDLESS proves the
+   forge write already succeeded ⇒ **no timeout value can matter**. Three candidates remain (see
+   M9's `#22` entry). Catch it with `KEEP_STACK=1` and interrogate forge-fake before concluding.
+5. Then `/prd-done` up to PR creation.
+
+**Known environmental issue (not a code defect):** the harness **leaks 4 docker images per run**
+and never reclaims them — 646 of 768 images on the dev machine were `uzi-e2e-*` orphans (~125GB).
+A partial prune ran (~523 removed, ~123 left). One run died on a `No such container` daemon error,
+plausibly but *unprovenly* related. Candidate fix: `down -v --rmi local` in teardown, suppressed
+under `KEEP_STACK=1`. Not yet scoped to a milestone.
+
+**Two lead errors corrected in-document, kept for the next reader:** the `#68` option-(b)
+recommendation (would have raced `UNIQUE (run_id, seq)`) and the `#22` "too-tight window"
+diagnosis (`wait_eq`'s 2nd arg is SECONDS, not tries). Both were caught by teammates, not by me.
+
 ## Problem
 
 The e2e harness (`e2e/run-e2e.sh`, 2984 lines, one serial script driving the full
