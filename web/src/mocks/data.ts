@@ -10,6 +10,7 @@ import type {
   Board,
   CliAuthRequestMeta,
   CliToken,
+  Disposition,
   ForgeConnection,
   IssueProposal,
   LatestRun,
@@ -21,6 +22,7 @@ import type {
   ReviewStatus,
   ReviewVerdict,
   Run,
+  TriageCounts,
   RunListItem,
   RunMessage,
   RunUsage,
@@ -275,6 +277,11 @@ export interface MockReview {
     issue_url: string;
     filed_at: string;
   }[];
+  // Triage dispositions (PRD #94), coordinate-keyed like filed_issues. `stale` is a
+  // seeded flag (the real server hash-compares); mockApi.recomputeTriage derives
+  // `triage` from these + filed_issues on every mutation, matching the server ladder.
+  dispositions: Disposition[];
+  triage: TriageCounts;
 }
 
 export const mockReviews: MockReview[] = [
@@ -328,6 +335,17 @@ export const mockReviews: MockReview[] = [
         confidence: "medium",
         created_at: minsAgo(6),
       },
+      {
+        // Dismissed as a false positive (PRD #94) → the "Dismissed · Not an issue"
+        // danger chip and the false-positive count.
+        id: "rec-5",
+        category: "improve_uzi",
+        target: "run timeout too aggressive",
+        rationale_md:
+          "The judge read the run as timing out, but it was a deliberate cancel from the approval gate — false positive.",
+        confidence: "low",
+        created_at: minsAgo(6),
+      },
     ],
     // Two seeded links so both state-C variants render on load: rec-1's filed_at is OLDER
     // than the review's updated_at (minsAgo(6)) → the STALE variant ("filed for an earlier
@@ -349,6 +367,21 @@ export const mockReviews: MockReview[] = [
         filed_at: minsAgo(2),
       },
     ],
+    // Seeded so the demo stack renders EVERY triage state on load (PRD #94):
+    //  - rec-1 (shellcheck): DONE + STALE — filed AND marked done (done > filed on the
+    //    ladder), and flagged stale to render the "recommendation changed" note.
+    //  - rec-2 (reviewer): DISMISSED · Won't do.
+    //  - rec-5 (run timeout…): DISMISSED · Not an issue (a false positive).
+    //  - rec-3 (poller): TO DO (no disposition, no filed link).
+    //  - rec-4 (deploy-agent): FILED (a settled link, no disposition).
+    dispositions: [
+      { category: "install_worker_tool", target: "shellcheck", status: "done", reason: "", set_at: minsAgo(120), stale: true },
+      { category: "improve_agent", target: "reviewer", status: "dismissed", reason: "wont_do", set_at: minsAgo(40), stale: false },
+      { category: "improve_uzi", target: "run timeout too aggressive", status: "dismissed", reason: "not_an_issue", set_at: minsAgo(15), stale: false },
+    ],
+    // total 5: todo 1 (rec-3), filed 1 (rec-4), done 1 (rec-1), dismissed 2 (rec-2,
+    // rec-5), of which 1 is a false positive (rec-5). Recomputed by mockApi on mutation.
+    triage: { total: 5, todo: 1, filed: 1, done: 1, dismissed: 2, false_positives: 1 },
   },
 ];
 

@@ -12,7 +12,16 @@ vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { listRuns: vi.fn(), adminListRuns: vi.fn(), adminListWorkers: vi.fn() },
+    api: {
+      listRuns: vi.fn(),
+      adminListRuns: vi.fn(),
+      adminListWorkers: vi.fn(),
+      // PRD #94: the global strip fetches this on mount. Default to an empty backlog so
+      // the pre-existing tests keep the strip hidden; the strip tests override it.
+      getJudgeStats: vi
+        .fn()
+        .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
+    },
   };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
@@ -189,5 +198,56 @@ describe("RunsList — usage meta line (PRD #40)", () => {
     expect(screen.getByText(/\$1\.87/)).toBeTruthy();
     // The no-usage run contributes no "tok" figure — exactly one run shows usage.
     expect(screen.queryAllByText(/tok/).length).toBe(1);
+  });
+})
+
+describe("RunsList — global judge-triage strip (PRD #94)", () => {
+  it("renders the strip with counts from getJudgeStats (ignores the runs list)", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.getJudgeStats.mockResolvedValue({
+      total: 47,
+      todo: 18,
+      filed: 9,
+      done: 12,
+      dismissed: 8,
+      false_positives: 3,
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("Judge recommendations · all your runs")).toBeTruthy(),
+    );
+    // Counts come straight from the global stats, not the (empty) runs list.
+    expect(screen.getByText("18")).toBeTruthy();
+    expect(screen.getByText("9")).toBeTruthy();
+    expect(screen.getByText("12")).toBeTruthy();
+    expect(screen.getByText("8")).toBeTruthy();
+    expect(screen.getByText(/3 of 8 dismissed were false positives/)).toBeTruthy();
+  });
+
+  it("hides the strip when the backlog is empty (total 0)", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.getJudgeStats.mockResolvedValue({
+      total: 0,
+      todo: 0,
+      filed: 0,
+      done: 0,
+      dismissed: 0,
+      false_positives: 0,
+    });
+
+    render(
+      <MemoryRouter>
+        <RunsList />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("No runs yet")).toBeTruthy());
+    expect(screen.queryByText("Judge recommendations · all your runs")).toBeNull();
   });
 })

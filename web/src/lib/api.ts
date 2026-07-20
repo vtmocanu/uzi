@@ -931,6 +931,34 @@ export interface FiledIssue {
   filed_at: string;
 }
 
+// Disposition is the user's triage verdict on a recommendation (PRD #94): done, or
+// dismissed with a reason (wont_do / not_an_issue = false positive). Coordinate-keyed
+// (category, target) like FiledIssue, so it matches a recommendation the same way and
+// survives a re-judge. Only coordinates with a current matching recommendation appear.
+// `stale` is server-computed (a rationale-hash compare, D#3) — RENDER it, never
+// recompute it in TS; the browser never sees a hash.
+export interface Disposition {
+  category: string;
+  target: string;
+  status: "done" | "dismissed";
+  reason: "" | "wont_do" | "not_an_issue";
+  set_at: string;
+  stale: boolean;
+}
+
+// TriageCounts is the bucketed tally the server computes with ONE Go helper (the
+// D#2 ladder dismissed > done > filed > todo), so the per-review bar and the global
+// strip cannot drift. false_positives is the not_an_issue sub-count of dismissed. The
+// web renders these DIRECTLY — never re-derived from the rows on screen (D#7/D#8).
+export interface TriageCounts {
+  total: number;
+  todo: number;
+  filed: number;
+  done: number;
+  dismissed: number;
+  false_positives: number;
+}
+
 export interface RunReview {
   id: string;
   target_run_id: string;
@@ -942,6 +970,11 @@ export interface RunReview {
   updated_at: string;
   recommendations: ReviewRecommendation[];
   filed_issues: FiledIssue[];
+  // PRD #94: the caller's triage dispositions (coordinate-keyed) + the bucketed
+  // per-review counts, both server-computed. The panel mirrors dispositions into a
+  // dispByCoord map (like filedByCoord) and renders `triage` verbatim.
+  dispositions: Disposition[];
+  triage: TriageCounts;
 }
 
 // IssueDraft is the templated, human-editable draft for filing a forge issue from a
@@ -1505,6 +1538,41 @@ const realApi = {
       `/runs/${runId}/review/recommendations/${recId}/issue`,
       body,
     ),
+
+  // ── Triage a recommendation (PRD #94) ───────────────────────────────────────
+  // setDisposition upserts the coordinate row (RequireUser, owner-only, no token
+  // spend, no forge write): reason is REQUIRED iff dismissed and MUST be omitted for
+  // done (the server 400s otherwise), so it is dropped from the body on done.
+  // Idempotent — re-clicking is last-writer-wins. Returns 204 (no body).
+  setDisposition: (
+    runId: string,
+    recId: string,
+    status: "done" | "dismissed",
+    reason?: "wont_do" | "not_an_issue",
+  ) =>
+    request<null>(
+      "PUT",
+      `/runs/${runId}/review/recommendations/${recId}/disposition`,
+      status === "dismissed" ? { status, reason } : { status },
+    ),
+  // deleteDisposition is Undo: it clears the coordinate row (204). A 404 means there
+  // was nothing to undo (already cleared, or a concurrent undo) — that is a SUCCESS,
+  // not a loud error, so it is swallowed to null; any other status propagates.
+  deleteDisposition: async (runId: string, recId: string): Promise<null> => {
+    try {
+      return await request<null>(
+        "DELETE",
+        `/runs/${runId}/review/recommendations/${recId}/disposition`,
+      );
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }
+  },
+  // getJudgeStats is the global "across all your runs" backlog tally (RequireUser,
+  // owner-scoped, all-time). It DELIBERATELY ignores any list filter — it is a global
+  // backlog, not the filtered view — and is bucketed by the same Go ladder as `triage`.
+  getJudgeStats: () => request<TriageCounts>("GET", "/me/judge/stats"),
 
   // ── Chat (PRD #39) — reconciled to M1's landed wire (Phase 3) ───────────────
   // The live view (messages, WS, replay) reuses getRun/getRunMessages/
