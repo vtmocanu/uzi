@@ -244,6 +244,20 @@ func getSkillRec(t *testing.T, db store.DBTX, id uuid.UUID, actor store.User) *h
 // sends. Deliberately not written as `id, _ := args[0].(uuid.UUID)`: on a type
 // mismatch that form yields a zero value, and a zero value would happily satisfy an
 // "IsAdmin must be false" assertion against a param that was never actually captured.
+//
+// That is not a hypothetical, and the two hardenings here are COMPLEMENTARY — neither
+// alone covers the non-admin side. Measured by restoring the comma-ok form with a type
+// mismatch in place:
+//
+//	--- PASS: TestGetSkillPassesCallerIdentity/non-admin_caller   <-- vacuous
+//	--- FAIL: TestGetSkillPassesCallerIdentity/admin_caller
+//
+// The t.Fatalf guards below are what keep `non-admin_caller` honest; without them it is
+// a zero-value tautology that observes nothing and still goes green. The `admin_caller`
+// subtest is the BACKSTOP: it demands is_admin == true, which no zero value can ever
+// satisfy, so it is the only assertion that still fails if this helper is ever
+// "simplified" back to comma-ok. Weaken either one and the other is load-bearing;
+// weaken both and the authz assertion silently stops asserting.
 func skillQueryArgs(t *testing.T, db *fakeSkillDB) (uuid.UUID, bool, pgtype.UUID) {
 	t.Helper()
 	if !db.called {
