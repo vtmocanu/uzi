@@ -15,6 +15,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+// workerMaxConcurrentRunsCeiling is the sanity ceiling for UZI_WORKER_MAX_CONCURRENT_RUNS.
+// It mirrors the api's maxAdvertisedConcurrentRuns band (api/internal/handler/
+// worker_protocol.go): the api validates a worker's self-reported cap to [1, 256], so 256
+// is the natural boot-time ceiling here too. Above the worker's own soft ceiling the
+// worker only WARNS (it does not reject), so without this bound a typo would render a
+// nonsense cap straight into the pod.
+const workerMaxConcurrentRunsCeiling = 256
+
 // Config holds the controller's runtime settings.
 type Config struct {
 	// APIBaseURL is the uzi api's base URL (scheme://host[:port], no path). https
@@ -92,6 +100,12 @@ type Config struct {
 	WorkerAPIURL string
 	// WorkerStorageClass is optional; empty means the cluster default.
 	WorkerStorageClass string
+	// WorkerMaxConcurrentRuns is the per-hosted-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS
+	// → the pod's WORKER_MAX_CONCURRENT_RUNS). Default 1 (safe opt-in); raising it opts
+	// into the intra-user concurrency residuals documented in docs/worker-setup.md
+	// (PRD #58 Decision 7). Real concurrency is enforced solely by the worker-side
+	// semaphore, so this pod env is the only thing pinning a hosted worker to 1.
+	WorkerMaxConcurrentRuns int
 
 	// --- docker-capable workers (PRD #83 M3) ----------------------------------
 	// Both empty unless this instance offers docker workers. They travel TOGETHER:
@@ -222,6 +236,26 @@ func loadWorkerSettings(cfg *Config) error {
 		return fmt.Errorf("UZI_API_CA_FILE is set but UZI_WORKER_API_URL is not https; the workers would carry a CA they never consult and their claim traffic — which carries the user's decrypted forge PAT and Anthropic token — would cross the pod network in the clear")
 	}
 	cfg.WorkerStorageClass = strings.TrimSpace(os.Getenv("UZI_WORKER_STORAGE_CLASS"))
+
+	// The per-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS). Default 1 (empty/unset),
+	// operator-configurable in [1, workerMaxConcurrentRunsCeiling]. A non-integer or an
+	// out-of-range value is a boot error rather than a silent clamp — the same "fail at
+	// boot, not at the far end" rule the CA/https and docker-tier couplings above follow.
+	// The upper bound matters because the worker only WARNS above its soft ceiling (it
+	// does not reject), so a typo like 100000 would otherwise boot and render into the
+	// pod. Raising it opts into the intra-user concurrency residuals documented in
+	// docs/worker-setup.md (PRD #58 Decision 7).
+	cfg.WorkerMaxConcurrentRuns = 1
+	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_MAX_CONCURRENT_RUNS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("UZI_WORKER_MAX_CONCURRENT_RUNS=%q is not an integer (accepted range [1, %d])", raw, workerMaxConcurrentRunsCeiling)
+		}
+		if n < 1 || n > workerMaxConcurrentRunsCeiling {
+			return fmt.Errorf("UZI_WORKER_MAX_CONCURRENT_RUNS=%d out of range: accepted [1, %d] (a worker with no run slot can never claim a run; the ceiling matches the api's advertised-cap sanity band)", n, workerMaxConcurrentRunsCeiling)
+		}
+		cfg.WorkerMaxConcurrentRuns = n
+	}
 
 	// The docker tier (PRD #83 M3): namespace + sidecar image, both or neither. No
 	// silent default for the namespace — guessing it means rendering privileged pods

@@ -84,6 +84,7 @@ func main() {
 		ServiceAccountName: cfg.WorkerServiceAccount,
 		APIURL:             cfg.WorkerAPIURL,
 		StorageClass:       cfg.WorkerStorageClass,
+		MaxConcurrentRuns:  cfg.WorkerMaxConcurrentRuns,
 		APICAPEM:           cfg.APICAPEM,
 	}, resolver, log)
 

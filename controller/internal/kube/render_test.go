@@ -357,7 +357,10 @@ func TestSecretCarriesTheTokenAndRelaysTheCA(t *testing.T) {
 	}
 }
 
-func TestWorkerEnvPinsTheSingleRunCap(t *testing.T) {
+func TestWorkerEnvDefaultsToSingleRunCap(t *testing.T) {
+	// testConfig() leaves MaxConcurrentRuns at its zero value, which must still render
+	// "1" — the default cap, so any RenderConfig{} built in a test keeps working. The
+	// cap is now operator-configurable (see TestWorkerEnvPropagatesTheConfiguredCap).
 	dep := RenderDeployment(testConfig(), desired("abc"), testSpec(t, "base", "m"))
 	env := map[string]string{}
 	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
@@ -369,7 +372,7 @@ func TestWorkerEnvPinsTheSingleRunCap(t *testing.T) {
 		}
 	}
 	if env["WORKER_MAX_CONCURRENT_RUNS"] != "1" {
-		t.Error("every preset pins WORKER_MAX_CONCURRENT_RUNS=1 until PRD #51 lands")
+		t.Errorf("WORKER_MAX_CONCURRENT_RUNS = %q, want the default 1 when unset", env["WORKER_MAX_CONCURRENT_RUNS"])
 	}
 	// Short Service names do not resolve cross-namespace; the worker can only reach the
 	// api by FQDN.
@@ -378,6 +381,31 @@ func TestWorkerEnvPinsTheSingleRunCap(t *testing.T) {
 	}
 	if env["UZI_WORKER_TOKEN_FILE"] != "/run/secrets/worker_token" {
 		t.Errorf("UZI_WORKER_TOKEN_FILE = %q", env["UZI_WORKER_TOKEN_FILE"])
+	}
+}
+
+// A configured cap propagates to the pod env, and — because the env is part of the
+// hashed pod template — changing it rolls the pod (the spec hash differs from the
+// default's). That roll-on-change is what makes an operator raising the cap take
+// effect on a worker's next roll rather than silently only on brand-new workers.
+func TestWorkerEnvPropagatesTheConfiguredCap(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxConcurrentRuns = 3
+	dep := RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m"))
+	var got string
+	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "WORKER_MAX_CONCURRENT_RUNS" {
+			got = e.Value
+		}
+	}
+	if got != "3" {
+		t.Errorf("WORKER_MAX_CONCURRENT_RUNS = %q, want the configured 3", got)
+	}
+	// The cap is in the hashed pod template, so a different cap is a different spec hash
+	// (roll-on-change): the same worker rolls onto the new cap when it next rolls.
+	if h1, h3 := SpecHashOf(testConfig(), desired("abc"), testSpec(t, "base", "m")),
+		SpecHashOf(cfg, desired("abc"), testSpec(t, "base", "m")); h1 == h3 {
+		t.Error("spec hash must differ between cap 1 and cap 3 so raising the cap rolls the pod")
 	}
 }
 

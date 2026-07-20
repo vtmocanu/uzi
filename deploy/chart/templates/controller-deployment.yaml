@@ -111,6 +111,12 @@ spec:
             - name: UZI_WORKER_STORAGE_CLASS
               value: {{ . | quote }}
             {{- end }}
+            # The per-worker run-slot cap. NOT with-gated: it always has a chart default
+            # (workers.maxConcurrentRuns: 1), so the controller always receives it and
+            # the default (1) is explicit in the rendered pod rather than implied by the
+            # env being absent. The controller rejects a non-integer or a value < 1.
+            - name: UZI_WORKER_MAX_CONCURRENT_RUNS
+              value: {{ .Values.workers.maxConcurrentRuns | quote }}
             {{- if .Values.workers.docker.enabled }}
             # The docker tier (PRD #83 M3, PRD #89). Namespace + image are required
             # together — the controller refuses to boot with one set and not the other —

@@ -183,6 +183,15 @@ root-started compose stack (a #58 single-uid start does not split). The design b
 (`adr/0042-worker-run-concurrency.md`) has the full research and the
 container-per-run model that eventually closes the rest.
 
+**Hosted workers don't set `WORKER_MAX_CONCURRENT_RUNS` directly.** For a
+controller-managed k8s worker (see [Hosted workers](./hosted-workers.md)) the cap
+comes from the chart value `workers.maxConcurrentRuns` (default 1), which the
+controller renders into the pod's `WORKER_MAX_CONCURRENT_RUNS` env for you. Raising
+it is an operator action — it needs a new controller/chart release to take effect,
+since hosted workers only roll on release — and the operator must size the preset
+to hold that many concurrent runs. It's the same knob described above, and raising
+it opts into the same intra-user residuals just covered.
+
 ## Multiple workers, removing a worker
 
 Register more than one worker (e.g. `laptop` and `ci-runner-1`); each claims independently from your queue. **Settings → Workers → Delete** removes a registration (refused while it holds a non-terminal run); it doesn't stop the container itself.
