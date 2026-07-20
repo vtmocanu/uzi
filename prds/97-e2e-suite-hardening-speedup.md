@@ -161,7 +161,19 @@ carry explicit author sign-off:
       smart-HTTP (the bares are one shared host dir, overlay `:35`/`:177`). Self-test
       the hook (push main → refused; push agent branch → accepted). Update
       `README.md` to drop the "would not catch the Basic-auth bug" caveat.
-- [ ] **M2 — live `/api/ws` + `uzi` CLI smoke**: a WS client subscribes to a live run
+- [x] **M2 — live `/api/ws` + `uzi` CLI smoke** — DONE `5d21ea3c`; reviewer APPROVE +
+      auditor PASS; full e2e green (178 PASS / 0 FAIL, run5). WS leg: `ws://api:8080/api/ws?run=`
+      with the `uzi_auth` cookie read from the HttpOnly jar line by name, subscribe-then-approve
+      ordering, asserts a real hub `type:"message" seq>0` frame, plus a no-cookie-rejected
+      negative control. CLI leg: `uzc_` minted via `POST /api/me/cli-tokens`, run hermetically
+      under `env -i`, `run list --json` id-set must equal `GET /api/runs`, `run approve` must
+      advance a parked run. Placed BEFORE the M1 git-auth leg (keeps M2's completing runs away
+      from PRD #95's timing-sensitive steer-queue read; verified via a baseline run). Known
+      residual: nginx's `location = /api/ws` proxy stays uncovered (probe is agent→api direct,
+      documented in the leg); LOW audit note — the JWT rides the probe's argv, prefer
+      `exec -e` next time (matches M1's existing pattern, not a regression). New host dep:
+      `go` on PATH for the CLI build (documented; `-buildvcs=false` fallback is worktree-local,
+      never committed). Original scope: a WS client subscribes to a live run
       over `/api/ws` and asserts it receives live frames during a real run (not just
       the REST `?after=` replay). **No new tooling needed** (fable review): the agent
       container's Node 22 has a global `WebSocket`, so a `compose exec agent node -e`
