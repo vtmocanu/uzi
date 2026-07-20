@@ -301,10 +301,6 @@ apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$
 # asserting a 422 (the PRDLESS run-create gate and the disabled label endpoint).
 apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
-# apidelete_code — a DELETE that echoes only the HTTP status (no -f), for the
-# disposition Undo (PRD #94) which returns 204. CSRF from the admin jar.
-apidelete_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X DELETE "$BASE$1" \
-  -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)"; }
 
 wait_http() {
   local deadline=$((SECONDS + 90))
@@ -938,29 +934,44 @@ echo "$PRIV_REPORT" | jq -e '.report.status == "ok"' >/dev/null 2>&1 \
   || fail "compliant connection privilege-check not ok: $PRIV_REPORT"
 pass "compliant connection reports least-privilege ✓"
 
-# --- PRD #16: skills authz (HTTP-glue status codes, live) ---------------------
-# The reviewer's M2 ask: pin the authz boundaries end to end, not just in unit
-# tests. Uses the fresh non-admin user registered above (FRESHJAR).
+# --- PRD #16: skills authz (router glue only) ---------------------------------
+# The reviewer's M2 ask was to pin the authz boundaries end to end. PRD #97 M4
+# COLLAPSED this phase: the 403-vs-404 skills/agent-template matrix is proven at the
+# handler layer by `api/internal/handler/skills_test.go` —
+# TestAuthorizeSkillWrite (builtin/global are admin-only; a user skill is owner-only;
+# a non-owner non-admin gets 404 with existence hidden, an admin who may not edit gets
+# 403), TestResetSkillStatus (the same 404 existence-oracle on the reset path) and
+# TestAllocatableRules (shared vs mine allocation). Those run in CI on every MR; what
+# no lower layer proves is that the HTTP routes REACH those helpers, so one
+# representative leg stays here as router glue.
+#
+# ⛔ TWO legs below are NOT part of that matrix and must NOT be "finished off" by a
+# later cleanup — each is the ONLY assertion of its property anywhere in the tree:
+#   1. non-admin `PUT /api/agent-templates/{id}/skills` → 403. This is the admin gate
+#      at `skill_allocations.go:105-107` (shared half is admin-only). `TestAllocatableRules`
+#      does NOT cover it — that pins WHICH skills are allocatable, a different property —
+#      and `SetTemplateSkills` has no handler test at all. A discriminating unit test
+#      would need a live pool (every non-403 path reaches `h.pool.Begin`), so this
+#      stays here (PRD #97 M4: enumerated leg-by-leg, found uncovered, deliberately kept).
+#   2. non-owner `PATCH /api/repos/{id}` → 404 — a *repos*-handler property, and there
+#      is no `repos_test.go` anywhere under `api/` (PRD #97 M4, fable review).
+# Uses the fresh non-admin user registered above (FRESHJAR).
 say "PRD #16 skills authz: a non-admin cannot reach admin / other-user surfaces"
+# $TID is also consumed by the PRD #16 skill-delivery phase further down — resolve it here.
 TID="$(apiget /api/agent-templates | jq -r '.templates[0].id // empty')"
 [ -n "$TID" ] || fail "no agent template to authorize against"
 
+# Router glue: the live route reaches authorizeSkillWrite and returns its status.
 C="$(fresh_code POST /api/skills '{"name":"e2e-nope","description":"x.","body":"b\n","scope":"global"}')"
 [ "$C" = 403 ] || fail "non-admin POST /skills scope=global: expected 403, got $C"
 pass "non-admin POST /skills scope=global ⇒ 403"
 
-# The admin owns a private (user-scope) skill; a non-admin GET of it must 404
-# (existence hidden), never 403.
-PRIV_ID="$(apipost /api/skills '{"name":"e2e-admin-private","description":"x.","body":"b\n","scope":"user"}' | jq -r '.skill.id')"
-[ -n "$PRIV_ID" ] && [ "$PRIV_ID" != null ] || fail "admin could not create a private skill"
-C="$(fresh_code GET "/api/skills/$PRIV_ID")"
-[ "$C" = 404 ] || fail "non-admin GET of another user's private skill: expected 404, got $C"
-pass "non-admin GET of another user's private skill ⇒ 404"
-
+# KEEPER (1): the shared-allocation admin gate — its only assertion anywhere.
 C="$(fresh_code PUT "/api/agent-templates/$TID/skills" '{"shared_skill_ids":[]}')"
 [ "$C" = 403 ] || fail "non-admin shared allocation: expected 403, got $C"
 pass "non-admin PUT shared allocation half ⇒ 403"
 
+# KEEPER (2): a repos-handler property with no handler test in the tree.
 C="$(fresh_code PATCH "/api/repos/$REPO_ID" '{"repo_skills_enabled":true}')"
 [ "$C" = 404 ] || fail "non-owner repo PATCH: expected 404, got $C"
 pass "non-owner non-admin PATCH /repos/{id} ⇒ 404"
@@ -1128,16 +1139,14 @@ else
   pass "PRD #40: run.usage folded the result frame (21400 in / 6100 out) via run_usage"
 fi
 
-# Aggregation, asserted against the RUN's own usage rather than a constant: true under
-# both executors, and a strictly better test — it catches an /api/usage that ignores
-# this run, which `>= 21400` would miss whenever some earlier run had already banked
-# the total.
-SELF_USAGE="$(apiget /api/usage)"
-[ "$(echo "$SELF_USAGE" | jq -r '.lifetime.input_tokens')" -ge "${RU_IN:-0}" ] \
-  || fail "/api/usage lifetime.input_tokens < this run's $RU_IN (got: $(echo "$SELF_USAGE" | jq -c '.lifetime'))"
-[ "$(echo "$SELF_USAGE" | jq -r '.run_count')" -ge 1 ] \
-  || fail "/api/usage run_count < 1 (got: $(echo "$SELF_USAGE" | jq -c '.run_count'))"
-pass "PRD #40: /api/usage aggregates the run (lifetime in >= this run's $RU_IN, run_count >= 1)"
+# PRD #97 M4: the /api/usage ROLLUP leg was dropped here. `SelfUsage`'s aggregation is
+# proven exactly (not with a `>=`) against a live Postgres by
+# `api/internal/store/run_usage_integration_test.go` TestUsageRollupsLiveDB — per-run
+# MAX-per-model (never a SUM of cumulative snapshots), lifetime vs 7-day windowing,
+# run_count excluding pre-feature runs, and per-user isolation — and that test runs in
+# CI on every MR (`test:api-store-it`), a stronger gate than this local-only harness.
+# What stays below is the full-wire half no lower layer reaches: the worker's terminal
+# result frame was actually parsed and folded onto the run.
 
 if [ "$EXECUTOR" = sdk ]; then
   # The live run's agent names come from the cloned repo's roster (PRD #37 selected
@@ -1515,6 +1524,31 @@ wait_status "$RUN_S" failed
   || fail "the delivered follow_up must remain readable (and Delivered) after the run goes terminal (B1 survive-terminal)"
 pass "steer queue survives terminal: the Delivered follow_up is still listed on the now-terminal (failed: run cancelled) run (B1)"
 
+# =============================================================================
+# ⛔ DO NOT DROP — PRD #97 M4 guard list. ⛔
+#
+# M4 removed or collapsed several phases whose properties a cheaper layer already
+# proves (#94 triage, #53 rate-limits, #46 Phase B, #33's stop_kind SQL, #40's usage
+# rollup, most of #16's authz matrix). The FOUR phases that follow in this block —
+# and the #83 Decision-3 leg at the foot of the file — look like the same kind of
+# candidate and are NOT. Do not "finish the job":
+#
+#   • secret-hygiene (just below) — scans the LIVE container logs and the LIVE /data
+#     volume of the running stack. No unit test can observe what this deployment
+#     actually wrote to disk and to stdout.
+#   • PRD #51 uid boundary (below) — reads real kernel state: file modes on a real
+#     Docker secret, a real setpriv drop to uid 10002, a real EACCES. A Go/TS test
+#     asserting the intended uids proves intent, not that the image enforces it.
+#   • PRD #58 XFF (below) — covers the COMPOSE topology's shipped empty
+#     TRUSTED_PROXIES default (forged X-Forwarded-For from the agent container must
+#     collapse into ONE rate-limit bucket). The unit test covers the K8S pod-CIDR
+#     case. Different deployment, different default, different bug.
+#   • PRD #83 Decision-3 (end of file, --profile agent-docker) — a DIFFERENT topology
+#     again (rootless DinD sidecar): it proves a container the sidecar started cannot
+#     read the worker's join token. Nothing below the live daemon can show that.
+#
+# If you are here to shrink the suite: shrink somewhere else.
+# =============================================================================
 say "secret-hygiene assertions"
 LOGS="$("${COMPOSE[@]}" logs --no-color 2>&1 || true)"
 # POSITIVE CONTROL (PRD #97 M3): both scans below assert a secret is ABSENT, which passes
@@ -1742,11 +1776,20 @@ pass "M6 E7: repo-local uploadpack.packObjectsHook ignored on the image git 2.54
 
 # =============================================================================
 # PRD #33 — deliberate-stop signal: a live-poller plan reject carrying a VERBATIM
-# reason must surface as a stop (runs.stop_kind='plan_rejected'), not a bare failure
-# the client can't classify (issue #15 item 3). A worker is online, so the reject is
-# poller-consumed (server_side=false); the stub runner reports `failed` with the
-# reason verbatim, and the server stamps stop_kind at verdict enqueue.
-say "PRD #33: live plan reject with a verbatim reason → stop_kind=plan_rejected + verbatim failure_reason"
+# reason must survive the round trip through the worker (issue #15 item 3). A worker
+# is online, so the reject is poller-consumed (server_side=false) and the stub runner
+# reports `failed` with the reason verbatim.
+#
+# PRD #97 M4: the stop_kind SQL half was dropped here. `runs.stop_kind` stamping is
+# proven against a live Postgres by `api/internal/store/stop_kind_integration_test.go`
+# TestCreateRunInputStopKindLiveDB — the two-query split (approve_plan/follow_up leave
+# stop_kind NULL; the CreateStopVerdictInput CTE stamps 'plan_rejected'/'cancelled' in
+# one statement), both the live and the server-side reject/cancel paths, and the
+# out-of-domain CHECK. That test runs in CI on every MR (`test:api-store-it`), a
+# stronger gate than this local-only harness. What stays is the full-wire half: the
+# reject really went out through the LIVE worker (server_side=false) and the reason
+# came back byte-for-byte.
+say "PRD #33: live plan reject with a verbatim reason → verbatim failure_reason back through the worker"
 IID_R="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E reject","description":"reject me — see prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"
 RUN_R="$(create_run "$REPO_ID" "$IID_R")" || fail "reject-path run-create failed (non-transient; see stderr)"
@@ -1760,11 +1803,9 @@ SS_R="$(apipost "/api/runs/$RUN_R/inputs" \
 [ "$SS_R" = false ] || fail "a reject against a LIVE worker must be poller-consumed, not server-side (got server_side=$SS_R)"
 wait_status "$RUN_R" failed
 REJ="$(apiget "/api/runs/$RUN_R")"
-[ "$(echo "$REJ" | jq -r '.run.stop_kind')" = plan_rejected ] \
-  || fail "rejected run must carry stop_kind=plan_rejected (got '$(echo "$REJ" | jq -r '.run.stop_kind')')"
 [ "$(echo "$REJ" | jq -r '.run.failure_reason')" = "$REJECT_REASON" ] \
   || fail "rejected run must carry the VERBATIM failure_reason (got '$(echo "$REJ" | jq -r '.run.failure_reason')')"
-pass "live plan reject: status=failed, stop_kind=plan_rejected, failure_reason=verbatim"
+pass "live plan reject: status=failed, failure_reason=verbatim through the worker"
 
 # =============================================================================
 # PRD #24 — MR-close watcher: a reviewer closing an agent's MR without merging
@@ -2380,20 +2421,36 @@ pass "lazy rewrap on unlock: user2's row flipped 'master' -> 'dek'; admin count 
 # selects the STUB judge queryFn (judge-runner-stub.ts): the judge model call makes
 # NO network request and returns an error result, so JudgeRunner deterministically
 # posts its command-not-found FALLBACK — a real review with a dummy token and ZERO
-# Anthropic spend. Two phases:
-#   A. funnel: enable the judge (global kill-switch + admin opt-in), finish an issue
-#      run → the committed-terminal funnel enqueues a `judge` run → the worker claims
-#      it (repo-less, Anthropic-only claim: no forge PAT) → fetches the trace via the
-#      judge-scoped endpoint → posts a review → a PERSIST-FIRST inbox notification
-#      lands for the reviewed run.
-#   B. deterministic tool naming + re-run UPSERT: plant a `jq: command not found`
-#      tool_result in the target's trace, fire the M4 re-run-judge action, and assert
-#      the replacement review UPSERTs the SAME single row to name install_worker_tool
-#      'jq' — the "names the missing tool even if the LLM call fails" success
-#      criterion, proven with no model. Judge is turned OFF again at the end so the
-#      later concurrency section's capacity math is unaffected.
+# Anthropic spend. What remains here is the funnel (formerly "Phase A"), which is
+# genuinely full-wire: enable the judge (global kill-switch + admin opt-in), finish an
+# issue run → the committed-terminal funnel enqueues a `judge` run → the worker claims
+# it (repo-less, Anthropic-only claim: no forge PAT) → fetches the trace via the
+# judge-scoped endpoint → posts a review → a PERSIST-FIRST inbox notification lands
+# for the reviewed run.
+# Phase B (plant `jq: command not found` → re-judge → the replacement review UPSERTs
+# the same single row naming install_worker_tool 'jq') was DROPPED by PRD #97 M4. Every
+# link of that chain is proven at a cheaper layer that runs in CI on every MR:
+#   - the trace scan that turns `bash: jq: command not found` into a missing-tool
+#     signal — `api/internal/workersvc/judge_m3_test.go` TestScanCommandNotFound
+#     (four shell dialects + dedupe), TestScanCommandNotFoundFiltersNoise,
+#     TestScanCommandNotFoundEmptyWhenClean, and TestJudgeClaimCarriesModelAndSignal
+#     (the signal reaches the worker's claim);
+#   - the signal → `install_worker_tool` recommendation mapping and the fact that a
+#     FAILED model call still lands the review — `agent/test/judge-runner.test.ts`
+#     (`fallbackReview` maps missing tools; the UZI_E2E_EXECUTOR=stub queryFn drives
+#     the deterministic fallback; a hung/timed-out query still posts it);
+#   - the review persisting its recommendations — `judge_m3_test.go`
+#     TestPostReviewPersistsVerdictAndRecs;
+#   - the re-judge UPSERT ("one review row per target, never a second") — live
+#     Postgres, `api/internal/store/recommendation_dispositions_integration_test.go`
+#     asserts `reviewID2 == reviewID` after a second
+#     UpsertRunReviewWithRecommendations on the same target (UNIQUE target_run_id).
+# Consequence: the PRD #68 phase below can no longer read a judge-produced
+# recommendation, so it seeds its own coordinate directly (see there).
+# Judge is turned OFF again at the end so the later concurrency section's capacity math
+# is unaffected.
 # =============================================================================
-say "PRD #46: run judge (stub) — funnel enqueue -> review -> notification -> re-run names the missing tool"
+say "PRD #46: run judge (stub) — funnel enqueue -> claim -> review -> persist-first notification"
 
 login   # fresh admin session; login also unlocks the admin's vault (the dummy token is DEK-sealed)
 [ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = true ] \
@@ -2403,7 +2460,7 @@ apiput /api/admin/settings '{"settings":{"judge_enabled":"true","judge_model":"h
   || fail "PRD #46: PUT /api/me/judge did not enable the per-user opt-in"
 pass "judge enabled (global kill-switch + admin opt-in); dummy token present; vault unlocked"
 
-# --- Phase A: a finished run is auto-judged; a review + notification land ---
+# --- the funnel: a finished run is auto-judged; a review + notification land ---
 J_IID="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E judge target","description":"judge e2e — implements prds/46-run-judge-self-improvement.md"}' \
   | jq -r '.card.iid')"
@@ -2440,25 +2497,30 @@ pass "judge run $J_JUDGE is repo-less (Anthropic-only claim; no forge PAT)"
   || fail "PRD #46: no judge_review inbox notification for the reviewed run (persist-first delivery)"
 pass "persist-first: a judge_review inbox notification landed for the reviewed run"
 
-# --- Phase B: plant a missing-tool signal, re-run the judge, assert it names the tool ---
-J_SEQ="$(db_psql "SELECT COALESCE(MAX(seq),0)+1 FROM run_messages WHERE run_id='$J_RUN'")"
-db_psql "INSERT INTO run_messages (run_id, seq, kind, agent, payload) VALUES ('$J_RUN', $J_SEQ, 'tool_result', 'coder', '{\"content\":\"bash: jq: command not found\"}'::jsonb)" >/dev/null
-J_REJUDGE="$(apipost "/api/runs/$J_RUN/rejudge" '' | jq -r '.run.id')"
-{ [ -n "$J_REJUDGE" ] && [ "$J_REJUDGE" != null ]; } || fail "PRD #46: re-run judge did not create a judge run"
-wait_status "$J_REJUDGE" completed 90
-apiget "/api/runs/$J_RUN/review" \
-  | jq -e '.review.recommendations[] | select(.category=="install_worker_tool" and .target=="jq")' >/dev/null \
-  || fail "PRD #46: the re-run judge review must name install_worker_tool 'jq' from the planted command-not-found"
-[ "$(db_psql "SELECT count(*) FROM run_reviews WHERE target_run_id='$J_RUN'")" = 1 ] \
-  || fail "PRD #46: re-judge must UPSERT a single review row, not stack a second"
-pass "deterministic fallback: re-run judge named install_worker_tool 'jq'; the review UPSERTed to one row"
-
 # --- PRD #68: file a forge issue from a judge recommendation -------------------
-# The review on $J_RUN carries an install_worker_tool/jq recommendation. Filing it
-# templates + sanitizes a draft server-side, creates a REAL issue on the fake forge
-# labelled exactly PRD+PRDLESS (never autopilot), persists the link, and enqueues NO
-# run — filing an issue and spending tokens on a run stay separate human decisions.
+# Filing a recommendation templates + sanitizes a draft server-side, creates a REAL
+# issue on the fake forge labelled exactly PRD+PRDLESS (never autopilot), persists the
+# link, and enqueues NO run — filing an issue and spending tokens on a run stay
+# separate human decisions.
+#
+# SETUP (PRD #97 M4): this phase used to consume the install_worker_tool/jq
+# recommendation that the dropped #46 Phase B produced by planting a
+# command-not-found and re-judging. It now SEEDS that coordinate directly on the review
+# the funnel above already landed — the same direct-seed fixture pattern the harness
+# uses for gauge rows. What #68 owns is everything DOWNSTREAM of a
+# recommendation existing (draft → forge issue → labels → link → 409 → startable), and
+# that is untouched; where the row came from was never this phase's property.
 say "PRD #68: file a forge issue from a judge recommendation"
+F_REVIEW="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.id')"
+{ [ -n "$F_REVIEW" ] && [ "$F_REVIEW" != null ]; } || fail "PRD #68: no review on $J_RUN to seed a recommendation on"
+# Pre-generate the id in SQL rather than INSERT ... RETURNING, whose psql command tag
+# ("INSERT 0 1") would contaminate the captured id once db_psql strips the newline.
+F_REC="$(db_psql "SELECT gen_random_uuid()")"
+[ -n "$F_REC" ] || fail "PRD #68: could not generate a recommendation id"
+db_psql "INSERT INTO review_recommendations (id, review_id, category, target, rationale_md, confidence)
+         VALUES ('$F_REC','$F_REVIEW','install_worker_tool','jq','the reviewer hit jq: command not found in two iterations','high')" >/dev/null
+# Read it back THROUGH the API (not the id we generated) so the seed only counts if the
+# review DTO actually surfaces the recommendation the filing routes will resolve.
 F_REC="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.recommendations[] | select(.category=="install_worker_tool" and .target=="jq") | .id')"
 { [ -n "$F_REC" ] && [ "$F_REC" != null ]; } || fail "PRD #68: no install_worker_tool/jq recommendation to file"
 
@@ -2530,76 +2592,27 @@ apiput /api/admin/settings '{"settings":{"judge_enabled":"false"}}' >/dev/null
 apiput /api/me/judge '{"enabled":false}' >/dev/null
 pass "judge disabled again (global + opt-in) — later sections run unjudged"
 
-# --- PRD #94: triage a judge recommendation (dismiss / undo) ------------------
-# The full-stack proof M5 mandates: dismissing an improve_uzi recommendation drops it
-# from the self-improvement backlog (and Undo re-includes it), and the disposition
-# write SPENDS NO TOKEN and WRITES NOTHING TO THE FORGE. The stubbed judge only ever
-# emits install_worker_tool (its command-not-found fallback), so we PLANT one
-# improve_uzi recommendation on the review that already landed on $J_RUN (a stubbed
-# review) — a fresh coordinate that does not collide with the filed jq row above.
-say "PRD #94: triage a judge recommendation — dismiss drops it from the self-improve backlog; undo re-includes; no spend, no forge write"
-
-DR_REVIEW="$(apiget "/api/runs/$J_RUN/review" | jq -r '.review.id')"
-{ [ -n "$DR_REVIEW" ] && [ "$DR_REVIEW" != null ]; } || fail "PRD #94: no review on $J_RUN to triage"
-# Pre-generate the id in SQL (a clean single value) rather than INSERT ... RETURNING,
-# whose psql command tag ("INSERT 0 1") would contaminate the captured id once db_psql
-# strips the newline between them — the existing legs INSERT to /dev/null for the same reason.
-DR_REC="$(db_psql "SELECT gen_random_uuid()")"
-{ [ -n "$DR_REC" ]; } || fail "PRD #94: could not generate a recommendation id"
-db_psql "INSERT INTO review_recommendations (id, review_id, category, target, rationale_md, confidence) VALUES ('$DR_REC','$DR_REVIEW','improve_uzi','e2e-triage','triage e2e: dismiss must drop this from the backlog','high')" >/dev/null
-
-# in_backlog — the ACTUAL ListOpenImproveUziRecommendations predicate (both coordinate
-# NOT EXISTS exclusions), scoped to the planted row: 1 = still in the engine's backlog,
-# 0 = excluded. Mirrors queries/selfimprove.sql so the e2e observes exactly what the
-# self-improve engine would fold into its tracking issue.
-in_backlog() {
-  db_psql "SELECT count(*) FROM review_recommendations rr
-    WHERE rr.id='$DR_REC' AND rr.category='improve_uzi' AND rr.addressed_by_run_id IS NULL
-      AND NOT EXISTS (SELECT 1 FROM recommendation_filed_issues f
-                      WHERE f.review_id=rr.review_id AND f.category=rr.category AND f.target=rr.target)
-      AND NOT EXISTS (SELECT 1 FROM recommendation_dispositions d
-                      WHERE d.review_id=rr.review_id AND d.category=rr.category AND d.target=rr.target)"
-}
-[ "$(in_backlog)" = 1 ] || fail "PRD #94: the planted improve_uzi rec must start IN the self-improve backlog"
-pass "planted improve_uzi/e2e-triage recommendation is in the self-improve backlog (baseline)"
-
-# Snapshot the no-spend / no-forge-write invariants: the total run count (a judge or any
-# run enqueue would bump it) and the forge's entire mutable surface (a forge write would
-# change issues/mrs/notes/labelEvents). A disposition must move neither.
-DR_RUNS_BEFORE="$(db_psql "SELECT count(*) FROM runs")"
-forge_sig() { fake_state | jq -Sc '{issues:(.issues|length), mrs:(.mrs|length), notes:(.notes|length), labelEvents:(.labelEvents|length)}'; }
-DR_FORGE_BEFORE="$(forge_sig)"
-
-# Dismiss it as a false positive (not_an_issue) via the real HTTP endpoint → 204.
-DR_PUT_CODE="$(apiput_code "/api/runs/$J_RUN/review/recommendations/$DR_REC/disposition" '{"status":"dismissed","reason":"not_an_issue"}')"
-[ "$DR_PUT_CODE" = 204 ] || fail "PRD #94: dismiss PUT = $DR_PUT_CODE, want 204"
-apiget "/api/runs/$J_RUN/review" \
-  | jq -e '.review.dispositions[] | select(.target=="e2e-triage" and .status=="dismissed" and .reason=="not_an_issue")' >/dev/null \
-  || fail "PRD #94: the review DTO must carry the dismissed disposition"
-apiget "/api/runs/$J_RUN/review" | jq -e '.review.triage.false_positives >= 1' >/dev/null \
-  || fail "PRD #94: the per-review triage must count the not_an_issue dismissal as a false positive"
-[ "$(in_backlog)" = 0 ] || fail "PRD #94: a dismissed improve_uzi rec must DROP OUT of the self-improve backlog"
-pass "dismiss (not_an_issue): the rec left the backlog and shows as a false positive in the triage"
-
-# The invariants: no run enqueued, no forge write.
-[ "$(db_psql "SELECT count(*) FROM runs")" = "$DR_RUNS_BEFORE" ] \
-  || fail "PRD #94: dismissing enqueued a run — a disposition must spend no token"
-[ "$(forge_sig)" = "$DR_FORGE_BEFORE" ] \
-  || fail "PRD #94: dismissing changed the forge state — a disposition must write nothing to the forge"
-pass "the dismissal enqueued NO run and wrote NOTHING to the forge (no spend, no forge write)"
-
-# Undo (DELETE) → 204, and the rec RE-INCLUDES in the backlog; still no run / no forge write.
-DR_DEL_CODE="$(apidelete_code "/api/runs/$J_RUN/review/recommendations/$DR_REC/disposition")"
-[ "$DR_DEL_CODE" = 204 ] || fail "PRD #94: undo DELETE = $DR_DEL_CODE, want 204"
-[ "$(in_backlog)" = 1 ] || fail "PRD #94: Undo must RE-INCLUDE the rec in the self-improve backlog"
-[ "$(db_psql "SELECT count(*) FROM runs")" = "$DR_RUNS_BEFORE" ] \
-  || fail "PRD #94: undo enqueued a run — a disposition must spend no token"
-[ "$(forge_sig)" = "$DR_FORGE_BEFORE" ] \
-  || fail "PRD #94: undo changed the forge state — a disposition must write nothing to the forge"
-pass "undo: the rec re-entered the backlog; still no run enqueued and no forge write"
-
-# Tidy: drop the planted recommendation so it does not linger in later sections' state.
-db_psql "DELETE FROM review_recommendations WHERE id='$DR_REC'" >/dev/null
+# --- PRD #94 triage (dismiss / undo) — DROPPED by PRD #97 M4 ------------------
+# The dismiss/undo triage phase used to sit here. Every property it asserted is proven
+# at a cheaper layer that runs in CI on every MR:
+#   - self-improve backlog EXCLUSION on dismiss and RE-INCLUSION on undo, the
+#     status/reason CHECK (dismissed REQUIRES a reason, done FORBIDS one), disposition
+#     survival across a re-judge, and the triage join — live Postgres,
+#     `api/internal/store/recommendation_dispositions_integration_test.go`
+#     (TestRecommendationDispositionsLiveDB), run by `test:api-store-it`;
+#   - the HTTP surface (PUT/DELETE → 204, owner-only, enum validation, idempotent
+#     double-PUT, double-undo, unknown-rec 404, the disposition on the review DTO and
+#     its server-computed stale flag, the triage ladder) —
+#     `api/internal/handler/review_disposition_test.go`;
+#   - "no spend, no forge write" — TestDispositionTouchesStoreOnly, a positive
+#     store-call ALLOWLIST proving the path calls only the owner-resolve reads plus the
+#     single disposition write, never a run-create/enqueue or any forge method. That is
+#     a structural proof, strictly stronger than this harness's before/after run count
+#     and forge-state signature, which could only catch a write that happened to land;
+#   - the PER-REVIEW `triage.false_positives` counter this phase read off the review DTO
+#     was the one leg with NO lower-layer test (reviewToDTO assembles its own triage
+#     rows), so PRD #97 M4 added handler-level TestGetRunReviewPerReviewTriage rather
+#     than dropping the property uncovered.
 
 # =============================================================================
 # PRD #39 — in-app uzi chat agent, end to end on the STUB chat executor.
@@ -3275,60 +3288,33 @@ apiput /api/admin/settings '{"settings":{"health_stall_seconds":"300"}}' >/dev/n
 fi
 
 # ---------------------------------------------------------------------------
-# PRD #53: per-user Claude rate-limit meters (read endpoints + status union).
-# The poller is DISABLED in the overlay (UZI_USAGE_POLL_INTERVAL=0) — the isolated
-# stack has no live Anthropic and the client's base URL is a hardcoded const, so
-# there is nothing to point at a fake. We seed one gauge row directly (the same
-# direct-seed fixture pattern used for user2's master-sealed row) and drive the
-# frozen contract end to end: unavailable → ok on /me, the admin list showing every
-# user incl. a token-less no_token, and a member 403 on the admin endpoint. The SPA
-# meters are validated against the kept stack by web-ux (KEEP_STACK).
-say "PRD #53: per-user rate-limit meters (seeded gauge row → read endpoints)"
+# PRD #53: per-user Claude rate-limit meters — COLLAPSED to a one-liner by PRD #97 M4.
+# The poller is DISABLED in the overlay (UZI_USAGE_POLL_INTERVAL=0) — the isolated stack
+# has no live Anthropic and the client's base URL is a hardcoded const, so there is
+# nothing to point at a fake. Everything this phase used to drive is proven at the
+# handler layer by `api/internal/handler/ratelimits_test.go`, which runs the real
+# handlers over httptest against a fake DBTX: the FULL status union on /me
+# (no_token / unavailable / ok, incl. the "no key leaks" checks), stale both ways
+# (3x-interval and the poller-disabled always-stale rule), the admin list shape (every
+# user appears, ok + no_token + unavailable, vault_locked), the member-403 through the
+# real RequireAdmin gate, and the D3b token-delete cascade. What no lower layer can show
+# is that a row written to the REAL schema by the REAL poller shape reaches the REAL
+# endpoint, so one seeded gauge row → /me remains.
+say "PRD #53: per-user rate-limit meters (seeded gauge row → /me)"
 login  # refresh the admin session
 ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
 [ -n "$ADMIN_ID" ] || fail "could not resolve the admin id for the rate-limit seed"
 
-# The seed admin holds a token but has no reading yet ⇒ unavailable (not no_token,
-# and not a ghost row).
-[ "$(apiget /api/me/rate-limits | jq -r '.status')" = unavailable ] \
-  || fail "admin (token, no reading) should read unavailable before any row is seeded"
-
-# Seed a fresh reading directly (the poller is off).
 db_psql "INSERT INTO anthropic_rate_limits
            (user_id, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, source, synced_at)
          VALUES ('$ADMIN_ID', 55, now() + interval '2 hours', 12, now() + interval '3 days', 'usage_endpoint', now())
          ON CONFLICT (user_id) DO UPDATE SET
            five_hour_pct = 55, seven_day_pct = 12, source = 'usage_endpoint', synced_at = now()" >/dev/null
 
-ME_RL="$(apiget /api/me/rate-limits)"
-[ "$(jq -r '.status'              <<<"$ME_RL")" = ok ]             || fail "/me/rate-limits status != ok after seeding a row"
-[ "$(jq -r '.five_hour.pct'       <<<"$ME_RL")" = 55 ]            || fail "/me/rate-limits five_hour.pct != 55"
-[ "$(jq -r '.seven_day.pct'       <<<"$ME_RL")" = 12 ]            || fail "/me/rate-limits seven_day.pct != 12"
-[ "$(jq -r '.source'              <<<"$ME_RL")" = usage_endpoint ] || fail "/me/rate-limits source != usage_endpoint"
-[ "$(jq -r '.five_hour.resets_at' <<<"$ME_RL")" != null ]        || fail "/me/rate-limits five_hour.resets_at should be an epoch, not null"
-# Poller disabled ⇒ every served reading is stale.
-[ "$(jq -r '.stale'               <<<"$ME_RL")" = true ]          || fail "/me/rate-limits stale should be true with the poller disabled"
-pass "/api/me/rate-limits returns the ok union for a seeded reading (stale with the poller off)"
-
-# Admin list: every user appears; the admin is ok, the token-less fresh user is no_token.
-ADMIN_RL="$(apiget /api/admin/rate-limits)"
-[ "$(jq -r --arg id "$ADMIN_ID" '.users[] | select(.id==$id) | .limits.status' <<<"$ADMIN_RL")" = ok ] \
-  || fail "the admin's own row should read ok in the admin list"
-[ "$(jq -r --arg e "$FRESH_EMAIL" '.users[] | select(.email==$e) | .limits.status' <<<"$ADMIN_RL")" = no_token ] \
-  || fail "the token-less fresh user should appear as no_token in the admin list"
-for e in "$ADMIN_EMAIL" "$FRESH_EMAIL" user2@uzi.e2e; do
-  [ "$(jq -r --arg e "$e" '[.users[] | select(.email==$e)] | length' <<<"$ADMIN_RL")" = 1 ] \
-    || fail "the admin rate-limit list is missing user $e (every user must appear)"
-done
-pass "/api/admin/rate-limits lists every user; admin=ok, token-less user=no_token"
-
-# A non-admin member is forbidden by the RequireAdmin gate. Refresh the fresh
-# user's session first so this asserts 403 (authz), not 401 (an expired cookie).
-curl -fsS -c "$FRESHJAR" -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
-  -d "{\"email\":\"$FRESH_EMAIL\",\"password\":\"$FRESH_PASS\"}" >/dev/null
-[ "$(fresh_code GET /api/admin/rate-limits)" = 403 ] \
-  || fail "a non-admin member must get 403 on /api/admin/rate-limits"
-pass "member gets 403 on /api/admin/rate-limits"
+apiget /api/me/rate-limits \
+  | jq -e '.status == "ok" and .five_hour.pct == 55 and .seven_day.pct == 12 and .source == "usage_endpoint"' >/dev/null \
+  || fail "/api/me/rate-limits did not surface the seeded gauge row (got: $(apiget /api/me/rate-limits | jq -c .))"
+pass "PRD #53: a seeded gauge row surfaces on /api/me/rate-limits (55% / 12%, usage_endpoint)"
 
 # ── PRD #83 M2: docker-capable worker (rootless DinD sidecar) ────────────────────────
 # Runs ONLY under `--profile agent-docker` (so the default suite is untouched). Two
@@ -3390,6 +3376,9 @@ $(printf '%s' "$tc_out" | tail -n 15)"
   pass "a toy 'docker compose up' runs through the sidecar (docker compose v2)"
 
   # (b) LIVE Decision-3 efficacy (deferred from M1, no daemon existed there).
+  # ⛔ DO NOT DROP (PRD #97 M4 guard list — the full list is in the block above the
+  # secret-hygiene phase). This is a DIFFERENT topology (rootless DinD sidecar) and it
+  # reads a live daemon's mount namespace; no unit test can stand in for it.
   CANARY="$(rootdk cat "$DTOK" 2>/dev/null | tr -d '\r\n' || true)"
   [ -n "$CANARY" ] || fail "could not read the join-token canary from the agent — the Decision-3 assertion would be vacuous"
   # positive control: a sidecar container CAN read a file that IS in the DinD fs, so an

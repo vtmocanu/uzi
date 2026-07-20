@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -504,6 +505,69 @@ func TestGetRunReviewStaleFlag(t *testing.T) {
 	}
 	if !staleByTarget["stale"] {
 		t.Error("a disposition whose stored hash differs from the current rationale must be stale=true")
+	}
+}
+
+// TestGetRunReviewPerReviewTriage pins the PER-REVIEW triage tally on the review DTO —
+// the counterpart of TestJudgeStatsAggregateLadder, which only covers the GLOBAL strip
+// fed by the flat store join. reviewToDTO assembles its OWN triage rows from the current
+// recommendations + dispositions + settled filed links (dispStatus/dispReason and the
+// filed_at-valid filter), so the ladder being right does not by itself make this right.
+// Added by PRD #97 M4: the e2e phase that used to assert `.review.triage.false_positives`
+// over the wire was dropped, and this was the one leg no lower layer covered.
+//
+// Five current recommendations: a not_an_issue dismissal (the ONLY false positive), a
+// wont_do dismissal (dismissed but NOT a false positive), a done, a SETTLED filed link,
+// and an UNSETTLED claim (must count todo, never filed). A disposition on a coordinate
+// with no current recommendation must not count at all.
+func TestGetRunReviewPerReviewTriage(t *testing.T) {
+	ownerID, runID, reviewID := uuid.New(), uuid.New(), uuid.New()
+	rec := func(cat, tgt string) store.ReviewRecommendation {
+		return store.ReviewRecommendation{ID: uuid.New(), ReviewID: reviewID, Category: cat, Target: tgt}
+	}
+	st := &dispStore{
+		ownerID: ownerID,
+		run:     store.Run{ID: runID, UserID: ownerID, Status: "completed", Kind: "issue"},
+		review:  store.RunReview{ID: reviewID, TargetRunID: runID, UserID: ownerID},
+		recs: []store.ReviewRecommendation{
+			rec("improve_uzi", "fp"),
+			rec("improve_uzi", "wont"),
+			rec("improve_agent", "done"),
+			rec("install_worker_tool", "settled"),
+			rec("install_worker_tool", "claimed"),
+		},
+		disps: []store.RecommendationDisposition{
+			{ReviewID: reviewID, Category: "improve_uzi", Target: "fp", Status: "dismissed",
+				DismissReason: pgtype.Text{String: "not_an_issue", Valid: true}},
+			{ReviewID: reviewID, Category: "improve_uzi", Target: "wont", Status: "dismissed",
+				DismissReason: pgtype.Text{String: "wont_do", Valid: true}},
+			{ReviewID: reviewID, Category: "improve_agent", Target: "done", Status: "done"},
+			// Stale coordinate: no current recommendation carries it, so it must not count.
+			{ReviewID: reviewID, Category: "add_agent", Target: "gone", Status: "done"},
+		},
+		filed: []store.RecommendationFiledIssue{
+			{ReviewID: reviewID, Category: "install_worker_tool", Target: "settled",
+				FiledAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}},
+			// An UNSETTLED claim (filed_at NULL) is NOT filed — it stays todo.
+			{ReviewID: reviewID, Category: "install_worker_tool", Target: "claimed"},
+		},
+	}
+	h := newRunsHandler(t, st)
+
+	w := httptest.NewRecorder()
+	h.GetRunReview(w, runReq(store.User{ID: ownerID}, runID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetRunReview = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Review apitypes.ReviewDTO `json:"review"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := apitypes.TriageDTO{Total: 5, Todo: 1, Filed: 1, Done: 1, Dismissed: 2, FalsePositives: 1}
+	if body.Review.Triage != want {
+		t.Fatalf("per-review triage = %+v, want %+v", body.Review.Triage, want)
 	}
 }
 
