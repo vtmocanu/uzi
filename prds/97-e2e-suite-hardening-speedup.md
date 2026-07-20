@@ -79,6 +79,18 @@ Every vanished leg must map to a named intended drop, and the restored `#16` leg
 the forgejo lane and the `--profile agent-docker` block are conditional and don't run by default.
 Valid for the DELTA only; quoting the static count against 182 is an apples-to-oranges error.
 
+**Small loose end:** `api/internal/handler/runs_test.go` carries **pre-existing** gofmt drift at
+HEAD (struct field alignment in `runsStore`), verified against `git show HEAD:` — it predates this
+work and was deliberately left out of a line-by-line-audited diff. `gofmt -l` is currently non-clean
+in the repo; worth a separate one-line fix.
+
+**Split integrity, verified not assumed:** `aad3c201` (M4) contains **zero M9 markers** and a diff of
+exactly **11 removed / 2 added**, so M4's accounting is reproduced by the split rather than asserted.
+`859a8066` (M9) was confirmed to be the validated tree by comparing its `run-e2e.sh` blob
+(`b0424822…`) byte-for-byte against the file that produced the 173/0 run. Caveat for the series:
+run6 validated the tree **with M9 on top**, so M4's tree alone was lint/unit-verified but never
+executed standalone — normal for a split series, stated rather than implied.
+
 **Two lead errors corrected in-document, kept for the next reader:** the `#68` option-(b)
 recommendation (would have raced `UNIQUE (run_id, seq)`) and the `#22` "too-tight window"
 diagnosis (`wait_eq`'s 2nd arg is SECONDS, not tries). Both were caught by teammates, not by me.
