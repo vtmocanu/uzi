@@ -19,7 +19,9 @@ export interface EmittedMessage {
   agent?: string;
   /** The subagent INVOCATION id (SDK `parent_tool_use_id`) and the task it was
    *  given (SDK `task_description`), PRD #99. Both are pure per-frame fields —
-   *  no correlation state — and absent for the lead and for infra frames. */
+   *  no correlation state — and absent when the frame carries neither field.
+   *  "Absent" tracks the SDK fields, not the role name: an agent NAMED lead in a
+   *  repo roster is a real subagent and does carry an instance id. */
   agentInstance?: string;
   agentLabel?: string;
   payload: Record<string, unknown>;

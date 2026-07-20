@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mapSdkMessage, isErrorResult, isResult, sessionIdOf, assistantUsageOf } from "../src/sdk-messages.js";
+import { mapSdkMessage, isErrorResult, isResult, sessionIdOf, assistantUsageOf, orphanInstanceKind } from "../src/sdk-messages.js";
 
 // SDK stream events → run_messages (kinds + agent attribution). Built with
 // hand-rolled SDK-shaped objects; no live session.
@@ -324,5 +324,58 @@ describe("mapSdkMessage instance + label capture (PRD #99)", () => {
     assert.equal(out[0]?.agentInstance, "toolu_A", "...but the instance id IS present, so the lane key is a subagent's");
     const rec = out[0] as unknown as Record<string, unknown>;
     assert.ok(!("agentLabel" in rec), "a replay frame carries no task_description");
+  });
+});
+
+// PRD #99: the orphan-instance DETECTOR. It exists so the "replay frames do not
+// arrive in practice" reasoning stays checkable against reality instead of being
+// assumed forever. It must key on the PRESENCE of subagent_type, never on
+// agentOf's output — the `??` in agentOf collapses "field absent" and
+// "field == 'lead'" into the same string, and this repo legitimately produces
+// both (a repo roster may ship an agent NAMED lead).
+describe("orphanInstanceKind (PRD #99)", () => {
+  it("fires on a frame with parent_tool_use_id but no subagent_type", () => {
+    assert.equal(
+      orphanInstanceKind({ type: "user", parent_tool_use_id: "toolu_A", message: { content: [] } }),
+      "user",
+    );
+  });
+
+  it("does NOT fire for a repo-authored subagent NAMED lead", () => {
+    // The case that broke the value-based version: subagent_type is PRESENT and
+    // its value is "lead". This is a healthy subagent frame, and a detector that
+    // fired here would mean "working as intended" and "replay artifact" at once.
+    assert.equal(
+      orphanInstanceKind({
+        type: "assistant",
+        subagent_type: "lead",
+        parent_tool_use_id: "toolu_A",
+        message: { content: [] },
+      }),
+      undefined,
+    );
+    // ...and the instance id is still captured for that frame, so two parallel
+    // invocations of a repo `lead` stay in separate lanes.
+    const out = mapSdkMessage({
+      type: "assistant",
+      subagent_type: "lead",
+      parent_tool_use_id: "toolu_A",
+      message: { content: [{ type: "text", text: "x" }] },
+    });
+    assert.equal(out[0]?.agentInstance, "toolu_A");
+    assert.equal(out[0]?.agent, "lead");
+  });
+
+  it("does not fire for the parentless orchestrator or an ordinary subagent", () => {
+    assert.equal(orphanInstanceKind({ type: "assistant", parent_tool_use_id: null, message: {} }), undefined);
+    assert.equal(
+      orphanInstanceKind({ type: "assistant", subagent_type: "coder", parent_tool_use_id: "toolu_B", message: {} }),
+      undefined,
+    );
+  });
+
+  it("is inert on junk", () => {
+    assert.equal(orphanInstanceKind(null), undefined);
+    assert.equal(orphanInstanceKind({ type: "result" }), undefined);
   });
 });

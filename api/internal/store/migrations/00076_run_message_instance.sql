@@ -6,8 +6,11 @@
 --     INVOCATION id, so two parallel same-role subagents stay distinguishable.
 --   agent_label    = the SDK's per-frame `task_description` — what that
 --     invocation was asked to do, used as the lane's title.
--- Both are NULL for the lead, for infra/worker frames, and for every
--- pre-migration message; the web falls back to the role name.
+-- Both are NULL whenever the frame carries no `parent_tool_use_id` -- the
+-- orchestrator's own turns, infra/worker frames, and every pre-migration message.
+-- NOT the same as `agent = 'lead'`: a repo may legitimately ship an agent NAMED
+-- lead, which is a real subagent and does carry an instance id.
+-- The web falls back to the role name.
 ALTER TABLE run_messages ADD COLUMN agent_instance text;
 ALTER TABLE run_messages ADD COLUMN agent_label text;
 

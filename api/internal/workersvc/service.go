@@ -299,7 +299,8 @@ type Params struct {
 type Broadcaster interface {
 	// PublishMessage forwards one newly-persisted run message. agentInstance and
 	// agentLabel are the PRD #99 per-frame subagent invocation id + task label,
-	// empty for the lead and for infra frames.
+	// empty when the frame carried no parent_tool_use_id (not the same as
+	// agent == "lead": a repo-authored agent may legitimately be NAMED lead).
 	PublishMessage(runID uuid.UUID, seq int32, kind, agent, agentInstance, agentLabel string, payload []byte, createdAt time.Time)
 	// PublishState signals that a run's status changed.
 	PublishState(runID uuid.UUID, status string)
@@ -930,13 +931,21 @@ func truncateRunes(s string, n int) string {
 }
 
 // IncomingMessage is one seq-numbered message a worker appends.
+//
+// Compat note: DecodeJSON sets DisallowUnknownFields, so a field a NEW worker
+// sends must already be DECLARED here in the release BEFORE that worker ships, or
+// the whole batch 400s and the batcher retries it forever. That rule is stated in
+// full on the register path (handler/worker_protocol.go, the Capabilities field);
+// it is repeated here because a reader of the messages path would not find it
+// there. The PRD #99 fields satisfy it: they were declared in M1, which lands
+// strictly before M2 starts emitting them.
 type IncomingMessage struct {
 	Seq   int32  `json:"seq"`
 	Kind  string `json:"kind"`
 	Agent string `json:"agent"`
 	// AgentInstance/AgentLabel are the PRD #99 per-frame subagent invocation id
 	// (the SDK's parent_tool_use_id) and its task description. Both are absent
-	// for the lead and for infra frames; empty string persists as SQL NULL.
+	// when the frame carried no parent_tool_use_id; empty string persists as NULL.
 	AgentInstance string          `json:"agent_instance,omitempty"`
 	AgentLabel    string          `json:"agent_label,omitempty"`
 	Payload       json.RawMessage `json:"payload"`

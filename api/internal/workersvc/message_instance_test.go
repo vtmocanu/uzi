@@ -71,6 +71,53 @@ func TestAppendMessagesCarriesInstanceAndLabel(t *testing.T) {
 	}
 }
 
+// TestIncomingMessageDecodesWorkerJSONKeys pins the worker→API JSON key names.
+// This is the ONE seam in the PRD #99 wire with no other guard: both ends are
+// mutation-tested in isolation, but nothing else asserts that IncomingMessage's
+// struct tags match what agent/src/protocol.ts's OutgoingMessage actually sends.
+//
+// A tag drift here is the worst failure mode in the whole design: both columns go
+// NULL forever, and the pane degrades to a role-fallback lane — which is
+// INDISTINGUISHABLE from "the SDK didn't provide it", the documented healthy
+// degradation. It would not look like a bug. The e2e leg that would otherwise
+// catch it is deferred until PRD #97 lands, so until then this test is the only
+// thing standing between a renamed tag and silent permanent data loss.
+//
+// The literal below is the exact shape the batcher emits (batcher.ts builds
+// `{seq, kind, agent, agent_instance, agent_label, payload}`); keep them in sync
+// BY HAND — that is the point of the test.
+func TestIncomingMessageDecodesWorkerJSONKeys(t *testing.T) {
+	const workerPayload = `{"seq":1,"kind":"tool_use","agent":"coder",` +
+		`"agent_instance":"toolu_A","agent_label":"web gate UX","payload":{"name":"Edit"}}`
+
+	var m IncomingMessage
+	if err := json.Unmarshal([]byte(workerPayload), &m); err != nil {
+		t.Fatalf("a real worker payload must decode into IncomingMessage: %v", err)
+	}
+	if m.AgentInstance != "toolu_A" {
+		t.Fatalf(`the "agent_instance" JSON key must land on AgentInstance, got %q`, m.AgentInstance)
+	}
+	if m.AgentLabel != "web gate UX" {
+		t.Fatalf(`the "agent_label" JSON key must land on AgentLabel, got %q`, m.AgentLabel)
+	}
+	// The pre-existing fields are asserted too: this test is the tag contract for
+	// the whole struct, not just the two new members.
+	if m.Seq != 1 || m.Kind != "tool_use" || m.Agent != "coder" {
+		t.Fatalf("base fields mis-decoded: %+v", m)
+	}
+
+	// A lead frame omits both keys entirely (the batcher only sets them when the
+	// SDK frame carried them). They must decode to "", which pgText maps to NULL.
+	var lead IncomingMessage
+	if err := json.Unmarshal([]byte(`{"seq":2,"kind":"text","agent":"lead","payload":{}}`), &lead); err != nil {
+		t.Fatalf("a lead payload must decode: %v", err)
+	}
+	if lead.AgentInstance != "" || lead.AgentLabel != "" {
+		t.Fatalf("omitted keys must decode to the empty string, got %q / %q",
+			lead.AgentInstance, lead.AgentLabel)
+	}
+}
+
 // TestAppendMessagesCapsAttributionFields proves the server-side bound on the
 // UNTRUSTED worker insert path. The only other ceiling is httpx.DecodeJSON's
 // 1 MiB LimitReader, which is PER BATCH, so without this one message could carry

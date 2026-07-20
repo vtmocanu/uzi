@@ -259,6 +259,43 @@ export function isErrorResult(message: unknown): boolean {
   return msg["subtype"] !== "success" || msg["is_error"] === true;
 }
 
+/**
+ * The frame type when a frame carries a `parent_tool_use_id` but NO
+ * `subagent_type` field — otherwise undefined. This is the `SDKUserMessageReplay`
+ * signature (sdk.d.ts:4334) and it should be IMPOSSIBLE on a well-formed frame,
+ * which is why it is worth an alarm rather than a silent normalization.
+ *
+ * The test is on the field's PRESENCE, never on `agentOf`'s output. That
+ * distinction is the whole point and it is easy to get wrong: `agentOf`'s
+ * `subagent_type ?? LEAD` collapses two genuinely different states into the same
+ * string `"lead"` —
+ *   - field ABSENT            → "lead"   (the replay case: actually anomalous)
+ *   - field PRESENT == "lead" → "lead"   (a repo-authored `lead` subagent, which
+ *                                         this repo explicitly supports:
+ *                                         repoagents.ts:46, and
+ *                                         `selectSubagents(source="repo")` applies
+ *                                         only an `exclude` check, so a repo
+ *                                         `lead` IS registered as a subagent)
+ * Anything keying off "is this the lead?" must decide which of the two it means.
+ * A value test here would fire on every frame of a healthy repo-`lead` subagent,
+ * making the signal mean "working as intended" and "replay artifact" at once.
+ *
+ * This is a DETECTOR, not a mutator: nothing is dropped or rewritten on the back
+ * of it. Its purpose is to keep the question observable — the decision to leave
+ * replay frames uncorrected (see this file's header) rests on the absence of
+ * these frames in practice, and without this line that absence could never be
+ * confirmed, only assumed. If it never fires, that reasoning stands on evidence;
+ * if it starts firing, the analysis is already waiting in the PRD's Decision 8.
+ * Do not delete it as defensive noise.
+ */
+export function orphanInstanceKind(message: unknown): string | undefined {
+  const msg = asRecord(message);
+  if (!msg) return undefined;
+  if (asString(msg["subagent_type"]) !== undefined) return undefined;
+  if (asString(msg["parent_tool_use_id"]) === undefined) return undefined;
+  return asString(msg["type"]) ?? "unknown";
+}
+
 /** Whether an SDK message is the terminal `result` frame. */
 export function isResult(message: unknown): boolean {
   return asRecord(message)?.["type"] === "result";

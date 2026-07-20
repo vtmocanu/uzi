@@ -527,11 +527,13 @@ export interface OutgoingMessage {
   /** Which (sub)agent produced it (lead|coder|reviewer|…); worker for infra. */
   agent?: string;
   /** Which INVOCATION of that agent produced it (PRD #99) — the SDK's per-frame
-   *  `parent_tool_use_id`. Absent for the lead and for infra frames. Two parallel
+   *  `parent_tool_use_id`. Absent when the frame carries no `parent_tool_use_id`
+   *  -- NOT the same as `agent === "lead"`, since a repo agent may be NAMED lead
+   *  and is a real subagent. Two parallel
    *  same-role subagents differ only here, so the pane can lane them apart. */
   agent_instance?: string;
   /** What that invocation was asked to do (PRD #99) — the SDK's per-frame
-   *  `task_description`. Absent for the lead and whenever the SDK omits it. */
+   *  `task_description`. Absent whenever the SDK frame omits that field. */
   agent_label?: string;
   payload: Record<string, unknown>;
 }

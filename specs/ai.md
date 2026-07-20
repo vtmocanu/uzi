@@ -735,7 +735,17 @@ Serves human: Feature #4 job queue + worker registry + lossless live stream.
   bottega's check-then-insert TOCTOU race with a DB constraint. Terminal runs are
   excluded so an issue can be re-run once its prior run finishes.
 - **`run_messages`** — `bigserial id, run_id→runs ON DELETE CASCADE, seq int,
-  kind, agent, payload jsonb, created_at`, **UNIQUE(run_id, seq)**. Per-run gapless
+  kind, agent, payload jsonb, created_at, agent_instance text, agent_label text`,
+  **UNIQUE(run_id, seq)**. The last two are PRD #99's per-instance attribution
+  (both nullable, appended by `00076`, no backfill): `agent_instance` is the SDK's
+  per-frame `parent_tool_use_id` — the subagent INVOCATION id, which is what keeps
+  two parallel same-role subagents distinguishable — and `agent_label` its
+  `task_description`. Both are NULL whenever the frame carried no
+  `parent_tool_use_id`. That is **not** the same condition as `agent = 'lead'`: a
+  repo may legitimately ship an agent NAMED `lead`, which is a real subagent and
+  does carry an instance id. `agent_label` is model-authored text, so it is
+  secret-redacted worker-side and rune-capped server-side on the untrusted insert
+  path rather than trusted at either end. Per-run gapless
   seq makes the worker's batched append idempotent and the browser stream replayable
   (fixes multica's lossy buffer). `kind ∈ {text, thinking, tool_use, tool_result,
   status, error, user_message, plan}`.

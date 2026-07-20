@@ -36,7 +36,8 @@ type Event struct {
 	Agent *string `json:"agent,omitempty"`
 	// AgentInstance/AgentLabel are the PRD #99 subagent invocation id + task
 	// label. The browser lanes a live frame off these without a REST re-read, so
-	// they must ride the frame exactly as Agent does; absent for the lead.
+	// they must ride the frame exactly as Agent does. Absent when the frame
+	// carried no parent_tool_use_id (which is NOT the same as Agent == "lead").
 	AgentInstance *string         `json:"agent_instance,omitempty"`
 	AgentLabel    *string         `json:"agent_label,omitempty"`
 	Payload       json.RawMessage `json:"payload,omitempty"`

@@ -1026,8 +1026,11 @@ export interface RunMessage {
   agent: string | null;
   // agent_instance is the subagent INVOCATION id (the SDK's per-frame
   // parent_tool_use_id, PRD #99), agent_label the task description that
-  // invocation was given. Both null for the lead, for infra frames, and for every
-  // pre-migration message — consumers fall back to `agent`.
+  // invocation was given. Both null when the frame carried no
+  // `parent_tool_use_id` — the orchestrator's own turns, infra frames, and every
+  // pre-migration message. NOT the same as `agent === "lead"`: a repo may ship an
+  // agent NAMED lead, which is a real subagent and does carry an id.
+  // Consumers fall back to `agent`.
   agent_instance: string | null;
   agent_label: string | null;
   payload: unknown;

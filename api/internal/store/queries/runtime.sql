@@ -588,6 +588,10 @@ ON CONFLICT (run_id, seq) DO NOTHING;
 -- Column order matches the run_messages table order (the two PRD #99 columns were
 -- appended by 00076), so sqlc keeps returning store.RunMessage rather than
 -- minting a separate ...Row type.
+-- TO DO IT RIGHT: new columns must be APPENDED to both this SELECT list and
+-- ListRunMessagesForWorkerPage's, in the same order the ALTER TABLE adds them.
+-- Diverge and sqlc mints per-query Row types for BOTH, breaking workersvc.Store's
+-- []store.RunMessage contract (a compile error at cmd/server/main.go).
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
@@ -748,7 +752,8 @@ WHERE r.id = @id AND r.user_id = @user_id AND r.kind <> 'judge';
 -- Authorization (the run is the worker's user's) is checked by the caller before
 -- this; here @lim caps the page so a single response can't be unbounded.
 -- Column order matches the table (see ListRunMessagesAfter) so the row stays
--- store.RunMessage.
+-- store.RunMessage. New columns must be APPENDED here AND in ListRunMessagesAfter,
+-- in the same order the ALTER TABLE adds them — see that query's note.
 SELECT id, run_id, seq, kind, agent, payload, created_at, agent_instance, agent_label
 FROM run_messages
 WHERE run_id = @run_id AND seq > @after_seq
