@@ -322,9 +322,16 @@ func TestBulkDispositionIdempotentLiveDB(t *testing.T) {
 // TestBulkDispositionRejectsBodyCoordinateLiveDB is the live-DB proof of the invariant
 // migrations 00071/00073 rely on: "the handler never accepts a category from the request
 // body — it reads it off the resolved recommendation". Neither table has a category CHECK,
-// on those exact grounds, so if the endpoint echoed body values into the upsert, this
-// bogus category would land in recommendation_dispositions as free text. It must instead
-// resolve to nothing and write nothing.
+// on those exact grounds, so a body-echo bug would land free text in the coordinate columns
+// with nothing to stop it.
+//
+// THE REQUEST MUST CARRY A RESOLVABLE ITEM, and that is not incidental. An earlier version
+// sent only bogus items — so zero members resolved, the upsert loop body never executed,
+// and the test stayed GREEN against an endpoint deliberately rewired to echo the body
+// (found by mutation, PRD #98 M2 review). With a real coordinate alongside, the loop runs
+// at least once, so a body-echo bug writes the bogus category under the resolvable member
+// and the count below catches it. A test that cannot reach the code it names proves
+// nothing.
 func TestBulkDispositionRejectsBodyCoordinateLiveDB(t *testing.T) {
 	h, pool, _ := bulkDispositionLiveDB(t)
 	ctx := context.Background()
@@ -333,27 +340,36 @@ func TestBulkDispositionRejectsBodyCoordinateLiveDB(t *testing.T) {
 
 	rec, got := doBulk(t, h, user,
 		`{"items":[{"category":"'; DROP TABLE runs; --","target":"anything"},`+
-			`{"category":"not_a_real_category","target":"rg"}],"status":"done"}`)
+			`{"category":"not_a_real_category","target":"rg"},`+
+			// The resolvable one: it makes the upsert loop actually execute.
+			`{"category":"install_worker_tool","target":"rg"}],"status":"done"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT = %d, want 200 (a bogus coordinate is not an error, it just matches nothing)", rec.Code)
 	}
-	if got.Updated != 0 {
-		t.Fatalf("updated = %d, want 0 — a body coordinate that resolves to no recommendation must write nothing", got.Updated)
+	if got.Updated != 1 {
+		t.Fatalf("updated = %d, want exactly 1 — only the resolvable coordinate may write, and it MUST "+
+			"write, or this test cannot observe a body-echo bug at all", got.Updated)
 	}
+	// Scoped to THIS caller's reviews, not the whole table. The store-IT runner shares one
+	// database across the entire suite, so an unscoped count is assertion-by-coincidence:
+	// any sibling test — or, as happened here, a leftover row from a mutation run against
+	// the same database — turns it red for reasons that have nothing to do with this code.
 	var n int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM recommendation_dispositions
-		  WHERE category NOT IN ('enable_tool','install_worker_tool','adjust_template',
-		                         'improve_agent','add_agent','improve_uzi')`).Scan(&n); err != nil {
+		`SELECT count(*) FROM recommendation_dispositions d
+		   JOIN run_reviews rv ON rv.id = d.review_id
+		  WHERE rv.user_id = $1
+		    AND d.category NOT IN ('enable_tool','install_worker_tool','adjust_template',
+		                           'improve_agent','add_agent','improve_uzi')`, userID).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {
 		t.Fatalf("%d disposition row(s) carry a category outside the six-enum set — a request body "+
 			"reached the coordinate columns, which is exactly what 00071/00073 assume cannot happen", n)
 	}
-	// The real coordinate in the same fixture is still untouched, so the miss was the
-	// bogus item and not a wholesale failure.
-	if rows := dispositionRowsFor(ctx, t, pool, userID); len(rows) != 0 {
-		t.Fatalf("nothing should have been disposed, got %v", rows)
+	// Exactly the resolved coordinate was written, under its OWN category/target.
+	rows := dispositionRowsFor(ctx, t, pool, userID)
+	if len(rows) != 1 || rows["install_worker_tool/rg"] != "done" {
+		t.Fatalf("disposition rows = %v, want exactly the resolved install_worker_tool/rg coordinate", rows)
 	}
 }

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -40,6 +41,10 @@ type bulkStore struct {
 	resolveArgs []store.ListOwnedRecommendationsForCoordsParams
 	upserted    []store.UpsertRecommendationDispositionParams
 	calls       []string
+
+	// failUpsertOn makes the Nth upsert (1-based) fail, for the partial-apply test. 0
+	// disables it.
+	failUpsertOn int
 }
 
 func (s *bulkStore) ListOwnedRecommendationsForCoords(_ context.Context, arg store.ListOwnedRecommendationsForCoordsParams) ([]store.ListOwnedRecommendationsForCoordsRow, error) {
@@ -56,6 +61,9 @@ func (s *bulkStore) ListOwnedRecommendationsForCoords(_ context.Context, arg sto
 func (s *bulkStore) UpsertRecommendationDisposition(_ context.Context, arg store.UpsertRecommendationDispositionParams) (store.RecommendationDisposition, error) {
 	s.calls = append(s.calls, "UpsertRecommendationDisposition")
 	s.upserted = append(s.upserted, arg)
+	if s.failUpsertOn > 0 && len(s.upserted) == s.failUpsertOn {
+		return store.RecommendationDisposition{}, errors.New("upsert exploded")
+	}
 	return store.RecommendationDisposition{ReviewID: arg.ReviewID, Category: arg.Category, Target: arg.Target, Status: arg.Status}, nil
 }
 
@@ -153,6 +161,29 @@ func TestBulkDispositionItemCap(t *testing.T) {
 		h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()}, body(workersvc.JudgeDispositionMaxItems)))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("exactly the cap = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+	})
+	// The cap counts DISTINCT work, not body length — which is the whole point of PF-2 and
+	// is only true because the cap check runs AFTER dedupeCoords. Moving the check before
+	// the dedup leaves every other test in the suite green (they all use distinct targets),
+	// so without this subtest nothing pins the ordering.
+	t.Run("over-cap raw items that dedupe to within the cap are accepted", func(t *testing.T) {
+		st := oneOpenMemberStore()
+		h := newRunsHandler(t, st)
+		items := make([]string, 0, workersvc.JudgeDispositionMaxItems*2)
+		for i := 0; i < workersvc.JudgeDispositionMaxItems*2; i++ {
+			// Two copies each of exactly `cap` distinct coordinates.
+			items = append(items, fmt.Sprintf(`{"category":"improve_uzi","target":"t%d"}`, i%workersvc.JudgeDispositionMaxItems))
+		}
+		rec := httptest.NewRecorder()
+		h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()},
+			`{"items":[`+strings.Join(items, ",")+`],"status":"done"}`))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%d raw items deduping to %d = %d, want 200 — the cap must count distinct work",
+				len(items), workersvc.JudgeDispositionMaxItems, rec.Code)
+		}
+		if n := len(st.resolveArgs[0].Categories); n != workersvc.JudgeDispositionMaxItems {
+			t.Fatalf("resolve received %d coordinates, want the %d distinct ones", n, workersvc.JudgeDispositionMaxItems)
 		}
 	})
 	t.Run("over the cap is 400 and writes nothing", func(t *testing.T) {
@@ -277,6 +308,48 @@ func TestBulkDispositionScopeSkipsSettledMembers(t *testing.T) {
 	}
 	if len(st.upserted) != 3 {
 		t.Fatalf("scope=all wrote %d members, want all 3", len(st.upserted))
+	}
+}
+
+// ---- partial failure ---------------------------------------------------------------
+
+// TestBulkDispositionPartialFailureIs500 pins the partial-apply contract, which nothing
+// covered before (PRD #98 M2 review, finding N). With the 2nd of 3 upserts failing, one
+// disposition has ALREADY been committed — there is no transaction, by design — and the
+// endpoint responds 500 with the generic error body, reporting no count.
+//
+// That is intended: a 500 makes no false claim of success, the landed subset shows up on
+// the next read, and every write is idempotent so a retry converges. The assertion worth
+// keeping is the negative one — a partial apply must never be dressed up as a success with
+// a misleading `updated`.
+func TestBulkDispositionPartialFailureIs500(t *testing.T) {
+	st := &bulkStore{members: map[string][]store.ListOwnedRecommendationsForCoordsRow{
+		"improve_uzi/docs": {
+			memberRow("improve_uzi", "docs", "", false),
+			memberRow("improve_uzi", "docs", "", false),
+			memberRow("improve_uzi", "docs", "", false),
+		},
+	}}
+	st.failUpsertOn = 2 // the second write blows up
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.BulkSetDispositions(rec, bulkPut(store.User{ID: uuid.New()},
+		`{"items":[{"category":"improve_uzi","target":"docs"}],"status":"done"}`))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("PUT with a failing upsert = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	// One write landed before the failure: the apply really is partial, not atomic.
+	if len(st.upserted) != 2 {
+		t.Fatalf("want 2 attempted upserts (one committed, one failed), got %d", len(st.upserted))
+	}
+	// And the body claims nothing about it.
+	if body := rec.Body.String(); !strings.Contains(body, "internal error") {
+		t.Fatalf("body = %s, want the generic internal error", body)
+	}
+	var got apitypes.JudgeDispositionResultDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err == nil && got.Updated != 0 {
+		t.Fatalf("a failed request must not report updated=%d — it must claim no completeness at all", got.Updated)
 	}
 }
 

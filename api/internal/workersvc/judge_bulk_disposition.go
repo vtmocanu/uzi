@@ -66,11 +66,21 @@ type JudgeDispositionCoord struct {
 //
 // Each write is #94's own idempotent coordinate upsert with the rationale_hash re-stamped
 // from the CURRENT rationale (its Decisions 3/6), so a double-click converges rather than
-// duplicating. The N upserts are NOT wrapped in a transaction, deliberately: each is a
-// local, side-effect-free, last-writer-wins upsert (there is no forge write and no token
-// spend to make exactly-once), so a partial failure is safely retried — the retry
-// re-applies the same values and converges. Fail-fast on the first error; the response
-// then reflects only what landed.
+// duplicating.
+//
+// PARTIAL-FAILURE CONTRACT. The N upserts are NOT wrapped in a transaction, deliberately:
+// each is a local, side-effect-free, last-writer-wins upsert (there is no forge write and
+// no token spend to make exactly-once), so a partial apply is safely retried and converges.
+// On the first upsert error this returns the ZERO DTO and the error, which the handler maps
+// to a 500 — it does NOT report how many writes landed. So if upsert 2 of 3 fails, one
+// disposition is already committed and the client is told only "internal error".
+//
+// That is the intended behavior, not an oversight: a 500 makes no false claim of success,
+// the landed subset is visible on the very next read, and a retry converges because every
+// write is idempotent. The requirement is that the endpoint must never CLAIM completeness
+// it does not have, and returning nothing satisfies it. A partial-success report (207, or
+// 200 with a `partial` flag) is a deliberate non-goal for v1 — revisit `updated` and the
+// re-read together if that ever changes.
 func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID, items []JudgeDispositionCoord, status, reason, scope string) (apitypes.JudgeDispositionResultDTO, error) {
 	coords := dedupeCoords(items)
 	if len(coords) > JudgeDispositionMaxItems {
@@ -126,7 +136,11 @@ func (s *Service) BulkSetDispositions(ctx context.Context, ownerUserID uuid.UUID
 	return apitypes.JudgeDispositionResultDTO{
 		Updated: updated,
 		Groups:  groupsForCoords(backlog.Groups, coords),
-		Triage:  backlog.Triage,
+		// Carried through: past the cap, a settled coordinate can fall outside the read
+		// window and have no group here. The flag is how a consumer tells that from
+		// "settled and gone" (see JudgeDispositionResultDTO).
+		Truncated: backlog.Truncated,
+		Triage:    backlog.Triage,
 	}, nil
 }
 

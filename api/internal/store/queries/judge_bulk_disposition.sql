@@ -12,12 +12,18 @@
 --     belongs to another user resolves to ZERO members and the caller cannot tell it apart
 --     from one that does not exist (PRD #94 Decision 5's one-404 rule — no existence
 --     oracle). `IsAdmin` is never consulted anywhere on this path.
---  2. The SELECT returns rr.category / rr.target — the RESOLVED row's values, not the
---     caller's. 00071 and 00073 both omit a category CHECK *on purpose*, stating that "the
---     handler never accepts a category from the request body — it reads it off the resolved
---     recommendation". Writing the disposition from these columns is what keeps that true:
---     a bogus or oversized body coordinate simply matches nothing, so a uzc_ token can
---     never write attacker-chosen text into a table with no CHECK to stop it.
+--  2. Only real recommendation coordinates come back. 00071 and 00073 both omit a category
+--     CHECK *on purpose*, stating that "the handler never accepts a category from the
+--     request body — it reads it off the resolved recommendation", so a bogus or oversized
+--     body coordinate must match nothing rather than reach the coordinate columns.
+--
+--     Credit where it is due: the guarantee comes from the `JOIN want ON want.category =
+--     rr.category AND want.target = rr.target`, NOT from the SELECT list naming rr.*. The
+--     join equates the two sides, so selecting want.category instead would be behaviourally
+--     identical (verified by mutation, PRD #98 M2 review). The SELECT list is written off
+--     `rr` because that is the honest source and it keeps the Go caller obviously correct —
+--     but do not mistake it for the enforcement, and do not "simplify" the JOIN on the
+--     theory that the SELECT list is what protects this.
 --
 -- The requested coordinates arrive as two PARALLEL arrays zipped by ordinal into `want`,
 -- so it is the exact list of (category, target) pairs, never their cross product. The

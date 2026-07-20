@@ -178,10 +178,19 @@ type JudgeBacklogDTO struct {
 // that just left To triage is still returned with its new rollup), and Triage is the
 // recomputed canonical tally — together enough for the page to update its rows AND its
 // badge from this one round-trip, with no follow-up GET.
+//
+// Truncated carries through from that re-read, which is bounded by the same hard row cap as
+// the backlog (workersvc.JudgeBacklogMaxRows). It matters because of a specific interaction:
+// a user past the cap can settle a coordinate that lies OUTSIDE the read window and get
+// Updated > 0 with NO corresponding entry in Groups. Without this flag a consumer cannot
+// tell that from "the group is gone", and would make the row vanish mid-interaction —
+// exactly what re-reading at bucket=all exists to prevent. When Truncated is true, treat a
+// missing group as UNKNOWN, not settled.
 type JudgeDispositionResultDTO struct {
-	Updated int                           `json:"updated"`
-	Groups  []JudgeRecommendationGroupDTO `json:"groups"`
-	Triage  TriageDTO                     `json:"triage"`
+	Updated   int                           `json:"updated"`
+	Groups    []JudgeRecommendationGroupDTO `json:"groups"`
+	Truncated bool                          `json:"truncated"`
+	Triage    TriageDTO                     `json:"triage"`
 }
 
 // ReviewDTO is the run's judge verdict + recommendations for the run page. summary_md

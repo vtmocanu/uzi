@@ -560,10 +560,24 @@ Judge page header). Single repo, so no cross-repo phase.
   `ORDER BY` spans two tables (`rv.created_at, rv.id, rr.created_at, rr.id`), so no
   single index supplies that ordering and the server must produce the caller's full
   join result and top-N sort it before `LIMIT` applies. `?bucket=all` on a heavy
-  account still walks all of *that caller's* rows server-side — bounded to own data
-  by `idx_run_reviews_user` (`00059`), never a full-table scan, i.e. the same
-  O(own-data) shape `/me/judge/stats` has always had. (Structural argument from the
-  query text and the migration's index list; **not** verified with `EXPLAIN`.) So
+  account still walks all of *that caller's* rows server-side. **`EXPLAIN (ANALYZE,
+  BUFFERS)` was subsequently run against a seeded multi-tenant fixture (120 users,
+  7,278 runs/reviews, 145,222 recommendations, caller owns 1,200) and one clause of
+  this paragraph came back FALSE — corrected here rather than left standing.** The
+  top-N-sort-above-the-join claim is confirmed (`Limit → Sort → Hash Left Join`,
+  the sort sits above the entire join), and `run_reviews` is index-bounded as
+  claimed (`Bitmap Index Scan on idx_run_reviews_user` → 60 rows). But **"never a
+  full-table scan" is wrong**: the plan carries `Seq Scan on review_recommendations
+  (rows=145222)` and `Seq Scan on runs (rows=7278)` — both read in full to return
+  1,200 rows. `idx_review_recommendations_review` exists and the planner does not
+  choose it, preferring hash joins, and the plan shape is identical at 24k and at
+  145k rows, so this is not a small-data artifact. **The read therefore scales with
+  the TOTAL size of `review_recommendations`/`runs` across all tenants, not with the
+  caller's backlog.** This is inherited from #94's join spine, not introduced by
+  this PRD — the companion `GET /me/judge/stats` shows the identical seq scan — but
+  #98 makes the judge page run **two** such scans per request, and the nav badge
+  polls one of them. Indexing it is a **#94-scoped** change needing its own
+  measurement, deliberately not attempted here. So
   the claim "an anchored pull reads only the rows it returns" is true of the API and
   **false of the database** — the `EXISTS` is still evaluated per candidate row.
   Do not promote that sentence into `docs/judge.md`.
