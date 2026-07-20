@@ -47,7 +47,7 @@ shortened alias), matching the strip.
 ## Design Decisions
 
 1. **Per-agent, not per-model.** The result frame already carries a per-**model**
-   `modelUsage` map (`agent/src/sdk-messages.ts:119`), but that cannot answer
+   `modelUsage` map (`agent/src/sdk-messages.ts:120`), but that cannot answer
    "which agent used which model" when several agents share a model (the common
    case — lead + subagents all on opus). The per-agent assistant-frame path is
    the only source of the agent→model mapping, so this rides that path.
@@ -56,17 +56,26 @@ shortened alias), matching the strip.
    drop, and every phase terminates on a signal frame; attaching earlier would
    systematically lose the lead's terminating-frame attribution — the identical
    argument PRD #40 made for `usage`. A frame whose messages are all filtered
-   loses its model (accepted, same as usage).
+   loses its model (accepted, same as usage). **`model` is co-gated with
+   `usage`**: it rides the *same* surviving frame, sharing the one
+   `usageAttached` flag (`agent/src/sdk-executor.ts:577-580`), so a model is
+   recorded only where that agent's tokens are. The web derive therefore reads
+   `model` inside the same `"usage" in payload` branch (`runUsage.ts:156-166`)
+   and never produces a zero-token agent row from a model-only frame.
 3. **Tokens-only stays true; no cost implied.** This column is deliberately
    *not* cost. Per-agent cost remains unavailable (the SDK bills the turn and
    sub-splits only by model), and the existing footnote ("tokens only — per-agent
    cost is not available") stays. This PRD does not touch that.
-4. **Multi-model per agent → primary + count.** An agent normally emits one
-   model across a run, so the cell is one string. If a set of >1 is observed
-   (model fallback, or a mid-run default change), render `claude-opus-4-8 +1`
-   (the most-frequent model, plus a count of the others); the "Attributed total"
-   row, which spans agents, reads `N models`. Deterministic tie-break: highest
-   frequency, then lexicographic.
+4. **Multi-model per agent → primary + count, driven by frequencies not a bare
+   set.** The derive keeps a per-agent **count map** (`Record<model, n>`,
+   incremented once per model-bearing attached frame — i.e. per counted `usage`
+   frame), not a `Set`, because the tie-break needs frequencies. An agent
+   normally has one entry, so the cell is that model string. With >1 distinct
+   models, render `<most-frequent> +K` where K = the number of *other* distinct
+   models (so two models → `+1`); tie-break highest count, then lexicographic.
+   The "Attributed total" row spans agents: it shows the **single model string**
+   when the whole run used exactly one distinct model (the common case), `N
+   models` when >1, and `—` only when no agent carried any model.
 5. **No wire/API/DTO change.** `run_messages.payload` is stored and forwarded
    verbatim (`json.RawMessage`, `workersvc/service.go:856`) and the web
    `RunMessage.payload` is `unknown`, read structurally via `rec()`. Adding an
@@ -90,14 +99,19 @@ shortened alias), matching the strip.
   carries `model` and that a filtered/all-signal frame does not.
 
 **web/**
-- `web/src/lib/runUsage.ts` — extend `AgentUsage` with `models: string[]` (or a
-  derived `model`/`modelSuffix`); collect the per-agent model set inside the
-  assistant-frame reduction (lines 156-166). Pure function; unit-tested.
+- `web/src/lib/runUsage.ts` — extend `AgentUsage` with a model **count map**
+  (`modelCounts: Record<string, number>`), incremented once per model-bearing
+  attached frame inside the same assistant-frame reduction (lines 156-166), plus
+  a derived display (`<most-frequent> +K`, tie-break highest count then
+  lexicographic — Decision 4). Also expose a run-wide distinct-model count/list
+  for the total row. Pure function; unit-tested.
 - `web/src/components/RunUsage.tsx` — add the `Model` column header + cells to
   the per-agent table (after Agent); the "Attributed total" row's Model cell
-  shows the run-wide model count (or `—`). Keep the tokens-only footnote.
-- `web/src/lib/runUsage` + `RunUsage` tests — per-agent model set (single,
-  multi, absent) and the rendered column (single model, `+1` suffix, `—`).
+  shows the single model string when the run used one distinct model, `N models`
+  when >1, `—` when none (Decision 4). Keep the tokens-only footnote.
+- `web/src/lib/runUsage` + `RunUsage` tests — per-agent model counts (single,
+  multi with `+K` + tie-break, absent) and the rendered column (single model,
+  `+1` suffix, `—`), plus the total row's single/`N models`/`—` cases.
 - `web/src/mocks/data.ts` — the demo run's per-agent frames gain a `model` so the
   mock/dev UI shows the column populated (matches PRD #40's demo-usage pattern).
 
