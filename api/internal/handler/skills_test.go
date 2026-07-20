@@ -1,11 +1,19 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
+	mw "gitlab.example.com/vtmocanu/uzi/api/internal/middleware"
 	"gitlab.example.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -157,4 +165,88 @@ func TestAllocatableRules(t *testing.T) {
 	if allocatableAsMine(theirs, actor) {
 		t.Error("another user's private skill must NOT be mine-allocatable")
 	}
+}
+
+// fakeSkillDB is a store.DBTX standing in for GetSkillForViewer's two outcomes: it
+// either scans back one skill row, or reports pgx.ErrNoRows.
+type fakeSkillDB struct{ skill *store.Skill }
+
+func (fakeSkillDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func (fakeSkillDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, pgx.ErrNoRows
+}
+func (f fakeSkillDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	if f.skill == nil {
+		return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
+	}
+	s := *f.skill
+	// GetSkillForViewer scans id, name, description, body, scope, user_id,
+	// updated_by, created_at, updated_at — the first five are all the DTO assertions
+	// below need; the rest keep their zero values.
+	return fakeScanRow{func(dest ...any) error {
+		if p, ok := dest[0].(*uuid.UUID); ok {
+			*p = s.ID
+		}
+		if p, ok := dest[1].(*string); ok {
+			*p = s.Name
+		}
+		if p, ok := dest[4].(*string); ok {
+			*p = s.Scope
+		}
+		return nil
+	}}
+}
+
+// getSkillRec drives GetSkill for one id with an authenticated non-admin caller.
+func getSkillRec(t *testing.T, db store.DBTX, id uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+	h := &Handler{q: store.New(db)}
+	req := httptest.NewRequest(http.MethodGet, "/api/skills/"+id.String(), nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", id.String())
+	req = req.WithContext(context.WithValue(
+		mw.ContextWithUser(req.Context(), store.User{ID: uuid.New(), IsActive: true}),
+		chi.RouteCtxKey, rctx))
+	rec := httptest.NewRecorder()
+	h.GetSkill(rec, req)
+	return rec
+}
+
+// TestGetSkillNotFoundVsFound joins the halves of the "another user's private skill is
+// indistinguishable from an absent one" property (PRD #97 M9b, issue #16). The store
+// half is proven against live PG by TestSkillsVisibilityLiveDB (its "single-get
+// visibility" block): a non-owner non-admin gets pgx.ErrNoRows. The handler half — that ErrNoRows becomes a
+// 404 and not a masked 500 — had no test anywhere until this one; the e2e leg that
+// used to span both was dropped. A 500 here would still deny the read, but it would
+// leak that the id resolves to something, which is the whole point of the 404.
+func TestGetSkillNotFoundVsFound(t *testing.T) {
+	t.Run("store says ErrNoRows -> 404", func(t *testing.T) {
+		rec := getSkillRec(t, fakeSkillDB{}, uuid.New())
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("store returns a skill -> 200", func(t *testing.T) {
+		want := store.Skill{ID: uuid.New(), Name: "visible-skill", Scope: "global"}
+		rec := getSkillRec(t, fakeSkillDB{skill: &want}, want.ID)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Skill struct {
+				ID    string `json:"id"`
+				Name  string `json:"name"`
+				Scope string `json:"scope"`
+			} `json:"skill"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out.Skill.ID != want.ID.String() || out.Skill.Name != want.Name || out.Skill.Scope != want.Scope {
+			t.Errorf("skill = %+v, want id=%s name=%s scope=%s", out.Skill, want.ID, want.Name, want.Scope)
+		}
+	})
 }
